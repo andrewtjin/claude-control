@@ -20,9 +20,10 @@ export interface ClaudeOauth {
 }
 
 /**
- * The `oauthAccount` block from `~/.claude.json`. This file lives OUTSIDE
- * `CLAUDE_CONFIG_DIR` and holds far more than auth, so unknown keys are preserved
- * verbatim on write — we only ever replace this one block. Hence the index signature.
+ * The `oauthAccount` block from the CLI config file (`~/.claude.json`, or
+ * `<CLAUDE_CONFIG_DIR>/.claude.json` when that env var is set — wet-verified, WT-1).
+ * The file holds far more than auth, so unknown keys are preserved verbatim on
+ * write — we only ever replace this one block. Hence the index signature.
  */
 export interface OauthAccount {
   accountUuid?: string;

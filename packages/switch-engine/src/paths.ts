@@ -12,7 +12,8 @@ export interface Paths {
   claudeDir: string;
   /** `<claudeDir>/.credentials.json` — the live `claudeAiOauth` block (Windows: plaintext). */
   credentialsPath: string;
-  /** `~/.claude.json` — holds `oauthAccount`. Lives in the HOME dir, NOT under claudeDir. */
+  /** The CLI config file holding `oauthAccount`: `~/.claude.json` normally, but when
+   *  `CLAUDE_CONFIG_DIR` is set the CLI keeps it INSIDE that dir (wet-verified, WT-1). */
   claudeJsonPath: string;
   /** Root of our encrypted vault + registry + audit trail. */
   vaultDir: string;
@@ -21,14 +22,16 @@ export interface Paths {
 /** Resolve the default production paths from the environment. */
 export function defaultPaths(env: NodeJS.ProcessEnv = process.env): Paths {
   const home = homedir();
-  // CLAUDE_CONFIG_DIR relocates .credentials.json but NOT ~/.claude.json — mirror that.
-  const claudeDir = env.CLAUDE_CONFIG_DIR?.trim() || join(home, '.claude');
+  // WT-1 (CLI 2.1.211): CLAUDE_CONFIG_DIR relocates the whole config — .credentials.json
+  // AND .claude.json both live inside it. Only the default (unset) case uses ~/.claude.json.
+  const configDir = env.CLAUDE_CONFIG_DIR?.trim();
+  const claudeDir = configDir || join(home, '.claude');
   // On Windows LOCALAPPDATA is the right home for machine-local encrypted state.
   const localAppData = env.LOCALAPPDATA?.trim() || join(home, 'AppData', 'Local');
   return {
     claudeDir,
     credentialsPath: join(claudeDir, '.credentials.json'),
-    claudeJsonPath: join(home, '.claude.json'),
+    claudeJsonPath: configDir ? join(configDir, '.claude.json') : join(home, '.claude.json'),
     vaultDir: join(localAppData, 'claude-control', 'vault'),
   };
 }
