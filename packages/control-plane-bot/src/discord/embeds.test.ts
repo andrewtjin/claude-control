@@ -23,20 +23,51 @@ function account(overrides: Partial<AccountUsage> = {}): AccountUsage {
 }
 
 describe('buildUsageEmbed', () => {
-  it('renders a field per account with formatted limits', () => {
+  it('renders a field per account with a layered progress bar per limit', () => {
     const embed = buildUsageEmbed({ accounts: [account()] }).toJSON();
     expect(embed.title).toBe('Usage');
     expect(embed.fields).toHaveLength(1);
     expect(embed.fields?.[0]?.name).toContain('Work');
-    expect(embed.fields?.[0]?.name).toContain('active');
-    expect(embed.fields?.[0]?.value).toContain('session 42%');
+    expect(embed.fields?.[0]?.name).toContain('🟢 active');
+    // 42% in the ok zone: 4 green cells, 6 empty, then the text line.
+    expect(embed.fields?.[0]?.value).toContain('🟩🟩🟩🟩⬜⬜⬜⬜⬜⬜ session 42%');
   });
 
-  it('marks idle accounts and surfaces a per-account error', () => {
+  it('colors the embed by the worst severity across all accounts', () => {
+    const ok = buildUsageEmbed({ accounts: [account()] }).toJSON();
+    expect(ok.color).toBe(0x2ecc71);
+    const critical = buildUsageEmbed({
+      accounts: [
+        account(),
+        account({ limits: [{ kind: 'weekly_all', percent: 97, isActive: true }] }),
+      ],
+    }).toJSON();
+    expect(critical.color).toBe(0xe74c3c);
+  });
+
+  it('appends a native relative timestamp when a limit has a future reset', () => {
+    const NOW = Date.parse('2026-07-16T12:00:00.000Z');
+    const resetsAt = '2026-07-16T14:00:00.000Z';
+    const embed = buildUsageEmbed(
+      {
+        accounts: [
+          account({ limits: [{ kind: 'session', percent: 42, isActive: true, resetsAt }] }),
+        ],
+      },
+      NOW,
+    ).toJSON();
+    expect(embed.fields?.[0]?.value).toContain(
+      `resets <t:${Math.floor(Date.parse(resetsAt) / 1000)}:R>`,
+    );
+  });
+
+  it('marks idle accounts, cached snapshots, and surfaces a per-account error', () => {
     const embed = buildUsageEmbed({
-      accounts: [account({ active: false, error: 'refresh failed' })],
+      accounts: [account({ active: false, source: 'cached', error: 'refresh failed' })],
     }).toJSON();
     expect(embed.fields?.[0]?.name).toContain('idle');
+    expect(embed.fields?.[0]?.name).toContain('· cached');
+    expect(embed.fields?.[0]?.name).toContain('⚠️');
     expect(embed.fields?.[0]?.value).toContain('refresh failed');
   });
 
@@ -81,7 +112,10 @@ describe('buildUsageEmbed', () => {
       },
       NOW,
     ).toJSON();
-    expect(embed.fields?.[0]?.value).toContain('5×5h windows left · weekly resets in 1d 2h');
+    const weeklyTs = Math.floor(Date.parse('2026-07-17T14:00:00.000Z') / 1000);
+    expect(embed.fields?.[0]?.value).toContain(
+      `🪟 5×5h windows left · weekly resets <t:${weeklyTs}:R>`,
+    );
   });
 
   it('omits the budget line when no weekly reset time is known', () => {
@@ -101,15 +135,60 @@ describe('buildTimelineEmbed', () => {
     }),
   ];
 
-  it('renders the outlook inside a code block so the ASCII tracks align', () => {
+  const SESSION_TS = Math.floor(Date.parse('2026-07-16T14:00:00.000Z') / 1000);
+  const WEEKLY_TS = Math.floor(Date.parse('2026-07-17T14:00:00.000Z') / 1000);
+
+  it('renders rich markdown — no code block, native timestamps, emoji track', () => {
     const embed = buildTimelineEmbed({ accounts }, NOW).toJSON();
     expect(embed.title).toBe('Reset timeline');
-    expect(embed.description).toMatch(/^```\n/);
-    expect(embed.description).toMatch(/\n```$/);
-    expect(embed.description).toContain('5h-session budget');
-    expect(embed.description).toContain('Reset timeline  now -> 1d 2h');
-    expect(embed.description).toContain('Upcoming resets');
-    expect(embed.description).toContain('5h window resets (42% used clears)');
+    expect(embed.description).not.toContain('```');
+    // Legend + shared span in the description.
+    expect(embed.description).toContain(`now → <t:${WEEKLY_TS}:R>`);
+    expect(embed.description).toContain('🟦 5h window');
+    // Per-account field: session bar, budget line, and the proportional track.
+    const field = embed.fields?.find((f) => f.name.includes('Work'));
+    expect(field?.name).toContain('🟢');
+    expect(field?.value).toContain(
+      `🟩🟩🟩🟩⬜⬜⬜⬜⬜⬜ window open · 42% used · resets <t:${SESSION_TS}:R>`,
+    );
+    expect(field?.value).toContain(
+      `🪟 5×5h windows left +1 partial · weekly resets <t:${WEEKLY_TS}:R>`,
+    );
+    // Track: session reset at 2h of a 26h span → cell 1 (round(2/26·11)); weekly at the end.
+    expect(field?.value).toContain('⬛🟦⬛⬛⬛⬛⬛⬛⬛⬛⬛🟪');
+  });
+
+  it('lists upcoming resets chronologically with reset semantics', () => {
+    const embed = buildTimelineEmbed({ accounts }, NOW).toJSON();
+    const upcoming = embed.fields?.find((f) => f.name === 'Upcoming resets');
+    expect(upcoming?.value).toContain(
+      `🟦 <t:${SESSION_TS}:R> — **Work** · 5h window resets (42% used clears)`,
+    );
+    expect(upcoming?.value).toContain(
+      `🟪 <t:${WEEKLY_TS}:R> — **Work** · weekly quota resets — 70% unused expires`,
+    );
+  });
+
+  it('shows a no-open-window signal when the session limit has no future reset', () => {
+    const embed = buildTimelineEmbed(
+      {
+        accounts: [
+          account({
+            limits: [
+              {
+                kind: 'weekly_all',
+                percent: 30,
+                isActive: true,
+                resetsAt: '2026-07-17T14:00:00.000Z',
+              },
+            ],
+          }),
+        ],
+      },
+      NOW,
+    ).toJSON();
+    const field = embed.fields?.find((f) => f.name.includes('Work'));
+    expect(field?.value).toContain('💤 no open 5h window');
   });
 
   it('appends the daemon-computed plan when the snapshot carries one', () => {
@@ -120,8 +199,14 @@ describe('buildTimelineEmbed', () => {
       advisories: [{ kind: 'all_healthy', message: 'All accounts have healthy headroom.' }],
     };
     const embed = buildTimelineEmbed({ accounts, plan }, NOW).toJSON();
-    expect(embed.description).toContain('Plan: Work has the most available headroom (58%).');
-    expect(embed.description).toContain('- All accounts have healthy headroom.');
+    const planField = embed.fields?.find((f) => f.name === 'Plan');
+    expect(planField?.value).toContain('Work has the most available headroom (58%).');
+    expect(planField?.value).toContain('• All accounts have healthy headroom.');
+  });
+
+  it('shows a placeholder when there are no accounts', () => {
+    const embed = buildTimelineEmbed({ accounts: [] }, NOW).toJSON();
+    expect(embed.description).toMatch(/no accounts/i);
   });
 });
 
