@@ -4,6 +4,7 @@
 // text — no colors or spinners — so it is readable in any terminal and easy to assert on.
 
 import type { StoredAccount } from '@claude-control/switch-engine';
+import type { AccountUsage } from '@claude-control/shared-protocol';
 
 /** Render the accounts registry as an aligned table. `activeId` is marked with `*`. */
 export function renderAccountsTable(accounts: StoredAccount[], activeId: string | null): string {
@@ -36,6 +37,53 @@ export function renderAccountsTable(accounts: StoredAccount[], activeId: string 
     ].join('  ');
 
   return [line(headers), ...rows.map(line)].join('\n');
+}
+
+/** One account's row for the usage view. `usage` is absent until the daemon has polled it. */
+export interface UsageRow {
+  label: string;
+  active: boolean;
+  usage: AccountUsage | undefined;
+}
+
+/** Render cross-account usage from the daemon's latest persisted poll. Shows each account's
+ *  source (live/cached), how stale the reading is, and the percent used per limit — so a
+ *  cached (frozen) number is never mistaken for a fresh one. Pure. */
+export function renderUsage(rows: UsageRow[], nowMs: number): string {
+  if (rows.length === 0) return 'No accounts yet. Add one with: cctl accounts add <label>';
+  return rows
+    .map((r) => {
+      const marker = r.active ? '*' : ' ';
+      if (!r.usage) {
+        return `${marker} ${r.label} — no usage data yet (start the daemon: cctl daemon start)`;
+      }
+      const age = ageLabel(nowMs - r.usage.fetchedAtMs);
+      const limits = r.usage.limits.length
+        ? r.usage.limits.map((l) => `${limitShort(l.kind)} ${Math.round(l.percent)}%`).join(' · ')
+        : 'no limits reported';
+      const err = r.usage.error ? `  [${r.usage.error}]` : '';
+      return `${marker} ${r.label}  (${r.usage.source}, ${age})  ${limits}${err}`;
+    })
+    .join('\n');
+}
+
+function limitShort(kind: AccountUsage['limits'][number]['kind']): string {
+  switch (kind) {
+    case 'session':
+      return '5h';
+    case 'weekly_all':
+      return 'week';
+    case 'weekly_scoped':
+      return 'week*';
+  }
+}
+
+/** "just now" / "3m ago" / "2h ago" — a coarse staleness label for a poll timestamp. */
+function ageLabel(ms: number): string {
+  if (ms < 60_000) return 'just now';
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${Math.floor(minutes / 60)}h ago`;
 }
 
 /** Width of a column = the longest of its header and any cell. */

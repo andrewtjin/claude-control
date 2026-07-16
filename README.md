@@ -42,13 +42,30 @@ pnpm run test
 The CLI is available as `cctl` once built (`pnpm --filter @claude-control/cli build`,
 then `node packages/cli/dist/bin.js --help`).
 
+## CLI
+
+`cctl` runs local, one-shot commands over the switch engine and the daemon's data:
+
+```
+cctl accounts add <label>   # capture the currently logged-in account
+cctl accounts list          # list stored accounts (active marked with *)
+cctl switch <id|label>      # activate an account
+cctl usage                  # cross-account usage from the daemon's latest poll
+cctl recover                # recover from an interrupted switch
+cctl doctor                 # check the local environment (DPAPI, vault, login)
+```
+
+Remote control (`pair`, `run`, and the background `daemon`) needs the running daemon
+connected to the hosted bot — an on-machine step described in `docs/VERIFICATION.md`.
+
 ## Status
 
-Pre-release. Core contracts, the switch engine, usage/attribution, pairing, and the
-control-plane relay are implemented and unit-tested. Live integration surfaces
-(real account switching, the Anthropic usage endpoint, Discord connectivity, and
-ConPTY-observed sessions) are gated behind on-machine verification — see
-`docs/VERIFICATION.md`.
+Pre-release. All seven packages are implemented and unit-tested (300+ tests), and the
+whole workspace builds, lints, and passes clean. An adversarial security pass on the
+control plane and daemon has been run and its findings fixed. Live integration surfaces
+— real account switching, the Anthropic usage endpoint, Discord connectivity, the CLI
+hook names, and ConPTY-observed sessions — are gated behind on-machine (wet)
+verification; each is enumerated with exact steps in `docs/VERIFICATION.md`.
 
 ## Platform
 

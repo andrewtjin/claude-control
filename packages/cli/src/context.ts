@@ -4,8 +4,20 @@
 // SwitchEngine on the real default paths. A `pino` logger is adapted to the engine's tiny
 // Logger interface; the CLI keeps it quiet by default (warn+).
 
+import { mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import pino from 'pino';
 import { SwitchEngine, defaultPaths, type Logger, type Paths } from '@claude-control/switch-engine';
+
+/** The daemon's sqlite database — a sibling of the vault under the claude-control data dir.
+ *  The CLI reads it (e.g. `cctl usage`) without needing the daemon process to be running.
+ *  Ensures the parent directory exists so opening a not-yet-created db does not fail (sqlite
+ *  cannot create a file under a missing directory). */
+export function daemonDbPath(paths: Paths = defaultPaths()): string {
+  const dir = dirname(paths.vaultDir);
+  mkdirSync(dir, { recursive: true });
+  return join(dir, 'daemon.db');
+}
 
 /** Build a SwitchEngine on the real, production paths. */
 export function buildEngine(paths: Paths = defaultPaths()): SwitchEngine {

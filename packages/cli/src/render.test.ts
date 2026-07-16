@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { renderAccountsTable } from './render.js';
+import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
 import type { StoredAccount } from '@claude-control/switch-engine';
+import type { AccountUsage } from '@claude-control/shared-protocol';
 
 function acct(id: string, label: string, extra: Partial<StoredAccount> = {}): StoredAccount {
   return { id, label, quarantined: false, createdAtMs: 0, updatedAtMs: 0, ...extra };
@@ -24,5 +25,46 @@ describe('renderAccountsTable', () => {
     // Active row carries the '*' marker; quarantined row shows the status.
     expect(out).toMatch(/\*\s+Work/);
     expect(out).toMatch(/quarantined/);
+  });
+});
+
+describe('renderUsage', () => {
+  const NOW = 1_000_000_000;
+  const usage = (over: Partial<AccountUsage> = {}): AccountUsage => ({
+    accountId: 'a',
+    label: 'Work',
+    active: true,
+    source: 'live',
+    fetchedAtMs: NOW - 3 * 60_000, // 3 minutes ago
+    limits: [
+      { kind: 'session', percent: 45, isActive: true },
+      { kind: 'weekly_all', percent: 30, isActive: true },
+    ],
+    ...over,
+  });
+
+  it('shows source, staleness, and per-limit percentages', () => {
+    const rows: UsageRow[] = [{ label: 'Work', active: true, usage: usage() }];
+    const out = renderUsage(rows, NOW);
+    expect(out).toMatch(/\* Work/); // active marker
+    expect(out).toMatch(/live, 3m ago/); // source + staleness
+    expect(out).toMatch(/5h 45%/); // session limit
+    expect(out).toMatch(/week 30%/); // weekly limit
+  });
+
+  it('labels a cached reading as cached so it is not mistaken for fresh', () => {
+    const rows: UsageRow[] = [
+      { label: 'Reserve', active: false, usage: usage({ source: 'cached', label: 'Reserve' }) },
+    ];
+    expect(renderUsage(rows, NOW)).toMatch(/cached, 3m ago/);
+  });
+
+  it('prompts to start the daemon when an account has no snapshot yet', () => {
+    const rows: UsageRow[] = [{ label: 'Fresh', active: false, usage: undefined }];
+    expect(renderUsage(rows, NOW)).toMatch(/no usage data yet/);
+  });
+
+  it('prompts to add accounts when empty', () => {
+    expect(renderUsage([], NOW)).toMatch(/No accounts yet/);
   });
 });

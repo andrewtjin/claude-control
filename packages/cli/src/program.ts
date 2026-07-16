@@ -6,11 +6,12 @@
 // which are unit-tested; here we only wire and print.
 
 import { Command } from 'commander';
-import { QuarantineError, UnknownAccountError } from '@claude-control/switch-engine';
-import { buildEngine, fail } from './context.js';
-import { renderAccountsTable } from './render.js';
+import { QuarantineError, UnknownAccountError, defaultPaths } from '@claude-control/switch-engine';
+import { Store } from '@claude-control/daemon';
+import type { AccountUsage } from '@claude-control/shared-protocol';
+import { buildEngine, daemonDbPath, fail } from './context.js';
+import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
 import { resolveAccountRef } from './resolve.js';
-import { defaultPaths } from '@claude-control/switch-engine';
 import { renderDoctor, runDoctor, summarize } from './doctor.js';
 
 const VERSION = '0.1.0';
@@ -61,6 +62,35 @@ export function buildProgram(): Command {
     });
 
   program
+    .command('usage')
+    .description("show usage across all accounts (from the daemon's latest poll)")
+    .action(async () => {
+      const engine = buildEngine();
+      const [accounts, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
+      // Read-only view of the daemon's persisted snapshots; works whether or not the daemon is
+      // currently running (it shows the last poll). Opening a not-yet-created db just yields an
+      // empty one, which renders as "no usage data yet".
+      const store = new Store(daemonDbPath());
+      try {
+        const rows: UsageRow[] = accounts.map((a) => {
+          const row = store.latestUsageSnapshot(a.id);
+          let usage: AccountUsage | undefined;
+          if (row) {
+            try {
+              usage = JSON.parse(row.json) as AccountUsage;
+            } catch {
+              usage = undefined; // a corrupt row must not crash the whole view
+            }
+          }
+          return { label: a.label, active: a.id === activeId, usage };
+        });
+        process.stdout.write(renderUsage(rows, Date.now()) + '\n');
+      } finally {
+        store.close();
+      }
+    });
+
+  program
     .command('doctor')
     .description('check the local environment')
     .action(() => {
@@ -70,19 +100,23 @@ export function buildProgram(): Command {
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);
     });
 
-  // Daemon-backed remote features. Wired once the daemon ships (M1+); surfaced now so the
-  // command set is discoverable and the guidance is honest rather than a silent absence.
+  // Remote-control features that require the running daemon connected to the hosted bot —
+  // an inherently on-machine (wet) step. Surfaced now so the command set is discoverable and
+  // the guidance is honest rather than a silent absence. See docs/VERIFICATION.md.
   for (const [name, note] of [
-    ['usage', 'cross-account usage needs the daemon poller'],
-    ['pair', 'pairing binds this machine to the Discord bot'],
-    ['run', 'remote sessions need the daemon'],
-    ['daemon', 'start/stop the background daemon'],
+    ['pair', 'bind this machine to the Discord bot (run /pair there for a code)'],
+    ['run', 'start a remote session (drive it from Discord)'],
+    ['daemon', 'run the background daemon (poller + control-plane connection)'],
   ] as const) {
     program
       .command(name)
-      .description(`(requires daemon — coming with M1) ${note}`)
+      .description(`(needs the running daemon + hosted bot) ${note}`)
       .allowUnknownOption(true)
-      .action(() => fail(`\`cctl ${name}\` requires the daemon, which is not built yet.`));
+      .action(() =>
+        fail(
+          `\`cctl ${name}\` needs the daemon connected to the bot — an on-machine step; see docs/VERIFICATION.md.`,
+        ),
+      );
   }
 
   return program;
