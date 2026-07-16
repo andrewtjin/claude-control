@@ -19,6 +19,7 @@ import {
   type EnvelopeDraft,
 } from '@claude-control/shared-protocol';
 import type { RecoverResult, ActivateResult, StoredAccount } from '@claude-control/switch-engine';
+import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import type {
   SessionManager,
   SessionHandle,
@@ -274,6 +275,33 @@ describe('Daemon lifecycle', () => {
     expect(controlPlaneClient.getState()).toBe('open');
     await waitFor(() => pollSpy.mock.calls.length > 0);
     await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+  });
+
+  it("feeds each poll cycle's advisor inputs to the auto-switcher when one is wired", async () => {
+    const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
+      void accounts;
+      return Promise.resolve();
+    });
+    // Rebuild with the optional collaborator present — afterEach stops whatever `daemon`
+    // points to, so reassigning keeps cleanup intact.
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      autoSwitcher: { evaluate },
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => evaluate.mock.calls.length > 0);
+    const inputs = evaluate.mock.calls[0]?.[0];
+    // One advisor input per account the fake engine reports, in poll order.
+    expect(inputs?.map((i) => i.accountId)).toEqual(['acct-x', 'acct-y']);
   });
 
   it('start() is idempotent — calling it twice does not double-connect or double-recover', async () => {

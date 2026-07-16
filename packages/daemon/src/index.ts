@@ -64,4 +64,16 @@ export {
   type BuildDaemonHookSpecsOptions,
 } from './hookInstaller.js';
 
-export { Daemon, type DaemonOptions, type SwitchEngineLike } from './daemon.js';
+export {
+  AutoSwitcher,
+  DEFAULT_AUTOSWITCH_COOLDOWN_MS,
+  type AutoSwitcherOptions,
+  type AutoSwitchActivateResult,
+} from './autoSwitcher.js';
+
+export {
+  Daemon,
+  type AutoSwitcherLike,
+  type DaemonOptions,
+  type SwitchEngineLike,
+} from './daemon.js';
