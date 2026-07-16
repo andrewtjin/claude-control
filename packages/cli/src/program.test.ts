@@ -32,6 +32,13 @@ describe('buildProgram', () => {
     expect(cmd?.options.map((o) => o.long)).toContain('--force');
   });
 
+  it('nests a real daemon run subcommand with pairing and relay flags', () => {
+    const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
+    const run = daemon?.commands.find((c) => c.name() === 'run');
+    expect(run).toBeDefined();
+    expect(run?.options.map((o) => o.long)).toEqual(expect.arrayContaining(['--pair', '--relay']));
+  });
+
   it('reports its version', () => {
     expect(buildProgram().version()).toBe('0.1.0');
   });
