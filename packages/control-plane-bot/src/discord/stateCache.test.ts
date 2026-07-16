@@ -1,0 +1,118 @@
+import { describe, it, expect } from 'vitest';
+import type { Envelope } from '@claude-control/shared-protocol';
+import { DaemonStateCache } from './stateCache.js';
+
+function usageSnapshot(discordUserId: string, plan?: object): Envelope {
+  return {
+    v: 1,
+    id: 'id-1',
+    ts: 0,
+    daemonId: 'daemon-1',
+    discordUserId,
+    type: 'usage.snapshot',
+    payload: {
+      accounts: [
+        {
+          accountId: 'a1',
+          label: 'Work',
+          active: true,
+          source: 'live',
+          fetchedAtMs: 0,
+          limits: [],
+        },
+      ],
+      ...(plan ? { plan } : {}),
+    },
+  } as Envelope;
+}
+
+describe('DaemonStateCache', () => {
+  it('has nothing cached for a user before any envelope arrives', () => {
+    const cache = new DaemonStateCache();
+    expect(cache.getUsage('user-a')).toBeUndefined();
+    expect(cache.getSessions('user-a')).toEqual([]);
+  });
+
+  it('records usage.snapshot and makes it readable by discordUserId', () => {
+    const cache = new DaemonStateCache();
+    cache.record('user-a', usageSnapshot('user-a'));
+    const usage = cache.getUsage('user-a');
+    expect(usage?.accounts).toHaveLength(1);
+    expect(usage?.plan).toBeUndefined();
+  });
+
+  it('only sets plan when the snapshot actually included one', () => {
+    const cache = new DaemonStateCache();
+    const plan = { recommendedAccountId: 'a1', reason: 'ok', ranking: [], advisories: [] };
+    cache.record('user-a', usageSnapshot('user-a', plan));
+    expect(cache.getUsage('user-a')?.plan).toEqual(plan);
+  });
+
+  it('a later snapshot overwrites the earlier one', () => {
+    const cache = new DaemonStateCache();
+    cache.record('user-a', usageSnapshot('user-a'));
+    const second: Envelope = {
+      v: 1,
+      id: 'id-2',
+      ts: 1,
+      daemonId: 'daemon-1',
+      discordUserId: 'user-a',
+      type: 'usage.snapshot',
+      payload: { accounts: [] },
+    };
+    cache.record('user-a', second);
+    expect(cache.getUsage('user-a')?.accounts).toHaveLength(0);
+  });
+
+  it('keeps per-user state isolated', () => {
+    const cache = new DaemonStateCache();
+    cache.record('user-a', usageSnapshot('user-a'));
+    expect(cache.getUsage('user-b')).toBeUndefined();
+  });
+
+  it('records session.status by sessionId, latest write wins', () => {
+    const cache = new DaemonStateCache();
+    const base: Omit<Envelope, 'payload' | 'type'> = {
+      v: 1,
+      id: 'id-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId: 'user-a',
+    };
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's1', state: 'starting' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's1', state: 'running' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's2', state: 'done' },
+    });
+
+    const sessions = cache.getSessions('user-a');
+    expect(sessions).toHaveLength(2);
+    expect(sessions.find((s) => s.sessionId === 's1')?.state).toBe('running');
+    expect(sessions.find((s) => s.sessionId === 's2')?.state).toBe('done');
+  });
+
+  it('ignores envelope types it does not track (e.g. hook.notification)', () => {
+    const cache = new DaemonStateCache();
+    cache.record('user-a', {
+      v: 1,
+      id: 'id-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId: 'user-a',
+      type: 'hook.notification',
+      payload: { event: 'notification', title: 't', body: 'b', level: 'info' },
+    });
+    expect(cache.getUsage('user-a')).toBeUndefined();
+    expect(cache.getSessions('user-a')).toEqual([]);
+  });
+});
