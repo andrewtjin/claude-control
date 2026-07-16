@@ -25,6 +25,7 @@ import {
 } from '@claude-control/switch-engine';
 import {
   AttributionJournal,
+  AutoSwitcher,
   ControlPlaneClient,
   Daemon,
   HookReceiver,
@@ -45,6 +46,19 @@ const POLL_TOKEN_MIN_TTL_MS = 60_000;
 export interface DaemonRunOptions {
   pair?: string;
   relay?: string;
+  /** Opt-in `--auto-switch`: hop accounts automatically when the active one runs low.
+   *  Tunables via env: CCTL_AUTOSWITCH_TRIGGER_PCT, CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT,
+   *  CCTL_AUTOSWITCH_COOLDOWN_MS. */
+  autoSwitch?: boolean;
+}
+
+/** A positive number from the environment, or undefined when unset/unparseable — an env
+ *  typo silently falling back to the default beats a daemon that refuses to start. */
+function envNumber(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 /**
@@ -157,6 +171,31 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
   });
 
+  // Auto-switch is strictly opt-in (`--auto-switch`): unattended account hops are a policy
+  // decision the owner makes explicitly, never a default. It calls the engine's normal
+  // activate() path, so the human-plausible cadence guard applies to auto-hops too, and it
+  // reports every attempt to the phone through the same switch.result push as /switch.
+  const triggerPercent = envNumber('CCTL_AUTOSWITCH_TRIGGER_PCT');
+  const minSessionHeadroomPct = envNumber('CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
+  const cooldownMs = envNumber('CCTL_AUTOSWITCH_COOLDOWN_MS');
+  const autoSwitcher = options.autoSwitch
+    ? new AutoSwitcher({
+        activate: (accountId) => engine.activate(accountId),
+        notify: (payload) =>
+          controlPlaneClient.send({
+            type: 'switch.result',
+            payload,
+            daemonId: controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
+          }),
+        policy: {
+          ...(triggerPercent !== undefined ? { triggerPercent } : {}),
+          ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
+        },
+        ...(cooldownMs !== undefined ? { cooldownMs } : {}),
+        logger,
+      })
+    : undefined;
+
   const daemon = new Daemon({
     store,
     switchEngine: engine,
@@ -165,11 +204,14 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     attributionJournal,
     hookReceiver,
     controlPlaneClient,
+    ...(autoSwitcher ? { autoSwitcher } : {}),
     logger,
   });
 
   await daemon.start();
-  process.stdout.write(`Daemon running (relay: ${relayUrl}). Ctrl+C to stop.\n`);
+  process.stdout.write(
+    `Daemon running (relay: ${relayUrl}${autoSwitcher ? ', auto-switch: on' : ''}). Ctrl+C to stop.\n`,
+  );
 
   const shutdown = (): void => {
     process.stdout.write('Stopping daemon...\n');

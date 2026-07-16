@@ -15,6 +15,7 @@ import type { AgentSdkClient } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { EnvelopeDraft, MessageOf } from '@claude-control/shared-protocol';
+import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
 import { UsagePoller, type PollAccount } from './usagePoller.js';
 import type { AttributionJournal } from './attributionJournal.js';
@@ -31,6 +32,12 @@ export interface SwitchEngineLike {
   getActiveId(): Promise<string | null>;
 }
 
+/** The slice of `AutoSwitcher` the daemon calls each poll cycle — narrowed to an interface
+ *  so lifecycle tests can fake it (mirroring `SwitchEngineLike`). */
+export interface AutoSwitcherLike {
+  evaluate(accounts: AccountUsageInput[]): Promise<void>;
+}
+
 export interface DaemonOptions {
   store: Store;
   switchEngine: SwitchEngineLike;
@@ -39,6 +46,8 @@ export interface DaemonOptions {
   attributionJournal: AttributionJournal;
   hookReceiver: HookReceiver;
   controlPlaneClient: ControlPlaneClient;
+  /** Opt-in: evaluated after every poll cycle; absent = auto-switching disabled. */
+  autoSwitcher?: AutoSwitcherLike;
   /** WET-GATED real Agent SDK adapter, overridable so tests never touch a real SDK. */
   createAgentSdkClient?: () => AgentSdkClient;
   /** How often to poll usage and re-sync attribution. */
@@ -63,6 +72,7 @@ export class Daemon {
   private readonly attributionJournal: AttributionJournal;
   private readonly hookReceiver: HookReceiver;
   private readonly controlPlaneClient: ControlPlaneClient;
+  private readonly autoSwitcher: AutoSwitcherLike | undefined;
   private readonly createAgentSdkClient: () => AgentSdkClient;
   private readonly pollIntervalMs: number;
   private readonly logger: Logger;
@@ -81,6 +91,7 @@ export class Daemon {
     this.attributionJournal = options.attributionJournal;
     this.hookReceiver = options.hookReceiver;
     this.controlPlaneClient = options.controlPlaneClient;
+    this.autoSwitcher = options.autoSwitcher;
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.logger = options.logger ?? noopLogger;
@@ -180,6 +191,17 @@ export class Daemon {
       type: 'usage.snapshot',
       payload: { accounts: snapshot.accounts, plan: snapshot.plan },
     });
+
+    // Auto-switch runs AFTER the snapshot ships, so the phone always sees the usage state
+    // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
+    // engine failures itself; this catch only guards against bugs in the evaluator so a
+    // broken policy can never take down the poll loop.
+    if (this.autoSwitcher) {
+      const inputs = snapshot.results.map((r) => r.usage.advisorInput);
+      await this.autoSwitcher.evaluate(inputs).catch((err: unknown) => {
+        this.logger.error({ err }, 'auto-switch evaluation failed');
+      });
+    }
   }
 
   // ---- inbound handlers ----

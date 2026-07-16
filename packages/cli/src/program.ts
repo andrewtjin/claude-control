@@ -141,7 +141,11 @@ export function buildProgram(): Command {
       '--relay <url>',
       'control-plane WebSocket url (default CCTL_RELAY_URL or ws://127.0.0.1:8765)',
     )
-    .action(async (opts: { pair?: string; relay?: string }) => {
+    .option(
+      '--auto-switch',
+      'when the active account runs low, auto-switch to the account with >=25% of a 5h window left whose weekly quota resets soonest',
+    )
+    .action(async (opts: { pair?: string; relay?: string; autoSwitch?: boolean }) => {
       await runDaemon(opts);
     });
 
