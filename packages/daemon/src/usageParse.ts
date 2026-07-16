@@ -2,11 +2,12 @@
 // `AccountUsage` (shared-protocol — what goes out over the wire to the phone) and
 // `AccountUsageInput` (usage-advisor — what feeds the burn-down optimizer).
 //
-// PURE: no IO, no throwing. The OAuth usage endpoint is undocumented and WET-GATED (see
-// usagePoller.ts), so its exact field names/shape are a best guess reverse-engineered from
-// the CLI. A poll that returns something we don't recognize must never crash the poller or
-// blind the advisor to every OTHER account — so every parse here degrades to a best-effort
-// result with an `error` note instead of throwing.
+// PURE: no IO, no throwing. The OAuth usage endpoint is undocumented but its live shape was
+// wet-confirmed 2026-07-16 (WT-2, wet-tests/results.json): `utilization.limits[]` with
+// kind/group/percent/severity/resets_at(nullable)/scope(nullable)/is_active. The endpoint
+// can still drift, so tolerance stays: a poll that returns something we don't recognize must
+// never crash the poller or blind the advisor to every OTHER account — every parse here
+// degrades to a best-effort result with an `error` note instead of throwing.
 
 import type { AccountUsage, UsageLimit } from '@claude-control/shared-protocol';
 import type { AccountUsageInput, LimitInput } from '@claude-control/usage-advisor';
@@ -23,8 +24,8 @@ const KNOWN_KINDS = new Set(['session', 'weekly_all', 'weekly_scoped']);
 
 function normalizeKind(raw: unknown): 'session' | 'weekly_all' | 'weekly_scoped' | undefined {
   if (typeof raw !== 'string') return undefined;
-  // The endpoint's field naming is unconfirmed (WET-GATED) — accept a couple of plausible
-  // spellings in addition to our own canonical ones.
+  // Wet-confirmed kinds: session, weekly_all, weekly_scoped (WT-2). The extra spellings stay
+  // accepted as cheap drift insurance.
   const normalized = raw.trim().toLowerCase();
   if (normalized === 'weekly' || normalized === 'weekly_all') return 'weekly_all';
   if (normalized === 'weekly_scoped' || normalized === 'weekly_opus') return 'weekly_scoped';
@@ -34,8 +35,8 @@ function normalizeKind(raw: unknown): 'session' | 'weekly_all' | 'weekly_scoped'
     : undefined;
 }
 
-/** Percent may arrive as `percent` (0-100) or `utilization` (0-1 fraction) — the endpoint's
- *  exact field is unconfirmed, so both are accepted and normalized to a 0-100 scale. */
+/** Percent arrives as `percent` (0-100 — wet-confirmed, WT-2); `utilization` (0-1 fraction)
+ *  stays accepted as drift insurance. Both normalize to a 0-100 scale. */
 function normalizePercent(raw: Record<string, unknown>): number | undefined {
   if (typeof raw.percent === 'number' && Number.isFinite(raw.percent)) return raw.percent;
   if (typeof raw.utilization === 'number' && Number.isFinite(raw.utilization)) {

@@ -15,6 +15,58 @@ const baseOpts: ParseUsageOptions = {
 };
 
 describe('parseUsageEndpointResponse', () => {
+  it('parses the exact live payload observed in WT-2 (2026-07-16, wet-tests/results.json)', () => {
+    // Verbatim shape from the real endpoint: extra `group` field, nullable resets_at/scope.
+    const raw = {
+      utilization: {
+        limits: [
+          {
+            kind: 'session',
+            group: 'session',
+            percent: 24,
+            severity: 'normal',
+            resets_at: '2026-07-16T19:40:00.380307+00:00',
+            scope: null,
+            is_active: false,
+          },
+          {
+            kind: 'weekly_all',
+            group: 'weekly',
+            percent: 0,
+            severity: 'normal',
+            resets_at: null,
+            scope: null,
+            is_active: false,
+          },
+          {
+            kind: 'weekly_scoped',
+            group: 'weekly',
+            percent: 0,
+            severity: 'normal',
+            resets_at: null,
+            scope: null,
+            is_active: false,
+          },
+        ],
+      },
+    };
+    const { accountUsage, advisorInput } = parseUsageEndpointResponse(raw, baseOpts);
+
+    expect(accountUsage.error).toBeUndefined();
+    expect(accountUsage.limits).toHaveLength(3);
+    expect(accountUsage.limits[0]).toMatchObject({
+      kind: 'session',
+      percent: 24,
+      severity: 'normal',
+      isActive: false,
+      resetsAt: '2026-07-16T19:40:00.380307+00:00',
+    });
+    // null resets_at / scope degrade to absent, never crash or coerce to a bogus value.
+    expect(accountUsage.limits[1]?.resetsAt).toBeUndefined();
+    expect(accountUsage.limits[1]?.scope).toBeUndefined();
+    expect(advisorInput.limits).toHaveLength(3);
+  });
+
   it('parses a well-formed response with percent-based limits', () => {
     const raw = {
       utilization: {
