@@ -7,8 +7,7 @@
   },
   "references": [
     { "path": "../shared-protocol" },
-    { "path": "../switch-engine" },
-    { "path": "../daemon" }
+    { "path": "../switch-engine" }
   ],
   "include": ["src/**/*.ts"]
 }
