@@ -53,11 +53,54 @@ export const AccountUsage = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Usage plan (the burn-down optimizer's recommendation)
+// ---------------------------------------------------------------------------
+
+export const UsageAdvisoryKind = z.enum([
+  'burn_before_reset',
+  'switch_now',
+  'exhausted',
+  'all_healthy',
+  'quarantined',
+]);
+
+/** One actionable note from the advisor, e.g. "burn account A before its weekly reset". */
+export const UsageAdvisory = z.object({
+  kind: UsageAdvisoryKind,
+  accountId: AccountId.nullish(),
+  message: z.string(),
+  /** Epoch ms by which to act (e.g. the reset that would strand unused quota). */
+  deadlineMs: z.number().int().nonnegative().nullish(),
+});
+
+/** One account's score in the ranking. Higher score = better to use right now. */
+export const AccountScore = z.object({
+  accountId: AccountId,
+  label: z.string(),
+  score: z.number(),
+  /** Remaining capacity right now, 0–100, as the min across active limits. */
+  headroomPct: z.number(),
+  weeklyResetAt: z.number().int().nonnegative().nullish(),
+  sessionResetAt: z.number().int().nonnegative().nullish(),
+  note: z.string(),
+});
+
+/** The advisor's full recommendation: which account to use now, why, the ranking, advisories. */
+export const UsagePlan = z.object({
+  recommendedAccountId: AccountId.nullish(),
+  reason: z.string(),
+  ranking: z.array(AccountScore),
+  advisories: z.array(UsageAdvisory),
+});
+
+// ---------------------------------------------------------------------------
 // Payloads (per message type)
 // ---------------------------------------------------------------------------
 
 const UsageSnapshotPayload = z.object({
   accounts: z.array(AccountUsage),
+  /** The optimizer's recommendation, when the daemon has computed one. */
+  plan: UsagePlan.nullish(),
 });
 
 const SwitchCommandPayload = z.object({
@@ -251,6 +294,9 @@ export type PayloadOf<T extends MessageType> = MessageOf<T>['payload'];
 
 export type UsageLimit = z.infer<typeof UsageLimit>;
 export type AccountUsage = z.infer<typeof AccountUsage>;
+export type UsageAdvisory = z.infer<typeof UsageAdvisory>;
+export type AccountScore = z.infer<typeof AccountScore>;
+export type UsagePlan = z.infer<typeof UsagePlan>;
 
 /** Runtime membership test for the discriminant — useful at socket boundaries. */
 export function isMessageType(value: string): value is MessageType {
