@@ -20,8 +20,12 @@ export interface Protector {
 }
 
 // PowerShell bodies. Input and output are base64 on stdin/stdout to keep binary safe.
+// $ProgressPreference silences Windows PowerShell 5.1's progress records ("Preparing
+// modules for first use."), which it serializes as `#< CLIXML ...` noise on stderr whenever
+// stderr is redirected — otherwise every DPAPI call spams the daemon/CLI console with it.
 const PROTECT_PS = `
 $ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
 Add-Type -AssemblyName System.Security
 $in=[Console]::In.ReadToEnd().Trim()
 $bytes=[Convert]::FromBase64String($in)
@@ -31,6 +35,7 @@ $prot=[System.Security.Cryptography.ProtectedData]::Protect($bytes,$null,[System
 
 const UNPROTECT_PS = `
 $ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
 Add-Type -AssemblyName System.Security
 $in=[Console]::In.ReadToEnd().Trim()
 $bytes=[Convert]::FromBase64String($in)
@@ -48,7 +53,16 @@ function runPowerShell(script: string, inputBase64: string): string {
     const out = execFileSync(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(script)],
-      { input: inputBase64, encoding: 'utf8', windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+      {
+        input: inputBase64,
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: 16 * 1024 * 1024,
+        // Pipe stderr instead of execFileSync's default inherit: whatever PowerShell still
+        // writes there (CLIXML chatter, real error text) must land in the thrown error's
+        // `stderr` field for diagnostics — never on the parent process's console.
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
     );
     return out.trim();
   } catch (err) {
