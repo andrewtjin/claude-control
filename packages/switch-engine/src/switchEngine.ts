@@ -17,7 +17,13 @@
 import { AuditLog } from './audit.js';
 import { CredentialStore } from './credentialStore.js';
 import { DpapiProtector, type Protector } from './dpapi.js';
-import { QuarantineError, RefreshError, UnknownAccountError, VerifyError } from './errors.js';
+import {
+  CadenceError,
+  QuarantineError,
+  RefreshError,
+  UnknownAccountError,
+  VerifyError,
+} from './errors.js';
 import { IntentStore } from './intent.js';
 import { acquireLock, type LockOptions } from './lock.js';
 import { noopLogger, type Logger } from './logger.js';
@@ -27,6 +33,8 @@ import {
   type RefreshDeps,
 } from './oauth.js';
 import type { Paths } from './paths.js';
+import { atomicWriteFile } from './fsutil.js';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   ActivateResult,
@@ -51,9 +59,21 @@ export interface SwitchEngineOptions {
   clock?: () => number;
   /** Refresh the target's access token when its remaining lifetime is below this. */
   refreshSkewMs?: number;
+  /** Minimum time between committed account switches (ToS posture: human-plausible cadence).
+   *  Defaults to 60s; 0 disables the guard. Bypass per-call with `activate(id, {force})`. */
+  minSwitchIntervalMs?: number;
   lockOptions?: LockOptions;
   logger?: Logger;
 }
+
+/** Per-call options for {@link SwitchEngine.activate}. */
+export interface ActivateOptions {
+  /** Bypass the switch-cadence guard for a deliberate operator override. */
+  force?: boolean;
+}
+
+/** Default minimum interval between switches — see `minSwitchIntervalMs`. */
+export const DEFAULT_MIN_SWITCH_INTERVAL_MS = 60_000;
 
 export class SwitchEngine {
   private readonly paths: Paths;
@@ -65,6 +85,7 @@ export class SwitchEngine {
   private readonly refreshDeps: RefreshDeps;
   private readonly clock: () => number;
   private readonly refreshSkewMs: number;
+  private readonly minSwitchIntervalMs: number;
   private readonly lockOptions: LockOptions;
   private readonly log: Logger;
 
@@ -79,6 +100,7 @@ export class SwitchEngine {
     this.refresh = options.refresh ?? defaultRefresh;
     this.refreshDeps = options.refreshDeps ?? {};
     this.refreshSkewMs = options.refreshSkewMs ?? DEFAULT_REFRESH_SKEW_MS;
+    this.minSwitchIntervalMs = options.minSwitchIntervalMs ?? DEFAULT_MIN_SWITCH_INTERVAL_MS;
     this.lockOptions = options.lockOptions ?? {};
     this.log = options.logger ?? noopLogger;
   }
@@ -103,7 +125,7 @@ export class SwitchEngine {
 
   /**
    * Capture whatever is currently logged in as a new stored account. Used by
-   * `cctl account add` right after an interactive login populated the live files.
+   * `cctl accounts add` right after an interactive login populated the live files.
    */
   async captureCurrentLogin(label: string): Promise<StoredAccount> {
     const live = await this.credStore.readLiveCredentials();
@@ -119,10 +141,39 @@ export class SwitchEngine {
     return account;
   }
 
+  /**
+   * Capture a login that was performed inside a TRANSIENT config dir (`CLAUDE_CONFIG_DIR`)
+   * as a new stored account — without touching the live login or the active id. This is the
+   * wet-verified (WT-1, CLI 2.1.211) way to onboard extra accounts: the CLI writes both
+   * `.credentials.json` and `.claude.json` inside the transient dir, leaving the real ones
+   * alone. The caller owns the transient dir and MUST delete it afterwards (token-bearing).
+   */
+  async captureFromConfigDir(label: string, configDir: string): Promise<StoredAccount> {
+    const store = new CredentialStore({
+      claudeDir: configDir,
+      credentialsPath: join(configDir, '.credentials.json'),
+      claudeJsonPath: join(configDir, '.claude.json'),
+      vaultDir: this.paths.vaultDir,
+    });
+    const creds = await store.readLiveCredentials();
+    if (!creds) {
+      throw new RefreshError(
+        `no credentials found in "${configDir}"; did the login complete?`,
+        'no_capture_login',
+      );
+    }
+    const oauthAccount = await store.readOauthAccount();
+    const bundle: CredentialBundle = oauthAccount
+      ? { claudeAiOauth: creds, oauthAccount }
+      : { claudeAiOauth: creds };
+    // Unlike captureCurrentLogin, the live account is unchanged — do NOT touch activeId.
+    return this.vault.addAccount(label, bundle);
+  }
+
   // ---- the state machine ----
 
   /** Make `targetId` the live account. See the class comment for the guarantees. */
-  async activate(targetId: string): Promise<ActivateResult> {
+  async activate(targetId: string, options: ActivateOptions = {}): Promise<ActivateResult> {
     const target = await this.vault.getAccount(targetId);
     if (!target) throw new UnknownAccountError(targetId);
     if (target.quarantined) {
@@ -132,6 +183,21 @@ export class SwitchEngine {
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
       const prevActiveId = await this.vault.getActiveId();
+
+      // Cadence guard (ToS posture): switching ACCOUNTS faster than a human plausibly would
+      // is refused. Re-activating the already-active account is a heal, not a hop — exempt.
+      if (!options.force && this.minSwitchIntervalMs > 0 && targetId !== prevActiveId) {
+        const last = await this.readLastSwitchAtMs();
+        const elapsed = last === undefined ? Infinity : this.clock() - last;
+        if (elapsed < this.minSwitchIntervalMs) {
+          const retryAfterMs = this.minSwitchIntervalMs - elapsed;
+          throw new CadenceError(
+            `switched ${Math.round(elapsed / 1000)}s ago; next switch allowed in ` +
+              `${Math.ceil(retryAfterMs / 1000)}s`,
+            retryAfterMs,
+          );
+        }
+      }
 
       // Snapshot the current live credentials so a failed write can be rolled back.
       const liveNow = await this.credStore.readLiveCredentials();
@@ -199,6 +265,9 @@ export class SwitchEngine {
 
       // Commit.
       await this.vault.setActive(targetId);
+      // A real account hop (not a same-account heal) restarts the cadence clock — forced
+      // switches too, so an override doesn't grant a free follow-up switch.
+      if (targetId !== prevActiveId) await this.writeLastSwitchAtMs(this.clock());
       this.audit.append({
         ts: this.clock(),
         event: 'activated',
@@ -362,6 +431,28 @@ export class SwitchEngine {
   private async finishIntent(): Promise<void> {
     await this.intent.clear();
     await this.vault.clearRollback();
+  }
+
+  // ---- cadence state (non-secret) ----
+
+  /** Epoch ms of the last committed account hop, or `undefined` if none recorded. */
+  private async readLastSwitchAtMs(): Promise<number | undefined> {
+    try {
+      const raw = await readFile(this.lastSwitchPath(), 'utf8');
+      const parsed = JSON.parse(raw) as { lastSwitchAtMs?: unknown };
+      return typeof parsed.lastSwitchAtMs === 'number' ? parsed.lastSwitchAtMs : undefined;
+    } catch {
+      // Missing or corrupt state must never block a switch — the guard just doesn't apply.
+      return undefined;
+    }
+  }
+
+  private async writeLastSwitchAtMs(atMs: number): Promise<void> {
+    await atomicWriteFile(this.lastSwitchPath(), JSON.stringify({ lastSwitchAtMs: atMs }));
+  }
+
+  private lastSwitchPath(): string {
+    return join(this.paths.vaultDir, 'last-switch.json');
   }
 
   private lockDir(): string {

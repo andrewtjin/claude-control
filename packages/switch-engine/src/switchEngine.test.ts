@@ -8,7 +8,7 @@ import { CredentialStore } from './credentialStore.js';
 import { Vault } from './vault.js';
 import { IntentStore } from './intent.js';
 import { sandboxPaths, type Paths } from './paths.js';
-import { QuarantineError, UnknownAccountError, RefreshError } from './errors.js';
+import { CadenceError, QuarantineError, UnknownAccountError, RefreshError } from './errors.js';
 import type { ClaudeOauth, CredentialBundle } from './types.js';
 
 const NOW = 100_000_000;
@@ -105,6 +105,42 @@ describe('captureCurrentLogin', () => {
   it('refuses when nothing is logged in', async () => {
     const h = await harness();
     await expect(h.engine.captureCurrentLogin('work')).rejects.toBeInstanceOf(RefreshError);
+  });
+});
+
+describe('captureFromConfigDir', () => {
+  it('vaults a transient-dir login without touching the live login or active id', async () => {
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+
+    // Simulate WT-1: a `claude` run under CLAUDE_CONFIG_DIR=<dir> left BOTH files there.
+    const captureDir = join(h.paths.claudeDir, '..', 'capture');
+    await mkdir(captureDir, { recursive: true });
+    const fresh = bundleFor('FRESH', NOW + 10 * HOUR);
+    const store = new CredentialStore({
+      claudeDir: captureDir,
+      credentialsPath: join(captureDir, '.credentials.json'),
+      claudeJsonPath: join(captureDir, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+    await store.writeLiveCredentials(fresh.claudeAiOauth);
+    await store.writeOauthAccount(fresh.oauthAccount!);
+
+    const account = await h.engine.captureFromConfigDir('fresh', captureDir);
+
+    expect(account.label).toBe('fresh');
+    expect(account.accountUuid).toBe('uuid-FRESH');
+    expect((await h.vault.readBundle(account.id)).claudeAiOauth.accessToken).toBe('FRESH');
+    // The real login is untouched: A stays live AND active.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+  });
+
+  it('refuses when the transient dir has no credentials (login never completed)', async () => {
+    const h = await harness();
+    const emptyDir = join(h.paths.claudeDir, '..', 'empty-capture');
+    await mkdir(emptyDir, { recursive: true });
+    await expect(h.engine.captureFromConfigDir('x', emptyDir)).rejects.toBeInstanceOf(RefreshError);
   });
 });
 
@@ -213,6 +249,71 @@ describe('activate — reconcile-by-reading', () => {
     const { accountB } = await seedAActiveWithB(h);
     const result = await h.engine.activate(accountB.id);
     expect(result.adoptedPreviousRotation).toBe(false);
+  });
+});
+
+describe('activate — cadence guard', () => {
+  /** Seed A (live+active) plus B and C, then hop to B to arm the cadence clock. */
+  async function armedHarness() {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    const accountC = await h.engine.addAccount('C', bundleFor('C', NOW + 10 * HOUR));
+    await h.engine.activate(accountB.id); // first hop always allowed (no prior state)
+    return { h, accountA, accountB, accountC };
+  }
+
+  it('blocks a second account hop inside the minimum interval', async () => {
+    const { h, accountC } = await armedHarness();
+    h.setNow(NOW + 10_000); // 10s after the hop — inside the 60s default window
+    const err = await h.engine.activate(accountC.id).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CadenceError);
+    expect((err as CadenceError).retryAfterMs).toBe(50_000);
+    // The blocked hop changed nothing: B is still live and active.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('B');
+  });
+
+  it('allows the hop once the interval has elapsed', async () => {
+    const { h, accountC } = await armedHarness();
+    h.setNow(NOW + 61_000);
+    await expect(h.engine.activate(accountC.id)).resolves.toMatchObject({ ok: true });
+  });
+
+  it('force bypasses the guard but still restarts the cadence clock', async () => {
+    const { h, accountA, accountC } = await armedHarness();
+    h.setNow(NOW + 10_000);
+    await expect(h.engine.activate(accountC.id, { force: true })).resolves.toMatchObject({
+      ok: true,
+    });
+    // The forced hop armed the clock at NOW+10s — an unforced hop right after is refused.
+    h.setNow(NOW + 20_000);
+    await expect(h.engine.activate(accountA.id)).rejects.toBeInstanceOf(CadenceError);
+  });
+
+  it('exempts re-activating the already-active account (heal, not hop)', async () => {
+    const { h, accountB } = await armedHarness();
+    h.setNow(NOW + 10_000);
+    await expect(h.engine.activate(accountB.id)).resolves.toMatchObject({ ok: true });
+  });
+
+  it('can be disabled with minSwitchIntervalMs: 0', async () => {
+    const h = await harness();
+    // Rebuild the engine on the same paths with the guard off.
+    const engine = new SwitchEngine({
+      paths: h.paths,
+      protector: new InsecurePassthroughProtector(),
+      refresh: h.refresh,
+      clock: () => NOW,
+      refreshSkewMs: 5 * 60 * 1000,
+      minSwitchIntervalMs: 0,
+      lockOptions: { timeoutMs: 2000, pollMs: 10 },
+    });
+    const a = bundleFor('A', NOW + 10 * HOUR);
+    await h.credStore.writeLiveCredentials(a.claudeAiOauth);
+    await h.credStore.writeOauthAccount(a.oauthAccount!);
+    const accountA = await engine.captureCurrentLogin('A');
+    const accountB = await engine.addAccount('B', bundleFor('B', NOW + 10 * HOUR));
+    await expect(engine.activate(accountB.id)).resolves.toMatchObject({ ok: true });
+    await expect(engine.activate(accountA.id)).resolves.toMatchObject({ ok: true });
   });
 });
 
