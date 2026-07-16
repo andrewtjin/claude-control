@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Test / coverage
+coverage/
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local dev scratch — planning docs are never tracked (dev-mode Tenet 3)
+.claude/*-dev/
+.claude/plan/
+tasks/lessons.md
+scratch/
+*.local
+
+# Runtime state that must never be committed (credentials, DB, vault)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.credentials.json
+vault/

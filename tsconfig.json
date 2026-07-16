@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/shared-protocol" },
+    { "path": "packages/switch-engine" },
+    { "path": "packages/session-runtime" },
+    { "path": "packages/daemon" },
+    { "path": "packages/control-plane-bot" },
+    { "path": "packages/cli" }
+  ]
+}

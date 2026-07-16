@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "references": [
+    { "path": "../shared-protocol" },
+    { "path": "../switch-engine" },
+    { "path": "../daemon" }
+  ],
+  "include": ["src/**/*.ts"]
+}

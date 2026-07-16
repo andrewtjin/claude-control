@@ -1,0 +1,25 @@
+{
+  "name": "@claude-control/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --root ../.. packages/daemon"
+  },
+  "dependencies": {
+    "@claude-control/shared-protocol": "workspace:*",
+    "@claude-control/switch-engine": "workspace:*",
+    "@claude-control/session-runtime": "workspace:*",
+    "pino": "^10.3.1",
+    "ws": "^8.21.1"
+  }
+}

@@ -1,0 +1,7 @@
+packages:
+  - 'packages/*'
+
+# Build-script approval (pnpm >= 10). esbuild (via vitest) fetches its platform binary
+# in a postinstall; allow it. Native optional deps (node-pty) are added per-package.
+allowBuilds:
+  esbuild: true

@@ -1,0 +1,28 @@
+{
+  "name": "@claude-control/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "cctl": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --root ../.. packages/cli"
+  },
+  "dependencies": {
+    "@claude-control/shared-protocol": "workspace:*",
+    "@claude-control/switch-engine": "workspace:*",
+    "@claude-control/daemon": "workspace:*",
+    "commander": "^15.0.0",
+    "pino": "^10.3.1"
+  }
+}
