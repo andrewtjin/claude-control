@@ -6,7 +6,17 @@
 // which are unit-tested; here we only wire and print.
 
 import { Command } from 'commander';
-import { QuarantineError, UnknownAccountError, defaultPaths } from '@claude-control/switch-engine';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import {
+  CadenceError,
+  QuarantineError,
+  SwitchEngineError,
+  UnknownAccountError,
+  defaultPaths,
+} from '@claude-control/switch-engine';
 import { Store } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import { buildEngine, daemonDbPath, fail } from './context.js';
@@ -29,12 +39,13 @@ export function buildProgram(): Command {
   program
     .command('switch <ref>')
     .description('activate an account by id or label')
-    .action(async (ref: string) => {
+    .option('--force', 'bypass the switch-cadence guard (deliberate override)')
+    .action(async (ref: string, opts: { force?: boolean }) => {
       const engine = buildEngine();
       const resolved = resolveAccountRef(await engine.listAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
       try {
-        const result = await engine.activate(resolved.account.id);
+        const result = await engine.activate(resolved.account.id, { force: Boolean(opts.force) });
         const bits = [
           result.wroteCredentials ? 'credentials written' : 'no change',
           result.refreshed ? 'token refreshed' : null,
@@ -44,6 +55,7 @@ export function buildProgram(): Command {
       } catch (err) {
         if (err instanceof QuarantineError)
           fail(`${resolved.account.label} is quarantined; re-login required.`);
+        if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
         if (err instanceof UnknownAccountError) fail(err.message);
         throw err;
       }
@@ -122,6 +134,43 @@ export function buildProgram(): Command {
   return program;
 }
 
+/**
+ * The `--fresh` capture flow (wet-verified WT-1): run an interactive `claude` inside a
+ * throwaway `CLAUDE_CONFIG_DIR`, let the user /login as the NEW account there, then vault
+ * what landed. The live login is never touched. The transient dir holds real tokens, so it
+ * is deleted no matter how the flow ends.
+ */
+async function addFreshAccount(label: string): Promise<void> {
+  const paths = defaultPaths();
+  const captureDir = join(dirname(paths.vaultDir), `capture-${randomUUID()}`);
+  mkdirSync(captureDir, { recursive: true });
+  try {
+    process.stdout.write(
+      'Opening a throwaway Claude window. In it:\n' +
+        '  1. /login — pick the NEW account in the browser (it may preselect the current one).\n' +
+        '  2. Send one short message so the login completes.\n' +
+        '  3. /exit\n\n',
+    );
+    const run = spawnSync('claude', [], {
+      stdio: 'inherit',
+      env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
+      shell: true, // `claude` is a .cmd shim on Windows
+    });
+    if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
+    const account = await buildEngine().captureFromConfigDir(label, captureDir);
+    process.stdout.write(
+      `Added ${account.label} (${account.id}). Your current login was not touched — ` +
+        `\`cctl switch ${account.label}\` to use it.\n`,
+    );
+  } catch (err) {
+    if (err instanceof SwitchEngineError && err.code === 'no_capture_login') fail(err.message);
+    throw err;
+  } finally {
+    // Token-bearing — must not outlive the capture, success or failure.
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+}
+
 function buildAccountCommands(program: Command): void {
   const accounts = program.command('accounts').description('manage stored accounts');
 
@@ -138,7 +187,15 @@ function buildAccountCommands(program: Command): void {
   accounts
     .command('add <label>')
     .description('capture the currently logged-in account under <label>')
-    .action(async (label: string) => {
+    .option(
+      '--fresh',
+      'log in as a NEW account in a throwaway window, without touching the live login',
+    )
+    .action(async (label: string, opts: { fresh?: boolean }) => {
+      if (opts.fresh) {
+        await addFreshAccount(label);
+        return;
+      }
       try {
         const account = await buildEngine().captureCurrentLogin(label);
         process.stdout.write(`Added ${account.label} (${account.id}) and set it active.\n`);

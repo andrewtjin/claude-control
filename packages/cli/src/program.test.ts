@@ -21,6 +21,17 @@ describe('buildProgram', () => {
     expect(subs).toEqual(['add', 'list', 'remove']);
   });
 
+  it('offers the --fresh capture flag on accounts add', () => {
+    const accounts = buildProgram().commands.find((c) => c.name() === 'accounts');
+    const add = accounts?.commands.find((c) => c.name() === 'add');
+    expect(add?.options.map((o) => o.long)).toContain('--fresh');
+  });
+
+  it('offers the --force cadence override on switch', () => {
+    const cmd = buildProgram().commands.find((c) => c.name() === 'switch');
+    expect(cmd?.options.map((o) => o.long)).toContain('--force');
+  });
+
   it('reports its version', () => {
     expect(buildProgram().version()).toBe('0.1.0');
   });

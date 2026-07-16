@@ -28,7 +28,19 @@ export function buildEngine(paths: Paths = defaultPaths()): SwitchEngine {
     warn: (obj, msg) => logger.warn(obj, msg),
     error: (obj, msg) => logger.error(obj, msg),
   };
-  return new SwitchEngine({ paths, logger: adapter });
+  // The switch-cadence guard defaults to 60s; operators can tune (or 0-disable) it via env.
+  const intervalEnv = Number(process.env.CCTL_SWITCH_MIN_INTERVAL_MS);
+  const options: ConstructorParameters<typeof SwitchEngine>[0] = { paths, logger: adapter };
+  if (Number.isFinite(intervalEnv) && intervalEnv >= 0) {
+    options.minSwitchIntervalMs = intervalEnv;
+  }
+  // Refresh-below-this-lifetime window (default 5 min). Setting it huge forces a refresh on
+  // the next activate — how the oauth.ts wet gate (docs/VERIFICATION.md §2) is exercised.
+  const skewEnv = Number(process.env.CCTL_REFRESH_SKEW_MS);
+  if (Number.isFinite(skewEnv) && skewEnv >= 0) {
+    options.refreshSkewMs = skewEnv;
+  }
+  return new SwitchEngine(options);
 }
 
 /** Print an error line and exit non-zero — the single failure path for command actions. */
