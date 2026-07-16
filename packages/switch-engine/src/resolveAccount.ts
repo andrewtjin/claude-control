@@ -4,8 +4,12 @@
 // id first (unambiguous), then an exact label, then a case-insensitive label. Ambiguity
 // (two accounts sharing a label under case-insensitive match) is reported rather than
 // guessed, so a switch never targets the wrong account silently.
+//
+// Lives here (not in the CLI) because every surface that accepts an account ref — `cctl
+// switch`, the daemon's `switch.command` handler behind Discord's `/switch` — must resolve
+// identically, or the same ref works locally and fails from the phone.
 
-import type { StoredAccount } from '@claude-control/switch-engine';
+import type { StoredAccount } from './types.js';
 
 export type ResolveResult =
   | { ok: true; account: StoredAccount }

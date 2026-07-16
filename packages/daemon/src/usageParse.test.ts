@@ -15,8 +15,63 @@ const baseOpts: ParseUsageOptions = {
 };
 
 describe('parseUsageEndpointResponse', () => {
-  it('parses the exact live payload observed in WT-2 (2026-07-16, wet-tests/results.json)', () => {
-    // Verbatim shape from the real endpoint: extra `group` field, nullable resets_at/scope.
+  it('parses the exact live payload observed at the M2 gate (2026-07-16 probe)', () => {
+    // Verbatim shape from a real 200 response: `limits` at the TOP level (no `utilization`
+    // wrapper), alongside sibling fields the parser must ignore. Object-valued `scope` and
+    // nullable resets_at appear in the wild too.
+    const raw = {
+      five_hour: { utilization: 4, resets_at: '2026-07-16T21:00:00.171240+00:00' },
+      seven_day: { utilization: 20, resets_at: '2026-07-17T12:00:00.171261+00:00' },
+      seven_day_opus: null,
+      extra_usage: { is_enabled: false },
+      spend: { percent: 0, severity: 'normal', enabled: false },
+      member_dashboard_available: false,
+      limits: [
+        {
+          kind: 'session',
+          group: 'session',
+          percent: 9,
+          severity: 'normal',
+          resets_at: '2026-07-16T21:00:00.171240+00:00',
+          scope: null,
+          is_active: false,
+        },
+        {
+          kind: 'weekly_all',
+          group: 'weekly',
+          percent: 21,
+          severity: 'normal',
+          resets_at: '2026-07-17T12:00:00.171261+00:00',
+          scope: null,
+          is_active: false,
+        },
+        {
+          kind: 'weekly_scoped',
+          group: 'weekly',
+          percent: 34,
+          severity: 'normal',
+          resets_at: '2026-07-17T12:00:00.171517+00:00',
+          scope: { model: { id: null, display_name: 'Fable' }, surface: null },
+          is_active: true,
+        },
+      ],
+    };
+    const { accountUsage, advisorInput } = parseUsageEndpointResponse(raw, baseOpts);
+
+    expect(accountUsage.error).toBeUndefined();
+    expect(accountUsage.limits).toHaveLength(3);
+    expect(accountUsage.limits[0]).toMatchObject({ kind: 'session', percent: 9 });
+    expect(accountUsage.limits[2]).toMatchObject({
+      kind: 'weekly_scoped',
+      percent: 34,
+      isActive: true,
+    });
+    expect(advisorInput.limits).toHaveLength(3);
+  });
+
+  it('parses the `utilization`-wrapped variant (how the CLI caches the same payload)', () => {
+    // Same limit family nested one level down — WT-2 originally recorded this shape from the
+    // CLI's `.claude.json` cache; the parser accepts both containers.
     const raw = {
       utilization: {
         limits: [
