@@ -86,6 +86,9 @@ importers:
       '@claude-control/switch-engine':
         specifier: workspace:*
         version: link:../switch-engine
+      '@claude-control/usage-advisor':
+        specifier: workspace:*
+        version: link:../usage-advisor
       pino:
         specifier: ^10.3.1
         version: 10.3.1
@@ -106,6 +109,8 @@ importers:
         version: 3.25.76
 
   packages/switch-engine: {}
+
+  packages/usage-advisor: {}
 
 packages:
 

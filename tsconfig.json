@@ -3,6 +3,7 @@
   "references": [
     { "path": "packages/shared-protocol" },
     { "path": "packages/switch-engine" },
+    { "path": "packages/usage-advisor" },
     { "path": "packages/session-runtime" },
     { "path": "packages/daemon" },
     { "path": "packages/control-plane-bot" },

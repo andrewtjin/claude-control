@@ -5,11 +5,5 @@
     "outDir": "dist",
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "references": [
-    { "path": "../shared-protocol" },
-    { "path": "../switch-engine" },
-    { "path": "../session-runtime" },
-    { "path": "../usage-advisor" }
-  ],
   "include": ["src/**/*.ts"]
 }
