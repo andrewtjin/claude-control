@@ -74,14 +74,28 @@ handles the verbatim payload (see `usageParse.test.ts`). **Correction:** omittin
 User-Agent did NOT get throttled (200 OK) — the header is sent anyway but is not
 load-bearing. Tier-0 cache was observed ~58 min stale, so staleness labels on cached
 data are mandatory, and the poller's tier-0 fallback stands.
+**Shape correction (2026-07-16, authenticated probe during the M2 gate):** the live
+response carries `limits[]` at the TOP level of the body — the `utilization.limits[]`
+nesting WT-2 recorded is how the CLI persists the same payload in `.claude.json`
+(`cachedUsageUtilization.utilization.limits`), not the wire shape. The parser accepts
+both containers (fix @ 013f053; the verbatim live body is a test fixture).
 
-### 4. Discord bot
+### 4. Discord bot ✅ CLOSED 2026-07-16
 
 **Verify:** the bot logs in (`DISCORD_BOT_TOKEN`), registers slash commands, creates a
 per-user channel on `/pair`, and renders the usage + plan embed with a working switch
 button.
-**Pass:** end-to-end from a phone — `/pair` binds, `/usage` shows the table, the switch
-button completes on the PC and edits the card.
+**Result (owner-run per `claude-control-orchestrator/tasks/m2-wet-gate-runbook.md`):**
+CONFIRMED end-to-end from a phone — `/pair` minted a code and `cctl daemon run --pair`
+bound the PC, adopting a DPAPI-persisted daemon identity; `/status`/`/usage`/`/accounts`
+answered from delivered `usage.snapshot`s; `/switch` completed on the PC (audit
+`activated` entry + live `oauthAccount` flip, both verified on disk) with the result card
+back on the phone; an immediate second switch was REFUSED by the cadence guard and the
+refusal surfaced on the phone. Two live-found defects were fixed mid-gate @ 013f053:
+`/switch` now resolves labels the same way `cctl switch` does, and the usage parser
+matches the real wire shape (see gate 3's shape correction). Notes: switching shipped as
+a `/switch` slash command (interactive buttons are M3 UX); there is no phone-side
+`--force`/cadence-retry yet — local `cctl switch <ref> --force` is the override (backlog).
 
 ### 5. Hook event names ⚠ PARTIALLY CLOSED 2026-07-16
 
@@ -114,12 +128,18 @@ Windows terminal.
 **Pass:** `cctl run` wraps a terminal; output is observed and a prompt can be injected;
 absence of `node-pty` degrades gracefully with a clear message.
 
-### 8. `~/.claude.json` round-trip
+### 8. `~/.claude.json` round-trip ✅ CLOSED 2026-07-16
 
 **Verify:** switching rewrites only the `oauthAccount` block and preserves every other
 key (projects, history, settings), including the duplicate-key quirk seen on real
 files.
-**Pass:** diff `~/.claude.json` before/after a switch — only `oauthAccount` changed.
+**Result (owner-run, same M2 gate):** CONFIRMED semantically — before/after comparison of
+the real file (81 top-level keys, 50 `projects` entries): zero keys added or removed,
+`projects` deep-equal, and the only switch-caused change was `oauthAccount`
+(`promptQueueUseCount` also moved, mutated by the running CLI itself, not the engine).
+Cosmetic caveat: the engine re-serializes the file minified onto one line, so a TEXT diff
+shows a full-file rewrite even though content is preserved — pretty-print-preserving
+writes are a polish backlog item.
 
 ## Reminder
 
