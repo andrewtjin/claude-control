@@ -206,6 +206,10 @@ const PairClaimPayload = z.object({
 
 const PairResultPayload = z.object({
   ok: z.boolean(),
+  /** The daemon id the BOT assigned at pairing. The daemon adopts this as its identity for
+   *  all later frames — it is minted server-side so a claimer can never name another user's
+   *  daemon (which would otherwise allow a cross-user binding hijack). */
+  daemonId: z.string().nullish(),
   daemonToken: z.string().nullish(),
   discordUserId: z.string().nullish(),
   error: z.string().nullish(),
