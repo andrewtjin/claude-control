@@ -9,11 +9,12 @@
 //   TRIGGER — the ACTIVE account's remaining quota is low (its worst limit is at/above
 //   `triggerPercent` used).
 //   ELIGIBLE — a candidate must still have at least `minSessionHeadroomPct` of its 5h
-//   session window left, and must not itself already be low (otherwise the switch would
-//   immediately re-trigger).
-//   CHOICE — among eligible candidates, the one whose WEEKLY quota resets soonest wins:
-//   its unused quota expires first, so burning it first wastes the least (the same
-//   asymmetry the timeline's "unused expires" line surfaces).
+//   session window left, must not itself already be low (otherwise the switch would
+//   immediately re-trigger), and must have a KNOWN future weekly reset — the weekly
+//   clock is the budget, and we never hop toward an account whose budget we can't see.
+//   CHOICE — the eligible account whose WEEKLY quota resets soonest, full stop. WEEKLY is
+//   the budget; the 5h window is only a gate, never a ranking key (owner ruling
+//   2026-07-16). Quota expiring soonest gets burned first, so the least is wasted.
 
 import { humanizeDuration, roundPct } from './format.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
@@ -64,31 +65,31 @@ export function decideAutoSwitch(
       !a.active &&
       !a.quarantined &&
       100 - sessionUsedPct(a, now) >= minSessionHeadroomPct &&
-      // Never hop to an account that would itself immediately count as low.
-      (worstPercent(a, now) ?? 0) < triggerPercent,
+      // Never hop to an account that would itself immediately count as low...
+      (worstPercent(a, now) ?? 0) < triggerPercent &&
+      // ...or whose weekly budget clock we can't see — the choice is BY weekly reset,
+      // so an unknown reset is not a lesser candidate, it's not a candidate at all.
+      weeklyResetAt(a, now) !== undefined,
   );
   if (candidates.length === 0) return null;
 
-  // Soonest weekly reset first (unused quota expiring soonest = burn it first). Accounts
-  // with no known weekly reset sort last; ties break on session headroom, then label so the
-  // decision is deterministic.
+  // Soonest weekly reset wins — weekly is the budget. Ties (same reset moment) go to the
+  // account with MORE weekly budget remaining (the larger expiring asset), then label so
+  // the decision is deterministic. The 5h window deliberately never ranks.
   candidates.sort((a, b) => {
-    const resetDelta = (weeklyResetAt(a, now) ?? Infinity) - (weeklyResetAt(b, now) ?? Infinity);
+    const resetDelta = (weeklyResetAt(a, now) as number) - (weeklyResetAt(b, now) as number);
     if (resetDelta !== 0) return resetDelta;
-    const sessionDelta = sessionUsedPct(a, now) - sessionUsedPct(b, now);
-    if (sessionDelta !== 0) return sessionDelta;
+    const weeklyDelta = weeklyUsedPct(a, now) - weeklyUsedPct(b, now);
+    if (weeklyDelta !== 0) return weeklyDelta;
     return a.label.localeCompare(b.label);
   });
   const target = candidates[0] as AccountUsageInput;
 
-  const targetReset = weeklyResetAt(target, now);
-  const resetNote =
-    targetReset !== undefined
-      ? `weekly resets in ${humanizeDuration(targetReset - now)}`
-      : 'weekly reset unknown';
+  const targetReset = weeklyResetAt(target, now) as number;
   const reason =
-    `${active.label} is at ${roundPct(activeWorst)}% used — switching to ${target.label} ` +
-    `(${roundPct(100 - sessionUsedPct(target, now))}% of a 5h window free, ${resetNote})`;
+    `${active.label} is at ${roundPct(activeWorst)}% used — ${target.label} has the ` +
+    `soonest weekly reset (in ${humanizeDuration(targetReset - now)}, ` +
+    `${roundPct(100 - weeklyUsedPct(target, now))}% weekly budget left)`;
 
   return { targetAccountId: target.accountId, targetLabel: target.label, reason };
 }
@@ -110,6 +111,17 @@ function worstPercent(account: AccountUsageInput, now: number): number | undefin
 function sessionUsedPct(account: AccountUsageInput, now: number): number {
   const session = effectiveLimits(account, now).find((l) => l.kind === 'session');
   return session?.percent ?? 0;
+}
+
+/** Percent of the weekly budget used — the max across live weekly limits (the binding
+ *  one). No live weekly limit = 0 (only reachable in reason text, since eligibility
+ *  already requires a known weekly reset). */
+function weeklyUsedPct(account: AccountUsageInput, now: number): number {
+  const weekly = effectiveLimits(account, now).filter(
+    (l) => l.kind === 'weekly_all' || l.kind === 'weekly_scoped',
+  );
+  if (weekly.length === 0) return 0;
+  return Math.max(...weekly.map((l) => l.percent));
 }
 
 /** The soonest known FUTURE weekly reset (weekly_all or weekly_scoped), or undefined. */

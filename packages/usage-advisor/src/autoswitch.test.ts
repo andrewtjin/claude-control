@@ -136,31 +136,51 @@ describe('decideAutoSwitch — choosing among candidates', () => {
     );
   });
 
-  it('prefers a known weekly reset over an unknown one', () => {
+  it('excludes candidates with an unknown weekly reset — the choice is BY the weekly clock', () => {
     const unknown = acct('unknown', {}, [{ kind: 'weekly_all', percent: 10 }]);
+    // Unknown-only: no switch at all rather than a hop the budget rule can't justify.
+    expect(decideAutoSwitch([lowActive(), unknown], NOW)).toBeNull();
     const known = acct('known', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 72 * H }]);
     expect(decideAutoSwitch([lowActive(), unknown, known], NOW)?.targetAccountId).toBe('known');
   });
 
-  it('breaks a reset-time tie on session headroom, then label', () => {
-    const busier = acct('busier', {}, [
-      { kind: 'session', percent: 40, resetsAt: NOW + 3 * H },
-      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H },
+  it('weekly reset time outranks session headroom — a closer reset wins even with a busier 5h window', () => {
+    const freshSessionLaterReset = acct('freshSession', {}, [
+      { kind: 'session', percent: 0, resetsAt: NOW + 3 * H },
+      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 72 * H },
     ]);
-    const fresher = acct('fresher', {}, [
-      { kind: 'session', percent: 5, resetsAt: NOW + 3 * H },
-      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H },
+    const busySessionSoonerReset = acct('busySession', {}, [
+      { kind: 'session', percent: 70, resetsAt: NOW + 3 * H }, // 30% left — eligible, but worse 5h
+      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 12 * H },
     ]);
-    expect(decideAutoSwitch([lowActive(), busier, fresher], NOW)?.targetAccountId).toBe('fresher');
+    expect(
+      decideAutoSwitch([lowActive(), freshSessionLaterReset, busySessionSoonerReset], NOW)
+        ?.targetAccountId,
+    ).toBe('busySession');
   });
 
-  it('explains the hop in one sentence with both criteria', () => {
+  it('breaks a reset-time tie on remaining weekly budget, never on the 5h window', () => {
+    // Session says pick 'lessWeeklyLeft' (fresher window); the weekly budget says otherwise.
+    const lessWeeklyLeft = acct('lessWeeklyLeft', {}, [
+      { kind: 'session', percent: 5, resetsAt: NOW + 3 * H },
+      { kind: 'weekly_all', percent: 60, resetsAt: NOW + 24 * H },
+    ]);
+    const moreWeeklyLeft = acct('moreWeeklyLeft', {}, [
+      { kind: 'session', percent: 70, resetsAt: NOW + 3 * H },
+      { kind: 'weekly_all', percent: 20, resetsAt: NOW + 24 * H },
+    ]);
+    expect(
+      decideAutoSwitch([lowActive(), lessWeeklyLeft, moreWeeklyLeft], NOW)?.targetAccountId,
+    ).toBe('moreWeeklyLeft');
+  });
+
+  it('explains the hop weekly-first in one sentence', () => {
     const spare = acct('spare', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 13 * H }]);
     const decision = decideAutoSwitch([lowActive(), spare], NOW);
     expect(decision?.reason).toContain('hot is at 96% used');
-    expect(decision?.reason).toContain('switching to spare');
-    expect(decision?.reason).toContain('100% of a 5h window free');
-    expect(decision?.reason).toContain('weekly resets in 13h');
+    expect(decision?.reason).toContain('spare has the soonest weekly reset');
+    expect(decision?.reason).toContain('in 13h');
+    expect(decision?.reason).toContain('90% weekly budget left');
   });
 
   it('returns null when every other account is ineligible', () => {
