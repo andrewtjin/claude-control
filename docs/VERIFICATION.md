@@ -30,8 +30,9 @@ unit tests over a mock never close a wet gate. Do not mark a wet gate done from 
 Run these on the owner's machine with a spare/test account before trusting the feature.
 
 ### 1. Hot-swap of a live interactive session — the M0 question
+
 **Claim to verify:** on Windows the CLI reads `.credentials.json` per request, so a
-switch applies to a *running* interactive session on its **next** message.
+switch applies to a _running_ interactive session on its **next** message.
 **How:** start `claude` interactively under account A; from another shell run the switch
 engine to activate B; send a new message in the running session.
 **Pass:** the next message is served by B (check the usage endpoint / account identity).
@@ -40,6 +41,7 @@ engine to activate B; send a new message in the running session.
 adapts to whichever answer this gate gives.
 
 ### 2. OAuth refresh endpoint
+
 **Verify:** `switch-engine/src/oauth.ts` `DEFAULT_TOKEN_ENDPOINT`,
 `CLAUDE_CODE_CLIENT_ID`, and the request/response shape are correct.
 **How:** point the switch engine at a spare account whose access token is near expiry
@@ -49,6 +51,7 @@ keeps working. **Fail signal:** `invalid_grant` on a token you know is live → 
 endpoint/shape is wrong, not the token.
 
 ### 3. Usage endpoint
+
 **Verify:** `GET https://api.anthropic.com/api/oauth/usage` with the Bearer token,
 `anthropic-beta: oauth-2025-04-20`, and a `User-Agent: claude-code/<ver>` returns the
 expected `utilization.limits[]`.
@@ -56,6 +59,7 @@ expected `utilization.limits[]`.
 User-Agent gets throttled; the poller must fall back to tier-0 cached data on error.
 
 ### 4. Discord bot
+
 **Verify:** the bot logs in (`DISCORD_BOT_TOKEN`), registers slash commands, creates a
 per-user channel on `/pair`, and renders the usage + plan embed with a working switch
 button.
@@ -63,6 +67,7 @@ button.
 button completes on the PC and edits the card.
 
 ### 5. Hook event names
+
 **Verify:** the exact `PermissionRequest` / `Stop` / `Notification` hook event names and
 payloads against the installed CLI version, and that merging our hooks into each
 profile's `settings.json` is non-destructive.
@@ -70,12 +75,14 @@ profile's `settings.json` is non-destructive.
 surfaces on the phone; approve/deny round-trips.
 
 ### 6. Managed sessions (Agent SDK)
+
 **Verify:** `session-runtime/src/managedSession.ts`'s adapter matches the real
 `@anthropic-ai/claude-agent-sdk` streaming API (message shapes, `interrupt`, input).
 **Pass:** `/run` starts a session that streams summarized milestones to a Discord
 thread; `/say` injects a prompt.
 
 ### 7. Observed sessions (ConPTY)
+
 **Verify:** `node-pty` (an optional dep, not installed by default) drives a real
 Windows terminal.
 **Setup:** `pnpm add -w node-pty` (needs MSVC build tools) or a prebuilt binary.
@@ -83,6 +90,7 @@ Windows terminal.
 absence of `node-pty` degrades gracefully with a clear message.
 
 ### 8. `~/.claude.json` round-trip
+
 **Verify:** switching rewrites only the `oauthAccount` block and preserves every other
 key (projects, history, settings), including the duplicate-key quirk seen on real
 files.

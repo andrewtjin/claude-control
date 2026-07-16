@@ -45,17 +45,17 @@ flowchart LR
 ## Packages and dependency direction
 
 Dependencies point **one way**, and the bot sits at the top of that order so it
-*cannot* reach credential code:
+_cannot_ reach credential code:
 
-| Package | Depends on | Role |
-| --- | --- | --- |
-| `shared-protocol` | — | zod-validated wire envelope + message union + codec. |
-| `switch-engine` | — | account vault (DPAPI), OAuth refresh, atomic switch, recovery. |
-| `usage-advisor` | — | pure burn-down optimizer: which account to use now. |
-| `session-runtime` | Agent SDK | managed + observed Claude sessions behind one interface. |
-| `daemon` | shared-protocol, switch-engine, usage-advisor, session-runtime | wires it all together; owns state. |
-| `control-plane-bot` | **shared-protocol only** | Discord bot + WS relay; zero credentials. |
-| `cli` (`cctl`) | shared-protocol, switch-engine, daemon | local command-line control. |
+| Package             | Depends on                                                     | Role                                                           |
+| ------------------- | -------------------------------------------------------------- | -------------------------------------------------------------- |
+| `shared-protocol`   | —                                                              | zod-validated wire envelope + message union + codec.           |
+| `switch-engine`     | —                                                              | account vault (DPAPI), OAuth refresh, atomic switch, recovery. |
+| `usage-advisor`     | —                                                              | pure burn-down optimizer: which account to use now.            |
+| `session-runtime`   | Agent SDK                                                      | managed + observed Claude sessions behind one interface.       |
+| `daemon`            | shared-protocol, switch-engine, usage-advisor, session-runtime | wires it all together; owns state.                             |
+| `control-plane-bot` | **shared-protocol only**                                       | Discord bot + WS relay; zero credentials.                      |
+| `cli` (`cctl`)      | shared-protocol, switch-engine, daemon                         | local command-line control.                                    |
 
 The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 "the bot holds zero credentials" a structural fact rather than a promise.

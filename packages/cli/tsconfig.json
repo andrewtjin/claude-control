@@ -5,9 +5,6 @@
     "outDir": "dist",
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "references": [
-    { "path": "../shared-protocol" },
-    { "path": "../switch-engine" }
-  ],
+  "references": [{ "path": "../shared-protocol" }, { "path": "../switch-engine" }],
   "include": ["src/**/*.ts"]
 }
