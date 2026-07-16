@@ -16,4 +16,10 @@ export { CredentialStore } from './credentialStore.js';
 export { acquireLock, Lock, type LockOptions } from './lock.js';
 export { IntentStore } from './intent.js';
 export { AuditLog, type AuditEntry } from './audit.js';
-export { SwitchEngine, type SwitchEngineOptions, type RefreshFn } from './switchEngine.js';
+export {
+  SwitchEngine,
+  DEFAULT_MIN_SWITCH_INTERVAL_MS,
+  type SwitchEngineOptions,
+  type ActivateOptions,
+  type RefreshFn,
+} from './switchEngine.js';

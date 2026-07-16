@@ -28,6 +28,19 @@ export class RefreshError extends SwitchEngineError {
   }
 }
 
+/** A switch was requested too soon after the previous one. Part of the ToS posture: keeps
+ *  any caller (including a future auto-switcher) at a human-plausible cadence. Bypass with
+ *  `activate(id, { force: true })` for deliberate operator overrides. */
+export class CadenceError extends SwitchEngineError {
+  constructor(
+    message: string,
+    /** How long until a switch would be allowed, ms. */
+    readonly retryAfterMs: number,
+  ) {
+    super(message, 'cadence_blocked');
+  }
+}
+
 /** Could not acquire the credential lock within the timeout — another process holds it. */
 export class LockTimeoutError extends SwitchEngineError {
   constructor(message: string) {
