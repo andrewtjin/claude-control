@@ -47,6 +47,9 @@ importers:
       '@claude-control/daemon':
         specifier: workspace:*
         version: link:../daemon
+      '@claude-control/session-runtime':
+        specifier: workspace:*
+        version: link:../session-runtime
       '@claude-control/shared-protocol':
         specifier: workspace:*
         version: link:../shared-protocol

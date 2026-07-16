@@ -20,6 +20,7 @@ import {
 import { Store } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import { buildEngine, daemonDbPath, fail } from './context.js';
+import { runDaemon } from './daemonRun.js';
 import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
 import { resolveAccountRef } from './resolve.js';
 import { renderDoctor, runDoctor, summarize } from './doctor.js';
@@ -112,24 +113,44 @@ export function buildProgram(): Command {
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);
     });
 
+  // The daemon: the one long-running local process (usage poller, hook receiver, attribution
+  // journal, control-plane connection). `--pair` is the first-run on-ramp: run /pair in
+  // Discord for a code, then `cctl daemon run --pair <code>`.
+  const daemon = program.command('daemon').description('the background daemon');
+  daemon
+    .command('run')
+    .description('run the daemon in the foreground (Ctrl+C to stop)')
+    .option('--pair <code>', 'pairing code from Discord /pair (adopts a new identity)')
+    .option(
+      '--relay <url>',
+      'control-plane WebSocket url (default CCTL_RELAY_URL or ws://127.0.0.1:8765)',
+    )
+    .action(async (opts: { pair?: string; relay?: string }) => {
+      await runDaemon(opts);
+    });
+
   // Remote-control features that require the running daemon connected to the hosted bot —
   // an inherently on-machine (wet) step. Surfaced now so the command set is discoverable and
   // the guidance is honest rather than a silent absence. See docs/VERIFICATION.md.
-  for (const [name, note] of [
-    ['pair', 'bind this machine to the Discord bot (run /pair there for a code)'],
-    ['run', 'start a remote session (drive it from Discord)'],
-    ['daemon', 'run the background daemon (poller + control-plane connection)'],
-  ] as const) {
-    program
-      .command(name)
-      .description(`(needs the running daemon + hosted bot) ${note}`)
-      .allowUnknownOption(true)
-      .action(() =>
-        fail(
-          `\`cctl ${name}\` needs the daemon connected to the bot — an on-machine step; see docs/VERIFICATION.md.`,
-        ),
-      );
-  }
+  program
+    .command('pair')
+    .description('bind this machine to the Discord bot')
+    .action(() =>
+      fail(
+        'run /pair in Discord for a code, then `cctl daemon run --pair <code>` — pairing happens on the daemon connection.',
+      ),
+    );
+  program
+    .command('run')
+    .description(
+      '(needs the running daemon + hosted bot) start a remote session (drive it from Discord)',
+    )
+    .allowUnknownOption(true)
+    .action(() =>
+      fail(
+        '`cctl run` needs the daemon connected to the bot — an on-machine step; see docs/VERIFICATION.md.',
+      ),
+    );
 
   return program;
 }
