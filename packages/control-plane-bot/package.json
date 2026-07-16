@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@claude-control/shared-protocol": "workspace:*",
+    "@claude-control/usage-advisor": "workspace:*",
     "discord.js": "^14.27.0",
     "pino": "^10.3.1",
     "ws": "^8.21.1"

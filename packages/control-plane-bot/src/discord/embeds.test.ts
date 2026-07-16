@@ -6,6 +6,7 @@ import {
   buildSessionListEmbed,
   buildPermissionRequestEmbed,
   buildSwitchResultEmbed,
+  buildTimelineEmbed,
 } from './embeds.js';
 import type { SessionStatus } from './stateCache.js';
 
@@ -58,6 +59,69 @@ describe('buildUsageEmbed', () => {
     const embed = buildUsageEmbed({ accounts: [] }).toJSON();
     expect(embed.description).toMatch(/no accounts/i);
     expect(embed.fields ?? []).toHaveLength(0);
+  });
+
+  it('appends the 5h-window budget when a weekly reset time is known', () => {
+    const NOW = Date.parse('2026-07-16T12:00:00.000Z');
+    const embed = buildUsageEmbed(
+      {
+        accounts: [
+          account({
+            limits: [
+              { kind: 'session', percent: 42, isActive: true },
+              {
+                kind: 'weekly_all',
+                percent: 30,
+                isActive: true,
+                resetsAt: '2026-07-17T14:00:00.000Z', // 26h out: 5 full 5h windows
+              },
+            ],
+          }),
+        ],
+      },
+      NOW,
+    ).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('5×5h windows left · weekly resets in 1d 2h');
+  });
+
+  it('omits the budget line when no weekly reset time is known', () => {
+    const embed = buildUsageEmbed({ accounts: [account()] }).toJSON();
+    expect(embed.fields?.[0]?.value).not.toContain('5h windows left');
+  });
+});
+
+describe('buildTimelineEmbed', () => {
+  const NOW = Date.parse('2026-07-16T12:00:00.000Z');
+  const accounts = [
+    account({
+      limits: [
+        { kind: 'session', percent: 42, isActive: true, resetsAt: '2026-07-16T14:00:00.000Z' },
+        { kind: 'weekly_all', percent: 30, isActive: true, resetsAt: '2026-07-17T14:00:00.000Z' },
+      ],
+    }),
+  ];
+
+  it('renders the outlook inside a code block so the ASCII tracks align', () => {
+    const embed = buildTimelineEmbed({ accounts }, NOW).toJSON();
+    expect(embed.title).toBe('Reset timeline');
+    expect(embed.description).toMatch(/^```\n/);
+    expect(embed.description).toMatch(/\n```$/);
+    expect(embed.description).toContain('5h-session budget');
+    expect(embed.description).toContain('Reset timeline  now -> 1d 2h');
+    expect(embed.description).toContain('Upcoming resets');
+    expect(embed.description).toContain('5h window resets (42% used clears)');
+  });
+
+  it('appends the daemon-computed plan when the snapshot carries one', () => {
+    const plan: UsagePlan = {
+      recommendedAccountId: 'acct-1',
+      reason: 'Work has the most available headroom (58%).',
+      ranking: [],
+      advisories: [{ kind: 'all_healthy', message: 'All accounts have healthy headroom.' }],
+    };
+    const embed = buildTimelineEmbed({ accounts, plan }, NOW).toJSON();
+    expect(embed.description).toContain('Plan: Work has the most available headroom (58%).');
+    expect(embed.description).toContain('- All accounts have healthy headroom.');
   });
 });
 

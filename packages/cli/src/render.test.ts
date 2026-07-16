@@ -52,6 +52,38 @@ describe('renderUsage', () => {
     expect(out).toMatch(/week 30%/); // weekly limit
   });
 
+  it('appends the 5h-window budget when reset times are known', () => {
+    // Open window ends in 2h, weekly resets in 12h: the open window + two more = 3.
+    const rows: UsageRow[] = [
+      {
+        label: 'Work',
+        active: true,
+        usage: usage({
+          limits: [
+            {
+              kind: 'session',
+              percent: 45,
+              isActive: true,
+              resetsAt: new Date(NOW + 2 * 3_600_000).toISOString(),
+            },
+            {
+              kind: 'weekly_all',
+              percent: 30,
+              isActive: true,
+              resetsAt: new Date(NOW + 12 * 3_600_000).toISOString(),
+            },
+          ],
+        }),
+      },
+    ];
+    expect(renderUsage(rows, NOW)).toMatch(/· 3x5h left/);
+  });
+
+  it('omits the window budget when no weekly reset time is known', () => {
+    const rows: UsageRow[] = [{ label: 'Work', active: true, usage: usage() }];
+    expect(renderUsage(rows, NOW)).not.toMatch(/x5h left/);
+  });
+
   it('labels a cached reading as cached so it is not mistaken for fresh', () => {
     const rows: UsageRow[] = [
       { label: 'Reserve', active: false, usage: usage({ source: 'cached', label: 'Reserve' }) },

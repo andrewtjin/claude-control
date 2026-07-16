@@ -11,7 +11,12 @@ import type { EmbedBuilder } from 'discord.js';
 import type { RelaySender } from '../relay.js';
 import type { PairingService } from '../pairing.js';
 import type { DaemonStateCache } from './stateCache.js';
-import { buildUsageEmbed, buildAccountsEmbed, buildSessionListEmbed } from './embeds.js';
+import {
+  buildUsageEmbed,
+  buildAccountsEmbed,
+  buildSessionListEmbed,
+  buildTimelineEmbed,
+} from './embeds.js';
 
 export interface CommandDeps {
   relay: RelaySender;
@@ -41,6 +46,14 @@ export function handleUsage(deps: CommandDeps, discordUserId: string): CommandRe
   const usage = deps.cache.getUsage(discordUserId);
   if (!usage) return { kind: 'text', text: 'No usage data yet — the daemon has not reported in.' };
   return { kind: 'embed', embed: buildUsageEmbed(usage) };
+}
+
+/** `/timeline` — the 5h-window budget + reset timeline, from the same cached snapshot as
+ *  `/usage` (the daemon pushes; the bot only renders). */
+export function handleTimeline(deps: CommandDeps, discordUserId: string): CommandResult {
+  const usage = deps.cache.getUsage(discordUserId);
+  if (!usage) return { kind: 'text', text: 'No usage data yet — the daemon has not reported in.' };
+  return { kind: 'embed', embed: buildTimelineEmbed(usage) };
 }
 
 /** `/accounts` — same cache, a lighter view. */

@@ -9,7 +9,8 @@
     { "path": "../shared-protocol" },
     { "path": "../switch-engine" },
     { "path": "../daemon" },
-    { "path": "../session-runtime" }
+    { "path": "../session-runtime" },
+    { "path": "../usage-advisor" }
   ],
   "include": ["src/**/*.ts"]
 }

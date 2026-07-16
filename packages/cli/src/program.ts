@@ -17,9 +17,17 @@ import {
   UnknownAccountError,
   defaultPaths,
   resolveAccountRef,
+  type StoredAccount,
 } from '@claude-control/switch-engine';
 import { Store } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
+import {
+  computeOutlook,
+  computePlan,
+  renderOutlook,
+  renderPlanSummary,
+  timelineInputFromWire,
+} from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { runDaemon } from './daemonRun.js';
 import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
@@ -78,29 +86,37 @@ export function buildProgram(): Command {
     .command('usage')
     .description("show usage across all accounts (from the daemon's latest poll)")
     .action(async () => {
-      const engine = buildEngine();
-      const [accounts, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
-      // Read-only view of the daemon's persisted snapshots; works whether or not the daemon is
-      // currently running (it shows the last poll). Opening a not-yet-created db just yields an
-      // empty one, which renders as "no usage data yet".
-      const store = new Store(daemonDbPath());
-      try {
-        const rows: UsageRow[] = accounts.map((a) => {
-          const row = store.latestUsageSnapshot(a.id);
-          let usage: AccountUsage | undefined;
-          if (row) {
-            try {
-              usage = JSON.parse(row.json) as AccountUsage;
-            } catch {
-              usage = undefined; // a corrupt row must not crash the whole view
-            }
-          }
-          return { label: a.label, active: a.id === activeId, usage };
-        });
-        process.stdout.write(renderUsage(rows, Date.now()) + '\n');
-      } finally {
-        store.close();
-      }
+      const { accounts, activeId, usageFor } = await readUsageState();
+      const rows: UsageRow[] = accounts.map((a) => ({
+        label: a.label,
+        active: a.id === activeId,
+        usage: usageFor(a.id),
+      }));
+      process.stdout.write(renderUsage(rows, Date.now()) + '\n');
+    });
+
+  program
+    .command('timeline')
+    .description('5h-session budget per account + when every limit resets, with a usage plan')
+    .action(async () => {
+      const { accounts, activeId, usageFor } = await readUsageState();
+      // Registry data (label/active/quarantined) is authoritative and current; the persisted
+      // snapshot only contributes the limits, so a stale snapshot can't misreport which
+      // account is live. Accounts without a snapshot still appear (as "unknown").
+      const inputs = timelineInputFromWire(
+        accounts.map((a) => ({
+          accountId: a.id,
+          label: a.label,
+          active: a.id === activeId,
+          quarantined: a.quarantined,
+          limits: usageFor(a.id)?.limits ?? [],
+        })),
+      );
+      const outlook = computeOutlook(inputs);
+      let text = renderOutlook(outlook);
+      // The burn-down plan turns the timeline into advice: what to use now and what to burn.
+      if (inputs.length > 0) text += '\n\n' + renderPlanSummary(computePlan(inputs));
+      process.stdout.write(text + '\n');
     });
 
   program
@@ -153,6 +169,35 @@ export function buildProgram(): Command {
     );
 
   return program;
+}
+
+/** Accounts + active id joined with the daemon's latest persisted usage snapshot per
+ *  account. Read-only view shared by `usage` and `timeline`: it works whether or not the
+ *  daemon is currently running (it shows the last poll), and opening a not-yet-created db
+ *  just yields an empty one. A corrupt snapshot row is skipped, never fatal. */
+async function readUsageState(): Promise<{
+  accounts: StoredAccount[];
+  activeId: string | null;
+  usageFor: (accountId: string) => AccountUsage | undefined;
+}> {
+  const engine = buildEngine();
+  const [accounts, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
+  const store = new Store(daemonDbPath());
+  const byId = new Map<string, AccountUsage>();
+  try {
+    for (const a of accounts) {
+      const row = store.latestUsageSnapshot(a.id);
+      if (!row) continue;
+      try {
+        byId.set(a.id, JSON.parse(row.json) as AccountUsage);
+      } catch {
+        // a corrupt row must not crash the whole view
+      }
+    }
+  } finally {
+    store.close();
+  }
+  return { accounts, activeId, usageFor: (accountId) => byId.get(accountId) };
 }
 
 /**
