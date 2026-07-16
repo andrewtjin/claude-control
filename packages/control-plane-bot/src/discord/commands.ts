@@ -30,7 +30,7 @@ export function handlePair(deps: CommandDeps, discordUserId: string): CommandRes
   const code = deps.pairing.createCode(discordUserId);
   return {
     kind: 'text',
-    text: `Pairing code: **${code}** — run \`cctl pair ${code}\` on the host within 10 minutes.`,
+    text: `Pairing code: **${code}** — run \`cctl daemon run --pair ${code}\` on the host within 10 minutes.`,
   };
 }
 

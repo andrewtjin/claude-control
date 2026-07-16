@@ -12,6 +12,7 @@ export {
   type RefreshDeps,
 } from './oauth.js';
 export { Vault } from './vault.js';
+export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
 export { CredentialStore } from './credentialStore.js';
 export { acquireLock, Lock, type LockOptions } from './lock.js';
 export { IntentStore } from './intent.js';

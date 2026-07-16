@@ -8,6 +8,7 @@
 // pre-built (dependency injection) so a lifecycle test can fake all of them.
 
 import type { RecoverResult, ActivateResult, StoredAccount } from '@claude-control/switch-engine';
+import { resolveAccountRef } from '@claude-control/switch-engine';
 import type { SessionManager } from '@claude-control/session-runtime';
 import { createAgentSdkClient as defaultCreateAgentSdkClient } from '@claude-control/session-runtime';
 import type { AgentSdkClient } from '@claude-control/session-runtime';
@@ -186,7 +187,12 @@ export class Daemon {
   private async handleSwitchCommand(msg: MessageOf<'switch.command'>): Promise<void> {
     const { requestId, targetAccountId } = msg.payload;
     try {
-      const result = await this.switchEngine.activate(targetAccountId);
+      // Phone-side commands carry whatever the user typed — an id or a label. Resolve it the
+      // same way `cctl switch` does, or `/switch account:spare` fails while the identical
+      // ref works locally. Unknown/ambiguous refs are refused with the resolver's message.
+      const resolved = resolveAccountRef(await this.switchEngine.listAccounts(), targetAccountId);
+      if (!resolved.ok) throw new Error(resolved.message);
+      const result = await this.switchEngine.activate(resolved.account.id);
       // The engine reports only what it mechanically did (see switch-engine's own docs):
       // whether a running interactive session picks up rewritten live credentials is a
       // separate, per-platform empirical fact this daemon does not currently verify — so a

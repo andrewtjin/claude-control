@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { resolveAccountRef } from './resolve.js';
-import type { StoredAccount } from '@claude-control/switch-engine';
+import { resolveAccountRef } from './resolveAccount.js';
+import type { StoredAccount } from './types.js';
 
 function acct(id: string, label: string): StoredAccount {
   return { id, label, quarantined: false, createdAtMs: 0, updatedAtMs: 0 };

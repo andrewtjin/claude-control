@@ -16,13 +16,13 @@ import {
   SwitchEngineError,
   UnknownAccountError,
   defaultPaths,
+  resolveAccountRef,
 } from '@claude-control/switch-engine';
 import { Store } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { runDaemon } from './daemonRun.js';
 import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
-import { resolveAccountRef } from './resolve.js';
 import { renderDoctor, runDoctor, summarize } from './doctor.js';
 
 const VERSION = '0.1.0';

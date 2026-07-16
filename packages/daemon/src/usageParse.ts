@@ -3,8 +3,11 @@
 // `AccountUsageInput` (usage-advisor — what feeds the burn-down optimizer).
 //
 // PURE: no IO, no throwing. The OAuth usage endpoint is undocumented but its live shape was
-// wet-confirmed 2026-07-16 (WT-2, wet-tests/results.json): `utilization.limits[]` with
-// kind/group/percent/severity/resets_at(nullable)/scope(nullable)/is_active. The endpoint
+// wet-confirmed 2026-07-16 (live probe during the M2 gate): `limits[]` at the TOP level of
+// the response body, with kind/group/percent/severity/resets_at(nullable)/scope(nullable)/
+// is_active. A `utilization`-wrapped variant also exists in the wild — it's how the CLI
+// persists the same payload in `.claude.json` (`cachedUsageUtilization.utilization.limits`),
+// and it's what WT-2 originally recorded — so both containers are accepted. The endpoint
 // can still drift, so tolerance stays: a poll that returns something we don't recognize must
 // never crash the poller or blind the advisor to every OTHER account — every parse here
 // degrades to a best-effort result with an `error` note instead of throwing.
@@ -103,62 +106,44 @@ export interface ParseUsageOptions {
 }
 
 /**
- * Parse the tier-1 OAuth usage endpoint's raw JSON body. Expected shape:
- *   { utilization: { limits: [{ kind, percent|utilization, severity?, resets_at?, scope?, is_active? }] } }
+ * Parse the tier-1 OAuth usage endpoint's raw JSON body. Live-confirmed shape (2026-07-16):
+ *   { limits: [{ kind, percent|utilization, severity?, resets_at?, scope?, is_active? }], ... }
+ * with `limits` at the top level; a `{ utilization: { limits: [...] } }` wrapper is also
+ * accepted (the CLI's cache file nests the same payload that way).
  * Never throws — an unrecognized shape yields an empty `limits` array plus an `error` note,
  * so the daemon still reports the account (as unknown-but-live) rather than dropping it.
  */
 export function parseUsageEndpointResponse(raw: unknown, opts: ParseUsageOptions): ParsedUsage {
-  const limits: UsageLimit[] = [];
-  const inputs: LimitInput[] = [];
-  let error: string | undefined;
-
-  if (!isRecord(raw)) {
-    error = 'response body was not a JSON object';
-  } else {
-    const utilization = raw.utilization;
-    if (!isRecord(utilization)) {
-      error = 'missing or malformed "utilization" field';
-    } else if (!Array.isArray(utilization.limits)) {
-      error = 'missing or malformed "utilization.limits" field';
-    } else {
-      let skipped = 0;
-      for (const rawLimit of utilization.limits) {
-        const parsed = parseOneLimit(rawLimit);
-        if (parsed) {
-          limits.push(parsed.limit);
-          inputs.push(parsed.input);
-        } else {
-          skipped++;
-        }
-      }
-      if (skipped > 0)
-        error = `skipped ${skipped} unrecognized limit entr${skipped === 1 ? 'y' : 'ies'}`;
-    }
-  }
-
-  return buildResult(opts, limits, inputs, error);
+  return parseLimitsPayload(raw, opts, 'response body was not a JSON object');
 }
 
 /**
  * Parse the tier-0 fallback shape cached in `~/.claude.json` under `cachedUsageUtilization`.
- * Its own shape is the same undocumented `{ limits: [...] }` family, just persisted locally
- * by the CLI rather than fetched fresh — so it goes through the same tolerant limit parser.
- * Never throws.
+ * It's the same `{ limits: [...] }` family — the CLI persists the endpoint's payload wrapped
+ * one level under `utilization` — so it goes through the same tolerant parser. Never throws.
  */
 export function parseCachedUsage(raw: unknown, opts: ParseUsageOptions): ParsedUsage {
+  return parseLimitsPayload(raw, opts, 'cached usage value was not a JSON object');
+}
+
+/** The shared tolerant core: find the `limits` array (top-level, or nested one level under
+ *  `utilization` — the CLI's cache wraps it that way), parse each entry best-effort, and
+ *  report anything unusable in an `error` note instead of throwing. */
+function parseLimitsPayload(
+  raw: unknown,
+  opts: ParseUsageOptions,
+  notObjectError: string,
+): ParsedUsage {
   const limits: UsageLimit[] = [];
   const inputs: LimitInput[] = [];
   let error: string | undefined;
 
   if (!isRecord(raw)) {
-    error = 'cached usage value was not a JSON object';
+    error = notObjectError;
   } else {
-    // Tolerate the value either being the `{ limits: [...] }` block directly, or nested one
-    // level under `utilization` like the live endpoint — the CLI's cache shape is unconfirmed.
     const container = isRecord(raw.utilization) ? raw.utilization : raw;
     if (!Array.isArray(container.limits)) {
-      error = 'missing or malformed cached "limits" field';
+      error = 'missing or malformed "limits" field';
     } else {
       let skipped = 0;
       for (const rawLimit of container.limits) {

@@ -141,7 +141,14 @@ function fakeSwitchEngine(): SwitchEngineLike & {
         wroteCredentials: true,
       }),
     ),
-    listAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
+    // Two known accounts so switch.command tests can exercise id AND label resolution — the
+    // daemon resolves the phone-supplied ref against this list before activating.
+    listAccounts: vi.fn((): Promise<StoredAccount[]> =>
+      Promise.resolve([
+        { id: 'acct-x', label: 'main', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
+        { id: 'acct-y', label: 'spare', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
+      ]),
+    ),
     getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
   };
 }
@@ -296,6 +303,47 @@ describe('Daemon lifecycle', () => {
         ok: true,
         activeAccountId: 'acct-x',
       });
+    }
+  });
+
+  it('resolves a LABEL in switch.command to the account id before activating', async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'switch.command',
+      payload: {
+        requestId: 'r-label',
+        targetAccountId: 'spare', // the label, exactly as a user would type it in /switch
+        reason: 'manual',
+        idempotencyKey: 'k-label',
+      },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
+    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y');
+    const result = relay.received.find((e) => e.type === 'switch.result');
+    if (result?.type === 'switch.result') {
+      expect(result.payload).toMatchObject({ ok: true, activeAccountId: 'acct-y' });
+    }
+  });
+
+  it('refuses an unknown account ref with ok:false and never calls activate()', async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'switch.command',
+      payload: {
+        requestId: 'r-unknown',
+        targetAccountId: 'no-such-account',
+        reason: 'manual',
+        idempotencyKey: 'k-unknown',
+      },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
+    expect(switchEngine.activate).not.toHaveBeenCalled();
+    const result = relay.received.find((e) => e.type === 'switch.result');
+    if (result?.type === 'switch.result') {
+      expect(result.payload.ok).toBe(false);
+      expect(result.payload.error).toMatch(/No account matches/);
     }
   });
 
