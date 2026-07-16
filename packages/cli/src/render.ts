@@ -5,6 +5,7 @@
 
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
+import { computeOutlook, timelineInputFromWire } from '@claude-control/usage-advisor';
 
 /** Render the accounts registry as an aligned table. `activeId` is marked with `*`. */
 export function renderAccountsTable(accounts: StoredAccount[], activeId: string | null): string {
@@ -62,9 +63,17 @@ export function renderUsage(rows: UsageRow[], nowMs: number): string {
         ? r.usage.limits.map((l) => `${limitShort(l.kind)} ${Math.round(l.percent)}%`).join(' · ')
         : 'no limits reported';
       const err = r.usage.error ? `  [${r.usage.error}]` : '';
-      return `${marker} ${r.label}  (${r.usage.source}, ${age})  ${limits}${err}`;
+      return `${marker} ${r.label}  (${r.usage.source}, ${age})  ${limits}${windowsLeft(r.usage, nowMs)}${err}`;
     })
     .join('\n');
+}
+
+/** "· 15x5h left" — how many 5h session windows still fit before this account's weekly
+ *  reset. Empty when no weekly reset time is known (full detail lives in `cctl timeline`). */
+function windowsLeft(usage: AccountUsage, nowMs: number): string {
+  const outlook = computeOutlook(timelineInputFromWire([usage]), nowMs);
+  const budget = outlook.accounts[0]?.budget;
+  return budget ? ` · ${budget.fullWindows}x5h left` : '';
 }
 
 function limitShort(kind: AccountUsage['limits'][number]['kind']): string {

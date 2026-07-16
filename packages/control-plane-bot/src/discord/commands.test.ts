@@ -7,6 +7,7 @@ import { DaemonStateCache } from './stateCache.js';
 import {
   handlePair,
   handleUsage,
+  handleTimeline,
   handleAccounts,
   handleSessions,
   handleStatus,
@@ -85,6 +86,38 @@ describe('read commands (usage/accounts/sessions/status)', () => {
       payload: { accounts: [] },
     });
     expect(handleUsage(deps, 'user-a').kind).toBe('embed');
+  });
+
+  it('handleTimeline answers from the same cached snapshot as handleUsage', () => {
+    const { relay } = createFakeRelay({ online: {} });
+    const cache = new DaemonStateCache();
+    const deps: CommandDeps = {
+      relay,
+      pairing: new PairingService({ bindings: new BindingStore() }),
+      cache,
+    };
+    expect(handleTimeline(deps, 'user-a').kind).toBe('text'); // no data yet
+
+    cache.record('user-a', {
+      v: 1,
+      id: 'x',
+      ts: 0,
+      daemonId: 'daemon-1',
+      type: 'usage.snapshot',
+      payload: {
+        accounts: [
+          {
+            accountId: 'acct-1',
+            label: 'Work',
+            active: true,
+            source: 'live',
+            fetchedAtMs: 0,
+            limits: [{ kind: 'weekly_all', percent: 30, isActive: true }],
+          },
+        ],
+      },
+    });
+    expect(handleTimeline(deps, 'user-a').kind).toBe('embed');
   });
 
   it('handleAccounts reflects the same cached snapshot', () => {

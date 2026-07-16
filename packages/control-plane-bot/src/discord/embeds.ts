@@ -5,6 +5,16 @@
 
 import { EmbedBuilder } from 'discord.js';
 import type { AccountUsage, UsagePlan } from '@claude-control/shared-protocol';
+// usage-advisor is a pure, credential-free library — importing it preserves the bot's
+// zero-credential guarantee (which forbids switch-engine, not math).
+import {
+  computeOutlook,
+  humanizeDuration,
+  renderOutlook,
+  renderPlanSummary,
+  timelineInputFromWire,
+  type ResetOutlook,
+} from '@claude-control/usage-advisor';
 import type { SessionStatus } from './stateCache.js';
 
 const COLOR_OK = 0x2ecc71;
@@ -21,20 +31,24 @@ function formatLimits(account: AccountUsage): string {
 
 /** `/usage` — the full table plus, when the daemon has computed one, the burn-down
  *  advisor's recommendation and any active advisories. */
-export function buildUsageEmbed(usage: {
-  accounts: AccountUsage[];
-  plan?: UsagePlan;
-}): EmbedBuilder {
+export function buildUsageEmbed(
+  usage: {
+    accounts: AccountUsage[];
+    plan?: UsagePlan;
+  },
+  nowMs = Date.now(),
+): EmbedBuilder {
   const embed = new EmbedBuilder().setTitle('Usage').setColor(COLOR_INFO);
   if (usage.accounts.length === 0) {
     embed.setDescription('No accounts reported yet.');
   }
+  const outlook = computeOutlook(timelineInputFromWire(usage.accounts), nowMs);
   for (const account of usage.accounts) {
     const marker = account.active ? '● active' : 'idle';
     const errorLine = account.error ? `\n:warning: ${account.error}` : '';
     embed.addFields({
       name: `${account.label} — ${marker}`,
-      value: `${formatLimits(account)}${errorLine}`,
+      value: `${formatLimits(account)}${windowsLine(outlook, account.accountId, nowMs)}${errorLine}`,
     });
   }
   if (usage.plan) {
@@ -50,6 +64,38 @@ export function buildUsageEmbed(usage: {
     }
   }
   return embed;
+}
+
+/** "12×5h windows left · weekly resets in 3d 4h" — the session budget line appended to an
+ *  account's `/usage` field, or empty when no weekly reset time is known. */
+function windowsLine(outlook: ResetOutlook, accountId: string, nowMs: number): string {
+  const budget = outlook.accounts.find((a) => a.accountId === accountId)?.budget;
+  if (!budget) return '';
+  return (
+    `\n${budget.fullWindows}×5h window${budget.fullWindows === 1 ? '' : 's'} left` +
+    ` · weekly resets in ${humanizeDuration(budget.weeklyResetAt - nowMs)}`
+  );
+}
+
+/** `/timeline` — the 5h-window budget and cross-account reset timeline, rendered by the
+ *  same pure text renderer the CLI uses and wrapped in a code block so the ASCII tracks
+ *  align. The daemon-computed plan (quarantine-aware) rides along when the snapshot has
+ *  one — the bot never recomputes advice from its own clock. */
+export function buildTimelineEmbed(
+  usage: {
+    accounts: AccountUsage[];
+    plan?: UsagePlan;
+  },
+  nowMs = Date.now(),
+): EmbedBuilder {
+  const outlook = computeOutlook(timelineInputFromWire(usage.accounts), nowMs);
+  // 28 columns keeps the track inside a phone-width Discord code block.
+  let text = renderOutlook(outlook, { trackWidth: 28 });
+  if (usage.plan) text += '\n\n' + renderPlanSummary(usage.plan);
+  return new EmbedBuilder()
+    .setTitle('Reset timeline')
+    .setColor(COLOR_INFO)
+    .setDescription('```\n' + text + '\n```');
 }
 
 /** `/accounts` — a lighter listing than `/usage`: which accounts exist and whether each is

@@ -5,6 +5,6 @@
     "outDir": "dist",
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "references": [{ "path": "../shared-protocol" }],
+  "references": [{ "path": "../shared-protocol" }, { "path": "../usage-advisor" }],
   "include": ["src/**/*.ts"]
 }

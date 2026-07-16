@@ -56,6 +56,9 @@ importers:
       '@claude-control/switch-engine':
         specifier: workspace:*
         version: link:../switch-engine
+      '@claude-control/usage-advisor':
+        specifier: workspace:*
+        version: link:../usage-advisor
       commander:
         specifier: ^15.0.0
         version: 15.0.0
@@ -68,6 +71,9 @@ importers:
       '@claude-control/shared-protocol':
         specifier: workspace:*
         version: link:../shared-protocol
+      '@claude-control/usage-advisor':
+        specifier: workspace:*
+        version: link:../usage-advisor
       discord.js:
         specifier: ^14.27.0
         version: 14.27.0

@@ -137,6 +137,9 @@ export class DiscordJsGateway implements DiscordGateway {
     return [
       new SlashCommandBuilder().setName('pair').setDescription('Pair a new daemon to your account'),
       new SlashCommandBuilder().setName('usage').setDescription('Show usage across accounts'),
+      new SlashCommandBuilder()
+        .setName('timeline')
+        .setDescription('5h-session budget and reset timeline across accounts'),
       new SlashCommandBuilder().setName('accounts').setDescription('List paired accounts'),
       new SlashCommandBuilder().setName('sessions').setDescription('List known sessions'),
       new SlashCommandBuilder().setName('status').setDescription('Show daemon connection status'),
@@ -202,6 +205,9 @@ export class DiscordJsGateway implements DiscordGateway {
         break;
       case 'usage':
         result = commands.handleUsage(this.deps, userId);
+        break;
+      case 'timeline':
+        result = commands.handleTimeline(this.deps, userId);
         break;
       case 'accounts':
         result = commands.handleAccounts(this.deps, userId);
