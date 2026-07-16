@@ -387,3 +387,89 @@ describe('recover', () => {
     expect(await h.vault.readRollback()).toBeUndefined();
   });
 });
+
+describe('refreshToken — background refresh for polling', () => {
+  it('refreshes an expired idle account in the vault without touching live files or active id', async () => {
+    const h = await harness();
+    // B's token expired an hour ago — exactly the blind-poller case.
+    const { accountA, accountB } = await seedAActiveWithB(h, NOW - HOUR);
+
+    const result = await h.engine.refreshToken(accountB.id);
+
+    expect(result).toMatchObject({ accountId: accountB.id, refreshed: true });
+    expect(result.expiresAt).toBe(NOW + HOUR);
+    expect(h.refresh).toHaveBeenCalledOnce();
+    // The rotated (single-use) token is persisted in the vault...
+    const vaulted = await h.vault.readBundle(accountB.id);
+    expect(vaulted.claudeAiOauth.accessToken).toBe('refreshed-B');
+    expect(vaulted.claudeAiOauth.refreshToken).toBe('rotated-r-B');
+    // ...and NOTHING live changed: A is still the live and active account.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect((await h.credStore.readOauthAccount())?.accountUuid).toBe('uuid-A');
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+    // No leftover switch machinery either.
+    expect(await h.intent.read()).toBeUndefined();
+    expect(await h.vault.readRollback()).toBeUndefined();
+  });
+
+  it('is a no-op when the token is still fresh', async () => {
+    const h = await harness();
+    const { accountB } = await seedAActiveWithB(h, NOW + 10 * HOUR);
+
+    const result = await h.engine.refreshToken(accountB.id);
+
+    expect(result).toMatchObject({ refreshed: false, skippedReason: 'token_fresh' });
+    expect(result.expiresAt).toBe(NOW + 10 * HOUR);
+    expect(h.refresh).not.toHaveBeenCalled();
+  });
+
+  it('never network-refreshes the ACTIVE account; adopts a CLI-side rotation instead', async () => {
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+    // The CLI rotated A's token while live; the vault copy is stale AND (say) expired.
+    const liveA = (await h.credStore.readLiveCredentials())!;
+    await h.credStore.writeLiveCredentials({ ...liveA, refreshToken: 'cli-rotated' });
+
+    const result = await h.engine.refreshToken(accountA.id);
+
+    // A refresh here would consume the single-use token the live session still holds.
+    expect(result).toMatchObject({
+      refreshed: false,
+      skippedReason: 'active_account',
+      adoptedLiveRotation: true,
+    });
+    expect(h.refresh).not.toHaveBeenCalled();
+    // The rotation was adopted into the vault, so the vault copy is current again.
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('cli-rotated');
+  });
+
+  it('quarantines the account when its refresh token is permanently dead', async () => {
+    const dead: RefreshFn = () => Promise.reject(new QuarantineError('invalid_grant'));
+    const h = await harness(dead);
+    const { accountB } = await seedAActiveWithB(h, NOW - HOUR);
+
+    await expect(h.engine.refreshToken(accountB.id)).rejects.toBeInstanceOf(QuarantineError);
+    expect((await h.engine.listAccounts()).find((a) => a.id === accountB.id)?.quarantined).toBe(
+      true,
+    );
+    // A quarantined account is then refused outright (no further refresh attempts).
+    await expect(h.engine.refreshToken(accountB.id)).rejects.toBeInstanceOf(QuarantineError);
+    expect(h.refresh).toHaveBeenCalledOnce();
+  });
+
+  it('propagates a transient refresh failure without quarantining', async () => {
+    const flaky: RefreshFn = () => Promise.reject(new RefreshError('network', 'network'));
+    const h = await harness(flaky);
+    const { accountB } = await seedAActiveWithB(h, NOW - HOUR);
+
+    await expect(h.engine.refreshToken(accountB.id)).rejects.toBeInstanceOf(RefreshError);
+    expect((await h.engine.listAccounts()).find((a) => a.id === accountB.id)?.quarantined).toBe(
+      false,
+    );
+  });
+
+  it('rejects an unknown account id', async () => {
+    const h = await harness();
+    await expect(h.engine.refreshToken('nope')).rejects.toBeInstanceOf(UnknownAccountError);
+  });
+});
