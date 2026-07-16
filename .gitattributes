@@ -1,0 +1,11 @@
+# Normalize all text to LF in the repo so formatting checks (prettier endOfLine: lf) are
+# deterministic across Windows and Linux/CI, regardless of the authoring platform.
+* text=auto eol=lf
+
+# Lockfiles and generated artifacts: keep LF, never treat as binary.
+pnpm-lock.yaml text eol=lf
+
+# Common binaries (none tracked today, but guard the class).
+*.png binary
+*.jpg binary
+*.ico binary
