@@ -34,4 +34,20 @@ describe.skipIf(process.platform !== 'win32')('DpapiProtector (real DPAPI)', () 
     const blob = p.protect(secret);
     expect(Buffer.from(blob, 'base64').equals(secret)).toBe(false);
   });
+
+  it('captures PowerShell stderr in the thrown error instead of leaking it to the console', () => {
+    const p = new DpapiProtector();
+    // Valid base64 that is NOT a DPAPI blob → ProtectedData::Unprotect throws inside
+    // PowerShell, which writes the error to stderr. With stderr piped (the fix), that text
+    // lands on the error's `stderr` field; execFileSync's default 'inherit' — the CLIXML
+    // console-spam regression this guards against — would leave it null and print instead.
+    try {
+      p.unprotect(Buffer.from('definitely not a dpapi blob').toString('base64'));
+      expect.unreachable('unprotect of a non-DPAPI blob must throw');
+    } catch (err) {
+      const cause = (err as { cause?: { stderr?: unknown } }).cause;
+      expect(typeof cause?.stderr).toBe('string');
+      expect((cause?.stderr as string).length).toBeGreaterThan(0);
+    }
+  });
 });
