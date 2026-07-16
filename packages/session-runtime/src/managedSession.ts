@@ -1,0 +1,211 @@
+// A managed session drives the Agent SDK directly: this process owns the query loop, so
+// interrupt/send/stop are real method calls rather than terminal keystrokes.
+//
+// The SDK boundary is the injectable `AgentSdkClient` interface below — a small domain
+// type this package owns, deliberately narrower than the real SDK's ~30-variant message
+// union (see agentSdkClient.ts, which is the WET-GATED adapter that maps one onto the
+// other). Tests here use a fake client and never touch a real process.
+
+import type { SessionEvent, SessionHandle, SessionState } from './types.js';
+import { summarizeText } from './summarizer.js';
+
+/**
+ * The events managedSession's state machine understands. This is our own vocabulary, not
+ * the Agent SDK's — `agentSdkClient.ts` is responsible for translating real SDK messages
+ * into these before they ever reach this file.
+ */
+export type AgentSdkEvent =
+  | { type: 'session_init'; sessionId: string }
+  | { type: 'assistant_text'; text: string }
+  | { type: 'tool_use'; name: string; input?: unknown }
+  | { type: 'tool_result'; name: string; ok: boolean; text?: string }
+  | { type: 'permission_required'; tool: string; summary: string }
+  /** One turn finished. `ok` is whether the turn itself succeeded; `false` is terminal
+   *  (the session cannot continue), `true` leaves the session idle in `waiting_input`
+   *  until `send()` starts another turn or `stop()` ends it. */
+  | { type: 'turn_result'; ok: boolean; summary: string }
+  | { type: 'error'; message: string };
+
+export interface AgentSdkQueryOptions {
+  /** Resume the underlying SDK session captured from a prior turn's `session_init`. */
+  resumeSessionId?: string;
+  cwd?: string;
+  accountId?: string;
+}
+
+/** The seam managedSession depends on instead of the real SDK. */
+export interface AgentSdkClient {
+  /** Run one turn. The returned iterable completes when the turn is over (normally after
+   *  a `turn_result` event) — it does not represent the whole multi-turn session. */
+  query(prompt: string, opts: AgentSdkQueryOptions): AsyncIterable<AgentSdkEvent>;
+  /** Cancel whatever turn is currently in flight, if any. */
+  interrupt(): Promise<void>;
+  /** Release any resources held for the session. */
+  end(): Promise<void>;
+}
+
+export interface ManagedSessionOptions {
+  id: string;
+  client: AgentSdkClient;
+  prompt: string;
+  resumeSessionId?: string;
+  cwd?: string;
+  accountId?: string;
+}
+
+/** Turn a possibly-multi-block SDK event into plain-text lines the shared summarizer can
+ *  classify. Kept as fixed, greppable prefixes ("Tool: ", "Session complete: ", …) so
+ *  classifyLine can match them exactly instead of guessing from prose. */
+function agentEventToText(event: AgentSdkEvent): string | undefined {
+  switch (event.type) {
+    case 'session_init':
+      return undefined; // internal bookkeeping only, nothing worth surfacing to a phone
+    case 'assistant_text':
+      return event.text;
+    case 'tool_use':
+      return `Tool: ${event.name}`;
+    case 'tool_result':
+      return event.ok
+        ? `Tool result: ${event.name} ok`
+        : `Tool result: ${event.name} failed${event.text ? `: ${event.text}` : ''}`;
+    case 'permission_required':
+      return `Permission required: ${event.tool} - ${event.summary}`;
+    case 'turn_result':
+      return event.ok ? `Session complete: ${event.summary}` : `Session failed: ${event.summary}`;
+    case 'error':
+      return `Error: ${event.message}`;
+  }
+}
+
+/**
+ * Start a managed session and immediately kick off its first turn. Callers must subscribe
+ * via `onEvent` synchronously (before yielding to the event loop) to be guaranteed not to
+ * miss the earliest events — the first turn starts on a microtask, not before this
+ * function returns, precisely so a same-tick subscriber never races it.
+ */
+export function startManagedSession(opts: ManagedSessionOptions): SessionHandle {
+  let state: SessionState = 'starting';
+  // The Agent SDK session id to resume from. Starts as whatever the caller passed in
+  // (continuing a previous session) and gets overwritten by the SDK's own `session_init`
+  // once the first turn actually starts one.
+  let resumeId: string | undefined = opts.resumeSessionId;
+  // True while a turn's async iteration is in flight — the authoritative guard against
+  // starting a second overlapping turn. Set synchronously at the top of runTurn (before
+  // any await), so a caller who calls send() twice without awaiting between still gets a
+  // deterministic accept/reject in call order.
+  let busy = false;
+  const listeners = new Set<(e: SessionEvent) => void>();
+
+  function emit(e: SessionEvent): void {
+    for (const cb of listeners) cb(e);
+  }
+
+  function setState(next: SessionState): void {
+    if (state === next) return;
+    state = next;
+    emit({ kind: 'status', state: next });
+  }
+
+  function emitText(text: string): void {
+    for (const e of summarizeText(text)) emit(e);
+  }
+
+  function handleEvent(event: AgentSdkEvent): void {
+    // A turn's own `client.interrupt()`/close race can deliver a straggler after we've
+    // already gone terminal; ignore it rather than resurrect a finished session.
+    if (state === 'done' || state === 'failed') return;
+
+    if (event.type === 'session_init') {
+      resumeId = event.sessionId;
+      return;
+    }
+
+    const text = agentEventToText(event);
+    if (text !== undefined) emitText(text);
+
+    switch (event.type) {
+      case 'assistant_text':
+      case 'tool_use':
+      case 'tool_result':
+        setState('running');
+        break;
+      case 'permission_required':
+        setState('waiting_permission');
+        break;
+      case 'turn_result':
+        setState(event.ok ? 'waiting_input' : 'failed');
+        break;
+      case 'error':
+        setState('failed');
+        break;
+    }
+  }
+
+  async function runTurn(prompt: string): Promise<void> {
+    busy = true;
+    try {
+      const queryOpts: AgentSdkQueryOptions = {
+        ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
+        ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+        ...(opts.accountId !== undefined ? { accountId: opts.accountId } : {}),
+      };
+      for await (const event of opts.client.query(prompt, queryOpts)) {
+        handleEvent(event);
+      }
+    } catch (err) {
+      // A rejected iterator (transport failure, SDK crash) is still just "the session
+      // failed" from a caller's point of view — never let it escape as an unhandled
+      // rejection out of the fire-and-forget kickoff below.
+      const message = err instanceof Error ? err.message : String(err);
+      if (state !== 'done' && state !== 'failed') {
+        emitText(`Error: ${message}`);
+        setState('failed');
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Deferred to a microtask so any caller that subscribes right after this function
+  // returns is guaranteed to be registered before the first event fires.
+  queueMicrotask(() => {
+    void runTurn(opts.prompt);
+  });
+
+  return {
+    id: opts.id,
+    getState: () => state,
+    onEvent(cb) {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    // Not `async` deliberately: the busy/terminal guards must reject *synchronously
+    // relative to each other* (see the busy-flag note on runTurn) rather than after an
+    // implicit microtask hop, so the check-then-kick sequence stays a single atomic tick.
+    send(text: string): Promise<void> {
+      if (busy) {
+        return Promise.reject(
+          new Error(
+            `session '${opts.id}' is busy with an in-flight turn — wait for 'waiting_input' or call interrupt() first`,
+          ),
+        );
+      }
+      if (state === 'done' || state === 'failed') {
+        return Promise.reject(
+          new Error(`cannot send to session '${opts.id}' in terminal state '${state}'`),
+        );
+      }
+      void runTurn(text);
+      return Promise.resolve();
+    },
+    async interrupt(): Promise<void> {
+      await opts.client.interrupt();
+    },
+    async stop(): Promise<void> {
+      await opts.client.end();
+      if (state !== 'done' && state !== 'failed') {
+        setState('done');
+      }
+    },
+  };
+}
