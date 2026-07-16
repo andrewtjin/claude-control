@@ -29,34 +29,46 @@ unit tests over a mock never close a wet gate. Do not mark a wet gate done from 
 
 Run these on the owner's machine with a spare/test account before trusting the feature.
 
-### 1. Hot-swap of a live interactive session — the M0 question
+> **2026-07-16 wet-test run (CLI 2.1.211):** gates 1–3 were exercised by the harness in
+> `claude-control-orchestrator/wet-tests/` (raw evidence: `results.json`, verdicts:
+> `RESULTS.md`). Per-gate status is stamped below. Bonus findings from the same run:
+> `CLAUDE_CONFIG_DIR` relocates the **entire** config — `.claude.json` included — which is
+> what makes `cctl accounts add --fresh` safe (WT-1); `--resume` works across accounts and
+> transcripts are identity-free, so the attribution journal is load-bearing (WT-4); refresh
+> tokens are single-use but a stale token does **not** revoke the grant family (WT-6), so
+> adopting a newer vault token is always safe. The CLI's stale-token failure is exit 1 with
+> `"Failed to authenticate: OAuth session expired and could not be refreshed"` — the string
+> quarantine UX copy should key on.
+
+### 1. Hot-swap of a live interactive session — the M0 question ✅ CLOSED 2026-07-16
 
 **Claim to verify:** on Windows the CLI reads `.credentials.json` per request, so a
 switch applies to a _running_ interactive session on its **next** message.
-**How:** start `claude` interactively under account A; from another shell run the switch
-engine to activate B; send a new message in the running session.
-**Pass:** the next message is served by B (check the usage endpoint / account identity).
-**If it fails:** the fallback UX ("staged for next launch") is already designed —
-`ActivateResult` reports only what was mechanically written, so the daemon's messaging
-adapts to whichever answer this gate gives.
+**Result (WT-3):** CONFIRMED — per-request reads; hot-swap applies to running sessions,
+including an interactive TUI (human-confirmed). The daemon's `hot_applied` outcome is
+accurate; the "staged for next launch" fallback UX is not needed on this CLI version.
 
-### 2. OAuth refresh endpoint
+### 2. OAuth refresh endpoint ⚠ PARTIALLY CLOSED 2026-07-16
 
 **Verify:** `switch-engine/src/oauth.ts` `DEFAULT_TOKEN_ENDPOINT`,
 `CLAUDE_CODE_CLIENT_ID`, and the request/response shape are correct.
-**How:** point the switch engine at a spare account whose access token is near expiry
-and trigger `activate`; watch it refresh.
-**Pass:** a new access + rotated refresh token are written to the vault and the account
-keeps working. **Fail signal:** `invalid_grant` on a token you know is live → the
-endpoint/shape is wrong, not the token.
+**Result (WT-6):** rotation SEMANTICS confirmed — single-use refresh tokens, rotation on
+CLI use, stale copy fails with the auth error above, and reuse does NOT revoke the newer
+token. **Still open:** one live `activate()` against a near-expiry spare account to prove
+our own endpoint/client-id/request shape (the harness observed CLI-driven rotation, not
+this module's request). **Fail signal:** `invalid_grant` on a token you know is live →
+the endpoint/shape is wrong, not the token.
 
-### 3. Usage endpoint
+### 3. Usage endpoint ✅ CLOSED 2026-07-16
 
-**Verify:** `GET https://api.anthropic.com/api/oauth/usage` with the Bearer token,
-`anthropic-beta: oauth-2025-04-20`, and a `User-Agent: claude-code/<ver>` returns the
-expected `utilization.limits[]`.
-**Pass:** live percentages for session + weekly limits. **Note:** omitting the
-User-Agent gets throttled; the poller must fall back to tier-0 cached data on error.
+**Verify:** `GET https://api.anthropic.com/api/oauth/usage` with the Bearer token and
+`anthropic-beta: oauth-2025-04-20` returns the expected `utilization.limits[]`.
+**Result (WT-2):** CONFIRMED — 3 limits (session, weekly_all, weekly_scoped) with
+kind/group/percent/severity/resets_at(nullable)/scope(nullable)/is_active; the parser
+handles the verbatim payload (see `usageParse.test.ts`). **Correction:** omitting the
+User-Agent did NOT get throttled (200 OK) — the header is sent anyway but is not
+load-bearing. Tier-0 cache was observed ~58 min stale, so staleness labels on cached
+data are mandatory, and the poller's tier-0 fallback stands.
 
 ### 4. Discord bot
 
@@ -66,13 +78,21 @@ button.
 **Pass:** end-to-end from a phone — `/pair` binds, `/usage` shows the table, the switch
 button completes on the PC and edits the card.
 
-### 5. Hook event names
+### 5. Hook event names ⚠ PARTIALLY CLOSED 2026-07-16
 
 **Verify:** the exact `PermissionRequest` / `Stop` / `Notification` hook event names and
 payloads against the installed CLI version, and that merging our hooks into each
 profile's `settings.json` is non-destructive.
-**Pass:** a permission prompt in a session reaches the loopback hook receiver and
-surfaces on the phone; approve/deny round-trips.
+**Result (WT-5):** 8 events confirmed with payloads on 2.1.211 — SessionStart, SessionEnd
+(+reason), UserPromptSubmit, PreToolUse (+tool_use_id/permission_mode/effort), PostToolUse
+(+tool_response/duration_ms), Notification (+notification_type; `idle_prompt` = the
+"waiting" card), Stop (+last_assistant_message = the "done" card), SubagentStop.
+**Still open:** the permission-time event itself — unobservable on the owner's machine
+(global `permissions.defaultMode: "auto"` means no prompt ever fires). Confirm at M3 in
+`default` mode; the phone card set must be mode-aware (`PreToolUse.permission_mode` is on
+every payload).
+**Pass (remaining):** a permission prompt in a `default`-mode session reaches the loopback
+hook receiver and surfaces on the phone; approve/deny round-trips.
 
 ### 6. Managed sessions (Agent SDK)
 
