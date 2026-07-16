@@ -71,6 +71,23 @@ describe('UsagePoller', () => {
     expect(snapshot.accounts[0]?.limits[0]?.percent).toBe(50);
   });
 
+  it('a throwing getToken falls back to tier-0 AND surfaces the failure on the account', async () => {
+    const fetchFn: FetchLike = vi.fn();
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.reject(new Error('token refresh failed: endpoint returned 503')),
+      getCachedUsage: () => Promise.resolve(cachedBody(50)),
+      clock: () => 1000,
+    });
+    const snapshot = await poller.pollAll([account]);
+    // Same fallback as an undefined token — the cycle survives, tier-0 answers...
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(snapshot.results[0]?.outcome).toBe('cached');
+    expect(snapshot.accounts[0]?.limits[0]?.percent).toBe(50);
+    // ...but the WHY reaches the snapshot instead of being swallowed.
+    expect(snapshot.accounts[0]?.error).toMatch(/token refresh failed: endpoint returned 503/);
+  });
+
   it('429 triggers cached fallback; the floor is a hard minimum wait even under backoff', async () => {
     let now = 0;
     const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(429, {})));
