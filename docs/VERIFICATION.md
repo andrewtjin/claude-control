@@ -48,16 +48,21 @@ switch applies to a _running_ interactive session on its **next** message.
 including an interactive TUI (human-confirmed). The daemon's `hot_applied` outcome is
 accurate; the "staged for next launch" fallback UX is not needed on this CLI version.
 
-### 2. OAuth refresh endpoint ⚠ PARTIALLY CLOSED 2026-07-16
+### 2. OAuth refresh endpoint ✅ CLOSED 2026-07-16
 
 **Verify:** `switch-engine/src/oauth.ts` `DEFAULT_TOKEN_ENDPOINT`,
 `CLAUDE_CODE_CLIENT_ID`, and the request/response shape are correct.
 **Result (WT-6):** rotation SEMANTICS confirmed — single-use refresh tokens, rotation on
 CLI use, stale copy fails with the auth error above, and reuse does NOT revoke the newer
-token. **Still open:** one live `activate()` against a near-expiry spare account to prove
-our own endpoint/client-id/request shape (the harness observed CLI-driven rotation, not
-this module's request). **Fail signal:** `invalid_grant` on a token you know is live →
-the endpoint/shape is wrong, not the token.
+token.
+**Result (live probe, owner-run per `claude-control-orchestrator/tasks/m0-wet-gate-runbook.md`):**
+CONFIRMED — with `CCTL_REFRESH_SKEW_MS` forcing the refresh path, `cctl switch spare`
+printed `Activated spare (credentials written, token refreshed).` — i.e. this module's own
+request to `DEFAULT_TOKEN_ENDPOINT` with `CLAUDE_CODE_CLIENT_ID` succeeded and the rotated
+token was persisted; a follow-up `claude -p` authenticated on the refreshed token. Same
+run also live-validated two M0 alignment features: `accounts add --fresh` captured the
+spare without touching the live login, and the cadence guard refused an immediate
+switch-back ("next switch allowed in Ns") until `--force`.
 
 ### 3. Usage endpoint ✅ CLOSED 2026-07-16
 
