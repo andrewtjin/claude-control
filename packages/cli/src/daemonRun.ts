@@ -36,6 +36,7 @@ import {
 } from '@claude-control/daemon';
 import { createSessionManager } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath } from './context.js';
+import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 
 const DEFAULT_RELAY_URL = 'ws://127.0.0.1:8765';
@@ -141,20 +142,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       engine,
       minTtlMs: POLL_TOKEN_MIN_TTL_MS,
     }),
-    // Tier-0 cache lives in the live ~/.claude.json, which only ever describes the ACTIVE
-    // account — any other account has no cache to fall back to.
-    getCachedUsage: async (accountId) => {
-      if ((await pollVault.getActiveId()) !== accountId) return undefined;
-      try {
-        const parsed = JSON.parse(await readFile(paths.claudeJsonPath, 'utf8')) as Record<
-          string,
-          unknown
-        >;
-        return parsed['cachedUsageUtilization'];
-      } catch {
-        return undefined;
-      }
-    },
+    // Tier-0 cache lives in the live ~/.claude.json — served only when it provably belongs
+    // to the account being polled (active + accountUuid match; see cachedUsageReader.ts).
+    getCachedUsage: createCachedUsageReader({
+      vault: pollVault,
+      claudeJsonPath: paths.claudeJsonPath,
+    }),
   });
 
   const attributionJournal = new AttributionJournal({ store, vaultDir: paths.vaultDir });
