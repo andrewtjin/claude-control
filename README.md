@@ -69,8 +69,19 @@ verification; each is enumerated with exact steps in `docs/VERIFICATION.md`.
 
 ## Platform
 
-Windows-first (DPAPI credential vault, ConPTY sessions). macOS/Linux support is a
-later milestone.
+**Windows-only today.** The implementation is platform-dependent in two load-bearing
+places:
+
+- **Credential vault encryption** uses Windows DPAPI (via PowerShell
+  `ProtectedData`, CurrentUser scope) — there is no macOS/Linux equivalent wired in
+  yet, so the vault cannot protect tokens off Windows.
+- **Observed sessions** (a later milestone) target ConPTY, the Windows
+  pseudo-console.
+
+Everything else (daemon, bot, CLI, usage polling) is portable Node ≥ 22.5.
+macOS support (Keychain-backed vault) is the next planned milestone; Linux
+(libsecret) after that. On an unsupported platform, `cctl doctor` reports the gap
+instead of failing silently.
 
 ## License
 

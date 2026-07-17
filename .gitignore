@@ -27,6 +27,9 @@ tasks/lessons.md
 scratch/
 *.local
 
+# Private working instructions — kept locally, never published (removed from history 2026-07-16)
+CLAUDE.md
+
 # Runtime state that must never be committed (credentials, DB, vault)
 *.db
 *.db-journal
