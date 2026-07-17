@@ -27,7 +27,9 @@ export interface AutoSwitchPolicy {
   minSessionHeadroomPct?: number;
 }
 
-export const DEFAULT_TRIGGER_PERCENT = 90;
+// 94: hop only when the account is genuinely near the wall (owner-tuned 2026-07-16 from the
+// original 90 — fewer premature hops, still ahead of the hard 100% cutoff).
+export const DEFAULT_TRIGGER_PERCENT = 94;
 export const DEFAULT_MIN_SESSION_HEADROOM_PCT = 25;
 
 /** A concrete "switch now" verdict. `null` from `decideAutoSwitch` means "do nothing". */

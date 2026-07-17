@@ -21,7 +21,9 @@ describe('summarize', () => {
 });
 
 describe('checkVaultProtection', () => {
-  it('reports a real protector round-trip on a supported platform', () => {
+  // 30s: the Windows path spawns powershell.exe (~2s alone, much slower under parallel
+  // suite load) — same allowance the real-DPAPI tests in dpapi.test.ts carry.
+  it('reports a real protector round-trip on a supported platform', { timeout: 30_000 }, () => {
     // Runs the REAL platform protector: DPAPI here on Windows, Keychain on a Mac. Either
     // way the check must pass on any supported dev machine.
     if (process.platform !== 'win32' && process.platform !== 'darwin') return;
