@@ -4,7 +4,7 @@
 // transform, which is what makes it unit-testable via `.toJSON()` without a real bot.
 
 import { EmbedBuilder } from 'discord.js';
-import type { AccountUsage, UsagePlan } from '@claude-control/shared-protocol';
+import type { AccountUsage, SettingsSnapshot, UsagePlan } from '@claude-control/shared-protocol';
 // usage-advisor is a pure, credential-free library — importing it preserves the bot's
 // zero-credential guarantee (which forbids switch-engine, not math).
 import {
@@ -229,6 +229,22 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
 
 /** `/sessions` — every session the daemon has reported a status for, most-recent value per
  *  session id (the cache overwrites, never appends). */
+/** `/settings` — the daemon's effective configuration. One line per knob; the source is
+ *  only called out when it is an explicit override (env/flag), so silent defaults read as
+ *  quiet and deliberate choices pop. */
+export function buildSettingsEmbed(snapshot: SettingsSnapshot): EmbedBuilder {
+  const lines = snapshot.settings.map((s) => {
+    const source = s.source === 'default' ? '' : ` _(via ${s.source})_`;
+    return `**${s.name}** — ${s.value}${source}`;
+  });
+  return new EmbedBuilder()
+    .setTitle('Daemon settings')
+    .setColor(COLOR_INFO)
+    .setDescription(lines.join('\n'))
+    .setFooter({ text: 'as of daemon start' })
+    .setTimestamp(snapshot.startedAtMs);
+}
+
 export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
   const embed = new EmbedBuilder().setTitle('Sessions').setColor(COLOR_INFO);
   if (sessions.length === 0) {

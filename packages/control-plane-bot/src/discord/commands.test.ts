@@ -10,6 +10,7 @@ import {
   handleTimeline,
   handleAccounts,
   handleSessions,
+  handleSettings,
   handleStatus,
   handleSwitch,
   handleRun,
@@ -86,6 +87,30 @@ describe('read commands (usage/accounts/sessions/status)', () => {
       payload: { accounts: [] },
     });
     expect(handleUsage(deps, 'user-a').kind).toBe('embed');
+  });
+
+  it('handleSettings answers from the cached settings.snapshot', () => {
+    const { relay } = createFakeRelay({ online: {} });
+    const cache = new DaemonStateCache();
+    const deps: CommandDeps = {
+      relay,
+      pairing: new PairingService({ bindings: new BindingStore() }),
+      cache,
+    };
+    expect(handleSettings(deps, 'user-a').kind).toBe('text'); // no data yet
+
+    cache.record('user-a', {
+      v: 1,
+      id: 'x',
+      ts: 0,
+      daemonId: 'daemon-1',
+      type: 'settings.snapshot',
+      payload: {
+        startedAtMs: 123,
+        settings: [{ name: 'auto-switch', value: 'on', source: 'flag' }],
+      },
+    });
+    expect(handleSettings(deps, 'user-a').kind).toBe('embed');
   });
 
   it('handleTimeline answers from the same cached snapshot as handleUsage', () => {
