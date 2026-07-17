@@ -16,6 +16,9 @@ import { noopLogger } from '../logger.js';
 // The committed sprites live next to this test file: src/discord → ../../assets/progress-bar.
 const ASSETS_DIR = join(dirname(fileURLToPath(import.meta.url)), '../../assets/progress-bar');
 
+/** Magic bytes every valid PNG starts with — used to prove uploads/files are really PNG. */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
 /** A resolver that echoes every name as a bracketed token, so a rendered bar reads as the
  *  exact sequence of sprite pieces it composed — easy to assert on. */
 const echoResolver: EmojiResolver = (name) => `[${name}]`;
@@ -73,14 +76,17 @@ describe('emojiResolverFrom', () => {
   });
 });
 
-/** A fake ApplicationEmojiManager that records create calls and lets a test seed pre-existing
- *  emojis, force a fetch failure, or fail specific creates — no real Discord client involved. */
+/** A fake ApplicationEmojiManager that records create calls (names + attachments) and lets a
+ *  test seed pre-existing emojis, force a fetch failure, or fail a given name's first N create
+ *  attempts (Infinity = always fails) — no real Discord client involved. */
 function fakeApplication(opts: {
   existing?: string[];
   fetchThrows?: boolean;
-  failCreate?: Set<string>;
-}): { app: ProgressApplicationLike; created: string[] } {
+  failCreate?: Map<string, number>;
+}): { app: ProgressApplicationLike; created: string[]; attachments: string[] } {
   const created: string[] = [];
+  const attachments: string[] = [];
+  const failuresLeft = new Map(opts.failCreate ?? []);
   let nextId = 1000;
   const existing: AppEmojiLike[] = (opts.existing ?? []).map((name) => ({
     name,
@@ -92,15 +98,23 @@ function fakeApplication(opts: {
         if (opts.fetchThrows) return Promise.reject(new Error('fetch boom'));
         return Promise.resolve({ values: () => existing[Symbol.iterator]() });
       },
-      create: ({ name }) => {
-        if (opts.failCreate?.has(name)) return Promise.reject(new Error(`create boom: ${name}`));
+      create: ({ attachment, name }) => {
+        const remaining = failuresLeft.get(name) ?? 0;
+        if (remaining > 0) {
+          failuresLeft.set(name, remaining - 1);
+          return Promise.reject(new Error(`create boom: ${name}`));
+        }
         created.push(name);
+        attachments.push(attachment);
         return Promise.resolve({ name, id: String(nextId++) });
       },
     },
   };
-  return { app, created };
+  return { app, created, attachments };
 }
+
+/** Instant fake sleep so retry paths don't stall the test run. */
+const noSleep = () => Promise.resolve();
 
 describe('ensureProgressEmojis', () => {
   it('creates only the missing sprites and returns the full name→id map', async () => {
@@ -123,11 +137,40 @@ describe('ensureProgressEmojis', () => {
     expect(map.size).toBe(PROGRESS_EMOJI_NAMES.length);
   });
 
-  it('absorbs a create failure, logs it, and returns the partial map without throwing', async () => {
+  it('uploads every sprite as a self-labelled PNG data URI, never a raw Buffer', async () => {
+    // Regression for the live 500: discord.js stamps Buffers as `data:image/jpg`, which
+    // Discord's application-emoji endpoint rejects because the bytes are PNG.
+    const { app, attachments } = fakeApplication({});
+    await ensureProgressEmojis(app, ASSETS_DIR, noopLogger);
+
+    expect(attachments).toHaveLength(PROGRESS_EMOJI_NAMES.length);
+    for (const attachment of attachments) {
+      expect(attachment.startsWith('data:image/png;base64,')).toBe(true);
+      // The base64 payload must actually decode to PNG bytes (signature check).
+      const bytes = Buffer.from(attachment.slice('data:image/png;base64,'.length), 'base64');
+      expect(bytes.subarray(0, 8).equals(PNG_SIGNATURE)).toBe(true);
+    }
+  });
+
+  it('retries a transient create failure and succeeds within the attempt budget', async () => {
+    // pb_re fails twice (transient 500s), then succeeds on the third and final attempt.
     const warn = vi.fn();
     const logger = { ...noopLogger, warn };
-    const { app, created } = fakeApplication({ failCreate: new Set(['pb_re']) });
-    const map = await ensureProgressEmojis(app, ASSETS_DIR, logger);
+    const { app, created } = fakeApplication({ failCreate: new Map([['pb_re', 2]]) });
+    const map = await ensureProgressEmojis(app, ASSETS_DIR, logger, noSleep);
+
+    expect(map.has('pb_re')).toBe(true);
+    expect(map.size).toBe(PROGRESS_EMOJI_NAMES.length);
+    expect(created).toContain('pb_re');
+    // Two retry warnings were logged along the way, but the sprite made it.
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it('absorbs a create that fails every attempt, logs it, and returns the partial map', async () => {
+    const warn = vi.fn();
+    const logger = { ...noopLogger, warn };
+    const { app, created } = fakeApplication({ failCreate: new Map([['pb_re', Infinity]]) });
+    const map = await ensureProgressEmojis(app, ASSETS_DIR, logger, noSleep);
 
     expect(map.has('pb_re')).toBe(false);
     expect(map.size).toBe(PROGRESS_EMOJI_NAMES.length - 1);
@@ -153,8 +196,6 @@ describe('ensureProgressEmojis', () => {
 describe('committed sprite PNGs', () => {
   // Decode a couple of the generated files to prove the hand-rolled PNG encoder produced valid
   // 28×28 RGBA images (the exact source art Discord ingests for a custom emoji).
-  const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
   it.each(['pb_le', 'pb_mf_g', 'pb_mh_y', 'pb_rf_r'])(
     '%s is a valid 28×28 RGBA PNG',
     async (name) => {
