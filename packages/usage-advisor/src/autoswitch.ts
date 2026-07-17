@@ -15,6 +15,15 @@
 //   CHOICE — the eligible account whose WEEKLY quota resets soonest, full stop. WEEKLY is
 //   the budget; the 5h window is only a gate, never a ranking key (owner ruling
 //   2026-07-16). Quota expiring soonest gets burned first, so the least is wasted.
+//
+// GREEDY mode (opt-in, owner request 2026-07-16) adds a second trigger: even when the
+// active account is NOT low, hop whenever some eligible account's weekly quota expires
+// STRICTLY sooner than the active one's — always burn the soonest-expiring budget. This is
+// what pulls us BACK after a low-trigger hop: A hits 94%, we hop to B; once A's 5h window
+// resets (its stale session limit stops counting and the 25% headroom gate reopens), A's
+// sooner weekly reset makes it the greedy target again, so B's budget is spared and A's
+// expiring quota gets fully burned. Strict `<` (never `<=`) is the anti-flap guarantee:
+// after the hop the new active account has the soonest reset itself, so greedy goes quiet.
 
 import { humanizeDuration, roundPct } from './format.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
@@ -25,6 +34,10 @@ export interface AutoSwitchPolicy {
   triggerPercent?: number;
   /** Candidates must have at least this percent of the 5h session window unused. */
   minSessionHeadroomPct?: number;
+  /** Also hop (even when the active account is healthy) to any eligible account whose
+   *  weekly quota expires strictly sooner — burn the expiring budget first. Off by
+   *  default: it trades more account hops for less wasted quota. */
+  greedy?: boolean;
 }
 
 // 94: hop only when the account is genuinely near the wall (owner-tuned 2026-07-16 from the
@@ -42,10 +55,11 @@ export interface AutoSwitchDecision {
 
 /**
  * Decide whether to auto-switch, and to which account. Returns `null` unless ALL of:
- * an active account exists, its remaining quota is low, and at least one eligible
- * candidate exists. Limits whose reset time is already past are ignored everywhere —
- * their percents describe a window that no longer exists (stale cached snapshots
- * routinely carry them).
+ * an active account exists, a trigger fires (its remaining quota is low, or greedy mode
+ * spots a sooner-expiring weekly budget elsewhere), and at least one eligible candidate
+ * exists. Limits whose reset time is already past are ignored everywhere — their
+ * percents describe a window that no longer exists (stale cached snapshots routinely
+ * carry them).
  */
 export function decideAutoSwitch(
   accounts: AccountUsageInput[],
@@ -60,7 +74,7 @@ export function decideAutoSwitch(
 
   // No limit data at all means we know nothing — never act on ignorance.
   const activeWorst = worstPercent(active, now);
-  if (activeWorst === undefined || activeWorst < triggerPercent) return null;
+  if (activeWorst === undefined) return null;
 
   const candidates = accounts.filter(
     (a) =>
@@ -86,14 +100,35 @@ export function decideAutoSwitch(
     return a.label.localeCompare(b.label);
   });
   const target = candidates[0] as AccountUsageInput;
-
   const targetReset = weeklyResetAt(target, now) as number;
-  const reason =
-    `${active.label} is at ${roundPct(activeWorst)}% used — ${target.label} has the ` +
-    `soonest weekly reset (in ${humanizeDuration(targetReset - now)}, ` +
-    `${roundPct(100 - weeklyUsedPct(target, now))}% weekly budget left)`;
+  const targetBudget =
+    `in ${humanizeDuration(targetReset - now)}, ` +
+    `${roundPct(100 - weeklyUsedPct(target, now))}% weekly budget left`;
 
-  return { targetAccountId: target.accountId, targetLabel: target.label, reason };
+  // Primary trigger: the active account is nearly out of quota.
+  if (activeWorst >= triggerPercent) {
+    const reason =
+      `${active.label} is at ${roundPct(activeWorst)}% used — ${target.label} has the ` +
+      `soonest weekly reset (${targetBudget})`;
+    return { targetAccountId: target.accountId, targetLabel: target.label, reason };
+  }
+
+  // Greedy trigger: the active account is fine, but someone else's weekly budget expires
+  // strictly sooner — burn that first. An active account with NO known weekly reset never
+  // outranks a known one (its budget clock is invisible, so any known expiry is "sooner").
+  if (policy.greedy) {
+    const activeReset = weeklyResetAt(active, now);
+    if (activeReset === undefined || targetReset < activeReset) {
+      const reason =
+        `greedy: ${target.label}'s weekly quota expires soonest (${targetBudget})` +
+        (activeReset === undefined
+          ? ` while ${active.label}'s weekly reset is unknown`
+          : ` — ${humanizeDuration(activeReset - targetReset)} before ${active.label}'s`);
+      return { targetAccountId: target.accountId, targetLabel: target.label, reason };
+    }
+  }
+
+  return null;
 }
 
 /** Limits that still describe a live window: reset time unknown, or still in the future. */

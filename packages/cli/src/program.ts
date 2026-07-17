@@ -146,9 +146,18 @@ export function buildProgram(): Command {
       '--auto-switch',
       'when the active account runs low, auto-switch to the account with >=25% of a 5h window left whose weekly quota resets soonest',
     )
-    .action(async (opts: { pair?: string; relay?: string; autoSwitch?: boolean }) => {
-      await runDaemon(opts);
-    });
+    .option(
+      '--greedy',
+      "with --auto-switch: also hop toward whichever account's weekly quota expires soonest, even while the active one is healthy (burns expiring budget first; env: CCTL_AUTOSWITCH_GREEDY)",
+    )
+    .action(
+      async (opts: { pair?: string; relay?: string; autoSwitch?: boolean; greedy?: boolean }) => {
+        // Greedy is a refinement of auto-switch, not a standalone mode — fail loudly rather
+        // than let the flag silently do nothing.
+        if (opts.greedy && !opts.autoSwitch) fail('--greedy requires --auto-switch.');
+        await runDaemon(opts);
+      },
+    );
 
   // Remote-control features that require the running daemon connected to the hosted bot —
   // an inherently on-machine (wet) step. Surfaced now so the command set is discoverable and

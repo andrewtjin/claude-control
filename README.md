@@ -19,7 +19,6 @@ strictly by Discord user. Your credentials never leave your machine.
 - **Approve from anywhere.** permission prompts and "done / waiting" notices reach
   your phone; approve or deny from Discord.
 
-
 ## Packages
 
 | Package                             | Role                                                                                         |

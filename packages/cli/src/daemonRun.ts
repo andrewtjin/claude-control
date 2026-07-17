@@ -49,8 +49,11 @@ export interface DaemonRunOptions {
   relay?: string;
   /** Opt-in `--auto-switch`: hop accounts automatically when the active one runs low.
    *  Tunables via env: CCTL_AUTOSWITCH_TRIGGER_PCT, CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT,
-   *  CCTL_AUTOSWITCH_COOLDOWN_MS. */
+   *  CCTL_AUTOSWITCH_COOLDOWN_MS, CCTL_AUTOSWITCH_GREEDY. */
   autoSwitch?: boolean;
+  /** Opt-in `--greedy` (requires --auto-switch): also hop toward whichever account's
+   *  weekly quota expires soonest, even while the active one is healthy. */
+  greedy?: boolean;
 }
 
 /** A positive number from the environment, or undefined when unset/unparseable — an env
@@ -60,6 +63,13 @@ function envNumber(name: string): number | undefined {
   if (raw === undefined || raw.trim() === '') return undefined;
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** A boolean flag from the environment: 1/true/yes/on (any case) means on; anything else —
+ *  including unset — means off. Same typo-tolerance stance as envNumber. */
+function envFlag(name: string): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
 
 /**
@@ -177,6 +187,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const triggerPercent = envNumber('CCTL_AUTOSWITCH_TRIGGER_PCT');
   const minSessionHeadroomPct = envNumber('CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
   const cooldownMs = envNumber('CCTL_AUTOSWITCH_COOLDOWN_MS');
+  // Greedy burn-back is on via the --greedy flag OR the env var — either signal opts in.
+  const greedy = options.greedy === true || envFlag('CCTL_AUTOSWITCH_GREEDY');
   const autoSwitcher = options.autoSwitch
     ? new AutoSwitcher({
         activate: (accountId) => engine.activate(accountId),
@@ -189,6 +201,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         policy: {
           ...(triggerPercent !== undefined ? { triggerPercent } : {}),
           ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
+          ...(greedy ? { greedy } : {}),
         },
         ...(cooldownMs !== undefined ? { cooldownMs } : {}),
         logger,
@@ -209,7 +222,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
 
   await daemon.start();
   process.stdout.write(
-    `Daemon running (relay: ${relayUrl}${autoSwitcher ? ', auto-switch: on' : ''}). Ctrl+C to stop.\n`,
+    `Daemon running (relay: ${relayUrl}${autoSwitcher ? `, auto-switch: on${greedy ? ' (greedy)' : ''}` : ''}). Ctrl+C to stop.\n`,
   );
 
   const shutdown = (): void => {
