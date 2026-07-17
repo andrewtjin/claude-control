@@ -49,23 +49,45 @@ then `node packages/cli/dist/bin.js --help`).
 ```
 cctl accounts add <label>   # capture the currently logged-in account
 cctl accounts list          # list stored accounts (active marked with *)
+cctl accounts relogin <ref> # re-login an existing (quarantined) account in place, keeping its id
 cctl switch <id|label>      # activate an account
 cctl usage                  # cross-account usage from the daemon's latest poll
 cctl recover                # recover from an interrupted switch
 cctl doctor                 # check the local environment (DPAPI, vault, login)
+
+cctl session register       # opt the current session into daemon tracking + phone streaming
+cctl session label <name>   # name the current tracked session (shown in the phone list)
+cctl session watch [--off]  # stream the current session to Discord (--off to stop)
+cctl session status         # show tracked sessions + active account (reads the daemon db offline)
 ```
+
+`accounts relogin` reuses an existing account's id and usage history (unlike
+`accounts add --fresh`, which mints a new one) and refuses if you log into a different
+account. The `cctl session` group is also exposed in-session as the `/cctl:*` slash
+commands shipped in `plugins/cctl/` — a self-contained Claude Code plugin that holds no
+secrets and only wraps the CLI.
 
 Remote control (`pair`, `run`, and the background `daemon`) needs the running daemon
 connected to the hosted bot — an on-machine step described in `docs/VERIFICATION.md`.
+The `cctl session register` / `label` / `watch` commands likewise need the running
+daemon; `status` reads the local database and works offline.
 
 ## Status
 
-Pre-release. All seven packages are implemented and unit-tested (300+ tests), and the
+Pre-release. All seven packages are implemented and unit-tested (600+ tests), and the
 whole workspace builds, lints, and passes clean. An adversarial security pass on the
-control plane and daemon has been run and its findings fixed. Live integration surfaces
-— real account switching, the Anthropic usage endpoint, Discord connectivity, the CLI
-hook names, and ConPTY-observed sessions — are gated behind on-machine (wet)
-verification; each is enumerated with exact steps in `docs/VERIFICATION.md`.
+control plane and daemon has been run and its findings fixed.
+
+Switching, cross-account usage, Discord pairing, and the `.claude.json` round-trip are
+wet-verified and closed (`docs/VERIFICATION.md` gates 1–4, 8). The remote-control
+milestones — **M3** (the loopback hook loop: mode-aware permission cards, done / waiting
+/ quarantine notices, guided re-login) and **M4** (phone-driven **managed** sessions over
+the Agent SDK: a live Discord card, streamed milestones, remote approve/deny, Stop
+escalation, and crash-resume) — are implemented on this branch and unit-proven, but their
+live surfaces are gated behind on-machine (wet) verification: the permission hook loop in
+`default` mode (gate 5), end-to-end managed sessions (gate 6), and ConPTY-observed
+sessions (gate 7). Each is enumerated with exact steps in `docs/VERIFICATION.md` and its
+linked runbook.
 
 ## Platform
 

@@ -110,15 +110,47 @@ profile's `settings.json` is non-destructive.
 (global `permissions.defaultMode: "auto"` means no prompt ever fires). Confirm at M3 in
 `default` mode; the phone card set must be mode-aware (`PreToolUse.permission_mode` is on
 every payload).
-**Pass (remaining):** a permission prompt in a `default`-mode session reaches the loopback
-hook receiver and surfaces on the phone; approve/deny round-trips.
+**M3 landed on `feat/remote-control`** (daemon `hookInstaller`/`hookReceiver`/`hookSecret`,
+mode-aware cards, two-tap, quarantine debounce) and is unit-proven, but the loop above is
+still unrun against a live `default`-mode prompt — **this gate stays OPEN.**
+**Pass (remaining) — run `claude-control-orchestrator/tasks/m3-wet-gate-runbook.md`:**
+(1) `cctl daemon run` installs the three hooks into `~/.claude/settings.json`
+non-destructively, with `hook-secret.enc` + `hook-endpoint.json` present, and a restart
+reuses the same secret with no duplicate entries; (2) a permission prompt in a
+`default`-mode session reaches the loopback receiver (record **which** event name the CLI
+actually sent — `PermissionRequest` vs `PreToolUse` — this is the open unknown) and
+surfaces a mode-aware card on the phone; (3) Approve → `Approved.` and a second tap →
+`Already handled.`; two-tap guards `Deny (session)`; (4) non-`default` modes show
+button-less info cards; (5) done / waiting / quarantine notices render, with the
+quarantine card debounced (one push per 30 min, none re-pushed on restart) and printing
+`cctl accounts relogin <label>`.
 
-### 6. Managed sessions (Agent SDK)
+### 6. Managed sessions (Agent SDK) — the M4 question
 
-**Verify:** `session-runtime/src/managedSession.ts`'s adapter matches the real
-`@anthropic-ai/claude-agent-sdk` streaming API (message shapes, `interrupt`, input).
-**Pass:** `/run` starts a session that streams summarized milestones to a Discord
-thread; `/say` injects a prompt.
+**Verify:** the daemon-wired managed-session path matches the real
+`@anthropic-ai/claude-agent-sdk` streaming API — message shapes, `canUseTool` permission
+parking, `interrupt`, and input injection — end to end through the Discord live card.
+**M4 landed on `feat/remote-control`** (session-runtime permission gate + ordered output,
+daemon permission routing / stop / orphan resume, bot thread-per-session live card +
+attachments, C6 `cctl session` commands + `cctl accounts relogin`) and is unit-proven, but
+none of it has run against a live SDK session — **this gate stays OPEN.**
+**Pass — run `claude-control-orchestrator/tasks/m4-wet-gate-runbook.md`:** (1) `/run`
+starts a managed session that streams a live card to the phone (DM today — channel-per-user
+is not built) with real tool names and milestone lines; `/say` injects a follow-up prompt;
+(2) the managed permission gate blocks the tool with **no timer**, round-trips Approve/Deny,
+resolves exactly once across a two-device double-tap, and is **never** auto-resolved by any
+timeout; (3) the Stop button (two-tap) escalates interrupt → grace → hard and fail-closes a
+pending permission; a repeat `/stop` is ignored (seen-set); (4) killing the daemon
+mid-session and restarting resumes the orphan under the **same** session id; (5) a lost
+output `seq` surfaces a visible gap marker, and long output attaches as `session-<id>.log`;
+(6) `cctl session register|label|watch|status` behave online/offline as specified
+(`status` reads the db with the daemon down; `register` fails loudly when it is down;
+re-register is idempotent); (7) `cctl accounts relogin <ref>` rewrites the same id and its
+identity guard refuses a login as a different account.
+**Known non-defects the runbook flags** (do not read as failures): session cards always
+land in DM; `watch --off` is recorded but does not yet gate the stream; there is no
+verbosity control (no protocol field); `session-threads.json` defaults under `%TEMP%`
+because the bot's `bin.ts` does not set the gateway `stateDir`.
 
 ### 7. Observed sessions (ConPTY)
 
