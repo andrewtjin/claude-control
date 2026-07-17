@@ -96,3 +96,20 @@ export interface RecoverResult {
   action: 'none' | 'rolled_forward' | 'rolled_back' | 'cleared';
   detail?: string;
 }
+
+/** What `refreshToken()` did for a background (non-switching) token refresh. */
+export interface RefreshTokenResult {
+  accountId: string;
+  /** True if a network refresh happened and the rotated token was persisted to the vault. */
+  refreshed: boolean;
+  /** Why no refresh happened, when `refreshed` is false:
+   *  - `token_fresh`: the access token's remaining lifetime is above the skew — nothing to do.
+   *  - `active_account`: the account is the live one; its single-use refresh token is shared
+   *    with the live files, so consuming it here would strand the running CLI with a dead
+   *    token. The engine only ADOPTS a CLI-side rotation into the vault, never refreshes. */
+  skippedReason?: 'token_fresh' | 'active_account';
+  /** True if the active account's live-file rotation was adopted into the vault. */
+  adoptedLiveRotation?: boolean;
+  /** Expiry (epoch ms) of the vault's access token after this call. */
+  expiresAt: number;
+}

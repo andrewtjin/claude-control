@@ -53,7 +53,9 @@ export interface UsagePollerOptions {
   fetch: FetchLike;
   /** Obtain a currently-valid access token for an account WITHOUT switching the live
    *  account — production wires this to the vault (decrypt + refresh-if-needed); tests
-   *  inject a fake. Returning `undefined` means "no usable token" (falls back to tier-0). */
+   *  inject a fake. Returning `undefined` means "no usable token" (falls back to tier-0
+   *  quietly); THROWING also falls back to tier-0 but surfaces the error message on the
+   *  account's snapshot entry — for failures worth reporting (e.g. a failed token refresh). */
   getToken: (accountId: string) => Promise<string | undefined>;
   /** The tier-0 cached usage payload for an account, from `~/.claude.json`'s
    *  `cachedUsageUtilization` — read fresh each fallback so it's never stale by construction. */
@@ -159,7 +161,7 @@ export class UsagePoller {
       this.retain(account.accountId, usage);
       return { accountId: account.accountId, usage, outcome };
     } catch (err) {
-      // One account's failure (a tier-0 disk read error, or `getToken` rejecting) must never
+      // One account's failure (e.g. a tier-0 disk read error) must never
       // reject the whole cycle (pollOne -> pollAll -> runPollCycle) and drop the snapshot +
       // plan for EVERY account. Degrade THIS account to a best-effort error entry, mirroring
       // the tolerant parse layer, and keep going.
@@ -177,9 +179,17 @@ export class UsagePoller {
     account: PollAccount,
     now: number,
   ): Promise<{ usage: ParsedUsage; outcome: 'live' | 'cached' }> {
-    const token = await this.getToken(account.accountId);
+    // A getToken failure is a REPORTABLE fallback, not a poll crash: tier-0 still answers,
+    // with the failure reason (e.g. "token refresh failed: ...") stamped on the result.
+    let token: string | undefined;
+    let tokenError: string | undefined;
+    try {
+      token = await this.getToken(account.accountId);
+    } catch (err) {
+      tokenError = err instanceof Error ? err.message : String(err);
+    }
     if (token === undefined) {
-      const usage = await this.fetchCached(account, now);
+      const usage = await this.fetchCached(account, now, tokenError);
       this.recordSuccess(account.accountId, now);
       return { usage, outcome: 'cached' };
     }
