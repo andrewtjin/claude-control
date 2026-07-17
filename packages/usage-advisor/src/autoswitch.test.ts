@@ -13,7 +13,7 @@ function acct(
   return { accountId: id, label: id, active: false, quarantined: false, limits, ...overrides };
 }
 
-/** An active account past the default 90% trigger on its session limit. */
+/** An active account past the default 94% trigger on its session limit. */
 function lowActive(): AccountUsageInput {
   return acct('hot', { active: true }, [
     { kind: 'session', percent: 96, resetsAt: NOW + 2 * H },
@@ -49,10 +49,18 @@ describe('decideAutoSwitch — trigger conditions', () => {
   it('triggers when the WEEKLY cap is nearly exhausted even with a fresh session', () => {
     const active = acct('a', { active: true }, [
       { kind: 'session', percent: 5, resetsAt: NOW + 4 * H },
-      { kind: 'weekly_all', percent: 93, resetsAt: NOW + 48 * H },
+      { kind: 'weekly_all', percent: 95, resetsAt: NOW + 48 * H },
     ]);
     const spare = acct('b', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
     expect(decideAutoSwitch([active, spare], NOW)?.targetAccountId).toBe('b');
+  });
+
+  it('holds below the 94% default trigger and fires exactly at it', () => {
+    const spare = acct('b', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
+    const at = (percent: number) =>
+      acct('a', { active: true }, [{ kind: 'session', percent, resetsAt: NOW + 2 * H }]);
+    expect(decideAutoSwitch([at(93.9), spare], NOW)).toBeNull();
+    expect(decideAutoSwitch([at(94), spare], NOW)?.targetAccountId).toBe('b');
   });
 
   it('ignores limits whose reset time is already past (stale window)', () => {
