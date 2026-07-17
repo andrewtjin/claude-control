@@ -257,6 +257,41 @@ describe('ControlPlaneClient', () => {
     expect(helloFrame?.daemonId).toBe('assigned-daemon-1');
   });
 
+  it('unpaired with no pairing code: rejects with re-pair guidance before touching the network', async () => {
+    // The wet-run regression this pins: `cctl daemon run` (no --pair) with no persisted
+    // identity used to encode a pair.claim with an EMPTY pairingCode, and the wire schema's
+    // min-length throw inside the ws open handler crashed the whole process.
+    const identityStore = memoryIdentityStore();
+    let socketsOpened = 0;
+    client = new ControlPlaneClient({
+      url: relay.url(),
+      identityStore,
+      store,
+      hostLabel: 'h',
+      reconnectBaseMs: 10,
+      createSocket: (url) => {
+        socketsOpened += 1;
+        return new WebSocket(url);
+      },
+    });
+    await expect(client.connect()).rejects.toThrow(/not paired.*--pair/s);
+    expect(socketsOpened).toBe(0); // failed up front — no connection attempt, no invalid frame
+  });
+
+  it('an explicit EMPTY pairing code is treated as unpaired, not sent on the wire', async () => {
+    const identityStore = memoryIdentityStore();
+    client = new ControlPlaneClient({
+      url: relay.url(),
+      identityStore,
+      store,
+      hostLabel: 'h',
+      pairingCode: '',
+      reconnectBaseMs: 10,
+    });
+    await expect(client.connect()).rejects.toThrow(/not paired/);
+    expect(relay.received).toHaveLength(0);
+  });
+
   it('rejects on a bad pairing code without adopting an identity', async () => {
     const identityStore = memoryIdentityStore();
     client = new ControlPlaneClient({

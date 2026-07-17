@@ -90,6 +90,13 @@ export interface ControlPlaneClientOptions {
   logger?: Logger;
 }
 
+/** The operator-facing "cannot connect at all" error: no adopted identity and no code to pair
+ *  with. Surfaced by `connect()` (and printed verbatim by `cctl`), so it must say exactly what
+ *  to do next rather than describe internal state. */
+const NOT_PAIRED_MESSAGE =
+  'this daemon is not paired (no stored identity) — get a pairing code from the bot with ' +
+  '/pair in Discord, then run `cctl daemon run --pair <code>`';
+
 const DEFAULT_OUTBOX_BOUND = 500;
 const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 10_000;
@@ -167,6 +174,13 @@ export class ControlPlaneClient {
     // A fresh connect() (e.g. after re-pairing) clears any prior terminal rejection.
     this.terminalRejection = false;
     this.identity = await this.opts.identityStore.load();
+    // Unpaired with nothing to pair with: fail HERE, before touching the network. Without this
+    // guard the socket's open handler would encode a pair.claim with an empty pairingCode,
+    // which the wire schema rejects — a synchronous throw inside a ws event handler, i.e. a
+    // process crash instead of the clean rejection this method's contract promises.
+    if (!this.identity && !hasPairingCode(this.opts.pairingCode)) {
+      throw new Error(NOT_PAIRED_MESSAGE);
+    }
     return new Promise((resolve, reject) => {
       this.connectedResolvers.push({ resolve, reject });
       this.openSocket();
@@ -228,11 +242,23 @@ export class ControlPlaneClient {
 
   private sendPairClaim(): void {
     if (!this.socket) return;
+    const pairingCode = this.opts.pairingCode;
+    if (!hasPairingCode(pairingCode)) {
+      // connect() guards this state up front; this is the backstop for any future path that
+      // reaches the pairing branch codeless (encoding an empty code throws the wire schema's
+      // min-length error inside a ws event handler — a process crash). Shut down cleanly:
+      // reconnecting cannot help when there is nothing to pair with.
+      this.opts.logger.error({}, NOT_PAIRED_MESSAGE);
+      this.stopped = true;
+      this.failConnect(new Error(NOT_PAIRED_MESSAGE));
+      this.socket.close(1000, 'no pairing code');
+      return;
+    }
     const draft: EnvelopeDraft = {
       // Placeholder — the bot ignores this field for identity on pair.claim (see class doc).
       daemonId: 'unpaired',
       type: 'pair.claim',
-      payload: { pairingCode: this.opts.pairingCode ?? '', hostLabel: this.opts.hostLabel },
+      payload: { pairingCode, hostLabel: this.opts.hostLabel },
     };
     this.socket.send(encode(stamp(draft)));
   }
@@ -427,6 +453,11 @@ export class ControlPlaneClient {
     this.connectedResolvers = [];
     for (const r of resolvers) r.reject(err);
   }
+}
+
+/** A usable first-run pairing code: present and non-empty (the wire schema requires min 1). */
+function hasPairingCode(code: string | undefined): code is string {
+  return code !== undefined && code.length > 0;
 }
 
 /** `ws` delivers message payloads as `Buffer | ArrayBuffer | Buffer[]` depending on framing. */
