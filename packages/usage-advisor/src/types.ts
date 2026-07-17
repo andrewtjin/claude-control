@@ -31,6 +31,10 @@ export interface AccountUsageInput {
 /** Knobs governing the recommendation. Defaults live in `advisor.ts`; override for tuning/tests. */
 export interface AdvisorOptions {
   now?: () => number;
+  /** True when the daemon is running `--auto-switch --greedy`: the burn plan is then being
+   *  EXECUTED automatically, so advice reads descriptive ("Greedy auto-switch burns A → B")
+   *  instead of imperative ("Burn A → B"). Display-only — the queue itself is identical. */
+  greedyAutoSwitch?: boolean;
   /** A reset within this window counts as "imminent" — its unused quota is at risk. */
   urgentWindowMs?: number;
   /** Only advise burning when at least this much of a limit is still unused. */

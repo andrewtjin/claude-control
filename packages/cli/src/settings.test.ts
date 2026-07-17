@@ -12,6 +12,7 @@ import {
   envNumber,
   readSettingsReport,
   renderSettings,
+  reportSaysGreedyActive,
   resolveCliSettings,
   resolveDaemonConfig,
   writeSettingsReport,
@@ -189,6 +190,25 @@ describe('renderSettings', () => {
     expect(text).toContain('<c>env    </c>');
     expect(text).toContain('<d>default</d>');
     expect(text).toContain('<d>CCTL_AUTOSWITCH_GREEDY</d>');
+  });
+});
+
+describe('reportSaysGreedyActive', () => {
+  const report = (autoSwitch: string, greedy: string) => ({
+    startedAtMs: 0,
+    settings: [
+      { name: 'auto-switch', value: autoSwitch, source: 'flag' as const },
+      { name: 'greedy burn-back', value: greedy, source: 'env' as const },
+    ],
+  });
+
+  it('is true only when BOTH auto-switch and greedy resolved to exactly "on"', () => {
+    expect(reportSaysGreedyActive(report('on', 'on'))).toBe(true);
+    expect(reportSaysGreedyActive(report('off', 'on'))).toBe(false);
+    expect(reportSaysGreedyActive(report('on', 'off'))).toBe(false);
+    // Greedy set but inactive renders as a longer string — correctly not "on".
+    expect(reportSaysGreedyActive(report('off', 'on (inactive: needs --auto-switch)'))).toBe(false);
+    expect(reportSaysGreedyActive(undefined)).toBe(false);
   });
 });
 

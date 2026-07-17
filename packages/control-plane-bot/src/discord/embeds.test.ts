@@ -72,19 +72,22 @@ describe('buildUsageEmbed', () => {
     expect(embed.fields?.[0]?.value).toContain('refresh failed');
   });
 
-  it('adds a recommendation field and advisories when a plan is present', () => {
+  it('adds one compact Plan field when a plan is present', () => {
     const plan: UsagePlan = {
       recommendedAccountId: 'acct-2',
-      reason: 'account 1 is near its weekly cap',
+      reason: 'Burn spare (48% weekly left, resets in 9h); hold main (weekly resets in 6d).',
       ranking: [],
       advisories: [{ kind: 'switch_now', message: 'switch before reset', accountId: 'acct-1' }],
     };
     const embed = buildUsageEmbed({ accounts: [account()], plan }).toJSON();
-    const rec = embed.fields?.find((f) => f.name === 'Recommendation');
-    expect(rec?.value).toContain('acct-2');
-    expect(rec?.value).toContain('near its weekly cap');
-    const advisories = embed.fields?.find((f) => f.name === 'Advisories');
-    expect(advisories?.value).toContain('switch before reset');
+    const planField = embed.fields?.find((f) => f.name === 'Plan');
+    expect(planField?.value).toBe(
+      'Burn spare (48% weekly left, resets in 9h); hold main (weekly resets in 6d).\n' +
+        '• switch before reset',
+    );
+    // The old two-heading layout is gone — advice is a single field now.
+    expect(embed.fields?.some((f) => f.name === 'Recommendation')).toBe(false);
+    expect(embed.fields?.some((f) => f.name === 'Advisories')).toBe(false);
   });
 
   it('shows a placeholder description when there are no accounts yet', () => {

@@ -105,6 +105,21 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const store = new Store(daemonDbPath(paths));
   const protector = defaultProtector();
 
+  // One resolution feeds BOTH behavior (the values wired below) and visibility (the rows
+  // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart.
+  const config = resolveDaemonConfig(process.env, {
+    autoSwitch: options.autoSwitch === true,
+    greedy: options.greedy === true,
+    ...(options.relay !== undefined ? { relay: options.relay } : {}),
+  });
+  const { relayUrl, triggerPercent, minSessionHeadroomPct, cooldownMs, greedy } = config.values;
+  const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
+  // Best-effort: the report is purely informational, so a write failure must not stop the
+  // daemon from starting.
+  await writeSettingsReport(daemonSettingsPath(paths), settingsReport).catch((err: unknown) => {
+    logger.warn({ err }, 'could not persist the effective-settings report');
+  });
+
   // An explicit --pair means "adopt a NEW identity", so any previously adopted one is
   // discarded first — otherwise the client would see a stored identity and skip pairing.
   const identityPath = join(dataDir, 'daemon-identity.enc');
@@ -131,25 +146,13 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       vault: pollVault,
       claudeJsonPath: paths.claudeJsonPath,
     }),
+    // Greedy-aware advice: when the daemon itself executes the burn plan, the plan's
+    // wording turns descriptive instead of telling the user to do it by hand.
+    ...(options.autoSwitch && greedy ? { advisorOptions: { greedyAutoSwitch: true } } : {}),
   });
 
   const attributionJournal = new AttributionJournal({ store, vaultDir: paths.vaultDir });
   const sessionManager = createSessionManager({ stateDir: join(dataDir, 'sessions') });
-
-  // One resolution feeds BOTH behavior (the values wired below) and visibility (the rows
-  // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart.
-  const config = resolveDaemonConfig(process.env, {
-    autoSwitch: options.autoSwitch === true,
-    greedy: options.greedy === true,
-    ...(options.relay !== undefined ? { relay: options.relay } : {}),
-  });
-  const { relayUrl, triggerPercent, minSessionHeadroomPct, cooldownMs, greedy } = config.values;
-  const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
-  // Best-effort: the report is purely informational, so a write failure must not stop the
-  // daemon from starting.
-  await writeSettingsReport(daemonSettingsPath(paths), settingsReport).catch((err: unknown) => {
-    logger.warn({ err }, 'could not persist the effective-settings report');
-  });
 
   const controlPlaneClient = new ControlPlaneClient({
     url: relayUrl,
