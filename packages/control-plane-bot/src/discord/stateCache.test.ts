@@ -101,6 +101,38 @@ describe('DaemonStateCache', () => {
     expect(sessions.find((s) => s.sessionId === 's2')?.state).toBe('done');
   });
 
+  it('records settings.snapshot per user, latest write wins', () => {
+    const cache = new DaemonStateCache();
+    const base: Omit<Envelope, 'payload' | 'type'> = {
+      v: 1,
+      id: 'id-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId: 'user-a',
+    };
+    expect(cache.getSettings('user-a')).toBeUndefined();
+    cache.record('user-a', {
+      ...base,
+      type: 'settings.snapshot',
+      payload: {
+        startedAtMs: 100,
+        settings: [{ name: 'auto-switch', value: 'off', source: 'default' }],
+      },
+    });
+    // A daemon restart with different flags pushes a new report — it must replace the old.
+    cache.record('user-a', {
+      ...base,
+      type: 'settings.snapshot',
+      payload: {
+        startedAtMs: 200,
+        settings: [{ name: 'auto-switch', value: 'on', source: 'flag' }],
+      },
+    });
+    expect(cache.getSettings('user-a')?.startedAtMs).toBe(200);
+    expect(cache.getSettings('user-a')?.settings[0]?.value).toBe('on');
+    expect(cache.getSettings('user-b')).toBeUndefined();
+  });
+
   it('ignores envelope types it does not track (e.g. hook.notification)', () => {
     const cache = new DaemonStateCache();
     cache.record('user-a', {
