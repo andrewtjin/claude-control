@@ -107,6 +107,42 @@ describe('hook.notification widened fields', () => {
   });
 });
 
+describe('session.output epoch (additive, N/N-1 tolerant)', () => {
+  const base: PayloadOf<'session.output'> = {
+    sessionId: 'sess-1',
+    seq: 0,
+    kind: 'stdout',
+    text: 'hi',
+    truncated: false,
+  };
+
+  it('parses without epoch — frames from pre-epoch daemons stay valid', () => {
+    const result = decode(rawFrame('session.output', base));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.output')) {
+      expect(result.envelope.payload.epoch ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries an epoch through a round-trip', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'session.output',
+      payload: { ...base, epoch: 'run-abc' },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.output')) {
+      expect(result.envelope.payload.epoch).toBe('run-abc');
+    }
+  });
+
+  it('rejects an empty-string epoch — absent and empty must not be conflated', () => {
+    const result = decode(rawFrame('session.output', { ...base, epoch: '' }));
+    expect(result.ok).toBe(false);
+  });
+});
+
 describe('session.stop', () => {
   it('is a registered message type', () => {
     expect(isMessageType('session.stop')).toBe(true);

@@ -7,6 +7,7 @@
 // protocol messages are wired to the right collaborator. Every collaborator is accepted
 // pre-built (dependency injection) so a lifecycle test can fake all of them.
 
+import { randomUUID } from 'node:crypto';
 import type { RecoverResult, ActivateResult, StoredAccount } from '@claude-control/switch-engine';
 import { resolveAccountRef } from '@claude-control/switch-engine';
 import type {
@@ -205,6 +206,14 @@ export class Daemon {
   /** Next `session.output.seq` to use per session — the protocol requires a monotonic
    *  per-session sequence so the phone can detect drops/reordering. */
   private readonly outputSeq = new Map<string, number>();
+  /** One epoch token for THIS daemon run, stamped on every `session.output` envelope. Because
+   *  {@link outputSeq} is in-memory it restarts at 0 on daemon restart; a crashed daemon never
+   *  emitted a terminal `session.status`, so the bot still holds reassembly state (nextSeq past 0)
+   *  for a session that `resumeOrphanedSessions` re-attaches under the SAME id and re-numbers from
+   *  0 — and would silently drop the resumed turn. A fresh epoch per run lets the bot detect the
+   *  restart and reset its reassembly (with a visible marker). Stable within a run so the bot never
+   *  resets spuriously mid-session. */
+  private readonly outputEpoch = randomUUID();
   /** requestId → owning sessionId for permission requests that ORIGINATED from a managed
    *  session's SDK `canUseTool` (as opposed to CLI-hook-originated ones). Inbound
    *  `permission.response` routes on membership here — see {@link handlePermissionResponse}
@@ -594,20 +603,23 @@ export class Daemon {
   private async handleSessionStop(msg: MessageOf<'session.stop'>): Promise<void> {
     const { sessionId, idempotencyKey } = msg.payload;
 
-    // Idempotency FIRST, before any await: a double-tapped Stop (same key, re-sent or
-    // replayed) must not run the ladder twice — a second interrupt() landing inside the first
-    // stop's grace window would turn a graceful wind-down into a harder stop than asked for.
+    // Duplicate-CHECK first, before any await: a double-tapped Stop (same key, re-sent or replayed)
+    // must not run the ladder twice — a second interrupt() landing inside the first stop's grace
+    // window would turn a graceful wind-down into a harder stop than asked for.
     if (this.seenStopKeys.has(idempotencyKey)) {
       this.logger.info({ sessionId, idempotencyKey }, 'duplicate session.stop ignored');
       return;
     }
-    this.rememberStopKey(idempotencyKey);
 
     const handle = this.sessionManager.get(sessionId);
     if (!handle) {
       // Unknown/inactive session: tell the phone explicitly (`relatesTo` = the stop frame's
       // own envelope id, the protocol's correlation anchor) rather than leaving the Stop
       // button waiting on a session.status ack that will never come — and never crash.
+      // Deliberately do NOT rememberStopKey here: burning the key on a stop that merely RACED a
+      // not-yet-live session (e.g. during the startup resume window) would make the card's stable
+      // per-(user,action,session) key un-stoppable forever once the session comes live. Sibling CLI
+      // handlers likewise only remember keys on success.
       this.logger.warn({ sessionId }, 'session.stop for unknown/inactive session');
       this.sendEnvelope({
         type: 'error',
@@ -619,6 +631,11 @@ export class Daemon {
       });
       return;
     }
+
+    // Remember the key now that a live handle exists — still BEFORE the first await. `get()` is
+    // synchronous, so nothing has yielded since the duplicate-CHECK above; the "suppress before the
+    // first await" invariant that protects the grace window from a double-tap is preserved.
+    this.rememberStopKey(idempotencyKey);
 
     const result = await escalateStop(handle, {
       ...(this.stopGraceMs !== undefined ? { graceMs: this.stopGraceMs } : {}),
@@ -792,7 +809,16 @@ export class Daemon {
     this.outputSeq.set(sessionId, seq + 1);
     this.sendEnvelope({
       type: 'session.output',
-      payload: { sessionId, seq, kind, text: event.text, truncated: false },
+      // `epoch` is this run's token so the bot can tell a restart-induced seq reset (which
+      // re-numbers from 0) apart from real output loss — see {@link outputEpoch}.
+      payload: {
+        sessionId,
+        seq,
+        kind,
+        text: event.text,
+        truncated: false,
+        epoch: this.outputEpoch,
+      },
     });
   }
 

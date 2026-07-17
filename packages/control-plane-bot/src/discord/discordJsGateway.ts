@@ -152,6 +152,15 @@ export class DiscordJsGateway implements DiscordGateway {
   private readonly cardMessages = new Map<string, Message>();
   /** One pending coalesced-flush timer per session route; rescheduled, never stacked. */
   private readonly flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Per-session-route serialization chain for managed-session frames (status/output). relay.ts
+   *  fires `deliver()` from an un-awaited `socket.on('message')` handler, so two frames for ONE
+   *  session would otherwise interleave across the awaits inside executeOps: the second's
+   *  editMessage can run before the first's `await sink.send()` has stored the card id in
+   *  {@link cardMessages}, posting a DUPLICATE card (and later edits then target whichever send
+   *  resolved last). Chaining each route's processing onto the previous one forces in-order,
+   *  run-to-completion delivery. The entry is deleted once it drains (bounded by LIVE routes) and
+   *  the chain NEVER rejects, so one bad frame can't stall every later frame for that session. */
+  private readonly deliverChains = new Map<string, Promise<void>>();
 
   constructor(options: DiscordJsGatewayOptions) {
     this.logger = options.logger ?? noopLogger;
@@ -210,16 +219,12 @@ export class DiscordJsGateway implements DiscordGateway {
    *  fed on EVERY envelope regardless, so `/usage`/`/sessions` keep answering from it. */
   async deliver(discordUserId: string, envelope: Envelope): Promise<void> {
     this.cache.record(discordUserId, envelope);
-    if (isType(envelope, 'session.status')) {
+    // Managed-session frames mutate shared per-route state (the planner view AND cardMessages), so
+    // they are serialized per route to defeat the interleaving that duplicates cards. Everything
+    // else is stateless w.r.t. that surface and keeps the direct path.
+    if (isType(envelope, 'session.status') || isType(envelope, 'session.output')) {
       const route: SessionRoute = { discordUserId, sessionId: envelope.payload.sessionId };
-      await this.runPlan(route, this.planner.onStatus(route, envelope.payload, this.clock()));
-      this.scheduleForget(route, envelope.payload.state);
-      return;
-    }
-    if (isType(envelope, 'session.output')) {
-      const route: SessionRoute = { discordUserId, sessionId: envelope.payload.sessionId };
-      await this.runPlan(route, this.planner.onOutput(route, envelope.payload, this.clock()));
-      return;
+      return this.enqueueSessionDelivery(route, envelope);
     }
     const push = renderPush(envelope);
     if (!push) return; // cache-only: not worth a DM
@@ -228,6 +233,42 @@ export class DiscordJsGateway implements DiscordGateway {
       await user.send(this.toSendOptions(push));
     } catch (err) {
       this.logger.warn({ err, discordUserId }, 'discord: failed to DM user');
+    }
+  }
+
+  /** Append one managed-session envelope to its route's serialization chain, returning a promise
+   *  that resolves when THIS envelope has been fully processed. Both branches of the `.then` run
+   *  the same processing so a (never-expected) prior rejection can't skip an envelope; the entry is
+   *  dropped once it drains, but only if it is still the tail (a later enqueue may have replaced it),
+   *  keeping the map bounded by live routes. */
+  private enqueueSessionDelivery(route: SessionRoute, envelope: Envelope): Promise<void> {
+    const key = sessionRouteKey(route);
+    const prior = this.deliverChains.get(key) ?? Promise.resolve();
+    const process = (): Promise<void> => this.processSessionEnvelope(route, envelope);
+    const next = prior.then(process, process);
+    this.deliverChains.set(key, next);
+    void next.finally(() => {
+      if (this.deliverChains.get(key) === next) this.deliverChains.delete(key);
+    });
+    return next;
+  }
+
+  /** Process one managed-session envelope: run its plan (create/edit the card, upload, etc.) and,
+   *  for a terminal status, schedule the forget grace. Never rejects — a throw here (executeOps
+   *  already swallows per-op failures, so this guards only against a planner bug) is logged so it
+   *  can't reject the route chain and stall every later frame for the session. */
+  private async processSessionEnvelope(route: SessionRoute, envelope: Envelope): Promise<void> {
+    try {
+      if (isType(envelope, 'session.status')) {
+        await this.runPlan(route, this.planner.onStatus(route, envelope.payload, this.clock()));
+        this.scheduleForget(route, envelope.payload.state);
+        return;
+      }
+      if (isType(envelope, 'session.output')) {
+        await this.runPlan(route, this.planner.onOutput(route, envelope.payload, this.clock()));
+      }
+    } catch (err) {
+      this.logger.warn({ err, route }, 'discord: session envelope processing failed');
     }
   }
 
@@ -297,8 +338,11 @@ export class DiscordJsGateway implements DiscordGateway {
 
   /** Resolve a session route to a sendable channel: its recorded thread, or the user's DM as the
    *  remembered fallback. Creates the thread on first use (persisting the mapping), and if a
-   *  previously-created thread has since vanished, pins the DM fallback so we stop re-fetching it. */
-  private async sinkFor(route: SessionRoute): Promise<SendableChannels | undefined> {
+   *  previously-created thread has since vanished, pins the DM fallback so we stop re-fetching it.
+   *  `protected` (not `private`) is the ONE seam the otherwise WET-GATED per-session op execution
+   *  exposes: it lets a test subclass return a controllable fake sink so the pure serialization of
+   *  {@link deliver} can be exercised without a real Discord connection. */
+  protected async sinkFor(route: SessionRoute): Promise<SendableChannels | undefined> {
     const target = await this.ensureTarget(route);
     if (target.kind === 'thread') {
       const channel = await this.client.channels.fetch(target.threadId);

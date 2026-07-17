@@ -174,6 +174,15 @@ const SessionOutputPayload = z.object({
   kind: z.enum(['stdout', 'milestone', 'summary', 'error']),
   text: z.string(),
   truncated: z.boolean().default(false),
+  /** One opaque token per daemon RUN (process lifetime), stamped on every chunk. The per-session
+   *  `seq` counter is in-memory and restarts at 0 when the daemon restarts, but a crashed daemon
+   *  never emitted a terminal `session.status`, so a long-lived bot still holds reassembly state
+   *  (its `nextSeq` advanced past 0) for that sessionId — and would silently swallow the resumed
+   *  turn's low-seq chunks. The bot compares this token across chunks: a CHANGE means "same session,
+   *  new daemon run" and it resets reassembly (with a visible marker) instead of dropping output.
+   *  Additive + tolerant like `permissionMode`/`notificationType`: a pre-epoch daemon omits it and
+   *  a current bot must treat its absence exactly as today (no reset). */
+  epoch: z.string().min(1).nullish(),
 });
 
 /** Phone-initiated stop of a managed session. Deliberately minimal: escalation semantics

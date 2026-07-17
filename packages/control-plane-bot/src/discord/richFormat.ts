@@ -177,6 +177,11 @@ export const NOTIFICATION_ICON: Record<NotificationKind, string> = {
  *  at send time, which would drop the whole card — so a long field is shortened, never omitted. */
 export const EMBED_DESCRIPTION_LIMIT = 4096;
 export const EMBED_FIELD_VALUE_LIMIT = 1024;
+/** Discord rejects a message whose top-level `content` exceeds 2000 chars (distinct from an embed
+ *  description's 4096). A milestone/summary/error/daemon-error line is posted as raw `content`, so
+ *  it is clamped to this before sending — an over-long line would otherwise be swallowed at send
+ *  time (executeOps catches the throw) and vanish, appearing on no surface. */
+export const MESSAGE_CONTENT_LIMIT = 2000;
 
 /**
  * Shorten `text` to at most `max` characters, appending a VISIBLE marker of exactly how much

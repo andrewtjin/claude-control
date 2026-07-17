@@ -16,8 +16,21 @@ function status(state: Status['state'], extra?: { summary?: string; accountId?: 
   };
 }
 
-function output(seq: number, kind: Output['kind'], text: string, truncated = false): Output {
-  return { sessionId: ROUTE.sessionId, seq, kind, text, truncated };
+function output(
+  seq: number,
+  kind: Output['kind'],
+  text: string,
+  truncated = false,
+  epoch?: string,
+): Output {
+  return {
+    sessionId: ROUTE.sessionId,
+    seq,
+    kind,
+    text,
+    truncated,
+    ...(epoch !== undefined ? { epoch } : {}),
+  };
 }
 
 // --- op selectors -----------------------------------------------------------
@@ -193,6 +206,75 @@ describe('SessionPlanner — stop composes with the live card', () => {
     p.onStopRequested(ROUTE, 100);
     const done = p.onStatus(ROUTE, status('failed', { summary: 'stopped' }), 5000);
     expect(embedTitle(edits(done.ops)[0]!)).toContain('failed');
+  });
+});
+
+describe('SessionPlanner — output epoch resets reassembly across a daemon restart (finding 1)', () => {
+  it('adopts the first epoch seen without emitting a restart marker', () => {
+    const p = new SessionPlanner({ attachThresholdChars: 1, coalesceWindowMs: 1000 });
+    p.onStatus(ROUTE, status('running'), 0);
+    p.onOutput(ROUTE, output(0, 'stdout', 'a', false, 'e1'), 0);
+    const r = p.onOutput(ROUTE, output(1, 'stdout', 'b', false, 'e1'), 0);
+    const transcript = (uploads(r.ops).at(-1) as { text: string } | undefined)?.text ?? '';
+    expect(transcript).toContain('ab');
+    expect(transcript).not.toContain('output stream restarted');
+  });
+
+  it('resets nextSeq and writes a visible marker when the epoch changes (resumed turn not dropped)', () => {
+    const p = new SessionPlanner({ attachThresholdChars: 1, coalesceWindowMs: 1000 });
+    p.onStatus(ROUTE, status('running'), 0);
+    // Run e1 advances nextSeq to 2.
+    p.onOutput(ROUTE, output(0, 'stdout', 'a', false, 'e1'), 0);
+    p.onOutput(ROUTE, output(1, 'stdout', 'b', false, 'e1'), 0);
+    // Daemon restart: same session, new epoch, seq restarts at 0. Without a reset this seq-0 chunk
+    // would be dropped as "below nextSeq"; with it, the transcript gains a restart marker then 'c'.
+    p.onOutput(ROUTE, output(0, 'stdout', 'c', false, 'e2'), 100);
+    // Read the COMPLETE transcript off the terminal top-up attachment (the first crossing already
+    // fired on 'b', so only terminal re-emits the whole thing).
+    const done = p.onStatus(ROUTE, status('done', { summary: 'resumed and finished' }), 200);
+    const transcript = (uploads(done.ops).at(-1) as { text: string }).text;
+    expect(transcript).toContain('output stream restarted — daemon resumed this session');
+    expect(transcript.endsWith('c')).toBe(true); // the resumed chunk survived, appended after the marker
+  });
+
+  it('never resets on an undefined epoch, even after an epoch was already tracked (old daemon)', () => {
+    const p = new SessionPlanner({ attachThresholdChars: 1, coalesceWindowMs: 1000 });
+    p.onStatus(ROUTE, status('running'), 0);
+    p.onOutput(ROUTE, output(0, 'stdout', 'a', false, 'e1'), 0); // adopt e1
+    // A subsequent chunk with NO epoch must behave exactly as today: seq 1 commits, no marker.
+    const r = p.onOutput(ROUTE, output(1, 'stdout', 'b'), 0);
+    const transcript = (uploads(r.ops).at(-1) as { text: string }).text;
+    expect(transcript).toBe('ab');
+    expect(transcript).not.toContain('output stream restarted');
+  });
+});
+
+describe('SessionPlanner — line content is clamped to the Discord limit (finding 2)', () => {
+  it('clamps an over-long milestone line to ≤2000 chars ending in a truncation label', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 0);
+    const r = p.onOutput(ROUTE, output(0, 'milestone', 'm'.repeat(5000)), 10);
+    const line = lineSends(r.ops)[0] as { content: string };
+    expect(line.content.length).toBeLessThanOrEqual(2000);
+    expect(line.content).toContain('chars truncated');
+  });
+});
+
+describe('SessionPlanner — no silent gap between the inline tail and the attachment (finding 4)', () => {
+  it('attaches output longer than the inline tail even in the old 1001–1499 silent zone', () => {
+    // Defaults: tail 1000, threshold now defaults to the tail (1000) with strictly-greater
+    // crossing — so 1001 chars (which the tail would clip) attaches instead of vanishing.
+    const p = new SessionPlanner({ coalesceWindowMs: 1000 });
+    p.onStatus(ROUTE, status('running'), 0);
+    const r = p.onOutput(ROUTE, output(0, 'stdout', 'x'.repeat(1001)), 5000);
+    expect(uploads(r.ops)).toHaveLength(1);
+  });
+
+  it('keeps output that exactly fits the inline tail inline-only (boundary stays un-attached)', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 1000 });
+    p.onStatus(ROUTE, status('running'), 0);
+    const r = p.onOutput(ROUTE, output(0, 'stdout', 'x'.repeat(1000)), 5000);
+    expect(uploads(r.ops)).toHaveLength(0);
   });
 });
 

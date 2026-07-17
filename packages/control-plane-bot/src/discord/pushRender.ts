@@ -15,6 +15,7 @@ import {
   buildWaitingEmbed,
 } from './embeds.js';
 import { permissionButtons, type ButtonSpec } from './buttons.js';
+import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
 
 /** One rendered push. `undefined` from `renderPush` means cache-only: the envelope updated
  *  DaemonStateCache but is not worth interrupting the user's phone for (raw stdout, snapshots
@@ -57,6 +58,17 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
     // Raw stdout is far too high-volume to DM; milestones/summaries/errors are worth it.
     if (envelope.payload.kind === 'stdout') return undefined;
     return { content: envelope.payload.text };
+  }
+  if (isType(envelope, 'error')) {
+    // A protocol `error` envelope is the daemon telling the phone something explicitly failed
+    // (e.g. a `/stop` for an unknown/not-yet-live session). Without a visible render it is dropped
+    // (DaemonStateCache ignores it) and the Stop button keeps showing "Stop requested" forever.
+    // Surface it as a DM, clamped to the content ceiling so a long message can't get the send
+    // rejected (which would re-hide it).
+    const { code, message } = envelope.payload;
+    return {
+      content: truncateLabeled(`⚠️ Daemon error (${code}): ${message}`, MESSAGE_CONTENT_LIMIT),
+    };
   }
   return undefined; // usage.snapshot / session.status / pair.result / control frames: cache-only
 }

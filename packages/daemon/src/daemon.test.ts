@@ -684,6 +684,29 @@ describe('Daemon lifecycle', () => {
     }
   });
 
+  it('stamps a stable per-run epoch on every session.output envelope', async () => {
+    // The epoch lets the bot tell a restart-induced seq reset (re-numbered from 0) apart from real
+    // output loss. It must be present and CONSTANT within a single daemon run.
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r1', prompt: 'do the thing', idempotencyKey: 'k' },
+    });
+    await waitFor(() => sessionManager.spawnManaged.mock.calls.length > 0);
+    const handle = sessionManager.get('spawned-session') as
+      ReturnType<typeof makeFakeHandle> | undefined;
+    handle?.emit({ kind: 'output', text: 'one' });
+    handle?.emit({ kind: 'output', text: 'two' });
+
+    await waitFor(() => relay.received.filter((e) => e.type === 'session.output').length >= 2);
+    const epochs = relay.received
+      .filter((e) => e.type === 'session.output')
+      .map((e) => (e.type === 'session.output' ? e.payload.epoch : undefined));
+    expect(epochs[0]).toBeTruthy(); // a non-empty per-run token is present
+    expect(epochs[0]).toBe(epochs[1]); // and stable within the run (no spurious mid-session reset)
+  });
+
   // ---- M4: managed-session permission pipeline ----
 
   /** Drive a session.spawn through the live relay and hand back the fake handle it created. */
@@ -891,6 +914,31 @@ describe('Daemon lifecycle', () => {
       expect(err.payload.relatesTo).toBe(pushed.id); // correlates to the stop frame itself
       expect(err.payload.message).toContain('ghost');
     }
+  });
+
+  it('a stop that races a not-yet-live session does not burn the key — a later stop still works', async () => {
+    await daemon.start();
+    // First stop targets a session that is not live yet (e.g. the startup resume window): it errors,
+    // and must NOT remember the idempotencyKey (otherwise the card's stable key is un-stoppable).
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.stop',
+      payload: { sessionId: 'late-session', idempotencyKey: 'stop-race' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+
+    // The session becomes live (a resume/spawn landed after the stop).
+    const handle = makeFakeHandle('late-session');
+    sessionManager.handles.set('late-session', handle);
+
+    // The SAME idempotencyKey now stops it successfully — the key was not burned by the race.
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.stop',
+      payload: { sessionId: 'late-session', idempotencyKey: 'stop-race' },
+    });
+    await waitFor(() => handle.stopCalls > 0);
+    expect(handle.interruptCalls).toBe(1);
   });
 
   // ---- M4: crash re-attach at startup ----

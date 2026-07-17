@@ -157,3 +157,29 @@ describe('renderPush — routing of other envelopes', () => {
     expect(renderPush(env('usage.snapshot', { accounts: [] }))).toBeUndefined();
   });
 });
+
+describe('renderPush — daemon error envelopes are surfaced (finding 5)', () => {
+  it('renders an error envelope as a visible DM carrying the code and message', () => {
+    const push = renderPush(
+      env('error', {
+        code: 'unknown_session',
+        message: "session.stop: no live session 'ghost' in this daemon",
+        relatesTo: 'stop-frame-id',
+      }),
+    );
+    expect(push?.content).toContain('unknown_session');
+    expect(push?.content).toContain("no live session 'ghost'");
+    expect(push?.embeds).toBeUndefined();
+  });
+
+  it('clamps an over-long error message to the content limit', () => {
+    const push = renderPush(env('error', { code: 'boom', message: 'm'.repeat(5000) }));
+    expect(push?.content).toBeDefined();
+    expect(push!.content!.length).toBeLessThanOrEqual(2000);
+    expect(push?.content).toContain('chars truncated');
+  });
+
+  it('still returns undefined for other cache-only control frames (pong)', () => {
+    expect(renderPush(env('pong', {}))).toBeUndefined();
+  });
+});
