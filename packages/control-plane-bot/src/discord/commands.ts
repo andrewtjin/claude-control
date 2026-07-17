@@ -18,6 +18,7 @@ import {
   buildTimelineEmbed,
 } from './embeds.js';
 import type { BarRenderer } from './emojiBars.js';
+import type { TimelineTrackStyle } from './richFormat.js';
 
 export interface CommandDeps {
   relay: RelaySender;
@@ -26,6 +27,9 @@ export interface CommandDeps {
   /** How to draw usage bars. Optional so tests (and the pre-`ready` gateway) omit it and get
    *  the unicode default; the gateway sets it to the emoji renderer once app emojis upload. */
   barRenderer?: BarRenderer;
+  /** How to draw `/timeline` reset tracks + marker glyphs — same lifecycle as `barRenderer`:
+   *  omitted → unicode default, upgraded by the gateway once the sprites upload. */
+  trackStyle?: TimelineTrackStyle;
 }
 
 export type CommandResult =
@@ -58,7 +62,10 @@ export function handleUsage(deps: CommandDeps, discordUserId: string): CommandRe
 export function handleTimeline(deps: CommandDeps, discordUserId: string): CommandResult {
   const usage = deps.cache.getUsage(discordUserId);
   if (!usage) return { kind: 'text', text: 'No usage data yet — the daemon has not reported in.' };
-  return { kind: 'embed', embed: buildTimelineEmbed(usage, undefined, deps.barRenderer) };
+  return {
+    kind: 'embed',
+    embed: buildTimelineEmbed(usage, undefined, deps.barRenderer, deps.trackStyle),
+  };
 }
 
 /** `/accounts` — same cache, a lighter view. */

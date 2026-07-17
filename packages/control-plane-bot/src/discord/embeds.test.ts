@@ -118,7 +118,7 @@ describe('buildUsageEmbed', () => {
     ).toJSON();
     const weeklyTs = Math.floor(Date.parse('2026-07-17T14:00:00.000Z') / 1000);
     expect(embed.fields?.[0]?.value).toContain(
-      `🪟 5×5h windows left · weekly resets <t:${weeklyTs}:R>`,
+      `5×5h windows left · weekly resets <t:${weeklyTs}:R>`,
     );
   });
 
@@ -165,7 +165,7 @@ describe('buildTimelineEmbed', () => {
       `🟩🟩🟩🟩⬜⬜⬜⬜⬜⬜ window open · 42% used · resets <t:${SESSION_TS}:R>`,
     );
     expect(field?.value).toContain(
-      `🪟 5×5h windows left +1 partial · weekly resets <t:${WEEKLY_TS}:R>`,
+      `5×5h windows left +1 partial · weekly resets <t:${WEEKLY_TS}:R>`,
     );
     // Track: session reset at 2h of a 26h span → cell 1 (round(2/26·11)); weekly at the end.
     expect(field?.value).toContain('⬛🟦⬛⬛⬛⬛⬛⬛⬛⬛⬛🟪');
@@ -201,7 +201,7 @@ describe('buildTimelineEmbed', () => {
       NOW,
     ).toJSON();
     const field = embed.fields?.find((f) => f.name.includes('Work'));
-    expect(field?.value).toContain('💤 no open 5h window');
+    expect(field?.value).toContain('no open 5h window');
   });
 
   it('appends the daemon-computed plan when the snapshot carries one', () => {
@@ -228,6 +228,26 @@ describe('buildTimelineEmbed', () => {
     const field = embed.fields?.find((f) => f.name.includes('Work'));
     expect(field?.value).toContain('EBAR(42) window open');
     expect(field?.value).not.toContain('🟩');
+  });
+
+  it('draws tracks and marker glyphs through an injected track style', () => {
+    // The gateway swaps in the sprite-backed style this same way; sentinels prove both the
+    // per-account track and the legend/list markers come from the injected style, and that
+    // no unicode track squares leak through anywhere.
+    const style = {
+      track: () => 'TRACK',
+      session: 'S!',
+      weekly: 'W!',
+      both: 'B!',
+    };
+    const embed = buildTimelineEmbed({ accounts }, NOW, undefined, style).toJSON();
+    expect(embed.description).toContain('S! 5h window · W! weekly · B! both');
+    const field = embed.fields?.find((f) => f.name.includes('Work'));
+    expect(field?.value).toContain('TRACK');
+    expect(field?.value).not.toContain('⬛');
+    const upcoming = embed.fields?.find((f) => f.name === 'Upcoming resets');
+    expect(upcoming?.value).toContain(`S! <t:${SESSION_TS}:R> — **Work**`);
+    expect(upcoming?.value).toContain(`W! <t:${WEEKLY_TS}:R> — **Work**`);
   });
 });
 

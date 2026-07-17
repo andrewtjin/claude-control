@@ -271,6 +271,35 @@ describe('renderOutlook', () => {
   it('prompts to add an account when there are none', () => {
     expect(renderOutlook(computeOutlook([], NOW))).toContain('No accounts yet');
   });
+
+  it('routes text through the style hooks without changing the visible layout', () => {
+    // A tagging style proves which hook saw which text; stripping the tags must reproduce
+    // the plain render exactly (the "styles are zero-visible-width" contract ANSI codes
+    // satisfy — layout is computed before styling).
+    const tag = (name: string) => (text: string) => `«${name}:${text}»`;
+    const outlook = computeOutlook(twoAccounts, NOW);
+    const styled = renderOutlook(outlook, {
+      trackWidth: 20,
+      style: {
+        heading: tag('h'),
+        label: tag('l'),
+        active: tag('a'),
+        dim: tag('d'),
+        session: tag('s'),
+        weekly: tag('w'),
+        both: tag('b'),
+        percent: (text, pct) => `«p${pct}:${text}»`,
+        alert: tag('!'),
+      },
+    });
+    expect(styled).toContain('«a:*» «l:main »'); // active marker + padded label, separately styled
+    expect(styled).toContain('«s:s»'); // session mark on the track
+    expect(styled).toContain('«w:w»'); // weekly mark on the track
+    expect(styled).toContain('«p34:34% used»'); // percent hook sees the number for banding
+    expect(styled.replace(/«[^:»]*:([^»]*)»/g, '$1')).toBe(
+      renderOutlook(outlook, { trackWidth: 20 }),
+    );
+  });
 });
 
 describe('renderPlanSummary', () => {

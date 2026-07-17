@@ -16,16 +16,16 @@ import type { SessionStatus } from './stateCache.js';
 import {
   accountMarker,
   discordRelative,
-  emojiTrack,
   EMBED_DESCRIPTION_LIMIT,
   EMBED_FIELD_VALUE_LIMIT,
   layeredBar,
   NOTIFICATION_COLOR,
   NOTIFICATION_ICON,
   SEVERITY_COLOR,
-  TRACK,
   truncateLabeled,
+  UNICODE_TRACK_STYLE,
   worstSeverity,
+  type TimelineTrackStyle,
   type TrackEvent,
 } from './richFormat.js';
 import type { BarRenderer } from './emojiBars.js';
@@ -105,14 +105,14 @@ export function buildUsageEmbed(
   return embed;
 }
 
-/** "🪟 12×5h windows left · weekly resets <t:...:R>" — the session budget line appended to
+/** "12×5h windows left · weekly resets <t:...:R>" — the session budget line appended to
  *  an account's `/usage` field, or empty when no weekly reset time is known. Uses a native
  *  timestamp so the line stays truthful even in old messages in the chat scrollback. */
 function windowsLine(outlook: ResetOutlook, accountId: string): string {
   const budget = outlook.accounts.find((a) => a.accountId === accountId)?.budget;
   if (!budget) return '';
   return (
-    `\n🪟 ${budget.fullWindows}×5h window${budget.fullWindows === 1 ? '' : 's'} left` +
+    `\n${budget.fullWindows}×5h window${budget.fullWindows === 1 ? '' : 's'} left` +
     ` · weekly resets ${discordRelative(budget.weeklyResetAt)}`
   );
 }
@@ -130,6 +130,7 @@ export function buildTimelineEmbed(
   },
   nowMs = Date.now(),
   barRenderer: BarRenderer = DEFAULT_BAR_RENDERER,
+  trackStyle: TimelineTrackStyle = UNICODE_TRACK_STYLE,
 ): EmbedBuilder {
   const outlook = computeOutlook(timelineInputFromWire(usage.accounts), nowMs);
   const embed = new EmbedBuilder().setTitle('Reset timeline').setColor(usageColor(usage.accounts));
@@ -143,7 +144,7 @@ export function buildTimelineEmbed(
   const spanMs = lastEvent ? Math.max(lastEvent.atMs - nowMs, 1) : 0;
   embed.setDescription(
     lastEvent
-      ? `Track spans now → ${discordRelative(lastEvent.atMs)} · ${TRACK.session} 5h window · ${TRACK.weekly} weekly · ${TRACK.both} both`
+      ? `Track spans now → ${discordRelative(lastEvent.atMs)} · ${trackStyle.session} 5h window · ${trackStyle.weekly} weekly · ${trackStyle.both} both`
       : 'No reset times reported yet — wait for the next daemon poll.',
   );
 
@@ -156,11 +157,11 @@ export function buildTimelineEmbed(
         `${barRenderer(a.sessionPercent ?? 0)} window open · ${a.sessionPercent ?? 0}% used · resets ${discordRelative(a.openWindowEndsAt)}`,
       );
     } else {
-      lines.push('💤 no open 5h window');
+      lines.push('no open 5h window');
     }
     if (a.budget) {
       lines.push(
-        `🪟 ${a.budget.fullWindows}×5h window${a.budget.fullWindows === 1 ? '' : 's'} left` +
+        `${a.budget.fullWindows}×5h window${a.budget.fullWindows === 1 ? '' : 's'} left` +
           `${a.budget.hasPartialWindow ? ' +1 partial' : ''}` +
           ` · weekly resets ${discordRelative(a.budget.weeklyResetAt)}`,
       );
@@ -171,7 +172,7 @@ export function buildTimelineEmbed(
       const events: TrackEvent[] = outlook.events
         .filter((e) => e.accountId === a.accountId)
         .map((e) => ({ atMs: e.atMs, kind: e.kind === 'session' ? 'session' : 'weekly' }));
-      if (events.length > 0) lines.push(emojiTrack(events, nowMs, spanMs));
+      if (events.length > 0) lines.push(trackStyle.track(events, nowMs, spanMs));
     }
     embed.addFields({
       name: `${accountMarker(a)} ${a.label}`,
@@ -184,7 +185,7 @@ export function buildTimelineEmbed(
       name: 'Upcoming resets',
       value: outlook.events
         .map((e) => {
-          const mark = e.kind === 'session' ? TRACK.session : TRACK.weekly;
+          const mark = e.kind === 'session' ? trackStyle.session : trackStyle.weekly;
           return `${mark} ${discordRelative(e.atMs)} — **${e.label}** · ${describeEvent(e.kind, e.percentUsed)}`;
         })
         .join('\n'),

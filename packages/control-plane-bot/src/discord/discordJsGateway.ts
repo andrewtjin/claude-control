@@ -34,8 +34,13 @@ import type { PairingService } from '../pairing.js';
 import type { Logger } from '../logger.js';
 import { noopLogger } from '../logger.js';
 import { DaemonStateCache } from './stateCache.js';
-import { layeredBar } from './richFormat.js';
-import { ensureProgressEmojis, emojiResolverFrom, renderEmojiBar } from './emojiBars.js';
+import { emojiTrack, layeredBar, UNICODE_TRACK_STYLE } from './richFormat.js';
+import {
+  ensureProgressEmojis,
+  emojiResolverFrom,
+  renderEmojiBar,
+  renderEmojiTrack,
+} from './emojiBars.js';
 import { renderPush, type RenderedPush } from './pushRender.js';
 import {
   buttonIdempotencyKey,
@@ -415,6 +420,16 @@ export class DiscordJsGateway implements DiscordGateway {
     // Per-bar fallback: if any sprite this particular bar needs is absent, use unicode.
     this.deps.barRenderer = (percent, width) =>
       renderEmojiBar(percent, resolve, width) ?? layeredBar(percent, width);
+    // Same deal for the `/timeline` track: sprite-backed when possible, unicode per-track
+    // (and per-marker) when not.
+    this.deps.trackStyle = {
+      track: (events, nowMs, spanMs, width) =>
+        renderEmojiTrack(events, nowMs, spanMs, resolve, width) ??
+        emojiTrack(events, nowMs, spanMs, width),
+      session: resolve('tl_ms') ?? UNICODE_TRACK_STYLE.session,
+      weekly: resolve('tl_mw') ?? UNICODE_TRACK_STYLE.weekly,
+      both: resolve('tl_mb') ?? UNICODE_TRACK_STYLE.both,
+    };
     this.logger.info({ count: byName.size }, 'discord: progress emoji bars enabled');
   }
 

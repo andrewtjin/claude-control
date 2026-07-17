@@ -15,7 +15,7 @@
 // available (no token, API failure, not yet uploaded) the renderer returns `undefined` and
 // the caller falls back to the unicode `layeredBar`. Nothing here ever throws.
 
-import { severityOf, type Severity } from './richFormat.js';
+import { severityOf, trackCells, type Severity, type TrackEvent } from './richFormat.js';
 import type { Logger } from '../logger.js';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -38,10 +38,14 @@ const COLOR_LETTER: Record<Severity, 'g' | 'y' | 'o' | 'r'> = {
   critical: 'r',
 };
 
-/** Every sprite the bar can reference. Kept as the single source of truth so the generator
- *  script, the uploader, and the tests all agree on exactly which 19 pieces exist:
- *   - 3 empty track pieces (left cap / middle / right cap)
- *   - per colour c: filled left cap, filled middle, half middle, filled right cap. */
+/** Every sprite the bar and timeline can reference. Kept as the single source of truth so
+ *  the generator script, the uploader, and the tests all agree on exactly which 28 pieces
+ *  exist:
+ *   - 3 empty track pieces (left cap / middle / right cap) — shared by bars AND timelines
+ *   - per bar colour c ∈ g/y/o/r: filled left cap, filled middle, half middle, filled
+ *     right cap (16)
+ *   - per timeline mark m ∈ s (5h window) / w (weekly) / b (both): a dot on the empty
+ *     track, in cap-l / middle / cap-r shapes (9). */
 export const PROGRESS_EMOJI_NAMES: readonly string[] = [
   'pb_le',
   'pb_me',
@@ -52,6 +56,7 @@ export const PROGRESS_EMOJI_NAMES: readonly string[] = [
     `pb_mh_${c}`,
     `pb_rf_${c}`,
   ]),
+  ...(['s', 'w', 'b'] as const).flatMap((m) => [`tl_l${m}`, `tl_m${m}`, `tl_r${m}`]),
 ];
 
 /**
@@ -95,6 +100,37 @@ export function renderEmojiBar(
       name = rightHalfFilled ? `pb_mf_${color}` : leftHalfFilled ? `pb_mh_${color}` : 'pb_me';
     }
 
+    const token = resolve(name);
+    if (token === undefined) return undefined; // any gap → let the caller use unicode
+    tokens.push(token);
+  }
+  return tokens.join('');
+}
+
+/**
+ * Build a slim emoji timeline track, or `undefined` if ANY sprite it needs is unavailable
+ * (so the caller falls back to the unicode track). Same recessed-tube look as the empty
+ * progress bar — the empty pieces ARE the bar's empty pieces — with reset markers drawn as
+ * dots on the track: blurple = 5h-window reset, violet = weekly reset, two-tone = both in
+ * one cell. Placement math is `trackCells`, shared with the unicode renderer, so the two
+ * tracks always agree on where a reset lands.
+ */
+export function renderEmojiTrack(
+  events: TrackEvent[],
+  nowMs: number,
+  spanMs: number,
+  resolve: EmojiResolver,
+  width = 12,
+): string | undefined {
+  const tokens: string[] = [];
+  const cells = trackCells(events, nowMs, spanMs, width);
+  for (let i = 0; i < cells.length; i++) {
+    const cap = i === 0 ? 'l' : i === cells.length - 1 ? 'r' : 'm';
+    const cell = cells[i] as (typeof cells)[number];
+    const name =
+      cell === 'empty'
+        ? `pb_${cap}e`
+        : `tl_${cap}${cell === 'both' ? 'b' : cell === 'session' ? 's' : 'w'}`;
     const token = resolve(name);
     if (token === undefined) return undefined; // any gap → let the caller use unicode
     tokens.push(token);
