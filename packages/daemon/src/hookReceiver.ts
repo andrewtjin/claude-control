@@ -9,11 +9,19 @@
 // unsolicited or replayed approval must never be applied.
 //
 // WET-GATED: the exact hook event names/payload shapes the installed CLI POSTs are
-// reverse-engineered and unconfirmed (see docs/VERIFICATION.md) — hence `eventNames` below is
-// configurable rather than hardcoded, and the request body is parsed tolerantly.
+// reverse-engineered (see docs/VERIFICATION.md) — hence `eventNames` below is configurable
+// rather than hardcoded, and the request body is parsed tolerantly. Wet finding 2026-07-17:
+// the CLI's hook payload is snake_case (`hook_event_name`, `session_id`, `tool_name`,
+// `tool_input`, `message`), so every field below reads snake_case FIRST with the original
+// camelCase guesses kept as fallbacks (unit tests and any internal senders use them).
+// Second wet finding: the CLI never sends a `requestId` — the daemon mints one, because the
+// requestId's real job is correlating OUR pending-permission row with the phone's response,
+// not echoing anything the CLI knows about.
 
+import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { EnvelopeDraft } from '@claude-control/shared-protocol';
+import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { Store } from './store.js';
 
 /** The three hook events the CLI is expected to send, and the header/config the daemon
@@ -47,6 +55,11 @@ export interface HookReceiverOptions {
   /** `daemonId` is a routing field on every envelope this receiver emits (see stamp()) — the
    *  daemon's own adopted identity, not something a hook payload could ever supply. */
   daemonId: () => string;
+  /** Observability for the wet gates and live debugging: every inbound POST's outcome
+   *  (accepted event, unrecognized event name, auth failure, parse failure) is logged, because
+   *  the curl hooks fail SILENTLY on the CLI side — this log is the only place a broken hook
+   *  loop is visible at all. Defaults to no-op for unit tests. */
+  logger?: Logger;
 }
 
 export interface ResolvePermissionResult {
@@ -128,6 +141,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function str(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
+/** Defensive cap for strings derived from `tool_input` — the protocol schema doesn't cap
+ *  summary/detail, but shipping an unbounded JSON blob through the relay to a Discord card
+ *  helps nobody. The marker makes the cut visible instead of silent. */
+function truncate(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max)}… [truncated]`;
+}
+/** Best human line for a permission card, derived from the tool's input: a Bash `command` or
+ *  a file path IS the summary a phone reader needs; anything else falls back to compact JSON. */
+function summarizeToolInput(toolInput: Record<string, unknown> | undefined): string | undefined {
+  if (!toolInput) return undefined;
+  const command = str(toolInput.command);
+  if (command !== undefined) return truncate(command, 200);
+  const filePath = str(toolInput.file_path);
+  if (filePath !== undefined) return truncate(filePath, 200);
+  const json = JSON.stringify(toolInput);
+  return json === '{}' ? undefined : truncate(json, 200);
+}
 
 export class HookReceiver {
   private readonly store: Store;
@@ -138,6 +168,7 @@ export class HookReceiver {
   private readonly clock: () => number;
   private readonly emit: (draft: EnvelopeDraft) => void;
   private readonly daemonId: () => string;
+  private readonly logger: Logger;
   private server: Server | undefined;
   /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
    *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
@@ -153,6 +184,7 @@ export class HookReceiver {
     this.clock = options.clock ?? Date.now;
     this.emit = options.emit;
     this.daemonId = options.daemonId;
+    this.logger = options.logger ?? noopLogger;
   }
 
   /** Install the CLI session-command logic. Called by the daemon before `listen` (symmetric
@@ -223,6 +255,8 @@ export class HookReceiver {
     const presented = req.headers[this.secretHeader.toLowerCase()];
     const presentedSecret = Array.isArray(presented) ? presented[0] : presented;
     if (presentedSecret !== this.secret) {
+      // A stale secret in settings.json (or a stranger on loopback) — never log the value.
+      this.logger.warn({ path: req.url }, 'hook POST rejected: bad or missing secret header');
       this.respond(res, 401, { ok: false, error: 'invalid secret' });
       return;
     }
@@ -340,12 +374,23 @@ export class HookReceiver {
       return;
     }
     const result = this.resolvePermission(requestId, decision);
+    if (result.ok) {
+      this.logger.info({ requestId, decision }, 'pending permission resolved');
+    } else {
+      // Not a daemon error — the security contract rejecting a stale/duplicate/expired
+      // resolve. Logged so a wet run can tell "guard working" from "resolve never arrived".
+      this.logger.warn({ requestId, decision, error: result.error }, 'permission resolve rejected');
+    }
     this.respond(res, result.ok ? 200 : 409, result);
   }
 
   private handleHookEvent(body: Record<string, unknown>, res: ServerResponse): void {
-    const event = str(body.event) ?? str(body.hookEventName);
+    // `hook_event_name` is the CLI's real field (wet-confirmed 2026-07-17); the camelCase
+    // names are our original guesses, kept for internal senders and existing tests.
+    const event = str(body.hook_event_name) ?? str(body.event) ?? str(body.hookEventName);
     if (event === undefined) {
+      // Keys only, never values — enough to diagnose a contract drift without logging content.
+      this.logger.warn({ keys: Object.keys(body) }, 'hook POST with no event name field');
       this.respond(res, 400, { ok: false, error: 'missing event name' });
       return;
     }
@@ -362,23 +407,40 @@ export class HookReceiver {
       this.handleStopOrNotification(body, res, 'notification');
       return;
     }
+    // THE wet-gate evidence line: whatever event name the CLI really fires at permission time
+    // (PermissionRequest vs PreToolUse is the open question) shows up here by name.
+    this.logger.warn(
+      { event, sessionId: str(body.session_id) ?? str(body.sessionId) },
+      'hook POST with unrecognized event name — not one of the three we handle',
+    );
     this.respond(res, 400, { ok: false, error: `unrecognized event "${event}"` });
   }
 
   private handlePermissionRequest(body: Record<string, unknown>, res: ServerResponse): void {
-    const requestId = str(body.requestId);
-    const sessionId = str(body.sessionId);
-    const tool = str(body.tool);
-    const summary = str(body.summary) ?? tool ?? 'unknown tool';
-    if (!requestId || !sessionId || !tool) {
-      this.respond(res, 400, { ok: false, error: 'requestId, sessionId, and tool are required' });
+    // The CLI names the tool `tool_name` and carries its arguments in `tool_input`; it sends
+    // NO requestId of its own, so the daemon mints one (its only job is correlating our
+    // pending row with the phone's later response). `requestId`/`sessionId`/`tool` remain as
+    // internal-sender/test aliases.
+    const requestId = str(body.requestId) ?? randomUUID();
+    const sessionId = str(body.session_id) ?? str(body.sessionId);
+    const tool = str(body.tool_name) ?? str(body.tool);
+    const toolInput = isRecord(body.tool_input) ? body.tool_input : undefined;
+    const summary = str(body.summary) ?? summarizeToolInput(toolInput) ?? tool ?? 'unknown tool';
+    if (!sessionId || !tool) {
+      this.logger.warn(
+        { keys: Object.keys(body) },
+        'permission hook POST missing session id or tool name',
+      );
+      this.respond(res, 400, { ok: false, error: 'session_id and tool_name are required' });
       return;
     }
 
     const now = this.clock();
     this.store.insertPendingPermission({ requestId, sessionId, tool, summary, createdAtMs: now });
 
-    const detail = str(body.detail);
+    const detail =
+      str(body.detail) ??
+      (toolInput !== undefined ? truncate(JSON.stringify(toolInput, null, 2), 2000) : undefined);
     const cwd = str(body.cwd);
     // The CLI's PreToolUse hook payload carries `permission_mode` (snake_case per Claude Code's
     // hook contract; we also accept camelCase defensively). Parsed tolerantly — any string
@@ -414,6 +476,10 @@ export class HookReceiver {
       },
     });
 
+    this.logger.info(
+      { requestId, sessionId, tool, permissionMode },
+      'permission hook received; card pushed',
+    );
     this.respond(res, 200, { ok: true });
   }
 
@@ -422,7 +488,7 @@ export class HookReceiver {
     res: ServerResponse,
     event: 'stop' | 'notification',
   ): void {
-    const sessionId = str(body.sessionId);
+    const sessionId = str(body.session_id) ?? str(body.sessionId);
     // Two optional discriminators from the CLI hook payload, threaded through so the bot can
     // render rich done/waiting cards (plan §4). Both parsed tolerantly (snake_case primary,
     // camelCase accepted): unknown values pass through unchanged and the bot falls back to the
@@ -453,6 +519,7 @@ export class HookReceiver {
         ...(lastAssistantMessage !== undefined ? { lastAssistantMessage } : {}),
       },
     });
+    this.logger.info({ event, sessionId, notificationType }, 'hook event received; card pushed');
     this.respond(res, 200, { ok: true });
   }
 

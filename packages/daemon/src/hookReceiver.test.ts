@@ -282,6 +282,129 @@ describe('HookReceiver', () => {
     });
   });
 
+  // The CLI's REAL hook payload contract (wet-confirmed 2026-07-17): snake_case field names
+  // (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `message`) and NO requestId.
+  // The camelCase bodies used elsewhere in this file remain supported as internal aliases.
+  describe('real CLI payload shape (snake_case)', () => {
+    it('accepts a real Stop payload: hook_event_name + session_id + last_assistant_message', async () => {
+      const res = await post(
+        port,
+        '/',
+        {
+          hook_event_name: 'Stop',
+          session_id: 'sess-real',
+          transcript_path: 'C:/x/transcript.jsonl',
+          cwd: 'C:/x',
+          last_assistant_message: 'All done.',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+      const note = emitted.find((e) => e.type === 'hook.notification');
+      expect(note?.payload).toMatchObject({
+        event: 'stop',
+        sessionId: 'sess-real',
+        body: 'All done.',
+      });
+    });
+
+    it('accepts a real Notification payload: message becomes the card body', async () => {
+      const res = await post(
+        port,
+        '/',
+        {
+          hook_event_name: 'Notification',
+          session_id: 'sess-real',
+          message: 'Claude needs your permission to use Bash',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+      const note = emitted.find((e) => e.type === 'hook.notification');
+      expect(note?.payload).toMatchObject({
+        event: 'notification',
+        sessionId: 'sess-real',
+        body: 'Claude needs your permission to use Bash',
+      });
+    });
+
+    it('accepts a real permission payload — tool_name/tool_input, MINTS a requestId, summary from the command', async () => {
+      const res = await post(
+        port,
+        '/',
+        {
+          hook_event_name: 'PermissionRequest',
+          session_id: 'sess-real',
+          tool_name: 'Bash',
+          tool_input: { command: 'echo hello' },
+          permission_mode: 'default',
+          cwd: 'C:/x',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+      const permission = emitted.find((e) => e.type === 'permission.request');
+      expect(permission?.payload).toMatchObject({
+        sessionId: 'sess-real',
+        tool: 'Bash',
+        summary: 'echo hello',
+        permissionMode: 'default',
+        cwd: 'C:/x',
+      });
+      const requestId = (permission?.payload as { requestId: string }).requestId;
+      expect(requestId).toBeTruthy(); // minted by the daemon — the CLI sends none
+      // The minted id is the resolvable one: the phone's response must find the pending row.
+      const resolved = await post(
+        port,
+        '/resolve-permission',
+        { requestId, decision: 'allow' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(resolved.status).toBe(200);
+    });
+
+    it('a permission payload with no tool name is still rejected (nothing useful to card)', async () => {
+      const res = await post(
+        port,
+        '/',
+        { hook_event_name: 'PermissionRequest', session_id: 'sess-real' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it('logs the exact unrecognized event name — the wet-gate evidence line', async () => {
+      const warns: unknown[] = [];
+      const logging = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'daemon-1',
+        logger: {
+          debug: () => {},
+          info: () => {},
+          warn: (obj) => warns.push(obj),
+          error: () => {},
+        },
+      });
+      const loggingPort = await logging.listen(0);
+      try {
+        const res = await post(
+          loggingPort,
+          '/',
+          { hook_event_name: 'PreToolUse', session_id: 'sess-real', tool_name: 'Bash' },
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(res.status).toBe(400);
+        expect(warns).toContainEqual(
+          expect.objectContaining({ event: 'PreToolUse', sessionId: 'sess-real' }),
+        );
+      } finally {
+        await logging.close();
+      }
+    });
+  });
+
   describe('resolvePermission via /resolve-permission', () => {
     async function requestPermission(requestId: string): Promise<void> {
       const res = await post(
