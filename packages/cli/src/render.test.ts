@@ -1,7 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
+import { ANSI_PALETTE } from './ansi.js';
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
+
+/** Remove ANSI SGR codes — used to prove color never changes the visible text/layout. */
+// eslint-disable-next-line no-control-regex -- matching ESC codes is the whole point
+const stripAnsi = (s: string) => s.replace(/\u001b\[[0-9;]*m/g, '');
 
 function acct(id: string, label: string, extra: Partial<StoredAccount> = {}): StoredAccount {
   return { id, label, quarantined: false, createdAtMs: 0, updatedAtMs: 0, ...extra };
@@ -25,6 +30,18 @@ describe('renderAccountsTable', () => {
     // Active row carries the '*' marker; quarantined row shows the status.
     expect(out).toMatch(/\*\s+Work/);
     expect(out).toMatch(/quarantined/);
+  });
+
+  it('colors quarantine red under a palette without disturbing column alignment', () => {
+    const accounts = [
+      acct('id-1', 'Work', { emailAddress: 'w@x.com' }),
+      acct('id-2', 'Dead', { quarantined: true }),
+    ];
+    const plain = renderAccountsTable(accounts, 'id-1');
+    const colored = renderAccountsTable(accounts, 'id-1', ANSI_PALETTE);
+    expect(colored).toContain(ANSI_PALETTE.red('quarantined'));
+    // Zero-width contract: stripping the codes reproduces the plain table exactly.
+    expect(stripAnsi(colored)).toBe(plain);
   });
 });
 
@@ -98,5 +115,28 @@ describe('renderUsage', () => {
 
   it('prompts to add accounts when empty', () => {
     expect(renderUsage([], NOW)).toMatch(/No accounts yet/);
+  });
+
+  it('colors percents by severity under a palette, plain text unchanged', () => {
+    const rows: UsageRow[] = [
+      {
+        label: 'Work',
+        active: true,
+        usage: usage({
+          error: 'refresh failed',
+          limits: [
+            { kind: 'session', percent: 45, isActive: true }, // ok → green
+            { kind: 'weekly_all', percent: 97, isActive: true }, // critical → red
+          ],
+        }),
+      },
+    ];
+    const plain = renderUsage(rows, NOW);
+    const colored = renderUsage(rows, NOW, ANSI_PALETTE);
+    expect(colored).toContain(ANSI_PALETTE.green('45%'));
+    expect(colored).toContain(ANSI_PALETTE.red('97%'));
+    expect(colored).toContain(ANSI_PALETTE.red('[refresh failed]'));
+    expect(colored).toContain(ANSI_PALETTE.green('*'));
+    expect(stripAnsi(colored)).toBe(plain);
   });
 });

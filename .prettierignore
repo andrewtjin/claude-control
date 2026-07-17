@@ -3,3 +3,7 @@ dist
 coverage
 *.tsbuildinfo
 pnpm-lock.yaml
+
+# local agent-tool artifacts (git-excluded, not part of the codebase)
+.agents/
+.claude/

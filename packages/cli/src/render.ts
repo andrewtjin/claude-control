@@ -1,14 +1,21 @@
 // Pure rendering helpers for the CLI.
 //
-// Kept free of IO so the exact output is unit-tested. The CLI stays deliberately plain
-// text — no colors or spinners — so it is readable in any terminal and easy to assert on.
+// Kept free of IO so the exact output is unit-tested. Output is plain text by DEFAULT —
+// color comes only from an injected palette (identity unless the program edge detected a
+// TTY; see ansi.ts), and layout is always computed on plain text before painting, so
+// styled and plain output align identically.
 
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import { computeOutlook, timelineInputFromWire } from '@claude-control/usage-advisor';
+import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
 
 /** Render the accounts registry as an aligned table. `activeId` is marked with `*`. */
-export function renderAccountsTable(accounts: StoredAccount[], activeId: string | null): string {
+export function renderAccountsTable(
+  accounts: StoredAccount[],
+  activeId: string | null,
+  palette: Palette = PLAIN_PALETTE,
+): string {
   if (accounts.length === 0) return 'No accounts yet. Add one with: cctl accounts add <label>';
 
   const rows = accounts.map((a) => ({
@@ -28,16 +35,27 @@ export function renderAccountsTable(accounts: StoredAccount[], activeId: string 
     id: colWidth(rows, headers, 'id'),
   };
 
-  const line = (r: typeof headers) =>
-    [
-      r.active.padEnd(widths.active),
-      r.label.padEnd(widths.label),
-      r.email.padEnd(widths.email),
-      r.status.padEnd(widths.status),
-      r.id.padEnd(widths.id),
+  // Pad first, paint after — ANSI codes are zero-width, so alignment survives.
+  const cells = (r: typeof headers) => [
+    r.active.padEnd(widths.active),
+    r.label.padEnd(widths.label),
+    r.email.padEnd(widths.email),
+    r.status.padEnd(widths.status),
+    r.id.padEnd(widths.id),
+  ];
+  const rowLine = (r: (typeof rows)[number]) => {
+    const [active, label, email, status, id] = cells(r);
+    const paintStatus = r.status === 'quarantined' ? palette.red : (t: string) => t;
+    return [
+      palette.green(active ?? ''),
+      palette.bold(label ?? ''),
+      email ?? '',
+      paintStatus(status ?? ''),
+      palette.dim(id ?? ''),
     ].join('  ');
+  };
 
-  return [line(headers), ...rows.map(line)].join('\n');
+  return [palette.dim(cells(headers).join('  ')), ...rows.map(rowLine)].join('\n');
 }
 
 /** One account's row for the usage view. `usage` is absent until the daemon has polled it. */
@@ -50,20 +68,31 @@ export interface UsageRow {
 /** Render cross-account usage from the daemon's latest persisted poll. Shows each account's
  *  source (live/cached), how stale the reading is, and the percent used per limit — so a
  *  cached (frozen) number is never mistaken for a fresh one. Pure. */
-export function renderUsage(rows: UsageRow[], nowMs: number): string {
+export function renderUsage(
+  rows: UsageRow[],
+  nowMs: number,
+  palette: Palette = PLAIN_PALETTE,
+): string {
   if (rows.length === 0) return 'No accounts yet. Add one with: cctl accounts add <label>';
   return rows
     .map((r) => {
-      const marker = r.active ? '*' : ' ';
+      const marker = r.active ? palette.green('*') : ' ';
+      const label = palette.bold(r.label);
       if (!r.usage) {
-        return `${marker} ${r.label} — no usage data yet (start the daemon: cctl daemon start)`;
+        return `${marker} ${label} — no usage data yet (start the daemon: cctl daemon start)`;
       }
       const age = ageLabel(nowMs - r.usage.fetchedAtMs);
       const limits = r.usage.limits.length
-        ? r.usage.limits.map((l) => `${limitShort(l.kind)} ${Math.round(l.percent)}%`).join(' · ')
+        ? r.usage.limits
+            .map((l) => {
+              const pct = Math.round(l.percent);
+              return `${limitShort(l.kind)} ${severityPaint(palette, pct)(`${pct}%`)}`;
+            })
+            .join(' · ')
         : 'no limits reported';
-      const err = r.usage.error ? `  [${r.usage.error}]` : '';
-      return `${marker} ${r.label}  (${r.usage.source}, ${age})  ${limits}${windowsLeft(r.usage, nowMs)}${err}`;
+      const err = r.usage.error ? `  ${palette.red(`[${r.usage.error}]`)}` : '';
+      const source = palette.dim(`(${r.usage.source}, ${age})`);
+      return `${marker} ${label}  ${source}  ${limits}${windowsLeft(r.usage, nowMs)}${err}`;
     })
     .join('\n');
 }

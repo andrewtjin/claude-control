@@ -30,6 +30,7 @@ import {
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { runDaemon } from './daemonRun.js';
+import { detectPalette, outlookStyle } from './ansi.js';
 import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
 import { renderDoctor, runDoctor, summarize } from './doctor.js';
 
@@ -92,7 +93,7 @@ export function buildProgram(): Command {
         active: a.id === activeId,
         usage: usageFor(a.id),
       }));
-      process.stdout.write(renderUsage(rows, Date.now()) + '\n');
+      process.stdout.write(renderUsage(rows, Date.now(), detectPalette()) + '\n');
     });
 
   program
@@ -113,7 +114,7 @@ export function buildProgram(): Command {
         })),
       );
       const outlook = computeOutlook(inputs);
-      let text = renderOutlook(outlook);
+      let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to use now and what to burn.
       if (inputs.length > 0) text += '\n\n' + renderPlanSummary(computePlan(inputs));
       process.stdout.write(text + '\n');
@@ -124,7 +125,7 @@ export function buildProgram(): Command {
     .description('check the local environment')
     .action(async () => {
       const checks = await runDoctor(defaultPaths());
-      process.stdout.write(renderDoctor(checks) + '\n');
+      process.stdout.write(renderDoctor(checks, detectPalette()) + '\n');
       const { passed, failed } = summarize(checks);
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);
     });
@@ -251,7 +252,7 @@ function buildAccountCommands(program: Command): void {
     .action(async () => {
       const engine = buildEngine();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
-      process.stdout.write(renderAccountsTable(list, activeId) + '\n');
+      process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
     });
 
   accounts
