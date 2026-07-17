@@ -122,8 +122,8 @@ export function buildProgram(): Command {
   program
     .command('doctor')
     .description('check the local environment')
-    .action(() => {
-      const checks = runDoctor(defaultPaths());
+    .action(async () => {
+      const checks = await runDoctor(defaultPaths());
       process.stdout.write(renderDoctor(checks) + '\n');
       const { passed, failed } = summarize(checks);
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);

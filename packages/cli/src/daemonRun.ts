@@ -16,9 +16,9 @@ import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import pino from 'pino';
 import {
-  DpapiProtector,
   Vault,
   defaultPaths,
+  defaultProtector,
   type Logger,
   type Paths,
   type Protector,
@@ -109,7 +109,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
 
   const engine = buildEngine(paths);
   const store = new Store(daemonDbPath(paths));
-  const protector = new DpapiProtector();
+  const protector = defaultProtector();
 
   // An explicit --pair means "adopt a NEW identity", so any previously adopted one is
   // discarded first — otherwise the client would see a stored identity and skip pairing.

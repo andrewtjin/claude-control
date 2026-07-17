@@ -19,20 +19,37 @@ export interface Paths {
   vaultDir: string;
 }
 
+/** The platform's convention for machine-local app state (the vault must NOT roam or sync:
+ *  its blobs are bound to this machine's DPAPI/Keychain and are garbage anywhere else). */
+function machineLocalDataRoot(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
+  const home = homedir();
+  switch (platform) {
+    case 'win32':
+      return env.LOCALAPPDATA?.trim() || join(home, 'AppData', 'Local');
+    case 'darwin':
+      return join(home, 'Library', 'Application Support');
+    default:
+      // XDG convention covers Linux and the BSDs.
+      return env.XDG_DATA_HOME?.trim() || join(home, '.local', 'share');
+  }
+}
+
 /** Resolve the default production paths from the environment. */
-export function defaultPaths(env: NodeJS.ProcessEnv = process.env): Paths {
+export function defaultPaths(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Paths {
   const home = homedir();
   // WT-1 (CLI 2.1.211): CLAUDE_CONFIG_DIR relocates the whole config — .credentials.json
   // AND .claude.json both live inside it. Only the default (unset) case uses ~/.claude.json.
+  // (Platform-independent per the CLI's docs; the mac wet gate re-verifies — assumption A3.)
   const configDir = env.CLAUDE_CONFIG_DIR?.trim();
   const claudeDir = configDir || join(home, '.claude');
-  // On Windows LOCALAPPDATA is the right home for machine-local encrypted state.
-  const localAppData = env.LOCALAPPDATA?.trim() || join(home, 'AppData', 'Local');
   return {
     claudeDir,
     credentialsPath: join(claudeDir, '.credentials.json'),
     claudeJsonPath: configDir ? join(configDir, '.claude.json') : join(home, '.claude.json'),
-    vaultDir: join(localAppData, 'claude-control', 'vault'),
+    vaultDir: join(machineLocalDataRoot(env, platform), 'claude-control', 'vault'),
   };
 }
 

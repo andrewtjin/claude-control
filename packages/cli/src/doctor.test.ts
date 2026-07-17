@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { renderDoctor, summarize, checkDpapi, type DoctorCheck } from './doctor.js';
+import { renderDoctor, summarize, checkVaultProtection, type DoctorCheck } from './doctor.js';
 
 const checks: DoctorCheck[] = [
   { name: 'dpapi', ok: true, detail: 'works' },
@@ -20,14 +20,20 @@ describe('summarize', () => {
   });
 });
 
-describe('checkDpapi', () => {
-  it('reports a real DPAPI round-trip on Windows, or unavailability elsewhere', () => {
-    const result = checkDpapi();
-    if (process.platform === 'win32') {
-      expect(result.ok).toBe(true);
-      expect(result.detail).toMatch(/round-trip/);
-    } else {
-      expect(result.ok).toBe(false);
-    }
+describe('checkVaultProtection', () => {
+  it('reports a real protector round-trip on a supported platform', () => {
+    // Runs the REAL platform protector: DPAPI here on Windows, Keychain on a Mac. Either
+    // way the check must pass on any supported dev machine.
+    if (process.platform !== 'win32' && process.platform !== 'darwin') return;
+    const result = checkVaultProtection();
+    expect(result.ok).toBe(true);
+    expect(result.detail).toMatch(/round-trip works/);
+  });
+
+  it('names the gap on an unsupported platform instead of failing silently', () => {
+    const result = checkVaultProtection('freebsd');
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/freebsd/);
+    expect(result.detail).toMatch(/win32 \(DPAPI\), darwin \(Keychain\)/);
   });
 });

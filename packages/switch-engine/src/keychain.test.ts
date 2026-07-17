@@ -1,0 +1,276 @@
+import { describe, it, expect } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import {
+  AesGcmProtector,
+  KeychainKeySource,
+  KeychainProtector,
+  KeychainCredentialChannel,
+  VAULT_KEY_SERVICE,
+  VAULT_KEY_ACCOUNT,
+  type ExecRunner,
+} from './keychain.js';
+import { VaultError } from './errors.js';
+import type { ClaudeOauth } from './types.js';
+
+// --- AesGcmProtector: pure crypto, provable on any platform -------------------------------
+
+describe('AesGcmProtector', () => {
+  const key = randomBytes(32);
+
+  it('round-trips arbitrary bytes and never emits plaintext', () => {
+    const p = new AesGcmProtector(key);
+    const secret = Buffer.from('refresh-token-🔐-value', 'utf8');
+    const blob = p.protect(secret);
+    expect(blob.startsWith('aesgcm:')).toBe(true);
+    expect(blob).not.toContain('refresh-token');
+    expect(p.unprotect(blob).equals(secret)).toBe(true);
+  });
+
+  it('uses a fresh IV per call (same plaintext, different blobs)', () => {
+    const p = new AesGcmProtector(key);
+    const secret = Buffer.from('same');
+    expect(p.protect(secret)).not.toBe(p.protect(secret));
+  });
+
+  it('rejects a tampered blob via GCM authentication, not garbage output', () => {
+    const p = new AesGcmProtector(key);
+    const blob = p.protect(Buffer.from('payload-payload-payload'));
+    const raw = Buffer.from(blob.slice('aesgcm:'.length), 'base64');
+    raw.writeUInt8(raw.readUInt8(raw.length - 1) ^ 0xff, raw.length - 1); // flip one bit
+    expect(() => p.unprotect(`aesgcm:${raw.toString('base64')}`)).toThrow(VaultError);
+  });
+
+  it('rejects a blob encrypted under a different key', () => {
+    const blob = new AesGcmProtector(randomBytes(32)).protect(Buffer.from('x'));
+    expect(() => new AesGcmProtector(key).unprotect(blob)).toThrow(VaultError);
+  });
+
+  it('rejects foreign and truncated blobs', () => {
+    const p = new AesGcmProtector(key);
+    expect(() => p.unprotect('insecure:abc')).toThrow(VaultError);
+    expect(() => p.unprotect('aesgcm:AAAA')).toThrow(VaultError);
+  });
+
+  it('requires a 32-byte key', () => {
+    expect(() => new AesGcmProtector(randomBytes(16))).toThrow(VaultError);
+  });
+});
+
+// --- Fake `security(1)` --------------------------------------------------------------------
+// Simulates the two subcommands we use, including the exit-44 "not found" stderr shape and
+// the `-i` stdin command mode, while recording every argv and stdin payload for hygiene
+// assertions.
+
+interface SecurityCall {
+  args: string[];
+  input?: string | undefined;
+}
+
+/** The token following a flag, '' when absent — keeps the strict indexer happy. */
+function argAfter(tokens: string[], flag: string): string {
+  return tokens[tokens.indexOf(flag) + 1] ?? '';
+}
+
+function fakeSecurity(store: Map<string, string>): { run: ExecRunner; calls: SecurityCall[] } {
+  const calls: SecurityCall[] = [];
+  const keyOf = (service: string, account: string) => `${service} ${account}`;
+  const run: ExecRunner = (file, args, input) => {
+    calls.push({ args, input });
+    if (file !== 'security') throw new Error(`unexpected binary: ${file}`);
+    if (args[0] === 'find-generic-password') {
+      const service = argAfter(args, '-s');
+      const account = argAfter(args, '-a');
+      const value = store.get(keyOf(service, account));
+      if (value === undefined) {
+        const err = new Error('security failed') as Error & { stderr: string };
+        err.stderr = 'security: SecKeychainSearchCopyNext: The specified item could not be found.';
+        throw err;
+      }
+      return value + '\n';
+    }
+    if (args[0] === '-i') {
+      // Parse the one stdin command line the way `security -i` tokenizes: whitespace-split
+      // with double-quoted segments honoring \" and \\ escapes.
+      const line = (input ?? '').trim();
+      const tokens = tokenize(line);
+      if (tokens[0] !== 'add-generic-password') throw new Error(`unexpected: ${tokens[0]}`);
+      const service = argAfter(tokens, '-s');
+      const account = argAfter(tokens, '-a');
+      const value = argAfter(tokens, '-w');
+      store.set(keyOf(service, account), value);
+      return '';
+    }
+    throw new Error(`unexpected security args: ${args.join(' ')}`);
+  };
+  return { run, calls };
+}
+
+/** Minimal shell-style tokenizer matching the quoting quoteSecurityArg produces. */
+function tokenize(line: string): string[] {
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < line.length) {
+    while (line[i] === ' ') i++;
+    if (i >= line.length) break;
+    let token = '';
+    if (line[i] === '"') {
+      i++;
+      while (i < line.length && line[i] !== '"') {
+        if (line[i] === '\\') i++;
+        token += line[i++];
+      }
+      i++; // closing quote
+    } else {
+      while (i < line.length && line[i] !== ' ') token += line[i++];
+    }
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+// --- KeychainKeySource ---------------------------------------------------------------------
+
+describe('KeychainKeySource', () => {
+  it('returns an existing key without writing', () => {
+    const hex = randomBytes(32).toString('hex');
+    const store = new Map([[`${VAULT_KEY_SERVICE} ${VAULT_KEY_ACCOUNT}`, hex]]);
+    const { run, calls } = fakeSecurity(store);
+
+    const key = new KeychainKeySource(run).getOrCreateKey();
+    expect(key.toString('hex')).toBe(hex);
+    expect(calls.every((c) => c.args[0] === 'find-generic-password')).toBe(true);
+  });
+
+  it('creates a key on first run and the SECRET RIDES STDIN, never argv', () => {
+    const store = new Map<string, string>();
+    const { run, calls } = fakeSecurity(store);
+
+    const key = new KeychainKeySource(run).getOrCreateKey();
+    expect(key.length).toBe(32);
+    // The stored value round-trips through a subsequent read.
+    expect(new KeychainKeySource(run).getOrCreateKey().equals(key)).toBe(true);
+
+    const writes = calls.filter((c) => c.args[0] === '-i');
+    expect(writes).toHaveLength(1);
+    const hex = key.toString('hex');
+    expect(writes[0]?.input).toContain(hex); // secret went via stdin...
+    for (const call of calls) {
+      expect(call.args.join(' ')).not.toContain(hex); // ...and NEVER via argv
+    }
+  });
+
+  it('rejects a malformed key found in the keychain instead of using it', () => {
+    const store = new Map([[`${VAULT_KEY_SERVICE} ${VAULT_KEY_ACCOUNT}`, 'not-hex!']]);
+    const { run } = fakeSecurity(store);
+    expect(() => new KeychainKeySource(run).getOrCreateKey()).toThrow(VaultError);
+  });
+
+  it('propagates non-not-found keychain failures as VaultError', () => {
+    const run: ExecRunner = () => {
+      const err = new Error('security failed') as Error & { stderr: string };
+      err.stderr = 'security: SecKeychainCopyDefault: A keychain cannot be found.';
+      throw err;
+    };
+    expect(() => new KeychainKeySource(run).getOrCreateKey()).toThrow(VaultError);
+  });
+});
+
+// --- KeychainProtector ---------------------------------------------------------------------
+
+describe('KeychainProtector', () => {
+  it('refuses to run off macOS (mirror of DpapiProtector win32 guard)', () => {
+    const { run } = fakeSecurity(new Map());
+    const p = new KeychainProtector(new KeychainKeySource(run), 'win32');
+    expect(() => p.protect(Buffer.from('x'))).toThrow(/only available on macOS/);
+    expect(() => p.unprotect('aesgcm:AAAA')).toThrow(/only available on macOS/);
+  });
+
+  it('round-trips through the keychain-held key on darwin', () => {
+    const { run } = fakeSecurity(new Map());
+    const p = new KeychainProtector(new KeychainKeySource(run), 'darwin');
+    const secret = Buffer.from(JSON.stringify({ accessToken: 'a', refreshToken: 'b' }));
+    expect(p.unprotect(p.protect(secret)).equals(secret)).toBe(true);
+  });
+
+  it('two protectors sharing one keychain interoperate (same stored key)', () => {
+    const store = new Map<string, string>();
+    const a = new KeychainProtector(new KeychainKeySource(fakeSecurity(store).run), 'darwin');
+    const b = new KeychainProtector(new KeychainKeySource(fakeSecurity(store).run), 'darwin');
+    const secret = Buffer.from('shared');
+    expect(b.unprotect(a.protect(secret)).equals(secret)).toBe(true);
+  });
+});
+
+// --- KeychainCredentialChannel ---------------------------------------------------------------
+
+const OAUTH: ClaudeOauth = { accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: 123 };
+const SERVICE = 'Claude Code-credentials';
+const itemKey = `${SERVICE} tester`;
+
+function channelWith(store: Map<string, string>) {
+  const fake = fakeSecurity(store);
+  return {
+    channel: new KeychainCredentialChannel({ account: 'tester', run: fake.run }),
+    calls: fake.calls,
+    store,
+  };
+}
+
+describe('KeychainCredentialChannel', () => {
+  it('reads the wrapped (.credentials.json-shaped) payload', async () => {
+    const { channel } = channelWith(
+      new Map([[itemKey, JSON.stringify({ claudeAiOauth: OAUTH, other: 1 })]]),
+    );
+    expect(await channel.readLiveCredentials()).toEqual(OAUTH);
+  });
+
+  it('reads a bare oauth-block payload', async () => {
+    const { channel } = channelWith(new Map([[itemKey, JSON.stringify(OAUTH)]]));
+    expect(await channel.readLiveCredentials()).toEqual(OAUTH);
+  });
+
+  it('tolerates hex output from find-generic-password', async () => {
+    const hex = Buffer.from(JSON.stringify({ claudeAiOauth: OAUTH }), 'utf8').toString('hex');
+    const { channel } = channelWith(new Map([[itemKey, hex]]));
+    expect(await channel.readLiveCredentials()).toEqual(OAUTH);
+  });
+
+  it('reads undefined when the item does not exist (= nobody logged in)', async () => {
+    const { channel } = channelWith(new Map());
+    expect(await channel.readLiveCredentials()).toBeUndefined();
+  });
+
+  it('write preserves sibling keys in a wrapped payload (surgical rule)', async () => {
+    const { channel, store } = channelWith(
+      new Map([[itemKey, JSON.stringify({ claudeAiOauth: OAUTH, scopes: ['x'] })]]),
+    );
+    const next: ClaudeOauth = { accessToken: 'at-2', refreshToken: 'rt-2', expiresAt: 456 };
+    await channel.writeLiveCredentials(next);
+    expect(JSON.parse(store.get(itemKey)!)).toEqual({ claudeAiOauth: next, scopes: ['x'] });
+  });
+
+  it('write preserves the bare shape when the CLI used one', async () => {
+    const { channel, store } = channelWith(new Map([[itemKey, JSON.stringify(OAUTH)]]));
+    const next: ClaudeOauth = { accessToken: 'at-2', refreshToken: 'rt-2', expiresAt: 456 };
+    await channel.writeLiveCredentials(next);
+    expect(JSON.parse(store.get(itemKey)!)).toEqual(next);
+  });
+
+  it('write survives the quoting round-trip: JSON with quotes/spaces goes via stdin only', async () => {
+    const { channel, calls, store } = channelWith(new Map());
+    await channel.writeLiveCredentials(OAUTH);
+    // The fake's tokenizer applies `security -i` quoting rules — the stored payload parsing
+    // back exactly proves quoteSecurityArg's escaping is self-consistent.
+    expect(JSON.parse(store.get(itemKey)!)).toEqual({ claudeAiOauth: OAUTH });
+    const writes = calls.filter((c) => c.args[0] === '-i');
+    expect(writes).toHaveLength(1);
+    for (const call of calls) {
+      expect(call.args.join(' ')).not.toContain(OAUTH.accessToken); // tokens never on argv
+    }
+  });
+
+  it('surfaces a non-JSON keychain item as a VaultError, never silently', async () => {
+    const { channel } = channelWith(new Map([[itemKey, 'not json at all']]));
+    await expect(channel.readLiveCredentials()).rejects.toThrow(VaultError);
+  });
+});
