@@ -30,9 +30,17 @@ import {
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { runDaemon } from './daemonRun.js';
-import { detectPalette, outlookStyle } from './ansi.js';
+import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
 import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
 import { renderDoctor, runDoctor, summarize } from './doctor.js';
+import {
+  daemonSettingsPath,
+  readSettingsReport,
+  renderSettings,
+  resolveCliSettings,
+  resolveDaemonConfig,
+  type SettingsSection,
+} from './settings.js';
 
 const VERSION = '0.1.0';
 
@@ -118,6 +126,29 @@ export function buildProgram(): Command {
       // The burn-down plan turns the timeline into advice: what to use now and what to burn.
       if (inputs.length > 0) text += '\n\n' + renderPlanSummary(computePlan(inputs));
       process.stdout.write(text + '\n');
+    });
+
+  program
+    .command('settings')
+    .description('show every configurable setting: effective value and where it came from')
+    .action(async () => {
+      const sections: SettingsSection[] = [
+        { title: 'cli (this shell)', rows: resolveCliSettings(process.env, colorEnabled()) },
+      ];
+      // Prefer the report the daemon persisted at its last start — those are the values it
+      // is ACTUALLY running with. Without one, preview what a daemon started from this
+      // shell would resolve (flags absent, env + defaults only).
+      const report = await readSettingsReport(daemonSettingsPath());
+      if (report) {
+        const since = new Date(report.startedAtMs).toLocaleString();
+        sections.push({ title: `daemon (effective since ${since})`, rows: report.settings });
+      } else {
+        sections.push({
+          title: 'daemon (no daemon has run yet — what `cctl daemon run` would use)',
+          rows: resolveDaemonConfig(process.env).rows,
+        });
+      }
+      process.stdout.write(renderSettings(sections, detectPalette()) + '\n');
     });
 
   program

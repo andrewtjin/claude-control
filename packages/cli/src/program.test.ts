@@ -13,6 +13,7 @@ describe('buildProgram', () => {
     // Daemon-backed placeholders are present so the surface is discoverable.
     expect(names).toContain('usage');
     expect(names).toContain('timeline');
+    expect(names).toContain('settings');
     expect(names).toContain('pair');
   });
 
