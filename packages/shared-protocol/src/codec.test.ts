@@ -54,6 +54,37 @@ describe('encode/decode round-trip', () => {
   });
 });
 
+describe('settings.snapshot', () => {
+  it('round-trips a settings report', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'settings.snapshot',
+      payload: {
+        startedAtMs: 1_700_000_000_000,
+        settings: [
+          { name: 'auto-switch', value: 'on', source: 'flag' },
+          { name: 'switch trigger', value: '94% used', source: 'default', detail: 'CCTL_...' },
+        ],
+      },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.envelope).toEqual(env);
+  });
+
+  it('rejects a source outside default/env/flag', () => {
+    const raw = JSON.stringify({
+      v: PROTOCOL_VERSION,
+      id: 'x',
+      ts: 0,
+      daemonId: 'd',
+      type: 'settings.snapshot',
+      payload: { startedAtMs: 0, settings: [{ name: 'n', value: 'v', source: 'magic' }] },
+    });
+    expect(decode(raw).ok).toBe(false);
+  });
+});
+
 describe('decode never throws', () => {
   it('rejects non-JSON with a reason', () => {
     const result = decode('not json{');

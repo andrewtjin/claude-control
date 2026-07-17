@@ -14,7 +14,7 @@ import { createAgentSdkClient as defaultCreateAgentSdkClient } from '@claude-con
 import type { AgentSdkClient } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
-import type { EnvelopeDraft, MessageOf } from '@claude-control/shared-protocol';
+import type { EnvelopeDraft, MessageOf, PayloadOf } from '@claude-control/shared-protocol';
 import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
 import { UsagePoller, type PollAccount } from './usagePoller.js';
@@ -48,6 +48,10 @@ export interface DaemonOptions {
   controlPlaneClient: ControlPlaneClient;
   /** Opt-in: evaluated after every poll cycle; absent = auto-switching disabled. */
   autoSwitcher?: AutoSwitcherLike;
+  /** The effective-settings report resolved at startup (see cli/settings.ts). When present
+   *  it is re-pushed with every poll cycle — settings never change mid-run, but the bot's
+   *  cache is in-memory, so the repeat is what survives a bot restart. */
+  settingsReport?: PayloadOf<'settings.snapshot'>;
   /** WET-GATED real Agent SDK adapter, overridable so tests never touch a real SDK. */
   createAgentSdkClient?: () => AgentSdkClient;
   /** How often to poll usage and re-sync attribution. */
@@ -73,6 +77,7 @@ export class Daemon {
   private readonly hookReceiver: HookReceiver;
   private readonly controlPlaneClient: ControlPlaneClient;
   private readonly autoSwitcher: AutoSwitcherLike | undefined;
+  private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
   private readonly createAgentSdkClient: () => AgentSdkClient;
   private readonly pollIntervalMs: number;
   private readonly logger: Logger;
@@ -92,6 +97,7 @@ export class Daemon {
     this.hookReceiver = options.hookReceiver;
     this.controlPlaneClient = options.controlPlaneClient;
     this.autoSwitcher = options.autoSwitcher;
+    this.settingsReport = options.settingsReport;
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.logger = options.logger ?? noopLogger;
@@ -191,6 +197,13 @@ export class Daemon {
       type: 'usage.snapshot',
       payload: { accounts: snapshot.accounts, plan: snapshot.plan },
     });
+
+    // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
+    // and re-sending keeps `/settings` answerable even after the bot restarts and loses its
+    // in-memory cache.
+    if (this.settingsReport) {
+      this.sendEnvelope({ type: 'settings.snapshot', payload: this.settingsReport });
+    }
 
     // Auto-switch runs AFTER the snapshot ships, so the phone always sees the usage state
     // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
