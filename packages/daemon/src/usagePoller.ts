@@ -189,7 +189,10 @@ export class UsagePoller {
       tokenError = err instanceof Error ? err.message : String(err);
     }
     if (token === undefined) {
-      const usage = await this.fetchCached(account, now, tokenError);
+      const usage =
+        tokenError !== undefined
+          ? await this.fallbackStale(account, now, tokenError)
+          : await this.fetchCached(account, now);
       this.recordSuccess(account.accountId, now);
       return { usage, outcome: 'cached' };
     }
@@ -205,7 +208,10 @@ export class UsagePoller {
 
       if (res.status === 429) {
         this.recordRateLimited(account.accountId, now);
-        const usage = await this.fetchCached(account, now);
+        // A 429 is a failure state like any other — it must reach the snapshot, never be
+        // swallowed (live incident 2026-07-17: an hour of silent 429s left the phone showing
+        // a stale wrong-account cache with no hint anything was failing).
+        const usage = await this.fallbackStale(account, now, 'usage endpoint rate-limited (429)');
         return { usage, outcome: 'cached' };
       }
 
@@ -213,7 +219,11 @@ export class UsagePoller {
         // Any other non-2xx is treated the same as a network failure below: fall back, but
         // don't apply 429-style backoff (a transient 5xx shouldn't silence future polls).
         this.recordSuccess(account.accountId, now);
-        const usage = await this.fetchCached(account, now, `usage endpoint returned ${res.status}`);
+        const usage = await this.fallbackStale(
+          account,
+          now,
+          `usage endpoint returned ${res.status}`,
+        );
         return { usage, outcome: 'cached' };
       }
 
@@ -229,10 +239,10 @@ export class UsagePoller {
       });
       return { usage, outcome: 'live' };
     } catch (err) {
-      // Network error (fetch rejected) — transient, no backoff penalty; fall back to tier-0.
+      // Network error (fetch rejected) — transient, no backoff penalty; fall back.
       this.recordSuccess(account.accountId, now);
       const message = err instanceof Error ? err.message : String(err);
-      const usage = await this.fetchCached(
+      const usage = await this.fallbackStale(
         account,
         now,
         `usage endpoint request failed: ${message}`,
@@ -273,9 +283,13 @@ export class UsagePoller {
   }
 
   private recordSuccess(accountId: string, now: number): void {
+    const prior = this.state.get(accountId);
     this.state.set(accountId, {
       consecutive429s: 0,
       nextDueAtMs: now + POLL_FLOOR_MS + this.jitter(),
+      // Timing bookkeeping must never discard the retained data — `fallbackStale` (and the
+      // skipped-cycle path) still need the last real result after this entry is rewritten.
+      ...(prior?.lastResult !== undefined ? { lastResult: prior.lastResult } : {}),
     });
   }
 
@@ -288,7 +302,41 @@ export class UsagePoller {
     this.state.set(accountId, {
       consecutive429s,
       nextDueAtMs: now + Math.max(POLL_FLOOR_MS, backoffMs) + this.jitter(),
+      ...(prior?.lastResult !== undefined ? { lastResult: prior.lastResult } : {}),
     });
+  }
+
+  /**
+   * Fall back for a poll that failed for `reason`: serve the FRESHEST stale data available —
+   * the tier-0 cache or the retained last real result — with the failure reason stamped on it.
+   * Tier-0 only describes the active account (and only as of when the CLI last wrote it); a
+   * retained result is often fresher and always describes THIS account, so pick by the data's
+   * own `fetchedAtMs`, preferring whichever side actually carries limits.
+   */
+  private async fallbackStale(
+    account: PollAccount,
+    now: number,
+    reason: string,
+  ): Promise<ParsedUsage> {
+    const tier0 = await this.fetchCached(account, now, reason);
+    const last = this.state.get(account.accountId)?.lastResult;
+    const lastHasData = last !== undefined && last.accountUsage.limits.length > 0;
+    const tier0HasData = tier0.accountUsage.limits.length > 0;
+    if (
+      !lastHasData ||
+      (tier0HasData && tier0.accountUsage.fetchedAtMs >= last.accountUsage.fetchedAtMs)
+    ) {
+      return tier0;
+    }
+    // Serve the retained result: identity re-stamped fresh, the ORIGINAL fetchedAtMs kept
+    // (the data really is that old), source 'cached' (it is no longer a live read), and the
+    // error REPLACED with this cycle's reason — never appended, so re-serving the same
+    // retained result across many failed cycles can't accumulate error text.
+    const restamped = restampIdentity(last, account);
+    return {
+      accountUsage: { ...restamped.accountUsage, source: 'cached', error: reason },
+      advisorInput: restamped.advisorInput,
+    };
   }
 
   private jitter(): number {

@@ -369,4 +369,79 @@ describe('UsagePoller', () => {
     expect(snapshot.plan.recommendedAccountId).toBe('acct-2');
     expect(snapshot.plan.ranking).toHaveLength(2);
   });
+
+  it('429 surfaces a rate-limited note on the snapshot instead of failing silently', async () => {
+    const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(429, {})));
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(10)),
+      clock: () => 1000,
+    });
+    const snapshot = await poller.pollAll([account]);
+    expect(snapshot.results[0]?.outcome).toBe('cached');
+    expect(snapshot.accounts[0]?.limits[0]?.percent).toBe(10);
+    // The failure state must render — never a clean-looking cached card.
+    expect(snapshot.accounts[0]?.error).toMatch(/rate-limited \(429\)/);
+  });
+
+  it('on 429 the retained last live result beats an absent/staler tier-0 cache', async () => {
+    let now = 1000;
+    let status = 200;
+    const fetchFn: FetchLike = vi.fn(() =>
+      Promise.resolve(status === 200 ? jsonResponse(200, liveBody(45)) : jsonResponse(429, {})),
+    );
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(undefined), // no usable tier-0 (e.g. foreign cache)
+      clock: () => now,
+      random: () => 0,
+    });
+
+    // First cycle: a real live read (45%) is retained.
+    await poller.pollAll([account]);
+
+    // Next due cycle 429s: the account must keep reporting the last REAL numbers — stamped
+    // with their ORIGINAL fetch time and 'cached' source — plus the rate-limited reason,
+    // rather than an empty wrong-shape tier-0 parse.
+    status = 429;
+    now += POLL_FLOOR_MS + 1;
+    const snapshot = await poller.pollAll([account]);
+    const usage = snapshot.accounts[0];
+    expect(usage?.limits[0]?.percent).toBe(45);
+    expect(usage?.fetchedAtMs).toBe(1000);
+    expect(usage?.source).toBe('cached');
+    expect(usage?.error).toMatch(/rate-limited \(429\)/);
+
+    // Repeated 429 cycles must not accumulate error text on the re-served result.
+    now += POLL_FLOOR_MS + 1;
+    const again = await poller.pollAll([account]);
+    expect(again.accounts[0]?.error).toBe('usage endpoint rate-limited (429)');
+  });
+
+  it('on 429 a FRESHER tier-0 cache (by its own fetchedAtMs) beats the retained result', async () => {
+    let now = 1000;
+    let status = 200;
+    const fetchFn: FetchLike = vi.fn(() =>
+      Promise.resolve(status === 200 ? jsonResponse(200, liveBody(45)) : jsonResponse(429, {})),
+    );
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      // Tier-0 written AFTER the live read (CLI refreshed its own cache meanwhile).
+      getCachedUsage: () =>
+        Promise.resolve({ fetchedAtMs: 5000, limits: [{ kind: 'session', percent: 60 }] }),
+      clock: () => now,
+      random: () => 0,
+    });
+
+    await poller.pollAll([account]); // live 45% retained at t=1000
+    status = 429;
+    now += POLL_FLOOR_MS + 1;
+    const snapshot = await poller.pollAll([account]);
+    expect(snapshot.accounts[0]?.limits[0]?.percent).toBe(60);
+    expect(snapshot.accounts[0]?.fetchedAtMs).toBe(5000);
+    expect(snapshot.accounts[0]?.error).toMatch(/rate-limited \(429\)/);
+  });
 });
