@@ -130,6 +130,13 @@ const PermissionRequestPayload = z.object({
   detail: z.string().nullish(),
   cwd: z.string().nullish(),
   expiresAt: z.number().int().nonnegative().nullish(),
+  /** The session's Claude Code permission mode (hook field `permission_mode`), e.g.
+   *  'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'. A tolerant string, not an
+   *  enum: Claude ships new modes without notice, and rejecting the whole frame over an
+   *  unknown mode would blind the phone to a real request. The bot's contract (plan §4):
+   *  approve/deny buttons ONLY when this is exactly 'default'; absent or unrecognized
+   *  modes get an informational card — fail-safe, never a button that lies. */
+  permissionMode: z.string().min(1).nullish(),
 });
 
 const PermissionResponsePayload = z.object({
@@ -154,12 +161,29 @@ const SessionSpawnPayload = z.object({
   idempotencyKey: IdempotencyKey,
 });
 
+/** Long output is a presentation problem, not a wire problem (decision, plan §4 "no silent
+ *  truncation"): the daemon streams ALL output as ordered `seq` chunks and never drops text;
+ *  when accumulated output crosses its inline-display threshold the BOT re-materializes the
+ *  chunks as a file attachment. No attachment wire type exists — attachments would duplicate
+ *  the chunk stream's content while adding a second delivery path to keep honest. `truncated`
+ *  stays as the daemon's explicit marker for the rare case a source itself truncated (e.g. a
+ *  capped scrollback), so the UI can label the gap instead of pretending completeness. */
 const SessionOutputPayload = z.object({
   sessionId: SessionId,
   seq: z.number().int().nonnegative(),
   kind: z.enum(['stdout', 'milestone', 'summary', 'error']),
   text: z.string(),
   truncated: z.boolean().default(false),
+});
+
+/** Phone-initiated stop of a managed session. Deliberately minimal: escalation semantics
+ *  (interrupt → grace window → hard stop) are a daemon policy, not a wire choice, and the
+ *  acknowledgment rides on the `session.status` transitions the daemon already emits
+ *  (running → done/failed) — a dedicated stop.result would be a second source of truth.
+ *  `idempotencyKey` lets a double-tapped Stop button resolve to "already handled". */
+const SessionStopPayload = z.object({
+  sessionId: SessionId,
+  idempotencyKey: IdempotencyKey,
 });
 
 const SessionStatusPayload = z.object({
@@ -178,12 +202,23 @@ const SessionStatusPayload = z.object({
   summary: z.string().nullish(),
 });
 
+/** Widened (not split into done/waiting variants) on purpose: title/body/level stays the one
+ *  required contract every bot version can render, so an N-1 bot shows a plain notification
+ *  where a current bot shows a rich done/waiting card. New variant TYPES would instead be
+ *  dropped whole by the older peer's envelope parse — a silent notification loss. */
 const HookNotificationPayload = z.object({
   event: z.enum(['permission', 'stop', 'notification']),
   sessionId: SessionId.nullish(),
   title: z.string(),
   body: z.string(),
   level: z.enum(['info', 'warn', 'success']).default('info'),
+  /** Raw hook `notification_type` (e.g. 'idle_prompt'). Tolerant string for the same reason
+   *  as `permissionMode`: the bot keys "waiting on you" cards off known values and falls back
+   *  to the generic card for anything else — never rejects the frame. */
+  notificationType: z.string().min(1).nullish(),
+  /** On Stop events: the hook's `last_assistant_message`, so the done card can show WHAT
+   *  Claude finished saying rather than a bare "session ended". */
+  lastAssistantMessage: z.string().nullish(),
 });
 
 // ---- control frames (socket lifecycle; not user-facing) ----
@@ -254,6 +289,7 @@ export const messageSchemas = {
   'session.spawn': frame('session.spawn', SessionSpawnPayload),
   'session.output': frame('session.output', SessionOutputPayload),
   'session.status': frame('session.status', SessionStatusPayload),
+  'session.stop': frame('session.stop', SessionStopPayload),
   'hook.notification': frame('hook.notification', HookNotificationPayload),
   hello: frame('hello', HelloPayload),
   'hello.result': frame('hello.result', HelloResultPayload),
@@ -275,6 +311,7 @@ export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['session.spawn'],
   messageSchemas['session.output'],
   messageSchemas['session.status'],
+  messageSchemas['session.stop'],
   messageSchemas['hook.notification'],
   messageSchemas.hello,
   messageSchemas['hello.result'],
