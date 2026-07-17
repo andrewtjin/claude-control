@@ -42,6 +42,7 @@ import type {
   CredentialBundle,
   OauthAccount,
   RecoverResult,
+  RefreshTokenResult,
   StoredAccount,
 } from './types.js';
 import { Vault } from './vault.js';
@@ -289,6 +290,74 @@ export class SwitchEngine {
   }
 
   /**
+   * Refresh an account's access token in the VAULT without changing the active account or
+   * touching the live credential files. Built for the daemon's usage poller, whose peek-only
+   * vault reads go blind once an idle account's access token expires.
+   *
+   * Runs under the same credential lock as `activate()` and persists the rotated (single-use)
+   * refresh token the instant it arrives — the one non-negotiable invariant of this engine.
+   * Two deliberate refusals:
+   *   - A fresh token (outside the skew window) is not refreshed: `skippedReason: 'token_fresh'`.
+   *   - The ACTIVE account is never network-refreshed: its refresh token is the same single-use
+   *     token the live files (and the running CLI) hold, so consuming it here would strand the
+   *     live session with a dead token. Instead any CLI-side rotation is adopted into the vault
+   *     (which may itself un-expire the vault copy): `skippedReason: 'active_account'`.
+   *
+   * @throws {UnknownAccountError} / {QuarantineError} as `activate()` does; a dead refresh
+   *   token (invalid_grant) quarantines the account, a transient failure just propagates.
+   */
+  async refreshToken(targetId: string): Promise<RefreshTokenResult> {
+    const target = await this.vault.getAccount(targetId);
+    if (!target) throw new UnknownAccountError(targetId);
+    if (target.quarantined) {
+      throw new QuarantineError(`account "${target.label}" is quarantined; re-login required`);
+    }
+
+    const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
+    try {
+      const activeId = await this.vault.getActiveId();
+
+      if (targetId === activeId) {
+        // Active account: adopt-only (see the method comment for why we never refresh it).
+        const liveNow = await this.credStore.readLiveCredentials();
+        const liveOauthAccount = await this.credStore.readOauthAccount();
+        const adopted = await this.adoptRotationIfNeeded(activeId, liveNow, liveOauthAccount);
+        const bundle = await this.vault.readBundle(targetId);
+        return {
+          accountId: targetId,
+          refreshed: false,
+          skippedReason: 'active_account',
+          adoptedLiveRotation: adopted,
+          expiresAt: bundle.claudeAiOauth.expiresAt,
+        };
+      }
+
+      const bundle = await this.vault.readBundle(targetId);
+      if (bundle.claudeAiOauth.expiresAt - this.clock() >= this.refreshSkewMs) {
+        return {
+          accountId: targetId,
+          refreshed: false,
+          skippedReason: 'token_fresh',
+          expiresAt: bundle.claudeAiOauth.expiresAt,
+        };
+      }
+
+      const updated = await this.refreshAndPersist(targetId, bundle);
+      this.audit.append({
+        ts: this.clock(),
+        event: 'refreshed',
+        fromAccountId: targetId,
+        toAccountId: targetId,
+        detail: 'background refresh (usage polling)',
+      });
+      this.log.info({ targetId }, 'background token refresh persisted');
+      return { accountId: targetId, refreshed: true, expiresAt: updated.claudeAiOauth.expiresAt };
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
    * Recover from a switch that crashed mid-flight. Called on daemon/CLI startup. Rolls the
    * operation forward if the new credentials are already live and valid, otherwise restores
    * the previous account from the encrypted snapshot.
@@ -387,11 +456,29 @@ export class SwitchEngine {
     return true;
   }
 
-  /** Refresh the target's token, persist the rotated token, and handle dead-token quarantine. */
+  /** Refresh the target's token for an in-flight `activate()` — the shared refresh core plus
+   *  the switch-specific cleanup (intent + rollback snapshot) on failure. */
   private async refreshTarget(
     targetId: string,
     bundle: CredentialBundle,
     hasRollback: boolean,
+  ): Promise<CredentialBundle> {
+    try {
+      return await this.refreshAndPersist(targetId, bundle);
+    } catch (err) {
+      // Nothing live has been written yet, so cleanup is just intent + snapshot.
+      await this.intent.clear();
+      if (hasRollback) await this.vault.clearRollback();
+      throw err;
+    }
+  }
+
+  /** The locked refresh core shared by `activate()` and `refreshToken()`: exchange the token,
+   *  persist the rotated (single-use) result IMMEDIATELY, quarantine on permanent death.
+   *  Callers must hold the credential lock. */
+  private async refreshAndPersist(
+    targetId: string,
+    bundle: CredentialBundle,
   ): Promise<CredentialBundle> {
     try {
       const next = await this.refresh(bundle.claudeAiOauth, this.refreshDeps);
@@ -400,9 +487,6 @@ export class SwitchEngine {
       await this.vault.writeBundle(targetId, updated);
       return updated;
     } catch (err) {
-      // Nothing live has been written yet, so cleanup is just intent + snapshot.
-      await this.intent.clear();
-      if (hasRollback) await this.vault.clearRollback();
       if (err instanceof QuarantineError) {
         await this.vault.quarantine(targetId, err.message);
         this.audit.append({

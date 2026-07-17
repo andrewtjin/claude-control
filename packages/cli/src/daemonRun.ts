@@ -36,6 +36,7 @@ import {
 } from '@claude-control/daemon';
 import { createSessionManager } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath } from './context.js';
+import { createPollTokenGetter } from './pollTokenGetter.js';
 
 const DEFAULT_RELAY_URL = 'ws://127.0.0.1:8765';
 
@@ -116,22 +117,20 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   if (options.pair) await rm(identityPath, { force: true });
   const identityStore = dpapiIdentityStore(identityPath, protector);
 
-  // The poller reads tokens straight from the vault WITHOUT switching. Peek-only by design:
-  // refreshing here would consume single-use refresh tokens outside the engine's locked
-  // refresh-and-persist path, so a near-expiry/expired token just falls back to tier-0.
+  // The poller reads tokens straight from the vault WITHOUT switching. When an idle
+  // account's vault token has expired, the getter asks the ENGINE to refresh it — inside the
+  // same locked refresh-and-persist path activate() uses (single-use refresh tokens are never
+  // consumed outside that lock) — then retries the read once. Attempts are rate-limited per
+  // account (1h floor, backoff on failure); a failure still falls back to tier-0, with the
+  // reason surfaced on that account's snapshot entry.
   const pollVault = new Vault(paths.vaultDir, protector);
   const poller = new UsagePoller({
     fetch: (url, init) => globalThis.fetch(url, init),
-    getToken: async (accountId) => {
-      try {
-        const bundle = await pollVault.readBundle(accountId);
-        const oauth = bundle.claudeAiOauth;
-        if (oauth.expiresAt - Date.now() < POLL_TOKEN_MIN_TTL_MS) return undefined;
-        return oauth.accessToken;
-      } catch {
-        return undefined; // unreadable bundle → tier-0 fallback, never a poll crash
-      }
-    },
+    getToken: createPollTokenGetter({
+      vault: pollVault,
+      engine,
+      minTtlMs: POLL_TOKEN_MIN_TTL_MS,
+    }),
     // Tier-0 cache lives in the live ~/.claude.json, which only ever describes the ACTIVE
     // account — any other account has no cache to fall back to.
     getCachedUsage: async (accountId) => {
