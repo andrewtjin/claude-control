@@ -7,7 +7,11 @@ import {
   buildPermissionRequestEmbed,
   buildSwitchResultEmbed,
   buildTimelineEmbed,
+  buildDoneEmbed,
+  buildWaitingEmbed,
+  buildQuarantineEmbed,
 } from './embeds.js';
+import { NOTIFICATION_COLOR } from './richFormat.js';
 import type { SessionStatus } from './stateCache.js';
 
 function account(overrides: Partial<AccountUsage> = {}): AccountUsage {
@@ -257,7 +261,7 @@ describe('buildSessionListEmbed', () => {
 
 describe('buildPermissionRequestEmbed', () => {
   it('sets the summary as the description and adds detail when present', () => {
-    const embed = buildPermissionRequestEmbed('run rm -rf', 'in /tmp/scratch').toJSON();
+    const embed = buildPermissionRequestEmbed('run rm -rf', 'in /tmp/scratch', 'default').toJSON();
     expect(embed.description).toBe('run rm -rf');
     expect(embed.fields?.[0]?.value).toBe('in /tmp/scratch');
   });
@@ -265,6 +269,57 @@ describe('buildPermissionRequestEmbed', () => {
   it('omits the detail field when none is given', () => {
     const embed = buildPermissionRequestEmbed('run rm -rf').toJSON();
     expect(embed.fields ?? []).toHaveLength(0);
+  });
+
+  it('is an actionable (warn) card in default mode', () => {
+    const embed = buildPermissionRequestEmbed('run rm -rf', undefined, 'default').toJSON();
+    expect(embed.title).toBe('Permission requested');
+    expect(embed.color).toBe(0xf1c40f);
+    expect(embed.footer?.text).toMatch(/approve or deny/i);
+  });
+
+  it('is an informational (info) card that explains why in a non-default mode', () => {
+    const embed = buildPermissionRequestEmbed('run rm -rf', undefined, 'acceptEdits').toJSON();
+    expect(embed.title).toBe('Permission (auto-handled)');
+    expect(embed.color).toBe(0x3498db);
+    expect(embed.footer?.text).toContain('acceptEdits');
+    // Description still names WHAT was requested, even though it can't be actioned here.
+    expect(embed.description).toBe('run rm -rf');
+  });
+});
+
+describe('lifecycle cards (done / waiting / quarantine)', () => {
+  it('buildDoneEmbed shows the last assistant message and a green ✅ card', () => {
+    const embed = buildDoneEmbed({ sessionId: 's1', lastAssistantMessage: 'Shipped it.' }).toJSON();
+    expect(embed.title).toContain('✅');
+    expect(embed.color).toBe(NOTIFICATION_COLOR.done);
+    expect(embed.description).toBe('Shipped it.');
+    expect(embed.fields?.[0]?.value).toBe('s1');
+  });
+
+  it('buildDoneEmbed labels a truncated long message instead of cutting silently', () => {
+    const long = 'x'.repeat(5000);
+    const embed = buildDoneEmbed({ lastAssistantMessage: long }).toJSON();
+    expect(embed.description!.length).toBeLessThanOrEqual(4096);
+    expect(embed.description).toContain('chars truncated');
+  });
+
+  it('buildWaitingEmbed is a blue 🔔 "your turn" card', () => {
+    const embed = buildWaitingEmbed({ sessionId: 's1', body: 'Reply to continue.' }).toJSON();
+    expect(embed.title).toContain('🔔');
+    expect(embed.color).toBe(NOTIFICATION_COLOR.waiting);
+    expect(embed.description).toBe('Reply to continue.');
+  });
+
+  it('buildQuarantineEmbed prints the injected host re-login command verbatim', () => {
+    const embed = buildQuarantineEmbed({
+      body: 'Work is quarantined.',
+      reloginCommand: 'cctl accounts add <label> --fresh',
+    }).toJSON();
+    expect(embed.title).toContain('🚫');
+    expect(embed.color).toBe(NOTIFICATION_COLOR.quarantine);
+    const fix = embed.fields?.find((f) => f.name === 'Fix it on the host');
+    expect(fix?.value).toContain('cctl accounts add <label> --fresh');
   });
 });
 

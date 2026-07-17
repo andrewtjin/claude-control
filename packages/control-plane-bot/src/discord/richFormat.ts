@@ -120,3 +120,49 @@ export function accountMarker(account: {
   if (account.error) return '⚠️';
   return account.active ? '🟢' : '⚪';
 }
+
+/** The three lifecycle notification cards get their OWN visual language, deliberately distinct
+ *  from the usage `SEVERITY_COLOR` gradient: a usage bar is a *measurement*, these are *events*
+ *  that demand (or celebrate) a specific reaction, so they must never be mistaken for a usage
+ *  band. 'done' = finished, no action; 'waiting' = your turn, act; 'quarantine' = an account is
+ *  down and only a host-side re-login fixes it. */
+export type NotificationKind = 'done' | 'waiting' | 'quarantine';
+
+/** Embed accent color per lifecycle card. Green reads "complete", blue "your calm attention",
+ *  red "action required" — the red intentionally matches `SEVERITY_COLOR.critical` because a
+ *  quarantined account is, for planning purposes, as bad as an exhausted one. */
+export const NOTIFICATION_COLOR: Record<NotificationKind, number> = {
+  done: 0x2ecc71,
+  waiting: 0x3498db,
+  quarantine: SEVERITY_COLOR.critical,
+};
+
+/** Leading icon per lifecycle card — the phone-first signal (color alone doesn't survive a
+ *  grayscale glance or an accent-blind viewer, so the icon carries the meaning too). */
+export const NOTIFICATION_ICON: Record<NotificationKind, string> = {
+  done: '✅',
+  waiting: '🔔',
+  quarantine: '🚫',
+};
+
+/** Discord embed length ceilings we truncate against. Exceeding either makes discord.js throw
+ *  at send time, which would drop the whole card — so a long field is shortened, never omitted. */
+export const EMBED_DESCRIPTION_LIMIT = 4096;
+export const EMBED_FIELD_VALUE_LIMIT = 1024;
+
+/**
+ * Shorten `text` to at most `max` characters, appending a VISIBLE marker of exactly how much
+ * was cut. The plan bans silent truncation: a shortened `last_assistant_message` must say so,
+ * so the reader knows the tail exists (full text arrives via the M4 attachment path). The
+ * result is guaranteed ≤ `max` — the marker budget is reserved using the largest possible
+ * hidden-count width, so the returned string can never itself overflow the limit.
+ */
+export function truncateLabeled(text: string, max: number): string {
+  if (text.length <= max) return text;
+  // Reserve room for the worst-case marker (hidden count as wide as the whole string) so the
+  // final string — slice + marker — is always within `max`.
+  const reserve = ` … [+${text.length} chars truncated]`.length;
+  const cut = Math.max(0, max - reserve);
+  const hidden = text.length - cut;
+  return `${text.slice(0, cut)} … [+${hidden} chars truncated]`;
+}

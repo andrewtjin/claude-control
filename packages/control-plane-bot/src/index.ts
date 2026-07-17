@@ -25,14 +25,27 @@ export { atomicWriteFile, readJsonIfExists } from './fsutil.js';
 export { DaemonStateCache, type SessionStatus } from './discord/stateCache.js';
 export {
   buildUsageEmbed,
+  buildTimelineEmbed,
   buildAccountsEmbed,
   buildSessionListEmbed,
   buildPermissionRequestEmbed,
   buildSwitchResultEmbed,
+  buildDoneEmbed,
+  buildWaitingEmbed,
+  buildQuarantineEmbed,
 } from './discord/embeds.js';
+export {
+  NOTIFICATION_COLOR,
+  NOTIFICATION_ICON,
+  truncateLabeled,
+  EMBED_DESCRIPTION_LIMIT,
+  EMBED_FIELD_VALUE_LIMIT,
+  type NotificationKind,
+} from './discord/richFormat.js';
 export {
   handlePair,
   handleUsage,
+  handleTimeline,
   handleAccounts,
   handleSessions,
   handleStatus,
@@ -47,4 +60,22 @@ export {
   type CommandResult,
   type RunOptions,
 } from './discord/commands.js';
+export { renderPush, RELOGIN_COMMAND, type RenderedPush } from './discord/pushRender.js';
+export {
+  encodeButton,
+  decodeButton,
+  resolveTap,
+  isDestructive,
+  permissionButtons,
+  buttonIdempotencyKey,
+  CONFIRM_TTL_MS,
+  type ButtonAction,
+  type ButtonPhase,
+  type ButtonScope,
+  type ButtonStyle,
+  type ButtonSpec,
+  type ParsedButton,
+  type TapOutcome,
+} from './discord/buttons.js';
+export { SeenKeys, type SeenKeysOptions } from './discord/idempotencyGuard.js';
 export { DiscordJsGateway, type DiscordJsGatewayOptions } from './discord/discordJsGateway.js';

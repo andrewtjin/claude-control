@@ -8,27 +8,38 @@
 // untestable surface is as small as it can be.
 
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   GatewayIntentBits,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
-  type EmbedBuilder,
   type Interaction,
+  type MessageActionRowComponentBuilder,
   SlashCommandBuilder,
 } from 'discord.js';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { isType, type Envelope } from '@claude-control/shared-protocol';
+import type { Envelope } from '@claude-control/shared-protocol';
 import type { DiscordGateway } from './gateway.js';
 import type { RelaySender } from '../relay.js';
 import type { PairingService } from '../pairing.js';
 import type { Logger } from '../logger.js';
 import { noopLogger } from '../logger.js';
 import { DaemonStateCache } from './stateCache.js';
-import { buildPermissionRequestEmbed, buildSwitchResultEmbed } from './embeds.js';
 import { layeredBar } from './richFormat.js';
 import { ensureProgressEmojis, emojiResolverFrom, renderEmojiBar } from './emojiBars.js';
+import { renderPush, type RenderedPush } from './pushRender.js';
+import {
+  buttonIdempotencyKey,
+  resolveTap,
+  type ButtonSpec,
+  type ButtonStyle as ButtonSpecStyle,
+  type TapOutcome,
+} from './buttons.js';
+import { SeenKeys } from './idempotencyGuard.js';
 import * as commands from './commands.js';
 import type { CommandDeps, CommandResult } from './commands.js';
 
@@ -46,15 +57,25 @@ export interface DiscordJsGatewayOptions {
   /** Defaults to `process.env.DISCORD_BOT_TOKEN`; pass explicitly to override (tests that
    *  construct this class without calling `start()` never need a token at all). */
   token?: string;
+  /** Injectable time source for the two-tap confirm TTL and the idempotency guard's eviction.
+   *  Defaults to `Date.now`; overridden in wet-debugging only. */
+  clock?: () => number;
 }
 
-/** One rendered push: text, an embed, or both. `undefined` from `renderPush` means
- *  "cache-only" — the envelope updates DaemonStateCache but is not worth interrupting the
- *  user's phone for (e.g. raw stdout, or a snapshot they can pull with `/usage`). */
-interface RenderedPush {
-  content?: string;
-  embeds?: EmbedBuilder[];
-}
+/** discord.js styles keyed by our plain ButtonSpec style — the gateway is the one place that
+ *  translates the render structs into real components. */
+const BUTTON_STYLE: Record<ButtonSpecStyle, ButtonStyle> = {
+  primary: ButtonStyle.Primary,
+  secondary: ButtonStyle.Secondary,
+  success: ButtonStyle.Success,
+  danger: ButtonStyle.Danger,
+};
+
+/** Bot-side dedupe bounds: keep the last 2000 executed button keys for 15 minutes — comfortably
+ *  longer than the daemon's permission TTL, so a double-tap is caught for as long as the original
+ *  request could still be live, without unbounded growth. */
+const SEEN_KEYS_MAX = 2000;
+const SEEN_KEYS_TTL_MS = 15 * 60_000;
 
 /** discord.js-backed DiscordGateway: DMs the bound user for daemon-originated pushes, and
  *  registers/handles the slash-command + button surface, delegating all mapping logic to
@@ -65,10 +86,19 @@ export class DiscordJsGateway implements DiscordGateway {
   private readonly deps: CommandDeps;
   private readonly logger: Logger;
   private readonly token: string | undefined;
+  private readonly clock: () => number;
+  /** Executed-button dedupe (deliverable 5): a double-tap hits the same key and is dropped. */
+  private readonly seenKeys: SeenKeys;
 
   constructor(options: DiscordJsGatewayOptions) {
     this.logger = options.logger ?? noopLogger;
     this.token = options.token ?? process.env.DISCORD_BOT_TOKEN;
+    this.clock = options.clock ?? (() => Date.now());
+    this.seenKeys = new SeenKeys({
+      max: SEEN_KEYS_MAX,
+      ttlMs: SEEN_KEYS_TTL_MS,
+      clock: this.clock,
+    });
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
     this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -102,37 +132,47 @@ export class DiscordJsGateway implements DiscordGateway {
     await this.client.destroy();
   }
 
-  /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user. */
+  /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user. The render
+   *  DECISION lives in the pure `renderPush` (pushRender.ts); here we only inflate the plain
+   *  ButtonSpecs into discord.js rows and put it on the wire. */
   async deliver(discordUserId: string, envelope: Envelope): Promise<void> {
     this.cache.record(discordUserId, envelope);
-    const push = this.renderPush(envelope);
+    const push = renderPush(envelope);
     if (!push) return; // cache-only: not worth a DM
     try {
       const user = await this.client.users.fetch(discordUserId);
-      await user.send(push);
+      await user.send(this.toSendOptions(push));
     } catch (err) {
       this.logger.warn({ err, discordUserId }, 'discord: failed to DM user');
     }
   }
 
-  /** Which pushes are worth a DM, and how to render them. `undefined` means cache-only. */
-  private renderPush(envelope: Envelope): RenderedPush | undefined {
-    if (isType(envelope, 'permission.request')) {
-      const detail = envelope.payload.detail ?? undefined;
-      return { embeds: [buildPermissionRequestEmbed(envelope.payload.summary, detail)] };
-    }
-    if (isType(envelope, 'hook.notification')) {
-      return { content: `**${envelope.payload.title}**\n${envelope.payload.body}` };
-    }
-    if (isType(envelope, 'switch.result')) {
-      return { embeds: [buildSwitchResultEmbed(envelope.payload.ok, envelope.payload.message)] };
-    }
-    if (isType(envelope, 'session.output')) {
-      // Raw stdout is far too high-volume to DM; milestones/summaries/errors are worth it.
-      if (envelope.payload.kind === 'stdout') return undefined;
-      return { content: envelope.payload.text };
-    }
-    return undefined; // usage.snapshot / session.status / pair.result / etc: cache-only
+  /** Inflate a RenderedPush into discord.js send options (content + embeds + component rows).
+   *  Return type is inferred from the conditional spreads so no key is ever present-and-undefined
+   *  — `exactOptionalPropertyTypes` rejects `embeds: undefined` at the `user.send` boundary. */
+  private toSendOptions(push: RenderedPush) {
+    return {
+      ...(push.content !== undefined ? { content: push.content } : {}),
+      ...(push.embeds !== undefined ? { embeds: push.embeds } : {}),
+      ...(push.components !== undefined ? { components: this.toRows(push.components) } : {}),
+    };
+  }
+
+  /** ButtonSpec rows → discord.js ActionRows. The only spot in the package that touches
+   *  ButtonBuilder, keeping the button DECISIONS (buttons.ts) discord.js-free and unit-tested. */
+  private toRows(rows: ButtonSpec[][]): ActionRowBuilder<MessageActionRowComponentBuilder>[] {
+    return rows.map((row) => {
+      const builder = new ActionRowBuilder<MessageActionRowComponentBuilder>();
+      for (const spec of row) {
+        builder.addComponents(
+          new ButtonBuilder()
+            .setCustomId(spec.customId)
+            .setLabel(spec.label)
+            .setStyle(BUTTON_STYLE[spec.style]),
+        );
+      }
+      return builder;
+    });
   }
 
   private async registerCommands(): Promise<void> {
@@ -289,6 +329,7 @@ export class DiscordJsGateway implements DiscordGateway {
           this.deps,
           userId,
           interaction.options.getString('session', true),
+          idempotencyKey,
         );
         break;
       case 'approve':
@@ -322,23 +363,75 @@ export class DiscordJsGateway implements DiscordGateway {
     await this.reply(interaction, result);
   }
 
+  /** Button routing is the whole two-tap + dedupe surface, but every DECISION is made by the pure
+   *  `resolveTap`; this method only performs the discord.js side effect each outcome names. */
   private async onButton(interaction: ButtonInteraction): Promise<void> {
     const userId = interaction.user.id;
-    const idempotencyKey = randomUUID();
-    // customId encodes "<action>:<argument>", e.g. "switch:acct-123" or "approve:req-456" —
-    // set when the button was attached to a pushed embed (see renderPush's callers).
-    const [action, arg] = interaction.customId.split(':');
-    let result: CommandResult;
-    if (action === 'switch' && arg) {
-      result = commands.handleSwitch(this.deps, userId, arg, randomUUID(), idempotencyKey);
-    } else if (action === 'approve' && arg) {
-      result = commands.handleApprove(this.deps, userId, arg, 'once', idempotencyKey);
-    } else if (action === 'deny' && arg) {
-      result = commands.handleDeny(this.deps, userId, arg, 'once', idempotencyKey);
-    } else {
-      result = { kind: 'error', message: `unrecognized button: ${interaction.customId}` };
+    const outcome = resolveTap(interaction.customId, this.clock());
+    switch (outcome.kind) {
+      case 'ignore':
+        await interaction.reply({ content: `Error: ${outcome.reason}`, ephemeral: true });
+        return;
+      case 'confirm':
+      case 'restore':
+        // First tap of a destructive action (confirm) or a Cancel/expired one (restore): swap the
+        // message's button row in place — no command is sent either way.
+        await interaction.update({ components: this.toRows(outcome.rows) });
+        return;
+      case 'execute':
+        await this.executeButton(interaction, userId, outcome);
+        return;
     }
-    await this.reply(interaction, result);
+  }
+
+  /** Run a confirmed/single-tap button, guarded by the bot-side dedupe so a double-tap collapses
+   *  to "already handled" without a second command frame. */
+  private async executeButton(
+    interaction: ButtonInteraction,
+    userId: string,
+    outcome: Extract<TapOutcome, { kind: 'execute' }>,
+  ): Promise<void> {
+    const key = buttonIdempotencyKey(userId, outcome);
+    if (!this.seenKeys.markIfNew(key)) {
+      await interaction.reply({ content: 'Already handled.', ephemeral: true });
+      return;
+    }
+    const result = this.dispatchButton(userId, outcome, key);
+    // Clear the card's buttons so it can't be tapped again, then report the outcome ephemerally.
+    await interaction.update({ components: [] });
+    await this.followUp(interaction, result);
+  }
+
+  /** Map an executed button to its command handler. `switch` needs a fresh requestId per attempt;
+   *  the idempotency `key` is the deterministic dedupe key so a daemon-side resend is also idempotent. */
+  private dispatchButton(
+    userId: string,
+    outcome: Extract<TapOutcome, { kind: 'execute' }>,
+    key: string,
+  ): CommandResult {
+    const scope: 'once' | 'session' = outcome.scope === 'session' ? 'session' : 'once';
+    switch (outcome.action) {
+      case 'approve':
+        return commands.handleApprove(this.deps, userId, outcome.id, scope, key);
+      case 'deny':
+        return commands.handleDeny(this.deps, userId, outcome.id, scope, key);
+      case 'switch':
+        return commands.handleSwitch(this.deps, userId, outcome.id, randomUUID(), key);
+      case 'stop':
+        return commands.handleStop(this.deps, userId, outcome.id, key);
+    }
+  }
+
+  /** Report a command result on a button interaction that has already been acknowledged via
+   *  `update` — must use `followUp`, not `reply`. */
+  private async followUp(interaction: ButtonInteraction, result: CommandResult): Promise<void> {
+    if (result.kind === 'embed') {
+      await interaction.followUp({ embeds: [result.embed], ephemeral: true });
+    } else if (result.kind === 'text') {
+      await interaction.followUp({ content: result.text, ephemeral: true });
+    } else {
+      await interaction.followUp({ content: `Error: ${result.message}`, ephemeral: true });
+    }
   }
 
   private async reply(

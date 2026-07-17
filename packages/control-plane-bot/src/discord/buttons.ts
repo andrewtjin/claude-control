@@ -1,0 +1,239 @@
+// Button customId grammar + the two-tap confirm state machine for destructive actions.
+//
+// discord.js buttons carry no server state between taps — the ONLY thing that survives a tap is
+// the button's `customId` string. So the entire two-tap confirm flow is encoded there: a
+// destructive button ships ARMED, its first tap swaps the row for a Confirm/Cancel pair whose
+// customIds carry the arm timestamp, and only the second (Confirm) tap executes. This keeps every
+// bit of the decision PURE and unit-testable off `resolveTap(customId, now)` with no discord.js
+// and no fake timers — the gateway does nothing but translate the returned ButtonSpecs into
+// real components and route an `execute` to the matching command handler.
+
+/** The four things a button can ultimately do. Each maps 1:1 to a command handler. */
+export type ButtonAction = 'approve' | 'deny' | 'switch' | 'stop';
+
+/** Where a button sits in the two-tap lifecycle. `go` = single-tap, execute immediately (safe
+ *  actions). `arm` = the resting state of a destructive button. `confirm`/`cancel` = the pair a
+ *  first tap swaps in. */
+export type ButtonPhase = 'go' | 'arm' | 'confirm' | 'cancel';
+
+/** Permission scope carried through to `permission.response`; `na` for actions that have none. */
+export type ButtonScope = 'once' | 'session' | 'na';
+
+/** discord.js button styles, as plain strings so this module stays discord.js-free (the gateway
+ *  maps these to `ButtonStyle.*`). */
+export type ButtonStyle = 'primary' | 'secondary' | 'success' | 'danger';
+
+/** A button as plain data — the render struct the gateway turns into a ButtonBuilder. */
+export interface ButtonSpec {
+  customId: string;
+  label: string;
+  style: ButtonStyle;
+}
+
+/** A decoded customId. `ts` is the arm timestamp stamped into a Confirm button (0 otherwise);
+ *  `id` is the free-form requestId / accountId / sessionId and may itself contain the delimiter. */
+export interface ParsedButton {
+  action: ButtonAction;
+  phase: ButtonPhase;
+  scope: ButtonScope;
+  ts: number;
+  id: string;
+}
+
+const PREFIX = 'cc';
+const SEP = ':';
+
+/** How long a Confirm button stays valid after its row is armed. Past this, a Confirm tap is
+ *  treated as stale (re-arm instead of firing) so a day-old card can't execute a destructive
+ *  action on an idle tap. */
+export const CONFIRM_TTL_MS = 30_000;
+
+/** discord.js hard cap on a customId. Our ids are server-minted UUIDs, so the encoded string is
+ *  ~60 chars — comfortably under this — but the constant documents the ceiling for reviewers. */
+export const CUSTOM_ID_MAX = 100;
+
+const ACTIONS = new Set<ButtonAction>(['approve', 'deny', 'switch', 'stop']);
+const PHASES = new Set<ButtonPhase>(['go', 'arm', 'confirm', 'cancel']);
+const SCOPES = new Set<ButtonScope>(['once', 'session', 'na']);
+
+/** Encode a customId. Field order is fixed and the free-form `id` goes LAST, so an id that
+ *  itself contains `:` round-trips through `decodeButton` intact. */
+export function encodeButton(p: ParsedButton): string {
+  return [PREFIX, p.action, p.phase, p.scope, Math.floor(p.ts), p.id].join(SEP);
+}
+
+/** Decode a customId, or `null` for anything that isn't one of ours (foreign/legacy buttons) or
+ *  is malformed. Rebuilds the trailing `id` by rejoining, so `:` inside an id survives. */
+export function decodeButton(customId: string): ParsedButton | null {
+  const parts = customId.split(SEP);
+  if (parts.length < 6 || parts[0] !== PREFIX) return null;
+  const [, action, phase, scope, tsRaw] = parts;
+  if (
+    action === undefined ||
+    phase === undefined ||
+    scope === undefined ||
+    tsRaw === undefined ||
+    !ACTIONS.has(action as ButtonAction) ||
+    !PHASES.has(phase as ButtonPhase) ||
+    !SCOPES.has(scope as ButtonScope)
+  ) {
+    return null;
+  }
+  const ts = Number(tsRaw);
+  if (!Number.isFinite(ts)) return null;
+  const id = parts.slice(5).join(SEP);
+  if (id.length === 0) return null;
+  return {
+    action: action as ButtonAction,
+    phase: phase as ButtonPhase,
+    scope: scope as ButtonScope,
+    ts,
+    id,
+  };
+}
+
+/** Which actions warrant a confirm step: switching accounts and stopping a session are always
+ *  destructive; denying is only destructive at `session` scope (a one-off deny is cheap and
+ *  re-requestable, a session deny blanks the tool for the whole run). */
+export function isDestructive(action: ButtonAction, scope: ButtonScope): boolean {
+  if (action === 'switch' || action === 'stop') return true;
+  return action === 'deny' && scope === 'session';
+}
+
+/** The result of a button tap, as plain data the gateway acts on:
+ *   - `execute`   → run the mapped command handler (and dedupe on its idempotency key first).
+ *   - `confirm`   → swap the message's row to the returned Confirm/Cancel buttons.
+ *   - `restore`   → put the armed button back (a Cancel tap, or a stale Confirm).
+ *   - `ignore`    → not our button, or malformed; do nothing but tell the user. */
+export type TapOutcome =
+  | { kind: 'ignore'; reason: string }
+  | { kind: 'execute'; action: ButtonAction; scope: ButtonScope; id: string }
+  | { kind: 'confirm'; rows: ButtonSpec[][]; note: string }
+  | { kind: 'restore'; rows: ButtonSpec[][]; note: string };
+
+/** Human label for a destructive button in its armed/confirm-target state. */
+function destructiveLabel(action: ButtonAction, scope: ButtonScope): string {
+  if (action === 'switch') return 'Switch account';
+  if (action === 'stop') return 'Stop session';
+  return scope === 'session' ? 'Deny (session)' : 'Deny';
+}
+
+/** Rebuild the armed button (the resting state a Cancel/timeout returns the row to). */
+function armedButton(p: ParsedButton): ButtonSpec {
+  return {
+    customId: encodeButton({ action: p.action, phase: 'arm', scope: p.scope, ts: 0, id: p.id }),
+    label: destructiveLabel(p.action, p.scope),
+    style: 'danger',
+  };
+}
+
+/** The Confirm/Cancel pair a first tap swaps in. Confirm carries `nowMs` so a later tap can be
+ *  aged out against CONFIRM_TTL_MS. */
+function confirmCancelRow(p: ParsedButton, nowMs: number): ButtonSpec[] {
+  return [
+    {
+      customId: encodeButton({
+        action: p.action,
+        phase: 'confirm',
+        scope: p.scope,
+        ts: nowMs,
+        id: p.id,
+      }),
+      label: 'Confirm',
+      style: 'danger',
+    },
+    {
+      customId: encodeButton({
+        action: p.action,
+        phase: 'cancel',
+        scope: p.scope,
+        ts: 0,
+        id: p.id,
+      }),
+      label: 'Cancel',
+      style: 'secondary',
+    },
+  ];
+}
+
+/**
+ * The whole two-tap decision, pure. Given the tapped customId and the current time, say what the
+ * gateway should do. `go` fires immediately; `arm` asks for confirmation; `confirm` fires only
+ * within the TTL, else re-arms; `cancel` re-arms. Unknown ids are ignored, never guessed at.
+ */
+export function resolveTap(
+  customId: string,
+  nowMs: number,
+  ttlMs: number = CONFIRM_TTL_MS,
+): TapOutcome {
+  const p = decodeButton(customId);
+  if (!p) return { kind: 'ignore', reason: `unrecognized button: ${customId}` };
+  switch (p.phase) {
+    case 'go':
+      return { kind: 'execute', action: p.action, scope: p.scope, id: p.id };
+    case 'arm':
+      return {
+        kind: 'confirm',
+        rows: [confirmCancelRow(p, nowMs)],
+        note: `Confirm ${destructiveLabel(p.action, p.scope).toLowerCase()}?`,
+      };
+    case 'confirm':
+      if (nowMs - p.ts > ttlMs) {
+        return {
+          kind: 'restore',
+          rows: [[armedButton(p)]],
+          note: 'Confirmation expired — tap again to retry.',
+        };
+      }
+      return { kind: 'execute', action: p.action, scope: p.scope, id: p.id };
+    case 'cancel':
+      return { kind: 'restore', rows: [[armedButton(p)]], note: 'Cancelled.' };
+  }
+}
+
+/**
+ * The button row for a permission.request card. Fail-safe mode gate (plan §4): buttons appear
+ * ONLY when the mode is exactly 'default'; every other, absent, or unknown mode returns `[]` so
+ * the card is informational and no button can lie about taking effect. Approve/Deny are safe
+ * single-tap; a session-scope Deny is destructive, so it ships armed and goes through confirm.
+ */
+export function permissionButtons(payload: {
+  requestId: string;
+  permissionMode?: string | null | undefined;
+}): ButtonSpec[][] {
+  if (payload.permissionMode !== 'default') return [];
+  const id = payload.requestId;
+  return [
+    [
+      {
+        customId: encodeButton({ action: 'approve', phase: 'go', scope: 'once', ts: 0, id }),
+        label: 'Approve',
+        style: 'success',
+      },
+      {
+        customId: encodeButton({ action: 'deny', phase: 'go', scope: 'once', ts: 0, id }),
+        label: 'Deny',
+        style: 'secondary',
+      },
+      {
+        customId: encodeButton({ action: 'deny', phase: 'arm', scope: 'session', ts: 0, id }),
+        label: 'Deny (session)',
+        style: 'danger',
+      },
+    ],
+  ];
+}
+
+/**
+ * The idempotency key for an executed button tap. Derived from the LOGICAL action (who + what +
+ * which target), NOT from the interaction id — that is exactly what lets a double-tap from two
+ * phones collapse to the same key so the second resolves to "already handled" instead of sending
+ * a second command frame. Slash commands keep fresh random keys (each invocation is intentional);
+ * only buttons dedupe.
+ */
+export function buttonIdempotencyKey(
+  userId: string,
+  o: { action: ButtonAction; scope: ButtonScope; id: string },
+): string {
+  return `btn:${userId}:${o.action}:${o.scope}:${o.id}`;
+}

@@ -189,28 +189,43 @@ export function handleDeny(
   return handlePermissionResponse(deps, discordUserId, requestId, 'deny', scope, idempotencyKey);
 }
 
-/** `/stop <sessionId>` — protocol v1 has no dedicated "stop a session" payload (see
- *  shared-protocol/messages.ts): the only session-directed message is `prompt.inject`, which
- *  talks TO a running turn, not to the process supervisor. Misusing it as a stop signal
- *  would silently invent session-runtime behavior that package does not implement yet.
- *  Surface that honestly instead of guessing at semantics we don't control. */
+/** `/stop <sessionId>` and the Stop button — request an orderly stop of a managed session. The
+ *  `session.stop` wire type exists as of the M3 protocol commit; escalation (interrupt → grace →
+ *  hard stop) is the daemon's policy and the acknowledgment rides on the `session.status`
+ *  transitions the daemon already emits, so there is no dedicated stop.result to wait on here.
+ *  `idempotencyKey` lets a double-tapped Stop resolve to "already handled" (daemon-side too). */
 export function handleStop(
-  _deps: CommandDeps,
-  _discordUserId: string,
-  _sessionId: string,
+  deps: CommandDeps,
+  discordUserId: string,
+  sessionId: string,
+  idempotencyKey: string,
 ): CommandResult {
-  return { kind: 'error', message: 'stopping a session is not wired in protocol v1 yet.' };
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'session.stop',
+    payload: { sessionId, idempotencyKey },
+  }));
+  return result.ok
+    ? { kind: 'text', text: 'Stop requested.' }
+    : { kind: 'error', message: result.error };
 }
 
 /** `/reauth <accountId>` — re-authenticating a quarantined account is an interactive OAuth
  *  flow that must run on the host (the bot holds zero credentials by design — see the
  *  package-level architecture rule); there is no protocol message for it because the bot
- *  structurally cannot perform it. Point the user at the local command instead of pretending
- *  a Discord button could complete an OAuth login. */
+ *  structurally cannot perform it. Point the user at the REAL host command that exists today —
+ *  `cctl accounts add <label> --fresh` (there is no in-place `relogin`/`login` verb yet; see the
+ *  report). This copy is kept in lockstep with the quarantine card's `RELOGIN_COMMAND`. */
 export function handleReauth(
   _deps: CommandDeps,
   _discordUserId: string,
   accountId: string,
 ): CommandResult {
-  return { kind: 'text', text: `Re-auth must run on the host: \`cctl login ${accountId}\`.` };
+  return {
+    kind: 'text',
+    text:
+      `Re-auth must run on the host (the bot holds no credentials). Run ` +
+      `\`cctl accounts add <label> --fresh\` to capture a fresh login, then \`cctl switch <label>\`. ` +
+      `(quarantined account: ${accountId})`,
+  };
 }

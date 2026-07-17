@@ -17,9 +17,14 @@ import {
   accountMarker,
   discordRelative,
   emojiTrack,
+  EMBED_DESCRIPTION_LIMIT,
+  EMBED_FIELD_VALUE_LIMIT,
   layeredBar,
+  NOTIFICATION_COLOR,
+  NOTIFICATION_ICON,
   SEVERITY_COLOR,
   TRACK,
+  truncateLabeled,
   worstSeverity,
   type TrackEvent,
 } from './richFormat.js';
@@ -238,14 +243,105 @@ export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
   return embed;
 }
 
-/** Rendered for an incoming permission.request push (buttons are attached by the caller,
- *  which owns the requestId needed to build them). */
-export function buildPermissionRequestEmbed(summary: string, detail?: string): EmbedBuilder {
+/** Rendered for an incoming permission.request push. Mode-aware by design (plan §4): a tap on
+ *  Approve/Deny can only *honestly* take effect when the session is in exactly `default`
+ *  permission mode — in acceptEdits/plan/bypassPermissions the CLI never blocks on a prompt, so
+ *  there is nothing here to approve. This builder therefore renders TWO visually distinct cards:
+ *
+ *   - `default` mode → an ACTIONABLE card (warn/yellow accent, "act below" footer). Its buttons
+ *     are attached by the caller (pushRender) which owns the requestId; this function only sets
+ *     the copy so the card and its buttons agree.
+ *   - any other / absent / unknown mode → an INFORMATIONAL card (info/blue accent) whose footer
+ *     says plainly why no buttons are offered. Fail-safe: we would rather show a button-less
+ *     notice than a button that silently does nothing.
+ *
+ *  `summary` stays the description in BOTH cards so the reader always sees WHAT was requested. */
+export function buildPermissionRequestEmbed(
+  summary: string,
+  detail?: string,
+  permissionMode?: string,
+): EmbedBuilder {
+  const actionable = permissionMode === 'default';
   const embed = new EmbedBuilder()
-    .setTitle('Permission requested')
-    .setColor(COLOR_WARN)
-    .setDescription(summary);
-  if (detail) embed.addFields({ name: 'Detail', value: detail });
+    .setTitle(actionable ? 'Permission requested' : 'Permission (auto-handled)')
+    .setColor(actionable ? COLOR_WARN : COLOR_INFO)
+    .setDescription(summary)
+    .setFooter({
+      text: actionable
+        ? 'Approve or Deny below · or /approve /deny'
+        : permissionMode
+          ? `Handled locally in ${permissionMode} mode — approve/deny is not available from Discord.`
+          : "This session isn't in default permission mode — no action is available here.",
+    });
+  if (detail)
+    embed.addFields({ name: 'Detail', value: truncateLabeled(detail, EMBED_FIELD_VALUE_LIMIT) });
+  return embed;
+}
+
+/** `hook.notification` Stop event → the "done" card: WHAT Claude finished saying, not a bare
+ *  "session ended". `lastAssistantMessage` can be long, so it is truncated with a visible marker
+ *  (no silent cut). Falls back to the daemon-supplied body when no final message was captured. */
+export function buildDoneEmbed(p: {
+  sessionId?: string;
+  lastAssistantMessage?: string;
+  body?: string;
+  title?: string;
+}): EmbedBuilder {
+  const message = p.lastAssistantMessage ?? p.body ?? 'Session finished.';
+  const embed = new EmbedBuilder()
+    .setTitle(`${NOTIFICATION_ICON.done} ${p.title ?? 'Done'}`)
+    .setColor(NOTIFICATION_COLOR.done)
+    .setDescription(truncateLabeled(message, EMBED_DESCRIPTION_LIMIT));
+  if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
+  return embed;
+}
+
+/** `hook.notification` with `notification_type: 'idle_prompt'` → the "waiting on you" card: the
+ *  session is blocked awaiting the user's next input. Distinct blue/🔔 language so it reads as
+ *  "your turn", never as an error or a completion. */
+export function buildWaitingEmbed(p: {
+  sessionId?: string;
+  title?: string;
+  body?: string;
+}): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setTitle(`${NOTIFICATION_ICON.waiting} ${p.title ?? 'Waiting on you'}`)
+    .setColor(NOTIFICATION_COLOR.waiting)
+    .setDescription(
+      truncateLabeled(
+        p.body && p.body.length > 0 ? p.body : 'A session is waiting for your reply.',
+        EMBED_DESCRIPTION_LIMIT,
+      ),
+    );
+  if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
+  return embed;
+}
+
+/** A quarantine notice → the "account down" card. Re-authentication is an interactive OAuth flow
+ *  that can only complete on the host (the bot holds zero credentials by design), so the card's
+ *  whole job is to name the account and print the EXACT host command to run. `reloginCommand` is
+ *  injected (from pushRender's single source of truth) so the card, `handleReauth`, and the real
+ *  CLI verb can never drift apart. */
+export function buildQuarantineEmbed(p: {
+  title?: string;
+  body?: string;
+  reloginCommand: string;
+}): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setTitle(`${NOTIFICATION_ICON.quarantine} ${p.title ?? 'Account needs re-login'}`)
+    .setColor(NOTIFICATION_COLOR.quarantine)
+    .setDescription(
+      truncateLabeled(
+        p.body && p.body.length > 0
+          ? p.body
+          : 'An account can no longer refresh its token and was quarantined.',
+        EMBED_DESCRIPTION_LIMIT,
+      ),
+    )
+    .addFields({
+      name: 'Fix it on the host',
+      value: `Run \`${p.reloginCommand}\` to capture a fresh login, then \`cctl switch <label>\`.`,
+    });
   return embed;
 }
 

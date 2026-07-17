@@ -266,21 +266,38 @@ describe('command-to-envelope mapping and ACL', () => {
   });
 });
 
-describe('unsupported-in-v1 commands are honest, not hacky', () => {
-  it('handleStop returns an explicit error rather than misusing prompt.inject', () => {
+describe('handleStop sends session.stop (wired as of the M3 protocol commit)', () => {
+  it('emits a session.stop frame to the invoking user’s daemon with the idempotency key', () => {
     const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
     const deps = makeDeps(relay);
-    const result = handleStop(deps, 'user-a', 's1');
-    expect(result.kind).toBe('error');
-    expect(sent).toHaveLength(0); // must not have sent anything to the daemon
+    const result = handleStop(deps, 'user-a', 's1', 'idem-stop');
+    expect(result.kind).toBe('text');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.draft).toMatchObject({
+      type: 'session.stop',
+      payload: { sessionId: 's1', idempotencyKey: 'idem-stop' },
+    });
   });
 
-  it('handleReauth points the user at the host CLI instead of sending an envelope', () => {
+  it('fails cleanly (no frame) when the caller has no reachable daemon', () => {
+    const { relay, sent } = createFakeRelay({ online: {} });
+    const deps = makeDeps(relay);
+    const result = handleStop(deps, 'user-a', 's1', 'idem-stop');
+    expect(result.kind).toBe('error');
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe('handleReauth stays host-only and prints the REAL CLI verb', () => {
+  it('points the user at `cctl accounts add --fresh` and never sends an envelope', () => {
     const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
     const deps = makeDeps(relay);
     const result = handleReauth(deps, 'user-a', 'acct-9');
     expect(result.kind).toBe('text');
+    // The account it names, the real verb, and NO invented `relogin`/`login` verb.
     expect(result.kind === 'text' && result.text).toContain('acct-9');
+    expect(result.kind === 'text' && result.text).toContain('cctl accounts add <label> --fresh');
+    expect(result.kind === 'text' && result.text).not.toContain('cctl login');
     expect(sent).toHaveLength(0);
   });
 });
