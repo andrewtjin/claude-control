@@ -5,6 +5,18 @@ export * from './paths.js';
 export * from './logger.js';
 export { type Protector, DpapiProtector, InsecurePassthroughProtector } from './dpapi.js';
 export {
+  AesGcmProtector,
+  KeychainKeySource,
+  KeychainProtector,
+  KeychainCredentialChannel,
+  defaultExecRunner,
+  VAULT_KEY_SERVICE,
+  VAULT_KEY_ACCOUNT,
+  CLAUDE_CLI_KEYCHAIN_SERVICE,
+  type ExecRunner,
+} from './keychain.js';
+export { defaultProtector, defaultLiveCredentialChannel } from './protector.js';
+export {
   refreshCredentials,
   CLAUDE_CODE_CLIENT_ID,
   DEFAULT_TOKEN_ENDPOINT,
@@ -13,7 +25,11 @@ export {
 } from './oauth.js';
 export { Vault } from './vault.js';
 export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
-export { CredentialStore } from './credentialStore.js';
+export {
+  CredentialStore,
+  FileCredentialChannel,
+  type LiveCredentialChannel,
+} from './credentialStore.js';
 export { acquireLock, Lock, type LockOptions } from './lock.js';
 export { IntentStore } from './intent.js';
 export { AuditLog, type AuditEntry } from './audit.js';
