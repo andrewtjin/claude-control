@@ -33,6 +33,9 @@ export {
   buildDoneEmbed,
   buildWaitingEmbed,
   buildQuarantineEmbed,
+  buildSessionCardEmbed,
+  buildSessionSummaryEmbed,
+  type SessionCardModel,
 } from './discord/embeds.js';
 export {
   NOTIFICATION_COLOR,
@@ -67,6 +70,7 @@ export {
   resolveTap,
   isDestructive,
   permissionButtons,
+  sessionCardButtons,
   buttonIdempotencyKey,
   CONFIRM_TTL_MS,
   type ButtonAction,
@@ -78,4 +82,29 @@ export {
   type TapOutcome,
 } from './discord/buttons.js';
 export { SeenKeys, type SeenKeysOptions } from './discord/idempotencyGuard.js';
-export { DiscordJsGateway, type DiscordJsGatewayOptions } from './discord/discordJsGateway.js';
+export {
+  OrderedOutput,
+  type OutputChunk,
+  type OutputKind,
+  type CommittedItem,
+  type OrderedOutputOptions,
+} from './discord/sessionOutput.js';
+export {
+  SessionPlanner,
+  sessionRouteKey,
+  type SessionRoute,
+  type GatewayOp,
+  type PlanResult,
+  type SessionPlannerConfig,
+} from './discord/sessionPlanner.js';
+export {
+  ThreadRegistry,
+  PersistentThreadRegistry,
+  type DeliveryTarget,
+} from './discord/threadRegistry.js';
+export {
+  DiscordJsGateway,
+  type DiscordJsGatewayOptions,
+  type SessionChannelResolver,
+  type SessionThreadParent,
+} from './discord/discordJsGateway.js';

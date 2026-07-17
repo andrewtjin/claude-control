@@ -7,6 +7,7 @@ import {
   isDestructive,
   permissionButtons,
   resolveTap,
+  sessionCardButtons,
   type ParsedButton,
 } from './buttons.js';
 
@@ -174,6 +175,37 @@ describe('permissionButtons — fail-safe mode gate', () => {
     expect(permissionButtons({ requestId: 'r' })).toEqual([]);
     expect(permissionButtons({ requestId: 'r', permissionMode: null })).toEqual([]);
     expect(permissionButtons({ requestId: 'r', permissionMode: 'some-future-mode' })).toEqual([]);
+  });
+});
+
+describe('sessionCardButtons — the live card Stop control', () => {
+  it('ships an armed Stop that flows through the two-tap confirm to an execute', () => {
+    const rows = sessionCardButtons({ sessionId: 'sess-1', stoppable: true });
+    expect(rows).toHaveLength(1);
+    const stop = rows[0]![0]!;
+    expect(stop.label).toBe('Stop session');
+    // Armed, carrying the sessionId, so a confirmed tap maps straight to handleStop(sessionId).
+    expect(decodeButton(stop.customId)).toMatchObject({
+      action: 'stop',
+      phase: 'arm',
+      id: 'sess-1',
+    });
+    // Tap 1: arm → Confirm/Cancel (executes nothing).
+    const first = resolveTap(stop.customId, 1000);
+    expect(first.kind).toBe('confirm');
+    if (first.kind !== 'confirm') throw new Error('unreachable');
+    // Tap 2 (Confirm within TTL): execute stop for that session.
+    const confirmId = first.rows[0]![0]!.customId;
+    expect(resolveTap(confirmId, 1000)).toEqual({
+      kind: 'execute',
+      action: 'stop',
+      scope: 'na',
+      id: 'sess-1',
+    });
+  });
+
+  it('offers no button once the session is stopping or terminal', () => {
+    expect(sessionCardButtons({ sessionId: 'sess-1', stoppable: false })).toEqual([]);
   });
 });
 

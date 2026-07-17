@@ -9,6 +9,7 @@
 
 import {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -16,13 +17,17 @@ import {
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Interaction,
+  type EmbedBuilder,
+  type Message,
   type MessageActionRowComponentBuilder,
+  type SendableChannels,
   SlashCommandBuilder,
 } from 'discord.js';
 import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import type { Envelope } from '@claude-control/shared-protocol';
+import { isType, type Envelope } from '@claude-control/shared-protocol';
 import type { DiscordGateway } from './gateway.js';
 import type { RelaySender } from '../relay.js';
 import type { PairingService } from '../pairing.js';
@@ -40,8 +45,39 @@ import {
   type TapOutcome,
 } from './buttons.js';
 import { SeenKeys } from './idempotencyGuard.js';
+import {
+  SessionPlanner,
+  sessionRouteKey,
+  type GatewayOp,
+  type PlanResult,
+  type SessionRoute,
+} from './sessionPlanner.js';
+import { PersistentThreadRegistry, type DeliveryTarget } from './threadRegistry.js';
 import * as commands from './commands.js';
 import type { CommandDeps, CommandResult } from './commands.js';
+
+/** A channel-like object that can host per-session threads. Kept structural (not a discord.js
+ *  channel class) so wiring a real per-user text channel later needs no change here, and so the
+ *  gateway compiles today with the default resolver that returns `undefined` (pure-DM deployment
+ *  until channel-per-user lands — every session then falls back to DM, which is the sanctioned
+ *  fallback path, not a failure). */
+export interface SessionThreadParent {
+  threads: { create(options: { name: string }): Promise<{ id: string }> };
+}
+
+/** Where a user's per-session threads should be created. Returns `undefined` (the default) when no
+ *  channel is available, in which case delivery falls back to the user's DM and remembers it. */
+export type SessionChannelResolver = (
+  discordUserId: string,
+) => Promise<SessionThreadParent | undefined>;
+
+/** The content/embeds/components subset common to `channel.send` and `message.edit`, so one built
+ *  payload drives both the initial card send and every subsequent in-place edit. */
+interface SessionMessagePayload {
+  content?: string;
+  embeds?: EmbedBuilder[];
+  components?: ActionRowBuilder<MessageActionRowComponentBuilder>[];
+}
 
 // Where the committed progress-bar sprites live, relative to this compiled file
 // (dist/discord/discordJsGateway.js → ../../assets/progress-bar → the package's assets dir).
@@ -57,10 +93,21 @@ export interface DiscordJsGatewayOptions {
   /** Defaults to `process.env.DISCORD_BOT_TOKEN`; pass explicitly to override (tests that
    *  construct this class without calling `start()` never need a token at all). */
   token?: string;
-  /** Injectable time source for the two-tap confirm TTL and the idempotency guard's eviction.
-   *  Defaults to `Date.now`; overridden in wet-debugging only. */
+  /** Injectable time source for the two-tap confirm TTL, the idempotency guard's eviction, and the
+   *  session card's coalescing window. Defaults to `Date.now`; overridden in wet-debugging only. */
   clock?: () => number;
+  /** Directory for the persisted session→thread registry. Defaults under the OS temp dir so the
+   *  bot works out of the box; a real deployment points this at its state dir. */
+  stateDir?: string;
+  /** How to obtain the channel a user's session threads are created in. Omitted → pure-DM
+   *  deployment (thread creation always falls back to DM, which is remembered per session). */
+  sessionChannelResolver?: SessionChannelResolver;
 }
+
+/** How long after a session goes terminal its in-memory streaming state is retained before being
+ *  dropped, so a long-lived bot does not accumulate every finished session forever. Comfortably
+ *  past any late trailing frame; the persisted thread mapping outlives it regardless. */
+const SESSION_FORGET_MS = 5 * 60_000;
 
 /** discord.js styles keyed by our plain ButtonSpec style — the gateway is the one place that
  *  translates the render structs into real components. */
@@ -89,6 +136,17 @@ export class DiscordJsGateway implements DiscordGateway {
   private readonly clock: () => number;
   /** Executed-button dedupe (deliverable 5): a double-tap hits the same key and is dropped. */
   private readonly seenKeys: SeenKeys;
+  /** Pure planner that turns session.output/session.status envelopes into thread ops (M4). */
+  private readonly planner = new SessionPlanner();
+  /** Persisted sessionId→thread map; loaded on start(), survives restart. */
+  private readonly threadReg: PersistentThreadRegistry;
+  private readonly sessionChannelResolver: SessionChannelResolver | undefined;
+  /** Live-card message per session route, so `editMessage ref:'card'` targets the right message.
+   *  In-memory only: after a restart the card id is gone and the first edit posts a fresh card
+   *  (a benign visual re-anchor, not a lost update). */
+  private readonly cardMessages = new Map<string, Message>();
+  /** One pending coalesced-flush timer per session route; rescheduled, never stacked. */
+  private readonly flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(options: DiscordJsGatewayOptions) {
     this.logger = options.logger ?? noopLogger;
@@ -99,6 +157,10 @@ export class DiscordJsGateway implements DiscordGateway {
       ttlMs: SEEN_KEYS_TTL_MS,
       clock: this.clock,
     });
+    this.threadReg = new PersistentThreadRegistry(
+      options.stateDir ?? join(tmpdir(), 'claude-control-bot'),
+    );
+    this.sessionChannelResolver = options.sessionChannelResolver;
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
     this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -120,11 +182,13 @@ export class DiscordJsGateway implements DiscordGateway {
   }
 
   /** Log in and start handling interactions. Never call from a test — it opens a real
-   *  connection to Discord's gateway. */
+   *  connection to Discord's gateway. Loads the persisted session→thread map first so sessions
+   *  streamed before a restart keep delivering to their existing threads. */
   async start(): Promise<void> {
     if (!this.token) {
       throw new Error('DISCORD_BOT_TOKEN is not set and no token was provided');
     }
+    await this.threadReg.load();
     await this.client.login(this.token);
   }
 
@@ -132,11 +196,26 @@ export class DiscordJsGateway implements DiscordGateway {
     await this.client.destroy();
   }
 
-  /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user. The render
-   *  DECISION lives in the pure `renderPush` (pushRender.ts); here we only inflate the plain
-   *  ButtonSpecs into discord.js rows and put it on the wire. */
+  /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user.
+   *
+   *  Two paths. Managed-session frames (session.status/session.output) go to the M4 thread-per-
+   *  session surface: the pure `SessionPlanner` turns them into thread ops (create/send/edit/upload)
+   *  which this class executes. Everything else keeps the M2/M3 behaviour — the pure `renderPush`
+   *  decides the DM card and this class only inflates ButtonSpecs and sends it. The state cache is
+   *  fed on EVERY envelope regardless, so `/usage`/`/sessions` keep answering from it. */
   async deliver(discordUserId: string, envelope: Envelope): Promise<void> {
     this.cache.record(discordUserId, envelope);
+    if (isType(envelope, 'session.status')) {
+      const route: SessionRoute = { discordUserId, sessionId: envelope.payload.sessionId };
+      await this.runPlan(route, this.planner.onStatus(route, envelope.payload, this.clock()));
+      this.scheduleForget(route, envelope.payload.state);
+      return;
+    }
+    if (isType(envelope, 'session.output')) {
+      const route: SessionRoute = { discordUserId, sessionId: envelope.payload.sessionId };
+      await this.runPlan(route, this.planner.onOutput(route, envelope.payload, this.clock()));
+      return;
+    }
     const push = renderPush(envelope);
     if (!push) return; // cache-only: not worth a DM
     try {
@@ -145,6 +224,148 @@ export class DiscordJsGateway implements DiscordGateway {
     } catch (err) {
       this.logger.warn({ err, discordUserId }, 'discord: failed to DM user');
     }
+  }
+
+  /** Execute a plan's ops in order, then (re)schedule its coalesced-flush timer. The single entry
+   *  point every planner interaction funnels through so op execution and timer management stay in
+   *  one place. */
+  private async runPlan(route: SessionRoute, plan: PlanResult): Promise<void> {
+    await this.executeOps(plan.ops);
+    if (plan.flushAtMs !== undefined) this.scheduleFlush(route, plan.flushAtMs);
+  }
+
+  /** Execute one batch of planner ops. Every discord.js side effect the session surface needs lives
+   *  here (thread resolution, send, edit, attachment upload) — WET-GATED, mirroring the rest of this
+   *  file; all the DECISIONS were already made by the pure planner. A failed op is logged and
+   *  skipped, never thrown: one bad send must not abort the batch or crash the relay. */
+  private async executeOps(ops: GatewayOp[]): Promise<void> {
+    for (const op of ops) {
+      try {
+        await this.executeOp(op);
+      } catch (err) {
+        this.logger.warn({ err, op: op.kind }, 'discord: session op failed');
+      }
+    }
+  }
+
+  private async executeOp(op: GatewayOp): Promise<void> {
+    const sink = await this.sinkFor(op.route);
+    if (!sink) return; // no deliverable target (should not happen — DM is the ultimate fallback)
+    const key = sessionRouteKey(op.route);
+    if (op.kind === 'sendMessage') {
+      const message = await sink.send(this.toSessionSendOptions(op));
+      if (op.role === 'card') this.cardMessages.set(key, message);
+      return;
+    }
+    if (op.kind === 'editMessage') {
+      const existing = this.cardMessages.get(key);
+      const payload = this.toSessionSendOptions(op);
+      if (existing) {
+        await existing.edit(payload);
+      } else {
+        // No remembered card (fresh process): re-anchor by posting a new card rather than dropping
+        // the update.
+        this.cardMessages.set(key, await sink.send(payload));
+      }
+      return;
+    }
+    // uploadAttachment
+    const attachment = new AttachmentBuilder(Buffer.from(op.text, 'utf8'), { name: op.filename });
+    await sink.send({
+      files: [attachment],
+      ...(op.content !== undefined ? { content: op.content } : {}),
+    });
+  }
+
+  /** Inflate a session op into a payload valid for BOTH `channel.send` and `message.edit` (the
+   *  common content/embeds/components subset). Conditional spreads keep any optional key from being
+   *  present-and-undefined (rejected under exactOptionalPropertyTypes). */
+  private toSessionSendOptions(
+    op: Extract<GatewayOp, { kind: 'sendMessage' | 'editMessage' }>,
+  ): SessionMessagePayload {
+    return {
+      ...('content' in op && op.content !== undefined ? { content: op.content } : {}),
+      ...(op.embed !== undefined ? { embeds: [op.embed] } : {}),
+      ...(op.components !== undefined ? { components: this.toRows(op.components) } : {}),
+    };
+  }
+
+  /** Resolve a session route to a sendable channel: its recorded thread, or the user's DM as the
+   *  remembered fallback. Creates the thread on first use (persisting the mapping), and if a
+   *  previously-created thread has since vanished, pins the DM fallback so we stop re-fetching it. */
+  private async sinkFor(route: SessionRoute): Promise<SendableChannels | undefined> {
+    const target = await this.ensureTarget(route);
+    if (target.kind === 'thread') {
+      const channel = await this.client.channels.fetch(target.threadId);
+      if (channel?.isSendable()) return channel;
+      // Thread gone → fall back to DM for the rest of the session and remember it.
+      await this.threadReg.record(route.discordUserId, route.sessionId, { kind: 'dm' });
+    }
+    const user = await this.client.users.fetch(route.discordUserId);
+    return user.createDM();
+  }
+
+  /** The persisted delivery target for a route, creating a thread the first time (or pinning a DM
+   *  fallback when no channel is available / creation fails). Never throws — the DM fallback is the
+   *  never-crash, never-drop guarantee. */
+  private async ensureTarget(route: SessionRoute): Promise<DeliveryTarget> {
+    const existing = this.threadReg.get(route.discordUserId, route.sessionId);
+    if (existing) return existing;
+    let target: DeliveryTarget = { kind: 'dm' };
+    try {
+      const parent = await this.sessionChannelResolver?.(route.discordUserId);
+      if (parent) {
+        const thread = await parent.threads.create({
+          name: `session ${route.sessionId.slice(0, 8)}`,
+        });
+        target = { kind: 'thread', threadId: thread.id };
+      }
+    } catch (err) {
+      this.logger.warn({ err, route }, 'discord: thread creation failed, falling back to DM');
+      target = { kind: 'dm' };
+    }
+    await this.threadReg.record(route.discordUserId, route.sessionId, target);
+    return target;
+  }
+
+  /** (Re)schedule the single coalesced-flush timer for a route. Clearing any prior timer first is
+   *  what enforces "≤1 edit per window": a burst of updates keeps moving one timer, never stacking. */
+  private scheduleFlush(route: SessionRoute, atMs: number): void {
+    const key = sessionRouteKey(route);
+    const prior = this.flushTimers.get(key);
+    if (prior) clearTimeout(prior);
+    const delay = Math.max(0, atMs - this.clock());
+    const timer = setTimeout(() => {
+      this.flushTimers.delete(key);
+      void this.runPlan(route, this.planner.flush(route, this.clock())).catch((err: unknown) => {
+        this.logger.warn({ err, route }, 'discord: session flush failed');
+      });
+    }, delay);
+    // Do not keep the event loop alive solely for a pending card edit.
+    if (typeof timer.unref === 'function') timer.unref();
+    this.flushTimers.set(key, timer);
+  }
+
+  /** Drop a terminal session's in-memory state (planner + card handle + any timer) after a grace. */
+  private scheduleForget(route: SessionRoute, state: string): void {
+    if (state !== 'done' && state !== 'failed' && state !== 'orphaned') return;
+    const key = sessionRouteKey(route);
+    const timer = setTimeout(() => {
+      this.planner.forget(route);
+      this.cardMessages.delete(key);
+      const pending = this.flushTimers.get(key);
+      if (pending) {
+        clearTimeout(pending);
+        this.flushTimers.delete(key);
+      }
+    }, SESSION_FORGET_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+  }
+
+  /** Optimistically flip a session card to "stopping…" the moment a stop is requested (from `/stop`
+   *  or the card's Stop button), before the daemon's terminal status confirms it. */
+  private async nudgeStop(route: SessionRoute): Promise<void> {
+    await this.executeOps(this.planner.onStopRequested(route, this.clock()).ops);
   }
 
   /** Inflate a RenderedPush into discord.js send options (content + embeds + component rows).
@@ -361,6 +582,14 @@ export class DiscordJsGateway implements DiscordGateway {
         result = { kind: 'error', message: `unknown command: ${interaction.commandName}` };
     }
     await this.reply(interaction, result);
+    // A successful /stop should flip the live session card to "stopping…" at once, not wait for the
+    // daemon's terminal status. No-op when that session was never streamed to a card here.
+    if (interaction.commandName === 'stop' && result.kind !== 'error') {
+      await this.nudgeStop({
+        discordUserId: userId,
+        sessionId: interaction.options.getString('session', true),
+      });
+    }
   }
 
   /** Button routing is the whole two-tap + dedupe surface, but every DECISION is made by the pure
@@ -400,6 +629,11 @@ export class DiscordJsGateway implements DiscordGateway {
     // Clear the card's buttons so it can't be tapped again, then report the outcome ephemerally.
     await interaction.update({ components: [] });
     await this.followUp(interaction, result);
+    // A confirmed Stop from the card flips it to "stopping…" immediately (same as /stop), composing
+    // the two-tap confirm + dedupe path above with the live-card state.
+    if (outcome.action === 'stop' && result.kind !== 'error') {
+      await this.nudgeStop({ discordUserId: userId, sessionId: outcome.id });
+    }
   }
 
   /** Map an executed button to its command handler. `switch` needs a fresh requestId per attempt;

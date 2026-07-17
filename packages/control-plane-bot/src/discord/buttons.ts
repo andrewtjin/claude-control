@@ -225,6 +225,36 @@ export function permissionButtons(payload: {
 }
 
 /**
+ * The button row for a live managed-session card: a single Stop control. Stop is destructive, so it
+ * ships ARMED (`phase:'arm'`) and goes through the same two-tap confirm as every other destructive
+ * button — a stray tap on a session card can never kill a running session outright. `id` is the
+ * sessionId, so an `execute` outcome maps straight to `handleStop` for that session. Returns `[]`
+ * for a session that is stopping or already terminal (nothing left to stop), so the card's row is
+ * simply cleared on its final edit.
+ */
+export function sessionCardButtons(payload: {
+  sessionId: string;
+  stoppable: boolean;
+}): ButtonSpec[][] {
+  if (!payload.stoppable) return [];
+  return [
+    [
+      {
+        customId: encodeButton({
+          action: 'stop',
+          phase: 'arm',
+          scope: 'na',
+          ts: 0,
+          id: payload.sessionId,
+        }),
+        label: 'Stop session',
+        style: 'danger',
+      },
+    ],
+  ];
+}
+
+/**
  * The idempotency key for an executed button tap. Derived from the LOGICAL action (who + what +
  * which target), NOT from the interaction id — that is exactly what lets a double-tap from two
  * phones collapse to the same key so the second resolves to "already handled" instead of sending

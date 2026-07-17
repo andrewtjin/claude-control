@@ -4,7 +4,7 @@
 // transform, which is what makes it unit-testable via `.toJSON()` without a real bot.
 
 import { EmbedBuilder } from 'discord.js';
-import type { AccountUsage, UsagePlan } from '@claude-control/shared-protocol';
+import type { AccountUsage, PayloadOf, UsagePlan } from '@claude-control/shared-protocol';
 // usage-advisor is a pure, credential-free library — importing it preserves the bot's
 // zero-credential guarantee (which forbids switch-engine, not math).
 import {
@@ -351,4 +351,122 @@ export function buildSwitchResultEmbed(ok: boolean, message: string): EmbedBuild
     .setTitle(ok ? 'Switched' : 'Switch failed')
     .setColor(ok ? COLOR_OK : COLOR_WARN)
     .setDescription(message);
+}
+
+// ---------------------------------------------------------------------------
+// Managed-session live card + final summary (M4 thread-per-session UX)
+// ---------------------------------------------------------------------------
+
+/** The session lifecycle states, as the wire reports them (see `session.status`). */
+type SessionState = PayloadOf<'session.status'>['state'];
+
+/** Per-state icon + accent so the live card reads at a phone-glance which stage the session is in.
+ *  Deliberately distinct from the usage `SEVERITY_COLOR` gradient — a session card is an *event
+ *  surface*, not a *measurement*, so it must never be mistaken for a usage band. */
+const SESSION_STATE_ICON: Record<SessionState, string> = {
+  starting: '⏳',
+  running: '🔄',
+  waiting_input: '🔔',
+  waiting_permission: '🔐',
+  done: '✅',
+  failed: '❌',
+  orphaned: '🧟',
+};
+const SESSION_STATE_COLOR: Record<SessionState, number> = {
+  starting: COLOR_INFO,
+  running: COLOR_INFO,
+  waiting_input: COLOR_INFO,
+  waiting_permission: COLOR_WARN,
+  done: COLOR_OK,
+  failed: SEVERITY_COLOR.critical,
+  orphaned: SEVERITY_COLOR.critical,
+};
+
+/** The pure, discord.js-free shape a session card renders from. Assembled by the SessionPlanner
+ *  from its accumulated per-session state; kept here (not in the planner) so embeds.ts stays the
+ *  single home for embed layout and the planner needs no discord.js beyond the returned builder. */
+export interface SessionCardModel {
+  sessionId: string;
+  state: SessionState;
+  /** Optimistic bot-side flag: the user asked to stop and no terminal status has landed yet.
+   *  Overrides the state icon/label with a "stopping…" affordance so the card never looks idle
+   *  while a stop is in flight. */
+  stopping: boolean;
+  summary?: string;
+  accountId?: string;
+  /** The tail of accumulated stdout, already sliced by the planner to a phone-friendly length. */
+  outputTail?: string;
+  totalOutputChars: number;
+  /** The full output has been (or is being) delivered as a file attachment. */
+  attached: boolean;
+  /** At least one seq gap was declared — the transcript has a labeled hole, shown honestly. */
+  hasGap: boolean;
+  /** A source truncated its own output somewhere in the stream. */
+  sourceTruncated: boolean;
+  /** At least one `error`-kind chunk was streamed. */
+  hadError: boolean;
+}
+
+/** Compose the "notes" line shown on both the live card and the summary — the honesty markers the
+ *  plan requires (attachment present, gap declared, source truncation) never rendered silently. */
+function sessionNotes(model: SessionCardModel): string | undefined {
+  const notes: string[] = [];
+  if (model.attached) notes.push('📎 full output attached');
+  if (model.hasGap) notes.push('⚠️ output has a gap (some chunks were lost)');
+  if (model.sourceTruncated) notes.push('⚠️ a source truncated its own output');
+  if (model.hadError) notes.push('❗ errors were emitted');
+  return notes.length > 0 ? notes.join('\n') : undefined;
+}
+
+/** The live, edited-in-place card for one managed session. One of these per session is created on
+ *  the first status/output and re-rendered (via an edit) as the session progresses. The stdout
+ *  tail is fenced as a code block for monospaced readability; it is bounded by the caller and
+ *  additionally clamped here so an over-long tail can never make discord.js reject the edit. */
+export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
+  const icon = model.stopping ? '🛑' : SESSION_STATE_ICON[model.state];
+  const label = model.stopping ? 'stopping…' : model.state.replace(/_/g, ' ');
+  const embed = new EmbedBuilder()
+    .setTitle(`${icon} Session ${label}`)
+    .setColor(model.stopping ? COLOR_WARN : SESSION_STATE_COLOR[model.state]);
+
+  const rawBody =
+    model.summary ??
+    (model.stopping ? 'Stop requested — waiting for the session to end.' : undefined);
+  // Hard-cap the body (a session summary is short; the cap defends the card against a runaway one)
+  // then reserve its length so the fenced tail below can never push the description over the limit.
+  const prefix = rawBody ? `${truncateLabeled(rawBody, 512)}\n` : '';
+  const tail = model.outputTail;
+  if (tail && tail.length > 0) {
+    const fenceOverhead = '```\n'.length + '\n```'.length; // fence wrapping the inner text
+    const inner = truncateLabeled(
+      tail,
+      Math.max(16, EMBED_DESCRIPTION_LIMIT - prefix.length - fenceOverhead),
+    );
+    embed.setDescription(`${prefix}\`\`\`\n${inner}\n\`\`\``);
+  } else {
+    embed.setDescription(prefix.length > 0 ? prefix.trimEnd() : 'No output yet.');
+  }
+
+  embed.addFields({ name: 'Session', value: model.sessionId });
+  if (model.accountId) embed.addFields({ name: 'Account', value: model.accountId });
+  const notes = sessionNotes(model);
+  if (notes) embed.addFields({ name: 'Notes', value: notes });
+  return embed;
+}
+
+/** The final summary card, posted as its OWN message when a session reaches a terminal state — a
+ *  standalone record of the outcome that survives above the live card's last edit. `done` reads as
+ *  completion; `failed`/`orphaned` read as an error. */
+export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder {
+  const icon = SESSION_STATE_ICON[model.state];
+  const embed = new EmbedBuilder()
+    .setTitle(`${icon} Session ${model.state === 'done' ? 'complete' : model.state}`)
+    .setColor(SESSION_STATE_COLOR[model.state])
+    .setDescription(truncateLabeled(model.summary ?? 'Session ended.', EMBED_DESCRIPTION_LIMIT));
+  embed.addFields({ name: 'Session', value: model.sessionId });
+  if (model.accountId) embed.addFields({ name: 'Account', value: model.accountId });
+  embed.addFields({ name: 'Output', value: `${model.totalOutputChars} chars streamed` });
+  const notes = sessionNotes(model);
+  if (notes) embed.addFields({ name: 'Notes', value: notes });
+  return embed;
 }
