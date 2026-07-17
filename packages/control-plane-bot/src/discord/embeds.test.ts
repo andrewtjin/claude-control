@@ -122,6 +122,15 @@ describe('buildUsageEmbed', () => {
     const embed = buildUsageEmbed({ accounts: [account()] }).toJSON();
     expect(embed.fields?.[0]?.value).not.toContain('5h windows left');
   });
+
+  it('renders bars through an injected renderer instead of the unicode default', () => {
+    // The gateway swaps in the emoji renderer this same way; a sentinel renderer proves the
+    // bar text comes from the injected function and NOT the built-in unicode squares.
+    const fakeBar = (percent: number) => `EBAR(${Math.round(percent)})`;
+    const embed = buildUsageEmbed({ accounts: [account()] }, undefined, fakeBar).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('EBAR(42) session 42%');
+    expect(embed.fields?.[0]?.value).not.toContain('🟩');
+  });
 });
 
 describe('buildTimelineEmbed', () => {
@@ -207,6 +216,14 @@ describe('buildTimelineEmbed', () => {
   it('shows a placeholder when there are no accounts', () => {
     const embed = buildTimelineEmbed({ accounts: [] }, NOW).toJSON();
     expect(embed.description).toMatch(/no accounts/i);
+  });
+
+  it('draws the session bar through an injected renderer', () => {
+    const fakeBar = (percent: number) => `EBAR(${Math.round(percent)})`;
+    const embed = buildTimelineEmbed({ accounts }, NOW, fakeBar).toJSON();
+    const field = embed.fields?.find((f) => f.name.includes('Work'));
+    expect(field?.value).toContain('EBAR(42) window open');
+    expect(field?.value).not.toContain('🟩');
   });
 });
 
