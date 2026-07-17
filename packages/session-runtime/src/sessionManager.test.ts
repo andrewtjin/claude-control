@@ -14,7 +14,13 @@ async function sandbox(): Promise<string> {
   return d;
 }
 afterEach(async () => {
-  await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
+  // maxRetries: a session whose fake turn completes right at test end can have a
+  // fire-and-forget persist() (see sessionManager.ts) drop a fresh sessions.json into the
+  // tree BETWEEN rm's unlink pass and its rmdir — observed as an ENOTEMPTY flake on Linux
+  // CI. Retrying re-enumerates the directory, sweeping up any straggler write.
+  await Promise.all(
+    dirs.map((d) => rm(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
+  );
   dirs = [];
 });
 
@@ -161,8 +167,11 @@ describe('createSessionManager', () => {
   it('generates a random id when none is given', async () => {
     const dir = await sandbox();
     const manager = createSessionManager({ stateDir: dir });
+    // Inert (never-resolved) turn for the same reason as the state-directory test below:
+    // this test only reads the synchronous handle/registry, and a completing turn would
+    // queue a fire-and-forget disk write racing afterEach's rm.
     const handle = await manager.spawnManaged({
-      client: fakeClient([{ type: 'turn_result', ok: true, summary: 'done' }]),
+      client: gatedFakeClient(deferred<void>().promise, []),
       prompt: 'go',
     });
     expect(handle.id).toMatch(/^[0-9a-f-]{36}$/);
@@ -224,9 +233,13 @@ describe('createSessionManager', () => {
     const root = await sandbox();
     const dir = join(root, 'nested', 'state');
     const manager = createSessionManager({ stateDir: dir });
+    // Never-resolved gate: the turn stays pending, so the only registry write is the one
+    // spawnManaged itself awaits — an ungated client's turn_result would queue a SECOND,
+    // fire-and-forget write that races afterEach's rm (the CI ENOTEMPTY flake). This test
+    // is about directory creation, not turn completion, so an inert session is enough.
     await manager.spawnManaged({
       id: 'm1',
-      client: fakeClient([{ type: 'turn_result', ok: true, summary: 'done' }]),
+      client: gatedFakeClient(deferred<void>().promise, []),
       prompt: 'go',
     });
     const persisted = await readRegistryFile(dir);
