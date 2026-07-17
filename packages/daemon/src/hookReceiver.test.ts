@@ -53,6 +53,18 @@ function post(
 
 const SECRET = 'test-secret-abc';
 
+/** Poll until `get` yields a value — permission POSTs are now HELD open awaiting a decision,
+ *  so tests observe their side effects (emitted envelopes) while the response is in flight. */
+async function waitFor<T>(get: () => T | undefined, timeoutMs = 2000): Promise<T> {
+  const start = Date.now();
+  for (;;) {
+    const value = get();
+    if (value !== undefined) return value;
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor timed out');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 describe('HookReceiver', () => {
   let store: Store;
   let receiver: HookReceiver;
@@ -68,6 +80,10 @@ describe('HookReceiver', () => {
       emit: (draft) => emitted.push(draft),
       daemonId: () => 'daemon-1',
       clock: () => 1_000_000,
+      // Long enough that a mid-hold resolve is never raced by the lapse; tests that WANT a
+      // lapse build their own receiver with a tiny hold. afterEach's close() answers any
+      // still-held responses neutrally, so no test hangs on an unresolved hold.
+      permissionHoldMs: 3000,
     });
     port = await receiver.listen(0);
   });
@@ -126,9 +142,9 @@ describe('HookReceiver', () => {
     });
   });
 
-  describe('PermissionRequest -> emits + persists', () => {
+  describe('PermissionRequest -> emits + persists (response held)', () => {
     it('persists a pending permission and emits permission.request + hook.notification', async () => {
-      const res = await post(
+      const held = post(
         port,
         '/',
         {
@@ -141,7 +157,7 @@ describe('HookReceiver', () => {
         },
         { 'x-claude-control-secret': SECRET },
       );
-      expect(res.status).toBe(200);
+      await waitFor(() => emitted.find((e) => e.type === 'permission.request'));
 
       const row = store.getPendingPermission('req-1');
       expect(row).toBeDefined();
@@ -154,10 +170,19 @@ describe('HookReceiver', () => {
         expect(emitted[0].payload.cwd).toBe('/tmp');
       }
       expect(emitted[1]?.type).toBe('hook.notification');
+
+      // Complete the hold so the held socket doesn't outlive the test.
+      await post(
+        port,
+        '/resolve-permission',
+        { requestId: 'req-1', decision: 'allow' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect((await held).status).toBe(200);
     });
 
     it('threads permission_mode into the permission.request payload (mode-aware cards)', async () => {
-      await post(
+      void post(
         port,
         '/',
         {
@@ -170,15 +195,15 @@ describe('HookReceiver', () => {
         },
         { 'x-claude-control-secret': SECRET },
       );
-      const req = emitted.find((e) => e.type === 'permission.request');
-      expect(req?.type).toBe('permission.request');
-      if (req?.type === 'permission.request') {
+      const req = await waitFor(() => emitted.find((e) => e.type === 'permission.request'));
+      expect(req.type).toBe('permission.request');
+      if (req.type === 'permission.request') {
         expect(req.payload.permissionMode).toBe('default');
       }
     });
 
     it('omits permissionMode entirely when the hook payload has no mode', async () => {
-      await post(
+      void post(
         port,
         '/',
         {
@@ -190,8 +215,8 @@ describe('HookReceiver', () => {
         },
         { 'x-claude-control-secret': SECRET },
       );
-      const req = emitted.find((e) => e.type === 'permission.request');
-      if (req?.type === 'permission.request') {
+      const req = await waitFor(() => emitted.find((e) => e.type === 'permission.request'));
+      if (req.type === 'permission.request') {
         // exactOptionalPropertyTypes: absent, not `undefined`.
         expect('permissionMode' in req.payload).toBe(false);
       }
@@ -328,8 +353,8 @@ describe('HookReceiver', () => {
       });
     });
 
-    it('accepts a real permission payload — tool_name/tool_input, MINTS a requestId, summary from the command', async () => {
-      const res = await post(
+    it('THE round-trip: holds the hook response and answers it with the allow decision on phone approve', async () => {
+      const held = post(
         port,
         '/',
         {
@@ -342,18 +367,17 @@ describe('HookReceiver', () => {
         },
         { 'x-claude-control-secret': SECRET },
       );
-      expect(res.status).toBe(200);
-      const permission = emitted.find((e) => e.type === 'permission.request');
-      expect(permission?.payload).toMatchObject({
+      const permission = await waitFor(() => emitted.find((e) => e.type === 'permission.request'));
+      expect(permission.payload).toMatchObject({
         sessionId: 'sess-real',
         tool: 'Bash',
         summary: 'echo hello',
         permissionMode: 'default',
         cwd: 'C:/x',
       });
-      const requestId = (permission?.payload as { requestId: string }).requestId;
+      const requestId = (permission.payload as { requestId: string }).requestId;
       expect(requestId).toBeTruthy(); // minted by the daemon — the CLI sends none
-      // The minted id is the resolvable one: the phone's response must find the pending row.
+
       const resolved = await post(
         port,
         '/resolve-permission',
@@ -361,6 +385,118 @@ describe('HookReceiver', () => {
         { 'x-claude-control-secret': SECRET },
       );
       expect(resolved.status).toBe(200);
+
+      // The held curl response IS the hook's stdout — the CLI decision schema comes back.
+      const hookRes = await held;
+      expect(hookRes.status).toBe(200);
+      expect(hookRes.body).toEqual({
+        hookSpecificOutput: {
+          hookEventName: 'PermissionRequest',
+          decision: { behavior: 'allow' },
+        },
+      });
+      expect(store.getPendingPermission(requestId)?.resolvedDecision).toBe('allow');
+    });
+
+    it('a phone deny answers the held response with behavior:deny and a reason', async () => {
+      const held = post(
+        port,
+        '/',
+        {
+          hook_event_name: 'PermissionRequest',
+          session_id: 'sess-real',
+          tool_name: 'Bash',
+          tool_input: { command: 'netstat -ano' },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const permission = await waitFor(() => emitted.find((e) => e.type === 'permission.request'));
+      const requestId = (permission.payload as { requestId: string }).requestId;
+      await post(
+        port,
+        '/resolve-permission',
+        { requestId, decision: 'deny' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const hookRes = await held;
+      expect(hookRes.body).toEqual({
+        hookSpecificOutput: {
+          hookEventName: 'PermissionRequest',
+          decision: { behavior: 'deny', message: 'denied by remote operator' },
+        },
+      });
+      expect(store.getPendingPermission(requestId)?.resolvedDecision).toBe('deny');
+    });
+
+    it('an unanswered hold lapses to a NEUTRAL response (local prompt takes over) and a late tap is rejected', async () => {
+      const lapsedEmitted: EnvelopeDraft[] = [];
+      const lapsing = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => lapsedEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        permissionHoldMs: 100,
+      });
+      const lapsingPort = await lapsing.listen(0);
+      try {
+        const hookRes = await post(
+          lapsingPort,
+          '/',
+          {
+            hook_event_name: 'PermissionRequest',
+            session_id: 'sess-real',
+            tool_name: 'Bash',
+            tool_input: { command: 'echo x' },
+          },
+          { 'x-claude-control-secret': SECRET },
+        );
+        // Neutral body: no decision fields → the CLI falls through to its local prompt.
+        expect(hookRes.status).toBe(200);
+        expect(hookRes.body).toEqual({});
+
+        const permission = lapsedEmitted.find((e) => e.type === 'permission.request');
+        const requestId = (permission?.payload as { requestId: string }).requestId;
+        const late = await post(
+          lapsingPort,
+          '/resolve-permission',
+          { requestId, decision: 'allow' },
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(late.status).toBe(409);
+        expect(late.body).toMatchObject({ ok: false });
+        // No decision was silently recorded for a request nothing applied.
+        expect(store.getPendingPermission(requestId)?.resolvedDecision).toBeNull();
+      } finally {
+        await lapsing.close();
+      }
+    });
+
+    it('AskUserQuestion is answered immediately with a waiting card, never a permission card', async () => {
+      const res = await post(
+        port,
+        '/',
+        {
+          hook_event_name: 'PermissionRequest',
+          session_id: 'sess-q',
+          tool_name: 'AskUserQuestion',
+          tool_input: { questions: [{ question: 'Which option do you want?', header: 'Choice' }] },
+          permission_mode: 'default',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      // Immediate + neutral — a held response would freeze the terminal question UI.
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({});
+      expect(emitted.some((e) => e.type === 'permission.request')).toBe(false);
+      const note = emitted.find((e) => e.type === 'hook.notification');
+      expect(note?.payload).toMatchObject({
+        event: 'notification',
+        sessionId: 'sess-q',
+        title: 'Waiting on you: Claude has a question in the terminal',
+        body: 'Which option do you want?',
+        notificationType: 'question_prompt',
+      });
     });
 
     it('a permission payload with no tool name is still rejected (nothing useful to card)', async () => {
@@ -406,18 +542,20 @@ describe('HookReceiver', () => {
   });
 
   describe('resolvePermission via /resolve-permission', () => {
-    async function requestPermission(requestId: string): Promise<void> {
-      const res = await post(
-        port,
-        '/',
-        { event: 'PermissionRequest', requestId, sessionId: 's', tool: 'Bash', summary: 'x' },
-        { 'x-claude-control-secret': SECRET },
-      );
-      expect(res.status).toBe(200);
+    // Seed the pending row directly — these tests exercise the resolve-side security
+    // contract, not the (now held-open) hook POST transport.
+    function requestPermission(requestId: string): void {
+      store.insertPendingPermission({
+        requestId,
+        sessionId: 's',
+        tool: 'Bash',
+        summary: 'x',
+        createdAtMs: 1_000_000,
+      });
     }
 
     it('a valid pending requestId can be resolved exactly once', async () => {
-      await requestPermission('req-a');
+      requestPermission('req-a');
       const first = await post(
         port,
         '/resolve-permission',
@@ -441,7 +579,7 @@ describe('HookReceiver', () => {
     });
 
     it('rejects a double-resolve of the same requestId', async () => {
-      await requestPermission('req-b');
+      requestPermission('req-b');
       const first = await post(
         port,
         '/resolve-permission',
@@ -474,18 +612,14 @@ describe('HookReceiver', () => {
       });
       const expiringPort = await expiringReceiver.listen(0);
       try {
-        await post(
-          expiringPort,
-          '/',
-          {
-            event: 'PermissionRequest',
-            requestId: 'req-exp',
-            sessionId: 's',
-            tool: 'Bash',
-            summary: 'x',
-          },
-          { 'x-claude-control-secret': SECRET },
-        );
+        // Direct row seed — a hook POST would be held open by default now.
+        store.insertPendingPermission({
+          requestId: 'req-exp',
+          sessionId: 's',
+          tool: 'Bash',
+          summary: 'x',
+          createdAtMs: now,
+        });
         now += 5000; // well past the 1000ms TTL
         const res = await post(
           expiringPort,

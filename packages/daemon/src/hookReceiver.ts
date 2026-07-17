@@ -47,6 +47,9 @@ export interface HookReceiverOptions {
   eventNames?: HookEventNames;
   /** How long a pending permission stays resolvable before it's treated as expired. */
   permissionTtlMs?: number;
+  /** How long a permission hook's HTTP response is held open for a remote decision before a
+   *  neutral answer lets the local prompt take over. See DEFAULT_PERMISSION_HOLD_MS. */
+  permissionHoldMs?: number;
   clock?: () => number;
   /** Called with a fully-formed envelope draft whenever a hook produces one — the daemon
    *  wires this to the control-plane client's send/outbox path. Kept synchronous-callback
@@ -133,6 +136,19 @@ export interface HookReceiverCliHandlers {
 export const DEFAULT_SECRET_HEADER = 'x-claude-control-secret';
 const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
 
+/** How long a permission hook's HTTP response is held open awaiting a phone decision before
+ *  we answer neutrally and let the CLI's local prompt take over. The CLI kills a command hook
+ *  after 600s by default (docs: settings.json hook `timeout`, seconds) — the 30s margin keeps
+ *  US in control of the lapse (a clean neutral response + honest late-tap rejection) instead
+ *  of curl dying and leaving the pending row silently resolvable. */
+const DEFAULT_PERMISSION_HOLD_MS = 570_000;
+
+/** Tools whose "permission" is really an interactive terminal exchange, not a remote-decidable
+ *  yes/no. Holding these would freeze the terminal UI they need (wet finding 2026-07-17: an
+ *  AskUserQuestion approve/deny card is nonsense — the phone can't answer the question), so
+ *  they get a "waiting on you" notification instead of a permission card, and no hold. */
+const INTERACTIVE_PROMPT_TOOLS = new Set(['AskUserQuestion']);
+
 /** Tolerant body narrowing helpers — a hook payload is attacker-adjacent (it's whatever the
  *  locally-running CLI sends), so every field is checked before use rather than trusted. */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -146,6 +162,13 @@ function str(value: unknown): string | undefined {
  *  helps nobody. The marker makes the cut visible instead of silent. */
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}… [truncated]`;
+}
+/** The first question AskUserQuestion is posing (`tool_input.questions[0].question`), so the
+ *  "waiting on you" card can show WHAT is being asked instead of a JSON blob. */
+function firstQuestionText(toolInput: Record<string, unknown> | undefined): string | undefined {
+  if (!toolInput || !Array.isArray(toolInput.questions)) return undefined;
+  const first: unknown = toolInput.questions[0];
+  return isRecord(first) ? str(first.question) : undefined;
 }
 /** Best human line for a permission card, derived from the tool's input: a Bash `command` or
  *  a file path IS the summary a phone reader needs; anything else falls back to compact JSON. */
@@ -169,11 +192,24 @@ export class HookReceiver {
   private readonly emit: (draft: EnvelopeDraft) => void;
   private readonly daemonId: () => string;
   private readonly logger: Logger;
+  private readonly permissionHoldMs: number;
   private server: Server | undefined;
   /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
    *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
    *  rather than a crash. */
   private cliHandlers: HookReceiverCliHandlers | undefined;
+  /** Permission hook responses currently held open awaiting a phone decision, keyed by the
+   *  requestId we minted. `event` echoes the exact hook event name the CLI fired — the
+   *  decision output must name it back (`hookSpecificOutput.hookEventName`). */
+  private readonly heldPermissions = new Map<
+    string,
+    { res: ServerResponse; timer: NodeJS.Timeout; event: string }
+  >();
+  /** requestIds whose hold ended WITHOUT a decision (lapse, dead socket, shutdown). Once the
+   *  local prompt has taken over, a late phone tap must be rejected honestly — resolving the
+   *  row would tell the phone "Approved." about a decision nothing ever applied. Entries
+   *  self-clean after the TTL, when the store's own expiry makes the guard redundant. */
+  private readonly lapsedHolds = new Set<string>();
 
   constructor(options: HookReceiverOptions) {
     this.store = options.store;
@@ -185,6 +221,7 @@ export class HookReceiver {
     this.emit = options.emit;
     this.daemonId = options.daemonId;
     this.logger = options.logger ?? noopLogger;
+    this.permissionHoldMs = options.permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS;
   }
 
   /** Install the CLI session-command logic. Called by the daemon before `listen` (symmetric
@@ -221,6 +258,15 @@ export class HookReceiver {
 
   async close(): Promise<void> {
     if (!this.server) return;
+    // Held permission responses are open connections — `server.close()` waits for them, so a
+    // shutdown mid-hold would hang until the hold lapsed. Answer them all neutrally first
+    // (the local prompt takes over, same as a lapse).
+    for (const [requestId, held] of this.heldPermissions) {
+      clearTimeout(held.timer);
+      this.markLapsed(requestId);
+      this.respond(held.res, 200, {});
+    }
+    this.heldPermissions.clear();
     await new Promise<void>((resolve, reject) => {
       this.server?.close((err) => (err ? reject(err) : resolve()));
     });
@@ -233,6 +279,12 @@ export class HookReceiver {
    * `{ok:false}` (never throws, never applies) for anything else.
    */
   resolvePermission(requestId: string, decision: 'allow' | 'deny'): ResolvePermissionResult {
+    // Once a hold ended without a decision, the CLI's local prompt owns this request — a late
+    // remote tap must not resolve the row (the phone would see "Approved." for a decision
+    // nothing applied).
+    if (this.lapsedHolds.has(requestId)) {
+      return { ok: false, error: 'hold lapsed — the local prompt took over' };
+    }
     const row = this.store.getPendingPermission(requestId);
     if (!row) return { ok: false, error: 'unknown requestId' };
     if (row.resolvedDecision !== null) return { ok: false, error: 'already resolved' };
@@ -243,7 +295,48 @@ export class HookReceiver {
     // checks above just produce a specific, honest error message for each rejection reason.
     const changed = this.store.resolvePendingPermission(requestId, decision);
     if (changed === 0) return { ok: false, error: 'already resolved' };
+    this.completeHeldPermission(requestId, decision);
     return { ok: true };
+  }
+
+  /** Answer a held permission hook response with the CLI's decision schema (docs: hook output
+   *  `hookSpecificOutput.decision`). curl prints our response body to stdout, and hook stdout
+   *  IS the CLI's decision channel — this is the moment a phone tap actually gates the tool.
+   *  No-op when the request isn't held (already lapsed, or resolved via a non-hook path). */
+  private completeHeldPermission(requestId: string, decision: 'allow' | 'deny'): void {
+    const held = this.heldPermissions.get(requestId);
+    if (!held) return;
+    clearTimeout(held.timer);
+    this.heldPermissions.delete(requestId);
+    this.respond(held.res, 200, {
+      hookSpecificOutput: {
+        hookEventName: held.event,
+        decision:
+          decision === 'allow'
+            ? { behavior: 'allow' }
+            : { behavior: 'deny', message: 'denied by remote operator' },
+      },
+    });
+    this.logger.info({ requestId, decision }, 'held permission response completed');
+  }
+
+  /** Record that `requestId`'s hold ended with no decision, and self-clean the marker after
+   *  the TTL (past it, the store's own expiry already rejects the resolve). */
+  private markLapsed(requestId: string): void {
+    this.lapsedHolds.add(requestId);
+    const cleanup = setTimeout(() => this.lapsedHolds.delete(requestId), this.permissionTtlMs);
+    cleanup.unref();
+  }
+
+  /** The hold window ended without a phone decision: answer neutrally (no `decision` in the
+   *  output → the CLI shows its normal local prompt) and mark the request lapsed. */
+  private lapseHeldPermission(requestId: string): void {
+    const held = this.heldPermissions.get(requestId);
+    if (!held) return;
+    this.heldPermissions.delete(requestId);
+    this.markLapsed(requestId);
+    this.logger.info({ requestId }, 'permission hold lapsed; local prompt takes over');
+    this.respond(held.res, 200, {});
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -396,7 +489,7 @@ export class HookReceiver {
     }
 
     if (event === this.eventNames.permissionRequest) {
-      this.handlePermissionRequest(body, res);
+      this.handlePermissionRequest(body, res, event);
       return;
     }
     if (event === this.eventNames.stop) {
@@ -416,7 +509,11 @@ export class HookReceiver {
     this.respond(res, 400, { ok: false, error: `unrecognized event "${event}"` });
   }
 
-  private handlePermissionRequest(body: Record<string, unknown>, res: ServerResponse): void {
+  private handlePermissionRequest(
+    body: Record<string, unknown>,
+    res: ServerResponse,
+    event: string,
+  ): void {
     // The CLI names the tool `tool_name` and carries its arguments in `tool_input`; it sends
     // NO requestId of its own, so the daemon mints one (its only job is correlating our
     // pending row with the phone's later response). `requestId`/`sessionId`/`tool` remain as
@@ -432,6 +529,28 @@ export class HookReceiver {
         'permission hook POST missing session id or tool name',
       );
       this.respond(res, 400, { ok: false, error: 'session_id and tool_name are required' });
+      return;
+    }
+
+    // An interactive-prompt tool (AskUserQuestion) is not a remote-decidable permission: the
+    // phone can't answer the question, and holding the response would freeze the terminal UI
+    // the question needs. Neutral answer immediately (normal flow shows the question) and
+    // push a "waiting on you" card naming what's being asked instead of approve/deny buttons.
+    if (INTERACTIVE_PROMPT_TOOLS.has(tool)) {
+      this.emit({
+        daemonId: this.daemonId(),
+        type: 'hook.notification',
+        payload: {
+          event: 'notification',
+          sessionId,
+          title: 'Waiting on you: Claude has a question in the terminal',
+          body: firstQuestionText(toolInput) ?? summary,
+          level: 'info',
+          notificationType: 'question_prompt',
+        },
+      });
+      this.logger.info({ sessionId, tool }, 'interactive-prompt tool; waiting card pushed');
+      this.respond(res, 200, {});
       return;
     }
 
@@ -476,11 +595,27 @@ export class HookReceiver {
       },
     });
 
+    // THE round-trip: hold this HTTP response open. A phone Approve/Deny lands in
+    // `resolvePermission`, which answers it with the CLI's decision schema; the hold lapsing
+    // (or the socket dying) answers neutrally and the local prompt takes over. The CLI's own
+    // hook timeout (600s default) outlasts our hold window — see DEFAULT_PERMISSION_HOLD_MS.
+    const timer = setTimeout(() => this.lapseHeldPermission(requestId), this.permissionHoldMs);
+    timer.unref();
+    this.heldPermissions.set(requestId, { res, timer, event });
+    res.on('close', () => {
+      // Fires on our own completion too — only a request STILL in the map is an abandoned
+      // socket (curl killed, session ended, CLI-side timeout beating ours).
+      if (this.heldPermissions.has(requestId)) {
+        clearTimeout(timer);
+        this.heldPermissions.delete(requestId);
+        this.markLapsed(requestId);
+        this.logger.info({ requestId }, 'held permission socket closed by the CLI side');
+      }
+    });
     this.logger.info(
       { requestId, sessionId, tool, permissionMode },
-      'permission hook received; card pushed',
+      'permission hook received; card pushed; response held for remote decision',
     );
-    this.respond(res, 200, { ok: true });
   }
 
   private handleStopOrNotification(
