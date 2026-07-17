@@ -11,14 +11,14 @@ strictly by Discord user. Your credentials never leave your machine.
 
 ## What it does
 
-- **Cross-account usage optimization** — one view of every account's 5-hour, weekly, and per-model
-  limits, with optimal use calculations.
-- **One-tap switch** — get a near-cap alert on your phone, switch accounts with a
-  tap; in-flight work resumes under the new account.
-- **Approve from anywhere** — permission prompts and "done / waiting" notices reach
-  your phone; approve or deny from Discord.
-- **Remote sessions** — send a prompt into a live session, or start a new one, and
+- **Auto-switch.** At low remaining 5h usage, you'll switch sessions to maximize uptime. Or, switch on phone with one tap.
+- **Remote sessions.** Send live prompts or start a new session, and
   watch milestones stream back.
+- **Cross-account usage optimization.** One view of every account's 5-hour, weekly, and per-model
+  limits, with optimal use calculations.
+- **Approve from anywhere.** permission prompts and "done / waiting" notices reach
+  your phone; approve or deny from Discord.
+
 
 ## Packages
 
