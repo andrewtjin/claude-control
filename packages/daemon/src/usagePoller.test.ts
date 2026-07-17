@@ -261,17 +261,45 @@ describe('UsagePoller', () => {
     expect(liveUsage.accountUsage.fetchedAtMs).toBe(1000);
     expect(liveUsage.accountUsage.source).toBe('live');
 
-    // Within the floor → this cycle is skipped. It must return the SAME retained object with
-    // its ORIGINAL fetchedAtMs/source, and must NOT re-read tier-0 (which would report frozen
-    // cache stamped fetchedAtMs:now as if freshly fetched).
+    // Within the floor → this cycle is skipped. It must return the retained POLLED DATA
+    // unchanged (ORIGINAL fetchedAtMs/source/limits), and must NOT re-read tier-0 (which
+    // would report frozen cache stamped fetchedAtMs:now as if freshly fetched).
     now = POLL_FLOOR_MS - 1;
     const skipped = await poller.pollAll([account]);
     expect(skipped.results[0]?.outcome).toBe('skipped');
-    expect(skipped.results[0]?.usage).toBe(liveUsage);
     expect(skipped.results[0]?.usage.accountUsage.fetchedAtMs).toBe(1000);
     expect(skipped.results[0]?.usage.accountUsage.source).toBe('live');
+    expect(skipped.results[0]?.usage.accountUsage.limits).toEqual(liveUsage.accountUsage.limits);
     expect(cachedReads).toBe(0);
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a skipped cycle re-stamps identity flags — a switch during the poll floor is visible at once', async () => {
+    let now = 1000;
+    const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(200, liveBody(42))));
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(undefined),
+      clock: () => now,
+    });
+
+    const live = await poller.pollAll([account]); // polled while ACTIVE
+    expect(live.results[0]?.usage.accountUsage.active).toBe(true);
+
+    // The user switches away before the account is due again: the skipped result must
+    // carry active:false (and current quarantine/label) even though its usage numbers and
+    // fetchedAtMs are still the retained ones — otherwise the advisor and the auto-switcher
+    // reason about who WAS active for up to a whole poll floor.
+    now = POLL_FLOOR_MS - 1;
+    const flipped: PollAccount = { ...account, active: false, quarantined: true, label: 'Renamed' };
+    const skipped = await poller.pollAll([flipped]);
+    expect(skipped.results[0]?.outcome).toBe('skipped');
+    expect(skipped.results[0]?.usage.accountUsage.active).toBe(false);
+    expect(skipped.results[0]?.usage.accountUsage.label).toBe('Renamed');
+    expect(skipped.results[0]?.usage.advisorInput.active).toBe(false);
+    expect(skipped.results[0]?.usage.advisorInput.quarantined).toBe(true);
+    expect(skipped.results[0]?.usage.accountUsage.fetchedAtMs).toBe(1000); // data still aged
   });
 
   it('one account failing to read tier-0 cache degrades only that account, not the whole cycle', async () => {
