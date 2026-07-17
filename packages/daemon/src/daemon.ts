@@ -9,8 +9,15 @@
 
 import type { RecoverResult, ActivateResult, StoredAccount } from '@claude-control/switch-engine';
 import { resolveAccountRef } from '@claude-control/switch-engine';
-import type { SessionManager } from '@claude-control/session-runtime';
-import { createAgentSdkClient as defaultCreateAgentSdkClient } from '@claude-control/session-runtime';
+import type {
+  SessionManager,
+  SessionHandle,
+  PermissionRequest,
+} from '@claude-control/session-runtime';
+import {
+  createAgentSdkClient as defaultCreateAgentSdkClient,
+  escalateStop,
+} from '@claude-control/session-runtime';
 import type { AgentSdkClient } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
@@ -63,6 +70,10 @@ export interface DaemonOptions {
   /** Minimum gap between repeat quarantine-notice pushes for the SAME account, so an account
    *  whose refresh flaps in and out of quarantine can't spam the phone. */
   quarantineNoticeDebounceMs?: number;
+  /** Grace window for `session.stop` escalation (interrupt → THIS long → hard stop); defaults
+   *  to escalateStop's own 5s. Injectable so tests can exercise the hard-stop rung with a
+   *  short real-time window instead of fake timers (house convention). */
+  stopGraceMs?: number;
   /** How often to poll usage and re-sync attribution. */
   pollIntervalMs?: number;
   logger?: Logger;
@@ -72,6 +83,31 @@ const DEFAULT_POLL_INTERVAL_MS = 60_000;
 /** 30 minutes: re-login is a minutes-long human action on the PC, so nagging more often than
  *  ~twice an hour for the same still-broken account is pure noise. */
 const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
+
+/**
+ * DECISION — managed sessions always run in Claude Code's 'default' permission mode.
+ * `session.spawn` carries no mode field (protocol v1), and 'default' is the only mode in
+ * which the SDK parks tools on `canUseTool` — which IS the remote approve/deny loop (plan §4:
+ * approve/deny buttons only for 'default'-mode sessions; every other mode gets an
+ * informational card). Any auto-approving mode (acceptEdits/bypassPermissions) would silently
+ * remove the human from the loop on a phone-spawned session — the opposite of what remote
+ * control exists for. If a future protocol rev adds a mode to session.spawn, the payload
+ * should override this constant; until then the daemon owns the policy, not the phone.
+ */
+const MANAGED_SESSION_PERMISSION_MODE = 'default';
+
+/** What a crash-resumed session is told on re-attach. Resume needs SOME prompt to start the
+ *  next turn (the SDK has no attach-without-prompting — see ResumeOrphanOptions), so this is
+ *  a reorientation nudge rather than new work the operator never asked for. */
+const RESUME_NUDGE_PROMPT =
+  'The controlling daemon restarted and re-attached to this session. Briefly recap where the ' +
+  'task stands, then continue from where you left off. If you were waiting on operator ' +
+  'input, restate the question and wait.';
+
+/** Bound on the session.stop idempotency set. Stop keys only need to survive the
+ *  double/triple-tap window (seconds), so a few hundred remembered keys is generous while
+ *  keeping the set trivially bounded across a long-lived daemon. */
+const MAX_SEEN_STOP_KEYS = 256;
 
 /** Plain `Omit` over a discriminated union collapses `type`/`payload` into the union of ALL
  *  variants' values, losing the correlation between them — the same reason shared-protocol's
@@ -93,6 +129,7 @@ export class Daemon {
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
   private readonly clock: () => number;
   private readonly quarantineNoticeDebounceMs: number;
+  private readonly stopGraceMs: number | undefined;
   private readonly pollIntervalMs: number;
   private readonly logger: Logger;
 
@@ -100,6 +137,16 @@ export class Daemon {
   /** Next `session.output.seq` to use per session — the protocol requires a monotonic
    *  per-session sequence so the phone can detect drops/reordering. */
   private readonly outputSeq = new Map<string, number>();
+  /** requestId → owning sessionId for permission requests that ORIGINATED from a managed
+   *  session's SDK `canUseTool` (as opposed to CLI-hook-originated ones). Inbound
+   *  `permission.response` routes on membership here — see {@link handlePermissionResponse}
+   *  for why a registry (and not an id prefix) is the routing mechanism. Entries are swept
+   *  when the owning session goes terminal (see {@link attachSessionPipes}), which bounds the
+   *  map by the pending prompts of LIVE sessions. */
+  private readonly managedPermissionRoutes = new Map<string, string>();
+  /** Recently seen `session.stop` idempotencyKeys, so a double-tapped/re-sent Stop never runs
+   *  the escalation ladder twice. Bounded FIFO — see {@link rememberStopKey}. */
+  private readonly seenStopKeys = new Set<string>();
   /** Per-account quarantine bookkeeping for edge-detection + debounce; see
    *  {@link reconcileQuarantineNotices}. In-memory only, so it resets on restart — which is
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
@@ -121,6 +168,7 @@ export class Daemon {
     this.clock = options.clock ?? Date.now;
     this.quarantineNoticeDebounceMs =
       options.quarantineNoticeDebounceMs ?? DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS;
+    this.stopGraceMs = options.stopGraceMs;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.logger = options.logger ?? noopLogger;
   }
@@ -177,9 +225,29 @@ export class Daemon {
           this.logger.error({ err }, 'error handling session.spawn');
         });
       },
+      onSessionStop: (msg) => {
+        this.handleSessionStop(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling session.stop');
+        });
+      },
     });
 
     await this.controlPlaneClient.connect();
+
+    // Re-attach managed sessions a previous daemon run left behind (crash mid-session). Runs
+    // AFTER connect() so resumed-session envelopes flow live immediately and so a broken
+    // relay surfaces before any SDK subprocess is spawned (the outbox would buffer either
+    // way). A failure here must NEVER kill startup: an un-resumable registry is a degraded
+    // feature, not a dead daemon — recover() has already stamped the records 'orphaned', so
+    // nothing is silently lost.
+    try {
+      await this.resumeOrphanedSessions();
+    } catch (err) {
+      this.logger.error(
+        { err },
+        'session re-attach failed; continuing startup without resumed sessions',
+      );
+    }
 
     // Run one poll cycle immediately so the phone has fresh data as soon as the daemon comes
     // up, rather than waiting a full interval; failures here must not crash startup — the
@@ -331,8 +399,63 @@ export class Daemon {
     }
   }
 
+  /**
+   * One inbound pipeline, two request origins:
+   *  - CLI-hook-originated requests (an interactive `claude` run on the PC) resolve through
+   *    `hookReceiver.resolvePermission` — the DB WHERE-guarded single-resolve path.
+   *  - SDK-originated requests (a managed session's parked `canUseTool`) resolve through the
+   *    owning `SessionHandle.resolvePermission` — the in-process permission gate that actually
+   *    unblocks the tool.
+   *
+   * WHY a requestId REGISTRY (managedPermissionRoutes) and not an id prefix: requestIds are
+   * minted by third parties (the SDK's control-request ids; the hook payload's own ids), so
+   * the daemon cannot impose a namespace without REWRITING the id — and a rewritten id would
+   * no longer match what the runtime/DB knows, forcing an unmangling step on every resolve and
+   * re-opening exactly the forged/stale-id ambiguity the security contract exists to close.
+   * The registry needs no such rewriting: membership is recorded at the only place an SDK
+   * request can enter ({@link handleManagedPermissionRequest}), so an id NOT in it is by
+   * construction not a managed request. Unknown ids resolve NOTHING on either leg — the
+   * managed leg returns 'unknown' from the gate, the hook leg rejects on its DB guard.
+   *
+   * `scope` is accepted on the wire but v1 applies every decision once-only (session-scoped
+   * allows are not implemented in the runtime) — the same posture the hook path has always had.
+   */
   private handlePermissionResponse(msg: MessageOf<'permission.response'>): void {
     const { requestId, decision } = msg.payload;
+
+    const owningSessionId = this.managedPermissionRoutes.get(requestId);
+    if (owningSessionId !== undefined) {
+      const handle = this.sessionManager.get(owningSessionId);
+      if (!handle?.resolvePermission) {
+        // The session died between request and response — the runtime already denied the
+        // request fail-closed when its turn ended. Drop; never fall through to the hook path,
+        // where "resolving" the row would record a decision nothing ever applied.
+        this.logger.warn(
+          { requestId, sessionId: owningSessionId },
+          'permission.response for a managed request whose session is gone; dropped',
+        );
+        return;
+      }
+      const outcome = handle.resolvePermission(requestId, {
+        behavior: decision,
+        // The SDK requires a reason on a deny; the adapter would default one, but naming the
+        // actual origin (a human on the phone) is more useful to the model than a generic.
+        ...(decision === 'deny' ? { message: 'denied by remote operator' } : {}),
+      });
+      if (outcome === 'resolved') {
+        // Mirror the applied decision onto the pending_permissions row so the audit trail
+        // matches what happened. The row is bookkeeping on this leg, not the guard (the
+        // runtime's gate is), so a 0-change result would only mean the row went missing.
+        this.store.resolvePendingPermission(requestId, decision);
+      } else {
+        // 'already_handled' (double-tap) or 'unknown' (request ended with its turn): the
+        // idempotency/fail-closed guard working, not a daemon error.
+        this.logger.warn({ requestId, outcome }, 'managed permission.response not applied');
+      }
+      return;
+    }
+
+    // Hook-originated (or entirely unknown) — the pre-existing path, unchanged.
     const result = this.hookReceiver.resolvePermission(requestId, decision);
     if (!result.ok) {
       // Exactly the security contract's job: a stale/forged/duplicate response is logged and
@@ -357,14 +480,197 @@ export class Daemon {
     const handle = await this.sessionManager.spawnManaged({
       client,
       prompt,
+      // Always 'default' so remote approve/deny actually works — see the constant's decision
+      // comment for why the daemon (not the spawn payload) owns this policy in protocol v1.
+      permissionMode: MANAGED_SESSION_PERMISSION_MODE,
       ...(resumeSessionId !== undefined && resumeSessionId !== null ? { resumeSessionId } : {}),
       ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
       ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
     });
 
-    handle.onEvent((event) => {
-      this.forwardSessionEvent(handle.id, accountId ?? undefined, event);
+    this.attachSessionPipes(handle, accountId ?? undefined);
+  }
+
+  /**
+   * Phone-initiated stop: interrupt → grace window → hard stop. `escalateStop` owns the
+   * ladder (tested in session-runtime); this handler owns idempotency and routing. There is
+   * deliberately NO stop.result envelope — the acknowledgment rides on the `session.status`
+   * transitions the stopped handle's own event stream already forwards (running →
+   * done/failed), so the phone's source of truth for "it stopped" is the same as for every
+   * other state change.
+   */
+  private async handleSessionStop(msg: MessageOf<'session.stop'>): Promise<void> {
+    const { sessionId, idempotencyKey } = msg.payload;
+
+    // Idempotency FIRST, before any await: a double-tapped Stop (same key, re-sent or
+    // replayed) must not run the ladder twice — a second interrupt() landing inside the first
+    // stop's grace window would turn a graceful wind-down into a harder stop than asked for.
+    if (this.seenStopKeys.has(idempotencyKey)) {
+      this.logger.info({ sessionId, idempotencyKey }, 'duplicate session.stop ignored');
+      return;
+    }
+    this.rememberStopKey(idempotencyKey);
+
+    const handle = this.sessionManager.get(sessionId);
+    if (!handle) {
+      // Unknown/inactive session: tell the phone explicitly (`relatesTo` = the stop frame's
+      // own envelope id, the protocol's correlation anchor) rather than leaving the Stop
+      // button waiting on a session.status ack that will never come — and never crash.
+      this.logger.warn({ sessionId }, 'session.stop for unknown/inactive session');
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'unknown_session',
+          message: `session.stop: no live session '${sessionId}' in this daemon`,
+          relatesTo: msg.id,
+        },
+      });
+      return;
+    }
+
+    const result = await escalateStop(handle, {
+      ...(this.stopGraceMs !== undefined ? { graceMs: this.stopGraceMs } : {}),
     });
+    // The rung is the honest answer to "did it die cleanly?" — logged for the record; the
+    // phone reads the outcome off the forwarded session.status transition.
+    this.logger.info(
+      { sessionId, rung: result.rung, state: result.state },
+      'session.stop escalation finished',
+    );
+  }
+
+  /** Remember a session.stop idempotencyKey with FIFO eviction past the bound — a JS Set
+   *  iterates in insertion order, so the first value is always the oldest key. */
+  private rememberStopKey(key: string): void {
+    this.seenStopKeys.add(key);
+    if (this.seenStopKeys.size > MAX_SEEN_STOP_KEYS) {
+      const oldest = this.seenStopKeys.values().next().value;
+      if (oldest !== undefined) this.seenStopKeys.delete(oldest);
+    }
+  }
+
+  // ---- managed-session plumbing (spawn + resume share all of it) ----
+
+  /**
+   * Re-attach every orphaned managed session at startup, wiring each resumed handle exactly
+   * like a fresh spawn so the phone cannot tell the difference. Skipped orphans are logged
+   * and stay stamped 'orphaned' on disk ("log + mark") — visible in `list()`, never silently
+   * dropped.
+   *
+   * PERSISTENCE DECISION: session records live in session-runtime's `sessions.json` (atomic
+   * temp+rename with a serialized write queue) and ONLY there — the Store's `sessions` table
+   * stays deliberately unwired. Mirroring every state change into sqlite would create a
+   * second source of truth that recover()/resumeOrphan never read, and a crash between the
+   * two writes guarantees eventual divergence; nothing reads the table today. If the planned
+   * `cctl session status` wants sqlite access, the mirror must land in the same commit as its
+   * reader (see the matching note in store.ts).
+   */
+  private async resumeOrphanedSessions(): Promise<void> {
+    const orphaned = await this.sessionManager.recover();
+    if (orphaned.length > 0) {
+      this.logger.info(
+        { sessionIds: orphaned.map((r) => r.id) },
+        'found orphaned sessions from a previous run',
+      );
+    }
+    // Optional on the interface only for minimal fakes — the real manager implements it.
+    const result = await this.sessionManager.resumeAllOrphans?.({
+      // Fresh client per resumed session: each managed session owns its own query lifecycle.
+      createClient: () => this.createAgentSdkClient(),
+      prompt: RESUME_NUDGE_PROMPT,
+      permissionMode: MANAGED_SESSION_PERMISSION_MODE,
+    });
+    if (!result) return;
+    for (const record of result.resumed) {
+      const handle = this.sessionManager.get(record.id);
+      if (!handle) continue; // resumed but already gone again — nothing live to subscribe to
+      this.attachSessionPipes(handle, record.accountId);
+      this.logger.info({ sessionId: record.id }, 'resumed orphaned session');
+    }
+    for (const skip of result.skipped) {
+      this.logger.warn({ sessionId: skip.id, reason: skip.reason }, 'orphaned session not resumed');
+    }
+  }
+
+  /**
+   * Subscribe the two channels every managed session must forward, identically for fresh
+   * spawns and crash-resumed sessions: display events → session.status/session.output
+   * envelopes, and STRUCTURED permission requests → the pending-permission pipeline. Also
+   * sweeps the session's permission routes on terminal status — which is what keeps
+   * `managedPermissionRoutes` bounded (a session's requests never outlive the session).
+   */
+  private attachSessionPipes(handle: SessionHandle, accountId: string | undefined): void {
+    handle.onEvent((event) => {
+      if (event.kind === 'status' && (event.state === 'done' || event.state === 'failed')) {
+        this.sweepManagedPermissionRoutes(handle.id);
+      }
+      this.forwardSessionEvent(handle.id, accountId, event);
+    });
+    // Optional on SessionHandle (observed terminals have no structured permission seam);
+    // managed handles always implement it.
+    handle.onPermissionRequest?.((req) => {
+      this.handleManagedPermissionRequest(handle.id, req);
+    });
+  }
+
+  /**
+   * An SDK-originated permission request: the managed session's `canUseTool` has PARKED a
+   * tool awaiting a human decision. Bookkeeping mirrors the hook-originated path (a
+   * `pending_permissions` row + a `permission.request` envelope) so the phone sees ONE kind of
+   * permission card regardless of origin — but the request is ALSO registered in
+   * `managedPermissionRoutes`, because resolution travels a different leg: back into the
+   * in-process SessionHandle that owns the blocked promise, not the hook receiver's
+   * DB-guarded resolve.
+   *
+   * No `expiresAt` on the envelope: unlike hook prompts (15-min TTL), an SDK-parked prompt
+   * deliberately has NO deadline (M4 non-negotiable: never auto-allow/deny on timeout) — it
+   * stays pending until a human answers or the turn/session ends, at which point the runtime
+   * denies it fail-closed.
+   */
+  private handleManagedPermissionRequest(sessionId: string, req: PermissionRequest): void {
+    // The SDK can re-deliver a control_request for a still-pending id (see the runtime's
+    // permissionGate.register) — a repeat must not re-insert the row or push a second card.
+    if (this.managedPermissionRoutes.has(req.requestId)) return;
+    this.managedPermissionRoutes.set(req.requestId, sessionId);
+    // Same duplicate-guard against the DB: protects the PRIMARY KEY insert from an id that
+    // (however improbably) collides with a hook-originated row.
+    if (this.store.getPendingPermission(req.requestId) === undefined) {
+      this.store.insertPendingPermission({
+        requestId: req.requestId,
+        sessionId,
+        tool: req.tool,
+        summary: req.summary,
+        createdAtMs: this.clock(),
+      });
+    }
+    this.sendEnvelope({
+      type: 'permission.request',
+      payload: {
+        requestId: req.requestId,
+        sessionId,
+        tool: req.tool,
+        summary: req.summary,
+        ...(req.permissionMode !== undefined ? { permissionMode: req.permissionMode } : {}),
+      },
+    });
+    // Deliberately NO companion hook.notification (the hook path sends one): a managed
+    // session's own event stream already surfaces the "Permission required: …" milestone as
+    // session.output, so a notification here would be a duplicate card on the phone.
+  }
+
+  /** Drop every permission route owned by `sessionId` once it ends, mirroring the runtime's
+   *  fail-closed teardown onto the audit rows: the session's gate has already DENIED any
+   *  still-pending request when it went terminal, so the row must not linger 'pending'. That
+   *  also makes a LATE phone response harmless — with the route gone it falls through to the
+   *  hook receiver's resolve, whose already-resolved DB guard rejects it instead of recording
+   *  a decision nothing ever applied. (The WHERE-guarded update leaves rows a human actually
+   *  answered untouched.) */
+  private sweepManagedPermissionRoutes(sessionId: string): void {
+    for (const [requestId, owner] of this.managedPermissionRoutes) {
+      if (owner !== sessionId) continue;
+      this.managedPermissionRoutes.delete(requestId);
+      this.store.resolvePendingPermission(requestId, 'deny');
+    }
   }
 
   /** Translate a session backend's own event vocabulary into wire envelopes for the phone. */

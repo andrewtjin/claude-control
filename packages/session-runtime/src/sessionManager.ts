@@ -93,6 +93,40 @@ export interface SpawnManagedOptions {
   resumeSessionId?: string;
   cwd?: string;
   accountId?: string;
+  /** Claude Code permission mode for the session (e.g. 'default' to enable remote
+   *  approve/deny). Threaded into every turn's query. */
+  permissionMode?: string;
+}
+
+/** Re-attach ONE crashed/orphaned managed session by resuming its underlying SDK session.
+ *  The record's identity (id/cwd/accountId/startedAt) is preserved; only a fresh `client`
+ *  and the `prompt` to start the resumed turn are supplied by the caller. */
+export interface ResumeOrphanOptions {
+  /** A fresh Agent SDK client for this session — each managed session owns its own query
+   *  lifecycle, so a resumed one needs its own client, not a shared instance. */
+  client: AgentSdkClient;
+  /** Prompt to start the resumed session's next turn. Resume needs a turn to attach to; the
+   *  SDK has no "attach without prompting", so the caller decides what to say — a continuation
+   *  nudge, or fresh phone-supplied text. */
+  prompt: string;
+  /** Optional permission mode for the resumed session (see SpawnManagedOptions). */
+  permissionMode?: string;
+}
+
+/** Re-attach ALL orphaned managed sessions at once (daemon startup, after `recover()`). */
+export interface ResumeAllOrphansOptions {
+  /** Fresh client per resumed session — invoked once per session actually resumed. */
+  createClient: () => AgentSdkClient;
+  prompt: string;
+  permissionMode?: string;
+}
+
+export interface ResumeAllOrphansResult {
+  /** The re-spawned records (now `starting`/`running` again), in registry order. */
+  resumed: SessionRecord[];
+  /** Orphans that were NOT resumed, each with why (not managed, already live, no resumeId, or
+   *  a spawn error) — so the daemon can log/quarantine rather than silently lose them. */
+  skipped: Array<{ id: string; reason: string }>;
 }
 
 export interface AttachObservedOptions {
@@ -119,6 +153,21 @@ export interface SessionManager {
    * first call finds nothing left to reconcile.
    */
   recover(): Promise<SessionRecord[]>;
+  /**
+   * Re-attach one orphaned managed session by resuming its underlying SDK session from the
+   * persisted `resumeId`, preserving the record's identity and emitting the SAME handle-event
+   * surface as a fresh spawn (so the daemon forwards session.status/output identically).
+   * OPTIONAL on the interface only so existing minimal fakes stay valid — the real manager
+   * always implements it. Throws (never silently degrades) if the session is unknown, already
+   * live, not managed, or has no persisted resumeId to resume from.
+   */
+  resumeOrphan?(sessionId: string, opts: ResumeOrphanOptions): Promise<SessionHandle>;
+  /**
+   * Re-attach every orphaned managed session (daemon startup, after `recover()`), resuming
+   * each and reporting which were skipped and why. Never throws for a single bad session — it
+   * is collected into `skipped` so one un-resumable orphan can't abort the whole re-attach.
+   */
+  resumeAllOrphans?(opts: ResumeAllOrphansOptions): Promise<ResumeAllOrphansResult>;
 }
 
 const TERMINAL_STATES: ReadonlySet<SessionState> = new Set(['done', 'failed', 'orphaned']);
@@ -160,6 +209,19 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
     return next;
   }
 
+  /** Persist the SDK's own session id onto a record as its resume anchor. Called from a
+   *  managed session's `onSessionId` (fires on `session_init`) so EVERY managed session —
+   *  not just ones that were themselves started with a resume id — becomes re-attachable
+   *  after a crash. Without this, a fresh spawn's record would carry no `resumeId` and
+   *  `resumeOrphan` could never resume it. Fire-and-forget persist: the in-memory record is
+   *  already correct; the next state-changing write retries on failure. */
+  function persistResumeId(id: string, sdkSessionId: string): void {
+    const current = records.get(id);
+    if (!current || current.resumeId === sdkSessionId) return;
+    current.resumeId = sdkSessionId;
+    void persist().catch(() => undefined);
+  }
+
   /** Wire a freshly-created handle's status/summary events back into its record, keeping
    *  the on-disk registry current without callers having to remember to do it. */
   function trackHandle(handle: SessionHandle, record: SessionRecord): void {
@@ -185,6 +247,94 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
     });
   }
 
+  /** Shared re-attach core. Preserves the record's identity (id/cwd/accountId/startedAt),
+   *  resumes the SDK session from the persisted `resumeId`, and re-tracks the new handle so
+   *  the event surface is identical to a fresh spawn. Throws for every reason a session
+   *  cannot be resumed rather than silently starting an unrelated session under the same id. */
+  async function resumeOrphanImpl(
+    sessionId: string,
+    resumeOpts: ResumeOrphanOptions,
+  ): Promise<SessionHandle> {
+    await ensureLoaded();
+    const record = records.get(sessionId);
+    if (!record) throw new Error(`cannot resume unknown session '${sessionId}'`);
+    if (handles.has(sessionId)) {
+      throw new Error(`session '${sessionId}' is already live in this process`);
+    }
+    if (record.kind !== 'managed') {
+      throw new Error(`cannot resume observed session '${sessionId}' via the Agent SDK`);
+    }
+    if (record.resumeId === undefined) {
+      throw new Error(
+        `cannot resume session '${sessionId}': no persisted resumeId (it never reached session_init)`,
+      );
+    }
+
+    const handle = startManagedSession({
+      id: record.id,
+      client: resumeOpts.client,
+      prompt: resumeOpts.prompt,
+      resumeSessionId: record.resumeId,
+      ...(record.cwd !== undefined ? { cwd: record.cwd } : {}),
+      ...(record.accountId !== undefined ? { accountId: record.accountId } : {}),
+      ...(resumeOpts.permissionMode !== undefined
+        ? { permissionMode: resumeOpts.permissionMode }
+        : {}),
+      onSessionId: (sdkSessionId) => persistResumeId(record.id, sdkSessionId),
+    });
+
+    // A fresh record that keeps identity but resets the live view to the new handle's state.
+    // The stale `summary` is dropped — the resumed turn will produce its own.
+    const resumedRecord: SessionRecord = {
+      id: record.id,
+      kind: 'managed',
+      state: handle.getState(),
+      startedAtMs: record.startedAtMs,
+      resumeId: record.resumeId,
+      ...(record.accountId !== undefined ? { accountId: record.accountId } : {}),
+      ...(record.cwd !== undefined ? { cwd: record.cwd } : {}),
+    };
+    // Subscribe before any further await so no early status event can be missed.
+    trackHandle(handle, resumedRecord);
+    await persist();
+    return handle;
+  }
+
+  async function resumeAllOrphansImpl(
+    resumeAllOpts: ResumeAllOrphansOptions,
+  ): Promise<ResumeAllOrphansResult> {
+    await ensureLoaded();
+    const resumed: SessionRecord[] = [];
+    const skipped: Array<{ id: string; reason: string }> = [];
+    // Snapshot before iterating: resumeOrphanImpl mutates `records` (replaces the orphan's
+    // entry with a live one), and mutating a Map mid-iteration is unsound.
+    for (const record of Array.from(records.values())) {
+      if (record.state !== 'orphaned') continue;
+      if (record.kind !== 'managed') {
+        skipped.push({ id: record.id, reason: 'not a managed session' });
+        continue;
+      }
+      if (record.resumeId === undefined) {
+        skipped.push({ id: record.id, reason: 'no persisted resumeId' });
+        continue;
+      }
+      try {
+        await resumeOrphanImpl(record.id, {
+          client: resumeAllOpts.createClient(),
+          prompt: resumeAllOpts.prompt,
+          ...(resumeAllOpts.permissionMode !== undefined
+            ? { permissionMode: resumeAllOpts.permissionMode }
+            : {}),
+        });
+        const live = records.get(record.id);
+        if (live) resumed.push(live);
+      } catch (err) {
+        skipped.push({ id: record.id, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return { resumed, skipped };
+  }
+
   return {
     async spawnManaged(spawnOpts): Promise<SessionHandle> {
       await ensureLoaded();
@@ -198,6 +348,10 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
           : {}),
         ...(spawnOpts.cwd !== undefined ? { cwd: spawnOpts.cwd } : {}),
         ...(spawnOpts.accountId !== undefined ? { accountId: spawnOpts.accountId } : {}),
+        ...(spawnOpts.permissionMode !== undefined
+          ? { permissionMode: spawnOpts.permissionMode }
+          : {}),
+        onSessionId: (sdkSessionId) => persistResumeId(id, sdkSessionId),
       });
       const record: SessionRecord = {
         id,
@@ -257,6 +411,14 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
       }
       if (orphaned.length > 0) await persist();
       return orphaned;
+    },
+
+    resumeOrphan(sessionId, resumeOpts): Promise<SessionHandle> {
+      return resumeOrphanImpl(sessionId, resumeOpts);
+    },
+
+    resumeAllOrphans(resumeAllOpts): Promise<ResumeAllOrphansResult> {
+      return resumeAllOrphansImpl(resumeAllOpts);
     },
   };
 }

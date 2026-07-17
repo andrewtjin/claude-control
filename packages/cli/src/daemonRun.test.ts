@@ -1,13 +1,14 @@
-// Tests for the daemon composition root's own logic. Only `dpapiIdentityStore` carries
-// testable behavior — the rest of daemonRun.ts is assembly of subsystems tested in their own
-// packages (and daemon.test.ts proves the composition shape against a live loopback relay).
+// Tests for the daemon composition root's own logic. `dpapiIdentityStore` and
+// `makeAgentSdkClientFactory` carry testable behavior — the rest of daemonRun.ts is assembly
+// of subsystems tested in their own packages (and daemon.test.ts proves the composition
+// shape against a live loopback relay).
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { InsecurePassthroughProtector } from '@claude-control/switch-engine';
-import { dpapiIdentityStore } from './daemonRun.js';
+import { InsecurePassthroughProtector, noopLogger } from '@claude-control/switch-engine';
+import { dpapiIdentityStore, makeAgentSdkClientFactory } from './daemonRun.js';
 
 describe('dpapiIdentityStore', () => {
   let dir: string;
@@ -47,5 +48,24 @@ describe('dpapiIdentityStore', () => {
     await writeFile(path, blob, 'utf8');
     const store = dpapiIdentityStore(path, protector);
     expect(await store.load()).toBeUndefined();
+  });
+});
+
+describe('makeAgentSdkClientFactory', () => {
+  // Constructing the real client is unit-safe: the WET gate sits on `query()` (that is what
+  // spawns a Claude Code subprocess), not on client construction — so this proves the
+  // composition-root wiring shape without ever touching the real SDK runtime.
+  it('builds a fresh, fully-featured SDK client per call (one client per managed session)', () => {
+    const factory = makeAgentSdkClientFactory(noopLogger);
+    const first = factory();
+    const second = factory();
+    // Distinct instances: sessions must never share a client, or interrupt/resolvePermission
+    // would cross-wire between concurrently running sessions.
+    expect(first).not.toBe(second);
+    expect(typeof first.query).toBe('function');
+    expect(typeof first.interrupt).toBe('function');
+    expect(typeof first.end).toBe('function');
+    // Remote approve/deny depends on the client exposing the permission-resolution seam.
+    expect(typeof first.resolvePermission).toBe('function');
   });
 });

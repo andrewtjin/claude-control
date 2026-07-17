@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { startManagedSession } from './managedSession.js';
 import type { AgentSdkClient, AgentSdkEvent, AgentSdkQueryOptions } from './managedSession.js';
-import type { SessionEvent } from './types.js';
+import type { PermissionDecision, PermissionRequest, SessionEvent } from './types.js';
 
 /** Let every currently-queued microtask (queueMicrotask kickoff, async generator steps)
  *  drain before assertions run. setTimeout is a macrotask, so it always runs after the
@@ -126,7 +126,7 @@ describe('startManagedSession', () => {
   it('transitions to waiting_permission on permission_required and back to running on the next activity event', async () => {
     const { client } = fakeClient([
       [
-        { type: 'permission_required', tool: 'Bash', summary: 'run tests' },
+        { type: 'permission_required', requestId: 'req-1', tool: 'Bash', summary: 'run tests' },
         { type: 'tool_use', name: 'Bash' },
         { type: 'turn_result', ok: true, summary: 'done' },
       ],
@@ -252,5 +252,77 @@ describe('startManagedSession', () => {
     unsubscribe();
     await tick();
     expect(events).toEqual([]);
+  });
+
+  it('surfaces a structured permission request (requestId + mode) via onPermissionRequest', async () => {
+    const { client } = fakeClient([
+      [
+        {
+          type: 'permission_required',
+          requestId: 'req-9',
+          tool: 'Bash',
+          summary: 'run tests',
+          permissionMode: 'default',
+        },
+        { type: 'turn_result', ok: true, summary: 'done' },
+      ],
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    expect(typeof handle.onPermissionRequest).toBe('function');
+    const reqs: PermissionRequest[] = [];
+    handle.onPermissionRequest!((r) => reqs.push(r));
+    await tick();
+    expect(reqs).toEqual([
+      { requestId: 'req-9', tool: 'Bash', summary: 'run tests', permissionMode: 'default' },
+    ]);
+  });
+
+  it('resolvePermission delegates to the client and returns its outcome', () => {
+    const resolveCalls: Array<{ requestId: string; decision: PermissionDecision }> = [];
+    const client: AgentSdkClient = {
+      query: () => ({
+        async *[Symbol.asyncIterator]() {
+          await Promise.resolve();
+          yield { type: 'turn_result', ok: true, summary: 'done' };
+        },
+      }),
+      interrupt: () => Promise.resolve(),
+      end: () => Promise.resolve(),
+      resolvePermission: (requestId, decision) => {
+        resolveCalls.push({ requestId, decision });
+        return 'resolved';
+      },
+    };
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    expect(handle.resolvePermission!('req-1', { behavior: 'allow' })).toBe('resolved');
+    expect(resolveCalls).toEqual([{ requestId: 'req-1', decision: { behavior: 'allow' } }]);
+  });
+
+  it('resolvePermission returns unknown when the client cannot resolve permissions', () => {
+    const { client } = fakeClient([[{ type: 'turn_result', ok: true, summary: 'done' }]]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    expect(handle.resolvePermission!('whatever', { behavior: 'deny', message: 'no' })).toBe(
+      'unknown',
+    );
+  });
+
+  it('threads permissionMode into every query', async () => {
+    const { client, calls } = fakeClient([[{ type: 'turn_result', ok: true, summary: 'done' }]]);
+    startManagedSession({ id: 's1', client, prompt: 'go', permissionMode: 'default' });
+    await tick();
+    expect(calls[0]?.opts.permissionMode).toBe('default');
+  });
+
+  it('reports the SDK session id via onSessionId when a turn initializes', async () => {
+    const seen: string[] = [];
+    const { client } = fakeClient([
+      [
+        { type: 'session_init', sessionId: 'sdk-77' },
+        { type: 'turn_result', ok: true, summary: 'done' },
+      ],
+    ]);
+    startManagedSession({ id: 's1', client, prompt: 'go', onSessionId: (sid) => seen.push(sid) });
+    await tick();
+    expect(seen).toEqual(['sdk-77']);
   });
 });

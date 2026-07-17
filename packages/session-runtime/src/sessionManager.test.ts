@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSessionManager } from './sessionManager.js';
-import type { AgentSdkClient, AgentSdkEvent } from './managedSession.js';
+import type { AgentSdkClient, AgentSdkEvent, AgentSdkQueryOptions } from './managedSession.js';
 import type { PtyFactory, PtyHandle, PtyExitInfo } from './observedSession.js';
 import type { SessionRecord } from './types.js';
 
@@ -65,6 +65,33 @@ function gatedFakeClient(gate: Promise<void>, events: AgentSdkEvent[]): AgentSdk
     interrupt: () => Promise.resolve(),
     end: () => Promise.resolve(),
   };
+}
+
+/** A client that records each query's prompt/opts and then BLOCKS forever (never yields), so
+ *  a resumed/spawned session stays deterministically at 'starting' and produces no further fs
+ *  writes to race afterEach cleanup — the same "permanently-pending is inert" pattern the
+ *  spawnManaged tests use. Lets a test assert how resume threaded the SDK session id. */
+function recordingBlockingClient(): {
+  client: AgentSdkClient;
+  calls: Array<{ prompt: string; opts: AgentSdkQueryOptions }>;
+} {
+  const calls: Array<{ prompt: string; opts: AgentSdkQueryOptions }> = [];
+  const client: AgentSdkClient = {
+    query(prompt, opts) {
+      calls.push({ prompt, opts });
+      // A never-resolving `next()` (not a yield-less generator) blocks the turn forever.
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise<IteratorResult<AgentSdkEvent>>(() => undefined),
+          };
+        },
+      };
+    },
+    interrupt: () => Promise.resolve(),
+    end: () => Promise.resolve(),
+  };
+  return { client, calls };
 }
 
 /** A fake PtyFactory whose spawned handle is driven by the returned emit* functions. */
@@ -315,6 +342,142 @@ describe('createSessionManager', () => {
       const second = await manager.recover();
 
       expect(second).toEqual([]);
+    });
+  });
+
+  describe('resume', () => {
+    it('persists the SDK session id as the record resumeId for a fresh spawn', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir, now: () => 1 });
+      await manager.spawnManaged({
+        id: 'm1',
+        client: fakeClient([
+          { type: 'session_init', sessionId: 'sdk-55' },
+          { type: 'turn_result', ok: true, summary: 'done' },
+        ]),
+        prompt: 'go',
+      });
+      await tick();
+
+      expect(manager.list().find((r) => r.id === 'm1')?.resumeId).toBe('sdk-55');
+      const persisted = await waitForRegistry(
+        dir,
+        (list) => list.find((r) => r.id === 'm1')?.resumeId === 'sdk-55',
+      );
+      expect(persisted.find((r) => r.id === 'm1')?.resumeId).toBe('sdk-55');
+    });
+
+    it('resumeOrphan re-spawns from the persisted resumeId, preserving record identity', async () => {
+      const dir = await sandbox();
+      const orphan: SessionRecord = {
+        id: 'crashed-1',
+        kind: 'managed',
+        state: 'orphaned',
+        startedAtMs: 111,
+        resumeId: 'sdk-abc',
+        accountId: 'acct-1',
+        cwd: '/work',
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([orphan]));
+      const manager = createSessionManager({ stateDir: dir, now: () => 999 });
+      await manager.recover();
+
+      const { client, calls } = recordingBlockingClient();
+      const handle = await manager.resumeOrphan!('crashed-1', { client, prompt: 'continue' });
+
+      // Identity preserved.
+      expect(handle.id).toBe('crashed-1');
+      expect(manager.get('crashed-1')).toBe(handle);
+      // Resumed from the SDK session id, with the caller's prompt — the whole point.
+      expect(calls[0]).toEqual({
+        prompt: 'continue',
+        opts: { resumeSessionId: 'sdk-abc', cwd: '/work', accountId: 'acct-1' },
+      });
+
+      const record = manager.list().find((r) => r.id === 'crashed-1');
+      expect(record?.kind).toBe('managed');
+      expect(record?.accountId).toBe('acct-1');
+      expect(record?.cwd).toBe('/work');
+      expect(record?.startedAtMs).toBe(111); // original start preserved, not re-clocked
+      expect(record?.resumeId).toBe('sdk-abc');
+      expect(record?.state).not.toBe('orphaned'); // now live again
+    });
+
+    it('resumeOrphan throws for an unknown session', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      await expect(
+        manager.resumeOrphan!('nope', { client: recordingBlockingClient().client, prompt: 'x' }),
+      ).rejects.toThrow(/unknown session/);
+    });
+
+    it('resumeOrphan refuses an observed session', async () => {
+      const dir = await sandbox();
+      const rec: SessionRecord = {
+        id: 'o1',
+        kind: 'observed',
+        state: 'orphaned',
+        startedAtMs: 1,
+        resumeId: 'x',
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([rec]));
+      const manager = createSessionManager({ stateDir: dir });
+      await expect(
+        manager.resumeOrphan!('o1', { client: recordingBlockingClient().client, prompt: 'x' }),
+      ).rejects.toThrow(/observed/);
+    });
+
+    it('resumeOrphan refuses a record with no persisted resumeId', async () => {
+      const dir = await sandbox();
+      const rec: SessionRecord = { id: 'm2', kind: 'managed', state: 'orphaned', startedAtMs: 1 };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([rec]));
+      const manager = createSessionManager({ stateDir: dir });
+      await expect(
+        manager.resumeOrphan!('m2', { client: recordingBlockingClient().client, prompt: 'x' }),
+      ).rejects.toThrow(/no persisted resumeId/);
+    });
+
+    it('resumeOrphan refuses a session that is already live in this process', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      await manager.spawnManaged({
+        id: 'm1',
+        client: recordingBlockingClient().client,
+        prompt: 'go',
+        resumeSessionId: 'sdk-1',
+      });
+      await expect(
+        manager.resumeOrphan!('m1', { client: recordingBlockingClient().client, prompt: 'x' }),
+      ).rejects.toThrow(/already live/);
+    });
+
+    it('resumeAllOrphans resumes managed orphans with a resumeId and reports the rest as skipped', async () => {
+      const dir = await sandbox();
+      const seed: SessionRecord[] = [
+        { id: 'a', kind: 'managed', state: 'orphaned', startedAtMs: 1, resumeId: 'sdk-a' },
+        { id: 'b', kind: 'managed', state: 'orphaned', startedAtMs: 2 }, // no resumeId
+        { id: 'c', kind: 'observed', state: 'orphaned', startedAtMs: 3, resumeId: 'sdk-c' },
+        { id: 'd', kind: 'managed', state: 'done', startedAtMs: 4, resumeId: 'sdk-d' }, // not orphaned
+      ];
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify(seed));
+      const manager = createSessionManager({ stateDir: dir });
+      await manager.recover();
+
+      const result = await manager.resumeAllOrphans!({
+        createClient: () => recordingBlockingClient().client,
+        prompt: 'continue',
+      });
+
+      expect(result.resumed.map((r) => r.id)).toEqual(['a']);
+      expect(result.skipped).toEqual(
+        expect.arrayContaining([
+          { id: 'b', reason: 'no persisted resumeId' },
+          { id: 'c', reason: 'not a managed session' },
+        ]),
+      );
+      // 'd' is done, not an orphan — neither resumed nor skipped.
+      expect(result.skipped.find((s) => s.id === 'd')).toBeUndefined();
+      expect(manager.get('a')).toBeDefined();
     });
   });
 });

@@ -37,7 +37,8 @@ import {
   type DaemonIdentity,
   type IdentityStore,
 } from '@claude-control/daemon';
-import { createSessionManager } from '@claude-control/session-runtime';
+import { createAgentSdkClient, createSessionManager } from '@claude-control/session-runtime';
+import type { AgentSdkClient } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath } from './context.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 
@@ -95,6 +96,36 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
       await writeFile(filePath, protector.protect(plaintext), 'utf8');
     },
   };
+}
+
+/**
+ * Factory for the WET-GATED real Agent SDK client — one FRESH client per managed session,
+ * because each session owns its own query lifecycle (a shared instance would cross-wire
+ * `interrupt`/`resolvePermission` between sessions; see session-runtime's
+ * ResumeAllOrphansOptions). Exported for its colocated test; the rest of runDaemon is
+ * untestable assembly.
+ *
+ * DECISION — no `configDirForAccount` is injected here, on purpose. Binding per-account
+ * CLAUDE_CONFIG_DIRs would give per-session credential isolation, but it forgoes the
+ * project's single-shared-~/.claude design (per-account config dirs were wet-refuted, WT-1 —
+ * see plan §4 "Credential layout") and with it credential HOT-SWAP: a `cctl switch` on the
+ * PC rewrites the shared live credentials that running sessions read per-request, whereas a
+ * session pinned to its own config dir would never see the swap. So sessions inherit
+ * whichever account the switch engine last ACTIVATED (activate-before-spawn model),
+ * `accountId` stays an attribution tag rather than a credential selector, and a spawn whose
+ * accountId was never activated is made LOUD through the daemon's logger instead of running
+ * silently mis-attributed.
+ */
+export function makeAgentSdkClientFactory(logger: Logger): () => AgentSdkClient {
+  return () =>
+    createAgentSdkClient({
+      onUnboundAccountId: (accountId) =>
+        logger.warn(
+          { accountId },
+          'session accountId is not bound to a config dir; it runs under the globally ' +
+            'active account — confirm the switch engine activated it before spawn',
+        ),
+    });
 }
 
 /** Assemble and start the daemon; resolves once it is up (the process then stays alive on
@@ -227,6 +258,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     controlPlaneClient,
     installHooks: (port) =>
       installHooks({ settingsPath, hooks: buildDaemonHookSpecs({ port, secret: hookSecret }) }),
+    // Real SDK adapter with the daemon's logger on the accountId fall-through — see
+    // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
+    createAgentSdkClient: makeAgentSdkClientFactory(logger),
     ...(autoSwitcher ? { autoSwitcher } : {}),
     logger,
   });

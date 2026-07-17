@@ -23,6 +23,49 @@ export type SessionState =
 /** Which backend is driving the session. */
 export type SessionKind = 'managed' | 'observed';
 
+/**
+ * A decision on a pending permission request, in THIS package's own vocabulary. The
+ * WET-gated Agent SDK adapter maps it onto the SDK's `PermissionResult`; keeping our own
+ * type means callers (daemon, tests) never depend on the SDK's shape. `deny` is the
+ * fail-closed default the runtime falls back to when a session ends with a request still
+ * outstanding — a permission is never auto-allowed on our side (see the M4 non-negotiable:
+ * no timeout-based auto-allow/deny).
+ */
+export interface PermissionDecision {
+  behavior: 'allow' | 'deny';
+  /** Reason surfaced to the model on a deny — the SDK requires a message for a deny result;
+   *  ignored for an allow. */
+  message?: string;
+  /** Optional replacement tool input for an allow (maps to the SDK's `updatedInput`), e.g. a
+   *  narrowed shell command the operator approved instead of the original. */
+  updatedInput?: Record<string, unknown>;
+}
+
+/**
+ * Outcome of resolving a pending permission. Single-resolve is the whole point: only the
+ * FIRST decision for a given requestId `resolved`s and is ever applied; a repeat (a
+ * double-tapped phone button, a second device) is `already_handled` — an idempotent no-op,
+ * never re-applied — and an id we hold no pending request for is `unknown`.
+ */
+export type PermissionResolveOutcome = 'resolved' | 'already_handled' | 'unknown';
+
+/**
+ * A structured permission request surfaced by a managed session. Deliberately separate from
+ * the `SessionEvent` stream: a `SessionEvent` is for DISPLAY (the summarized "Permission
+ * required: …" milestone line the phone shows), and carries no id, whereas THIS carries the
+ * `requestId` the daemon must echo back into `resolvePermission` to actually unblock the
+ * tool. Routing the two on the same channel would force the daemon to parse an id back out
+ * of display text.
+ */
+export interface PermissionRequest {
+  requestId: string;
+  tool: string;
+  summary: string;
+  /** The session's Claude Code permission mode (e.g. 'default'), when known — the bot shows
+   *  approve/deny buttons only for 'default', an informational card otherwise. */
+  permissionMode?: string;
+}
+
 /** The persisted, non-live view of a session — what survives a daemon restart. */
 export interface SessionRecord {
   id: string;
@@ -73,4 +116,22 @@ export interface SessionHandle {
   interrupt(): Promise<void>;
   /** Tear the session down. Idempotent. */
   stop(): Promise<void>;
+  /**
+   * Subscribe to STRUCTURED permission requests (managed sessions only). Optional because an
+   * observed terminal has no structured permission seam — its permissions surface through the
+   * CLI's own local prompt / hooks, not this handle. Separate from `onEvent` on purpose: the
+   * request carries the `requestId` that `resolvePermission` needs, which the display-only
+   * `SessionEvent` milestone deliberately does not. Returns an unsubscribe function; subscribe
+   * synchronously right after obtaining the handle for the same reason `onEvent` says to.
+   */
+  onPermissionRequest?(cb: (req: PermissionRequest) => void): () => void;
+  /**
+   * Record a decision for a pending permission request this session surfaced (managed only).
+   * Single-resolve: the first decision wins and is applied; a repeat returns `already_handled`
+   * without re-applying; an unknown/expired id returns `unknown`. Optional for the same reason
+   * as `onPermissionRequest`. NEVER blocks and NEVER times out — the decision comes from a
+   * human via the phone, and an unanswered request simply stays pending until the session ends
+   * (at which point it is denied, fail-closed) — it is never auto-allowed.
+   */
+  resolvePermission?(requestId: string, decision: PermissionDecision): PermissionResolveOutcome;
 }

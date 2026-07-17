@@ -421,7 +421,7 @@ describe('ControlPlaneClient', () => {
     expect(titles).toEqual(['n2', 'n3', 'n4']); // oldest (n0, n1) dropped
   });
 
-  it('dispatches inbound switch.command / permission.response / prompt.inject / session.spawn to handlers', async () => {
+  it('dispatches inbound switch.command / permission.response / prompt.inject / session.spawn / session.stop to handlers', async () => {
     const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
     relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
     const identityStore = memoryIdentityStore(identity);
@@ -430,6 +430,7 @@ describe('ControlPlaneClient', () => {
     const onPermissionResponse = vi.fn();
     const onPromptInject = vi.fn();
     const onSessionSpawn = vi.fn();
+    const onSessionStop = vi.fn();
 
     client = new ControlPlaneClient({
       url: relay.url(),
@@ -437,7 +438,13 @@ describe('ControlPlaneClient', () => {
       store,
       hostLabel: 'h',
       reconnectBaseMs: 10,
-      handlers: { onSwitchCommand, onPermissionResponse, onPromptInject, onSessionSpawn },
+      handlers: {
+        onSwitchCommand,
+        onPermissionResponse,
+        onPromptInject,
+        onSessionSpawn,
+        onSessionStop,
+      },
     });
     await client.connect();
 
@@ -462,12 +469,18 @@ describe('ControlPlaneClient', () => {
       type: 'session.spawn',
       payload: { requestId: 'r3', prompt: 'do it', idempotencyKey: 'k4' },
     });
+    send({
+      daemonId: identity.daemonId,
+      type: 'session.stop',
+      payload: { sessionId: 's1', idempotencyKey: 'k5' },
+    });
 
-    await waitFor(() => onSessionSpawn.mock.calls.length > 0);
+    await waitFor(() => onSessionStop.mock.calls.length > 0);
     expect(onSwitchCommand).toHaveBeenCalledTimes(1);
     expect(onPermissionResponse).toHaveBeenCalledTimes(1);
     expect(onPromptInject).toHaveBeenCalledTimes(1);
     expect(onSessionSpawn).toHaveBeenCalledTimes(1);
+    expect(onSessionStop).toHaveBeenCalledTimes(1);
   });
 
   it('drops an invalid/undecodable inbound frame without crashing the connection', async () => {

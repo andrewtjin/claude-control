@@ -345,6 +345,13 @@ export class Store {
   }
 
   // ---- sessions ----
+  //
+  // DECISION (M4): the daemon deliberately does NOT write this table. Session records'
+  // single source of truth is session-runtime's `sessions.json` (atomic temp+rename), which
+  // is what recover()/resumeOrphan actually read — mirroring state changes here would add a
+  // second source of truth with no reader and a crash window in which the two disagree. The
+  // table and accessors stay for the planned `cctl session status` reader; wire a writer
+  // ONLY together with that reader (see daemon.ts resumeOrphanedSessions for the long form).
 
   private toSessionRow(row: Record<string, unknown>): SessionRow {
     return {
@@ -357,8 +364,8 @@ export class Store {
     };
   }
 
-  /** Insert-or-replace by id — sessions are mirrored here on every state change, so the
-   *  latest write always wins. */
+  /** Insert-or-replace by id (latest write wins). Currently WRITER-LESS by decision — see
+   *  the section note above before wiring a caller. */
   upsertSession(row: SessionRow): void {
     this.db
       .prepare(

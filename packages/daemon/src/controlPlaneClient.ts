@@ -53,6 +53,10 @@ export interface ControlPlaneHandlers {
   onPermissionResponse?: (msg: MessageOf<'permission.response'>) => void;
   onPromptInject?: (msg: MessageOf<'prompt.inject'>) => void;
   onSessionSpawn?: (msg: MessageOf<'session.spawn'>) => void;
+  /** Phone-initiated stop of a managed session (M4). Like every other inbound command, the
+   *  client only routes the frame — escalation policy (interrupt → grace → hard stop) and
+   *  idempotency live in the daemon's handler. */
+  onSessionStop?: (msg: MessageOf<'session.stop'>) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +282,7 @@ export class ControlPlaneClient {
       this.opts.handlers.onPermissionResponse?.(envelope);
     else if (isType(envelope, 'prompt.inject')) this.opts.handlers.onPromptInject?.(envelope);
     else if (isType(envelope, 'session.spawn')) this.opts.handlers.onSessionSpawn?.(envelope);
+    else if (isType(envelope, 'session.stop')) this.opts.handlers.onSessionStop?.(envelope);
     // Any other type (usage.snapshot, session.output, etc.) is bot->phone traffic the daemon
     // itself never receives from the relay; silently ignored rather than treated as an error.
   }

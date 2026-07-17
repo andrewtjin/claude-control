@@ -18,14 +18,23 @@ import {
   type Envelope,
   type EnvelopeDraft,
 } from '@claude-control/shared-protocol';
-import type { RecoverResult, ActivateResult, StoredAccount } from '@claude-control/switch-engine';
+import type {
+  RecoverResult,
+  ActivateResult,
+  StoredAccount,
+  Logger,
+} from '@claude-control/switch-engine';
 import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import type {
   SessionManager,
   SessionHandle,
   SessionEvent,
   SessionRecord,
+  SessionState,
   AgentSdkClient,
+  PermissionDecision,
+  PermissionRequest,
+  ResumeAllOrphansOptions,
 } from '@claude-control/session-runtime';
 import { Store } from './store.js';
 import { UsagePoller } from './usagePoller.js';
@@ -97,8 +106,11 @@ class SteadyRelay {
     return `ws://127.0.0.1:${port}`;
   }
 
-  push(draft: EnvelopeDraft): void {
-    this.socket?.send(encode(stamp(draft)));
+  /** Returns the stamped envelope so tests can correlate on its `id` (e.g. error.relatesTo). */
+  push(draft: EnvelopeDraft): Envelope {
+    const envelope = stamp(draft);
+    this.socket?.send(encode(envelope));
+    return envelope;
   }
 
   async close(): Promise<void> {
@@ -160,16 +172,44 @@ function fakeSwitchEngine(): SwitchEngineLike & {
   };
 }
 
-/** A controllable fake SessionHandle — tests can synthesize events via `emit`. */
-function makeFakeHandle(
-  id: string,
-): SessionHandle & { emit: (e: SessionEvent) => void; sent: string[] } {
+/** What the upgraded fake handle exposes on top of SessionHandle: event/permission
+ *  synthesizers plus observability for everything the daemon may do to a session. */
+interface FakeHandle extends SessionHandle {
+  emit: (e: SessionEvent) => void;
+  /** Synthesize a structured SDK permission request (the managed-session seam). */
+  emitPermission: (req: PermissionRequest) => void;
+  sent: string[];
+  /** Decisions the daemon routed into resolvePermission, in arrival order. */
+  resolved: Array<{ requestId: string; decision: PermissionDecision }>;
+  interruptCalls: number;
+  stopCalls: number;
+}
+
+/** A controllable fake SessionHandle — tests can synthesize display events via `emit` and
+ *  structured permission requests via `emitPermission`, and observe what the daemon did
+ *  (sent prompts, interrupt/stop calls, resolved decisions). By default `interrupt()` moves
+ *  the fake to 'waiting_input' so escalateStop's grace wait settles instantly; pass
+ *  `settleOnInterrupt: false` to pin it 'running' and force the hard-stop rung. `stop()`
+ *  goes terminal and emits the status event, mirroring the real handle's ack surface. */
+function makeFakeHandle(id: string, settleOnInterrupt = true): FakeHandle {
   const listeners = new Set<(e: SessionEvent) => void>();
+  const permissionListeners = new Set<(req: PermissionRequest) => void>();
   const sent: string[] = [];
-  return {
+  // Single-resolve bookkeeping mirroring the real permission gate: first decision wins,
+  // repeats are 'already_handled', ids never requested are 'unknown'.
+  const knownIds = new Set<string>();
+  const settledIds = new Set<string>();
+  let state: SessionState = 'running';
+  const emit = (e: SessionEvent): void => {
+    for (const cb of listeners) cb(e);
+  };
+  const handle: FakeHandle = {
     id,
     sent,
-    getState: () => 'running',
+    resolved: [],
+    interruptCalls: 0,
+    stopCalls: 0,
+    getState: () => state,
     onEvent(cb) {
       listeners.add(cb);
       return () => listeners.delete(cb);
@@ -178,17 +218,45 @@ function makeFakeHandle(
       sent.push(text);
       return Promise.resolve();
     },
-    interrupt: () => Promise.resolve(),
-    stop: () => Promise.resolve(),
-    emit(e: SessionEvent) {
-      for (const cb of listeners) cb(e);
+    interrupt: () => {
+      handle.interruptCalls += 1;
+      if (settleOnInterrupt) state = 'waiting_input';
+      return Promise.resolve();
+    },
+    stop: () => {
+      handle.stopCalls += 1;
+      state = 'done';
+      emit({ kind: 'status', state: 'done' });
+      return Promise.resolve();
+    },
+    onPermissionRequest(cb) {
+      permissionListeners.add(cb);
+      return () => permissionListeners.delete(cb);
+    },
+    resolvePermission(requestId, decision) {
+      if (!knownIds.has(requestId)) return 'unknown';
+      if (settledIds.has(requestId)) return 'already_handled';
+      settledIds.add(requestId);
+      handle.resolved.push({ requestId, decision });
+      return 'resolved';
+    },
+    emit,
+    emitPermission(req: PermissionRequest) {
+      knownIds.add(req.requestId);
+      for (const cb of permissionListeners) cb(req);
     },
   };
+  return handle;
 }
 
-function fakeSessionManager(): SessionManager & { spawnManaged: ReturnType<typeof vi.fn> } {
+function fakeSessionManager(): SessionManager & {
+  spawnManaged: ReturnType<typeof vi.fn>;
+  /** Exposed so resume tests can pre-register handles the daemon should find via get(). */
+  handles: Map<string, SessionHandle>;
+} {
   const handles = new Map<string, SessionHandle>();
   return {
+    handles,
     spawnManaged: vi.fn((opts) => {
       void opts;
       const handle = makeFakeHandle('spawned-session');
@@ -209,6 +277,25 @@ const fakeAgentSdkClient: AgentSdkClient = {
   interrupt: async () => {},
   end: async () => {},
 };
+
+/** Capture log lines so tests can assert on values the daemon only reports via the logger
+ *  (e.g. the stop-escalation rung) — house convention keeps such policy observable without
+ *  widening the daemon's public surface just for tests. */
+function capturingLogger(): {
+  logger: Logger;
+  entries: Array<{ level: string; obj: unknown; msg: string | undefined }>;
+} {
+  const entries: Array<{ level: string; obj: unknown; msg: string | undefined }> = [];
+  const log =
+    (level: string) =>
+    (obj: unknown, msg?: string): void => {
+      entries.push({ level, obj, msg });
+    };
+  return {
+    logger: { debug: log('debug'), info: log('info'), warn: log('warn'), error: log('error') },
+    entries,
+  };
+}
 
 describe('Daemon lifecycle', () => {
   let relay: SteadyRelay;
@@ -594,6 +681,273 @@ describe('Daemon lifecycle', () => {
         text: 'hi from the session',
       });
     }
+  });
+
+  // ---- M4: managed-session permission pipeline ----
+
+  /** Drive a session.spawn through the live relay and hand back the fake handle it created. */
+  async function spawnFakeSession(): Promise<FakeHandle> {
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-spawn', prompt: 'do the thing', idempotencyKey: 'k-spawn' },
+    });
+    await waitFor(() => sessionManager.spawnManaged.mock.calls.length > 0);
+    const handle = sessionManager.get('spawned-session');
+    if (!handle) throw new Error('spawn did not register a handle');
+    return handle as FakeHandle;
+  }
+
+  it("spawns managed sessions in 'default' permission mode and forwards SDK permission requests", async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    // The mode is daemon policy (session.spawn has no mode field in v1) and 'default' is the
+    // only mode in which remote approve/deny works — see MANAGED_SESSION_PERMISSION_MODE.
+    expect(sessionManager.spawnManaged).toHaveBeenCalledWith(
+      expect.objectContaining({ permissionMode: 'default' }),
+    );
+
+    handle.emitPermission({
+      requestId: 'sdk-req-1',
+      tool: 'Bash',
+      summary: 'run ls',
+      permissionMode: 'default',
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'permission.request'));
+    const request = relay.received.find((e) => e.type === 'permission.request');
+    if (request?.type === 'permission.request') {
+      expect(request.payload).toMatchObject({
+        requestId: 'sdk-req-1',
+        sessionId: 'spawned-session',
+        tool: 'Bash',
+        summary: 'run ls',
+        permissionMode: 'default',
+      });
+      // No TTL on an SDK-parked prompt — the M4 non-negotiable bans timeout-based decisions.
+      expect(request.payload.expiresAt ?? undefined).toBeUndefined();
+    }
+    // Same bookkeeping as a hook-originated request: a pending_permissions row exists.
+    expect(store.getPendingPermission('sdk-req-1')).toMatchObject({
+      sessionId: 'spawned-session',
+      tool: 'Bash',
+      resolvedDecision: null,
+    });
+  });
+
+  it('routes permission.response for an SDK-originated request into the session handle', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emitPermission({ requestId: 'sdk-req-2', tool: 'Write', summary: 'write file' });
+    await waitFor(() => store.getPendingPermission('sdk-req-2') !== undefined);
+
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'permission.response',
+      payload: { requestId: 'sdk-req-2', decision: 'allow', scope: 'once', idempotencyKey: 'ka' },
+    });
+    await waitFor(() => handle.resolved.length > 0);
+    expect(handle.resolved[0]).toMatchObject({
+      requestId: 'sdk-req-2',
+      decision: { behavior: 'allow' },
+    });
+    // The audit row mirrors the decision the handle actually applied.
+    await waitFor(() => store.getPendingPermission('sdk-req-2')?.resolvedDecision === 'allow');
+  });
+
+  it('a repeated permission.response for a managed request is applied exactly once', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emitPermission({ requestId: 'sdk-req-3', tool: 'Bash', summary: 'rm -rf things' });
+    await waitFor(() => store.getPendingPermission('sdk-req-3') !== undefined);
+
+    const payload = { requestId: 'sdk-req-3', decision: 'deny', scope: 'once' } as const;
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'permission.response',
+      payload: { ...payload, idempotencyKey: 'k-first' },
+    });
+    await waitFor(() => handle.resolved.length > 0);
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'permission.response',
+      payload: { ...payload, idempotencyKey: 'k-second' },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(handle.resolved).toHaveLength(1); // the double-tap is 'already_handled', never re-applied
+    // A deny reaches the handle with an explicit reason (the SDK requires one on deny).
+    expect(handle.resolved[0]?.decision.behavior).toBe('deny');
+    expect(handle.resolved[0]?.decision.message).toContain('remote');
+  });
+
+  it('a re-delivered SDK permission request produces exactly one card and one row', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    const req: PermissionRequest = { requestId: 'sdk-req-4', tool: 'Bash', summary: 'again' };
+    handle.emitPermission(req);
+    handle.emitPermission(req); // the SDK may re-deliver a control_request for a pending id
+    await waitFor(() => relay.received.some((e) => e.type === 'permission.request'));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(relay.received.filter((e) => e.type === 'permission.request')).toHaveLength(1);
+  });
+
+  it('sweeps managed routes at session end: rows fail closed and a late response is rejected', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emitPermission({ requestId: 'sdk-req-5', tool: 'Bash', summary: 'pending at death' });
+    await waitFor(() => store.getPendingPermission('sdk-req-5') !== undefined);
+
+    handle.emit({ kind: 'status', state: 'done' }); // session ends with the request pending
+    // The audit row mirrors the runtime's fail-closed teardown (the gate denies on turn end).
+    expect(store.getPendingPermission('sdk-req-5')?.resolvedDecision).toBe('deny');
+
+    // A LATE response falls through to the hook path, whose already-resolved DB guard rejects
+    // it — it must never reach the handle or flip the recorded deny to an allow.
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'permission.response',
+      payload: { requestId: 'sdk-req-5', decision: 'allow', scope: 'once', idempotencyKey: 'kl' },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(handle.resolved).toHaveLength(0);
+    expect(store.getPendingPermission('sdk-req-5')?.resolvedDecision).toBe('deny');
+  });
+
+  // ---- M4: session.stop ----
+
+  it('wires session.stop -> interrupt-then-stop, acked via the forwarded session.status', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.stop',
+      payload: { sessionId: 'spawned-session', idempotencyKey: 'stop-1' },
+    });
+    await waitFor(() => handle.stopCalls > 0);
+    expect(handle.interruptCalls).toBe(1);
+    // There is deliberately no stop.result — the ack IS the session.status 'done' transition.
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'session.status' && e.payload.state === 'done'),
+    );
+  });
+
+  it('a repeated session.stop idempotencyKey never double-escalates', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    const stop = {
+      daemonId: 'daemon-under-test',
+      type: 'session.stop',
+      payload: { sessionId: 'spawned-session', idempotencyKey: 'stop-dup' },
+    } as const;
+    relay.push(stop);
+    await waitFor(() => handle.stopCalls > 0);
+    relay.push(stop); // the double-tap / redelivery
+    await new Promise((r) => setTimeout(r, 60));
+    expect(handle.interruptCalls).toBe(1);
+    expect(handle.stopCalls).toBe(1);
+  });
+
+  it('hard-stops a session that does not settle within the grace window (rung logged)', async () => {
+    const { logger, entries } = capturingLogger();
+    const stuck = makeFakeHandle('stuck-session', false); // interrupt() leaves it 'running'
+    sessionManager.handles.set('stuck-session', stuck);
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+      stopGraceMs: 25, // short REAL grace window — house convention forbids fake timers
+      logger,
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.stop',
+      payload: { sessionId: 'stuck-session', idempotencyKey: 'stop-hard' },
+    });
+    await waitFor(() => stuck.stopCalls > 0);
+    expect(stuck.interruptCalls).toBe(1);
+    await waitFor(() => entries.some((e) => e.msg === 'session.stop escalation finished'));
+    const finished = entries.find((e) => e.msg === 'session.stop escalation finished');
+    expect((finished?.obj as { rung?: string }).rung).toBe('hard_stopped');
+  });
+
+  it('session.stop for an unknown session emits an error envelope correlated via relatesTo', async () => {
+    await daemon.start();
+    const pushed = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.stop',
+      payload: { sessionId: 'ghost', idempotencyKey: 'stop-ghost' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const err = relay.received.find((e) => e.type === 'error');
+    if (err?.type === 'error') {
+      expect(err.payload.code).toBe('unknown_session');
+      expect(err.payload.relatesTo).toBe(pushed.id); // correlates to the stop frame itself
+      expect(err.payload.message).toContain('ghost');
+    }
+  });
+
+  // ---- M4: crash re-attach at startup ----
+
+  it('resumes orphaned sessions at startup and wires them exactly like fresh spawns', async () => {
+    const handle = makeFakeHandle('orphan-1');
+    const resumedRecord: SessionRecord = {
+      id: 'orphan-1',
+      kind: 'managed',
+      state: 'running',
+      startedAtMs: 0,
+      accountId: 'acct-x',
+      resumeId: 'sdk-abc',
+    };
+    const resumeAllOrphans = vi.fn((opts: ResumeAllOrphansOptions) => {
+      void opts;
+      sessionManager.handles.set(handle.id, handle);
+      return Promise.resolve({
+        resumed: [resumedRecord],
+        skipped: [{ id: 'orphan-2', reason: 'no persisted resumeId' }],
+      });
+    });
+    sessionManager.resumeAllOrphans = resumeAllOrphans;
+    await daemon.start();
+
+    expect(resumeAllOrphans).toHaveBeenCalledTimes(1);
+    const opts = resumeAllOrphans.mock.calls[0]?.[0];
+    // Resumed sessions get the same remote-approval mode as fresh spawns, a non-empty
+    // continuation nudge, and clients from the daemon's own injected factory.
+    expect(opts?.permissionMode).toBe('default');
+    expect(opts?.prompt.length).toBeGreaterThan(0);
+    expect(opts?.createClient()).toBe(fakeAgentSdkClient);
+
+    handle.emit({ kind: 'status', state: 'running' });
+    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
+    const status = relay.received.find((e) => e.type === 'session.status');
+    if (status?.type === 'session.status') {
+      expect(status.payload).toMatchObject({
+        sessionId: 'orphan-1',
+        state: 'running',
+        accountId: 'acct-x', // threaded from the persisted record, like a spawn payload's
+      });
+    }
+
+    // The structured permission pipe is attached on resume too, not just on spawn.
+    handle.emitPermission({ requestId: 'resume-req-1', tool: 'Bash', summary: 'continue' });
+    await waitFor(() => relay.received.some((e) => e.type === 'permission.request'));
+    const request = relay.received.find((e) => e.type === 'permission.request');
+    if (request?.type === 'permission.request') {
+      expect(request.payload).toMatchObject({ requestId: 'resume-req-1', sessionId: 'orphan-1' });
+    }
+  });
+
+  it('a failing session re-attach is logged and never kills startup', async () => {
+    sessionManager.recover = vi.fn(() => Promise.reject(new Error('corrupt sessions.json')));
+    await expect(daemon.start()).resolves.toBeUndefined();
+    // The daemon is fully up regardless — still connected to the control plane.
+    expect(controlPlaneClient.getState()).toBe('open');
   });
 
   it('stop() closes the hook receiver, closes the control-plane client, and stops polling', async () => {
