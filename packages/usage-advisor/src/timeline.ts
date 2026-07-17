@@ -182,34 +182,74 @@ export function timelineInputFromWire(accounts: WireUsageLike[]): AccountUsageIn
 }
 
 // ---------------------------------------------------------------------------
-// Rendering (plain text, shared by the CLI and the Discord code block)
+// Rendering (plain text by default; optional style hooks for terminal color)
 // ---------------------------------------------------------------------------
+
+/**
+ * Style hooks for `renderOutlook`. Every hook is a text decorator that must not change the
+ * VISIBLE width of its input (layout is computed on plain text, then styled) — which is
+ * exactly what ANSI escape codes satisfy. The default is the identity style, so the output
+ * stays byte-for-byte plain unless a caller (the CLI on a TTY) opts in.
+ */
+export interface OutlookStyle {
+  /** Section headings ("5h-session budget…", "Reset timeline…", "Upcoming resets"). */
+  heading(text: string): string;
+  /** Account labels (pre-padded — see the width rule above). */
+  label(text: string): string;
+  /** The `*` active-account marker. */
+  active(text: string): string;
+  /** Low-salience furniture: empty track cells, pipes, "in <duration>" lead-ins. */
+  dim(text: string): string;
+  /** The three timeline marks: 's' (5h window), 'w' (weekly), '*' (both in one cell). */
+  session(text: string): string;
+  weekly(text: string): string;
+  both(text: string): string;
+  /** A phrase containing a usage percent, colorable by its severity band. */
+  percent(text: string, pct: number): string;
+  /** Loud problems: quarantined accounts, unused quota about to expire. */
+  alert(text: string): string;
+}
+
+/** The identity style — plain text, the default everywhere. */
+export const PLAIN_OUTLOOK_STYLE: OutlookStyle = {
+  heading: (t) => t,
+  label: (t) => t,
+  active: (t) => t,
+  dim: (t) => t,
+  session: (t) => t,
+  weekly: (t) => t,
+  both: (t) => t,
+  percent: (t) => t,
+  alert: (t) => t,
+};
 
 /** Options for `renderOutlook`. `trackWidth` is the interior of the ASCII timeline bar. */
 export interface RenderOutlookOptions {
   trackWidth?: number;
+  style?: OutlookStyle;
 }
 
 const DEFAULT_TRACK_WIDTH = 36;
 
 /**
- * Render the outlook as plain ASCII: a per-account 5h-window budget, a proportional
- * timeline track per account (s = 5h window resets, w = weekly resets, * = both in the same
- * cell), and the merged list of upcoming resets. Deliberately color- and unicode-free so it
- * reads identically in any terminal and inside a Discord code block.
+ * Render the outlook as ASCII: a per-account 5h-window budget, a proportional timeline
+ * track per account (s = 5h window resets, w = weekly resets, * = both in the same cell),
+ * and the merged list of upcoming resets. Plain and unicode-free by default so it reads
+ * identically in any terminal; pass `style` to add color without touching the layout.
  */
 export function renderOutlook(outlook: ResetOutlook, options: RenderOutlookOptions = {}): string {
   if (outlook.accounts.length === 0) {
     return 'No accounts yet. Add one with: cctl accounts add <label>';
   }
   const width = options.trackWidth ?? DEFAULT_TRACK_WIDTH;
+  const st = options.style ?? PLAIN_OUTLOOK_STYLE;
   const now = outlook.generatedAtMs;
   const labelWidth = Math.max(...outlook.accounts.map((a) => a.label.length));
 
-  const sections: string[] = [budgetSection(outlook, now, labelWidth)];
+  const sections: string[] = [budgetSection(outlook, now, labelWidth, st)];
   if (outlook.events.length > 0) {
-    sections.push(timelineSection(outlook, now, labelWidth, width));
-    sections.push(upcomingSection(outlook, now, labelWidth));
+    sections.push(timelineSection(outlook, now, labelWidth, width, st));
+    sections.push(upcomingSection(outlook, now, labelWidth, st));
   } else {
     sections.push('No reset times reported yet — wait for the next daemon poll.');
   }
@@ -217,18 +257,26 @@ export function renderOutlook(outlook: ResetOutlook, options: RenderOutlookOptio
 }
 
 /** "how many 5h windows do I have left on each account" — one line per account. */
-function budgetSection(outlook: ResetOutlook, now: number, labelWidth: number): string {
-  const lines = ['5h-session budget (windows you can still open before each weekly reset)'];
+function budgetSection(
+  outlook: ResetOutlook,
+  now: number,
+  labelWidth: number,
+  st: OutlookStyle,
+): string {
+  const lines = [
+    st.heading('5h-session budget (windows you can still open before each weekly reset)'),
+  ];
   for (const a of outlook.accounts) {
-    const marker = a.active ? '*' : ' ';
-    const label = a.label.padEnd(labelWidth);
+    const marker = a.active ? st.active('*') : ' ';
+    const label = st.label(a.label.padEnd(labelWidth));
     if (a.quarantined) {
-      lines.push(`${marker} ${label}  quarantined — re-login required`);
+      lines.push(`${marker} ${label}  ${st.alert('quarantined — re-login required')}`);
       continue;
     }
+    const pct = a.sessionPercent ?? 0;
     const window =
       a.openWindowEndsAt !== undefined
-        ? `window open (${a.sessionPercent ?? 0}% used, resets in ${humanizeDuration(a.openWindowEndsAt - now)})`
+        ? `window open (${st.percent(`${pct}% used`, pct)}, resets in ${humanizeDuration(a.openWindowEndsAt - now)})`
         : 'no open window';
     const budget = a.budget
       ? `${a.budget.fullWindows} full 5h window${a.budget.fullWindows === 1 ? '' : 's'}` +
@@ -240,18 +288,26 @@ function budgetSection(outlook: ResetOutlook, now: number, labelWidth: number): 
   return lines.join('\n');
 }
 
+/** Style one track cell: dashes recede, marks pop in their own hue. */
+function styleCell(cell: string, st: OutlookStyle): string {
+  if (cell === 's') return st.session(cell);
+  if (cell === 'w') return st.weekly(cell);
+  if (cell === '*') return st.both(cell);
+  return st.dim(cell);
+}
+
 /** Proportional ASCII track per account, all sharing one time scale (now → last event). */
 function timelineSection(
   outlook: ResetOutlook,
   now: number,
   labelWidth: number,
   width: number,
+  st: OutlookStyle,
 ): string {
   const lastEvent = outlook.events[outlook.events.length - 1] as ResetEvent;
   const span = Math.max(lastEvent.atMs - now, 1); // avoid divide-by-zero on a same-ms event
-  const lines = [
-    `Reset timeline  now -> ${humanizeDuration(span)}  (s = 5h window resets, w = weekly resets)`,
-  ];
+  const legend = `(${st.session('s')} = 5h window resets, ${st.weekly('w')} = weekly resets)`;
+  const lines = [`${st.heading(`Reset timeline  now -> ${humanizeDuration(span)}`)}  ${legend}`];
   for (const a of outlook.accounts) {
     const cells: string[] = new Array<string>(width).fill('-');
     for (const e of outlook.events) {
@@ -261,30 +317,38 @@ function timelineSection(
       // Two resets landing in the same cell collapse to '*' so neither silently vanishes.
       cells[pos] = cells[pos] === '-' || cells[pos] === mark ? mark : '*';
     }
-    lines.push(`  ${a.label.padEnd(labelWidth)}  |${cells.join('')}|`);
+    const track = cells.map((c) => styleCell(c, st)).join('');
+    lines.push(`  ${st.label(a.label.padEnd(labelWidth))}  ${st.dim('|')}${track}${st.dim('|')}`);
   }
   return lines.join('\n');
 }
 
 /** The merged chronological list — what refreshes next, and what each reset means. */
-function upcomingSection(outlook: ResetOutlook, now: number, labelWidth: number): string {
+function upcomingSection(
+  outlook: ResetOutlook,
+  now: number,
+  labelWidth: number,
+  st: OutlookStyle,
+): string {
   const inWidth = Math.max(...outlook.events.map((e) => humanizeDuration(e.atMs - now).length));
-  const lines = ['Upcoming resets'];
+  const lines = [st.heading('Upcoming resets')];
   for (const e of outlook.events) {
-    const when = `in ${humanizeDuration(e.atMs - now).padEnd(inWidth)}`;
-    lines.push(`  ${when}  ${e.label.padEnd(labelWidth)}  ${describeEvent(e)}`);
+    const when = st.dim(`in ${humanizeDuration(e.atMs - now).padEnd(inWidth)}`);
+    lines.push(`  ${when}  ${st.label(e.label.padEnd(labelWidth))}  ${describeEvent(e, st)}`);
   }
   return lines.join('\n');
 }
 
 /** What a reset means for planning: a session reset frees the window; a weekly reset wastes
  *  whatever headroom went unburned — that asymmetry is the "use them efficiently" signal. */
-function describeEvent(e: ResetEvent): string {
-  if (e.kind === 'session') return `5h window resets (${e.percentUsed}% used clears)`;
+function describeEvent(e: ResetEvent, st: OutlookStyle): string {
+  if (e.kind === 'session') {
+    return `5h window resets (${st.percent(`${e.percentUsed}% used`, e.percentUsed)} clears)`;
+  }
   const scoped = e.kind === 'weekly_scoped' ? 'weekly (scoped)' : 'weekly';
   const unused = 100 - e.percentUsed;
   return unused > 0
-    ? `${scoped} quota resets — ${unused}% unused expires with it`
+    ? `${scoped} quota resets — ${st.alert(`${unused}% unused expires with it`)}`
     : `${scoped} quota resets`;
 }
 

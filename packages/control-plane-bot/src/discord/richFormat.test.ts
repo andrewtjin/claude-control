@@ -7,6 +7,8 @@ import {
   SEVERITY_COLOR,
   severityOf,
   TRACK,
+  trackCells,
+  UNICODE_TRACK_STYLE,
   worstSeverity,
 } from './richFormat.js';
 
@@ -119,6 +121,64 @@ describe('emojiTrack', () => {
     const cells = [...track];
     expect(cells[11]).toBe(TRACK.weekly);
     expect(cells.slice(0, 11).every((c) => c === TRACK.empty)).toBe(true);
+  });
+});
+
+describe('trackCells', () => {
+  const NOW = 1_000_000;
+  const SPAN = 12_000;
+
+  it('is the placement math emojiTrack renders from', () => {
+    const events = [
+      { atMs: NOW + 3_000, kind: 'session' as const },
+      { atMs: NOW + SPAN, kind: 'weekly' as const },
+    ];
+    const cells = trackCells(events, NOW, SPAN);
+    expect(cells).toHaveLength(12);
+    expect(cells[3]).toBe('session');
+    expect(cells[11]).toBe('weekly');
+    expect(cells.filter((c) => c === 'empty')).toHaveLength(10);
+    // The unicode renderer is exactly this mapping — no independent math to drift.
+    expect(emojiTrack(events, NOW, SPAN)).toBe(
+      cells
+        .map((c) => (c === 'empty' ? TRACK.empty : c === 'session' ? TRACK.session : TRACK.weekly))
+        .join(''),
+    );
+  });
+
+  it('collapses same-cell collisions to both and keeps same-kind stacking stable', () => {
+    expect(
+      trackCells(
+        [
+          { atMs: NOW + 1, kind: 'session' },
+          { atMs: NOW + 2, kind: 'weekly' },
+        ],
+        NOW,
+        SPAN,
+      )[0],
+    ).toBe('both');
+    expect(
+      trackCells(
+        [
+          { atMs: NOW + 1, kind: 'session' },
+          { atMs: NOW + 2, kind: 'session' },
+        ],
+        NOW,
+        SPAN,
+      )[0],
+    ).toBe('session');
+  });
+});
+
+describe('UNICODE_TRACK_STYLE', () => {
+  it('bundles the unicode track renderer with the TRACK marker glyphs', () => {
+    expect(UNICODE_TRACK_STYLE.session).toBe(TRACK.session);
+    expect(UNICODE_TRACK_STYLE.weekly).toBe(TRACK.weekly);
+    expect(UNICODE_TRACK_STYLE.both).toBe(TRACK.both);
+    const NOW = 1_000_000;
+    expect(UNICODE_TRACK_STYLE.track([{ atMs: NOW, kind: 'session' }], NOW, 12_000)).toBe(
+      emojiTrack([{ atMs: NOW, kind: 'session' }], NOW, 12_000),
+    );
   });
 });
 
