@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installHooks, buildDaemonHookSpecs, type HookCommandSpec } from './hookInstaller.js';
+import { DEFAULT_SECRET_HEADER } from './hookReceiver.js';
 
 async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, 'utf8'));
@@ -131,6 +132,112 @@ describe('installHooks', () => {
     expect(await readFile(settingsPath, 'utf8')).toBe('{not valid json');
   });
 
+  // The daemon's curl commands embed an OS-assigned per-run port, so exact-command dedup
+  // alone appends one dead entry per restart (wet-run finding, 2026-07-17). These pin the
+  // ownedCommandMarker prune that closes that hole.
+  describe('ownedCommandMarker (stale-generation pruning)', () => {
+    /** Mirrors production: the marker is the secret-header name baked into every command. */
+    const MARKER = 'x-claude-control-secret';
+    const ourCommand = (port: number) => `curl -H "${MARKER}: s3cr3t" http://127.0.0.1:${port}/`;
+    const install = (port: number) =>
+      installHooks({
+        settingsPath,
+        hooks: [
+          { event: 'PermissionRequest', command: ourCommand(port) },
+          { event: 'Stop', command: ourCommand(port) },
+        ],
+        ownedCommandMarker: MARKER,
+      });
+    const commandsFor = (settings: unknown, event: string): string[] => {
+      const groups = (settings as { hooks: Record<string, { hooks: { command: string }[] }[]> })
+        .hooks[event];
+      return (groups ?? []).flatMap((g) => g.hooks.map((h) => h.command));
+    };
+
+    it('a restart with a new port REPLACES the previous entry instead of appending', async () => {
+      await install(1111);
+      await install(2222);
+      const settings = await readJson(settingsPath);
+      for (const event of ['PermissionRequest', 'Stop']) {
+        expect(commandsFor(settings, event)).toEqual([ourCommand(2222)]);
+      }
+    });
+
+    it('stays idempotent when the port has NOT changed', async () => {
+      await install(1111);
+      await install(1111);
+      const settings = await readJson(settingsPath);
+      expect(commandsFor(settings, 'Stop')).toEqual([ourCommand(1111)]);
+    });
+
+    it('never prunes foreign entries — no marker means not ours', async () => {
+      await writeFile(
+        settingsPath,
+        JSON.stringify(
+          {
+            hooks: {
+              Stop: [
+                { hooks: [{ type: 'command', command: 'some-other-tool --notify' }] },
+                // Our stale generation shares a group with nobody, pointing at a dead port.
+                { hooks: [{ type: 'command', command: ourCommand(1111) }] },
+              ],
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      await install(2222);
+      const settings = await readJson(settingsPath);
+      const commands = commandsFor(settings, 'Stop');
+      expect(commands).toContain('some-other-tool --notify');
+      expect(commands).toContain(ourCommand(2222));
+      expect(commands).not.toContain(ourCommand(1111));
+    });
+
+    it('drops a group its pruning emptied, but preserves a group that was already empty', async () => {
+      await writeFile(
+        settingsPath,
+        JSON.stringify(
+          {
+            hooks: {
+              Stop: [
+                { matcher: 'Bash', hooks: [{ type: 'command', command: ourCommand(1111) }] },
+                { matcher: 'Write', hooks: [] }, // someone else's pre-existing empty group
+              ],
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      await install(2222);
+      const settings = (await readJson(settingsPath)) as {
+        hooks: { Stop: { matcher?: string; hooks: unknown[] }[] };
+      };
+      const matchers = settings.hooks.Stop.map((g) => g.matcher);
+      expect(matchers).not.toContain('Bash'); // emptied by pruning → dropped
+      expect(matchers).toContain('Write'); // already empty → preserved
+      expect(commandsFor(settings, 'Stop')).toEqual([ourCommand(2222)]);
+    });
+
+    it('leaves events outside the current specs untouched even if they carry the marker', async () => {
+      await writeFile(
+        settingsPath,
+        JSON.stringify(
+          {
+            hooks: { Notification: [{ hooks: [{ type: 'command', command: ourCommand(1111) }] }] },
+          },
+          null,
+          2,
+        ),
+      );
+      await install(2222); // installs PermissionRequest + Stop only
+      const settings = await readJson(settingsPath);
+      expect(commandsFor(settings, 'Notification')).toEqual([ourCommand(1111)]);
+    });
+  });
+
   it('installs multiple distinct events in one call', async () => {
     await installHooks({
       settingsPath,
@@ -153,6 +260,13 @@ describe('buildDaemonHookSpecs', () => {
     for (const s of specs) {
       expect(s.command).toContain('127.0.0.1:4567');
       expect(s.command).toContain('s3cr3t');
+    }
+  });
+
+  it('bakes DEFAULT_SECRET_HEADER into every command — the marker daemonRun prunes by', () => {
+    const specs = buildDaemonHookSpecs({ port: 4567, secret: 's3cr3t' });
+    for (const s of specs) {
+      expect(s.command).toContain(DEFAULT_SECRET_HEADER);
     }
   });
 

@@ -10,13 +10,19 @@
 // Idempotent + self-healing: running `installHooks` again never duplicates an entry, and if
 // our own hook state was left malformed by e.g. a manual edit or a partial write, the next
 // call coalesces it back to canonical form rather than erroring or piling on a duplicate.
+// Exact-command dedup alone is NOT enough for that: the daemon's curl commands embed an
+// OS-assigned per-run port, so every restart produces a command that has never been seen
+// before, and the previous run's entry (now pointing at a dead port) would accumulate
+// forever. `ownedCommandMarker` closes that hole — entries carrying the marker are
+// recognizably OURS regardless of which port generation they came from, and any that don't
+// match a current spec are pruned before the merge.
 //
 // WET-GATED: the exact `settings.json` hooks schema (event names, matcher semantics, the
 // installed CLI version's exact expectations) is reverse-engineered — see docs/VERIFICATION.md.
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { DEFAULT_HOOK_EVENT_NAMES } from './hookReceiver.js';
+import { DEFAULT_HOOK_EVENT_NAMES, DEFAULT_SECRET_HEADER } from './hookReceiver.js';
 
 /** Write via temp-then-rename in the same directory so a crash mid-write can never leave
  *  `settings.json` half-written — a reader sees either the whole old file or the whole new
@@ -79,6 +85,14 @@ function isHookGroup(value: unknown): value is HookGroup {
 export interface InstallHooksOptions {
   settingsPath: string;
   hooks: HookCommandSpec[];
+  /** Ownership fingerprint: a substring that appears in every command WE ever installed and
+   *  in nobody else's (the daemon passes its secret-header name). When set, entries carrying
+   *  it that don't exactly match a current spec are treated as stale generations of ours —
+   *  same hook, dead port from a previous run — and removed before the merge. Without it,
+   *  exact-command dedup can only recognize the CURRENT command, so every port rotation
+   *  would append a fresh entry and leave the old one behind. Optional because the marker is
+   *  meaningless for callers whose commands are stable across runs. */
+  ownedCommandMarker?: string;
 }
 
 export async function installHooks(options: InstallHooksOptions): Promise<void> {
@@ -88,6 +102,12 @@ export async function installHooks(options: InstallHooksOptions): Promise<void> 
   // with a fresh object rather than erroring — the rest of the file is untouched either way.
   const hooksSection: JsonObject = isRecord(settings.hooks) ? settings.hooks : {};
   settings.hooks = hooksSection;
+
+  // Prune BEFORE merging so a stale generation of our own command (old port) is replaced,
+  // not joined, by the current one. Only events we're installing into are touched.
+  if (options.ownedCommandMarker !== undefined) {
+    pruneStaleOwnedEntries(hooksSection, options.hooks, options.ownedCommandMarker);
+  }
 
   for (const spec of options.hooks) {
     mergeOneHook(hooksSection, spec);
@@ -122,6 +142,48 @@ function mergeOneHook(hooksSection: JsonObject, spec: HookCommandSpec): void {
   }
 
   hooksSection[spec.event] = groups;
+}
+
+/** Remove stale generations of OUR OWN entries (marker present, command not current) from the
+ *  events we're about to install into. Foreign entries — no marker — are never touched, and
+ *  neither are events outside `specs`. A group this pruning empties is dropped (it existed
+ *  only to hold our stale entry); a group that was ALREADY empty is someone else's state and
+ *  is preserved as-is. */
+function pruneStaleOwnedEntries(
+  hooksSection: JsonObject,
+  specs: HookCommandSpec[],
+  marker: string,
+): void {
+  // The same event can appear in several specs, so staleness is judged against the full set
+  // of current commands for that event, not just one spec's.
+  const currentByEvent = new Map<string, Set<string>>();
+  for (const spec of specs) {
+    const set = currentByEvent.get(spec.event) ?? new Set<string>();
+    set.add(spec.command);
+    currentByEvent.set(spec.event, set);
+  }
+
+  for (const [event, currentCommands] of currentByEvent) {
+    const groups = hooksSection[event];
+    if (!Array.isArray(groups)) continue; // malformed per-event value; mergeOneHook self-heals it
+    hooksSection[event] = groups.filter((group) => {
+      if (!isHookGroup(group)) return true; // not recognizably a group — not ours to judge
+      const countBefore = group.hooks.length;
+      group.hooks = group.hooks.filter(
+        (entry) => !isStaleOwnedEntry(entry, marker, currentCommands),
+      );
+      return group.hooks.length > 0 || group.hooks.length === countBefore;
+    });
+  }
+}
+
+/** An entry is a stale generation of ours when its command carries the ownership marker but
+ *  isn't one of the commands being installed right now. Deliberately does NOT require
+ *  `type: 'command'`: a half-written entry whose command is recognizably ours is still ours
+ *  to heal away. */
+function isStaleOwnedEntry(entry: unknown, marker: string, currentCommands: Set<string>): boolean {
+  if (!isRecord(entry) || typeof entry.command !== 'string') return false;
+  return entry.command.includes(marker) && !currentCommands.has(entry.command);
 }
 
 async function readSettings(path: string): Promise<JsonObject> {
@@ -165,7 +227,7 @@ export interface BuildDaemonHookSpecsOptions {
  */
 export function buildDaemonHookSpecs(options: BuildDaemonHookSpecsOptions): HookCommandSpec[] {
   const eventNames = options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES;
-  const secretHeader = options.secretHeader ?? 'x-claude-control-secret';
+  const secretHeader = options.secretHeader ?? DEFAULT_SECRET_HEADER;
   const url = `http://127.0.0.1:${options.port}/`;
   const command = `curl -s -X POST -H "content-type: application/json" -H "${secretHeader}: ${options.secret}" --data-binary @- ${url}`;
   return [

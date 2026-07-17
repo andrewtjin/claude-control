@@ -26,6 +26,7 @@ import {
   AttributionJournal,
   AutoSwitcher,
   ControlPlaneClient,
+  DEFAULT_SECRET_HEADER,
   Daemon,
   HookReceiver,
   Store,
@@ -260,7 +261,14 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     hookReceiver,
     controlPlaneClient,
     installHooks: (port) =>
-      installHooks({ settingsPath, hooks: buildDaemonHookSpecs({ port, secret: hookSecret }) }),
+      installHooks({
+        settingsPath,
+        hooks: buildDaemonHookSpecs({ port, secret: hookSecret }),
+        // The receiver's port is OS-assigned per run, so each restart rewrites the curl
+        // commands. The secret-header name is the port-independent fingerprint that lets the
+        // installer replace its own previous-run entry instead of appending one per restart.
+        ownedCommandMarker: DEFAULT_SECRET_HEADER,
+      }),
     // Publish the receiver's actual loopback port so `cctl session register|label|watch` can
     // find this daemon (the port is OS-assigned per run, so it must be published, not derived).
     // Rewritten every start; the shutdown handler removes it so a stopped daemon leaves no

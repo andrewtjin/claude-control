@@ -114,7 +114,10 @@ export interface HookReceiverCliHandlers {
   watchSession(input: SessionWatchInput): Promise<SessionCommandResult>;
 }
 
-const DEFAULT_SECRET_HEADER = 'x-claude-control-secret';
+/** Exported because the header name doubles as the installer's ownership fingerprint: any
+ *  settings.json hook command containing it is one of OURS (some generation of the curl
+ *  forwarder), which is what lets installHooks replace stale-port entries across restarts. */
+export const DEFAULT_SECRET_HEADER = 'x-claude-control-secret';
 const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
 
 /** Tolerant body narrowing helpers — a hook payload is attacker-adjacent (it's whatever the
