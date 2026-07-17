@@ -37,6 +37,7 @@ import {
   daemonSettingsPath,
   readSettingsReport,
   renderSettings,
+  reportSaysGreedyActive,
   resolveCliSettings,
   resolveDaemonConfig,
   type SettingsSection,
@@ -123,8 +124,14 @@ export function buildProgram(): Command {
       );
       const outlook = computeOutlook(inputs);
       let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
-      // The burn-down plan turns the timeline into advice: what to use now and what to burn.
-      if (inputs.length > 0) text += '\n\n' + renderPlanSummary(computePlan(inputs));
+      // The burn-down plan turns the timeline into advice: what to burn first and what to
+      // hold. When the last-started daemon runs greedy auto-switch, the advice matches its
+      // descriptive phrasing (the daemon executes the plan; the user doesn't have to).
+      if (inputs.length > 0) {
+        const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
+        text +=
+          '\n\n' + renderPlanSummary(computePlan(inputs, greedy ? { greedyAutoSwitch: true } : {}));
+      }
       process.stdout.write(text + '\n');
     });
 

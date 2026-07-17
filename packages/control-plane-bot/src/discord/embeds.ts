@@ -89,16 +89,10 @@ export function buildUsageEmbed(
     });
   }
   if (usage.plan) {
-    const rec = usage.plan.recommendedAccountId
-      ? `Use **${usage.plan.recommendedAccountId}** — ${usage.plan.reason}`
-      : usage.plan.reason;
-    embed.addFields({ name: 'Recommendation', value: rec });
-    if (usage.plan.advisories.length > 0) {
-      embed.addFields({
-        name: 'Advisories',
-        value: usage.plan.advisories.map((a) => `• ${a.message}`).join('\n'),
-      });
-    }
+    // One compact field: the reason line already carries the whole burn order (see the
+    // advisor), and advisories only exist for exceptional states — no separate headings.
+    const lines = [usage.plan.reason, ...usage.plan.advisories.map((a) => `• ${a.message}`)];
+    embed.addFields({ name: 'Plan', value: lines.join('\n') });
   }
   return embed;
 }

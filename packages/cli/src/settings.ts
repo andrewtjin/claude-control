@@ -272,6 +272,17 @@ export async function writeSettingsReport(filePath: string, report: SettingsRepo
   await writeFile(filePath, JSON.stringify(report, null, 2) + '\n', 'utf8');
 }
 
+/** Whether the report says greedy auto-switch was ACTIVE at the last daemon start (both the
+ *  auto-switch and greedy rows resolved to exactly 'on' — an inactive greedy renders as
+ *  'on (inactive: …)', which correctly fails this test). Used to phrase local plan advice
+ *  consistently with the daemon's own; a stopped daemon makes this optimistically stale,
+ *  which only affects wording, never the burn order itself. */
+export function reportSaysGreedyActive(report: SettingsReport | undefined): boolean {
+  if (!report) return false;
+  const value = (name: string) => report.settings.find((r) => r.name === name)?.value;
+  return value('auto-switch') === 'on' && value('greedy burn-back') === 'on';
+}
+
 /** Missing, corrupt, or foreign content degrades to `undefined` ("no daemon has reported")
  *  rather than crashing a purely informational view. */
 export async function readSettingsReport(filePath: string): Promise<SettingsReport | undefined> {
