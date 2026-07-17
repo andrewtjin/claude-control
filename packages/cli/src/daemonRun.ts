@@ -31,9 +31,11 @@ import {
   Store,
   UsagePoller,
   buildDaemonHookSpecs,
+  hookEndpointPath,
   hookSecretPath,
   installHooks,
   loadOrCreateHookSecret,
+  writeHookEndpoint,
   type DaemonIdentity,
   type IdentityStore,
 } from '@claude-control/daemon';
@@ -258,6 +260,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     controlPlaneClient,
     installHooks: (port) =>
       installHooks({ settingsPath, hooks: buildDaemonHookSpecs({ port, secret: hookSecret }) }),
+    // Publish the receiver's actual loopback port so `cctl session register|label|watch` can
+    // find this daemon (the port is OS-assigned per run, so it must be published, not derived).
+    // Rewritten every start; the shutdown handler removes it so a stopped daemon leaves no
+    // stale pointer. The secret file is the auth gate — this only answers "where".
+    publishHookEndpoint: (port) => writeHookEndpoint(hookEndpointPath(dataDir), { port }),
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),
@@ -275,6 +282,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     void daemon
       .stop()
       .catch(() => {})
+      // Remove the published endpoint so a `cctl session` command run against a stopped daemon
+      // fails fast with "start the daemon" rather than racing a dead port. Best-effort.
+      .then(() => rm(hookEndpointPath(dataDir), { force: true }).catch(() => {}))
       .then(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);

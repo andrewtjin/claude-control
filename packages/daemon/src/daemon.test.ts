@@ -146,6 +146,7 @@ function fakeSwitchEngine(): SwitchEngineLike & {
   activate: ReturnType<typeof vi.fn>;
   recover: ReturnType<typeof vi.fn>;
   listAccounts: ReturnType<typeof vi.fn>;
+  getActiveId: ReturnType<typeof vi.fn>;
 } {
   return {
     recover: vi.fn((): Promise<RecoverResult> =>
@@ -968,6 +969,133 @@ describe('Daemon lifecycle', () => {
     await daemon.start();
     await daemon.stop();
     await expect(daemon.stop()).resolves.toBeUndefined();
+  });
+
+  // ---- C6: cctl session registry (loopback CLI endpoints) + display mirror ----
+
+  /** Rebuild + start the daemon with a port-capturing endpoint publisher, so the test knows the
+   *  loopback port to POST cctl-session commands at. Returns the bound port. */
+  async function startCapturingHookPort(): Promise<number> {
+    let captured: number | undefined;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      publishHookEndpoint: (port) => {
+        captured = port;
+        return Promise.resolve();
+      },
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+    await waitFor(() => captured !== undefined);
+    if (captured === undefined) throw new Error('hook port was never published');
+    return captured;
+  }
+
+  /** POST a cctl-session command to the daemon's loopback CLI endpoint (real HTTP, house
+   *  convention). Secret is the receiver's own ('shh' from beforeEach). */
+  async function postCli(
+    hookPort: number,
+    verb: string,
+    body: Record<string, unknown>,
+  ): Promise<{ status: number; body: Record<string, unknown> | undefined }> {
+    const res = await fetch(`http://127.0.0.1:${hookPort}/cli/session/${verb}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-claude-control-secret': 'shh' },
+      body: JSON.stringify(body),
+    });
+    const parsed = (await res.json().catch(() => undefined)) as Record<string, unknown> | undefined;
+    return { status: res.status, body: parsed };
+  }
+
+  it('mirrors managed-session state transitions into the display-only sessions table', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emit({ kind: 'status', state: 'running' });
+    await waitFor(() => store.getSession('spawned-session') !== undefined);
+    expect(store.getSession('spawned-session')).toMatchObject({
+      kind: 'managed',
+      state: 'running',
+    });
+  });
+
+  it('publishHookEndpoint is called with the receiver’s actual bound port', async () => {
+    const port = await startCapturingHookPort();
+    expect(port).toBeGreaterThan(0);
+  });
+
+  it('register creates an interactive session row (watch on, active account tagged)', async () => {
+    switchEngine.getActiveId.mockResolvedValue('acct-x');
+    const hookPort = await startCapturingHookPort();
+    const res = await postCli(hookPort, 'register', {
+      sessionId: 'cc-sess-1',
+      idempotencyKey: 'reg-1',
+      label: 'refactor',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, status: 'applied' });
+    const row = store.getSession('cc-sess-1');
+    expect(row).toMatchObject({ kind: 'interactive', accountId: 'acct-x' });
+    const parsed = JSON.parse(row!.json) as { label: string; watch: boolean };
+    expect(parsed).toMatchObject({ label: 'refactor', watch: true });
+  });
+
+  it('register is idempotent on the idempotency key (re-send = already_handled)', async () => {
+    const hookPort = await startCapturingHookPort();
+    const first = await postCli(hookPort, 'register', {
+      sessionId: 'cc-sess-2',
+      idempotencyKey: 'dup',
+    });
+    expect(first.body).toMatchObject({ status: 'applied' });
+    const second = await postCli(hookPort, 'register', {
+      sessionId: 'cc-sess-2',
+      idempotencyKey: 'dup',
+    });
+    expect(second.status).toBe(200);
+    expect(second.body).toMatchObject({ status: 'already_handled' });
+  });
+
+  it('label/watch on an UNREGISTERED session are a clean 404, never a crash', async () => {
+    const hookPort = await startCapturingHookPort();
+    const label = await postCli(hookPort, 'label', {
+      sessionId: 'ghost',
+      idempotencyKey: 'l',
+      label: 'x',
+    });
+    expect(label.status).toBe(404);
+    expect(label.body).toMatchObject({ ok: false, code: 'unknown_session' });
+    const watch = await postCli(hookPort, 'watch', {
+      sessionId: 'ghost',
+      idempotencyKey: 'w',
+      watch: true,
+    });
+    expect(watch.status).toBe(404);
+  });
+
+  it('watch flips the streaming flag; label sets the name preserving watch', async () => {
+    const hookPort = await startCapturingHookPort();
+    await postCli(hookPort, 'register', { sessionId: 'cc-sess-3', idempotencyKey: 'r3' });
+    await postCli(hookPort, 'watch', {
+      sessionId: 'cc-sess-3',
+      idempotencyKey: 'w3',
+      watch: false,
+    });
+    await postCli(hookPort, 'label', {
+      sessionId: 'cc-sess-3',
+      idempotencyKey: 'l3',
+      label: 'named',
+    });
+    const parsed = JSON.parse(store.getSession('cc-sess-3')!.json) as {
+      label: string;
+      watch: boolean;
+    };
+    expect(parsed).toMatchObject({ label: 'named', watch: false });
   });
 });
 

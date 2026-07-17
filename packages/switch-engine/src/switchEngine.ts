@@ -182,6 +182,78 @@ export class SwitchEngine {
     return this.vault.addAccount(label, bundle);
   }
 
+  /**
+   * Re-login an EXISTING account in place. Reuses the same transient-config-dir capture the
+   * `accounts add --fresh` flow uses, but writes the freshly captured credentials into the
+   * account's EXISTING vault entry — SAME id — and lifts its quarantine flag on success.
+   *
+   * WHY a distinct verb from {@link captureFromConfigDir}: that one mints a NEW id via
+   * `addAccount`, which is exactly wrong for recovering a quarantined account. A new id would
+   * orphan every `activation_intervals` / `usage_snapshots` row keyed to the old id and split
+   * that account's usage history in two. Re-login exists precisely to keep the id (and thus all
+   * attribution) intact while swapping in a live token — so it overwrites the bundle in place.
+   *
+   * IDENTITY GUARD: if the existing account and the captured login BOTH report an `accountUuid`
+   * and they disagree, refuse. Writing a different account's tokens under this id would corrupt
+   * the very attribution this verb exists to protect (e.g. the user logged into the wrong
+   * account in the transient window). A missing uuid on either side skips the check — an older
+   * capture or a provider that doesn't report one shouldn't block recovery.
+   *
+   * The caller owns the transient `configDir` and MUST delete it afterwards (token-bearing) —
+   * same contract as {@link captureFromConfigDir}.
+   */
+  async reloginFromConfigDir(accountId: string, configDir: string): Promise<StoredAccount> {
+    const existing = await this.vault.getAccount(accountId);
+    if (!existing) throw new UnknownAccountError(accountId);
+
+    // File-based capture on every platform (the mac Keychain caveat is captureFromConfigDir's
+    // A3 assumption): the transient dir is a plain CLAUDE_CONFIG_DIR the CLI populated with
+    // `.credentials.json` + `.claude.json` (WT-1). Same seam add --fresh reads from.
+    const store = new CredentialStore({
+      claudeDir: configDir,
+      credentialsPath: join(configDir, '.credentials.json'),
+      claudeJsonPath: join(configDir, '.claude.json'),
+      vaultDir: this.paths.vaultDir,
+    });
+    const creds = await store.readLiveCredentials();
+    if (!creds) {
+      throw new RefreshError(
+        `no credentials found in "${configDir}"; did the login complete?`,
+        'no_capture_login',
+      );
+    }
+    const oauthAccount = await store.readOauthAccount();
+
+    // Attribution guard — see the method comment for why a mismatch is fatal, not a warning.
+    if (
+      existing.accountUuid !== undefined &&
+      oauthAccount?.accountUuid !== undefined &&
+      existing.accountUuid !== oauthAccount.accountUuid
+    ) {
+      throw new RefreshError(
+        `the captured login is a different account (${oauthAccount.emailAddress ?? oauthAccount.accountUuid}) ` +
+          `than "${existing.label}" — re-login must use the SAME account to keep its usage history intact`,
+        'relogin_identity_mismatch',
+      );
+    }
+
+    const bundle: CredentialBundle = oauthAccount
+      ? { claudeAiOauth: creds, oauthAccount }
+      : { claudeAiOauth: creds };
+    // Overwrite the encrypted bundle IN PLACE (same id) so every attribution row keyed to this
+    // id stays valid, then lift quarantine: a successful capture means the account can
+    // authenticate again. `clearQuarantine` is a no-op flag-wise if it was never quarantined
+    // (re-login is also a legitimate way to rotate a still-valid login) and bumps updatedAtMs,
+    // so the registry reflects the re-login.
+    await this.vault.writeBundle(accountId, bundle);
+    await this.vault.clearQuarantine(accountId);
+    const refreshed = await this.vault.getAccount(accountId);
+    // Only undefined if the account was removed concurrently mid-call — surface that as the
+    // unknown-account error rather than returning a stale record.
+    if (!refreshed) throw new UnknownAccountError(accountId);
+    return refreshed;
+  }
+
   // ---- the state machine ----
 
   /** Make `targetId` the live account. See the class comment for the guarantees. */

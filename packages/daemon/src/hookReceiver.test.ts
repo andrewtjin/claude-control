@@ -2,7 +2,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { request } from 'node:http';
 import type { EnvelopeDraft } from '@claude-control/shared-protocol';
 import { Store } from './store.js';
-import { HookReceiver } from './hookReceiver.js';
+import {
+  HookReceiver,
+  type HookReceiverCliHandlers,
+  type SessionCommandResult,
+} from './hookReceiver.js';
 
 interface RawResponse {
   status: number;
@@ -381,6 +385,169 @@ describe('HookReceiver', () => {
         { 'x-claude-control-secret': SECRET },
       );
       expect(res.status).toBe(400);
+    });
+  });
+
+  describe('CLI session endpoints (/cli/session/*)', () => {
+    // A configurable, call-recording set of CLI handlers — the receiver owns transport; the
+    // daemon (faked here) owns the registry logic, so these tests assert only the boundary.
+    interface FakeCli {
+      handlers: HookReceiverCliHandlers;
+      calls: Array<{ verb: string; input: unknown }>;
+    }
+    function fakeCli(respond: (verb: string, input: unknown) => SessionCommandResult): FakeCli {
+      const calls: FakeCli['calls'] = [];
+      const make =
+        (verb: string) =>
+        (input: unknown): Promise<SessionCommandResult> => {
+          calls.push({ verb, input });
+          return Promise.resolve(respond(verb, input));
+        };
+      // A handler accepting `unknown` is assignable to one accepting the concrete input type
+      // (contravariance), so no cast is needed.
+      return {
+        calls,
+        handlers: {
+          registerSession: make('register'),
+          labelSession: make('label'),
+          watchSession: make('watch'),
+        },
+      };
+    }
+
+    const okApplied: SessionCommandResult = {
+      ok: true,
+      status: 'applied',
+      session: { id: 'sess-1', kind: 'interactive', state: 'active', watch: true, label: 'work' },
+    };
+
+    it('still enforces the secret on CLI routes', async () => {
+      receiver.setCliHandlers(fakeCli(() => okApplied).handlers);
+      const res = await post(port, '/cli/session/register', {
+        sessionId: 'sess-1',
+        idempotencyKey: 'k',
+      });
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 503 when the daemon has not installed handlers yet', async () => {
+      // The default receiver in beforeEach has no CLI handlers set.
+      const res = await post(
+        port,
+        '/cli/session/register',
+        { sessionId: 'sess-1', idempotencyKey: 'k' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(503);
+    });
+
+    it('routes register to the handler and echoes its result', async () => {
+      const cli = fakeCli(() => okApplied);
+      receiver.setCliHandlers(cli.handlers);
+      const res = await post(
+        port,
+        '/cli/session/register',
+        { sessionId: 'sess-1', idempotencyKey: 'k1', label: 'work' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true, status: 'applied' });
+      expect(cli.calls).toEqual([
+        { verb: 'register', input: { sessionId: 'sess-1', idempotencyKey: 'k1', label: 'work' } },
+      ]);
+    });
+
+    it('maps an unknown_session result onto a 404 with the daemon message', async () => {
+      receiver.setCliHandlers(
+        fakeCli(() => ({
+          ok: false,
+          code: 'unknown_session',
+          message: "session 'sess-x' is not registered",
+        })).handlers,
+      );
+      const res = await post(
+        port,
+        '/cli/session/label',
+        { sessionId: 'sess-x', idempotencyKey: 'k', label: 'name' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(404);
+      expect(res.body).toMatchObject({ ok: false, code: 'unknown_session' });
+    });
+
+    it('rejects a CLI command missing sessionId or idempotencyKey with 400 (handler untouched)', async () => {
+      const cli = fakeCli(() => okApplied);
+      receiver.setCliHandlers(cli.handlers);
+      const noSession = await post(
+        port,
+        '/cli/session/register',
+        { idempotencyKey: 'k' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(noSession.status).toBe(400);
+      const noKey = await post(
+        port,
+        '/cli/session/register',
+        { sessionId: 'sess-1' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(noKey.status).toBe(400);
+      expect(cli.calls).toHaveLength(0);
+    });
+
+    it('rejects label with an empty/missing label, and watch with a non-boolean, as 400', async () => {
+      const cli = fakeCli(() => okApplied);
+      receiver.setCliHandlers(cli.handlers);
+      const emptyLabel = await post(
+        port,
+        '/cli/session/label',
+        { sessionId: 'sess-1', idempotencyKey: 'k', label: '' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(emptyLabel.status).toBe(400);
+      const badWatch = await post(
+        port,
+        '/cli/session/watch',
+        { sessionId: 'sess-1', idempotencyKey: 'k', watch: 'yes' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(badWatch.status).toBe(400);
+      expect(cli.calls).toHaveLength(0);
+    });
+
+    it('accepts watch:false (turning streaming off is a valid boolean)', async () => {
+      const cli = fakeCli((_verb, input) => ({
+        ok: true,
+        status: 'applied',
+        session: {
+          id: 'sess-1',
+          kind: 'interactive',
+          state: 'active',
+          watch: (input as { watch: boolean }).watch,
+        },
+      }));
+      receiver.setCliHandlers(cli.handlers);
+      const res = await post(
+        port,
+        '/cli/session/watch',
+        { sessionId: 'sess-1', idempotencyKey: 'k', watch: false },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+      expect(cli.calls).toEqual([
+        { verb: 'watch', input: { sessionId: 'sess-1', idempotencyKey: 'k', watch: false } },
+      ]);
+    });
+
+    it('404s an unknown /cli/... path', async () => {
+      receiver.setCliHandlers(fakeCli(() => okApplied).handlers);
+      const res = await post(
+        port,
+        '/cli/session/bogus',
+        { sessionId: 'sess-1', idempotencyKey: 'k' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(404);
     });
   });
 });

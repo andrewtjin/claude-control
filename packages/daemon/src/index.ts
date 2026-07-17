@@ -45,7 +45,21 @@ export {
   type HookEventNames,
   type HookReceiverOptions,
   type ResolvePermissionResult,
+  type HookReceiverCliHandlers,
+  type SessionCommandBase,
+  type SessionRegisterInput,
+  type SessionLabelInput,
+  type SessionWatchInput,
+  type SessionCommandResult,
+  type TrackedSessionView,
 } from './hookReceiver.js';
+
+export {
+  hookEndpointPath,
+  readHookEndpoint,
+  writeHookEndpoint,
+  type HookEndpoint,
+} from './hookEndpoint.js';
 
 export {
   ControlPlaneClient,

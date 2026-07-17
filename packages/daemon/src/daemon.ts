@@ -26,7 +26,15 @@ import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
 import { UsagePoller, type PollAccount } from './usagePoller.js';
 import type { AttributionJournal } from './attributionJournal.js';
-import type { HookReceiver } from './hookReceiver.js';
+import type {
+  HookReceiver,
+  HookReceiverCliHandlers,
+  SessionCommandResult,
+  SessionLabelInput,
+  SessionRegisterInput,
+  SessionWatchInput,
+  TrackedSessionView,
+} from './hookReceiver.js';
 import { ControlPlaneClient } from './controlPlaneClient.js';
 
 /** The subset of `SwitchEngine`'s public surface the daemon depends on — narrower than the
@@ -64,6 +72,13 @@ export interface DaemonOptions {
    *  omit it. Its rejection must NEVER crash startup: settings.json can be read-only or locked,
    *  and hooks are additive, not load-bearing for the daemon's own liveness. */
   installHooks?: (port: number) => Promise<void>;
+  /** Publish the hook receiver's bound loopback port so a separate `cctl session` process can
+   *  find this daemon (see hookEndpoint.ts). Called AFTER the receiver binds, with its actual
+   *  port. Injected — the composition root owns WHERE the endpoint file lives — and optional so
+   *  lifecycle tests can omit it. Failure is logged and swallowed: an unpublished endpoint means
+   *  `cctl session register/label/watch` can't reach the daemon (they degrade to a clear "start
+   *  the daemon" message), but nothing else the daemon does depends on it. */
+  publishHookEndpoint?: (port: number) => Promise<void>;
   /** Injectable clock (house convention: no fake timers). Only used for the quarantine-notice
    *  debounce; defaults to `Date.now`. */
   clock?: () => number;
@@ -109,6 +124,58 @@ const RESUME_NUDGE_PROMPT =
  *  keeping the set trivially bounded across a long-lived daemon. */
 const MAX_SEEN_STOP_KEYS = 256;
 
+/** Bound on the `cctl session register|label|watch` idempotency set. Same FIFO discipline as
+ *  the stop keys; a little larger because a busy user may register/label several sessions. The
+ *  underlying operations are value-idempotent anyway (setting a label/watch flag to the same
+ *  value twice is harmless) — the key set only exists to answer "already handled" for a genuine
+ *  re-send without re-reading the switch engine for attribution. */
+const MAX_SEEN_SESSION_CMD_KEYS = 512;
+
+/** The Store `sessions.kind` value for a registered INTERACTIVE session — distinct from
+ *  session-runtime's own 'managed'/'observed' kinds (the Store column is free-form text; see
+ *  store.ts's decision note). These rows exist only for `cctl session status`. */
+const INTERACTIVE_SESSION_KIND = 'interactive';
+
+/** A registered interactive session, as mirrored (display-only) into the Store `sessions`
+ *  table's `json` column. Deliberately coarse: `state` is a single 'active' value — this commit
+ *  does NOT thread live hook events into per-turn state for interactive sessions (that is the
+ *  future SessionStart-auto-register work in the plan), and staleness is tolerated because the
+ *  table is observability, never a recovery source (store.ts). */
+interface TrackedInteractiveSession {
+  id: string;
+  kind: typeof INTERACTIVE_SESSION_KIND;
+  state: 'active';
+  /** Human label for the phone's session list. */
+  label?: string;
+  /** Per-session Discord-streaming opt-in. Recorded here as the control surface; enforcement
+   *  (filtering the unconditional M3 hook stream on this flag) is deliberately deferred so this
+   *  commit cannot regress M3 — see the note in {@link Daemon.watchSession}. */
+  watch: boolean;
+  /** The account that was live when the session was registered — an attribution tag, matching
+   *  the accountId semantics on managed sessions. */
+  accountId?: string;
+  registeredAtMs: number;
+  updatedAtMs: number;
+}
+
+/** Pure view mapper: the compact shape echoed back to the CLI on a command. */
+function interactiveView(t: TrackedInteractiveSession): TrackedSessionView {
+  return {
+    id: t.id,
+    kind: t.kind,
+    state: t.state,
+    watch: t.watch,
+    ...(t.label !== undefined ? { label: t.label } : {}),
+    ...(t.accountId !== undefined ? { accountId: t.accountId } : {}),
+  };
+}
+
+/** A view for the rare replay-with-vanished-row case (see registerSession): the row is gone but
+ *  the idempotency key says we already applied, so we echo a minimal honest view. */
+function minimalInteractiveView(sessionId: string): TrackedSessionView {
+  return { id: sessionId, kind: INTERACTIVE_SESSION_KIND, state: 'active', watch: true };
+}
+
 /** Plain `Omit` over a discriminated union collapses `type`/`payload` into the union of ALL
  *  variants' values, losing the correlation between them — the same reason shared-protocol's
  *  own `EnvelopeDraft` is built with a distributive Omit rather than the built-in one. Reused
@@ -127,6 +194,7 @@ export class Daemon {
   private readonly autoSwitcher: AutoSwitcherLike | undefined;
   private readonly createAgentSdkClient: () => AgentSdkClient;
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
+  private readonly publishHookEndpoint: ((port: number) => Promise<void>) | undefined;
   private readonly clock: () => number;
   private readonly quarantineNoticeDebounceMs: number;
   private readonly stopGraceMs: number | undefined;
@@ -147,6 +215,10 @@ export class Daemon {
   /** Recently seen `session.stop` idempotencyKeys, so a double-tapped/re-sent Stop never runs
    *  the escalation ladder twice. Bounded FIFO — see {@link rememberStopKey}. */
   private readonly seenStopKeys = new Set<string>();
+  /** Recently seen `cctl session register|label|watch` idempotencyKeys, so a re-sent command
+   *  answers "already handled" instead of re-applying. Bounded FIFO — see
+   *  {@link rememberSessionCmdKey}. */
+  private readonly seenSessionCmdKeys = new Set<string>();
   /** Per-account quarantine bookkeeping for edge-detection + debounce; see
    *  {@link reconcileQuarantineNotices}. In-memory only, so it resets on restart — which is
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
@@ -165,6 +237,7 @@ export class Daemon {
     this.autoSwitcher = options.autoSwitcher;
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
     this.installHooks = options.installHooks;
+    this.publishHookEndpoint = options.publishHookEndpoint;
     this.clock = options.clock ?? Date.now;
     this.quarantineNoticeDebounceMs =
       options.quarantineNoticeDebounceMs ?? DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS;
@@ -188,7 +261,26 @@ export class Daemon {
       this.logger.info({ recovery }, 'switch engine recovery ran on daemon startup');
     }
 
+    // Install the CLI session-command logic BEFORE binding, so a `cctl session` request that
+    // arrives the instant the port opens is served rather than 503'd. Pure delegation — the
+    // registry logic lives in this class's methods; the receiver owns transport + auth.
+    this.hookReceiver.setCliHandlers(this.cliHandlers());
+
     const hookPort = await this.hookReceiver.listen(0);
+
+    // Publish the bound loopback port so `cctl session register|label|watch` can find us. Like
+    // hook self-heal below, this is additive and fail-open: a publish failure only degrades the
+    // CLI-command surface, never the daemon's own liveness.
+    if (this.publishHookEndpoint) {
+      try {
+        await this.publishHookEndpoint(hookPort);
+      } catch (err) {
+        this.logger.error(
+          { err },
+          'failed to publish hook endpoint; cctl session commands cannot reach this daemon',
+        );
+      }
+    }
 
     // Self-heal the CLI's hook config so permission/stop/notification events actually reach the
     // receiver we just bound. A failure here (settings.json unwritable/locked, or invalid JSON
@@ -680,6 +772,10 @@ export class Daemon {
     event: SessionEvent,
   ): void {
     if (event.kind === 'status') {
+      // Mirror the transition into the display-only Store table BEFORE shipping the envelope,
+      // so `cctl session status` reflects the same state the phone just saw. Failure to mirror
+      // must never block the live envelope — see mirrorManagedSession.
+      this.mirrorManagedSession(sessionId, accountId, event.state);
       this.sendEnvelope({
         type: 'session.status',
         payload: {
@@ -698,6 +794,201 @@ export class Daemon {
       type: 'session.output',
       payload: { sessionId, seq, kind, text: event.text, truncated: false },
     });
+  }
+
+  // ---- cctl session CLI commands (interactive-session registry) ----
+  //
+  // These back the `cctl session register|label|watch` loopback endpoints (hookReceiver). They
+  // manage a DISPLAY-ONLY registry of interactive Claude Code sessions the user opted into
+  // tracking, mirrored into the Store `sessions` table (kind='interactive') so `cctl session
+  // status` reads them offline. This is purely additive observability: it never touches the M3
+  // hook stream, the M4 managed-session pipeline, or recovery (store.ts). SEMANTICS (documented
+  // per the C6 brief — the plan §7 wording is intentionally high-level here):
+  //   - register: opt a session into tracking; default `watch: true` (registering implies you
+  //     want it on the phone). Idempotent; a re-register keeps any prior label/watch choice.
+  //   - label:    name a REGISTERED session (404 if not registered — register is the gateway).
+  //   - watch:    set the per-session streaming opt-in on a REGISTERED session (404 otherwise).
+  // The watch flag is RECORDED as the control surface; enforcing it (filtering the unconditional
+  // M3 hook stream) is deferred so this commit cannot regress M3 — see watchSession.
+
+  /** Bind this daemon's registry methods as the receiver's CLI handlers. `register` is async
+   *  (it reads the switch engine for attribution); `label`/`watch` are synchronous and wrapped
+   *  in a resolved promise to satisfy the uniformly-async handler contract. */
+  private cliHandlers(): HookReceiverCliHandlers {
+    return {
+      registerSession: (input) => this.registerSession(input),
+      labelSession: (input) => Promise.resolve(this.labelSession(input)),
+      watchSession: (input) => Promise.resolve(this.watchSession(input)),
+    };
+  }
+
+  /** Opt an interactive session into daemon tracking. Async because it reads the switch engine
+   *  for the attribution tag. Idempotent on `idempotencyKey` AND value-idempotent (a re-register
+   *  preserves the prior label/watch). */
+  private async registerSession(input: SessionRegisterInput): Promise<SessionCommandResult> {
+    if (this.seenSessionCmdKeys.has(input.idempotencyKey)) {
+      const current = this.readInteractiveSession(input.sessionId);
+      return {
+        ok: true,
+        status: 'already_handled',
+        session: current ? interactiveView(current) : minimalInteractiveView(input.sessionId),
+      };
+    }
+    const existing = this.readInteractiveSession(input.sessionId);
+    const now = this.clock();
+    // Best-effort attribution: tag with the live account, but never let a switch-engine read
+    // failure block registration (observability plumbing must not depend on the vault).
+    const activeId =
+      existing?.accountId ?? (await this.switchEngine.getActiveId().catch(() => null)) ?? undefined;
+    const label = input.label ?? existing?.label;
+    const tracked: TrackedInteractiveSession = {
+      id: input.sessionId,
+      kind: INTERACTIVE_SESSION_KIND,
+      state: 'active',
+      // Registering implies streaming; but never downgrade a prior explicit `watch: false`.
+      watch: existing?.watch ?? true,
+      registeredAtMs: existing?.registeredAtMs ?? now,
+      updatedAtMs: now,
+      ...(label !== undefined ? { label } : {}),
+      ...(activeId !== undefined ? { accountId: activeId } : {}),
+    };
+    this.writeInteractiveSession(tracked);
+    this.rememberSessionCmdKey(input.idempotencyKey);
+    return { ok: true, status: 'applied', session: interactiveView(tracked) };
+  }
+
+  /** Name a registered interactive session. 404 (`unknown_session`) if it was never registered
+   *  — register is the deliberate gateway, which also gives the CLI a clean, testable failure. */
+  private labelSession(input: SessionLabelInput): SessionCommandResult {
+    if (this.seenSessionCmdKeys.has(input.idempotencyKey)) {
+      const current = this.readInteractiveSession(input.sessionId);
+      return {
+        ok: true,
+        status: 'already_handled',
+        session: current ? interactiveView(current) : minimalInteractiveView(input.sessionId),
+      };
+    }
+    const existing = this.readInteractiveSession(input.sessionId);
+    if (!existing) return this.notRegistered(input.sessionId);
+    const tracked: TrackedInteractiveSession = {
+      ...existing,
+      label: input.label,
+      updatedAtMs: this.clock(),
+    };
+    this.writeInteractiveSession(tracked);
+    this.rememberSessionCmdKey(input.idempotencyKey);
+    return { ok: true, status: 'applied', session: interactiveView(tracked) };
+  }
+
+  /** Set the per-session Discord-streaming opt-in on a registered interactive session.
+   *
+   * DELIBERATELY records-only: it does NOT gate the daemon's hook stream on this flag. M3
+   * streams every session's hook notifications unconditionally, and the plan places auto-filter
+   * (a SessionStart hook auto-registering sessions, then streaming only watched ones) AFTER M3.
+   * Gating here now would silence M3 cards for every not-yet-registered session — a regression.
+   * So this commit ships the control surface (persisted + shown in `cctl session status`) that
+   * the future filter will consult, without changing what streams today. 404 if not registered. */
+  private watchSession(input: SessionWatchInput): SessionCommandResult {
+    if (this.seenSessionCmdKeys.has(input.idempotencyKey)) {
+      const current = this.readInteractiveSession(input.sessionId);
+      return {
+        ok: true,
+        status: 'already_handled',
+        session: current ? interactiveView(current) : minimalInteractiveView(input.sessionId),
+      };
+    }
+    const existing = this.readInteractiveSession(input.sessionId);
+    if (!existing) return this.notRegistered(input.sessionId);
+    const tracked: TrackedInteractiveSession = {
+      ...existing,
+      watch: input.watch,
+      updatedAtMs: this.clock(),
+    };
+    this.writeInteractiveSession(tracked);
+    this.rememberSessionCmdKey(input.idempotencyKey);
+    return { ok: true, status: 'applied', session: interactiveView(tracked) };
+  }
+
+  /** The one 404 body for label/watch against a session that was never registered. */
+  private notRegistered(sessionId: string): SessionCommandResult {
+    return {
+      ok: false,
+      code: 'unknown_session',
+      message:
+        `session '${sessionId}' is not registered — run \`cctl session register\` ` +
+        `(or /cctl:register) in that session first`,
+    };
+  }
+
+  /** Read a registered interactive session from the Store mirror, or `undefined` if the id is
+   *  not an interactive row (or is a corrupt/foreign row — treated as not registered so a
+   *  re-register heals it). Never a managed row: managed and interactive share the table but
+   *  the kind column keeps them apart. */
+  private readInteractiveSession(sessionId: string): TrackedInteractiveSession | undefined {
+    const row = this.store.getSession(sessionId);
+    if (!row || row.kind !== INTERACTIVE_SESSION_KIND) return undefined;
+    try {
+      return JSON.parse(row.json) as TrackedInteractiveSession;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Upsert an interactive session into the display-only Store table. */
+  private writeInteractiveSession(tracked: TrackedInteractiveSession): void {
+    this.store.upsertSession({
+      id: tracked.id,
+      kind: tracked.kind,
+      state: tracked.state,
+      accountId: tracked.accountId ?? null,
+      json: JSON.stringify(tracked),
+      updatedAtMs: tracked.updatedAtMs,
+    });
+  }
+
+  /** Remember a session-command idempotencyKey with FIFO eviction past the bound (a JS Set
+   *  iterates in insertion order, so the first value is the oldest). */
+  private rememberSessionCmdKey(key: string): void {
+    this.seenSessionCmdKeys.add(key);
+    if (this.seenSessionCmdKeys.size > MAX_SEEN_SESSION_CMD_KEYS) {
+      const oldest = this.seenSessionCmdKeys.values().next().value;
+      if (oldest !== undefined) this.seenSessionCmdKeys.delete(oldest);
+    }
+  }
+
+  /** Mirror a managed session's state transition into the display-only Store table (kind
+   *  'managed'), so `cctl session status` shows phone-spawned sessions alongside interactive
+   *  ones. Pulls the richer SessionRecord from the manager when available (resumeId/cwd/summary),
+   *  else writes a minimal snapshot from what the event carried. Best-effort: a serialize/write
+   *  failure here must not break live envelope forwarding, so it is swallowed (the next
+   *  transition rewrites the row; the table is observability, never authoritative — store.ts). */
+  private mirrorManagedSession(
+    sessionId: string,
+    accountId: string | undefined,
+    state: string,
+  ): void {
+    try {
+      const record = this.sessionManager.list().find((r) => r.id === sessionId);
+      const json = record ?? {
+        id: sessionId,
+        kind: 'managed',
+        state,
+        ...(accountId !== undefined ? { accountId } : {}),
+      };
+      this.store.upsertSession({
+        id: sessionId,
+        kind: 'managed',
+        state,
+        accountId: accountId ?? record?.accountId ?? null,
+        json: JSON.stringify(json),
+        updatedAtMs: this.clock(),
+      });
+    } catch (err) {
+      this.logger.warn(
+        { err, sessionId },
+        'failed to mirror managed session to store (display only)',
+      );
+    }
   }
 
   // ---- outbound ----

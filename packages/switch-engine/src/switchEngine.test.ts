@@ -144,6 +144,98 @@ describe('captureFromConfigDir', () => {
   });
 });
 
+describe('reloginFromConfigDir', () => {
+  /** A bundle whose account uuid is set explicitly, so a test can make the existing account and
+   *  the captured login share (or deliberately NOT share) an identity. */
+  function bundleWithUuid(access: string, uuid: string, expiresAt: number): CredentialBundle {
+    return {
+      claudeAiOauth: oauth(access, expiresAt),
+      oauthAccount: { accountUuid: uuid, emailAddress: `${access}@x.com` },
+    };
+  }
+
+  /** Write a transient-config-dir login (what a `claude` run under CLAUDE_CONFIG_DIR leaves). */
+  async function writeCapture(h: Harness, dir: string, bundle: CredentialBundle): Promise<void> {
+    await mkdir(dir, { recursive: true });
+    const store = new CredentialStore({
+      claudeDir: dir,
+      credentialsPath: join(dir, '.credentials.json'),
+      claudeJsonPath: join(dir, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+    await store.writeLiveCredentials(bundle.claudeAiOauth);
+    await store.writeOauthAccount(bundle.oauthAccount!);
+  }
+
+  it('rewrites the SAME account id in place and clears quarantine (attribution preserved)', async () => {
+    const h = await harness();
+    const existing = await h.engine.addAccount(
+      'work',
+      bundleWithUuid('OLD', 'uuid-work', NOW + HOUR),
+    );
+    await h.vault.quarantine(existing.id, 'refresh token died');
+
+    const captureDir = join(h.paths.claudeDir, '..', 'relogin-capture');
+    await writeCapture(h, captureDir, bundleWithUuid('NEW', 'uuid-work', NOW + 10 * HOUR));
+
+    const result = await h.engine.reloginFromConfigDir(existing.id, captureDir);
+
+    // The id is preserved — every activation_intervals / usage_snapshots row keyed to it stays
+    // valid, which is the whole reason this verb exists instead of add --fresh.
+    expect(result.id).toBe(existing.id);
+    expect(result.quarantined).toBe(false);
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('NEW');
+    // Still exactly one account — no new id was minted.
+    expect(await h.engine.listAccounts()).toHaveLength(1);
+  });
+
+  it('refuses (and changes nothing) when the captured login is a DIFFERENT account', async () => {
+    const h = await harness();
+    const existing = await h.engine.addAccount(
+      'work',
+      bundleWithUuid('OLD', 'uuid-work', NOW + HOUR),
+    );
+    await h.vault.quarantine(existing.id, 'refresh token died');
+
+    const captureDir = join(h.paths.claudeDir, '..', 'wrong-account');
+    await writeCapture(
+      h,
+      captureDir,
+      bundleWithUuid('WRONG', 'uuid-someone-else', NOW + 10 * HOUR),
+    );
+
+    await expect(h.engine.reloginFromConfigDir(existing.id, captureDir)).rejects.toBeInstanceOf(
+      RefreshError,
+    );
+    // The vault bundle and quarantine flag are untouched — a wrong-account capture must never
+    // corrupt the entry it was meant to heal.
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('OLD');
+    expect((await h.engine.listAccounts())[0]?.quarantined).toBe(true);
+  });
+
+  it('refuses when the transient dir has no credentials (login never completed)', async () => {
+    const h = await harness();
+    const existing = await h.engine.addAccount(
+      'work',
+      bundleWithUuid('OLD', 'uuid-work', NOW + HOUR),
+    );
+    const emptyDir = join(h.paths.claudeDir, '..', 'relogin-empty');
+    await mkdir(emptyDir, { recursive: true });
+    await expect(h.engine.reloginFromConfigDir(existing.id, emptyDir)).rejects.toBeInstanceOf(
+      RefreshError,
+    );
+  });
+
+  it('refuses for an unknown account id', async () => {
+    const h = await harness();
+    const someDir = join(h.paths.claudeDir, '..', 'unused-capture');
+    await mkdir(someDir, { recursive: true });
+    await expect(h.engine.reloginFromConfigDir('no-such-id', someDir)).rejects.toBeInstanceOf(
+      UnknownAccountError,
+    );
+  });
+});
+
 describe('activate — happy path', () => {
   it('writes both live files, commits, and leaves no intent or rollback', async () => {
     const h = await harness();

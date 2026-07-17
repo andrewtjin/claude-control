@@ -346,12 +346,17 @@ export class Store {
 
   // ---- sessions ----
   //
-  // DECISION (M4): the daemon deliberately does NOT write this table. Session records'
-  // single source of truth is session-runtime's `sessions.json` (atomic temp+rename), which
-  // is what recover()/resumeOrphan actually read — mirroring state changes here would add a
-  // second source of truth with no reader and a crash window in which the two disagree. The
-  // table and accessors stay for the planned `cctl session status` reader; wire a writer
-  // ONLY together with that reader (see daemon.ts resumeOrphanedSessions for the long form).
+  // DECISION (M4 → C6): this table is a DISPLAY-ONLY MIRROR for `cctl session status`, NOT a
+  // source of truth. Recovery NEVER reads it: session-runtime's `sessions.json` (atomic
+  // temp+rename) remains the single source of truth that recover()/resumeOrphan read, precisely
+  // because a mirror can diverge from it across a crash window. The M4 decision deferred wiring
+  // any writer until its reader existed ("a second source of truth with no reader is pure
+  // divergence risk"); C6 lands BOTH together — the daemon mirrors managed-session state
+  // transitions here (see daemon.ts `mirrorManagedSession`) and registers interactive sessions
+  // here (see daemon.ts `registerSession`), and `cctl session status` reads it offline. Because
+  // it is observability-only, STALENESS AFTER A CRASH IS TOLERATED: a row left 'running' by a
+  // dead daemon is a cosmetic lie in `session status`, never a recovery hazard (recovery reads
+  // sessions.json, which is authoritative). Do not make anything on the recovery path read here.
 
   private toSessionRow(row: Record<string, unknown>): SessionRow {
     return {
@@ -364,8 +369,9 @@ export class Store {
     };
   }
 
-  /** Insert-or-replace by id (latest write wins). Currently WRITER-LESS by decision — see
-   *  the section note above before wiring a caller. */
+  /** Insert-or-replace by id (latest write wins). Written by the daemon's display mirror only
+   *  (managed-session transitions + interactive-session registration) — see the section note
+   *  above: this is observability, never a recovery source. */
   upsertSession(row: SessionRow): void {
     this.db
       .prepare(

@@ -54,6 +54,66 @@ export interface ResolvePermissionResult {
   error?: string;
 }
 
+// ---------------------------------------------------------------------------
+// CLI session endpoints (the `cctl session register|label|watch` surface)
+// ---------------------------------------------------------------------------
+//
+// These share the SAME loopback server and the SAME `x-claude-control-secret` gate as the hook
+// events — a `cctl` process authenticates with the secret the daemon minted (read-only via the
+// CLI's `loadHookSecret`). The receiver owns transport (routing, auth, body validation, mapping
+// a domain result onto an HTTP status); the LOGIC (a session registry + idempotency) lives in
+// the injected {@link HookReceiverCliHandlers}, so it is unit-testable at the daemon level and
+// the receiver stays a thin, auditable boundary — mirroring how `emit`/`resolvePermission`
+// already split transport from policy.
+
+/** Fields every mutating CLI command carries: the interactive session it targets, and an
+ *  idempotency key so a re-sent request (a network retry, a double-invoked slash command)
+ *  resolves to "already handled" instead of applying twice (plan §4 non-negotiable). */
+export interface SessionCommandBase {
+  sessionId: string;
+  idempotencyKey: string;
+}
+export interface SessionRegisterInput extends SessionCommandBase {
+  /** Optional human label to set at registration time (equivalent to a follow-up `label`). */
+  label?: string;
+}
+export interface SessionLabelInput extends SessionCommandBase {
+  label: string;
+}
+export interface SessionWatchInput extends SessionCommandBase {
+  /** Per-session Discord-streaming opt-in flag. */
+  watch: boolean;
+}
+
+/** Compact view of a tracked session, echoed back so the CLI can print a confirmation without
+ *  a second round-trip. `kind`/`state` are free-form strings (the daemon stores 'interactive'
+ *  for registered sessions, distinct from session-runtime's managed/observed kinds). */
+export interface TrackedSessionView {
+  id: string;
+  kind: string;
+  state: string;
+  label?: string;
+  watch: boolean;
+  accountId?: string;
+}
+
+/** Outcome of a CLI session command. `applied` = the mutation took effect (or a first
+ *  registration); `already_handled` = a duplicate idempotency key, a harmless no-op that still
+ *  echoes the current view. A failure names a machine-stable `code` the transport maps to a
+ *  4xx — `unknown_session` (a label/watch against a session that was never registered) becomes
+ *  404, never a crash. */
+export type SessionCommandResult =
+  | { ok: true; status: 'applied' | 'already_handled'; session: TrackedSessionView }
+  | { ok: false; code: 'unknown_session'; message: string };
+
+/** The session-command logic the daemon installs via {@link HookReceiver.setCliHandlers}. Async
+ *  because registration reads the switch engine (for the active-account attribution tag). */
+export interface HookReceiverCliHandlers {
+  registerSession(input: SessionRegisterInput): Promise<SessionCommandResult>;
+  labelSession(input: SessionLabelInput): Promise<SessionCommandResult>;
+  watchSession(input: SessionWatchInput): Promise<SessionCommandResult>;
+}
+
 const DEFAULT_SECRET_HEADER = 'x-claude-control-secret';
 const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
 
@@ -76,6 +136,10 @@ export class HookReceiver {
   private readonly emit: (draft: EnvelopeDraft) => void;
   private readonly daemonId: () => string;
   private server: Server | undefined;
+  /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
+   *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
+   *  rather than a crash. */
+  private cliHandlers: HookReceiverCliHandlers | undefined;
 
   constructor(options: HookReceiverOptions) {
     this.store = options.store;
@@ -86,6 +150,13 @@ export class HookReceiver {
     this.clock = options.clock ?? Date.now;
     this.emit = options.emit;
     this.daemonId = options.daemonId;
+  }
+
+  /** Install the CLI session-command logic. Called by the daemon before `listen` (symmetric
+   *  with `ControlPlaneClient.setHandlers`), which is why the field is nullable — the receiver
+   *  is constructed in the composition root before the Daemon that owns the registry exists. */
+  setCliHandlers(handlers: HookReceiverCliHandlers): void {
+    this.cliHandlers = handlers;
   }
 
   /** Start listening on 127.0.0.1. `port: 0` (the default) picks an OS-assigned ephemeral
@@ -171,8 +242,87 @@ export class HookReceiver {
       this.handleResolvePermission(body, res);
       return;
     }
+    if (path.startsWith('/cli/')) {
+      await this.handleCliRequest(path, body, res);
+      return;
+    }
 
     this.handleHookEvent(body, res);
+  }
+
+  /** Route a `cctl session` command. Validates the common shape here (so a malformed request is
+   *  a 400 that never reaches the registry), delegates the mutation to the injected handlers,
+   *  and maps the domain result onto an HTTP status. Never throws to the caller — a handler
+   *  rejection would be caught by `listen`'s wrapper and answered 500, but the handlers
+   *  themselves return results rather than throwing for expected failures (unknown session). */
+  private async handleCliRequest(
+    path: string,
+    body: Record<string, unknown>,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (!this.cliHandlers) {
+      // Raced daemon startup (handlers installed just before listen); tell the CLI to retry.
+      this.respond(res, 503, { ok: false, error: 'daemon is starting; retry in a moment' });
+      return;
+    }
+    const sessionId = str(body.sessionId);
+    const idempotencyKey = str(body.idempotencyKey);
+    if (!sessionId || !idempotencyKey) {
+      this.respond(res, 400, {
+        ok: false,
+        error: 'sessionId and idempotencyKey are required',
+      });
+      return;
+    }
+    const base: SessionCommandBase = { sessionId, idempotencyKey };
+
+    switch (path) {
+      case '/cli/session/register': {
+        const label = str(body.label);
+        const result = await this.cliHandlers.registerSession({
+          ...base,
+          ...(label !== undefined ? { label } : {}),
+        });
+        this.respondSessionCommand(res, result);
+        return;
+      }
+      case '/cli/session/label': {
+        const label = str(body.label);
+        if (label === undefined || label.length === 0) {
+          this.respond(res, 400, { ok: false, error: 'label is required and must be non-empty' });
+          return;
+        }
+        const result = await this.cliHandlers.labelSession({ ...base, label });
+        this.respondSessionCommand(res, result);
+        return;
+      }
+      case '/cli/session/watch': {
+        // A boolean, strictly — a missing/omitted `watch` is a client bug, not a default, since
+        // register vs unwatch are opposite intents. `true`/`false` both pass; nothing else does.
+        if (typeof body.watch !== 'boolean') {
+          this.respond(res, 400, { ok: false, error: 'watch must be a boolean' });
+          return;
+        }
+        const result = await this.cliHandlers.watchSession({ ...base, watch: body.watch });
+        this.respondSessionCommand(res, result);
+        return;
+      }
+      default:
+        this.respond(res, 404, { ok: false, error: `unknown CLI endpoint "${path}"` });
+    }
+  }
+
+  /** Map a {@link SessionCommandResult} onto an HTTP response: success → 200 (with the echoed
+   *  view), `unknown_session` → 404 with a useful body. The full result object is the body
+   *  either way, so the CLI can print `status`/`session` or `code`/`message` without guessing. */
+  private respondSessionCommand(res: ServerResponse, result: SessionCommandResult): void {
+    if (result.ok) {
+      this.respond(res, 200, result);
+      return;
+    }
+    // Only one failure code today; a switch keeps the mapping honest if more are added.
+    const status = result.code === 'unknown_session' ? 404 : 400;
+    this.respond(res, status, result);
   }
 
   private handleResolvePermission(body: Record<string, unknown>, res: ServerResponse): void {

@@ -14,12 +14,27 @@ describe('buildProgram', () => {
     expect(names).toContain('usage');
     expect(names).toContain('timeline');
     expect(names).toContain('pair');
+    expect(names).toContain('session');
   });
 
-  it('nests account subcommands', () => {
+  it('nests account subcommands including in-place relogin', () => {
     const accounts = buildProgram().commands.find((c) => c.name() === 'accounts');
     const subs = accounts?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['add', 'list', 'remove']);
+    expect(subs).toEqual(['add', 'list', 'relogin', 'remove']);
+  });
+
+  it('nests session subcommands', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const subs = session?.commands.map((c) => c.name()).sort();
+    expect(subs).toEqual(['label', 'register', 'status', 'watch']);
+  });
+
+  it('offers --session on the register/label/watch session commands', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    for (const name of ['register', 'label', 'watch']) {
+      const cmd = session?.commands.find((c) => c.name() === name);
+      expect(cmd?.options.map((o) => o.long)).toContain('--session');
+    }
   });
 
   it('offers the --fresh capture flag on accounts add', () => {
