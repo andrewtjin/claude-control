@@ -34,6 +34,13 @@ const DEFAULTS = {
 const URGENCY_WEIGHT = 2;
 const RISK_WEIGHT = 3;
 
+/** Wire-safe stand-in for the internal -Infinity "unusable" score. -Infinity is fine for
+ *  in-process sorting but JSON.stringify renders it `null`, which fails the protocol's
+ *  `score: z.number()` on the bot side and silently drops the WHOLE usage.snapshot frame —
+ *  blinding the phone exactly when an account is quarantined/exhausted. Any finite value
+ *  far below the real score range (roughly -45..300 given the weights above) works. */
+const UNUSABLE_SCORE = -10_000;
+
 /** Internal per-account analysis, before it becomes an AccountScore. */
 interface Analysis {
   input: AccountUsageInput;
@@ -145,7 +152,7 @@ function toRanking(analyses: Analysis[]): AccountScore[] {
       const score: AccountScore = {
         accountId: a.input.accountId,
         label: a.input.label,
-        score: Math.round(a.score),
+        score: Number.isFinite(a.score) ? Math.round(a.score) : UNUSABLE_SCORE,
         headroomPct: roundPct(a.headroomPct),
         note: noteFor(a),
       };
