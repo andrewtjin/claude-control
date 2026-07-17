@@ -78,7 +78,10 @@ export function buildUsageEmbed(
     // Signal differences at a glance: 🟢 active / ⚪ idle / ⚠️ erroring, plus a cached-data
     // marker so a stale tier-0 snapshot is never mistaken for a live read.
     const marker = `${accountMarker(account)} ${account.active ? 'active' : 'idle'}`;
-    const cached = account.source === 'cached' ? ' · cached' : '';
+    // Cached data carries its true fetch time — show it, so an hours-old number can never
+    // masquerade as current (the timestamp renders as a live-updating "N minutes ago").
+    const cached =
+      account.source === 'cached' ? ` · cached ${discordRelative(account.fetchedAtMs)}` : '';
     const errorLine = account.error ? `\n⚠️ ${account.error}` : '';
     embed.addFields({
       name: `${account.label} — ${marker}${cached}`,

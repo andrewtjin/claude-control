@@ -123,7 +123,20 @@ export function parseUsageEndpointResponse(raw: unknown, opts: ParseUsageOptions
  * one level under `utilization` — so it goes through the same tolerant parser. Never throws.
  */
 export function parseCachedUsage(raw: unknown, opts: ParseUsageOptions): ParsedUsage {
-  return parseLimitsPayload(raw, opts, 'cached usage value was not a JSON object');
+  // The CLI stamps the cache with WHEN it fetched (`fetchedAtMs`). Honor it: a stale cache
+  // must be reported at its true age, not re-stamped as if fetched at poll time — the phone
+  // (and the burn-down advisor's caller) can only judge staleness from this field.
+  const fetchedAtMs =
+    isRecord(raw) && typeof raw.fetchedAtMs === 'number' && Number.isFinite(raw.fetchedAtMs)
+      ? raw.fetchedAtMs
+      : opts.fetchedAtMs;
+  return parseLimitsPayload(
+    raw,
+    { ...opts, fetchedAtMs },
+    // `undefined` is the reader saying "no cache exists for this account" (e.g. it belongs to
+    // a different account) — a normal condition deserving a plain message, not a parse error.
+    raw === undefined ? 'no cached usage available' : 'cached usage value was not a JSON object',
+  );
 }
 
 /** The shared tolerant core: find the `limits` array (top-level, or nested one level under
