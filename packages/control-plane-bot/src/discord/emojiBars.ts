@@ -113,17 +113,26 @@ export interface AppEmojiLike {
   id: string;
 }
 
-/** The emoji manager surface we touch: list existing, create one from a PNG buffer. */
+/** The emoji manager surface we touch: list existing, create one from a PNG data URI.
+ *  `attachment` is a `data:image/png;base64,…` STRING, never a raw Buffer: discord.js's
+ *  resolver stamps Buffers as `data:image/jpg` regardless of content, and Discord's
+ *  application-emoji endpoint 500s on the MIME/bytes mismatch. Pre-built data URIs pass
+ *  through discord.js verbatim. */
 export interface AppEmojiManagerLike {
   /** `application.emojis.fetch()` → a Collection; we only need `.values()`. */
   fetch(): Promise<{ values(): IterableIterator<AppEmojiLike> }>;
-  create(options: { attachment: Buffer; name: string }): Promise<AppEmojiLike>;
+  create(options: { attachment: string; name: string }): Promise<AppEmojiLike>;
 }
 
 /** The application object we accept — just its `.emojis` manager. */
 export interface ProgressApplicationLike {
   emojis: AppEmojiManagerLike;
 }
+
+/** Upload attempts per sprite (1 initial + retries) and the base backoff between them.
+ *  Kept small: 19 sprites × worst-case 3 tries must not stall bot startup for long. */
+export const CREATE_ATTEMPTS = 3;
+export const CREATE_RETRY_DELAY_MS = 750;
 
 /**
  * Idempotently ensure every progress sprite exists as an application emoji, and return the
@@ -140,6 +149,8 @@ export async function ensureProgressEmojis(
   application: ProgressApplicationLike,
   assetsDir: string,
   logger: Logger,
+  // Injectable so retry tests don't sleep for real; production callers omit it.
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
 ): Promise<Map<string, string>> {
   const byName = new Map<string, string>();
 
@@ -157,14 +168,33 @@ export async function ensureProgressEmojis(
 
   // 2. Create only the missing sprites. Each create is independent — one bad upload logs and
   //    is skipped, leaving a partial map (the renderer will fall back per-bar as needed).
+  //    Each create is retried a couple of times: Discord's application-emoji endpoint throws
+  //    transient 500s often enough that a single blind attempt loses sprites for no reason.
   for (const name of PROGRESS_EMOJI_NAMES) {
     if (byName.has(name)) continue;
+    let attachment: string;
     try {
-      const attachment = await readFile(join(assetsDir, `${name}.png`));
-      const created = await application.emojis.create({ attachment, name });
-      byName.set(created.name ?? name, created.id);
+      // Build the data URI ourselves (see AppEmojiManagerLike) — the bytes ARE PNG, so the
+      // label must say PNG or Discord rejects the upload.
+      const png = await readFile(join(assetsDir, `${name}.png`));
+      attachment = `data:image/png;base64,${png.toString('base64')}`;
     } catch (err) {
-      logger.warn({ err, name }, 'progress emojis: create failed; skipping');
+      logger.warn({ err, name }, 'progress emojis: sprite file unreadable; skipping');
+      continue;
+    }
+    for (let attempt = 1; attempt <= CREATE_ATTEMPTS; attempt++) {
+      try {
+        const created = await application.emojis.create({ attachment, name });
+        byName.set(created.name ?? name, created.id);
+        break;
+      } catch (err) {
+        if (attempt === CREATE_ATTEMPTS) {
+          logger.warn({ err, name }, 'progress emojis: create failed; skipping');
+        } else {
+          logger.warn({ err, name, attempt }, 'progress emojis: create failed; retrying');
+          await sleep(CREATE_RETRY_DELAY_MS * attempt);
+        }
+      }
     }
   }
 
