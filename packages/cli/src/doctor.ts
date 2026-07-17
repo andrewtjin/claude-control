@@ -6,7 +6,11 @@
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { DpapiProtector, type Paths } from '@claude-control/switch-engine';
+import {
+  defaultLiveCredentialChannel,
+  defaultProtector,
+  type Paths,
+} from '@claude-control/switch-engine';
 
 export interface DoctorCheck {
   name: string;
@@ -25,22 +29,22 @@ export function summarize(checks: DoctorCheck[]): { passed: number; failed: numb
   return { passed: checks.length - failed, failed };
 }
 
-/** DPAPI availability, verified by a real protect/unprotect round-trip (Windows only). */
-export function checkDpapi(): DoctorCheck {
-  if (process.platform !== 'win32') {
-    return { name: 'dpapi', ok: false, detail: 'not on Windows (vault encryption unavailable)' };
-  }
+/** Vault encryption availability, verified by a REAL protect/unprotect round-trip through
+ *  this platform's protector (win32: DPAPI · darwin: Keychain+AES-GCM). On an unsupported
+ *  platform the factory's error IS the report — the gap is stated, never silent. */
+export function checkVaultProtection(platform: NodeJS.Platform = process.platform): DoctorCheck {
+  const label = platform === 'win32' ? 'DPAPI' : platform === 'darwin' ? 'Keychain' : platform;
   try {
-    const p = new DpapiProtector();
+    const p = defaultProtector(platform);
     const probe = Buffer.from('cctl-doctor-probe');
     const ok = p.unprotect(p.protect(probe)).equals(probe);
     return {
-      name: 'dpapi',
+      name: 'vault-crypto',
       ok,
-      detail: ok ? 'protect/unprotect round-trip works' : 'round-trip mismatch',
+      detail: ok ? `${label} protect/unprotect round-trip works` : `${label} round-trip mismatch`,
     };
   } catch (err) {
-    return { name: 'dpapi', ok: false, detail: `DPAPI error: ${(err as Error).message}` };
+    return { name: 'vault-crypto', ok: false, detail: (err as Error).message };
   }
 }
 
@@ -54,16 +58,31 @@ export function checkVault(paths: Paths): DoctorCheck {
   };
 }
 
-/** Whether someone is currently logged in (live credentials present). */
-export function checkLiveLogin(paths: Paths): DoctorCheck {
-  const ok = existsSync(paths.credentialsPath);
-  return {
-    name: 'login',
-    ok,
-    detail: ok
-      ? 'live credentials found'
-      : `no ${paths.credentialsPath} — run \`claude\` and log in first`,
-  };
+/** Whether someone is currently logged in — read through this platform's live-credential
+ *  channel, so on macOS this probes the CLI's Keychain item (which doubles as the wet-gate
+ *  verifier for the item-name/shape assumptions), not a file that never exists there. */
+export async function checkLiveLogin(
+  paths: Paths,
+  platform: NodeJS.Platform = process.platform,
+): Promise<DoctorCheck> {
+  const where = platform === 'darwin' ? "the CLI's Keychain item" : paths.credentialsPath;
+  try {
+    const live = await defaultLiveCredentialChannel(paths, platform).readLiveCredentials();
+    return {
+      name: 'login',
+      ok: live !== undefined,
+      detail:
+        live !== undefined
+          ? `live credentials found in ${where}`
+          : `no live credentials in ${where} — run \`claude\` and log in first`,
+    };
+  } catch (err) {
+    return {
+      name: 'login',
+      ok: false,
+      detail: `error reading ${where}: ${(err as Error).message}`,
+    };
+  }
 }
 
 /** The `~/.claude.json` config the switch touches is present. */
@@ -77,11 +96,11 @@ export function checkClaudeJson(paths: Paths): DoctorCheck {
 }
 
 /** Run every check for the given paths. */
-export function runDoctor(paths: Paths): DoctorCheck[] {
+export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
   return [
-    checkDpapi(),
+    checkVaultProtection(),
     checkVault(paths),
-    checkLiveLogin(paths),
+    await checkLiveLogin(paths),
     checkClaudeJson(paths),
     { name: 'lock', ok: true, detail: join(paths.vaultDir, '.lock') },
   ];
