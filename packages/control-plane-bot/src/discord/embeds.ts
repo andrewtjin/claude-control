@@ -341,7 +341,7 @@ export function buildQuarantineEmbed(p: {
     )
     .addFields({
       name: 'Fix it on the host',
-      value: `Run \`${p.reloginCommand}\` to capture a fresh login, then \`cctl switch <label>\`.`,
+      value: `Run \`${p.reloginCommand}\` to restore the account, then \`cctl switch <label>\`.`,
     });
   return embed;
 }

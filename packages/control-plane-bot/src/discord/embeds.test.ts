@@ -334,12 +334,12 @@ describe('lifecycle cards (done / waiting / quarantine)', () => {
   it('buildQuarantineEmbed prints the injected host re-login command verbatim', () => {
     const embed = buildQuarantineEmbed({
       body: 'Work is quarantined.',
-      reloginCommand: 'cctl accounts add <label> --fresh',
+      reloginCommand: 'cctl accounts relogin <label>',
     }).toJSON();
     expect(embed.title).toContain('🚫');
     expect(embed.color).toBe(NOTIFICATION_COLOR.quarantine);
     const fix = embed.fields?.find((f) => f.name === 'Fix it on the host');
-    expect(fix?.value).toContain('cctl accounts add <label> --fresh');
+    expect(fix?.value).toContain('cctl accounts relogin <label>');
   });
 });
 

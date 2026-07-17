@@ -289,14 +289,16 @@ describe('handleStop sends session.stop (wired as of the M3 protocol commit)', (
 });
 
 describe('handleReauth stays host-only and prints the REAL CLI verb', () => {
-  it('points the user at `cctl accounts add --fresh` and never sends an envelope', () => {
+  it('points the user at `cctl accounts relogin` and never sends an envelope', () => {
     const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
     const deps = makeDeps(relay);
     const result = handleReauth(deps, 'user-a', 'acct-9');
     expect(result.kind).toBe('text');
-    // The account it names, the real verb, and NO invented `relogin`/`login` verb.
+    // The account it names, the in-place verb, and NOT the id-minting `add --fresh` (which
+    // would break usage attribution) or the nonexistent `cctl login`.
     expect(result.kind === 'text' && result.text).toContain('acct-9');
-    expect(result.kind === 'text' && result.text).toContain('cctl accounts add <label> --fresh');
+    expect(result.kind === 'text' && result.text).toContain('cctl accounts relogin <label>');
+    expect(result.kind === 'text' && result.text).not.toContain('--fresh');
     expect(result.kind === 'text' && result.text).not.toContain('cctl login');
     expect(sent).toHaveLength(0);
   });

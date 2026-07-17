@@ -220,9 +220,9 @@ export function handleStop(
 /** `/reauth <accountId>` — re-authenticating a quarantined account is an interactive OAuth
  *  flow that must run on the host (the bot holds zero credentials by design — see the
  *  package-level architecture rule); there is no protocol message for it because the bot
- *  structurally cannot perform it. Point the user at the REAL host command that exists today —
- *  `cctl accounts add <label> --fresh` (there is no in-place `relogin`/`login` verb yet; see the
- *  report). This copy is kept in lockstep with the quarantine card's `RELOGIN_COMMAND`. */
+ *  structurally cannot perform it. Point the user at `cctl accounts relogin <label>`, which
+ *  re-logs into the EXISTING vault entry in place (same account id — usage attribution survives,
+ *  quarantine cleared). This copy is kept in lockstep with the quarantine card's `RELOGIN_COMMAND`. */
 export function handleReauth(
   _deps: CommandDeps,
   _discordUserId: string,
@@ -232,7 +232,7 @@ export function handleReauth(
     kind: 'text',
     text:
       `Re-auth must run on the host (the bot holds no credentials). Run ` +
-      `\`cctl accounts add <label> --fresh\` to capture a fresh login, then \`cctl switch <label>\`. ` +
-      `(quarantined account: ${accountId})`,
+      `\`cctl accounts relogin <label>\` to re-login in place (usage history kept), then ` +
+      `\`cctl switch <label>\`. (quarantined account: ${accountId})`,
   };
 }

@@ -27,10 +27,10 @@ export interface RenderedPush {
 }
 
 /** The single source of truth for the host re-login command, shared by the quarantine card and
- *  `handleReauth` so the two can never print different instructions. This is the REAL verb that
- *  exists in the CLI today (`cctl accounts add <label> --fresh`) — the plan's `cctl accounts
- *  relogin` and the old `cctl login` do not exist yet (see the report). */
-export const RELOGIN_COMMAND = 'cctl accounts add <label> --fresh';
+ *  `handleReauth` so the two can never print different instructions. `cctl accounts relogin`
+ *  re-captures credentials into the EXISTING vault entry (same account id, quarantine cleared),
+ *  so usage attribution survives — unlike `accounts add --fresh`, which mints a new id. */
+export const RELOGIN_COMMAND = 'cctl accounts relogin <label>';
 
 /** Map one daemon-originated envelope to what the bot should DM, or `undefined` for cache-only. */
 export function renderPush(envelope: Envelope): RenderedPush | undefined {
