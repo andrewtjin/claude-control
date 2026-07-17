@@ -11,8 +11,8 @@ strictly by Discord user. Your credentials never leave your machine.
 
 ## What it does
 
-- **Cross-account usage** — one view of every account's 5-hour, weekly, and per-model
-  limits, without switching to poll them.
+- **Cross-account usage optimization** — one view of every account's 5-hour, weekly, and per-model
+  limits, with optimal use calculations.
 - **One-tap switch** — get a near-cap alert on your phone, switch accounts with a
   tap; in-flight work resumes under the new account.
 - **Approve from anywhere** — permission prompts and "done / waiting" notices reach
