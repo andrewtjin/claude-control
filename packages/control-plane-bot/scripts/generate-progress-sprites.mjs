@@ -4,8 +4,9 @@
 // emojis (bot-owned custom emojis that work in DMs with no server). Those emojis are just
 // small PNGs uploaded once via the Discord API, so the *source of truth* for how a bar looks
 // has to be a committed, reproducible asset — not a hand-drawn file nobody can regenerate.
-// This script draws all 19 sprite pieces deterministically and writes them next door under
-// assets/progress-bar/. Re-run it to change the look; commit the regenerated PNGs.
+// This script draws all 28 sprite pieces (progress-bar cells + timeline reset markers)
+// deterministically and writes them next door under assets/progress-bar/. Re-run it to
+// change the look; commit the regenerated PNGs.
 //
 // WHY no image library: the bot package guards a zero-new-runtime-dependency rule, and even a
 // build-only image dep is avoidable here — a progress-bar cell is just a rounded rectangle.
@@ -46,6 +47,15 @@ const FILL = {
 const EMPTY_EDGE = [0x2b, 0x2d, 0x31]; // track colour at the rim
 const EMPTY_MID = [0x3a, 0x3c, 0x42]; // subtle lighter "inner emptiness" at the centre
 
+// Timeline reset-marker dots, drawn ON the empty track. Blurple/violet sit apart from the
+// severity palette on purpose: a reset marker is a schedule fact, not a usage judgement.
+const MARK = {
+  s: [0x58, 0x65, 0xf2], // 5h-window reset — Discord blurple
+  w: [0xa9, 0x70, 0xe8], // weekly reset — soft violet
+};
+const DOT_R = 5; // dot radius: fits the 7px half-height band with a 2px track rim visible
+const CX = SIZE / 2; // dots are centred in their cell
+
 // --- Sprite catalogue -------------------------------------------------------------------
 // cap: which end is rounded ('l' left, 'r' right, 'm' none/square both sides so middles
 //      connect seamlessly).
@@ -62,7 +72,16 @@ const COLOR_PIECES = Object.keys(FILL).flatMap((c) => [
   { name: `pb_mh_${c}`, cap: 'm', color: c, filledAt: (x) => x < HALF_X }, // half middle
   { name: `pb_rf_${c}`, cap: 'r', color: c, filledAt: () => true }, // filled right cap
 ]);
-const PIECES = [...EMPTY_PIECES, ...COLOR_PIECES];
+// Timeline markers: a dot on the empty track, in every cap shape so a reset landing in the
+// first/last cell keeps its rounded end. mark 's'/'w' is a solid dot; 'b' (both kinds in one
+// cell) splits the dot vertically — left half blurple, right half violet — so neither
+// meaning silently vanishes.
+const TRACK_PIECES = ['s', 'w', 'b'].flatMap((m) => [
+  { name: `tl_l${m}`, cap: 'l', mark: m, filledAt: () => false },
+  { name: `tl_m${m}`, cap: 'm', mark: m, filledAt: () => false },
+  { name: `tl_r${m}`, cap: 'r', mark: m, filledAt: () => false },
+]);
+const PIECES = [...EMPTY_PIECES, ...COLOR_PIECES, ...TRACK_PIECES];
 
 // --- Drawing ----------------------------------------------------------------------------
 
@@ -80,9 +99,16 @@ function insideTrack(cap, px, py) {
 }
 
 /** Colour (RGB triple) of an in-track sub-sample. Filled columns take the solid zone colour;
- *  empty columns take the track colour shaded lighter toward the vertical centre. */
+ *  marker pieces draw their dot over the empty track; everything else takes the track colour
+ *  shaded lighter toward the vertical centre. */
 function sampleColor(piece, px, py) {
   if (piece.filledAt(px)) return FILL[piece.color];
+  // Marker dot: a circle centred in the cell, on top of the empty-track background. The
+  // supersampler anti-aliases the dot edge exactly like the track edge.
+  if (piece.mark && (px - CX) ** 2 + (py - CY) ** 2 <= DOT_R * DOT_R) {
+    if (piece.mark === 'b') return px < CX ? MARK.s : MARK.w; // two-tone "both" split
+    return MARK[piece.mark];
+  }
   // Subtle vertical shading: t=1 at the centre line, 0 at the rim → recessed-tube look.
   const t = 1 - Math.min(1, Math.abs(py - CY) / R);
   return [

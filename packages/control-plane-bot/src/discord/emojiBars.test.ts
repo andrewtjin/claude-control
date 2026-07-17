@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   renderEmojiBar,
+  renderEmojiTrack,
   ensureProgressEmojis,
   emojiResolverFrom,
   PROGRESS_EMOJI_NAMES,
@@ -65,6 +66,64 @@ describe('renderEmojiBar composition', () => {
     // Missing even the empty cap the 0% bar needs → also bails out.
     const missingCap: EmojiResolver = (name) => (name === 'pb_le' ? undefined : `[${name}]`);
     expect(renderEmojiBar(0, missingCap)).toBeUndefined();
+  });
+});
+
+describe('renderEmojiTrack composition', () => {
+  const NOW = 1_000_000;
+  const SPAN = 12_000; // 12 cells → 1000ms per step across width-1 slots
+
+  it('draws markers on the slim empty track, keeping cap shapes at the ends', () => {
+    const track = renderEmojiTrack(
+      [
+        { atMs: NOW, kind: 'session' },
+        { atMs: NOW + SPAN, kind: 'weekly' },
+      ],
+      NOW,
+      SPAN,
+      echoResolver,
+    );
+    // Session in the first cell → left-cap session marker; weekly in the last → right-cap
+    // weekly marker; everything between is the bar's own empty middle piece.
+    expect(track).toBe('[tl_ls]' + '[pb_me]'.repeat(10) + '[tl_rw]');
+  });
+
+  it('uses middle-shaped markers away from the ends and both-markers on collisions', () => {
+    const track = renderEmojiTrack(
+      [
+        { atMs: NOW + SPAN / 2, kind: 'session' },
+        { atMs: NOW + SPAN / 2, kind: 'weekly' },
+      ],
+      NOW,
+      SPAN,
+      echoResolver,
+    );
+    // Both kinds land in cell 6 (round(0.5·11)) → the two-tone both-marker, middle shape.
+    expect(track).toBe(
+      '[pb_le]' + '[pb_me]'.repeat(5) + '[tl_mb]' + '[pb_me]'.repeat(4) + '[pb_re]',
+    );
+  });
+
+  it('returns undefined when ANY needed sprite is missing (caller falls back to unicode)', () => {
+    const missingMarker: EmojiResolver = (name) => (name === 'tl_ls' ? undefined : `[${name}]`);
+    expect(
+      renderEmojiTrack([{ atMs: NOW, kind: 'session' }], NOW, SPAN, missingMarker),
+    ).toBeUndefined();
+    const missingEmpty: EmojiResolver = (name) => (name === 'pb_me' ? undefined : `[${name}]`);
+    expect(
+      renderEmojiTrack([{ atMs: NOW, kind: 'session' }], NOW, SPAN, missingEmpty),
+    ).toBeUndefined();
+  });
+
+  it('agrees with the unicode track on marker placement (shared trackCells math)', () => {
+    const events = [
+      { atMs: NOW + 3_000, kind: 'session' as const },
+      { atMs: NOW + SPAN, kind: 'weekly' as const },
+    ];
+    const track = renderEmojiTrack(events, NOW, SPAN, echoResolver) as string;
+    const markerAt = (i: number) => track.split('][')[i]?.replace(/[[\]]/g, '');
+    expect(markerAt(3)).toBe('tl_ms'); // round(3/12·11) = 3
+    expect(markerAt(11)).toBe('tl_rw');
   });
 });
 
@@ -196,7 +255,7 @@ describe('ensureProgressEmojis', () => {
 describe('committed sprite PNGs', () => {
   // Decode a couple of the generated files to prove the hand-rolled PNG encoder produced valid
   // 28×28 RGBA images (the exact source art Discord ingests for a custom emoji).
-  it.each(['pb_le', 'pb_mf_g', 'pb_mh_y', 'pb_rf_r'])(
+  it.each(['pb_le', 'pb_mf_g', 'pb_mh_y', 'pb_rf_r', 'tl_ms', 'tl_lb', 'tl_rw'])(
     '%s is a valid 28×28 RGBA PNG',
     async (name) => {
       const buf = await readFile(join(ASSETS_DIR, `${name}.png`));
@@ -209,11 +268,11 @@ describe('committed sprite PNGs', () => {
     },
   );
 
-  it('ships exactly the 19 sprites the renderer can reference', async () => {
+  it('ships exactly the 28 sprites the renderers can reference', async () => {
     for (const name of PROGRESS_EMOJI_NAMES) {
       const buf = await readFile(join(ASSETS_DIR, `${name}.png`));
       expect(buf.subarray(0, 8).equals(PNG_SIGNATURE)).toBe(true);
     }
-    expect(PROGRESS_EMOJI_NAMES).toHaveLength(19);
+    expect(PROGRESS_EMOJI_NAMES).toHaveLength(28);
   });
 });

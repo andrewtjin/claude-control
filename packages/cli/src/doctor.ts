@@ -11,6 +11,7 @@ import {
   defaultProtector,
   type Paths,
 } from '@claude-control/switch-engine';
+import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 export interface DoctorCheck {
   name: string;
@@ -18,9 +19,11 @@ export interface DoctorCheck {
   detail: string;
 }
 
-/** Render checks as `[ok]/[!!]` lines. Pure. */
-export function renderDoctor(checks: DoctorCheck[]): string {
-  return checks.map((c) => `${c.ok ? '[ok]' : '[!!]'} ${c.name}: ${c.detail}`).join('\n');
+/** Render checks as `[ok]/[!!]` lines (green/red when a color palette is injected). Pure. */
+export function renderDoctor(checks: DoctorCheck[], palette: Palette = PLAIN_PALETTE): string {
+  return checks
+    .map((c) => `${c.ok ? palette.green('[ok]') : palette.red('[!!]')} ${c.name}: ${c.detail}`)
+    .join('\n');
 }
 
 /** Count outcomes. Pure. */
