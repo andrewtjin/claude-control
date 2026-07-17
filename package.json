@@ -14,7 +14,7 @@
     "typecheck": "tsc -b --noEmit false && tsc -b",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint packages",
+    "lint": "eslint packages --ignore-pattern \"packages/*/scripts/**\"",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "ci:check": "pnpm run lint && pnpm run format:check && pnpm run build && pnpm run test"
