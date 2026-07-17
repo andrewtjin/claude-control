@@ -8,6 +8,7 @@ import {
   buildSettingsEmbed,
   buildSwitchResultEmbed,
   buildTimelineEmbed,
+  clampFieldValue,
 } from './embeds.js';
 import type { SessionStatus } from './stateCache.js';
 
@@ -323,5 +324,88 @@ describe('buildSwitchResultEmbed', () => {
     expect(ok.title).toBe('Switched');
     expect(fail.title).toBe('Switch failed');
     expect(ok.description).toBe('switched to acct-2');
+  });
+});
+
+describe('clampFieldValue', () => {
+  it('passes short values through untouched', () => {
+    expect(clampFieldValue('line1\nline2')).toBe('line1\nline2');
+  });
+
+  it('drops whole trailing lines and reports how many were cut', () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `line ${i} `.padEnd(100, 'x'));
+    const clamped = clampFieldValue(lines.join('\n'));
+    expect(clamped.length).toBeLessThanOrEqual(1024);
+    expect(clamped).toContain('line 0');
+    // No partial line survives — a cut mid-line would break emoji-sprite tokens on screen.
+    expect(clamped).toMatch(/… \+\d+ more$/);
+    for (const kept of clamped.split('\n').slice(0, -1)) expect(lines).toContain(kept);
+  });
+
+  it('hard-truncates a single line that alone exceeds the cap', () => {
+    const clamped = clampFieldValue('y'.repeat(3000));
+    expect(clamped.length).toBe(1024);
+    expect(clamped.endsWith('…')).toBe(true);
+  });
+});
+
+describe('embed field overflow (regression)', () => {
+  // The 2026-07-17 live failure: FOUR 3-limit accounts × emoji-sprite marks (~28 raw chars
+  // per token) push the "Upcoming resets" value past Discord's 1024 cap, and discord.js
+  // VALIDATES at addFields time — so `/timeline` threw instead of rendering. Rebuild that
+  // exact shape and require it to render clamped.
+  const NOW = Date.parse('2026-07-17T12:00:00.000Z');
+  const spriteToken = '<:tl_ms:1384311055791234567>'; // realistic 19-digit-snowflake length
+  const spriteStyle = {
+    track: () => spriteToken.repeat(12),
+    session: spriteToken,
+    weekly: spriteToken,
+    both: spriteToken,
+  };
+  const fleet = ['legoboy', 'jina25', 'tjin.29', 'debate'].map((label, i) =>
+    account({
+      accountId: `acct-${label}`,
+      label,
+      active: label === 'tjin.29',
+      limits: [
+        { kind: 'session', percent: 40 + i, isActive: true, resetsAt: '2026-07-17T14:00:00.000Z' },
+        {
+          kind: 'weekly_all',
+          percent: 60 + i,
+          isActive: true,
+          resetsAt: '2026-07-20T12:00:00.000Z',
+        },
+        {
+          kind: 'weekly_scoped',
+          percent: 20 + i,
+          isActive: true,
+          resetsAt: '2026-07-21T12:00:00.000Z',
+        },
+      ],
+    }),
+  );
+
+  it('renders /timeline for a 4-account fleet with sprite marks instead of throwing', () => {
+    const embed = buildTimelineEmbed({ accounts: fleet }, NOW, undefined, spriteStyle).toJSON();
+    for (const field of embed.fields ?? []) {
+      expect(field.value.length).toBeLessThanOrEqual(1024);
+    }
+    const upcoming = embed.fields?.find((f) => f.name === 'Upcoming resets');
+    // All 12 events cannot fit — the clamp must have cut the far tail, visibly.
+    expect(upcoming?.value).toMatch(/… \+\d+ more$/);
+    // Soonest resets (today's 5h windows) survive; they are the actionable ones.
+    expect(upcoming?.value).toContain('**legoboy**');
+  });
+
+  it('renders /usage for the same fleet within field limits', () => {
+    const embed = buildUsageEmbed({ accounts: fleet }, NOW).toJSON();
+    for (const field of embed.fields ?? []) {
+      expect(field.value.length).toBeLessThanOrEqual(1024);
+    }
+  });
+
+  it('clamps an unbounded permission detail instead of throwing', () => {
+    const embed = buildPermissionRequestEmbed('run a command', 'x'.repeat(5000)).toJSON();
+    expect(embed.fields?.[0]?.value.length).toBeLessThanOrEqual(1024);
   });
 });

@@ -29,6 +29,39 @@ const COLOR_OK = 0x2ecc71;
 const COLOR_WARN = 0xf1c40f;
 const COLOR_INFO = 0x3498db;
 
+/** Discord's hard cap on an embed field's `value`. discord.js VALIDATES this at
+ *  `addFields` time (shapeshift CombinedPropertyError), so an oversized value doesn't
+ *  degrade — it makes the whole command throw. */
+const FIELD_VALUE_MAX = 1024;
+
+/**
+ * Clamp a field value to Discord's 1024-char cap by dropping whole trailing LINES and
+ * appending a "… +N more" marker, so the field degrades to "show the first lines" instead
+ * of crashing the command. Lines are the unit because every multi-line field here is
+ * sorted most-relevant-first (soonest resets, first accounts), and because emoji-sprite
+ * tokens (`<:pb_mf_g:123…>`, ~28 raw chars each) make raw length ~10× the visible length —
+ * cutting mid-line would leave a broken half-token on screen. A single line that alone
+ * exceeds the cap (pathological) is hard-truncated with an ellipsis rather than thrown.
+ */
+export function clampFieldValue(value: string, max = FIELD_VALUE_MAX): string {
+  if (value.length <= max) return value;
+  const lines = value.split('\n');
+  const kept = [...lines];
+  while (kept.length > 1) {
+    kept.pop();
+    const candidate = `${kept.join('\n')}\n… +${lines.length - kept.length} more`;
+    if (candidate.length <= max) return candidate;
+  }
+  return `${(kept[0] ?? '').slice(0, max - 1)}…`;
+}
+
+/** `addFields` with the value clamped — every data-driven field in this module goes
+ *  through here so no snapshot shape (more accounts, more limits, longer labels) can
+ *  ever make a command throw at the validation layer again. */
+function addClampedField(embed: EmbedBuilder, name: string, value: string): void {
+  embed.addFields({ name, value: clampFieldValue(value) });
+}
+
 // The default bar renderer is the credential-free unicode `layeredBar`. It is injected as an
 // optional parameter (not hidden module state) so these builders stay PURE and every existing
 // call site — and every test — keeps getting unicode bars untouched. The gateway swaps in the
@@ -83,16 +116,17 @@ export function buildUsageEmbed(
     const cached =
       account.source === 'cached' ? ` · cached ${discordRelative(account.fetchedAtMs)}` : '';
     const errorLine = account.error ? `\n⚠️ ${account.error}` : '';
-    embed.addFields({
-      name: `${account.label} — ${marker}${cached}`,
-      value: `${formatLimits(account, nowMs, barRenderer)}${windowsLine(outlook, account.accountId)}${errorLine}`,
-    });
+    addClampedField(
+      embed,
+      `${account.label} — ${marker}${cached}`,
+      `${formatLimits(account, nowMs, barRenderer)}${windowsLine(outlook, account.accountId)}${errorLine}`,
+    );
   }
   if (usage.plan) {
     // One compact field: the reason line already carries the whole burn order (see the
     // advisor), and advisories only exist for exceptional states — no separate headings.
     const lines = [usage.plan.reason, ...usage.plan.advisories.map((a) => `• ${a.message}`)];
-    embed.addFields({ name: 'Plan', value: lines.join('\n') });
+    addClampedField(embed, 'Plan', lines.join('\n'));
   }
   return embed;
 }
@@ -166,28 +200,30 @@ export function buildTimelineEmbed(
         .map((e) => ({ atMs: e.atMs, kind: e.kind === 'session' ? 'session' : 'weekly' }));
       if (events.length > 0) lines.push(trackStyle.track(events, nowMs, spanMs));
     }
-    embed.addFields({
-      name: `${accountMarker(a)} ${a.label}`,
-      value: lines.join('\n'),
-    });
+    addClampedField(embed, `${accountMarker(a)} ${a.label}`, lines.join('\n'));
   }
 
   if (outlook.events.length > 0) {
-    embed.addFields({
-      name: 'Upcoming resets',
-      value: outlook.events
+    // This is the field that grows FASTEST with fleet size: one line per (account × limit)
+    // reset, each line ~105 raw chars with emoji-sprite marks — four 3-limit accounts
+    // already exceed the cap, so the clamp is what keeps `/timeline` alive as accounts
+    // are added (soonest resets survive; the far tail is what gets dropped).
+    addClampedField(
+      embed,
+      'Upcoming resets',
+      outlook.events
         .map((e) => {
           const mark = e.kind === 'session' ? trackStyle.session : trackStyle.weekly;
           return `${mark} ${discordRelative(e.atMs)} — **${e.label}** · ${describeEvent(e.kind, e.percentUsed)}`;
         })
         .join('\n'),
-    });
+    );
   }
 
   if (usage.plan) {
     const planLines = [usage.plan.reason];
     for (const adv of usage.plan.advisories) planLines.push(`• ${adv.message}`);
-    embed.addFields({ name: 'Plan', value: planLines.join('\n') });
+    addClampedField(embed, 'Plan', planLines.join('\n'));
   }
   return embed;
 }
@@ -213,10 +249,11 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
     return embed;
   }
   for (const account of accounts) {
-    embed.addFields({
-      name: `${accountMarker(account)} ${account.label}`,
-      value: `${account.active ? 'active' : 'idle'} · source: ${account.source}`,
-    });
+    addClampedField(
+      embed,
+      `${accountMarker(account)} ${account.label}`,
+      `${account.active ? 'active' : 'idle'} · source: ${account.source}`,
+    );
   }
   return embed;
 }
@@ -246,8 +283,9 @@ export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
     return embed;
   }
   for (const session of sessions) {
+    // Summaries are daemon-relayed model text — unbounded, so clamp like everything else.
     const summaryLine = session.summary ? ` — ${session.summary}` : '';
-    embed.addFields({ name: session.sessionId, value: `${session.state}${summaryLine}` });
+    addClampedField(embed, session.sessionId, `${session.state}${summaryLine}`);
   }
   return embed;
 }
@@ -259,7 +297,8 @@ export function buildPermissionRequestEmbed(summary: string, detail?: string): E
     .setTitle('Permission requested')
     .setColor(COLOR_WARN)
     .setDescription(summary);
-  if (detail) embed.addFields({ name: 'Detail', value: detail });
+  // Detail is hook-supplied tool input — unbounded (a long Bash command, a big diff).
+  if (detail) addClampedField(embed, 'Detail', detail);
   return embed;
 }
 
