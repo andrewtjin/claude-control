@@ -23,10 +23,19 @@ import {
   worstSeverity,
   type TrackEvent,
 } from './richFormat.js';
+import type { BarRenderer } from './emojiBars.js';
 
 const COLOR_OK = 0x2ecc71;
 const COLOR_WARN = 0xf1c40f;
 const COLOR_INFO = 0x3498db;
+
+// The default bar renderer is the credential-free unicode `layeredBar`. It is injected as an
+// optional parameter (not hidden module state) so these builders stay PURE and every existing
+// call site — and every test — keeps getting unicode bars untouched. The gateway swaps in the
+// emoji renderer at runtime only after `ensureProgressEmojis` succeeds (see discordJsGateway).
+// A parameter beats a module-level mutable/setter here because it keeps the "which bar?"
+// decision explicit at the call site and leaves the functions trivially unit-testable.
+export const DEFAULT_BAR_RENDERER: BarRenderer = layeredBar;
 
 /** Embed accent color for a usage snapshot: the worst severity across every limit of
  *  every account, or neutral blue when no limit data exists yet. */
@@ -35,16 +44,17 @@ function usageColor(accounts: AccountUsage[]): number {
   return percents.length === 0 ? COLOR_INFO : SEVERITY_COLOR[worstSeverity(percents)];
 }
 
-/** Render one account's limits as layered progress bars, one line per limit:
- *  "🟩🟩🟩🟩⬜⬜⬜⬜⬜⬜ session 42% · resets <t:...:R>". */
-function formatLimits(account: AccountUsage, nowMs: number): string {
+/** Render one account's limits as progress bars, one line per limit:
+ *  "🟩🟩🟩🟩⬜⬜⬜⬜⬜⬜ session 42% · resets <t:...:R>". `bar` is the injected renderer
+ *  (unicode by default, emoji at runtime). */
+function formatLimits(account: AccountUsage, nowMs: number, bar: BarRenderer): string {
   if (account.limits.length === 0) return 'no limit data';
   return account.limits
     .map((l) => {
       const resetMs = l.resetsAt != null ? Date.parse(l.resetsAt) : NaN;
       const reset =
         Number.isFinite(resetMs) && resetMs > nowMs ? ` · resets ${discordRelative(resetMs)}` : '';
-      return `${layeredBar(l.percent)} ${l.kind.replace(/_/g, ' ')} ${Math.round(l.percent)}%${reset}`;
+      return `${bar(l.percent)} ${l.kind.replace(/_/g, ' ')} ${Math.round(l.percent)}%${reset}`;
     })
     .join('\n');
 }
@@ -57,6 +67,7 @@ export function buildUsageEmbed(
     plan?: UsagePlan;
   },
   nowMs = Date.now(),
+  barRenderer: BarRenderer = DEFAULT_BAR_RENDERER,
 ): EmbedBuilder {
   const embed = new EmbedBuilder().setTitle('Usage').setColor(usageColor(usage.accounts));
   if (usage.accounts.length === 0) {
@@ -71,7 +82,7 @@ export function buildUsageEmbed(
     const errorLine = account.error ? `\n⚠️ ${account.error}` : '';
     embed.addFields({
       name: `${account.label} — ${marker}${cached}`,
-      value: `${formatLimits(account, nowMs)}${windowsLine(outlook, account.accountId)}${errorLine}`,
+      value: `${formatLimits(account, nowMs, barRenderer)}${windowsLine(outlook, account.accountId)}${errorLine}`,
     });
   }
   if (usage.plan) {
@@ -113,6 +124,7 @@ export function buildTimelineEmbed(
     plan?: UsagePlan;
   },
   nowMs = Date.now(),
+  barRenderer: BarRenderer = DEFAULT_BAR_RENDERER,
 ): EmbedBuilder {
   const outlook = computeOutlook(timelineInputFromWire(usage.accounts), nowMs);
   const embed = new EmbedBuilder().setTitle('Reset timeline').setColor(usageColor(usage.accounts));
@@ -136,7 +148,7 @@ export function buildTimelineEmbed(
       lines.push('🚫 quarantined — re-login required');
     } else if (a.openWindowEndsAt !== undefined) {
       lines.push(
-        `${layeredBar(a.sessionPercent ?? 0)} window open · ${a.sessionPercent ?? 0}% used · resets ${discordRelative(a.openWindowEndsAt)}`,
+        `${barRenderer(a.sessionPercent ?? 0)} window open · ${a.sessionPercent ?? 0}% used · resets ${discordRelative(a.openWindowEndsAt)}`,
       );
     } else {
       lines.push('💤 no open 5h window');
