@@ -36,7 +36,12 @@ import {
   type DaemonIdentity,
   type IdentityStore,
 } from './controlPlaneClient.js';
-import { Daemon, type SwitchEngineLike } from './daemon.js';
+import {
+  Daemon,
+  reconcileQuarantineNotices,
+  type SwitchEngineLike,
+  type QuarantineNoticeState,
+} from './daemon.js';
 
 // ---------------------------------------------------------------------------
 // A minimal steady-state relay: accepts `hello` unconditionally, collects every envelope it
@@ -128,6 +133,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void
 function fakeSwitchEngine(): SwitchEngineLike & {
   activate: ReturnType<typeof vi.fn>;
   recover: ReturnType<typeof vi.fn>;
+  listAccounts: ReturnType<typeof vi.fn>;
 } {
   return {
     recover: vi.fn((): Promise<RecoverResult> =>
@@ -275,6 +281,123 @@ describe('Daemon lifecycle', () => {
     expect(controlPlaneClient.getState()).toBe('open');
     await waitFor(() => pollSpy.mock.calls.length > 0);
     await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+  });
+
+  it('installs hooks on startup with the receiver’s actual bound port', async () => {
+    let installedPort: number | undefined;
+    const installHooks = vi.fn((port: number) => {
+      installedPort = port;
+      return Promise.resolve();
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      installHooks,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    expect(installHooks).toHaveBeenCalledTimes(1);
+    // The port is OS-assigned (listen(0)); we can't predict it, but it must be a real bound port.
+    expect(typeof installedPort).toBe('number');
+    expect(installedPort).toBeGreaterThan(0);
+  });
+
+  it('a failing hook self-heal is swallowed — the daemon still comes up and polls', async () => {
+    const installHooks = vi.fn(() => Promise.reject(new Error('EACCES: settings.json read-only')));
+    const pollSpy = vi.spyOn(poller, 'pollAll');
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      installHooks,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+
+    // start() must resolve despite the installer throwing.
+    await expect(daemon.start()).resolves.toBeUndefined();
+    expect(installHooks).toHaveBeenCalledTimes(1);
+    expect(controlPlaneClient.getState()).toBe('open');
+    await waitFor(() => pollSpy.mock.calls.length > 0);
+  });
+
+  it('does NOT push a quarantine notice for an account already quarantined at first poll', async () => {
+    // First sight of a quarantined account is recorded silently (restart-storm guard) — the
+    // standing state rides on the usage snapshot, not a fresh push. NOTE: we key off the poll
+    // spy, not usage.snapshot: a snapshot containing a quarantined account currently fails
+    // envelope decode at the relay (advisor scores unusable accounts -Infinity → JSON null →
+    // fails AccountScore.score; see the daemon agent's report), so it never arrives — but the
+    // quarantine hook.notification (a separate envelope) would, if one were emitted.
+    switchEngine.listAccounts.mockResolvedValue([
+      { id: 'acct-q', label: 'dead', quarantined: true, createdAtMs: 0, updatedAtMs: 0 },
+    ]);
+    const pollSpy = vi.spyOn(poller, 'pollAll');
+    await daemon.start();
+    await waitFor(() => pollSpy.mock.calls.length > 0);
+    // Let any envelope the cycle would emit make it across the real socket before asserting.
+    await new Promise((r) => setTimeout(r, 60));
+    const quarantineCards = relay.received.filter(
+      (e) => e.type === 'hook.notification' && e.payload.notificationType === 'quarantine',
+    );
+    expect(quarantineCards).toHaveLength(0);
+  });
+
+  it('pushes exactly one quarantine notice when an account transitions into quarantine', async () => {
+    // Cycle 1 (immediate): healthy → records baseline. Cycle 2+ (interval): quarantined →
+    // false→true transition fires the quarantine card (a hook.notification, which decodes fine
+    // even though that cycle's usage.snapshot does not — see the note in the test above).
+    switchEngine.listAccounts
+      .mockResolvedValueOnce([
+        { id: 'acct-q', label: 'spare', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
+      ])
+      .mockResolvedValue([
+        { id: 'acct-q', label: 'spare', quarantined: true, createdAtMs: 0, updatedAtMs: 0 },
+      ]);
+    // Rebuild with a short poll interval so the second cycle actually runs (real timers, not
+    // fake — house convention). A huge debounce guarantees the transition fires at most once
+    // across the several interval cycles this test spans.
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 30,
+      quarantineNoticeDebounceMs: 10 * 60_000,
+    });
+    await daemon.start();
+
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'quarantine',
+      ),
+    );
+    // Give a few more interval cycles a chance to (wrongly) double-fire; debounce must hold.
+    await new Promise((r) => setTimeout(r, 120));
+    const cards = relay.received.filter(
+      (e) => e.type === 'hook.notification' && e.payload.notificationType === 'quarantine',
+    );
+    expect(cards).toHaveLength(1);
+    const card = cards[0];
+    if (card?.type === 'hook.notification') {
+      expect(card.payload.level).toBe('warn');
+      expect(card.payload.title).toContain('spare'); // label in the title
+      expect(card.payload.body).toContain('acct-q'); // account id (human-readable ref) in the body
+    }
   });
 
   it("feeds each poll cycle's advisor inputs to the auto-switcher when one is wired", async () => {
@@ -491,5 +614,76 @@ describe('Daemon lifecycle', () => {
     await daemon.start();
     await daemon.stop();
     await expect(daemon.stop()).resolves.toBeUndefined();
+  });
+});
+
+// The edge-detection + debounce logic is pure, so it is proven here directly rather than by
+// orchestrating live poll cycles (the daemon lifecycle tests above cover the wiring).
+describe('reconcileQuarantineNotices', () => {
+  const acct = (accountId: string, quarantined: boolean, label = accountId) => ({
+    accountId,
+    label,
+    quarantined,
+  });
+  const DEBOUNCE = 60_000;
+
+  it('records a first-sight account silently (no notice), whether healthy or already quarantined', () => {
+    const empty = new Map<string, QuarantineNoticeState>();
+    const { notices, nextState } = reconcileQuarantineNotices(
+      [acct('a', false), acct('b', true)],
+      empty,
+      1000,
+      DEBOUNCE,
+    );
+    expect(notices).toEqual([]);
+    expect(nextState.get('a')).toEqual({ quarantined: false, lastNoticeAtMs: 0 });
+    expect(nextState.get('b')).toEqual({ quarantined: true, lastNoticeAtMs: 0 });
+  });
+
+  it('fires a notice on a healthy→quarantined transition observed across two cycles', () => {
+    const s1 = reconcileQuarantineNotices([acct('a', false)], new Map(), 1000, DEBOUNCE).nextState;
+    const { notices, nextState } = reconcileQuarantineNotices(
+      [acct('a', true, 'spare')],
+      s1,
+      2000,
+      DEBOUNCE,
+    );
+    expect(notices).toEqual([{ accountId: 'a', label: 'spare' }]);
+    expect(nextState.get('a')).toEqual({ quarantined: true, lastNoticeAtMs: 2000 });
+  });
+
+  it('does not re-fire while the account stays quarantined across subsequent cycles', () => {
+    let state = reconcileQuarantineNotices([acct('a', false)], new Map(), 0, DEBOUNCE).nextState;
+    state = reconcileQuarantineNotices([acct('a', true)], state, 1000, DEBOUNCE).nextState; // fires
+    const third = reconcileQuarantineNotices([acct('a', true)], state, 2000, DEBOUNCE); // still quarantined
+    expect(third.notices).toEqual([]);
+  });
+
+  it('debounces a flap: quarantine → clear → quarantine within the window fires only once', () => {
+    let state = reconcileQuarantineNotices([acct('a', false)], new Map(), 0, DEBOUNCE).nextState;
+    // First transition at t=1000 → fires.
+    const first = reconcileQuarantineNotices([acct('a', true)], state, 1000, DEBOUNCE);
+    expect(first.notices).toHaveLength(1);
+    state = first.nextState;
+    // Clears at t=1500.
+    state = reconcileQuarantineNotices([acct('a', false)], state, 1500, DEBOUNCE).nextState;
+    // Re-quarantines at t=2000, still inside the 60s debounce of the t=1000 notice → suppressed.
+    const second = reconcileQuarantineNotices([acct('a', true)], state, 2000, DEBOUNCE);
+    expect(second.notices).toEqual([]);
+  });
+
+  it('re-fires once the debounce window has fully elapsed', () => {
+    let state = reconcileQuarantineNotices([acct('a', false)], new Map(), 0, DEBOUNCE).nextState;
+    state = reconcileQuarantineNotices([acct('a', true)], state, 1000, DEBOUNCE).nextState; // fires @1000
+    state = reconcileQuarantineNotices([acct('a', false)], state, 2000, DEBOUNCE).nextState; // clears
+    // Re-quarantine at t = 1000 + DEBOUNCE (exactly the window boundary) → fires again.
+    const again = reconcileQuarantineNotices([acct('a', true)], state, 1000 + DEBOUNCE, DEBOUNCE);
+    expect(again.notices).toEqual([{ accountId: 'a', label: 'a' }]);
+  });
+
+  it('does not mutate the passed-in previous-state map', () => {
+    const prev = new Map<string, QuarantineNoticeState>();
+    reconcileQuarantineNotices([acct('a', false)], prev, 0, DEBOUNCE);
+    expect(prev.size).toBe(0);
   });
 });

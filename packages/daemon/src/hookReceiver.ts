@@ -227,6 +227,14 @@ export class HookReceiver {
 
     const detail = str(body.detail);
     const cwd = str(body.cwd);
+    // The CLI's PreToolUse hook payload carries `permission_mode` (snake_case per Claude Code's
+    // hook contract; we also accept camelCase defensively). Parsed tolerantly — any string
+    // passes through untouched — because the bot, not the daemon, decides what a mode MEANS
+    // (plan §4: approve/deny buttons only when this is exactly 'default'). Threading it is
+    // non-negotiable for a mode-aware card; a missing/unknown mode simply omits the field and
+    // the bot falls back to an informational card — it never changes the permission SEMANTICS
+    // here (the security contract on resolvePermission is untouched).
+    const permissionMode = str(body.permission_mode) ?? str(body.permissionMode);
     this.emit({
       daemonId: this.daemonId(),
       type: 'permission.request',
@@ -237,6 +245,7 @@ export class HookReceiver {
         summary,
         ...(detail !== undefined ? { detail } : {}),
         ...(cwd !== undefined ? { cwd } : {}),
+        ...(permissionMode !== undefined ? { permissionMode } : {}),
         expiresAt: now + this.permissionTtlMs,
       },
     });
@@ -261,8 +270,23 @@ export class HookReceiver {
     event: 'stop' | 'notification',
   ): void {
     const sessionId = str(body.sessionId);
+    // Two optional discriminators from the CLI hook payload, threaded through so the bot can
+    // render rich done/waiting cards (plan §4). Both parsed tolerantly (snake_case primary,
+    // camelCase accepted): unknown values pass through unchanged and the bot falls back to the
+    // generic card rather than the frame being rejected.
+    //   - Notification events carry `notification_type` (e.g. 'idle_prompt' → the "waiting on
+    //     you" card).
+    //   - Stop events carry `last_assistant_message` (WHAT Claude finished saying → the "done"
+    //     card). When a Stop arrives with no explicit body/message, we surface that message as
+    //     the body so the done card isn't empty.
+    const notificationType = str(body.notification_type) ?? str(body.notificationType);
+    const lastAssistantMessage = str(body.last_assistant_message) ?? str(body.lastAssistantMessage);
     const title = str(body.title) ?? (event === 'stop' ? 'Session stopped' : 'Notification');
-    const text = str(body.body) ?? str(body.message) ?? '';
+    const text =
+      str(body.body) ??
+      str(body.message) ??
+      (event === 'stop' ? lastAssistantMessage : undefined) ??
+      '';
     this.emit({
       daemonId: this.daemonId(),
       type: 'hook.notification',
@@ -272,6 +296,8 @@ export class HookReceiver {
         title,
         body: text,
         level: 'info',
+        ...(notificationType !== undefined ? { notificationType } : {}),
+        ...(lastAssistantMessage !== undefined ? { lastAssistantMessage } : {}),
       },
     });
     this.respond(res, 200, { ok: true });

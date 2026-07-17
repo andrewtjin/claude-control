@@ -65,6 +65,13 @@ export {
 } from './hookInstaller.js';
 
 export {
+  hookSecretPath,
+  loadHookSecret,
+  loadOrCreateHookSecret,
+  type HookSecretOptions,
+} from './hookSecret.js';
+
+export {
   AutoSwitcher,
   DEFAULT_AUTOSWITCH_COOLDOWN_MS,
   type AutoSwitcherOptions,

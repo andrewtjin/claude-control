@@ -151,6 +151,47 @@ describe('HookReceiver', () => {
       }
       expect(emitted[1]?.type).toBe('hook.notification');
     });
+
+    it('threads permission_mode into the permission.request payload (mode-aware cards)', async () => {
+      await post(
+        port,
+        '/',
+        {
+          event: 'PermissionRequest',
+          requestId: 'req-mode',
+          sessionId: 'sess-1',
+          tool: 'Bash',
+          summary: 'run something',
+          permission_mode: 'default',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const req = emitted.find((e) => e.type === 'permission.request');
+      expect(req?.type).toBe('permission.request');
+      if (req?.type === 'permission.request') {
+        expect(req.payload.permissionMode).toBe('default');
+      }
+    });
+
+    it('omits permissionMode entirely when the hook payload has no mode', async () => {
+      await post(
+        port,
+        '/',
+        {
+          event: 'PermissionRequest',
+          requestId: 'req-nomode',
+          sessionId: 'sess-1',
+          tool: 'Bash',
+          summary: 'run something',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const req = emitted.find((e) => e.type === 'permission.request');
+      if (req?.type === 'permission.request') {
+        // exactOptionalPropertyTypes: absent, not `undefined`.
+        expect('permissionMode' in req.payload).toBe(false);
+      }
+    });
   });
 
   describe('Stop / Notification -> emit hook.notification', () => {
@@ -181,6 +222,58 @@ describe('HookReceiver', () => {
       if (emitted[0]?.type === 'hook.notification') {
         expect(emitted[0].payload.event).toBe('notification');
         expect(emitted[0].payload.body).toBe('hello');
+      }
+    });
+
+    it('threads notification_type (e.g. idle_prompt) into the notification card', async () => {
+      await post(
+        port,
+        '/',
+        { event: 'Notification', notification_type: 'idle_prompt', body: 'waiting on you' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const note = emitted.find((e) => e.type === 'hook.notification');
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.notificationType).toBe('idle_prompt');
+      }
+    });
+
+    it('Stop threads last_assistant_message and uses it as the body when none is given', async () => {
+      await post(
+        port,
+        '/',
+        {
+          event: 'Stop',
+          sessionId: 'sess-done',
+          last_assistant_message: 'All done — I refactored the parser.',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const note = emitted.find((e) => e.type === 'hook.notification');
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.event).toBe('stop');
+        expect(note.payload.lastAssistantMessage).toBe('All done — I refactored the parser.');
+        // No explicit body was sent, so the done card falls back to the assistant message.
+        expect(note.payload.body).toBe('All done — I refactored the parser.');
+      }
+    });
+
+    it('an explicit body is not overridden by last_assistant_message on Stop', async () => {
+      await post(
+        port,
+        '/',
+        {
+          event: 'Stop',
+          sessionId: 'sess-done',
+          body: 'custom body',
+          last_assistant_message: 'assistant said this',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const note = emitted.find((e) => e.type === 'hook.notification');
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.body).toBe('custom body');
+        expect(note.payload.lastAssistantMessage).toBe('assistant said this');
       }
     });
   });

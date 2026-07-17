@@ -10,7 +10,6 @@
 // credential, so it is persisted DPAPI-encrypted beside the vault — same at-rest posture as
 // OAuth tokens, useless if copied off this machine/user.
 
-import { randomUUID } from 'node:crypto';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -31,6 +30,10 @@ import {
   HookReceiver,
   Store,
   UsagePoller,
+  buildDaemonHookSpecs,
+  hookSecretPath,
+  installHooks,
+  loadOrCreateHookSecret,
   type DaemonIdentity,
   type IdentityStore,
 } from '@claude-control/daemon';
@@ -160,12 +163,23 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     ...(options.pair ? { pairingCode: options.pair } : {}),
   });
 
+  // The hook secret must be STABLE across restarts: it is baked into the curl commands
+  // installHooks() writes into settings.json, so a fresh per-run secret would 401 every
+  // previously-installed hook and leave a dead curl line per restart. Generated once,
+  // DPAPI-encrypted beside daemon-identity.enc, re-read every run. A later `cctl session` CLI
+  // reads the SAME file (read-only) to authenticate to this receiver — hence the load/store
+  // helper lives in the daemon package (see hookSecret.ts's sharing contract). Both processes
+  // derive the path from `hookSecretPath(dataDir)`.
+  const hookSecret = await loadOrCreateHookSecret({
+    filePath: hookSecretPath(dataDir),
+    protector,
+  });
+
   // The receiver forwards hook envelopes out through the client (which buffers to its outbox
-  // while disconnected). Secret is per-run: hooks are not installed until M3, and the
-  // installer will persist a stable secret when it lands.
+  // while disconnected).
   const hookReceiver = new HookReceiver({
     store,
-    secret: randomUUID(),
+    secret: hookSecret,
     emit: (draft) => controlPlaneClient.send(draft),
     daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
   });
@@ -195,6 +209,14 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       })
     : undefined;
 
+  // Which profile gets hooks installed: the design uses a SINGLE shared ~/.claude for every
+  // account (per-account config dirs were wet-refuted, WT-1 — see plan §4 Credential layout),
+  // so there is exactly ONE user-level settings.json and it covers every account the daemon
+  // rotates through. `paths.claudeDir` honors CLAUDE_CONFIG_DIR, so this is the same file the
+  // CLI actually reads settings from. The Daemon calls this AFTER binding the receiver, with
+  // the real port, and swallows any failure (unwritable settings.json) so startup never dies.
+  const settingsPath = join(paths.claudeDir, 'settings.json');
+
   const daemon = new Daemon({
     store,
     switchEngine: engine,
@@ -203,6 +225,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     attributionJournal,
     hookReceiver,
     controlPlaneClient,
+    installHooks: (port) =>
+      installHooks({ settingsPath, hooks: buildDaemonHookSpecs({ port, secret: hookSecret }) }),
     ...(autoSwitcher ? { autoSwitcher } : {}),
     logger,
   });
