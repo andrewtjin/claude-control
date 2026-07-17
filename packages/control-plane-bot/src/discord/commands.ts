@@ -17,11 +17,15 @@ import {
   buildSessionListEmbed,
   buildTimelineEmbed,
 } from './embeds.js';
+import type { BarRenderer } from './emojiBars.js';
 
 export interface CommandDeps {
   relay: RelaySender;
   pairing: PairingService;
   cache: DaemonStateCache;
+  /** How to draw usage bars. Optional so tests (and the pre-`ready` gateway) omit it and get
+   *  the unicode default; the gateway sets it to the emoji renderer once app emojis upload. */
+  barRenderer?: BarRenderer;
 }
 
 export type CommandResult =
@@ -45,7 +49,8 @@ export function handlePair(deps: CommandDeps, discordUserId: string): CommandRes
 export function handleUsage(deps: CommandDeps, discordUserId: string): CommandResult {
   const usage = deps.cache.getUsage(discordUserId);
   if (!usage) return { kind: 'text', text: 'No usage data yet — the daemon has not reported in.' };
-  return { kind: 'embed', embed: buildUsageEmbed(usage) };
+  // nowMs left to its default; barRenderer may be undefined → buildUsageEmbed uses unicode.
+  return { kind: 'embed', embed: buildUsageEmbed(usage, undefined, deps.barRenderer) };
 }
 
 /** `/timeline` — the 5h-window budget + reset timeline, from the same cached snapshot as
@@ -53,7 +58,7 @@ export function handleUsage(deps: CommandDeps, discordUserId: string): CommandRe
 export function handleTimeline(deps: CommandDeps, discordUserId: string): CommandResult {
   const usage = deps.cache.getUsage(discordUserId);
   if (!usage) return { kind: 'text', text: 'No usage data yet — the daemon has not reported in.' };
-  return { kind: 'embed', embed: buildTimelineEmbed(usage) };
+  return { kind: 'embed', embed: buildTimelineEmbed(usage, undefined, deps.barRenderer) };
 }
 
 /** `/accounts` — same cache, a lighter view. */

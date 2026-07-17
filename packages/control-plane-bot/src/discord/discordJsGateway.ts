@@ -17,6 +17,8 @@ import {
   SlashCommandBuilder,
 } from 'discord.js';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { isType, type Envelope } from '@claude-control/shared-protocol';
 import type { DiscordGateway } from './gateway.js';
 import type { RelaySender } from '../relay.js';
@@ -25,8 +27,17 @@ import type { Logger } from '../logger.js';
 import { noopLogger } from '../logger.js';
 import { DaemonStateCache } from './stateCache.js';
 import { buildPermissionRequestEmbed, buildSwitchResultEmbed } from './embeds.js';
+import { layeredBar } from './richFormat.js';
+import { ensureProgressEmojis, emojiResolverFrom, renderEmojiBar } from './emojiBars.js';
 import * as commands from './commands.js';
 import type { CommandDeps, CommandResult } from './commands.js';
+
+// Where the committed progress-bar sprites live, relative to this compiled file
+// (dist/discord/discordJsGateway.js → ../../assets/progress-bar → the package's assets dir).
+const PROGRESS_ASSETS_DIR = join(
+  dirname(fileURLToPath(import.meta.url)),
+  '../../assets/progress-bar',
+);
 
 export interface DiscordJsGatewayOptions {
   relay: RelaySender;
@@ -64,6 +75,11 @@ export class DiscordJsGateway implements DiscordGateway {
     this.client.once('ready', () => {
       this.registerCommands().catch((err: unknown) => {
         this.logger.error({ err }, 'discord: failed to register slash commands');
+      });
+      // Upload the progress-bar sprites and, if that yields any emojis, upgrade the injected
+      // bar renderer from unicode to slim emoji bars. Best-effort: never blocks the bot.
+      this.setupProgressEmojis().catch((err: unknown) => {
+        this.logger.error({ err }, 'discord: failed to set up progress emojis');
       });
     });
     this.client.on('interactionCreate', (interaction) => {
@@ -123,6 +139,22 @@ export class DiscordJsGateway implements DiscordGateway {
     const application = this.client.application;
     if (!application) return;
     await application.commands.set(this.commandDefinitions());
+  }
+
+  /** Ensure the progress-bar application emojis exist, then swap the injected bar renderer
+   *  over to the emoji renderer. Falls through to unicode (no swap) whenever no emoji is
+   *  available — `ensureProgressEmojis` never throws, and `renderEmojiBar` returns `undefined`
+   *  per-bar if a sprite is still missing, at which point we render the unicode bar instead. */
+  private async setupProgressEmojis(): Promise<void> {
+    const application = this.client.application;
+    if (!application) return;
+    const byName = await ensureProgressEmojis(application, PROGRESS_ASSETS_DIR, this.logger);
+    if (byName.size === 0) return; // nothing uploaded → keep the unicode default
+    const resolve = emojiResolverFrom(byName);
+    // Per-bar fallback: if any sprite this particular bar needs is absent, use unicode.
+    this.deps.barRenderer = (percent, width) =>
+      renderEmojiBar(percent, resolve, width) ?? layeredBar(percent, width);
+    this.logger.info({ count: byName.size }, 'discord: progress emoji bars enabled');
   }
 
   private commandDefinitions() {
