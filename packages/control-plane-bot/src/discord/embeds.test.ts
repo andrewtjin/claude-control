@@ -231,6 +231,35 @@ describe('buildTimelineEmbed', () => {
     expect(field?.value).not.toContain('🟩');
   });
 
+  it('flags a cached account with its true age and failure reason (2026-07-17 incident)', () => {
+    // The incident surface: stale fallback data rendered on /timeline exactly like a live
+    // read. The cached marker must carry the ORIGINAL fetch time, not render time.
+    const fetchedAtMs = Date.parse('2026-07-16T10:00:00.000Z');
+    const stale = account({
+      source: 'cached',
+      fetchedAtMs,
+      error: 'usage endpoint rate-limited (429)',
+      limits: [
+        { kind: 'session', percent: 42, isActive: true, resetsAt: '2026-07-16T14:00:00.000Z' },
+      ],
+    });
+    const live = account({
+      accountId: 'acct-2',
+      label: 'Play',
+      active: false,
+      limits: [
+        { kind: 'session', percent: 10, isActive: true, resetsAt: '2026-07-16T13:00:00.000Z' },
+      ],
+    });
+    const embed = buildTimelineEmbed({ accounts: [stale, live] }, NOW).toJSON();
+    const staleField = embed.fields?.find((f) => f.name.includes('Work'));
+    expect(staleField?.name).toContain(`· cached <t:${Math.floor(fetchedAtMs / 1000)}:R>`);
+    expect(staleField?.value).toContain('⚠️ usage endpoint rate-limited (429)');
+    const liveField = embed.fields?.find((f) => f.name.includes('Play'));
+    expect(liveField?.name).not.toContain('cached');
+    expect(liveField?.value).not.toContain('⚠️');
+  });
+
   it('draws tracks and marker glyphs through an injected track style', () => {
     // The gateway swaps in the sprite-backed style this same way; sentinels prove both the
     // per-account track and the legend/list markers come from the injected style, and that
@@ -257,6 +286,17 @@ describe('buildAccountsEmbed', () => {
     const embed = buildAccountsEmbed([account({ source: 'cached' })]).toJSON();
     expect(embed.fields).toHaveLength(1);
     expect(embed.fields?.[0]?.value).toContain('cached');
+  });
+
+  it('shows the true fetch age and failure reason for cached data, neither for live', () => {
+    const fetchedAtMs = Date.parse('2026-07-16T10:00:00.000Z');
+    const embed = buildAccountsEmbed([
+      account({ source: 'cached', fetchedAtMs, error: 'usage endpoint rate-limited (429)' }),
+      account({ accountId: 'acct-2', label: 'Play', active: false }),
+    ]).toJSON();
+    expect(embed.fields?.[0]?.value).toContain(`cached (<t:${Math.floor(fetchedAtMs / 1000)}:R>)`);
+    expect(embed.fields?.[0]?.value).toContain('⚠️ usage endpoint rate-limited (429)');
+    expect(embed.fields?.[1]?.value).toBe('idle · source: live');
   });
 
   it('shows a placeholder when there are no accounts', () => {

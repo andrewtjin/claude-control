@@ -70,6 +70,21 @@ function addClampedField(embed: EmbedBuilder, name: string, value: string): void
 // decision explicit at the call site and leaves the functions trivially unit-testable.
 export const DEFAULT_BAR_RENDERER: BarRenderer = layeredBar;
 
+/** " · cached <t:...:R>" suffix for an account whose data is a stale fallback, or '' for a
+ *  live read. Cached data carries its TRUE fetch time (the poller preserves the original
+ *  stamp), and the native timestamp renders as a live-updating "N minutes ago" — so an
+ *  hours-old number can never masquerade as current, on any surface that shows usage.
+ *  (Live incident 2026-07-17: /timeline showed a stale wrong-account cache as if live.) */
+function cachedSuffix(account: Pick<AccountUsage, 'source' | 'fetchedAtMs'> | undefined): string {
+  return account?.source === 'cached' ? ` · cached ${discordRelative(account.fetchedAtMs)}` : '';
+}
+
+/** "\n⚠️ <reason>" suffix carrying the account's failure note (e.g. "usage endpoint
+ *  rate-limited (429)"), or '' when the data arrived clean. */
+function errorSuffix(account: Pick<AccountUsage, 'error'> | undefined): string {
+  return account?.error ? `\n⚠️ ${account.error}` : '';
+}
+
 /** Embed accent color for a usage snapshot: the worst severity across every limit of
  *  every account, or neutral blue when no limit data exists yet. */
 function usageColor(accounts: AccountUsage[]): number {
@@ -111,15 +126,10 @@ export function buildUsageEmbed(
     // Signal differences at a glance: 🟢 active / ⚪ idle / ⚠️ erroring, plus a cached-data
     // marker so a stale tier-0 snapshot is never mistaken for a live read.
     const marker = `${accountMarker(account)} ${account.active ? 'active' : 'idle'}`;
-    // Cached data carries its true fetch time — show it, so an hours-old number can never
-    // masquerade as current (the timestamp renders as a live-updating "N minutes ago").
-    const cached =
-      account.source === 'cached' ? ` · cached ${discordRelative(account.fetchedAtMs)}` : '';
-    const errorLine = account.error ? `\n⚠️ ${account.error}` : '';
     addClampedField(
       embed,
-      `${account.label} — ${marker}${cached}`,
-      `${formatLimits(account, nowMs, barRenderer)}${windowsLine(outlook, account.accountId)}${errorLine}`,
+      `${account.label} — ${marker}${cachedSuffix(account)}`,
+      `${formatLimits(account, nowMs, barRenderer)}${windowsLine(outlook, account.accountId)}${errorSuffix(account)}`,
     );
   }
   if (usage.plan) {
@@ -175,6 +185,10 @@ export function buildTimelineEmbed(
   );
 
   for (const a of outlook.accounts) {
+    // The outlook account is derived math; staleness/error live on the WIRE account. Look it
+    // up so /timeline flags stale data the same way /usage does — this was the surface the
+    // 2026-07-17 incident actually played out on (stale bars rendered indistinguishably live).
+    const wire = usage.accounts.find((acc) => acc.accountId === a.accountId);
     const lines: string[] = [];
     if (a.quarantined) {
       lines.push('🚫 quarantined — re-login required');
@@ -200,7 +214,11 @@ export function buildTimelineEmbed(
         .map((e) => ({ atMs: e.atMs, kind: e.kind === 'session' ? 'session' : 'weekly' }));
       if (events.length > 0) lines.push(trackStyle.track(events, nowMs, spanMs));
     }
-    addClampedField(embed, `${accountMarker(a)} ${a.label}`, lines.join('\n'));
+    addClampedField(
+      embed,
+      `${accountMarker(a)} ${a.label}${cachedSuffix(wire)}`,
+      `${lines.join('\n')}${errorSuffix(wire)}`,
+    );
   }
 
   if (outlook.events.length > 0) {
@@ -249,10 +267,13 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
     return embed;
   }
   for (const account of accounts) {
+    // "source: cached" alone hides HOW stale — show the true fetch age and any failure
+    // reason, same as /usage and /timeline, so no surface renders old data as current.
+    const age = account.source === 'cached' ? ` (${discordRelative(account.fetchedAtMs)})` : '';
     addClampedField(
       embed,
       `${accountMarker(account)} ${account.label}`,
-      `${account.active ? 'active' : 'idle'} · source: ${account.source}`,
+      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${errorSuffix(account)}`,
     );
   }
   return embed;
