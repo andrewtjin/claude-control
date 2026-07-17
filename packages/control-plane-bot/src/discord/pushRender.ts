@@ -70,7 +70,7 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
       content: truncateLabeled(`⚠️ Daemon error (${code}): ${message}`, MESSAGE_CONTENT_LIMIT),
     };
   }
-  return undefined; // usage.snapshot / session.status / pair.result / control frames: cache-only
+  return undefined; // usage.snapshot / settings.snapshot / session.status / pair.result / control frames: cache-only
 }
 
 /** hook.notification → the right lifecycle card. Stop always wins (it carries the final message);

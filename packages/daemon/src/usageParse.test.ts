@@ -267,4 +267,18 @@ describe('parseCachedUsage', () => {
       expect(accountUsage.error).toBeDefined();
     }
   });
+
+  it("honors the cache's own fetchedAtMs so stale data reports its true age", () => {
+    const raw = { fetchedAtMs: 555, limits: [{ kind: 'session', percent: 20 }] };
+    const { accountUsage } = parseCachedUsage(raw, baseOpts);
+    expect(accountUsage.fetchedAtMs).toBe(555);
+    // A cache without its own stamp keeps the caller's poll time (pre-existing behavior).
+    const unstamped = parseCachedUsage({ limits: [] }, baseOpts);
+    expect(unstamped.accountUsage.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
+  });
+
+  it('reports "no cached usage" plainly when the reader had nothing to offer', () => {
+    const { accountUsage } = parseCachedUsage(undefined, baseOpts);
+    expect(accountUsage.error).toBe('no cached usage available');
+  });
 });

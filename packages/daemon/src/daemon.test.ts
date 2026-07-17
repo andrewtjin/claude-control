@@ -488,6 +488,37 @@ describe('Daemon lifecycle', () => {
     }
   });
 
+  it('re-pushes the effective-settings report with every poll cycle when one is wired', async () => {
+    const settingsReport = {
+      startedAtMs: 1_700_000_000_000,
+      settings: [{ name: 'auto-switch', value: 'on', source: 'flag' as const }],
+    };
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      settingsReport,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => relay.received.some((e) => e.type === 'settings.snapshot'));
+    const pushed = relay.received.find((e) => e.type === 'settings.snapshot');
+    expect(pushed?.payload).toEqual(settingsReport);
+  });
+
+  it('does not push settings.snapshot when no report was provided', async () => {
+    await daemon.start();
+    // The usage snapshot proves a full poll cycle ran — by then settings would have shipped.
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    expect(relay.received.some((e) => e.type === 'settings.snapshot')).toBe(false);
+  });
+
   it("feeds each poll cycle's advisor inputs to the auto-switcher when one is wired", async () => {
     const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
       void accounts;

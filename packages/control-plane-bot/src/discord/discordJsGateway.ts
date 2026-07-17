@@ -494,6 +494,9 @@ export class DiscordJsGateway implements DiscordGateway {
         .setDescription('5h-session budget and reset timeline across accounts'),
       new SlashCommandBuilder().setName('accounts').setDescription('List paired accounts'),
       new SlashCommandBuilder().setName('sessions').setDescription('List known sessions'),
+      new SlashCommandBuilder()
+        .setName('settings')
+        .setDescription("Show the daemon's effective settings and where each came from"),
       new SlashCommandBuilder().setName('status').setDescription('Show daemon connection status'),
       account('switch', 'Switch the active account'),
       new SlashCommandBuilder()
@@ -566,6 +569,9 @@ export class DiscordJsGateway implements DiscordGateway {
         break;
       case 'sessions':
         result = commands.handleSessions(this.deps, userId);
+        break;
+      case 'settings':
+        result = commands.handleSettings(this.deps, userId);
         break;
       case 'status':
         result = commands.handleStatus(this.deps, userId);

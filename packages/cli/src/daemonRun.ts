@@ -42,9 +42,9 @@ import {
 import { createAgentSdkClient, createSessionManager } from '@claude-control/session-runtime';
 import type { AgentSdkClient } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath } from './context.js';
+import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
-
-const DEFAULT_RELAY_URL = 'ws://127.0.0.1:8765';
+import { daemonSettingsPath, resolveDaemonConfig, writeSettingsReport } from './settings.js';
 
 /** Token considered unusable for polling within this window before expiry — the poller then
  *  falls back to tier-0 rather than racing the expiry mid-request. */
@@ -55,17 +55,11 @@ export interface DaemonRunOptions {
   relay?: string;
   /** Opt-in `--auto-switch`: hop accounts automatically when the active one runs low.
    *  Tunables via env: CCTL_AUTOSWITCH_TRIGGER_PCT, CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT,
-   *  CCTL_AUTOSWITCH_COOLDOWN_MS. */
+   *  CCTL_AUTOSWITCH_COOLDOWN_MS, CCTL_AUTOSWITCH_GREEDY. */
   autoSwitch?: boolean;
-}
-
-/** A positive number from the environment, or undefined when unset/unparseable — an env
- *  typo silently falling back to the default beats a daemon that refuses to start. */
-function envNumber(name: string): number | undefined {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === '') return undefined;
-  const value = Number(raw);
-  return Number.isFinite(value) && value >= 0 ? value : undefined;
+  /** Opt-in `--greedy` (requires --auto-switch): also hop toward whichever account's
+   *  weekly quota expires soonest, even while the active one is healthy. */
+  greedy?: boolean;
 }
 
 /**
@@ -147,6 +141,21 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const store = new Store(daemonDbPath(paths));
   const protector = defaultProtector();
 
+  // One resolution feeds BOTH behavior (the values wired below) and visibility (the rows
+  // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart.
+  const config = resolveDaemonConfig(process.env, {
+    autoSwitch: options.autoSwitch === true,
+    greedy: options.greedy === true,
+    ...(options.relay !== undefined ? { relay: options.relay } : {}),
+  });
+  const { relayUrl, triggerPercent, minSessionHeadroomPct, cooldownMs, greedy } = config.values;
+  const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
+  // Best-effort: the report is purely informational, so a write failure must not stop the
+  // daemon from starting.
+  await writeSettingsReport(daemonSettingsPath(paths), settingsReport).catch((err: unknown) => {
+    logger.warn({ err }, 'could not persist the effective-settings report');
+  });
+
   // An explicit --pair means "adopt a NEW identity", so any previously adopted one is
   // discarded first — otherwise the client would see a stored identity and skip pairing.
   const identityPath = join(dataDir, 'daemon-identity.enc');
@@ -167,26 +176,20 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       engine,
       minTtlMs: POLL_TOKEN_MIN_TTL_MS,
     }),
-    // Tier-0 cache lives in the live ~/.claude.json, which only ever describes the ACTIVE
-    // account — any other account has no cache to fall back to.
-    getCachedUsage: async (accountId) => {
-      if ((await pollVault.getActiveId()) !== accountId) return undefined;
-      try {
-        const parsed = JSON.parse(await readFile(paths.claudeJsonPath, 'utf8')) as Record<
-          string,
-          unknown
-        >;
-        return parsed['cachedUsageUtilization'];
-      } catch {
-        return undefined;
-      }
-    },
+    // Tier-0 cache lives in the live ~/.claude.json — served only when it provably belongs
+    // to the account being polled (active + accountUuid match; see cachedUsageReader.ts).
+    getCachedUsage: createCachedUsageReader({
+      vault: pollVault,
+      claudeJsonPath: paths.claudeJsonPath,
+    }),
+    // Greedy-aware advice: when the daemon itself executes the burn plan, the plan's
+    // wording turns descriptive instead of telling the user to do it by hand.
+    ...(options.autoSwitch && greedy ? { advisorOptions: { greedyAutoSwitch: true } } : {}),
   });
 
   const attributionJournal = new AttributionJournal({ store, vaultDir: paths.vaultDir });
   const sessionManager = createSessionManager({ stateDir: join(dataDir, 'sessions') });
 
-  const relayUrl = options.relay ?? process.env.CCTL_RELAY_URL ?? DEFAULT_RELAY_URL;
   const controlPlaneClient = new ControlPlaneClient({
     url: relayUrl,
     identityStore,
@@ -221,9 +224,6 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // decision the owner makes explicitly, never a default. It calls the engine's normal
   // activate() path, so the human-plausible cadence guard applies to auto-hops too, and it
   // reports every attempt to the phone through the same switch.result push as /switch.
-  const triggerPercent = envNumber('CCTL_AUTOSWITCH_TRIGGER_PCT');
-  const minSessionHeadroomPct = envNumber('CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
-  const cooldownMs = envNumber('CCTL_AUTOSWITCH_COOLDOWN_MS');
   const autoSwitcher = options.autoSwitch
     ? new AutoSwitcher({
         activate: (accountId) => engine.activate(accountId),
@@ -236,6 +236,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         policy: {
           ...(triggerPercent !== undefined ? { triggerPercent } : {}),
           ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
+          ...(greedy ? { greedy } : {}),
         },
         ...(cooldownMs !== undefined ? { cooldownMs } : {}),
         logger,
@@ -269,12 +270,13 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),
     ...(autoSwitcher ? { autoSwitcher } : {}),
+    settingsReport,
     logger,
   });
 
   await daemon.start();
   process.stdout.write(
-    `Daemon running (relay: ${relayUrl}${autoSwitcher ? ', auto-switch: on' : ''}). Ctrl+C to stop.\n`,
+    `Daemon running (relay: ${relayUrl}${autoSwitcher ? `, auto-switch: on${greedy ? ' (greedy)' : ''}` : ''}). Ctrl+C to stop.\n`,
   );
 
   const shutdown = (): void => {

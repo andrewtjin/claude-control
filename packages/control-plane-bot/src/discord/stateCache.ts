@@ -23,6 +23,9 @@ interface UsageState {
 
 interface UserState {
   usage?: UsageState;
+  /** The daemon's effective-settings report; a new push overwrites (a daemon restart may
+   *  legitimately carry different flags). */
+  settings?: PayloadOf<'settings.snapshot'>;
   /** Latest status per session id; a new session.status push for the same id overwrites it. */
   sessions: Map<string, SessionStatus>;
 }
@@ -44,9 +47,15 @@ export class DaemonStateCache {
         usage.plan = envelope.payload.plan;
       }
       state.usage = usage;
+    } else if (isType(envelope, 'settings.snapshot')) {
+      state.settings = envelope.payload;
     } else if (isType(envelope, 'session.status')) {
       state.sessions.set(envelope.payload.sessionId, envelope.payload);
     }
+  }
+
+  getSettings(discordUserId: string): PayloadOf<'settings.snapshot'> | undefined {
+    return this.byUser.get(discordUserId)?.settings;
   }
 
   getUsage(discordUserId: string): UsageState | undefined {

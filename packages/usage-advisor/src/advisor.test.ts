@@ -75,31 +75,78 @@ describe('computePlan — degenerate inputs', () => {
 });
 
 describe('computePlan — burn-before-reset (the core behavior)', () => {
-  it('prefers the account whose unused quota is about to reset over one with more headroom', () => {
+  it('prefers the account whose unused weekly quota is about to reset over one with more headroom', () => {
     // A: 40% unused, resets in 2h (at risk). B: 80% unused, resets in 6 days (safe reserve).
     const a = acct('a', 'Burnme', [{ kind: 'weekly_all', percent: 60, resetsAt: NOW + 2 * HOUR }]);
     const b = acct('b', 'Reserve', [{ kind: 'weekly_all', percent: 20, resetsAt: NOW + 6 * DAY }]);
     const plan = computePlan([b, a], opts); // note: input order shouldn't matter
 
     expect(plan.recommendedAccountId).toBe('a');
-    expect(plan.reason).toMatch(/resets soon|use it now/i);
-    const burn = plan.advisories.find((x) => x.kind === 'burn_before_reset' && x.accountId === 'a');
-    expect(burn).toBeDefined();
-    expect(burn?.deadlineMs).toBe(NOW + 2 * HOUR);
+    // The single reason line carries the whole strategy: burn order plus the held reserve.
+    expect(plan.reason).toBe(
+      'Burn Burnme (40% weekly left, resets in 2h); hold Reserve (weekly resets in 6d).',
+    );
+    // The queue is no longer duplicated as per-account advisories — the reason IS the plan.
+    expect(plan.advisories).toEqual([]);
     // B ranks below A despite more headroom, because A's quota is at risk.
     expect(plan.ranking[0]?.accountId).toBe('a');
   });
 
-  it('does not raise a burn advisory for a reset outside the urgent window', () => {
+  it('never treats an expiring SESSION window as burnable quota (the 5h window rolls back)', () => {
+    // The owner's real trio: legoboy's empty session resets soonest, but its weekly budget
+    // is safe for 7 days — the old algorithm said "burn legoboy"; the right call is to burn
+    // the soonest-expiring WEEKLY budgets: jina25 (9h) then tjin.29 (19h).
+    const legoboy = acct('lego', 'legoboy', [
+      { kind: 'session', percent: 1, resetsAt: NOW + 4 * HOUR },
+      { kind: 'weekly_all', percent: 0, resetsAt: NOW + 7 * DAY },
+    ]);
+    const jina = acct(
+      'jina',
+      'jina25',
+      [
+        { kind: 'session', percent: 5, resetsAt: NOW + 5 * HOUR },
+        { kind: 'weekly_all', percent: 52, resetsAt: NOW + 9 * HOUR },
+      ],
+      { active: true },
+    );
+    const tjin = acct('tjin', 'tjin.29', [
+      { kind: 'session', percent: 0, resetsAt: NOW + 4 * HOUR },
+      { kind: 'weekly_all', percent: 20, resetsAt: NOW + 19 * HOUR },
+    ]);
+    const plan = computePlan([legoboy, jina, tjin], opts);
+
+    expect(plan.recommendedAccountId).toBe('jina');
+    expect(plan.reason).toBe(
+      'Burn jina25 (48% weekly left, resets in 9h) → tjin.29 (80% weekly left, in 19h); ' +
+        'hold legoboy (weekly resets in 7d).',
+    );
+    expect(plan.advisories).toEqual([]);
+  });
+
+  it('phrases the plan descriptively when greedy auto-switch executes it', () => {
+    const a = acct('a', 'Burnme', [{ kind: 'weekly_all', percent: 60, resetsAt: NOW + 2 * HOUR }]);
+    const b = acct('b', 'Reserve', [{ kind: 'weekly_all', percent: 20, resetsAt: NOW + 6 * DAY }]);
+    const plan = computePlan([a, b], { ...opts, greedyAutoSwitch: true });
+    expect(plan.reason).toBe(
+      'Greedy auto-switch burns Burnme (40% weekly left, resets in 2h); ' +
+        'hold Reserve (weekly resets in 6d).',
+    );
+    // The queue itself is identical — only the wording changes.
+    expect(plan.recommendedAccountId).toBe('a');
+  });
+
+  it('falls back to headroom advice for a weekly reset outside the urgent window', () => {
     const a = acct('a', 'A', [{ kind: 'weekly_all', percent: 60, resetsAt: NOW + 3 * DAY }]);
     const plan = computePlan([a], opts);
+    expect(plan.reason).toBe('A has the most available headroom (40%).');
     expect(plan.advisories.some((x) => x.kind === 'burn_before_reset')).toBe(false);
   });
 
-  it('ignores an imminent reset with only trivial unused quota', () => {
+  it('ignores an imminent weekly reset with only trivial unused quota', () => {
     // Only 5% unused — below the significance threshold, so not worth burning.
     const a = acct('a', 'A', [{ kind: 'weekly_all', percent: 95, resetsAt: NOW + 1 * HOUR }]);
     const plan = computePlan([a], opts);
+    expect(plan.reason).not.toMatch(/burn/i);
     expect(plan.advisories.some((x) => x.kind === 'burn_before_reset')).toBe(false);
   });
 });

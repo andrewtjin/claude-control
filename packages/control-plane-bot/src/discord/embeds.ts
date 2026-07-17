@@ -4,7 +4,12 @@
 // transform, which is what makes it unit-testable via `.toJSON()` without a real bot.
 
 import { EmbedBuilder } from 'discord.js';
-import type { AccountUsage, PayloadOf, UsagePlan } from '@claude-control/shared-protocol';
+import type {
+  AccountUsage,
+  PayloadOf,
+  SettingsSnapshot,
+  UsagePlan,
+} from '@claude-control/shared-protocol';
 // usage-advisor is a pure, credential-free library — importing it preserves the bot's
 // zero-credential guarantee (which forbids switch-engine, not math).
 import {
@@ -83,7 +88,10 @@ export function buildUsageEmbed(
     // Signal differences at a glance: 🟢 active / ⚪ idle / ⚠️ erroring, plus a cached-data
     // marker so a stale tier-0 snapshot is never mistaken for a live read.
     const marker = `${accountMarker(account)} ${account.active ? 'active' : 'idle'}`;
-    const cached = account.source === 'cached' ? ' · cached' : '';
+    // Cached data carries its true fetch time — show it, so an hours-old number can never
+    // masquerade as current (the timestamp renders as a live-updating "N minutes ago").
+    const cached =
+      account.source === 'cached' ? ` · cached ${discordRelative(account.fetchedAtMs)}` : '';
     const errorLine = account.error ? `\n⚠️ ${account.error}` : '';
     embed.addFields({
       name: `${account.label} — ${marker}${cached}`,
@@ -91,16 +99,10 @@ export function buildUsageEmbed(
     });
   }
   if (usage.plan) {
-    const rec = usage.plan.recommendedAccountId
-      ? `Use **${usage.plan.recommendedAccountId}** — ${usage.plan.reason}`
-      : usage.plan.reason;
-    embed.addFields({ name: 'Recommendation', value: rec });
-    if (usage.plan.advisories.length > 0) {
-      embed.addFields({
-        name: 'Advisories',
-        value: usage.plan.advisories.map((a) => `• ${a.message}`).join('\n'),
-      });
-    }
+    // One compact field: the reason line already carries the whole burn order (see the
+    // advisor), and advisories only exist for exceptional states — no separate headings.
+    const lines = [usage.plan.reason, ...usage.plan.advisories.map((a) => `• ${a.message}`)];
+    embed.addFields({ name: 'Plan', value: lines.join('\n') });
   }
   return embed;
 }
@@ -231,6 +233,22 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
 
 /** `/sessions` — every session the daemon has reported a status for, most-recent value per
  *  session id (the cache overwrites, never appends). */
+/** `/settings` — the daemon's effective configuration. One line per knob; the source is
+ *  only called out when it is an explicit override (env/flag), so silent defaults read as
+ *  quiet and deliberate choices pop. */
+export function buildSettingsEmbed(snapshot: SettingsSnapshot): EmbedBuilder {
+  const lines = snapshot.settings.map((s) => {
+    const source = s.source === 'default' ? '' : ` _(via ${s.source})_`;
+    return `**${s.name}** — ${s.value}${source}`;
+  });
+  return new EmbedBuilder()
+    .setTitle('Daemon settings')
+    .setColor(COLOR_INFO)
+    .setDescription(lines.join('\n'))
+    .setFooter({ text: 'as of daemon start' })
+    .setTimestamp(snapshot.startedAtMs);
+}
+
 export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
   const embed = new EmbedBuilder().setTitle('Sessions').setColor(COLOR_INFO);
   if (sessions.length === 0) {

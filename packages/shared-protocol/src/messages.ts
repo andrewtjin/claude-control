@@ -94,6 +94,25 @@ export const UsagePlan = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Settings (the daemon's effective configuration, for visibility only)
+// ---------------------------------------------------------------------------
+
+/** Where a setting's effective value came from — the whole point of the settings view is
+ *  distinguishing a deliberate override (env/flag) from a silent default. */
+export const SettingSource = z.enum(['default', 'env', 'flag']);
+
+/** One knob, pre-rendered by the daemon: a human name, the effective value as display text
+ *  (e.g. "on", "94% used", "10m"), and its source. `detail` names how to change it (the env
+ *  var / flag), so the view teaches its own configuration surface. Display-only: nothing
+ *  routes or authorizes on these strings. */
+export const SettingRow = z.object({
+  name: z.string().min(1),
+  value: z.string(),
+  source: SettingSource,
+  detail: z.string().nullish(),
+});
+
+// ---------------------------------------------------------------------------
 // Payloads (per message type)
 // ---------------------------------------------------------------------------
 
@@ -101,6 +120,16 @@ const UsageSnapshotPayload = z.object({
   accounts: z.array(AccountUsage),
   /** The optimizer's recommendation, when the daemon has computed one. */
   plan: UsagePlan.nullish(),
+});
+
+/** The daemon's effective settings, resolved once at startup (flags and env are read only
+ *  then, so the report is immutable for the life of the run). `startedAtMs` dates the
+ *  report — the phone shows "as of daemon start", never pretending settings are live.
+ *  Exported (unlike the other payload schemas) because the daemon persists this exact
+ *  shape to disk for `cctl settings`, which re-validates it with the same schema. */
+export const SettingsSnapshot = z.object({
+  startedAtMs: z.number().int().nonnegative(),
+  settings: z.array(SettingRow),
 });
 
 const SwitchCommandPayload = z.object({
@@ -290,6 +319,7 @@ function frame<T extends string, P extends z.ZodTypeAny>(type: T, payload: P) {
 
 export const messageSchemas = {
   'usage.snapshot': frame('usage.snapshot', UsageSnapshotPayload),
+  'settings.snapshot': frame('settings.snapshot', SettingsSnapshot),
   'switch.command': frame('switch.command', SwitchCommandPayload),
   'switch.result': frame('switch.result', SwitchResultPayload),
   'permission.request': frame('permission.request', PermissionRequestPayload),
@@ -312,6 +342,7 @@ export const messageSchemas = {
 /** The full frame schema. One `.parse` validates routing + type + payload together. */
 export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['usage.snapshot'],
+  messageSchemas['settings.snapshot'],
   messageSchemas['switch.command'],
   messageSchemas['switch.result'],
   messageSchemas['permission.request'],
@@ -344,6 +375,9 @@ export type PayloadOf<T extends MessageType> = MessageOf<T>['payload'];
 
 export type UsageLimit = z.infer<typeof UsageLimit>;
 export type AccountUsage = z.infer<typeof AccountUsage>;
+export type SettingSource = z.infer<typeof SettingSource>;
+export type SettingRow = z.infer<typeof SettingRow>;
+export type SettingsSnapshot = z.infer<typeof SettingsSnapshot>;
 export type UsageAdvisory = z.infer<typeof UsageAdvisory>;
 export type AccountScore = z.infer<typeof AccountScore>;
 export type UsagePlan = z.infer<typeof UsagePlan>;

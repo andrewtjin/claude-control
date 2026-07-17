@@ -15,6 +15,7 @@ import {
   buildUsageEmbed,
   buildAccountsEmbed,
   buildSessionListEmbed,
+  buildSettingsEmbed,
   buildTimelineEmbed,
 } from './embeds.js';
 import type { BarRenderer } from './emojiBars.js';
@@ -66,6 +67,14 @@ export function handleTimeline(deps: CommandDeps, discordUserId: string): Comman
     kind: 'embed',
     embed: buildTimelineEmbed(usage, undefined, deps.barRenderer, deps.trackStyle),
   };
+}
+
+/** `/settings` — the daemon's effective configuration, from the settings.snapshot it pushes
+ *  alongside every usage snapshot (same cache-answer pattern as `/usage`). */
+export function handleSettings(deps: CommandDeps, discordUserId: string): CommandResult {
+  const settings = deps.cache.getSettings(discordUserId);
+  if (!settings) return { kind: 'text', text: 'No settings yet — the daemon has not reported in.' };
+  return { kind: 'embed', embed: buildSettingsEmbed(settings) };
 }
 
 /** `/accounts` — same cache, a lighter view. */

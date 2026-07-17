@@ -13,6 +13,7 @@ describe('buildProgram', () => {
     // Daemon-backed placeholders are present so the surface is discoverable.
     expect(names).toContain('usage');
     expect(names).toContain('timeline');
+    expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
   });
@@ -48,11 +49,13 @@ describe('buildProgram', () => {
     expect(cmd?.options.map((o) => o.long)).toContain('--force');
   });
 
-  it('nests a real daemon run subcommand with pairing and relay flags', () => {
+  it('nests a real daemon run subcommand with pairing, relay, and auto-switch flags', () => {
     const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
     const run = daemon?.commands.find((c) => c.name() === 'run');
     expect(run).toBeDefined();
-    expect(run?.options.map((o) => o.long)).toEqual(expect.arrayContaining(['--pair', '--relay']));
+    expect(run?.options.map((o) => o.long)).toEqual(
+      expect.arrayContaining(['--pair', '--relay', '--auto-switch', '--greedy']),
+    );
   });
 
   it('reports its version', () => {

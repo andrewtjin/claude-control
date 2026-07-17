@@ -13,7 +13,7 @@ function acct(
   return { accountId: id, label: id, active: false, quarantined: false, limits, ...overrides };
 }
 
-/** An active account past the default 90% trigger on its session limit. */
+/** An active account past the default 94% trigger on its session limit. */
 function lowActive(): AccountUsageInput {
   return acct('hot', { active: true }, [
     { kind: 'session', percent: 96, resetsAt: NOW + 2 * H },
@@ -49,10 +49,18 @@ describe('decideAutoSwitch — trigger conditions', () => {
   it('triggers when the WEEKLY cap is nearly exhausted even with a fresh session', () => {
     const active = acct('a', { active: true }, [
       { kind: 'session', percent: 5, resetsAt: NOW + 4 * H },
-      { kind: 'weekly_all', percent: 93, resetsAt: NOW + 48 * H },
+      { kind: 'weekly_all', percent: 95, resetsAt: NOW + 48 * H },
     ]);
     const spare = acct('b', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
     expect(decideAutoSwitch([active, spare], NOW)?.targetAccountId).toBe('b');
+  });
+
+  it('holds below the 94% default trigger and fires exactly at it', () => {
+    const spare = acct('b', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
+    const at = (percent: number) =>
+      acct('a', { active: true }, [{ kind: 'session', percent, resetsAt: NOW + 2 * H }]);
+    expect(decideAutoSwitch([at(93.9), spare], NOW)).toBeNull();
+    expect(decideAutoSwitch([at(94), spare], NOW)?.targetAccountId).toBe('b');
   });
 
   it('ignores limits whose reset time is already past (stale window)', () => {
@@ -187,5 +195,98 @@ describe('decideAutoSwitch — choosing among candidates', () => {
     const q = acct('q', { quarantined: true });
     expect(decideAutoSwitch([lowActive(), q], NOW)).toBeNull();
     expect(decideAutoSwitch([lowActive()], NOW)).toBeNull();
+  });
+});
+
+describe('decideAutoSwitch — greedy mode', () => {
+  const GREEDY = { greedy: true };
+
+  /** A healthy active account whose weekly quota resets comfortably late. */
+  function healthyActive(weeklyResetsAt = NOW + 30 * H): AccountUsageInput {
+    return acct('current', { active: true }, [
+      { kind: 'session', percent: 20, resetsAt: NOW + 3 * H },
+      { kind: 'weekly_all', percent: 40, resetsAt: weeklyResetsAt },
+    ]);
+  }
+
+  it('is OFF by default — a healthy active account never hops toward a sooner reset', () => {
+    const sooner = acct('sooner', {}, [{ kind: 'weekly_all', percent: 50, resetsAt: NOW + 7 * H }]);
+    expect(decideAutoSwitch([healthyActive(), sooner], NOW)).toBeNull();
+  });
+
+  it("burns back: hops to the idle account once its 5h window has reset (the owner's A/B case)", () => {
+    // B is active after a low-trigger hop away from A; A's old 94% session limit has since
+    // expired (stale — ignored), leaving only its weekly, which resets well before B's.
+    const b = acct('B', { active: true }, [
+      { kind: 'session', percent: 15, resetsAt: NOW + 4 * H },
+      { kind: 'weekly_all', percent: 30, resetsAt: NOW + 30 * H }, // resets 6PM next day
+    ]);
+    const a = acct('A', {}, [
+      { kind: 'session', percent: 94, resetsAt: NOW - H }, // the burned window, now closed
+      { kind: 'weekly_all', percent: 50, resetsAt: NOW + 7 * H }, // resets 7AM — much sooner
+    ]);
+    const decision = decideAutoSwitch([b, a], NOW, GREEDY);
+    expect(decision?.targetAccountId).toBe('A');
+    expect(decision?.reason).toContain('greedy:');
+    expect(decision?.reason).toContain("A's weekly quota expires soonest");
+    expect(decision?.reason).toContain('in 7h');
+    expect(decision?.reason).toContain('50% weekly budget left');
+    expect(decision?.reason).toContain("before B's");
+  });
+
+  it('does NOT hop back while the burned 5h window is still open (no headroom yet)', () => {
+    const b = acct('B', { active: true }, [
+      { kind: 'session', percent: 15, resetsAt: NOW + 4 * H },
+      { kind: 'weekly_all', percent: 30, resetsAt: NOW + 30 * H },
+    ]);
+    const a = acct('A', {}, [
+      { kind: 'session', percent: 94, resetsAt: NOW + H }, // still live — only 6% headroom
+      { kind: 'weekly_all', percent: 50, resetsAt: NOW + 7 * H },
+    ]);
+    expect(decideAutoSwitch([b, a], NOW, GREEDY)).toBeNull();
+  });
+
+  it('stays put when the active account itself has the soonest weekly reset (anti-flap)', () => {
+    const later = acct('later', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 60 * H }]);
+    expect(decideAutoSwitch([healthyActive(NOW + 30 * H), later], NOW, GREEDY)).toBeNull();
+  });
+
+  it('treats a tie in reset times as "stay" — only a STRICTLY sooner reset moves', () => {
+    const sameReset = acct('twin', {}, [
+      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 30 * H },
+    ]);
+    expect(decideAutoSwitch([healthyActive(NOW + 30 * H), sameReset], NOW, GREEDY)).toBeNull();
+  });
+
+  it("hops when the active account's weekly reset is unknown but a candidate's is known", () => {
+    const active = acct('mystery', { active: true }, [
+      { kind: 'session', percent: 20, resetsAt: NOW + 3 * H }, // no weekly limit reported
+    ]);
+    const known = acct('known', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
+    const decision = decideAutoSwitch([active, known], NOW, GREEDY);
+    expect(decision?.targetAccountId).toBe('known');
+    expect(decision?.reason).toContain("mystery's weekly reset is unknown");
+  });
+
+  it('still respects candidate eligibility — a sooner reset behind a low account stays put', () => {
+    const nearlyBurned = acct('burned', {}, [
+      { kind: 'weekly_all', percent: 95, resetsAt: NOW + 7 * H }, // sooner, but itself low
+    ]);
+    expect(decideAutoSwitch([healthyActive(NOW + 30 * H), nearlyBurned], NOW, GREEDY)).toBeNull();
+  });
+
+  it('never acts on an active account with no limit data, even in greedy mode', () => {
+    const active = acct('blind', { active: true });
+    const known = acct('known', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
+    expect(decideAutoSwitch([active, known], NOW, GREEDY)).toBeNull();
+  });
+
+  it('leaves the low-quota trigger and its reason untouched when greedy is on', () => {
+    const spare = acct('spare', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 13 * H }]);
+    const plain = decideAutoSwitch([lowActive(), spare], NOW);
+    const greedy = decideAutoSwitch([lowActive(), spare], NOW, GREEDY);
+    expect(greedy).toEqual(plain);
+    expect(greedy?.reason).toContain('hot is at 96% used');
+    expect(greedy?.reason).not.toContain('greedy:');
   });
 });
