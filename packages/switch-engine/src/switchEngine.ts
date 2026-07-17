@@ -15,8 +15,9 @@
 // engine reports only what it mechanically did.
 
 import { AuditLog } from './audit.js';
-import { CredentialStore } from './credentialStore.js';
-import { DpapiProtector, type Protector } from './dpapi.js';
+import { CredentialStore, type LiveCredentialChannel } from './credentialStore.js';
+import { type Protector } from './dpapi.js';
+import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
 import {
   CadenceError,
   QuarantineError,
@@ -52,8 +53,12 @@ export type RefreshFn = (current: ClaudeOauth, deps?: RefreshDeps) => Promise<Cl
 
 export interface SwitchEngineOptions {
   paths: Paths;
-  /** Defaults to real DPAPI. Tests pass an insecure passthrough. */
+  /** Defaults to this platform's real protector (win32 DPAPI / darwin Keychain).
+   *  Tests pass an insecure passthrough. */
   protector?: Protector;
+  /** Where the LIVE `claudeAiOauth` block lives. Defaults per platform (darwin: the CLI's
+   *  Keychain item; elsewhere: `.credentials.json`). Tests pass an in-memory fake. */
+  liveCredentialChannel?: LiveCredentialChannel;
   /** Defaults to the real OAuth refresh. Tests pass a fake. */
   refresh?: RefreshFn;
   refreshDeps?: RefreshDeps;
@@ -93,9 +98,12 @@ export class SwitchEngine {
   constructor(options: SwitchEngineOptions) {
     this.paths = options.paths;
     this.clock = options.clock ?? Date.now;
-    const protector = options.protector ?? new DpapiProtector();
+    const protector = options.protector ?? defaultProtector();
     this.vault = new Vault(this.paths.vaultDir, protector, this.clock);
-    this.credStore = new CredentialStore(this.paths);
+    this.credStore = new CredentialStore(
+      this.paths,
+      options.liveCredentialChannel ?? defaultLiveCredentialChannel(this.paths),
+    );
     this.intent = new IntentStore(this.paths.vaultDir);
     this.audit = new AuditLog(this.paths.vaultDir);
     this.refresh = options.refresh ?? defaultRefresh;
@@ -150,6 +158,9 @@ export class SwitchEngine {
    * alone. The caller owns the transient dir and MUST delete it afterwards (token-bearing).
    */
   async captureFromConfigDir(label: string, configDir: string): Promise<StoredAccount> {
+    // Deliberately FILE-based on every platform: the transient dir's contents are what we
+    // capture. Whether the mac CLI honors CLAUDE_CONFIG_DIR with files (or still writes its
+    // Keychain item, which would make this flow read nothing) is mac wet-gate assumption A3.
     const store = new CredentialStore({
       claudeDir: configDir,
       credentialsPath: join(configDir, '.credentials.json'),
