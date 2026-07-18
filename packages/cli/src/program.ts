@@ -16,10 +16,11 @@ import {
   SwitchEngineError,
   UnknownAccountError,
   defaultPaths,
+  defaultProtector,
   resolveAccountRef,
   type StoredAccount,
 } from '@claude-control/switch-engine';
-import { Store } from '@claude-control/daemon';
+import { Store, readHeartbeat } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import {
   computeOutlook,
@@ -29,9 +30,16 @@ import {
   timelineInputFromWire,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
-import { runDaemon } from './daemonRun.js';
+import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
+import {
+  installDaemonTask,
+  queryDaemonTask,
+  resolveCctlShimPath,
+  startDaemonTaskNow,
+  uninstallDaemonTask,
+} from './daemonInstall.js';
 import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
-import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
+import { renderAccountsTable, renderDaemonStatus, renderUsage, type UsageRow } from './render.js';
 import { renderDoctor, runDoctor, summarize } from './doctor.js';
 import {
   daemonSettingsPath,
@@ -193,9 +201,97 @@ export function buildProgram(): Command {
         // Greedy is a refinement of auto-switch, not a standalone mode — fail loudly rather
         // than let the flag silently do nothing.
         if (opts.greedy && !opts.autoSwitch) fail('--greedy requires --auto-switch.');
-        await runDaemon(opts);
+        try {
+          await runDaemon(opts);
+        } catch (err) {
+          // A second daemon instance (see daemonRun.ts's instance lock) is the expected
+          // failure mode here — surfaced as `error: ...`, never a raw stack trace.
+          fail((err as Error).message);
+        }
       },
     );
+
+  daemon
+    .command('install')
+    .description('register a logon Scheduled Task that starts the daemon automatically')
+    .action(() => {
+      let shimPath: string;
+      try {
+        shimPath = resolveCctlShimPath();
+      } catch (err) {
+        fail(`could not resolve the installed cctl location: ${(err as Error).message}`);
+      }
+      let outcome: ReturnType<typeof installDaemonTask>;
+      try {
+        outcome = installDaemonTask({ shimPath });
+      } catch (err) {
+        fail(`could not register the logon task: ${(err as Error).message}`);
+      }
+      const verb = { created: 'Registered', updated: 'Updated', unchanged: 'Already registered' }[
+        outcome
+      ];
+      process.stdout.write(`${verb} the logon task to run "${shimPath} daemon run" at logon.\n`);
+      // Best-effort: get the daemon running now rather than making the user wait for the next
+      // logon. A failure here does not undo the (successful) registration above — Task
+      // Scheduler will still bring the daemon up next time.
+      try {
+        startDaemonTaskNow();
+        process.stdout.write('Daemon starting now.\n');
+      } catch (err) {
+        process.stdout.write(
+          `Could not start it immediately (${(err as Error).message}); ` +
+            'it will start at your next logon.\n',
+        );
+      }
+    });
+
+  daemon
+    .command('uninstall')
+    .description('remove the logon Scheduled Task (does not stop an already-running daemon)')
+    .action(() => {
+      let outcome: ReturnType<typeof uninstallDaemonTask>;
+      try {
+        outcome = uninstallDaemonTask();
+      } catch (err) {
+        fail(`could not remove the logon task: ${(err as Error).message}`);
+      }
+      process.stdout.write(
+        outcome === 'removed'
+          ? 'Removed the logon task. A daemon already running keeps running until stopped.\n'
+          : 'No logon task was registered.\n',
+      );
+    });
+
+  daemon
+    .command('status')
+    .description('at-a-glance daemon health: logon task, heartbeat, pairing, relay')
+    .action(async () => {
+      const paths = defaultPaths();
+      const dataDir = dirname(paths.vaultDir);
+
+      // Each source is queried independently and degrades on its own — a PowerShell failure
+      // here must not hide the heartbeat/pairing lines, which are still meaningful without it.
+      let task: ReturnType<typeof queryDaemonTask>;
+      try {
+        task = queryDaemonTask();
+      } catch {
+        task = { registered: false };
+      }
+
+      const heartbeat = await readHeartbeat(join(dataDir, 'daemon-heartbeat.json'));
+      const identity = await dpapiIdentityStore(
+        join(dataDir, 'daemon-identity.enc'),
+        defaultProtector(),
+      ).load();
+      const relayUrl = resolveDaemonConfig(process.env).values.relayUrl;
+
+      process.stdout.write(
+        renderDaemonStatus(
+          { task, heartbeat, paired: identity !== undefined, relayUrl },
+          detectPalette(),
+        ) + '\n',
+      );
+    });
 
   // Remote-control features that require the running daemon connected to the hosted bot —
   // an inherently on-machine (wet) step. Surfaced now so the command set is discoverable and

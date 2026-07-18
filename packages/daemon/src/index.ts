@@ -69,6 +69,16 @@ export {
 export { loadOrCreateHookSecret } from './hookSecret.js';
 
 export {
+  HeartbeatWriter,
+  readHeartbeat,
+  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_STALE_AFTER_MS,
+  type HeartbeatState,
+  type HeartbeatReading,
+  type HeartbeatWriterOptions,
+} from './heartbeat.js';
+
+export {
   AutoSwitcher,
   DEFAULT_AUTOSWITCH_COOLDOWN_MS,
   type AutoSwitcherOptions,
