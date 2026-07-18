@@ -9,6 +9,8 @@ import { join } from 'node:path';
 import {
   defaultLiveCredentialChannel,
   defaultProtector,
+  resolveClaudeCliKeychainTarget,
+  type LiveCredentialChannel,
   type Paths,
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
@@ -189,17 +191,27 @@ export function checkVault(paths: Paths): DoctorCheck {
 export async function checkLiveLogin(
   paths: Paths,
   platform: NodeJS.Platform = process.platform,
+  channel: LiveCredentialChannel = defaultLiveCredentialChannel(paths, platform),
 ): Promise<DoctorCheck> {
-  const where = platform === 'darwin' ? "the CLI's Keychain item" : paths.credentialsPath;
+  // On darwin, name the EXACT Keychain target (service/account, env overrides applied) so a
+  // wrong item name self-diagnoses instead of reading as "you are not logged in". The suggested
+  // command is deliberately an ATTRIBUTE-ONLY dump: `-w`/`-g` would print the live OAuth token
+  // to the operator's terminal. The env overrides make a name mismatch a config fix.
+  const target = platform === 'darwin' ? resolveClaudeCliKeychainTarget() : undefined;
+  const where = target
+    ? `the CLI's Keychain item (service="${target.service}", account="${target.account}")`
+    : paths.credentialsPath;
+  const missDetail = target
+    ? `no live credentials in ${where} - verify with ` +
+      `\`security find-generic-password -s "${target.service}"\` (attribute-only; never -w/-g), ` +
+      `or set CLAUDE_CLI_KEYCHAIN_SERVICE / CLAUDE_CLI_KEYCHAIN_ACCOUNT`
+    : `no live credentials in ${where} - run \`claude\` and log in first`;
   try {
-    const live = await defaultLiveCredentialChannel(paths, platform).readLiveCredentials();
+    const live = await channel.readLiveCredentials();
     return {
       name: 'login',
       ok: live !== undefined,
-      detail:
-        live !== undefined
-          ? `live credentials found in ${where}`
-          : `no live credentials in ${where} - run \`claude\` and log in first`,
+      detail: live !== undefined ? `live credentials found in ${where}` : missDetail,
     };
   } catch (err) {
     return {

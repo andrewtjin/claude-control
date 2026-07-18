@@ -4,7 +4,11 @@
 // platform is one new case here — callers never change.
 
 import { DpapiProtector, type Protector } from './dpapi.js';
-import { KeychainCredentialChannel, KeychainProtector } from './keychain.js';
+import {
+  KeychainCredentialChannel,
+  KeychainProtector,
+  resolveClaudeCliKeychainTarget,
+} from './keychain.js';
 import { FileKeyProtector, FileKeySource } from './fileKey.js';
 import { FileCredentialChannel, type LiveCredentialChannel } from './credentialStore.js';
 import { defaultVaultKeyPath, type Paths } from './paths.js';
@@ -39,7 +43,11 @@ export function defaultLiveCredentialChannel(
   paths: Paths,
   platform: NodeJS.Platform = process.platform,
 ): LiveCredentialChannel {
-  return platform === 'darwin'
-    ? new KeychainCredentialChannel()
-    : new FileCredentialChannel(paths.credentialsPath);
+  if (platform === 'darwin') {
+    // The item name/account the CLI actually uses is an assumption until macOS is verified on
+    // hardware, so it is operator-overridable by env; unset resolves to the shipped defaults.
+    const { service, account } = resolveClaudeCliKeychainTarget();
+    return new KeychainCredentialChannel({ service, account });
+  }
+  return new FileCredentialChannel(paths.credentialsPath);
 }
