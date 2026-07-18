@@ -23,9 +23,11 @@ export interface DoctorCheck {
 // gated behind `--experimental-sqlite`) but the first version that exposes it WITHOUT that
 // flag: 22.13.0 on the 22.x line (and 23.4.0 on 23.x). cctl runs as a bare `cctl`/Scheduled
 // Task command, so it can't pass a runtime flag — a user on 22.5–22.12 would see the daemon's
-// sqlite store fail to load. The package's `engines` field says `>=22.5.0`, which is why this
-// check exists instead of trusting it. Confirmed on this repo's dev machine: `require('node:
-// sqlite')` loads unflagged on v24.
+// sqlite store fail to load. The publishable package's `engines` field is kept at this same
+// floor (see doctor.test.ts), but npm's own engine check is advisory by default, so a user who
+// ignores or bypasses that warning can still get here — this check exists to catch them with
+// an actionable message instead of a raw builtin-module error. Confirmed on this repo's dev
+// machine: `require('node:sqlite')` loads unflagged on v24.
 export const MIN_NODE_VERSION = '22.13.0';
 
 /** Parse `vX.Y.Z` (or `X.Y.Z`) into a numeric tuple; undefined for anything unparseable. */

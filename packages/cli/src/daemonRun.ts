@@ -95,8 +95,39 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
   };
 }
 
-/** Assemble and start the daemon; resolves once it is up (the process then stays alive on
- *  the hook receiver's server + the control-plane socket until Ctrl+C). */
+/**
+ * Poll `getPort()` until it returns a bound port or `timeoutMs` elapses. Used to observe the
+ * hook receiver's port without waiting on the whole (possibly-hanging) `daemon.start()`
+ * promise — see the call site in `runDaemon`. `clock`/`sleep` are injectable so tests never
+ * need real wall-clock waits.
+ */
+export async function waitForHookPort(
+  getPort: () => number | undefined,
+  options: {
+    timeoutMs?: number;
+    pollMs?: number;
+    clock?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<number | undefined> {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const pollMs = options.pollMs ?? 25;
+  const clock = options.clock ?? Date.now;
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = clock() + timeoutMs;
+  for (;;) {
+    const port = getPort();
+    if (port !== undefined) return port;
+    if (clock() >= deadline) return undefined;
+    await sleep(pollMs);
+  }
+}
+
+/** Assemble and start the daemon; resolves once local readiness (heartbeat, installed hooks)
+ *  is in place — deliberately NOT once the control-plane connection is live, since that can
+ *  hang indefinitely (see the `daemon.start()` call site below). The process then stays alive
+ *  on the hook receiver's server + the control-plane socket until Ctrl+C. */
 export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const paths: Paths = defaultPaths();
   const dataDir = dirname(paths.vaultDir);
@@ -252,22 +283,34 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
 
   // Liveness signal for `cctl daemon status` (see heartbeat.ts) — a separate process, possibly
   // reading this long after the daemon that wrote it has exited, so a file is the only channel
-  // that survives a hard crash. Started once the daemon is actually up, stopped on shutdown.
+  // that survives a hard crash. Started as soon as this process is up (not gated on the
+  // control-plane connection — see the comment below), stopped on shutdown.
   const heartbeat = new HeartbeatWriter(join(dataDir, 'daemon-heartbeat.json'), {
     onError: (err) => logger.warn({ err }, 'could not write the daemon heartbeat'),
   });
 
-  await daemon.start();
+  // `daemon.start()` awaits the control-plane connect(), which by design can hang forever —
+  // an unpaired/skip-pairing local-only setup, or any relay-down logon, never resolves nor
+  // rejects it (see ControlPlaneClient.connect()). Heartbeat and hook install are this
+  // process's own local promises ("I'm alive"; "here's where to POST hook events") and must
+  // not wait behind the remote one, or a local-only daemon never installs hooks, never writes
+  // a heartbeat, and `cctl setup`/`cctl status` see it as never having come up at all. Kick
+  // start() off in the background instead; its own rejection can only come from a subsystem
+  // failure surfaced through the normal shutdown path, so log rather than crash the process.
+  void daemon.start().catch((err: unknown) => {
+    logger.error({ err }, 'daemon failed to start');
+  });
+
   heartbeat.start();
 
-  // Installed AFTER start() (not before) because `daemon.start()` is what actually binds the
-  // hook receiver's port — an OS-assigned ephemeral port that's different on every run, so
-  // this has to happen every start, not just first-run setup. installHooks' managed-marker
-  // pruning (see hookInstaller.ts) makes repeating it idempotent and self-healing: it replaces
-  // last run's now-dead port/secret without touching any other tool's hooks. Best-effort — a
-  // profile the daemon can't write to must not stop an otherwise-healthy daemon from serving
-  // already-connected clients; the setup wizard surfaces install failures explicitly.
-  const hookPort = hookReceiver.getPort();
+  // The hook receiver binds its OS-assigned port early inside start() — recovery and the local
+  // socket bind, both fast and purely local — well before start() reaches the (possibly
+  // hanging) connect() call. Poll briefly for it rather than waiting on the whole promise.
+  // installHooks' managed-marker pruning (see hookInstaller.ts) makes repeating this every run
+  // idempotent and self-healing: it replaces last run's now-dead port/secret without touching
+  // any other tool's hooks. Best-effort — a profile the daemon can't write to must not stop an
+  // otherwise-healthy daemon; the setup wizard surfaces install failures explicitly.
+  const hookPort = await waitForHookPort(() => hookReceiver.getPort());
   if (hookPort !== undefined) {
     await installHooks({
       settingsPath: join(paths.claudeDir, 'settings.json'),
@@ -276,7 +319,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       logger.warn({ err }, 'could not install hooks into settings.json');
     });
   } else {
-    logger.warn('hook receiver has no bound port after start(); skipped installing hooks');
+    logger.warn('hook receiver never bound a port; skipped installing hooks');
   }
 
   process.stdout.write(
