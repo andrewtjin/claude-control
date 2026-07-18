@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import {
   renderDoctor,
   summarize,
@@ -10,6 +13,10 @@ import {
   type DoctorCheck,
   type ProbeFetch,
 } from './doctor.js';
+
+// This file lives at packages/cli/src/, so two levels up is packages/, where the publishable
+// bundle lives at cctl-publish/package.json (see dependencyClosure.test.ts for the same idiom).
+const PACKAGES_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const checks: DoctorCheck[] = [
   { name: 'dpapi', ok: true, detail: 'works' },
@@ -52,9 +59,22 @@ describe('checkVaultProtection', () => {
 
 describe('checkNodeVersion', () => {
   // The floor is the first UNFLAGGED node:sqlite (22.13.0), not the flagged introduction
-  // (22.5.0) the package's `engines` field advertises.
-  it('is the unflagged-node:sqlite floor, not the flagged 22.5.0', () => {
+  // (22.5.0) — this check exists because npm's own `engines` enforcement is advisory, so a
+  // user on an old-but-flagged Node can still get this far and needs an actionable message.
+  it('is the unflagged-node:sqlite floor', () => {
     expect(MIN_NODE_VERSION).toBe('22.13.0');
+  });
+
+  // The publishable package's own `engines.node` must not advertise a floor doctor itself
+  // knows is broken (node:sqlite still flagged) — npm's engine check is advisory by default,
+  // so a stale floor there would let exactly the crashing versions install.
+  it('publishable package.json declares a floor at least as high as this check', () => {
+    const publishedManifest = JSON.parse(
+      readFileSync(join(PACKAGES_DIR, 'cctl-publish', 'package.json'), 'utf8'),
+    ) as { engines?: { node?: string } };
+    const declaredFloor = publishedManifest.engines?.node?.replace(/^>=\s*/, '');
+    expect(declaredFloor).toBeDefined();
+    expect(checkNodeVersion(declaredFloor, MIN_NODE_VERSION).ok).toBe(true);
   });
 
   it('passes for versions at or above the floor', () => {
