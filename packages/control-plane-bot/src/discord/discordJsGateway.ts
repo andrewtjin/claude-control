@@ -417,14 +417,22 @@ export class DiscordJsGateway implements DiscordGateway {
     await this.executeOps(this.planner.onStopRequested(route, this.clock()).ops);
   }
 
-  /** Inflate a RenderedPush into discord.js send options (content + embeds + component rows).
-   *  Return type is inferred from the conditional spreads so no key is ever present-and-undefined
-   *  — `exactOptionalPropertyTypes` rejects `embeds: undefined` at the `user.send` boundary. */
+  /** Inflate a RenderedPush into discord.js send options (content + embeds + component rows +
+   *  file attachments). Return type is inferred from the conditional spreads so no key is ever
+   *  present-and-undefined — `exactOptionalPropertyTypes` rejects `embeds: undefined` at the
+   *  `user.send` boundary. */
   private toSendOptions(push: RenderedPush) {
     return {
       ...(push.content !== undefined ? { content: push.content } : {}),
       ...(push.embeds !== undefined ? { embeds: push.embeds } : {}),
       ...(push.components !== undefined ? { components: this.toRows(push.components) } : {}),
+      ...(push.files !== undefined
+        ? {
+            files: push.files.map(
+              (f) => new AttachmentBuilder(Buffer.from(f.text, 'utf8'), { name: f.filename }),
+            ),
+          }
+        : {}),
     };
   }
 

@@ -222,6 +222,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
     logger,
     forwardNotificationCards: config.values.waitingCards,
+    commandOutputCards: config.values.commandOutputCards,
+    fullToolOutput: config.values.fullToolOutput,
     ...(config.values.permissionHoldMs !== undefined
       ? { permissionHoldMs: config.values.permissionHoldMs }
       : {}),

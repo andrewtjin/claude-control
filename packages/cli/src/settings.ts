@@ -56,6 +56,16 @@ export function envFlag(env: NodeJS.ProcessEnv, name: string): boolean {
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
 
+/** A tri-state boolean from the environment, for knobs whose default is ON: explicit on,
+ *  explicit off (0/false/no/off), or undefined when unset/unparseable — the caller picks the
+ *  default, and the settings view attributes 'env' only to a parsed override. */
+export function envBool(env: NodeJS.ProcessEnv, name: string): boolean | undefined {
+  const raw = env[name]?.trim().toLowerCase();
+  if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return true;
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'off') return false;
+  return undefined;
+}
+
 /** Compact duration for display: "45s", "10m", "2h". Sub-second values are only reachable
  *  through deliberate env overrides, so millisecond precision is not worth the noise. */
 function humanizeMs(ms: number): string {
@@ -94,6 +104,8 @@ export interface DaemonConfig {
     cooldownMs: number | undefined;
     waitingCards: boolean;
     permissionHoldMs: number | undefined;
+    commandOutputCards: boolean;
+    fullToolOutput: boolean;
   };
   rows: SettingRow[];
 }
@@ -122,6 +134,12 @@ export function resolveDaemonConfig(
   // The hook contract offers ONE decision channel: while a permission is held for a remote
   // decision the terminal cannot prompt. A shorter hold favors keyboard-first use.
   const permissionHoldMs = envNumber(env, 'CCTL_PERMISSION_HOLD_MS');
+  // Default ON: a remote operator can't see the terminal, so every shell command's output is
+  // pushed as a card in every permission mode; `off` silences chatty sessions.
+  const commandOutputEnv = envBool(env, 'CCTL_COMMAND_OUTPUT');
+  const commandOutputCards = commandOutputEnv ?? true;
+  // Default OFF: cards ship a phone-sized excerpt; full output arrives as a file attachment.
+  const fullToolOutput = envFlag(env, 'CCTL_TOOL_OUTPUT_FULL');
 
   const rows: SettingRow[] = [
     {
@@ -168,6 +186,18 @@ export function resolveDaemonConfig(
       detail: 'CCTL_PERMISSION_HOLD_MS (remote-decision window; local prompt appears after)',
     },
     {
+      name: 'command output cards',
+      value: commandOutputCards ? 'on' : 'off',
+      source: envSource(commandOutputEnv !== undefined),
+      detail: "CCTL_COMMAND_OUTPUT (every shell command's output as a phone card; off silences)",
+    },
+    {
+      name: 'full tool output',
+      value: fullToolOutput ? 'on' : 'off',
+      source: envSource(fullToolOutput),
+      detail: 'CCTL_TOOL_OUTPUT_FULL (complete output; long output arrives as a file attachment)',
+    },
+    {
       name: 'relay url',
       value: relayUrl,
       source: flags.relay !== undefined ? 'flag' : envSource(relayEnv !== undefined),
@@ -191,6 +221,8 @@ export function resolveDaemonConfig(
       cooldownMs,
       waitingCards,
       permissionHoldMs,
+      commandOutputCards,
+      fullToolOutput,
     },
     rows,
   };

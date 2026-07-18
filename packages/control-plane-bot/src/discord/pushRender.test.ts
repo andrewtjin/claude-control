@@ -117,9 +117,11 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(push?.content).toBe(
       '**Output — netstat -ano**\n```\nTCP 127.0.0.1:5433 LISTENING 41184\n```',
     );
+    // Fits in one message — no attachment needed.
+    expect(push?.files).toBeUndefined();
   });
 
-  it('tool_output clamps long output without ever breaking the closing fence', () => {
+  it('tool_output clamps long output without breaking the fence, and attaches the full text', () => {
     const push = renderPush(
       env('hook.notification', {
         event: 'notification',
@@ -132,6 +134,8 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(push!.content!.length).toBeLessThanOrEqual(2000);
     expect(push?.content?.endsWith('\n```')).toBe(true);
     expect(push?.content).toContain('chars truncated');
+    // The inline block is a preview; the COMPLETE raw output rides as a file attachment.
+    expect(push?.files).toEqual([{ filename: 'output.txt', text: 'x'.repeat(5000) }]);
   });
 
   it('tool_output defuses embedded ``` so output cannot terminate its own fence', () => {

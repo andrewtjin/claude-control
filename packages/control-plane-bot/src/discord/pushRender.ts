@@ -17,6 +17,14 @@ import {
 import { permissionButtons, type ButtonSpec } from './buttons.js';
 import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
 
+/** A text file to attach to the message — the same delivery session threads use for full
+ *  stdout. Plain data (no discord.js types) so this module stays unit-testable; the gateway
+ *  inflates it into an AttachmentBuilder. */
+export interface PushFile {
+  filename: string;
+  text: string;
+}
+
 /** One rendered push. `undefined` from `renderPush` means cache-only: the envelope updated
  *  DaemonStateCache but is not worth interrupting the user's phone for (raw stdout, snapshots
  *  they can pull with `/usage`, socket control frames). `components` are plain ButtonSpecs the
@@ -25,6 +33,7 @@ export interface RenderedPush {
   content?: string;
   embeds?: EmbedBuilder[];
   components?: ButtonSpec[][];
+  files?: PushFile[];
 }
 
 /** The single source of truth for the host re-login command, shared by the quarantine card and
@@ -90,20 +99,27 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush {
   }
   switch (p.notificationType) {
     case 'tool_output': {
-      // A remotely-approved tool's output. Rendered as a fenced code block so multi-line
-      // command output stays readable on a phone; the body is clamped BEFORE assembly so
-      // truncation can never eat the closing fence and leave the block unterminated.
-      // Embedded ``` sequences are defused with a zero-width space — output text must not
-      // be able to terminate its own fence.
+      // A tool run's output. Rendered as a fenced code block so multi-line command output
+      // stays readable on a phone; the body is clamped BEFORE assembly so truncation can
+      // never eat the closing fence and leave the block unterminated. Embedded ``` sequences
+      // are defused with a zero-width space — output text must not be able to terminate its
+      // own fence.
       const header = `**${p.title}**\n`;
       const fenceOverhead = '```\n\n```'.length;
       const zeroWidthSpace = String.fromCharCode(0x200b);
       const safeBody = p.body.replaceAll('```', '`' + zeroWidthSpace + '``');
-      const clamped = truncateLabeled(
-        safeBody,
-        Math.max(0, MESSAGE_CONTENT_LIMIT - header.length - fenceOverhead),
-      );
-      return { content: `${header}\`\`\`\n${clamped}\n\`\`\`` };
+      const maxBody = Math.max(0, MESSAGE_CONTENT_LIMIT - header.length - fenceOverhead);
+      if (safeBody.length > maxBody) {
+        // Too big for one message (the daemon ships more than this only when full output is
+        // enabled): the COMPLETE raw text rides as a .txt attachment under a clamped inline
+        // preview, so nothing is lost to Discord's content ceiling. The file gets the raw
+        // body — a real file needs no fence defusing.
+        return {
+          content: `${header}\`\`\`\n${truncateLabeled(safeBody, maxBody)}\n\`\`\``,
+          files: [{ filename: 'output.txt', text: p.body }],
+        };
+      }
+      return { content: `${header}\`\`\`\n${safeBody}\n\`\`\`` };
     }
     case 'idle_prompt':
       return {

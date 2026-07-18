@@ -8,6 +8,7 @@ import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import {
   DEFAULT_RELAY_URL,
   daemonSettingsPath,
+  envBool,
   envFlag,
   envNumber,
   readSettingsReport,
@@ -40,6 +41,15 @@ describe('envNumber / envFlag', () => {
     for (const off of ['0', 'false', 'nope', '']) expect(envFlag({ X: off }, 'X')).toBe(false);
     expect(envFlag({}, 'X')).toBe(false);
   });
+
+  it('envBool distinguishes explicit on, explicit off, and unset/garbage', () => {
+    for (const on of ['1', 'true', 'YES', 'On']) expect(envBool({ X: on }, 'X')).toBe(true);
+    for (const off of ['0', 'false', 'No', 'OFF']) expect(envBool({ X: off }, 'X')).toBe(false);
+    // Unset and typos fall back to the caller's default — and read as such in the view.
+    expect(envBool({}, 'X')).toBeUndefined();
+    expect(envBool({ X: 'nope' }, 'X')).toBeUndefined();
+    expect(envBool({ X: '  ' }, 'X')).toBeUndefined();
+  });
 });
 
 describe('resolveDaemonConfig', () => {
@@ -54,6 +64,8 @@ describe('resolveDaemonConfig', () => {
       cooldownMs: undefined,
       waitingCards: false,
       permissionHoldMs: undefined,
+      commandOutputCards: true,
+      fullToolOutput: false,
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('off');
@@ -63,6 +75,8 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'auto-switch cooldown').value).toBe('10m');
     expect(row(rows, 'waiting cards').value).toBe('off');
     expect(row(rows, 'permission hold').value).toBe('570s');
+    expect(row(rows, 'command output cards').value).toBe('on');
+    expect(row(rows, 'full tool output').value).toBe('off');
     expect(row(rows, 'relay url').value).toBe(DEFAULT_RELAY_URL);
     expect(row(rows, 'daemon log level').value).toBe('info');
   });
@@ -77,6 +91,25 @@ describe('resolveDaemonConfig', () => {
     const { values, rows } = resolveDaemonConfig({ CCTL_WAITING_CARDS: '1' });
     expect(values.waitingCards).toBe(true);
     expect(row(rows, 'waiting cards')).toMatchObject({ value: 'on', source: 'env' });
+  });
+
+  it('silences command output cards via CCTL_COMMAND_OUTPUT=off (a default-on knob)', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_COMMAND_OUTPUT: 'off' });
+    expect(values.commandOutputCards).toBe(false);
+    expect(row(rows, 'command output cards')).toMatchObject({ value: 'off', source: 'env' });
+    // A typo'd value falls back to the on default — and the view says default, not env.
+    const typo = resolveDaemonConfig({ CCTL_COMMAND_OUTPUT: 'nope' });
+    expect(typo.values.commandOutputCards).toBe(true);
+    expect(row(typo.rows, 'command output cards')).toMatchObject({
+      value: 'on',
+      source: 'default',
+    });
+  });
+
+  it('enables full tool output via CCTL_TOOL_OUTPUT_FULL', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_TOOL_OUTPUT_FULL: '1' });
+    expect(values.fullToolOutput).toBe(true);
+    expect(row(rows, 'full tool output')).toMatchObject({ value: 'on', source: 'env' });
   });
 
   it('reflects env overrides in both values and rows, with source "env"', () => {

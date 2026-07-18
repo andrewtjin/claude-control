@@ -88,6 +88,10 @@ describe('HookReceiver', () => {
       // forwarding-shape tests below exercise the wire payload. The default-off behavior has
       // its own describe with a dedicated receiver.
       forwardNotificationCards: true,
+      // Command cards default ON; the harness turns them off so the watch-mechanics tests
+      // observe ONLY the one-shot watch (and so the off knob itself is exercised). The
+      // default-on behavior has its own describe with a dedicated receiver.
+      commandOutputCards: false,
     });
     port = await receiver.listen(0);
   });
@@ -227,7 +231,7 @@ describe('HookReceiver', () => {
     });
   });
 
-  describe('PostToolUse output forwarding (armed only by a remote allow)', () => {
+  describe('PostToolUse output forwarding (watch mechanics; command cards off)', () => {
     /** Drive a full remote approval: hold the permission response, tap allow, await the hold
      *  completing — the receiver has now armed a one-shot output watch for this exact run. */
     async function remoteAllow(
@@ -305,7 +309,7 @@ describe('HookReceiver', () => {
       expect(outputCards()).toHaveLength(1);
     });
 
-    it('a PostToolUse with no armed watch (ordinary local tool use) is never forwarded', async () => {
+    it('with command cards off, a shell run with no armed watch is never forwarded', async () => {
       const res = await postToolUse({ command: 'ls' }, { stdout: 'files' });
       expect(res.status).toBe(200);
       expect(outputCards()).toHaveLength(0);
@@ -354,6 +358,180 @@ describe('HookReceiver', () => {
       expect(cards[0]?.body.length).toBeLessThan(2000);
       expect(cards[0]?.body).toContain('[truncated]');
       expect(cards[1]?.body).toBe('(no output)');
+    });
+  });
+
+  describe('shell command output cards (default on, every mode)', () => {
+    // A remote operator cannot see the terminal, so shell output must not depend on how the
+    // run was approved — no watch, no permission round-trip, any permission mode.
+    let cardReceiver: HookReceiver;
+    let cardPort: number;
+    let cardEmitted: EnvelopeDraft[];
+
+    beforeEach(async () => {
+      cardEmitted = [];
+      cardReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => cardEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        permissionHoldMs: 3000,
+        // No commandOutputCards — this describe pins the DEFAULT (on).
+      });
+      cardPort = await cardReceiver.listen(0);
+    });
+
+    afterEach(async () => {
+      await cardReceiver.close();
+    });
+
+    const cards = () =>
+      cardEmitted.flatMap((e) =>
+        e.type === 'hook.notification' && e.payload.notificationType === 'tool_output'
+          ? [e.payload]
+          : [],
+      );
+
+    function postTool(
+      tool: string,
+      toolInput: Record<string, unknown>,
+      toolResponse: unknown,
+    ): Promise<RawResponse> {
+      return post(
+        cardPort,
+        '/',
+        {
+          hook_event_name: 'PostToolUse',
+          session_id: 'sess-cards',
+          tool_name: tool,
+          tool_input: toolInput,
+          tool_response: toolResponse,
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+    }
+
+    it('forwards a shell command that was never remotely approved', async () => {
+      const res = await postTool(
+        'Bash',
+        { command: 'netstat -ano' },
+        { stdout: 'TCP 127.0.0.1:5433 LISTENING 41184', stderr: '' },
+      );
+      expect(res.status).toBe(200);
+      const seen = cards();
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.title).toBe('Output — netstat -ano');
+      expect(seen[0]?.body).toBe('TCP 127.0.0.1:5433 LISTENING 41184');
+      expect(seen[0]?.sessionId).toBe('sess-cards');
+    });
+
+    it('forwards a repeated shell command every time — a card per run, not one-shot', async () => {
+      await postTool('Bash', { command: 'echo hi' }, { stdout: 'hi' });
+      await postTool('Bash', { command: 'echo hi' }, { stdout: 'hi again' });
+      expect(cards()).toHaveLength(2);
+    });
+
+    it('counts PowerShell as a shell command too', async () => {
+      await postTool('PowerShell', { command: 'Get-Date' }, { stdout: 'Thursday' });
+      expect(cards()).toHaveLength(1);
+    });
+
+    it('never forwards a non-shell tool without a watch', async () => {
+      await postTool('Read', { file_path: 'C:/x.txt' }, 'file contents');
+      expect(cards()).toHaveLength(0);
+    });
+
+    it('a remotely approved shell run yields exactly ONE card (watch and command card never double up)', async () => {
+      const held = post(
+        cardPort,
+        '/',
+        {
+          event: 'PermissionRequest',
+          requestId: 'req-cards-1',
+          session_id: 'sess-cards',
+          tool_name: 'Bash',
+          tool_input: { command: 'netstat -ano' },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      await waitFor(() =>
+        cardEmitted.find(
+          (e) => e.type === 'permission.request' && e.payload.requestId === 'req-cards-1',
+        ),
+      );
+      await post(
+        cardPort,
+        '/resolve-permission',
+        { requestId: 'req-cards-1', decision: 'allow' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect((await held).status).toBe(200);
+      await postTool('Bash', { command: 'netstat -ano' }, { stdout: 'TCP LISTENING' });
+      expect(cards()).toHaveLength(1);
+    });
+
+    it('still caps at the phone-sized excerpt by default', async () => {
+      await postTool('Bash', { command: 'big' }, { stdout: 'x'.repeat(5000) });
+      expect(cards()[0]?.body).toContain('[truncated]');
+      expect(cards()[0]?.body.length).toBeLessThan(2000);
+    });
+  });
+
+  describe('full tool output (CCTL_TOOL_OUTPUT_FULL)', () => {
+    let fullReceiver: HookReceiver;
+    let fullPort: number;
+    let fullEmitted: EnvelopeDraft[];
+
+    beforeEach(async () => {
+      fullEmitted = [];
+      fullReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => fullEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        fullToolOutput: true,
+      });
+      fullPort = await fullReceiver.listen(0);
+    });
+
+    afterEach(async () => {
+      await fullReceiver.close();
+    });
+
+    const fullCards = () =>
+      fullEmitted.flatMap((e) =>
+        e.type === 'hook.notification' && e.payload.notificationType === 'tool_output'
+          ? [e.payload]
+          : [],
+      );
+
+    function postShell(toolResponse: unknown): Promise<RawResponse> {
+      return post(
+        fullPort,
+        '/',
+        {
+          hook_event_name: 'PostToolUse',
+          session_id: 'sess-full',
+          tool_name: 'Bash',
+          tool_input: { command: 'big' },
+          tool_response: toolResponse,
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+    }
+
+    it('ships output whole past the excerpt cap — the bot attaches what one message cannot hold', async () => {
+      await postShell({ stdout: 'x'.repeat(5000) });
+      expect(fullCards()[0]?.body).toBe('x'.repeat(5000));
+    });
+
+    it('still bounds the wire: output past the ceiling is cut with a visible marker', async () => {
+      await postShell({ stdout: 'x'.repeat(210_000) });
+      const body = fullCards()[0]?.body ?? '';
+      expect(body).toContain('[truncated]');
+      expect(body.length).toBeLessThan(210_000);
     });
   });
 

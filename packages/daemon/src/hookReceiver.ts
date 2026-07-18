@@ -58,6 +58,17 @@ export interface HookReceiverOptions {
    *  Stop/done cards and the daemon's own emits (quarantine, AskUserQuestion's question
    *  card) are not affected by this switch. */
   forwardNotificationCards?: boolean;
+  /** Push every completed shell command's output as a phone card, in every permission mode
+   *  and regardless of how the run was approved. Default ON: a remote operator cannot see
+   *  the terminal, so output visibility must not depend on the approval path — accept-edits/
+   *  plan/bypass sessions run commands too. CCTL_COMMAND_OUTPUT=off silences chatty sessions.
+   *  Non-shell tools still forward only when remotely approved (see `outputWatches`). */
+  commandOutputCards?: boolean;
+  /** Ship complete tool output instead of the phone-sized excerpt; the bot delivers anything
+   *  past one Discord message as a text-file attachment. A generous wire ceiling still
+   *  applies (OUTPUT_BODY_FULL_MAX) so a runaway command cannot push megabytes. Default OFF;
+   *  CCTL_TOOL_OUTPUT_FULL enables. */
+  fullToolOutput?: boolean;
   clock?: () => number;
   /** Called with a fully-formed envelope draft whenever a hook produces one — the daemon
    *  wires this to the control-plane client's send/outbox path. Kept synchronous-callback
@@ -170,6 +181,13 @@ const OUTPUT_WATCH_CAP = 16;
 /** Cap on the output text shipped in the card body. The bot clamps to Discord's limits again,
  *  but the wire shouldn't carry megabytes of stdout to show a phone-sized excerpt. */
 const OUTPUT_BODY_MAX = 1500;
+/** The cap when full output is requested (CCTL_TOOL_OUTPUT_FULL) — sized so a whole listing
+ *  survives to the bot's file-attachment path while still bounding what one command can push
+ *  through the wire. */
+const OUTPUT_BODY_FULL_MAX = 200_000;
+/** Tool names whose runs are shell commands — the runs whose output is pushed as a card in
+ *  every permission mode (names observed at the live boundary). */
+const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
 
 /** Tolerant body narrowing helpers — a hook payload is attacker-adjacent (it's whatever the
  *  locally-running CLI sends), so every field is checked before use rather than trusted. */
@@ -255,6 +273,8 @@ export class HookReceiver {
   private readonly logger: Logger;
   private readonly permissionHoldMs: number;
   private readonly forwardNotificationCards: boolean;
+  private readonly commandOutputCards: boolean;
+  private readonly fullToolOutput: boolean;
   private server: Server | undefined;
   /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
    *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
@@ -308,6 +328,8 @@ export class HookReceiver {
     this.logger = options.logger ?? noopLogger;
     this.permissionHoldMs = options.permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS;
     this.forwardNotificationCards = options.forwardNotificationCards ?? false;
+    this.commandOutputCards = options.commandOutputCards ?? true;
+    this.fullToolOutput = options.fullToolOutput ?? false;
   }
 
   /** Install the CLI session-command logic. Called by the daemon before `listen` (symmetric
@@ -736,12 +758,15 @@ export class HookReceiver {
   }
 
   /** PostToolUse fires after EVERY completed tool call, so this handler is observe-only and
-   *  deliberately permissive: nothing here can fail a hook (always 200), and nothing is
-   *  forwarded unless a one-shot watch — armed by a remote allow — matches this exact run.
-   *  Forwarding rides `hook.notification` with `notificationType: 'tool_output'` (the schema's
-   *  tolerant-string extension point), so no wire change: an older bot shows the generic
-   *  title/body card, which for output IS the content. This emit is daemon-originated — the
-   *  CCTL_WAITING_CARDS suppression gate only covers the CLI's Notification nags. */
+   *  deliberately permissive: nothing here can fail a hook (always 200). Two things forward:
+   *  a run matching a one-shot watch armed by a remote allow (any tool), and — unless
+   *  commandOutputCards is off — every shell command, in every permission mode: a remote
+   *  operator cannot see the terminal, so command output must not depend on how the run was
+   *  approved. Forwarding rides `hook.notification` with `notificationType: 'tool_output'`
+   *  (the schema's tolerant-string extension point), so no wire change: an older bot shows
+   *  the generic title/body card, which for output IS the content. This emit is
+   *  daemon-originated — the CCTL_WAITING_CARDS suppression gate only covers the CLI's
+   *  Notification nags. */
   private handlePostToolUse(body: Record<string, unknown>, res: ServerResponse): void {
     const sessionId = str(body.session_id) ?? str(body.sessionId);
     const tool = str(body.tool_name) ?? str(body.tool);
@@ -760,11 +785,14 @@ export class HookReceiver {
     const matchIndex = this.outputWatches.findIndex(
       (w) => w.sessionId === sessionId && w.tool === tool && w.inputKey === inputKey,
     );
-    if (matchIndex === -1) {
+    // A remotely-approved shell run matches BOTH paths; consuming the watch first keeps the
+    // one-shot bookkeeping exact and the card count at one.
+    const watched = matchIndex !== -1;
+    if (watched) this.outputWatches.splice(matchIndex, 1);
+    if (!watched && !(this.commandOutputCards && SHELL_TOOLS.has(tool))) {
       this.respond(res, 200, { ok: true });
       return;
     }
-    this.outputWatches.splice(matchIndex, 1);
     const text = toolResponseText(body.tool_response).trim();
     this.emit({
       daemonId: this.daemonId(),
@@ -773,9 +801,12 @@ export class HookReceiver {
         event: 'notification',
         sessionId,
         title: `Output — ${summarizeToolInput(toolInput) ?? tool}`,
-        // An empty result still confirms the approved tool RAN — silence here would read as
-        // the approval having vanished.
-        body: text === '' ? '(no output)' : truncate(text, OUTPUT_BODY_MAX),
+        // An empty result still confirms the tool RAN — silence here would read as the run
+        // having vanished.
+        body:
+          text === ''
+            ? '(no output)'
+            : truncate(text, this.fullToolOutput ? OUTPUT_BODY_FULL_MAX : OUTPUT_BODY_MAX),
         level: 'info',
         notificationType: 'tool_output',
       },
@@ -783,7 +814,9 @@ export class HookReceiver {
     // Size only, never content — tool output can contain anything.
     this.logger.info(
       { sessionId, tool, chars: text.length },
-      'remotely approved tool finished; output card pushed',
+      watched
+        ? 'remotely approved tool finished; output card pushed'
+        : 'shell command finished; output card pushed',
     );
     this.respond(res, 200, { ok: true });
   }
