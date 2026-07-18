@@ -256,6 +256,67 @@ describe('buildTimelineEmbed', () => {
   });
 });
 
+describe('emoji-width overflow fallback', () => {
+  // A real custom-emoji cell is a ~25-char mention (`<:name:id>`); enough of them push a
+  // field past Discord's 1024-char ceiling, and discord.js then rejects the WHOLE embed
+  // (the live failure mode: /timeline dead once emoji bars were enabled). The builders must
+  // fall back to the 1-char unicode cells instead — same information, plainer glyphs.
+  const WIDE_CELL = '<:pb_mf_g:123456789012345678>';
+  const wideBar = (): string => WIDE_CELL.repeat(12);
+  const wideTrack = {
+    session: WIDE_CELL,
+    weekly: WIDE_CELL,
+    both: WIDE_CELL,
+    track: (): string => WIDE_CELL.repeat(24),
+  };
+  const NOW = Date.parse('2026-07-16T12:00:00.000Z');
+  const accounts = [
+    account({
+      limits: [
+        { kind: 'session', percent: 42, isActive: true, resetsAt: '2026-07-16T14:00:00.000Z' },
+        { kind: 'weekly_all', percent: 30, isActive: true, resetsAt: '2026-07-17T14:00:00.000Z' },
+      ],
+    }),
+  ];
+
+  it('buildTimelineEmbed falls back to unicode when emoji cells would overflow a field', () => {
+    const embed = buildTimelineEmbed({ accounts }, NOW, wideBar, wideTrack).toJSON();
+    for (const field of embed.fields ?? []) {
+      expect(field.value.length).toBeLessThanOrEqual(1024);
+    }
+    const field = embed.fields?.find((f) => f.name.includes('Work'));
+    expect(field?.value).toContain('🟩🟩🟩🟩⬜⬜⬜⬜⬜⬜ window open');
+    expect(field?.value).not.toContain(WIDE_CELL);
+  });
+
+  it('buildUsageEmbed falls back to unicode when emoji bars would overflow a field', () => {
+    const embed = buildUsageEmbed(
+      {
+        accounts: [
+          account({
+            limits: [
+              { kind: 'session', percent: 42, isActive: true },
+              { kind: 'weekly_all', percent: 30, isActive: true },
+              { kind: 'weekly_scoped', percent: 10, isActive: true },
+            ],
+          }),
+        ],
+      },
+      NOW,
+      wideBar,
+    ).toJSON();
+    const field = embed.fields?.[0];
+    expect(field?.value.length).toBeLessThanOrEqual(1024);
+    expect(field?.value).toContain('🟩🟩🟩🟩⬜⬜⬜⬜⬜⬜ session 42%');
+    expect(field?.value).not.toContain(WIDE_CELL);
+  });
+
+  it('keeps the preferred emoji cells when the field fits', () => {
+    const embed = buildUsageEmbed({ accounts: [account()] }, NOW, wideBar).toJSON();
+    expect(embed.fields?.[0]?.value).toContain(WIDE_CELL);
+  });
+});
+
 describe('buildAccountsEmbed', () => {
   it('lists each account with its source', () => {
     const embed = buildAccountsEmbed([account({ source: 'cached' })]).toJSON();

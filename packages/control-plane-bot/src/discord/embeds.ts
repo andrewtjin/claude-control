@@ -47,6 +47,18 @@ const COLOR_INFO = 0x3498db;
 // decision explicit at the call site and leaves the functions trivially unit-testable.
 export const DEFAULT_BAR_RENDERER: BarRenderer = layeredBar;
 
+/** Render a field value with the preferred (possibly emoji) renderers, falling back to the
+ *  unicode renderers when the result would cross Discord's per-field ceiling. A custom-emoji
+ *  mention (`<:name:id>`) costs ~25 chars of that budget where a unicode cell costs 1, so an
+ *  emoji bar-plus-track field can overflow where its unicode twin fits easily — and
+ *  discord.js rejects the WHOLE message over one over-long field. Clamps as the last resort:
+ *  a plainer bar beats a dead slash command. */
+function fitFieldValue(render: (unicodeFallback: boolean) => string): string {
+  const preferred = render(false);
+  if (preferred.length <= EMBED_FIELD_VALUE_LIMIT) return preferred;
+  return truncateLabeled(render(true), EMBED_FIELD_VALUE_LIMIT);
+}
+
 /** Embed accent color for a usage snapshot: the worst severity across every limit of
  *  every account, or neutral blue when no limit data exists yet. */
 function usageColor(accounts: AccountUsage[]): number {
@@ -95,14 +107,20 @@ export function buildUsageEmbed(
     const errorLine = account.error ? `\n⚠️ ${account.error}` : '';
     embed.addFields({
       name: `${account.label} — ${marker}${cached}`,
-      value: `${formatLimits(account, nowMs, barRenderer)}${windowsLine(outlook, account.accountId)}${errorLine}`,
+      value: fitFieldValue(
+        (unicodeFallback) =>
+          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${errorLine}`,
+      ),
     });
   }
   if (usage.plan) {
     // One compact field: the reason line already carries the whole burn order (see the
     // advisor), and advisories only exist for exceptional states — no separate headings.
     const lines = [usage.plan.reason, ...usage.plan.advisories.map((a) => `• ${a.message}`)];
-    embed.addFields({ name: 'Plan', value: lines.join('\n') });
+    embed.addFields({
+      name: 'Plan',
+      value: truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT),
+    });
   }
   return embed;
 }
@@ -151,53 +169,67 @@ export function buildTimelineEmbed(
   );
 
   for (const a of outlook.accounts) {
-    const lines: string[] = [];
-    if (a.quarantined) {
-      lines.push('🚫 quarantined — re-login required');
-    } else if (a.openWindowEndsAt !== undefined) {
-      lines.push(
-        `${barRenderer(a.sessionPercent ?? 0)} window open · ${a.sessionPercent ?? 0}% used · resets ${discordRelative(a.openWindowEndsAt)}`,
-      );
-    } else {
-      lines.push('no open 5h window');
-    }
-    if (a.budget) {
-      lines.push(
-        `${a.budget.fullWindows}×5h window${a.budget.fullWindows === 1 ? '' : 's'} left` +
-          `${a.budget.hasPartialWindow ? ' +1 partial' : ''}` +
-          ` · weekly resets ${discordRelative(a.budget.weeklyResetAt)}`,
-      );
-    } else if (!a.quarantined) {
-      lines.push('weekly reset time unknown');
-    }
-    if (spanMs > 0) {
-      const events: TrackEvent[] = outlook.events
-        .filter((e) => e.accountId === a.accountId)
-        .map((e) => ({ atMs: e.atMs, kind: e.kind === 'session' ? 'session' : 'weekly' }));
-      if (events.length > 0) lines.push(trackStyle.track(events, nowMs, spanMs));
-    }
+    const accountLines = (bar: BarRenderer, style: TimelineTrackStyle): string => {
+      const lines: string[] = [];
+      if (a.quarantined) {
+        lines.push('🚫 quarantined — re-login required');
+      } else if (a.openWindowEndsAt !== undefined) {
+        lines.push(
+          `${bar(a.sessionPercent ?? 0)} window open · ${a.sessionPercent ?? 0}% used · resets ${discordRelative(a.openWindowEndsAt)}`,
+        );
+      } else {
+        lines.push('no open 5h window');
+      }
+      if (a.budget) {
+        lines.push(
+          `${a.budget.fullWindows}×5h window${a.budget.fullWindows === 1 ? '' : 's'} left` +
+            `${a.budget.hasPartialWindow ? ' +1 partial' : ''}` +
+            ` · weekly resets ${discordRelative(a.budget.weeklyResetAt)}`,
+        );
+      } else if (!a.quarantined) {
+        lines.push('weekly reset time unknown');
+      }
+      if (spanMs > 0) {
+        const events: TrackEvent[] = outlook.events
+          .filter((e) => e.accountId === a.accountId)
+          .map((e) => ({ atMs: e.atMs, kind: e.kind === 'session' ? 'session' : 'weekly' }));
+        if (events.length > 0) lines.push(style.track(events, nowMs, spanMs));
+      }
+      return lines.join('\n');
+    };
     embed.addFields({
       name: `${accountMarker(a)} ${a.label}`,
-      value: lines.join('\n'),
+      value: fitFieldValue((unicodeFallback) =>
+        unicodeFallback
+          ? accountLines(DEFAULT_BAR_RENDERER, UNICODE_TRACK_STYLE)
+          : accountLines(barRenderer, trackStyle),
+      ),
     });
   }
 
   if (outlook.events.length > 0) {
-    embed.addFields({
-      name: 'Upcoming resets',
-      value: outlook.events
+    const upcoming = (style: TimelineTrackStyle): string =>
+      outlook.events
         .map((e) => {
-          const mark = e.kind === 'session' ? trackStyle.session : trackStyle.weekly;
+          const mark = e.kind === 'session' ? style.session : style.weekly;
           return `${mark} ${discordRelative(e.atMs)} — **${e.label}** · ${describeEvent(e.kind, e.percentUsed)}`;
         })
-        .join('\n'),
+        .join('\n');
+    embed.addFields({
+      name: 'Upcoming resets',
+      value: fitFieldValue((unicodeFallback) =>
+        upcoming(unicodeFallback ? UNICODE_TRACK_STYLE : trackStyle),
+      ),
     });
   }
 
   if (usage.plan) {
     const planLines = [usage.plan.reason];
     for (const adv of usage.plan.advisories) planLines.push(`• ${adv.message}`);
-    embed.addFields({ name: 'Plan', value: planLines.join('\n') });
+    embed.addFields({
+      name: 'Plan',
+      value: truncateLabeled(planLines.join('\n'), EMBED_FIELD_VALUE_LIMIT),
+    });
   }
   return embed;
 }
