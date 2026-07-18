@@ -794,12 +794,16 @@ export class HookReceiver {
       return;
     }
     const text = toolResponseText(body.tool_response).trim();
+    // The hook's `cwd` rides along so the phone can tell WHICH window produced this output —
+    // several sessions running shell commands at once are otherwise indistinguishable.
+    const cwd = str(body.cwd);
     this.emit({
       daemonId: this.daemonId(),
       type: 'hook.notification',
       payload: {
         event: 'notification',
         sessionId,
+        ...(cwd !== undefined ? { cwd } : {}),
         title: `Output — ${summarizeToolInput(toolInput) ?? tool}`,
         // An empty result still confirms the tool RAN — silence here would read as the run
         // having vanished.

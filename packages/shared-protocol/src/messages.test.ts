@@ -92,6 +92,14 @@ describe('hook.notification widened fields', () => {
     }
   });
 
+  it('carries cwd so the bot can tag which window a notification came from', () => {
+    const result = decode(rawFrame('hook.notification', { ...base, cwd: 'C:\\repos\\proj' }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'hook.notification')) {
+      expect(result.envelope.payload.cwd).toBe('C:\\repos\\proj');
+    }
+  });
+
   it('accepts an unknown notificationType string — bot falls back, wire never rejects', () => {
     const result = decode(
       rawFrame('hook.notification', { ...base, notificationType: 'brand_new_kind' }),

@@ -162,9 +162,10 @@ const PermissionRequestPayload = z.object({
   /** The session's Claude Code permission mode (hook field `permission_mode`), e.g.
    *  'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'. A tolerant string, not an
    *  enum: Claude ships new modes without notice, and rejecting the whole frame over an
-   *  unknown mode would blind the phone to a real request. The bot's contract:
-   *  approve/deny buttons ONLY when this is exactly 'default'; absent or unrecognized
-   *  modes get an informational card — fail-safe, never a button that lies. */
+   *  unknown mode would blind the phone to a real request. Display context only: the card
+   *  keeps its Approve/Deny buttons in every mode — a request only exists while the CLI is
+   *  actually blocking on a prompt — so the bot shows the mode on the card instead of
+   *  gating the controls on it. */
   permissionMode: z.string().min(1).nullish(),
 });
 
@@ -247,6 +248,12 @@ const SessionStatusPayload = z.object({
 const HookNotificationPayload = z.object({
   event: z.enum(['permission', 'stop', 'notification']),
   sessionId: SessionId.nullish(),
+  /** The session's working directory, when the hook reported one. Several CLI windows can
+   *  notify at once and their cards are otherwise indistinguishable, so the bot renders the
+   *  directory's basename (with a sessionId prefix) as the card's origin tag. Additive +
+   *  tolerant like `notificationType`: an older daemon omits it and the card simply loses
+   *  the folder half of its tag. */
+  cwd: z.string().nullish(),
   title: z.string(),
   body: z.string(),
   level: z.enum(['info', 'warn', 'success']).default('info'),

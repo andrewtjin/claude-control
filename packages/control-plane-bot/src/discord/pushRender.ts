@@ -104,7 +104,7 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush {
       // never eat the closing fence and leave the block unterminated. Embedded ``` sequences
       // are defused with a zero-width space — output text must not be able to terminate its
       // own fence.
-      const header = `**${p.title}**\n`;
+      const header = `**${p.title}**${sessionTag(p)}\n`;
       const fenceOverhead = '```\n\n```'.length;
       const zeroWidthSpace = String.fromCharCode(0x200b);
       const safeBody = p.body.replaceAll('```', '`' + zeroWidthSpace + '``');
@@ -140,4 +140,22 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush {
     default:
       return { content: `**${p.title}**\n${p.body}` };
   }
+}
+
+/** " · <folder> · <session prefix>" appended to an output card's header. Several CLI windows
+ *  can stream shell output at once, and untagged cards are indistinguishable on a phone: the
+ *  working directory's basename is the human-meaningful origin, and the session-id prefix
+ *  splits two windows running in the same directory. Either part may be absent (older daemon,
+ *  internal sender) — the tag shrinks instead of guessing, down to nothing. */
+function sessionTag(p: PayloadOf<'hook.notification'>): string {
+  // Hooks report native paths — split on both separators so Windows and POSIX paths both
+  // yield a basename, and drop empty segments so a trailing separator can't blank the folder.
+  const folder = p.cwd
+    ?.split(/[\\/]/)
+    .filter((segment) => segment !== '')
+    .pop();
+  const parts = [folder, p.sessionId?.slice(0, 8)].filter(
+    (part): part is string => part !== undefined && part !== '',
+  );
+  return parts.length === 0 ? '' : ` · ${parts.join(' · ')}`;
 }

@@ -397,6 +397,7 @@ describe('HookReceiver', () => {
       tool: string,
       toolInput: Record<string, unknown>,
       toolResponse: unknown,
+      cwd?: string,
     ): Promise<RawResponse> {
       return post(
         cardPort,
@@ -407,6 +408,7 @@ describe('HookReceiver', () => {
           tool_name: tool,
           tool_input: toolInput,
           tool_response: toolResponse,
+          ...(cwd !== undefined ? { cwd } : {}),
         },
         { 'x-claude-control-secret': SECRET },
       );
@@ -440,6 +442,15 @@ describe('HookReceiver', () => {
     it('never forwards a non-shell tool without a watch', async () => {
       await postTool('Read', { file_path: 'C:/x.txt' }, 'file contents');
       expect(cards()).toHaveLength(0);
+    });
+
+    it("relays the hook's cwd so the phone can tell which window produced the output", async () => {
+      await postTool('Bash', { command: 'pwd' }, { stdout: '/x' }, 'C:\\repos\\proj');
+      await postTool('Bash', { command: 'pwd' }, { stdout: '/x' });
+      const seen = cards();
+      // A hook that reports no cwd still forwards — the card just loses the folder tag.
+      expect(seen[0]?.cwd).toBe('C:\\repos\\proj');
+      expect(seen[1]?.cwd ?? undefined).toBeUndefined();
     });
 
     it('a remotely approved shell run yields exactly ONE card (watch and command card never double up)', async () => {

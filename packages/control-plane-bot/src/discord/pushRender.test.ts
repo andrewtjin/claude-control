@@ -114,11 +114,60 @@ describe('renderPush — lifecycle notification cards', () => {
       }),
     );
     expect(push?.embeds).toBeUndefined();
+    // The header carries the session prefix so concurrent windows stay distinguishable.
     expect(push?.content).toBe(
-      '**Output — netstat -ano**\n```\nTCP 127.0.0.1:5433 LISTENING 41184\n```',
+      '**Output — netstat -ano** · s1\n```\nTCP 127.0.0.1:5433 LISTENING 41184\n```',
     );
     // Fits in one message — no attachment needed.
     expect(push?.files).toBeUndefined();
+  });
+
+  it('tool_output tags the header with the working directory and session prefix', () => {
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        sessionId: '3b35a35f-7f34-46ca-95a0-90258b142eb0',
+        cwd: 'C:\\repos\\claude-control-wt-remote',
+        title: 'Output — netstat -ano',
+        body: 'TCP LISTENING',
+        level: 'info',
+        notificationType: 'tool_output',
+      }),
+    );
+    // Folder basename + an 8-char session prefix: enough to tell windows apart at a glance.
+    expect(
+      push?.content?.startsWith(
+        '**Output — netstat -ano** · claude-control-wt-remote · 3b35a35f\n',
+      ),
+    ).toBe(true);
+  });
+
+  it('tool_output derives the folder from POSIX paths too, ignoring a trailing slash', () => {
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        sessionId: 'abcd1234-9999',
+        cwd: '/home/andrew/proj/',
+        title: 'Output — ls',
+        body: 'files',
+        level: 'info',
+        notificationType: 'tool_output',
+      }),
+    );
+    expect(push?.content?.startsWith('**Output — ls** · proj · abcd1234\n')).toBe(true);
+  });
+
+  it('tool_output with no session identity keeps a plain untagged header', () => {
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        title: 'Output — x',
+        body: 'y',
+        level: 'info',
+        notificationType: 'tool_output',
+      }),
+    );
+    expect(push?.content).toBe('**Output — x**\n```\ny\n```');
   });
 
   it('tool_output clamps long output without breaking the fence, and attaches the full text', () => {
