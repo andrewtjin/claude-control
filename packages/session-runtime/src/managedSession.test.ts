@@ -96,6 +96,39 @@ describe('startManagedSession', () => {
     ]);
   });
 
+  it('keeps a multi-line turn summary whole — one summary event, no lines stranded as output', async () => {
+    const { client } = fakeClient([
+      [{ type: 'turn_result', ok: true, summary: 'My cwd is:\nC:\\repos\\proj\nAll good.' }],
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    const events = collectEvents(handle);
+    await tick();
+
+    // Exactly one summary carrying every line — re-classifying per line would keep only the
+    // "Session complete:" head and demote the rest to transcript-only output.
+    expect(events).toEqual([
+      { kind: 'summary', text: 'Session complete: My cwd is:\nC:\\repos\\proj\nAll good.' },
+      { kind: 'status', state: 'waiting_input' },
+    ]);
+  });
+
+  it('keeps a multi-line tool failure whole in its milestone', async () => {
+    const { client } = fakeClient([
+      [
+        { type: 'tool_result', name: 'Bash', ok: false, text: 'exit 1\nstderr says no' },
+        { type: 'turn_result', ok: true, summary: 'done' },
+      ],
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(events[0]).toEqual({
+      kind: 'milestone',
+      text: 'Tool result: Bash failed: exit 1\nstderr says no',
+    });
+  });
+
   it('captures the resume session id from session_init and threads it into the next query', async () => {
     const { client, calls } = fakeClient([
       [

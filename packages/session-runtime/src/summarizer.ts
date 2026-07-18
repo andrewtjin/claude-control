@@ -1,7 +1,8 @@
-// Pure text -> SessionEvent classification, shared by both backends. managedSession turns
-// each Agent SDK message into one or more plain-text lines first (see agentEventToLines in
-// managedSession.ts); observedSession feeds raw ConPTY output straight in. Routing both
-// through the same classifier means "what counts as a milestone" is defined exactly once.
+// Pure text -> SessionEvent classification, shared by both backends. managedSession feeds
+// assistant prose through it (its structured SDK events already know their kind and emit
+// directly — see agentEventToDisplay in managedSession.ts); observedSession feeds raw ConPTY
+// output straight in. Routing all free-form text through the same classifier means "what
+// counts as a milestone" is defined exactly once.
 //
 // Every function here is pure (no IO, no mutable module state) so the heuristics can be
 // exhaustively table-tested without faking a session, a process, or a clock.
@@ -81,10 +82,11 @@ export function collapseRepeats(lines: string[]): string[] {
 // Line classification
 // ---------------------------------------------------------------------------
 
-// Lines managedSession itself emits (see agentEventToLines) use these fixed prefixes, so
-// they classify deterministically rather than by fuzzy content matching. Observed-terminal
-// output obviously won't use these prefixes, which is fine — it falls through to the
-// generic heuristics below.
+// managedSession's structured events use these fixed prefixes (see agentEventToDisplay) and
+// emit their display events directly; the patterns stay here so the SAME phrases classify
+// deterministically when they arrive as free-form text (an observed terminal echoing a
+// transcript, assistant prose quoting a milestone) rather than by fuzzy content matching.
+// Output that never uses them falls through to the generic heuristics below.
 const TOOL_PREFIX_PATTERN = /^Tool: /;
 const TOOL_RESULT_PREFIX_PATTERN = /^Tool result: /;
 const PERMISSION_PREFIX_PATTERN = /^Permission required: /;

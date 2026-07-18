@@ -489,6 +489,116 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('managed-session hook suppression', () => {
+    // A managed session already reaches the phone as session.status/session.output (live
+    // card, milestone lines, summary card) — its own hooks reporting the same turn would say
+    // everything twice. Permission requests are NOT suppressed: they hold a decision channel
+    // no other surface provides.
+    let mgReceiver: HookReceiver;
+    let mgPort: number;
+    let mgEmitted: EnvelopeDraft[];
+
+    beforeEach(async () => {
+      mgEmitted = [];
+      mgReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => mgEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        permissionHoldMs: 3000,
+        isManagedSession: (sessionId) => sessionId === 'sess-managed',
+      });
+      mgPort = await mgReceiver.listen(0);
+    });
+
+    afterEach(async () => {
+      await mgReceiver.close();
+    });
+
+    const mgCards = () =>
+      mgEmitted.flatMap((e) =>
+        e.type === 'hook.notification' && e.payload.notificationType === 'tool_output'
+          ? [e.payload]
+          : [],
+      );
+
+    function mgPostTool(sessionId: string): Promise<RawResponse> {
+      return post(
+        mgPort,
+        '/',
+        {
+          hook_event_name: 'PostToolUse',
+          session_id: sessionId,
+          tool_name: 'Bash',
+          tool_input: { command: 'netstat -ano' },
+          tool_response: { stdout: 'TCP LISTENING' },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+    }
+
+    it("suppresses a managed session's Stop — the summary card already reports it", async () => {
+      const res = await post(
+        mgPort,
+        '/',
+        { event: 'Stop', session_id: 'sess-managed', last_assistant_message: 'done' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      // Suppression is a display choice, never a hook failure.
+      expect(res.status).toBe(200);
+      expect(mgEmitted).toHaveLength(0);
+    });
+
+    it('still forwards Stop from an interactive CLI window', async () => {
+      await post(
+        mgPort,
+        '/',
+        { event: 'Stop', session_id: 'sess-window' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(mgEmitted.filter((e) => e.type === 'hook.notification')).toHaveLength(1);
+    });
+
+    it('suppresses blanket shell output cards for a managed session, not for a window', async () => {
+      await mgPostTool('sess-managed');
+      expect(mgCards()).toHaveLength(0);
+      await mgPostTool('sess-window');
+      expect(mgCards()).toHaveLength(1);
+    });
+
+    it('a remote-approve watch still forwards the managed run the operator asked to see', async () => {
+      // The permission.request itself must ALSO survive suppression — it is the decision
+      // channel, and this hold-and-approve round-trip proves it end to end.
+      const held = post(
+        mgPort,
+        '/',
+        {
+          event: 'PermissionRequest',
+          requestId: 'req-mg-1',
+          session_id: 'sess-managed',
+          tool_name: 'Bash',
+          tool_input: { command: 'netstat -ano' },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      await waitFor(() =>
+        mgEmitted.find(
+          (e) => e.type === 'permission.request' && e.payload.requestId === 'req-mg-1',
+        ),
+      );
+      await post(
+        mgPort,
+        '/resolve-permission',
+        { requestId: 'req-mg-1', decision: 'allow' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect((await held).status).toBe(200);
+      await mgPostTool('sess-managed');
+      expect(mgCards()).toHaveLength(1);
+    });
+  });
+
   describe('full tool output (CCTL_TOOL_OUTPUT_FULL)', () => {
     let fullReceiver: HookReceiver;
     let fullPort: number;

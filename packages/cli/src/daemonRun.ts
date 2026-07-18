@@ -224,6 +224,10 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     forwardNotificationCards: config.values.waitingCards,
     commandOutputCards: config.values.commandOutputCards,
     fullToolOutput: config.values.fullToolOutput,
+    // A managed session is recognized by either its record id or the SDK session id its hooks
+    // report (persisted as the record's resume anchor on session_init).
+    isManagedSession: (sessionId) =>
+      sessionManager.list().some((r) => r.id === sessionId || r.resumeId === sessionId),
     ...(config.values.permissionHoldMs !== undefined
       ? { permissionHoldMs: config.values.permissionHoldMs }
       : {}),

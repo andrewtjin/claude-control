@@ -85,27 +85,36 @@ export interface ManagedSessionOptions {
   onSessionId?: (sdkSessionId: string) => void;
 }
 
-/** Turn a possibly-multi-block SDK event into plain-text lines the shared summarizer can
- *  classify. Kept as fixed, greppable prefixes ("Tool: ", "Session complete: ", …) so
- *  classifyLine can match them exactly instead of guessing from prose. */
-function agentEventToText(event: AgentSdkEvent): string | undefined {
+/** Map a structured SDK event straight to its display event. The kind is already known here,
+ *  so routing through the line classifier would be a lossy detour: it splits on newlines and
+ *  re-guesses each line, stranding every line after the first in the transcript (a multi-line
+ *  turn summary kept only its "Session complete:" head). Assistant prose is the one genuinely
+ *  unstructured event — it stays on the shared classifier (see handleEvent). The fixed
+ *  prefixes ("Tool: ", "Session complete: ", …) match what classifyLine recognizes, so
+ *  managed sessions and observed-terminal output still speak one vocabulary. */
+function agentEventToDisplay(event: AgentSdkEvent): SessionEvent | undefined {
   switch (event.type) {
     case 'session_init':
-      return undefined; // internal bookkeeping only, nothing worth surfacing to a phone
     case 'assistant_text':
-      return event.text;
+      return undefined; // init is internal bookkeeping; prose goes through the classifier
     case 'tool_use':
-      return `Tool: ${event.name}`;
+      return { kind: 'milestone', text: `Tool: ${event.name}` };
     case 'tool_result':
-      return event.ok
-        ? `Tool result: ${event.name} ok`
-        : `Tool result: ${event.name} failed${event.text ? `: ${event.text}` : ''}`;
+      return {
+        kind: 'milestone',
+        text: event.ok
+          ? `Tool result: ${event.name} ok`
+          : `Tool result: ${event.name} failed${event.text ? `: ${event.text}` : ''}`,
+      };
     case 'permission_required':
-      return `Permission required: ${event.tool} - ${event.summary}`;
+      return { kind: 'milestone', text: `Permission required: ${event.tool} - ${event.summary}` };
     case 'turn_result':
-      return event.ok ? `Session complete: ${event.summary}` : `Session failed: ${event.summary}`;
+      return {
+        kind: 'summary',
+        text: event.ok ? `Session complete: ${event.summary}` : `Session failed: ${event.summary}`,
+      };
     case 'error':
-      return `Error: ${event.message}`;
+      return { kind: 'error', text: `Error: ${event.message}` };
   }
 }
 
@@ -164,8 +173,12 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       return;
     }
 
-    const text = agentEventToText(event);
-    if (text !== undefined) emitText(text);
+    if (event.type === 'assistant_text') {
+      emitText(event.text);
+    } else {
+      const display = agentEventToDisplay(event);
+      if (display !== undefined) emit(display);
+    }
 
     switch (event.type) {
       case 'assistant_text':

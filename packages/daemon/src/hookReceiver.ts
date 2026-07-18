@@ -69,6 +69,14 @@ export interface HookReceiverOptions {
    *  applies (OUTPUT_BODY_FULL_MAX) so a runaway command cannot push megabytes. Default OFF;
    *  CCTL_TOOL_OUTPUT_FULL enables. */
   fullToolOutput?: boolean;
+  /** Answers "does this hook session_id belong to a session this daemon manages?" A managed
+   *  session already reaches the phone through session.status/session.output (live card,
+   *  milestone lines, summary card), so its hook-driven cards — the per-turn Stop card,
+   *  waiting nags, blanket shell output cards — would say everything twice. Permission
+   *  requests are NEVER suppressed by this: they hold a decision channel no other surface
+   *  provides, and an explicitly-armed output watch still forwards. Default: nothing is
+   *  managed (interactive CLI windows keep every card). */
+  isManagedSession?: (sessionId: string) => boolean;
   clock?: () => number;
   /** Called with a fully-formed envelope draft whenever a hook produces one — the daemon
    *  wires this to the control-plane client's send/outbox path. Kept synchronous-callback
@@ -275,6 +283,7 @@ export class HookReceiver {
   private readonly forwardNotificationCards: boolean;
   private readonly commandOutputCards: boolean;
   private readonly fullToolOutput: boolean;
+  private readonly isManagedSession: (sessionId: string) => boolean;
   private server: Server | undefined;
   /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
    *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
@@ -330,6 +339,7 @@ export class HookReceiver {
     this.forwardNotificationCards = options.forwardNotificationCards ?? false;
     this.commandOutputCards = options.commandOutputCards ?? true;
     this.fullToolOutput = options.fullToolOutput ?? false;
+    this.isManagedSession = options.isManagedSession ?? (() => false);
   }
 
   /** Install the CLI session-command logic. Called by the daemon before `listen` (symmetric
@@ -789,7 +799,13 @@ export class HookReceiver {
     // one-shot bookkeeping exact and the card count at one.
     const watched = matchIndex !== -1;
     if (watched) this.outputWatches.splice(matchIndex, 1);
-    if (!watched && !(this.commandOutputCards && SHELL_TOOLS.has(tool))) {
+    // An explicitly-armed watch always forwards — the operator tapped Approve and asked to
+    // see the result. Blanket shell cards skip managed sessions: their output already streams
+    // into the session thread, so a DM card would show the same run twice.
+    if (
+      !watched &&
+      !(this.commandOutputCards && SHELL_TOOLS.has(tool) && !this.isManagedSession(sessionId))
+    ) {
       this.respond(res, 200, { ok: true });
       return;
     }
@@ -831,6 +847,15 @@ export class HookReceiver {
     event: 'stop' | 'notification',
   ): void {
     const sessionId = str(body.session_id) ?? str(body.sessionId);
+    // A managed session's lifecycle already reaches the phone as session.status/session.output
+    // (live card, milestone lines, summary card) — its own Stop/Notification hooks reporting
+    // the same turn would say everything twice. Suppression is a display choice: the hook
+    // still gets its 200.
+    if (sessionId !== undefined && this.isManagedSession(sessionId)) {
+      this.logger.info({ event, sessionId }, 'hook event from a managed session suppressed');
+      this.respond(res, 200, { ok: true });
+      return;
+    }
     // Notification events are the CLI mirroring its terminal nags ("Claude is waiting for your
     // input", "Claude needs your permission") — with real permission/done cards in place they
     // are duplicate noise, so forwarding them is opt-in.
