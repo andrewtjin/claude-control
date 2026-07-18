@@ -228,8 +228,8 @@ describe('HookReceiver', () => {
   });
 
   describe('Notification suppression (default: waiting cards off)', () => {
-    // Wet finding (gate 5): the CLI's Notification nags ("Claude is waiting for your input")
-    // duplicate the real permission/done cards, so forwarding them is opt-in.
+    // The CLI's Notification nags ("Claude is waiting for your input") duplicate the real
+    // permission/done cards, so forwarding them is opt-in.
     let quietReceiver: HookReceiver;
     let quietPort: number;
     let quietEmitted: EnvelopeDraft[];
@@ -363,7 +363,7 @@ describe('HookReceiver', () => {
     });
   });
 
-  // The CLI's REAL hook payload contract (wet-confirmed 2026-07-17): snake_case field names
+  // The CLI's REAL hook payload contract: snake_case field names
   // (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `message`) and NO requestId.
   // The camelCase bodies used elsewhere in this file remain supported as internal aliases.
   describe('real CLI payload shape (snake_case)', () => {
@@ -443,12 +443,14 @@ describe('HookReceiver', () => {
       expect(resolved.status).toBe(200);
 
       // The held curl response IS the hook's stdout — the CLI decision schema comes back.
+      // Allow echoes the ORIGINAL tool_input as updatedInput (the contract runs the tool
+      // with updatedInput; omitting it risks an empty-input run).
       const hookRes = await held;
       expect(hookRes.status).toBe(200);
       expect(hookRes.body).toEqual({
         hookSpecificOutput: {
           hookEventName: 'PermissionRequest',
-          decision: { behavior: 'allow' },
+          decision: { behavior: 'allow', updatedInput: { command: 'echo hello' } },
         },
       });
       expect(store.getPendingPermission(requestId)?.resolvedDecision).toBe('allow');

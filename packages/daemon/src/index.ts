@@ -42,6 +42,7 @@ export { AttributionJournal, type AttributionJournalOptions } from './attributio
 export {
   HookReceiver,
   DEFAULT_HOOK_EVENT_NAMES,
+  DEFAULT_PERMISSION_HOLD_MS,
   DEFAULT_SECRET_HEADER,
   type HookEventNames,
   type HookReceiverOptions,

@@ -667,10 +667,16 @@ export class DiscordJsGateway implements DiscordGateway {
         await interaction.reply({ content: `Error: ${outcome.reason}`, ephemeral: true });
         return;
       case 'confirm':
-      case 'restore':
-        // First tap of a destructive action (confirm) or a Cancel/expired one (restore): swap the
-        // message's button row in place — no command is sent either way.
+        // First tap of a destructive action: swap in Confirm/Cancel — the new buttons ARE the
+        // feedback, no extra message needed.
         await interaction.update({ components: this.toRows(outcome.rows) });
+        return;
+      case 'restore':
+        // A restore visibly undoes the row with no other signal — say WHY, ephemerally: an
+        // expired Confirm silently resetting to the original buttons reads as a bug, not a
+        // timeout. Ephemeral keeps it feedback for the tapper, not card clutter.
+        await interaction.update({ components: this.toRows(outcome.rows) });
+        await interaction.followUp({ content: outcome.note, ephemeral: true });
         return;
       case 'execute':
         await this.executeButton(interaction, userId, outcome);

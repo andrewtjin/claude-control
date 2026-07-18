@@ -1,20 +1,19 @@
 // Loopback HTTP server that receives Claude Code CLI hook events (PermissionRequest, Stop,
 // Notification) and turns them into protocol envelopes for the control-plane client to send.
 //
-// SECURITY CONTRACT (bot security review, finding #4): the bot deliberately does not
+// SECURITY CONTRACT: the bot deliberately does not
 // correlate `permission.response` messages against anything — it just relays what the phone
 // says. That means THIS process is the only thing standing between "a stale/forged/duplicate
 // approval" and "a tool actually running". `resolvePermission` therefore rejects any
 // requestId that is not a currently-pending row: unknown, already-resolved, or expired. An
 // unsolicited or replayed approval must never be applied.
 //
-// WET-GATED: the exact hook event names/payload shapes the installed CLI POSTs are
-// reverse-engineered (see docs/VERIFICATION.md) — hence `eventNames` below is configurable
-// rather than hardcoded, and the request body is parsed tolerantly. Wet finding 2026-07-17:
-// the CLI's hook payload is snake_case (`hook_event_name`, `session_id`, `tool_name`,
-// `tool_input`, `message`), so every field below reads snake_case FIRST with the original
-// camelCase guesses kept as fallbacks (unit tests and any internal senders use them).
-// Second wet finding: the CLI never sends a `requestId` — the daemon mints one, because the
+// The exact hook event names/payload shapes the installed CLI POSTs are reverse-engineered
+// (see docs/VERIFICATION.md) — hence `eventNames` below is configurable rather than
+// hardcoded, and the request body is parsed tolerantly. The CLI's hook payload is snake_case
+// (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `message`), so every field
+// below reads snake_case FIRST with camelCase fallbacks (unit tests and any internal senders
+// use them). The CLI never sends a `requestId` — the daemon mints one, because the
 // requestId's real job is correlating OUR pending-permission row with the phone's response,
 // not echoing anything the CLI knows about.
 
@@ -51,10 +50,10 @@ export interface HookReceiverOptions {
    *  neutral answer lets the local prompt take over. See DEFAULT_PERMISSION_HOLD_MS. */
   permissionHoldMs?: number;
   /** Forward the CLI's `Notification` hook events ("Claude is waiting for your input",
-   *  "Claude needs your permission") as phone cards. Default OFF (wet finding, gate 5
-   *  2026-07-17: they duplicate the real permission/done cards and read as nag noise) —
-   *  opt back in with CCTL_WAITING_CARDS. Stop/done cards and the daemon's own emits
-   *  (quarantine, AskUserQuestion's question card) are not affected by this switch. */
+   *  "Claude needs your permission") as phone cards. Default OFF — they duplicate the real
+   *  permission/done cards and read as nag noise; opt back in with CCTL_WAITING_CARDS.
+   *  Stop/done cards and the daemon's own emits (quarantine, AskUserQuestion's question
+   *  card) are not affected by this switch. */
   forwardNotificationCards?: boolean;
   clock?: () => number;
   /** Called with a fully-formed envelope draft whenever a hook produces one — the daemon
@@ -64,7 +63,7 @@ export interface HookReceiverOptions {
   /** `daemonId` is a routing field on every envelope this receiver emits (see stamp()) — the
    *  daemon's own adopted identity, not something a hook payload could ever supply. */
   daemonId: () => string;
-  /** Observability for the wet gates and live debugging: every inbound POST's outcome
+  /** Observability for live debugging: every inbound POST's outcome
    *  (accepted event, unrecognized event name, auth failure, parse failure) is logged, because
    *  the curl hooks fail SILENTLY on the CLI side — this log is the only place a broken hook
    *  loop is visible at all. Defaults to no-op for unit tests. */
@@ -90,7 +89,7 @@ export interface ResolvePermissionResult {
 
 /** Fields every mutating CLI command carries: the interactive session it targets, and an
  *  idempotency key so a re-sent request (a network retry, a double-invoked slash command)
- *  resolves to "already handled" instead of applying twice (plan §4 non-negotiable). */
+ *  resolves to "already handled" instead of applying twice. */
 export interface SessionCommandBase {
   sessionId: string;
   idempotencyKey: string;
@@ -146,13 +145,16 @@ const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
  *  we answer neutrally and let the CLI's local prompt take over. The CLI kills a command hook
  *  after 600s by default (docs: settings.json hook `timeout`, seconds) — the 30s margin keeps
  *  US in control of the lapse (a clean neutral response + honest late-tap rejection) instead
- *  of curl dying and leaving the pending row silently resolvable. */
-const DEFAULT_PERMISSION_HOLD_MS = 570_000;
+ *  of curl dying and leaving the pending row silently resolvable. Tunable via
+ *  CCTL_PERMISSION_HOLD_MS: the hook contract offers exactly ONE decision channel, so while
+ *  the hold is open the terminal cannot prompt — a shorter hold trades remote decision time
+ *  for a faster local-prompt fallback when the operator is at the keyboard. */
+export const DEFAULT_PERMISSION_HOLD_MS = 570_000;
 
 /** Tools whose "permission" is really an interactive terminal exchange, not a remote-decidable
- *  yes/no. Holding these would freeze the terminal UI they need (wet finding 2026-07-17: an
- *  AskUserQuestion approve/deny card is nonsense — the phone can't answer the question), so
- *  they get a "waiting on you" notification instead of a permission card, and no hold. */
+ *  yes/no. Holding these would freeze the terminal UI they need, and an approve/deny card is
+ *  nonsense for a question the phone can't answer — so they get a "waiting on you"
+ *  notification instead of a permission card, and no hold. */
 const INTERACTIVE_PROMPT_TOOLS = new Set(['AskUserQuestion']);
 
 /** Tolerant body narrowing helpers — a hook payload is attacker-adjacent (it's whatever the
@@ -207,10 +209,18 @@ export class HookReceiver {
   private cliHandlers: HookReceiverCliHandlers | undefined;
   /** Permission hook responses currently held open awaiting a phone decision, keyed by the
    *  requestId we minted. `event` echoes the exact hook event name the CLI fired — the
-   *  decision output must name it back (`hookSpecificOutput.hookEventName`). */
+   *  decision output must name it back (`hookSpecificOutput.hookEventName`). `toolInput` is
+   *  the CLI's original `tool_input`, echoed back as `updatedInput` on allow: the SDK's
+   *  permission contract runs the tool with `updatedInput`, and an allow without it risks
+   *  the tool running on empty input. */
   private readonly heldPermissions = new Map<
     string,
-    { res: ServerResponse; timer: NodeJS.Timeout; event: string }
+    {
+      res: ServerResponse;
+      timer: NodeJS.Timeout;
+      event: string;
+      toolInput?: Record<string, unknown>;
+    }
   >();
   /** requestIds whose hold ended WITHOUT a decision (lapse, dead socket, shutdown). Once the
    *  local prompt has taken over, a late phone tap must be rejected honestly — resolving the
@@ -316,12 +326,18 @@ export class HookReceiver {
     if (!held) return;
     clearTimeout(held.timer);
     this.heldPermissions.delete(requestId);
+    // Allow echoes the ORIGINAL tool_input as updatedInput — the permission contract runs
+    // the tool with updatedInput, so omitting it risks an empty-input run. We never modify
+    // the input, only echo it.
     this.respond(held.res, 200, {
       hookSpecificOutput: {
         hookEventName: held.event,
         decision:
           decision === 'allow'
-            ? { behavior: 'allow' }
+            ? {
+                behavior: 'allow',
+                ...(held.toolInput !== undefined ? { updatedInput: held.toolInput } : {}),
+              }
             : { behavior: 'deny', message: 'denied by remote operator' },
       },
     });
@@ -479,15 +495,15 @@ export class HookReceiver {
       this.logger.info({ requestId, decision }, 'pending permission resolved');
     } else {
       // Not a daemon error — the security contract rejecting a stale/duplicate/expired
-      // resolve. Logged so a wet run can tell "guard working" from "resolve never arrived".
+      // resolve. Logged so an operator can tell "guard working" from "resolve never arrived".
       this.logger.warn({ requestId, decision, error: result.error }, 'permission resolve rejected');
     }
     this.respond(res, result.ok ? 200 : 409, result);
   }
 
   private handleHookEvent(body: Record<string, unknown>, res: ServerResponse): void {
-    // `hook_event_name` is the CLI's real field (wet-confirmed 2026-07-17); the camelCase
-    // names are our original guesses, kept for internal senders and existing tests.
+    // `hook_event_name` is the CLI's real field; the camelCase names are aliases kept for
+    // internal senders and existing tests.
     const event = str(body.hook_event_name) ?? str(body.event) ?? str(body.hookEventName);
     if (event === undefined) {
       // Keys only, never values — enough to diagnose a contract drift without logging content.
@@ -508,8 +524,8 @@ export class HookReceiver {
       this.handleStopOrNotification(body, res, 'notification');
       return;
     }
-    // THE wet-gate evidence line: whatever event name the CLI really fires at permission time
-    // (PermissionRequest vs PreToolUse is the open question) shows up here by name.
+    // Whatever event name the CLI fires that we don't handle shows up here by name, so a
+    // contract drift is visible in the log instead of silently dropped.
     this.logger.warn(
       { event, sessionId: str(body.session_id) ?? str(body.sessionId) },
       'hook POST with unrecognized event name — not one of the three we handle',
@@ -569,10 +585,10 @@ export class HookReceiver {
       str(body.detail) ??
       (toolInput !== undefined ? truncate(JSON.stringify(toolInput, null, 2), 2000) : undefined);
     const cwd = str(body.cwd);
-    // The CLI's PreToolUse hook payload carries `permission_mode` (snake_case per Claude Code's
-    // hook contract; we also accept camelCase defensively). Parsed tolerantly — any string
+    // The hook payload carries `permission_mode` (snake_case per Claude Code's hook
+    // contract; we also accept camelCase defensively). Parsed tolerantly — any string
     // passes through untouched — because the bot, not the daemon, decides what a mode MEANS
-    // (plan §4: approve/deny buttons only when this is exactly 'default'). Threading it is
+    // (approve/deny buttons only when this is exactly 'default'). Threading it is
     // non-negotiable for a mode-aware card; a missing/unknown mode simply omits the field and
     // the bot falls back to an informational card — it never changes the permission SEMANTICS
     // here (the security contract on resolvePermission is untouched).
@@ -609,7 +625,12 @@ export class HookReceiver {
     // hook timeout (600s default) outlasts our hold window — see DEFAULT_PERMISSION_HOLD_MS.
     const timer = setTimeout(() => this.lapseHeldPermission(requestId), this.permissionHoldMs);
     timer.unref();
-    this.heldPermissions.set(requestId, { res, timer, event });
+    this.heldPermissions.set(requestId, {
+      res,
+      timer,
+      event,
+      ...(toolInput !== undefined ? { toolInput } : {}),
+    });
     res.on('close', () => {
       // Fires on our own completion too — only a request STILL in the map is an abandoned
       // socket (curl killed, session ended, CLI-side timeout beating ours).
@@ -634,7 +655,7 @@ export class HookReceiver {
     const sessionId = str(body.session_id) ?? str(body.sessionId);
     // Notification events are the CLI mirroring its terminal nags ("Claude is waiting for your
     // input", "Claude needs your permission") — with real permission/done cards in place they
-    // are duplicate noise, so forwarding them is opt-in (wet finding, gate 5 2026-07-17).
+    // are duplicate noise, so forwarding them is opt-in.
     // The hook is still answered 200: suppression is a display choice, never a hook failure.
     if (event === 'notification' && !this.forwardNotificationCards) {
       this.logger.info(
@@ -645,7 +666,7 @@ export class HookReceiver {
       return;
     }
     // Two optional discriminators from the CLI hook payload, threaded through so the bot can
-    // render rich done/waiting cards (plan §4). Both parsed tolerantly (snake_case primary,
+    // render rich done/waiting cards. Both parsed tolerantly (snake_case primary,
     // camelCase accepted): unknown values pass through unchanged and the bot falls back to the
     // generic card rather than the frame being rejected.
     //   - Notification events carry `notification_type` (e.g. 'idle_prompt' → the "waiting on

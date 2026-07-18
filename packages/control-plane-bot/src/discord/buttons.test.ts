@@ -118,10 +118,13 @@ describe('resolveTap — two-tap state machine', () => {
       action: 'stop',
       id: 'sess-1',
     });
+    // The note names the window so the reset teaches the mechanic — a silent revert reads
+    // as a bug. The gateway surfaces it as an ephemeral follow-up.
+    expect(out.note).toBe('Expired; confirm within 30s. Tap again to retry.');
   });
 
   it('a Cancel on a permission-card deny restores the FULL Approve/Deny/Deny (session) row', () => {
-    // Wet finding (gate 5.4): restoring only the armed deny button ate Approve/Deny for good.
+    // Restoring only the armed deny button would lose Approve/Deny for good.
     const id = encodeButton({
       action: 'deny',
       phase: 'cancel',

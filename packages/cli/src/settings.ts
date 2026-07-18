@@ -25,7 +25,7 @@ import {
   defaultPaths,
   type Paths,
 } from '@claude-control/switch-engine';
-import { DEFAULT_AUTOSWITCH_COOLDOWN_MS } from '@claude-control/daemon';
+import { DEFAULT_AUTOSWITCH_COOLDOWN_MS, DEFAULT_PERMISSION_HOLD_MS } from '@claude-control/daemon';
 import {
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
   DEFAULT_TRIGGER_PERCENT,
@@ -93,6 +93,7 @@ export interface DaemonConfig {
     minSessionHeadroomPct: number | undefined;
     cooldownMs: number | undefined;
     waitingCards: boolean;
+    permissionHoldMs: number | undefined;
   };
   rows: SettingRow[];
 }
@@ -116,8 +117,11 @@ export function resolveDaemonConfig(
   const relayEnv = env['CCTL_RELAY_URL'];
   const relayUrl = flags.relay ?? relayEnv ?? DEFAULT_RELAY_URL;
   // Default OFF: the CLI's Notification hook nags ("Claude is waiting for your input…")
-  // duplicate the real permission/done cards on the phone (wet finding, gate 5 2026-07-17).
+  // duplicate the real permission/done cards on the phone.
   const waitingCards = envFlag(env, 'CCTL_WAITING_CARDS');
+  // The hook contract offers ONE decision channel: while a permission is held for a remote
+  // decision the terminal cannot prompt. A shorter hold favors keyboard-first use.
+  const permissionHoldMs = envNumber(env, 'CCTL_PERMISSION_HOLD_MS');
 
   const rows: SettingRow[] = [
     {
@@ -158,6 +162,12 @@ export function resolveDaemonConfig(
       detail: 'CCTL_WAITING_CARDS ("Claude is waiting…" terminal nags as phone cards)',
     },
     {
+      name: 'permission hold',
+      value: `${Math.round((permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS) / 1000)}s`,
+      source: envSource(permissionHoldMs !== undefined),
+      detail: 'CCTL_PERMISSION_HOLD_MS (remote-decision window; local prompt appears after)',
+    },
+    {
       name: 'relay url',
       value: relayUrl,
       source: flags.relay !== undefined ? 'flag' : envSource(relayEnv !== undefined),
@@ -180,6 +190,7 @@ export function resolveDaemonConfig(
       minSessionHeadroomPct,
       cooldownMs,
       waitingCards,
+      permissionHoldMs,
     },
     rows,
   };

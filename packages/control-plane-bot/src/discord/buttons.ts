@@ -131,8 +131,8 @@ function armedButton(p: ParsedButton): ButtonSpec {
  *  only state that survives a tap, but it proves what the card originally rendered: permission
  *  buttons ship ONLY in default mode (the tapped deny's existence is that proof), and a Stop
  *  button ships only on a stoppable session — so the whole original row is reconstructible.
- *  Restoring just the armed button (the old behavior) permanently ate the sibling Approve/Deny
- *  buttons on a permission card (wet finding, gate 5.4). */
+ *  Restoring just the armed button would permanently lose the sibling Approve/Deny buttons on
+ *  a permission card. */
 function restoredRows(p: ParsedButton): ButtonSpec[][] {
   if (p.action === 'approve' || p.action === 'deny') {
     return permissionButtons({ requestId: p.id, permissionMode: 'default' });
@@ -196,10 +196,12 @@ export function resolveTap(
       };
     case 'confirm':
       if (nowMs - p.ts > ttlMs) {
+        // Name the window so the reset teaches the mechanic — a silent revert to the
+        // original buttons reads as a failure, not a timeout.
         return {
           kind: 'restore',
           rows: restoredRows(p),
-          note: 'Confirmation expired — tap again to retry.',
+          note: `Expired; confirm within ${Math.round(ttlMs / 1000)}s. Tap again to retry.`,
         };
       }
       return { kind: 'execute', action: p.action, scope: p.scope, id: p.id };
@@ -209,7 +211,7 @@ export function resolveTap(
 }
 
 /**
- * The button row for a permission.request card. Fail-safe mode gate (plan §4): buttons appear
+ * The button row for a permission.request card. Fail-safe mode gate: buttons appear
  * ONLY when the mode is exactly 'default'; every other, absent, or unknown mode returns `[]` so
  * the card is informational and no button can lie about taking effect. Approve/Deny are safe
  * single-tap; a session-scope Deny is destructive, so it ships armed and goes through confirm.

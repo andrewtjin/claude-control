@@ -53,6 +53,7 @@ describe('resolveDaemonConfig', () => {
       minSessionHeadroomPct: undefined,
       cooldownMs: undefined,
       waitingCards: false,
+      permissionHoldMs: undefined,
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('off');
@@ -61,8 +62,15 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'min session headroom').value).toBe('25% left');
     expect(row(rows, 'auto-switch cooldown').value).toBe('10m');
     expect(row(rows, 'waiting cards').value).toBe('off');
+    expect(row(rows, 'permission hold').value).toBe('570s');
     expect(row(rows, 'relay url').value).toBe(DEFAULT_RELAY_URL);
     expect(row(rows, 'daemon log level').value).toBe('info');
+  });
+
+  it('reads the permission hold window from CCTL_PERMISSION_HOLD_MS', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_PERMISSION_HOLD_MS: '60000' });
+    expect(values.permissionHoldMs).toBe(60_000);
+    expect(row(rows, 'permission hold')).toMatchObject({ value: '60s', source: 'env' });
   });
 
   it('enables waiting cards (the "Claude is waiting…" nag forwarding) only via env opt-in', () => {

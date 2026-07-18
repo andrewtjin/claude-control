@@ -104,8 +104,9 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
  *
  * DECISION — no `configDirForAccount` is injected here, on purpose. Binding per-account
  * CLAUDE_CONFIG_DIRs would give per-session credential isolation, but it forgoes the
- * project's single-shared-~/.claude design (per-account config dirs were wet-refuted, WT-1 —
- * see plan §4 "Credential layout") and with it credential HOT-SWAP: a `cctl switch` on the
+ * project's single-shared-~/.claude design (the CLI reads some config outside
+ * CLAUDE_CONFIG_DIR, so per-account config dirs don't isolate) and with it credential
+ * HOT-SWAP: a `cctl switch` on the
  * PC rewrites the shared live credentials that running sessions read per-request, whereas a
  * session pinned to its own config dir would never see the swap. So sessions inherit
  * whichever account the switch engine last ACTIVATED (activate-before-spawn model),
@@ -221,6 +222,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
     logger,
     forwardNotificationCards: config.values.waitingCards,
+    ...(config.values.permissionHoldMs !== undefined
+      ? { permissionHoldMs: config.values.permissionHoldMs }
+      : {}),
   });
 
   // Auto-switch is strictly opt-in (`--auto-switch`): unattended account hops are a policy
@@ -247,7 +251,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     : undefined;
 
   // Which profile gets hooks installed: the design uses a SINGLE shared ~/.claude for every
-  // account (per-account config dirs were wet-refuted, WT-1 — see plan §4 Credential layout),
+  // account (per-account config dirs don't isolate — the CLI reads some config outside them),
   // so there is exactly ONE user-level settings.json and it covers every account the daemon
   // rotates through. `paths.claudeDir` honors CLAUDE_CONFIG_DIR, so this is the same file the
   // CLI actually reads settings from. The Daemon calls this AFTER binding the receiver, with
