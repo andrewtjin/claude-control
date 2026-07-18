@@ -491,9 +491,9 @@ describe('HookReceiver', () => {
 
   describe('managed-session hook suppression', () => {
     // A managed session already reaches the phone as session.status/session.output (live
-    // card, milestone lines, summary card) — its own hooks reporting the same turn would say
-    // everything twice. Permission requests are NOT suppressed: they hold a decision channel
-    // no other surface provides.
+    // card, milestone lines, summary card) and decides permissions through the SDK gate —
+    // its CLI subprocess inherits the installed hooks, so unsuppressed hook traffic says
+    // everything twice (and a held permission hook RACES the SDK's parked request).
     let mgReceiver: HookReceiver;
     let mgPort: number;
     let mgEmitted: EnvelopeDraft[];
@@ -567,10 +567,8 @@ describe('HookReceiver', () => {
       expect(mgCards()).toHaveLength(1);
     });
 
-    it('a remote-approve watch still forwards the managed run the operator asked to see', async () => {
-      // The permission.request itself must ALSO survive suppression — it is the decision
-      // channel, and this hold-and-approve round-trip proves it end to end.
-      const held = post(
+    it("answers a managed session's permission hook neutrally — the SDK gate owns the decision", async () => {
+      const res = await post(
         mgPort,
         '/',
         {
@@ -582,20 +580,37 @@ describe('HookReceiver', () => {
         },
         { 'x-claude-control-secret': SECRET },
       );
+      // Resolves IMMEDIATELY with a neutral answer: not held for a remote decision, and no
+      // card pushed — the SDK's canUseTool card is the one permission card for this run.
+      expect(res.status).toBe(200);
+      expect(mgEmitted).toHaveLength(0);
+    });
+
+    it('still holds a permission from an interactive CLI window for the remote decision', async () => {
+      const held = post(
+        mgPort,
+        '/',
+        {
+          event: 'PermissionRequest',
+          requestId: 'req-mg-2',
+          session_id: 'sess-window',
+          tool_name: 'Bash',
+          tool_input: { command: 'x' },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
       await waitFor(() =>
         mgEmitted.find(
-          (e) => e.type === 'permission.request' && e.payload.requestId === 'req-mg-1',
+          (e) => e.type === 'permission.request' && e.payload.requestId === 'req-mg-2',
         ),
       );
       await post(
         mgPort,
         '/resolve-permission',
-        { requestId: 'req-mg-1', decision: 'allow' },
+        { requestId: 'req-mg-2', decision: 'allow' },
         { 'x-claude-control-secret': SECRET },
       );
       expect((await held).status).toBe(200);
-      await mgPostTool('sess-managed');
-      expect(mgCards()).toHaveLength(1);
     });
   });
 

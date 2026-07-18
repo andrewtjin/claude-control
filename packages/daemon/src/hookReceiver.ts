@@ -71,11 +71,12 @@ export interface HookReceiverOptions {
   fullToolOutput?: boolean;
   /** Answers "does this hook session_id belong to a session this daemon manages?" A managed
    *  session already reaches the phone through session.status/session.output (live card,
-   *  milestone lines, summary card), so its hook-driven cards — the per-turn Stop card,
-   *  waiting nags, blanket shell output cards — would say everything twice. Permission
-   *  requests are NEVER suppressed by this: they hold a decision channel no other surface
-   *  provides, and an explicitly-armed output watch still forwards. Default: nothing is
-   *  managed (interactive CLI windows keep every card). */
+   *  milestone lines, summary card) and decides permissions through the SDK's canUseTool
+   *  gate — yet its CLI subprocess inherits the globally-installed hooks, so without this
+   *  check every event arrives TWICE. Suppressed for managed sessions: Stop/Notification
+   *  cards, blanket shell output cards, and hook permission prompts (answered neutrally so
+   *  the CLI falls through to the SDK gate and the phone sees exactly ONE card). Default:
+   *  nothing is managed (interactive CLI windows keep every card). */
   isManagedSession?: (sessionId: string) => boolean;
   clock?: () => number;
   /** Called with a fully-formed envelope draft whenever a hook produces one — the daemon
@@ -670,6 +671,22 @@ export class HookReceiver {
         'permission hook POST missing session id or tool name',
       );
       this.respond(res, 400, { ok: false, error: 'session_id and tool_name are required' });
+      return;
+    }
+
+    // A managed session's CLI subprocess inherits the globally-installed hooks, so its
+    // permission prompts arrive HERE as well as through the SDK's canUseTool gate — two
+    // cards for one tool call, and a race between two decision channels (the hook answer
+    // reaches the CLI first and the SDK's parked request dies as "already handled"). The SDK
+    // gate is the managed decision channel: answer the hook neutrally (no decision, no card,
+    // no hold) so the CLI falls through to its normal control-request path and the phone
+    // sees exactly ONE card.
+    if (this.isManagedSession(sessionId)) {
+      this.logger.info(
+        { sessionId, tool },
+        'permission hook from a managed session; neutral answer (SDK gate owns the decision)',
+      );
+      this.respond(res, 200, {});
       return;
     }
 
