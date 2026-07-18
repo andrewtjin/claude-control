@@ -8,9 +8,9 @@
 //
 // SECURITY: the daemon's control-plane identity (daemonId + daemonToken) is a bearer
 // credential, so it is persisted DPAPI-encrypted beside the vault — same at-rest posture as
-// OAuth tokens, useless if copied off this machine/user.
+// OAuth tokens, useless if copied off this machine/user. The hook secret (see hookSecret.ts)
+// gets the identical treatment for the identical reason.
 
-import { randomUUID } from 'node:crypto';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -31,6 +31,9 @@ import {
   HookReceiver,
   Store,
   UsagePoller,
+  buildDaemonHookSpecs,
+  installHooks,
+  loadOrCreateHookSecret,
   type DaemonIdentity,
   type IdentityStore,
 } from '@claude-control/daemon';
@@ -126,6 +129,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   if (options.pair) await rm(identityPath, { force: true });
   const identityStore = dpapiIdentityStore(identityPath, protector);
 
+  // Stable across restarts (see hookSecret.ts) — minted once, then reused for as long as this
+  // file decrypts, so the curl command `installHooks` writes into settings.json keeps working
+  // after every future daemon restart instead of 401ing until it's reinstalled.
+  const hookSecretPath = join(dataDir, 'hook-secret.enc');
+  const hookSecret = await loadOrCreateHookSecret(hookSecretPath, protector);
+
   // The poller reads tokens straight from the vault WITHOUT switching. When an idle
   // account's vault token has expired, the getter asks the ENGINE to refresh it — inside the
   // same locked refresh-and-persist path activate() uses (single-use refresh tokens are never
@@ -164,11 +173,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   });
 
   // The receiver forwards hook envelopes out through the client (which buffers to its outbox
-  // while disconnected). Secret is per-run: hooks are not installed until M3, and the
-  // installer will persist a stable secret when it lands.
+  // while disconnected). The secret is the stable one loaded above, not minted per run — see
+  // hookSecret.ts for why that matters.
   const hookReceiver = new HookReceiver({
     store,
-    secret: randomUUID(),
+    secret: hookSecret,
     emit: (draft) => controlPlaneClient.send(draft),
     daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
   });
@@ -210,6 +219,26 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   });
 
   await daemon.start();
+
+  // Installed AFTER start() (not before) because `daemon.start()` is what actually binds the
+  // hook receiver's port — an OS-assigned ephemeral port that's different on every run, so
+  // this has to happen every start, not just first-run setup. installHooks' managed-marker
+  // pruning (see hookInstaller.ts) makes repeating it idempotent and self-healing: it replaces
+  // last run's now-dead port/secret without touching any other tool's hooks. Best-effort — a
+  // profile the daemon can't write to must not stop an otherwise-healthy daemon from serving
+  // already-connected clients; the setup wizard surfaces install failures explicitly.
+  const hookPort = hookReceiver.getPort();
+  if (hookPort !== undefined) {
+    await installHooks({
+      settingsPath: join(paths.claudeDir, 'settings.json'),
+      hooks: buildDaemonHookSpecs({ port: hookPort, secret: hookSecret }),
+    }).catch((err: unknown) => {
+      logger.warn({ err }, 'could not install hooks into settings.json');
+    });
+  } else {
+    logger.warn('hook receiver has no bound port after start(); skipped installing hooks');
+  }
+
   process.stdout.write(
     `Daemon running (relay: ${relayUrl}${autoSwitcher ? `, auto-switch: on${greedy ? ' (greedy)' : ''}` : ''}). Ctrl+C to stop.\n`,
   );
