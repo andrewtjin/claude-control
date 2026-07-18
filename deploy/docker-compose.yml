@@ -1,0 +1,45 @@
+# Self-host path for the control-plane bot: `docker compose up` from this directory is the
+# complete deploy. Also the reference for the shared/hosted bot — same file either way.
+#
+# Two services: `bot` (the daemon-facing relay + Discord gateway) and `caddy` (reverse proxy
+# in front of it, terminating automatic TLS for the hostname in .env). Copy .env.example to
+# .env alongside this file and fill in DISCORD_BOT_TOKEN + RELAY_HOSTNAME before starting.
+
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: packages/control-plane-bot/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # bindings.json (the only state this bot persists) lives on the named volume below, not
+      # in the image, so a redeploy/restart never loses a pairing.
+      CCTL_BOT_STATE_DIR: /data/bot-state
+      CCTL_RELAY_PORT: '8765'
+    volumes:
+      - bot-state:/data/bot-state
+    # Not published to the host directly — caddy is the only public entry point.
+    expose:
+      - '8765'
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - bot
+    env_file: .env
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  # Backup story for this round: copy the volume. No DB migration, no external store.
+  bot-state:
+  # Caddy's ACME account + issued certs — losing this just costs a re-issue, not an outage.
+  caddy-data:
+  caddy-config:

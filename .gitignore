@@ -37,3 +37,6 @@ CLAUDE.md
 *.db-shm
 .credentials.json
 vault/
+
+# Deploy-time secrets (bot token, relay hostname) — only the .example template is tracked
+deploy/.env

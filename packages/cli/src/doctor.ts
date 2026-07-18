@@ -19,6 +19,121 @@ export interface DoctorCheck {
   detail: string;
 }
 
+// The Node floor is NOT the version that first shipped `node:sqlite` (22.5.0, where it was
+// gated behind `--experimental-sqlite`) but the first version that exposes it WITHOUT that
+// flag: 22.13.0 on the 22.x line (and 23.4.0 on 23.x). cctl runs as a bare `cctl`/Scheduled
+// Task command, so it can't pass a runtime flag — a user on 22.5–22.12 would see the daemon's
+// sqlite store fail to load. The publishable package's `engines` field is kept at this same
+// floor (see doctor.test.ts), but npm's own engine check is advisory by default, so a user who
+// ignores or bypasses that warning can still get here — this check exists to catch them with
+// an actionable message instead of a raw builtin-module error. Confirmed on this repo's dev
+// machine: `require('node:sqlite')` loads unflagged on v24.
+export const MIN_NODE_VERSION = '22.13.0';
+
+/** Parse `vX.Y.Z` (or `X.Y.Z`) into a numeric tuple; undefined for anything unparseable. */
+function parseNodeVersion(version: string): [number, number, number] | undefined {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+  if (!match) return undefined;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/** -1/0/1 like a comparator, on major→minor→patch order. */
+function compareVersions(a: [number, number, number], b: [number, number, number]): number {
+  for (let i = 0; i < 3; i++) {
+    const av = a[i] ?? 0;
+    const bv = b[i] ?? 0;
+    if (av !== bv) return av < bv ? -1 : 1;
+  }
+  return 0;
+}
+
+/** Whether this Node is new enough that the daemon's `node:sqlite` store loads without a
+ *  runtime flag. Takes the version string (default `process.version`) and floor explicitly so
+ *  it is exercised against fixed inputs rather than only whatever Node happens to run the
+ *  suite. */
+export function checkNodeVersion(
+  version: string = process.version,
+  floor: string = MIN_NODE_VERSION,
+): DoctorCheck {
+  const current = parseNodeVersion(version);
+  const minimum = parseNodeVersion(floor) ?? [0, 0, 0];
+  if (!current) {
+    return { name: 'node', ok: false, detail: `could not parse Node version "${version}"` };
+  }
+  const ok = compareVersions(current, minimum) >= 0;
+  return {
+    name: 'node',
+    ok,
+    detail: ok
+      ? `${version} (>= ${floor}; node:sqlite works without --experimental-sqlite)`
+      : `${version} is too old — cctl needs Node >= ${floor} ` +
+        '(earlier versions require --experimental-sqlite for node:sqlite, which cctl cannot pass)',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Relay reachability
+// ---------------------------------------------------------------------------
+
+/** The minimal fetch surface the relay probe needs — injected in tests so no socket is ever
+ *  opened, and so a timeout/connection error is exercised deterministically. */
+export type ProbeFetch = (
+  url: string,
+  init?: { signal?: AbortSignal },
+) => Promise<{ ok: boolean; status: number }>;
+
+export interface RelayProbe {
+  reachable: boolean;
+  detail: string;
+}
+
+export interface ProbeRelayOptions {
+  fetchFn?: ProbeFetch;
+  timeoutMs?: number;
+}
+
+/** Default: probe the relay soon enough that an unreachable host doesn't stall the wizard, but
+ *  with enough slack for a real round-trip to a hosted relay. */
+export const RELAY_PROBE_TIMEOUT_MS = 4000;
+
+/** Derive the bot's unauthenticated `GET /health` URL from the relay WebSocket url: `ws`→`http`,
+ *  `wss`→`https`, then a `/health` path. Anything else is returned with `/health` appended as a
+ *  best effort so the caller still has something to probe. Pure. */
+export function healthUrlFromRelay(relayUrl: string): string {
+  const trimmed = relayUrl.trim().replace(/\/+$/, '');
+  const httpUrl = trimmed.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://');
+  return `${httpUrl}/health`;
+}
+
+/**
+ * Probe whether the relay's HTTP health endpoint answers — the signal that lets the wizard say
+ * "the relay is down" rather than "your network is broken" when pairing later fails. A non-200,
+ * a connection error, or a timeout all report `reachable: false` with a human detail; only an
+ * actual 200 counts as reachable.
+ */
+export async function probeRelay(
+  relayUrl: string,
+  options: ProbeRelayOptions = {},
+): Promise<RelayProbe> {
+  const fetchFn = options.fetchFn ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? RELAY_PROBE_TIMEOUT_MS;
+  const healthUrl = healthUrlFromRelay(relayUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchFn(healthUrl, { signal: controller.signal });
+    if (res.ok) return { reachable: true, detail: `relay healthy at ${healthUrl}` };
+    return { reachable: false, detail: `relay answered ${healthUrl} with HTTP ${res.status}` };
+  } catch (err) {
+    return {
+      reachable: false,
+      detail: `no response from ${healthUrl} (${(err as Error).message})`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Render checks as `[ok]/[!!]` lines (green/red when a color palette is injected). Pure. */
 export function renderDoctor(checks: DoctorCheck[], palette: Palette = PLAIN_PALETTE): string {
   return checks
@@ -101,6 +216,7 @@ export function checkClaudeJson(paths: Paths): DoctorCheck {
 /** Run every check for the given paths. */
 export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
   return [
+    checkNodeVersion(),
     checkVaultProtection(),
     checkVault(paths),
     await checkLiveLogin(paths),

@@ -7,7 +7,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InsecurePassthroughProtector } from '@claude-control/switch-engine';
-import { dpapiIdentityStore } from './daemonRun.js';
+import { dpapiIdentityStore, waitForHookPort } from './daemonRun.js';
 
 describe('dpapiIdentityStore', () => {
   let dir: string;
@@ -47,5 +47,31 @@ describe('dpapiIdentityStore', () => {
     await writeFile(path, blob, 'utf8');
     const store = dpapiIdentityStore(path, protector);
     expect(await store.load()).toBeUndefined();
+  });
+});
+
+// waitForHookPort backs runDaemon's decoupling of hook install from the control-plane
+// connect() — proving it here (rather than only via daemonRun's untested assembly) is what
+// actually verifies a hung connect() no longer starves hook install/heartbeat.
+describe('waitForHookPort', () => {
+  it('resolves immediately when the port is already bound', async () => {
+    const port = await waitForHookPort(() => 5173);
+    expect(port).toBe(5173);
+  });
+
+  it('polls until the port becomes bound, without waiting on anything else', async () => {
+    let calls = 0;
+    const getPort = (): number | undefined => {
+      calls += 1;
+      return calls >= 3 ? 4321 : undefined;
+    };
+    const port = await waitForHookPort(getPort, { pollMs: 5, timeoutMs: 1_000 });
+    expect(port).toBe(4321);
+    expect(calls).toBeGreaterThanOrEqual(3);
+  });
+
+  it('gives up and resolves undefined once the deadline passes, instead of hanging forever', async () => {
+    const port = await waitForHookPort(() => undefined, { timeoutMs: 30, pollMs: 10 });
+    expect(port).toBeUndefined();
   });
 });
