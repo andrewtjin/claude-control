@@ -1,10 +1,10 @@
-# @claude-control/cctl
+# claudecontrol
 
 `cctl` — switch between multiple Claude Code accounts, see usage across all of them at
 once, and drive your sessions from your phone.
 
 ```bash
-npm i -g @claude-control/cctl
+npm i -g claudecontrol
 cctl setup
 ```
 
