@@ -12,6 +12,7 @@ import {
   buildPermissionRequestEmbed,
   buildQuarantineEmbed,
   buildSwitchResultEmbed,
+  buildToolOutputEmbed,
   buildWaitingEmbed,
 } from './embeds.js';
 import { permissionButtons, type ButtonSpec } from './buttons.js';
@@ -99,27 +100,25 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush {
   }
   switch (p.notificationType) {
     case 'tool_output': {
-      // A tool run's output. Rendered as a fenced code block so multi-line command output
-      // stays readable on a phone; the body is clamped BEFORE assembly so truncation can
-      // never eat the closing fence and leave the block unterminated. Embedded ``` sequences
-      // are defused with a zero-width space — output text must not be able to terminate its
-      // own fence.
-      const header = `**${p.title}**${sessionTag(p)}\n`;
-      const fenceOverhead = '```\n\n```'.length;
+      // Compact by design: full-length fenced messages were flooding the DM, so the card is
+      // a fixed-height embed — a glanceable preview behind a fence, the origin tag in the
+      // footer, and the COMPLETE raw text as a .txt attachment the reader taps to expand
+      // (a real file needs no fence defusing). Embedded ``` sequences in the preview are
+      // defused with a zero-width space so output text cannot terminate its own fence.
       const zeroWidthSpace = String.fromCharCode(0x200b);
       const safeBody = p.body.replaceAll('```', '`' + zeroWidthSpace + '``');
-      const maxBody = Math.max(0, MESSAGE_CONTENT_LIMIT - header.length - fenceOverhead);
-      if (safeBody.length > maxBody) {
-        // Too big for one message (the daemon ships more than this only when full output is
-        // enabled): the COMPLETE raw text rides as a .txt attachment under a clamped inline
-        // preview, so nothing is lost to Discord's content ceiling. The file gets the raw
-        // body — a real file needs no fence defusing.
-        return {
-          content: `${header}\`\`\`\n${truncateLabeled(safeBody, maxBody)}\n\`\`\``,
-          files: [{ filename: 'output.txt', text: p.body }],
-        };
-      }
-      return { content: `${header}\`\`\`\n${safeBody}\n\`\`\`` };
+      const { text: preview, clipped } = previewOf(safeBody);
+      const tag = sessionTag(p);
+      const embed = buildToolOutputEmbed({
+        title: p.title,
+        preview,
+        attached: clipped,
+        totalChars: p.body.length,
+        ...(tag !== '' ? { footer: tag } : {}),
+      });
+      return clipped
+        ? { embeds: [embed], files: [{ filename: 'output.txt', text: p.body }] }
+        : { embeds: [embed] };
     }
     case 'idle_prompt':
       return {
@@ -142,11 +141,27 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush {
   }
 }
 
-/** " · <folder> · <session prefix>" appended to an output card's header. Several CLI windows
- *  can stream shell output at once, and untagged cards are indistinguishable on a phone: the
- *  working directory's basename is the human-meaningful origin, and the session-id prefix
- *  splits two windows running in the same directory. Either part may be absent (older daemon,
- *  internal sender) — the tag shrinks instead of guessing, down to nothing. */
+/** How much output the card shows inline: enough lines to glance at, never enough to flood
+ *  a DM. Anything past this rides in the tap-to-expand attachment. */
+const PREVIEW_MAX_LINES = 6;
+const PREVIEW_MAX_CHARS = 300;
+
+/** Clamp output to the card's glanceable preview: the first lines up to both caps, with a
+ *  visible continuation mark when anything was cut (`clipped` tells the caller to attach the
+ *  full text). */
+function previewOf(text: string): { text: string; clipped: boolean } {
+  let head = text.split('\n').slice(0, PREVIEW_MAX_LINES).join('\n');
+  if (head.length > PREVIEW_MAX_CHARS) head = head.slice(0, PREVIEW_MAX_CHARS);
+  if (head === text) return { text, clipped: false };
+  return { text: `${head.trimEnd()}\n…`, clipped: true };
+}
+
+/** "<folder> · <session prefix>" — the output card's footer, tying the card to the window
+ *  that produced it. Several CLI windows can stream shell output at once, and untagged cards
+ *  are indistinguishable on a phone: the working directory's basename is the human-meaningful
+ *  origin, and the session-id prefix splits two windows running in the same directory. Either
+ *  part may be absent (older daemon, internal sender) — the tag shrinks instead of guessing,
+ *  down to the empty string (no footer). */
 function sessionTag(p: PayloadOf<'hook.notification'>): string {
   // Hooks report native paths — split on both separators so Windows and POSIX paths both
   // yield a basename, and drop empty segments so a trailing separator can't blank the folder.
@@ -157,5 +172,5 @@ function sessionTag(p: PayloadOf<'hook.notification'>): string {
   const parts = [folder, p.sessionId?.slice(0, 8)].filter(
     (part): part is string => part !== undefined && part !== '',
   );
-  return parts.length === 0 ? '' : ` · ${parts.join(' · ')}`;
+  return parts.join(' · ');
 }

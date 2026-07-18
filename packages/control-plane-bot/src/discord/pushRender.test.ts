@@ -102,7 +102,7 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(fix?.value).toContain(RELOGIN_COMMAND);
   });
 
-  it('a tool_output notification renders the output as a fenced code block', () => {
+  it('a tool_output notification renders a compact embed with a fenced preview', () => {
     const push = renderPush(
       env('hook.notification', {
         event: 'notification',
@@ -113,16 +113,17 @@ describe('renderPush — lifecycle notification cards', () => {
         notificationType: 'tool_output',
       }),
     );
-    expect(push?.embeds).toBeUndefined();
-    // The header carries the session prefix so concurrent windows stay distinguishable.
-    expect(push?.content).toBe(
-      '**Output — netstat -ano** · s1\n```\nTCP 127.0.0.1:5433 LISTENING 41184\n```',
-    );
-    // Fits in one message — no attachment needed.
+    expect(push?.content).toBeUndefined();
+    const json = push?.embeds?.[0]?.toJSON();
+    expect(json?.title).toBe('Output — netstat -ano');
+    expect(json?.description).toBe('```\nTCP 127.0.0.1:5433 LISTENING 41184\n```');
+    // The session prefix rides the footer so concurrent windows stay distinguishable.
+    expect(json?.footer?.text).toBe('s1');
+    // Fits the preview whole — nothing to expand, no attachment.
     expect(push?.files).toBeUndefined();
   });
 
-  it('tool_output tags the header with the working directory and session prefix', () => {
+  it('tool_output puts the working directory and session prefix in the footer', () => {
     const push = renderPush(
       env('hook.notification', {
         event: 'notification',
@@ -135,11 +136,7 @@ describe('renderPush — lifecycle notification cards', () => {
       }),
     );
     // Folder basename + an 8-char session prefix: enough to tell windows apart at a glance.
-    expect(
-      push?.content?.startsWith(
-        '**Output — netstat -ano** · claude-control-wt-remote · 3b35a35f\n',
-      ),
-    ).toBe(true);
+    expect(push?.embeds?.[0]?.toJSON().footer?.text).toBe('claude-control-wt-remote · 3b35a35f');
   });
 
   it('tool_output derives the folder from POSIX paths too, ignoring a trailing slash', () => {
@@ -154,10 +151,10 @@ describe('renderPush — lifecycle notification cards', () => {
         notificationType: 'tool_output',
       }),
     );
-    expect(push?.content?.startsWith('**Output — ls** · proj · abcd1234\n')).toBe(true);
+    expect(push?.embeds?.[0]?.toJSON().footer?.text).toBe('proj · abcd1234');
   });
 
-  it('tool_output with no session identity keeps a plain untagged header', () => {
+  it('tool_output with no session identity has no footer', () => {
     const push = renderPush(
       env('hook.notification', {
         event: 'notification',
@@ -167,10 +164,12 @@ describe('renderPush — lifecycle notification cards', () => {
         notificationType: 'tool_output',
       }),
     );
-    expect(push?.content).toBe('**Output — x**\n```\ny\n```');
+    const json = push?.embeds?.[0]?.toJSON();
+    expect(json?.description).toBe('```\ny\n```');
+    expect(json?.footer ?? undefined).toBeUndefined();
   });
 
-  it('tool_output clamps long output without breaking the fence, and attaches the full text', () => {
+  it('tool_output past the preview keeps the card glanceable and attaches the full text', () => {
     const push = renderPush(
       env('hook.notification', {
         event: 'notification',
@@ -180,14 +179,34 @@ describe('renderPush — lifecycle notification cards', () => {
         notificationType: 'tool_output',
       }),
     );
-    expect(push!.content!.length).toBeLessThanOrEqual(2000);
-    expect(push?.content?.endsWith('\n```')).toBe(true);
-    expect(push?.content).toContain('chars truncated');
-    // The inline block is a preview; the COMPLETE raw output rides as a file attachment.
+    const json = push?.embeds?.[0]?.toJSON();
+    // The card is a fixed-height preview with a visible continuation mark…
+    expect(json?.description?.length).toBeLessThan(500);
+    expect(json?.description).toContain('…');
+    expect(json?.description).toContain('full output attached (5000 chars)');
+    // …and the COMPLETE raw output rides as the tap-to-expand file attachment.
     expect(push?.files).toEqual([{ filename: 'output.txt', text: 'x'.repeat(5000) }]);
   });
 
-  it('tool_output defuses embedded ``` so output cannot terminate its own fence', () => {
+  it('tool_output clamps the preview by line count, not only by chars', () => {
+    const body = Array.from({ length: 10 }, (_, i) => `line ${i}`).join('\n');
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        title: 'Output — lines',
+        body,
+        level: 'info',
+        notificationType: 'tool_output',
+      }),
+    );
+    const description = push?.embeds?.[0]?.toJSON().description ?? '';
+    expect(description).toContain('line 5');
+    expect(description).not.toContain('line 6');
+    expect(description).toContain('…');
+    expect(push?.files).toEqual([{ filename: 'output.txt', text: body }]);
+  });
+
+  it('tool_output defuses embedded ``` so output cannot terminate its preview fence', () => {
     const push = renderPush(
       env('hook.notification', {
         event: 'notification',
@@ -198,8 +217,11 @@ describe('renderPush — lifecycle notification cards', () => {
       }),
     );
     // Everything between the opening and closing fence must contain no raw ``` run.
-    const content = push!.content!;
-    const interior = content.slice(content.indexOf('```\n') + 4, -'\n```'.length);
+    const description = push!.embeds![0]!.toJSON().description!;
+    const interior = description.slice(
+      description.indexOf('```\n') + 4,
+      description.lastIndexOf('\n```'),
+    );
     expect(interior).not.toContain('```');
     expect(interior).toContain('before');
     expect(interior).toContain('after');

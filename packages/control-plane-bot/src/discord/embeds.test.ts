@@ -9,6 +9,7 @@ import {
   buildSwitchResultEmbed,
   buildTimelineEmbed,
   buildDoneEmbed,
+  buildToolOutputEmbed,
   buildWaitingEmbed,
   buildQuarantineEmbed,
 } from './embeds.js';
@@ -342,6 +343,33 @@ describe('buildPermissionRequestEmbed', () => {
     const embed = buildPermissionRequestEmbed('run rm -rf').toJSON();
     expect(embed.title).toBe('Permission requested');
     expect(embed.footer?.text).not.toContain('mode');
+  });
+});
+
+describe('buildToolOutputEmbed', () => {
+  it('renders the fenced preview with the origin tag as the footer', () => {
+    const embed = buildToolOutputEmbed({
+      title: 'Output — ls',
+      preview: 'files',
+      attached: false,
+      totalChars: 5,
+      footer: 'proj · abcd1234',
+    }).toJSON();
+    expect(embed.title).toBe('Output — ls');
+    expect(embed.description).toBe('```\nfiles\n```');
+    expect(embed.footer?.text).toBe('proj · abcd1234');
+  });
+
+  it('notes the tap-to-expand attachment when the preview was clipped, and omits an empty footer', () => {
+    const embed = buildToolOutputEmbed({
+      title: 'Output — big',
+      preview: 'x\n…',
+      attached: true,
+      totalChars: 5000,
+    }).toJSON();
+    expect(embed.description).toContain('full output attached (5000 chars)');
+    expect(embed.description).toContain('tap to expand');
+    expect(embed.footer ?? undefined).toBeUndefined();
   });
 });
 

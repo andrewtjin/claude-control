@@ -195,7 +195,8 @@ export function resolveDaemonConfig(
       name: 'full tool output',
       value: fullToolOutput ? 'on' : 'off',
       source: envSource(fullToolOutput),
-      detail: 'CCTL_TOOL_OUTPUT_FULL (complete output; long output arrives as a file attachment)',
+      detail:
+        'CCTL_TOOL_OUTPUT_FULL (the attached output.txt carries the complete output instead of the phone-sized excerpt)',
     },
     {
       name: 'relay url',

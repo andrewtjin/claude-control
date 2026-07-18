@@ -288,6 +288,29 @@ export function buildPermissionRequestEmbed(
   return embed;
 }
 
+/** A completed tool run's output as a COMPACT card: a glanceable few-line preview fenced in
+ *  the description, the origin tag (folder · session) as the footer, and — when the preview
+ *  was clipped — a note pointing at the .txt attachment the reader taps to expand (the caller
+ *  ships the file). Replaces a full-length fenced message: busy sessions were flooding the
+ *  DM, so the card keeps a stable, small height and the detail lives one tap away. */
+export function buildToolOutputEmbed(p: {
+  title: string;
+  preview: string;
+  attached: boolean;
+  totalChars: number;
+  footer?: string;
+}): EmbedBuilder {
+  const attachedNote = p.attached
+    ? `\n📎 full output attached (${p.totalChars} chars) — tap to expand`
+    : '';
+  const embed = new EmbedBuilder()
+    .setTitle(truncateLabeled(p.title, 256))
+    .setColor(COLOR_INFO)
+    .setDescription(`\`\`\`\n${p.preview}\n\`\`\`${attachedNote}`);
+  if (p.footer !== undefined && p.footer !== '') embed.setFooter({ text: p.footer });
+  return embed;
+}
+
 /** `hook.notification` Stop event → the "done" card: WHAT Claude finished saying, not a bare
  *  "session ended". `lastAssistantMessage` can be long, so it is truncated with a visible marker
  *  (no silent cut). Falls back to the daemon-supplied body when no final message was captured. */
