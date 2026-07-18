@@ -1,5 +1,5 @@
 {
-  "name": "@claude-control/cctl",
+  "name": "claudecontrol",
   "version": "0.1.0",
   "private": false,
   "description": "cctl — switch Claude Code accounts, see cross-account usage, and drive sessions from your phone.",
