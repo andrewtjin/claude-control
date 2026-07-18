@@ -9,6 +9,9 @@ import { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, rmSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { hostname } from 'node:os';
+import { createInterface } from 'node:readline';
 import { dirname, join } from 'node:path';
 import {
   CadenceError,
@@ -20,7 +23,12 @@ import {
   resolveAccountRef,
   type StoredAccount,
 } from '@claude-control/switch-engine';
-import { Store, readHeartbeat } from '@claude-control/daemon';
+import {
+  ControlPlaneClient,
+  Store,
+  buildDaemonHookSpecs,
+  readHeartbeat,
+} from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import {
   computeOutlook,
@@ -40,7 +48,19 @@ import {
 } from './daemonInstall.js';
 import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
 import { renderAccountsTable, renderDaemonStatus, renderUsage, type UsageRow } from './render.js';
-import { renderDoctor, runDoctor, summarize } from './doctor.js';
+import { checkLiveLogin, probeRelay, renderDoctor, runDoctor, summarize } from './doctor.js';
+import {
+  connectWithTimeout,
+  normalizePairingCode,
+  renderSetupSummary,
+  runSetup,
+  PAIRING_TIMEOUT_MS,
+  type AutostartResult,
+  type PairResult,
+  type SetupDeps,
+  type SetupSummary,
+  type WizardIo,
+} from './setup.js';
 import {
   daemonSettingsPath,
   readSettingsReport,
@@ -176,6 +196,34 @@ export function buildProgram(): Command {
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);
     });
 
+  program
+    .command('setup')
+    .description('guided first-run setup: accounts, hooks, relay, Discord pairing, autostart')
+    .option('--reconfigure', 're-run every step even when setup already looks complete')
+    .option(
+      '--relay <url>',
+      'relay WebSocket url to pair against (else CCTL_RELAY_URL or the built-in)',
+    )
+    .action(async (opts: { reconfigure?: boolean; relay?: string }) => {
+      const { io, close } = createWizardIo();
+      try {
+        const outcome = await runSetup(buildSetupDeps(io, opts.relay), {
+          reconfigure: Boolean(opts.reconfigure),
+        });
+        // The wizard prints its own refusal line; only the exit code is set here.
+        if (outcome === 'not-interactive') process.exitCode = 1;
+      } finally {
+        close();
+      }
+    });
+
+  program
+    .command('status')
+    .description('at-a-glance: accounts, hooks, relay, daemon, pairing')
+    .action(async () => {
+      process.stdout.write(renderSetupSummary(await readStatusSummary(), detectPalette()) + '\n');
+    });
+
   // The daemon: the one long-running local process (usage poller, hook receiver, attribution
   // journal, control-plane connection). `--pair` is the first-run on-ramp: run /pair in
   // Discord for a code, then `cctl daemon run --pair <code>`.
@@ -293,17 +341,51 @@ export function buildProgram(): Command {
       );
     });
 
-  // Remote-control features that require the running daemon connected to the hosted bot —
-  // an inherently on-machine (wet) step. Surfaced now so the command set is discoverable and
-  // the guidance is honest rather than a silent absence. See docs/VERIFICATION.md.
+  // Bind this machine to the bot with a one-time `/pair` code. Adopts (and persists) the
+  // daemon identity now; the daemon reconnects with it on its next start. The wizard runs this
+  // same flow as step 6 — this standalone command is for re-pairing later.
   program
     .command('pair')
-    .description('bind this machine to the Discord bot')
-    .action(() =>
-      fail(
-        'run /pair in Discord for a code, then `cctl daemon run --pair <code>` — pairing happens on the daemon connection.',
-      ),
-    );
+    .description('bind this machine to the Discord bot using a /pair code')
+    .argument('[code]', 'the one-time code from Discord /pair (prompted if omitted)')
+    .option('--relay <url>', 'relay WebSocket url to pair against')
+    .action(async (codeArg: string | undefined, opts: { relay?: string }) => {
+      const relayUrl = resolveRelayUrl(opts.relay);
+      let raw = codeArg;
+      if (raw === undefined) {
+        if (!(process.stdin.isTTY && process.stdout.isTTY)) {
+          fail('no code given and this is not a terminal — pass it: cctl pair <code>');
+        }
+        const { io, close } = createWizardIo();
+        try {
+          raw = await io.ask('Pairing code from Discord /pair: ');
+        } finally {
+          close();
+        }
+      }
+      const code = normalizePairingCode(raw);
+      if (!code) fail('empty pairing code.');
+      process.stdout.write(`Pairing against ${relayUrl} ...\n`);
+      const result = await attemptPair(code, relayUrl);
+      if (result.ok) {
+        process.stdout.write(
+          'Paired. Start the daemon to connect: `cctl daemon install` (or `cctl setup`).\n',
+        );
+        return;
+      }
+      if (result.reason === 'timeout') {
+        fail(
+          `could not reach the relay (${result.detail}) — check a firewall/proxy, or pass --relay <url>.`,
+        );
+      }
+      if (result.reason === 'rejected') {
+        fail(
+          `the relay refused that code (${result.detail}) — codes are one-time; run /pair again.`,
+        );
+      }
+      fail(`pairing failed: ${result.detail}`);
+    });
+
   program
     .command('run')
     .description(
@@ -316,7 +398,192 @@ export function buildProgram(): Command {
       ),
     );
 
+  // Bare `cctl` (no subcommand): a short status summary once there are accounts, otherwise a
+  // single nudge to run setup — never Commander's raw usage dump. `--help`/`--version` are
+  // handled by Commander before this ever runs.
+  program.action(async () => {
+    const summary = await readStatusSummary();
+    if (summary.accounts.length === 0) {
+      process.stdout.write('Not set up yet. Run: cctl setup\n');
+      return;
+    }
+    process.stdout.write(renderSetupSummary(summary, detectPalette()) + '\n');
+    process.stdout.write(
+      '\nCommands: cctl usage · cctl timeline · cctl switch <account> · cctl setup\n',
+    );
+  });
+
   return program;
+}
+
+// ---------------------------------------------------------------------------
+// Setup wizard assembly (composition root — untested, like daemonRun.ts)
+//
+// These wire the real subsystems behind the wizard's injected `SetupDeps` seam: the switch
+// engine, the live-login probe, the hooks-marker reader, the relay health probe, the pairing
+// socket (with the wizard's own timeout), and the Scheduled Task lifecycle. The ORCHESTRATION
+// that uses them — step order, re-entry, pauses, retries — lives (and is tested) in setup.ts.
+// ---------------------------------------------------------------------------
+
+/** A readline-backed `WizardIo`. Returns a `close` the caller must run (a live readline keeps
+ *  the process alive). `isInteractive` requires BOTH streams to be TTYs — the wizard refuses
+ *  otherwise, so it never hangs waiting on input that can't come. */
+function createWizardIo(): { io: WizardIo; close: () => void } {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const io: WizardIo = {
+    write: (text) => void process.stdout.write(text),
+    ask: (prompt) => new Promise<string>((resolve) => rl.question(prompt, resolve)),
+    isInteractive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    palette: detectPalette(),
+  };
+  return { io, close: () => rl.close() };
+}
+
+/** Resolve the effective relay url with the standard flag > env > default precedence (the same
+ *  resolution the daemon uses, so a `cctl pair`/`cctl setup` targets exactly what the daemon
+ *  will later connect to). */
+function resolveRelayUrl(relayFlag?: string): string {
+  return resolveDaemonConfig(process.env, relayFlag !== undefined ? { relay: relayFlag } : {})
+    .values.relayUrl;
+}
+
+/** The marker header every daemon-installed hook command carries (see `buildDaemonHookSpecs`).
+ *  Recovered from a throwaway spec rather than hardcoded so this reader can't silently drift
+ *  from the daemon's literal — its presence in settings.json is how setup/status tell that
+ *  hooks are wired, without re-deriving the live loopback port or secret. */
+function managedHookMarker(): string {
+  const probe = buildDaemonHookSpecs({ port: 0, secret: 'probe' })[0]?.command ?? '';
+  return /x-[\w-]*managed:\s*\S+/i.exec(probe)?.[0] ?? 'x-claude-control-managed: 1';
+}
+
+/** Whether our managed hooks are present in a profile's settings.json. A missing/unreadable
+ *  file simply means "not installed", never an error. */
+async function hooksInstalledAt(settingsPath: string): Promise<boolean> {
+  let raw: string;
+  try {
+    raw = await readFile(settingsPath, 'utf8');
+  } catch {
+    return false;
+  }
+  return raw.includes(managedHookMarker());
+}
+
+/** One pairing attempt against `relayUrl`, bounded by the wizard's own deadline (connect()
+ *  reconnects forever, so without this it would hang on an unreachable relay). Adopts and
+ *  persists the daemon identity on success; the transient client is always torn down. */
+async function attemptPair(code: string, relayUrl: string): Promise<PairResult> {
+  const paths = defaultPaths();
+  const dataDir = dirname(paths.vaultDir);
+  const store = new Store(daemonDbPath(paths));
+  const identityStore = dpapiIdentityStore(
+    join(dataDir, 'daemon-identity.enc'),
+    defaultProtector(),
+  );
+  const client = new ControlPlaneClient({
+    url: relayUrl,
+    identityStore,
+    store,
+    hostLabel: hostname(),
+    pairingCode: code,
+  });
+  try {
+    return await connectWithTimeout(
+      { connect: () => client.connect(), close: () => client.close() },
+      PAIRING_TIMEOUT_MS,
+    );
+  } finally {
+    // The wizard only needed to adopt the identity; the daemon owns the durable connection.
+    client.close();
+    store.close();
+  }
+}
+
+/** Register/update the logon task and kick it now. Starting is best-effort — a correctly
+ *  registered task still comes up at the next logon. */
+function installAutostart(): Promise<AutostartResult> {
+  const task = installDaemonTask({ shimPath: resolveCctlShimPath() });
+  try {
+    startDaemonTaskNow();
+    return Promise.resolve({ task, started: true });
+  } catch (err) {
+    return Promise.resolve({ task, started: false, detail: (err as Error).message });
+  }
+}
+
+/** Poll the daemon heartbeat until it reports alive or a short deadline passes — the wizard's
+ *  round-trip check that the just-started daemon actually came up. */
+async function verifyDaemonAlive(): Promise<boolean> {
+  const heartbeatPath = join(dirname(defaultPaths().vaultDir), 'daemon-heartbeat.json');
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    if ((await readHeartbeat(heartbeatPath)).state === 'alive') return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+/** Assemble the production `SetupDeps` for one wizard run. */
+function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
+  const paths = defaultPaths();
+  const dataDir = dirname(paths.vaultDir);
+  const settingsPath = join(paths.claudeDir, 'settings.json');
+  const identityPath = join(dataDir, 'daemon-identity.enc');
+  const relayUrl = resolveRelayUrl(relayFlag);
+  const engine = buildEngine(paths);
+  return {
+    io,
+    runDoctor: () => runDoctor(paths),
+    isLoggedIn: async () => (await checkLiveLogin(paths)).ok,
+    listAccounts: () => engine.listAccounts(),
+    captureCurrentLogin: (label) => engine.captureCurrentLogin(label),
+    addFreshAccount: (label) => addFreshAccount(label),
+    hooksInstalled: () => hooksInstalledAt(settingsPath),
+    hooksProfilePath: settingsPath,
+    relayUrl,
+    probeRelay: (url) => probeRelay(url),
+    isPaired: async () =>
+      (await dpapiIdentityStore(identityPath, defaultProtector()).load()) !== undefined,
+    pair: (pairCode) => attemptPair(pairCode, relayUrl),
+    taskRegistered: () => {
+      try {
+        return Promise.resolve(queryDaemonTask().registered);
+      } catch {
+        return Promise.resolve(false);
+      }
+    },
+    installAutostart,
+    verifyDaemon: verifyDaemonAlive,
+  };
+}
+
+/** Gather the at-a-glance status the bare-`cctl` summary and `cctl status` both render. Every
+ *  source degrades on its own (a PowerShell failure must not hide the account/pairing lines). */
+async function readStatusSummary(): Promise<SetupSummary> {
+  const paths = defaultPaths();
+  const dataDir = dirname(paths.vaultDir);
+  const settingsPath = join(paths.claudeDir, 'settings.json');
+  const engine = buildEngine(paths);
+  const [accounts, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
+  const [hooksInstalled, identity] = await Promise.all([
+    hooksInstalledAt(settingsPath),
+    dpapiIdentityStore(join(dataDir, 'daemon-identity.enc'), defaultProtector()).load(),
+  ]);
+  let taskRegistered = false;
+  try {
+    taskRegistered = queryDaemonTask().registered;
+  } catch {
+    taskRegistered = false;
+  }
+  const heartbeat = await readHeartbeat(join(dataDir, 'daemon-heartbeat.json'));
+  return {
+    accounts: accounts.map((a) => ({ label: a.label, active: a.id === activeId })),
+    hooksInstalled,
+    hooksProfilePath: settingsPath,
+    relayUrl: resolveRelayUrl(),
+    taskRegistered,
+    daemonAlive: heartbeat.state === 'alive',
+    paired: identity !== undefined,
+  };
 }
 
 /** Accounts + active id joined with the daemon's latest persisted usage snapshot per
