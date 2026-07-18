@@ -48,3 +48,46 @@ jobs:
         # `doctor`: its checks (DPAPI, vault, ConPTY) are Windows-only and this runner is
         # ubuntu.
         run: pnpm --filter claudecontrol run smoke-test
+
+  # First platform-specific leg: exercises the real `security(1)` vault-key path that ubuntu
+  # cannot. NON-BLOCKING by design (continue-on-error; not a required check) — the authoritative
+  # macOS wet gate is owner-run on real hardware (docs/VERIFICATION.md #12). A green here only proves
+  # that OUR OWN vault-key item round-trips through real `security`; it says nothing about the CLI's
+  # cross-app item or the A4 GUI prompt, which reproduce only on hardware with a logged-in CLI.
+  check-macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare an unlocked CI keychain
+        # A fresh keychain set as default (unlocked with an empty password) avoids guessing the
+        # runner's login-keychain password. `security add/find-generic-password` with no -keychain
+        # arg then targets this one. A bare `unlock-keychain` would prompt and HANG in CI.
+        run: |
+          security create-keychain -p "" ci.keychain
+          security set-keychain-settings ci.keychain
+          security unlock-keychain -p "" ci.keychain
+          security list-keychains -d user -s ci.keychain "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -s ci.keychain
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Darwin-only real-security(1) vault-key round-trip
+        # Just this one darwin test, NOT the full suite: switchEngine.test.ts seeds a live account
+        # from a file fixture, but on darwin the live channel is the Keychain — empty on a headless
+        # runner — so it can't pass here (an unrelated latent gap, not a vault-path signal). This
+        # file runs only on darwin (skipIf) and is the automatable half of the owner-run wet gate
+        # (docs/VERIFICATION.md #12); everywhere else it skips to 0 tests.
+        run: pnpm exec vitest run packages/switch-engine/src/keychain.darwin.test.ts
