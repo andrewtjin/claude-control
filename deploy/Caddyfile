@@ -1,0 +1,8 @@
+# Reverse proxy for the control-plane bot. Caddy requests and renews a Let's Encrypt
+# certificate for RELAY_HOSTNAME automatically — no manual cert handling, no bare-IP
+# workaround (Let's Encrypt cannot issue for a bare IP, which is why this needs a real
+# hostname; see deploy/.env.example).
+
+{$RELAY_HOSTNAME} {
+	reverse_proxy bot:8765
+}
