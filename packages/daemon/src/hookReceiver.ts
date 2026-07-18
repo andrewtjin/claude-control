@@ -50,6 +50,12 @@ export interface HookReceiverOptions {
   /** How long a permission hook's HTTP response is held open for a remote decision before a
    *  neutral answer lets the local prompt take over. See DEFAULT_PERMISSION_HOLD_MS. */
   permissionHoldMs?: number;
+  /** Forward the CLI's `Notification` hook events ("Claude is waiting for your input",
+   *  "Claude needs your permission") as phone cards. Default OFF (wet finding, gate 5
+   *  2026-07-17: they duplicate the real permission/done cards and read as nag noise) —
+   *  opt back in with CCTL_WAITING_CARDS. Stop/done cards and the daemon's own emits
+   *  (quarantine, AskUserQuestion's question card) are not affected by this switch. */
+  forwardNotificationCards?: boolean;
   clock?: () => number;
   /** Called with a fully-formed envelope draft whenever a hook produces one — the daemon
    *  wires this to the control-plane client's send/outbox path. Kept synchronous-callback
@@ -193,6 +199,7 @@ export class HookReceiver {
   private readonly daemonId: () => string;
   private readonly logger: Logger;
   private readonly permissionHoldMs: number;
+  private readonly forwardNotificationCards: boolean;
   private server: Server | undefined;
   /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
    *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
@@ -222,6 +229,7 @@ export class HookReceiver {
     this.daemonId = options.daemonId;
     this.logger = options.logger ?? noopLogger;
     this.permissionHoldMs = options.permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS;
+    this.forwardNotificationCards = options.forwardNotificationCards ?? false;
   }
 
   /** Install the CLI session-command logic. Called by the daemon before `listen` (symmetric
@@ -624,6 +632,18 @@ export class HookReceiver {
     event: 'stop' | 'notification',
   ): void {
     const sessionId = str(body.session_id) ?? str(body.sessionId);
+    // Notification events are the CLI mirroring its terminal nags ("Claude is waiting for your
+    // input", "Claude needs your permission") — with real permission/done cards in place they
+    // are duplicate noise, so forwarding them is opt-in (wet finding, gate 5 2026-07-17).
+    // The hook is still answered 200: suppression is a display choice, never a hook failure.
+    if (event === 'notification' && !this.forwardNotificationCards) {
+      this.logger.info(
+        { event, sessionId, notificationType: str(body.notification_type) },
+        'notification hook suppressed (waiting cards off — CCTL_WAITING_CARDS enables)',
+      );
+      this.respond(res, 200, { ok: true });
+      return;
+    }
     // Two optional discriminators from the CLI hook payload, threaded through so the bot can
     // render rich done/waiting cards (plan §4). Both parsed tolerantly (snake_case primary,
     // camelCase accepted): unknown values pass through unchanged and the bot falls back to the

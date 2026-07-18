@@ -84,6 +84,10 @@ describe('HookReceiver', () => {
       // lapse build their own receiver with a tiny hold. afterEach's close() answers any
       // still-held responses neutrally, so no test hangs on an unresolved hold.
       permissionHoldMs: 3000,
+      // Notification forwarding is opt-in (off by default); the harness opts in so the
+      // forwarding-shape tests below exercise the wire payload. The default-off behavior has
+      // its own describe with a dedicated receiver.
+      forwardNotificationCards: true,
     });
     port = await receiver.listen(0);
   });
@@ -219,6 +223,58 @@ describe('HookReceiver', () => {
       if (req.type === 'permission.request') {
         // exactOptionalPropertyTypes: absent, not `undefined`.
         expect('permissionMode' in req.payload).toBe(false);
+      }
+    });
+  });
+
+  describe('Notification suppression (default: waiting cards off)', () => {
+    // Wet finding (gate 5): the CLI's Notification nags ("Claude is waiting for your input")
+    // duplicate the real permission/done cards, so forwarding them is opt-in.
+    let quietReceiver: HookReceiver;
+    let quietPort: number;
+    let quietEmitted: EnvelopeDraft[];
+
+    beforeEach(async () => {
+      quietEmitted = [];
+      quietReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => quietEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        // No forwardNotificationCards — this describe pins the DEFAULT.
+      });
+      quietPort = await quietReceiver.listen(0);
+    });
+
+    afterEach(async () => {
+      await quietReceiver.close();
+    });
+
+    it('answers a Notification 200 but emits NO card by default', async () => {
+      const res = await post(
+        quietPort,
+        '/',
+        { event: 'Notification', notification_type: 'idle_prompt', message: 'Claude is waiting' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      // Suppression is a display choice, never a hook failure — the CLI must see success.
+      expect(res.status).toBe(200);
+      expect(quietEmitted).toHaveLength(0);
+    });
+
+    it('still forwards Stop (done cards) by default', async () => {
+      const res = await post(
+        quietPort,
+        '/',
+        { event: 'Stop', session_id: 'sess-1' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+      expect(quietEmitted).toHaveLength(1);
+      expect(quietEmitted[0]?.type).toBe('hook.notification');
+      if (quietEmitted[0]?.type === 'hook.notification') {
+        expect(quietEmitted[0].payload.event).toBe('stop');
       }
     });
   });

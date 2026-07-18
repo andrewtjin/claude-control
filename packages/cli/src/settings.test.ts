@@ -52,6 +52,7 @@ describe('resolveDaemonConfig', () => {
       triggerPercent: undefined,
       minSessionHeadroomPct: undefined,
       cooldownMs: undefined,
+      waitingCards: false,
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('off');
@@ -59,8 +60,15 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'switch trigger').value).toBe('94% used');
     expect(row(rows, 'min session headroom').value).toBe('25% left');
     expect(row(rows, 'auto-switch cooldown').value).toBe('10m');
+    expect(row(rows, 'waiting cards').value).toBe('off');
     expect(row(rows, 'relay url').value).toBe(DEFAULT_RELAY_URL);
     expect(row(rows, 'daemon log level').value).toBe('info');
+  });
+
+  it('enables waiting cards (the "Claude is waiting…" nag forwarding) only via env opt-in', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_WAITING_CARDS: '1' });
+    expect(values.waitingCards).toBe(true);
+    expect(row(rows, 'waiting cards')).toMatchObject({ value: 'on', source: 'env' });
   });
 
   it('reflects env overrides in both values and rows, with source "env"', () => {

@@ -220,6 +220,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     emit: (draft) => controlPlaneClient.send(draft),
     daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
     logger,
+    forwardNotificationCards: config.values.waitingCards,
   });
 
   // Auto-switch is strictly opt-in (`--auto-switch`): unattended account hops are a policy

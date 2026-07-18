@@ -92,6 +92,7 @@ export interface DaemonConfig {
     triggerPercent: number | undefined;
     minSessionHeadroomPct: number | undefined;
     cooldownMs: number | undefined;
+    waitingCards: boolean;
   };
   rows: SettingRow[];
 }
@@ -114,6 +115,9 @@ export function resolveDaemonConfig(
   const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
   const relayEnv = env['CCTL_RELAY_URL'];
   const relayUrl = flags.relay ?? relayEnv ?? DEFAULT_RELAY_URL;
+  // Default OFF: the CLI's Notification hook nags ("Claude is waiting for your input…")
+  // duplicate the real permission/done cards on the phone (wet finding, gate 5 2026-07-17).
+  const waitingCards = envFlag(env, 'CCTL_WAITING_CARDS');
 
   const rows: SettingRow[] = [
     {
@@ -148,6 +152,12 @@ export function resolveDaemonConfig(
       detail: 'CCTL_AUTOSWITCH_COOLDOWN_MS',
     },
     {
+      name: 'waiting cards',
+      value: waitingCards ? 'on' : 'off',
+      source: envSource(waitingCards),
+      detail: 'CCTL_WAITING_CARDS ("Claude is waiting…" terminal nags as phone cards)',
+    },
+    {
       name: 'relay url',
       value: relayUrl,
       source: flags.relay !== undefined ? 'flag' : envSource(relayEnv !== undefined),
@@ -162,7 +172,15 @@ export function resolveDaemonConfig(
   ];
 
   return {
-    values: { relayUrl, autoSwitch, greedy, triggerPercent, minSessionHeadroomPct, cooldownMs },
+    values: {
+      relayUrl,
+      autoSwitch,
+      greedy,
+      triggerPercent,
+      minSessionHeadroomPct,
+      cooldownMs,
+      waitingCards,
+    },
     rows,
   };
 }
