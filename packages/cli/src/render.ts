@@ -7,6 +7,7 @@
 
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
+import type { HeartbeatReading } from '@claude-control/daemon';
 import { computeOutlook, timelineInputFromWire } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
 
@@ -131,4 +132,57 @@ function colWidth<K extends string>(
   key: K,
 ): number {
   return Math.max(headers[key].length, ...rows.map((r) => r[key].length));
+}
+
+/** What `cctl daemon status` has gathered before rendering — one snapshot from three
+ *  independent sources (a live Scheduled Task query, the heartbeat file, the identity file)
+ *  joined here only for display; each source degrades on its own (see daemonInstall.ts,
+ *  heartbeat.ts, dpapiIdentityStore) so a missing piece never blocks the other lines. */
+export interface DaemonStatusView {
+  task: { registered: boolean; state?: string };
+  heartbeat: HeartbeatReading;
+  paired: boolean;
+  relayUrl: string;
+}
+
+/** Render an at-a-glance daemon health report: logon task, heartbeat, pairing, relay. Pure —
+ *  every value is gathered by the caller (`cctl daemon status`'s action). */
+export function renderDaemonStatus(
+  view: DaemonStatusView,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  return [
+    taskLine(view.task, palette),
+    heartbeatLine(view, palette),
+    view.paired
+      ? `${palette.green('[ok]')} paired with the relay`
+      : `${palette.yellow('[--]')} not paired — see: cctl pair`,
+    `${palette.dim('relay:')} ${view.relayUrl}`,
+  ].join('\n');
+}
+
+function taskLine(task: DaemonStatusView['task'], palette: Palette): string {
+  if (!task.registered) {
+    return `${palette.yellow('[--]')} logon task not registered — run: cctl daemon install`;
+  }
+  const state = task.state ? ` (${task.state})` : '';
+  return `${palette.green('[ok]')} logon task registered${state}`;
+}
+
+/** The heartbeat line additionally reads `task.registered`: a stale heartbeat backed by a
+ *  registered logon task will self-heal at the next logon, which is worth saying outright
+ *  rather than leaving the reader to infer it from a bare timestamp. */
+function heartbeatLine(view: DaemonStatusView, palette: Palette): string {
+  const { heartbeat, task } = view;
+  if (heartbeat.state === 'never') {
+    return `${palette.dim('[--]')} daemon has never run on this machine — run: cctl daemon install`;
+  }
+  const age = ageLabel(heartbeat.ageMs);
+  if (heartbeat.state === 'alive') {
+    return `${palette.green('[ok]')} daemon alive (heartbeat ${age})`;
+  }
+  const nextStep = task.registered
+    ? 'will restart at next logon (or run: cctl daemon install to start it now)'
+    : 'not scheduled to restart — run: cctl daemon install';
+  return `${palette.red('[!!]')} daemon not responding (last heartbeat ${age}) — ${nextStep}`;
 }

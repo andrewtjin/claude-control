@@ -43,6 +43,12 @@ describe('buildProgram', () => {
     );
   });
 
+  it('nests install, uninstall, and status alongside run under daemon', () => {
+    const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
+    const subs = daemon?.commands.map((c) => c.name()).sort();
+    expect(subs).toEqual(['install', 'run', 'status', 'uninstall']);
+  });
+
   it('reports its version', () => {
     expect(buildProgram().version()).toBe('0.1.0');
   });

@@ -17,8 +17,11 @@ import { dirname, join } from 'node:path';
 import pino from 'pino';
 import {
   Vault,
+  acquireLock,
   defaultPaths,
   defaultProtector,
+  LockTimeoutError,
+  type Lock,
   type Logger,
   type Paths,
   type Protector,
@@ -28,6 +31,7 @@ import {
   AutoSwitcher,
   ControlPlaneClient,
   Daemon,
+  HeartbeatWriter,
   HookReceiver,
   Store,
   UsagePoller,
@@ -96,6 +100,34 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
 export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const paths: Paths = defaultPaths();
   const dataDir = dirname(paths.vaultDir);
+
+  // Second-instance guard, acquired before any other IO (in particular, before the sqlite
+  // store below is opened): the daemon is a per-machine singleton — its Scheduled Task, hook
+  // receiver, and control-plane identity all assume exactly one running copy, and two writers
+  // on the same daemon.db would otherwise fail unpredictably at the FIRST concurrent write
+  // rather than up front with a clear reason. This is a SEPARATE lock directory from
+  // switch-engine's credential lock (held only for the duration of one activate()/recover()
+  // call) — reusing that one for the daemon's whole lifetime would starve every `cctl switch`
+  // while the daemon is up. Reusing `acquireLock`'s mkdir-atomic + stale-pid-reclaim primitive
+  // here means a crashed daemon's lock self-heals exactly like the credential lock does. A
+  // short timeout: a live holder is not going to let go, so waiting out the credential lock's
+  // ~15s default would just make a doomed second launch feel hung.
+  let instanceLock: Lock;
+  try {
+    instanceLock = await acquireLock(join(dataDir, 'daemon-instance.lock'), Date.now, {
+      timeoutMs: 1_000,
+      pollMs: 100,
+    });
+  } catch (err) {
+    if (err instanceof LockTimeoutError) {
+      throw new Error(
+        'a cctl daemon is already running on this machine (see `cctl daemon status`); ' +
+          'stop it before starting another.',
+      );
+    }
+    throw err;
+  }
+
   const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
   const logger: Logger = {
     debug: (obj, msg) => p.debug(obj, msg),
@@ -218,7 +250,15 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     logger,
   });
 
+  // Liveness signal for `cctl daemon status` (see heartbeat.ts) — a separate process, possibly
+  // reading this long after the daemon that wrote it has exited, so a file is the only channel
+  // that survives a hard crash. Started once the daemon is actually up, stopped on shutdown.
+  const heartbeat = new HeartbeatWriter(join(dataDir, 'daemon-heartbeat.json'), {
+    onError: (err) => logger.warn({ err }, 'could not write the daemon heartbeat'),
+  });
+
   await daemon.start();
+  heartbeat.start();
 
   // Installed AFTER start() (not before) because `daemon.start()` is what actually binds the
   // hook receiver's port — an OS-assigned ephemeral port that's different on every run, so
@@ -245,9 +285,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
 
   const shutdown = (): void => {
     process.stdout.write('Stopping daemon...\n');
+    heartbeat.stop();
     void daemon
       .stop()
       .catch(() => {})
+      .then(() => instanceLock.release())
       .then(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
