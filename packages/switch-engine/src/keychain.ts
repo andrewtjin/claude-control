@@ -17,8 +17,9 @@
 // secret rides inside the stdin line, never in the process table.
 //
 // ⚠ WET-GATE NOTICE: everything touching the REAL `security(1)` or the REAL mac CLI is
-// unverified until `tasks/mac-wet-gate-runbook.md` runs on an actual Mac (assumptions A1-A4
-// in the mac-compatibility plan). The logic below is unit-tested against a fake runner only.
+// unverified until `claude-control-orchestrator/tasks/mac-wet-gate-runbook.md` (sibling repo)
+// runs on an actual Mac (assumptions A1-A4 in the mac-compatibility plan). The logic below is
+// unit-tested against a fake runner only.
 
 import { execFileSync } from 'node:child_process';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';

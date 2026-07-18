@@ -3,10 +3,12 @@
 **Windows-only today.** Two load-bearing places tie the implementation to Windows:
 
 - **Credential vault encryption** uses Windows DPAPI (via PowerShell `ProtectedData`,
-  `CurrentUser` scope) — there is no macOS/Linux equivalent wired in yet, so the vault
-  cannot protect tokens off Windows. `cctl doctor` runs a real protect/unprotect
-  round-trip through this platform's protector and reports the gap outright on an
-  unsupported platform, instead of failing silently later.
+  `CurrentUser` scope). A macOS Keychain-backed equivalent is implemented (`48644ef`)
+  but unverified on Mac hardware (see `docs/VERIFICATION.md` §12); there is no Linux
+  equivalent yet, so Windows is the only verified vault platform today. `cctl doctor`
+  runs a real protect/unprotect round-trip through this platform's protector and
+  reports the gap outright on an unsupported platform, instead of failing silently
+  later.
 - **Autostart** registers a logon **Scheduled Task** (`cctl daemon install`), because
   the DPAPI vault is `CurrentUser`-scoped: the daemon must run as the logged-in user,
   which makes a Windows service structurally wrong regardless of convenience — a
@@ -31,8 +33,10 @@ it turns into a confusing runtime error.
 
 ## Coming later
 
-- **macOS** (Keychain-backed vault) is the next planned milestone; its own gated
-  verification tracks separately and does not block anything documented here.
+- **macOS** (Keychain-backed vault) is **implemented** (`48644ef`) but not yet
+  verified on Mac hardware — not a supported platform until its wet gate closes. That
+  verification tracks separately (`docs/VERIFICATION.md` §12) and does not block
+  anything documented here.
 - **Linux** (libsecret-backed vault) after that.
 
 On an unsupported platform, `cctl doctor` reports the gap instead of failing
