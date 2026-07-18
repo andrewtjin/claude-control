@@ -171,6 +171,26 @@ export class KeychainProtector implements Protector {
 /** The mac CLI's own Keychain item (assumed name — verify on a real Mac). */
 export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
+/** Effective service/account for the CLI's live Keychain item, applying operator env overrides
+ *  over the shipped defaults. Shared by the live-channel factory (`defaultLiveCredentialChannel`)
+ *  and `cctl doctor` so both ACT ON and REPORT the same target: if the CLI turns out to use a
+ *  different item name than assumed above, the operator corrects it with an env var instead of
+ *  waiting on a code change. `env` is injected for testability; unset keys fall back to the
+ *  default service and the login user, i.e. identical to constructing the channel with no
+ *  options. */
+export function resolveClaudeCliKeychainTarget(env: NodeJS.ProcessEnv = process.env): {
+  service: string;
+  account: string;
+} {
+  // `||` (not `??`): a set-but-blank override (`export CLAUDE_CLI_KEYCHAIN_SERVICE=`) is an
+  // operator slip, not an intentional empty item name — fall back to the default there too. An
+  // empty service/account is never a valid `security(1)` target, so this can only help.
+  return {
+    service: env.CLAUDE_CLI_KEYCHAIN_SERVICE || CLAUDE_CLI_KEYCHAIN_SERVICE,
+    account: env.CLAUDE_CLI_KEYCHAIN_ACCOUNT || userInfo().username,
+  };
+}
+
 /**
  * Live-credential channel backed by the Claude CLI's macOS Keychain item. Behavior mirrors
  * the file channel's SURGICAL rule: read the existing payload, replace exactly the
