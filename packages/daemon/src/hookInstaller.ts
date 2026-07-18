@@ -189,16 +189,26 @@ export interface UninstallHooksOptions {
 export async function uninstallHooks(options: UninstallHooksOptions): Promise<void> {
   const settings = await readSettings(options.settingsPath);
   if (!isRecord(settings.hooks)) return; // nothing installed, nothing to remove
-  const hooksSection = settings.hooks;
+  const hooksSection: JsonObject = settings.hooks;
 
-  const events = Object.values(options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES);
+  // `HookEventNames` has no index signature, so `Object.values` can't infer a typed array from
+  // it (TypeScript silently falls back to `any[]`) — list the three fields explicitly instead.
+  const activeEventNames = options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES;
+  const events: string[] = [
+    activeEventNames.permissionRequest,
+    activeEventNames.stop,
+    activeEventNames.notification,
+  ];
   let changed = false;
 
   for (const event of events) {
     const existing = hooksSection[event];
     if (!Array.isArray(existing)) continue;
+    // `Array.isArray` narrows to `any[]` (that's how the built-in signature is declared), so
+    // pin it back down to `unknown[]` rather than letting `any` leak into the map/filter below.
+    const existingGroups: unknown[] = existing;
 
-    const prunedGroups = existing
+    const prunedGroups = existingGroups
       .map((g) => {
         if (!isHookGroup(g)) return g; // not recognizably ours to interpret — leave as-is
         const keptHooks = g.hooks.filter((h) => !isHookEntry(h) || !isOwnedHookCommand(h.command));
@@ -207,7 +217,7 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<vo
       })
       // A group left with zero hooks by the prune above is dead weight — drop it too.
       .filter((g) => !isHookGroup(g) || g.hooks.length > 0);
-    if (prunedGroups.length !== existing.length) changed = true;
+    if (prunedGroups.length !== existingGroups.length) changed = true;
 
     hooksSection[event] = prunedGroups;
   }

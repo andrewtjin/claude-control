@@ -234,7 +234,7 @@ describe('uninstallHooks', () => {
     expect(settings.theme).toBe('dark');
     expect(settings.hooks.PermissionRequest ?? []).toEqual([]);
     expect(settings.hooks.Notification ?? []).toEqual([]);
-    const stopCommands = settings.hooks.Stop.flatMap((g) => g.hooks.map((h) => h.command));
+    const stopCommands = (settings.hooks.Stop ?? []).flatMap((g) => g.hooks.map((h) => h.command));
     expect(stopCommands).toEqual(['some-other-tool --notify']);
   });
 
