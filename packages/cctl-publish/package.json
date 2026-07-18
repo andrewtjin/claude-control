@@ -1,0 +1,34 @@
+{
+  "name": "@claude-control/cctl",
+  "version": "0.1.0",
+  "private": false,
+  "description": "cctl — switch Claude Code accounts, see cross-account usage, and drive sessions from your phone.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andrewtjin/claude-control.git",
+    "directory": "packages/cctl-publish"
+  },
+  "homepage": "https://github.com/andrewtjin/claude-control#readme",
+  "bugs": "https://github.com/andrewtjin/claude-control/issues",
+  "bin": {
+    "cctl": "./dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "smoke-test": "node scripts/smoke-test.mjs",
+    "prepublishOnly": "node scripts/build.mjs && node scripts/smoke-test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

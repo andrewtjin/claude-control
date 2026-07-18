@@ -42,6 +42,12 @@ importers:
         specifier: ^3.0.2
         version: 3.2.7(@types/node@22.20.1)(tsx@4.23.1)
 
+  packages/cctl-publish:
+    devDependencies:
+      esbuild:
+        specifier: ^0.28.1
+        version: 0.28.1
+
   packages/cli:
     dependencies:
       '@claude-control/daemon':

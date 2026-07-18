@@ -19,14 +19,22 @@ import { hashToken, mintToken } from './tokens.js';
 import { RelayServer, type DiscordGateway } from './relay.js';
 
 /** Collects every envelope delivered to it and exposes a way to await N of them, so tests
- *  don't have to race the relay's internal async handling with a fixed sleep. */
+ *  don't have to race the relay's internal async handling with a fixed sleep. Also records
+ *  every `sendPrimer` call (the post-pairing DM), which fires from a fire-and-forget path in
+ *  relay.ts, so tests need the same wait-for-count treatment to observe it deterministically. */
 function createFakeGateway() {
   const deliveries: { discordUserId: string; envelope: Envelope }[] = [];
+  const primers: string[] = [];
   let onDeliver: (() => void) | undefined;
+  let onPrimer: (() => void) | undefined;
   const gateway: DiscordGateway = {
     deliver(discordUserId, envelope) {
       deliveries.push({ discordUserId, envelope });
       onDeliver?.();
+    },
+    sendPrimer(discordUserId) {
+      primers.push(discordUserId);
+      onPrimer?.();
     },
   };
   async function waitForCount(n: number, timeoutMs = 2000): Promise<void> {
@@ -45,7 +53,20 @@ function createFakeGateway() {
       };
     });
   }
-  return { gateway, deliveries, waitForCount };
+  async function waitForPrimerCount(n: number, timeoutMs = 2000): Promise<void> {
+    if (primers.length >= n) return;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timed out waiting for primer')), timeoutMs);
+      onPrimer = () => {
+        if (primers.length >= n) {
+          clearTimeout(timer);
+          onPrimer = undefined;
+          resolve();
+        }
+      };
+    });
+  }
+  return { gateway, deliveries, primers, waitForCount, waitForPrimerCount };
 }
 
 function connect(port: number): Promise<WebSocket> {
@@ -476,6 +497,56 @@ describe('RelayServer', () => {
       if (result.type !== 'pair.result') throw new Error('unreachable');
       expect(result.payload.ok).toBe(false);
       expect(closeCode).toBe(1000);
+    });
+
+    it('DMs the pairing primer to the owning user on a successful claim', async () => {
+      const code = pairing.createCode('user-a');
+      const ws = await connect(port);
+      sendEnvelope(ws, {
+        daemonId: 'daemon-new',
+        type: 'pair.claim',
+        payload: { pairingCode: code, hostLabel: 'fresh-host' },
+      });
+      await nextMessage(ws);
+      await fake.waitForPrimerCount(1);
+      expect(fake.primers).toEqual(['user-a']);
+      ws.close();
+    });
+
+    it('never sends a primer for a rejected claim', async () => {
+      const ws = await connect(port);
+      sendEnvelope(ws, {
+        daemonId: 'daemon-x',
+        type: 'pair.claim',
+        payload: { pairingCode: '000000', hostLabel: 'host' },
+      });
+      await nextMessage(ws);
+      // No successful pairing occurred, so nothing should ever arrive — give the
+      // fire-and-forget primer path a beat to run before asserting silence.
+      await new Promise((r) => setTimeout(r, 100));
+      expect(fake.primers).toEqual([]);
+      ws.close();
+    });
+  });
+
+  describe('/health', () => {
+    it('responds 200 with a JSON body on GET /health', async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toContain('application/json');
+      const body: unknown = await res.json();
+      expect(body).toEqual({ ok: true });
+    });
+
+    it('responds 404 for any other path', async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/nope`);
+      expect(res.status).toBe(404);
+    });
+
+    it('never requires daemon credentials — no auth header, no pairing state needed', async () => {
+      // Nothing was paired or bound in this test at all; the probe must still answer.
+      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(res.status).toBe(200);
     });
   });
 });

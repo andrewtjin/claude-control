@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
+import {
+  renderAccountsTable,
+  renderDaemonStatus,
+  renderUsage,
+  type DaemonStatusView,
+  type UsageRow,
+} from './render.js';
 import { ANSI_PALETTE } from './ansi.js';
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
@@ -137,6 +143,64 @@ describe('renderUsage', () => {
     expect(colored).toContain(ANSI_PALETTE.red('97%'));
     expect(colored).toContain(ANSI_PALETTE.red('[refresh failed]'));
     expect(colored).toContain(ANSI_PALETTE.green('*'));
+    expect(stripAnsi(colored)).toBe(plain);
+  });
+});
+
+describe('renderDaemonStatus', () => {
+  const healthy: DaemonStatusView = {
+    task: { registered: true, state: 'Ready' },
+    heartbeat: { state: 'alive', writtenAtMs: 0, ageMs: 5_000 },
+    paired: true,
+    relayUrl: 'wss://relay.example.com',
+  };
+
+  it('reports every dimension as ok on a fully healthy daemon', () => {
+    const out = renderDaemonStatus(healthy);
+    expect(out).toMatch(/logon task registered \(Ready\)/);
+    expect(out).toMatch(/daemon alive \(heartbeat just now\)/);
+    expect(out).toMatch(/paired with the relay/);
+    expect(out).toMatch(/relay:\s+wss:\/\/relay\.example\.com/);
+  });
+
+  it('prompts to install when no logon task is registered', () => {
+    const out = renderDaemonStatus({ ...healthy, task: { registered: false } });
+    expect(out).toMatch(/logon task not registered — run: cctl daemon install/);
+  });
+
+  it("says the daemon has never run when the heartbeat state is 'never'", () => {
+    const out = renderDaemonStatus({ ...healthy, heartbeat: { state: 'never' } });
+    expect(out).toMatch(/daemon has never run on this machine — run: cctl daemon install/);
+  });
+
+  it('explains a stale heartbeat will self-heal at next logon when the task IS registered', () => {
+    const out = renderDaemonStatus({
+      ...healthy,
+      heartbeat: { state: 'stale', writtenAtMs: 0, ageMs: 5 * 60_000 },
+    });
+    expect(out).toMatch(/daemon not responding/);
+    expect(out).toMatch(/will restart at next logon/);
+  });
+
+  it('does NOT promise a next-logon restart for a stale heartbeat when no task is registered', () => {
+    const out = renderDaemonStatus({
+      ...healthy,
+      task: { registered: false },
+      heartbeat: { state: 'stale', writtenAtMs: 0, ageMs: 5 * 60_000 },
+    });
+    expect(out).toMatch(/not scheduled to restart — run: cctl daemon install/);
+    expect(out).not.toMatch(/will restart at next logon/);
+  });
+
+  it('prompts to pair when not paired', () => {
+    const out = renderDaemonStatus({ ...healthy, paired: false });
+    expect(out).toMatch(/not paired — see: cctl pair/);
+  });
+
+  it('colors the alive/ok lines green under a palette without changing the plain text', () => {
+    const plain = renderDaemonStatus(healthy);
+    const colored = renderDaemonStatus(healthy, ANSI_PALETTE);
+    expect(colored).toContain(ANSI_PALETTE.green('[ok]'));
     expect(stripAnsi(colored)).toBe(plain);
   });
 });

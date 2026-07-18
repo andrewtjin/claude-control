@@ -1,0 +1,16 @@
+# Keeps the Docker build context (repo root — see packages/control-plane-bot/Dockerfile) to
+# just what a scoped pnpm install/build actually needs. Without this, `COPY . .` would ship a
+# host-platform node_modules (breaks a Linux image build on Windows/macOS dev machines) and
+# every package's dist/coverage output straight into the build context.
+node_modules
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+coverage
+**/coverage
+.git
+.claude
+tasks
+scratch
+*.local
+*.log

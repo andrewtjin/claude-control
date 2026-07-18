@@ -8,6 +8,12 @@
 // it never inspects payload semantics (e.g. it does not track pending permission requests),
 // so it structurally cannot fabricate a response on a daemon's or a user's behalf.
 
+import {
+  createServer,
+  type Server as HttpServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import {
   decode,
@@ -43,8 +49,9 @@ export interface RelayServerOptions {
   pairing: PairingService;
   gateway: DiscordGateway;
   logger?: Logger;
-  /** Port to listen on; 0 (default) picks an OS-assigned ephemeral port — use that in tests
-   *  and read the real port back from `listen()`. */
+  /** Port the HTTP server (daemon websockets + the unauthenticated `/health` probe) listens
+   *  on; 0 (default) picks an OS-assigned ephemeral port — use that in tests and read the
+   *  real port back from `listen()`. */
   port?: number;
   /** ms between server-initiated ws pings; 0 disables the heartbeat entirely (tests). */
   heartbeatMs?: number;
@@ -67,6 +74,7 @@ const FIRST_FRAME_TIMEOUT_MS = 10_000;
 const DEFAULT_HEARTBEAT_MS = 30_000;
 
 export class RelayServer implements RelaySender {
+  private readonly httpServer: HttpServer;
   private readonly wss: WebSocketServer;
   private readonly bindings: BindingStore;
   private readonly pairing: PairingService;
@@ -80,10 +88,17 @@ export class RelayServer implements RelaySender {
     this.pairing = options.pairing;
     this.gateway = options.gateway;
     this.logger = options.logger ?? noopLogger;
-    this.wss = new WebSocketServer({ port: options.port ?? 0 });
+    // An explicit http.Server (rather than letting WebSocketServer's `port` option create one
+    // implicitly) so a plain GET can be answered on the same port the daemon sockets use —
+    // ws only ever attaches an 'upgrade' handler to it, never a 'request' handler of its own.
+    this.httpServer = createServer((req, res) => {
+      this.onHttpRequest(req, res);
+    });
+    this.wss = new WebSocketServer({ server: this.httpServer });
     this.wss.on('connection', (socket) => {
       this.onConnection(socket);
     });
+    this.httpServer.listen(options.port ?? 0);
 
     const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     // A 0 (or otherwise falsy) heartbeat disables the interval entirely — real deployments
@@ -98,10 +113,10 @@ export class RelayServer implements RelaySender {
   /** Resolve once the underlying server is accepting connections; returns the bound port
    *  (the actual OS-assigned port when constructed with `port: 0`). */
   async listen(): Promise<number> {
-    if (this.wss.address()) return this.currentPort();
+    if (this.httpServer.listening) return this.currentPort();
     await new Promise<void>((resolve, reject) => {
-      this.wss.once('listening', resolve);
-      this.wss.once('error', reject);
+      this.httpServer.once('listening', resolve);
+      this.httpServer.once('error', reject);
     });
     return this.currentPort();
   }
@@ -110,8 +125,14 @@ export class RelayServer implements RelaySender {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     for (const conn of this.connectionsByDaemon.values()) conn.socket.terminate();
     this.connectionsByDaemon.clear();
+    // wss.close() only tears down its own bookkeeping when constructed with an external
+    // server — it deliberately does NOT close that server, so the http.Server needs its own
+    // explicit close() or the process would leak an open listening socket.
     await new Promise<void>((resolve, reject) => {
       this.wss.close((err) => (err ? reject(err) : resolve()));
+    });
+    await new Promise<void>((resolve, reject) => {
+      this.httpServer.close((err) => (err ? reject(err) : resolve()));
     });
   }
 
@@ -140,11 +161,25 @@ export class RelayServer implements RelaySender {
   }
 
   private currentPort(): number {
-    const addr = this.wss.address();
+    const addr = this.httpServer.address();
     if (addr === null || typeof addr === 'string') {
       throw new Error('relay server has no network address');
     }
     return addr.port;
+  }
+
+  /** Unauthenticated GET /health on the same port daemons connect to — lets a setup wizard
+   *  distinguish "the relay is unreachable" from "your network/firewall is broken" without
+   *  needing any daemon credentials. Deliberately minimal: no auth, no request body, no
+   *  binding/pairing state — a plain liveness probe, nothing that could leak user data. */
+  private onHttpRequest(req: IncomingMessage, res: ServerResponse): void {
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
   }
 
   private onConnection(socket: WebSocket): void {
@@ -278,6 +313,16 @@ export class RelayServer implements RelaySender {
       payload.daemonId = result.daemonId;
       payload.daemonToken = result.daemonToken;
       payload.discordUserId = result.discordUserId;
+      // First-run primer: the user's very first signal after pairing should be what to try
+      // next, not silence until a daemon happens to push something. Best-effort — a DM
+      // failure (e.g. the user has DMs closed) must never fail the pairing itself, which has
+      // already succeeded by this point.
+      Promise.resolve(this.gateway.sendPrimer(result.discordUserId)).catch((err: unknown) => {
+        this.logger.warn(
+          { err, discordUserId: result.discordUserId },
+          'relay: failed to send pairing primer DM',
+        );
+      });
     } else {
       payload.error = result.error;
     }

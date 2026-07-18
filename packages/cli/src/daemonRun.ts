@@ -8,17 +8,20 @@
 //
 // SECURITY: the daemon's control-plane identity (daemonId + daemonToken) is a bearer
 // credential, so it is persisted DPAPI-encrypted beside the vault — same at-rest posture as
-// OAuth tokens, useless if copied off this machine/user.
+// OAuth tokens, useless if copied off this machine/user. The hook secret (see hookSecret.ts)
+// gets the identical treatment for the identical reason.
 
-import { randomUUID } from 'node:crypto';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import pino from 'pino';
 import {
   Vault,
+  acquireLock,
   defaultPaths,
   defaultProtector,
+  LockTimeoutError,
+  type Lock,
   type Logger,
   type Paths,
   type Protector,
@@ -28,9 +31,13 @@ import {
   AutoSwitcher,
   ControlPlaneClient,
   Daemon,
+  HeartbeatWriter,
   HookReceiver,
   Store,
   UsagePoller,
+  buildDaemonHookSpecs,
+  installHooks,
+  loadOrCreateHookSecret,
   type DaemonIdentity,
   type IdentityStore,
 } from '@claude-control/daemon';
@@ -88,11 +95,70 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
   };
 }
 
-/** Assemble and start the daemon; resolves once it is up (the process then stays alive on
- *  the hook receiver's server + the control-plane socket until Ctrl+C). */
+/**
+ * Poll `getPort()` until it returns a bound port or `timeoutMs` elapses. Used to observe the
+ * hook receiver's port without waiting on the whole (possibly-hanging) `daemon.start()`
+ * promise — see the call site in `runDaemon`. `clock`/`sleep` are injectable so tests never
+ * need real wall-clock waits.
+ */
+export async function waitForHookPort(
+  getPort: () => number | undefined,
+  options: {
+    timeoutMs?: number;
+    pollMs?: number;
+    clock?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<number | undefined> {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const pollMs = options.pollMs ?? 25;
+  const clock = options.clock ?? Date.now;
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = clock() + timeoutMs;
+  for (;;) {
+    const port = getPort();
+    if (port !== undefined) return port;
+    if (clock() >= deadline) return undefined;
+    await sleep(pollMs);
+  }
+}
+
+/** Assemble and start the daemon; resolves once local readiness (heartbeat, installed hooks)
+ *  is in place — deliberately NOT once the control-plane connection is live, since that can
+ *  hang indefinitely (see the `daemon.start()` call site below). The process then stays alive
+ *  on the hook receiver's server + the control-plane socket until Ctrl+C. */
 export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const paths: Paths = defaultPaths();
   const dataDir = dirname(paths.vaultDir);
+
+  // Second-instance guard, acquired before any other IO (in particular, before the sqlite
+  // store below is opened): the daemon is a per-machine singleton — its Scheduled Task, hook
+  // receiver, and control-plane identity all assume exactly one running copy, and two writers
+  // on the same daemon.db would otherwise fail unpredictably at the FIRST concurrent write
+  // rather than up front with a clear reason. This is a SEPARATE lock directory from
+  // switch-engine's credential lock (held only for the duration of one activate()/recover()
+  // call) — reusing that one for the daemon's whole lifetime would starve every `cctl switch`
+  // while the daemon is up. Reusing `acquireLock`'s mkdir-atomic + stale-pid-reclaim primitive
+  // here means a crashed daemon's lock self-heals exactly like the credential lock does. A
+  // short timeout: a live holder is not going to let go, so waiting out the credential lock's
+  // ~15s default would just make a doomed second launch feel hung.
+  let instanceLock: Lock;
+  try {
+    instanceLock = await acquireLock(join(dataDir, 'daemon-instance.lock'), Date.now, {
+      timeoutMs: 1_000,
+      pollMs: 100,
+    });
+  } catch (err) {
+    if (err instanceof LockTimeoutError) {
+      throw new Error(
+        'a cctl daemon is already running on this machine (see `cctl daemon status`); ' +
+          'stop it before starting another.',
+      );
+    }
+    throw err;
+  }
+
   const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
   const logger: Logger = {
     debug: (obj, msg) => p.debug(obj, msg),
@@ -125,6 +191,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const identityPath = join(dataDir, 'daemon-identity.enc');
   if (options.pair) await rm(identityPath, { force: true });
   const identityStore = dpapiIdentityStore(identityPath, protector);
+
+  // Stable across restarts (see hookSecret.ts) — minted once, then reused for as long as this
+  // file decrypts, so the curl command `installHooks` writes into settings.json keeps working
+  // after every future daemon restart instead of 401ing until it's reinstalled.
+  const hookSecretPath = join(dataDir, 'hook-secret.enc');
+  const hookSecret = await loadOrCreateHookSecret(hookSecretPath, protector);
 
   // The poller reads tokens straight from the vault WITHOUT switching. When an idle
   // account's vault token has expired, the getter asks the ENGINE to refresh it — inside the
@@ -164,11 +236,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   });
 
   // The receiver forwards hook envelopes out through the client (which buffers to its outbox
-  // while disconnected). Secret is per-run: hooks are not installed until M3, and the
-  // installer will persist a stable secret when it lands.
+  // while disconnected). The secret is the stable one loaded above, not minted per run — see
+  // hookSecret.ts for why that matters.
   const hookReceiver = new HookReceiver({
     store,
-    secret: randomUUID(),
+    secret: hookSecret,
     emit: (draft) => controlPlaneClient.send(draft),
     daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
   });
@@ -209,16 +281,58 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     logger,
   });
 
-  await daemon.start();
+  // Liveness signal for `cctl daemon status` (see heartbeat.ts) — a separate process, possibly
+  // reading this long after the daemon that wrote it has exited, so a file is the only channel
+  // that survives a hard crash. Started as soon as this process is up (not gated on the
+  // control-plane connection — see the comment below), stopped on shutdown.
+  const heartbeat = new HeartbeatWriter(join(dataDir, 'daemon-heartbeat.json'), {
+    onError: (err) => logger.warn({ err }, 'could not write the daemon heartbeat'),
+  });
+
+  // `daemon.start()` awaits the control-plane connect(), which by design can hang forever —
+  // an unpaired/skip-pairing local-only setup, or any relay-down logon, never resolves nor
+  // rejects it (see ControlPlaneClient.connect()). Heartbeat and hook install are this
+  // process's own local promises ("I'm alive"; "here's where to POST hook events") and must
+  // not wait behind the remote one, or a local-only daemon never installs hooks, never writes
+  // a heartbeat, and `cctl setup`/`cctl status` see it as never having come up at all. Kick
+  // start() off in the background instead; its own rejection can only come from a subsystem
+  // failure surfaced through the normal shutdown path, so log rather than crash the process.
+  void daemon.start().catch((err: unknown) => {
+    logger.error({ err }, 'daemon failed to start');
+  });
+
+  heartbeat.start();
+
+  // The hook receiver binds its OS-assigned port early inside start() — recovery and the local
+  // socket bind, both fast and purely local — well before start() reaches the (possibly
+  // hanging) connect() call. Poll briefly for it rather than waiting on the whole promise.
+  // installHooks' managed-marker pruning (see hookInstaller.ts) makes repeating this every run
+  // idempotent and self-healing: it replaces last run's now-dead port/secret without touching
+  // any other tool's hooks. Best-effort — a profile the daemon can't write to must not stop an
+  // otherwise-healthy daemon; the setup wizard surfaces install failures explicitly.
+  const hookPort = await waitForHookPort(() => hookReceiver.getPort());
+  if (hookPort !== undefined) {
+    await installHooks({
+      settingsPath: join(paths.claudeDir, 'settings.json'),
+      hooks: buildDaemonHookSpecs({ port: hookPort, secret: hookSecret }),
+    }).catch((err: unknown) => {
+      logger.warn({ err }, 'could not install hooks into settings.json');
+    });
+  } else {
+    logger.warn('hook receiver never bound a port; skipped installing hooks');
+  }
+
   process.stdout.write(
     `Daemon running (relay: ${relayUrl}${autoSwitcher ? `, auto-switch: on${greedy ? ' (greedy)' : ''}` : ''}). Ctrl+C to stop.\n`,
   );
 
   const shutdown = (): void => {
     process.stdout.write('Stopping daemon...\n');
+    heartbeat.stop();
     void daemon
       .stop()
       .catch(() => {})
+      .then(() => instanceLock.release())
       .then(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
