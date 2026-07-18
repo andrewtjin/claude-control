@@ -1118,36 +1118,201 @@ describe('Daemon lifecycle', () => {
     }
   });
 
-  it('prompt.inject to a registered terminal session says watch-only, not unknown', async () => {
-    // A `cctl session register`ed interactive session: visible in tracking, but the daemon
-    // has no input channel to another process's terminal — /say must say so.
+  /** Seed a `cctl session register`ed interactive session row directly (bypassing the CLI
+   *  endpoint) — the starting state for every steering test. */
+  function seedTerminalSession(id: string, label?: string): void {
     store.upsertSession({
-      id: 'terminal-1',
+      id,
       kind: 'interactive',
       state: 'active',
       accountId: null,
       json: JSON.stringify({
-        id: 'terminal-1',
+        id,
         kind: 'interactive',
         state: 'active',
+        ...(label !== undefined ? { label } : {}),
         watch: true,
         registeredAtMs: 0,
         updatedAtMs: 0,
       }),
       updatedAtMs: 0,
     });
+  }
+
+  /** POST a raw hook event (as the CLI's curl forwarder would) at the receiver. */
+  async function postHook(
+    hookPort: number,
+    body: Record<string, unknown>,
+  ): Promise<Record<string, unknown> | undefined> {
+    const res = await fetch(`http://127.0.0.1:${hookPort}/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-claude-control-secret': 'shh' },
+      body: JSON.stringify(body),
+    });
+    return (await res.json().catch(() => undefined)) as Record<string, unknown> | undefined;
+  }
+
+  it('prompt.inject to a registered terminal session queues and confirms, never errors', async () => {
+    seedTerminalSession('terminal-1', 'demo');
     await daemon.start();
     relay.push({
       daemonId: 'daemon-under-test',
       type: 'prompt.inject',
       payload: { sessionId: 'terminal-1', text: 'steer this', idempotencyKey: 'k' },
     });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    );
+    const card = relay.received.find((e) => e.type === 'hook.notification');
+    if (card?.type === 'hook.notification') {
+      expect(card.payload.title).toContain('demo');
+      expect(card.payload.body).toContain('steer this');
+      expect(card.payload.body).toContain('finishes its current turn');
+    }
+    expect(relay.received.some((e) => e.type === 'error')).toBe(false);
+  });
+
+  it('queued steering delivers as the session’s next Stop-hook answer, exactly once', async () => {
+    seedTerminalSession('terminal-2');
+    const hookPort = await startCapturingHookPort();
+    for (const [i, text] of ['fix the flaky test first', 'then push'].entries()) {
+      relay.push({
+        daemonId: 'daemon-under-test',
+        type: 'prompt.inject',
+        payload: { sessionId: 'terminal-2', text, idempotencyKey: `steer-${i}` },
+      });
+    }
+    // Both queued-confirmation cards seen -> the queue mutations have landed; Stop can fire.
+    await waitFor(
+      () =>
+        relay.received.filter(
+          (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+        ).length === 2,
+    );
+
+    const answer = await postHook(hookPort, { hook_event_name: 'Stop', session_id: 'terminal-2' });
+
+    // The CLI's documented Stop contract: block + reason = continue the turn with the reason
+    // as guidance. Everything queued delivers in one answer, in arrival order.
+    expect(answer).toEqual({ decision: 'block', reason: 'fix the flaky test first\n\nthen push' });
+    await waitFor(() =>
+      relay.received.some(
+        (e) =>
+          e.type === 'hook.notification' && e.payload.notificationType === 'steering_delivered',
+      ),
+    );
+
+    // Consumed on delivery: the next Stop is a normal stop again.
+    const second = await postHook(hookPort, { hook_event_name: 'Stop', session_id: 'terminal-2' });
+    expect(second).toEqual({ ok: true });
+  });
+
+  it('steering past the TTL is dropped with an expiry card, never delivered', async () => {
+    seedTerminalSession('terminal-3');
+    let now = 1_000_000;
+    let captured: number | undefined;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      clock: () => now,
+      publishHookEndpoint: (port) => {
+        captured = port;
+        return Promise.resolve();
+      },
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+    await waitFor(() => captured !== undefined);
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-3', text: 'stale by now', idempotencyKey: 'ttl-1' },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    );
+
+    now += 31 * 60_000; // past the 30-minute steering TTL
+    if (captured === undefined) throw new Error('unreachable');
+    const answer = await postHook(captured, { hook_event_name: 'Stop', session_id: 'terminal-3' });
+
+    expect(answer).toEqual({ ok: true });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_expired',
+      ),
+    );
+  });
+
+  it('a full steering queue refuses the next /say with an honest error', async () => {
+    seedTerminalSession('terminal-4');
+    await daemon.start();
+    for (let i = 0; i < 8; i++) {
+      relay.push({
+        daemonId: 'daemon-under-test',
+        type: 'prompt.inject',
+        payload: { sessionId: 'terminal-4', text: `msg ${i}`, idempotencyKey: `cap-${i}` },
+      });
+    }
+    await waitFor(
+      () =>
+        relay.received.filter(
+          (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+        ).length === 8,
+    );
+
+    const overflow = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-4', text: 'one too many', idempotencyKey: 'cap-8' },
+    });
+
     await waitFor(() => relay.received.some((e) => e.type === 'error'));
     const error = relay.received.find((e) => e.type === 'error');
     if (error?.type === 'error') {
-      expect(error.payload.code).toBe('watch_only_session');
-      expect(error.payload.message).toContain('no input channel');
+      expect(error.payload.code).toBe('steer_queue_full');
+      expect(error.payload.relatesTo).toBe(overflow.id);
     }
+  });
+
+  it('unregister discards the session’s queued steering', async () => {
+    seedTerminalSession('terminal-5');
+    const hookPort = await startCapturingHookPort();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-5', text: 'soon obsolete', idempotencyKey: 'un-1' },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    );
+
+    const res = await postCli(hookPort, 'unregister', {
+      sessionId: 'terminal-5',
+      idempotencyKey: 'un-2',
+    });
+    expect(res.body).toMatchObject({ ok: true, status: 'applied' });
+
+    const answer = await postHook(hookPort, { hook_event_name: 'Stop', session_id: 'terminal-5' });
+    expect(answer).toEqual({ ok: true });
+    expect(
+      relay.received.some(
+        (e) =>
+          e.type === 'hook.notification' && e.payload.notificationType === 'steering_delivered',
+      ),
+    ).toBe(false);
   });
 
   it('a failed orphan re-attach answers resume_failed with the cause', async () => {

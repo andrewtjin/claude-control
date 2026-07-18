@@ -169,6 +169,21 @@ interface TrackedInteractiveSession {
   updatedAtMs: number;
 }
 
+/** How long queued /say steering for an interactive session stays deliverable. Delivery only
+ *  happens at a turn boundary (the session's next Stop hook), and a long turn can legitimately
+ *  run tens of minutes — but guidance written for a context that is hours gone would arrive as
+ *  a non sequitur, so entries past the TTL are dropped (with a card, never silently). */
+const STEERING_TTL_MS = 30 * 60_000;
+/** Upper bound on queued steer texts per session. Hitting it means nothing is delivering (an
+ *  idle or closed window) — refusing the next /say with an honest error beats silently
+ *  dropping the oldest, and it bounds what a dead session can accumulate in memory. */
+const STEERING_QUEUE_CAP = 8;
+/** One queued/delivered steering text, held in arrival order. */
+interface QueuedSteering {
+  text: string;
+  queuedAtMs: number;
+}
+
 /** Pure view mapper: the compact shape echoed back to the CLI on a command. */
 function interactiveView(t: TrackedInteractiveSession): TrackedSessionView {
   return {
@@ -242,6 +257,11 @@ export class Daemon {
    *  answers "already handled" instead of re-applying. Bounded FIFO — see
    *  {@link rememberSessionCmdKey}. */
   private readonly seenSessionCmdKeys = new Set<string>();
+  /** Operator /say texts queued per REGISTERED INTERACTIVE session, awaiting that session's
+   *  next Stop hook (see {@link queueSteering}). In-memory only — a daemon restart drops the
+   *  queue, which is tolerable because every queued text was confirmed to the phone as
+   *  "queued", delivery is best-effort by design, and the TTL bounds staleness anyway. */
+  private readonly pendingSteering = new Map<string, QueuedSteering[]>();
   /** Per-account quarantine bookkeeping for edge-detection + debounce; see
    *  {@link reconcileQuarantineNotices}. In-memory only, so it resets on restart — which is
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
@@ -289,6 +309,9 @@ export class Daemon {
     // arrives the instant the port opens is served rather than 503'd. Pure delegation — the
     // registry logic lives in this class's methods; the receiver owns transport + auth.
     this.hookReceiver.setCliHandlers(this.cliHandlers());
+    // Same late-binding seam for steering: the receiver answers Stop hooks, this class owns
+    // WHAT is queued for them (the /say → queue → turn-boundary delivery path).
+    this.hookReceiver.setSteeringSource((sessionId) => this.takePendingSteering(sessionId));
 
     const hookPort = await this.hookReceiver.listen(0);
 
@@ -598,15 +621,23 @@ export class Daemon {
       return;
     }
 
+    // A REGISTERED terminal session has no direct input channel (the daemon cannot type into
+    // another process's terminal), but it does have a turn boundary: queue the text and
+    // deliver it as the session's next Stop-hook answer. See queueSteering.
+    const tracked = this.readInteractiveSession(sessionId);
+    if (tracked !== undefined) {
+      this.queueSteering(msg, tracked);
+      return;
+    }
+
     // No live handle — the session may be an orphan from a previous daemon run. Re-attach it
     // NOW, with the operator's text as the resumed turn's prompt: resuming always runs a real
     // turn (the SDK has no attach-without-prompting), so re-attach happens only at the moment
     // the operator actually addresses the session, never as a startup side effect. Gated to
-    // 'orphaned' managed records: a terminal session stays terminal — prompting it is
-    // refused, same as a session this daemon never knew. Every refusal ANSWERS the phone
-    // (an error envelope, same as stop's unknown-session path): the bot acks a /say as soon
-    // as the relay accepts the frame, so a silent drop here would leave the operator
-    // believing text reached a session that never heard it.
+    // 'orphaned' managed records. Every refusal ANSWERS the phone (an error envelope, same as
+    // stop's unknown-session path): the bot acks a /say as soon as the relay accepts the
+    // frame, so a silent drop here would leave the operator believing text reached a session
+    // that never heard it.
     const record = this.sessionManager.list().find((r) => r.id === sessionId);
     if (
       record === undefined ||
@@ -646,29 +677,115 @@ export class Daemon {
   /**
    * Tell the phone WHY its /say went nowhere. The message is cause-specific because the
    * generic "unknown session" reads as a typo when the id is plainly visible in the phone's
-   * own session list — the two common real causes are a REGISTERED TERMINAL session (the
-   * daemon only hears from it via hooks, a one-way stream; it cannot type into another
-   * process's terminal) and a managed session that already ended.
+   * own session list. (A registered terminal session never lands here — its /say queues for
+   * turn-boundary delivery instead; see {@link queueSteering}.)
    */
   private answerPromptInjectRefusal(
     msg: MessageOf<'prompt.inject'>,
     record: SessionRecord | undefined,
   ): void {
     const { sessionId } = msg.payload;
-    let code = 'unknown_session';
-    let detail = `no live session '${sessionId}' in this daemon`;
-    if (this.readInteractiveSession(sessionId) !== undefined) {
-      code = 'watch_only_session';
-      detail =
-        `'${sessionId}' is a terminal session — it streams to the phone but has no input ` +
-        `channel, so /say cannot reach it. Only sessions started with /run are steerable.`;
-    } else if (record !== undefined && (record.state === 'done' || record.state === 'failed')) {
-      detail = `session '${sessionId}' already ended`;
-    }
+    const detail =
+      record !== undefined && (record.state === 'done' || record.state === 'failed')
+        ? `session '${sessionId}' already ended`
+        : `no live session '${sessionId}' in this daemon`;
     this.sendEnvelope({
       type: 'error',
-      payload: { code, message: `prompt.inject: ${detail}`, relatesTo: msg.id },
+      payload: { code: 'unknown_session', message: `prompt.inject: ${detail}`, relatesTo: msg.id },
     });
+  }
+
+  /**
+   * Queue a /say for a REGISTERED INTERACTIVE session and confirm the queueing to the phone.
+   * The daemon only hears from a terminal session through its hooks (a one-way stream), so
+   * there is exactly one supported reverse channel: answering its next Stop hook with the
+   * CLI's documented `{"decision": "block", "reason": …}`, which continues the turn with the
+   * text as guidance ({@link takePendingSteering} is the delivery side). Honest limits, also
+   * reflected in the card copy: delivery happens only at a turn boundary — a session that is
+   * sitting idle hears nothing until it next finishes a turn — and a bounded queue + TTL keep
+   * a closed window from accumulating stale guidance forever.
+   */
+  private queueSteering(msg: MessageOf<'prompt.inject'>, tracked: TrackedInteractiveSession): void {
+    const { sessionId, text } = msg.payload;
+    const queue = this.pendingSteering.get(sessionId) ?? [];
+    if (queue.length >= STEERING_QUEUE_CAP) {
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'steer_queue_full',
+          message:
+            `prompt.inject: ${queue.length} messages are already queued for '${sessionId}' and ` +
+            `none have delivered — the session looks idle or closed. Queued text delivers when ` +
+            `it next finishes a turn; \`cctl session unregister\` discards the queue.`,
+          relatesTo: msg.id,
+        },
+      });
+      return;
+    }
+    queue.push({ text, queuedAtMs: this.clock() });
+    this.pendingSteering.set(sessionId, queue);
+    const excerpt = text.length > 120 ? `${text.slice(0, 120)}…` : text;
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        sessionId,
+        title: `Queued for ${tracked.label ?? 'terminal session'}`,
+        body:
+          `"${excerpt}" — delivers when the session finishes its current turn` +
+          `${queue.length > 1 ? ` (${queue.length} queued)` : ''}.`,
+        level: 'info',
+        notificationType: 'steering_queued',
+      },
+    });
+    this.logger.info({ sessionId, queued: queue.length }, 'steering queued for terminal session');
+  }
+
+  /**
+   * The delivery side of {@link queueSteering}, installed into the hook receiver as its
+   * steering source: consume everything queued for `sessionId`, expire what aged past the
+   * TTL (with a card — the operator was told it was queued, so it must not vanish silently),
+   * and hand back the surviving texts joined in arrival order for the Stop-hook answer.
+   */
+  private takePendingSteering(sessionId: string): string | undefined {
+    const queue = this.pendingSteering.get(sessionId);
+    if (queue === undefined) return undefined;
+    this.pendingSteering.delete(sessionId);
+    const now = this.clock();
+    const fresh = queue.filter((q) => now - q.queuedAtMs <= STEERING_TTL_MS);
+    const expired = queue.length - fresh.length;
+    if (expired > 0) {
+      this.sendEnvelope({
+        type: 'hook.notification',
+        payload: {
+          event: 'notification',
+          sessionId,
+          title: 'Steering expired',
+          body:
+            `${expired} queued message${expired === 1 ? '' : 's'} aged past ` +
+            `${STEERING_TTL_MS / 60_000} minutes before the session finished a turn — ` +
+            `dropped, not delivered.`,
+          level: 'warn',
+          notificationType: 'steering_expired',
+        },
+      });
+    }
+    if (fresh.length === 0) return undefined;
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        sessionId,
+        title: 'Steering delivered',
+        body:
+          `${fresh.length === 1 ? 'Your message was' : `${fresh.length} messages were`} ` +
+          `handed to the session at its turn boundary — it is continuing with your guidance.`,
+        level: 'success',
+        notificationType: 'steering_delivered',
+      },
+    });
+    this.logger.info({ sessionId, delivered: fresh.length, expired }, 'steering delivered');
+    return fresh.map((q) => q.text).join('\n\n');
   }
 
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
@@ -1093,6 +1210,9 @@ export class Daemon {
     const existing = this.readInteractiveSession(input.sessionId);
     if (!existing) return this.notRegistered(input.sessionId);
     this.store.deleteSession(input.sessionId);
+    // Queued steering dies with the registration: nothing would ever deliver it (delivery is
+    // gated on the registry), and a later re-register must not inherit stale guidance.
+    this.pendingSteering.delete(input.sessionId);
     this.rememberSessionCmdKey(input.idempotencyKey);
     // Echo the view of what was removed so the CLI can confirm WHICH session it just forgot.
     return { ok: true, status: 'applied', session: interactiveView(existing) };

@@ -807,6 +807,89 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('Stop-hook steering delivery', () => {
+    it('answers Stop with block+reason when the steering source has queued text', async () => {
+      const taken: string[] = [];
+      receiver.setSteeringSource((sessionId) => {
+        taken.push(sessionId);
+        return sessionId === 'sess-steer' ? 'focus on the failing test' : undefined;
+      });
+
+      const res = await post(
+        port,
+        '/',
+        { event: 'Stop', sessionId: 'sess-steer' },
+        { 'x-claude-control-secret': SECRET },
+      );
+
+      // The CLI's documented Stop contract: block + reason = continue the turn with the
+      // reason as guidance. Top-level fields, not hookSpecificOutput.
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ decision: 'block', reason: 'focus on the failing test' });
+      expect(taken).toEqual(['sess-steer']);
+      // No stop card: the session is not stopping, it is continuing.
+      expect(emitted).toHaveLength(0);
+    });
+
+    it('a Stop with nothing queued keeps the normal neutral answer and stop card', async () => {
+      receiver.setSteeringSource(() => undefined);
+      const res = await post(
+        port,
+        '/',
+        { event: 'Stop', sessionId: 'sess-idle' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.body).toEqual({ ok: true });
+      expect(emitted.some((e) => e.type === 'hook.notification')).toBe(true);
+    });
+
+    it('never consults steering for a managed session (SDK send path owns it)', async () => {
+      const managed = new Store(':memory:');
+      const taken: string[] = [];
+      const managedReceiver = new HookReceiver({
+        store: managed,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'daemon-1',
+        isManagedSession: () => true,
+      });
+      managedReceiver.setSteeringSource((sessionId) => {
+        taken.push(sessionId);
+        return 'must never deliver';
+      });
+      const managedPort = await managedReceiver.listen(0);
+      try {
+        const res = await post(
+          managedPort,
+          '/',
+          { event: 'Stop', sessionId: 'managed-1' },
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(res.body).toEqual({ ok: true });
+        expect(taken).toEqual([]);
+      } finally {
+        await managedReceiver.close();
+        managed.close();
+      }
+    });
+
+    it('Notification events never consume steering, even with text queued', async () => {
+      const taken: string[] = [];
+      receiver.setSteeringSource((sessionId) => {
+        taken.push(sessionId);
+        return 'queued text';
+      });
+      const res = await post(
+        port,
+        '/',
+        { event: 'Notification', sessionId: 'sess-steer', body: 'waiting' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.body).toEqual({ ok: true });
+      expect(taken).toEqual([]);
+    });
+  });
+
   // The CLI's REAL hook payload contract: snake_case field names
   // (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `message`) and NO requestId.
   // The camelCase bodies used elsewhere in this file remain supported as internal aliases.

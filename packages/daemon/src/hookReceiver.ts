@@ -300,6 +300,10 @@ export class HookReceiver {
    *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
    *  rather than a crash. */
   private cliHandlers: HookReceiverCliHandlers | undefined;
+  /** Installed by the daemon — see {@link setSteeringSource}. Undefined until then (and in
+   *  receivers without a steering owner, e.g. unit harnesses): every Stop is then answered
+   *  neutrally, exactly the pre-steering behavior. */
+  private takeSteering: ((sessionId: string) => string | undefined) | undefined;
   /** Permission hook responses currently held open awaiting a phone decision, keyed by the
    *  requestId we minted. `event` echoes the exact hook event name the CLI fired — the
    *  decision output must name it back (`hookSpecificOutput.hookEventName`). `toolInput` is
@@ -358,6 +362,15 @@ export class HookReceiver {
    *  is constructed in the composition root before the Daemon that owns the registry exists. */
   setCliHandlers(handlers: HookReceiverCliHandlers): void {
     this.cliHandlers = handlers;
+  }
+
+  /** Install the operator-steering source (same late-binding contract as
+   *  {@link setCliHandlers}: the daemon that owns the queue is constructed after this
+   *  receiver). Called with the session id of every Stop hook from a NON-managed session;
+   *  returning text CONSUMES whatever the operator queued for that session and delivers it as
+   *  the Stop answer, `undefined` means nothing is queued and the Stop proceeds normally. */
+  setSteeringSource(take: (sessionId: string) => string | undefined): void {
+    this.takeSteering = take;
   }
 
   /** Start listening on 127.0.0.1. `port: 0` (the default) picks an OS-assigned ephemeral
@@ -887,6 +900,24 @@ export class HookReceiver {
       this.logger.info({ event, sessionId }, 'hook event from a managed session suppressed');
       this.respond(res, 200, { ok: true });
       return;
+    }
+    // Queued operator steering delivers HERE, at the turn boundary: the CLI's documented
+    // Stop-hook contract takes `{"decision": "block", "reason": …}` as "do not stop —
+    // continue the turn with `reason` as guidance", and hook stdout (curl printing this
+    // response body) is the CLI's decision channel — the same mechanism the held-permission
+    // answers ride. This is the only supported reverse channel into an interactive terminal
+    // session, which is why /say to one queues instead of typing. The stop card is
+    // deliberately NOT emitted on delivery: the session is not stopping.
+    // Ordered after the managed check — managed sessions are steered through the SDK's own
+    // send path and always keep the neutral answer.
+    if (event === 'stop' && sessionId !== undefined) {
+      const steering = this.takeSteering?.(sessionId);
+      if (steering !== undefined) {
+        this.respond(res, 200, { decision: 'block', reason: steering });
+        // Size only, never content — steering text is operator input.
+        this.logger.info({ sessionId, chars: steering.length }, 'stop answered with steering');
+        return;
+      }
     }
     // Notification events are the CLI mirroring its terminal nags ("Claude is waiting for your
     // input", "Claude needs your permission") — with real permission/done cards in place they
