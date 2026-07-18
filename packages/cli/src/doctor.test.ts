@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -9,10 +9,12 @@ import {
   checkNodeVersion,
   healthUrlFromRelay,
   probeRelay,
+  checkLiveLogin,
   MIN_NODE_VERSION,
   type DoctorCheck,
   type ProbeFetch,
 } from './doctor.js';
+import { sandboxPaths, type LiveCredentialChannel } from '@claude-control/switch-engine';
 
 // This file lives at packages/cli/src/, so two levels up is packages/, where the publishable
 // bundle lives at cctl-publish/package.json (see dependencyClosure.test.ts for the same idiom).
@@ -148,5 +150,47 @@ describe('probeRelay', () => {
     };
     await probeRelay('wss://relay.example.com', { fetchFn });
     expect(seen).toBe('https://relay.example.com/health');
+  });
+});
+
+describe('checkLiveLogin (darwin)', () => {
+  const paths = sandboxPaths('root');
+  // Isolate the override env so an ambient CLAUDE_CLI_KEYCHAIN_* on a dev box or CI runner can't
+  // flip these default-target assertions into spurious failures.
+  const saved = {
+    s: process.env.CLAUDE_CLI_KEYCHAIN_SERVICE,
+    a: process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT,
+  };
+  beforeEach(() => {
+    delete process.env.CLAUDE_CLI_KEYCHAIN_SERVICE;
+    delete process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT;
+  });
+  afterEach(() => {
+    if (saved.s === undefined) delete process.env.CLAUDE_CLI_KEYCHAIN_SERVICE;
+    else process.env.CLAUDE_CLI_KEYCHAIN_SERVICE = saved.s;
+    if (saved.a === undefined) delete process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT;
+    else process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT = saved.a;
+  });
+  // Inject a fake channel so the check never touches real `security(1)` — which on a Mac could
+  // raise the very A4 GUI prompt the wet gate exists to probe.
+  const fakeChannel = (creds: unknown): LiveCredentialChannel =>
+    ({
+      readLiveCredentials: () => Promise.resolve(creds),
+      writeLiveCredentials: () => Promise.resolve(),
+    }) as LiveCredentialChannel;
+
+  it('names the effective Keychain service/account so an A1 miss self-diagnoses', async () => {
+    const res = await checkLiveLogin(paths, 'darwin', fakeChannel(undefined));
+    expect(res.ok).toBe(false);
+    expect(res.detail).toContain('service="Claude Code-credentials"');
+    // R16: the hint stays attribute-only and points at the env override, never a token read.
+    expect(res.detail).toMatch(/attribute-only/);
+    expect(res.detail).toMatch(/CLAUDE_CLI_KEYCHAIN_SERVICE/);
+  });
+
+  it('reports found credentials against the same named target', async () => {
+    const res = await checkLiveLogin(paths, 'darwin', fakeChannel({ accessToken: 'x' }));
+    expect(res.ok).toBe(true);
+    expect(res.detail).toContain('service="Claude Code-credentials"');
   });
 });
