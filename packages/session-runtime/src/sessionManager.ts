@@ -113,22 +113,6 @@ export interface ResumeOrphanOptions {
   permissionMode?: string;
 }
 
-/** Re-attach ALL orphaned managed sessions at once (daemon startup, after `recover()`). */
-export interface ResumeAllOrphansOptions {
-  /** Fresh client per resumed session — invoked once per session actually resumed. */
-  createClient: () => AgentSdkClient;
-  prompt: string;
-  permissionMode?: string;
-}
-
-export interface ResumeAllOrphansResult {
-  /** The re-spawned records (now `starting`/`running` again), in registry order. */
-  resumed: SessionRecord[];
-  /** Orphans that were NOT resumed, each with why (not managed, already live, no resumeId, or
-   *  a spawn error) — so the daemon can log/quarantine rather than silently lose them. */
-  skipped: Array<{ id: string; reason: string }>;
-}
-
 export interface AttachObservedOptions {
   id?: string;
   ptyFactory: PtyFactory;
@@ -157,17 +141,15 @@ export interface SessionManager {
    * Re-attach one orphaned managed session by resuming its underlying SDK session from the
    * persisted `resumeId`, preserving the record's identity and emitting the SAME handle-event
    * surface as a fresh spawn (so the daemon forwards session.status/output identically).
+   * Resuming always starts a real turn (the SDK has no attach-without-prompting), so this is
+   * strictly an on-demand operation — the caller supplies the prompt the operator actually
+   * sent; there is deliberately NO bulk resume-everything counterpart, because running an
+   * unasked-for turn on every idle session is never correct.
    * OPTIONAL on the interface only so existing minimal fakes stay valid — the real manager
    * always implements it. Throws (never silently degrades) if the session is unknown, already
    * live, not managed, or has no persisted resumeId to resume from.
    */
   resumeOrphan?(sessionId: string, opts: ResumeOrphanOptions): Promise<SessionHandle>;
-  /**
-   * Re-attach every orphaned managed session (daemon startup, after `recover()`), resuming
-   * each and reporting which were skipped and why. Never throws for a single bad session — it
-   * is collected into `skipped` so one un-resumable orphan can't abort the whole re-attach.
-   */
-  resumeAllOrphans?(opts: ResumeAllOrphansOptions): Promise<ResumeAllOrphansResult>;
 }
 
 const TERMINAL_STATES: ReadonlySet<SessionState> = new Set(['done', 'failed', 'orphaned']);
@@ -300,41 +282,6 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
     return handle;
   }
 
-  async function resumeAllOrphansImpl(
-    resumeAllOpts: ResumeAllOrphansOptions,
-  ): Promise<ResumeAllOrphansResult> {
-    await ensureLoaded();
-    const resumed: SessionRecord[] = [];
-    const skipped: Array<{ id: string; reason: string }> = [];
-    // Snapshot before iterating: resumeOrphanImpl mutates `records` (replaces the orphan's
-    // entry with a live one), and mutating a Map mid-iteration is unsound.
-    for (const record of Array.from(records.values())) {
-      if (record.state !== 'orphaned') continue;
-      if (record.kind !== 'managed') {
-        skipped.push({ id: record.id, reason: 'not a managed session' });
-        continue;
-      }
-      if (record.resumeId === undefined) {
-        skipped.push({ id: record.id, reason: 'no persisted resumeId' });
-        continue;
-      }
-      try {
-        await resumeOrphanImpl(record.id, {
-          client: resumeAllOpts.createClient(),
-          prompt: resumeAllOpts.prompt,
-          ...(resumeAllOpts.permissionMode !== undefined
-            ? { permissionMode: resumeAllOpts.permissionMode }
-            : {}),
-        });
-        const live = records.get(record.id);
-        if (live) resumed.push(live);
-      } catch (err) {
-        skipped.push({ id: record.id, reason: err instanceof Error ? err.message : String(err) });
-      }
-    }
-    return { resumed, skipped };
-  }
-
   return {
     async spawnManaged(spawnOpts): Promise<SessionHandle> {
       await ensureLoaded();
@@ -415,10 +362,6 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
 
     resumeOrphan(sessionId, resumeOpts): Promise<SessionHandle> {
       return resumeOrphanImpl(sessionId, resumeOpts);
-    },
-
-    resumeAllOrphans(resumeAllOpts): Promise<ResumeAllOrphansResult> {
-      return resumeAllOrphansImpl(resumeAllOpts);
     },
   };
 }

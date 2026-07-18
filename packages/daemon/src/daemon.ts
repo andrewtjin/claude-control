@@ -116,14 +116,6 @@ const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
  */
 const MANAGED_SESSION_PERMISSION_MODE = 'default';
 
-/** What a crash-resumed session is told on re-attach. Resume needs SOME prompt to start the
- *  next turn (the SDK has no attach-without-prompting — see ResumeOrphanOptions), so this is
- *  a reorientation nudge rather than new work the operator never asked for. */
-const RESUME_NUDGE_PROMPT =
-  'The controlling daemon restarted and re-attached to this session. Briefly recap where the ' +
-  'task stands, then continue from where you left off. If you were waiting on operator ' +
-  'input, restate the question and wait.';
-
 /** Bound on the session.stop idempotency set. Stop keys only need to survive the
  *  double/triple-tap window (seconds), so a few hundred remembered keys is generous while
  *  keeping the set trivially bounded across a long-lived daemon. */
@@ -214,8 +206,8 @@ export class Daemon {
   /** One epoch token for THIS daemon run, stamped on every `session.output` envelope. Because
    *  {@link outputSeq} is in-memory it restarts at 0 on daemon restart; a crashed daemon never
    *  emitted a terminal `session.status`, so the bot still holds reassembly state (nextSeq past 0)
-   *  for a session that `resumeOrphanedSessions` re-attaches under the SAME id and re-numbers from
-   *  0 — and would silently drop the resumed turn. A fresh epoch per run lets the bot detect the
+   *  for a session that a later operator prompt re-attaches under the SAME id (see
+   *  {@link handlePromptInject}) and re-numbers from 0 — and would silently drop the resumed turn. A fresh epoch per run lets the bot detect the
    *  restart and reset its reassembly (with a visible marker). Stable within a run so the bot never
    *  resets spuriously mid-session. */
   private readonly outputEpoch = randomUUID();
@@ -341,19 +333,17 @@ export class Daemon {
 
     await this.controlPlaneClient.connect();
 
-    // Re-attach managed sessions a previous daemon run left behind (crash mid-session). Runs
-    // AFTER connect() so resumed-session envelopes flow live immediately and so a broken
-    // relay surfaces before any SDK subprocess is spawned (the outbox would buffer either
-    // way). A failure here must NEVER kill startup: an un-resumable registry is a degraded
-    // feature, not a dead daemon — recover() has already stamped the records 'orphaned', so
-    // nothing is silently lost.
+    // Reconcile session records a previous daemon run left behind: stamp them 'orphaned' so
+    // their persisted state is honest. Deliberately NO re-attach here — resuming a session
+    // always runs a real turn (the SDK has no attach-without-prompting), so an eager pass
+    // would re-run work nobody asked for on every single restart, once per idle session.
+    // Orphans stay dormant until the operator actually addresses one, at which point THEIR
+    // text is the resumed turn (see handlePromptInject). A failure here must NEVER kill
+    // startup: an un-reconcilable registry is a degraded feature, not a dead daemon.
     try {
-      await this.resumeOrphanedSessions();
+      await this.reconcileOrphanedSessions();
     } catch (err) {
-      this.logger.error(
-        { err },
-        'session re-attach failed; continuing startup without resumed sessions',
-      );
+      this.logger.error({ err }, 'session reconciliation failed; continuing startup without it');
     }
 
     // Run one poll cycle immediately so the phone has fresh data as soon as the daemon comes
@@ -581,11 +571,40 @@ export class Daemon {
   private async handlePromptInject(msg: MessageOf<'prompt.inject'>): Promise<void> {
     const { sessionId, text } = msg.payload;
     const handle = this.sessionManager.get(sessionId);
-    if (!handle) {
+    if (handle) {
+      await handle.send(text);
+      return;
+    }
+
+    // No live handle — the session may be an orphan from a previous daemon run. Re-attach it
+    // NOW, with the operator's text as the resumed turn's prompt: resuming always runs a real
+    // turn (the SDK has no attach-without-prompting), so re-attach happens only at the moment
+    // the operator actually addresses the session, never as a startup side effect. Gated to
+    // 'orphaned' managed records: a terminal session stays terminal — prompting it is a
+    // warn-and-drop, same as a session this daemon never knew.
+    const record = this.sessionManager.list().find((r) => r.id === sessionId);
+    if (
+      record === undefined ||
+      record.kind !== 'managed' ||
+      record.state !== 'orphaned' ||
+      this.sessionManager.resumeOrphan === undefined
+    ) {
       this.logger.warn({ sessionId }, 'prompt.inject for unknown/inactive session');
       return;
     }
-    await handle.send(text);
+    try {
+      const resumed = await this.sessionManager.resumeOrphan(sessionId, {
+        client: this.createAgentSdkClient(),
+        prompt: text,
+        permissionMode: MANAGED_SESSION_PERMISSION_MODE,
+      });
+      this.attachSessionPipes(resumed, record.accountId);
+      this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
+    } catch (err) {
+      // Un-resumable (e.g. no persisted resumeId): logged and dropped, the record stays
+      // 'orphaned' on disk — degraded but honest, never a crashed dispatch loop.
+      this.logger.warn({ sessionId, err }, 'orphaned session could not be re-attached');
+    }
   }
 
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
@@ -674,10 +693,11 @@ export class Daemon {
   // ---- managed-session plumbing (spawn + resume share all of it) ----
 
   /**
-   * Re-attach every orphaned managed session at startup, wiring each resumed handle exactly
-   * like a fresh spawn so the phone cannot tell the difference. Skipped orphans are logged
-   * and stay stamped 'orphaned' on disk ("log + mark") — visible in `list()`, never silently
-   * dropped.
+   * Stamp session records a previous daemon run left behind as 'orphaned' — bookkeeping
+   * only, no re-attach. Resuming an SDK session always starts a real turn, so re-attach is
+   * strictly on demand: the operator's next prompt.inject to an orphan resumes it with that
+   * text as the turn (see {@link handlePromptInject}). Orphans stay visible in `list()`,
+   * never silently dropped.
    *
    * PERSISTENCE DECISION: session records live in session-runtime's `sessions.json` (atomic
    * temp+rename with a serialized write queue) and ONLY there — the Store's `sessions` table
@@ -687,30 +707,13 @@ export class Daemon {
    * `cctl session status` wants sqlite access, the mirror must land in the same commit as its
    * reader (see the matching note in store.ts).
    */
-  private async resumeOrphanedSessions(): Promise<void> {
+  private async reconcileOrphanedSessions(): Promise<void> {
     const orphaned = await this.sessionManager.recover();
     if (orphaned.length > 0) {
       this.logger.info(
         { sessionIds: orphaned.map((r) => r.id) },
-        'found orphaned sessions from a previous run',
+        'found orphaned sessions from a previous run; each re-attaches on its next operator prompt',
       );
-    }
-    // Optional on the interface only for minimal fakes — the real manager implements it.
-    const result = await this.sessionManager.resumeAllOrphans?.({
-      // Fresh client per resumed session: each managed session owns its own query lifecycle.
-      createClient: () => this.createAgentSdkClient(),
-      prompt: RESUME_NUDGE_PROMPT,
-      permissionMode: MANAGED_SESSION_PERMISSION_MODE,
-    });
-    if (!result) return;
-    for (const record of result.resumed) {
-      const handle = this.sessionManager.get(record.id);
-      if (!handle) continue; // resumed but already gone again — nothing live to subscribe to
-      this.attachSessionPipes(handle, record.accountId);
-      this.logger.info({ sessionId: record.id }, 'resumed orphaned session');
-    }
-    for (const skip of result.skipped) {
-      this.logger.warn({ sessionId: skip.id, reason: skip.reason }, 'orphaned session not resumed');
     }
   }
 

@@ -266,6 +266,23 @@ describe('startManagedSession', () => {
     expect(handle.getState()).toBe('done');
   });
 
+  it('stop() still reaches done when end() rejects (dead transport)', async () => {
+    const { client, counts } = fakeClient([[{ type: 'turn_result', ok: true, summary: 'done' }]]);
+    client.end = () => {
+      counts.end++;
+      return Promise.reject(new Error('transport already closed'));
+    };
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    await tick();
+    expect(handle.getState()).toBe('waiting_input');
+
+    // A rejecting teardown must not leave the session immortal: stop() resolves and the
+    // state is terminal regardless, so a registry restart can never resurrect it.
+    await handle.stop();
+    expect(counts.end).toBe(1);
+    expect(handle.getState()).toBe('done');
+  });
+
   it('stop() does not downgrade a session that already reached failed', async () => {
     const { client, counts } = fakeClient([[{ type: 'error', message: 'boom' }]]);
     const handle = startManagedSession({ id: 's1', client, prompt: 'go' });

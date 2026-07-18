@@ -19,7 +19,9 @@ export type StopRung =
   /** The in-flight work wound down within the grace window (or there was none), so no forced
    *  kill was needed; the session was then torn down cleanly. */
   | 'interrupted'
-  /** The grace window elapsed with work still in flight; `stop()` forced it down. */
+  /** The graceful rung didn't settle it — the grace window elapsed with work still in
+   *  flight, or the interrupt itself failed (e.g. a dead transport with nothing left to
+   *  write to); `stop()` forced it down. */
   | 'hard_stopped';
 
 export interface StopEscalationResult {
@@ -105,9 +107,19 @@ export async function escalateStop(
     return { rung: 'already_terminal', state: handle.getState() };
   }
 
-  // Rung 1: ask the in-flight turn to cancel, then give it room to wind down.
-  await handle.interrupt();
-  const settled = await waitUntilSettled(handle, graceMs, sleep);
+  // Rung 1: ask the in-flight turn to cancel, then give it room to wind down. An interrupt
+  // can reject outright when the underlying transport is already dead (a gone subprocess has
+  // nothing to deliver the cancel to) — that must not abort the ladder, because the entire
+  // point of stop is that the session ends even when the graceful rung is unavailable.
+  // A failed interrupt skips the grace wait (nothing was asked to wind down) and goes
+  // straight to the hard stop.
+  let interrupted = true;
+  try {
+    await handle.interrupt();
+  } catch {
+    interrupted = false;
+  }
+  const settled = interrupted && (await waitUntilSettled(handle, graceMs, sleep));
 
   // Rung 2: tear the session down regardless — a graceful interrupt still needs a stop() to
   // release the underlying query/PTY. `stop()` is idempotent and forces a terminal state.

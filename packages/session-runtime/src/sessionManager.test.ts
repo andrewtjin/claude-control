@@ -450,34 +450,5 @@ describe('createSessionManager', () => {
         manager.resumeOrphan!('m1', { client: recordingBlockingClient().client, prompt: 'x' }),
       ).rejects.toThrow(/already live/);
     });
-
-    it('resumeAllOrphans resumes managed orphans with a resumeId and reports the rest as skipped', async () => {
-      const dir = await sandbox();
-      const seed: SessionRecord[] = [
-        { id: 'a', kind: 'managed', state: 'orphaned', startedAtMs: 1, resumeId: 'sdk-a' },
-        { id: 'b', kind: 'managed', state: 'orphaned', startedAtMs: 2 }, // no resumeId
-        { id: 'c', kind: 'observed', state: 'orphaned', startedAtMs: 3, resumeId: 'sdk-c' },
-        { id: 'd', kind: 'managed', state: 'done', startedAtMs: 4, resumeId: 'sdk-d' }, // not orphaned
-      ];
-      await writeFile(join(dir, 'sessions.json'), JSON.stringify(seed));
-      const manager = createSessionManager({ stateDir: dir });
-      await manager.recover();
-
-      const result = await manager.resumeAllOrphans!({
-        createClient: () => recordingBlockingClient().client,
-        prompt: 'continue',
-      });
-
-      expect(result.resumed.map((r) => r.id)).toEqual(['a']);
-      expect(result.skipped).toEqual(
-        expect.arrayContaining([
-          { id: 'b', reason: 'no persisted resumeId' },
-          { id: 'c', reason: 'not a managed session' },
-        ]),
-      );
-      // 'd' is done, not an orphan — neither resumed nor skipped.
-      expect(result.skipped.find((s) => s.id === 'd')).toBeUndefined();
-      expect(manager.get('a')).toBeDefined();
-    });
   });
 });

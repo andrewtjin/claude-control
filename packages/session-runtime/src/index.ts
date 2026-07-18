@@ -55,6 +55,4 @@ export type {
   SpawnManagedOptions,
   AttachObservedOptions,
   ResumeOrphanOptions,
-  ResumeAllOrphansOptions,
-  ResumeAllOrphansResult,
 } from './sessionManager.js';

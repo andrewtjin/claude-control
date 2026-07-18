@@ -99,7 +99,7 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
  * Factory for the real Agent SDK client (live boundary) — one FRESH client per managed session,
  * because each session owns its own query lifecycle (a shared instance would cross-wire
  * `interrupt`/`resolvePermission` between sessions; see session-runtime's
- * ResumeAllOrphansOptions). Exported for its colocated test; the rest of runDaemon is
+ * ResumeOrphanOptions). Exported for its colocated test; the rest of runDaemon is
  * untestable assembly.
  *
  * DECISION — no `configDirForAccount` is injected here, on purpose. Binding per-account

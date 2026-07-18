@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { escalateStop } from './stopEscalation.js';
 import type { SessionEvent, SessionHandle, SessionState } from './types.js';
 
@@ -99,5 +99,23 @@ describe('escalateStop', () => {
     const result = await escalateStop(fake.handle, { graceMs: 5, sleep: () => Promise.resolve() });
     expect(result.rung).toBe('hard_stopped');
     expect(fake.counts).toEqual({ interrupt: 1, stop: 1 });
+  });
+
+  it('a failed interrupt skips the grace wait and still hard-stops the session', async () => {
+    // A dead transport rejects the interrupt outright — the ladder must fall through to
+    // stop(), not abort with the session left alive.
+    const fake = fakeHandle({
+      onInterrupt: () => {
+        throw new Error('transport is gone');
+      },
+    });
+    const sleep = vi.fn((): Promise<void> => Promise.resolve());
+    const result = await escalateStop(fake.handle, { graceMs: 1000, sleep });
+
+    expect(result.rung).toBe('hard_stopped');
+    expect(result.state).toBe('done');
+    expect(fake.counts).toEqual({ interrupt: 1, stop: 1 });
+    // Nothing was asked to wind down, so nothing waited on the grace window.
+    expect(sleep).not.toHaveBeenCalled();
   });
 });

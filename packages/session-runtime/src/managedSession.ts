@@ -279,7 +279,16 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       await opts.client.interrupt();
     },
     async stop(): Promise<void> {
-      await opts.client.end();
+      // Client teardown is best-effort: end() can reject when the transport is already dead
+      // (the SDK subprocess died out from under us), and the session is no less over for it.
+      // What MUST happen is the terminal state stamp — without it the registry keeps this
+      // record non-terminal and a later daemon run would treat a session the operator
+      // explicitly ended as still alive.
+      try {
+        await opts.client.end();
+      } catch {
+        // A dead transport cannot be torn down twice; there is nothing left to release.
+      }
       if (state !== 'done' && state !== 'failed') {
         setState('done');
       }

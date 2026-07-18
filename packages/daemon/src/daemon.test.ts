@@ -34,7 +34,7 @@ import type {
   AgentSdkClient,
   PermissionDecision,
   PermissionRequest,
-  ResumeAllOrphansOptions,
+  ResumeOrphanOptions,
 } from '@claude-control/session-runtime';
 import { Store } from './store.js';
 import { UsagePoller } from './usagePoller.js';
@@ -254,10 +254,18 @@ function fakeSessionManager(): SessionManager & {
   spawnManaged: ReturnType<typeof vi.fn>;
   /** Exposed so resume tests can pre-register handles the daemon should find via get(). */
   handles: Map<string, SessionHandle>;
+  /** Backing array for list() — tests seed persisted-looking records here. */
+  records: SessionRecord[];
+  /** Every resumeOrphan call, observable with real types (no mock-generics needed). */
+  resumeOrphanCalls: Array<{ sessionId: string; opts: ResumeOrphanOptions }>;
 } {
   const handles = new Map<string, SessionHandle>();
+  const records: SessionRecord[] = [];
+  const resumeOrphanCalls: Array<{ sessionId: string; opts: ResumeOrphanOptions }> = [];
   return {
     handles,
+    records,
+    resumeOrphanCalls,
     spawnManaged: vi.fn((opts) => {
       void opts;
       const handle = makeFakeHandle('spawned-session');
@@ -268,8 +276,15 @@ function fakeSessionManager(): SessionManager & {
       throw new Error('not used in this test');
     }),
     get: (id: string) => handles.get(id),
-    list: (): SessionRecord[] => [],
+    list: (): SessionRecord[] => records,
     recover: (): Promise<SessionRecord[]> => Promise.resolve([]),
+    resumeOrphan: (sessionId, opts) => {
+      resumeOrphanCalls.push({ sessionId, opts });
+      // Mirror the real manager: the resumed handle comes live under the SAME id.
+      const handle = makeFakeHandle(sessionId);
+      handles.set(sessionId, handle);
+      return Promise.resolve(handle);
+    },
   };
 }
 
@@ -949,7 +964,7 @@ describe('Daemon lifecycle', () => {
 
   it('a stop that races a not-yet-live session does not burn the key — a later stop still works', async () => {
     await daemon.start();
-    // First stop targets a session that is not live yet (e.g. the startup resume window): it errors,
+    // First stop targets a session that is not live yet (e.g. a spawn still in flight): it errors,
     // and must NOT remember the idempotencyKey (otherwise the card's stable key is un-stoppable).
     relay.push({
       daemonId: 'daemon-under-test',
@@ -972,50 +987,72 @@ describe('Daemon lifecycle', () => {
     expect(handle.interruptCalls).toBe(1);
   });
 
-  // ---- crash re-attach at startup ----
+  // ---- orphan reconciliation + on-demand re-attach ----
 
-  it('resumes orphaned sessions at startup and wires them exactly like fresh spawns', async () => {
-    const handle = makeFakeHandle('orphan-1');
-    const resumedRecord: SessionRecord = {
+  it('startup stamps leftover records orphaned but never resumes them', async () => {
+    const orphan: SessionRecord = {
       id: 'orphan-1',
       kind: 'managed',
-      state: 'running',
+      state: 'orphaned',
       startedAtMs: 0,
       accountId: 'acct-x',
       resumeId: 'sdk-abc',
     };
-    const resumeAllOrphans = vi.fn((opts: ResumeAllOrphansOptions) => {
-      void opts;
-      sessionManager.handles.set(handle.id, handle);
-      return Promise.resolve({
-        resumed: [resumedRecord],
-        skipped: [{ id: 'orphan-2', reason: 'no persisted resumeId' }],
-      });
-    });
-    sessionManager.resumeAllOrphans = resumeAllOrphans;
+    sessionManager.records.push(orphan);
+    const recover = vi.fn(() => Promise.resolve([orphan]));
+    sessionManager.recover = recover;
     await daemon.start();
 
-    expect(resumeAllOrphans).toHaveBeenCalledTimes(1);
-    const opts = resumeAllOrphans.mock.calls[0]?.[0];
-    // Resumed sessions get the same remote-approval mode as fresh spawns, a non-empty
-    // continuation nudge, and clients from the daemon's own injected factory.
-    expect(opts?.permissionMode).toBe('default');
-    expect(opts?.prompt.length).toBeGreaterThan(0);
-    expect(opts?.createClient()).toBe(fakeAgentSdkClient);
+    expect(recover).toHaveBeenCalledTimes(1);
+    // Reconciliation is bookkeeping only: nothing resumed means nothing can run a turn —
+    // an orphan re-attaches solely when an operator prompt addresses it.
+    expect(sessionManager.resumeOrphanCalls).toHaveLength(0);
+    expect(sessionManager.get('orphan-1')).toBeUndefined();
+  });
 
-    handle.emit({ kind: 'status', state: 'running' });
+  it("prompt.inject to an orphan re-attaches it with the operator's text as the resumed turn", async () => {
+    sessionManager.records.push({
+      id: 'orphan-1',
+      kind: 'managed',
+      state: 'orphaned',
+      startedAtMs: 0,
+      accountId: 'acct-x',
+      resumeId: 'sdk-abc',
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'orphan-1', text: 'pick the task back up', idempotencyKey: 'k' },
+    });
+    await waitFor(() => sessionManager.resumeOrphanCalls.length > 0);
+
+    const call = sessionManager.resumeOrphanCalls[0];
+    expect(call?.sessionId).toBe('orphan-1');
+    // The operator's own text is the resumed turn — never a synthetic prompt.
+    expect(call?.opts.prompt).toBe('pick the task back up');
+    // Resumed sessions get the same remote-approval mode as fresh spawns, and clients from
+    // the daemon's own injected factory.
+    expect(call?.opts.permissionMode).toBe('default');
+    expect(call?.opts.client).toBe(fakeAgentSdkClient);
+
+    // The re-attached handle is wired exactly like a fresh spawn: status events flow as
+    // envelopes with the persisted record's account threaded.
+    const handle = sessionManager.get('orphan-1') as ReturnType<typeof makeFakeHandle> | undefined;
+    expect(handle).toBeDefined();
+    handle?.emit({ kind: 'status', state: 'running' });
     await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
     const status = relay.received.find((e) => e.type === 'session.status');
     if (status?.type === 'session.status') {
       expect(status.payload).toMatchObject({
         sessionId: 'orphan-1',
         state: 'running',
-        accountId: 'acct-x', // threaded from the persisted record, like a spawn payload's
+        accountId: 'acct-x',
       });
     }
 
-    // The structured permission pipe is attached on resume too, not just on spawn.
-    handle.emitPermission({ requestId: 'resume-req-1', tool: 'Bash', summary: 'continue' });
+    // The structured permission pipe is attached on re-attach too, not just on spawn.
+    handle?.emitPermission({ requestId: 'resume-req-1', tool: 'Bash', summary: 'continue' });
     await waitFor(() => relay.received.some((e) => e.type === 'permission.request'));
     const request = relay.received.find((e) => e.type === 'permission.request');
     if (request?.type === 'permission.request') {
@@ -1023,7 +1060,27 @@ describe('Daemon lifecycle', () => {
     }
   });
 
-  it('a failing session re-attach is logged and never kills startup', async () => {
+  it('prompt.inject never resurrects a terminal session — a done record is warned and dropped', async () => {
+    sessionManager.records.push({
+      id: 'done-1',
+      kind: 'managed',
+      state: 'done',
+      startedAtMs: 0,
+      resumeId: 'sdk-done',
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'done-1', text: 'hello?', idempotencyKey: 'k' },
+    });
+    // Nothing observable should happen — give the dispatch a moment, then assert no resume.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(sessionManager.resumeOrphanCalls).toHaveLength(0);
+    expect(sessionManager.get('done-1')).toBeUndefined();
+  });
+
+  it('a failing session reconciliation is logged and never kills startup', async () => {
     sessionManager.recover = vi.fn(() => Promise.reject(new Error('corrupt sessions.json')));
     await expect(daemon.start()).resolves.toBeUndefined();
     // The daemon is fully up regardless — still connected to the control plane.
