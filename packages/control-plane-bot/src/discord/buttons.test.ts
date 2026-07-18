@@ -120,7 +120,8 @@ describe('resolveTap — two-tap state machine', () => {
     });
   });
 
-  it('a Cancel tap restores the armed button and executes nothing', () => {
+  it('a Cancel on a permission-card deny restores the FULL Approve/Deny/Deny (session) row', () => {
+    // Wet finding (gate 5.4): restoring only the armed deny button ate Approve/Deny for good.
     const id = encodeButton({
       action: 'deny',
       phase: 'cancel',
@@ -131,11 +132,49 @@ describe('resolveTap — two-tap state machine', () => {
     const out = resolveTap(id, NOW);
     expect(out.kind).toBe('restore');
     if (out.kind !== 'restore') throw new Error('unreachable');
+    expect(out.rows).toEqual(permissionButtons({ requestId: 'req-9', permissionMode: 'default' }));
+    expect(out.rows[0]!.map((b) => b.label)).toEqual(['Approve', 'Deny', 'Deny (session)']);
+  });
+
+  it('a stale Confirm on a permission-card deny also re-arms to the full row', () => {
+    const id = encodeButton({
+      action: 'deny',
+      phase: 'confirm',
+      scope: 'session',
+      ts: NOW,
+      id: 'req-9',
+    });
+    const out = resolveTap(id, NOW + CONFIRM_TTL_MS + 1);
+    expect(out.kind).toBe('restore');
+    if (out.kind !== 'restore') throw new Error('unreachable');
+    expect(out.rows).toEqual(permissionButtons({ requestId: 'req-9', permissionMode: 'default' }));
+  });
+
+  it('a Cancel on a session-card Stop restores the single armed Stop (its whole row)', () => {
+    const id = encodeButton({ action: 'stop', phase: 'cancel', scope: 'na', ts: 0, id: 'sess-1' });
+    const out = resolveTap(id, NOW);
+    expect(out.kind).toBe('restore');
+    if (out.kind !== 'restore') throw new Error('unreachable');
+    expect(out.rows).toEqual(sessionCardButtons({ sessionId: 'sess-1', stoppable: true }));
+  });
+
+  it('a Cancel on a switch button falls back to re-arming just that button', () => {
+    const id = encodeButton({
+      action: 'switch',
+      phase: 'cancel',
+      scope: 'na',
+      ts: 0,
+      id: 'acct-2',
+    });
+    const out = resolveTap(id, NOW);
+    expect(out.kind).toBe('restore');
+    if (out.kind !== 'restore') throw new Error('unreachable');
+    expect(out.rows).toHaveLength(1);
+    expect(out.rows[0]).toHaveLength(1);
     expect(decodeButton(out.rows[0]![0]!.customId)).toMatchObject({
       phase: 'arm',
-      action: 'deny',
-      scope: 'session',
-      id: 'req-9',
+      action: 'switch',
+      id: 'acct-2',
     });
   });
 

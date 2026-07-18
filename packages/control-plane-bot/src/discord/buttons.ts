@@ -127,6 +127,23 @@ function armedButton(p: ParsedButton): ButtonSpec {
   };
 }
 
+/** The FULL row a restore (Cancel / stale Confirm) returns the message to. The customId is the
+ *  only state that survives a tap, but it proves what the card originally rendered: permission
+ *  buttons ship ONLY in default mode (the tapped deny's existence is that proof), and a Stop
+ *  button ships only on a stoppable session — so the whole original row is reconstructible.
+ *  Restoring just the armed button (the old behavior) permanently ate the sibling Approve/Deny
+ *  buttons on a permission card (wet finding, gate 5.4). */
+function restoredRows(p: ParsedButton): ButtonSpec[][] {
+  if (p.action === 'approve' || p.action === 'deny') {
+    return permissionButtons({ requestId: p.id, permissionMode: 'default' });
+  }
+  if (p.action === 'stop') {
+    return sessionCardButtons({ sessionId: p.id, stoppable: true });
+  }
+  // 'switch' has no multi-button card today — the armed button IS its whole row.
+  return [[armedButton(p)]];
+}
+
 /** The Confirm/Cancel pair a first tap swaps in. Confirm carries `nowMs` so a later tap can be
  *  aged out against CONFIRM_TTL_MS. */
 function confirmCancelRow(p: ParsedButton, nowMs: number): ButtonSpec[] {
@@ -181,13 +198,13 @@ export function resolveTap(
       if (nowMs - p.ts > ttlMs) {
         return {
           kind: 'restore',
-          rows: [[armedButton(p)]],
+          rows: restoredRows(p),
           note: 'Confirmation expired — tap again to retry.',
         };
       }
       return { kind: 'execute', action: p.action, scope: p.scope, id: p.id };
     case 'cancel':
-      return { kind: 'restore', rows: [[armedButton(p)]], note: 'Cancelled.' };
+      return { kind: 'restore', rows: restoredRows(p), note: 'Cancelled.' };
   }
 }
 
