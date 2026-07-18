@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, mkdir } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SwitchEngine, type RefreshFn } from './switchEngine.js';
@@ -341,6 +341,122 @@ describe('activate — reconcile-by-reading', () => {
     const { accountB } = await seedAActiveWithB(h);
     const result = await h.engine.activate(accountB.id);
     expect(result.adoptedPreviousRotation).toBe(false);
+  });
+});
+
+describe('active-id reconciliation (external /login inside the Claude CLI)', () => {
+  /** Simulate a `/login` done INSIDE the Claude CLI: the live credential + identity files
+   *  change hands entirely outside this engine, so the registry is never told. */
+  async function externalLogin(h: Harness, bundle: CredentialBundle): Promise<void> {
+    await h.credStore.writeLiveCredentials(bundle.claudeAiOauth);
+    await h.credStore.writeOauthAccount(bundle.oauthAccount!);
+  }
+
+  it('getActiveId follows the live login to the stored account that owns it', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+
+    await externalLogin(h, bundleFor('B', NOW + 10 * HOUR));
+
+    expect(await h.engine.getActiveId()).toBe(accountB.id);
+    // The registry itself is NOT rewritten — reconciliation is a read-side judgment.
+    expect(await h.vault.getActiveId()).toBe(accountA.id);
+  });
+
+  it('getActiveId returns null when the live login was never captured here', async () => {
+    const h = await harness();
+    await seedAActiveWithB(h);
+
+    await externalLogin(h, bundleFor('STRANGER', NOW + 10 * HOUR));
+
+    expect(await h.engine.getActiveId()).toBeNull();
+  });
+
+  it('getActiveId falls back to the registry when no live identity is readable', async () => {
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+
+    // ~/.claude.json lost its oauthAccount block — the registry is the best remaining evidence.
+    await writeFile(h.paths.claudeJsonPath, JSON.stringify({ someOtherKey: true }));
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+    // Same for an outright corrupt file: degrade, never throw on a read path.
+    await writeFile(h.paths.claudeJsonPath, 'not json at all');
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+  });
+
+  it('refreshToken protects the ACTUALLY-live account after an external login', async () => {
+    const h = await harness();
+    const { accountB } = await seedAActiveWithB(h);
+    // The user /login'd as B in the CLI, which then rotated B's token: the vault copy is stale.
+    const b = bundleFor('B', NOW + 10 * HOUR);
+    await externalLogin(h, {
+      ...b,
+      claudeAiOauth: { ...b.claudeAiOauth, refreshToken: 'cli-rotated-B' },
+    });
+
+    const result = await h.engine.refreshToken(accountB.id);
+
+    // Adopt-only, never a network refresh — consuming B's single-use refresh token here would
+    // strand the live session the user is sitting in (the registry still names A, but A's
+    // credentials are no longer the live ones).
+    expect(result).toMatchObject({
+      refreshed: false,
+      skippedReason: 'active_account',
+      adoptedLiveRotation: true,
+    });
+    expect(h.refresh).not.toHaveBeenCalled();
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.refreshToken).toBe(
+      'cli-rotated-B',
+    );
+  });
+
+  it('activate after an external login adopts the live rotation into the account that owns it', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    const b = bundleFor('B', NOW + 10 * HOUR);
+    await externalLogin(h, {
+      ...b,
+      claudeAiOauth: { ...b.claudeAiOauth, refreshToken: 'cli-rotated-B' },
+    });
+
+    // The registry still says A — but B owns the live token, so this is a heal of the live
+    // account and the CLI's rotation must land in B's bundle, never A's.
+    const result = await h.engine.activate(accountB.id);
+
+    expect(result).toMatchObject({
+      ok: true,
+      activeAccountId: accountB.id,
+      adoptedPreviousRotation: true,
+    });
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.refreshToken).toBe(
+      'cli-rotated-B',
+    );
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('r-A');
+    // The committed switch heals the registry record.
+    expect(await h.vault.getActiveId()).toBe(accountB.id);
+  });
+
+  it('never adopts live credentials into a bundle that provably belongs to someone else', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    // Corrupt-state seam: A's registry row still carries uuid-A, but its BUNDLE was replaced
+    // by one with a different identity (e.g. a hand-restored backup). The live login (uuid-A,
+    // rotated) reconciles to A by row — adoption must still refuse to write into a bundle
+    // whose own identity disagrees.
+    await h.vault.writeBundle(accountA.id, {
+      claudeAiOauth: oauth('A2', NOW + 10 * HOUR),
+      oauthAccount: { accountUuid: 'uuid-ELSE', emailAddress: 'a2@x.com' },
+    });
+    const liveA = bundleFor('A', NOW + 10 * HOUR);
+    await externalLogin(h, {
+      ...liveA,
+      claudeAiOauth: { ...liveA.claudeAiOauth, refreshToken: 'cli-rotated' },
+    });
+
+    const result = await h.engine.activate(accountB.id);
+
+    expect(result.adoptedPreviousRotation).toBe(false);
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('r-A2');
   });
 });
 

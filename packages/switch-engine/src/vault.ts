@@ -50,6 +50,9 @@ export class Vault {
     return (await this.listAccounts()).find((a) => a.id === id);
   }
 
+  /** The RAW registry record of the last committed switch. It can lag reality after a
+   *  `/login` inside the Claude CLI — consumers who need "who is live right now" must use
+   *  `SwitchEngine.getActiveId()`, which reconciles this against the live login identity. */
   async getActiveId(): Promise<string | null> {
     return (await this.loadRegistry()).activeId;
   }

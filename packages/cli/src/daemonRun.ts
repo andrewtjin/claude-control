@@ -180,8 +180,13 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     }),
     // Tier-0 cache lives in the live ~/.claude.json — served only when it provably belongs
     // to the account being polled (active + accountUuid match; see cachedUsageReader.ts).
+    // Active-id via the ENGINE, not the raw vault: the registry can lag an external `/login`
+    // (see SwitchEngine.getActiveId), which would blind tier-0 for the truly-live account.
     getCachedUsage: createCachedUsageReader({
-      vault: pollVault,
+      vault: {
+        getActiveId: () => engine.getActiveId(),
+        getAccount: (id) => pollVault.getAccount(id),
+      },
       claudeJsonPath: paths.claudeJsonPath,
     }),
     // Greedy-aware advice: when the daemon itself executes the burn plan, the plan's

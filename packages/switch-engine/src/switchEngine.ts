@@ -119,9 +119,6 @@ export class SwitchEngine {
   listAccounts(): Promise<StoredAccount[]> {
     return this.vault.listAccounts();
   }
-  getActiveId(): Promise<string | null> {
-    return this.vault.getActiveId();
-  }
   addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
     return this.vault.addAccount(label, bundle);
   }
@@ -130,6 +127,37 @@ export class SwitchEngine {
   }
   clearQuarantine(id: string): Promise<void> {
     return this.vault.clearQuarantine(id);
+  }
+
+  // ---- active account (live-login reconciled) ----
+
+  /**
+   * The id of the stored account whose credentials are live RIGHT NOW.
+   *
+   * The registry's `activeId` only records the last switch THIS engine committed — a `/login`
+   * inside the Claude CLI swaps the live login without telling us, and trusting the registry
+   * afterwards misreports who is active everywhere downstream (the accounts listing, the
+   * phone's active marker, usage attribution) and mis-routes the live-token protections in
+   * `activate()` / `refreshToken()` at whichever account the registry still names. So the
+   * registry answer is reconciled against the live login's identity (`oauthAccount.accountUuid`
+   * from `~/.claude.json` — the same signal the re-login guard trusts). Only a PROVABLE
+   * mismatch overrides the registry:
+   *   - the live identity matches the registry's account → the registry answer stands;
+   *   - it matches a DIFFERENT stored account → that account is the live one;
+   *   - it matches no stored account (a login never captured here) → null, because claiming
+   *     any stored account is active would be false;
+   *   - no live identity is readable → the registry record, the best remaining evidence.
+   */
+  async getActiveId(): Promise<string | null> {
+    const registryId = await this.vault.getActiveId();
+    // A corrupt/unreadable ~/.claude.json must degrade to the registry answer, never throw —
+    // this is a read path callers hit on every listing and poll cycle.
+    const live = await this.credStore.readOauthAccount().catch(() => undefined);
+    const liveUuid = live?.accountUuid;
+    if (liveUuid === undefined) return registryId;
+    const matches = (await this.vault.listAccounts()).filter((a) => a.accountUuid === liveUuid);
+    if (matches.some((m) => m.id === registryId)) return registryId;
+    return matches[0]?.id ?? null;
   }
 
   /**
@@ -266,7 +294,10 @@ export class SwitchEngine {
 
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
-      const prevActiveId = await this.vault.getActiveId();
+      // Live-reconciled, not the raw registry: `prevActiveId` names who OWNS the live token
+      // below (rotation adoption, audit), and after an external `/login` the registry's
+      // record points at an account whose credentials are no longer the live ones.
+      const prevActiveId = await this.getActiveId();
 
       // Cadence guard (ToS posture): switching ACCOUNTS faster than a human plausibly would
       // is refused. Re-activating the already-active account is a heal, not a hop — exempt.
@@ -398,7 +429,10 @@ export class SwitchEngine {
 
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
-      const activeId = await this.vault.getActiveId();
+      // Live-reconciled for the same reason as `activate()`: the adopt-only protection below
+      // must shield the account whose token is ACTUALLY live, not whichever one the registry
+      // last recorded — network-refreshing the live account's token would strand its session.
+      const activeId = await this.getActiveId();
 
       if (targetId === activeId) {
         // Active account: adopt-only (see the method comment for why we never refresh it).
@@ -475,7 +509,11 @@ export class SwitchEngine {
       const target = await this.vault.readBundle(pending.targetId).catch(() => undefined);
       const live = await this.credStore.readLiveCredentials();
       if (target && live && live.accessToken === target.claudeAiOauth.accessToken) {
-        // The target creds are already live and valid — roll forward and commit.
+        // The target creds are already live and valid — roll forward and commit. Finish the
+        // interrupted live write first: activate() lands the identity block AFTER the
+        // credentials, so a crash between the two leaves a live identity that still names the
+        // previous account (which would also mislead the live-login reconciliation).
+        if (target.oauthAccount) await this.credStore.writeOauthAccount(target.oauthAccount);
         await this.vault.setActive(pending.targetId);
         this.audit.append({
           ts: this.clock(),
@@ -520,6 +558,13 @@ export class SwitchEngine {
     if (!prevActiveId || !liveNow) return false;
     const prevBundle = await this.vault.readBundle(prevActiveId).catch(() => undefined);
     if (!prevBundle) return false;
+    // Identity guard: adoption WRITES the live credentials into this account's bundle, so a
+    // provable owner mismatch must skip — persisting another account's tokens under this id
+    // would corrupt both the bundle and every usage-attribution row keyed to it. Unprovable
+    // (either side missing a uuid) falls through to the token comparison, as before.
+    const prevUuid = prevBundle.oauthAccount?.accountUuid;
+    const liveUuid = liveOauthAccount?.accountUuid;
+    if (prevUuid !== undefined && liveUuid !== undefined && prevUuid !== liveUuid) return false;
     if (liveNow.refreshToken === prevBundle.claudeAiOauth.refreshToken) return false;
 
     await this.vault.writeBundle(prevActiveId, {
