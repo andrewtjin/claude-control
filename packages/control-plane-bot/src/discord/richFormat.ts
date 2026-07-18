@@ -186,7 +186,7 @@ export const MESSAGE_CONTENT_LIMIT = 2000;
 /**
  * Shorten `text` to at most `max` characters, appending a VISIBLE marker of exactly how much
  * was cut. The plan bans silent truncation: a shortened `last_assistant_message` must say so,
- * so the reader knows the tail exists (full text arrives via the M4 attachment path). The
+ * so the reader knows the tail exists (full text arrives via the attachment path). The
  * result is guaranteed ≤ `max` — the marker budget is reserved using the largest possible
  * hidden-count width, so the returned string can never itself overflow the limit.
  */

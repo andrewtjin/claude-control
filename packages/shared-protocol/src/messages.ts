@@ -162,7 +162,7 @@ const PermissionRequestPayload = z.object({
   /** The session's Claude Code permission mode (hook field `permission_mode`), e.g.
    *  'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'. A tolerant string, not an
    *  enum: Claude ships new modes without notice, and rejecting the whole frame over an
-   *  unknown mode would blind the phone to a real request. The bot's contract (plan §4):
+   *  unknown mode would blind the phone to a real request. The bot's contract:
    *  approve/deny buttons ONLY when this is exactly 'default'; absent or unrecognized
    *  modes get an informational card — fail-safe, never a button that lies. */
   permissionMode: z.string().min(1).nullish(),
@@ -190,7 +190,7 @@ const SessionSpawnPayload = z.object({
   idempotencyKey: IdempotencyKey,
 });
 
-/** Long output is a presentation problem, not a wire problem (decision, plan §4 "no silent
+/** Long output is a presentation problem, not a wire problem (decision: "no silent
  *  truncation"): the daemon streams ALL output as ordered `seq` chunks and never drops text;
  *  when accumulated output crosses its inline-display threshold the BOT re-materializes the
  *  chunks as a file attachment. No attachment wire type exists — attachments would duplicate

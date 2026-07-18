@@ -3,7 +3,7 @@
 //
 // The SDK boundary is the injectable `AgentSdkClient` interface below — a small domain
 // type this package owns, deliberately narrower than the real SDK's ~30-variant message
-// union (see agentSdkClient.ts, which is the WET-GATED adapter that maps one onto the
+// union (see agentSdkClient.ts, which is the live-boundary adapter that maps one onto the
 // other). Tests here use a fake client and never touch a real process.
 
 import type {

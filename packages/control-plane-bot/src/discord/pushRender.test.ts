@@ -158,7 +158,7 @@ describe('renderPush — routing of other envelopes', () => {
   });
 });
 
-describe('renderPush — daemon error envelopes are surfaced (finding 5)', () => {
+describe('renderPush — daemon error envelopes are surfaced', () => {
   it('renders an error envelope as a visible DM carrying the code and message', () => {
     const push = renderPush(
       env('error', {

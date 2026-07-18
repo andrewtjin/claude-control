@@ -346,12 +346,12 @@ export class Store {
 
   // ---- sessions ----
   //
-  // DECISION (M4 → C6): this table is a DISPLAY-ONLY MIRROR for `cctl session status`, NOT a
+  // DECISION: this table is a DISPLAY-ONLY MIRROR for `cctl session status`, NOT a
   // source of truth. Recovery NEVER reads it: session-runtime's `sessions.json` (atomic
   // temp+rename) remains the single source of truth that recover()/resumeOrphan read, precisely
-  // because a mirror can diverge from it across a crash window. The M4 decision deferred wiring
-  // any writer until its reader existed ("a second source of truth with no reader is pure
-  // divergence risk"); C6 lands BOTH together — the daemon mirrors managed-session state
+  // because a mirror can diverge from it across a crash window. Wiring a writer was deferred
+  // until its reader existed ("a second source of truth with no reader is pure
+  // divergence risk"); both land together — the daemon mirrors managed-session state
   // transitions here (see daemon.ts `mirrorManagedSession`) and registers interactive sessions
   // here (see daemon.ts `registerSession`), and `cctl session status` reads it offline. Because
   // it is observability-only, STALENESS AFTER A CRASH IS TOLERATED: a row left 'running' by a

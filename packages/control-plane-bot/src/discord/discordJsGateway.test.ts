@@ -1,6 +1,6 @@
-// discordJsGateway is otherwise WET-GATED (see its file header): start()/deliver() make real
+// discordJsGateway is otherwise a live boundary (see its file header): start()/deliver() make real
 // Discord API calls, so it is not unit-tested. This ONE test is the deliberate exception — it
-// proves the per-session-route SERIALIZATION of deliver() (finding 3), which is gateway-local
+// proves the per-session-route SERIALIZATION of deliver(), which is gateway-local
 // state (the promise chain + the cardMessages map) that no pure module can hold. It exercises that
 // serialization through the single `protected sinkFor` seam by returning a controllable fake sink,
 // so nothing here touches a real Discord connection.
@@ -69,7 +69,7 @@ function tick(): Promise<void> {
   return new Promise((r) => setTimeout(r, 0));
 }
 
-describe('DiscordJsGateway — per-session delivery is serialized (finding 3)', () => {
+describe('DiscordJsGateway — per-session delivery is serialized', () => {
   it('two concurrently-delivered frames for one session produce ONE card send, then an edit', async () => {
     const gw = new TestGateway({ relay: stubRelay, pairing: stubPairing });
     const sink = new FakeSink();

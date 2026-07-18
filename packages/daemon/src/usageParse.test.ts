@@ -15,7 +15,7 @@ const baseOpts: ParseUsageOptions = {
 };
 
 describe('parseUsageEndpointResponse', () => {
-  it('parses the exact live payload observed at the M2 gate (2026-07-16 probe)', () => {
+  it('parses an exact payload observed from the live endpoint', () => {
     // Verbatim shape from a real 200 response: `limits` at the TOP level (no `utilization`
     // wrapper), alongside sibling fields the parser must ignore. Object-valued `scope` and
     // nullable resets_at appear in the wild too.
@@ -70,7 +70,7 @@ describe('parseUsageEndpointResponse', () => {
   });
 
   it('parses the `utilization`-wrapped variant (how the CLI caches the same payload)', () => {
-    // Same limit family nested one level down — WT-2 originally recorded this shape from the
+    // Same limit family nested one level down — an earlier live capture recorded this shape from the
     // CLI's `.claude.json` cache; the parser accepts both containers.
     const raw = {
       utilization: {

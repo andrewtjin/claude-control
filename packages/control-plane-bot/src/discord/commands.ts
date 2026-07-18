@@ -206,7 +206,7 @@ export function handleDeny(
 }
 
 /** `/stop <sessionId>` and the Stop button — request an orderly stop of a managed session. The
- *  `session.stop` wire type exists as of the M3 protocol commit; escalation (interrupt → grace →
+ *  `session.stop` wire type exists in the protocol; escalation (interrupt → grace →
  *  hard stop) is the daemon's policy and the acknowledgment rides on the `session.status`
  *  transitions the daemon already emits, so there is no dedicated stop.result to wait on here.
  *  `idempotencyKey` lets a double-tapped Stop resolve to "already handled" (daemon-side too). */

@@ -1,6 +1,6 @@
 // Pure "which daemon push is worth a DM, and how does it render" decision.
 //
-// This is the logic the WET-GATED gateway used to hold inline. Pulling it here makes every
+// This is the logic the live-boundary gateway used to hold inline. Pulling it here makes every
 // routing decision — mode-aware permission cards, the done/waiting/quarantine lifecycle cards,
 // which envelopes are cache-only — unit-testable off plain envelopes, leaving discordJsGateway
 // as nothing but "call renderPush, turn the ButtonSpecs into components, send it".

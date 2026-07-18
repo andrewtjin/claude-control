@@ -1,4 +1,4 @@
-// Locks in the wet-verified (WT-1, CLI 2.1.211) CLAUDE_CONFIG_DIR semantics: the env var
+// Locks in the CLAUDE_CONFIG_DIR semantics observed on CLI 2.1.211: the env var
 // relocates the ENTIRE config — both .credentials.json and .claude.json — while the
 // default (unset) case keeps .claude.json in the home dir.
 
@@ -15,7 +15,7 @@ describe('defaultPaths', () => {
     expect(paths.claudeJsonPath).toBe(join(homedir(), '.claude.json'));
   });
 
-  it('relocates BOTH credential files into CLAUDE_CONFIG_DIR when set (WT-1)', () => {
+  it('relocates BOTH credential files into CLAUDE_CONFIG_DIR when set', () => {
     const dir = join('C:', 'somewhere', 'transient');
     const paths = defaultPaths({ CLAUDE_CONFIG_DIR: dir });
     expect(paths.claudeDir).toBe(dir);

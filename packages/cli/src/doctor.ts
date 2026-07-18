@@ -62,8 +62,8 @@ export function checkVault(paths: Paths): DoctorCheck {
 }
 
 /** Whether someone is currently logged in — read through this platform's live-credential
- *  channel, so on macOS this probes the CLI's Keychain item (which doubles as the wet-gate
- *  verifier for the item-name/shape assumptions), not a file that never exists there. */
+ *  channel, so on macOS this probes the CLI's Keychain item (which doubles as the live check
+ *  of the item-name/shape assumptions), not a file that never exists there. */
 export async function checkLiveLogin(
   paths: Paths,
   platform: NodeJS.Platform = process.platform,

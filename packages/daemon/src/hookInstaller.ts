@@ -17,7 +17,7 @@
 // recognizably OURS regardless of which port generation they came from, and any that don't
 // match a current spec are pruned before the merge.
 //
-// WET-GATED: the exact `settings.json` hooks schema (event names, matcher semantics, the
+// The exact `settings.json` hooks schema (event names, matcher semantics, the
 // installed CLI version's exact expectations) is reverse-engineered — see docs/VERIFICATION.md.
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';

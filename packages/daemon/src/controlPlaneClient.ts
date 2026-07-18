@@ -53,7 +53,7 @@ export interface ControlPlaneHandlers {
   onPermissionResponse?: (msg: MessageOf<'permission.response'>) => void;
   onPromptInject?: (msg: MessageOf<'prompt.inject'>) => void;
   onSessionSpawn?: (msg: MessageOf<'session.spawn'>) => void;
-  /** Phone-initiated stop of a managed session (M4). Like every other inbound command, the
+  /** Phone-initiated stop of a managed session. Like every other inbound command, the
    *  client only routes the frame — escalation policy (interrupt → grace → hard stop) and
    *  idempotency live in the daemon's handler. */
   onSessionStop?: (msg: MessageOf<'session.stop'>) => void;

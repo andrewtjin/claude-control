@@ -9,9 +9,9 @@
 // owns and only resolving it when a decision arrives. That mechanism is the whole reason
 // this module exists as its own pure unit: the gate can be exhaustively tested (blocking,
 // single-resolve, deny-on-teardown, no-leak) without ever spawning a real SDK process,
-// while the WET-gated adapter (agentSdkClient.ts) just wires the SDK's canUseTool onto it.
+// while the live-boundary adapter (agentSdkClient.ts) just wires the SDK's canUseTool onto it.
 //
-// NON-NEGOTIABLE (plan §4 / M4): there is deliberately no timer here. An abandoned request
+// NON-NEGOTIABLE: there is deliberately no timer here. An abandoned request
 // is bounded ONLY by the session/turn ending — `denyAll()` — never by an auto-decision.
 
 import type { PermissionDecision, PermissionResolveOutcome } from './types.js';
@@ -79,7 +79,7 @@ export function createPermissionGate(): PermissionGate {
       const entry = entries.get(requestId);
       if (!entry) return 'unknown';
       // Settled entries are KEPT (not deleted) precisely so a repeat returns 'already_handled'
-      // rather than 'unknown' — the double-tap idempotency the M4 contract requires. The gate
+      // rather than 'unknown' — the double-tap idempotency the design requires. The gate
       // is per-turn and discarded at turn end, so retained settled entries never accumulate.
       if (entry.settled) return 'already_handled';
       entry.settled = true;

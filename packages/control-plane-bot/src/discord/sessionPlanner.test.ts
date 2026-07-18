@@ -209,7 +209,7 @@ describe('SessionPlanner — stop composes with the live card', () => {
   });
 });
 
-describe('SessionPlanner — output epoch resets reassembly across a daemon restart (finding 1)', () => {
+describe('SessionPlanner — output epoch resets reassembly across a daemon restart', () => {
   it('adopts the first epoch seen without emitting a restart marker', () => {
     const p = new SessionPlanner({ attachThresholdChars: 1, coalesceWindowMs: 1000 });
     p.onStatus(ROUTE, status('running'), 0);
@@ -249,7 +249,7 @@ describe('SessionPlanner — output epoch resets reassembly across a daemon rest
   });
 });
 
-describe('SessionPlanner — line content is clamped to the Discord limit (finding 2)', () => {
+describe('SessionPlanner — line content is clamped to the Discord limit', () => {
   it('clamps an over-long milestone line to ≤2000 chars ending in a truncation label', () => {
     const p = new SessionPlanner();
     p.onStatus(ROUTE, status('running'), 0);
@@ -260,7 +260,7 @@ describe('SessionPlanner — line content is clamped to the Discord limit (findi
   });
 });
 
-describe('SessionPlanner — no silent gap between the inline tail and the attachment (finding 4)', () => {
+describe('SessionPlanner — no silent gap between the inline tail and the attachment', () => {
   it('attaches output longer than the inline tail even in the old 1001–1499 silent zone', () => {
     // Defaults: tail 1000, threshold now defaults to the tail (1000) with strictly-greater
     // crossing — so 1001 chars (which the tail would clip) attaches instead of vanishing.

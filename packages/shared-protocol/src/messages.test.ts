@@ -3,7 +3,7 @@ import { decode, isType, stamp, encode } from './codec.js';
 import { Envelope, isMessageType, type PayloadOf } from './messages.js';
 import { PROTOCOL_VERSION } from './version.js';
 
-// Schema-level tests for the M3/M4 protocol additions (permissionMode, the widened
+// Schema-level tests for the hook/managed-session protocol additions (permissionMode, the widened
 // hook.notification, session.stop). Codec mechanics live in codec.test.ts; this file
 // proves the CONTRACT: new fields are optional (old peers' frames still parse), tolerant
 // (unknown mode/type strings never reject a frame), and the new type is fully registered.
@@ -28,7 +28,7 @@ describe('permission.request permissionMode', () => {
     summary: 'run a command',
   };
 
-  it('parses without permissionMode — frames from pre-M3 daemons stay valid', () => {
+  it('parses without permissionMode — frames from older daemons stay valid', () => {
     const result = decode(rawFrame('permission.request', base));
     expect(result.ok).toBe(true);
     if (result.ok && isType(result.envelope, 'permission.request')) {

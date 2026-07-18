@@ -258,7 +258,7 @@ describe('ControlPlaneClient', () => {
   });
 
   it('unpaired with no pairing code: rejects with re-pair guidance before touching the network', async () => {
-    // The wet-run regression this pins: `cctl daemon run` (no --pair) with no persisted
+    // The regression this pins: `cctl daemon run` (no --pair) with no persisted
     // identity used to encode a pair.claim with an EMPTY pairingCode, and the wire schema's
     // min-length throw inside the ws open handler crashed the whole process.
     const identityStore = memoryIdentityStore();

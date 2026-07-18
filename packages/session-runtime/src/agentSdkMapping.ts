@@ -1,7 +1,7 @@
 // Pure translation between the real Agent SDK's shapes and this package's own domain
 // vocabulary — the half of the SDK adapter that has NO subprocess side effects and can
 // therefore be unit-tested exhaustively. Only the thin wiring that actually calls
-// `query()` / hands the SDK a `canUseTool` callback stays WET-gated (see agentSdkClient.ts).
+// `query()` / hands the SDK a `canUseTool` callback stays in the live-boundary adapter (see agentSdkClient.ts).
 //
 // Everything here imports the SDK ONLY as `import type` (erased at compile time), so pulling
 // this module into a test never loads the SDK runtime or spawns a Claude Code process.
@@ -120,7 +120,7 @@ const KNOWN_PERMISSION_MODES: ReadonlySet<string> = new Set<PermissionMode>([
 ]);
 
 /** The subset of the SDK's `Options` this adapter sets. Returned as a plain object the
- *  WET-gated adapter spreads into the real `query()` options alongside its `canUseTool`
+ *  live-boundary adapter spreads into the real `query()` options alongside its `canUseTool`
  *  wiring. `env` is present only when we bind a per-account config dir (see below). */
 export interface SdkQueryOptionsShape {
   resume?: string;
@@ -144,7 +144,7 @@ export interface SdkQueryOptionsShape {
  *  - `configDirForAccount` given → bind the account by pointing `env.CLAUDE_CONFIG_DIR` at
  *    that account's config dir. This is the one legitimate SDK mechanism for per-session
  *    account isolation.
- *  - otherwise → the project's default single-shared-`~/.claude` design (plan §4/WT-1): the
+ *  - otherwise → the project's default single-shared-`~/.claude` design: the
  *    switch engine has already ACTIVATED the intended account globally before spawn, so the
  *    session inherits it. `accountId` is then an attribution tag, not a selector — and the
  *    drop is made LOUD via `onUnboundAccountId` (never silent), so a daemon that forgot to

@@ -3,11 +3,11 @@
 // `AccountUsageInput` (usage-advisor — what feeds the burn-down optimizer).
 //
 // PURE: no IO, no throwing. The OAuth usage endpoint is undocumented but its live shape was
-// wet-confirmed 2026-07-16 (live probe during the M2 gate): `limits[]` at the TOP level of
+// confirmed against the live endpoint: `limits[]` at the TOP level of
 // the response body, with kind/group/percent/severity/resets_at(nullable)/scope(nullable)/
 // is_active. A `utilization`-wrapped variant also exists in the wild — it's how the CLI
 // persists the same payload in `.claude.json` (`cachedUsageUtilization.utilization.limits`),
-// and it's what WT-2 originally recorded — so both containers are accepted. The endpoint
+// and an earlier live capture recorded that shape — so both containers are accepted. The endpoint
 // can still drift, so tolerance stays: a poll that returns something we don't recognize must
 // never crash the poller or blind the advisor to every OTHER account — every parse here
 // degrades to a best-effort result with an `error` note instead of throwing.
@@ -27,7 +27,7 @@ const KNOWN_KINDS = new Set(['session', 'weekly_all', 'weekly_scoped']);
 
 function normalizeKind(raw: unknown): 'session' | 'weekly_all' | 'weekly_scoped' | undefined {
   if (typeof raw !== 'string') return undefined;
-  // Wet-confirmed kinds: session, weekly_all, weekly_scoped (WT-2). The extra spellings stay
+  // Live-observed kinds: session, weekly_all, weekly_scoped. The extra spellings stay
   // accepted as cheap drift insurance.
   const normalized = raw.trim().toLowerCase();
   if (normalized === 'weekly' || normalized === 'weekly_all') return 'weekly_all';
@@ -38,7 +38,7 @@ function normalizeKind(raw: unknown): 'session' | 'weekly_all' | 'weekly_scoped'
     : undefined;
 }
 
-/** Percent arrives as `percent` (0-100 — wet-confirmed, WT-2); `utilization` (0-1 fraction)
+/** Percent arrives as `percent` (0-100, live-observed); `utilization` (0-1 fraction)
  *  stays accepted as drift insurance. Both normalize to a 0-100 scale. */
 function normalizePercent(raw: Record<string, unknown>): number | undefined {
   if (typeof raw.percent === 'number' && Number.isFinite(raw.percent)) return raw.percent;
@@ -106,7 +106,7 @@ export interface ParseUsageOptions {
 }
 
 /**
- * Parse the tier-1 OAuth usage endpoint's raw JSON body. Live-confirmed shape (2026-07-16):
+ * Parse the tier-1 OAuth usage endpoint's raw JSON body. Live-confirmed shape:
  *   { limits: [{ kind, percent|utilization, severity?, resets_at?, scope?, is_active? }], ... }
  * with `limits` at the top level; a `{ utilization: { limits: [...] } }` wrapper is also
  * accepted (the CLI's cache file nests the same payload that way).

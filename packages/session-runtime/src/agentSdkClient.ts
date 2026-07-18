@@ -1,7 +1,7 @@
 // The real `AgentSdkClient` — adapts `@anthropic-ai/claude-agent-sdk`'s `query()` onto the
 // minimal domain interface managedSession.ts depends on.
 //
-// WET-GATED: this file is the ONLY one in the package that calls the real `sdkQuery()` /
+// LIVE BOUNDARY: this file is the ONLY one in the package that calls the real `sdkQuery()` /
 // hands the SDK a live `canUseTool` callback, so it is the only one that would spawn a
 // Claude Code subprocess and consume API/plan quota. It is checked for type-shape
 // plausibility against the SDK's published `.d.ts` but is NOT exercised by the unit suite.
@@ -18,7 +18,7 @@
 //      blocks on `permissionGate.register()` until `resolvePermission()` (never a timer).
 //   2. `tool_result` names the real tool via the id->name map mapSdkMessage keeps per turn.
 //   3. `accountId` is threaded via `buildSdkQueryOptions` (config-dir bind) or made LOUD —
-//      see agentSdkMapping.ts's BuildSdkQueryOptionsDeps for the full finding.
+//      see agentSdkMapping.ts's BuildSdkQueryOptionsDeps for the full rationale.
 
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { PermissionResult, Query as SdkQuery } from '@anthropic-ai/claude-agent-sdk';
@@ -44,13 +44,13 @@ function defaultOnUnboundAccountId(accountId: string): void {
   console.warn(
     `[agentSdkClient] accountId '${accountId}' is not bound to a config dir — this session ` +
       `runs under whichever account the switch engine last activated globally. Confirm it was ` +
-      `activated before spawn (see agentSdkMapping.ts for the credential-selection finding).`,
+      `activated before spawn (see agentSdkMapping.ts for the credential-selection rationale).`,
   );
 }
 
 /** Map our domain decision onto the SDK's `PermissionResult`. `deny` requires a message; an
  *  `allow` may carry a narrowed `updatedInput`. Trivial, but SDK-typed, so it stays here in
- *  the WET-gated file rather than in the pure mapping module. */
+ *  the live-boundary file rather than in the pure mapping module. */
 function decisionToPermissionResult(decision: PermissionDecision): PermissionResult {
   if (decision.behavior === 'allow') {
     return {

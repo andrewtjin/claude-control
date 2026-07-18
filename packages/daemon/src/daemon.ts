@@ -68,12 +68,12 @@ export interface DaemonOptions {
    *  it is re-pushed with every poll cycle — settings never change mid-run, but the bot's
    *  cache is in-memory, so the repeat is what survives a bot restart. */
   settingsReport?: PayloadOf<'settings.snapshot'>;
-  /** WET-GATED real Agent SDK adapter, overridable so tests never touch a real SDK. */
+  /** Real Agent SDK adapter (live boundary), overridable so tests never touch a real SDK. */
   createAgentSdkClient?: () => AgentSdkClient;
   /** Self-heal the CLI's hook config on startup. Called AFTER the hook receiver binds, with
    *  its actual loopback port, so it can (re)install the curl hooks that POST to that port.
    *  Injected — the composition root owns WHERE settings.json lives and which profile is
-   *  targeted (see daemonRun.ts) — and optional so lifecycle tests and the pre-M3 path can
+   *  targeted (see daemonRun.ts) — and optional so lifecycle tests and hook-less setups can
    *  omit it. Its rejection must NEVER crash startup: settings.json can be read-only or locked,
    *  and hooks are additive, not load-bearing for the daemon's own liveness. */
   installHooks?: (port: number) => Promise<void>;
@@ -107,7 +107,7 @@ const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
 /**
  * DECISION — managed sessions always run in Claude Code's 'default' permission mode.
  * `session.spawn` carries no mode field (protocol v1), and 'default' is the only mode in
- * which the SDK parks tools on `canUseTool` — which IS the remote approve/deny loop (plan §4:
+ * which the SDK parks tools on `canUseTool` — which IS the remote approve/deny loop (design:
  * approve/deny buttons only for 'default'-mode sessions; every other mode gets an
  * informational card). Any auto-approving mode (acceptEdits/bypassPermissions) would silently
  * remove the human from the loop on a phone-spawned session — the opposite of what remote
@@ -153,8 +153,8 @@ interface TrackedInteractiveSession {
   /** Human label for the phone's session list. */
   label?: string;
   /** Per-session Discord-streaming opt-in. Recorded here as the control surface; enforcement
-   *  (filtering the unconditional M3 hook stream on this flag) is deliberately deferred so this
-   *  commit cannot regress M3 — see the note in {@link Daemon.watchSession}. */
+   *  (filtering the unconditional hook stream on this flag) is deliberately deferred so it
+   *  cannot regress live hook cards — see the note in {@link Daemon.watchSession}. */
   watch: boolean;
   /** The account that was live when the session was registered — an attribution tag, matching
    *  the accountId semantics on managed sessions. */
@@ -745,7 +745,7 @@ export class Daemon {
    * DB-guarded resolve.
    *
    * No `expiresAt` on the envelope: unlike hook prompts (15-min TTL), an SDK-parked prompt
-   * deliberately has NO deadline (M4 non-negotiable: never auto-allow/deny on timeout) — it
+   * deliberately has NO deadline (never auto-allow/deny on timeout) — it
    * stays pending until a human answers or the turn/session ends, at which point the runtime
    * denies it fail-closed.
    */
@@ -840,15 +840,14 @@ export class Daemon {
   // These back the `cctl session register|label|watch` loopback endpoints (hookReceiver). They
   // manage a DISPLAY-ONLY registry of interactive Claude Code sessions the user opted into
   // tracking, mirrored into the Store `sessions` table (kind='interactive') so `cctl session
-  // status` reads them offline. This is purely additive observability: it never touches the M3
-  // hook stream, the M4 managed-session pipeline, or recovery (store.ts). SEMANTICS (documented
-  // per the C6 brief — the plan §7 wording is intentionally high-level here):
+  // status` reads them offline. This is purely additive observability: it never touches the
+  // hook stream, the managed-session pipeline, or recovery (store.ts). SEMANTICS:
   //   - register: opt a session into tracking; default `watch: true` (registering implies you
   //     want it on the phone). Idempotent; a re-register keeps any prior label/watch choice.
   //   - label:    name a REGISTERED session (404 if not registered — register is the gateway).
   //   - watch:    set the per-session streaming opt-in on a REGISTERED session (404 otherwise).
   // The watch flag is RECORDED as the control surface; enforcing it (filtering the unconditional
-  // M3 hook stream) is deferred so this commit cannot regress M3 — see watchSession.
+  // hook stream) is deferred so it cannot regress live cards — see watchSession.
 
   /** Bind this daemon's registry methods as the receiver's CLI handlers. `register` is async
    *  (it reads the switch engine for attribution); `label`/`watch` are synchronous and wrapped
@@ -921,11 +920,11 @@ export class Daemon {
 
   /** Set the per-session Discord-streaming opt-in on a registered interactive session.
    *
-   * DELIBERATELY records-only: it does NOT gate the daemon's hook stream on this flag. M3
-   * streams every session's hook notifications unconditionally, and the plan places auto-filter
-   * (a SessionStart hook auto-registering sessions, then streaming only watched ones) AFTER M3.
-   * Gating here now would silence M3 cards for every not-yet-registered session — a regression.
-   * So this commit ships the control surface (persisted + shown in `cctl session status`) that
+   * DELIBERATELY records-only: it does NOT gate the daemon's hook stream on this flag. The daemon
+   * streams every session's hook notifications unconditionally; auto-filtering (a SessionStart
+   * hook auto-registering sessions, then streaming only watched ones) comes later.
+   * Gating here now would silence cards for every not-yet-registered session — a regression.
+   * So this ships the control surface (persisted + shown in `cctl session status`) that
    * the future filter will consult, without changing what streams today. 404 if not registered. */
   private watchSession(input: SessionWatchInput): SessionCommandResult {
     if (this.seenSessionCmdKeys.has(input.idempotencyKey)) {
@@ -1061,7 +1060,7 @@ export interface QuarantineNotice {
  * forward. Pure (no IO, no clock read) so the tricky edge + debounce logic can be unit-tested
  * directly instead of by orchestrating multiple live poll cycles.
  *
- * Rules (plan §4 "quarantine + guided re-login", plus a restart-storm guard):
+ * Rules (quarantine + guided re-login, plus a restart-storm guard):
  *   - Fire ONLY on a false→true transition THIS process observed. An account already
  *     quarantined at first sight (no prior state) is recorded SILENTLY — its standing state is
  *     already carried on every usage snapshot's advisory, and re-alerting on every daemon

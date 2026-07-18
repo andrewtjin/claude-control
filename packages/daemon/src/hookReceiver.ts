@@ -24,7 +24,7 @@ import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { Store } from './store.js';
 
 /** The three hook events the CLI is expected to send, and the header/config the daemon
- *  expects on every request. Configurable because the real names are WET-GATED. */
+ *  expects on every request. Configurable because the real names were reverse-engineered from the installed CLI. */
 export interface HookEventNames {
   permissionRequest: string;
   stop: string;

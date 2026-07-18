@@ -567,7 +567,7 @@ describe('HookReceiver', () => {
       expect(res.status).toBe(400);
     });
 
-    it('logs the exact unrecognized event name — the wet-gate evidence line', async () => {
+    it('logs the exact unrecognized event name', async () => {
       const warns: unknown[] = [];
       const logging = new HookReceiver({
         store,

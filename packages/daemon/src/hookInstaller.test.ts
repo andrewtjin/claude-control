@@ -133,7 +133,7 @@ describe('installHooks', () => {
   });
 
   // The daemon's curl commands embed an OS-assigned per-run port, so exact-command dedup
-  // alone appends one dead entry per restart (wet-run finding, 2026-07-17). These pin the
+  // alone appends one dead entry per restart. These pin the
   // ownedCommandMarker prune that closes that hole.
   describe('ownedCommandMarker (stale-generation pruning)', () => {
     /** Mirrors production: the marker is the secret-header name baked into every command. */

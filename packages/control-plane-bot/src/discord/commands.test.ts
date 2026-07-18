@@ -291,7 +291,7 @@ describe('command-to-envelope mapping and ACL', () => {
   });
 });
 
-describe('handleStop sends session.stop (wired as of the M3 protocol commit)', () => {
+describe('handleStop sends session.stop', () => {
   it('emits a session.stop frame to the invoking user’s daemon with the idempotency key', () => {
     const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
     const deps = makeDeps(relay);

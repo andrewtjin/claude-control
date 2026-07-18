@@ -3,7 +3,7 @@
 //
 // WHY STABLE: the receiver authenticates every inbound POST with a shared secret (see
 // hookReceiver.ts's `secretHeader`), and that secret is baked verbatim into the curl command
-// hookInstaller.ts writes into `settings.json`. A fresh per-run secret (the pre-M3 behaviour,
+// hookInstaller.ts writes into `settings.json`. A fresh per-run secret (the earlier behaviour,
 // `randomUUID()` each start) would therefore 401 every hook the *previous* run installed until
 // the next self-heal re-install, and worse, each run would append a NEW curl command carrying
 // its own secret — settings.json would accrue one dead hook per restart. Persisting the secret

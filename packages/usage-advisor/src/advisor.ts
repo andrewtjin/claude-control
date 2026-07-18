@@ -10,7 +10,7 @@
 // nothing is lost — the same capacity comes right back. When a weekly limit resets, every
 // unused percent evaporates for good. So an account with an empty session window but a
 // distant weekly reset is a RESERVE (its budget is safe for days), never a burn target —
-// the same owner ruling the auto-switch policy encodes ("weekly is the budget; the 5h
+// the same rule the auto-switch policy encodes ("weekly is the budget; the 5h
 // window is only a gate"). Session limits still bind headroom and exhaustion.
 //
 // The plan's single `reason` line carries the whole story — the burn order (soonest-expiring

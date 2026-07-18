@@ -211,7 +211,7 @@ export function buildProgram(): Command {
     );
 
   // Remote-control features that require the running daemon connected to the hosted bot —
-  // an inherently on-machine (wet) step. Surfaced now so the command set is discoverable and
+  // an inherently on-machine step. Surfaced now so the command set is discoverable and
   // the guidance is honest rather than a silent absence. See docs/VERIFICATION.md.
   program
     .command('pair')
@@ -266,7 +266,7 @@ async function readUsageState(): Promise<{
 }
 
 /**
- * The `--fresh` capture flow (wet-verified WT-1): run an interactive `claude` inside a
+ * The `--fresh` capture flow: run an interactive `claude` inside a
  * throwaway `CLAUDE_CONFIG_DIR`, let the user /login as the NEW account there, then vault
  * what landed. The live login is never touched. The transient dir holds real tokens, so it
  * is deleted no matter how the flow ends.

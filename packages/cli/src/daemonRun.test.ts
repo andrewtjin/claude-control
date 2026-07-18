@@ -52,7 +52,7 @@ describe('dpapiIdentityStore', () => {
 });
 
 describe('makeAgentSdkClientFactory', () => {
-  // Constructing the real client is unit-safe: the WET gate sits on `query()` (that is what
+  // Constructing the real client is unit-safe: the live boundary sits on `query()` (that is what
   // spawns a Claude Code subprocess), not on client construction — so this proves the
   // composition-root wiring shape without ever touching the real SDK runtime.
   it('builds a fresh, fully-featured SDK client per call (one client per managed session)', () => {

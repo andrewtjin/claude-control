@@ -96,7 +96,7 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
 }
 
 /**
- * Factory for the WET-GATED real Agent SDK client — one FRESH client per managed session,
+ * Factory for the real Agent SDK client (live boundary) — one FRESH client per managed session,
  * because each session owns its own query lifecycle (a shared instance would cross-wire
  * `interrupt`/`resolvePermission` between sessions; see session-runtime's
  * ResumeAllOrphansOptions). Exported for its colocated test; the rest of runDaemon is
@@ -106,8 +106,8 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
  * CLAUDE_CONFIG_DIRs would give per-session credential isolation, but it forgoes the
  * project's single-shared-~/.claude design (the CLI reads some config outside
  * CLAUDE_CONFIG_DIR, so per-account config dirs don't isolate) and with it credential
- * HOT-SWAP: a `cctl switch` on the
- * PC rewrites the shared live credentials that running sessions read per-request, whereas a
+ * HOT-SWAP: a `cctl switch` on the PC rewrites the shared live credentials that running
+ * sessions read per-request, whereas a
  * session pinned to its own config dir would never see the swap. So sessions inherit
  * whichever account the switch engine last ACTIVATED (activate-before-spawn model),
  * `accountId` stays an attribution tag rather than a credential selector, and a spawn whose

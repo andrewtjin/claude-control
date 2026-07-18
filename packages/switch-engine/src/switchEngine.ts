@@ -1,4 +1,4 @@
-// The switch engine: the safety-critical core of the whole system (milestone M0).
+// The switch engine: the safety-critical core of the whole system.
 //
 // `activate(id)` makes an account's credentials the live ones, with these guarantees:
 //   1. Mutual exclusion with our other processes (file lock).
@@ -153,14 +153,14 @@ export class SwitchEngine {
   /**
    * Capture a login that was performed inside a TRANSIENT config dir (`CLAUDE_CONFIG_DIR`)
    * as a new stored account — without touching the live login or the active id. This is the
-   * wet-verified (WT-1, CLI 2.1.211) way to onboard extra accounts: the CLI writes both
+   * verified (CLI 2.1.211) way to onboard extra accounts: the CLI writes both
    * `.credentials.json` and `.claude.json` inside the transient dir, leaving the real ones
    * alone. The caller owns the transient dir and MUST delete it afterwards (token-bearing).
    */
   async captureFromConfigDir(label: string, configDir: string): Promise<StoredAccount> {
     // Deliberately FILE-based on every platform: the transient dir's contents are what we
     // capture. Whether the mac CLI honors CLAUDE_CONFIG_DIR with files (or still writes its
-    // Keychain item, which would make this flow read nothing) is mac wet-gate assumption A3.
+    // Keychain item, which would make this flow read nothing) is unverified on a real Mac.
     const store = new CredentialStore({
       claudeDir: configDir,
       credentialsPath: join(configDir, '.credentials.json'),
@@ -206,9 +206,9 @@ export class SwitchEngine {
     const existing = await this.vault.getAccount(accountId);
     if (!existing) throw new UnknownAccountError(accountId);
 
-    // File-based capture on every platform (the mac Keychain caveat is captureFromConfigDir's
-    // A3 assumption): the transient dir is a plain CLAUDE_CONFIG_DIR the CLI populated with
-    // `.credentials.json` + `.claude.json` (WT-1). Same seam add --fresh reads from.
+    // File-based capture on every platform (the mac Keychain caveat above applies here too):
+    // the transient dir is a plain CLAUDE_CONFIG_DIR the CLI populated with
+    // `.credentials.json` + `.claude.json`. Same seam add --fresh reads from.
     const store = new CredentialStore({
       claudeDir: configDir,
       credentialsPath: join(configDir, '.credentials.json'),

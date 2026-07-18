@@ -738,7 +738,7 @@ describe('Daemon lifecycle', () => {
     expect(epochs[0]).toBe(epochs[1]); // and stable within the run (no spurious mid-session reset)
   });
 
-  // ---- M4: managed-session permission pipeline ----
+  // ---- managed-session permission pipeline ----
 
   /** Drive a session.spawn through the live relay and hand back the fake handle it created. */
   async function spawnFakeSession(): Promise<FakeHandle> {
@@ -778,7 +778,7 @@ describe('Daemon lifecycle', () => {
         summary: 'run ls',
         permissionMode: 'default',
       });
-      // No TTL on an SDK-parked prompt — the M4 non-negotiable bans timeout-based decisions.
+      // No TTL on an SDK-parked prompt — the design bans timeout-based decisions.
       expect(request.payload.expiresAt ?? undefined).toBeUndefined();
     }
     // Same bookkeeping as a hook-originated request: a pending_permissions row exists.
@@ -867,7 +867,7 @@ describe('Daemon lifecycle', () => {
     expect(store.getPendingPermission('sdk-req-5')?.resolvedDecision).toBe('deny');
   });
 
-  // ---- M4: session.stop ----
+  // ---- session.stop ----
 
   it('wires session.stop -> interrupt-then-stop, acked via the forwarded session.status', async () => {
     await daemon.start();
@@ -972,7 +972,7 @@ describe('Daemon lifecycle', () => {
     expect(handle.interruptCalls).toBe(1);
   });
 
-  // ---- M4: crash re-attach at startup ----
+  // ---- crash re-attach at startup ----
 
   it('resumes orphaned sessions at startup and wires them exactly like fresh spawns', async () => {
     const handle = makeFakeHandle('orphan-1');
@@ -1050,7 +1050,7 @@ describe('Daemon lifecycle', () => {
     await expect(daemon.stop()).resolves.toBeUndefined();
   });
 
-  // ---- C6: cctl session registry (loopback CLI endpoints) + display mirror ----
+  // ---- cctl session registry (loopback CLI endpoints) + display mirror ----
 
   /** Rebuild + start the daemon with a port-capturing endpoint publisher, so the test knows the
    *  loopback port to POST cctl-session commands at. Returns the bound port. */

@@ -25,10 +25,10 @@ export type SessionKind = 'managed' | 'observed';
 
 /**
  * A decision on a pending permission request, in THIS package's own vocabulary. The
- * WET-gated Agent SDK adapter maps it onto the SDK's `PermissionResult`; keeping our own
+ * live-boundary Agent SDK adapter maps it onto the SDK's `PermissionResult`; keeping our own
  * type means callers (daemon, tests) never depend on the SDK's shape. `deny` is the
  * fail-closed default the runtime falls back to when a session ends with a request still
- * outstanding — a permission is never auto-allowed on our side (see the M4 non-negotiable:
+ * outstanding — a permission is never auto-allowed on our side (see the non-negotiable:
  * no timeout-based auto-allow/deny).
  */
 export interface PermissionDecision {

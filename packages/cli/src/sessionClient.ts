@@ -2,7 +2,7 @@
 //
 // `cctl session register|label|watch` talk to the RUNNING daemon over the same 127.0.0.1
 // HookReceiver server the CLI hooks use, guarded by the SAME `x-claude-control-secret`. Two
-// invariants from the C6 brief:
+// invariants:
 //   1. The CLI is NEVER a secret author. It reads the daemon-minted secret with the daemon
 //      package's READ-ONLY `loadHookSecret`; if the file is missing (daemon never ran) it fails
 //      with an actionable message rather than inventing a secret the receiver would reject.

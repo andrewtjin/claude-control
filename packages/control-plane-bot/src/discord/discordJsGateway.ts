@@ -1,7 +1,7 @@
 // Real discord.js wiring: login, slash-command registration, interaction routing, and
 // pushing daemon-originated envelopes to the owning user's DMs.
 //
-// WET-GATED: `start()` opens a real Discord gateway connection and `deliver()` makes real
+// LIVE BOUNDARY: `start()` opens a real Discord gateway connection and `deliver()` makes real
 // Discord API calls — neither can be exercised headlessly, so neither is unit-tested. Every
 // piece of actual LOGIC (which handler a command maps to, what an embed looks like) lives in
 // commands.ts / embeds.ts and IS unit-tested; this file is deliberately thin glue so the
@@ -99,7 +99,7 @@ export interface DiscordJsGatewayOptions {
    *  construct this class without calling `start()` never need a token at all). */
   token?: string;
   /** Injectable time source for the two-tap confirm TTL, the idempotency guard's eviction, and the
-   *  session card's coalescing window. Defaults to `Date.now`; overridden in wet-debugging only. */
+   *  session card's coalescing window. Defaults to `Date.now`; overridden in live debugging only. */
   clock?: () => number;
   /** Directory for the persisted session→thread registry. Defaults under the OS temp dir so the
    *  bot works out of the box; a real deployment points this at its state dir. */
@@ -139,9 +139,9 @@ export class DiscordJsGateway implements DiscordGateway {
   private readonly logger: Logger;
   private readonly token: string | undefined;
   private readonly clock: () => number;
-  /** Executed-button dedupe (deliverable 5): a double-tap hits the same key and is dropped. */
+  /** Executed-button dedupe: a double-tap hits the same key and is dropped. */
   private readonly seenKeys: SeenKeys;
-  /** Pure planner that turns session.output/session.status envelopes into thread ops (M4). */
+  /** Pure planner that turns session.output/session.status envelopes into thread ops. */
   private readonly planner = new SessionPlanner();
   /** Persisted sessionId→thread map; loaded on start(), survives restart. */
   private readonly threadReg: PersistentThreadRegistry;
@@ -212,9 +212,9 @@ export class DiscordJsGateway implements DiscordGateway {
 
   /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user.
    *
-   *  Two paths. Managed-session frames (session.status/session.output) go to the M4 thread-per-
+   *  Two paths. Managed-session frames (session.status/session.output) go to the thread-per-
    *  session surface: the pure `SessionPlanner` turns them into thread ops (create/send/edit/upload)
-   *  which this class executes. Everything else keeps the M2/M3 behaviour — the pure `renderPush`
+   *  which this class executes. Everything else keeps the card behaviour — the pure `renderPush`
    *  decides the DM card and this class only inflates ButtonSpecs and sends it. The state cache is
    *  fed on EVERY envelope regardless, so `/usage`/`/sessions` keep answering from it. */
   async deliver(discordUserId: string, envelope: Envelope): Promise<void> {
@@ -281,7 +281,7 @@ export class DiscordJsGateway implements DiscordGateway {
   }
 
   /** Execute one batch of planner ops. Every discord.js side effect the session surface needs lives
-   *  here (thread resolution, send, edit, attachment upload) — WET-GATED, mirroring the rest of this
+   *  here (thread resolution, send, edit, attachment upload) — live-boundary, mirroring the rest of this
    *  file; all the DECISIONS were already made by the pure planner. A failed op is logged and
    *  skipped, never thrown: one bad send must not abort the batch or crash the relay. */
   private async executeOps(ops: GatewayOp[]): Promise<void> {
@@ -339,7 +339,7 @@ export class DiscordJsGateway implements DiscordGateway {
   /** Resolve a session route to a sendable channel: its recorded thread, or the user's DM as the
    *  remembered fallback. Creates the thread on first use (persisting the mapping), and if a
    *  previously-created thread has since vanished, pins the DM fallback so we stop re-fetching it.
-   *  `protected` (not `private`) is the ONE seam the otherwise WET-GATED per-session op execution
+   *  `protected` (not `private`) is the ONE seam the otherwise live-boundary per-session op execution
    *  exposes: it lets a test subclass return a controllable fake sink so the pure serialization of
    *  {@link deliver} can be exercised without a real Discord connection. */
   protected async sinkFor(route: SessionRoute): Promise<SendableChannels | undefined> {

@@ -262,7 +262,7 @@ export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
   return embed;
 }
 
-/** Rendered for an incoming permission.request push. Mode-aware by design (plan §4): a tap on
+/** Rendered for an incoming permission.request push. Mode-aware by design: a tap on
  *  Approve/Deny can only *honestly* take effect when the session is in exactly `default`
  *  permission mode — in acceptEdits/plan/bypassPermissions the CLI never blocks on a prompt, so
  *  there is nothing here to approve. This builder therefore renders TWO visually distinct cards:
@@ -373,7 +373,7 @@ export function buildSwitchResultEmbed(ok: boolean, message: string): EmbedBuild
 }
 
 // ---------------------------------------------------------------------------
-// Managed-session live card + final summary (M4 thread-per-session UX)
+// Managed-session live card + final summary (thread-per-session UX)
 // ---------------------------------------------------------------------------
 
 /** The session lifecycle states, as the wire reports them (see `session.status`). */

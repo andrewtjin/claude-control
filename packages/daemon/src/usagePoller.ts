@@ -6,7 +6,7 @@
 // A per-account floor + jitter + backoff keeps this from hammering the endpoint or the vault's
 // refresh path; a tier-0 cached fallback keeps the advisor fed even when the network is down.
 //
-// WET-GATED: the real endpoint URL, header names, and response shape are reverse-engineered
+// The real endpoint URL, header names, and response shape are reverse-engineered
 // from the CLI (see docs/VERIFICATION.md) — this module only ever calls the INJECTED `fetch`,
 // never `globalThis.fetch`, so tests can fully control what "the endpoint" returns.
 
@@ -209,8 +209,8 @@ export class UsagePoller {
       if (res.status === 429) {
         this.recordRateLimited(account.accountId, now);
         // A 429 is a failure state like any other — it must reach the snapshot, never be
-        // swallowed (live incident 2026-07-17: an hour of silent 429s left the phone showing
-        // a stale wrong-account cache with no hint anything was failing).
+        // swallowed — an hour of silent 429s would leave the phone showing a stale
+        // wrong-account cache with no hint anything was failing.
         const usage = await this.fallbackStale(account, now, 'usage endpoint rate-limited (429)');
         return { usage, outcome: 'cached' };
       }

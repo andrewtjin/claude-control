@@ -6,7 +6,7 @@
 // A hard `invalid_grant` means the token is permanently spent and the account must be
 // quarantined; anything else (network, 5xx) is transient and safe to retry later.
 //
-// WET-GATED: the endpoint URL, client id, and exact request/response shape are reverse-
+// The endpoint URL, client id, and exact request/response shape are reverse-
 // engineered from the CLI and MUST be confirmed against a real refresh before trusting.
 // Everything here is injectable so tests never hit the network. See docs/VERIFICATION.md.
 
@@ -17,7 +17,7 @@ import { QuarantineError, RefreshError } from './errors.js';
  *  a different value. */
 export const CLAUDE_CODE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
-/** Best-known token endpoint; confirm during wet verification. */
+/** Best-known token endpoint; confirm against the live service. */
 export const DEFAULT_TOKEN_ENDPOINT = 'https://console.anthropic.com/v1/oauth/token';
 
 /** Refresh below this remaining access-token lifetime. */

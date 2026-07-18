@@ -13,10 +13,9 @@
 //   immediately re-trigger), and must have a KNOWN future weekly reset — the weekly
 //   clock is the budget, and we never hop toward an account whose budget we can't see.
 //   CHOICE — the eligible account whose WEEKLY quota resets soonest, full stop. WEEKLY is
-//   the budget; the 5h window is only a gate, never a ranking key (owner ruling
-//   2026-07-16). Quota expiring soonest gets burned first, so the least is wasted.
+//   the budget; the 5h window is only a gate, never a ranking key. Quota expiring soonest gets burned first, so the least is wasted.
 //
-// GREEDY mode (opt-in, owner request 2026-07-16) adds a second trigger: even when the
+// GREEDY mode (opt-in) adds a second trigger: even when the
 // active account is NOT low, hop whenever some eligible account's weekly quota expires
 // STRICTLY sooner than the active one's — always burn the soonest-expiring budget. This is
 // what pulls us BACK after a low-trigger hop: A hits 94%, we hop to B; once A's 5h window
@@ -40,8 +39,8 @@ export interface AutoSwitchPolicy {
   greedy?: boolean;
 }
 
-// 94: hop only when the account is genuinely near the wall (owner-tuned 2026-07-16 from the
-// original 90 — fewer premature hops, still ahead of the hard 100% cutoff).
+// 94: hop only when the account is genuinely near the wall — fewer premature hops, still
+// ahead of the hard 100% cutoff.
 export const DEFAULT_TRIGGER_PERCENT = 94;
 export const DEFAULT_MIN_SESSION_HEADROOM_PCT = 25;
 

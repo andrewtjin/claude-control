@@ -16,9 +16,8 @@
 // stdout). Writes go through `security -i`, which reads whole commands from STDIN — the
 // secret rides inside the stdin line, never in the process table.
 //
-// ⚠ WET-GATE NOTICE: everything touching the REAL `security(1)` or the REAL mac CLI is
-// unverified until `tasks/mac-wet-gate-runbook.md` runs on an actual Mac (assumptions A1-A4
-// in the mac-compatibility plan). The logic below is unit-tested against a fake runner only.
+// ⚠ Everything touching the REAL `security(1)` or the REAL mac CLI is unverified until it
+// runs on an actual Mac. The logic below is unit-tested against a fake runner only.
 
 import { execFileSync } from 'node:child_process';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
@@ -43,8 +42,8 @@ export const defaultExecRunner: ExecRunner = (file, args, input) =>
   });
 
 /** `security -i` tokenizes stdin lines like a shell: to pass an arbitrary string as one
- *  argument it must be double-quoted with `\` and `"` escaped. (Wet-gate assumption: this
- *  matches the real parser — exercised by the runbook before first real switch.) */
+ *  argument it must be double-quoted with `\` and `"` escaped. (Assumed to match the real
+ *  parser — exercise on a real Mac before the first real switch.) */
 function quoteSecurityArg(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
@@ -181,14 +180,14 @@ export class KeychainProtector implements Protector {
 
 // --- 2. Live credentials ---------------------------------------------------------------
 
-/** The mac CLI's own Keychain item (wet-gate assumption A1). */
+/** The mac CLI's own Keychain item (assumed name — verify on a real Mac). */
 export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
 /**
  * Live-credential channel backed by the Claude CLI's macOS Keychain item. Behavior mirrors
  * the file channel's SURGICAL rule: read the existing payload, replace exactly the
  * `claudeAiOauth` block, write the rest back untouched — and additionally PRESERVE THE
- * CLI'S PAYLOAD SHAPE, whichever it turns out to be (wet-gate assumption A2):
+ * CLI'S PAYLOAD SHAPE, whichever it turns out to be (assumed — verify on a real Mac):
  *   wrapped — `{"claudeAiOauth":{...}, ...}` (the `.credentials.json` shape), or
  *   bare    — the oauth block itself at top level.
  * A missing item reads as `undefined` ("nobody logged in"), exactly like a missing file.

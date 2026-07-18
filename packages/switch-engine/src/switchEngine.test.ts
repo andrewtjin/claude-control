@@ -113,7 +113,7 @@ describe('captureFromConfigDir', () => {
     const h = await harness();
     const { accountA } = await seedAActiveWithB(h);
 
-    // Simulate WT-1: a `claude` run under CLAUDE_CONFIG_DIR=<dir> left BOTH files there.
+    // Simulate a `claude` run under CLAUDE_CONFIG_DIR=<dir> leaving BOTH files there.
     const captureDir = join(h.paths.claudeDir, '..', 'capture');
     await mkdir(captureDir, { recursive: true });
     const fresh = bundleFor('FRESH', NOW + 10 * HOUR);
