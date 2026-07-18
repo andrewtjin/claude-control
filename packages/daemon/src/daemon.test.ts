@@ -1076,7 +1076,7 @@ describe('Daemon lifecycle', () => {
     }
   });
 
-  it('prompt.inject never resurrects a terminal session — a done record is warned and dropped', async () => {
+  it('prompt.inject never resurrects a terminal session — refused with an "already ended" answer', async () => {
     sessionManager.records.push({
       id: 'done-1',
       kind: 'managed',
@@ -1085,15 +1085,92 @@ describe('Daemon lifecycle', () => {
       resumeId: 'sdk-done',
     });
     await daemon.start();
-    relay.push({
+    const frame = relay.push({
       daemonId: 'daemon-under-test',
       type: 'prompt.inject',
       payload: { sessionId: 'done-1', text: 'hello?', idempotencyKey: 'k' },
     });
-    // Nothing observable should happen — give the dispatch a moment, then assert no resume.
-    await new Promise((r) => setTimeout(r, 50));
+    // The refusal must be VISIBLE (the bot acks /say optimistically): an error envelope
+    // correlated to the inject frame, and no resume.
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const error = relay.received.find((e) => e.type === 'error');
+    if (error?.type === 'error') {
+      expect(error.payload.code).toBe('unknown_session');
+      expect(error.payload.message).toContain('already ended');
+      expect(error.payload.relatesTo).toBe(frame.id);
+    }
     expect(sessionManager.resumeOrphanCalls).toHaveLength(0);
     expect(sessionManager.get('done-1')).toBeUndefined();
+  });
+
+  it('prompt.inject to a wholly unknown id answers unknown_session, never a silent drop', async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'ghost-1', text: 'anyone home?', idempotencyKey: 'k' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const error = relay.received.find((e) => e.type === 'error');
+    if (error?.type === 'error') {
+      expect(error.payload.code).toBe('unknown_session');
+      expect(error.payload.message).toContain("no live session 'ghost-1'");
+    }
+  });
+
+  it('prompt.inject to a registered terminal session says watch-only, not unknown', async () => {
+    // A `cctl session register`ed interactive session: visible in tracking, but the daemon
+    // has no input channel to another process's terminal — /say must say so.
+    store.upsertSession({
+      id: 'terminal-1',
+      kind: 'interactive',
+      state: 'active',
+      accountId: null,
+      json: JSON.stringify({
+        id: 'terminal-1',
+        kind: 'interactive',
+        state: 'active',
+        watch: true,
+        registeredAtMs: 0,
+        updatedAtMs: 0,
+      }),
+      updatedAtMs: 0,
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-1', text: 'steer this', idempotencyKey: 'k' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const error = relay.received.find((e) => e.type === 'error');
+    if (error?.type === 'error') {
+      expect(error.payload.code).toBe('watch_only_session');
+      expect(error.payload.message).toContain('no input channel');
+    }
+  });
+
+  it('a failed orphan re-attach answers resume_failed with the cause', async () => {
+    sessionManager.records.push({
+      id: 'orphan-2',
+      kind: 'managed',
+      state: 'orphaned',
+      startedAtMs: 0,
+      resumeId: 'sdk-x',
+    });
+    sessionManager.resumeOrphan = () => Promise.reject(new Error('no conversation on disk'));
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'orphan-2', text: 'continue', idempotencyKey: 'k' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const error = relay.received.find((e) => e.type === 'error');
+    if (error?.type === 'error') {
+      expect(error.payload.code).toBe('resume_failed');
+      expect(error.payload.message).toContain('no conversation on disk');
+    }
   });
 
   // ---- phone-initiated prune of dormant records ----

@@ -13,6 +13,7 @@ import { resolveAccountRef } from '@claude-control/switch-engine';
 import type {
   SessionManager,
   SessionHandle,
+  SessionRecord,
   PermissionRequest,
 } from '@claude-control/session-runtime';
 import {
@@ -601,8 +602,11 @@ export class Daemon {
     // NOW, with the operator's text as the resumed turn's prompt: resuming always runs a real
     // turn (the SDK has no attach-without-prompting), so re-attach happens only at the moment
     // the operator actually addresses the session, never as a startup side effect. Gated to
-    // 'orphaned' managed records: a terminal session stays terminal — prompting it is a
-    // warn-and-drop, same as a session this daemon never knew.
+    // 'orphaned' managed records: a terminal session stays terminal — prompting it is
+    // refused, same as a session this daemon never knew. Every refusal ANSWERS the phone
+    // (an error envelope, same as stop's unknown-session path): the bot acks a /say as soon
+    // as the relay accepts the frame, so a silent drop here would leave the operator
+    // believing text reached a session that never heard it.
     const record = this.sessionManager.list().find((r) => r.id === sessionId);
     if (
       record === undefined ||
@@ -611,6 +615,7 @@ export class Daemon {
       this.sessionManager.resumeOrphan === undefined
     ) {
       this.logger.warn({ sessionId }, 'prompt.inject for unknown/inactive session');
+      this.answerPromptInjectRefusal(msg, record);
       return;
     }
     try {
@@ -622,10 +627,48 @@ export class Daemon {
       this.attachSessionPipes(resumed, record.accountId);
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
     } catch (err) {
-      // Un-resumable (e.g. no persisted resumeId): logged and dropped, the record stays
-      // 'orphaned' on disk — degraded but honest, never a crashed dispatch loop.
+      // Un-resumable (e.g. no persisted resumeId): logged, the record stays 'orphaned' on
+      // disk, and the phone is told — degraded but honest, never a crashed dispatch loop.
       this.logger.warn({ sessionId, err }, 'orphaned session could not be re-attached');
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'resume_failed',
+          message:
+            `prompt.inject: session '${sessionId}' could not be re-attached ` +
+            `(${err instanceof Error ? err.message : String(err)})`,
+          relatesTo: msg.id,
+        },
+      });
     }
+  }
+
+  /**
+   * Tell the phone WHY its /say went nowhere. The message is cause-specific because the
+   * generic "unknown session" reads as a typo when the id is plainly visible in the phone's
+   * own session list — the two common real causes are a REGISTERED TERMINAL session (the
+   * daemon only hears from it via hooks, a one-way stream; it cannot type into another
+   * process's terminal) and a managed session that already ended.
+   */
+  private answerPromptInjectRefusal(
+    msg: MessageOf<'prompt.inject'>,
+    record: SessionRecord | undefined,
+  ): void {
+    const { sessionId } = msg.payload;
+    let code = 'unknown_session';
+    let detail = `no live session '${sessionId}' in this daemon`;
+    if (this.readInteractiveSession(sessionId) !== undefined) {
+      code = 'watch_only_session';
+      detail =
+        `'${sessionId}' is a terminal session — it streams to the phone but has no input ` +
+        `channel, so /say cannot reach it. Only sessions started with /run are steerable.`;
+    } else if (record !== undefined && (record.state === 'done' || record.state === 'failed')) {
+      detail = `session '${sessionId}' already ended`;
+    }
+    this.sendEnvelope({
+      type: 'error',
+      payload: { code, message: `prompt.inject: ${detail}`, relatesTo: msg.id },
+    });
   }
 
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
