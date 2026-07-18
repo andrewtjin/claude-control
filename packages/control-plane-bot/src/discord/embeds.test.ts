@@ -319,20 +319,29 @@ describe('buildPermissionRequestEmbed', () => {
     expect(embed.fields ?? []).toHaveLength(0);
   });
 
-  it('is an actionable (warn) card in default mode', () => {
+  it('is an actionable (warn) card in default mode, with no mode note', () => {
     const embed = buildPermissionRequestEmbed('run rm -rf', undefined, 'default').toJSON();
     expect(embed.title).toBe('Permission requested');
     expect(embed.color).toBe(0xf1c40f);
     expect(embed.footer?.text).toMatch(/approve or deny/i);
+    expect(embed.footer?.text).not.toContain('mode');
   });
 
-  it('is an informational (info) card that explains why in a non-default mode', () => {
+  it('stays actionable in a non-default mode and names the mode as context', () => {
+    // Accept-edits auto-approves file edits but still prompts (and the daemon still holds)
+    // for shell commands — so the card keeps its approve/deny copy in every mode.
     const embed = buildPermissionRequestEmbed('run rm -rf', undefined, 'acceptEdits').toJSON();
-    expect(embed.title).toBe('Permission (auto-handled)');
-    expect(embed.color).toBe(0x3498db);
-    expect(embed.footer?.text).toContain('acceptEdits');
-    // Description still names WHAT was requested, even though it can't be actioned here.
+    expect(embed.title).toBe('Permission requested');
+    expect(embed.color).toBe(0xf1c40f);
+    expect(embed.footer?.text).toMatch(/approve or deny/i);
+    expect(embed.footer?.text).toContain('acceptEdits mode');
     expect(embed.description).toBe('run rm -rf');
+  });
+
+  it('treats an absent mode as a plain actionable card', () => {
+    const embed = buildPermissionRequestEmbed('run rm -rf').toJSON();
+    expect(embed.title).toBe('Permission requested');
+    expect(embed.footer?.text).not.toContain('mode');
   });
 });
 

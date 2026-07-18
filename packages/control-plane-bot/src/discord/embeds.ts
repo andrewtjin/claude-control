@@ -262,36 +262,27 @@ export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
   return embed;
 }
 
-/** Rendered for an incoming permission.request push. Mode-aware by design: a tap on
- *  Approve/Deny can only *honestly* take effect when the session is in exactly `default`
- *  permission mode — in acceptEdits/plan/bypassPermissions the CLI never blocks on a prompt, so
- *  there is nothing here to approve. This builder therefore renders TWO visually distinct cards:
- *
- *   - `default` mode → an ACTIONABLE card (warn/yellow accent, "act below" footer). Its buttons
- *     are attached by the caller (pushRender) which owns the requestId; this function only sets
- *     the copy so the card and its buttons agree.
- *   - any other / absent / unknown mode → an INFORMATIONAL card (info/blue accent) whose footer
- *     says plainly why no buttons are offered. Fail-safe: we would rather show a button-less
- *     notice than a button that silently does nothing.
- *
- *  `summary` stays the description in BOTH cards so the reader always sees WHAT was requested. */
+/** Rendered for an incoming permission.request push — actionable in EVERY permission mode.
+ *  This card only exists while the daemon is holding the hook's HTTP response open for a
+ *  remote decision, and the CLI only fires that hook when it is actually blocking on a prompt
+ *  (accept-edits auto-approves file edits but still prompts for shell commands), so
+ *  Approve/Deny always take effect honestly. A non-default mode is shown in the footer as
+ *  context, never as a reason to withhold the controls. The buttons themselves are attached by
+ *  the caller (pushRender), which owns the requestId; this function only sets the copy so the
+ *  card and its buttons agree. `summary` is the description so the reader always sees WHAT was
+ *  requested. */
 export function buildPermissionRequestEmbed(
   summary: string,
   detail?: string,
   permissionMode?: string,
 ): EmbedBuilder {
-  const actionable = permissionMode === 'default';
+  const modeNote =
+    permissionMode !== undefined && permissionMode !== 'default' ? ` · ${permissionMode} mode` : '';
   const embed = new EmbedBuilder()
-    .setTitle(actionable ? 'Permission requested' : 'Permission (auto-handled)')
-    .setColor(actionable ? COLOR_WARN : COLOR_INFO)
+    .setTitle('Permission requested')
+    .setColor(COLOR_WARN)
     .setDescription(summary)
-    .setFooter({
-      text: actionable
-        ? 'Approve or Deny below · or /approve /deny'
-        : permissionMode
-          ? `Handled locally in ${permissionMode} mode — approve/deny is not available from Discord.`
-          : "This session isn't in default permission mode — no action is available here.",
-    });
+    .setFooter({ text: `Approve or Deny below · or /approve /deny${modeNote}` });
   if (detail)
     embed.addFields({ name: 'Detail', value: truncateLabeled(detail, EMBED_FIELD_VALUE_LIMIT) });
   return embed;

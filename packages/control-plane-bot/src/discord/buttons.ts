@@ -129,13 +129,12 @@ function armedButton(p: ParsedButton): ButtonSpec {
 
 /** The FULL row a restore (Cancel / stale Confirm) returns the message to. The customId is the
  *  only state that survives a tap, but it proves what the card originally rendered: permission
- *  buttons ship ONLY in default mode (the tapped deny's existence is that proof), and a Stop
- *  button ships only on a stoppable session — so the whole original row is reconstructible.
- *  Restoring just the armed button would permanently lose the sibling Approve/Deny buttons on
- *  a permission card. */
+ *  buttons ship on EVERY permission card, and a Stop button ships only on a stoppable session
+ *  — so the whole original row is reconstructible. Restoring just the armed button would
+ *  permanently lose the sibling Approve/Deny buttons on a permission card. */
 function restoredRows(p: ParsedButton): ButtonSpec[][] {
   if (p.action === 'approve' || p.action === 'deny') {
-    return permissionButtons({ requestId: p.id, permissionMode: 'default' });
+    return permissionButtons({ requestId: p.id });
   }
   if (p.action === 'stop') {
     return sessionCardButtons({ sessionId: p.id, stoppable: true });
@@ -211,16 +210,15 @@ export function resolveTap(
 }
 
 /**
- * The button row for a permission.request card. Fail-safe mode gate: buttons appear
- * ONLY when the mode is exactly 'default'; every other, absent, or unknown mode returns `[]` so
- * the card is informational and no button can lie about taking effect. Approve/Deny are safe
- * single-tap; a session-scope Deny is destructive, so it ships armed and goes through confirm.
+ * The button row for a permission.request card — attached in EVERY permission mode. The daemon
+ * only emits permission.request while it is holding the hook's HTTP response open for a remote
+ * decision, and the CLI only fires that hook when it is actually blocking on a prompt (accept-
+ * edits auto-approves file edits but still prompts for shell commands), so a card can only
+ * exist while a tap would truthfully take effect; a lapsed hold already gets its own honest
+ * refusal on tap. Approve/Deny are safe single-tap; a session-scope Deny is destructive, so it
+ * ships armed and goes through confirm.
  */
-export function permissionButtons(payload: {
-  requestId: string;
-  permissionMode?: string | null | undefined;
-}): ButtonSpec[][] {
-  if (payload.permissionMode !== 'default') return [];
+export function permissionButtons(payload: { requestId: string }): ButtonSpec[][] {
   const id = payload.requestId;
   return [
     [

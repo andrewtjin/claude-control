@@ -135,7 +135,7 @@ describe('resolveTap — two-tap state machine', () => {
     const out = resolveTap(id, NOW);
     expect(out.kind).toBe('restore');
     if (out.kind !== 'restore') throw new Error('unreachable');
-    expect(out.rows).toEqual(permissionButtons({ requestId: 'req-9', permissionMode: 'default' }));
+    expect(out.rows).toEqual(permissionButtons({ requestId: 'req-9' }));
     expect(out.rows[0]!.map((b) => b.label)).toEqual(['Approve', 'Deny', 'Deny (session)']);
   });
 
@@ -150,7 +150,7 @@ describe('resolveTap — two-tap state machine', () => {
     const out = resolveTap(id, NOW + CONFIRM_TTL_MS + 1);
     expect(out.kind).toBe('restore');
     if (out.kind !== 'restore') throw new Error('unreachable');
-    expect(out.rows).toEqual(permissionButtons({ requestId: 'req-9', permissionMode: 'default' }));
+    expect(out.rows).toEqual(permissionButtons({ requestId: 'req-9' }));
   });
 
   it('a Cancel on a session-card Stop restores the single armed Stop (its whole row)', () => {
@@ -186,9 +186,11 @@ describe('resolveTap — two-tap state machine', () => {
   });
 });
 
-describe('permissionButtons — fail-safe mode gate', () => {
-  it('offers Approve / Deny / Deny(session) ONLY in default mode', () => {
-    const rows = permissionButtons({ requestId: 'req-1', permissionMode: 'default' });
+describe('permissionButtons', () => {
+  // No mode parameter on purpose: a permission card only exists while the daemon holds the
+  // hook response open for a remote decision, so the buttons are truthful in every mode.
+  it('offers Approve / Deny / Deny(session)', () => {
+    const rows = permissionButtons({ requestId: 'req-1' });
     expect(rows).toHaveLength(1);
     const labels = rows[0]!.map((b) => b.label);
     expect(labels).toEqual(['Approve', 'Deny', 'Deny (session)']);
@@ -208,15 +210,6 @@ describe('permissionButtons — fail-safe mode gate', () => {
       phase: 'arm',
       scope: 'session',
     });
-  });
-
-  it('returns NO buttons for any non-default, absent, or unknown mode', () => {
-    expect(permissionButtons({ requestId: 'r', permissionMode: 'acceptEdits' })).toEqual([]);
-    expect(permissionButtons({ requestId: 'r', permissionMode: 'plan' })).toEqual([]);
-    expect(permissionButtons({ requestId: 'r', permissionMode: 'bypassPermissions' })).toEqual([]);
-    expect(permissionButtons({ requestId: 'r' })).toEqual([]);
-    expect(permissionButtons({ requestId: 'r', permissionMode: null })).toEqual([]);
-    expect(permissionButtons({ requestId: 'r', permissionMode: 'some-future-mode' })).toEqual([]);
   });
 });
 

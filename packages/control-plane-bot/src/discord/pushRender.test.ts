@@ -8,8 +8,8 @@ function env(type: Envelope['type'], payload: unknown): Envelope {
   return { v: 1, id: 'id-1', ts: 0, daemonId: 'daemon-1', type, payload } as Envelope;
 }
 
-describe('renderPush — permission.request is mode-aware', () => {
-  it('attaches Approve/Deny buttons ONLY in default mode', () => {
+describe('renderPush — permission.request', () => {
+  it('attaches Approve/Deny buttons carrying the requestId', () => {
     const push = renderPush(
       env('permission.request', {
         requestId: 'req-1',
@@ -28,7 +28,9 @@ describe('renderPush — permission.request is mode-aware', () => {
     expect(push?.embeds?.[0]?.toJSON().title).toBe('Permission requested');
   });
 
-  it('renders a button-less informational card for any non-default mode', () => {
+  it('keeps the buttons in every permission mode (the daemon holds the decision channel)', () => {
+    // The card only exists while the daemon holds the hook response open, so a remote tap
+    // always takes effect — accept-edits still prompts for shell commands.
     for (const mode of ['acceptEdits', 'plan', 'bypassPermissions', 'future-mode']) {
       const push = renderPush(
         env('permission.request', {
@@ -39,16 +41,16 @@ describe('renderPush — permission.request is mode-aware', () => {
           permissionMode: mode,
         }),
       );
-      expect(push?.components).toBeUndefined();
-      expect(push?.embeds?.[0]?.toJSON().title).toBe('Permission (auto-handled)');
+      expect(push?.components?.[0]).toHaveLength(3);
+      expect(push?.embeds?.[0]?.toJSON().title).toBe('Permission requested');
     }
   });
 
-  it('treats an absent mode as non-actionable (fail-safe)', () => {
+  it('keeps the buttons when the mode is absent', () => {
     const push = renderPush(
       env('permission.request', { requestId: 'r', sessionId: 's', tool: 'Bash', summary: 'x' }),
     );
-    expect(push?.components).toBeUndefined();
+    expect(push?.components?.[0]).toHaveLength(3);
   });
 });
 

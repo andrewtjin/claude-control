@@ -40,13 +40,10 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
     const detail = p.detail ?? undefined;
     const mode = p.permissionMode ?? undefined;
     const embed = buildPermissionRequestEmbed(p.summary, detail, mode);
-    const components = permissionButtons({
-      requestId: p.requestId,
-      permissionMode: p.permissionMode,
-    });
-    // Only attach a components array when there ARE buttons — an empty row array would render as
-    // a stray empty action bar.
-    return components.length > 0 ? { embeds: [embed], components } : { embeds: [embed] };
+    // Buttons ship in every permission mode: this envelope only exists while the daemon holds
+    // the hook response open for a remote decision (see permissionButtons), so a tap always
+    // takes effect honestly; the mode is context on the embed, not a gate.
+    return { embeds: [embed], components: permissionButtons({ requestId: p.requestId }) };
   }
   if (isType(envelope, 'hook.notification')) {
     return renderNotification(envelope.payload);

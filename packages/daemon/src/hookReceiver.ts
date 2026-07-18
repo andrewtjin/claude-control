@@ -672,11 +672,12 @@ export class HookReceiver {
     const cwd = str(body.cwd);
     // The hook payload carries `permission_mode` (snake_case per Claude Code's hook
     // contract; we also accept camelCase defensively). Parsed tolerantly — any string
-    // passes through untouched — because the bot, not the daemon, decides what a mode MEANS
-    // (approve/deny buttons only when this is exactly 'default'). Threading it is
-    // non-negotiable for a mode-aware card; a missing/unknown mode simply omits the field and
-    // the bot falls back to an informational card — it never changes the permission SEMANTICS
-    // here (the security contract on resolvePermission is untouched).
+    // passes through untouched — because it is display context for the bot's card: this hook
+    // only fires when the CLI is actually blocking on a prompt (accept-edits still prompts
+    // for shell commands), so the card stays actionable in every mode and the bot shows the
+    // mode instead of gating on it. A missing/unknown mode simply omits the field; it never
+    // changes the permission SEMANTICS here (the security contract on resolvePermission is
+    // untouched).
     const permissionMode = str(body.permission_mode) ?? str(body.permissionMode);
     this.emit({
       daemonId: this.daemonId(),
