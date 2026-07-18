@@ -1,4 +1,4 @@
-// Non-destructively wires our three hooks into a Claude Code profile's `settings.json`.
+// Non-destructively wires our hooks into a Claude Code profile's `settings.json`.
 //
 // `settings.json` is the CLI's own config file — it can carry hooks other tools installed,
 // plus unrelated keys (theme, permissions, etc.) that this module has no business touching.
@@ -206,7 +206,7 @@ async function readSettings(path: string): Promise<JsonObject> {
 }
 
 // ---------------------------------------------------------------------------
-// Building the daemon's own three hook specs
+// Building the daemon's own hook specs
 // ---------------------------------------------------------------------------
 
 export interface BuildDaemonHookSpecsOptions {
@@ -220,10 +220,11 @@ export interface BuildDaemonHookSpecsOptions {
 }
 
 /**
- * The three hook specs the daemon needs on every profile it manages: forward the CLI's hook
+ * The hook specs the daemon needs on every profile it manages: forward the CLI's hook
  * JSON (fed on stdin, per Claude Code's hook contract) as an HTTP POST to the loopback
  * receiver. Kept as a small, readable curl one-liner so a user inspecting settings.json can
- * see exactly what runs.
+ * see exactly what runs. PostToolUse carries no matcher on purpose: it must observe every
+ * tool (the receiver decides which runs are worth forwarding, not the hook filter).
  */
 export function buildDaemonHookSpecs(options: BuildDaemonHookSpecsOptions): HookCommandSpec[] {
   const eventNames = options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES;
@@ -234,5 +235,6 @@ export function buildDaemonHookSpecs(options: BuildDaemonHookSpecsOptions): Hook
     { event: eventNames.permissionRequest, command },
     { event: eventNames.stop, command },
     { event: eventNames.notification, command },
+    { event: eventNames.postToolUse, command },
   ];
 }

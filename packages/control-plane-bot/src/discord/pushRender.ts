@@ -74,8 +74,8 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
 }
 
 /** hook.notification → the right lifecycle card. Stop always wins (it carries the final message);
- *  otherwise the tolerant `notificationType` string selects waiting/quarantine, and anything
- *  unknown falls back to the generic title/body content an N-1 bot would also show. */
+ *  otherwise the tolerant `notificationType` string selects tool-output/waiting/quarantine, and
+ *  anything unknown falls back to the generic title/body content an N-1 bot would also show. */
 function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush {
   if (p.event === 'stop') {
     return {
@@ -92,6 +92,22 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush {
     };
   }
   switch (p.notificationType) {
+    case 'tool_output': {
+      // A remotely-approved tool's output. Rendered as a fenced code block so multi-line
+      // command output stays readable on a phone; the body is clamped BEFORE assembly so
+      // truncation can never eat the closing fence and leave the block unterminated.
+      // Embedded ``` sequences are defused with a zero-width space — output text must not
+      // be able to terminate its own fence.
+      const header = `**${p.title}**\n`;
+      const fenceOverhead = '```\n\n```'.length;
+      const zeroWidthSpace = String.fromCharCode(0x200b);
+      const safeBody = p.body.replaceAll('```', '`' + zeroWidthSpace + '``');
+      const clamped = truncateLabeled(
+        safeBody,
+        Math.max(0, MESSAGE_CONTENT_LIMIT - header.length - fenceOverhead),
+      );
+      return { content: `${header}\`\`\`\n${clamped}\n\`\`\`` };
+    }
     case 'idle_prompt':
       return {
         embeds: [

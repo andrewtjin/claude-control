@@ -227,6 +227,136 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('PostToolUse output forwarding (armed only by a remote allow)', () => {
+    /** Drive a full remote approval: hold the permission response, tap allow, await the hold
+     *  completing — the receiver has now armed a one-shot output watch for this exact run. */
+    async function remoteAllow(
+      requestId: string,
+      toolInput: Record<string, unknown>,
+    ): Promise<void> {
+      const held = post(
+        port,
+        '/',
+        {
+          event: 'PermissionRequest',
+          requestId,
+          session_id: 'sess-out',
+          tool_name: 'Bash',
+          tool_input: toolInput,
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      await waitFor(() =>
+        emitted.find((e) => e.type === 'permission.request' && e.payload.requestId === requestId),
+      );
+      await post(
+        port,
+        '/resolve-permission',
+        { requestId, decision: 'allow' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect((await held).status).toBe(200);
+    }
+
+    /** The CLI's real PostToolUse shape: snake_case fields, per-tool `tool_response`. */
+    function postToolUse(
+      toolInput: Record<string, unknown>,
+      toolResponse: unknown,
+    ): Promise<RawResponse> {
+      return post(
+        port,
+        '/',
+        {
+          hook_event_name: 'PostToolUse',
+          session_id: 'sess-out',
+          tool_name: 'Bash',
+          tool_input: toolInput,
+          tool_response: toolResponse,
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+    }
+
+    const outputCards = () =>
+      emitted.flatMap((e) =>
+        e.type === 'hook.notification' && e.payload.notificationType === 'tool_output'
+          ? [e.payload]
+          : [],
+      );
+
+    it("forwards a remotely-approved tool's output as a tool_output card", async () => {
+      await remoteAllow('req-out-1', { command: 'netstat -ano' });
+      const res = await postToolUse(
+        { command: 'netstat -ano' },
+        { stdout: 'TCP 127.0.0.1:5433 LISTENING 41184', stderr: '' },
+      );
+      expect(res.status).toBe(200);
+      const cards = outputCards();
+      expect(cards).toHaveLength(1);
+      expect(cards[0]?.title).toBe('Output — netstat -ano');
+      expect(cards[0]?.body).toBe('TCP 127.0.0.1:5433 LISTENING 41184');
+      expect(cards[0]?.sessionId).toBe('sess-out');
+    });
+
+    it('the watch is one-shot — a repeat of the same command is not forwarded again', async () => {
+      await remoteAllow('req-out-2', { command: 'echo hi' });
+      await postToolUse({ command: 'echo hi' }, { stdout: 'hi' });
+      await postToolUse({ command: 'echo hi' }, { stdout: 'hi again' });
+      expect(outputCards()).toHaveLength(1);
+    });
+
+    it('a PostToolUse with no armed watch (ordinary local tool use) is never forwarded', async () => {
+      const res = await postToolUse({ command: 'ls' }, { stdout: 'files' });
+      expect(res.status).toBe(200);
+      expect(outputCards()).toHaveLength(0);
+    });
+
+    it('a remote deny arms nothing', async () => {
+      const held = post(
+        port,
+        '/',
+        {
+          event: 'PermissionRequest',
+          requestId: 'req-out-3',
+          session_id: 'sess-out',
+          tool_name: 'Bash',
+          tool_input: { command: 'rm x' },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      await waitFor(() => emitted.find((e) => e.type === 'permission.request'));
+      await post(
+        port,
+        '/resolve-permission',
+        { requestId: 'req-out-3', decision: 'deny' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      await held;
+      await postToolUse({ command: 'rm x' }, { stdout: 'should never surface' });
+      expect(outputCards()).toHaveLength(0);
+    });
+
+    it('matches tool_input by content, not key order', async () => {
+      await remoteAllow('req-out-4', { command: 'x', timeout: 5 });
+      await postToolUse({ timeout: 5, command: 'x' }, 'plain string output');
+      const cards = outputCards();
+      expect(cards).toHaveLength(1);
+      expect(cards[0]?.body).toBe('plain string output');
+    });
+
+    it('caps long output with a visible marker and labels empty output honestly', async () => {
+      await remoteAllow('req-out-5', { command: 'big' });
+      await postToolUse({ command: 'big' }, { stdout: 'x'.repeat(5000) });
+      await remoteAllow('req-out-6', { command: 'quiet' });
+      await postToolUse({ command: 'quiet' }, { stdout: '   ' });
+      const cards = outputCards();
+      expect(cards).toHaveLength(2);
+      expect(cards[0]?.body.length).toBeLessThan(2000);
+      expect(cards[0]?.body).toContain('[truncated]');
+      expect(cards[1]?.body).toBe('(no output)');
+    });
+  });
+
   describe('Notification suppression (default: waiting cards off)', () => {
     // The CLI's Notification nags ("Claude is waiting for your input") duplicate the real
     // permission/done cards, so forwarding them is opt-in.

@@ -255,12 +255,24 @@ describe('installHooks', () => {
 describe('buildDaemonHookSpecs', () => {
   it('builds one spec per default hook event, posting to the loopback receiver with the secret header', () => {
     const specs = buildDaemonHookSpecs({ port: 4567, secret: 's3cr3t' });
-    expect(specs).toHaveLength(3);
-    expect(specs.map((s) => s.event).sort()).toEqual(['Notification', 'PermissionRequest', 'Stop']);
+    expect(specs).toHaveLength(4);
+    expect(specs.map((s) => s.event).sort()).toEqual([
+      'Notification',
+      'PermissionRequest',
+      'PostToolUse',
+      'Stop',
+    ]);
     for (const s of specs) {
       expect(s.command).toContain('127.0.0.1:4567');
       expect(s.command).toContain('s3cr3t');
     }
+  });
+
+  it('the PostToolUse spec carries no matcher — the receiver filters, not the hook', () => {
+    const specs = buildDaemonHookSpecs({ port: 4567, secret: 's3cr3t' });
+    const postToolUse = specs.find((s) => s.event === 'PostToolUse');
+    expect(postToolUse).toBeDefined();
+    expect(postToolUse?.matcher).toBeUndefined();
   });
 
   it('bakes DEFAULT_SECRET_HEADER into every command — the marker daemonRun prunes by', () => {
@@ -278,8 +290,14 @@ describe('buildDaemonHookSpecs', () => {
         permissionRequest: 'CustomPerm',
         stop: 'CustomStop',
         notification: 'CustomNotif',
+        postToolUse: 'CustomPost',
       },
     });
-    expect(specs.map((s) => s.event).sort()).toEqual(['CustomNotif', 'CustomPerm', 'CustomStop']);
+    expect(specs.map((s) => s.event).sort()).toEqual([
+      'CustomNotif',
+      'CustomPerm',
+      'CustomPost',
+      'CustomStop',
+    ]);
   });
 });

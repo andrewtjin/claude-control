@@ -100,6 +100,56 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(fix?.value).toContain(RELOGIN_COMMAND);
   });
 
+  it('a tool_output notification renders the output as a fenced code block', () => {
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        sessionId: 's1',
+        title: 'Output — netstat -ano',
+        body: 'TCP 127.0.0.1:5433 LISTENING 41184',
+        level: 'info',
+        notificationType: 'tool_output',
+      }),
+    );
+    expect(push?.embeds).toBeUndefined();
+    expect(push?.content).toBe(
+      '**Output — netstat -ano**\n```\nTCP 127.0.0.1:5433 LISTENING 41184\n```',
+    );
+  });
+
+  it('tool_output clamps long output without ever breaking the closing fence', () => {
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        title: 'Output — big',
+        body: 'x'.repeat(5000),
+        level: 'info',
+        notificationType: 'tool_output',
+      }),
+    );
+    expect(push!.content!.length).toBeLessThanOrEqual(2000);
+    expect(push?.content?.endsWith('\n```')).toBe(true);
+    expect(push?.content).toContain('chars truncated');
+  });
+
+  it('tool_output defuses embedded ``` so output cannot terminate its own fence', () => {
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        title: 'Output — tricky',
+        body: 'before\n```\nafter',
+        level: 'info',
+        notificationType: 'tool_output',
+      }),
+    );
+    // Everything between the opening and closing fence must contain no raw ``` run.
+    const content = push!.content!;
+    const interior = content.slice(content.indexOf('```\n') + 4, -'\n```'.length);
+    expect(interior).not.toContain('```');
+    expect(interior).toContain('before');
+    expect(interior).toContain('after');
+  });
+
   it('falls back to the generic content card for an unknown notificationType', () => {
     const push = renderPush(
       env('hook.notification', {

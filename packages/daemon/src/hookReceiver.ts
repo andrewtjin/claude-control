@@ -1,5 +1,6 @@
 // Loopback HTTP server that receives Claude Code CLI hook events (PermissionRequest, Stop,
-// Notification) and turns them into protocol envelopes for the control-plane client to send.
+// Notification, PostToolUse) and turns them into protocol envelopes for the control-plane
+// client to send.
 //
 // SECURITY CONTRACT: the bot deliberately does not
 // correlate `permission.response` messages against anything — it just relays what the phone
@@ -23,18 +24,20 @@ import type { EnvelopeDraft } from '@claude-control/shared-protocol';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { Store } from './store.js';
 
-/** The three hook events the CLI is expected to send, and the header/config the daemon
+/** The hook events the CLI is expected to send, and the header/config the daemon
  *  expects on every request. Configurable because the real names were reverse-engineered from the installed CLI. */
 export interface HookEventNames {
   permissionRequest: string;
   stop: string;
   notification: string;
+  postToolUse: string;
 }
 
 export const DEFAULT_HOOK_EVENT_NAMES: HookEventNames = {
   permissionRequest: 'PermissionRequest',
   stop: 'Stop',
   notification: 'Notification',
+  postToolUse: 'PostToolUse',
 };
 
 export interface HookReceiverOptions {
@@ -157,6 +160,17 @@ export const DEFAULT_PERMISSION_HOLD_MS = 570_000;
  *  notification instead of a permission card, and no hold. */
 const INTERACTIVE_PROMPT_TOOLS = new Set(['AskUserQuestion']);
 
+/** How long after a remote allow the matching PostToolUse is still forwarded as an output
+ *  card. PostToolUse fires only when the tool FINISHES, so the window must outlast a slow
+ *  command (a build, a long test run), not just the approval round-trip. */
+const OUTPUT_WATCH_TTL_MS = 10 * 60_000;
+/** Upper bound on armed output watches — each remote allow arms exactly one, so hitting this
+ *  means watches are leaking (tools approved but never completing); oldest are dropped. */
+const OUTPUT_WATCH_CAP = 16;
+/** Cap on the output text shipped in the card body. The bot clamps to Discord's limits again,
+ *  but the wire shouldn't carry megabytes of stdout to show a phone-sized excerpt. */
+const OUTPUT_BODY_MAX = 1500;
+
 /** Tolerant body narrowing helpers — a hook payload is attacker-adjacent (it's whatever the
  *  locally-running CLI sends), so every field is checked before use rather than trusted. */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -177,6 +191,45 @@ function firstQuestionText(toolInput: Record<string, unknown> | undefined): stri
   if (!toolInput || !Array.isArray(toolInput.questions)) return undefined;
   const first: unknown = toolInput.questions[0];
   return isRecord(first) ? str(first.question) : undefined;
+}
+/** Deterministic identity for a tool_input object, insensitive to key order: both sides of a
+ *  watch match (the PermissionRequest's `tool_input` and the later PostToolUse's) come out of
+ *  separate JSON.parse calls, and nothing guarantees the CLI serialized them identically. */
+function stableKey(value: unknown): string {
+  if (value === undefined) return 'undefined';
+  if (Array.isArray(value)) return `[${value.map(stableKey).join(',')}]`;
+  if (isRecord(value)) {
+    const entries = Object.keys(value)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableKey(value[k])}`);
+    return `{${entries.join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+/** The human-readable text inside a PostToolUse `tool_response`. The shape is per-tool and
+ *  reverse-engineered (live boundary): Bash sends `{stdout, stderr, ...}`, some tools send a
+ *  bare string, others structured objects — so prefer real output streams, fall back to
+ *  compact JSON, and never throw on a shape we haven't seen. */
+function toolResponseText(toolResponse: unknown): string {
+  if (typeof toolResponse === 'string') return toolResponse;
+  if (isRecord(toolResponse)) {
+    const stdout = str(toolResponse.stdout);
+    const stderr = str(toolResponse.stderr);
+    // The presence of stream fields means this IS a command-style response — blank streams
+    // are a genuinely silent command, not a shape to fall back to JSON on.
+    if (stdout !== undefined || stderr !== undefined) {
+      return [stdout, stderr]
+        .filter((s): s is string => s !== undefined && s.trim() !== '')
+        .join('\n');
+    }
+    const json = JSON.stringify(toolResponse);
+    return json === '{}' ? '' : json;
+  }
+  if (toolResponse === undefined || toolResponse === null) return '';
+  if (typeof toolResponse === 'number' || typeof toolResponse === 'boolean') {
+    return String(toolResponse);
+  }
+  return JSON.stringify(toolResponse);
 }
 /** Best human line for a permission card, derived from the tool's input: a Bash `command` or
  *  a file path IS the summary a phone reader needs; anything else falls back to compact JSON. */
@@ -212,16 +265,31 @@ export class HookReceiver {
    *  decision output must name it back (`hookSpecificOutput.hookEventName`). `toolInput` is
    *  the CLI's original `tool_input`, echoed back as `updatedInput` on allow: the SDK's
    *  permission contract runs the tool with `updatedInput`, and an allow without it risks
-   *  the tool running on empty input. */
+   *  the tool running on empty input. `sessionId`/`tool` identify the run so a remote allow
+   *  can arm an output watch (see `outputWatches`). */
   private readonly heldPermissions = new Map<
     string,
     {
       res: ServerResponse;
       timer: NodeJS.Timeout;
       event: string;
+      sessionId: string;
+      tool: string;
       toolInput?: Record<string, unknown>;
     }
   >();
+  /** One-shot watches armed by remote allows: when the matching PostToolUse arrives, its
+   *  output is forwarded to the phone as a card. This closes the visibility gap a remote
+   *  approval creates — the tool runs in a terminal the operator, by definition, is not
+   *  watching (they answered from the phone), and its output would otherwise appear nowhere
+   *  they can see. Keyed by session + tool + stable input identity so ordinary local tool
+   *  use never leaks to the phone; one-shot so a repeated identical command doesn't either. */
+  private readonly outputWatches: Array<{
+    sessionId: string;
+    tool: string;
+    inputKey: string;
+    expiresAtMs: number;
+  }> = [];
   /** requestIds whose hold ended WITHOUT a decision (lapse, dead socket, shutdown). Once the
    *  local prompt has taken over, a late phone tap must be rejected honestly — resolving the
    *  row would tell the phone "Approved." about a decision nothing ever applied. Entries
@@ -326,6 +394,19 @@ export class HookReceiver {
     if (!held) return;
     clearTimeout(held.timer);
     this.heldPermissions.delete(requestId);
+    // A remote allow arms a one-shot output watch: the operator approved from the phone, so
+    // the phone is where the tool's output must land. Denies and lapses arm nothing — a
+    // denied tool produces no output, and a lapsed hold means the operator answered at the
+    // terminal, where the output is already in front of them.
+    if (decision === 'allow') {
+      this.outputWatches.push({
+        sessionId: held.sessionId,
+        tool: held.tool,
+        inputKey: stableKey(held.toolInput ?? {}),
+        expiresAtMs: this.clock() + OUTPUT_WATCH_TTL_MS,
+      });
+      while (this.outputWatches.length > OUTPUT_WATCH_CAP) this.outputWatches.shift();
+    }
     // Allow echoes the ORIGINAL tool_input as updatedInput — the permission contract runs
     // the tool with updatedInput, so omitting it risks an empty-input run. We never modify
     // the input, only echo it.
@@ -524,11 +605,15 @@ export class HookReceiver {
       this.handleStopOrNotification(body, res, 'notification');
       return;
     }
+    if (event === this.eventNames.postToolUse) {
+      this.handlePostToolUse(body, res);
+      return;
+    }
     // Whatever event name the CLI fires that we don't handle shows up here by name, so a
     // contract drift is visible in the log instead of silently dropped.
     this.logger.warn(
       { event, sessionId: str(body.session_id) ?? str(body.sessionId) },
-      'hook POST with unrecognized event name — not one of the three we handle',
+      'hook POST with unrecognized event name — not an event we handle',
     );
     this.respond(res, 400, { ok: false, error: `unrecognized event "${event}"` });
   }
@@ -629,6 +714,8 @@ export class HookReceiver {
       res,
       timer,
       event,
+      sessionId,
+      tool,
       ...(toolInput !== undefined ? { toolInput } : {}),
     });
     res.on('close', () => {
@@ -645,6 +732,59 @@ export class HookReceiver {
       { requestId, sessionId, tool, permissionMode },
       'permission hook received; card pushed; response held for remote decision',
     );
+  }
+
+  /** PostToolUse fires after EVERY completed tool call, so this handler is observe-only and
+   *  deliberately permissive: nothing here can fail a hook (always 200), and nothing is
+   *  forwarded unless a one-shot watch — armed by a remote allow — matches this exact run.
+   *  Forwarding rides `hook.notification` with `notificationType: 'tool_output'` (the schema's
+   *  tolerant-string extension point), so no wire change: an older bot shows the generic
+   *  title/body card, which for output IS the content. This emit is daemon-originated — the
+   *  CCTL_WAITING_CARDS suppression gate only covers the CLI's Notification nags. */
+  private handlePostToolUse(body: Record<string, unknown>, res: ServerResponse): void {
+    const sessionId = str(body.session_id) ?? str(body.sessionId);
+    const tool = str(body.tool_name) ?? str(body.tool);
+    const toolInput = isRecord(body.tool_input) ? body.tool_input : undefined;
+    const now = this.clock();
+    // Expired watches are pruned lazily here (no timers to clean up on close).
+    for (let i = this.outputWatches.length - 1; i >= 0; i--) {
+      const watch = this.outputWatches[i];
+      if (watch !== undefined && watch.expiresAtMs < now) this.outputWatches.splice(i, 1);
+    }
+    if (sessionId === undefined || tool === undefined) {
+      this.respond(res, 200, { ok: true });
+      return;
+    }
+    const inputKey = stableKey(toolInput ?? {});
+    const matchIndex = this.outputWatches.findIndex(
+      (w) => w.sessionId === sessionId && w.tool === tool && w.inputKey === inputKey,
+    );
+    if (matchIndex === -1) {
+      this.respond(res, 200, { ok: true });
+      return;
+    }
+    this.outputWatches.splice(matchIndex, 1);
+    const text = toolResponseText(body.tool_response).trim();
+    this.emit({
+      daemonId: this.daemonId(),
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        sessionId,
+        title: `Output — ${summarizeToolInput(toolInput) ?? tool}`,
+        // An empty result still confirms the approved tool RAN — silence here would read as
+        // the approval having vanished.
+        body: text === '' ? '(no output)' : truncate(text, OUTPUT_BODY_MAX),
+        level: 'info',
+        notificationType: 'tool_output',
+      },
+    });
+    // Size only, never content — tool output can contain anything.
+    this.logger.info(
+      { sessionId, tool, chars: text.length },
+      'remotely approved tool finished; output card pushed',
+    );
+    this.respond(res, 200, { ok: true });
   }
 
   private handleStopOrNotification(
