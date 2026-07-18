@@ -99,7 +99,7 @@ export interface ResolvePermissionResult {
 }
 
 // ---------------------------------------------------------------------------
-// CLI session endpoints (the `cctl session register|label|watch` surface)
+// CLI session endpoints (the `cctl session register|label|watch|unregister` surface)
 // ---------------------------------------------------------------------------
 //
 // These share the SAME loopback server and the SAME `x-claude-control-secret` gate as the hook
@@ -143,11 +143,18 @@ export interface TrackedSessionView {
 
 /** Outcome of a CLI session command. `applied` = the mutation took effect (or a first
  *  registration); `already_handled` = a duplicate idempotency key, a harmless no-op that still
- *  echoes the current view. A failure names a machine-stable `code` the transport maps to a
- *  4xx — `unknown_session` (a label/watch against a session that was never registered) becomes
- *  404, never a crash. */
+ *  echoes the current view; `already_registered` = a REPEATED register that would change
+ *  nothing — distinct from `already_handled` because it happens across separate deliberate
+ *  invocations (fresh keys), and the user asked whether it took, not to take it again. A
+ *  failure names a machine-stable `code` the transport maps to a 4xx — `unknown_session` (a
+ *  label/watch/unregister against a session that was never registered) becomes 404, never a
+ *  crash. */
 export type SessionCommandResult =
-  | { ok: true; status: 'applied' | 'already_handled'; session: TrackedSessionView }
+  | {
+      ok: true;
+      status: 'applied' | 'already_handled' | 'already_registered';
+      session: TrackedSessionView;
+    }
   | { ok: false; code: 'unknown_session'; message: string };
 
 /** The session-command logic the daemon installs via {@link HookReceiver.setCliHandlers}. Async
@@ -156,6 +163,9 @@ export interface HookReceiverCliHandlers {
   registerSession(input: SessionRegisterInput): Promise<SessionCommandResult>;
   labelSession(input: SessionLabelInput): Promise<SessionCommandResult>;
   watchSession(input: SessionWatchInput): Promise<SessionCommandResult>;
+  /** Drop a registered session from tracking entirely (the undo for `register` — also the
+   *  cleanup path for a registration made with a mistyped/garbage id). */
+  unregisterSession(input: SessionCommandBase): Promise<SessionCommandResult>;
 }
 
 /** Exported because the header name doubles as the installer's ownership fingerprint: any
@@ -572,6 +582,11 @@ export class HookReceiver {
           return;
         }
         const result = await this.cliHandlers.watchSession({ ...base, watch: body.watch });
+        this.respondSessionCommand(res, result);
+        return;
+      }
+      case '/cli/session/unregister': {
+        const result = await this.cliHandlers.unregisterSession(base);
         this.respondSessionCommand(res, result);
         return;
       }

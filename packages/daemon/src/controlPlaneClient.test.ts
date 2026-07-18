@@ -456,7 +456,7 @@ describe('ControlPlaneClient', () => {
     expect(titles).toEqual(['n2', 'n3', 'n4']); // oldest (n0, n1) dropped
   });
 
-  it('dispatches inbound switch.command / permission.response / prompt.inject / session.spawn / session.stop to handlers', async () => {
+  it('dispatches inbound switch.command / permission.response / prompt.inject / session.spawn / session.stop / session.prune to handlers', async () => {
     const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
     relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
     const identityStore = memoryIdentityStore(identity);
@@ -466,6 +466,7 @@ describe('ControlPlaneClient', () => {
     const onPromptInject = vi.fn();
     const onSessionSpawn = vi.fn();
     const onSessionStop = vi.fn();
+    const onSessionPrune = vi.fn();
 
     client = new ControlPlaneClient({
       url: relay.url(),
@@ -479,6 +480,7 @@ describe('ControlPlaneClient', () => {
         onPromptInject,
         onSessionSpawn,
         onSessionStop,
+        onSessionPrune,
       },
     });
     await client.connect();
@@ -509,13 +511,19 @@ describe('ControlPlaneClient', () => {
       type: 'session.stop',
       payload: { sessionId: 's1', idempotencyKey: 'k5' },
     });
+    send({
+      daemonId: identity.daemonId,
+      type: 'session.prune',
+      payload: { requestId: 'r4', idempotencyKey: 'k6' },
+    });
 
-    await waitFor(() => onSessionStop.mock.calls.length > 0);
+    await waitFor(() => onSessionPrune.mock.calls.length > 0);
     expect(onSwitchCommand).toHaveBeenCalledTimes(1);
     expect(onPermissionResponse).toHaveBeenCalledTimes(1);
     expect(onPromptInject).toHaveBeenCalledTimes(1);
     expect(onSessionSpawn).toHaveBeenCalledTimes(1);
     expect(onSessionStop).toHaveBeenCalledTimes(1);
+    expect(onSessionPrune).toHaveBeenCalledTimes(1);
   });
 
   it('drops an invalid/undecodable inbound frame without crashing the connection', async () => {

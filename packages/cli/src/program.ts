@@ -446,6 +446,14 @@ function buildSessionCommands(program: Command): void {
     });
 
   session
+    .command('unregister')
+    .description("remove a session from the daemon's tracking (undo register, e.g. a mistyped id)")
+    .option(sessionIdOption, sessionIdHelp)
+    .action(async (opts: { session?: string }) => {
+      await runSessionCommand('unregister', opts, {});
+    });
+
+  session
     .command('status')
     .description('show tracked sessions and the active account (reads the daemon db offline)')
     .action(async () => {
@@ -527,16 +535,29 @@ async function runSessionCommand(
   }
 }
 
+/** Past-tense confirmation verb per command, for the one-line result print. */
+const SESSION_VERB_PAST: Record<SessionVerb, string> = {
+  register: 'Registered',
+  label: 'Labeled',
+  watch: 'Updated watch for',
+  unregister: 'Unregistered',
+};
+
 /** Print a one-line confirmation of a session command result. */
 function printSessionResult(verb: SessionVerb, result: SessionCommandSuccess): void {
   const s = result.session;
-  const already = result.status === 'already_handled' ? ' (already handled)' : '';
-  const verbPast =
-    verb === 'register' ? 'Registered' : verb === 'label' ? 'Labeled' : 'Updated watch for';
   const bits = [
     s.label !== undefined ? `label: ${s.label}` : undefined,
     `watch: ${s.watch ? 'on' : 'off'}`,
     s.accountId !== undefined ? `account: ${s.accountId}` : undefined,
-  ].filter((b): b is string => b !== undefined);
-  process.stdout.write(`${verbPast} session ${s.id}${already} — ${bits.join(', ')}.\n`);
+  ]
+    .filter((b): b is string => b !== undefined)
+    .join(', ');
+  // A no-change re-register must not read as if something just happened — say what IS.
+  if (result.status === 'already_registered') {
+    process.stdout.write(`Session ${s.id} is already registered — ${bits}. Nothing changed.\n`);
+    return;
+  }
+  const already = result.status === 'already_handled' ? ' (already handled)' : '';
+  process.stdout.write(`${SESSION_VERB_PAST[verb]} session ${s.id}${already} — ${bits}.\n`);
 }

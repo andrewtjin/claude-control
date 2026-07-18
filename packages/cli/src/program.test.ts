@@ -27,12 +27,12 @@ describe('buildProgram', () => {
   it('nests session subcommands', () => {
     const session = buildProgram().commands.find((c) => c.name() === 'session');
     const subs = session?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['label', 'register', 'status', 'watch']);
+    expect(subs).toEqual(['label', 'register', 'status', 'unregister', 'watch']);
   });
 
-  it('offers --session on the register/label/watch session commands', () => {
+  it('offers --session on the register/label/watch/unregister session commands', () => {
     const session = buildProgram().commands.find((c) => c.name() === 'session');
-    for (const name of ['register', 'label', 'watch']) {
+    for (const name of ['register', 'label', 'watch', 'unregister']) {
       const cmd = session?.commands.find((c) => c.name() === name);
       expect(cmd?.options.map((o) => o.long)).toContain('--session');
     }

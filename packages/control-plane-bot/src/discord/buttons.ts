@@ -8,8 +8,8 @@
 // and no fake timers — the gateway does nothing but translate the returned ButtonSpecs into
 // real components and route an `execute` to the matching command handler.
 
-/** The four things a button can ultimately do. Each maps 1:1 to a command handler. */
-export type ButtonAction = 'approve' | 'deny' | 'switch' | 'stop';
+/** The things a button can ultimately do. Each maps 1:1 to a command handler. */
+export type ButtonAction = 'approve' | 'deny' | 'switch' | 'stop' | 'prune';
 
 /** Where a button sits in the two-tap lifecycle. `go` = single-tap, execute immediately (safe
  *  actions). `arm` = the resting state of a destructive button. `confirm`/`cancel` = the pair a
@@ -52,7 +52,7 @@ export const CONFIRM_TTL_MS = 30_000;
  *  ~60 chars — comfortably under this — but the constant documents the ceiling for reviewers. */
 export const CUSTOM_ID_MAX = 100;
 
-const ACTIONS = new Set<ButtonAction>(['approve', 'deny', 'switch', 'stop']);
+const ACTIONS = new Set<ButtonAction>(['approve', 'deny', 'switch', 'stop', 'prune']);
 const PHASES = new Set<ButtonPhase>(['go', 'arm', 'confirm', 'cancel']);
 const SCOPES = new Set<ButtonScope>(['once', 'session', 'na']);
 
@@ -92,11 +92,12 @@ export function decodeButton(customId: string): ParsedButton | null {
   };
 }
 
-/** Which actions warrant a confirm step: switching accounts and stopping a session are always
- *  destructive; denying is only destructive at `session` scope (a one-off deny is cheap and
+/** Which actions warrant a confirm step: switching accounts, stopping a session, and pruning
+ *  session records are always destructive (a prune irrevocably forgets every dormant session's
+ *  resume anchor); denying is only destructive at `session` scope (a one-off deny is cheap and
  *  re-requestable, a session deny blanks the tool for the whole run). */
 export function isDestructive(action: ButtonAction, scope: ButtonScope): boolean {
-  if (action === 'switch' || action === 'stop') return true;
+  if (action === 'switch' || action === 'stop' || action === 'prune') return true;
   return action === 'deny' && scope === 'session';
 }
 
@@ -115,6 +116,7 @@ export type TapOutcome =
 function destructiveLabel(action: ButtonAction, scope: ButtonScope): string {
   if (action === 'switch') return 'Switch account';
   if (action === 'stop') return 'Stop session';
+  if (action === 'prune') return 'Prune sessions';
   return scope === 'session' ? 'Deny (session)' : 'Deny';
 }
 
@@ -139,7 +141,7 @@ function restoredRows(p: ParsedButton): ButtonSpec[][] {
   if (p.action === 'stop') {
     return sessionCardButtons({ sessionId: p.id, stoppable: true });
   }
-  // 'switch' has no multi-button card today — the armed button IS its whole row.
+  // 'switch' and 'prune' have no multi-button card — the armed button IS the whole row.
   return [[armedButton(p)]];
 }
 
@@ -265,6 +267,30 @@ export function sessionCardButtons(payload: {
           id: payload.sessionId,
         }),
         label: 'Stop session',
+        style: 'danger',
+      },
+    ],
+  ];
+}
+
+/**
+ * The button row for the `/prune` confirmation card: a single armed Prune control, the same
+ * two-tap confirm every destructive button gets. `id` is the requestId minted for THIS `/prune`
+ * invocation — deliberately NOT a constant: the executed-button dedupe keys off (user, action,
+ * id), and a fixed id would swallow a legitimate second prune issued within the dedupe window.
+ */
+export function pruneButtons(payload: { requestId: string }): ButtonSpec[][] {
+  return [
+    [
+      {
+        customId: encodeButton({
+          action: 'prune',
+          phase: 'arm',
+          scope: 'na',
+          ts: 0,
+          id: payload.requestId,
+        }),
+        label: 'Prune sessions',
         style: 'danger',
       },
     ],

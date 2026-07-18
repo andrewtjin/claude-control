@@ -177,6 +177,20 @@ describe('Store', () => {
     it('returns undefined for an unknown session id', () => {
       expect(store.getSession('missing')).toBeUndefined();
     });
+
+    it('deleteSession removes the row and reports whether anything was there', () => {
+      store.upsertSession({
+        id: 'sess-3',
+        kind: 'interactive',
+        state: 'active',
+        accountId: null,
+        json: '{}',
+        updatedAtMs: 1,
+      });
+      expect(store.deleteSession('sess-3')).toBe(true);
+      expect(store.getSession('sess-3')).toBeUndefined();
+      expect(store.deleteSession('sess-3')).toBe(false);
+    });
   });
 
   describe('outbox', () => {

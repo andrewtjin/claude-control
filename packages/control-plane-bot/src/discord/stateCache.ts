@@ -51,6 +51,12 @@ export class DaemonStateCache {
       state.settings = envelope.payload;
     } else if (isType(envelope, 'session.status')) {
       state.sessions.set(envelope.payload.sessionId, envelope.payload);
+    } else if (isType(envelope, 'session.prune.result')) {
+      // The daemon names exactly what its registry dropped; mirror the removal so `/sessions`
+      // stops showing rows that no longer exist anywhere. Ids this cache never saw are no-ops.
+      for (const sessionId of envelope.payload.prunedSessionIds) {
+        state.sessions.delete(sessionId);
+      }
     }
   }
 

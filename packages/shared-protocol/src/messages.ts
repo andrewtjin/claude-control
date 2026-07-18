@@ -225,6 +225,29 @@ const SessionStopPayload = z.object({
   idempotencyKey: IdempotencyKey,
 });
 
+/** Phone-initiated prune of DORMANT session records: every record resting in a terminal
+ *  state (done/failed/orphaned). A live session is untouchable by construction — its record
+ *  is never in a terminal state while its process runs. Pruning is registry-only: the
+ *  underlying Claude conversation on the host survives; only the daemon's memory of the
+ *  session (including its resume anchor) is dropped, so a pruned orphan can no longer be
+ *  revived from the phone. */
+const SessionPrunePayload = z.object({
+  requestId: RequestId,
+  idempotencyKey: IdempotencyKey,
+});
+
+/** The daemon's answer to session.prune. Unlike session.stop there IS a dedicated result
+ *  envelope: pruned records DISAPPEAR rather than transition, so no session.status ack will
+ *  ever come — and the bot needs the exact pruned ids to drop its own cached `/sessions`
+ *  rows (its cache is fed by status pushes and would otherwise show the rows forever). */
+const SessionPruneResultPayload = z.object({
+  requestId: RequestId,
+  ok: z.boolean(),
+  /** Exactly the records that were removed; empty on a failed or no-op prune. */
+  prunedSessionIds: z.array(SessionId),
+  error: z.string().nullish(),
+});
+
 const SessionStatusPayload = z.object({
   sessionId: SessionId,
   state: z.enum([
@@ -336,6 +359,8 @@ export const messageSchemas = {
   'session.output': frame('session.output', SessionOutputPayload),
   'session.status': frame('session.status', SessionStatusPayload),
   'session.stop': frame('session.stop', SessionStopPayload),
+  'session.prune': frame('session.prune', SessionPrunePayload),
+  'session.prune.result': frame('session.prune.result', SessionPruneResultPayload),
   'hook.notification': frame('hook.notification', HookNotificationPayload),
   hello: frame('hello', HelloPayload),
   'hello.result': frame('hello.result', HelloResultPayload),
@@ -359,6 +384,8 @@ export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['session.output'],
   messageSchemas['session.status'],
   messageSchemas['session.stop'],
+  messageSchemas['session.prune'],
+  messageSchemas['session.prune.result'],
   messageSchemas['hook.notification'],
   messageSchemas.hello,
   messageSchemas['hello.result'],

@@ -38,15 +38,18 @@ export interface SessionView {
   accountId?: string;
 }
 
-/** A successful CLI session command result. */
+/** A successful CLI session command result. Statuses mirror the daemon's contract: `applied`
+ *  (the mutation took), `already_handled` (duplicate idempotency key), `already_registered`
+ *  (a repeated register that would change nothing — value-level feedback across separate
+ *  invocations, which fresh per-invocation keys cannot catch). */
 export interface SessionCommandSuccess {
   ok: true;
-  status: 'applied' | 'already_handled';
+  status: 'applied' | 'already_handled' | 'already_registered';
   session: SessionView;
 }
 
 /** The verbs the daemon exposes as mutating loopback endpoints. */
-export type SessionVerb = 'register' | 'label' | 'watch';
+export type SessionVerb = 'register' | 'label' | 'watch' | 'unregister';
 
 /** Every failure the CLI can surface for a session command carries a human-actionable message;
  *  a dedicated class lets the command action print it cleanly (via `fail`) without leaking a
@@ -154,7 +157,10 @@ export async function callDaemonSession(
   }
   return {
     ok: true,
-    status: body.status === 'already_handled' ? 'already_handled' : 'applied',
+    status:
+      body.status === 'already_handled' || body.status === 'already_registered'
+        ? body.status
+        : 'applied',
     session: body.session,
   };
 }

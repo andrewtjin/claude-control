@@ -57,6 +57,10 @@ export interface ControlPlaneHandlers {
    *  client only routes the frame — escalation policy (interrupt → grace → hard stop) and
    *  idempotency live in the daemon's handler. */
   onSessionStop?: (msg: MessageOf<'session.stop'>) => void;
+  /** Phone-initiated prune of dormant (terminal-state) session records. Routing only, as
+   *  with every other inbound command — what "dormant" means and the result reply live in
+   *  the daemon's handler. */
+  onSessionPrune?: (msg: MessageOf<'session.prune'>) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +313,7 @@ export class ControlPlaneClient {
     else if (isType(envelope, 'prompt.inject')) this.opts.handlers.onPromptInject?.(envelope);
     else if (isType(envelope, 'session.spawn')) this.opts.handlers.onSessionSpawn?.(envelope);
     else if (isType(envelope, 'session.stop')) this.opts.handlers.onSessionStop?.(envelope);
+    else if (isType(envelope, 'session.prune')) this.opts.handlers.onSessionPrune?.(envelope);
     // Any other type (usage.snapshot, session.output, etc.) is bot->phone traffic the daemon
     // itself never receives from the relay; silently ignored rather than treated as an error.
   }

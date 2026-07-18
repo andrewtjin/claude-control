@@ -345,6 +345,93 @@ describe('createSessionManager', () => {
     });
   });
 
+  describe('prune', () => {
+    it('removes every terminal-state record, persists, and returns exactly what it removed', async () => {
+      const dir = await sandbox();
+      const done: SessionRecord = { id: 'done-1', kind: 'managed', state: 'done', startedAtMs: 1 };
+      const failed: SessionRecord = {
+        id: 'failed-1',
+        kind: 'observed',
+        state: 'failed',
+        startedAtMs: 2,
+      };
+      const orphan: SessionRecord = {
+        id: 'orphan-1',
+        kind: 'managed',
+        state: 'orphaned',
+        startedAtMs: 3,
+        resumeId: 'sdk-1',
+      };
+      const resting: SessionRecord = {
+        id: 'resting-1',
+        kind: 'managed',
+        state: 'waiting_input',
+        startedAtMs: 4,
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([done, failed, orphan, resting]));
+
+      const manager = createSessionManager({ stateDir: dir });
+      const pruned = await manager.prune!();
+
+      expect(pruned.map((r) => r.id).sort()).toEqual(['done-1', 'failed-1', 'orphan-1']);
+      expect(manager.list()).toEqual([resting]);
+      // The removal is durable, not just in-memory: a restarted manager must not resurrect them.
+      expect(await readRegistryFile(dir)).toEqual([resting]);
+    });
+
+    it('returns empty (and never writes) when nothing is dormant', async () => {
+      const dir = await sandbox();
+      const resting: SessionRecord = {
+        id: 'resting-1',
+        kind: 'managed',
+        state: 'waiting_input',
+        startedAtMs: 4,
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([resting]));
+
+      const manager = createSessionManager({ stateDir: dir });
+      expect(await manager.prune!()).toEqual([]);
+      expect(manager.list()).toEqual([resting]);
+    });
+
+    it('drops the inert handle of a session that finished in this process', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      const handle = await manager.spawnManaged({
+        id: 'm1',
+        client: fakeClient([{ type: 'turn_result', ok: true, summary: 'ok' }]),
+        prompt: 'go',
+      });
+      await tick();
+      // Rest the finished turn's record in a terminal state (a completed turn parks at
+      // waiting_input by design, which prune must NOT touch — see the stop path).
+      await handle.stop();
+      expect(manager.list().find((r) => r.id === 'm1')?.state).toBe('done');
+
+      const pruned = await manager.prune!();
+
+      expect(pruned.map((r) => r.id)).toEqual(['m1']);
+      expect(manager.get('m1')).toBeUndefined();
+      expect(manager.list()).toEqual([]);
+    });
+
+    it('never touches a live session mid-turn', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      const gate = deferred<void>();
+      await manager.spawnManaged({
+        id: 'm1',
+        client: gatedFakeClient(gate.promise, [{ type: 'turn_result', ok: true, summary: 'ok' }]),
+        prompt: 'go',
+      });
+
+      expect(await manager.prune!()).toEqual([]);
+      expect(manager.get('m1')).toBeDefined();
+
+      // Deliberately never resolved — see the equivalent note in the recover test above.
+    });
+  });
+
   describe('resume', () => {
     it('persists the SDK session id as the record resumeId for a fresh spawn', async () => {
       const dir = await sandbox();

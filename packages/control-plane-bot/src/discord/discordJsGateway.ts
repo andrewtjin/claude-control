@@ -503,6 +503,9 @@ export class DiscordJsGateway implements DiscordGateway {
       new SlashCommandBuilder().setName('accounts').setDescription('List paired accounts'),
       new SlashCommandBuilder().setName('sessions').setDescription('List known sessions'),
       new SlashCommandBuilder()
+        .setName('prune')
+        .setDescription('Remove dormant session records (asks to confirm)'),
+      new SlashCommandBuilder()
         .setName('settings')
         .setDescription("Show the daemon's effective settings and where each came from"),
       new SlashCommandBuilder().setName('status').setDescription('Show daemon connection status'),
@@ -577,6 +580,9 @@ export class DiscordJsGateway implements DiscordGateway {
         break;
       case 'sessions':
         result = commands.handleSessions(this.deps, userId);
+        break;
+      case 'prune':
+        result = commands.handlePruneRequest(this.deps, userId, requestId);
         break;
       case 'settings':
         result = commands.handleSettings(this.deps, userId);
@@ -732,6 +738,10 @@ export class DiscordJsGateway implements DiscordGateway {
         return commands.handleSwitch(this.deps, userId, outcome.id, randomUUID(), key);
       case 'stop':
         return commands.handleStop(this.deps, userId, outcome.id, key);
+      case 'prune':
+        // The armed button carries the /prune invocation's requestId as its id (see
+        // pruneButtons) — reuse it so the frame correlates back to that invocation.
+        return commands.handlePruneConfirm(this.deps, userId, outcome.id, key);
     }
   }
 
@@ -741,7 +751,11 @@ export class DiscordJsGateway implements DiscordGateway {
     if (result.kind === 'embed') {
       await interaction.followUp({ embeds: [result.embed], ephemeral: true });
     } else if (result.kind === 'text') {
-      await interaction.followUp({ content: result.text, ephemeral: true });
+      await interaction.followUp({
+        content: result.text,
+        ephemeral: true,
+        ...(result.components !== undefined ? { components: this.toRows(result.components) } : {}),
+      });
     } else {
       await interaction.followUp({ content: `Error: ${result.message}`, ephemeral: true });
     }
@@ -754,7 +768,13 @@ export class DiscordJsGateway implements DiscordGateway {
     if (result.kind === 'embed') {
       await interaction.reply({ embeds: [result.embed], ephemeral: true });
     } else if (result.kind === 'text') {
-      await interaction.reply({ content: result.text, ephemeral: true });
+      await interaction.reply({
+        content: result.text,
+        ephemeral: true,
+        // A text result may carry buttons (e.g. /prune's armed confirm control) — inflate
+        // them exactly like every other ButtonSpec surface.
+        ...(result.components !== undefined ? { components: this.toRows(result.components) } : {}),
+      });
     } else {
       await interaction.reply({ content: `Error: ${result.message}`, ephemeral: true });
     }

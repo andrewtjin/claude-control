@@ -392,6 +392,13 @@ export class Store {
     return row ? this.toSessionRow(row) : undefined;
   }
 
+  /** Remove one row from the display mirror (the `cctl session unregister` path). Returns
+   *  whether a row was actually deleted, so the caller can answer "was never registered"
+   *  honestly instead of pretending an unregister of nothing succeeded. */
+  deleteSession(id: string): boolean {
+    return this.db.prepare(`DELETE FROM sessions WHERE id = ?`).run(id).changes > 0;
+  }
+
   listSessions(): SessionRow[] {
     return this.db
       .prepare(`SELECT * FROM sessions ORDER BY updatedAtMs ASC`)

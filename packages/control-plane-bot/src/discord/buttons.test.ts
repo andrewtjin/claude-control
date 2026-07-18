@@ -6,6 +6,7 @@ import {
   encodeButton,
   isDestructive,
   permissionButtons,
+  pruneButtons,
   resolveTap,
   sessionCardButtons,
   type ParsedButton,
@@ -46,9 +47,10 @@ describe('encode/decode customId', () => {
 });
 
 describe('isDestructive', () => {
-  it('flags switch and stop always, deny only at session scope', () => {
+  it('flags switch, stop, and prune always, deny only at session scope', () => {
     expect(isDestructive('switch', 'na')).toBe(true);
     expect(isDestructive('stop', 'na')).toBe(true);
+    expect(isDestructive('prune', 'na')).toBe(true);
     expect(isDestructive('deny', 'session')).toBe(true);
     expect(isDestructive('deny', 'once')).toBe(false);
     expect(isDestructive('approve', 'once')).toBe(false);
@@ -241,6 +243,42 @@ describe('sessionCardButtons — the live card Stop control', () => {
 
   it('offers no button once the session is stopping or terminal', () => {
     expect(sessionCardButtons({ sessionId: 'sess-1', stoppable: false })).toEqual([]);
+  });
+});
+
+describe('pruneButtons — the /prune confirmation control', () => {
+  it('ships an armed Prune that flows through the two-tap confirm to an execute', () => {
+    const rows = pruneButtons({ requestId: 'req-9' });
+    expect(rows).toHaveLength(1);
+    const prune = rows[0]![0]!;
+    expect(prune.label).toBe('Prune sessions');
+    expect(prune.style).toBe('danger');
+    // Armed and carrying the /prune invocation's requestId, so the executed tap's dedupe
+    // key is scoped to that invocation (a later /prune must never collapse into it).
+    expect(decodeButton(prune.customId)).toMatchObject({
+      action: 'prune',
+      phase: 'arm',
+      scope: 'na',
+      id: 'req-9',
+    });
+    const first = resolveTap(prune.customId, 1000);
+    expect(first.kind).toBe('confirm');
+    if (first.kind !== 'confirm') throw new Error('unreachable');
+    const confirmId = first.rows[0]![0]!.customId;
+    expect(resolveTap(confirmId, 1000)).toEqual({
+      kind: 'execute',
+      action: 'prune',
+      scope: 'na',
+      id: 'req-9',
+    });
+  });
+
+  it('a Cancel re-arms just the Prune button (its whole row)', () => {
+    const id = encodeButton({ action: 'prune', phase: 'cancel', scope: 'na', ts: 0, id: 'req-9' });
+    const out = resolveTap(id, 1000);
+    expect(out.kind).toBe('restore');
+    if (out.kind !== 'restore') throw new Error('unreachable');
+    expect(out.rows).toEqual(pruneButtons({ requestId: 'req-9' }));
   });
 });
 

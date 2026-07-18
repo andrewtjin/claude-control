@@ -20,6 +20,7 @@ import {
 } from './embeds.js';
 import type { BarRenderer } from './emojiBars.js';
 import type { TimelineTrackStyle } from './richFormat.js';
+import { pruneButtons, type ButtonSpec } from './buttons.js';
 
 export interface CommandDeps {
   relay: RelaySender;
@@ -35,7 +36,9 @@ export interface CommandDeps {
 
 export type CommandResult =
   | { kind: 'embed'; embed: EmbedBuilder }
-  | { kind: 'text'; text: string }
+  /** `components` lets a reply carry buttons (e.g. `/prune`'s armed confirm control); plain
+   *  ButtonSpecs so this module stays free of discord.js component types — the gateway inflates. */
+  | { kind: 'text'; text: string; components?: ButtonSpec[][] }
   | { kind: 'error'; message: string };
 
 /** `/pair` — issue a fresh pairing code for the invoking user. No envelope is sent here;
@@ -223,6 +226,57 @@ export function handleStop(
   }));
   return result.ok
     ? { kind: 'text', text: 'Stop requested.' }
+    : { kind: 'error', message: result.error };
+}
+
+/** Session states a prune removes — mirrors the daemon's definition of "dormant" (the
+ *  registry's terminal states). Kept here only to render an honest PREVIEW; the daemon's
+ *  registry is the authority on what actually gets pruned. */
+const DORMANT_STATES = new Set(['done', 'failed', 'orphaned']);
+
+/** `/prune` — the confirmation card. Nothing is sent to the daemon here: the reply carries an
+ *  ARMED Prune button (two-tap confirm, like every destructive control) and only the confirmed
+ *  tap sends the actual `session.prune` (see {@link handlePruneConfirm}). The preview counts the
+ *  BOT's cached view; the daemon may know dormant records this cache never saw (e.g. after a bot
+ *  restart), so the copy promises "all dormant records", not the listed count. */
+export function handlePruneRequest(
+  deps: CommandDeps,
+  discordUserId: string,
+  requestId: string,
+): CommandResult {
+  if (!deps.relay.isOnline(discordUserId)) {
+    return { kind: 'error', message: 'Daemon is offline or not paired.' };
+  }
+  const dormant = deps.cache.getSessions(discordUserId).filter((s) => DORMANT_STATES.has(s.state));
+  const listed = dormant.map((s) => `\`${s.sessionId.slice(0, 8)}\` (${s.state})`).join(', ');
+  const preview =
+    dormant.length > 0
+      ? `${dormant.length} dormant here: ${listed}.`
+      : 'None known here (the daemon may still hold some).';
+  return {
+    kind: 'text',
+    text:
+      `Prune removes ALL dormant session records (done / failed / orphaned) from the daemon's ` +
+      `registry. ${preview}\nA pruned session can no longer be revived with \`/say\` — the ` +
+      `conversation itself stays on the host. Live sessions are untouched.`,
+    components: pruneButtons({ requestId }),
+  };
+}
+
+/** The confirmed Prune tap — the only place a `session.prune` frame is actually sent. */
+export function handlePruneConfirm(
+  deps: CommandDeps,
+  discordUserId: string,
+  requestId: string,
+  idempotencyKey: string,
+): CommandResult {
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'session.prune',
+    payload: { requestId, idempotencyKey },
+  }));
+  return result.ok
+    ? { kind: 'text', text: 'Prune requested.' }
     : { kind: 'error', message: result.error };
 }
 

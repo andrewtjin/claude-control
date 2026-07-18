@@ -18,9 +18,12 @@ import {
   handleApprove,
   handleDeny,
   handleStop,
+  handlePruneRequest,
+  handlePruneConfirm,
   handleReauth,
   type CommandDeps,
 } from './commands.js';
+import { decodeButton } from './buttons.js';
 
 /** A fake relay that never has network state — it records what it was asked to send and
  *  lets tests control whether "the daemon" is reachable, without any real socket. */
@@ -310,6 +313,69 @@ describe('handleStop sends session.stop', () => {
     const result = handleStop(deps, 'user-a', 's1', 'idem-stop');
     expect(result.kind).toBe('error');
     expect(sent).toHaveLength(0);
+  });
+});
+
+describe('handlePruneRequest / handlePruneConfirm — the two-step prune', () => {
+  it('the request sends NOTHING — it returns a preview with an armed Prune button', () => {
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const cache = new DaemonStateCache();
+    const deps: CommandDeps = {
+      relay,
+      pairing: new PairingService({ bindings: new BindingStore() }),
+      cache,
+    };
+    cache.record('user-a', {
+      v: 1,
+      id: 'x1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      type: 'session.status',
+      payload: { sessionId: 'orphan-1', state: 'orphaned' },
+    });
+    cache.record('user-a', {
+      v: 1,
+      id: 'x2',
+      ts: 0,
+      daemonId: 'daemon-1',
+      type: 'session.status',
+      payload: { sessionId: 'live-1', state: 'running' },
+    });
+
+    const result = handlePruneRequest(deps, 'user-a', 'req-1');
+
+    expect(sent).toHaveLength(0); // confirmation gate: no frame until the confirmed tap
+    expect(result.kind).toBe('text');
+    if (result.kind !== 'text') throw new Error('unreachable');
+    expect(result.text).toContain('1 dormant');
+    expect(result.text).toContain('orphan-1'.slice(0, 8));
+    expect(result.text).not.toContain('live-1'.slice(0, 8)); // live sessions are not on the block
+    // The armed button carries THIS invocation's requestId so its dedupe key is per-invocation.
+    const armed = result.components?.[0]?.[0];
+    if (armed === undefined) throw new Error('unreachable');
+    const parsed = decodeButton(armed.customId);
+    expect(parsed).toMatchObject({ action: 'prune', phase: 'arm', id: 'req-1' });
+  });
+
+  it('the request fails cleanly when the daemon is offline (nothing to prune against)', () => {
+    const { relay, sent } = createFakeRelay({ online: {} });
+    const deps = makeDeps(relay);
+    expect(handlePruneRequest(deps, 'user-a', 'req-1').kind).toBe('error');
+    expect(sent).toHaveLength(0);
+  });
+
+  it('the confirm is the only step that sends session.prune, with requestId + idempotency key', () => {
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const deps = makeDeps(relay);
+
+    const result = handlePruneConfirm(deps, 'user-a', 'req-1', 'idem-1');
+
+    expect(result.kind).toBe('text');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.draft).toMatchObject({
+      type: 'session.prune',
+      payload: { requestId: 'req-1', idempotencyKey: 'idem-1' },
+    });
   });
 });
 

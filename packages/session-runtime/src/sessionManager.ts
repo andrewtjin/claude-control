@@ -150,6 +150,17 @@ export interface SessionManager {
    * live, not managed, or has no persisted resumeId to resume from.
    */
   resumeOrphan?(sessionId: string, opts: ResumeOrphanOptions): Promise<SessionHandle>;
+  /**
+   * Remove every record resting in a terminal state (done/failed/orphaned) from the registry
+   * and persist the result, returning exactly what was removed. Non-terminal records are
+   * untouchable by construction — a session with live work is never in a terminal state — so
+   * pruning can only ever forget history, never kill work. Forgetting is the point AND the
+   * cost: a pruned orphan loses its resume anchor, so it can no longer be revived on demand
+   * (the underlying conversation on the host survives — only this registry's row is dropped).
+   * OPTIONAL on the interface for the same fake-compatibility reason as `resumeOrphan`; the
+   * real manager always implements it.
+   */
+  prune?(): Promise<SessionRecord[]>;
 }
 
 const TERMINAL_STATES: ReadonlySet<SessionState> = new Set(['done', 'failed', 'orphaned']);
@@ -362,6 +373,22 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
 
     resumeOrphan(sessionId, resumeOpts): Promise<SessionHandle> {
       return resumeOrphanImpl(sessionId, resumeOpts);
+    },
+
+    async prune(): Promise<SessionRecord[]> {
+      await ensureLoaded();
+      const pruned: SessionRecord[] = [];
+      for (const record of records.values()) {
+        if (!TERMINAL_STATES.has(record.state)) continue;
+        records.delete(record.id);
+        // A terminal record's handle (a session that finished in THIS process) is inert —
+        // its state only became terminal because the underlying query ended — so dropping it
+        // with the record leaves nothing dangling for get() to hand out.
+        handles.delete(record.id);
+        pruned.push(record);
+      }
+      if (pruned.length > 0) await persist();
+      return pruned;
     },
   };
 }

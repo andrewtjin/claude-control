@@ -258,14 +258,18 @@ function fakeSessionManager(): SessionManager & {
   records: SessionRecord[];
   /** Every resumeOrphan call, observable with real types (no mock-generics needed). */
   resumeOrphanCalls: Array<{ sessionId: string; opts: ResumeOrphanOptions }>;
+  /** One entry per prune() call: the batch of ids it removed. */
+  pruneCalls: string[][];
 } {
   const handles = new Map<string, SessionHandle>();
   const records: SessionRecord[] = [];
   const resumeOrphanCalls: Array<{ sessionId: string; opts: ResumeOrphanOptions }> = [];
+  const pruneCalls: string[][] = [];
   return {
     handles,
     records,
     resumeOrphanCalls,
+    pruneCalls,
     spawnManaged: vi.fn((opts) => {
       void opts;
       const handle = makeFakeHandle('spawned-session');
@@ -284,6 +288,18 @@ function fakeSessionManager(): SessionManager & {
       const handle = makeFakeHandle(sessionId);
       handles.set(sessionId, handle);
       return Promise.resolve(handle);
+    },
+    prune: (): Promise<SessionRecord[]> => {
+      // Mirror the real manager: terminal-state records go, everything else stays.
+      const pruned = records.filter(
+        (r) => r.state === 'done' || r.state === 'failed' || r.state === 'orphaned',
+      );
+      for (const record of pruned) {
+        records.splice(records.indexOf(record), 1);
+        handles.delete(record.id);
+      }
+      pruneCalls.push(pruned.map((r) => r.id));
+      return Promise.resolve(pruned);
     },
   };
 }
@@ -1080,6 +1096,66 @@ describe('Daemon lifecycle', () => {
     expect(sessionManager.get('done-1')).toBeUndefined();
   });
 
+  // ---- phone-initiated prune of dormant records ----
+
+  it('session.prune drops dormant records and answers with exactly the pruned ids', async () => {
+    sessionManager.records.push(
+      { id: 'orphan-1', kind: 'managed', state: 'orphaned', startedAtMs: 0, resumeId: 'sdk-a' },
+      { id: 'done-1', kind: 'managed', state: 'done', startedAtMs: 1 },
+      { id: 'resting-1', kind: 'managed', state: 'waiting_input', startedAtMs: 2 },
+    );
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.prune',
+      payload: { requestId: 'pr-1', idempotencyKey: 'pk-1' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'session.prune.result'));
+
+    const result = relay.received.find((e) => e.type === 'session.prune.result');
+    if (result?.type === 'session.prune.result') {
+      expect(result.payload.requestId).toBe('pr-1');
+      expect(result.payload.ok).toBe(true);
+      expect([...result.payload.prunedSessionIds].sort()).toEqual(['done-1', 'orphan-1']);
+    }
+    // The continuable session survived; only dormant history was forgotten.
+    expect(sessionManager.records.map((r) => r.id)).toEqual(['resting-1']);
+  });
+
+  it('a replayed session.prune (same idempotencyKey) is answered once, never re-run', async () => {
+    await daemon.start();
+    const frame = {
+      daemonId: 'daemon-under-test',
+      type: 'session.prune' as const,
+      payload: { requestId: 'pr-dup', idempotencyKey: 'pk-dup' },
+    };
+    relay.push(frame);
+    await waitFor(() => relay.received.some((e) => e.type === 'session.prune.result'));
+    relay.push(frame);
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(relay.received.filter((e) => e.type === 'session.prune.result')).toHaveLength(1);
+    expect(sessionManager.pruneCalls).toHaveLength(1);
+  });
+
+  it('a failing prune answers ok:false with the error instead of going silent', async () => {
+    sessionManager.prune = () => Promise.reject(new Error('registry locked'));
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.prune',
+      payload: { requestId: 'pr-err', idempotencyKey: 'pk-err' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'session.prune.result'));
+
+    const result = relay.received.find((e) => e.type === 'session.prune.result');
+    if (result?.type === 'session.prune.result') {
+      expect(result.payload.ok).toBe(false);
+      expect(result.payload.prunedSessionIds).toEqual([]);
+      expect(result.payload.error).toContain('registry locked');
+    }
+  });
+
   it('a failing session reconciliation is logged and never kills startup', async () => {
     sessionManager.recover = vi.fn(() => Promise.reject(new Error('corrupt sessions.json')));
     await expect(daemon.start()).resolves.toBeUndefined();
@@ -1232,6 +1308,86 @@ describe('Daemon lifecycle', () => {
       watch: boolean;
     };
     expect(parsed).toMatchObject({ label: 'named', watch: false });
+  });
+
+  it('a repeated no-change register answers already_registered — fresh keys, no rewrite', async () => {
+    const hookPort = await startCapturingHookPort();
+    await postCli(hookPort, 'register', {
+      sessionId: 'cc-sess-5',
+      idempotencyKey: 'r5a',
+      label: 'demo',
+    });
+    const rowAfterFirst = store.getSession('cc-sess-5');
+
+    // A separate deliberate invocation (new key, same values) — the key set cannot catch
+    // this; the VALUE comparison must, and the row must not be churned by it.
+    const same = await postCli(hookPort, 'register', {
+      sessionId: 'cc-sess-5',
+      idempotencyKey: 'r5b',
+      label: 'demo',
+    });
+    expect(same.status).toBe(200);
+    expect(same.body).toMatchObject({ ok: true, status: 'already_registered' });
+    expect(store.getSession('cc-sess-5')).toEqual(rowAfterFirst);
+
+    // Supplying a NEW label is a genuine update, not a repeat.
+    const relabel = await postCli(hookPort, 'register', {
+      sessionId: 'cc-sess-5',
+      idempotencyKey: 'r5c',
+      label: 'renamed',
+    });
+    expect(relabel.body).toMatchObject({ ok: true, status: 'applied' });
+    const parsed = JSON.parse(store.getSession('cc-sess-5')!.json) as { label: string };
+    expect(parsed.label).toBe('renamed');
+  });
+
+  it('unregister removes the row; the id is then unknown to label/unregister alike', async () => {
+    const hookPort = await startCapturingHookPort();
+    await postCli(hookPort, 'register', { sessionId: 'cc-sess-6', idempotencyKey: 'r6' });
+    expect(store.getSession('cc-sess-6')).toBeDefined();
+
+    const removed = await postCli(hookPort, 'unregister', {
+      sessionId: 'cc-sess-6',
+      idempotencyKey: 'u6',
+    });
+    expect(removed.status).toBe(200);
+    expect(removed.body).toMatchObject({ ok: true, status: 'applied' });
+    expect(store.getSession('cc-sess-6')).toBeUndefined();
+
+    // A fresh unregister of the now-gone id is an honest 404…
+    const again = await postCli(hookPort, 'unregister', {
+      sessionId: 'cc-sess-6',
+      idempotencyKey: 'u6-fresh',
+    });
+    expect(again.status).toBe(404);
+    expect(again.body).toMatchObject({ ok: false, code: 'unknown_session' });
+
+    // …while a REPLAY of the applied unregister (same key) stays a calm already_handled.
+    const replay = await postCli(hookPort, 'unregister', {
+      sessionId: 'cc-sess-6',
+      idempotencyKey: 'u6',
+    });
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({ ok: true, status: 'already_handled' });
+  });
+
+  it('unregister never touches a managed mirror row (interactive-only by kind)', async () => {
+    const hookPort = await startCapturingHookPort();
+    // A managed session's mirror row shares the table but not the kind.
+    store.upsertSession({
+      id: 'managed-1',
+      kind: 'managed',
+      state: 'running',
+      accountId: null,
+      json: '{}',
+      updatedAtMs: 0,
+    });
+    const res = await postCli(hookPort, 'unregister', {
+      sessionId: 'managed-1',
+      idempotencyKey: 'um',
+    });
+    expect(res.status).toBe(404);
+    expect(store.getSession('managed-1')).toBeDefined();
   });
 });
 

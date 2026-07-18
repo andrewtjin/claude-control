@@ -1170,6 +1170,7 @@ describe('HookReceiver', () => {
           registerSession: make('register'),
           labelSession: make('label'),
           watchSession: make('watch'),
+          unregisterSession: make('unregister'),
         },
       };
     }
@@ -1295,6 +1296,21 @@ describe('HookReceiver', () => {
       expect(res.status).toBe(200);
       expect(cli.calls).toEqual([
         { verb: 'watch', input: { sessionId: 'sess-1', idempotencyKey: 'k', watch: false } },
+      ]);
+    });
+
+    it('routes unregister to the handler with the base fields only', async () => {
+      const cli = fakeCli(() => okApplied);
+      receiver.setCliHandlers(cli.handlers);
+      const res = await post(
+        port,
+        '/cli/session/unregister',
+        { sessionId: 'sess-1', idempotencyKey: 'k9' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+      expect(cli.calls).toEqual([
+        { verb: 'unregister', input: { sessionId: 'sess-1', idempotencyKey: 'k9' } },
       ]);
     });
 

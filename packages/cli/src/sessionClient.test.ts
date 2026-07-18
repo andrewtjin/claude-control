@@ -88,6 +88,10 @@ async function harness(
       calls.push({ verb: 'watch', input });
       return Promise.resolve(respond('watch', input));
     },
+    unregisterSession: (input) => {
+      calls.push({ verb: 'unregister', input });
+      return Promise.resolve(respond('unregister', input));
+    },
   };
 
   const receiver = new HookReceiver({
@@ -140,6 +144,29 @@ describe('callDaemonSession', () => {
     expect(h.calls).toEqual([
       { verb: 'register', input: { sessionId: 'sess-1', idempotencyKey: 'key-1', label: 'work' } },
     ]);
+  });
+
+  it('POSTs an unregister command and returns the applied result', async () => {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    const result = await callDaemonSession(
+      'unregister',
+      { sessionId: 'sess-1', idempotencyKey: 'key-u' },
+      { dataDir: h.dataDir, protector: h.protector },
+    );
+    expect(result).toEqual({ ok: true, status: 'applied', session: view });
+    expect(h.calls).toEqual([
+      { verb: 'unregister', input: { sessionId: 'sess-1', idempotencyKey: 'key-u' } },
+    ]);
+  });
+
+  it("passes the daemon's already_registered status through untouched", async () => {
+    const h = await harness(() => ({ ok: true, status: 'already_registered', session: view }));
+    const result = await callDaemonSession(
+      'register',
+      { sessionId: 'sess-1', idempotencyKey: 'key-2' },
+      { dataDir: h.dataDir, protector: h.protector },
+    );
+    expect(result.status).toBe('already_registered');
   });
 
   it('surfaces a daemon 4xx (unknown_session) as an actionable SessionClientError', async () => {

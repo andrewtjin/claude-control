@@ -30,6 +30,7 @@ import type { AttributionJournal } from './attributionJournal.js';
 import type {
   HookReceiver,
   HookReceiverCliHandlers,
+  SessionCommandBase,
   SessionCommandResult,
   SessionLabelInput,
   SessionRegisterInput,
@@ -116,10 +117,22 @@ const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
  */
 const MANAGED_SESSION_PERMISSION_MODE = 'default';
 
-/** Bound on the session.stop idempotency set. Stop keys only need to survive the
- *  double/triple-tap window (seconds), so a few hundred remembered keys is generous while
- *  keeping the set trivially bounded across a long-lived daemon. */
+/** Bound on the session.stop and session.prune idempotency sets. These keys only need to
+ *  survive the double/triple-tap window (seconds), so a few hundred remembered keys is
+ *  generous while keeping each set trivially bounded across a long-lived daemon. */
 const MAX_SEEN_STOP_KEYS = 256;
+
+/** Remember an idempotency key with FIFO eviction past the bound — a JS Set iterates in
+ *  insertion order, so the first value is always the oldest key. The one eviction mechanic
+ *  behind every idempotency set the daemon keeps; the sets themselves stay separate because
+ *  each names which commands share a dedupe namespace. */
+function rememberBounded(keys: Set<string>, key: string, bound: number): void {
+  keys.add(key);
+  if (keys.size > bound) {
+    const oldest = keys.values().next().value;
+    if (oldest !== undefined) keys.delete(oldest);
+  }
+}
 
 /** Bound on the `cctl session register|label|watch` idempotency set. Same FIFO discipline as
  *  the stop keys; a little larger because a busy user may register/label several sessions. The
@@ -221,6 +234,9 @@ export class Daemon {
   /** Recently seen `session.stop` idempotencyKeys, so a double-tapped/re-sent Stop never runs
    *  the escalation ladder twice. Bounded FIFO — see {@link rememberStopKey}. */
   private readonly seenStopKeys = new Set<string>();
+  /** Recently seen `session.prune` idempotencyKeys, so a re-sent/replayed prune answers once
+   *  instead of posting a second (empty) result. Bounded FIFO like the stop keys. */
+  private readonly seenPruneKeys = new Set<string>();
   /** Recently seen `cctl session register|label|watch` idempotencyKeys, so a re-sent command
    *  answers "already handled" instead of re-applying. Bounded FIFO — see
    *  {@link rememberSessionCmdKey}. */
@@ -327,6 +343,11 @@ export class Daemon {
       onSessionStop: (msg) => {
         this.handleSessionStop(msg).catch((err: unknown) => {
           this.logger.error({ err }, 'error handling session.stop');
+        });
+      },
+      onSessionPrune: (msg) => {
+        this.handleSessionPrune(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling session.prune');
         });
       },
     });
@@ -680,13 +701,62 @@ export class Daemon {
     );
   }
 
-  /** Remember a session.stop idempotencyKey with FIFO eviction past the bound — a JS Set
-   *  iterates in insertion order, so the first value is always the oldest key. */
+  /** Remember a session.stop idempotencyKey. Kept as a named method (not an inline
+   *  {@link rememberBounded} call) because handleSessionStop's key-burning rules reference it. */
   private rememberStopKey(key: string): void {
-    this.seenStopKeys.add(key);
-    if (this.seenStopKeys.size > MAX_SEEN_STOP_KEYS) {
-      const oldest = this.seenStopKeys.values().next().value;
-      if (oldest !== undefined) this.seenStopKeys.delete(oldest);
+    rememberBounded(this.seenStopKeys, key, MAX_SEEN_STOP_KEYS);
+  }
+
+  /**
+   * Phone-initiated prune of dormant session records. The registry primitive
+   * (`sessionManager.prune`) owns what "dormant" means — terminal-state records only, so a
+   * live session is structurally untouchable; this handler owns idempotency and the result
+   * reply. Unlike stop there IS a dedicated result envelope: pruned records disappear rather
+   * than transition, so no session.status ack ever comes, and the phone needs the exact
+   * pruned ids to clear its own cached session list.
+   */
+  private async handleSessionPrune(msg: MessageOf<'session.prune'>): Promise<void> {
+    const { requestId, idempotencyKey } = msg.payload;
+    if (this.seenPruneKeys.has(idempotencyKey)) {
+      this.logger.info({ requestId, idempotencyKey }, 'duplicate session.prune ignored');
+      return;
+    }
+    // Burn the key before the first await. Unlike stop there is no not-yet-live race to
+    // protect the key from: a prune always applies to whatever is dormant right now, and a
+    // failed prune should NOT be silently retried by a replayed frame — the phone got an
+    // explicit ok:false result to act on.
+    rememberBounded(this.seenPruneKeys, idempotencyKey, MAX_SEEN_STOP_KEYS);
+
+    if (this.sessionManager.prune === undefined) {
+      this.sendEnvelope({
+        type: 'session.prune.result',
+        payload: {
+          requestId,
+          ok: false,
+          prunedSessionIds: [],
+          error: 'this daemon cannot prune session records',
+        },
+      });
+      return;
+    }
+    try {
+      const pruned = await this.sessionManager.prune();
+      this.logger.info({ sessionIds: pruned.map((r) => r.id) }, 'pruned dormant session records');
+      this.sendEnvelope({
+        type: 'session.prune.result',
+        payload: { requestId, ok: true, prunedSessionIds: pruned.map((r) => r.id) },
+      });
+    } catch (err) {
+      this.logger.error({ err }, 'session prune failed');
+      this.sendEnvelope({
+        type: 'session.prune.result',
+        payload: {
+          requestId,
+          ok: false,
+          prunedSessionIds: [],
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
     }
   }
 
@@ -845,10 +915,13 @@ export class Daemon {
   // tracking, mirrored into the Store `sessions` table (kind='interactive') so `cctl session
   // status` reads them offline. This is purely additive observability: it never touches the
   // hook stream, the managed-session pipeline, or recovery (store.ts). SEMANTICS:
-  //   - register: opt a session into tracking; default `watch: true` (registering implies you
-  //     want it on the phone). Idempotent; a re-register keeps any prior label/watch choice.
-  //   - label:    name a REGISTERED session (404 if not registered — register is the gateway).
-  //   - watch:    set the per-session streaming opt-in on a REGISTERED session (404 otherwise).
+  //   - register:   opt a session into tracking; default `watch: true` (registering implies you
+  //     want it on the phone). Idempotent; a no-change re-register answers 'already_registered'
+  //     and keeps any prior label/watch choice.
+  //   - label:      name a REGISTERED session (404 if not registered — register is the gateway).
+  //   - watch:      set the per-session streaming opt-in on a REGISTERED session (404 otherwise).
+  //   - unregister: drop a REGISTERED session from tracking (404 otherwise) — the undo for
+  //     register, including registrations made with a mistyped id.
   // The watch flag is RECORDED as the control surface; enforcing it (filtering the unconditional
   // hook stream) is deferred so it cannot regress live cards — see watchSession.
 
@@ -860,6 +933,7 @@ export class Daemon {
       registerSession: (input) => this.registerSession(input),
       labelSession: (input) => Promise.resolve(this.labelSession(input)),
       watchSession: (input) => Promise.resolve(this.watchSession(input)),
+      unregisterSession: (input) => Promise.resolve(this.unregisterSession(input)),
     };
   }
 
@@ -876,6 +950,14 @@ export class Daemon {
       };
     }
     const existing = this.readInteractiveSession(input.sessionId);
+    // A repeated register that would change nothing gets its own status (not a fresh
+    // "Registered" that reads as if something happened): the keys differ across deliberate
+    // invocations, so key-idempotency can't catch this — it is VALUE-level feedback. No
+    // write either, so updatedAtMs honestly reflects the last real change. A re-register
+    // that supplies a NEW label falls through: that is a genuine update.
+    if (existing !== undefined && (input.label === undefined || input.label === existing.label)) {
+      return { ok: true, status: 'already_registered', session: interactiveView(existing) };
+    }
     const now = this.clock();
     // Best-effort attribution: tag with the live account, but never let a switch-engine read
     // failure block registration (observability plumbing must not depend on the vault).
@@ -950,7 +1032,30 @@ export class Daemon {
     return { ok: true, status: 'applied', session: interactiveView(tracked) };
   }
 
-  /** The one 404 body for label/watch against a session that was never registered. */
+  /** Drop a registered interactive session from tracking — the undo for `register`, and the
+   *  cleanup path for a registration made with a garbage id (register accepts any string, so
+   *  a typo like "67" becomes a row only THIS can remove). 404 (`unknown_session`) if it was
+   *  never registered, mirroring label/watch; managed rows are untouchable here (the kind
+   *  check in readInteractiveSession keeps them apart). */
+  private unregisterSession(input: SessionCommandBase): SessionCommandResult {
+    if (this.seenSessionCmdKeys.has(input.idempotencyKey)) {
+      // Replay of an unregister that already applied: the row is gone, so echo the minimal
+      // honest view rather than a 404 that would read as "it never existed".
+      return {
+        ok: true,
+        status: 'already_handled',
+        session: minimalInteractiveView(input.sessionId),
+      };
+    }
+    const existing = this.readInteractiveSession(input.sessionId);
+    if (!existing) return this.notRegistered(input.sessionId);
+    this.store.deleteSession(input.sessionId);
+    this.rememberSessionCmdKey(input.idempotencyKey);
+    // Echo the view of what was removed so the CLI can confirm WHICH session it just forgot.
+    return { ok: true, status: 'applied', session: interactiveView(existing) };
+  }
+
+  /** The one 404 body for label/watch/unregister against a session that was never registered. */
   private notRegistered(sessionId: string): SessionCommandResult {
     return {
       ok: false,
@@ -987,14 +1092,9 @@ export class Daemon {
     });
   }
 
-  /** Remember a session-command idempotencyKey with FIFO eviction past the bound (a JS Set
-   *  iterates in insertion order, so the first value is the oldest). */
+  /** Remember a `cctl session register|label|watch` idempotencyKey. */
   private rememberSessionCmdKey(key: string): void {
-    this.seenSessionCmdKeys.add(key);
-    if (this.seenSessionCmdKeys.size > MAX_SEEN_SESSION_CMD_KEYS) {
-      const oldest = this.seenSessionCmdKeys.values().next().value;
-      if (oldest !== undefined) this.seenSessionCmdKeys.delete(oldest);
-    }
+    rememberBounded(this.seenSessionCmdKeys, key, MAX_SEEN_SESSION_CMD_KEYS);
   }
 
   /** Mirror a managed session's state transition into the display-only Store table (kind

@@ -283,6 +283,38 @@ describe('renderPush — routing of other envelopes', () => {
   it('usage.snapshot is cache-only (no DM)', () => {
     expect(renderPush(env('usage.snapshot', { accounts: [] }))).toBeUndefined();
   });
+
+  it('session.prune.result reports the pruned count (and pluralizes honestly)', () => {
+    const one = renderPush(
+      env('session.prune.result', { requestId: 'r', ok: true, prunedSessionIds: ['s1'] }),
+    );
+    expect(one?.content).toContain('1 dormant session record');
+    expect(one?.content).not.toContain('records');
+    const many = renderPush(
+      env('session.prune.result', { requestId: 'r', ok: true, prunedSessionIds: ['s1', 's2'] }),
+    );
+    expect(many?.content).toContain('2 dormant session records');
+  });
+
+  it('an empty prune says nothing was there rather than celebrating a no-op', () => {
+    const push = renderPush(
+      env('session.prune.result', { requestId: 'r', ok: true, prunedSessionIds: [] }),
+    );
+    expect(push?.content).toContain('Nothing to prune');
+  });
+
+  it('a failed prune surfaces the daemon error', () => {
+    const push = renderPush(
+      env('session.prune.result', {
+        requestId: 'r',
+        ok: false,
+        prunedSessionIds: [],
+        error: 'registry locked',
+      }),
+    );
+    expect(push?.content).toContain('Prune failed');
+    expect(push?.content).toContain('registry locked');
+  });
 });
 
 describe('renderPush — daemon error envelopes are surfaced', () => {

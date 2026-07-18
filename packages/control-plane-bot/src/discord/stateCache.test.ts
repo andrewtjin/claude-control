@@ -101,6 +101,38 @@ describe('DaemonStateCache', () => {
     expect(sessions.find((s) => s.sessionId === 's2')?.state).toBe('done');
   });
 
+  it('session.prune.result removes exactly the pruned ids, leaving the rest', () => {
+    const cache = new DaemonStateCache();
+    const base: Omit<Envelope, 'payload' | 'type'> = {
+      v: 1,
+      id: 'id-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId: 'user-a',
+    };
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's1', state: 'orphaned' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's2', state: 'running' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.prune.result',
+      // 's-unknown' was never cached — removal of an unknown id must be a silent no-op
+      // (the daemon can legitimately prune records this cache never saw).
+      payload: { requestId: 'r1', ok: true, prunedSessionIds: ['s1', 's-unknown'] },
+    });
+
+    const sessions = cache.getSessions('user-a');
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.sessionId).toBe('s2');
+  });
+
   it('records settings.snapshot per user, latest write wins', () => {
     const cache = new DaemonStateCache();
     const base: Omit<Envelope, 'payload' | 'type'> = {

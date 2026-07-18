@@ -61,6 +61,27 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
   if (isType(envelope, 'switch.result')) {
     return { embeds: [buildSwitchResultEmbed(envelope.payload.ok, envelope.payload.message)] };
   }
+  if (isType(envelope, 'session.prune.result')) {
+    // The visible close of the /prune flow (the cache removal happened in DaemonStateCache).
+    // Count over ids: prunes are rare and the count is the decision-relevant fact; the freed
+    // rows are simply gone from /sessions.
+    const p = envelope.payload;
+    if (!p.ok) {
+      return {
+        content: truncateLabeled(
+          `⚠️ Prune failed: ${p.error ?? 'unknown error'}`,
+          MESSAGE_CONTENT_LIMIT,
+        ),
+      };
+    }
+    const n = p.prunedSessionIds.length;
+    return {
+      content:
+        n === 0
+          ? '🧹 Nothing to prune — no dormant session records.'
+          : `🧹 Pruned ${n} dormant session record${n === 1 ? '' : 's'}.`,
+    };
+  }
   if (isType(envelope, 'session.output')) {
     // Raw stdout is far too high-volume to DM; milestones/summaries/errors are worth it.
     if (envelope.payload.kind === 'stdout') return undefined;

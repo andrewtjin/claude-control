@@ -196,3 +196,81 @@ describe('session.stop', () => {
     expect(parsed.success).toBe(true);
   });
 });
+
+describe('session.prune / session.prune.result', () => {
+  it('both are registered message types', () => {
+    expect(isMessageType('session.prune')).toBe(true);
+    expect(isMessageType('session.prune.result')).toBe(true);
+  });
+
+  it('round-trips a prune command', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      discordUserId: 'user-1',
+      type: 'session.prune',
+      payload: { requestId: 'req-1', idempotencyKey: 'idem-1' },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.prune')) {
+      expect(result.envelope.payload.requestId).toBe('req-1');
+      expect(result.envelope.payload.idempotencyKey).toBe('idem-1');
+    }
+  });
+
+  it('rejects a prune without an idempotencyKey — every mutating command must dedupe', () => {
+    const result = decode(rawFrame('session.prune', { requestId: 'req-1' }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/idempotencyKey/);
+  });
+
+  it('round-trips a result carrying the pruned ids', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'session.prune.result',
+      payload: { requestId: 'req-1', ok: true, prunedSessionIds: ['sess-1', 'sess-2'] },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.prune.result')) {
+      expect(result.envelope.payload.prunedSessionIds).toEqual(['sess-1', 'sess-2']);
+    }
+  });
+
+  it('a failed result carries an error and no pruned ids', () => {
+    const result = decode(
+      rawFrame('session.prune.result', {
+        requestId: 'req-1',
+        ok: false,
+        prunedSessionIds: [],
+        error: 'registry unreadable',
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.prune.result')) {
+      expect(result.envelope.payload.ok).toBe(false);
+      expect(result.envelope.payload.error).toBe('registry unreadable');
+    }
+  });
+
+  it('both are part of the Envelope union, not just the schema map', () => {
+    const prune = Envelope.safeParse({
+      v: PROTOCOL_VERSION,
+      id: 'msg-1',
+      ts: 1,
+      daemonId: 'daemon-1',
+      type: 'session.prune',
+      payload: { requestId: 'req-1', idempotencyKey: 'idem-1' },
+    });
+    expect(prune.success).toBe(true);
+    const pruneResult = Envelope.safeParse({
+      v: PROTOCOL_VERSION,
+      id: 'msg-2',
+      ts: 1,
+      daemonId: 'daemon-1',
+      type: 'session.prune.result',
+      payload: { requestId: 'req-1', ok: true, prunedSessionIds: [] },
+    });
+    expect(pruneResult.success).toBe(true);
+  });
+});
