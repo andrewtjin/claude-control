@@ -58,11 +58,15 @@ export {
 
 export {
   installHooks,
+  uninstallHooks,
   buildDaemonHookSpecs,
   type HookCommandSpec,
   type InstallHooksOptions,
+  type UninstallHooksOptions,
   type BuildDaemonHookSpecsOptions,
 } from './hookInstaller.js';
+
+export { loadOrCreateHookSecret } from './hookSecret.js';
 
 export {
   AutoSwitcher,
