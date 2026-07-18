@@ -9,6 +9,19 @@ own accounts. A single **shared Discord bot** acts as a credential-free control
 plane: it holds no tokens and never sees session content, routing every interaction
 strictly by Discord user. Your credentials never leave your machine.
 
+## Quick start
+
+```
+npm i -g @claude-control/cctl
+cctl setup
+```
+
+That's it — `cctl setup` walks you through accounts, hooks, Discord pairing, and
+autostart. See `docs/SETUP.md` for the full walkthrough.
+
+If `cctl` isn't found after install, your npm global bin directory isn't on `PATH`;
+run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
+
 ## What it does
 
 - **Auto-switch.** At low remaining 5h usage, you'll switch sessions to maximize uptime. Or, switch on phone with one tap.
@@ -19,68 +32,19 @@ strictly by Discord user. Your credentials never leave your machine.
 - **Approve from anywhere.** permission prompts and "done / waiting" notices reach
   your phone; approve or deny from Discord.
 
-## Packages
-
-| Package                             | Role                                                                                         |
-| ----------------------------------- | -------------------------------------------------------------------------------------------- |
-| `@claude-control/shared-protocol`   | Wire contract (zod-validated envelope + message types). The only package the bot may import. |
-| `@claude-control/switch-engine`     | Account vault, OAuth refresh, atomic activation, crash recovery.                             |
-| `@claude-control/session-runtime`   | Managed (Agent SDK) and observed (ConPTY) sessions.                                          |
-| `@claude-control/daemon`            | Usage poller, attribution journal, session manager, hook receiver, control-plane client.     |
-| `@claude-control/control-plane-bot` | Discord bot + WebSocket relay; holds zero credentials.                                       |
-| `@claude-control/cli`               | `cctl` — the local command-line interface.                                                   |
-
-## Quick start
-
-```bash
-pnpm install
-pnpm run build
-pnpm run test
-```
-
-The CLI is available as `cctl` once built (`pnpm --filter @claude-control/cli build`,
-then `node packages/cli/dist/bin.js --help`).
-
-## CLI
-
-`cctl` runs local, one-shot commands over the switch engine and the daemon's data:
-
-```
-cctl accounts add <label>   # capture the currently logged-in account
-cctl accounts list          # list stored accounts (active marked with *)
-cctl switch <id|label>      # activate an account
-cctl usage                  # cross-account usage from the daemon's latest poll
-cctl recover                # recover from an interrupted switch
-cctl doctor                 # check the local environment (DPAPI, vault, login)
-```
-
-Remote control (`pair`, `run`, and the background `daemon`) needs the running daemon
-connected to the hosted bot — an on-machine step described in `docs/VERIFICATION.md`.
-
-## Status
-
-Pre-release. All seven packages are implemented and unit-tested (300+ tests), and the
-whole workspace builds, lints, and passes clean. An adversarial security pass on the
-control plane and daemon has been run and its findings fixed. Live integration surfaces
-— real account switching, the Anthropic usage endpoint, Discord connectivity, the CLI
-hook names, and ConPTY-observed sessions — are gated behind on-machine (wet)
-verification; each is enumerated with exact steps in `docs/VERIFICATION.md`.
-
 ## Platform
 
-**Windows-only today.** The implementation is platform-dependent in two load-bearing
-places:
+**Windows-only today** (macOS is a planned next milestone). See `docs/PLATFORM.md`
+for the details and `cctl doctor` for a live report on your machine.
 
-- **Credential vault encryption** uses Windows DPAPI (via PowerShell
-  `ProtectedData`, CurrentUser scope) — there is no macOS/Linux equivalent wired in
-  yet, so the vault cannot protect tokens off Windows.
-- **Observed sessions** (a later milestone) target ConPTY, the Windows
-  pseudo-console.
+## Docs
 
-Everything else (daemon, bot, CLI, usage polling) is portable Node ≥ 22.5.
-macOS support (Keychain-backed vault) is the next planned milestone; Linux
-(libsecret) after that. On an unsupported platform, `cctl doctor` reports the gap
-instead of failing silently.
+- `docs/SETUP.md` — full `cctl setup` walkthrough, every step and unhappy path.
+- `docs/CLI.md` — complete command reference, plus building from source.
+- `docs/ARCHITECTURE.md` — system shape, package boundaries, trust model.
+- `docs/PLATFORM.md` — Windows-only caveats and the Node version floor.
+- `docs/SELF_HOST.md` — run your own control-plane bot instead of the shared one.
+- `docs/VERIFICATION.md` — what's unit-proven vs. what needs on-machine confirmation.
 
 ## License
 
