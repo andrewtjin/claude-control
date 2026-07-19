@@ -29,8 +29,16 @@ interface RunResult {
 }
 
 /** Spawn the forwarder the way Claude Code's hook runner does: payload on stdin, answer on
- *  stdout. The secret header travels as the single `--secret-header` argument. */
-function runForwarder(scriptPath: string, payload: string, args?: string[]): Promise<RunResult> {
+ *  stdout. The secret header travels as the single `--secret-header` argument. `beforeEnd`
+ *  runs between writing the payload and closing stdin — the script reads its endpoint file
+ *  at startup but only dials once stdin ends, so holding stdin open is a deterministic way
+ *  to interleave work (e.g. rewriting the endpoint file) between those two moments. */
+function runForwarder(
+  scriptPath: string,
+  payload: string,
+  args?: string[],
+  beforeEnd?: () => Promise<void>,
+): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [
       scriptPath,
@@ -45,7 +53,11 @@ function runForwarder(scriptPath: string, payload: string, args?: string[]): Pro
     child.stdin.on('error', () => {});
     child.on('error', reject);
     child.on('close', (code) => resolve({ code, stdout, stderr }));
-    child.stdin.end(payload);
+    child.stdin.write(payload);
+    void (beforeEnd ? beforeEnd() : Promise.resolve()).then(
+      () => child.stdin.end(),
+      (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))),
+    );
   });
 }
 
@@ -192,6 +204,40 @@ describe('hook forwarder script', () => {
     expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
     expect(existsSync(hookEndpointPath(dataDir))).toBe(false);
   }, 15_000);
+
+  it('never deletes an endpoint file re-published after the failed port was read (restart race)', async () => {
+    // The live incident: a forwarder reads port A, the daemon restarts and publishes port B,
+    // the forwarder's connect to A fails and its cleanup unlinks the file — hiding the new,
+    // healthy daemon from every later hook. The guard re-reads the file at failure time and
+    // deletes only if it still names the failed port.
+    const { server: deadServer, port: deadPort } = await startServer('unused');
+    await new Promise<void>((resolve) => deadServer.close(() => resolve()));
+    const { server: liveServer, port: livePort } = await startServer('{"ok":true}');
+    try {
+      await writeHookEndpoint(hookEndpointPath(dataDir), { port: deadPort });
+      // The script reads the file during startup and only dials on stdin end — holding stdin
+      // open lets the "daemon restart" (file rewrite) land deterministically in between. If a
+      // slow spawn makes the rewrite land BEFORE the startup read, the forwarder just talks
+      // to the live port instead: a fire-and-forget payload makes every assertion below hold
+      // on either interleave (exit 0, empty stdout, file preserved with the new port).
+      const result = await runForwarder(
+        scriptPath,
+        '{"hook_event_name":"PostToolUse"}',
+        undefined,
+        async () => {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          await writeHookEndpoint(hookEndpointPath(dataDir), { port: livePort });
+        },
+      );
+      expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+      const preserved = JSON.parse(await readFile(hookEndpointPath(dataDir), 'utf8')) as {
+        port: number;
+      };
+      expect(preserved.port).toBe(livePort);
+    } finally {
+      liveServer.close();
+    }
+  }, 20_000);
 
   it('a corrupt endpoint file behaves like no daemon — exit 0, no crash', async () => {
     await writeFile(hookEndpointPath(dataDir), '{not json', 'utf8');

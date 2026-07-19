@@ -13,7 +13,11 @@
 //     network at all — the only cost is process startup.
 //   - Endpoint file present but nothing listening (crash leftover): one connect attempt to
 //     127.0.0.1 bounded by a short CONNECT-ONLY timeout, then the stale endpoint file is
-//     removed so every later event takes the no-network fast path. Exit 0.
+//     removed so every later event takes the no-network fast path. Exit 0. The removal is
+//     GUARDED: the file is re-read at failure time and deleted only if it still names the
+//     port that failed — a daemon restarting mid-flight re-publishes the file for its new
+//     port, and an unguarded unlink would hide that healthy receiver from every later hook
+//     (live-observed; the daemon's periodic re-publish is the second layer of defense).
 //   - Connected: what happens next depends on WHETHER THE EVENT'S RESPONSE CARRIES ANYTHING.
 //     PermissionRequest answers are long-poll decisions and Stop answers deliver operator
 //     steering ({"decision":"block","reason":…}), so those two ride the response with NO
@@ -133,9 +137,14 @@ process.stdin.on('end', () => {
     clearTimeout(connectTimer);
     if (!connected) {
       // Nothing listening behind a published endpoint: crash leftover. Drop the
-      // stale file so later events skip straight to the no-network fast path.
+      // stale file so later events skip straight to the no-network fast path —
+      // but ONLY if it still names the port that just failed. A daemon restart
+      // between our startup read and this failure re-publishes the file for the
+      // NEW receiver; deleting that would hide a healthy daemon from every
+      // later hook (live-observed). Unreadable/changed file: leave it alone.
       try {
-        fs.unlinkSync(endpointFile);
+        const current = JSON.parse(fs.readFileSync(endpointFile, 'utf8'));
+        if (current.port === port) fs.unlinkSync(endpointFile);
       } catch {}
     }
     bail();

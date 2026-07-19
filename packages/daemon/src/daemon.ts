@@ -87,6 +87,11 @@ export interface DaemonOptions {
    *  `cctl session register/label/watch` can't reach the daemon (they degrade to a clear "start
    *  the daemon" message), but nothing else the daemon does depends on it. */
   publishHookEndpoint?: (port: number) => Promise<void>;
+  /** Cadence for RE-publishing the endpoint (default 60s). The file can be deleted out from
+   *  under a running daemon — a stale-port forwarder's cleanup can race a restart — and a
+   *  missing file makes every hook take the silent no-daemon fast path; the heartbeat bounds
+   *  that outage to one interval. Injectable so tests can prove the re-publish quickly. */
+  endpointRepublishMs?: number;
   /** Injectable clock (house convention: no fake timers). Only used for the quarantine-notice
    *  debounce; defaults to `Date.now`. */
   clock?: () => number;
@@ -147,6 +152,10 @@ const MAX_SEEN_SESSION_CMD_KEYS = 512;
  *  session-runtime's own 'managed'/'observed' kinds (the Store column is free-form text; see
  *  store.ts's decision note). These rows exist only for `cctl session status`. */
 const INTERACTIVE_SESSION_KIND = 'interactive';
+
+/** Endpoint re-publish heartbeat (see DaemonOptions.endpointRepublishMs): bounds how long a
+ *  deleted endpoint file can hide a running daemon from its hooks. */
+const DEFAULT_ENDPOINT_REPUBLISH_MS = 60_000;
 
 /** A registered interactive session, as mirrored (display-only) into the Store `sessions`
  *  table's `json` column. Deliberately coarse: `state` is a single 'active' value — this commit
@@ -223,6 +232,8 @@ export class Daemon {
   private readonly createAgentSdkClient: () => AgentSdkClient;
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
   private readonly publishHookEndpoint: ((port: number) => Promise<void>) | undefined;
+  private readonly endpointRepublishMs: number;
+  private endpointRepublishTimer: ReturnType<typeof setInterval> | undefined;
   private readonly clock: () => number;
   private readonly quarantineNoticeDebounceMs: number;
   private readonly stopGraceMs: number | undefined;
@@ -285,6 +296,7 @@ export class Daemon {
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
     this.installHooks = options.installHooks;
     this.publishHookEndpoint = options.publishHookEndpoint;
+    this.endpointRepublishMs = options.endpointRepublishMs ?? DEFAULT_ENDPOINT_REPUBLISH_MS;
     this.clock = options.clock ?? Date.now;
     this.quarantineNoticeDebounceMs =
       options.quarantineNoticeDebounceMs ?? DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS;
@@ -332,8 +344,18 @@ export class Daemon {
 
     // Publish the bound loopback port so `cctl session register|label|watch` can find us. Like
     // hook self-heal below, this is additive and fail-open: a publish failure only degrades the
-    // CLI-command surface, never the daemon's own liveness.
+    // CLI-command surface, never the daemon's own liveness. Re-published on a heartbeat: the
+    // file is this daemon's ONLY discoverability, and it can be deleted while we run (a
+    // stale-port forwarder's cleanup racing a restart, an operator mistake) — without the
+    // heartbeat that leaves a healthy, listening daemon no hook can find until the next start.
     if (this.publishHookEndpoint) {
+      const republish = this.publishHookEndpoint;
+      this.endpointRepublishTimer = setInterval(() => {
+        republish(hookPort).catch((err: unknown) => {
+          this.logger.warn({ err }, 'hook endpoint re-publish failed; retrying next heartbeat');
+        });
+      }, this.endpointRepublishMs);
+      this.endpointRepublishTimer.unref();
       try {
         await this.publishHookEndpoint(hookPort);
       } catch (err) {
@@ -424,6 +446,8 @@ export class Daemon {
     this.started = false;
     this.stopLoopLagMonitor?.();
     this.stopLoopLagMonitor = undefined;
+    if (this.endpointRepublishTimer) clearInterval(this.endpointRepublishTimer);
+    this.endpointRepublishTimer = undefined;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = undefined;
     this.controlPlaneClient.close();

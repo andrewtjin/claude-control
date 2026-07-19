@@ -1484,6 +1484,30 @@ describe('Daemon lifecycle', () => {
     expect(port).toBeGreaterThan(0);
   });
 
+  it('re-publishes the hook endpoint on a heartbeat, so a deleted endpoint file self-heals', async () => {
+    const publishes: number[] = [];
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      publishHookEndpoint: (port) => {
+        publishes.push(port);
+        return Promise.resolve();
+      },
+      endpointRepublishMs: 25,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+    // One initial publish plus heartbeat re-publishes, all naming the same bound port.
+    await waitFor(() => publishes.length >= 3);
+    expect(new Set(publishes).size).toBe(1);
+  });
+
   it('GET /healthz answers ok without a secret — the supervision liveness probe', async () => {
     const hookPort = await startCapturingHookPort();
     const res = await fetch(`http://127.0.0.1:${hookPort}/healthz`);
