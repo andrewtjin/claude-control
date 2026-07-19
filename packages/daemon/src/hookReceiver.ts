@@ -114,6 +114,9 @@ export interface ResolvePermissionResult {
  *  idempotency key so a re-sent request (a network retry, a double-invoked slash command)
  *  resolves to "already handled" instead of applying twice. */
 export interface SessionCommandBase {
+  /** The target interactive session, as an id or (for label/watch/unregister only) a registered
+   *  label — the daemon resolves it. `register` never resolves labels here: its sessionId is
+   *  what CREATES the row, so it must be the real Claude session id. */
   sessionId: string;
   idempotencyKey: string;
 }
@@ -147,15 +150,16 @@ export interface TrackedSessionView {
  *  nothing — distinct from `already_handled` because it happens across separate deliberate
  *  invocations (fresh keys), and the user asked whether it took, not to take it again. A
  *  failure names a machine-stable `code` the transport maps to a 4xx — `unknown_session` (a
- *  label/watch/unregister against a session that was never registered) becomes 404, never a
- *  crash. */
+ *  label/watch/unregister against a session that was never registered) becomes 404;
+ *  `ambiguous_label` (a label ref that matches more than one registered session) becomes 409 —
+ *  never a crash, and never a guess at which session was meant. */
 export type SessionCommandResult =
   | {
       ok: true;
       status: 'applied' | 'already_handled' | 'already_registered';
       session: TrackedSessionView;
     }
-  | { ok: false; code: 'unknown_session'; message: string };
+  | { ok: false; code: 'unknown_session' | 'ambiguous_label'; message: string };
 
 /** The session-command logic the daemon installs via {@link HookReceiver.setCliHandlers}. Async
  *  because registration reads the switch engine (for the active-account attribution tag). */
@@ -627,15 +631,24 @@ export class HookReceiver {
   }
 
   /** Map a {@link SessionCommandResult} onto an HTTP response: success → 200 (with the echoed
-   *  view), `unknown_session` → 404 with a useful body. The full result object is the body
+   *  view), `unknown_session` → 404, `ambiguous_label` → 409. The full result object is the body
    *  either way, so the CLI can print `status`/`session` or `code`/`message` without guessing. */
   private respondSessionCommand(res: ServerResponse, result: SessionCommandResult): void {
     if (result.ok) {
       this.respond(res, 200, result);
       return;
     }
-    // Only one failure code today; a switch keeps the mapping honest if more are added.
-    const status = result.code === 'unknown_session' ? 404 : 400;
+    // A real switch — not a fallback default — so a new failure code added later must be
+    // mapped deliberately instead of silently landing on some other status.
+    let status: number;
+    switch (result.code) {
+      case 'unknown_session':
+        status = 404;
+        break;
+      case 'ambiguous_label':
+        status = 409;
+        break;
+    }
     this.respond(res, status, result);
   }
 

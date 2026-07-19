@@ -525,7 +525,9 @@ export class DiscordJsGateway implements DiscordGateway {
       new SlashCommandBuilder()
         .setName('say')
         .setDescription('Send a message into a running session')
-        .addStringOption((o) => o.setName('session').setDescription('Session id').setRequired(true))
+        .addStringOption((o) =>
+          o.setName('session').setDescription('Session id or label').setRequired(true),
+        )
         .addStringOption((o) => o.setName('text').setDescription('Message').setRequired(true)),
       new SlashCommandBuilder()
         .setName('stop')

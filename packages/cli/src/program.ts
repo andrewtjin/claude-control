@@ -467,6 +467,11 @@ function buildSessionCommands(program: Command): void {
   const sessionIdOption = '--session <id>';
   const sessionIdHelp =
     'session id (Claude Code does not reliably expose it to slash commands — pass it explicitly)';
+  // label/watch/unregister run daemon-side against a session already known to the registry, so
+  // (unlike register, which CREATES the row and must get the real id) they can also take that
+  // session's label — the daemon resolves it, preferring an exact id match if both match.
+  const sessionIdOrLabelHelp =
+    'session id, or the label of a registered session (id wins if both match)';
 
   session
     .command('register')
@@ -482,7 +487,7 @@ function buildSessionCommands(program: Command): void {
   session
     .command('label <name>')
     .description('name the current tracked session (shown in the phone session list)')
-    .option(sessionIdOption, sessionIdHelp)
+    .option(sessionIdOption, sessionIdOrLabelHelp)
     .action(async (name: string, opts: { session?: string }) => {
       await runSessionCommand('label', opts, { label: name });
     });
@@ -490,7 +495,7 @@ function buildSessionCommands(program: Command): void {
   session
     .command('watch')
     .description('stream this session to Discord (use --off to stop streaming it)')
-    .option(sessionIdOption, sessionIdHelp)
+    .option(sessionIdOption, sessionIdOrLabelHelp)
     .option('--off', 'turn per-session streaming OFF (default is on)')
     .action(async (opts: { session?: string; off?: boolean }) => {
       await runSessionCommand('watch', opts, { watch: !opts.off });
@@ -499,9 +504,17 @@ function buildSessionCommands(program: Command): void {
   session
     .command('unregister')
     .description("remove a session from the daemon's tracking (undo register, e.g. a mistyped id)")
-    .option(sessionIdOption, sessionIdHelp)
-    .action(async (opts: { session?: string }) => {
-      await runSessionCommand('unregister', opts, {});
+    .option(sessionIdOption, sessionIdOrLabelHelp)
+    .option('--label <label>', 'remove by registered label instead of id')
+    .action(async (opts: { session?: string; label?: string }) => {
+      if (opts.session !== undefined && opts.label !== undefined) {
+        fail('pass one of --session or --label, not both');
+      }
+      // Routing the label through the SAME `session` field (rather than a separate ref param)
+      // bypasses runSessionCommand's env-var fallback: an explicit --label must always win, the
+      // way an explicit --session already does.
+      const ref = opts.label !== undefined ? { session: opts.label } : opts;
+      await runSessionCommand('unregister', ref, {});
     });
 
   session

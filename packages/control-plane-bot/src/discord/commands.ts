@@ -152,7 +152,9 @@ export function handleRun(
     : { kind: 'error', message: result.error };
 }
 
-/** `/say <sessionId> <text>` — inject a message into a running session. */
+/** `/say <sessionId|label> <text>` — inject a message into a running session. `sessionId` is
+ *  passed through verbatim; a registered session's label resolves to its real id daemon-side
+ *  (Daemon.resolveInteractiveRef), so the bot itself stays oblivious to the distinction. */
 export function handleSay(
   deps: CommandDeps,
   discordUserId: string,

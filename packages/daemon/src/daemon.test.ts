@@ -1662,6 +1662,162 @@ describe('Daemon lifecycle', () => {
     expect(res.status).toBe(404);
     expect(store.getSession('managed-1')).toBeDefined();
   });
+
+  // ---- label refs: label/watch/unregister (and prompt.inject) may address a session by its
+  // registered label instead of its id — the daemon resolves it (resolveInteractiveRef). ----
+
+  it('unregister by label removes the row and echoes the real session id', async () => {
+    seedTerminalSession('term-by-label', 'demo-label');
+    const hookPort = await startCapturingHookPort();
+
+    const res = await postCli(hookPort, 'unregister', {
+      sessionId: 'demo-label',
+      idempotencyKey: 'ul-1',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      ok: true,
+      status: 'applied',
+      session: { id: 'term-by-label' },
+    });
+    expect(store.getSession('term-by-label')).toBeUndefined();
+  });
+
+  it('watch/label by label ref apply to the right row', async () => {
+    seedTerminalSession('term-a', 'alpha-label');
+    seedTerminalSession('term-b', 'beta-label');
+    const hookPort = await startCapturingHookPort();
+
+    await postCli(hookPort, 'watch', {
+      sessionId: 'beta-label',
+      idempotencyKey: 'wl-1',
+      watch: false,
+    });
+    await postCli(hookPort, 'label', {
+      sessionId: 'alpha-label',
+      idempotencyKey: 'll-1',
+      label: 'renamed-alpha',
+    });
+
+    const a = JSON.parse(store.getSession('term-a')!.json) as { label: string; watch: boolean };
+    const b = JSON.parse(store.getSession('term-b')!.json) as { label: string; watch: boolean };
+    // Each command only touched the row its OWN label named — a shared resolver is not license
+    // to blur which row a command acts on.
+    expect(a).toMatchObject({ label: 'renamed-alpha', watch: true });
+    expect(b).toMatchObject({ label: 'beta-label', watch: false });
+  });
+
+  it('an ambiguous label is refused with 409 naming both matching ids, rows untouched', async () => {
+    seedTerminalSession('term-dup-1', 'dup');
+    seedTerminalSession('term-dup-2', 'dup');
+    const hookPort = await startCapturingHookPort();
+    const before1 = store.getSession('term-dup-1');
+    const before2 = store.getSession('term-dup-2');
+
+    const res = await postCli(hookPort, 'label', {
+      sessionId: 'dup',
+      idempotencyKey: 'amb-1',
+      label: 'x',
+    });
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ ok: false, code: 'ambiguous_label' });
+    const message = res.body?.message as string | undefined;
+    expect(message).toContain('term-dup-1');
+    expect(message).toContain('term-dup-2');
+    expect(store.getSession('term-dup-1')).toEqual(before1);
+    expect(store.getSession('term-dup-2')).toEqual(before2);
+  });
+
+  it('an id ref wins outright over a session labeled with that same string', async () => {
+    seedTerminalSession('alpha');
+    seedTerminalSession('term-other', 'alpha');
+    const hookPort = await startCapturingHookPort();
+
+    const res = await postCli(hookPort, 'label', {
+      sessionId: 'alpha',
+      idempotencyKey: 'idwin-1',
+      label: 'renamed',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, session: { id: 'alpha', label: 'renamed' } });
+    // The session merely LABELED 'alpha' never entered the resolution — its own label is untouched.
+    const other = JSON.parse(store.getSession('term-other')!.json) as { label: string };
+    expect(other.label).toBe('alpha');
+  });
+
+  it('register never resolves labels: a sessionId equal to an existing label creates a new row', async () => {
+    seedTerminalSession('term-labeled', 'taken-label');
+    const hookPort = await startCapturingHookPort();
+
+    const res = await postCli(hookPort, 'register', {
+      sessionId: 'taken-label',
+      idempotencyKey: 'reg-label-1',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      ok: true,
+      status: 'applied',
+      session: { id: 'taken-label' },
+    });
+    // A brand-new row keyed on the literal string 'taken-label' — the session that happens to be
+    // LABELED that string is a completely separate row, untouched.
+    expect(store.getSession('taken-label')).toBeDefined();
+    const untouched = JSON.parse(store.getSession('term-labeled')!.json) as { label: string };
+    expect(untouched.label).toBe('taken-label');
+  });
+
+  it('prompt.inject by label queues steering under the REAL session id', async () => {
+    seedTerminalSession('term-lab-1', 'wet');
+    const hookPort = await startCapturingHookPort();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'wet', text: 'steer by label', idempotencyKey: 'lbl-1' },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    );
+    const card = relay.received.find((e) => e.type === 'hook.notification');
+    if (card?.type === 'hook.notification') {
+      // Queued under the REAL id, not the label the operator typed — otherwise the Stop hook
+      // below (which only ever knows the real id) could never find the queue.
+      expect(card.payload.sessionId).toBe('term-lab-1');
+    }
+    expect(relay.received.some((e) => e.type === 'error')).toBe(false);
+
+    const answer = await postHook(hookPort, { hook_event_name: 'Stop', session_id: 'term-lab-1' });
+    expect(answer).toEqual({ decision: 'block', reason: 'steer by label' });
+  });
+
+  it('prompt.inject with an ambiguous label answers an error envelope and queues nothing', async () => {
+    seedTerminalSession('term-dup-a', 'dup');
+    seedTerminalSession('term-dup-b', 'dup');
+    const hookPort = await startCapturingHookPort();
+    const frame = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'dup', text: 'who gets this?', idempotencyKey: 'amb-inj-1' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const error = relay.received.find((e) => e.type === 'error');
+    if (error?.type === 'error') {
+      expect(error.payload.code).toBe('ambiguous_label');
+      expect(error.payload.relatesTo).toBe(frame.id);
+    }
+    expect(
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    ).toBe(false);
+
+    // Neither candidate got anything queued — both answer a plain, un-steered stop.
+    const answerA = await postHook(hookPort, { hook_event_name: 'Stop', session_id: 'term-dup-a' });
+    const answerB = await postHook(hookPort, { hook_event_name: 'Stop', session_id: 'term-dup-b' });
+    expect(answerA).toEqual({ ok: true });
+    expect(answerB).toEqual({ ok: true });
+  });
 });
 
 // The edge-detection + debounce logic is pure, so it is proven here directly rather than by

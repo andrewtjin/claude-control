@@ -38,6 +38,16 @@ describe('buildProgram', () => {
     }
   });
 
+  it('offers --label on unregister as an alternative to --session', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const unregister = session?.commands.find((c) => c.name() === 'unregister');
+    expect(unregister?.options.map((o) => o.long)).toContain('--label');
+    // register already has its own --label (set at registration time) — unregister's is a
+    // distinct alternative-ref flag, not a naming collision to worry about across commands.
+    const register = session?.commands.find((c) => c.name() === 'register');
+    expect(register?.options.map((o) => o.long)).toContain('--label');
+  });
+
   it('offers the --fresh capture flag on accounts add', () => {
     const accounts = buildProgram().commands.find((c) => c.name() === 'accounts');
     const add = accounts?.commands.find((c) => c.name() === 'add');

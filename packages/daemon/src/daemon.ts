@@ -194,6 +194,15 @@ interface QueuedSteering {
   queuedAtMs: number;
 }
 
+/** Outcome of resolving a label/watch/unregister ref (or a prompt.inject sessionId) against the
+ *  interactive registry — see {@link Daemon.resolveInteractiveRef}. A distinct 'ambiguous'
+ *  outcome (rather than just picking the first match) is the whole point: a label collision
+ *  must never let the daemon guess which session the operator meant. */
+type InteractiveRefResolution =
+  | { outcome: 'resolved'; tracked: TrackedInteractiveSession }
+  | { outcome: 'ambiguous'; matches: TrackedInteractiveSession[] }
+  | { outcome: 'none' };
+
 /** Pure view mapper: the compact shape echoed back to the CLI on a command. */
 function interactiveView(t: TrackedInteractiveSession): TrackedSessionView {
   return {
@@ -664,10 +673,25 @@ export class Daemon {
 
     // A REGISTERED terminal session has no direct input channel (the daemon cannot type into
     // another process's terminal), but it does have a turn boundary: queue the text and
-    // deliver it as the session's next Stop-hook answer. See queueSteering.
-    const tracked = this.readInteractiveSession(sessionId);
-    if (tracked !== undefined) {
-      this.queueSteering(msg, tracked);
+    // deliver it as the session's next Stop-hook answer. See queueSteering. The ref may be the
+    // real id or a registered label — resolveInteractiveRef covers both, same as label/watch/
+    // unregister.
+    const resolution = this.resolveInteractiveRef(sessionId);
+    if (resolution.outcome === 'resolved') {
+      this.queueSteering(msg, resolution.tracked);
+      return;
+    }
+    if (resolution.outcome === 'ambiguous') {
+      // Mirrors answerPromptInjectRefusal's shape: every refusal ANSWERS the phone, since the
+      // bot already acked the /say optimistically when the relay accepted the frame.
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'ambiguous_label',
+          message: this.ambiguousLabelMessage(sessionId, resolution.matches),
+          relatesTo: msg.id,
+        },
+      });
       return;
     }
 
@@ -745,9 +769,15 @@ export class Daemon {
    * reflected in the card copy: delivery happens only at a turn boundary — a session that is
    * sitting idle hears nothing until it next finishes a turn — and a bounded queue + TTL keep
    * a closed window from accumulating stale guidance forever.
+   *
+   * Keyed on `tracked.id`, NEVER on `msg.payload.sessionId`: the caller may have addressed this
+   * session by its registered label, but the Stop hook that eventually asks for the queue
+   * (takePendingSteering) always carries the session's real id — queuing under the label would
+   * make delivery unreachable.
    */
   private queueSteering(msg: MessageOf<'prompt.inject'>, tracked: TrackedInteractiveSession): void {
-    const { sessionId, text } = msg.payload;
+    const { text } = msg.payload;
+    const sessionId = tracked.id;
     const queue = this.pendingSteering.get(sessionId) ?? [];
     if (queue.length >= STEERING_QUEUE_CAP) {
       this.sendEnvelope({
@@ -1123,6 +1153,10 @@ export class Daemon {
   //   - watch:      set the per-session streaming opt-in on a REGISTERED session (404 otherwise).
   //   - unregister: drop a REGISTERED session from tracking (404 otherwise) — the undo for
   //     register, including registrations made with a mistyped id.
+  // label/watch/unregister (and prompt.inject) accept EITHER the real session id or a registered
+  // label as their ref — see resolveInteractiveRef. A label matching more than one session is
+  // 409 'ambiguous_label', never a guess. register never resolves labels: its sessionId is what
+  // CREATES the row, so it must be the real Claude session id.
   // The watch flag is RECORDED as the control surface; enforcing it (filtering the unconditional
   // hook stream) is deferred so it cannot regress live cards — see watchSession.
 
@@ -1181,8 +1215,62 @@ export class Daemon {
     return { ok: true, status: 'applied', session: interactiveView(tracked) };
   }
 
+  /**
+   * Resolve a label/watch/unregister ref (also used for prompt.inject's sessionId) against the
+   * interactive registry. An exact id match wins outright — a label can never shadow a real id,
+   * so this checks {@link readInteractiveSession} FIRST and only falls back to a label scan when
+   * that misses. The scan is case-sensitive exact match against every interactive row (corrupt
+   * rows are skipped, never fatal — same tolerance as readInteractiveSession). Zero label
+   * matches is 'none' (the caller's existing not-registered path); more than one is 'ambiguous'
+   * (never guess which session the operator meant); exactly one is 'resolved'. Register is
+   * deliberately NOT a caller of this — its sessionId creates the row and must be the real id.
+   */
+  private resolveInteractiveRef(ref: string): InteractiveRefResolution {
+    const byId = this.readInteractiveSession(ref);
+    if (byId !== undefined) return { outcome: 'resolved', tracked: byId };
+
+    const matches: TrackedInteractiveSession[] = [];
+    for (const row of this.store.listSessions()) {
+      if (row.kind !== INTERACTIVE_SESSION_KIND) continue;
+      let parsed: TrackedInteractiveSession;
+      try {
+        parsed = JSON.parse(row.json) as TrackedInteractiveSession;
+      } catch {
+        continue;
+      }
+      if (parsed.label === ref) matches.push(parsed);
+    }
+    // Destructuring (rather than indexing matches[0]) keeps this correct under
+    // noUncheckedIndexedAccess without an unreachable branch.
+    const [tracked, ...rest] = matches;
+    if (tracked === undefined) return { outcome: 'none' };
+    if (rest.length > 0) return { outcome: 'ambiguous', matches };
+    return { outcome: 'resolved', tracked };
+  }
+
+  /** The shared "which sessions did that label match" wording for {@link resolveInteractiveRef}'s
+   *  ambiguous outcome — used identically by the CLI-command failure result and the
+   *  prompt.inject error envelope, so an operator sees the same explanation either way. */
+  private ambiguousLabelMessage(ref: string, matches: TrackedInteractiveSession[]): string {
+    const ids = matches.map((m) => m.id).join(', ');
+    return `label '${ref}' matches ${matches.length} sessions: ${ids} — use the session id`;
+  }
+
+  /** The `ambiguous_label` failure shape for label/watch/unregister. */
+  private ambiguousLabelResult(
+    ref: string,
+    matches: TrackedInteractiveSession[],
+  ): SessionCommandResult {
+    return {
+      ok: false,
+      code: 'ambiguous_label',
+      message: this.ambiguousLabelMessage(ref, matches),
+    };
+  }
+
   /** Name a registered interactive session. 404 (`unknown_session`) if it was never registered
-   *  — register is the deliberate gateway, which also gives the CLI a clean, testable failure. */
+   *  — register is the deliberate gateway, which also gives the CLI a clean, testable failure.
+   *  `input.sessionId` may be the real id or a registered label — see resolveInteractiveRef. */
   private labelSession(input: SessionLabelInput): SessionCommandResult {
     if (this.seenSessionCmdKeys.has(input.idempotencyKey)) {
       const current = this.readInteractiveSession(input.sessionId);
@@ -1192,10 +1280,13 @@ export class Daemon {
         session: current ? interactiveView(current) : minimalInteractiveView(input.sessionId),
       };
     }
-    const existing = this.readInteractiveSession(input.sessionId);
-    if (!existing) return this.notRegistered(input.sessionId);
+    const resolution = this.resolveInteractiveRef(input.sessionId);
+    if (resolution.outcome === 'ambiguous') {
+      return this.ambiguousLabelResult(input.sessionId, resolution.matches);
+    }
+    if (resolution.outcome === 'none') return this.notRegistered(input.sessionId);
     const tracked: TrackedInteractiveSession = {
-      ...existing,
+      ...resolution.tracked,
       label: input.label,
       updatedAtMs: this.clock(),
     };
@@ -1211,7 +1302,8 @@ export class Daemon {
    * hook auto-registering sessions, then streaming only watched ones) comes later.
    * Gating here now would silence cards for every not-yet-registered session — a regression.
    * So this ships the control surface (persisted + shown in `cctl session status`) that
-   * the future filter will consult, without changing what streams today. 404 if not registered. */
+   * the future filter will consult, without changing what streams today. 404 if not registered.
+   * `input.sessionId` may be the real id or a registered label — see resolveInteractiveRef. */
   private watchSession(input: SessionWatchInput): SessionCommandResult {
     if (this.seenSessionCmdKeys.has(input.idempotencyKey)) {
       const current = this.readInteractiveSession(input.sessionId);
@@ -1221,10 +1313,13 @@ export class Daemon {
         session: current ? interactiveView(current) : minimalInteractiveView(input.sessionId),
       };
     }
-    const existing = this.readInteractiveSession(input.sessionId);
-    if (!existing) return this.notRegistered(input.sessionId);
+    const resolution = this.resolveInteractiveRef(input.sessionId);
+    if (resolution.outcome === 'ambiguous') {
+      return this.ambiguousLabelResult(input.sessionId, resolution.matches);
+    }
+    if (resolution.outcome === 'none') return this.notRegistered(input.sessionId);
     const tracked: TrackedInteractiveSession = {
-      ...existing,
+      ...resolution.tracked,
       watch: input.watch,
       updatedAtMs: this.clock(),
     };
@@ -1237,7 +1332,8 @@ export class Daemon {
    *  cleanup path for a registration made with a garbage id (register accepts any string, so
    *  a typo like "67" becomes a row only THIS can remove). 404 (`unknown_session`) if it was
    *  never registered, mirroring label/watch; managed rows are untouchable here (the kind
-   *  check in readInteractiveSession keeps them apart). */
+   *  check in readInteractiveSession keeps them apart). `input.sessionId` may be the real id or
+   *  a registered label — see resolveInteractiveRef. */
   private unregisterSession(input: SessionCommandBase): SessionCommandResult {
     if (this.seenSessionCmdKeys.has(input.idempotencyKey)) {
       // Replay of an unregister that already applied: the row is gone, so echo the minimal
@@ -1248,12 +1344,16 @@ export class Daemon {
         session: minimalInteractiveView(input.sessionId),
       };
     }
-    const existing = this.readInteractiveSession(input.sessionId);
-    if (!existing) return this.notRegistered(input.sessionId);
-    this.store.deleteSession(input.sessionId);
+    const resolution = this.resolveInteractiveRef(input.sessionId);
+    if (resolution.outcome === 'ambiguous') {
+      return this.ambiguousLabelResult(input.sessionId, resolution.matches);
+    }
+    if (resolution.outcome === 'none') return this.notRegistered(input.sessionId);
+    const existing = resolution.tracked;
+    this.store.deleteSession(existing.id);
     // Queued steering dies with the registration: nothing would ever deliver it (delivery is
     // gated on the registry), and a later re-register must not inherit stale guidance.
-    this.pendingSteering.delete(input.sessionId);
+    this.pendingSteering.delete(existing.id);
     this.rememberSessionCmdKey(input.idempotencyKey);
     // Echo the view of what was removed so the CLI can confirm WHICH session it just forgot.
     return { ok: true, status: 'applied', session: interactiveView(existing) };
