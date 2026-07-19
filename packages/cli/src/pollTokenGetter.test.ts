@@ -346,9 +346,15 @@ describe('createPollTokenGetter — identity invariant', () => {
     ]);
   });
 
-  it('fails OPEN on profile unavailability: network error, non-2xx, and shape drift all hand out the token', async () => {
+  it('fails OPEN on profile unavailability: network error, timeout abort, non-2xx, and shape drift all hand out the token', async () => {
     const cases: ProfileFetch[] = [
       () => Promise.reject(new Error('offline')),
+      () => {
+        // The rejection AbortSignal.timeout produces — must fail open like any network error.
+        const err = new Error('The operation was aborted due to timeout');
+        err.name = 'TimeoutError';
+        return Promise.reject(err);
+      },
       () => Promise.resolve({ ok: false, json: () => Promise.resolve({}) }),
       () => Promise.resolve({ ok: true, json: () => Promise.resolve({ unexpected: true }) }),
     ];

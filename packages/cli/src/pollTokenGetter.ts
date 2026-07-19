@@ -46,6 +46,11 @@ export const PROFILE_ENDPOINT = 'https://api.anthropic.com/api/oauth/profile';
 /** Mirrors the usage poller's beta header — both endpoints sit behind the same OAuth gate. */
 export const PROFILE_BETA_HEADER = 'oauth-2025-04-20';
 
+/** The ownership check is a liveness probe, not a gate: bound it tightly so a slow/hung profile
+ *  endpoint fails OPEN (hands the token out) fast instead of stalling the account's poll. An
+ *  abort lands in the same catch as any other network error, which already fails open. */
+export const PROFILE_FETCH_TIMEOUT_MS = 10_000;
+
 /** The one engine capability this wrapper needs — tests inject a fake. */
 export interface PollRefreshEngine {
   refreshToken(accountId: string): Promise<RefreshTokenResult>;
@@ -59,10 +64,12 @@ export interface AccountIdentityRow {
   quarantineReason?: string;
 }
 
-/** Minimal fetch shape for the profile call, injectable for tests. */
+/** Minimal fetch shape for the profile call, injectable for tests. `signal` rides through so
+ *  the call can be bounded with an `AbortSignal.timeout`; the default `globalThis.fetch` path
+ *  forwards it untouched. */
 export type ProfileFetch = (
   url: string,
-  init: { headers: Record<string, string> },
+  init: { headers: Record<string, string>; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; json(): Promise<unknown> }>;
 
 /** Wiring for the identity invariant. Absent entirely → legacy behavior (no checks) — the
@@ -173,6 +180,8 @@ export function createPollTokenGetter(
           'anthropic-beta': PROFILE_BETA_HEADER,
           'user-agent': identity.userAgent ?? 'claude-code/1.0.0',
         },
+        // A timeout aborts into the catch below and fails open, exactly like a network error.
+        signal: AbortSignal.timeout(PROFILE_FETCH_TIMEOUT_MS),
       });
       if (!res.ok) return token; // 401/429/5xx: availability or auth, never identity evidence
       body = await res.json();

@@ -23,9 +23,15 @@ export const DEFAULT_TOKEN_ENDPOINT = 'https://console.anthropic.com/v1/oauth/to
 /** Refresh below this remaining access-token lifetime. */
 export const DEFAULT_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
+/** Hard ceiling on the refresh network call. A hung token endpoint aborts here and surfaces as
+ *  a TRANSIENT {@link RefreshError} (safe to retry) rather than pinning the switch engine's
+ *  credential lock; invalid_grant → {@link QuarantineError} semantics are unaffected because
+ *  they only apply to a completed non-2xx response. */
+export const DEFAULT_REFRESH_TIMEOUT_MS = 30_000;
+
 type FetchLike = (
   input: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
 
 export interface RefreshDeps {
@@ -68,6 +74,8 @@ export async function refreshCredentials(
         ...deps.extraHeaders,
       },
       body,
+      // A timeout rejects into this catch as a transient RefreshError — never a QuarantineError.
+      signal: AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS),
     });
   } catch (err) {
     throw new RefreshError('network error during token refresh', 'network', { cause: err });

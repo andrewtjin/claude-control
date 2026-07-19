@@ -29,6 +29,12 @@ export const POLL_JITTER_MS = 15_000;
 export const BACKOFF_BASE_MS = 30_000;
 export const BACKOFF_CAP_MS = 30 * 60_000;
 
+/** Hard ceiling on any single usage-endpoint request. Accounts poll concurrently, but a socket
+ *  the endpoint accepts yet never answers would still pin one account's slot for Node's default
+ *  undici timeouts (tens of seconds to minutes); this bounds that to a fixed window, after which
+ *  the fetch aborts and the account degrades to tier-0 like any other transient network failure. */
+export const POLL_FETCH_TIMEOUT_MS = 30_000;
+
 /** Minimal shape of a fetch response the poller actually uses — narrower than the DOM
  *  `Response` type so tests can hand back a plain object instead of a real fetch Response. */
 export interface FetchLikeResponse {
@@ -36,9 +42,11 @@ export interface FetchLikeResponse {
   status: number;
   json(): Promise<unknown>;
 }
+/** The injected fetch. `signal` rides through so the poller can bound each request with an
+ *  `AbortSignal.timeout`; the production wiring forwards it straight to `globalThis.fetch`. */
 export type FetchLike = (
   url: string,
-  init: { headers: Record<string, string> },
+  init: { headers: Record<string, string>; signal?: AbortSignal },
 ) => Promise<FetchLikeResponse>;
 
 /** One account this poller is responsible for. */
@@ -125,10 +133,12 @@ export class UsagePoller {
    *  plan from whatever usage is now current for each — freshly polled or carried over from
    *  a prior call. Accounts never before polled always poll (no prior result to carry). */
   async pollAll(accounts: PollAccount[]): Promise<SnapshotResult> {
-    const results: AccountPollResult[] = [];
-    for (const account of accounts) {
-      results.push(await this.pollOne(account));
-    }
+    // Poll every account concurrently: `pollOne` catches its own failures and always resolves
+    // to a (possibly degraded) result, so `Promise.all` can never reject, and one slow/silent
+    // account can no longer stall the others. Per-account timing/backoff state is keyed by
+    // accountId, and `Promise.all` preserves input order, so the assembled snapshot stays in
+    // account order regardless of which fetch settles first.
+    const results = await Promise.all(accounts.map((account) => this.pollOne(account)));
 
     const accountUsages = results.map((r) => r.usage.accountUsage);
     const advisorInputs: AccountUsageInput[] = results.map((r) => r.usage.advisorInput);
@@ -204,6 +214,9 @@ export class UsagePoller {
           'anthropic-beta': ANTHROPIC_BETA_HEADER,
           'user-agent': this.userAgent,
         },
+        // A hung endpoint aborts here and lands in the catch below as a transient network
+        // failure (tier-0 fallback), never blocking the cycle past this bound.
+        signal: AbortSignal.timeout(POLL_FETCH_TIMEOUT_MS),
       });
 
       if (res.status === 429) {

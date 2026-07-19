@@ -230,16 +230,26 @@ function firstQuestionText(toolInput: Record<string, unknown> | undefined): stri
   const first: unknown = toolInput.questions[0];
   return isRecord(first) ? str(first.question) : undefined;
 }
+/** Recursion bound for {@link stableKey}. `tool_input` is attacker-adjacent CLI input, and
+ *  JSON.parse builds structures far deeper than the JS call stack tolerates, so an unbounded
+ *  recursion would throw `RangeError` inside a handler contracted to always answer. Set well
+ *  above any real tool_input nesting; past it the subtree collapses to a sentinel. */
+const STABLE_KEY_MAX_DEPTH = 32;
+
 /** Deterministic identity for a tool_input object, insensitive to key order: both sides of a
  *  watch match (the PermissionRequest's `tool_input` and the later PostToolUse's) come out of
- *  separate JSON.parse calls, and nothing guarantees the CLI serialized them identically. */
-function stableKey(value: unknown): string {
+ *  separate JSON.parse calls, and nothing guarantees the CLI serialized them identically.
+ *  Depth-bounded so it is TOTAL (never throws): beyond {@link STABLE_KEY_MAX_DEPTH} the subtree
+ *  becomes a `"[deep]"` sentinel. Shallow inputs are unaffected — their key is byte-identical to
+ *  the unbounded form, so key-order insensitivity for normal payloads is preserved. */
+function stableKey(value: unknown, depth = 0): string {
+  if (depth > STABLE_KEY_MAX_DEPTH) return '"[deep]"';
   if (value === undefined) return 'undefined';
-  if (Array.isArray(value)) return `[${value.map(stableKey).join(',')}]`;
+  if (Array.isArray(value)) return `[${value.map((v) => stableKey(v, depth + 1)).join(',')}]`;
   if (isRecord(value)) {
     const entries = Object.keys(value)
       .sort()
-      .map((k) => `${JSON.stringify(k)}:${stableKey(value[k])}`);
+      .map((k) => `${JSON.stringify(k)}:${stableKey(value[k], depth + 1)}`);
     return `{${entries.join(',')}}`;
   }
   return JSON.stringify(value);
@@ -919,7 +929,19 @@ export class HookReceiver {
     // Ordered after the managed check — managed sessions are steered through the SDK's own
     // send path and always keep the neutral answer.
     if (event === 'stop' && sessionId !== undefined) {
-      const steering = this.takeSteering?.(sessionId);
+      // `takeSteering` is an injected callback; a throw from it must never fail the hook (the
+      // never-fail-a-hook contract this whole file upholds). Swallow it and fall through to the
+      // normal neutral answer, exactly as when nothing is queued.
+      let steering: string | undefined;
+      try {
+        steering = this.takeSteering?.(sessionId);
+      } catch (err) {
+        this.logger.warn(
+          { event, sessionId, err },
+          'steering source threw; answering Stop neutrally',
+        );
+        steering = undefined;
+      }
       if (steering !== undefined) {
         this.respond(res, 200, { decision: 'block', reason: steering });
         // Size only, never content — steering text is operator input.

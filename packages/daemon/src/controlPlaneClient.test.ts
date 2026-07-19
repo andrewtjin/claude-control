@@ -30,12 +30,16 @@ interface FakeRelayOptions {
   validCodes?: Map<string, string>;
   /** When true, hello always fails (simulates a version mismatch). */
   rejectHello?: boolean;
+  /** When true, the relay accepts the socket and records the hello but never answers it —
+   *  simulates a hung relay that leaves the handshake unfinished. */
+  silentHello?: boolean;
 }
 
 class FakeRelay {
   private readonly wss: WebSocketServer;
   private readonly validCodes: Map<string, string>;
   private readonly rejectHello: boolean;
+  private readonly silentHello: boolean;
   private nextDaemonSeq = 1;
   readonly tokensByDaemonId = new Map<string, string>();
   /** Every envelope any connected socket has sent us, in receipt order — lets tests assert on
@@ -46,6 +50,7 @@ class FakeRelay {
   constructor(options: FakeRelayOptions = {}) {
     this.validCodes = options.validCodes ?? new Map([['code-1', 'assigned-daemon-1']]);
     this.rejectHello = options.rejectHello ?? false;
+    this.silentHello = options.silentHello ?? false;
     this.wss = new WebSocketServer({ port: 0 });
     this.wss.on('connection', (socket) => this.onConnection(socket));
   }
@@ -142,6 +147,9 @@ class FakeRelay {
   }
 
   private handleHello(socket: WebSocket, envelope: MessageOf<'hello'>): void {
+    // Accept the socket, record the hello (already pushed in onConnection), but never answer —
+    // the client's handshake bound must be what breaks the stall.
+    if (this.silentHello) return;
     const negotiated = negotiateVersion(envelope.payload.protocolVersion);
     const expectedToken = this.tokensByDaemonId.get(envelope.daemonId);
     if (this.rejectHello || negotiated === null || expectedToken !== envelope.payload.daemonToken) {
@@ -361,6 +369,44 @@ describe('ControlPlaneClient', () => {
       expect(rejectionLogs.some((m) => /rejected hello/.test(m))).toBe(true);
     } finally {
       await badRelay.close();
+    }
+  });
+
+  it('a relay that accepts the socket but never answers hello times out and reconnects', async () => {
+    // The stall this pins: the WS handshake succeeds, the client sends hello, and the relay
+    // never replies — without the handshake bound, connect() would hang forever and startup
+    // would stick mid-boot while /healthz still reported OK.
+    const silentRelay = new FakeRelay({ silentHello: true });
+    await silentRelay.listen();
+    try {
+      const identity: DaemonIdentity = { daemonId: 'd1', daemonToken: 't1' };
+      silentRelay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+      const identityStore = memoryIdentityStore(identity);
+      client = new ControlPlaneClient({
+        url: silentRelay.url(),
+        identityStore,
+        store,
+        hostLabel: 'h',
+        helloTimeoutMs: 40, // tiny bound so the stall is broken fast
+        reconnectBaseMs: 10,
+        reconnectCapMs: 20,
+        heartbeatMs: 100_000, // heartbeat off — the handshake bound is what must fire
+      });
+
+      // connect() never resolves against a silent relay; observe the reconnect it drives instead
+      // of awaiting it (the daemon's `await connect()` is precisely what a hang would trap).
+      void client.connect();
+
+      // First hello goes unanswered; the bound fires, forces a reconnect, and a SECOND hello is
+      // sent — proof the client did not stall on the dead handshake.
+      await waitFor(() => silentRelay.received.filter((e) => e.type === 'hello').length >= 2);
+      expect(silentRelay.received.filter((e) => e.type === 'hello').length).toBeGreaterThanOrEqual(
+        2,
+      );
+      // It is retrying, not terminally stuck or self-closed.
+      expect(['connecting', 'reconnecting']).toContain(client.getState());
+    } finally {
+      await silentRelay.close();
     }
   });
 

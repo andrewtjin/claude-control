@@ -348,6 +348,21 @@ describe('HookReceiver', () => {
       expect(cards[0]?.body).toBe('plain string output');
     });
 
+    it('a deeply nested tool_input never throws — the observe-only handler stays total (200 ok)', async () => {
+      // JSON.parse builds nesting far deeper than the recursion stack tolerates, and tool_input
+      // is attacker-adjacent CLI content. Without stableKey's depth bound this would throw
+      // RangeError, and the "always 200" PostToolUse handler would answer a bare 500 instead.
+      // Built as a raw string so no client-side JSON.stringify hits the same stack limit.
+      const depth = 20_000;
+      const nested = '{"a":'.repeat(depth) + '1' + '}'.repeat(depth);
+      const raw = `{"hook_event_name":"PostToolUse","session_id":"sess-out","tool_name":"Bash","tool_input":${nested},"tool_response":{"stdout":"x"}}`;
+      const res = await post(port, '/', raw, { 'x-claude-control-secret': SECRET });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true });
+      // Identity for NORMAL (shallow) inputs is proven unchanged by the key-order test above,
+      // which still passes: the depth bound only alters keys past its limit.
+    });
+
     it('caps long output with a visible marker and labels empty output honestly', async () => {
       await remoteAllow('req-out-5', { command: 'big' });
       await postToolUse({ command: 'big' }, { stdout: 'x'.repeat(5000) });
@@ -887,6 +902,47 @@ describe('HookReceiver', () => {
       );
       expect(res.body).toEqual({ ok: true });
       expect(taken).toEqual([]);
+    });
+
+    it('a throwing steering source never fails the Stop hook — neutral answer, warn logged', async () => {
+      // takeSteering is an injected callback; a throw must not escape to the top-level 500
+      // handler and violate the never-fail-a-hook contract. The Stop answers neutrally (as when
+      // nothing is queued) and the failure is logged rather than swallowed.
+      const warns: unknown[] = [];
+      const throwingStore = new Store(':memory:');
+      const throwingReceiver = new HookReceiver({
+        store: throwingStore,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        logger: {
+          debug: () => {},
+          info: () => {},
+          warn: (obj) => warns.push(obj),
+          error: () => {},
+        },
+      });
+      throwingReceiver.setSteeringSource(() => {
+        throw new Error('steering queue exploded');
+      });
+      const throwingPort = await throwingReceiver.listen(0);
+      try {
+        const res = await post(
+          throwingPort,
+          '/',
+          { event: 'Stop', sessionId: 'sess-boom' },
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ ok: true });
+        expect(warns.some((w) => (w as { sessionId?: string }).sessionId === 'sess-boom')).toBe(
+          true,
+        );
+      } finally {
+        await throwingReceiver.close();
+        throwingStore.close();
+      }
     });
   });
 

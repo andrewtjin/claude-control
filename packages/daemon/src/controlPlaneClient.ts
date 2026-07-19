@@ -85,6 +85,10 @@ export interface ControlPlaneClientOptions {
   heartbeatMs?: number;
   /** ms to wait for a pong before deciding the connection is dead. */
   heartbeatTimeoutMs?: number;
+  /** ms to wait for the handshake to complete (a valid hello.result, or pairing then a
+   *  follow-up hello) after a socket opens, before treating the connection as dead and forcing
+   *  a reconnect. Guards against a relay that accepts the socket but never answers. */
+  helloTimeoutMs?: number;
   /** Base/cap for reconnect backoff. */
   reconnectBaseMs?: number;
   reconnectCapMs?: number;
@@ -106,6 +110,9 @@ const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 10_000;
 const DEFAULT_RECONNECT_BASE_MS = 1000;
 const DEFAULT_RECONNECT_CAP_MS = 60_000;
+/** Default handshake bound: comfortably past a healthy relay's hello round-trip, short enough
+ *  that a silent relay is retried rather than stalling startup indefinitely. */
+const DEFAULT_HELLO_TIMEOUT_MS = 15_000;
 
 /** Connection lifecycle, exposed for tests/observability. `'rejected'` is terminal: the bot
  *  refused the hello (revoked token / unsupported version), so retrying is pointless and the
@@ -125,6 +132,10 @@ export class ControlPlaneClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   private heartbeatTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Bounds the wait for a completed handshake after a socket opens. Armed per connection
+   *  attempt in `openSocket`, cleared once hello succeeds/terminally-rejects or the socket
+   *  closes; on fire it forces the socket dead so the normal reconnect path runs. */
+  private handshakeTimer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
   /** Set once the bot terminally rejects our hello. Like `stopped`, it suppresses reconnect —
    *  but it is NOT caused by our own `close()`, so the end state is `'rejected'`, not
@@ -147,6 +158,7 @@ export class ControlPlaneClient {
       outboxBound: options.outboxBound ?? DEFAULT_OUTBOX_BOUND,
       heartbeatMs: options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
       heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS,
+      helloTimeoutMs: options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS,
       reconnectBaseMs: options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS,
       reconnectCapMs: options.reconnectCapMs ?? DEFAULT_RECONNECT_CAP_MS,
       random: options.random ?? Math.random,
@@ -195,6 +207,7 @@ export class ControlPlaneClient {
   close(): void {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.clearHandshakeTimeout();
     this.stopHeartbeat();
     this.socket?.close(1000, 'client closing');
     this.state = 'closed';
@@ -219,6 +232,9 @@ export class ControlPlaneClient {
     this.state = this.identity ? 'connecting' : 'pairing';
     const socket = this.opts.createSocket(this.opts.url);
     this.socket = socket;
+    // Bound the whole handshake (connect + hello.result, or pairing + follow-up hello). A relay
+    // that accepts the socket but never answers would otherwise leave connect() pending forever.
+    this.armHandshakeTimeout();
 
     socket.on('open', () => {
       if (this.identity) {
@@ -339,6 +355,8 @@ export class ControlPlaneClient {
   }
 
   private handleHelloResult(envelope: MessageOf<'hello.result'>): void {
+    // The handshake completed (either way) — its bound no longer applies to this socket.
+    this.clearHandshakeTimeout();
     if (!envelope.payload.ok) {
       // A hello rejection is TERMINAL: a revoked token or an unsupported protocol version will
       // reject again on every reconnect, so spinning the reconnect loop forever is pointless
@@ -367,6 +385,8 @@ export class ControlPlaneClient {
 
   private onDisconnect(): void {
     this.stopHeartbeat();
+    // The socket is gone: any pending handshake bound is moot (a reconnect re-arms its own).
+    this.clearHandshakeTimeout();
     // Either a deliberate local shutdown (`stopped`) or a terminal bot rejection suppresses
     // reconnect. They differ only in the resting state they report.
     if (this.stopped || this.terminalRejection) {
@@ -438,6 +458,27 @@ export class ControlPlaneClient {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = undefined;
     this.clearHeartbeatTimeout();
+  }
+
+  /** Arm the per-attempt handshake bound. On fire, force the socket dead so the `'close'`
+   *  handler runs the ordinary reconnect/backoff path — identical to how a mid-handshake socket
+   *  error is already handled. The in-flight `connect()` promise stays pending and resolves when
+   *  a later attempt's hello succeeds, so a stalled relay never throws out of the daemon. */
+  private armHandshakeTimeout(): void {
+    this.clearHandshakeTimeout();
+    this.handshakeTimer = setTimeout(() => {
+      this.opts.logger.error({}, 'control-plane handshake timed out; forcing reconnect');
+      const socket = this.socket;
+      // `terminate()` emits `'close'`, which drives `onDisconnect` → reconnect. If the socket is
+      // somehow already gone, run that path directly so a reconnect is still scheduled.
+      if (socket) socket.terminate();
+      else this.onDisconnect();
+    }, this.opts.helloTimeoutMs);
+  }
+
+  private clearHandshakeTimeout(): void {
+    if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
+    this.handshakeTimer = undefined;
   }
 
   private clearHeartbeatTimeout(): void {
