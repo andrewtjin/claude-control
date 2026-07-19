@@ -112,6 +112,17 @@ export class Store {
   }
 
   private migrate(): void {
+    // WAL keeps commits cheap (no per-commit journal-file create/delete + fsync — the daemon
+    // writes on every envelope via the outbox and on every hook event) and lets the CLI's
+    // offline readers (`cctl session status`, `usage`) read while the daemon writes. Applied
+    // before the DDL so even the first-ever migration commits in WAL. On `:memory:` databases
+    // (tests) the pragma is a no-op. synchronous=NORMAL is the documented safe pairing for
+    // WAL — a power loss can lose the last commit, never corrupt, and every table here is a
+    // cache/mirror/outbox that tolerates exactly that.
+    this.db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+    `);
     // Idempotent: every deploy of the daemon calls this on startup against a possibly
     // already-migrated file, so every statement is `IF NOT EXISTS`.
     this.db.exec(`

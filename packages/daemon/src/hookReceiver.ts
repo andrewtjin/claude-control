@@ -169,8 +169,9 @@ export interface HookReceiverCliHandlers {
 }
 
 /** Exported because the header name doubles as the installer's ownership fingerprint: any
- *  settings.json hook command containing it is one of OURS (some generation of the curl
- *  forwarder), which is what lets installHooks replace stale-port entries across restarts. */
+ *  settings.json hook command containing it is one of OURS (some generation of the hook
+ *  forwarder command), which is what lets installHooks replace stale entries across
+ *  restarts. */
 export const DEFAULT_SECRET_HEADER = 'x-claude-control-secret';
 const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
 
@@ -501,6 +502,13 @@ export class HookReceiver {
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Liveness probe for supervisors and acceptance checks. Deliberately secret-free: the
+    // server is loopback-only and the response carries nothing but "a process is listening" —
+    // which any port scan would learn anyway. Everything stateful stays behind the secret.
+    if (req.method === 'GET' && req.url === '/healthz') {
+      this.respond(res, 200, { ok: true });
+      return;
+    }
     if (req.method !== 'POST') {
       this.respond(res, 405, { ok: false, error: 'method not allowed' });
       return;

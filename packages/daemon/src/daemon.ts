@@ -39,6 +39,7 @@ import type {
   TrackedSessionView,
 } from './hookReceiver.js';
 import { ControlPlaneClient } from './controlPlaneClient.js';
+import { startLoopLagMonitor } from './loopLagMonitor.js';
 
 /** The subset of `SwitchEngine`'s public surface the daemon depends on — narrower than the
  *  concrete class so tests can fake it without building a whole real engine. The real
@@ -229,6 +230,8 @@ export class Daemon {
   private readonly logger: Logger;
 
   private pollTimer: ReturnType<typeof setInterval> | undefined;
+  /** Tear-down for the event-loop lag watchdog started in {@link start}. */
+  private stopLoopLagMonitor: (() => void) | undefined;
   /** Next `session.output.seq` to use per session — the protocol requires a monotonic
    *  per-session sequence so the phone can detect drops/reordering. */
   private readonly outputSeq = new Map<string, number>();
@@ -299,6 +302,18 @@ export class Daemon {
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+
+    // Loop-lag watchdog: any synchronous work anywhere in this process re-couples hook
+    // latency (paid per tool call by every session on the machine) to that work. The warning
+    // names the stall so the regression class that motivated it (sync child-process waits on
+    // the poll path) can never again hide behind "hooks feel slow".
+    this.stopLoopLagMonitor = startLoopLagMonitor({
+      onStall: (lagMs) =>
+        this.logger.warn(
+          { lagMs },
+          'event loop stalled — every concurrent hook request waited this long; find and async the blocking work',
+        ),
+    });
 
     const recovery = await this.switchEngine.recover();
     if (recovery.recovered) {
@@ -407,6 +422,8 @@ export class Daemon {
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
+    this.stopLoopLagMonitor?.();
+    this.stopLoopLagMonitor = undefined;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = undefined;
     this.controlPlaneClient.close();

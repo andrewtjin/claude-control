@@ -48,6 +48,7 @@ import { buildEngine, daemonDbPath } from './context.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import { daemonSettingsPath, resolveDaemonConfig, writeSettingsReport } from './settings.js';
+import { crashLogPath, installCrashLogging } from './daemonSupervise.js';
 
 /** Token considered unusable for polling within this window before expiry — the poller then
  *  falls back to tier-0 rather than racing the expiry mid-request. */
@@ -133,6 +134,10 @@ export function makeAgentSdkClientFactory(logger: Logger): () => AgentSdkClient 
 export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const paths: Paths = defaultPaths();
   const dataDir = dirname(paths.vaultDir);
+  // Last-breath crash visibility: the daemon died silently once and nothing said why or
+  // restarted it. Whatever kills this process from here on leaves a line in daemon-crash.log
+  // and a non-zero exit for `cctl daemon supervise` to answer with a respawn.
+  installCrashLogging(crashLogPath(dataDir));
   const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
   const logger: Logger = {
     debug: (obj, msg) => p.debug(obj, msg),

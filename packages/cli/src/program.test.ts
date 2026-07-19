@@ -58,6 +58,16 @@ describe('buildProgram', () => {
     );
   });
 
+  it('daemon supervise mirrors the run option surface (nothing can be forwarded wrong)', () => {
+    const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
+    const run = daemon?.commands.find((c) => c.name() === 'run');
+    const supervise = daemon?.commands.find((c) => c.name() === 'supervise');
+    expect(supervise).toBeDefined();
+    expect(supervise?.options.map((o) => o.long).sort()).toEqual(
+      run?.options.map((o) => o.long).sort(),
+    );
+  });
+
   it('reports its version', () => {
     expect(buildProgram().version()).toBe('0.1.0');
   });

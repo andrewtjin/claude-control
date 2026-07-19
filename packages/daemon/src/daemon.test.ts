@@ -1484,6 +1484,13 @@ describe('Daemon lifecycle', () => {
     expect(port).toBeGreaterThan(0);
   });
 
+  it('GET /healthz answers ok without a secret — the supervision liveness probe', async () => {
+    const hookPort = await startCapturingHookPort();
+    const res = await fetch(`http://127.0.0.1:${hookPort}/healthz`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+  });
+
   it('register creates an interactive session row (watch on, active account tagged)', async () => {
     switchEngine.getActiveId.mockResolvedValue('acct-x');
     const hookPort = await startCapturingHookPort();

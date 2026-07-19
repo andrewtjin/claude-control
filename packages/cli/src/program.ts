@@ -6,7 +6,7 @@
 // which are unit-tested; here we only wire and print.
 
 import { Command } from 'commander';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -30,6 +30,7 @@ import {
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { runDaemon } from './daemonRun.js';
+import { appendCrashLine, crashLogPath, superviseDaemon } from './daemonSupervise.js';
 import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
 import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
 import {
@@ -207,6 +208,47 @@ export function buildProgram(): Command {
         // than let the flag silently do nothing.
         if (opts.greedy && !opts.autoSwitch) fail('--greedy requires --auto-switch.');
         await runDaemon(opts);
+      },
+    );
+  daemon
+    .command('supervise')
+    .description(
+      'run the daemon and restart it automatically if it crashes (a clean exit ends supervision)',
+    )
+    .option('--pair <code>', 'pairing code from Discord /pair (adopts a new identity)')
+    .option(
+      '--relay <url>',
+      'control-plane WebSocket url (default CCTL_RELAY_URL or ws://127.0.0.1:8765)',
+    )
+    .option('--auto-switch', 'forwarded to `daemon run` — see its help')
+    .option('--greedy', 'forwarded to `daemon run` — see its help')
+    .action(
+      async (opts: { pair?: string; relay?: string; autoSwitch?: boolean; greedy?: boolean }) => {
+        if (opts.greedy && !opts.autoSwitch) fail('--greedy requires --auto-switch.');
+        // Reconstruct the child argv from the parsed flags: the supervisor and `daemon run`
+        // deliberately share an option surface so nothing can be forwarded wrong.
+        const childArgs = [
+          'daemon',
+          'run',
+          ...(opts.pair !== undefined ? ['--pair', opts.pair] : []),
+          ...(opts.relay !== undefined ? ['--relay', opts.relay] : []),
+          ...(opts.autoSwitch ? ['--auto-switch'] : []),
+          ...(opts.greedy ? ['--greedy'] : []),
+        ];
+        const crashFile = crashLogPath(dirname(defaultPaths().vaultDir));
+        const controller = new AbortController();
+        process.once('SIGINT', () => controller.abort());
+        process.once('SIGTERM', () => controller.abort());
+        await superviseDaemon({
+          // process.argv[1] is this CLI's own entry — the child is the same cctl, same node.
+          spawnChild: () =>
+            spawn(process.execPath, [process.argv[1] ?? '', ...childArgs], {
+              stdio: 'inherit',
+            }),
+          log: (line) => process.stdout.write(line + '\n'),
+          logCrash: (line) => appendCrashLine(crashFile, line),
+          signal: controller.signal,
+        });
       },
     );
 
