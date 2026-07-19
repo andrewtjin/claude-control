@@ -33,7 +33,8 @@ describe('buildUsageEmbed', () => {
   it('renders a field per account with a layered progress bar per limit', () => {
     const embed = buildUsageEmbed({ accounts: [account()] }).toJSON();
     expect(embed.title).toBe('Usage');
-    expect(embed.fields).toHaveLength(1);
+    // One field per account, plus the trailing Pacing field.
+    expect(embed.fields).toHaveLength(2);
     expect(embed.fields?.[0]?.name).toContain('Work');
     expect(embed.fields?.[0]?.name).toContain('🟢 active');
     // 42% in the ok zone: 4 green cells, 6 empty, then the text line.
@@ -141,6 +142,40 @@ describe('buildUsageEmbed', () => {
     expect(embed.fields?.[0]?.value).toContain('EBAR(42) session 42%');
     expect(embed.fields?.[0]?.value).not.toContain('🟩');
   });
+
+  it('adds a Pacing field computed from the same accounts', () => {
+    const NOW = Date.parse('2026-07-16T12:00:00.000Z');
+    const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+    const embed = buildUsageEmbed(
+      {
+        accounts: [
+          account({
+            limits: [
+              // 38% elapsed, 52% used — the same "ahead of pace" fixture as usage-advisor's
+              // pacing tests, so the expected headline is known exactly.
+              {
+                kind: 'weekly_all',
+                percent: 52,
+                isActive: true,
+                resetsAt: new Date(NOW + Math.round(0.62 * WEEK_MS)).toISOString(),
+              },
+            ],
+          }),
+        ],
+      },
+      NOW,
+    ).toJSON();
+    const pacing = embed.fields?.find((f) => f.name === 'Pacing');
+    expect(pacing?.value).toBe(
+      '38% of the combined week elapsed, 52% of budget burned - ahead of pace (~1.4x): ' +
+        'slow down or expect an early wall.',
+    );
+  });
+
+  it('omits the Pacing field when there are no accounts', () => {
+    const embed = buildUsageEmbed({ accounts: [] }).toJSON();
+    expect(embed.fields ?? []).toHaveLength(0);
+  });
 });
 
 describe('buildTimelineEmbed', () => {
@@ -226,6 +261,16 @@ describe('buildTimelineEmbed', () => {
   it('shows a placeholder when there are no accounts', () => {
     const embed = buildTimelineEmbed({ accounts: [] }, NOW).toJSON();
     expect(embed.description).toMatch(/no accounts/i);
+  });
+
+  it('adds a Pacing field alongside the timeline', () => {
+    // Work is 42%/30% used with resets 2h/26h out — a fresh (just-computed) pacing verdict
+    // from the SAME accounts the timeline above already renders; only assert it's present
+    // and sane, since the exact verdict here is incidental to this fixture's real purpose.
+    const embed = buildTimelineEmbed({ accounts }, NOW).toJSON();
+    const pacing = embed.fields?.find((f) => f.name === 'Pacing');
+    expect(pacing?.value).toBeTruthy();
+    expect(pacing?.value).not.toContain('NaN');
   });
 
   it('draws the session bar through an injected renderer', () => {

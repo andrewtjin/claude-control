@@ -14,6 +14,7 @@ import type {
 // zero-credential guarantee (which forbids switch-engine, not math).
 import {
   computeOutlook,
+  computePacing,
   timelineInputFromWire,
   type ResetOutlook,
 } from '@claude-control/usage-advisor';
@@ -126,7 +127,16 @@ export function buildUsageEmbed(
       value: truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT),
     });
   }
+  if (usage.accounts.length > 0) embed.addFields(pacingField(usage.accounts, nowMs));
   return embed;
+}
+
+/** The "Pacing" field shared by `/usage` and `/timeline`: the aggregate cross-account verdict
+ *  layered on top of the account-by-account view above it — same headline the CLI prints,
+ *  computed from the same AccountUsage snapshot both embeds already render from. */
+function pacingField(accounts: AccountUsage[], nowMs: number): { name: string; value: string } {
+  const pacing = computePacing(timelineInputFromWire(accounts), nowMs);
+  return { name: 'Pacing', value: truncateLabeled(pacing.headline, EMBED_FIELD_VALUE_LIMIT) };
 }
 
 /** "12×5h windows left · weekly resets <t:...:R>" — the session budget line appended to
@@ -235,6 +245,7 @@ export function buildTimelineEmbed(
       value: truncateLabeled(planLines.join('\n'), EMBED_FIELD_VALUE_LIMIT),
     });
   }
+  embed.addFields(pacingField(usage.accounts, nowMs));
   return embed;
 }
 

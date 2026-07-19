@@ -27,6 +27,7 @@ import {
   renderOutlook,
   renderPlanSummary,
   timelineInputFromWire,
+  type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { runDaemon } from './daemonRun.js';
@@ -37,7 +38,7 @@ import {
   superviseDaemon,
 } from './daemonSupervise.js';
 import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
-import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
+import { renderAccountsTable, renderPacingLine, renderUsage, type UsageRow } from './render.js';
 import {
   renderSessionStatus,
   type SessionStatusHeader,
@@ -116,12 +117,19 @@ export function buildProgram(): Command {
     .description("show usage across all accounts (from the daemon's latest poll)")
     .action(async () => {
       const { accounts, activeId, usageFor } = await readUsageState();
+      const nowMs = Date.now();
       const rows: UsageRow[] = accounts.map((a) => ({
         label: a.label,
         active: a.id === activeId,
         usage: usageFor(a.id),
       }));
-      process.stdout.write(renderUsage(rows, Date.now(), detectPalette()) + '\n');
+      let text = renderUsage(rows, nowMs, detectPalette());
+      // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
+      // state), which UsageRow doesn't carry — build it separately rather than widen UsageRow
+      // for one trailing line.
+      const inputs = buildAdvisorInputs(accounts, activeId, usageFor);
+      if (inputs.length > 0) text += '\n\n' + renderPacingLine(inputs, nowMs);
+      process.stdout.write(text + '\n');
     });
 
   program
@@ -129,18 +137,8 @@ export function buildProgram(): Command {
     .description('5h-session budget per account + when every limit resets, with a usage plan')
     .action(async () => {
       const { accounts, activeId, usageFor } = await readUsageState();
-      // Registry data (label/active/quarantined) is authoritative and current; the persisted
-      // snapshot only contributes the limits, so a stale snapshot can't misreport which
-      // account is live. Accounts without a snapshot still appear (as "unknown").
-      const inputs = timelineInputFromWire(
-        accounts.map((a) => ({
-          accountId: a.id,
-          label: a.label,
-          active: a.id === activeId,
-          quarantined: a.quarantined,
-          limits: usageFor(a.id)?.limits ?? [],
-        })),
-      );
+      const nowMs = Date.now();
+      const inputs = buildAdvisorInputs(accounts, activeId, usageFor);
       const outlook = computeOutlook(inputs);
       let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to burn first and what to
@@ -150,6 +148,7 @@ export function buildProgram(): Command {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
         text +=
           '\n\n' + renderPlanSummary(computePlan(inputs, greedy ? { greedyAutoSwitch: true } : {}));
+        text += '\n\n' + renderPacingLine(inputs, nowMs);
       }
       process.stdout.write(text + '\n');
     });
@@ -314,6 +313,26 @@ async function readUsageState(): Promise<{
     store.close();
   }
   return { accounts, activeId, usageFor: (accountId) => byId.get(accountId) };
+}
+
+/** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both
+ *  commands' pacing line. Registry data (label/active/quarantined) is authoritative and
+ *  current; the persisted snapshot only contributes the limits, so a stale snapshot can't
+ *  misreport which account is live. Accounts without a snapshot still appear (as "unknown"). */
+function buildAdvisorInputs(
+  accounts: StoredAccount[],
+  activeId: string | null,
+  usageFor: (accountId: string) => AccountUsage | undefined,
+): AccountUsageInput[] {
+  return timelineInputFromWire(
+    accounts.map((a) => ({
+      accountId: a.id,
+      label: a.label,
+      active: a.id === activeId,
+      quarantined: a.quarantined,
+      limits: usageFor(a.id)?.limits ?? [],
+    })),
+  );
 }
 
 /**

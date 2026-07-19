@@ -7,7 +7,12 @@
 
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
-import { computeOutlook, timelineInputFromWire } from '@claude-control/usage-advisor';
+import {
+  computeOutlook,
+  computePacing,
+  timelineInputFromWire,
+  type AccountUsageInput,
+} from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
 
 /** Render the accounts registry as an aligned table. `activeId` is marked with `*`. */
@@ -95,6 +100,14 @@ export function renderUsage(
       return `${marker} ${label}  ${source}  ${limits}${windowsLeft(r.usage, nowMs)}${err}`;
     })
     .join('\n');
+}
+
+/** "Pacing: 38% of the combined week elapsed, ..." — the one-line cross-account pacing
+ *  verdict appended after `cctl usage` and `cctl timeline`'s own output. Shares the same
+ *  AccountUsageInput view the burn plan is computed from, so the two never disagree on what
+ *  counts as "an account". */
+export function renderPacingLine(inputs: AccountUsageInput[], nowMs: number): string {
+  return `Pacing: ${computePacing(inputs, nowMs).headline}`;
 }
 
 /** "· 15x5h left" — how many 5h session windows still fit before this account's weekly

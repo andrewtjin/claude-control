@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
+import { renderAccountsTable, renderPacingLine, renderUsage, type UsageRow } from './render.js';
 import { ANSI_PALETTE } from './ansi.js';
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
+import type { AccountUsageInput } from '@claude-control/usage-advisor';
 
 /** Remove ANSI SGR codes — used to prove color never changes the visible text/layout. */
 // eslint-disable-next-line no-control-regex -- matching ESC codes is the whole point
@@ -138,5 +139,40 @@ describe('renderUsage', () => {
     expect(colored).toContain(ANSI_PALETTE.red('[refresh failed]'));
     expect(colored).toContain(ANSI_PALETTE.green('*'));
     expect(stripAnsi(colored)).toBe(plain);
+  });
+});
+
+describe('renderPacingLine', () => {
+  const NOW = Date.parse('2026-07-16T12:00:00.000Z');
+  const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+  function input(accountId: string, percent: number, elapsedFraction: number): AccountUsageInput {
+    return {
+      accountId,
+      label: accountId,
+      active: false,
+      quarantined: false,
+      limits: [
+        { kind: 'weekly_all', percent, resetsAt: NOW + Math.round((1 - elapsedFraction) * WEEK_MS) },
+      ],
+    };
+  }
+
+  it('prints a "Pacing: " line matching the computed verdict', () => {
+    // 52% used / 38% elapsed = ahead of pace — same fixture as usage-advisor's pacing tests.
+    const line = renderPacingLine([input('a', 52, 0.38)], NOW);
+    expect(line).toBe(
+      'Pacing: 38% of the combined week elapsed, 52% of budget burned - ahead of pace (~1.4x): ' +
+        'slow down or expect an early wall.',
+    );
+  });
+
+  it('reports the on-pace headline when burn tracks elapsed time', () => {
+    const line = renderPacingLine([input('a', 49, 0.52)], NOW);
+    expect(line).toBe('Pacing: on pace (52% elapsed, 49% burned).');
+  });
+
+  it('reports pace unknown with no accounts', () => {
+    expect(renderPacingLine([], NOW)).toBe('Pacing: No weekly usage data yet - pace unknown.');
   });
 });
