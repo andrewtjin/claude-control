@@ -437,20 +437,36 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
 
   // ---- [7/7] autostart + daemon, then round-trip verify ----
   step(7, 'Autostart and start the daemon');
-  const autostart = await deps.installAutostart();
-  const taskVerb = {
-    created: 'Registered',
-    updated: 'Updated',
-    unchanged: 'Already registered',
-  }[autostart.task];
-  io.write(`${taskVerb} the logon task so the daemon starts automatically.\n`);
-  if (!autostart.started) {
+  // A failed registration must not kill the wizard at its final step — everything before it
+  // (accounts, hooks, pairing) is already done, and the daemon runs fine without autostart.
+  // Degrade to a warning with the retry path; the summary below reports the task honestly.
+  let autostart: AutostartResult | undefined;
+  try {
+    autostart = await deps.installAutostart();
+  } catch (err) {
     io.write(
       p.yellow(
-        `Could not start it right now${autostart.detail ? ` (${autostart.detail})` : ''}; ` +
-          'it will start at your next logon.\n',
+        `Could not register the logon task: ${(err as Error).message}\n` +
+          'The daemon still runs manually (`cctl daemon run` or `cctl daemon supervise`); ' +
+          'retry autostart later with `cctl daemon install`.\n',
       ),
     );
+  }
+  if (autostart) {
+    const taskVerb = {
+      created: 'Registered',
+      updated: 'Updated',
+      unchanged: 'Already registered',
+    }[autostart.task];
+    io.write(`${taskVerb} the logon task so the daemon starts automatically.\n`);
+    if (!autostart.started) {
+      io.write(
+        p.yellow(
+          `Could not start it right now${autostart.detail ? ` (${autostart.detail})` : ''}; ` +
+            'it will start at your next logon.\n',
+        ),
+      );
+    }
   }
   const daemonAlive = await deps.verifyDaemon();
   io.write(
