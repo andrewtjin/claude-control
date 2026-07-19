@@ -176,6 +176,17 @@ const PermissionResponsePayload = z.object({
   idempotencyKey: IdempotencyKey,
 });
 
+/** A held permission's hold ended WITHOUT a phone decision — the daemon's honest signal that
+ *  the card's Approve/Deny buttons are now dead and must stop claiming otherwise. `reason`
+ *  names WHY so the bot's edit can say something true: `local` (the operator answered at the
+ *  terminal — detected where the hook's response socket closes while still held), `expired`
+ *  (the hold window's own timer fired first), `shutdown` (the daemon closed while the hold was
+ *  still open). Never sent for a permission the phone actually decided. */
+const PermissionLapsedPayload = z.object({
+  requestId: RequestId,
+  reason: z.enum(['local', 'expired', 'shutdown']),
+});
+
 const PromptInjectPayload = z.object({
   sessionId: SessionId,
   text: z.string().min(1),
@@ -354,6 +365,7 @@ export const messageSchemas = {
   'switch.result': frame('switch.result', SwitchResultPayload),
   'permission.request': frame('permission.request', PermissionRequestPayload),
   'permission.response': frame('permission.response', PermissionResponsePayload),
+  'permission.lapsed': frame('permission.lapsed', PermissionLapsedPayload),
   'prompt.inject': frame('prompt.inject', PromptInjectPayload),
   'session.spawn': frame('session.spawn', SessionSpawnPayload),
   'session.output': frame('session.output', SessionOutputPayload),
@@ -379,6 +391,7 @@ export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['switch.result'],
   messageSchemas['permission.request'],
   messageSchemas['permission.response'],
+  messageSchemas['permission.lapsed'],
   messageSchemas['prompt.inject'],
   messageSchemas['session.spawn'],
   messageSchemas['session.output'],

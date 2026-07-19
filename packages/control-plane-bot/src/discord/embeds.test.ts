@@ -5,6 +5,7 @@ import {
   buildAccountsEmbed,
   buildSessionListEmbed,
   buildPermissionRequestEmbed,
+  buildLapsedPermissionEmbed,
   buildSettingsEmbed,
   buildSwitchResultEmbed,
   buildTimelineEmbed,
@@ -404,6 +405,39 @@ describe('buildPermissionRequestEmbed', () => {
     const embed = buildPermissionRequestEmbed('run rm -rf').toJSON();
     expect(embed.title).toBe('Permission requested');
     expect(embed.footer?.text).not.toContain('mode');
+  });
+});
+
+describe('buildLapsedPermissionEmbed', () => {
+  it('picks the right title per reason', () => {
+    expect(buildLapsedPermissionEmbed('local').toJSON().title).toBe('Handled at the terminal');
+    expect(buildLapsedPermissionEmbed('expired').toJSON().title).toBe(
+      'Expired — answer at the terminal',
+    );
+    expect(buildLapsedPermissionEmbed('shutdown').toJSON().title).toBe('Daemon stopped');
+  });
+
+  it('recolors to the muted accent regardless of reason', () => {
+    expect(buildLapsedPermissionEmbed('expired').toJSON().color).toBe(0x95a5a6);
+  });
+
+  it('preserves the original embed content (summary, detail, footer) — only title/color change', () => {
+    const original = buildPermissionRequestEmbed(
+      'run rm -rf',
+      'in /tmp/scratch',
+      'default',
+    ).toJSON();
+    const lapsed = buildLapsedPermissionEmbed('expired', original).toJSON();
+    expect(lapsed.description).toBe('run rm -rf');
+    expect(lapsed.fields?.[0]?.value).toBe('in /tmp/scratch');
+    expect(lapsed.title).toBe('Expired — answer at the terminal');
+    expect(lapsed.color).toBe(0x95a5a6);
+  });
+
+  it('still produces a valid card with no original embed', () => {
+    const lapsed = buildLapsedPermissionEmbed('shutdown').toJSON();
+    expect(lapsed.title).toBe('Daemon stopped');
+    expect(lapsed.description).toBeUndefined();
   });
 });
 

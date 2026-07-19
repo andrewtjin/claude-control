@@ -27,7 +27,7 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { isType, type Envelope } from '@claude-control/shared-protocol';
+import { isType, type Envelope, type PayloadOf } from '@claude-control/shared-protocol';
 import type { DiscordGateway } from './gateway.js';
 import type { RelaySender } from '../relay.js';
 import type { PairingService } from '../pairing.js';
@@ -42,6 +42,8 @@ import {
   renderEmojiTrack,
 } from './emojiBars.js';
 import { renderPush, type RenderedPush } from './pushRender.js';
+import { buildLapsedPermissionEmbed } from './embeds.js';
+import { PermissionCardRegistry, type CardRef } from './permissionCards.js';
 import {
   buttonIdempotencyKey,
   resolveTap,
@@ -150,6 +152,14 @@ export class DiscordJsGateway implements DiscordGateway {
    *  In-memory only: after a restart the card id is gone and the first edit posts a fresh card
    *  (a benign visual re-anchor, not a lost update). */
   private readonly cardMessages = new Map<string, Message>();
+  /** requestId -> {channelId, messageId} for a just-sent permission card, so a LATER
+   *  `permission.lapsed` push can find and edit it. Unlike `cardMessages` this is not keyed by
+   *  session route (a permission card belongs to no session route) and holds a plain ref, not a
+   *  live discord.js Message — the entry can easily outlive any local object cache lifetime
+   *  reasoning, and re-resolving through the client on the (rare) lapse edit is cheap. `protected`
+   *  (not `private`), same seam rationale as {@link sinkFor}: it lets a test subclass seed a
+   *  known ref without opening a real Discord connection. */
+  protected readonly permissionCards = new PermissionCardRegistry();
   /** One pending coalesced-flush timer per session route; rescheduled, never stacked. */
   private readonly flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Per-session-route serialization chain for managed-session frames (status/output). relay.ts
@@ -212,11 +222,14 @@ export class DiscordJsGateway implements DiscordGateway {
 
   /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user.
    *
-   *  Two paths. Managed-session frames (session.status/session.output) go to the thread-per-
+   *  Three paths. Managed-session frames (session.status/session.output) go to the thread-per-
    *  session surface: the pure `SessionPlanner` turns them into thread ops (create/send/edit/upload)
-   *  which this class executes. Everything else keeps the card behaviour — the pure `renderPush`
-   *  decides the DM card and this class only inflates ButtonSpecs and sends it. The state cache is
-   *  fed on EVERY envelope regardless, so `/usage`/`/sessions` keep answering from it. */
+   *  which this class executes. `permission.lapsed` EDITS an already-sent permission card rather
+   *  than sending anything new (see {@link applyPermissionLapse}). Everything else keeps the card
+   *  behaviour — the pure `renderPush` decides the DM card and this class only inflates
+   *  ButtonSpecs and sends it, recording where a permission card landed so a later lapse can find
+   *  it. The state cache is fed on EVERY envelope regardless, so `/usage`/`/sessions` keep
+   *  answering from it. */
   async deliver(discordUserId: string, envelope: Envelope): Promise<void> {
     this.cache.record(discordUserId, envelope);
     // Managed-session frames mutate shared per-route state (the planner view AND cardMessages), so
@@ -226,14 +239,68 @@ export class DiscordJsGateway implements DiscordGateway {
       const route: SessionRoute = { discordUserId, sessionId: envelope.payload.sessionId };
       return this.enqueueSessionDelivery(route, envelope);
     }
+    if (isType(envelope, 'permission.lapsed')) {
+      return this.applyPermissionLapse(envelope.payload);
+    }
     const push = renderPush(envelope);
     if (!push) return; // cache-only: not worth a DM
     try {
       const user = await this.client.users.fetch(discordUserId);
-      await user.send(this.toSendOptions(push));
+      const message = await user.send(this.toSendOptions(push));
+      // Remember where THIS permission card landed so a later permission.lapsed push (the hold
+      // ending without a phone decision) can find and edit it — the only place this envelope
+      // type's requestId->message mapping is populated.
+      if (isType(envelope, 'permission.request')) {
+        this.permissionCards.record(envelope.payload.requestId, {
+          channelId: message.channelId,
+          messageId: message.id,
+        });
+      }
     } catch (err) {
       this.logger.warn({ err, discordUserId }, 'discord: failed to DM user');
     }
+  }
+
+  /** permission.lapsed: the hold ended without a phone decision (local terminal answer, TTL
+   *  expiry, or a daemon shutdown) — the card must stop claiming its Approve/Deny buttons still
+   *  work. Edits the ORIGINAL card in place (found via `permissionCards`): keeps the embed's
+   *  content but retitles/recolors it for the reason, and strips every button. If this bot never
+   *  saw the original send (restarted since, or the ref aged out of the bounded map) there is
+   *  nothing to edit — dropped silently (debug log only): never crash, and never send a NEW
+   *  message in place of a card the reader can no longer act on anyway. */
+  private async applyPermissionLapse(payload: PayloadOf<'permission.lapsed'>): Promise<void> {
+    const ref = this.permissionCards.take(payload.requestId);
+    if (!ref) {
+      this.logger.debug(
+        { requestId: payload.requestId },
+        'discord: permission.lapsed for a card this bot never tracked (restart, or already evicted)',
+      );
+      return;
+    }
+    try {
+      const message = await this.resolveCardMessage(ref);
+      if (!message) return;
+      const original = message.embeds[0]?.toJSON();
+      const embed = buildLapsedPermissionEmbed(payload.reason, original);
+      await message.edit({ embeds: [embed], components: [] });
+    } catch (err) {
+      this.logger.warn(
+        { err, requestId: payload.requestId },
+        'discord: failed to edit a lapsed permission card',
+      );
+    }
+  }
+
+  /** Resolve a stored {channelId, messageId} ref to the live discord.js Message to edit — the
+   *  one seam {@link applyPermissionLapse} needs from the real connection. `protected` (not
+   *  `private`), same rationale as {@link sinkFor}: a test subclass can return a fake message
+   *  without opening a real gateway connection. Returns `undefined` (never throws) for a channel
+   *  that is gone or not text-based — the caller's contract from there is the same silent drop as
+   *  an untracked requestId. */
+  protected async resolveCardMessage(ref: CardRef): Promise<Message | undefined> {
+    const channel = await this.client.channels.fetch(ref.channelId);
+    if (!channel?.isTextBased()) return undefined;
+    return channel.messages.fetch(ref.messageId);
   }
 
   /** Append one managed-session envelope to its route's serialization chain, returning a promise

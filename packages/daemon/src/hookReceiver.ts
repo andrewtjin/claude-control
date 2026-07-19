@@ -420,7 +420,7 @@ export class HookReceiver {
     // (the local prompt takes over, same as a lapse).
     for (const [requestId, held] of this.heldPermissions) {
       clearTimeout(held.timer);
-      this.markLapsed(requestId);
+      this.markLapsed(requestId, 'shutdown');
       this.respond(held.res, 200, {});
     }
     this.heldPermissions.clear();
@@ -496,12 +496,20 @@ export class HookReceiver {
     this.logger.info({ requestId, decision }, 'held permission response completed');
   }
 
-  /** Record that `requestId`'s hold ended with no decision, and self-clean the marker after
-   *  the TTL (past it, the store's own expiry already rejects the resolve). */
-  private markLapsed(requestId: string): void {
+  /** Record that `requestId`'s hold ended with no decision, self-clean the marker after the TTL
+   *  (past it, the store's own expiry already rejects the resolve), and tell the phone so its
+   *  card can stop lying about live Approve/Deny buttons. Every caller here represents exactly
+   *  one undecided hold ending — a decided permission resolves through `completeHeldPermission`
+   *  instead and never reaches this method — so one call is exactly one `permission.lapsed`. */
+  private markLapsed(requestId: string, reason: 'local' | 'expired' | 'shutdown'): void {
     this.lapsedHolds.add(requestId);
     const cleanup = setTimeout(() => this.lapsedHolds.delete(requestId), this.permissionTtlMs);
     cleanup.unref();
+    this.emit({
+      daemonId: this.daemonId(),
+      type: 'permission.lapsed',
+      payload: { requestId, reason },
+    });
   }
 
   /** The hold window ended without a phone decision: answer neutrally (no `decision` in the
@@ -510,7 +518,7 @@ export class HookReceiver {
     const held = this.heldPermissions.get(requestId);
     if (!held) return;
     this.heldPermissions.delete(requestId);
-    this.markLapsed(requestId);
+    this.markLapsed(requestId, 'expired');
     this.logger.info({ requestId }, 'permission hold lapsed; local prompt takes over');
     this.respond(held.res, 200, {});
   }
@@ -829,11 +837,14 @@ export class HookReceiver {
     });
     res.on('close', () => {
       // Fires on our own completion too — only a request STILL in the map is an abandoned
-      // socket (curl killed, session ended, CLI-side timeout beating ours).
+      // socket (curl killed, session ended, CLI-side timeout beating ours). This is distinct
+      // from the hold TIMER firing (lapseHeldPermission): the CLI itself tore down the hook
+      // call, which in practice means the operator answered at the terminal and the CLI moved
+      // on without waiting for us — hence reason 'local', not the generic 'expired'.
       if (this.heldPermissions.has(requestId)) {
         clearTimeout(timer);
         this.heldPermissions.delete(requestId);
-        this.markLapsed(requestId);
+        this.markLapsed(requestId, 'local');
         this.logger.info({ requestId }, 'held permission socket closed by the CLI side');
       }
     });

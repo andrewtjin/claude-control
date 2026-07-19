@@ -3,7 +3,7 @@
 // No network calls, no Interaction objects — every function here is a straight data
 // transform, which is what makes it unit-testable via `.toJSON()` without a real bot.
 
-import { EmbedBuilder } from 'discord.js';
+import { EmbedBuilder, type APIEmbed } from 'discord.js';
 import type {
   AccountUsage,
   PayloadOf,
@@ -38,6 +38,10 @@ import type { BarRenderer } from './emojiBars.js';
 const COLOR_OK = 0x2ecc71;
 const COLOR_WARN = 0xf1c40f;
 const COLOR_INFO = 0x3498db;
+/** A dead card's accent: neither a warning (COLOR_WARN, still awaiting a tap) nor an error —
+ *  just inert. Used only by `buildLapsedPermissionEmbed`, so a lapsed card reads as visibly
+ *  different from a live one at a glance, before the reader even parses the new title. */
+const COLOR_MUTED = 0x95a5a6;
 
 // The default bar renderer is the credential-free unicode `layeredBar`. It is injected as an
 // optional parameter (not hidden module state) so these builders stay PURE and every existing
@@ -318,6 +322,30 @@ export function buildPermissionRequestEmbed(
   if (detail)
     embed.addFields({ name: 'Detail', value: truncateLabeled(detail, EMBED_FIELD_VALUE_LIMIT) });
   return embed;
+}
+
+/** Human title per lapse reason — the phone reader's only cue for WHY the buttons died, since
+ *  the daemon-side wire reason string is never shown verbatim. */
+const LAPSE_TITLE: Record<PayloadOf<'permission.lapsed'>['reason'], string> = {
+  local: 'Handled at the terminal',
+  expired: 'Expired — answer at the terminal',
+  shutdown: 'Daemon stopped',
+};
+
+/** Rendered for a permission.lapsed push: the hold ended without a phone decision, so the card
+ *  must stop claiming its Approve/Deny buttons still work. Keeps whatever the ORIGINAL card
+ *  said (summary, detail, footer) — the reader should still be able to see WHAT was asked —
+ *  and only swaps the title and accent color; the caller strips the button components
+ *  separately (`components: []` on the edit), since that lives in the message payload, not the
+ *  embed. `original` is the live card's embed data as read back from Discord (this side never
+ *  stores a copy of the request text, only the message reference) — `undefined` when the
+ *  message somehow had no embed, which still produces a valid, if bare, card. */
+export function buildLapsedPermissionEmbed(
+  reason: PayloadOf<'permission.lapsed'>['reason'],
+  original?: APIEmbed,
+): EmbedBuilder {
+  const embed = original ? EmbedBuilder.from(original) : new EmbedBuilder();
+  return embed.setTitle(LAPSE_TITLE[reason]).setColor(COLOR_MUTED);
 }
 
 /** A completed tool run's output as a COMPACT card: a glanceable few-line preview fenced in

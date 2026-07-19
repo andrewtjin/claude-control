@@ -197,6 +197,49 @@ describe('session.stop', () => {
   });
 });
 
+describe('permission.lapsed', () => {
+  it('is a registered message type', () => {
+    expect(isMessageType('permission.lapsed')).toBe(true);
+  });
+
+  it('round-trips for each reason', () => {
+    for (const reason of ['local', 'expired', 'shutdown'] as const) {
+      const env = stamp({
+        daemonId: 'daemon-1',
+        type: 'permission.lapsed',
+        payload: { requestId: 'req-1', reason },
+      });
+      const result = decode(encode(env));
+      expect(result.ok).toBe(true);
+      if (result.ok && isType(result.envelope, 'permission.lapsed')) {
+        expect(result.envelope.payload).toEqual({ requestId: 'req-1', reason });
+      }
+    }
+  });
+
+  it('rejects an unknown reason — the enum is closed, unlike permissionMode/notificationType', () => {
+    const result = decode(rawFrame('permission.lapsed', { requestId: 'req-1', reason: 'other' }));
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects a lapse without a requestId — nothing to correlate the edit against', () => {
+    const result = decode(rawFrame('permission.lapsed', { reason: 'expired' }));
+    expect(result.ok).toBe(false);
+  });
+
+  it('is part of the Envelope union, not just the schema map', () => {
+    const parsed = Envelope.safeParse({
+      v: PROTOCOL_VERSION,
+      id: 'msg-1',
+      ts: 1,
+      daemonId: 'daemon-1',
+      type: 'permission.lapsed',
+      payload: { requestId: 'req-1', reason: 'local' },
+    });
+    expect(parsed.success).toBe(true);
+  });
+});
+
 describe('session.prune / session.prune.result', () => {
   it('both are registered message types', () => {
     expect(isMessageType('session.prune')).toBe(true);

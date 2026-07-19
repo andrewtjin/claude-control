@@ -1098,6 +1098,14 @@ describe('HookReceiver', () => {
 
         const permission = lapsedEmitted.find((e) => e.type === 'permission.request');
         const requestId = (permission?.payload as { requestId: string }).requestId;
+
+        // The phone must hear about the lapse so it can kill the stale card's buttons — the
+        // hold's own timer firing is reason 'expired'.
+        const lapse = await waitFor(() =>
+          lapsedEmitted.find((e) => e.type === 'permission.lapsed'),
+        );
+        expect(lapse.payload).toEqual({ requestId, reason: 'expired' });
+
         const late = await post(
           lapsingPort,
           '/resolve-permission',
@@ -1110,6 +1118,79 @@ describe('HookReceiver', () => {
         expect(store.getPendingPermission(requestId)?.resolvedDecision).toBeNull();
       } finally {
         await lapsing.close();
+      }
+    });
+
+    it('a DECIDED hold emits no permission.lapsed — only an undecided hold end is a lapse', async () => {
+      const held = post(
+        port,
+        '/',
+        {
+          hook_event_name: 'PermissionRequest',
+          session_id: 'sess-real',
+          tool_name: 'Bash',
+          tool_input: { command: 'echo decided' },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const permission = await waitFor(() => emitted.find((e) => e.type === 'permission.request'));
+      const requestId = (permission.payload as { requestId: string }).requestId;
+      const resolved = await post(
+        port,
+        '/resolve-permission',
+        { requestId, decision: 'allow' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(resolved.status).toBe(200);
+      await held; // the hook response completes with the allow decision, not a lapse
+      expect(emitted.some((e) => e.type === 'permission.lapsed')).toBe(false);
+    });
+
+    it('a socket closed by the CLI side (local answer wins) lapses with reason "local"', async () => {
+      const localEmitted: EnvelopeDraft[] = [];
+      const localReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => localEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        // Long hold so only the destroyed socket (never the timer) can trigger the lapse.
+        permissionHoldMs: 60_000,
+      });
+      const localPort = await localReceiver.listen(0);
+      try {
+        const req = request(
+          {
+            host: '127.0.0.1',
+            port: localPort,
+            path: '/',
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-claude-control-secret': SECRET },
+          },
+          () => {},
+        );
+        req.end(
+          JSON.stringify({
+            hook_event_name: 'PermissionRequest',
+            session_id: 'sess-real',
+            tool_name: 'Bash',
+            tool_input: { command: 'echo local' },
+          }),
+        );
+
+        const permission = await waitFor(() =>
+          localEmitted.find((e) => e.type === 'permission.request'),
+        );
+        const requestId = (permission.payload as { requestId: string }).requestId;
+
+        // Simulate the CLI tearing down the hook call (a local terminal answer won) by killing
+        // the client socket before the daemon ever answers it.
+        req.destroy();
+
+        const lapse = await waitFor(() => localEmitted.find((e) => e.type === 'permission.lapsed'));
+        expect(lapse.payload).toEqual({ requestId, reason: 'local' });
+      } finally {
+        await localReceiver.close();
       }
     });
 
@@ -1179,6 +1260,44 @@ describe('HookReceiver', () => {
       } finally {
         await logging.close();
       }
+    });
+  });
+
+  describe('close() during a held permission', () => {
+    it('emits permission.lapsed with reason "shutdown" for every still-held request', async () => {
+      const shutdownEmitted: EnvelopeDraft[] = [];
+      const shutdownReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => shutdownEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        permissionHoldMs: 60_000, // long enough that only close() can end the hold in this test
+      });
+      const shutdownPort = await shutdownReceiver.listen(0);
+      const held = post(
+        shutdownPort,
+        '/',
+        {
+          hook_event_name: 'PermissionRequest',
+          session_id: 'sess-real',
+          tool_name: 'Bash',
+          tool_input: { command: 'echo shutdown' },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const permission = await waitFor(() =>
+        shutdownEmitted.find((e) => e.type === 'permission.request'),
+      );
+      const requestId = (permission.payload as { requestId: string }).requestId;
+
+      await shutdownReceiver.close();
+      // close() answers the held response neutrally so the awaited POST resolves too.
+      const hookRes = await held;
+      expect(hookRes.body).toEqual({});
+
+      const lapse = shutdownEmitted.find((e) => e.type === 'permission.lapsed');
+      expect(lapse?.payload).toEqual({ requestId, reason: 'shutdown' });
     });
   });
 
