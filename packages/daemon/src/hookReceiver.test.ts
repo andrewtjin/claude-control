@@ -1281,6 +1281,9 @@ describe('HookReceiver', () => {
           },
           () => {},
         );
+        // Destroying the request below surfaces client-side as ECONNRESET; without a
+        // listener that becomes a process-level unhandled error and fails the whole run.
+        req.on('error', () => {});
         req.end(
           JSON.stringify({
             hook_event_name: 'PermissionRequest',
