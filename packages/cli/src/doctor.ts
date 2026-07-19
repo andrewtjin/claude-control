@@ -79,7 +79,7 @@ export async function checkLiveLogin(
       detail:
         live !== undefined
           ? `live credentials found in ${where}`
-          : `no live credentials in ${where} — run \`claude\` and log in first`,
+          : `no live credentials in ${where} - run \`claude\` and log in first`,
     };
   } catch (err) {
     return {

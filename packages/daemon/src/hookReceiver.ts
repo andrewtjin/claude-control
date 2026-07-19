@@ -723,7 +723,7 @@ export class HookReceiver {
     // contract drift is visible in the log instead of silently dropped.
     this.logger.warn(
       { event, sessionId: str(body.session_id) ?? str(body.sessionId) },
-      'hook POST with unrecognized event name — not an event we handle',
+      'hook POST with unrecognized event name - not an event we handle',
     );
     this.respond(res, 400, { ok: false, error: `unrecognized event "${event}"` });
   }
@@ -990,7 +990,7 @@ export class HookReceiver {
     if (event === 'notification' && !this.forwardNotificationCards) {
       this.logger.info(
         { event, sessionId, notificationType: str(body.notification_type) },
-        'notification hook suppressed (waiting cards off — CCTL_WAITING_CARDS enables)',
+        'notification hook suppressed (waiting cards off - CCTL_WAITING_CARDS enables)',
       );
       this.respond(res, 200, { ok: true });
       return;

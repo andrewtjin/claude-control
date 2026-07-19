@@ -230,15 +230,15 @@ describe('renderOutlook', () => {
     // spare's weekly at 26h: round(26/76*19) = round(6.5) = 7.
     expect(text).toContain('spare  |-------w------------|');
     expect(text).toContain('in 2h     main   5h window resets (34% used clears)');
-    expect(text).toContain('in 1d 2h  spare  weekly quota resets — 40% unused expires with it');
-    expect(text).toContain('in 3d 4h  main   weekly quota resets — 79% unused expires with it');
+    expect(text).toContain('in 1d 2h  spare  weekly quota resets - 40% unused expires with it');
+    expect(text).toContain('in 3d 4h  main   weekly quota resets - 79% unused expires with it');
   });
 
   it('marks a quarantined account instead of budgeting it', () => {
     const text = renderOutlook(
       computeOutlook([account({ accountId: 'a', label: 'dead', quarantined: true })], NOW),
     );
-    expect(text).toContain('dead  quarantined — re-login required');
+    expect(text).toContain('dead  quarantined - re-login required');
   });
 
   it('collapses two resets in the same track cell to *', () => {

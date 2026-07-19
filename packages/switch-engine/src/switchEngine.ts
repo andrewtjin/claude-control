@@ -287,7 +287,7 @@ export class SwitchEngine {
     ) {
       throw new RefreshError(
         `the captured login is a different account (${oauthAccount.emailAddress ?? oauthAccount.accountUuid}) ` +
-          `than "${existing.label}" — re-login must use the SAME account to keep its usage history intact`,
+          `than "${existing.label}" - re-login must use the SAME account to keep its usage history intact`,
         'relogin_identity_mismatch',
       );
     }

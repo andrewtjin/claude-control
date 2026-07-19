@@ -279,7 +279,7 @@ export async function superviseDaemon(options: SuperviseOptions): Promise<void> 
       return;
     }
     if (!outcome.error && outcome.code === 0) {
-      options.log('supervise: daemon exited cleanly — supervision ends with it.');
+      options.log('supervise: daemon exited cleanly - supervision ends with it.');
       return;
     }
 
@@ -293,7 +293,7 @@ export async function superviseDaemon(options: SuperviseOptions): Promise<void> 
       : `daemon exited code=${outcome.code ?? 'null'} signal=${outcome.signal ?? 'none'}`;
     options.logCrash(`supervise: ${detail}; restarting in ${delayMs}ms`);
     options.log(
-      `supervise: ${detail} — restarting in ${Math.round(delayMs / 1000)}s` +
+      `supervise: ${detail} - restarting in ${Math.round(delayMs / 1000)}s` +
         (looping
           ? ` (crash loop: ${crashTimes.length} exits in ${Math.round(windowMs / 1000)}s)`
           : ''),

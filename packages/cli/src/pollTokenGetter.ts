@@ -149,7 +149,7 @@ export function createPollTokenGetter(
     ) {
       const reason = `vault bundle identity mismatch (bundle ${bundleUuid} != registry ${row.accountUuid})`;
       await identity.quarantine(accountId, reason);
-      throw new IdentityMismatchError(`${reason} — quarantined; run cctl accounts relogin`);
+      throw new IdentityMismatchError(`${reason} - quarantined; run cctl accounts relogin`);
     }
     const oauth = bundle.claudeAiOauth;
     if (oauth.expiresAt - clock() < options.minTtlMs) return undefined;
@@ -193,7 +193,7 @@ export function createPollTokenGetter(
     if (liveUuid === undefined || liveUuid === row.accountUuid) return token; // drift or match
     const reason = `token ownership mismatch (profile account ${liveUuid} != registry ${row.accountUuid})`;
     await identity.quarantine(accountId, reason);
-    throw new IdentityMismatchError(`${reason} — quarantined; run cctl accounts relogin`);
+    throw new IdentityMismatchError(`${reason} - quarantined; run cctl accounts relogin`);
   };
 
   return async (accountId: string): Promise<string | undefined> => {
@@ -204,7 +204,7 @@ export function createPollTokenGetter(
     // snapshot honest (retained data + why) instead of silently serving the wrong numbers.
     if (identity !== undefined && row?.quarantined === true) {
       throw new Error(
-        `account is quarantined (${row.quarantineReason ?? 're-login required'}) — not polled`,
+        `account is quarantined (${row.quarantineReason ?? 're-login required'}) - not polled`,
       );
     }
 

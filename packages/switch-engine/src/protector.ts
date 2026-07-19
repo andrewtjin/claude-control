@@ -21,7 +21,7 @@ export function defaultProtector(platform: NodeJS.Platform = process.platform): 
       return new KeychainProtector();
     default:
       throw new VaultError(
-        `no credential-at-rest protector for platform "${platform}" — supported: win32 (DPAPI), darwin (Keychain)`,
+        `no credential-at-rest protector for platform "${platform}" - supported: win32 (DPAPI), darwin (Keychain)`,
       );
   }
 }

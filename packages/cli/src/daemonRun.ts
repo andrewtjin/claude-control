@@ -129,7 +129,7 @@ export function makeAgentSdkClientFactory(logger: Logger): () => AgentSdkClient 
         logger.warn(
           { accountId },
           'session accountId is not bound to a config dir; it runs under the globally ' +
-            'active account — confirm the switch engine activated it before spawn',
+            'active account - confirm the switch engine activated it before spawn',
         ),
     });
 }

@@ -181,7 +181,7 @@ export function resolveDaemonConfig(
       value: humanizeMs(greedyResetMarginMs ?? DEFAULT_GREEDY_RESET_MARGIN_MS),
       source: envSource(greedyResetMarginMs !== undefined),
       detail:
-        'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS (weekly resets closer than this count as the same deadline — no greedy hop)',
+        'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS (weekly resets closer than this count as the same deadline - no greedy hop)',
     },
     {
       name: 'auto-switch cooldown',
@@ -193,7 +193,7 @@ export function resolveDaemonConfig(
       name: 'waiting cards',
       value: waitingCards ? 'on' : 'off',
       source: envSource(waitingCards),
-      detail: 'CCTL_WAITING_CARDS ("Claude is waiting…" terminal nags as phone cards)',
+      detail: 'CCTL_WAITING_CARDS ("Claude is waiting..." terminal nags as phone cards)',
     },
     {
       name: 'permission hold',

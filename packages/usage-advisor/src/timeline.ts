@@ -251,7 +251,7 @@ export function renderOutlook(outlook: ResetOutlook, options: RenderOutlookOptio
     sections.push(timelineSection(outlook, now, labelWidth, width, st));
     sections.push(upcomingSection(outlook, now, labelWidth, st));
   } else {
-    sections.push('No reset times reported yet — wait for the next daemon poll.');
+    sections.push('No reset times reported yet - wait for the next daemon poll.');
   }
   return sections.join('\n\n');
 }
@@ -270,7 +270,7 @@ function budgetSection(
     const marker = a.active ? st.active('*') : ' ';
     const label = st.label(a.label.padEnd(labelWidth));
     if (a.quarantined) {
-      lines.push(`${marker} ${label}  ${st.alert('quarantined — re-login required')}`);
+      lines.push(`${marker} ${label}  ${st.alert('quarantined - re-login required')}`);
       continue;
     }
     const pct = a.sessionPercent ?? 0;
@@ -348,7 +348,7 @@ function describeEvent(e: ResetEvent, st: OutlookStyle): string {
   const scoped = e.kind === 'weekly_scoped' ? 'weekly (scoped)' : 'weekly';
   const unused = 100 - e.percentUsed;
   return unused > 0
-    ? `${scoped} quota resets — ${st.alert(`${unused}% unused expires with it`)}`
+    ? `${scoped} quota resets - ${st.alert(`${unused}% unused expires with it`)}`
     : `${scoped} quota resets`;
 }
 

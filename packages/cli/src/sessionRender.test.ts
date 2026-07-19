@@ -37,7 +37,7 @@ describe('renderSessionStatus', () => {
     // Managed row: short id (first 8 chars), watch dash.
     expect(out).toContain('abcdef12');
     expect(out).not.toContain('abcdef1234567890');
-    expect(out).toContain('—');
+    expect(out).toContain('-');
   });
 
   it('shows watch off distinctly from watch on', () => {

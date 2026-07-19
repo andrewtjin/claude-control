@@ -26,7 +26,7 @@ export function renderAccountsTable(
   const rows = accounts.map((a) => ({
     active: a.id === activeId ? '*' : ' ',
     label: a.label,
-    email: a.emailAddress ?? '—',
+    email: a.emailAddress ?? '-',
     status: a.quarantined ? 'quarantined' : 'ok',
     id: a.id,
   }));
@@ -84,7 +84,7 @@ export function renderUsage(
       const marker = r.active ? palette.green('*') : ' ';
       const label = palette.bold(r.label);
       if (!r.usage) {
-        return `${marker} ${label} — no usage data yet (start the daemon: cctl daemon start)`;
+        return `${marker} ${label} - no usage data yet (start the daemon: cctl daemon start)`;
       }
       const age = ageLabel(nowMs - r.usage.fetchedAtMs);
       const limits = r.usage.limits.length

@@ -14,7 +14,14 @@ async function sandbox(): Promise<string> {
   return d;
 }
 afterEach(async () => {
-  await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
+  // Status/summary mirroring and persistResumeId persist fire-and-forget (see sessionManager.ts:
+  // `void persist().catch(...)`) — a test whose fake client actually completes a turn can leave
+  // an atomicWriteFile still mid mkdir/open/write/rename inside this same directory when the test
+  // body returns. On Windows an open handle or a directory entry that appears mid-walk turns a
+  // bare recursive rm into an intermittent ENOTEMPTY/EBUSY; retrying absorbs that instead of
+  // requiring every test to track and await each fire-and-forget write (same pattern hookForwarder
+  // .test.ts uses for its own real fs cleanup).
+  await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true, maxRetries: 5 })));
   dirs = [];
 });
 

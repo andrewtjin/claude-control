@@ -138,5 +138,5 @@ function mapTokenResponse(current: ClaudeOauth, parsed: unknown, nowMs: number):
 }
 
 function truncate(text: string, max = 200): string {
-  return text.length > max ? text.slice(0, max) + '…' : text;
+  return text.length > max ? text.slice(0, max) + '...' : text;
 }

@@ -69,7 +69,7 @@ export function buildProgram(): Command {
   const program = new Command();
   program
     .name('cctl')
-    .description('claude-control — switch Claude accounts, see usage, control sessions')
+    .description('claude-control - switch Claude accounts, see usage, control sessions')
     .version(VERSION);
 
   buildAccountCommands(program);
@@ -107,7 +107,7 @@ export function buildProgram(): Command {
       const result = await buildEngine().recover();
       process.stdout.write(
         result.recovered
-          ? `Recovered: ${result.action}${result.detail ? ` — ${result.detail}` : ''}.\n`
+          ? `Recovered: ${result.action}${result.detail ? ` - ${result.detail}` : ''}.\n`
           : 'Nothing to recover.\n',
       );
     });
@@ -169,7 +169,7 @@ export function buildProgram(): Command {
         sections.push({ title: `daemon (effective since ${since})`, rows: report.settings });
       } else {
         sections.push({
-          title: 'daemon (no daemon has run yet — what `cctl daemon run` would use)',
+          title: 'daemon (no daemon has run yet - what `cctl daemon run` would use)',
           rows: resolveDaemonConfig(process.env).rows,
         });
       }
@@ -224,8 +224,8 @@ export function buildProgram(): Command {
       '--relay <url>',
       'control-plane WebSocket url (default CCTL_RELAY_URL or ws://127.0.0.1:8765)',
     )
-    .option('--auto-switch', 'forwarded to `daemon run` — see its help')
-    .option('--greedy', 'forwarded to `daemon run` — see its help')
+    .option('--auto-switch', 'forwarded to `daemon run` - see its help')
+    .option('--greedy', 'forwarded to `daemon run` - see its help')
     .action(
       async (opts: { pair?: string; relay?: string; autoSwitch?: boolean; greedy?: boolean }) => {
         if (opts.greedy && !opts.autoSwitch) fail('--greedy requires --auto-switch.');
@@ -268,7 +268,7 @@ export function buildProgram(): Command {
     .description('bind this machine to the Discord bot')
     .action(() =>
       fail(
-        'run /pair in Discord for a code, then `cctl daemon run --pair <code>` — pairing happens on the daemon connection.',
+        'run /pair in Discord for a code, then `cctl daemon run --pair <code>` - pairing happens on the daemon connection.',
       ),
     );
   program
@@ -279,7 +279,7 @@ export function buildProgram(): Command {
     .allowUnknownOption(true)
     .action(() =>
       fail(
-        '`cctl run` needs the daemon connected to the bot — an on-machine step; see docs/VERIFICATION.md.',
+        '`cctl run` needs the daemon connected to the bot - an on-machine step; see docs/VERIFICATION.md.',
       ),
     );
 
@@ -348,7 +348,7 @@ async function addFreshAccount(label: string): Promise<void> {
   try {
     process.stdout.write(
       'Opening a throwaway Claude window. In it:\n' +
-        '  1. /login — pick the NEW account in the browser (it may preselect the current one).\n' +
+        '  1. /login - pick the NEW account in the browser (it may preselect the current one).\n' +
         '  2. Send one short message so the login completes.\n' +
         '  3. /exit\n\n',
     );
@@ -360,7 +360,7 @@ async function addFreshAccount(label: string): Promise<void> {
     if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
     const account = await buildEngine().captureFromConfigDir(label, captureDir);
     process.stdout.write(
-      `Added ${account.label} (${account.id}). Your current login was not touched — ` +
+      `Added ${account.label} (${account.id}). Your current login was not touched - ` +
         `\`cctl switch ${account.label}\` to use it.\n`,
     );
   } catch (err) {
@@ -391,7 +391,7 @@ async function reloginAccount(ref: string): Promise<void> {
   try {
     process.stdout.write(
       `Re-logging in "${account.label}" (${account.id}). A throwaway Claude window will open.\n` +
-        '  1. /login — pick the SAME account this entry belongs to (attribution is preserved).\n' +
+        '  1. /login - pick the SAME account this entry belongs to (attribution is preserved).\n' +
         '  2. Send one short message so the login completes.\n' +
         '  3. /exit\n\n',
     );
@@ -403,7 +403,7 @@ async function reloginAccount(ref: string): Promise<void> {
     if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
     const updated = await engine.reloginFromConfigDir(account.id, captureDir);
     process.stdout.write(
-      `Re-logged in ${updated.label} (${updated.id}). Quarantine cleared; usage history kept — ` +
+      `Re-logged in ${updated.label} (${updated.id}). Quarantine cleared; usage history kept - ` +
         `\`cctl switch ${updated.label}\` to use it.\n`,
     );
   } catch (err) {
@@ -485,7 +485,7 @@ function buildSessionCommands(program: Command): void {
 
   const sessionIdOption = '--session <id>';
   const sessionIdHelp =
-    'session id (Claude Code does not reliably expose it to slash commands — pass it explicitly)';
+    'session id (Claude Code does not reliably expose it to slash commands - pass it explicitly)';
   // label/watch/unregister run daemon-side against a session already known to the registry, so
   // (unlike register, which CREATES the row and must get the real id) they can also take that
   // session's label — the daemon resolves it, preferring an exact id match if both match.
@@ -599,7 +599,7 @@ async function runSessionCommand(
   const sessionId = resolveSessionId(opts);
   if (!sessionId) {
     fail(
-      'could not determine the session id. Pass --session <id> — Claude Code does not reliably ' +
+      'could not determine the session id. Pass --session <id> - Claude Code does not reliably ' +
         'expose it to slash commands.',
     );
   }
@@ -638,9 +638,9 @@ function printSessionResult(verb: SessionVerb, result: SessionCommandSuccess): v
     .join(', ');
   // A no-change re-register must not read as if something just happened — say what IS.
   if (result.status === 'already_registered') {
-    process.stdout.write(`Session ${s.id} is already registered — ${bits}. Nothing changed.\n`);
+    process.stdout.write(`Session ${s.id} is already registered - ${bits}. Nothing changed.\n`);
     return;
   }
   const already = result.status === 'already_handled' ? ' (already handled)' : '';
-  process.stdout.write(`${SESSION_VERB_PAST[verb]} session ${s.id}${already} — ${bits}.\n`);
+  process.stdout.write(`${SESSION_VERB_PAST[verb]} session ${s.id}${already} - ${bits}.\n`);
 }

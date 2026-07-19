@@ -116,14 +116,14 @@ export async function callDaemonSession(
   const secret = await loadHookSecret({ filePath: hookSecretPath(dataDir), protector });
   if (secret === undefined) {
     throw new SessionClientError(
-      'the daemon has never run on this machine, so its loopback secret does not exist yet — ' +
+      'the daemon has never run on this machine, so its loopback secret does not exist yet - ' +
         'start it with `cctl daemon run`',
     );
   }
   const endpoint = await readHookEndpoint(hookEndpointPath(dataDir));
   if (endpoint === undefined) {
     throw new SessionClientError(
-      'the daemon is not running (no loopback endpoint published) — start it with `cctl daemon run`',
+      'the daemon is not running (no loopback endpoint published) - start it with `cctl daemon run`',
     );
   }
 
@@ -137,7 +137,7 @@ export async function callDaemonSession(
   } catch (err) {
     // A published endpoint whose daemon has since died → connection refused.
     throw new SessionClientError(
-      `could not reach the daemon on 127.0.0.1:${endpoint.port} — is \`cctl daemon run\` still ` +
+      `could not reach the daemon on 127.0.0.1:${endpoint.port} - is \`cctl daemon run\` still ` +
         `running? (${err instanceof Error ? err.message : String(err)})`,
     );
   }

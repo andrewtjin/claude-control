@@ -102,7 +102,7 @@ export interface ControlPlaneClientOptions {
  *  with. Surfaced by `connect()` (and printed verbatim by `cctl`), so it must say exactly what
  *  to do next rather than describe internal state. */
 const NOT_PAIRED_MESSAGE =
-  'this daemon is not paired (no stored identity) — get a pairing code from the bot with ' +
+  'this daemon is not paired (no stored identity) - get a pairing code from the bot with ' +
   '/pair in Discord, then run `cctl daemon run --pair <code>`';
 
 const DEFAULT_OUTBOX_BOUND = 500;
@@ -367,7 +367,7 @@ export class ControlPlaneClient {
       this.state = 'rejected';
       this.opts.logger.error(
         { reason },
-        'control-plane rejected hello — stopping; re-pairing required',
+        'control-plane rejected hello - stopping; re-pairing required',
       );
       this.stopHeartbeat();
       this.failConnect(new Error(reason));

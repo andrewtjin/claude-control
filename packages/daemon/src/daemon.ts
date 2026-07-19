@@ -332,7 +332,7 @@ export class Daemon {
       onStall: (lagMs) =>
         this.logger.warn(
           { lagMs },
-          'event loop stalled — every concurrent hook request waited this long; find and async the blocking work',
+          'event loop stalled - every concurrent hook request waited this long; find and async the blocking work',
         ),
     });
 
@@ -1369,7 +1369,7 @@ export class Daemon {
       ok: false,
       code: 'unknown_session',
       message:
-        `session '${sessionId}' is not registered — run \`cctl session register\` ` +
+        `session '${sessionId}' is not registered - run \`cctl session register\` ` +
         `(or /cctl:register) in that session first`,
     };
   }

@@ -33,14 +33,14 @@ function shortId(id: string): string {
 }
 
 function watchCell(watch: boolean | undefined): string {
-  if (watch === undefined) return '—';
+  if (watch === undefined) return '-';
   return watch ? 'on' : 'off';
 }
 
 /** Render the active-account header line, or a gentle "no data yet" when nothing is known. */
 function renderHeader(header: SessionStatusHeader | undefined, palette: Palette): string {
   if (!header || header.activeLabel === undefined) {
-    return palette.dim('Active account: (none — start the daemon: cctl daemon run)');
+    return palette.dim('Active account: (none - start the daemon: cctl daemon run)');
   }
   const budget =
     header.fullWindowsLeft !== undefined ? `  ·  ${header.fullWindowsLeft}x5h left` : '';
@@ -71,7 +71,7 @@ export function renderSessionStatus(
     kind: r.kind,
     state: r.state,
     watch: watchCell(r.watch),
-    account: r.accountLabel ?? '—',
+    account: r.accountLabel ?? '-',
   }));
 
   const headers = {

@@ -42,7 +42,7 @@ function defaultOnUnboundAccountId(accountId: string): void {
   // Deliberate: the drop must be observable; a daemon with a real logger overrides this via
   // deps.onUnboundAccountId.
   console.warn(
-    `[agentSdkClient] accountId '${accountId}' is not bound to a config dir — this session ` +
+    `[agentSdkClient] accountId '${accountId}' is not bound to a config dir - this session ` +
       `runs under whichever account the switch engine last activated globally. Confirm it was ` +
       `activated before spawn (see agentSdkMapping.ts for the credential-selection rationale).`,
   );

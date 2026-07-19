@@ -263,7 +263,7 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       if (busy) {
         return Promise.reject(
           new Error(
-            `session '${opts.id}' is busy with an in-flight turn — wait for 'waiting_input' or call interrupt() first`,
+            `session '${opts.id}' is busy with an in-flight turn - wait for 'waiting_input' or call interrupt() first`,
           ),
         );
       }

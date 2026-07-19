@@ -42,7 +42,7 @@ export function instanceLockPath(dataDir: string): string {
 export class DaemonAlreadyRunningError extends Error {
   constructor(readonly pid: number) {
     super(
-      `another daemon (pid ${pid}) is already running — stop it or use ` +
+      `another daemon (pid ${pid}) is already running - stop it or use ` +
         '`cctl daemon supervise` exclusively.',
     );
     this.name = new.target.name;
