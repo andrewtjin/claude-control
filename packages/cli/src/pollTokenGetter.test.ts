@@ -7,7 +7,11 @@ import type { CredentialBundle, RefreshTokenResult } from '@claude-control/switc
 import {
   createPollTokenGetter,
   POLL_REFRESH_MIN_INTERVAL_MS,
+  PROFILE_ENDPOINT,
+  type AccountIdentityRow,
+  type PollIdentityOptions,
   type PollRefreshEngine,
+  type ProfileFetch,
 } from './pollTokenGetter.js';
 
 const MIN_TTL_MS = 60_000;
@@ -219,5 +223,232 @@ describe('createPollTokenGetter', () => {
     const err = await getToken('a1').catch((e: unknown) => e as Error);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).not.toMatch(/SECRET-ACCESS/);
+  });
+});
+
+// --- identity invariant --------------------------------------------------------------------
+// The getter must never hand out a token it cannot attribute to the account it is filed
+// under: a contaminated bundle once made the poller silently report one account's usage as
+// another's. Local check = registry row uuid vs bundle uuid; network check = profile
+// endpoint's account.uuid vs registry row uuid, asked with the very token about to be used.
+
+/** A bundle whose captured identity block names `uuid`. */
+function bundleOwnedBy(access: string, expiresAt: number, uuid: string): CredentialBundle {
+  return {
+    claudeAiOauth: { accessToken: access, refreshToken: 'r-' + access, expiresAt },
+    oauthAccount: { accountUuid: uuid },
+  };
+}
+
+/** A profile endpoint fake answering 200 with `account.uuid = uuid`, recording every call. */
+function profileAnswering(uuid: string): { fetchFn: ProfileFetch; calls: string[] } {
+  const calls: string[] = [];
+  const fetchFn: ProfileFetch = (url) => {
+    calls.push(url);
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ account: { uuid } }) });
+  };
+  return { fetchFn, calls };
+}
+
+/** Identity wiring over a one-row fake registry + a quarantine recorder. */
+function fakeIdentity(
+  row: AccountIdentityRow | undefined,
+  fetchFn: ProfileFetch,
+): { identity: PollIdentityOptions; quarantined: Array<{ id: string; reason: string }> } {
+  const quarantined: Array<{ id: string; reason: string }> = [];
+  return {
+    quarantined,
+    identity: {
+      lookupAccount: () => Promise.resolve(row),
+      quarantine: (id, reason) => {
+        quarantined.push({ id, reason });
+        return Promise.resolve();
+      },
+      fetchFn,
+    },
+  };
+}
+
+describe('createPollTokenGetter — identity invariant', () => {
+  const ROW_UUID = 'uuid-own';
+  const FOREIGN_UUID = 'uuid-foreign';
+  const noEngine = () => fakeEngine(() => Promise.reject(new Error('unused'))).engine;
+
+  it('hands out a token whose bundle and profile identity both match, hitting the profile endpoint once per call', async () => {
+    const bundles = new Map([['a1', bundleOwnedBy('tok', 10 * HOUR, ROW_UUID)]]);
+    const profile = profileAnswering(ROW_UUID);
+    const { identity, quarantined } = fakeIdentity(
+      { accountUuid: ROW_UUID, quarantined: false },
+      profile.fetchFn,
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine: noEngine(),
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+      identity,
+    });
+
+    expect(await getToken('a1')).toBe('tok');
+    expect(await getToken('a1')).toBe('tok');
+    expect(profile.calls).toEqual([PROFILE_ENDPOINT, PROFILE_ENDPOINT]);
+    expect(quarantined).toEqual([]);
+  });
+
+  it('a bundle filed under the wrong account quarantines with both uuids named and withholds the token', async () => {
+    const bundles = new Map([['a1', bundleOwnedBy('tok', 10 * HOUR, FOREIGN_UUID)]]);
+    const profile = profileAnswering(ROW_UUID);
+    const { identity, quarantined } = fakeIdentity(
+      { accountUuid: ROW_UUID, quarantined: false },
+      profile.fetchFn,
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine: noEngine(),
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+      identity,
+    });
+
+    await expect(getToken('a1')).rejects.toThrow(/identity mismatch.*quarantined/);
+    expect(quarantined).toEqual([
+      {
+        id: 'a1',
+        reason: `vault bundle identity mismatch (bundle ${FOREIGN_UUID} != registry ${ROW_UUID})`,
+      },
+    ]);
+    expect(profile.calls).toEqual([]); // the local check gates before any network use
+  });
+
+  it('a row-matching bundle whose TOKEN the profile attributes elsewhere quarantines and withholds', async () => {
+    // The lie the local check cannot see: a refresh response carries no identity, so foreign
+    // tokens can sit under an honest-looking identity block. Only the network answer counts.
+    const bundles = new Map([['a1', bundleOwnedBy('tok', 10 * HOUR, ROW_UUID)]]);
+    const profile = profileAnswering(FOREIGN_UUID);
+    const { identity, quarantined } = fakeIdentity(
+      { accountUuid: ROW_UUID, quarantined: false },
+      profile.fetchFn,
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine: noEngine(),
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+      identity,
+    });
+
+    await expect(getToken('a1')).rejects.toThrow(/token ownership mismatch.*quarantined/);
+    expect(quarantined).toEqual([
+      {
+        id: 'a1',
+        reason: `token ownership mismatch (profile account ${FOREIGN_UUID} != registry ${ROW_UUID})`,
+      },
+    ]);
+  });
+
+  it('fails OPEN on profile unavailability: network error, non-2xx, and shape drift all hand out the token', async () => {
+    const cases: ProfileFetch[] = [
+      () => Promise.reject(new Error('offline')),
+      () => Promise.resolve({ ok: false, json: () => Promise.resolve({}) }),
+      () => Promise.resolve({ ok: true, json: () => Promise.resolve({ unexpected: true }) }),
+    ];
+    for (const fetchFn of cases) {
+      const bundles = new Map([['a1', bundleOwnedBy('tok', 10 * HOUR, ROW_UUID)]]);
+      const { identity, quarantined } = fakeIdentity(
+        { accountUuid: ROW_UUID, quarantined: false },
+        fetchFn,
+      );
+      const getToken = createPollTokenGetter({
+        vault: fakeVault(bundles),
+        engine: noEngine(),
+        minTtlMs: MIN_TTL_MS,
+        clock: () => 0,
+        identity,
+      });
+      expect(await getToken('a1')).toBe('tok');
+      expect(quarantined).toEqual([]);
+    }
+  });
+
+  it('a quarantined account is not polled at all: no bundle read, no network, reason surfaced', async () => {
+    const readBundle = vi.fn(() => Promise.reject(new Error('must not be called')));
+    const profile = profileAnswering(ROW_UUID);
+    const { identity } = fakeIdentity(
+      { accountUuid: ROW_UUID, quarantined: true, quarantineReason: 'refresh token died' },
+      profile.fetchFn,
+    );
+    const getToken = createPollTokenGetter({
+      vault: { readBundle },
+      engine: noEngine(),
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+      identity,
+    });
+
+    await expect(getToken('a1')).rejects.toThrow(/quarantined \(refresh token died\)/);
+    expect(readBundle).not.toHaveBeenCalled();
+    expect(profile.calls).toEqual([]);
+  });
+
+  it('an uncaptured identity is unverifiable, not guilty: row without a uuid skips both checks', async () => {
+    const bundles = new Map([['a1', bundleOwnedBy('tok', 10 * HOUR, FOREIGN_UUID)]]);
+    const profile = profileAnswering(FOREIGN_UUID);
+    const { identity, quarantined } = fakeIdentity({ quarantined: false }, profile.fetchFn);
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine: noEngine(),
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+      identity,
+    });
+
+    expect(await getToken('a1')).toBe('tok');
+    expect(profile.calls).toEqual([]); // nothing to compare against — no wasted call either
+    expect(quarantined).toEqual([]);
+  });
+
+  it('verifyOwnership: false keeps the free local check but never touches the network', async () => {
+    const bundles = new Map([['a1', bundleOwnedBy('tok', 10 * HOUR, FOREIGN_UUID)]]);
+    const profile = profileAnswering(ROW_UUID);
+    const { identity, quarantined } = fakeIdentity(
+      { accountUuid: ROW_UUID, quarantined: false },
+      profile.fetchFn,
+    );
+    identity.verifyOwnership = false;
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine: noEngine(),
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+      identity,
+    });
+
+    await expect(getToken('a1')).rejects.toThrow(/vault bundle identity mismatch/);
+    expect(quarantined).toHaveLength(1);
+    expect(profile.calls).toEqual([]);
+  });
+
+  it('the post-refresh re-read re-runs the checks — rotated contents earn no extra trust', async () => {
+    // Refresh "succeeds" but rotates a FOREIGN bundle into place (the contamination shape).
+    const bundles = new Map([['a1', bundleOwnedBy('tok-old', -HOUR, ROW_UUID)]]);
+    const { engine } = fakeEngine((id) => {
+      bundles.set(id, bundleOwnedBy('tok-new', 10 * HOUR, FOREIGN_UUID));
+      return Promise.resolve(refreshedResult(id, 10 * HOUR));
+    });
+    const profile = profileAnswering(ROW_UUID);
+    const { identity, quarantined } = fakeIdentity(
+      { accountUuid: ROW_UUID, quarantined: false },
+      profile.fetchFn,
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine,
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+      identity,
+    });
+
+    await expect(getToken('a1')).rejects.toThrow(/vault bundle identity mismatch/);
+    expect(quarantined).toHaveLength(1);
   });
 });

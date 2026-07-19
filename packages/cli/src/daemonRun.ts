@@ -191,6 +191,15 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       vault: pollVault,
       engine,
       minTtlMs: POLL_TOKEN_MIN_TTL_MS,
+      // Identity invariant: never hand the poller a token that cannot be attributed to the
+      // account it is filed under. Registry truth + quarantine go straight to the vault
+      // (StoredAccount satisfies the row shape structurally); a quarantine here surfaces
+      // through the existing notice reconciler as the guided re-login card.
+      identity: {
+        lookupAccount: (id) => pollVault.getAccount(id),
+        quarantine: (id, reason) => pollVault.quarantine(id, reason),
+        verifyOwnership: config.values.identityCheck,
+      },
     }),
     // Tier-0 cache lives in the live ~/.claude.json — served only when it provably belongs
     // to the account being polled (active + accountUuid match; see cachedUsageReader.ts).

@@ -108,6 +108,7 @@ export interface DaemonConfig {
     permissionHoldMs: number | undefined;
     commandOutputCards: boolean;
     fullToolOutput: boolean;
+    identityCheck: boolean;
   };
   rows: SettingRow[];
 }
@@ -143,6 +144,11 @@ export function resolveDaemonConfig(
   const commandOutputCards = commandOutputEnv ?? true;
   // Default OFF: cards ship a phone-sized excerpt; full output arrives as a file attachment.
   const fullToolOutput = envFlag(env, 'CCTL_TOOL_OUTPUT_FULL');
+  // Default ON: each poll verifies the vault token's OWNER against the OAuth profile
+  // endpoint and quarantines on mismatch — the guard against a bundle silently holding
+  // another account's credentials. The free local row-vs-bundle check runs regardless.
+  const identityCheckEnv = envBool(env, 'CCTL_IDENTITY_CHECK');
+  const identityCheck = identityCheckEnv ?? true;
 
   const rows: SettingRow[] = [
     {
@@ -202,6 +208,13 @@ export function resolveDaemonConfig(
       detail: "CCTL_COMMAND_OUTPUT (every shell command's output as a phone card; off silences)",
     },
     {
+      name: 'identity check',
+      value: identityCheck ? 'on' : 'off',
+      source: envSource(identityCheckEnv !== undefined),
+      detail:
+        'CCTL_IDENTITY_CHECK (verify each vault token really belongs to its account per poll; quarantine on mismatch)',
+    },
+    {
       name: 'full tool output',
       value: fullToolOutput ? 'on' : 'off',
       source: envSource(fullToolOutput),
@@ -235,6 +248,7 @@ export function resolveDaemonConfig(
       permissionHoldMs,
       commandOutputCards,
       fullToolOutput,
+      identityCheck,
     },
     rows,
   };

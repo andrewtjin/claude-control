@@ -67,6 +67,7 @@ describe('resolveDaemonConfig', () => {
       permissionHoldMs: undefined,
       commandOutputCards: true,
       fullToolOutput: false,
+      identityCheck: true,
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('off');
@@ -78,6 +79,7 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'waiting cards').value).toBe('off');
     expect(row(rows, 'permission hold').value).toBe('570s');
     expect(row(rows, 'command output cards').value).toBe('on');
+    expect(row(rows, 'identity check').value).toBe('on');
     expect(row(rows, 'full tool output').value).toBe('off');
     expect(row(rows, 'relay url').value).toBe(DEFAULT_RELAY_URL);
     expect(row(rows, 'daemon log level').value).toBe('info');
@@ -114,6 +116,16 @@ describe('resolveDaemonConfig', () => {
       value: 'on',
       source: 'default',
     });
+  });
+
+  it('disables the network identity check via CCTL_IDENTITY_CHECK=off (default stays on)', () => {
+    const off = resolveDaemonConfig({ CCTL_IDENTITY_CHECK: 'off' });
+    expect(off.values.identityCheck).toBe(false);
+    expect(row(off.rows, 'identity check')).toMatchObject({ value: 'off', source: 'env' });
+    // A typo is not an override — the safe default (on) stands, attributed as default.
+    const typo = resolveDaemonConfig({ CCTL_IDENTITY_CHECK: 'nah' });
+    expect(typo.values.identityCheck).toBe(true);
+    expect(row(typo.rows, 'identity check')).toMatchObject({ value: 'on', source: 'default' });
   });
 
   it('enables full tool output via CCTL_TOOL_OUTPUT_FULL', () => {
