@@ -81,6 +81,10 @@ describe('HeartbeatWriter', () => {
     // Exactly one more tick from the single live interval, not two.
     expect(ticks).toBe(ticksAfterFirstStart + 1);
     writer.stop();
+    // The tick above kicked off a real temp-file write + rename; on Windows, afterEach's
+    // recursive rm can walk the directory mid-rename and die with ENOTEMPTY unless the
+    // write settles first.
+    await writer.flush();
   });
 
   it('reports a write failure through onError instead of throwing out of the timer', async () => {
