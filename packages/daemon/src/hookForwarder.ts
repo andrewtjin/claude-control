@@ -14,14 +14,21 @@
 //   - Endpoint file present but nothing listening (crash leftover): one connect attempt to
 //     127.0.0.1 bounded by a short CONNECT-ONLY timeout, then the stale endpoint file is
 //     removed so every later event takes the no-network fast path. Exit 0.
-//   - Connected: the response is awaited WITHOUT any deadline, and its body is printed to
-//     stdout verbatim. Held permission answers are long-polls (minutes) and Stop-hook
-//     steering rides the response body — a total-time cap here would sever both channels.
+//   - Connected: what happens next depends on WHETHER THE EVENT'S RESPONSE CARRIES ANYTHING.
+//     PermissionRequest answers are long-poll decisions and Stop answers deliver operator
+//     steering ({"decision":"block","reason":…}), so those two ride the response with NO
+//     deadline and print it to stdout verbatim. Notification and PostToolUse answers are
+//     always an ignored {ok:true} — for those the script exits as soon as the request body
+//     has been handed to the connected socket (fire-and-forget), so a daemon whose event
+//     loop is momentarily busy can NEVER stall a tool call: the kernel owns delivery from
+//     that point and the daemon reads the event when it gets there. An unrecognized or
+//     unparsable event rides the response — correctness over speed for anything unknown.
 //
 // Reading the receiver's CURRENT port from the endpoint file at fire time also makes the
 // installed command port-independent: a running session's hook snapshot keeps working across
 // daemon restarts instead of pointing at a dead port forever. Events that fire while the
-// daemon is down are dropped by design; while it is up, delivery stays synchronous, ordered,
+// daemon is down are dropped by design; while it is up, delivery stays complete, ordered
+// (the session serializes its own hook events; connections are accepted in arrival order),
 // and unduplicated — exactly as before.
 //
 // The script must stay dependency-free CommonJS (any Node on PATH can run it, regardless of
@@ -43,8 +50,10 @@ export function hookForwarderPath(dataDir: string): string {
 export const HOOK_FORWARDER_SOURCE = `'use strict';
 // claude-control hook forwarder (written by the daemon; safe to delete — it is
 // re-created on daemon start). Forwards the Claude Code hook payload on stdin
-// to the local daemon's loopback receiver and prints the response to stdout.
-// No daemon (no endpoint file, or nothing listening) => exit 0 quickly.
+// to the local daemon's loopback receiver. PermissionRequest/Stop responses are
+// awaited and printed (decisions and steering ride them); everything else is
+// fire-and-forget once the body reaches the socket. No daemon (no endpoint
+// file, or nothing listening) => exit 0 quickly.
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -52,6 +61,11 @@ const http = require('http');
 // Bounds the CONNECT only, never the response wait: permission answers are
 // long-polls and steering rides the response body.
 const CONNECT_TIMEOUT_MS = 400;
+
+// Events whose RESPONSE carries a decision back into the session. Every other
+// event's response is an ignored ack, so waiting for it would only re-couple
+// tool-call latency to daemon responsiveness.
+const RESPONSE_EVENTS = ['PermissionRequest', 'Stop'];
 
 const endpointFile = path.join(__dirname, 'hook-endpoint.json');
 
@@ -76,35 +90,65 @@ const headers = {
 };
 headers[headerArg.slice(0, sep).trim()] = headerArg.slice(sep + 1).trim();
 
-const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/', headers });
-let connected = false;
-const connectTimer = setTimeout(() => {
-  if (!connected) req.destroy(new Error('connect timeout'));
-}, CONNECT_TIMEOUT_MS);
-req.on('socket', (socket) => {
-  socket.on('connect', () => {
-    connected = true;
-    clearTimeout(connectTimer);
-  });
-});
-req.on('error', () => {
-  clearTimeout(connectTimer);
-  if (!connected) {
-    // Nothing listening behind a published endpoint: crash leftover. Drop the
-    // stale file so later events skip straight to the no-network fast path.
-    try {
-      fs.unlinkSync(endpointFile);
-    } catch {}
-  }
-  bail();
-});
-req.on('response', (res) => {
-  res.pipe(process.stdout);
-  res.on('end', () => process.exit(0));
-  res.on('error', bail);
-});
+// The whole payload is buffered (hook payloads are small) so the event name can
+// pick the mode before the request is sent.
+let body = '';
+process.stdin.setEncoding('utf8');
 process.stdin.on('error', bail);
-process.stdin.pipe(req);
+process.stdin.on('data', (chunk) => {
+  body += chunk;
+});
+process.stdin.on('end', () => {
+  let event;
+  try {
+    event = JSON.parse(body).hook_event_name;
+  } catch {}
+  // Unknown/unparsable events ride the response: never guess that an answer is ignorable.
+  const awaitResponse = typeof event !== 'string' || RESPONSE_EVENTS.indexOf(event) >= 0;
+
+  const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/', headers });
+  let connected = false;
+  let flushed = false;
+  const connectTimer = setTimeout(() => {
+    if (!connected) req.destroy(new Error('connect timeout'));
+  }, CONNECT_TIMEOUT_MS);
+  // Fire-and-forget completes when BOTH hold: the socket is connected and the body has been
+  // flushed to it. From there the kernel owns delivery — a busy daemon reads the event when
+  // its loop frees up, and this process's exit cannot lose gracefully-closed TCP data.
+  function maybeDone() {
+    if (!awaitResponse && connected && flushed) process.exit(0);
+  }
+  req.on('socket', (socket) => {
+    socket.on('connect', () => {
+      connected = true;
+      clearTimeout(connectTimer);
+      maybeDone();
+    });
+  });
+  req.on('finish', () => {
+    flushed = true;
+    maybeDone();
+  });
+  req.on('error', () => {
+    clearTimeout(connectTimer);
+    if (!connected) {
+      // Nothing listening behind a published endpoint: crash leftover. Drop the
+      // stale file so later events skip straight to the no-network fast path.
+      try {
+        fs.unlinkSync(endpointFile);
+      } catch {}
+    }
+    bail();
+  });
+  if (awaitResponse) {
+    req.on('response', (res) => {
+      res.pipe(process.stdout);
+      res.on('end', () => process.exit(0));
+      res.on('error', bail);
+    });
+  }
+  req.end(body);
+});
 `;
 
 /** Write (or refresh) the forwarder script. Called on daemon start, before hook install, so

@@ -5,8 +5,10 @@
 // dir, spawn it under the real node binary, and speak to it over real loopback sockets. The
 // policies under test are the ones the module exists for: no-network fast path when the
 // endpoint file is absent, connect-ONLY timeout (a slow response must still be delivered —
-// permission answers are long-polls), stale-endpoint self-healing, and verbatim response
-// passthrough on stdout (hook answers ride it).
+// permission answers are long-polls, steering rides Stop), verbatim response passthrough on
+// stdout for PermissionRequest/Stop, fire-and-forget for Notification/PostToolUse (exit on
+// flush; a busy daemon can never stall a tool call, yet the body still arrives), and
+// stale-endpoint self-healing.
 
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -52,8 +54,19 @@ interface CapturedRequest {
   body: string;
 }
 
+/** Poll until `cond` holds — the fire-and-forget forwarder exits before the server has
+ *  necessarily read the body, so its delivery assertion needs a short grace window. */
+async function until(cond: () => boolean, timeoutMs = 3000): Promise<void> {
+  const startedAt = Date.now();
+  while (!cond()) {
+    if (Date.now() - startedAt > timeoutMs) throw new Error('condition not met in time');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 /** A real loopback receiver stand-in: captures every request, answers with `responseBody`
- *  after `delayMs`. */
+ *  after `delayMs`. `delayMs: Infinity` never answers at all — the stand-in for a daemon
+ *  whose event loop is blocked indefinitely. */
 function startServer(
   responseBody: string,
   delayMs = 0,
@@ -64,6 +77,7 @@ function startServer(
     req.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')));
     req.on('end', () => {
       requests.push({ headers: req.headers, body });
+      if (!Number.isFinite(delayMs)) return; // never respond
       setTimeout(() => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(responseBody);
@@ -130,6 +144,39 @@ describe('hook forwarder script', () => {
       await writeHookEndpoint(hookEndpointPath(dataDir), { port });
       const result = await runForwarder(scriptPath, '{"hook_event_name":"PermissionRequest"}');
       expect(result).toEqual({ code: 0, stdout: '{"ok":true}', stderr: '' });
+    } finally {
+      server.close();
+    }
+  }, 15_000);
+
+  it('Notification/PostToolUse are fire-and-forget: exit without any response, body still delivered', async () => {
+    for (const event of ['Notification', 'PostToolUse']) {
+      // The server NEVER responds — the stand-in for a daemon whose loop is blocked
+      // indefinitely. A response-riding forwarder would hang here until the test timeout;
+      // fire-and-forget must exit once the body reaches the socket (no wall-clock bound, so
+      // the proof is immune to suite-load spawn jitter) — and the body must still arrive.
+      const { server, port, requests } = await startServer('unused', Infinity);
+      try {
+        await writeHookEndpoint(hookEndpointPath(dataDir), { port });
+        const payload = `{"hook_event_name":"${event}","session_id":"s-1"}`;
+        const result = await runForwarder(scriptPath, payload);
+        expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+        await until(() => requests.length === 1);
+        expect(requests[0]?.body).toBe(payload);
+      } finally {
+        server.close();
+      }
+    }
+  }, 20_000);
+
+  it('an unparsable payload rides the response — never guess that an answer is ignorable', async () => {
+    const { server, port } = await startServer('{"ok":true}', 600);
+    try {
+      await writeHookEndpoint(hookEndpointPath(dataDir), { port });
+      const startedAt = Date.now();
+      const result = await runForwarder(scriptPath, 'not json at all');
+      expect(result).toEqual({ code: 0, stdout: '{"ok":true}', stderr: '' });
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(600);
     } finally {
       server.close();
     }
