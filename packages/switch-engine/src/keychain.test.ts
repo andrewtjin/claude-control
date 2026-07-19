@@ -17,38 +17,38 @@ import type { ClaudeOauth } from './types.js';
 describe('AesGcmProtector', () => {
   const key = randomBytes(32);
 
-  it('round-trips arbitrary bytes and never emits plaintext', () => {
+  it('round-trips arbitrary bytes and never emits plaintext', async () => {
     const p = new AesGcmProtector(key);
     const secret = Buffer.from('refresh-token-🔐-value', 'utf8');
-    const blob = p.protect(secret);
+    const blob = await p.protect(secret);
     expect(blob.startsWith('aesgcm:')).toBe(true);
     expect(blob).not.toContain('refresh-token');
-    expect(p.unprotect(blob).equals(secret)).toBe(true);
+    expect((await p.unprotect(blob)).equals(secret)).toBe(true);
   });
 
-  it('uses a fresh IV per call (same plaintext, different blobs)', () => {
+  it('uses a fresh IV per call (same plaintext, different blobs)', async () => {
     const p = new AesGcmProtector(key);
     const secret = Buffer.from('same');
-    expect(p.protect(secret)).not.toBe(p.protect(secret));
+    expect(await p.protect(secret)).not.toBe(await p.protect(secret));
   });
 
-  it('rejects a tampered blob via GCM authentication, not garbage output', () => {
+  it('rejects a tampered blob via GCM authentication, not garbage output', async () => {
     const p = new AesGcmProtector(key);
-    const blob = p.protect(Buffer.from('payload-payload-payload'));
+    const blob = await p.protect(Buffer.from('payload-payload-payload'));
     const raw = Buffer.from(blob.slice('aesgcm:'.length), 'base64');
     raw.writeUInt8(raw.readUInt8(raw.length - 1) ^ 0xff, raw.length - 1); // flip one bit
-    expect(() => p.unprotect(`aesgcm:${raw.toString('base64')}`)).toThrow(VaultError);
+    await expect(p.unprotect(`aesgcm:${raw.toString('base64')}`)).rejects.toThrow(VaultError);
   });
 
-  it('rejects a blob encrypted under a different key', () => {
-    const blob = new AesGcmProtector(randomBytes(32)).protect(Buffer.from('x'));
-    expect(() => new AesGcmProtector(key).unprotect(blob)).toThrow(VaultError);
+  it('rejects a blob encrypted under a different key', async () => {
+    const blob = await new AesGcmProtector(randomBytes(32)).protect(Buffer.from('x'));
+    await expect(new AesGcmProtector(key).unprotect(blob)).rejects.toThrow(VaultError);
   });
 
-  it('rejects foreign and truncated blobs', () => {
+  it('rejects foreign and truncated blobs', async () => {
     const p = new AesGcmProtector(key);
-    expect(() => p.unprotect('insecure:abc')).toThrow(VaultError);
-    expect(() => p.unprotect('aesgcm:AAAA')).toThrow(VaultError);
+    await expect(p.unprotect('insecure:abc')).rejects.toThrow(VaultError);
+    await expect(p.unprotect('aesgcm:AAAA')).rejects.toThrow(VaultError);
   });
 
   it('requires a 32-byte key', () => {
@@ -74,7 +74,15 @@ function argAfter(tokens: string[], flag: string): string {
 function fakeSecurity(store: Map<string, string>): { run: ExecRunner; calls: SecurityCall[] } {
   const calls: SecurityCall[] = [];
   const keyOf = (service: string, account: string) => `${service} ${account}`;
+  // Sync body wrapped into the async ExecRunner contract: throws become rejections.
   const run: ExecRunner = (file, args, input) => {
+    try {
+      return Promise.resolve(runSync(file, args, input));
+    } catch (err) {
+      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  };
+  const runSync = (file: string, args: string[], input?: string): string => {
     calls.push({ args, input });
     if (file !== 'security') throw new Error(`unexpected binary: ${file}`);
     if (args[0] === 'find-generic-password') {
@@ -131,24 +139,24 @@ function tokenize(line: string): string[] {
 // --- KeychainKeySource ---------------------------------------------------------------------
 
 describe('KeychainKeySource', () => {
-  it('returns an existing key without writing', () => {
+  it('returns an existing key without writing', async () => {
     const hex = randomBytes(32).toString('hex');
     const store = new Map([[`${VAULT_KEY_SERVICE} ${VAULT_KEY_ACCOUNT}`, hex]]);
     const { run, calls } = fakeSecurity(store);
 
-    const key = new KeychainKeySource(run).getOrCreateKey();
+    const key = await new KeychainKeySource(run).getOrCreateKey();
     expect(key.toString('hex')).toBe(hex);
     expect(calls.every((c) => c.args[0] === 'find-generic-password')).toBe(true);
   });
 
-  it('creates a key on first run and the SECRET RIDES STDIN, never argv', () => {
+  it('creates a key on first run and the SECRET RIDES STDIN, never argv', async () => {
     const store = new Map<string, string>();
     const { run, calls } = fakeSecurity(store);
 
-    const key = new KeychainKeySource(run).getOrCreateKey();
+    const key = await new KeychainKeySource(run).getOrCreateKey();
     expect(key.length).toBe(32);
     // The stored value round-trips through a subsequent read.
-    expect(new KeychainKeySource(run).getOrCreateKey().equals(key)).toBe(true);
+    expect((await new KeychainKeySource(run).getOrCreateKey()).equals(key)).toBe(true);
 
     const writes = calls.filter((c) => c.args[0] === '-i');
     expect(writes).toHaveLength(1);
@@ -159,45 +167,45 @@ describe('KeychainKeySource', () => {
     }
   });
 
-  it('rejects a malformed key found in the keychain instead of using it', () => {
+  it('rejects a malformed key found in the keychain instead of using it', async () => {
     const store = new Map([[`${VAULT_KEY_SERVICE} ${VAULT_KEY_ACCOUNT}`, 'not-hex!']]);
     const { run } = fakeSecurity(store);
-    expect(() => new KeychainKeySource(run).getOrCreateKey()).toThrow(VaultError);
+    await expect(new KeychainKeySource(run).getOrCreateKey()).rejects.toThrow(VaultError);
   });
 
-  it('propagates non-not-found keychain failures as VaultError', () => {
+  it('propagates non-not-found keychain failures as VaultError', async () => {
     const run: ExecRunner = () => {
       const err = new Error('security failed') as Error & { stderr: string };
       err.stderr = 'security: SecKeychainCopyDefault: A keychain cannot be found.';
-      throw err;
+      return Promise.reject(err);
     };
-    expect(() => new KeychainKeySource(run).getOrCreateKey()).toThrow(VaultError);
+    await expect(new KeychainKeySource(run).getOrCreateKey()).rejects.toThrow(VaultError);
   });
 });
 
 // --- KeychainProtector ---------------------------------------------------------------------
 
 describe('KeychainProtector', () => {
-  it('refuses to run off macOS (mirror of DpapiProtector win32 guard)', () => {
+  it('refuses to run off macOS (mirror of DpapiProtector win32 guard)', async () => {
     const { run } = fakeSecurity(new Map());
     const p = new KeychainProtector(new KeychainKeySource(run), 'win32');
-    expect(() => p.protect(Buffer.from('x'))).toThrow(/only available on macOS/);
-    expect(() => p.unprotect('aesgcm:AAAA')).toThrow(/only available on macOS/);
+    await expect(p.protect(Buffer.from('x'))).rejects.toThrow(/only available on macOS/);
+    await expect(p.unprotect('aesgcm:AAAA')).rejects.toThrow(/only available on macOS/);
   });
 
-  it('round-trips through the keychain-held key on darwin', () => {
+  it('round-trips through the keychain-held key on darwin', async () => {
     const { run } = fakeSecurity(new Map());
     const p = new KeychainProtector(new KeychainKeySource(run), 'darwin');
     const secret = Buffer.from(JSON.stringify({ accessToken: 'a', refreshToken: 'b' }));
-    expect(p.unprotect(p.protect(secret)).equals(secret)).toBe(true);
+    expect((await p.unprotect(await p.protect(secret))).equals(secret)).toBe(true);
   });
 
-  it('two protectors sharing one keychain interoperate (same stored key)', () => {
+  it('two protectors sharing one keychain interoperate (same stored key)', async () => {
     const store = new Map<string, string>();
     const a = new KeychainProtector(new KeychainKeySource(fakeSecurity(store).run), 'darwin');
     const b = new KeychainProtector(new KeychainKeySource(fakeSecurity(store).run), 'darwin');
     const secret = Buffer.from('shared');
-    expect(b.unprotect(a.protect(secret)).equals(secret)).toBe(true);
+    expect((await b.unprotect(await a.protect(secret))).equals(secret)).toBe(true);
   });
 });
 

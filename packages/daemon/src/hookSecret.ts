@@ -66,7 +66,7 @@ export async function loadHookSecret(
     return undefined; // never generated on this machine yet
   }
   try {
-    const secret = opts.protector.unprotect(blob.trim()).toString('utf8');
+    const secret = (await opts.protector.unprotect(blob.trim())).toString('utf8');
     return secret.length > 0 ? secret : undefined;
   } catch {
     return undefined; // corrupt / foreign / wrong-user blob
@@ -87,6 +87,6 @@ export async function loadOrCreateHookSecret(opts: HookSecretOptions): Promise<s
   // crash is self-correcting on the next start (unreadable → regenerate). Ensure the parent
   // dir exists so the very first run on a clean machine doesn't ENOENT.
   await mkdir(dirname(opts.filePath), { recursive: true });
-  await writeFile(opts.filePath, opts.protector.protect(Buffer.from(secret, 'utf8')), 'utf8');
+  await writeFile(opts.filePath, await opts.protector.protect(Buffer.from(secret, 'utf8')), 'utf8');
   return secret;
 }

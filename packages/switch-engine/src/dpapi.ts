@@ -6,17 +6,24 @@
 // tools, works on a stock Windows box. Secrets are passed on stdin (never argv) so they do
 // not appear in the process table, and the PowerShell body is delivered via -EncodedCommand
 // to avoid any quoting/injection surface.
+//
+// The Protector contract is ASYNC and must stay async: a PowerShell spawn costs hundreds of
+// milliseconds to whole seconds on a loaded Windows box, and the daemon calls unprotect on
+// every usage poll. Run synchronously (the original execFileSync design), each call froze the
+// daemon's entire event loop for the spawn's lifetime — live-measured as 0.5–3.8s stalls on
+// EVERY concurrent hook request, taxing every Claude Code tool call on the machine. Nothing
+// that shells out may ever sit behind a synchronous interface here.
 
-import { execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { VaultError } from './errors.js';
 
 /** Pluggable protector so tests can substitute an in-memory fake for logic that doesn't
  *  specifically exercise DPAPI. Both directions round-trip base64 <-> base64. */
 export interface Protector {
   /** Encrypt raw bytes, returning an opaque base64 blob. */
-  protect(plaintext: Buffer): string;
+  protect(plaintext: Buffer): Promise<string>;
   /** Decrypt a base64 blob produced by {@link protect}, returning the original bytes. */
-  unprotect(blob: string): Buffer;
+  unprotect(blob: string): Promise<Buffer>;
 }
 
 // PowerShell bodies. Input and output are base64 on stdin/stdout to keep binary safe.
@@ -48,42 +55,70 @@ function encodeCommand(script: string): string {
   return Buffer.from(script, 'utf16le').toString('base64');
 }
 
-function runPowerShell(script: string, inputBase64: string): string {
-  try {
-    const out = execFileSync(
+/** Bound on captured stdout/stderr — a DPAPI blob for a token bundle is a few KB; anything
+ *  approaching this is a malfunction, not data. */
+const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+/** Spawn PowerShell asynchronously, feed `inputBase64` on stdin, and resolve with trimmed
+ *  stdout. Rejects with a VaultError carrying the exit code and stderr text (PowerShell's
+ *  CLIXML chatter or real error text) — never lets either land on the parent console. */
+function runPowerShell(script: string, inputBase64: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(script)],
-      {
-        input: inputBase64,
-        encoding: 'utf8',
-        windowsHide: true,
-        maxBuffer: 16 * 1024 * 1024,
-        // Pipe stderr instead of execFileSync's default inherit: whatever PowerShell still
-        // writes there (CLIXML chatter, real error text) must land in the thrown error's
-        // `stderr` field for diagnostics — never on the parent process's console.
-        stdio: ['pipe', 'pipe', 'pipe'],
-      },
+      { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
     );
-    return out.trim();
-  } catch (err) {
-    throw new VaultError('DPAPI operation failed', { cause: err });
-  }
+    const out: Buffer[] = [];
+    const errOut: Buffer[] = [];
+    let outBytes = 0;
+    child.stdout.on('data', (chunk: Buffer) => {
+      outBytes += chunk.length;
+      if (outBytes <= MAX_OUTPUT_BYTES) out.push(chunk);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (errOut.length < 64) errOut.push(chunk);
+    });
+    child.on('error', (err) => {
+      reject(new VaultError('DPAPI operation failed', { cause: err }));
+    });
+    child.on('close', (code) => {
+      if (code === 0 && outBytes <= MAX_OUTPUT_BYTES) {
+        resolve(Buffer.concat(out).toString('utf8').trim());
+        return;
+      }
+      const stderr = Buffer.concat(errOut).toString('utf8').slice(0, 2000);
+      const detail =
+        outBytes > MAX_OUTPUT_BYTES
+          ? 'output exceeded sanity bound'
+          : `exit code ${code ?? 'null'}`;
+      reject(
+        new VaultError('DPAPI operation failed', {
+          cause: new Error(`powershell ${detail}${stderr ? `: ${stderr}` : ''}`),
+        }),
+      );
+    });
+    // A crashed child can close stdin before we finish writing — that surfaces via 'close'
+    // above with the real cause, so the write error itself is deliberately swallowed.
+    child.stdin.on('error', () => {});
+    child.stdin.end(inputBase64);
+  });
 }
 
 /** Real DPAPI protector backed by PowerShell ProtectedData (Windows only). */
 export class DpapiProtector implements Protector {
-  protect(plaintext: Buffer): string {
+  protect(plaintext: Buffer): Promise<string> {
     if (process.platform !== 'win32') {
-      throw new VaultError('DPAPI is only available on Windows');
+      return Promise.reject(new VaultError('DPAPI is only available on Windows'));
     }
     return runPowerShell(PROTECT_PS, plaintext.toString('base64'));
   }
 
-  unprotect(blob: string): Buffer {
+  async unprotect(blob: string): Promise<Buffer> {
     if (process.platform !== 'win32') {
       throw new VaultError('DPAPI is only available on Windows');
     }
-    return Buffer.from(runPowerShell(UNPROTECT_PS, blob), 'base64');
+    return Buffer.from(await runPowerShell(UNPROTECT_PS, blob), 'base64');
   }
 }
 
@@ -93,14 +128,16 @@ export class DpapiProtector implements Protector {
  * the name is deliberately alarming so it cannot be selected by accident.
  */
 export class InsecurePassthroughProtector implements Protector {
-  protect(plaintext: Buffer): string {
-    return `insecure:${plaintext.toString('base64')}`;
+  protect(plaintext: Buffer): Promise<string> {
+    return Promise.resolve(`insecure:${plaintext.toString('base64')}`);
   }
 
-  unprotect(blob: string): Buffer {
+  unprotect(blob: string): Promise<Buffer> {
     if (!blob.startsWith('insecure:')) {
-      throw new VaultError('blob was not produced by InsecurePassthroughProtector');
+      return Promise.reject(
+        new VaultError('blob was not produced by InsecurePassthroughProtector'),
+      );
     }
-    return Buffer.from(blob.slice('insecure:'.length), 'base64');
+    return Promise.resolve(Buffer.from(blob.slice('insecure:'.length), 'base64'));
   }
 }

@@ -35,12 +35,14 @@ export function summarize(checks: DoctorCheck[]): { passed: number; failed: numb
 /** Vault encryption availability, verified by a REAL protect/unprotect round-trip through
  *  this platform's protector (win32: DPAPI · darwin: Keychain+AES-GCM). On an unsupported
  *  platform the factory's error IS the report — the gap is stated, never silent. */
-export function checkVaultProtection(platform: NodeJS.Platform = process.platform): DoctorCheck {
+export async function checkVaultProtection(
+  platform: NodeJS.Platform = process.platform,
+): Promise<DoctorCheck> {
   const label = platform === 'win32' ? 'DPAPI' : platform === 'darwin' ? 'Keychain' : platform;
   try {
     const p = defaultProtector(platform);
     const probe = Buffer.from('cctl-doctor-probe');
-    const ok = p.unprotect(p.protect(probe)).equals(probe);
+    const ok = (await p.unprotect(await p.protect(probe))).equals(probe);
     return {
       name: 'vault-crypto',
       ok,
@@ -101,7 +103,7 @@ export function checkClaudeJson(paths: Paths): DoctorCheck {
 /** Run every check for the given paths. */
 export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
   return [
-    checkVaultProtection(),
+    await checkVaultProtection(),
     checkVault(paths),
     await checkLiveLogin(paths),
     checkClaudeJson(paths),

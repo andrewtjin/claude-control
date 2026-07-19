@@ -44,7 +44,9 @@ describe('dpapiIdentityStore', () => {
 
   it('rejects a structurally wrong (but decryptable) payload as unpaired', async () => {
     // A valid encrypted blob whose JSON lacks the required fields must not be adopted.
-    const blob = protector.protect(Buffer.from(JSON.stringify({ some: 'other-shape' }), 'utf8'));
+    const blob = await protector.protect(
+      Buffer.from(JSON.stringify({ some: 'other-shape' }), 'utf8'),
+    );
     await writeFile(path, blob, 'utf8');
     const store = dpapiIdentityStore(path, protector);
     expect(await store.load()).toBeUndefined();

@@ -23,17 +23,21 @@ describe('summarize', () => {
 describe('checkVaultProtection', () => {
   // 30s: the Windows path spawns powershell.exe (~2s alone, much slower under parallel
   // suite load) — same allowance the real-DPAPI tests in dpapi.test.ts carry.
-  it('reports a real protector round-trip on a supported platform', { timeout: 30_000 }, () => {
-    // Runs the REAL platform protector: DPAPI here on Windows, Keychain on a Mac. Either
-    // way the check must pass on any supported dev machine.
-    if (process.platform !== 'win32' && process.platform !== 'darwin') return;
-    const result = checkVaultProtection();
-    expect(result.ok).toBe(true);
-    expect(result.detail).toMatch(/round-trip works/);
-  });
+  it(
+    'reports a real protector round-trip on a supported platform',
+    { timeout: 30_000 },
+    async () => {
+      // Runs the REAL platform protector: DPAPI here on Windows, Keychain on a Mac. Either
+      // way the check must pass on any supported dev machine.
+      if (process.platform !== 'win32' && process.platform !== 'darwin') return;
+      const result = await checkVaultProtection();
+      expect(result.ok).toBe(true);
+      expect(result.detail).toMatch(/round-trip works/);
+    },
+  );
 
-  it('names the gap on an unsupported platform instead of failing silently', () => {
-    const result = checkVaultProtection('freebsd');
+  it('names the gap on an unsupported platform instead of failing silently', async () => {
+    const result = await checkVaultProtection('freebsd');
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/freebsd/);
     expect(result.detail).toMatch(/win32 \(DPAPI\), darwin \(Keychain\)/);

@@ -16,10 +16,14 @@
 // stdout). Writes go through `security -i`, which reads whole commands from STDIN — the
 // secret rides inside the stdin line, never in the process table.
 //
+// Shelling out is ASYNC end-to-end for the same reason dpapi.ts is: a child-process spawn
+// behind a synchronous call sits on the daemon's event loop and stalls every concurrent hook
+// request for the spawn's lifetime.
+//
 // ⚠ Everything touching the REAL `security(1)` or the REAL mac CLI is unverified until it
 // runs on an actual Mac. The logic below is unit-tested against a fake runner only.
 
-import { execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { userInfo } from 'node:os';
 import { VaultError } from './errors.js';
@@ -28,17 +32,35 @@ import type { ClaudeOauth } from './types.js';
 import type { LiveCredentialChannel } from './credentialStore.js';
 
 /** How this module shells out. Injected so every code path unit-tests on any platform.
- *  Returns stdout; MUST throw on a non-zero exit (execFileSync's native behavior). */
-export type ExecRunner = (file: string, args: string[], input?: string) => string;
+ *  Resolves with stdout; MUST reject on a non-zero exit, with the process's stderr text
+ *  reachable via the error's `stderr` field (isNotFound relies on it). */
+export type ExecRunner = (file: string, args: string[], input?: string) => Promise<string>;
 
-/** Production runner. stderr is piped so `security`'s error text lands in thrown errors
+/** Production runner. stderr is captured so `security`'s error text lands in rejected errors
  *  (same rationale as dpapi.ts's runPowerShell) and never on the parent console. */
 export const defaultExecRunner: ExecRunner = (file, args, input) =>
-  execFileSync(file, args, {
-    input,
-    encoding: 'utf8',
-    maxBuffer: 16 * 1024 * 1024,
-    stdio: ['pipe', 'pipe', 'pipe'],
+  new Promise((resolve, reject) => {
+    const child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const out: Buffer[] = [];
+    const errOut: Buffer[] = [];
+    child.stdout.on('data', (chunk: Buffer) => out.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => errOut.push(chunk));
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(out).toString('utf8'));
+        return;
+      }
+      const stderr = Buffer.concat(errOut).toString('utf8');
+      const err = new Error(`${file} exited with code ${code ?? 'null'}: ${stderr.slice(0, 2000)}`);
+      // Mirror execFile's error shape: isNotFound inspects `stderr` to tell "item missing"
+      // from a real failure.
+      (err as Error & { stderr: string }).stderr = stderr;
+      reject(err);
+    });
+    child.stdin.on('error', () => {}); // a dead child surfaces via 'close', not the write
+    if (input !== undefined) child.stdin.end(input);
+    else child.stdin.end();
   });
 
 /** `security -i` tokenizes stdin lines like a shell: to pass an arbitrary string as one
@@ -66,34 +88,44 @@ export const VAULT_KEY_ACCOUNT = 'vault-key';
  * AES-256-GCM protector over an injected 32-byte key. Pure node:crypto — unit-testable on
  * every platform. Blob format: `aesgcm:` + base64( iv(12) ‖ authTag(16) ‖ ciphertext ), so
  * tampering with ANY byte fails authentication rather than yielding garbage plaintext.
+ * The crypto itself is fast in-process CPU; the async signatures exist to satisfy the
+ * Protector contract, whose other implementations genuinely shell out.
  */
 export class AesGcmProtector implements Protector {
   constructor(private readonly key: Buffer) {
     if (key.length !== 32) throw new VaultError('AES-256-GCM requires a 32-byte key');
   }
 
-  protect(plaintext: Buffer): string {
+  protect(plaintext: Buffer): Promise<string> {
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', this.key, iv);
     const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-    return `aesgcm:${Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64')}`;
+    return Promise.resolve(
+      `aesgcm:${Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64')}`,
+    );
   }
 
-  unprotect(blob: string): Buffer {
-    if (!blob.startsWith('aesgcm:')) {
-      throw new VaultError('blob was not produced by AesGcmProtector');
-    }
-    const raw = Buffer.from(blob.slice('aesgcm:'.length), 'base64');
-    if (raw.length < 12 + 16) throw new VaultError('AES-GCM blob too short');
-    const decipher = createDecipheriv('aes-256-gcm', this.key, raw.subarray(0, 12));
-    decipher.setAuthTag(raw.subarray(12, 28));
+  unprotect(blob: string): Promise<Buffer> {
     try {
-      return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]);
+      if (!blob.startsWith('aesgcm:')) {
+        throw new VaultError('blob was not produced by AesGcmProtector');
+      }
+      const raw = Buffer.from(blob.slice('aesgcm:'.length), 'base64');
+      if (raw.length < 12 + 16) throw new VaultError('AES-GCM blob too short');
+      const decipher = createDecipheriv('aes-256-gcm', this.key, raw.subarray(0, 12));
+      decipher.setAuthTag(raw.subarray(12, 28));
+      try {
+        return Promise.resolve(
+          Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]),
+        );
+      } catch (err) {
+        // Wrong key or tampered blob — GCM authentication failed either way.
+        throw new VaultError('AES-GCM authentication failed (wrong key or corrupted blob)', {
+          cause: err,
+        });
+      }
     } catch (err) {
-      // Wrong key or tampered blob — GCM authentication failed either way.
-      throw new VaultError('AES-GCM authentication failed (wrong key or corrupted blob)', {
-        cause: err,
-      });
+      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
     }
   }
 }
@@ -107,12 +139,12 @@ export class AesGcmProtector implements Protector {
 export class KeychainKeySource {
   constructor(private readonly run: ExecRunner = defaultExecRunner) {}
 
-  getOrCreateKey(): Buffer {
-    const existing = this.readKey();
+  async getOrCreateKey(): Promise<Buffer> {
+    const existing = await this.readKey();
     if (existing) return existing;
     const fresh = randomBytes(32).toString('hex');
     try {
-      this.run(
+      await this.run(
         'security',
         ['-i'],
         `add-generic-password -U -s ${VAULT_KEY_SERVICE} -a ${VAULT_KEY_ACCOUNT} -w ${fresh}\n`,
@@ -122,15 +154,15 @@ export class KeychainKeySource {
     }
     // Re-read instead of trusting our value: if a concurrent creator won the -U upsert race,
     // the keychain's copy is the truth.
-    const stored = this.readKey();
+    const stored = await this.readKey();
     if (!stored) throw new VaultError('vault key vanished after Keychain write');
     return stored;
   }
 
-  private readKey(): Buffer | undefined {
+  private async readKey(): Promise<Buffer | undefined> {
     let out: string;
     try {
-      out = this.run('security', [
+      out = await this.run('security', [
         'find-generic-password',
         '-s',
         VAULT_KEY_SERVICE,
@@ -161,20 +193,20 @@ export class KeychainProtector implements Protector {
     private readonly platform: NodeJS.Platform = process.platform,
   ) {}
 
-  private delegate(): AesGcmProtector {
+  private async delegate(): Promise<AesGcmProtector> {
     if (this.platform !== 'darwin') {
       throw new VaultError('Keychain protection is only available on macOS');
     }
-    this.inner ??= new AesGcmProtector(this.keySource.getOrCreateKey());
+    this.inner ??= new AesGcmProtector(await this.keySource.getOrCreateKey());
     return this.inner;
   }
 
-  protect(plaintext: Buffer): string {
-    return this.delegate().protect(plaintext);
+  async protect(plaintext: Buffer): Promise<string> {
+    return (await this.delegate()).protect(plaintext);
   }
 
-  unprotect(blob: string): Buffer {
-    return this.delegate().unprotect(blob);
+  async unprotect(blob: string): Promise<Buffer> {
+    return (await this.delegate()).unprotect(blob);
   }
 }
 
@@ -203,55 +235,41 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
     this.run = options?.run ?? defaultExecRunner;
   }
 
-  // The channel contract is Promise-based (the file channel genuinely awaits IO) but
-  // `security(1)` is invoked synchronously — hence explicit resolve/reject, not async
-  // (which the require-await lint rightly flags). Failures must REJECT, never throw
-  // synchronously, so callers' promise handling sees them.
-  readLiveCredentials(): Promise<ClaudeOauth | undefined> {
-    try {
-      const payload = this.readPayload();
-      if (payload === undefined) return Promise.resolve(undefined);
-      const block =
-        isObject(payload) && 'claudeAiOauth' in payload ? payload.claudeAiOauth : payload;
-      return Promise.resolve(isOauthShape(block) ? block : undefined);
-    } catch (err) {
-      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
-    }
+  async readLiveCredentials(): Promise<ClaudeOauth | undefined> {
+    const payload = await this.readPayload();
+    if (payload === undefined) return undefined;
+    const block = isObject(payload) && 'claudeAiOauth' in payload ? payload.claudeAiOauth : payload;
+    return isOauthShape(block) ? block : undefined;
   }
 
-  writeLiveCredentials(oauth: ClaudeOauth): Promise<void> {
+  async writeLiveCredentials(oauth: ClaudeOauth): Promise<void> {
+    const existing = await this.readPayload();
+    // Preserve the CLI's shape: only wrap when the existing payload wraps (or nothing
+    // exists yet, where the .credentials.json-compatible wrapped shape is the safer
+    // canonical form).
+    const next =
+      existing === undefined || (isObject(existing) && 'claudeAiOauth' in existing)
+        ? { ...(isObject(existing) ? existing : {}), claudeAiOauth: oauth }
+        : oauth;
+    const json = JSON.stringify(next);
     try {
-      const existing = this.readPayload();
-      // Preserve the CLI's shape: only wrap when the existing payload wraps (or nothing
-      // exists yet, where the .credentials.json-compatible wrapped shape is the safer
-      // canonical form).
-      const next =
-        existing === undefined || (isObject(existing) && 'claudeAiOauth' in existing)
-          ? { ...(isObject(existing) ? existing : {}), claudeAiOauth: oauth }
-          : oauth;
-      const json = JSON.stringify(next);
-      try {
-        this.run(
-          'security',
-          ['-i'],
-          `add-generic-password -U -s ${quoteSecurityArg(this.service)} -a ${quoteSecurityArg(this.account)} -w ${quoteSecurityArg(json)}\n`,
-        );
-      } catch (err) {
-        throw new VaultError('failed to write live credentials to the login Keychain', {
-          cause: err,
-        });
-      }
-      return Promise.resolve();
+      await this.run(
+        'security',
+        ['-i'],
+        `add-generic-password -U -s ${quoteSecurityArg(this.service)} -a ${quoteSecurityArg(this.account)} -w ${quoteSecurityArg(json)}\n`,
+      );
     } catch (err) {
-      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+      throw new VaultError('failed to write live credentials to the login Keychain', {
+        cause: err,
+      });
     }
   }
 
   /** Raw item payload parsed as JSON, or `undefined` when the item does not exist. */
-  private readPayload(): unknown {
+  private async readPayload(): Promise<unknown> {
     let out: string;
     try {
-      out = this.run('security', [
+      out = await this.run('security', [
         'find-generic-password',
         '-s',
         this.service,

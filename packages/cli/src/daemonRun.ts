@@ -80,7 +80,7 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
         return undefined; // never paired on this machine
       }
       try {
-        const json = protector.unprotect(encrypted.trim()).toString('utf8');
+        const json = (await protector.unprotect(encrypted.trim())).toString('utf8');
         const parsed = JSON.parse(json) as Partial<DaemonIdentity>;
         if (typeof parsed.daemonId !== 'string' || typeof parsed.daemonToken !== 'string') {
           return undefined;
@@ -92,7 +92,7 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
     },
     async save(identity: DaemonIdentity): Promise<void> {
       const plaintext = Buffer.from(JSON.stringify(identity), 'utf8');
-      await writeFile(filePath, protector.protect(plaintext), 'utf8');
+      await writeFile(filePath, await protector.protect(plaintext), 'utf8');
     },
   };
 }

@@ -34,7 +34,7 @@ describe('loadOrCreateHookSecret (daemon-side, cross-platform via passthrough)',
     // Persisted encrypted, not plaintext.
     const onDisk = await readFile(filePath, 'utf8');
     expect(onDisk).not.toContain('minted');
-    expect(protector.unprotect(onDisk).toString('utf8')).toBe('minted');
+    expect((await protector.unprotect(onDisk)).toString('utf8')).toBe('minted');
   });
 
   it('is STABLE across restarts — a second load returns the same secret, not a new one', async () => {
@@ -63,7 +63,9 @@ describe('loadOrCreateHookSecret (daemon-side, cross-platform via passthrough)',
       generate: () => 'deep',
     });
     expect(secret).toBe('deep');
-    expect(protector.unprotect(await readFile(nested, 'utf8')).toString('utf8')).toBe('deep');
+    expect((await protector.unprotect(await readFile(nested, 'utf8'))).toString('utf8')).toBe(
+      'deep',
+    );
   });
 });
 
