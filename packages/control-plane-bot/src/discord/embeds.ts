@@ -44,6 +44,39 @@ const COLOR_INFO = 0x3498db;
  *  different from a live one at a glance, before the reader even parses the new title. */
 const COLOR_MUTED = 0x95a5a6;
 
+/** Discord's hard cap on an embed field's `value`. discord.js VALIDATES this at
+ *  `addFields` time (shapeshift CombinedPropertyError), so an oversized value doesn't
+ *  degrade — it makes the whole command throw. */
+const FIELD_VALUE_MAX = 1024;
+
+/**
+ * Clamp a field value to Discord's 1024-char cap by dropping whole trailing LINES and
+ * appending a "… +N more" marker, so the field degrades to "show the first lines" instead
+ * of crashing the command. Lines are the unit because every multi-line field here is
+ * sorted most-relevant-first (soonest resets, first accounts), and because emoji-sprite
+ * tokens (`<:pb_mf_g:123…>`, ~28 raw chars each) make raw length ~10× the visible length —
+ * cutting mid-line would leave a broken half-token on screen. A single line that alone
+ * exceeds the cap (pathological) is hard-truncated with an ellipsis rather than thrown.
+ */
+export function clampFieldValue(value: string, max = FIELD_VALUE_MAX): string {
+  if (value.length <= max) return value;
+  const lines = value.split('\n');
+  const kept = [...lines];
+  while (kept.length > 1) {
+    kept.pop();
+    const candidate = `${kept.join('\n')}\n… +${lines.length - kept.length} more`;
+    if (candidate.length <= max) return candidate;
+  }
+  return `${(kept[0] ?? '').slice(0, max - 1)}…`;
+}
+
+/** `addFields` with the value clamped — every data-driven field in this module goes
+ *  through here so no snapshot shape (more accounts, more limits, longer labels) can
+ *  ever make a command throw at the validation layer again. */
+function addClampedField(embed: EmbedBuilder, name: string, value: string): void {
+  embed.addFields({ name, value: clampFieldValue(value) });
+}
+
 // The default bar renderer is the credential-free unicode `layeredBar`. It is injected as an
 // optional parameter (not hidden module state) so these builders stay PURE and every existing
 // call site — and every test — keeps getting unicode bars untouched. The gateway swaps in the
@@ -56,12 +89,27 @@ export const DEFAULT_BAR_RENDERER: BarRenderer = layeredBar;
  *  unicode renderers when the result would cross Discord's per-field ceiling. A custom-emoji
  *  mention (`<:name:id>`) costs ~25 chars of that budget where a unicode cell costs 1, so an
  *  emoji bar-plus-track field can overflow where its unicode twin fits easily — and
- *  discord.js rejects the WHOLE message over one over-long field. Clamps as the last resort:
- *  a plainer bar beats a dead slash command. */
+ *  discord.js rejects the WHOLE message over one over-long field. Clamps as the last resort —
+ *  by whole lines (see `clampFieldValue`), since cutting mid-line could leave a broken
+ *  half-token on screen: a plainer, shorter bar list beats a dead slash command. */
 function fitFieldValue(render: (unicodeFallback: boolean) => string): string {
   const preferred = render(false);
   if (preferred.length <= EMBED_FIELD_VALUE_LIMIT) return preferred;
-  return truncateLabeled(render(true), EMBED_FIELD_VALUE_LIMIT);
+  return clampFieldValue(render(true), EMBED_FIELD_VALUE_LIMIT);
+}
+
+/** " · cached <t:...:R>" suffix for an account whose data is a stale fallback, or '' for a
+ *  live read. Cached data carries its TRUE fetch time (the poller preserves the original
+ *  stamp), and the native timestamp renders as a live-updating "N minutes ago" — so an
+ *  hours-old number can never masquerade as current, on any surface that shows usage. */
+function cachedSuffix(account: Pick<AccountUsage, 'source' | 'fetchedAtMs'> | undefined): string {
+  return account?.source === 'cached' ? ` · cached ${discordRelative(account.fetchedAtMs)}` : '';
+}
+
+/** "\n⚠️ <reason>" suffix carrying the account's failure note (e.g. "usage endpoint
+ *  rate-limited (429)"), or '' when the data arrived clean. */
+function errorSuffix(account: Pick<AccountUsage, 'error'> | undefined): string {
+  return account?.error ? `\n⚠️ ${account.error}` : '';
 }
 
 /** Embed accent color for a usage snapshot: the worst severity across every limit of
@@ -105,16 +153,11 @@ export function buildUsageEmbed(
     // Signal differences at a glance: 🟢 active / ⚪ idle / ⚠️ erroring, plus a cached-data
     // marker so a stale tier-0 snapshot is never mistaken for a live read.
     const marker = `${accountMarker(account)} ${account.active ? 'active' : 'idle'}`;
-    // Cached data carries its true fetch time — show it, so an hours-old number can never
-    // masquerade as current (the timestamp renders as a live-updating "N minutes ago").
-    const cached =
-      account.source === 'cached' ? ` · cached ${discordRelative(account.fetchedAtMs)}` : '';
-    const errorLine = account.error ? `\n⚠️ ${account.error}` : '';
     embed.addFields({
-      name: `${account.label} — ${marker}${cached}`,
+      name: `${account.label} — ${marker}${cachedSuffix(account)}`,
       value: fitFieldValue(
         (unicodeFallback) =>
-          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${errorLine}`,
+          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${errorSuffix(account)}`,
       ),
     });
   }
@@ -122,10 +165,7 @@ export function buildUsageEmbed(
     // One compact field: the reason line already carries the whole burn order (see the
     // advisor), and advisories only exist for exceptional states — no separate headings.
     const lines = [usage.plan.reason, ...usage.plan.advisories.map((a) => `• ${a.message}`)];
-    embed.addFields({
-      name: 'Plan',
-      value: truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT),
-    });
+    addClampedField(embed, 'Plan', lines.join('\n'));
   }
   if (usage.accounts.length > 0) embed.addFields(pacingField(usage.accounts, nowMs));
   return embed;
@@ -183,6 +223,10 @@ export function buildTimelineEmbed(
   );
 
   for (const a of outlook.accounts) {
+    // The outlook account is derived math; staleness/error live on the WIRE account. Look it
+    // up so /timeline flags stale data the same way /usage does — stale bars must never
+    // render indistinguishably from live ones.
+    const wire = usage.accounts.find((acc) => acc.accountId === a.accountId);
     const accountLines = (bar: BarRenderer, style: TimelineTrackStyle): string => {
       const lines: string[] = [];
       if (a.quarantined) {
@@ -212,16 +256,23 @@ export function buildTimelineEmbed(
       return lines.join('\n');
     };
     embed.addFields({
-      name: `${accountMarker(a)} ${a.label}`,
-      value: fitFieldValue((unicodeFallback) =>
-        unicodeFallback
-          ? accountLines(DEFAULT_BAR_RENDERER, UNICODE_TRACK_STYLE)
-          : accountLines(barRenderer, trackStyle),
+      name: `${accountMarker(a)} ${a.label}${cachedSuffix(wire)}`,
+      value: fitFieldValue(
+        (unicodeFallback) =>
+          `${
+            unicodeFallback
+              ? accountLines(DEFAULT_BAR_RENDERER, UNICODE_TRACK_STYLE)
+              : accountLines(barRenderer, trackStyle)
+          }${errorSuffix(wire)}`,
       ),
     });
   }
 
   if (outlook.events.length > 0) {
+    // This is the field that grows FASTEST with fleet size: one line per (account × limit)
+    // reset — the emoji→unicode fallback plus the line-dropping clamp is what keeps
+    // `/timeline` alive as accounts are added (soonest resets survive; the far tail is
+    // what gets dropped).
     const upcoming = (style: TimelineTrackStyle): string =>
       outlook.events
         .map((e) => {
@@ -240,10 +291,7 @@ export function buildTimelineEmbed(
   if (usage.plan) {
     const planLines = [usage.plan.reason];
     for (const adv of usage.plan.advisories) planLines.push(`• ${adv.message}`);
-    embed.addFields({
-      name: 'Plan',
-      value: truncateLabeled(planLines.join('\n'), EMBED_FIELD_VALUE_LIMIT),
-    });
+    addClampedField(embed, 'Plan', planLines.join('\n'));
   }
   embed.addFields(pacingField(usage.accounts, nowMs));
   return embed;
@@ -270,10 +318,14 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
     return embed;
   }
   for (const account of accounts) {
-    embed.addFields({
-      name: `${accountMarker(account)} ${account.label}`,
-      value: `${account.active ? 'active' : 'idle'} · source: ${account.source}`,
-    });
+    // "source: cached" alone hides HOW stale — show the true fetch age and any failure
+    // reason, same as /usage and /timeline, so no surface renders old data as current.
+    const age = account.source === 'cached' ? ` (${discordRelative(account.fetchedAtMs)})` : '';
+    addClampedField(
+      embed,
+      `${accountMarker(account)} ${account.label}`,
+      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${errorSuffix(account)}`,
+    );
   }
   return embed;
 }
@@ -303,8 +355,9 @@ export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
     return embed;
   }
   for (const session of sessions) {
+    // Summaries are daemon-relayed model text — unbounded, so clamp like everything else.
     const summaryLine = session.summary ? ` — ${session.summary}` : '';
-    embed.addFields({ name: session.sessionId, value: `${session.state}${summaryLine}` });
+    addClampedField(embed, session.sessionId, `${session.state}${summaryLine}`);
   }
   return embed;
 }
@@ -330,8 +383,8 @@ export function buildPermissionRequestEmbed(
     .setColor(COLOR_WARN)
     .setDescription(summary)
     .setFooter({ text: `Approve or Deny below · or /approve /deny${modeNote}` });
-  if (detail)
-    embed.addFields({ name: 'Detail', value: truncateLabeled(detail, EMBED_FIELD_VALUE_LIMIT) });
+  // Detail is hook-supplied tool input — unbounded (a long Bash command, a big diff).
+  if (detail) addClampedField(embed, 'Detail', detail);
   return embed;
 }
 

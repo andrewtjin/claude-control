@@ -13,6 +13,7 @@ import {
 import { Store } from './store.js';
 import {
   ControlPlaneClient,
+  ControlPlaneRejectionError,
   type DaemonIdentity,
   type IdentityStore,
 } from './controlPlaneClient.js';
@@ -283,6 +284,9 @@ describe('ControlPlaneClient', () => {
       },
     });
     await expect(client.connect()).rejects.toThrow(/not paired.*--pair/s);
+    // Typed as a terminal control-plane rejection so runDaemon keeps serving local-only
+    // instead of exiting (an exit under supervise would respawn-storm on an unfixable state).
+    await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
     expect(socketsOpened).toBe(0); // failed up front — no connection attempt, no invalid frame
   });
 
@@ -310,7 +314,7 @@ describe('ControlPlaneClient', () => {
       pairingCode: 'wrong-code',
       reconnectBaseMs: 10,
     });
-    await expect(client.connect()).rejects.toThrow();
+    await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
     expect(identityStore.current()).toBeUndefined();
   });
 
@@ -327,7 +331,7 @@ describe('ControlPlaneClient', () => {
         hostLabel: 'h',
         reconnectBaseMs: 10,
       });
-      await expect(client.connect()).rejects.toThrow();
+      await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
     } finally {
       await badRelay.close();
     }

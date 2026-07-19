@@ -1698,4 +1698,32 @@ describe('HookReceiver', () => {
       expect(res.status).toBe(404);
     });
   });
+
+  describe('getPort', () => {
+    it('reports the same port listen() resolved with', () => {
+      expect(receiver.getPort()).toBe(port);
+    });
+
+    it('reports undefined before listen() has ever been called', () => {
+      const fresh = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'd',
+      });
+      expect(fresh.getPort()).toBeUndefined();
+    });
+
+    it('reports undefined again after close()', async () => {
+      const other = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'd',
+      });
+      await other.listen(0);
+      await other.close();
+      expect(other.getPort()).toBeUndefined();
+    });
+  });
 });

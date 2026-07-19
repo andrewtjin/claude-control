@@ -13,6 +13,7 @@ import {
   buildToolOutputEmbed,
   buildWaitingEmbed,
   buildQuarantineEmbed,
+  clampFieldValue,
 } from './embeds.js';
 import { NOTIFICATION_COLOR } from './richFormat.js';
 import type { SessionStatus } from './stateCache.js';
@@ -281,6 +282,35 @@ describe('buildTimelineEmbed', () => {
     expect(field?.value).not.toContain('🟩');
   });
 
+  it('flags a cached account with its true age and failure reason (2026-07-17 incident)', () => {
+    // The incident surface: stale fallback data rendered on /timeline exactly like a live
+    // read. The cached marker must carry the ORIGINAL fetch time, not render time.
+    const fetchedAtMs = Date.parse('2026-07-16T10:00:00.000Z');
+    const stale = account({
+      source: 'cached',
+      fetchedAtMs,
+      error: 'usage endpoint rate-limited (429)',
+      limits: [
+        { kind: 'session', percent: 42, isActive: true, resetsAt: '2026-07-16T14:00:00.000Z' },
+      ],
+    });
+    const live = account({
+      accountId: 'acct-2',
+      label: 'Play',
+      active: false,
+      limits: [
+        { kind: 'session', percent: 10, isActive: true, resetsAt: '2026-07-16T13:00:00.000Z' },
+      ],
+    });
+    const embed = buildTimelineEmbed({ accounts: [stale, live] }, NOW).toJSON();
+    const staleField = embed.fields?.find((f) => f.name.includes('Work'));
+    expect(staleField?.name).toContain(`· cached <t:${Math.floor(fetchedAtMs / 1000)}:R>`);
+    expect(staleField?.value).toContain('⚠️ usage endpoint rate-limited (429)');
+    const liveField = embed.fields?.find((f) => f.name.includes('Play'));
+    expect(liveField?.name).not.toContain('cached');
+    expect(liveField?.value).not.toContain('⚠️');
+  });
+
   it('draws tracks and marker glyphs through an injected track style', () => {
     // The gateway swaps in the sprite-backed style this same way; sentinels prove both the
     // per-account track and the legend/list markers come from the injected style, and that
@@ -368,6 +398,17 @@ describe('buildAccountsEmbed', () => {
     const embed = buildAccountsEmbed([account({ source: 'cached' })]).toJSON();
     expect(embed.fields).toHaveLength(1);
     expect(embed.fields?.[0]?.value).toContain('cached');
+  });
+
+  it('shows the true fetch age and failure reason for cached data, neither for live', () => {
+    const fetchedAtMs = Date.parse('2026-07-16T10:00:00.000Z');
+    const embed = buildAccountsEmbed([
+      account({ source: 'cached', fetchedAtMs, error: 'usage endpoint rate-limited (429)' }),
+      account({ accountId: 'acct-2', label: 'Play', active: false }),
+    ]).toJSON();
+    expect(embed.fields?.[0]?.value).toContain(`cached (<t:${Math.floor(fetchedAtMs / 1000)}:R>)`);
+    expect(embed.fields?.[0]?.value).toContain('⚠️ usage endpoint rate-limited (429)');
+    expect(embed.fields?.[1]?.value).toBe('idle · source: live');
   });
 
   it('shows a placeholder when there are no accounts', () => {
@@ -555,5 +596,124 @@ describe('buildSwitchResultEmbed', () => {
     expect(ok.title).toBe('Switched');
     expect(fail.title).toBe('Switch failed');
     expect(ok.description).toBe('switched to acct-2');
+  });
+});
+
+describe('clampFieldValue', () => {
+  it('passes short values through untouched', () => {
+    expect(clampFieldValue('line1\nline2')).toBe('line1\nline2');
+  });
+
+  it('drops whole trailing lines and reports how many were cut', () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `line ${i} `.padEnd(100, 'x'));
+    const clamped = clampFieldValue(lines.join('\n'));
+    expect(clamped.length).toBeLessThanOrEqual(1024);
+    expect(clamped).toContain('line 0');
+    // No partial line survives — a cut mid-line would break emoji-sprite tokens on screen.
+    expect(clamped).toMatch(/… \+\d+ more$/);
+    for (const kept of clamped.split('\n').slice(0, -1)) expect(lines).toContain(kept);
+  });
+
+  it('hard-truncates a single line that alone exceeds the cap', () => {
+    const clamped = clampFieldValue('y'.repeat(3000));
+    expect(clamped.length).toBe(1024);
+    expect(clamped.endsWith('…')).toBe(true);
+  });
+});
+
+describe('embed field overflow (regression)', () => {
+  // FOUR 3-limit accounts × emoji-sprite marks (~28 raw chars per token) push the
+  // "Upcoming resets" value past Discord's 1024 cap, and discord.js VALIDATES at addFields
+  // time — so `/timeline` would throw instead of rendering. Rebuild that exact shape and
+  // require it to degrade: first to unicode marks (everything still shown), and only past
+  // that to the line-dropping clamp.
+  const NOW = Date.parse('2026-07-17T12:00:00.000Z');
+  const spriteToken = '<:tl_ms:1384311055791234567>'; // realistic 19-digit-snowflake length
+  const spriteStyle = {
+    track: () => spriteToken.repeat(12),
+    session: spriteToken,
+    weekly: spriteToken,
+    both: spriteToken,
+  };
+  const fleet = ['legoboy', 'jina25', 'tjin.29', 'debate'].map((label, i) =>
+    account({
+      accountId: `acct-${label}`,
+      label,
+      active: label === 'tjin.29',
+      limits: [
+        { kind: 'session', percent: 40 + i, isActive: true, resetsAt: '2026-07-17T14:00:00.000Z' },
+        {
+          kind: 'weekly_all',
+          percent: 60 + i,
+          isActive: true,
+          resetsAt: '2026-07-20T12:00:00.000Z',
+        },
+        {
+          kind: 'weekly_scoped',
+          percent: 20 + i,
+          isActive: true,
+          resetsAt: '2026-07-21T12:00:00.000Z',
+        },
+      ],
+    }),
+  );
+
+  it('renders /timeline for a 4-account fleet with sprite marks instead of throwing', () => {
+    const embed = buildTimelineEmbed({ accounts: fleet }, NOW, undefined, spriteStyle).toJSON();
+    for (const field of embed.fields ?? []) {
+      expect(field.value.length).toBeLessThanOrEqual(1024);
+    }
+    const upcoming = embed.fields?.find((f) => f.name === 'Upcoming resets');
+    // The sprite render overflows, so the field falls back to unicode marks — which fit,
+    // keeping EVERY event visible instead of dropping the far tail.
+    expect(upcoming?.value).not.toContain(spriteToken);
+    for (const label of ['legoboy', 'jina25', 'tjin.29', 'debate']) {
+      expect(upcoming?.value).toContain(`**${label}**`);
+    }
+  });
+
+  it('clamps with a visible "+N more" marker once even the unicode render overflows', () => {
+    // A fleet big enough that 1-char unicode marks still cross the cap (12 accounts × 3
+    // limits ≈ 36 event lines). The clamp cuts the far tail, keeping the soonest resets.
+    const bigFleet = Array.from({ length: 12 }, (_, i) =>
+      account({
+        accountId: `acct-${i}`,
+        label: `account-${i}`,
+        active: i === 0,
+        limits: [
+          { kind: 'session', percent: 40, isActive: true, resetsAt: '2026-07-17T14:00:00.000Z' },
+          {
+            kind: 'weekly_all',
+            percent: 60,
+            isActive: true,
+            resetsAt: '2026-07-20T12:00:00.000Z',
+          },
+          {
+            kind: 'weekly_scoped',
+            percent: 20,
+            isActive: true,
+            resetsAt: '2026-07-21T12:00:00.000Z',
+          },
+        ],
+      }),
+    );
+    const embed = buildTimelineEmbed({ accounts: bigFleet }, NOW, undefined, spriteStyle).toJSON();
+    const upcoming = embed.fields?.find((f) => f.name === 'Upcoming resets');
+    expect(upcoming?.value.length).toBeLessThanOrEqual(1024);
+    expect(upcoming?.value).toMatch(/… \+\d+ more$/);
+    // Soonest resets (today's 5h windows) survive; they are the actionable ones.
+    expect(upcoming?.value).toContain('**account-0**');
+  });
+
+  it('renders /usage for the same fleet within field limits', () => {
+    const embed = buildUsageEmbed({ accounts: fleet }, NOW).toJSON();
+    for (const field of embed.fields ?? []) {
+      expect(field.value.length).toBeLessThanOrEqual(1024);
+    }
+  });
+
+  it('clamps an unbounded permission detail instead of throwing', () => {
+    const embed = buildPermissionRequestEmbed('run a command', 'x'.repeat(5000)).toJSON();
+    expect(embed.fields?.[0]?.value.length).toBeLessThanOrEqual(1024);
   });
 });

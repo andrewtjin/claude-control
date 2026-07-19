@@ -185,6 +185,39 @@ Cosmetic caveat: the engine re-serializes the file minified onto one line, so a 
 shows a full-file rewrite even though content is preserved — pretty-print-preserving
 writes are a polish backlog item.
 
+### 9. Fresh-machine install ⏳ PENDING
+
+**Claim to verify:** on a fresh Windows profile (or fresh VM) with only Node ≥ 22.13
+present, `npm i -g claudecontrol` followed by `cctl setup` reaches a paired,
+autostarted daemon with a working phone `/usage` in **≤ 10 minutes**, without opening
+any doc (README's quick start is the whole prompt).
+**Verify:** time the run start-to-finish; confirm every wizard step in
+`docs/SETUP.md` matches what actually prints; confirm no step required reading a doc
+to get unstuck.
+**Result:** not yet run.
+
+### 10. Reboot / autostart survival ⏳ PENDING
+
+**Claim to verify:** after `cctl daemon install` (directly or via `cctl setup`), the
+daemon is up and reconnected to the relay **after a full reboot, without any user
+action** — no login shell, no manual `cctl daemon run`.
+**Verify:** reboot the machine that ran gate 9, wait past logon, then confirm
+`cctl daemon status` reports the heartbeat alive and the Scheduled Task's last run
+succeeded; confirm `/usage` on the phone reflects a fresh poll.
+**Result:** not yet run.
+
+### 11. VPS compose + wss end-to-end ⏳ PENDING
+
+**Claim to verify:** `docker compose up` from `deploy/` (per `docs/SELF_HOST.md`) on a
+real VPS with a real hostname brings up a working bot behind Caddy's automatic TLS,
+and a daemon pointed at `wss://<hostname>` pairs and round-trips exactly like the
+shared bot.
+**Verify:** deploy per `docs/SELF_HOST.md`; confirm `GET https://<hostname>/health`
+returns 200; run `cctl setup --relay wss://<hostname>` (or `cctl pair --relay
+wss://<hostname>`) end-to-end from a separate machine; confirm `/usage` and `/switch`
+work over the VPS relay the same as gate 4 did over the shared one.
+**Result:** not yet run.
+
 ## Reminder
 
 The undocumented endpoints (2, 3) and hook names (5) can change without notice. Parsing

@@ -93,6 +93,19 @@ const PROGRESS_ASSETS_DIR = join(
   '../../assets/progress-bar',
 );
 
+// Sent once, right after a daemon successfully claims a pairing code. Lists only commands
+// that are wired to something today — `/stop` and `/reauth` both reply with an explanatory
+// error (see commands.ts) rather than doing the thing their name implies, so they're left off
+// a message whose entire job is telling a brand-new user what to try first.
+const PAIRING_PRIMER_MESSAGE = [
+  "Paired. Here's what works right now:",
+  '`/usage` — usage across accounts',
+  '`/timeline` — 5h-session budget and reset timeline',
+  '`/switch <account>` — switch the active account',
+  '`/run <prompt>` — start a Claude Code session',
+  '`/status` — daemon connection status',
+].join('\n');
+
 export interface DiscordJsGatewayOptions {
   relay: RelaySender;
   pairing: PairingService;
@@ -258,6 +271,16 @@ export class DiscordJsGateway implements DiscordGateway {
       }
     } catch (err) {
       this.logger.warn({ err, discordUserId }, 'discord: failed to DM user');
+    }
+  }
+
+  /** DiscordGateway.sendPrimer — DM the working-commands primer to a freshly paired user. */
+  async sendPrimer(discordUserId: string): Promise<void> {
+    try {
+      const user = await this.client.users.fetch(discordUserId);
+      await user.send(PAIRING_PRIMER_MESSAGE);
+    } catch (err) {
+      this.logger.warn({ err, discordUserId }, 'discord: failed to send pairing primer DM');
     }
   }
 

@@ -67,6 +67,7 @@ export { hookForwarderPath, writeHookForwarder, HOOK_FORWARDER_SOURCE } from './
 
 export {
   ControlPlaneClient,
+  ControlPlaneRejectionError,
   type ConnectionState,
   type ControlPlaneClientOptions,
   type ControlPlaneHandlers,
@@ -76,11 +77,23 @@ export {
 
 export {
   installHooks,
+  uninstallHooks,
   buildDaemonHookSpecs,
   type HookCommandSpec,
   type InstallHooksOptions,
+  type UninstallHooksOptions,
   type BuildDaemonHookSpecsOptions,
 } from './hookInstaller.js';
+
+export {
+  HeartbeatWriter,
+  readHeartbeat,
+  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_STALE_AFTER_MS,
+  type HeartbeatState,
+  type HeartbeatReading,
+  type HeartbeatWriterOptions,
+} from './heartbeat.js';
 
 export {
   hookSecretPath,

@@ -23,7 +23,11 @@
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { DEFAULT_HOOK_EVENT_NAMES, DEFAULT_SECRET_HEADER } from './hookReceiver.js';
+import {
+  DEFAULT_HOOK_EVENT_NAMES,
+  DEFAULT_SECRET_HEADER,
+  type HookEventNames,
+} from './hookReceiver.js';
 
 /** Write via temp-then-rename in the same directory so a crash mid-write can never leave
  *  `settings.json` half-written — a reader sees either the whole old file or the whole new
@@ -80,6 +84,31 @@ function isHookGroup(value: unknown): value is HookGroup {
 }
 
 // ---------------------------------------------------------------------------
+// Ownership marker
+// ---------------------------------------------------------------------------
+
+// Every command WE install carries this header, independent of the (rotatable) secret value —
+// it's how `installHooks`/`uninstallHooks` recognize "this entry is ours" without depending on
+// a specific secret. Without it, a secret rotation (see hookSecret.ts) would leave the
+// previous entry stranded forever as a dead, no-longer-valid duplicate instead of being
+// replaced. Any command NOT carrying this marker belongs to some other tool and is never
+// touched by either function.
+const MANAGED_HEADER = 'x-claude-control-managed';
+const MANAGED_HEADER_VALUE = '1';
+
+/** Recognize a command as ours across EVERY generation we ever shipped: the early curl
+ *  one-liners carried the explicit managed header above, while the current forwarder command
+ *  carries only the secret header — whose NAME is equally unique to us and equally
+ *  secret-value-independent. Checking both means uninstall/prune can clean up any mix of
+ *  generations, and neither check can ever match another tool's hook. */
+function isOwnedHookCommand(command: string): boolean {
+  return (
+    command.includes(`${MANAGED_HEADER}: ${MANAGED_HEADER_VALUE}`) ||
+    command.includes(DEFAULT_SECRET_HEADER)
+  );
+}
+
+// ---------------------------------------------------------------------------
 // installHooks
 // ---------------------------------------------------------------------------
 
@@ -132,6 +161,13 @@ function mergeOneHook(hooksSection: JsonObject, spec: HookCommandSpec): void {
     targetGroup = { hooks: [], ...(spec.matcher !== undefined ? { matcher: spec.matcher } : {}) };
     groups.push(targetGroup);
   }
+
+  // Prune stale copies of THIS install's own hook (recognized by the managed marker, not by
+  // exact command text) before re-adding it — see the marker comment above for why this
+  // can't just be an exact-match dedupe.
+  targetGroup.hooks = targetGroup.hooks.filter(
+    (h) => !isHookEntry(h) || !isOwnedHookCommand(h.command) || h.command === spec.command,
+  );
 
   // Only well-formed entries are checked for a duplicate — a malformed one can't be trusted
   // to mean "already installed", so we'd rather add ours than silently skip it.
@@ -204,6 +240,68 @@ async function readSettings(path: string): Promise<JsonObject> {
     throw new Error(`settings.json at "${path}" is not valid JSON; refusing to overwrite it`);
   }
   return isRecord(parsed) ? parsed : {};
+}
+
+// ---------------------------------------------------------------------------
+// uninstallHooks
+// ---------------------------------------------------------------------------
+
+export interface UninstallHooksOptions {
+  settingsPath: string;
+  /** Event names to prune our entries from. Defaults to the five daemon events (see
+   *  `buildDaemonHookSpecs`) — pass the same custom names here if the daemon was ever
+   *  installed with `eventNames` overridden, otherwise those entries are left behind. */
+  eventNames?: HookEventNames;
+}
+
+/**
+ * Remove every hook entry `installHooks` is responsible for (recognized by the ownership
+ * marks in `isOwnedHookCommand`, regardless of which secret it carries at the time), leaving
+ * everything else in settings.json — other tools' hooks, unrelated keys, even our own groups'
+ * `matcher` — completely untouched. A settings.json with nothing of ours to remove is left
+ * alone: no rewrite, not even a re-serialize.
+ */
+export async function uninstallHooks(options: UninstallHooksOptions): Promise<void> {
+  const settings = await readSettings(options.settingsPath);
+  if (!isRecord(settings.hooks)) return; // nothing installed, nothing to remove
+  const hooksSection: JsonObject = settings.hooks;
+
+  // `HookEventNames` has no index signature, so `Object.values` can't infer a typed array from
+  // it (TypeScript silently falls back to `any[]`) — list the five fields explicitly instead.
+  const activeEventNames = options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES;
+  const events: string[] = [
+    activeEventNames.permissionRequest,
+    activeEventNames.stop,
+    activeEventNames.notification,
+    activeEventNames.postToolUse,
+    activeEventNames.userPromptSubmit,
+  ];
+  let changed = false;
+
+  for (const event of events) {
+    const existing = hooksSection[event];
+    if (!Array.isArray(existing)) continue;
+    // `Array.isArray` narrows to `any[]` (that's how the built-in signature is declared), so
+    // pin it back down to `unknown[]` rather than letting `any` leak into the map/filter below.
+    const existingGroups: unknown[] = existing;
+
+    const prunedGroups = existingGroups
+      .map((g) => {
+        if (!isHookGroup(g)) return g; // not recognizably ours to interpret — leave as-is
+        const keptHooks = g.hooks.filter((h) => !isHookEntry(h) || !isOwnedHookCommand(h.command));
+        if (keptHooks.length !== g.hooks.length) changed = true;
+        return { ...g, hooks: keptHooks };
+      })
+      // A group left with zero hooks by the prune above is dead weight — drop it too.
+      .filter((g) => !isHookGroup(g) || g.hooks.length > 0);
+    if (prunedGroups.length !== existingGroups.length) changed = true;
+
+    hooksSection[event] = prunedGroups;
+  }
+
+  if (changed) {
+    await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  }
 }
 
 // ---------------------------------------------------------------------------

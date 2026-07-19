@@ -16,6 +16,23 @@ describe('buildProgram', () => {
     expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
+    // First-run + at-a-glance status surfaces.
+    expect(names).toContain('setup');
+    expect(names).toContain('status');
+  });
+
+  it('offers --reconfigure and --relay on setup', () => {
+    const setup = buildProgram().commands.find((c) => c.name() === 'setup');
+    expect(setup?.options.map((o) => o.long)).toEqual(
+      expect.arrayContaining(['--reconfigure', '--relay']),
+    );
+  });
+
+  it('gives pair an optional code argument and a --relay override', () => {
+    const pair = buildProgram().commands.find((c) => c.name() === 'pair');
+    expect(pair?.options.map((o) => o.long)).toContain('--relay');
+    // The optional [code] argument keeps pairing usable both interactively and as `cctl pair <code>`.
+    expect(pair?.registeredArguments.map((a) => a.name())).toContain('code');
   });
 
   it('nests account subcommands including in-place relogin', () => {
@@ -76,6 +93,12 @@ describe('buildProgram', () => {
     expect(supervise?.options.map((o) => o.long).sort()).toEqual(
       run?.options.map((o) => o.long).sort(),
     );
+  });
+
+  it('nests install, uninstall, status, and supervise alongside run under daemon', () => {
+    const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
+    const subs = daemon?.commands.map((c) => c.name()).sort();
+    expect(subs).toEqual(['install', 'run', 'status', 'supervise', 'uninstall']);
   });
 
   it('reports its version', () => {

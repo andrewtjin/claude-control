@@ -105,6 +105,19 @@ const NOT_PAIRED_MESSAGE =
   'this daemon is not paired (no stored identity) - get a pairing code from the bot with ' +
   '/pair in Discord, then run `cctl daemon run --pair <code>`';
 
+/** A control-plane rejection with NO retry path: not paired, a refused pairing code, or a
+ *  hello rejection (revoked token / unsupported protocol). Typed so a composition root can
+ *  tell "the CONNECTION is refused — the daemon itself is fine, keep serving locally and
+ *  tell the operator to re-pair" apart from a local subsystem failure that should kill the
+ *  process. Retrying (or exiting so a supervisor restarts and retries) cannot fix any of
+ *  these — that is exactly why the client marks them terminal instead of reconnecting. */
+export class ControlPlaneRejectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ControlPlaneRejectionError';
+  }
+}
+
 const DEFAULT_OUTBOX_BOUND = 500;
 const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 10_000;
@@ -195,7 +208,7 @@ export class ControlPlaneClient {
     // which the wire schema rejects — a synchronous throw inside a ws event handler, i.e. a
     // process crash instead of the clean rejection this method's contract promises.
     if (!this.identity && !hasPairingCode(this.opts.pairingCode)) {
-      throw new Error(NOT_PAIRED_MESSAGE);
+      throw new ControlPlaneRejectionError(NOT_PAIRED_MESSAGE);
     }
     return new Promise((resolve, reject) => {
       this.connectedResolvers.push({ resolve, reject });
@@ -270,7 +283,7 @@ export class ControlPlaneClient {
       // reconnecting cannot help when there is nothing to pair with.
       this.opts.logger.error({}, NOT_PAIRED_MESSAGE);
       this.stopped = true;
-      this.failConnect(new Error(NOT_PAIRED_MESSAGE));
+      this.failConnect(new ControlPlaneRejectionError(NOT_PAIRED_MESSAGE));
       this.socket.close(1000, 'no pairing code');
       return;
     }
@@ -343,7 +356,7 @@ export class ControlPlaneClient {
       daemonToken === undefined ||
       daemonToken === null
     ) {
-      this.failConnect(new Error(error ?? 'pairing failed'));
+      this.failConnect(new ControlPlaneRejectionError(error ?? 'pairing failed'));
       return;
     }
     const identity: DaemonIdentity = { daemonId, daemonToken };
@@ -370,7 +383,7 @@ export class ControlPlaneClient {
         'control-plane rejected hello - stopping; re-pairing required',
       );
       this.stopHeartbeat();
-      this.failConnect(new Error(reason));
+      this.failConnect(new ControlPlaneRejectionError(reason));
       this.socket?.close(4002, 'hello rejected');
       return;
     }

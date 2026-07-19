@@ -436,6 +436,15 @@ export class HookReceiver {
     this.server = undefined;
   }
 
+  /** The port actually bound by `listen()` — `undefined` before it has been called, or after
+   *  `close()`. Lets a composition root that holds this receiver (but not its internal
+   *  server) learn the real, often OS-assigned, port — e.g. to (re)install hooks that must
+   *  POST back to this exact address. */
+  getPort(): number | undefined {
+    const address = this.server?.address();
+    return address !== null && typeof address === 'object' ? address.port : undefined;
+  }
+
   /**
    * Record a decision for a pending permission request. Enforces the security contract: only
    * a currently-pending, non-expired request can be resolved, and only once. Returns

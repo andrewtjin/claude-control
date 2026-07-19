@@ -8,7 +8,8 @@
 //
 // SECURITY: the daemon's control-plane identity (daemonId + daemonToken) is a bearer
 // credential, so it is persisted DPAPI-encrypted beside the vault — same at-rest posture as
-// OAuth tokens, useless if copied off this machine/user.
+// OAuth tokens, useless if copied off this machine/user. The hook secret (see hookSecret.ts)
+// gets the identical treatment for the identical reason.
 
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
@@ -26,8 +27,10 @@ import {
   AttributionJournal,
   AutoSwitcher,
   ControlPlaneClient,
+  ControlPlaneRejectionError,
   DEFAULT_SECRET_HEADER,
   Daemon,
+  HeartbeatWriter,
   HookReceiver,
   Store,
   UsagePoller,
@@ -134,8 +137,12 @@ export function makeAgentSdkClientFactory(logger: Logger): () => AgentSdkClient 
     });
 }
 
-/** Assemble and start the daemon; resolves once it is up (the process then stays alive on
- *  the hook receiver's server + the control-plane socket until Ctrl+C). */
+/** Assemble and start the daemon; resolves once the process-level guards (crash log, instance
+ *  lock) and the heartbeat are up and `daemon.start()` has been launched. Local readiness —
+ *  receiver bind, endpoint publish, hook install — completes asynchronously inside start(),
+ *  all BEFORE its control-plane connect(), which by design can hang indefinitely and is
+ *  deliberately never awaited here. The process then stays alive on the hook receiver's
+ *  server + the control-plane socket until Ctrl+C. */
 export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const paths: Paths = defaultPaths();
   const dataDir = dirname(paths.vaultDir);
@@ -261,7 +268,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   });
 
   // The receiver forwards hook envelopes out through the client (which buffers to its outbox
-  // while disconnected).
+  // while disconnected). The secret is the stable one loaded above, not minted per run — see
+  // hookSecret.ts for why that matters.
   const hookReceiver = new HookReceiver({
     store,
     secret: hookSecret,
@@ -348,13 +356,48 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     logger,
   });
 
-  await daemon.start();
+  // Liveness signal for `cctl daemon status` (see heartbeat.ts) — a separate process, possibly
+  // reading this long after the daemon that wrote it has exited, so a file is the only channel
+  // that survives a hard crash. Started as soon as this process is up (not gated on the
+  // control-plane connection — see the comment below), stopped on shutdown.
+  const heartbeat = new HeartbeatWriter(join(dataDir, 'daemon-heartbeat.json'), {
+    onError: (err) => logger.warn({ err }, 'could not write the daemon heartbeat'),
+  });
+
+  // `daemon.start()` awaits the control-plane connect(), which on a down/silent relay never
+  // resolves nor rejects (it reconnects internally forever). Heartbeat, endpoint publish, and
+  // hook install are this process's own local work ("I'm alive"; "here's where to POST hook
+  // events") and must not wait behind the remote promise — start() runs all of them BEFORE
+  // its connect() await, so kicking it off in the background keeps a local-only daemon fully
+  // functional. A rejection is one of two very different things:
+  //   - A TERMINAL control-plane rejection (not paired, refused pairing code, revoked token /
+  //     protocol mismatch — see ControlPlaneRejectionError): the daemon itself is healthy and
+  //     all its local surfaces already came up, so it keeps running local-only with the
+  //     operator-facing reason logged. Exiting here would make `cctl daemon supervise`
+  //     respawn-storm against a rejection no restart can fix — the client marks these
+  //     terminal precisely so nothing retries them.
+  //   - Anything else is a pre-connect subsystem failure (recovery, receiver bind, sqlite) —
+  //     that daemon is a zombie the healthz probe may never flag (no endpoint file reads as
+  //     vacuously healthy), so it must DIE loudly for supervise to answer with a respawn,
+  //     exactly as a synchronous startup failure always did.
+  void daemon.start().catch((err: unknown) => {
+    if (err instanceof ControlPlaneRejectionError) {
+      logger.error({ err }, 'control plane refused this daemon; running local-only');
+      return;
+    }
+    logger.error({ err }, 'daemon failed to start');
+    process.exit(1);
+  });
+
+  heartbeat.start();
+
   process.stdout.write(
     `Daemon running (relay: ${relayUrl}${autoSwitcher ? `, auto-switch: on${greedy ? ' (greedy)' : ''}` : ''}). Ctrl+C to stop.\n`,
   );
 
   const shutdown = (): void => {
     process.stdout.write('Stopping daemon...\n');
+    heartbeat.stop();
     void daemon
       .stop()
       .catch(() => {})

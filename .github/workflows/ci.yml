@@ -39,3 +39,12 @@ jobs:
 
       - name: Test
         run: pnpm run test
+
+      - name: Bundle publishable cctl package
+        run: pnpm --filter claudecontrol run build
+
+      - name: Smoke test the bundle
+        # Boots the bundle standalone (no workspace symlinks) with --version/--help. Not
+        # `doctor`: its checks (DPAPI, vault, ConPTY) are Windows-only and this runner is
+        # ubuntu.
+        run: pnpm --filter claudecontrol run smoke-test
