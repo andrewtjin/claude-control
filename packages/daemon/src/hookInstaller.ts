@@ -259,11 +259,12 @@ export interface UninstallHooksOptions {
  * marks in `isOwnedHookCommand`, regardless of which secret it carries at the time), leaving
  * everything else in settings.json — other tools' hooks, unrelated keys, even our own groups'
  * `matcher` — completely untouched. A settings.json with nothing of ours to remove is left
- * alone: no rewrite, not even a re-serialize.
+ * alone: no rewrite, not even a re-serialize. The outcome says which case happened, so a
+ * caller reporting to a human never claims a removal that was actually a no-op.
  */
-export async function uninstallHooks(options: UninstallHooksOptions): Promise<void> {
+export async function uninstallHooks(options: UninstallHooksOptions): Promise<'removed' | 'none'> {
   const settings = await readSettings(options.settingsPath);
-  if (!isRecord(settings.hooks)) return; // nothing installed, nothing to remove
+  if (!isRecord(settings.hooks)) return 'none'; // nothing installed, nothing to remove
   const hooksSection: JsonObject = settings.hooks;
 
   // `HookEventNames` has no index signature, so `Object.values` can't infer a typed array from
@@ -299,9 +300,9 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<vo
     hooksSection[event] = prunedGroups;
   }
 
-  if (changed) {
-    await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
-  }
+  if (!changed) return 'none';
+  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  return 'removed';
 }
 
 // ---------------------------------------------------------------------------

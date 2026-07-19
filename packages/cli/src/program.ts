@@ -28,6 +28,7 @@ import {
   Store,
   buildDaemonHookSpecs,
   readHeartbeat,
+  uninstallHooks,
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
@@ -365,8 +366,11 @@ export function buildProgram(): Command {
 
   daemon
     .command('uninstall')
-    .description('remove the logon Scheduled Task (does not stop an already-running daemon)')
-    .action(() => {
+    .description(
+      'remove the logon Scheduled Task and the daemon hook entries ' +
+        '(does not stop an already-running daemon)',
+    )
+    .action(async () => {
       let outcome: ReturnType<typeof uninstallDaemonTask>;
       try {
         outcome = uninstallDaemonTask();
@@ -378,6 +382,26 @@ export function buildProgram(): Command {
           ? 'Removed the logon task. A daemon already running keeps running until stopped.\n'
           : 'No logon task was registered.\n',
       );
+
+      // Same settings.json the daemon installs into (claudeDir honors CLAUDE_CONFIG_DIR).
+      // Best-effort: the task removal above already succeeded, so a hook-removal failure
+      // (e.g. a corrupt settings.json, which uninstallHooks refuses to touch) downgrades to
+      // a warning instead of turning that success into a failure exit.
+      const settingsPath = join(defaultPaths().claudeDir, 'settings.json');
+      try {
+        const hooks = await uninstallHooks({ settingsPath });
+        process.stdout.write(
+          hooks === 'removed'
+            ? 'Removed the daemon hook entries from settings.json. A daemon still ' +
+                'running reinstalls them on its next start.\n'
+            : 'No daemon hook entries were installed in settings.json.\n',
+        );
+      } catch (err) {
+        process.stdout.write(
+          `Warning: could not remove the daemon hook entries from ${settingsPath}: ` +
+            `${(err as Error).message}\n`,
+        );
+      }
     });
 
   daemon

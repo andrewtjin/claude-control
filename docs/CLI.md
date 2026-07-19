@@ -73,7 +73,7 @@ cctl daemon supervise                  # run + auto-restart on crash or hang (sa
                                         # as `daemon run`; a clean exit ends supervision)
 
 cctl daemon install     # register the logon Scheduled Task and start the daemon now
-cctl daemon uninstall   # remove the logon task (does not stop an already-running daemon)
+cctl daemon uninstall   # remove the logon task + the daemon's hook entries in settings.json
 cctl daemon status      # logon task, heartbeat, pairing, relay — at a glance
 ```
 
@@ -82,6 +82,13 @@ registration first and only calls `Register-ScheduledTask` when the resolved act
 actually differs, so re-running it (e.g. re-entering `cctl setup`) is a fast no-op. A
 second daemon instance is refused up front with an actionable message naming the
 running daemon's pid, not a raw exception.
+
+`cctl daemon uninstall` also prunes the daemon's own hook entries from
+`~/.claude/settings.json` — only entries it installed; other tools' hooks and the rest
+of the file are untouched. Hook removal is best-effort: if settings.json can't be
+touched (e.g. it isn't valid JSON), the command prints a warning but the task removal
+still counts as a success. Neither step stops an already-running daemon, and a running
+daemon reinstalls its hooks on its next start — stop it for the removal to stick.
 
 `cctl daemon supervise` respawns the daemon a couple of seconds after a crash (with a
 cooldown if it crash-loops), probes its local health endpoint, and kills + respawns a

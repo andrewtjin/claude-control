@@ -381,7 +381,7 @@ describe('uninstallHooks', () => {
         secret: 's3cr3t',
       }),
     });
-    await uninstallHooks({ settingsPath });
+    await expect(uninstallHooks({ settingsPath })).resolves.toBe('removed');
 
     const settings = (await readJson(settingsPath)) as {
       theme: string;
@@ -399,12 +399,12 @@ describe('uninstallHooks', () => {
   it('is a no-op (no rewrite) when nothing of ours is installed', async () => {
     await writeFile(settingsPath, JSON.stringify({ hooks: {} }, null, 2), 'utf8');
     const before = await readFile(settingsPath, 'utf8');
-    await uninstallHooks({ settingsPath });
+    await expect(uninstallHooks({ settingsPath })).resolves.toBe('none');
     expect(await readFile(settingsPath, 'utf8')).toBe(before);
   });
 
   it('does nothing (and does not throw) when settings.json does not exist', async () => {
-    await expect(uninstallHooks({ settingsPath })).resolves.toBeUndefined();
+    await expect(uninstallHooks({ settingsPath })).resolves.toBe('none');
   });
 });
 
