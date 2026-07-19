@@ -132,9 +132,9 @@ describe('installHooks', () => {
     expect(await readFile(settingsPath, 'utf8')).toBe('{not valid json');
   });
 
-  // The daemon's curl commands embed an OS-assigned per-run port, so exact-command dedup
-  // alone appends one dead entry per restart. These pin the
-  // ownedCommandMarker prune that closes that hole.
+  // An earlier command generation embedded an OS-assigned per-run port, so exact-command
+  // dedup alone appended one dead entry per restart. These pin the ownedCommandMarker prune
+  // that closes that hole (and now migrates old generations to the current command shape).
   describe('ownedCommandMarker (stale-generation pruning)', () => {
     /** Mirrors production: the marker is the secret-header name baked into every command. */
     const MARKER = 'x-claude-control-secret';
@@ -161,6 +161,27 @@ describe('installHooks', () => {
       for (const event of ['PermissionRequest', 'Stop']) {
         expect(commandsFor(settings, event)).toEqual([ourCommand(2222)]);
       }
+    });
+
+    it('migrates a previous-generation curl entry to the current forwarder command', async () => {
+      // The exact previous production shape: port-embedding curl with the secret header.
+      const legacy = `curl -s -X POST -H "content-type: application/json" -H "${MARKER}: s3cr3t" --data-binary @- http://127.0.0.1:53441/`;
+      await writeFile(
+        settingsPath,
+        JSON.stringify(
+          { hooks: { Stop: [{ hooks: [{ type: 'command', command: legacy }] }] } },
+          null,
+          2,
+        ),
+      );
+      const specs = buildDaemonHookSpecs({
+        secret: 's3cr3t',
+        forwarderPath: 'C:\\data\\hook-forward.cjs',
+      });
+      await installHooks({ settingsPath, hooks: specs, ownedCommandMarker: MARKER });
+      const settings = await readJson(settingsPath);
+      const stopSpec = specs.find((s) => s.event === 'Stop');
+      expect(commandsFor(settings, 'Stop')).toEqual([stopSpec?.command]);
     });
 
     it('stays idempotent when the port has NOT changed', async () => {
@@ -253,8 +274,10 @@ describe('installHooks', () => {
 });
 
 describe('buildDaemonHookSpecs', () => {
-  it('builds one spec per default hook event, posting to the loopback receiver with the secret header', () => {
-    const specs = buildDaemonHookSpecs({ port: 4567, secret: 's3cr3t' });
+  const base = { secret: 's3cr3t', forwarderPath: 'C:\\data dir\\hook-forward.cjs' };
+
+  it('builds one spec per default hook event, running the forwarder with the secret header', () => {
+    const specs = buildDaemonHookSpecs(base);
     expect(specs).toHaveLength(4);
     expect(specs.map((s) => s.event).sort()).toEqual([
       'Notification',
@@ -263,20 +286,37 @@ describe('buildDaemonHookSpecs', () => {
       'Stop',
     ]);
     for (const s of specs) {
-      expect(s.command).toContain('127.0.0.1:4567');
-      expect(s.command).toContain('s3cr3t');
+      expect(s.command).toContain('"C:\\data dir\\hook-forward.cjs"');
+      expect(s.command).toContain(`--secret-header "${DEFAULT_SECRET_HEADER}: s3cr3t"`);
+    }
+  });
+
+  it('carries no port — the forwarder discovers the current one at fire time, so the command survives restarts', () => {
+    for (const s of buildDaemonHookSpecs(base)) {
+      expect(s.command).not.toMatch(/127\.0\.0\.1|\bcurl\b|:\d{2,5}\//);
+    }
+  });
+
+  it('runs under the daemon’s own node binary by default, quoted (paths may contain spaces)', () => {
+    const specs = buildDaemonHookSpecs(base);
+    for (const s of specs) {
+      expect(s.command.startsWith(`"${process.execPath}" `)).toBe(true);
+    }
+    const custom = buildDaemonHookSpecs({ ...base, nodePath: 'D:\\other node\\node.exe' });
+    for (const s of custom) {
+      expect(s.command.startsWith('"D:\\other node\\node.exe" ')).toBe(true);
     }
   });
 
   it('the PostToolUse spec carries no matcher — the receiver filters, not the hook', () => {
-    const specs = buildDaemonHookSpecs({ port: 4567, secret: 's3cr3t' });
+    const specs = buildDaemonHookSpecs(base);
     const postToolUse = specs.find((s) => s.event === 'PostToolUse');
     expect(postToolUse).toBeDefined();
     expect(postToolUse?.matcher).toBeUndefined();
   });
 
   it('bakes DEFAULT_SECRET_HEADER into every command — the marker daemonRun prunes by', () => {
-    const specs = buildDaemonHookSpecs({ port: 4567, secret: 's3cr3t' });
+    const specs = buildDaemonHookSpecs(base);
     for (const s of specs) {
       expect(s.command).toContain(DEFAULT_SECRET_HEADER);
     }
@@ -284,8 +324,7 @@ describe('buildDaemonHookSpecs', () => {
 
   it('honors custom event names', () => {
     const specs = buildDaemonHookSpecs({
-      port: 1,
-      secret: 'x',
+      ...base,
       eventNames: {
         permissionRequest: 'CustomPerm',
         stop: 'CustomStop',

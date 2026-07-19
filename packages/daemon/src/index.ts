@@ -63,6 +63,8 @@ export {
   type HookEndpoint,
 } from './hookEndpoint.js';
 
+export { hookForwarderPath, writeHookForwarder, HOOK_FORWARDER_SOURCE } from './hookForwarder.js';
+
 export {
   ControlPlaneClient,
   type ConnectionState,

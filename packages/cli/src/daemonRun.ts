@@ -33,8 +33,10 @@ import {
   UsagePoller,
   buildDaemonHookSpecs,
   hookEndpointPath,
+  hookForwarderPath,
   hookSecretPath,
   installHooks,
+  writeHookForwarder,
   loadOrCreateHookSecret,
   writeHookEndpoint,
   type DaemonIdentity,
@@ -277,15 +279,21 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     attributionJournal,
     hookReceiver,
     controlPlaneClient,
-    installHooks: (port) =>
-      installHooks({
+    installHooks: async () => {
+      // The forwarder script is (re)written before the hook entries that point at it, so the
+      // installed command always has a current script behind it. The command itself is
+      // port-independent (the forwarder reads the endpoint file at fire time) and therefore
+      // stable across restarts; the secret-header name still fingerprints our entries so the
+      // installer replaces earlier generations — including the previous port-embedding curl
+      // shape — instead of accumulating them.
+      const forwarderPath = hookForwarderPath(dataDir);
+      await writeHookForwarder(forwarderPath);
+      await installHooks({
         settingsPath,
-        hooks: buildDaemonHookSpecs({ port, secret: hookSecret }),
-        // The receiver's port is OS-assigned per run, so each restart rewrites the curl
-        // commands. The secret-header name is the port-independent fingerprint that lets the
-        // installer replace its own previous-run entry instead of appending one per restart.
+        hooks: buildDaemonHookSpecs({ secret: hookSecret, forwarderPath }),
         ownedCommandMarker: DEFAULT_SECRET_HEADER,
-      }),
+      });
+    },
     // Publish the receiver's actual loopback port so `cctl session register|label|watch` can
     // find this daemon (the port is OS-assigned per run, so it must be published, not derived).
     // Rewritten every start; the shutdown handler removes it so a stopped daemon leaves no

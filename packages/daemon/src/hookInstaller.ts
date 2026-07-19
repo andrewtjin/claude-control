@@ -10,12 +10,13 @@
 // Idempotent + self-healing: running `installHooks` again never duplicates an entry, and if
 // our own hook state was left malformed by e.g. a manual edit or a partial write, the next
 // call coalesces it back to canonical form rather than erroring or piling on a duplicate.
-// Exact-command dedup alone is NOT enough for that: the daemon's curl commands embed an
-// OS-assigned per-run port, so every restart produces a command that has never been seen
-// before, and the previous run's entry (now pointing at a dead port) would accumulate
-// forever. `ownedCommandMarker` closes that hole — entries carrying the marker are
-// recognizably OURS regardless of which port generation they came from, and any that don't
-// match a current spec are pruned before the merge.
+// Exact-command dedup alone is NOT enough for that: our command has changed shape across
+// releases (an earlier generation was a curl one-liner embedding an OS-assigned per-run
+// port, minting a never-seen command every restart), and it still varies with the node and
+// script paths — a stale generation would accumulate forever. `ownedCommandMarker` closes
+// that hole — entries carrying the marker are recognizably OURS regardless of which
+// generation they came from, and any that don't match a current spec are pruned before the
+// merge.
 //
 // The exact `settings.json` hooks schema (event names, matcher semantics, the
 // installed CLI version's exact expectations) is reverse-engineered — see docs/VERIFICATION.md.
@@ -210,10 +211,13 @@ async function readSettings(path: string): Promise<JsonObject> {
 // ---------------------------------------------------------------------------
 
 export interface BuildDaemonHookSpecsOptions {
-  /** Loopback port `hookReceiver` is listening on. */
-  port: number;
   /** Shared secret `hookReceiver` requires (see hookReceiver.ts `secretHeader`). */
   secret: string;
+  /** Absolute path of the forwarder script (see hookForwarder.ts) the command runs. */
+  forwarderPath: string;
+  /** Node executable to run the forwarder with. Defaults to the running process's own
+   *  binary — the daemon IS Node, so its binary is known-good and needs no PATH lookup. */
+  nodePath?: string;
   eventNames?: typeof DEFAULT_HOOK_EVENT_NAMES;
   /** Header name the receiver expects the secret on; must match `HookReceiverOptions.secretHeader`. */
   secretHeader?: string;
@@ -222,15 +226,21 @@ export interface BuildDaemonHookSpecsOptions {
 /**
  * The hook specs the daemon needs on every profile it manages: forward the CLI's hook
  * JSON (fed on stdin, per Claude Code's hook contract) as an HTTP POST to the loopback
- * receiver. Kept as a small, readable curl one-liner so a user inspecting settings.json can
- * see exactly what runs. PostToolUse carries no matcher on purpose: it must observe every
- * tool (the receiver decides which runs are worth forwarding, not the hook filter).
+ * receiver, via the forwarder script (hookForwarder.ts) so the daemon-down fast path and
+ * the connect-timeout policy live in ONE place instead of four duplicated one-liners.
+ * The command deliberately carries no port — the forwarder discovers the current one from
+ * the endpoint file at fire time, so the installed entries (and every running session's
+ * startup snapshot of them) stay valid across daemon restarts. The secret header stays on
+ * the command line both as the receiver's auth and as the ownership marker `installHooks`
+ * prunes stale generations by — including previous-shape curl entries, which carried the
+ * same header name. PostToolUse carries no matcher on purpose: it must observe every tool
+ * (the receiver decides which runs are worth forwarding, not the hook filter).
  */
 export function buildDaemonHookSpecs(options: BuildDaemonHookSpecsOptions): HookCommandSpec[] {
   const eventNames = options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES;
   const secretHeader = options.secretHeader ?? DEFAULT_SECRET_HEADER;
-  const url = `http://127.0.0.1:${options.port}/`;
-  const command = `curl -s -X POST -H "content-type: application/json" -H "${secretHeader}: ${options.secret}" --data-binary @- ${url}`;
+  const nodePath = options.nodePath ?? process.execPath;
+  const command = `"${nodePath}" "${options.forwarderPath}" --secret-header "${secretHeader}: ${options.secret}"`;
   return [
     { event: eventNames.permissionRequest, command },
     { event: eventNames.stop, command },
