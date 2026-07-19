@@ -8,7 +8,14 @@ import { CredentialStore } from './credentialStore.js';
 import { Vault } from './vault.js';
 import { IntentStore } from './intent.js';
 import { sandboxPaths, type Paths } from './paths.js';
-import { CadenceError, QuarantineError, UnknownAccountError, RefreshError } from './errors.js';
+import {
+  CadenceError,
+  QuarantineError,
+  UnknownAccountError,
+  RefreshError,
+  LockTimeoutError,
+} from './errors.js';
+import { acquireLock } from './lock.js';
 import type { ClaudeOauth, CredentialBundle } from './types.js';
 
 const NOW = 100_000_000;
@@ -679,5 +686,93 @@ describe('refreshToken — background refresh for polling', () => {
   it('rejects an unknown account id', async () => {
     const h = await harness();
     await expect(h.engine.refreshToken('nope')).rejects.toBeInstanceOf(UnknownAccountError);
+  });
+});
+
+describe('registry mutators serialize against the credential lock', () => {
+  /** An engine on `paths` whose registry mutators give up quickly under contention, so the test
+   *  observes the lock-contention error without waiting out a long timeout. */
+  function shortLockEngine(paths: Paths): SwitchEngine {
+    return new SwitchEngine({
+      paths,
+      protector: new InsecurePassthroughProtector(),
+      refresh: vi.fn(),
+      clock: Date.now,
+      lockOptions: { timeoutMs: 150, pollMs: 10 },
+    });
+  }
+
+  /** Hold the engine's credential lock (as a concurrent process would), run `call`, and require
+   *  it to fail with LockTimeoutError — proving the mutator waits on the same mutex activate()
+   *  uses instead of racing straight into an unlocked registry read-modify-write. */
+  async function expectBlockedWhileLocked(
+    paths: Paths,
+    call: (engine: SwitchEngine) => Promise<unknown>,
+  ): Promise<void> {
+    const engine = shortLockEngine(paths);
+    const lock = await acquireLock(join(paths.vaultDir, '.lock'), Date.now, {});
+    try {
+      await expect(call(engine)).rejects.toBeInstanceOf(LockTimeoutError);
+    } finally {
+      lock.release();
+    }
+  }
+
+  it('addAccount waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.addAccount('X', bundleFor('X', NOW + HOUR)));
+  });
+
+  it('removeAccount waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.removeAccount('any-id'));
+  });
+
+  it('clearQuarantine waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.clearQuarantine('any-id'));
+  });
+
+  it('captureCurrentLogin waits on the lock (the add + setActive path)', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.captureCurrentLogin('X'));
+  });
+
+  it('captureFromConfigDir waits on the lock', async () => {
+    const h = await harness();
+    // Seed a transient capture dir so the method reaches its registry write rather than failing
+    // earlier — though it blocks on lock acquisition before it even reads the dir.
+    const captureDir = join(h.paths.claudeDir, '..', 'locked-capture');
+    await mkdir(captureDir, { recursive: true });
+    const store = new CredentialStore({
+      claudeDir: captureDir,
+      credentialsPath: join(captureDir, '.credentials.json'),
+      claudeJsonPath: join(captureDir, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+    const fresh = bundleFor('FRESH', NOW + 10 * HOUR);
+    await store.writeLiveCredentials(fresh.claudeAiOauth);
+    await store.writeOauthAccount(fresh.oauthAccount!);
+    await expectBlockedWhileLocked(h.paths, (e) => e.captureFromConfigDir('fresh', captureDir));
+  });
+
+  it('reloginFromConfigDir waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) =>
+      e.reloginFromConfigDir('any-id', join(h.paths.claudeDir, '..', 'relogin-unused')),
+    );
+  });
+
+  it('a mutator succeeds once the lock is released', async () => {
+    const h = await harness();
+    const engine = shortLockEngine(h.paths);
+    const lock = await acquireLock(join(h.paths.vaultDir, '.lock'), Date.now, {});
+    // While held, the add is refused; after release it goes through and commits to the registry.
+    await expect(engine.addAccount('X', bundleFor('X', NOW + HOUR))).rejects.toBeInstanceOf(
+      LockTimeoutError,
+    );
+    lock.release();
+    const account = await engine.addAccount('X', bundleFor('X', NOW + HOUR));
+    expect((await engine.listAccounts()).map((a) => a.id)).toContain(account.id);
   });
 });

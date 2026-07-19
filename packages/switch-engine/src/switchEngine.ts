@@ -114,19 +114,29 @@ export class SwitchEngine {
     this.log = options.logger ?? noopLogger;
   }
 
-  // ---- registry passthroughs ----
+  // ---- registry mutators (lock-guarded) ----
+  //
+  // The registry (accounts.json) is a read-modify-write file. Every method that writes it MUST
+  // hold the credential lock, or a separate CLI process mutating the registry (`cctl accounts
+  // add`/`remove`/`relogin`) would race the daemon's activate()/refreshToken()/recover() — which
+  // hold the lock across a multi-await sequence — and race other CLI writers, silently losing one
+  // side's update on whichever save() commits last. `listAccounts`/`getActiveId` are pure reads
+  // and intentionally stay unlocked (a torn read at worst returns slightly stale metadata, and
+  // saveRegistry writes the whole file atomically). None of these mutators are called from a
+  // context that already holds the lock — activate()/recover()/the capture verbs reach the vault
+  // directly — so wrapping them here cannot deadlock the (non-reentrant) lock.
 
   listAccounts(): Promise<StoredAccount[]> {
     return this.vault.listAccounts();
   }
   addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
-    return this.vault.addAccount(label, bundle);
+    return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
   }
   removeAccount(id: string): Promise<void> {
-    return this.vault.removeAccount(id);
+    return this.withCredentialLock(() => this.vault.removeAccount(id));
   }
   clearQuarantine(id: string): Promise<void> {
-    return this.vault.clearQuarantine(id);
+    return this.withCredentialLock(() => this.vault.clearQuarantine(id));
   }
 
   // ---- active account (live-login reconciled) ----
@@ -165,17 +175,22 @@ export class SwitchEngine {
    * `cctl accounts add` right after an interactive login populated the live files.
    */
   async captureCurrentLogin(label: string): Promise<StoredAccount> {
-    const live = await this.credStore.readLiveCredentials();
-    if (!live)
-      throw new RefreshError('no live credentials to capture; log in first', 'no_live_login');
-    const oauthAccount = await this.credStore.readOauthAccount();
-    const bundle: CredentialBundle = oauthAccount
-      ? { claudeAiOauth: live, oauthAccount }
-      : { claudeAiOauth: live };
-    const account = await this.vault.addAccount(label, bundle);
-    // The just-captured account IS the live one; record that so the first switch reconciles.
-    await this.vault.setActive(account.id);
-    return account;
+    // Locked for the whole capture: the add + setActive pair below are two registry writes that
+    // must land as one atomic unit, and reading the live login while a switch is mid-flight would
+    // otherwise see a torn set of credential files.
+    return this.withCredentialLock(async () => {
+      const live = await this.credStore.readLiveCredentials();
+      if (!live)
+        throw new RefreshError('no live credentials to capture; log in first', 'no_live_login');
+      const oauthAccount = await this.credStore.readOauthAccount();
+      const bundle: CredentialBundle = oauthAccount
+        ? { claudeAiOauth: live, oauthAccount }
+        : { claudeAiOauth: live };
+      const account = await this.vault.addAccount(label, bundle);
+      // The just-captured account IS the live one; record that so the first switch reconciles.
+      await this.vault.setActive(account.id);
+      return account;
+    });
   }
 
   /**
@@ -206,8 +221,9 @@ export class SwitchEngine {
     const bundle: CredentialBundle = oauthAccount
       ? { claudeAiOauth: creds, oauthAccount }
       : { claudeAiOauth: creds };
-    // Unlike captureCurrentLogin, the live account is unchanged — do NOT touch activeId.
-    return this.vault.addAccount(label, bundle);
+    // Unlike captureCurrentLogin, the live account is unchanged — do NOT touch activeId. The
+    // transient-dir reads above touch no shared state; only the registry write needs the lock.
+    return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
   }
 
   /**
@@ -231,6 +247,17 @@ export class SwitchEngine {
    * same contract as {@link captureFromConfigDir}.
    */
   async reloginFromConfigDir(accountId: string, configDir: string): Promise<StoredAccount> {
+    // Locked end-to-end so the existence check, the in-place bundle overwrite, and the quarantine
+    // clear cannot interleave with a concurrent registry writer — which could remove the account
+    // between the check and the write, orphaning its freshly written bundle.
+    return this.withCredentialLock(() => this.reloginFromConfigDirLocked(accountId, configDir));
+  }
+
+  /** The unlocked core of {@link reloginFromConfigDir}; the public wrapper holds the lock. */
+  private async reloginFromConfigDirLocked(
+    accountId: string,
+    configDir: string,
+  ): Promise<StoredAccount> {
     const existing = await this.vault.getAccount(accountId);
     if (!existing) throw new UnknownAccountError(accountId);
 
@@ -669,5 +696,21 @@ export class SwitchEngine {
 
   private lockDir(): string {
     return join(this.paths.vaultDir, '.lock');
+  }
+
+  /**
+   * Run a registry mutation while holding the credential lock, mirroring the acquire/try-finally
+   * that activate()/refreshToken()/recover() use (same {@link lockOptions}). This is how every
+   * registry writer — in-process and across separate CLI processes — funnels through one mutex.
+   * The lock is NOT reentrant, so only callers that do not already hold it may use this; the
+   * switch state machine holds the lock itself and reaches the vault directly instead.
+   */
+  private async withCredentialLock<T>(mutate: () => Promise<T>): Promise<T> {
+    const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
+    try {
+      return await mutate();
+    } finally {
+      lock.release();
+    }
   }
 }
