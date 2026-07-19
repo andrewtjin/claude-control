@@ -44,11 +44,16 @@ import {
 } from '@claude-control/daemon';
 import { createAgentSdkClient, createSessionManager } from '@claude-control/session-runtime';
 import type { AgentSdkClient } from '@claude-control/session-runtime';
-import { buildEngine, daemonDbPath } from './context.js';
+import { buildEngine, daemonDbPath, fail } from './context.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import { daemonSettingsPath, resolveDaemonConfig, writeSettingsReport } from './settings.js';
 import { crashLogPath, installCrashLogging } from './daemonSupervise.js';
+import {
+  acquireInstanceLock,
+  releaseInstanceLock,
+  DaemonAlreadyRunningError,
+} from './daemonInstanceLock.js';
 
 /** Token considered unusable for polling within this window before expiry — the poller then
  *  falls back to tier-0 rather than racing the expiry mid-request. */
@@ -138,6 +143,20 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // restarted it. Whatever kills this process from here on leaves a line in daemon-crash.log
   // and a non-zero exit for `cctl daemon supervise` to answer with a respawn.
   installCrashLogging(crashLogPath(dataDir));
+  // Single-instance guard: a second concurrent `daemon run` (a manual run while `daemon
+  // supervise` already has one, or two supervisors) would otherwise fight the first over
+  // hook-endpoint.json, the settings.json hook installs, the hook secret, and daemon.db — all
+  // four get corrupted by the loser writing over the winner mid-run. Acquired before any of
+  // that state is touched, and specifically BEFORE the refusal case ever reaches pino/log
+  // setup, so a refused start prints one clean line and exits rather than looking like it
+  // partially started. `cctl daemon supervise` needs no equivalent: its child process is the
+  // one that holds this lock.
+  try {
+    await acquireInstanceLock(dataDir);
+  } catch (err) {
+    if (err instanceof DaemonAlreadyRunningError) fail(err.message);
+    throw err; // an unexpected IO error here is a real failure, not a clean refusal
+  }
   const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
   const logger: Logger = {
     debug: (obj, msg) => p.debug(obj, msg),
@@ -342,6 +361,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       // Remove the published endpoint so a `cctl session` command run against a stopped daemon
       // fails fast with "start the daemon" rather than racing a dead port. Best-effort.
       .then(() => rm(hookEndpointPath(dataDir), { force: true }).catch(() => {}))
+      // Free the instance lock so a subsequent `daemon run` doesn't have to wait for the
+      // liveness check to notice this pid is gone. Best-effort, and guarded internally (only
+      // deletes if it still records OUR pid) — a crash instead of a clean Ctrl+C skips this,
+      // which is fine: the next start's liveness check treats the leftover file as stale.
+      .then(() => releaseInstanceLock(dataDir).catch(() => {}))
       .then(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
