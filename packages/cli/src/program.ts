@@ -30,7 +30,12 @@ import {
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { runDaemon } from './daemonRun.js';
-import { appendCrashLine, crashLogPath, superviseDaemon } from './daemonSupervise.js';
+import {
+  appendCrashLine,
+  buildDefaultProbeFn,
+  crashLogPath,
+  superviseDaemon,
+} from './daemonSupervise.js';
 import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
 import { renderAccountsTable, renderUsage, type UsageRow } from './render.js';
 import {
@@ -235,7 +240,8 @@ export function buildProgram(): Command {
           ...(opts.autoSwitch ? ['--auto-switch'] : []),
           ...(opts.greedy ? ['--greedy'] : []),
         ];
-        const crashFile = crashLogPath(dirname(defaultPaths().vaultDir));
+        const dataDir = dirname(defaultPaths().vaultDir);
+        const crashFile = crashLogPath(dataDir);
         const controller = new AbortController();
         process.once('SIGINT', () => controller.abort());
         process.once('SIGTERM', () => controller.abort());
@@ -248,6 +254,9 @@ export function buildProgram(): Command {
           log: (line) => process.stdout.write(line + '\n'),
           logCrash: (line) => appendCrashLine(crashFile, line),
           signal: controller.signal,
+          // Catches a HUNG child (alive, unresponsive) that would otherwise stall every
+          // hook until a human noticed — a plain exit-code check never sees it.
+          probe: { probeFn: buildDefaultProbeFn(dataDir) },
         });
       },
     );
