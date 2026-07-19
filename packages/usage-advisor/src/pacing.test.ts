@@ -22,7 +22,11 @@ function account(overrides: Partial<AccountUsageInput> & { accountId: string }):
 /** A weekly_all limit whose reset time encodes an exact elapsedFraction, so test numbers can
  *  be reasoned about by hand instead of guessed. */
 function weeklyLimit(percent: number, elapsedFraction: number): LimitInput {
-  return { kind: 'weekly_all', percent, resetsAt: NOW + Math.round((1 - elapsedFraction) * WEEK_MS) };
+  return {
+    kind: 'weekly_all',
+    percent,
+    resetsAt: NOW + Math.round((1 - elapsedFraction) * WEEK_MS),
+  };
 }
 
 describe('computePacing — verdict bands', () => {
@@ -100,10 +104,7 @@ describe('computePacing — verdict bands', () => {
 
 describe('computePacing — fresh and unknown', () => {
   it('reports fresh when the combined week just reset (elapsed ~0)', () => {
-    const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(10, 0)] })],
-      NOW,
-    );
+    const pacing = computePacing([account({ accountId: 'a', limits: [weeklyLimit(10, 0)] })], NOW);
     expect(pacing.verdict).toBe('fresh');
     expect(pacing.paceRatio).toBeUndefined();
     expect(pacing.weekElapsedPct).toBe(0);
@@ -139,7 +140,12 @@ describe('computePacing — fresh and unknown', () => {
 
   it('reports unknown when accounts exist but none carry weekly data', () => {
     const pacing = computePacing(
-      [account({ accountId: 'a', limits: [{ kind: 'session', percent: 20, resetsAt: NOW + 1000 }] })],
+      [
+        account({
+          accountId: 'a',
+          limits: [{ kind: 'session', percent: 20, resetsAt: NOW + 1000 }],
+        }),
+      ],
       NOW,
     );
     expect(pacing.verdict).toBe('unknown');
@@ -277,7 +283,9 @@ describe('computePacing — weekly_all vs weekly_scoped', () => {
       [
         account({
           accountId: 'a',
-          limits: [{ kind: 'weekly_scoped', percent: 33, resetsAt: NOW + Math.round(0.5 * WEEK_MS) }],
+          limits: [
+            { kind: 'weekly_scoped', percent: 33, resetsAt: NOW + Math.round(0.5 * WEEK_MS) },
+          ],
         }),
       ],
       NOW,

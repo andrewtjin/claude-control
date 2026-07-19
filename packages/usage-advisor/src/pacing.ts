@@ -130,7 +130,8 @@ function analyzeAccount(
   const limit = weeklyLimitFor(account.limits);
   const { percent, resetsAt } = weeklyFields(limit);
   const usedPct = percent !== undefined ? roundPct(clamp01(percent / 100) * 100) : undefined;
-  const elapsedPct = resetsAt !== undefined ? roundPct(elapsedFraction(resetsAt, nowMs) * 100) : undefined;
+  const elapsedPct =
+    resetsAt !== undefined ? roundPct(elapsedFraction(resetsAt, nowMs) * 100) : undefined;
 
   if (account.quarantined) {
     return {
@@ -176,7 +177,9 @@ function analyzeAccount(
 /** The limit pacing budgets against: weekly_all, falling back to weekly_scoped only when no
  *  weekly_all entry exists at all (matches the advisor's "weekly is the budget" convention). */
 function weeklyLimitFor(limits: LimitInput[]): LimitInput | undefined {
-  return limits.find((l) => l.kind === 'weekly_all') ?? limits.find((l) => l.kind === 'weekly_scoped');
+  return (
+    limits.find((l) => l.kind === 'weekly_all') ?? limits.find((l) => l.kind === 'weekly_scoped')
+  );
 }
 
 /** Pull percent/resetsAt off the selected limit, treating a non-finite or absent value as not
@@ -192,7 +195,11 @@ function weeklyFields(limit: LimitInput | undefined): { percent?: number; resets
 }
 
 /** Why an account with no quarantine flag still failed to contribute. */
-function missingDataReason(limit: LimitInput | undefined, hasPercent: boolean, hasReset: boolean): string {
+function missingDataReason(
+  limit: LimitInput | undefined,
+  hasPercent: boolean,
+  hasReset: boolean,
+): string {
   if (!limit) return 'no weekly limit reported';
   if (!hasPercent && !hasReset) return 'weekly limit missing percent and reset time';
   return hasPercent ? 'weekly limit missing reset time' : 'weekly limit missing percent';

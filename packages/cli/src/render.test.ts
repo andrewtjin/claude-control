@@ -153,7 +153,11 @@ describe('renderPacingLine', () => {
       active: false,
       quarantined: false,
       limits: [
-        { kind: 'weekly_all', percent, resetsAt: NOW + Math.round((1 - elapsedFraction) * WEEK_MS) },
+        {
+          kind: 'weekly_all',
+          percent,
+          resetsAt: NOW + Math.round((1 - elapsedFraction) * WEEK_MS),
+        },
       ],
     };
   }

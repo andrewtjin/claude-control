@@ -11,12 +11,7 @@ export {
 } from './autoswitch.js';
 export { humanizeDuration, roundPct } from './format.js';
 export { severityOf, worstSeverity, type Severity } from './severity.js';
-export {
-  computePacing,
-  type AccountPacing,
-  type Pacing,
-  type PacingVerdict,
-} from './pacing.js';
+export { computePacing, type AccountPacing, type Pacing, type PacingVerdict } from './pacing.js';
 export {
   PLAIN_OUTLOOK_STYLE,
   SESSION_WINDOW_MS,
