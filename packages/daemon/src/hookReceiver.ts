@@ -1,6 +1,6 @@
 // Loopback HTTP server that receives Claude Code CLI hook events (PermissionRequest, Stop,
-// Notification, PostToolUse) and turns them into protocol envelopes for the control-plane
-// client to send.
+// Notification, PostToolUse, UserPromptSubmit) and turns them into protocol envelopes for the
+// control-plane client to send.
 //
 // SECURITY CONTRACT: the bot deliberately does not
 // correlate `permission.response` messages against anything — it just relays what the phone
@@ -31,6 +31,10 @@ export interface HookEventNames {
   stop: string;
   notification: string;
   postToolUse: string;
+  /** Fires locally when the user types a prompt — the second (and only other) delivery
+   *  channel for queued operator steering, alongside Stop. Unlike Stop it does not wait for a
+   *  turn to finish: it is the session's next opportunity to hear queued guidance while idle. */
+  userPromptSubmit: string;
 }
 
 export const DEFAULT_HOOK_EVENT_NAMES: HookEventNames = {
@@ -38,6 +42,7 @@ export const DEFAULT_HOOK_EVENT_NAMES: HookEventNames = {
   stop: 'Stop',
   notification: 'Notification',
   postToolUse: 'PostToolUse',
+  userPromptSubmit: 'UserPromptSubmit',
 };
 
 export interface HookReceiverOptions {
@@ -381,9 +386,10 @@ export class HookReceiver {
 
   /** Install the operator-steering source (same late-binding contract as
    *  {@link setCliHandlers}: the daemon that owns the queue is constructed after this
-   *  receiver). Called with the session id of every Stop hook from a NON-managed session;
-   *  returning text CONSUMES whatever the operator queued for that session and delivers it as
-   *  the Stop answer, `undefined` means nothing is queued and the Stop proceeds normally. */
+   *  receiver). Called with the session id of every Stop OR UserPromptSubmit hook from a
+   *  NON-managed session; returning text CONSUMES whatever the operator queued for that session
+   *  and delivers it as that hook's answer (Stop's `decision: 'block'`, UserPromptSubmit's
+   *  `additionalContext`), `undefined` means nothing is queued and the hook proceeds normally. */
   setSteeringSource(take: (sessionId: string) => string | undefined): void {
     this.takeSteering = take;
   }
@@ -709,6 +715,10 @@ export class HookReceiver {
       this.handlePostToolUse(body, res);
       return;
     }
+    if (event === this.eventNames.userPromptSubmit) {
+      this.handleUserPromptSubmit(body, res, event);
+      return;
+    }
     // Whatever event name the CLI fires that we don't handle shows up here by name, so a
     // contract drift is visible in the log instead of silently dropped.
     this.logger.warn(
@@ -1017,6 +1027,62 @@ export class HookReceiver {
     });
     this.logger.info({ event, sessionId, notificationType }, 'hook event received; card pushed');
     this.respond(res, 200, { ok: true });
+  }
+
+  /**
+   * The second delivery channel for queued operator steering (see {@link setSteeringSource}):
+   * UserPromptSubmit fires the moment the user types locally, which can happen while the
+   * session is sitting idle — Stop alone only delivers at the NEXT turn boundary, so a closed
+   * window between turns would otherwise hear nothing. The CLI's documented contract for this
+   * hook is `hookSpecificOutput.additionalContext` (a string spliced into the turn the user is
+   * about to start), the injection mechanism instead of Stop's `decision: 'block'`. Consumption
+   * is exactly-once by construction: both this and the Stop path route through the SAME
+   * `takeSteering` callback, which deletes the queue entry on first read — whichever hook fires
+   * first wins, and the other finds nothing queued.
+   */
+  private handleUserPromptSubmit(
+    body: Record<string, unknown>,
+    res: ServerResponse,
+    event: string,
+  ): void {
+    const sessionId = str(body.session_id) ?? str(body.sessionId);
+    // Same suppression as Stop, checked first: a managed session's steering already delivers
+    // through the SDK's own send path, and its CLI subprocess inherits every installed hook —
+    // consulting the queue here too would risk the same text landing twice.
+    if (sessionId !== undefined && this.isManagedSession(sessionId)) {
+      this.respond(res, 200, {});
+      return;
+    }
+    let steering: string | undefined;
+    if (sessionId !== undefined) {
+      // `takeSteering` is an injected callback; a throw from it must never fail the hook (the
+      // never-fail-a-hook contract this whole file upholds). Swallow it and answer with no
+      // context, exactly as when nothing is queued.
+      try {
+        steering = this.takeSteering?.(sessionId);
+      } catch (err) {
+        this.logger.warn(
+          { event, sessionId, err },
+          'steering source threw; answering UserPromptSubmit with no context',
+        );
+        steering = undefined;
+      }
+    }
+    if (steering === undefined) {
+      this.respond(res, 200, {});
+      return;
+    }
+    // `hookEventName` echoes the event name exactly as received (mirroring the PermissionRequest
+    // decision path), not a hardcoded literal — if a caller configured custom event names, the
+    // echo must match what the CLI actually sent.
+    this.respond(res, 200, {
+      hookSpecificOutput: { hookEventName: event, additionalContext: steering },
+    });
+    // Size only, never content — steering text is operator input.
+    this.logger.info(
+      { sessionId, chars: steering.length },
+      'UserPromptSubmit answered with steering',
+    );
   }
 
   private respond(res: ServerResponse, status: number, body: unknown): void {

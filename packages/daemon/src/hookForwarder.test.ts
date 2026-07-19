@@ -148,6 +148,22 @@ describe('hook forwarder script', () => {
     }
   });
 
+  it('UserPromptSubmit rides the response — its additionalContext must reach the session, not fire-and-forget', async () => {
+    const responseBody =
+      '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"go"}}';
+    // Delay past the connect timeout: a fire-and-forget forwarder would already have exited,
+    // so a delivered response here proves this event rides it like PermissionRequest/Stop.
+    const { server, port } = await startServer(responseBody, 1000);
+    try {
+      await writeHookEndpoint(hookEndpointPath(dataDir), { port });
+      const payload = '{"hook_event_name":"UserPromptSubmit","session_id":"s-1"}';
+      const result = await runForwarder(scriptPath, payload);
+      expect(result).toEqual({ code: 0, stdout: responseBody, stderr: '' });
+    } finally {
+      server.close();
+    }
+  }, 15_000);
+
   it('a response slower than the connect timeout is still delivered — the timeout bounds the CONNECT only', async () => {
     // 1s delay ≫ the script's 400ms connect timeout; a total-time cap would sever this
     // (and with it every held-permission long-poll).

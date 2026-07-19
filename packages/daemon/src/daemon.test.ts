@@ -1169,7 +1169,7 @@ describe('Daemon lifecycle', () => {
     if (card?.type === 'hook.notification') {
       expect(card.payload.title).toContain('demo');
       expect(card.payload.body).toContain('steer this');
-      expect(card.payload.body).toContain('finishes its current turn');
+      expect(card.payload.body).toContain('finishes its current turn or you next type in it');
     }
     expect(relay.received.some((e) => e.type === 'error')).toBe(false);
   });
@@ -1313,6 +1313,198 @@ describe('Daemon lifecycle', () => {
           e.type === 'hook.notification' && e.payload.notificationType === 'steering_delivered',
       ),
     ).toBe(false);
+  });
+
+  // ---- UserPromptSubmit: the second steering delivery channel, for a session sitting idle ----
+
+  it('queued steering delivers via UserPromptSubmit, and a subsequent Stop finds nothing left', async () => {
+    seedTerminalSession('terminal-upsub-1');
+    const hookPort = await startCapturingHookPort();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: {
+        sessionId: 'terminal-upsub-1',
+        text: 'type-triggered steer',
+        idempotencyKey: 'up-1',
+      },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    );
+
+    const answer = await postHook(hookPort, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'terminal-upsub-1',
+    });
+    expect(answer).toEqual({
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: 'type-triggered steer',
+      },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) =>
+          e.type === 'hook.notification' && e.payload.notificationType === 'steering_delivered',
+      ),
+    );
+
+    // Consumed exactly once: the same Map.delete backs both delivery channels, so the
+    // session's next Stop finds an already-empty queue.
+    const stopAnswer = await postHook(hookPort, {
+      hook_event_name: 'Stop',
+      session_id: 'terminal-upsub-1',
+    });
+    expect(stopAnswer).toEqual({ ok: true });
+  });
+
+  it('queued steering delivers via Stop first; a later UserPromptSubmit finds nothing left', async () => {
+    seedTerminalSession('terminal-upsub-2');
+    const hookPort = await startCapturingHookPort();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-upsub-2', text: 'stop-delivered', idempotencyKey: 'up-2' },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    );
+
+    const stopAnswer = await postHook(hookPort, {
+      hook_event_name: 'Stop',
+      session_id: 'terminal-upsub-2',
+    });
+    expect(stopAnswer).toEqual({ decision: 'block', reason: 'stop-delivered' });
+
+    const answer = await postHook(hookPort, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'terminal-upsub-2',
+    });
+    expect(answer).toEqual({});
+  });
+
+  it('managed session UserPromptSubmit always answers {}, leaving the queue untouched', async () => {
+    seedTerminalSession('managed-upsub-1');
+    // isManagedSession is a closure so this ONE test can flip it mid-run: the first
+    // UserPromptSubmit proves the managed branch never touches the queue (answers {} while
+    // steering is queued, no steering_delivered card), and flipping it false afterward proves
+    // the queue was genuinely untouched by actually delivering the SAME text unchanged.
+    let treatAsManaged = true;
+    const managedHookReceiver = new HookReceiver({
+      store,
+      secret: 'shh',
+      emit: () => {},
+      daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unknown',
+      isManagedSession: (sessionId) => treatAsManaged && sessionId === 'managed-upsub-1',
+    });
+    let captured: number | undefined;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver: managedHookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      publishHookEndpoint: (port) => {
+        captured = port;
+        return Promise.resolve();
+      },
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+    await waitFor(() => captured !== undefined);
+    if (captured === undefined) throw new Error('unreachable');
+
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'managed-upsub-1', text: 'still queued', idempotencyKey: 'mg-up-1' },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    );
+
+    const managedAnswer = await postHook(captured, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'managed-upsub-1',
+    });
+    expect(managedAnswer).toEqual({});
+    expect(
+      relay.received.some(
+        (e) =>
+          e.type === 'hook.notification' && e.payload.notificationType === 'steering_delivered',
+      ),
+    ).toBe(false);
+
+    treatAsManaged = false;
+    const answer = await postHook(captured, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'managed-upsub-1',
+    });
+    expect(answer).toEqual({
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: 'still queued' },
+    });
+  });
+
+  it('TTL-expired steering at UserPromptSubmit time is dropped with an expiry card, never delivered', async () => {
+    seedTerminalSession('terminal-upsub-3');
+    let now = 1_000_000;
+    let captured: number | undefined;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      clock: () => now,
+      publishHookEndpoint: (port) => {
+        captured = port;
+        return Promise.resolve();
+      },
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+    await waitFor(() => captured !== undefined);
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: {
+        sessionId: 'terminal-upsub-3',
+        text: 'stale by the time you type',
+        idempotencyKey: 'ttl-up-1',
+      },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_queued',
+      ),
+    );
+
+    now += 31 * 60_000; // past the 30-minute steering TTL
+    if (captured === undefined) throw new Error('unreachable');
+    const answer = await postHook(captured, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'terminal-upsub-3',
+    });
+
+    expect(answer).toEqual({});
+    await waitFor(() =>
+      relay.received.some(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'steering_expired',
+      ),
+    );
   });
 
   it('a failed orphan re-attach answers resume_failed with the cause', async () => {

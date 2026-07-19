@@ -271,6 +271,22 @@ describe('installHooks', () => {
       'Stop',
     ]);
   });
+
+  it('installs all five default daemon hook events, including UserPromptSubmit', async () => {
+    const specs = buildDaemonHookSpecs({
+      secret: 's3cr3t',
+      forwarderPath: 'C:\\data\\hook-forward.cjs',
+    });
+    await installHooks({ settingsPath, hooks: specs });
+    const settings = (await readJson(settingsPath)) as { hooks: Record<string, unknown> };
+    expect(Object.keys(settings.hooks).sort()).toEqual([
+      'Notification',
+      'PermissionRequest',
+      'PostToolUse',
+      'Stop',
+      'UserPromptSubmit',
+    ]);
+  });
 });
 
 describe('buildDaemonHookSpecs', () => {
@@ -278,17 +294,27 @@ describe('buildDaemonHookSpecs', () => {
 
   it('builds one spec per default hook event, running the forwarder with the secret header', () => {
     const specs = buildDaemonHookSpecs(base);
-    expect(specs).toHaveLength(4);
+    expect(specs).toHaveLength(5);
     expect(specs.map((s) => s.event).sort()).toEqual([
       'Notification',
       'PermissionRequest',
       'PostToolUse',
       'Stop',
+      'UserPromptSubmit',
     ]);
     for (const s of specs) {
       expect(s.command).toContain('"C:\\data dir\\hook-forward.cjs"');
       expect(s.command).toContain(`--secret-header "${DEFAULT_SECRET_HEADER}: s3cr3t"`);
     }
+  });
+
+  it('the UserPromptSubmit spec uses the same forwarder command shape as the others', () => {
+    const specs = buildDaemonHookSpecs(base);
+    const permissionRequest = specs.find((s) => s.event === 'PermissionRequest');
+    const userPromptSubmit = specs.find((s) => s.event === 'UserPromptSubmit');
+    expect(userPromptSubmit).toBeDefined();
+    expect(userPromptSubmit?.command).toBe(permissionRequest?.command);
+    expect(userPromptSubmit?.matcher).toBeUndefined();
   });
 
   it('carries no port — the forwarder discovers the current one at fire time, so the command survives restarts', () => {
@@ -330,12 +356,14 @@ describe('buildDaemonHookSpecs', () => {
         stop: 'CustomStop',
         notification: 'CustomNotif',
         postToolUse: 'CustomPost',
+        userPromptSubmit: 'CustomPrompt',
       },
     });
     expect(specs.map((s) => s.event).sort()).toEqual([
       'CustomNotif',
       'CustomPerm',
       'CustomPost',
+      'CustomPrompt',
       'CustomStop',
     ]);
   });

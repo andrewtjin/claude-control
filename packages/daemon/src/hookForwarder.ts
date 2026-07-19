@@ -19,14 +19,16 @@
 //     port, and an unguarded unlink would hide that healthy receiver from every later hook
 //     (live-observed; the daemon's periodic re-publish is the second layer of defense).
 //   - Connected: what happens next depends on WHETHER THE EVENT'S RESPONSE CARRIES ANYTHING.
-//     PermissionRequest answers are long-poll decisions and Stop answers deliver operator
-//     steering ({"decision":"block","reason":…}), so those two ride the response with NO
-//     deadline and print it to stdout verbatim. Notification and PostToolUse answers are
-//     always an ignored {ok:true} — for those the script exits as soon as the request body
-//     has been handed to the connected socket (fire-and-forget), so a daemon whose event
-//     loop is momentarily busy can NEVER stall a tool call: the kernel owns delivery from
-//     that point and the daemon reads the event when it gets there. An unrecognized or
-//     unparsable event rides the response — correctness over speed for anything unknown.
+//     PermissionRequest answers are long-poll decisions, and Stop/UserPromptSubmit answers
+//     deliver operator steering (Stop: {"decision":"block","reason":…}; UserPromptSubmit:
+//     {"hookSpecificOutput":{"hookEventName":…,"additionalContext":…}}), so those three ride
+//     the response with NO deadline and print it to stdout verbatim. Notification and
+//     PostToolUse answers are always an ignored {ok:true} — for those the script exits as soon
+//     as the request body has been handed to the connected socket (fire-and-forget), so a
+//     daemon whose event loop is momentarily busy can NEVER stall a tool call: the kernel owns
+//     delivery from that point and the daemon reads the event when it gets there. An
+//     unrecognized or unparsable event rides the response — correctness over speed for
+//     anything unknown.
 //
 // Reading the receiver's CURRENT port from the endpoint file at fire time also makes the
 // installed command port-independent: a running session's hook snapshot keeps working across
@@ -54,9 +56,9 @@ export function hookForwarderPath(dataDir: string): string {
 export const HOOK_FORWARDER_SOURCE = `'use strict';
 // claude-control hook forwarder (written by the daemon; safe to delete — it is
 // re-created on daemon start). Forwards the Claude Code hook payload on stdin
-// to the local daemon's loopback receiver. PermissionRequest/Stop responses are
-// awaited and printed (decisions and steering ride them); everything else is
-// fire-and-forget once the body reaches the socket. No daemon (no endpoint
+// to the local daemon's loopback receiver. PermissionRequest/Stop/UserPromptSubmit
+// responses are awaited and printed (decisions and steering ride them); everything
+// else is fire-and-forget once the body reaches the socket. No daemon (no endpoint
 // file, or nothing listening) => exit 0 quickly.
 const fs = require('fs');
 const path = require('path');
@@ -69,7 +71,7 @@ const CONNECT_TIMEOUT_MS = 400;
 // Events whose RESPONSE carries a decision back into the session. Every other
 // event's response is an ignored ack, so waiting for it would only re-couple
 // tool-call latency to daemon responsiveness.
-const RESPONSE_EVENTS = ['PermissionRequest', 'Stop'];
+const RESPONSE_EVENTS = ['PermissionRequest', 'Stop', 'UserPromptSubmit'];
 
 const endpointFile = path.join(__dirname, 'hook-endpoint.json');
 

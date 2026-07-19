@@ -227,7 +227,7 @@ export interface BuildDaemonHookSpecsOptions {
  * The hook specs the daemon needs on every profile it manages: forward the CLI's hook
  * JSON (fed on stdin, per Claude Code's hook contract) as an HTTP POST to the loopback
  * receiver, via the forwarder script (hookForwarder.ts) so the daemon-down fast path and
- * the connect-timeout policy live in ONE place instead of four duplicated one-liners.
+ * the connect-timeout policy live in ONE place instead of five duplicated one-liners.
  * The command deliberately carries no port — the forwarder discovers the current one from
  * the endpoint file at fire time, so the installed entries (and every running session's
  * startup snapshot of them) stay valid across daemon restarts. The secret header stays on
@@ -246,5 +246,6 @@ export function buildDaemonHookSpecs(options: BuildDaemonHookSpecsOptions): Hook
     { event: eventNames.stop, command },
     { event: eventNames.notification, command },
     { event: eventNames.postToolUse, command },
+    { event: eventNames.userPromptSubmit, command },
   ];
 }

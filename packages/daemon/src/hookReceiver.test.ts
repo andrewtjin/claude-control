@@ -946,6 +946,118 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('UserPromptSubmit steering delivery', () => {
+    // The second delivery channel for queued steering, alongside Stop — fires the moment the
+    // user types locally, so a session sitting idle between turns still hears queued guidance.
+    it('answers with hookSpecificOutput.additionalContext when the steering source has queued text', async () => {
+      const taken: string[] = [];
+      receiver.setSteeringSource((sessionId) => {
+        taken.push(sessionId);
+        return sessionId === 'sess-steer' ? 'focus on the failing test' : undefined;
+      });
+
+      const res = await post(
+        port,
+        '/',
+        { event: 'UserPromptSubmit', sessionId: 'sess-steer' },
+        { 'x-claude-control-secret': SECRET },
+      );
+
+      // hookEventName echoes the event name exactly as received (mirrors the PermissionRequest
+      // decision path), and additionalContext carries the queued text into the new turn.
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        hookSpecificOutput: {
+          hookEventName: 'UserPromptSubmit',
+          additionalContext: 'focus on the failing test',
+        },
+      });
+      expect(taken).toEqual(['sess-steer']);
+    });
+
+    it('a UserPromptSubmit with nothing queued answers {} — no card, unlike Stop', async () => {
+      receiver.setSteeringSource(() => undefined);
+      const res = await post(
+        port,
+        '/',
+        { event: 'UserPromptSubmit', sessionId: 'sess-idle' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.body).toEqual({});
+      expect(emitted).toHaveLength(0);
+    });
+
+    it('never consults steering for a managed session (SDK send path owns it)', async () => {
+      const managed = new Store(':memory:');
+      const taken: string[] = [];
+      const managedReceiver = new HookReceiver({
+        store: managed,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'daemon-1',
+        isManagedSession: () => true,
+      });
+      managedReceiver.setSteeringSource((sessionId) => {
+        taken.push(sessionId);
+        return 'must never deliver';
+      });
+      const managedPort = await managedReceiver.listen(0);
+      try {
+        const res = await post(
+          managedPort,
+          '/',
+          { event: 'UserPromptSubmit', sessionId: 'managed-1' },
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(res.body).toEqual({});
+        expect(taken).toEqual([]);
+      } finally {
+        await managedReceiver.close();
+        managed.close();
+      }
+    });
+
+    it('a throwing steering source never fails the hook — {} answer, warn logged', async () => {
+      // Same defensive wrap as the Stop path: takeSteering is an injected callback, and a
+      // throw from it must never escape to the top-level 500 handler.
+      const warns: unknown[] = [];
+      const throwingStore = new Store(':memory:');
+      const throwingReceiver = new HookReceiver({
+        store: throwingStore,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        logger: {
+          debug: () => {},
+          info: () => {},
+          warn: (obj) => warns.push(obj),
+          error: () => {},
+        },
+      });
+      throwingReceiver.setSteeringSource(() => {
+        throw new Error('steering queue exploded');
+      });
+      const throwingPort = await throwingReceiver.listen(0);
+      try {
+        const res = await post(
+          throwingPort,
+          '/',
+          { event: 'UserPromptSubmit', sessionId: 'sess-boom' },
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({});
+        expect(warns.some((w) => (w as { sessionId?: string }).sessionId === 'sess-boom')).toBe(
+          true,
+        );
+      } finally {
+        await throwingReceiver.close();
+        throwingStore.close();
+      }
+    });
+  });
+
   // The CLI's REAL hook payload contract: snake_case field names
   // (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `message`) and NO requestId.
   // The camelCase bodies used elsewhere in this file remain supported as internal aliases.

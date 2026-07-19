@@ -763,15 +763,16 @@ export class Daemon {
   /**
    * Queue a /say for a REGISTERED INTERACTIVE session and confirm the queueing to the phone.
    * The daemon only hears from a terminal session through its hooks (a one-way stream), so
-   * there is exactly one supported reverse channel: answering its next Stop hook with the
-   * CLI's documented `{"decision": "block", "reason": …}`, which continues the turn with the
-   * text as guidance ({@link takePendingSteering} is the delivery side). Honest limits, also
-   * reflected in the card copy: delivery happens only at a turn boundary — a session that is
-   * sitting idle hears nothing until it next finishes a turn — and a bounded queue + TTL keep
-   * a closed window from accumulating stale guidance forever.
+   * delivery rides one of two supported reverse channels, whichever the session hits first:
+   * its next Stop hook, answered with the CLI's documented `{"decision": "block", "reason": …}`
+   * (continues the turn with the text as guidance), or its next UserPromptSubmit hook —
+   * fired the moment the user types locally, which can happen while the session is otherwise
+   * idle — answered with `hookSpecificOutput.additionalContext` ({@link takePendingSteering}
+   * is the delivery side for both). A bounded queue + TTL still keep a closed window (one that
+   * hits NEITHER channel) from accumulating stale guidance forever.
    *
    * Keyed on `tracked.id`, NEVER on `msg.payload.sessionId`: the caller may have addressed this
-   * session by its registered label, but the Stop hook that eventually asks for the queue
+   * session by its registered label, but the hook that eventually asks for the queue
    * (takePendingSteering) always carries the session's real id — queuing under the label would
    * make delivery unreachable.
    */
@@ -803,7 +804,7 @@ export class Daemon {
         sessionId,
         title: `Queued for ${tracked.label ?? 'terminal session'}`,
         body:
-          `"${excerpt}" — delivers when the session finishes its current turn` +
+          `"${excerpt}" — delivers when the session finishes its current turn or you next type in it` +
           `${queue.length > 1 ? ` (${queue.length} queued)` : ''}.`,
         level: 'info',
         notificationType: 'steering_queued',
@@ -816,7 +817,10 @@ export class Daemon {
    * The delivery side of {@link queueSteering}, installed into the hook receiver as its
    * steering source: consume everything queued for `sessionId`, expire what aged past the
    * TTL (with a card — the operator was told it was queued, so it must not vanish silently),
-   * and hand back the surviving texts joined in arrival order for the Stop-hook answer.
+   * and hand back the surviving texts joined in arrival order for the answer to WHICHEVER hook
+   * asked first (Stop or UserPromptSubmit — the receiver routes both here). The `Map.delete`
+   * below is what makes consumption exactly-once: the second hook to fire for a session finds
+   * nothing queued, never a repeat delivery.
    */
   private takePendingSteering(sessionId: string): string | undefined {
     const queue = this.pendingSteering.get(sessionId);
@@ -834,8 +838,8 @@ export class Daemon {
           title: 'Steering expired',
           body:
             `${expired} queued message${expired === 1 ? '' : 's'} aged past ` +
-            `${STEERING_TTL_MS / 60_000} minutes before the session finished a turn — ` +
-            `dropped, not delivered.`,
+            `${STEERING_TTL_MS / 60_000} minutes before the session finished a turn or the ` +
+            `user typed again — dropped, not delivered.`,
           level: 'warn',
           notificationType: 'steering_expired',
         },
