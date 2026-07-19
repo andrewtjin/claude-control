@@ -97,7 +97,7 @@ matches the real wire shape (see gate 3's shape correction). Notes: switching sh
 a `/switch` slash command (interactive buttons are M3 UX); there is no phone-side
 `--force`/cadence-retry yet — local `cctl switch <ref> --force` is the override (backlog).
 
-### 5. Hook event names ⚠ NEARLY CLOSED 2026-07-17 (one item open)
+### 5. Hook event names ✅ CLOSED 2026-07-19
 
 **Verify:** the exact `PermissionRequest` / `Stop` / `Notification` hook event names and
 payloads against the installed CLI version, and that merging our hooks into each
@@ -125,19 +125,20 @@ keep Approve/Deny in EVERY mode and show the mode as footer context (shipped @ `
 after the button-less design proved wrong live). Bonus, same run: every completed shell
 command delivers an output card in every permission mode (truncated by default;
 `CCTL_TOOL_OUTPUT_FULL` ships the rest as a file attachment).
-**Still open:** (5) done / waiting / quarantine notices — quarantine debounce (one push per
-30 min, none re-pushed on restart) and the `cctl accounts relogin <label>` copy are unrun.
-The gate closes when they are.
+**Result (owner sign-off 2026-07-19):** the remaining item — done / waiting / quarantine
+notices, including the quarantine debounce and the `cctl accounts relogin <label>` guided
+copy — ran clean in the owner's live sessions (the quarantine path was exercised for real
+during a live vault repair). Gate closed on that confirmation, with no regressions
+outstanding at the merged tip.
 
-### 6. Managed sessions (Agent SDK) — the M4 question
+### 6. Managed sessions (Agent SDK) — the M4 question ✅ CLOSED 2026-07-19
 
 **Verify:** the daemon-wired managed-session path matches the real
 `@anthropic-ai/claude-agent-sdk` streaming API — message shapes, `canUseTool` permission
 parking, `interrupt`, and input injection — end to end through the Discord live card.
 **M4 landed on `feat/remote-control`** (session-runtime permission gate + ordered output,
 daemon permission routing / stop / orphan resume, bot thread-per-session live card +
-attachments, C6 `cctl session` commands + `cctl accounts relogin`) and is unit-proven, but
-none of it has run against a live SDK session — **this gate stays OPEN.**
+attachments, C6 `cctl session` commands + `cctl accounts relogin`) and is unit-proven.
 **Progress (owner-run 2026-07-17, in flight):** item (1) confirmed live — `/run` streams a
 live card that edits in place, milestone lines post as their own messages, and `/say`
 injects a follow-up into the running session. Two live defects were found and fixed on the
@@ -145,7 +146,12 @@ branch: a managed session's own Stop hook duplicated every turn's summary as a
 "Session stopped" card (the receiver now suppresses hook-driven cards for sessions the
 daemon manages — permission requests and armed output watches still forward), and a
 multi-line turn summary kept only its first line (structured SDK events now emit their
-display event directly instead of being re-classified line by line). Items (2)–(7) unrun.
+display event directly instead of being re-classified line by line).
+**Result (owner sign-off 2026-07-19):** the pass criteria below were exercised across the
+owner's live runs — permission round-trips (exactly-once across a double-tap), Stop
+escalation, orphan resume, output attachments, the `cctl session` command set, and
+`accounts relogin` — and the owner confirmed the gate clean with no regressions
+outstanding at the merged tip. Kept for the record:
 **Pass — run `claude-control-orchestrator/tasks/m4-wet-gate-runbook.md`:** (1) `/run`
 starts a managed session that streams a live card to the phone (DM today — channel-per-user
 is not built) with real tool names and milestone lines; `/say` injects a follow-up prompt;
