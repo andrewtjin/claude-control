@@ -17,12 +17,21 @@
 //
 // GREEDY mode (opt-in) adds a second trigger: even when the
 // active account is NOT low, hop whenever some eligible account's weekly quota expires
-// STRICTLY sooner than the active one's — always burn the soonest-expiring budget. This is
+// MATERIALLY sooner than the active one's — always burn the soonest-expiring budget. This is
 // what pulls us BACK after a low-trigger hop: A hits 94%, we hop to B; once A's 5h window
 // resets (its stale session limit stops counting and the 25% headroom gate reopens), A's
 // sooner weekly reset makes it the greedy target again, so B's budget is spared and A's
-// expiring quota gets fully burned. Strict `<` (never `<=`) is the anti-flap guarantee:
-// after the hop the new active account has the soonest reset itself, so greedy goes quiet.
+// expiring quota gets fully burned.
+//
+// "Materially" is the anti-flap guarantee, and it must be a TIME MARGIN, not strict `<`:
+// live-observed, the usage endpoint re-computes `resets_at` per response with sub-second
+// jitter (the same nominal Wednesday-05:00 reset arrives as 04:59:59.70 on one poll and
+// 05:00:00.51 on the next). Between two accounts sharing a nominal reset, raw-millisecond
+// ordering therefore flips at random every poll, and strict `<` executes a hop on every
+// cooldown expiry — endless ping-pong between budget-equal accounts. Within
+// `greedyResetMarginMs` the budgets are the same for scheduling purposes, so greedy stays
+// put and lets the active account's 5h window be used to the full; the low-quota trigger
+// still rotates windows across equal accounts once the active one genuinely nears the wall.
 
 import { humanizeDuration, roundPct } from './format.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
@@ -34,15 +43,22 @@ export interface AutoSwitchPolicy {
   /** Candidates must have at least this percent of the 5h session window unused. */
   minSessionHeadroomPct?: number;
   /** Also hop (even when the active account is healthy) to any eligible account whose
-   *  weekly quota expires strictly sooner — burn the expiring budget first. Off by
+   *  weekly quota expires materially sooner — burn the expiring budget first. Off by
    *  default: it trades more account hops for less wasted quota. */
   greedy?: boolean;
+  /** Greedy only hops when the target's weekly reset beats the active one's by MORE than
+   *  this margin. Resets closer together than this count as the same budget deadline —
+   *  see the module header for why raw ordering can't be trusted (per-poll jitter). */
+  greedyResetMarginMs?: number;
 }
 
 // 94: hop only when the account is genuinely near the wall — fewer premature hops, still
 // ahead of the hard 100% cutoff.
 export const DEFAULT_TRIGGER_PERCENT = 94;
 export const DEFAULT_MIN_SESSION_HEADROOM_PCT = 25;
+// 15 minutes: orders of magnitude above the endpoint's observed sub-second reset jitter,
+// far below any reset gap that would make burn order actually matter within a week.
+export const DEFAULT_GREEDY_RESET_MARGIN_MS = 15 * 60_000;
 
 /** A concrete "switch now" verdict. `null` from `decideAutoSwitch` means "do nothing". */
 export interface AutoSwitchDecision {
@@ -113,11 +129,13 @@ export function decideAutoSwitch(
   }
 
   // Greedy trigger: the active account is fine, but someone else's weekly budget expires
-  // strictly sooner — burn that first. An active account with NO known weekly reset never
-  // outranks a known one (its budget clock is invisible, so any known expiry is "sooner").
+  // MATERIALLY sooner (beyond the anti-flap margin) — burn that first. An active account
+  // with NO known weekly reset never outranks a known one (its budget clock is invisible,
+  // so any known expiry is "sooner").
   if (policy.greedy) {
+    const marginMs = policy.greedyResetMarginMs ?? DEFAULT_GREEDY_RESET_MARGIN_MS;
     const activeReset = weeklyResetAt(active, now);
-    if (activeReset === undefined || targetReset < activeReset) {
+    if (activeReset === undefined || targetReset < activeReset - marginMs) {
       const reason =
         `greedy: ${target.label}'s weekly quota expires soonest (${targetBudget})` +
         (activeReset === undefined

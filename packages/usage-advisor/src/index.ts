@@ -5,6 +5,7 @@ export {
   decideAutoSwitch,
   DEFAULT_TRIGGER_PERCENT,
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
+  DEFAULT_GREEDY_RESET_MARGIN_MS,
   type AutoSwitchDecision,
   type AutoSwitchPolicy,
 } from './autoswitch.js';

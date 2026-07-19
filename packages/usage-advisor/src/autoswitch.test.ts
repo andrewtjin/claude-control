@@ -251,11 +251,55 @@ describe('decideAutoSwitch — greedy mode', () => {
     expect(decideAutoSwitch([healthyActive(NOW + 30 * H), later], NOW, GREEDY)).toBeNull();
   });
 
-  it('treats a tie in reset times as "stay" — only a STRICTLY sooner reset moves', () => {
+  it('treats a tie in reset times as "stay" — only a MATERIALLY sooner reset moves', () => {
     const sameReset = acct('twin', {}, [
       { kind: 'weekly_all', percent: 10, resetsAt: NOW + 30 * H },
     ]);
     expect(decideAutoSwitch([healthyActive(NOW + 30 * H), sameReset], NOW, GREEDY)).toBeNull();
+  });
+
+  it('stays put across per-poll reset jitter — sub-second ordering flips never ping-pong', () => {
+    // Live-observed: the endpoint re-computes resets_at per response, so two accounts
+    // sharing a nominal weekly reset arrive with sub-second skew whose ORDER flips from
+    // poll to poll. Whichever side of the flip a poll lands on, greedy must stay put.
+    const jitterMs = 800;
+    const activeSoonerPoll = [
+      healthyActive(NOW + 30 * H - jitterMs),
+      acct('twin', {}, [{ kind: 'weekly_all', percent: 40, resetsAt: NOW + 30 * H + jitterMs }]),
+    ];
+    const twinSoonerPoll = [
+      healthyActive(NOW + 30 * H + jitterMs),
+      acct('twin', {}, [{ kind: 'weekly_all', percent: 40, resetsAt: NOW + 30 * H - jitterMs }]),
+    ];
+    expect(decideAutoSwitch(activeSoonerPoll, NOW, GREEDY)).toBeNull();
+    expect(decideAutoSwitch(twinSoonerPoll, NOW, GREEDY)).toBeNull();
+  });
+
+  it('hops only past the 15-minute default margin — at the margin stays, beyond it moves', () => {
+    const target = (advantageMs: number) =>
+      acct('sooner', {}, [
+        { kind: 'weekly_all', percent: 10, resetsAt: NOW + 30 * H - advantageMs },
+      ]);
+    const min = 15 * 60_000;
+    expect(decideAutoSwitch([healthyActive(NOW + 30 * H), target(min)], NOW, GREEDY)).toBeNull();
+    expect(
+      decideAutoSwitch([healthyActive(NOW + 30 * H), target(min + 60_000)], NOW, GREEDY)
+        ?.targetAccountId,
+    ).toBe('sooner');
+  });
+
+  it('honors a custom greedyResetMarginMs in both directions', () => {
+    const target = acct('sooner', {}, [
+      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 29 * H }, // 1h sooner than active
+    ]);
+    const accounts = [healthyActive(NOW + 30 * H), target];
+    // A 2h margin says 1h apart is the same deadline; margin 0 restores raw ordering.
+    expect(
+      decideAutoSwitch(accounts, NOW, { greedy: true, greedyResetMarginMs: 2 * H }),
+    ).toBeNull();
+    expect(
+      decideAutoSwitch(accounts, NOW, { greedy: true, greedyResetMarginMs: 0 })?.targetAccountId,
+    ).toBe('sooner');
   });
 
   it("hops when the active account's weekly reset is unknown but a candidate's is known", () => {

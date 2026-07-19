@@ -152,7 +152,14 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     greedy: options.greedy === true,
     ...(options.relay !== undefined ? { relay: options.relay } : {}),
   });
-  const { relayUrl, triggerPercent, minSessionHeadroomPct, cooldownMs, greedy } = config.values;
+  const {
+    relayUrl,
+    triggerPercent,
+    minSessionHeadroomPct,
+    greedyResetMarginMs,
+    cooldownMs,
+    greedy,
+  } = config.values;
   const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
   // Best-effort: the report is purely informational, so a write failure must not stop the
   // daemon from starting.
@@ -256,6 +263,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         policy: {
           ...(triggerPercent !== undefined ? { triggerPercent } : {}),
           ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
+          ...(greedyResetMarginMs !== undefined ? { greedyResetMarginMs } : {}),
           ...(greedy ? { greedy } : {}),
         },
         ...(cooldownMs !== undefined ? { cooldownMs } : {}),

@@ -27,6 +27,7 @@ import {
 } from '@claude-control/switch-engine';
 import { DEFAULT_AUTOSWITCH_COOLDOWN_MS, DEFAULT_PERMISSION_HOLD_MS } from '@claude-control/daemon';
 import {
+  DEFAULT_GREEDY_RESET_MARGIN_MS,
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
   DEFAULT_TRIGGER_PERCENT,
 } from '@claude-control/usage-advisor';
@@ -101,6 +102,7 @@ export interface DaemonConfig {
     greedy: boolean;
     triggerPercent: number | undefined;
     minSessionHeadroomPct: number | undefined;
+    greedyResetMarginMs: number | undefined;
     cooldownMs: number | undefined;
     waitingCards: boolean;
     permissionHoldMs: number | undefined;
@@ -125,6 +127,7 @@ export function resolveDaemonConfig(
   const greedy = greedyFlag || greedyEnv;
   const triggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_TRIGGER_PCT');
   const minSessionHeadroomPct = envNumber(env, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
+  const greedyResetMarginMs = envNumber(env, 'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS');
   const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
   const relayEnv = env['CCTL_RELAY_URL'];
   const relayUrl = flags.relay ?? relayEnv ?? DEFAULT_RELAY_URL;
@@ -166,6 +169,13 @@ export function resolveDaemonConfig(
       value: `${minSessionHeadroomPct ?? DEFAULT_MIN_SESSION_HEADROOM_PCT}% left`,
       source: envSource(minSessionHeadroomPct !== undefined),
       detail: 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT',
+    },
+    {
+      name: 'greedy reset margin',
+      value: humanizeMs(greedyResetMarginMs ?? DEFAULT_GREEDY_RESET_MARGIN_MS),
+      source: envSource(greedyResetMarginMs !== undefined),
+      detail:
+        'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS (weekly resets closer than this count as the same deadline — no greedy hop)',
     },
     {
       name: 'auto-switch cooldown',
@@ -219,6 +229,7 @@ export function resolveDaemonConfig(
       greedy,
       triggerPercent,
       minSessionHeadroomPct,
+      greedyResetMarginMs,
       cooldownMs,
       waitingCards,
       permissionHoldMs,
