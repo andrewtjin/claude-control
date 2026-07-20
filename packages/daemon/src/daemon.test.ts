@@ -290,9 +290,14 @@ function fakeSessionManager(): SessionManager & {
       return Promise.resolve(handle);
     },
     prune: (): Promise<SessionRecord[]> => {
-      // Mirror the real manager: terminal-state records go, everything else stays.
+      // Mirror the real manager's dormancy rule: terminal-state records go, and so does any
+      // non-terminal record with no live handle; only handle-backed live work stays.
       const pruned = records.filter(
-        (r) => r.state === 'done' || r.state === 'failed' || r.state === 'orphaned',
+        (r) =>
+          r.state === 'done' ||
+          r.state === 'failed' ||
+          r.state === 'orphaned' ||
+          !handles.has(r.id),
       );
       for (const record of pruned) {
         records.splice(records.indexOf(record), 1);
@@ -1533,12 +1538,32 @@ describe('Daemon lifecycle', () => {
 
   // ---- phone-initiated prune of dormant records ----
 
-  it('session.prune drops dormant records and answers with exactly the pruned ids', async () => {
+  it('session.prune drops dormant records and answers pruned + remaining ids', async () => {
     sessionManager.records.push(
       { id: 'orphan-1', kind: 'managed', state: 'orphaned', startedAtMs: 0, resumeId: 'sdk-a' },
       { id: 'done-1', kind: 'managed', state: 'done', startedAtMs: 1 },
       { id: 'resting-1', kind: 'managed', state: 'waiting_input', startedAtMs: 2 },
     );
+    // The live handle is what keeps the resting session out of the dormant set.
+    sessionManager.handles.set('resting-1', makeFakeHandle('resting-1'));
+    // Display-mirror rows for a pruned and a surviving session: the prune must clean up the
+    // first and leave the second, or `cctl session status` shows pruned sessions forever.
+    store.upsertSession({
+      id: 'done-1',
+      kind: 'managed',
+      state: 'done',
+      accountId: null,
+      json: '{}',
+      updatedAtMs: 1,
+    });
+    store.upsertSession({
+      id: 'resting-1',
+      kind: 'managed',
+      state: 'waiting_input',
+      accountId: null,
+      json: '{}',
+      updatedAtMs: 2,
+    });
     await daemon.start();
     relay.push({
       daemonId: 'daemon-under-test',
@@ -1552,9 +1577,15 @@ describe('Daemon lifecycle', () => {
       expect(result.payload.requestId).toBe('pr-1');
       expect(result.payload.ok).toBe(true);
       expect([...result.payload.prunedSessionIds].sort()).toEqual(['done-1', 'orphan-1']);
+      // The registry's post-prune view rides along so the bot can also drop cached rows for
+      // sessions this daemon holds no record of at all.
+      expect(result.payload.remainingSessionIds).toEqual(['resting-1']);
     }
     // The continuable session survived; only dormant history was forgotten.
     expect(sessionManager.records.map((r) => r.id)).toEqual(['resting-1']);
+    // And the display mirror matches: pruned row gone, surviving row intact.
+    expect(store.getSession('done-1')).toBeUndefined();
+    expect(store.getSession('resting-1')).toBeDefined();
   });
 
   it('a replayed session.prune (same idempotencyKey) is answered once, never re-run', async () => {

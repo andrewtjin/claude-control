@@ -944,11 +944,13 @@ export class Daemon {
 
   /**
    * Phone-initiated prune of dormant session records. The registry primitive
-   * (`sessionManager.prune`) owns what "dormant" means — terminal-state records only, so a
-   * live session is structurally untouchable; this handler owns idempotency and the result
+   * (`sessionManager.prune`) owns what "dormant" means — terminal records, plus non-terminal
+   * leftovers with no live handle in this process (their owner is gone) — so a session with
+   * live work is structurally untouchable; this handler owns idempotency and the result
    * reply. Unlike stop there IS a dedicated result envelope: pruned records disappear rather
    * than transition, so no session.status ack ever comes, and the phone needs the exact
-   * pruned ids to clear its own cached session list.
+   * pruned ids to clear its own cached session list — plus the registry's remaining ids, so
+   * it can also drop cached ghosts this daemon holds no record of at all.
    */
   private async handleSessionPrune(msg: MessageOf<'session.prune'>): Promise<void> {
     const { requestId, idempotencyKey } = msg.payload;
@@ -976,10 +978,32 @@ export class Daemon {
     }
     try {
       const pruned = await this.sessionManager.prune();
+      // Drop the display-only Store mirror rows too: the registry record is gone, so a
+      // leftover mirror row would show the pruned session in `cctl session status` forever.
+      // Best-effort per row — the mirror is observability, never authoritative.
+      for (const record of pruned) {
+        try {
+          this.store.deleteSession(record.id);
+        } catch (err) {
+          this.logger.warn(
+            { err, sessionId: record.id },
+            'failed to drop a pruned session from the display mirror',
+          );
+        }
+      }
       this.logger.info({ sessionIds: pruned.map((r) => r.id) }, 'pruned dormant session records');
       this.sendEnvelope({
         type: 'session.prune.result',
-        payload: { requestId, ok: true, prunedSessionIds: pruned.map((r) => r.id) },
+        payload: {
+          requestId,
+          ok: true,
+          prunedSessionIds: pruned.map((r) => r.id),
+          // The full post-prune registry view, so the bot can also clear cached rows for
+          // sessions this daemon holds NO record of (lost rather than pruned) — without it
+          // those ghosts would outlive every prune. Computed after the prune, so it can
+          // only over-include (a session spawned mid-prune), never name a pruned id.
+          remainingSessionIds: this.sessionManager.list().map((r) => r.id),
+        },
       });
     } catch (err) {
       this.logger.error({ err }, 'session prune failed');

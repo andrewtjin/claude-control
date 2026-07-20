@@ -353,7 +353,7 @@ describe('createSessionManager', () => {
   });
 
   describe('prune', () => {
-    it('removes every terminal-state record, persists, and returns exactly what it removed', async () => {
+    it('removes every dormant record, persists, and returns exactly what it removed', async () => {
       const dir = await sandbox();
       const done: SessionRecord = { id: 'done-1', kind: 'managed', state: 'done', startedAtMs: 1 };
       const failed: SessionRecord = {
@@ -369,6 +369,9 @@ describe('createSessionManager', () => {
         startedAtMs: 3,
         resumeId: 'sdk-1',
       };
+      // Non-terminal but handle-less: no process owns it, so it is dormant too — exactly the
+      // leftover class that is never terminal, past startup reconciliation, and unreachable
+      // by stop(); prune is the only path that can ever retire it.
       const resting: SessionRecord = {
         id: 'resting-1',
         kind: 'managed',
@@ -380,25 +383,56 @@ describe('createSessionManager', () => {
       const manager = createSessionManager({ stateDir: dir });
       const pruned = await manager.prune!();
 
-      expect(pruned.map((r) => r.id).sort()).toEqual(['done-1', 'failed-1', 'orphan-1']);
-      expect(manager.list()).toEqual([resting]);
+      expect(pruned.map((r) => r.id).sort()).toEqual([
+        'done-1',
+        'failed-1',
+        'orphan-1',
+        'resting-1',
+      ]);
+      expect(manager.list()).toEqual([]);
       // The removal is durable, not just in-memory: a restarted manager must not resurrect them.
-      expect(await readRegistryFile(dir)).toEqual([resting]);
+      expect(await readRegistryFile(dir)).toEqual([]);
+    });
+
+    it('prunes a stuck non-terminal leftover no live handle backs (abandoned by its owner)', async () => {
+      // The reported shape: a record parked in waiting_permission whose owning process is
+      // gone (another daemon wrote it into the shared registry, or a wedge outlived its
+      // handle). It never goes terminal, recover() only runs at startup, and stop() has no
+      // handle to reach — before the dormancy rule covered it, nothing could EVER remove it.
+      const dir = await sandbox();
+      const stuck: SessionRecord = {
+        id: 'stuck-1',
+        kind: 'managed',
+        state: 'waiting_permission',
+        startedAtMs: 5,
+        resumeId: 'sdk-9',
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([stuck]));
+
+      const manager = createSessionManager({ stateDir: dir });
+      const pruned = await manager.prune!();
+
+      expect(pruned.map((r) => r.id)).toEqual(['stuck-1']);
+      expect(manager.list()).toEqual([]);
+      expect(await readRegistryFile(dir)).toEqual([]);
     });
 
     it('returns empty (and never writes) when nothing is dormant', async () => {
       const dir = await sandbox();
-      const resting: SessionRecord = {
-        id: 'resting-1',
-        kind: 'managed',
-        state: 'waiting_input',
-        startedAtMs: 4,
-      };
-      await writeFile(join(dir, 'sessions.json'), JSON.stringify([resting]));
-
       const manager = createSessionManager({ stateDir: dir });
+      // A live handle is what makes a non-terminal record NOT dormant — gated so the session
+      // is still deterministically mid-turn when prune runs.
+      const gate = deferred<void>();
+      await manager.spawnManaged({
+        id: 'live-1',
+        client: gatedFakeClient(gate.promise, [{ type: 'turn_result', ok: true, summary: 'ok' }]),
+        prompt: 'go',
+      });
+
       expect(await manager.prune!()).toEqual([]);
-      expect(manager.list()).toEqual([resting]);
+      expect(manager.list().map((r) => r.id)).toEqual(['live-1']);
+
+      // Deliberately never resolved — see the equivalent note in the recover test above.
     });
 
     it('drops the inert handle of a session that finished in this process', async () => {

@@ -268,6 +268,8 @@ describe('session.prune / session.prune.result', () => {
   });
 
   it('round-trips a result carrying the pruned ids', () => {
+    // Deliberately WITHOUT remainingSessionIds: a result from a daemon predating that field
+    // must still decode (the field is additive, never required).
     const env = stamp({
       daemonId: 'daemon-1',
       type: 'session.prune.result',
@@ -277,6 +279,25 @@ describe('session.prune / session.prune.result', () => {
     expect(result.ok).toBe(true);
     if (result.ok && isType(result.envelope, 'session.prune.result')) {
       expect(result.envelope.payload.prunedSessionIds).toEqual(['sess-1', 'sess-2']);
+      expect(result.envelope.payload.remainingSessionIds ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('round-trips the post-prune remaining view when the daemon reports one', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'session.prune.result',
+      payload: {
+        requestId: 'req-1',
+        ok: true,
+        prunedSessionIds: ['sess-1'],
+        remainingSessionIds: ['sess-2', 'sess-3'],
+      },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.prune.result')) {
+      expect(result.envelope.payload.remainingSessionIds).toEqual(['sess-2', 'sess-3']);
     }
   });
 

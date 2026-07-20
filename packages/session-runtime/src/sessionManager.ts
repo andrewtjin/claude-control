@@ -151,12 +151,18 @@ export interface SessionManager {
    */
   resumeOrphan?(sessionId: string, opts: ResumeOrphanOptions): Promise<SessionHandle>;
   /**
-   * Remove every record resting in a terminal state (done/failed/orphaned) from the registry
-   * and persist the result, returning exactly what was removed. Non-terminal records are
-   * untouchable by construction — a session with live work is never in a terminal state — so
-   * pruning can only ever forget history, never kill work. Forgetting is the point AND the
-   * cost: a pruned orphan loses its resume anchor, so it can no longer be revived on demand
-   * (the underlying conversation on the host survives — only this registry's row is dropped).
+   * Remove every DORMANT record from the registry and persist the result, returning exactly
+   * what was removed. Dormant means no work this process could ever act on: a terminal
+   * state (done/failed/orphaned), OR a non-terminal state with no live handle in this
+   * process — the same "owning process is gone" discriminator recover() applies at startup,
+   * re-applied here because records can also go dormant AFTER startup (most commonly a
+   * record another process wrote into the shared registry and then abandoned): such a
+   * record is never terminal, startup reconciliation already ran, and stop() cannot reach
+   * it, so without this clause nothing could ever retire it. A session with live work in
+   * this process always has a handle, so it stays structurally untouchable — pruning can
+   * only ever forget history, never kill work. Forgetting is the point AND the cost: a
+   * pruned orphan loses its resume anchor, so it can no longer be revived on demand (the
+   * underlying conversation on the host survives — only this registry's row is dropped).
    * OPTIONAL on the interface for the same fake-compatibility reason as `resumeOrphan`; the
    * real manager always implements it.
    */
@@ -379,7 +385,11 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
       await ensureLoaded();
       const pruned: SessionRecord[] = [];
       for (const record of records.values()) {
-        if (!TERMINAL_STATES.has(record.state)) continue;
+        // Dormant = terminal, OR non-terminal with no live handle in this process (the
+        // interface doc owns the full rationale). The handle check is the safety
+        // invariant: live work always has a handle here, so it can never be pruned, while
+        // a handle-less non-terminal leftover has no owner and no other retirement path.
+        if (!TERMINAL_STATES.has(record.state) && handles.has(record.id)) continue;
         records.delete(record.id);
         // A terminal record's handle (a session that finished in THIS process) is inert —
         // its state only became terminal because the underlying query ended — so dropping it

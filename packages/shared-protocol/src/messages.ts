@@ -237,11 +237,13 @@ const SessionStopPayload = z.object({
 });
 
 /** Phone-initiated prune of DORMANT session records: every record resting in a terminal
- *  state (done/failed/orphaned). A live session is untouchable by construction — its record
- *  is never in a terminal state while its process runs. Pruning is registry-only: the
- *  underlying Claude conversation on the host survives; only the daemon's memory of the
- *  session (including its resume anchor) is dropped, so a pruned orphan can no longer be
- *  revived from the phone. */
+ *  state (done/failed/orphaned), plus non-terminal leftovers whose owning process is gone
+ *  (the daemon holds no live handle for them — records an earlier or parallel daemon run
+ *  wrote and abandoned). A live session is untouchable by construction — live work always
+ *  has a handle in the serving daemon. Pruning is registry-only: the underlying Claude
+ *  conversation on the host survives; only the daemon's memory of the session (including
+ *  its resume anchor) is dropped, so a pruned orphan can no longer be revived from the
+ *  phone. */
 const SessionPrunePayload = z.object({
   requestId: RequestId,
   idempotencyKey: IdempotencyKey,
@@ -256,6 +258,13 @@ const SessionPruneResultPayload = z.object({
   ok: z.boolean(),
   /** Exactly the records that were removed; empty on a failed or no-op prune. */
   prunedSessionIds: z.array(SessionId),
+  /** The registry's FULL post-prune view (every id it still holds). The pruned ids alone
+   *  cannot clear a cached row for a session the daemon no longer knows AT ALL (its record
+   *  was lost rather than pruned — e.g. clobbered registry, wiped state dir), and such
+   *  ghosts would otherwise sit in the bot's `/sessions` list forever. When present, the
+   *  bot drops every cached session NOT listed here; optional so a result from a daemon
+   *  predating this field keeps its old pruned-ids-only meaning. */
+  remainingSessionIds: z.array(SessionId).nullish(),
   error: z.string().nullish(),
 });
 

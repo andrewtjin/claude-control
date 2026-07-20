@@ -231,9 +231,11 @@ export function handleStop(
     : { kind: 'error', message: result.error };
 }
 
-/** Session states a prune removes — mirrors the daemon's definition of "dormant" (the
- *  registry's terminal states). Kept here only to render an honest PREVIEW; the daemon's
- *  registry is the authority on what actually gets pruned. */
+/** Session states a prune ALWAYS removes — the registry's terminal states. The daemon also
+ *  prunes non-terminal leftovers it holds no live handle for (records an earlier daemon run
+ *  abandoned), which this cache cannot distinguish from live sessions, so the preview counts
+ *  only the certain set; the daemon's registry is the authority on what actually gets
+ *  pruned. */
 const DORMANT_STATES = new Set(['done', 'failed', 'orphaned']);
 
 /** `/prune` — the confirmation card. Nothing is sent to the daemon here: the reply carries an
@@ -258,9 +260,10 @@ export function handlePruneRequest(
   return {
     kind: 'text',
     text:
-      `Prune removes ALL dormant session records (done / failed / orphaned) from the daemon's ` +
-      `registry. ${preview}\nA pruned session can no longer be revived with \`/say\` — the ` +
-      `conversation itself stays on the host. Live sessions are untouched.`,
+      `Prune removes ALL dormant session records (done / failed / orphaned, plus records ` +
+      `left behind by an earlier daemon run) from the daemon's registry. ${preview}\nA ` +
+      `pruned session can no longer be revived with \`/say\` — the conversation itself ` +
+      `stays on the host. Live sessions are untouched.`,
     components: pruneButtons({ requestId }),
   };
 }
