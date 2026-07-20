@@ -59,6 +59,25 @@ describe.skipIf(process.platform !== 'win32')(
       await inFlight; // and the call itself still completes normally
     });
 
+    // Six serialized PowerShell runs (~20s alone) — its own budget, over the describe's 30s.
+    it(
+      'serves concurrent calls correctly through the shared worker (answers never cross)',
+      { timeout: 90_000 },
+      async () => {
+        // The worker runner dispatches replies by call id; three overlapping round-trips with
+        // distinct payloads prove no answer ever lands on the wrong caller.
+        const p = new DpapiProtector();
+        const secrets = ['alpha-secret', 'bravo-secret', 'charlie-secret'].map((s) =>
+          Buffer.from(s, 'utf8'),
+        );
+        const blobs = await Promise.all(secrets.map((s) => p.protect(s)));
+        const roundTripped = await Promise.all(blobs.map((b) => p.unprotect(b)));
+        roundTripped.forEach((buf, i) => {
+          expect(buf.equals(secrets[i]!)).toBe(true);
+        });
+      },
+    );
+
     it('captures PowerShell stderr in the rejection instead of leaking it to the console', async () => {
       const p = new DpapiProtector();
       // Valid base64 that is NOT a DPAPI blob → ProtectedData::Unprotect throws inside
