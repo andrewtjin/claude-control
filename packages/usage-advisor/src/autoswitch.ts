@@ -7,7 +7,10 @@
 //
 // The policy, as specified by the owner:
 //   TRIGGER — the ACTIVE account's remaining quota is low (its worst limit is at/above
-//   `triggerPercent` used).
+//   `triggerPercent` used). When the account's snapshot is STALE (older than `staleAfterMs`)
+//   the bar tightens to `staleTriggerPercent`: usage only grows while we're blind, so a
+//   stale near-limit reading is a floor, not a fact — hop before the unseen burn crosses
+//   the hard cutoff and kills the session mid-work.
 //   ELIGIBLE — a candidate must still have at least `minSessionHeadroomPct` of its 5h
 //   session window left, must not itself already be low (otherwise the switch would
 //   immediately re-trigger), and must have a KNOWN future weekly reset — the weekly
@@ -40,6 +43,14 @@ import type { AccountUsageInput, LimitInput } from './types.js';
 export interface AutoSwitchPolicy {
   /** The active account is "low" when its worst limit is at/above this percent used. */
   triggerPercent?: number;
+  /** The tightened "low" threshold applied to an account whose snapshot is STALE (older
+   *  than `staleAfterMs`). Usage only grows while we can't see it, so a stale near-limit
+   *  reading must be assumed worse than it says: hop away from (and never toward) such an
+   *  account earlier than the fresh-data trigger would. Clamped to never exceed
+   *  `triggerPercent` — stale data can only tighten the bar, never raise it. */
+  staleTriggerPercent?: number;
+  /** Snapshot age at/above which an account's data counts as stale. */
+  staleAfterMs?: number;
   /** Candidates must have at least this percent of the 5h session window unused. */
   minSessionHeadroomPct?: number;
   /** Also hop (even when the active account is healthy) to any eligible account whose
@@ -55,6 +66,14 @@ export interface AutoSwitchPolicy {
 // 94: hop only when the account is genuinely near the wall — fewer premature hops, still
 // ahead of the hard 100% cutoff.
 export const DEFAULT_TRIGGER_PERCENT = 94;
+// 85 on stale data: a snapshot that old says "at LEAST this much used" — real usage has kept
+// growing unseen, and waiting for a fresh 94% that may never arrive risks riding the account
+// into the hard cutoff mid-session (lost work). 15% of assumed headroom buys the hop.
+export const DEFAULT_STALE_TRIGGER_PERCENT = 85;
+// 15 minutes: a healthy poller refreshes every ~3, so this is several consecutive failed
+// live polls — genuine blindness, not one bad cycle. Cache-served snapshots carry their own
+// original stamp, so hours-old fallback data lands here immediately.
+export const DEFAULT_STALE_AFTER_MS = 15 * 60_000;
 export const DEFAULT_MIN_SESSION_HEADROOM_PCT = 25;
 // 15 minutes: orders of magnitude above the endpoint's observed sub-second reset jitter,
 // far below any reset gap that would make burn order actually matter within a week.
@@ -83,6 +102,19 @@ export function decideAutoSwitch(
 ): AutoSwitchDecision | null {
   const triggerPercent = policy.triggerPercent ?? DEFAULT_TRIGGER_PERCENT;
   const minSessionHeadroomPct = policy.minSessionHeadroomPct ?? DEFAULT_MIN_SESSION_HEADROOM_PCT;
+  const staleAfterMs = policy.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  // Stale data can only TIGHTEN the bar — a misconfigured stale threshold above the fresh
+  // one would make blindness a reason to relax, which is never right.
+  const staleTriggerPercent = Math.min(
+    policy.staleTriggerPercent ?? DEFAULT_STALE_TRIGGER_PERCENT,
+    triggerPercent,
+  );
+  /** Snapshot age, or 0 for accounts that never carried a stamp (treated as fresh). */
+  const snapshotAge = (a: AccountUsageInput): number =>
+    a.fetchedAtMs === undefined ? 0 : Math.max(0, now - a.fetchedAtMs);
+  /** The "low" threshold this account is judged against, given its snapshot's age. */
+  const lowThreshold = (a: AccountUsageInput): number =>
+    snapshotAge(a) >= staleAfterMs ? staleTriggerPercent : triggerPercent;
 
   const active = accounts.find((a) => a.active);
   if (!active) return null;
@@ -96,8 +128,10 @@ export function decideAutoSwitch(
       !a.active &&
       !a.quarantined &&
       100 - sessionUsedPct(a, now) >= minSessionHeadroomPct &&
-      // Never hop to an account that would itself immediately count as low...
-      (worstPercent(a, now) ?? 0) < triggerPercent &&
+      // Never hop to an account that would itself immediately count as low — judged by ITS
+      // OWN snapshot's age, so a stale near-limit candidate (whose true usage may already
+      // be past the wall) is no safer a target than it would be to keep...
+      (worstPercent(a, now) ?? 0) < lowThreshold(a) &&
       // ...or whose weekly budget clock we can't see — the choice is BY weekly reset,
       // so an unknown reset is not a lesser candidate, it's not a candidate at all.
       weeklyResetAt(a, now) !== undefined,
@@ -120,11 +154,17 @@ export function decideAutoSwitch(
     `in ${humanizeDuration(targetReset - now)}, ` +
     `${roundPct(100 - weeklyUsedPct(target, now))}% weekly budget left`;
 
-  // Primary trigger: the active account is nearly out of quota.
-  if (activeWorst >= triggerPercent) {
+  // Primary trigger: the active account is nearly out of quota. On a stale snapshot the
+  // tightened threshold applies; a hop that ONLY the derate explains says so in its reason
+  // (the fresh-data phrasing would claim a certainty the numbers don't have).
+  if (activeWorst >= lowThreshold(active)) {
     const reason =
-      `${active.label} is at ${roundPct(activeWorst)}% used — ${target.label} has the ` +
-      `soonest weekly reset (${targetBudget})`;
+      activeWorst < triggerPercent
+        ? `${active.label} is at ${roundPct(activeWorst)}% used on usage data ` +
+          `${humanizeDuration(snapshotAge(active))} old — hopping preemptively — ` +
+          `${target.label} has the soonest weekly reset (${targetBudget})`
+        : `${active.label} is at ${roundPct(activeWorst)}% used — ${target.label} has the ` +
+          `soonest weekly reset (${targetBudget})`;
     return { targetAccountId: target.accountId, targetLabel: target.label, reason };
   }
 

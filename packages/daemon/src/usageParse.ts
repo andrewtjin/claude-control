@@ -202,6 +202,9 @@ function buildResult(
     active: opts.active,
     quarantined: opts.quarantined,
     limits: inputs,
+    // Same stamp the wire shape carries (cache-honored, never re-stamped at poll time) —
+    // the auto-switch policy tightens its trigger on data this field shows to be stale.
+    fetchedAtMs: opts.fetchedAtMs,
   };
   return { accountUsage, advisorInput };
 }

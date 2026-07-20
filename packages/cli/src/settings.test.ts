@@ -60,6 +60,8 @@ describe('resolveDaemonConfig', () => {
       autoSwitch: false,
       greedy: false,
       triggerPercent: undefined,
+      staleTriggerPercent: undefined,
+      staleAfterMs: undefined,
       minSessionHeadroomPct: undefined,
       greedyResetMarginMs: undefined,
       cooldownMs: undefined,
@@ -73,6 +75,8 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'auto-switch').value).toBe('off');
     expect(row(rows, 'greedy burn-back').value).toBe('off');
     expect(row(rows, 'switch trigger').value).toBe('94% used');
+    expect(row(rows, 'stale switch trigger').value).toBe('85% used');
+    expect(row(rows, 'stale snapshot age').value).toBe('15m');
     expect(row(rows, 'min session headroom').value).toBe('25% left');
     expect(row(rows, 'greedy reset margin').value).toBe('15m');
     expect(row(rows, 'auto-switch cooldown').value).toBe('10m');
@@ -97,6 +101,27 @@ describe('resolveDaemonConfig', () => {
     });
     expect(values.greedyResetMarginMs).toBe(3_600_000);
     expect(row(rows, 'greedy reset margin')).toMatchObject({ value: '1h', source: 'env' });
+  });
+
+  it('reads the stale-trigger knobs from their env vars', () => {
+    const { values, rows } = resolveDaemonConfig({
+      CCTL_AUTOSWITCH_STALE_TRIGGER_PCT: '80',
+      CCTL_AUTOSWITCH_STALE_AFTER_MS: '600000',
+    });
+    expect(values.staleTriggerPercent).toBe(80);
+    expect(values.staleAfterMs).toBe(600_000);
+    expect(row(rows, 'stale switch trigger')).toMatchObject({ value: '80% used', source: 'env' });
+    expect(row(rows, 'stale snapshot age')).toMatchObject({ value: '10m', source: 'env' });
+  });
+
+  it('shows the stale trigger CLAMPED to the fresh one, matching what the policy will run', () => {
+    // Stale data can only tighten the bar; a stale threshold configured above the fresh
+    // trigger is ignored by the policy, so the view must show the value that actually fires.
+    const { rows } = resolveDaemonConfig({
+      CCTL_AUTOSWITCH_TRIGGER_PCT: '75',
+      CCTL_AUTOSWITCH_STALE_TRIGGER_PCT: '90',
+    });
+    expect(row(rows, 'stale switch trigger').value).toBe('75% used');
   });
 
   it('enables waiting cards (the "Claude is waiting…" nag forwarding) only via env opt-in', () => {

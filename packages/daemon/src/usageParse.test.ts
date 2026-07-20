@@ -234,7 +234,7 @@ describe('parseUsageEndpointResponse', () => {
   });
 
   it('carries accountId/label/active/source through to AccountUsage', () => {
-    const { accountUsage } = parseUsageEndpointResponse(
+    const { accountUsage, advisorInput } = parseUsageEndpointResponse(
       {},
       { ...baseOpts, source: 'cached', active: false },
     );
@@ -243,6 +243,7 @@ describe('parseUsageEndpointResponse', () => {
     expect(accountUsage.active).toBe(false);
     expect(accountUsage.source).toBe('cached');
     expect(accountUsage.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
+    expect(advisorInput.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
   });
 });
 
@@ -272,11 +273,16 @@ describe('parseCachedUsage', () => {
 
   it("honors the cache's own fetchedAtMs so stale data reports its true age", () => {
     const raw = { fetchedAtMs: 555, limits: [{ kind: 'session', percent: 20 }] };
-    const { accountUsage } = parseCachedUsage(raw, baseOpts);
+    const { accountUsage, advisorInput } = parseCachedUsage(raw, baseOpts);
     expect(accountUsage.fetchedAtMs).toBe(555);
+    // The advisor input carries the SAME honored stamp — the auto-switch policy's stale
+    // trigger judges data age from this field, so a cache re-stamped as fresh here would
+    // disable the preemptive hop exactly when it matters.
+    expect(advisorInput.fetchedAtMs).toBe(555);
     // A cache without its own stamp keeps the caller's poll time (pre-existing behavior).
     const unstamped = parseCachedUsage({ limits: [] }, baseOpts);
     expect(unstamped.accountUsage.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
+    expect(unstamped.advisorInput.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
   });
 
   it('reports "no cached usage" plainly when the reader had nothing to offer', () => {

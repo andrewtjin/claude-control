@@ -29,6 +29,8 @@ import { DEFAULT_AUTOSWITCH_COOLDOWN_MS, DEFAULT_PERMISSION_HOLD_MS } from '@cla
 import {
   DEFAULT_GREEDY_RESET_MARGIN_MS,
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
+  DEFAULT_STALE_AFTER_MS,
+  DEFAULT_STALE_TRIGGER_PERCENT,
   DEFAULT_TRIGGER_PERCENT,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
@@ -101,6 +103,8 @@ export interface DaemonConfig {
     autoSwitch: boolean;
     greedy: boolean;
     triggerPercent: number | undefined;
+    staleTriggerPercent: number | undefined;
+    staleAfterMs: number | undefined;
     minSessionHeadroomPct: number | undefined;
     greedyResetMarginMs: number | undefined;
     cooldownMs: number | undefined;
@@ -127,6 +131,8 @@ export function resolveDaemonConfig(
   const greedyEnv = envFlag(env, 'CCTL_AUTOSWITCH_GREEDY');
   const greedy = greedyFlag || greedyEnv;
   const triggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_TRIGGER_PCT');
+  const staleTriggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT');
+  const staleAfterMs = envNumber(env, 'CCTL_AUTOSWITCH_STALE_AFTER_MS');
   const minSessionHeadroomPct = envNumber(env, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
   const greedyResetMarginMs = envNumber(env, 'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS');
   const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
@@ -169,6 +175,23 @@ export function resolveDaemonConfig(
       value: `${triggerPercent ?? DEFAULT_TRIGGER_PERCENT}% used`,
       source: envSource(triggerPercent !== undefined),
       detail: 'CCTL_AUTOSWITCH_TRIGGER_PCT',
+    },
+    {
+      name: 'stale switch trigger',
+      // Mirrors the policy's clamp (stale can only tighten the bar) so the view shows the
+      // threshold that will actually fire, not a raw override the policy would ignore.
+      value: `${Math.min(
+        staleTriggerPercent ?? DEFAULT_STALE_TRIGGER_PERCENT,
+        triggerPercent ?? DEFAULT_TRIGGER_PERCENT,
+      )}% used`,
+      source: envSource(staleTriggerPercent !== undefined),
+      detail: 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT (tightened trigger while usage data is stale)',
+    },
+    {
+      name: 'stale snapshot age',
+      value: humanizeMs(staleAfterMs ?? DEFAULT_STALE_AFTER_MS),
+      source: envSource(staleAfterMs !== undefined),
+      detail: 'CCTL_AUTOSWITCH_STALE_AFTER_MS (usage data older than this counts as stale)',
     },
     {
       name: 'min session headroom',
@@ -241,6 +264,8 @@ export function resolveDaemonConfig(
       autoSwitch,
       greedy,
       triggerPercent,
+      staleTriggerPercent,
+      staleAfterMs,
       minSessionHeadroomPct,
       greedyResetMarginMs,
       cooldownMs,

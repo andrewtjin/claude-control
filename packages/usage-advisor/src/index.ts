@@ -4,6 +4,8 @@ export { computePlan } from './advisor.js';
 export {
   decideAutoSwitch,
   DEFAULT_TRIGGER_PERCENT,
+  DEFAULT_STALE_TRIGGER_PERCENT,
+  DEFAULT_STALE_AFTER_MS,
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
   DEFAULT_GREEDY_RESET_MARGIN_MS,
   type AutoSwitchDecision,

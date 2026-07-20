@@ -206,6 +206,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const {
     relayUrl,
     triggerPercent,
+    staleTriggerPercent,
+    staleAfterMs,
     minSessionHeadroomPct,
     greedyResetMarginMs,
     cooldownMs,
@@ -323,6 +325,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
           }),
         policy: {
           ...(triggerPercent !== undefined ? { triggerPercent } : {}),
+          ...(staleTriggerPercent !== undefined ? { staleTriggerPercent } : {}),
+          ...(staleAfterMs !== undefined ? { staleAfterMs } : {}),
           ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
           ...(greedyResetMarginMs !== undefined ? { greedyResetMarginMs } : {}),
           ...(greedy ? { greedy } : {}),
