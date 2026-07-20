@@ -126,7 +126,8 @@ function limitShort(kind: AccountUsage['limits'][number]['kind']): string {
     case 'weekly_all':
       return 'week';
     case 'weekly_scoped':
-      return 'week*';
+      // The scoped weekly cap is the Fable-tier limit — name the model, not the wire kind.
+      return 'fable';
   }
 }
 

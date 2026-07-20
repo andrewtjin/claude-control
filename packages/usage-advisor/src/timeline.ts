@@ -345,11 +345,13 @@ function describeEvent(e: ResetEvent, st: OutlookStyle): string {
   if (e.kind === 'session') {
     return `5h window resets (${st.percent(`${e.percentUsed}% used`, e.percentUsed)} clears)`;
   }
-  const scoped = e.kind === 'weekly_scoped' ? 'weekly (scoped)' : 'weekly';
+  // The scoped weekly cap is the Fable-tier limit, so name the model rather than the
+  // opaque wire kind.
+  const label = e.kind === 'weekly_scoped' ? 'weekly (fable)' : 'weekly';
   const unused = 100 - e.percentUsed;
   return unused > 0
-    ? `${scoped} quota resets - ${st.alert(`${unused}% unused expires with it`)}`
-    : `${scoped} quota resets`;
+    ? `${label} quota resets - ${st.alert(`${unused}% unused expires with it`)}`
+    : `${label} quota resets`;
 }
 
 /** Compact rendering of an advisor plan, appended under the timeline by both frontends.

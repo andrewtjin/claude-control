@@ -129,7 +129,9 @@ function formatLimits(account: AccountUsage, nowMs: number, bar: BarRenderer): s
       const resetMs = l.resetsAt != null ? Date.parse(l.resetsAt) : NaN;
       const reset =
         Number.isFinite(resetMs) && resetMs > nowMs ? ` · resets ${discordRelative(resetMs)}` : '';
-      return `${bar(l.percent)} ${l.kind.replace(/_/g, ' ')} ${Math.round(l.percent)}%${reset}`;
+      // The scoped weekly cap is the Fable-tier limit — name the model, not the wire kind.
+      const kindLabel = l.kind === 'weekly_scoped' ? 'weekly fable' : l.kind.replace(/_/g, ' ');
+      return `${bar(l.percent)} ${kindLabel} ${Math.round(l.percent)}%${reset}`;
     })
     .join('\n');
 }
@@ -302,11 +304,11 @@ export function buildTimelineEmbed(
  *  signal (same semantics as the CLI's text renderer). */
 function describeEvent(kind: string, percentUsed: number): string {
   if (kind === 'session') return `5h window resets (${percentUsed}% used clears)`;
-  const scoped = kind === 'weekly_scoped' ? 'weekly (scoped)' : 'weekly';
+  // The scoped weekly cap is the Fable-tier limit, so name the model rather than the
+  // opaque wire kind.
+  const label = kind === 'weekly_scoped' ? 'weekly (fable)' : 'weekly';
   const unused = 100 - percentUsed;
-  return unused > 0
-    ? `${scoped} quota resets — ${unused}% unused expires`
-    : `${scoped} quota resets`;
+  return unused > 0 ? `${label} quota resets — ${unused}% unused expires` : `${label} quota resets`;
 }
 
 /** `/accounts` — a lighter listing than `/usage`: which accounts exist and whether each is

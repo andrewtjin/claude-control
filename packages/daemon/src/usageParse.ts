@@ -27,11 +27,16 @@ const KNOWN_KINDS = new Set(['session', 'weekly_all', 'weekly_scoped']);
 
 function normalizeKind(raw: unknown): 'session' | 'weekly_all' | 'weekly_scoped' | undefined {
   if (typeof raw !== 'string') return undefined;
-  // Live-observed kinds: session, weekly_all, weekly_scoped. The extra spellings stay
-  // accepted as cheap drift insurance.
+  // Live-observed kinds: session, weekly_all, weekly_scoped (the model-scoped cap — Fable
+  // tier). The extra spellings stay accepted as cheap drift insurance.
   const normalized = raw.trim().toLowerCase();
   if (normalized === 'weekly' || normalized === 'weekly_all') return 'weekly_all';
-  if (normalized === 'weekly_scoped' || normalized === 'weekly_opus') return 'weekly_scoped';
+  if (
+    normalized === 'weekly_scoped' ||
+    normalized === 'weekly_opus' ||
+    normalized === 'weekly_fable'
+  )
+    return 'weekly_scoped';
   if (normalized === 'session' || normalized === 'five_hour') return 'session';
   return KNOWN_KINDS.has(normalized)
     ? (normalized as 'session' | 'weekly_all' | 'weekly_scoped')

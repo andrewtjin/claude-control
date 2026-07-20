@@ -170,6 +170,7 @@ describe('parseUsageEndpointResponse', () => {
           { kind: 'weekly', percent: 1 },
           { kind: 'five_hour', percent: 2 },
           { kind: 'weekly_opus', percent: 3 },
+          { kind: 'weekly_fable', percent: 4 },
         ],
       },
     };
@@ -177,6 +178,7 @@ describe('parseUsageEndpointResponse', () => {
     expect(accountUsage.limits.map((l) => l.kind)).toEqual([
       'weekly_all',
       'session',
+      'weekly_scoped',
       'weekly_scoped',
     ]);
   });
