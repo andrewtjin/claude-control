@@ -1419,13 +1419,14 @@ describe('HookReceiver', () => {
   describe('resolvePermission via /resolve-permission', () => {
     // Seed the pending row directly — these tests exercise the resolve-side security
     // contract, not the (now held-open) hook POST transport.
-    function requestPermission(requestId: string): void {
+    function requestPermission(requestId: string, origin: 'hook' | 'managed' = 'hook'): void {
       store.insertPendingPermission({
         requestId,
         sessionId: 's',
         tool: 'Bash',
         summary: 'x',
         createdAtMs: 1_000_000,
+        origin,
       });
     }
 
@@ -1440,6 +1441,25 @@ describe('HookReceiver', () => {
       expect(first.status).toBe(200);
       expect(first.body).toEqual({ ok: true });
       expect(store.getPendingPermission('req-a')?.resolvedDecision).toBe('allow');
+    });
+
+    it('REFUSES to resolve a managed-origin row — the SDK gate in the owning process is the only applier', async () => {
+      // The cross-process misroute this pins: a daemon that does not own the session's
+      // parked canUseTool (a second process on the same database, or a restarted one whose
+      // in-memory route is gone) falls through to this resolver. Flipping the row would
+      // report success for a decision nothing applied; it must refuse and leave the row
+      // pending instead.
+      requestPermission('req-managed', 'managed');
+      const res = await post(
+        port,
+        '/resolve-permission',
+        { requestId: 'req-managed', decision: 'allow' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ ok: false });
+      // The row is untouched — still pending, never falsified to 'allow'.
+      expect(store.getPendingPermission('req-managed')?.resolvedDecision).toBeNull();
     });
 
     it('rejects an UNKNOWN requestId with ok:false — never applies an unsolicited approval', async () => {
@@ -1494,6 +1514,7 @@ describe('HookReceiver', () => {
           tool: 'Bash',
           summary: 'x',
           createdAtMs: now,
+          origin: 'hook',
         });
         now += 5000; // well past the 1000ms TTL
         const res = await post(

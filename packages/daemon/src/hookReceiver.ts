@@ -459,6 +459,20 @@ export class HookReceiver {
     }
     const row = this.store.getPendingPermission(requestId);
     if (!row) return { ok: false, error: 'unknown requestId' };
+    // A managed-origin row mirrors an SDK-parked prompt whose blocking promise lives in the
+    // daemon process that spawned the session — only that process's in-memory gate can apply
+    // a decision, so "resolving" the row here would record an allow/deny nothing ever
+    // applied while the parked tool stays parked. Reachable when the owning process's route
+    // is gone (it restarted) or when a SECOND daemon process sharing this database received
+    // the response; both must refuse, never falsify the audit row.
+    if (row.origin === 'managed') {
+      return {
+        ok: false,
+        error:
+          'request belongs to a managed session - only the daemon process holding its SDK ' +
+          'gate can apply a decision (is a second daemon process running?)',
+      };
+    }
     if (row.resolvedDecision !== null) return { ok: false, error: 'already resolved' };
     if (this.clock() - row.createdAtMs > this.permissionTtlMs) {
       return { ok: false, error: 'expired' };
@@ -799,7 +813,14 @@ export class HookReceiver {
     }
 
     const now = this.clock();
-    this.store.insertPendingPermission({ requestId, sessionId, tool, summary, createdAtMs: now });
+    this.store.insertPendingPermission({
+      requestId,
+      sessionId,
+      tool,
+      summary,
+      createdAtMs: now,
+      origin: 'hook',
+    });
 
     const detail =
       str(body.detail) ??

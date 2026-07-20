@@ -676,6 +676,7 @@ describe('Daemon lifecycle', () => {
       tool: 'Bash',
       summary: 'run it',
       createdAtMs: Date.now(),
+      origin: 'hook',
     });
     await daemon.start();
     relay.push({

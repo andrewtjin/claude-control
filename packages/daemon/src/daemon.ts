@@ -1071,6 +1071,11 @@ export class Daemon {
         tool: req.tool,
         summary: req.summary,
         createdAtMs: this.clock(),
+        // Marks the row as SDK-owned so the hook receiver's resolve path refuses it: only
+        // THIS process's in-memory gate can actually apply a decision to a parked tool, and
+        // a resolver in any other process flipping the shared row would record an allow/deny
+        // nothing ever applied.
+        origin: 'managed',
       });
     }
     this.sendEnvelope({

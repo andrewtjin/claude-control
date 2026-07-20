@@ -37,6 +37,11 @@ export interface PendingPermissionRow {
   tool: string;
   summary: string;
   createdAtMs: number;
+  /** Which leg surfaced the request: 'hook' (a CLI hook's held HTTP response — the hook
+   *  receiver's resolve path answers it) or 'managed' (an SDK-parked `canUseTool` — ONLY the
+   *  daemon process holding the in-memory gate can apply a decision, so the hook receiver
+   *  must refuse to resolve these rows; see hookReceiver.resolvePermission). */
+  origin: string;
   /** `null` until `resolvePendingPermissionDecision` records an answer. */
   resolvedDecision: string | null;
 }
@@ -151,6 +156,7 @@ export class Store {
         tool TEXT NOT NULL,
         summary TEXT NOT NULL,
         createdAtMs INTEGER NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'hook',
         resolvedDecision TEXT
       );
 
@@ -169,6 +175,19 @@ export class Store {
         createdAtMs INTEGER NOT NULL
       );
     `);
+    // `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a database created
+    // before the `origin` column existed must be upgraded here. Legacy rows default to
+    // 'hook': the resolve path has always treated every row as hook-originated, so the
+    // default preserves exactly the behavior those rows already had — a legacy managed row
+    // loses only the new refuse-from-the-wrong-process protection, never its resolvability.
+    const pendingPermissionColumns = this.db
+      .prepare(`PRAGMA table_info(pending_permissions)`)
+      .all();
+    if (!pendingPermissionColumns.some((col) => col['name'] === 'origin')) {
+      this.db.exec(
+        `ALTER TABLE pending_permissions ADD COLUMN origin TEXT NOT NULL DEFAULT 'hook'`,
+      );
+    }
   }
 
   // ---- usage_snapshots ----
@@ -311,6 +330,7 @@ export class Store {
       tool: requireString(row, 'tool'),
       summary: requireString(row, 'summary'),
       createdAtMs: requireNumber(row, 'createdAtMs'),
+      origin: requireString(row, 'origin'),
       resolvedDecision: optionalString(row, 'resolvedDecision'),
     };
   }
@@ -318,10 +338,10 @@ export class Store {
   insertPendingPermission(row: Omit<PendingPermissionRow, 'resolvedDecision'>): void {
     this.db
       .prepare(
-        `INSERT INTO pending_permissions (requestId, sessionId, tool, summary, createdAtMs, resolvedDecision)
-         VALUES (?, ?, ?, ?, ?, NULL)`,
+        `INSERT INTO pending_permissions (requestId, sessionId, tool, summary, createdAtMs, origin, resolvedDecision)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
       )
-      .run(row.requestId, row.sessionId, row.tool, row.summary, row.createdAtMs);
+      .run(row.requestId, row.sessionId, row.tool, row.summary, row.createdAtMs, row.origin);
   }
 
   getPendingPermission(requestId: string): PendingPermissionRow | undefined {
