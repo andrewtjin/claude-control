@@ -102,12 +102,20 @@ export interface DaemonOptions {
    *  to escalateStop's own 5s. Injectable so tests can exercise the hard-stop rung with a
    *  short real-time window instead of fake timers (house convention). */
   stopGraceMs?: number;
+  /** Bound on the live-session teardown inside {@link stop} (default 5s). Injectable so a
+   *  test can prove a wedged handle cannot hang shutdown, without fake timers. */
+  sessionStopOnShutdownMs?: number;
   /** How often to poll usage and re-sync attribution. */
   pollIntervalMs?: number;
   logger?: Logger;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
+/** How long {@link Daemon.stop} waits for live session handles to tear down before closing
+ *  the rest anyway. Generous for a normal `client.end()` (subprocess exit is fast), tight
+ *  enough that one wedged transport cannot hold Ctrl+C hostage; a handle that misses the
+ *  bound is exactly the crash shape the next start's recover() already reconciles. */
+const DEFAULT_SESSION_STOP_ON_SHUTDOWN_MS = 5_000;
 /** 30 minutes: re-login is a minutes-long human action on the PC, so nagging more often than
  *  ~twice an hour for the same still-broken account is pure noise. */
 const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
@@ -246,6 +254,7 @@ export class Daemon {
   private readonly clock: () => number;
   private readonly quarantineNoticeDebounceMs: number;
   private readonly stopGraceMs: number | undefined;
+  private readonly sessionStopOnShutdownMs: number;
   private readonly pollIntervalMs: number;
   private readonly logger: Logger;
 
@@ -310,6 +319,8 @@ export class Daemon {
     this.quarantineNoticeDebounceMs =
       options.quarantineNoticeDebounceMs ?? DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS;
     this.stopGraceMs = options.stopGraceMs;
+    this.sessionStopOnShutdownMs =
+      options.sessionStopOnShutdownMs ?? DEFAULT_SESSION_STOP_ON_SHUTDOWN_MS;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.logger = options.logger ?? noopLogger;
   }
@@ -459,9 +470,38 @@ export class Daemon {
     this.endpointRepublishTimer = undefined;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = undefined;
+    // Live sessions FIRST, while the store/receiver they report through still work: each
+    // handle.stop() ends the spawned SDK subprocess and fail-closes any parked permission
+    // prompt through the runtime's own turn teardown. Without this, shutdown leaks the
+    // `claude` child processes — still running under the last-activated account, invisible
+    // to the next daemon run (whose recover() only stamps the registry rows 'orphaned').
+    await this.stopLiveSessions();
     this.controlPlaneClient.close();
     await this.hookReceiver.close();
     this.store.close();
+  }
+
+  /** Stop every live session handle, bounded by {@link sessionStopOnShutdownMs}. Plain
+   *  `handle.stop()`, deliberately NOT the interrupt-then-grace escalation ladder: shutdown
+   *  is not a request to finish the turn gracefully, and a per-session grace window would
+   *  hold process exit hostage. Failures are settled, never thrown — a handle whose
+   *  transport is already dead is no less stopped for it — and a handle that outlives the
+   *  bound is left to next start's recover(), the same as any crash. */
+  private async stopLiveSessions(): Promise<void> {
+    const handles = this.sessionManager
+      .list()
+      .map((record) => this.sessionManager.get(record.id))
+      .filter((handle): handle is SessionHandle => handle !== undefined);
+    if (handles.length === 0) return;
+    this.logger.info({ count: handles.length }, 'stopping live sessions before shutdown');
+    const bound = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, this.sessionStopOnShutdownMs);
+      timer.unref();
+    });
+    await Promise.race([
+      Promise.allSettled(handles.map((handle) => handle.stop())).then(() => undefined),
+      bound,
+    ]);
   }
 
   // ---- poll cycle ----

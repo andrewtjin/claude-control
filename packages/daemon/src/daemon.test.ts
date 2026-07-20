@@ -1649,6 +1649,61 @@ describe('Daemon lifecycle', () => {
     await expect(daemon.stop()).resolves.toBeUndefined();
   });
 
+  it('stop() stops every live session handle — no leaked SDK subprocess on shutdown', async () => {
+    // Two live sessions — one mid-turn, one parked on a permission — exactly the shapes a
+    // Ctrl+C used to leak: their client.end() never ran, so the spawned `claude` process
+    // kept running under the active account, invisible to the next daemon run.
+    const running = makeFakeHandle('live-running');
+    const parked = makeFakeHandle('live-parked');
+    sessionManager.records.push(
+      { id: 'live-running', kind: 'managed', state: 'running', startedAtMs: 0 },
+      { id: 'live-parked', kind: 'managed', state: 'waiting_permission', startedAtMs: 1 },
+    );
+    sessionManager.handles.set('live-running', running);
+    sessionManager.handles.set('live-parked', parked);
+    await daemon.start();
+
+    await daemon.stop();
+
+    expect(running.stopCalls).toBe(1);
+    expect(parked.stopCalls).toBe(1);
+  });
+
+  it('a wedged handle.stop() cannot hang shutdown — the teardown is bounded', async () => {
+    const wedged = makeFakeHandle('wedged-1');
+    wedged.stop = () => {
+      wedged.stopCalls += 1;
+      return new Promise<void>(() => undefined); // never settles — a dead transport
+    };
+    sessionManager.records.push({
+      id: 'wedged-1',
+      kind: 'managed',
+      state: 'running',
+      startedAtMs: 0,
+    });
+    sessionManager.handles.set('wedged-1', wedged);
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      sessionStopOnShutdownMs: 50, // short real-time bound, house convention (no fake timers)
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    // Boundedness is proven by resolving at all: an unbounded teardown would await the
+    // never-settling stop() forever and this test would die on its own timeout. No
+    // wall-clock assertion — elapsed-time checks flake under parallel-suite load.
+    await daemon.stop();
+
+    expect(wedged.stopCalls).toBe(1);
+  });
+
   // ---- cctl session registry (loopback CLI endpoints) + display mirror ----
 
   /** Rebuild + start the daemon with a port-capturing endpoint publisher, so the test knows the
