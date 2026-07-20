@@ -1,9 +1,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   acquireInstanceLock,
+  probePredecessorEndpoint,
   releaseInstanceLock,
   instanceLockPath,
   DaemonAlreadyRunningError,
@@ -105,5 +107,67 @@ describe('acquireInstanceLock / releaseInstanceLock', () => {
     await acquireInstanceLock(dir);
     const record = JSON.parse(await readFile(instanceLockPath(dir), 'utf8')) as { pid: number };
     expect(record.pid).toBe(process.pid);
+  });
+});
+
+describe('probePredecessorEndpoint — the fail-open backstop behind the lock', () => {
+  let servers: Server[] = [];
+  afterEach(async () => {
+    await Promise.all(
+      servers.map((server) => {
+        server.closeAllConnections();
+        return new Promise<void>((resolve) => server.close(() => resolve()));
+      }),
+    );
+    servers = [];
+  });
+
+  /** Bind a real loopback server (house convention: live boundary, no fetch mocks) and return
+   *  its OS-assigned port. */
+  function listen(server: Server): Promise<number> {
+    servers.push(server);
+    return new Promise((resolve) => {
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        resolve(typeof addr === 'object' && addr !== null ? addr.port : 0);
+      });
+    });
+  }
+
+  it("a live daemon answering /healthz 200 probes 'serving' — the lockless-predecessor refusal", async () => {
+    const port = await listen(
+      createServer((req, res) => {
+        res.writeHead(req.url === '/healthz' ? 200 : 404, { 'content-type': 'application/json' });
+        res.end('{"ok":true}');
+      }),
+    );
+    expect(await probePredecessorEndpoint(port)).toBe('serving');
+  });
+
+  it("a dead port (crash leftover endpoint file) probes 'dead' — startup proceeds", async () => {
+    // Bind then fully close, so the port is real but definitely refusing right now.
+    const server = createServer(() => undefined);
+    const port = await listen(server);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    servers = servers.filter((s) => s !== server);
+
+    expect(await probePredecessorEndpoint(port)).toBe('dead');
+  });
+
+  it("an unrelated app that answers /healthz non-200 probes 'dead' — no false refusal on port reuse", async () => {
+    const port = await listen(
+      createServer((_req, res) => {
+        res.writeHead(404);
+        res.end();
+      }),
+    );
+    expect(await probePredecessorEndpoint(port)).toBe('dead');
+  });
+
+  it("a listener that accepts but never answers probes 'serving' — a wedged daemon still refuses", async () => {
+    // No response handler: the connection is accepted and then sits — the shape of a live
+    // daemon mid event-loop stall, which must refuse rather than invite a duel.
+    const port = await listen(createServer(() => undefined));
+    expect(await probePredecessorEndpoint(port, 200)).toBe('serving');
   });
 });

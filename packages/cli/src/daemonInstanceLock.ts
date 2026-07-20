@@ -137,6 +137,52 @@ export async function acquireInstanceLock(dataDir: string): Promise<void> {
   );
 }
 
+/** How long {@link probePredecessorEndpoint} waits for the published port to answer before
+ *  classifying it. Generous enough that a live daemon mid event-loop stall (multi-second
+ *  stalls have been observed) still answers; see the probe for why a timeout REFUSES. */
+const DEFAULT_PREDECESSOR_PROBE_TIMEOUT_MS = 1_500;
+
+/** What {@link probePredecessorEndpoint} found on the published port: 'serving' = something
+ *  is alive there and startup must refuse; 'dead' = nothing (or nothing daemon-shaped) is
+ *  listening and startup may proceed. */
+export type PredecessorProbeOutcome = 'serving' | 'dead';
+
+/**
+ * The instance lock's fail-open backstop. The lock refuses a second daemon that plays by the
+ * rules, but it cannot see a daemon that holds NO lock — one started before the lock existed,
+ * or whose lock file was hand-deleted. Such a daemon's published hook endpoint is the one
+ * trace it cannot help leaving (it rewrites the file on start and re-publishes on a
+ * heartbeat), so after acquiring the lock the starter probes that port's `/healthz`:
+ *   - HTTP 200 → a serving daemon answered: refuse (regardless of lock state).
+ *   - Timeout with the connection ACCEPTED → something is listening but wedged; a live
+ *     daemon mid event-loop stall looks exactly like this, so refuse rather than start a
+ *     duel against it.
+ *   - Connection refused / any other network error → a crash leftover file naming a dead
+ *     port (the common, benign case): proceed. Errors never refuse — this probe is
+ *     defense-in-depth on top of the lock, and an unreachable-port quirk must not brick
+ *     startup.
+ *   - Non-200 answer → whatever is listening is not this daemon (it always answers 200):
+ *     an unrelated process reusing the ephemeral port. Proceed; the daemon binds its own
+ *     fresh port and rewrites the file.
+ * Pid-free by design, so pid reuse cannot confuse it.
+ */
+export async function probePredecessorEndpoint(
+  port: number,
+  timeoutMs: number = DEFAULT_PREDECESSOR_PROBE_TIMEOUT_MS,
+): Promise<PredecessorProbeOutcome> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: controller.signal });
+    return res.status === 200 ? 'serving' : 'dead';
+  } catch (err) {
+    if ((err as Error).name === 'AbortError' || controller.signal.aborted) return 'serving';
+    return 'dead';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Release the instance lock, but ONLY if it still records THIS process's pid — the same
  * guarded-delete pattern the hook forwarder uses for its endpoint file cleanup. Without the

@@ -39,6 +39,7 @@ import {
   hookForwarderPath,
   hookSecretPath,
   installHooks,
+  readHookEndpoint,
   writeHookForwarder,
   loadOrCreateHookSecret,
   writeHookEndpoint,
@@ -54,6 +55,7 @@ import { daemonSettingsPath, resolveDaemonConfig, writeSettingsReport } from './
 import { crashLogPath, installCrashLogging } from './daemonSupervise.js';
 import {
   acquireInstanceLock,
+  probePredecessorEndpoint,
   releaseInstanceLock,
   DaemonAlreadyRunningError,
 } from './daemonInstanceLock.js';
@@ -163,6 +165,24 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   } catch (err) {
     if (err instanceof DaemonAlreadyRunningError) fail(err.message);
     throw err; // an unexpected IO error here is a real failure, not a clean refusal
+  }
+  // Fail-open backstop behind the lock: a daemon that holds NO lock (started before the
+  // lock existed, or its lock file was hand-deleted) is invisible to acquireInstanceLock,
+  // and running beside it corrupts the same four shared surfaces the lock protects. Its
+  // published hook endpoint is the one trace it cannot help leaving — probe it, and refuse
+  // to start beside a live answer. See probePredecessorEndpoint for the classification.
+  const publishedEndpoint = await readHookEndpoint(hookEndpointPath(dataDir));
+  if (publishedEndpoint !== undefined) {
+    const probe = await probePredecessorEndpoint(publishedEndpoint.port);
+    if (probe === 'serving') {
+      await releaseInstanceLock(dataDir);
+      fail(
+        `another daemon is already serving on port ${publishedEndpoint.port} even though it ` +
+          `holds no instance lock (likely started before the lock existed). Stop that ` +
+          `process first; if you are sure no daemon is running, delete ` +
+          `${hookEndpointPath(dataDir)} and retry.`,
+      );
+    }
   }
   const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
   const logger: Logger = {
