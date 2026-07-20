@@ -175,14 +175,16 @@ export class DiscordJsGateway implements DiscordGateway {
   protected readonly permissionCards = new PermissionCardRegistry();
   /** One pending coalesced-flush timer per session route; rescheduled, never stacked. */
   private readonly flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Per-session-route serialization chain for managed-session frames (status/output). relay.ts
-   *  fires `deliver()` from an un-awaited `socket.on('message')` handler, so two frames for ONE
-   *  session would otherwise interleave across the awaits inside executeOps: the second's
-   *  editMessage can run before the first's `await sink.send()` has stored the card id in
-   *  {@link cardMessages}, posting a DUPLICATE card (and later edits then target whichever send
-   *  resolved last). Chaining each route's processing onto the previous one forces in-order,
-   *  run-to-completion delivery. The entry is deleted once it drains (bounded by LIVE routes) and
-   *  the chain NEVER rejects, so one bad frame can't stall every later frame for that session. */
+  /** Per-session-route serialization chain for EVERY card mutation: managed-session frames
+   *  (status/output), the coalesced-flush timer, and the stop nudge. relay.ts fires `deliver()`
+   *  from an un-awaited `socket.on('message')` handler, and the flush timer / stop nudge fire on
+   *  their own schedules, so any two of them for ONE session would otherwise interleave across
+   *  the awaits inside executeOps: the second's editMessage can run before the first's
+   *  `await sink.send()` has stored the card id in {@link cardMessages}, posting a DUPLICATE
+   *  card (and later edits then target whichever send resolved last). Chaining each route's
+   *  work onto the previous unit forces in-order, run-to-completion mutation of the card
+   *  surface — see {@link chainOnRoute}. The entry is deleted once it drains (bounded by LIVE
+   *  routes) and the chain NEVER rejects, so one bad unit can't stall the route. */
   private readonly deliverChains = new Map<string, Promise<void>>();
 
   constructor(options: DiscordJsGatewayOptions) {
@@ -326,21 +328,30 @@ export class DiscordJsGateway implements DiscordGateway {
     return channel.messages.fetch(ref.messageId);
   }
 
-  /** Append one managed-session envelope to its route's serialization chain, returning a promise
-   *  that resolves when THIS envelope has been fully processed. Both branches of the `.then` run
-   *  the same processing so a (never-expected) prior rejection can't skip an envelope; the entry is
-   *  dropped once it drains, but only if it is still the tail (a later enqueue may have replaced it),
-   *  keeping the map bounded by live routes. */
-  private enqueueSessionDelivery(route: SessionRoute, envelope: Envelope): Promise<void> {
+  /** Append one unit of card work to its route's serialization chain, returning a promise that
+   *  resolves when THIS unit has fully run. EVERY mutation of a route's card surface (envelope
+   *  processing, the coalesced-flush timer, the stop nudge) must come through here: any of them
+   *  can hit the empty-`cardMessages` re-anchor branch in {@link executeOp}, and two doing so
+   *  concurrently each post a fresh card — the later `cardMessages.set` wins and the earlier
+   *  card is orphaned, taking no further edits, forever stuck on its last state. Both branches
+   *  of the `.then` run the work so a (never-expected) prior rejection can't skip a unit; the
+   *  entry is dropped once it drains, but only if it is still the tail (a later append may have
+   *  replaced it), keeping the map bounded by live routes. `work` must never reject — every
+   *  caller wraps its own failure handling — so the chain itself can never stall a route. */
+  private chainOnRoute(route: SessionRoute, work: () => Promise<void>): Promise<void> {
     const key = sessionRouteKey(route);
     const prior = this.deliverChains.get(key) ?? Promise.resolve();
-    const process = (): Promise<void> => this.processSessionEnvelope(route, envelope);
-    const next = prior.then(process, process);
+    const next = prior.then(work, work);
     this.deliverChains.set(key, next);
     void next.finally(() => {
       if (this.deliverChains.get(key) === next) this.deliverChains.delete(key);
     });
     return next;
+  }
+
+  /** Append one managed-session envelope to its route's serialization chain. */
+  private enqueueSessionDelivery(route: SessionRoute, envelope: Envelope): Promise<void> {
+    return this.chainOnRoute(route, () => this.processSessionEnvelope(route, envelope));
   }
 
   /** Process one managed-session envelope: run its plan (create/edit the card, upload, etc.) and,
@@ -476,8 +487,15 @@ export class DiscordJsGateway implements DiscordGateway {
     const delay = Math.max(0, atMs - this.clock());
     const timer = setTimeout(() => {
       this.flushTimers.delete(key);
-      void this.runPlan(route, this.planner.flush(route, this.clock())).catch((err: unknown) => {
-        this.logger.warn({ err, route }, 'discord: session flush failed');
+      // Through the route chain, never directly: the timer fires on its own schedule, so a
+      // direct runPlan would race whatever chained delivery is mid-flight and can duplicate
+      // the live card (see chainOnRoute). The catch keeps the chain's never-rejects contract.
+      void this.chainOnRoute(route, async () => {
+        try {
+          await this.runPlan(route, this.planner.flush(route, this.clock()));
+        } catch (err) {
+          this.logger.warn({ err, route }, 'discord: session flush failed');
+        }
       });
     }, delay);
     // Do not keep the event loop alive solely for a pending card edit.
@@ -502,9 +520,20 @@ export class DiscordJsGateway implements DiscordGateway {
   }
 
   /** Optimistically flip a session card to "stopping…" the moment a stop is requested (from `/stop`
-   *  or the card's Stop button), before the daemon's terminal status confirms it. */
-  private async nudgeStop(route: SessionRoute): Promise<void> {
-    await this.executeOps(this.planner.onStopRequested(route, this.clock()).ops);
+   *  or the card's Stop button), before the daemon's terminal status confirms it. Through the
+   *  route chain like every other card mutation — a direct edit here races in-flight chained
+   *  deliveries for the same card (see chainOnRoute); the catch keeps the chain's
+   *  never-rejects contract. `protected` (not `private`), same seam rationale as
+   *  {@link sinkFor}: the serialization test drives the nudge directly, without the full fake
+   *  interaction its production caller would need. */
+  protected async nudgeStop(route: SessionRoute): Promise<void> {
+    await this.chainOnRoute(route, async () => {
+      try {
+        await this.executeOps(this.planner.onStopRequested(route, this.clock()).ops);
+      } catch (err) {
+        this.logger.warn({ err, route }, 'discord: stop nudge failed');
+      }
+    });
   }
 
   /** Inflate a RenderedPush into discord.js send options (content + embeds + component rows +

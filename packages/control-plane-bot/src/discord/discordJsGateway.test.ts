@@ -47,11 +47,16 @@ class FakeSink {
   }
 }
 
-/** DiscordJsGateway with its one testable seam (sinkFor) redirected to a fake sink. */
+/** DiscordJsGateway with its testable seams redirected: sinkFor returns a fake sink, and the
+ *  protected stop nudge is exposed so the serialization tests can fire it directly (its
+ *  production caller needs a full fake Discord interaction, beside the point here). */
 class TestGateway extends DiscordJsGateway {
   testSink: FakeSink | undefined;
   protected override sinkFor(_route: SessionRoute): Promise<SendableChannels | undefined> {
     return Promise.resolve(this.testSink as unknown as SendableChannels);
+  }
+  driveNudgeStop(route: SessionRoute): Promise<void> {
+    return this.nudgeStop(route);
   }
 }
 
@@ -98,6 +103,30 @@ describe('DiscordJsGateway — per-session delivery is serialized', () => {
     // standalone summary line — never a duplicate card.
     expect(sink.message.editCount).toBe(1);
     expect(sink.sends.length).toBe(2); // [card send, summary line send]
+  });
+
+  it('a stop nudge during an in-flight card send edits THAT card — never posts a second', async () => {
+    const gw = new TestGateway({ relay: stubRelay, pairing: stubPairing });
+    const sink = new FakeSink();
+    sink.gateFirstSend = true; // park the card send in flight
+    gw.testSink = sink;
+    const route: SessionRoute = { discordUserId: 'u1', sessionId: 's1' };
+
+    const pA = gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
+    // The planner marked the card posted at PLAN time, but the send itself is still parked, so
+    // the card id is not yet remembered — exactly the window where an unchained nudge used to
+    // hit the empty-map re-anchor branch and post a DUPLICATE card (the frozen-card shape: the
+    // later send wins the map and the first card never receives another edit).
+    const pB = gw.driveNudgeStop(route);
+
+    await tick();
+    expect(sink.sends.length).toBe(1); // the nudge is chained behind the delivery, not racing it
+
+    sink.releaseGate();
+    await Promise.all([pA, pB]);
+
+    expect(sink.sends.length).toBe(1); // still exactly one card
+    expect(sink.message.editCount).toBe(1); // "stopping…" landed as an edit on that card
   });
 });
 
