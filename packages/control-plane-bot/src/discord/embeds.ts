@@ -35,6 +35,7 @@ import {
   type TrackEvent,
 } from './richFormat.js';
 import type { BarRenderer } from './emojiBars.js';
+import { formatTables } from './tableFormat.js';
 
 const COLOR_OK = 0x2ecc71;
 const COLOR_WARN = 0xf1c40f;
@@ -589,8 +590,13 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
     .setColor(model.stopping ? COLOR_WARN : SESSION_STATE_COLOR[model.state]);
 
   const rawBody =
-    model.summary ??
-    (model.stopping ? 'Stop requested — waiting for the session to end.' : undefined);
+    model.summary !== undefined
+      ? // Tables in a summary arrive terminal-sized; re-render them phone-width and fenced
+        // before capping, so a capped body cuts wrapped rows rather than shredded borders.
+        formatTables(model.summary)
+      : model.stopping
+        ? 'Stop requested — waiting for the session to end.'
+        : undefined;
   // Hard-cap the body (a session summary is short; the cap defends the card against a runaway one)
   // then reserve its length so the fenced tail below can never push the description over the limit.
   const prefix = rawBody ? `${truncateLabeled(rawBody, 512)}\n` : '';
@@ -621,7 +627,12 @@ export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder 
   const embed = new EmbedBuilder()
     .setTitle(`${icon} Session ${model.state === 'done' ? 'complete' : model.state}`)
     .setColor(SESSION_STATE_COLOR[model.state])
-    .setDescription(truncateLabeled(model.summary ?? 'Session ended.', EMBED_DESCRIPTION_LIMIT));
+    .setDescription(
+      truncateLabeled(
+        model.summary !== undefined ? formatTables(model.summary) : 'Session ended.',
+        EMBED_DESCRIPTION_LIMIT,
+      ),
+    );
   embed.addFields({ name: 'Session', value: model.sessionId });
   if (model.accountId) embed.addFields({ name: 'Account', value: model.accountId });
   embed.addFields({ name: 'Output', value: `${model.totalOutputChars} chars streamed` });

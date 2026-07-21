@@ -13,7 +13,10 @@ import {
   buildToolOutputEmbed,
   buildWaitingEmbed,
   buildQuarantineEmbed,
+  buildSessionCardEmbed,
+  buildSessionSummaryEmbed,
   clampFieldValue,
+  type SessionCardModel,
 } from './embeds.js';
 import { NOTIFICATION_COLOR } from './richFormat.js';
 import type { SessionStatus } from './stateCache.js';
@@ -715,5 +718,51 @@ describe('embed field overflow (regression)', () => {
   it('clamps an unbounded permission detail instead of throwing', () => {
     const embed = buildPermissionRequestEmbed('run a command', 'x'.repeat(5000)).toJSON();
     expect(embed.fields?.[0]?.value.length).toBeLessThanOrEqual(1024);
+  });
+});
+
+describe('session card / summary embeds — table re-rendering', () => {
+  const TABLE = [
+    'Verification verdicts:',
+    '┌───────────────────────────────────────────────────┬────────────────────────────────────┐',
+    '│                     Inferred                      │             Confirmed              │',
+    '├───────────────────────────────────────────────────┼────────────────────────────────────┤',
+    '│ Precedence --relay > env > config.json > built-in │ matches what #6 shipped            │',
+    '└───────────────────────────────────────────────────┴────────────────────────────────────┘',
+  ].join('\n');
+
+  function model(overrides: Partial<SessionCardModel> = {}): SessionCardModel {
+    return {
+      sessionId: 's1',
+      state: 'done',
+      stopping: false,
+      totalOutputChars: 0,
+      attached: false,
+      hasGap: false,
+      sourceTruncated: false,
+      hadError: false,
+      ...overrides,
+    };
+  }
+
+  it('summary embed re-renders a terminal table phone-width inside a fence', () => {
+    const embed = buildSessionSummaryEmbed(model({ summary: TABLE })).toJSON();
+    const description = embed.description ?? '';
+    expect(description).toContain('Verification verdicts:');
+    expect(description).toContain('```');
+    // The re-rendered box fits a phone-width code block; the 88-column original would not.
+    for (const line of description.split('\n').filter((l) => /^[┌│├└]/.test(l))) {
+      expect(line.length).toBeLessThanOrEqual(40);
+    }
+    expect(description).toContain('Confirmed');
+  });
+
+  it('live card body re-renders a table in the summary the same way', () => {
+    const embed = buildSessionCardEmbed(model({ state: 'running', summary: TABLE })).toJSON();
+    const description = embed.description ?? '';
+    expect(description).toContain('```');
+    const boxLines = description.split('\n').filter((l) => /^[┌│├└]/.test(l));
+    expect(boxLines.length).toBeGreaterThan(0);
+    for (const line of boxLines) expect(line.length).toBeLessThanOrEqual(40);
   });
 });

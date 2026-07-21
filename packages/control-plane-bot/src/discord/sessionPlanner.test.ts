@@ -109,6 +109,28 @@ describe('SessionPlanner — milestone / summary / error lines', () => {
     expect((lineSends(r.ops)[0] as { content: string }).content).toBe('🔹 partial ⟨truncated⟩');
   });
 
+  it('re-renders a table in a summary line as a fenced phone-width box', () => {
+    // Standalone lines post as proportional-font content, where terminal box-drawing turns
+    // to soup — the planner must ship tables through the table formatter, fenced.
+    const table = [
+      'verdicts:',
+      '┌──────────────────────────────────────────────┬─────────────┐',
+      '│ Inferred                                     │ Confirmed   │',
+      '├──────────────────────────────────────────────┼─────────────┤',
+      '│ some very long inferred claim that overflows │ exact match │',
+      '└──────────────────────────────────────────────┴─────────────┘',
+    ].join('\n');
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 0);
+    const r = p.onOutput(ROUTE, output(0, 'summary', table), 10);
+    const content = (lineSends(r.ops)[0] as { content: string }).content;
+    expect(content.startsWith('📝 verdicts:')).toBe(true);
+    expect(content).toContain('```');
+    for (const line of content.split('\n').filter((l) => l.startsWith('│') || l.startsWith('┌')))
+      expect(line.length).toBeLessThanOrEqual(40);
+    expect(content).toContain('Confirmed');
+  });
+
   it('posts an error as its own line AND keeps it in the transcript', () => {
     const p = new SessionPlanner({ attachThresholdChars: 1 }); // force an attachment so we can read the transcript
     p.onStatus(ROUTE, status('running'), 0);
