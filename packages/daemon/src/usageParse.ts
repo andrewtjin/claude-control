@@ -126,9 +126,17 @@ export function parseCachedUsage(raw: unknown, opts: ParseUsageOptions): ParsedU
   // The CLI stamps the cache with WHEN it fetched (`fetchedAtMs`). Honor it: a stale cache
   // must be reported at its true age, not re-stamped as if fetched at poll time — the phone
   // (and the burn-down advisor's caller) can only judge staleness from this field.
+  // The guard is INTEGER and non-negative, not merely finite, because this value is copied
+  // onto a wire field declared `.int().nonnegative()`. A fractional or negative stamp passes
+  // `Number.isFinite` but fails at encode time — and encoding throws on the SENDING side,
+  // aborting the rest of the poll cycle: every account's usage snapshot, the piggybacked
+  // settings snapshot, and the auto-switch evaluation all go with it. This file is written by
+  // another program, so its shape is an assumption and never a guarantee; a bad stamp must
+  // cost only its own field, the way the sibling percent/kind values already do.
+  const cachedStamp = isRecord(raw) ? raw.fetchedAtMs : undefined;
   const fetchedAtMs =
-    isRecord(raw) && typeof raw.fetchedAtMs === 'number' && Number.isFinite(raw.fetchedAtMs)
-      ? raw.fetchedAtMs
+    typeof cachedStamp === 'number' && Number.isInteger(cachedStamp) && cachedStamp >= 0
+      ? cachedStamp
       : opts.fetchedAtMs;
   return parseLimitsPayload(
     raw,
