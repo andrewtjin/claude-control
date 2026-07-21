@@ -51,7 +51,8 @@ is currently running.
 ```
 cctl status     # at-a-glance: accounts, hooks, relay, daemon, pairing
 cctl settings   # every configurable setting: effective value and where it came from
-                # (flag / env / default), for both this shell and the last-started daemon
+                # (flag / env / config / default), for both this shell and the
+                # last-started daemon
 cctl doctor     # environment checks: Node version, vault crypto round-trip, vault dir,
                 # live login, ~/.claude.json
 ```
@@ -118,8 +119,22 @@ Until the daemon is connected to the bot, `cctl run` fails with a pointer to
 ## Relay override precedence
 
 Every command that talks to the relay resolves the url the same way, highest
-precedence first: `--relay <url>` flag → `CCTL_RELAY_URL` env var → the built-in
-default. `cctl settings` shows the effective value and which of the three produced it.
+precedence first: `--relay <url>` flag → `CCTL_RELAY_URL` env var → `relayUrl` in
+`config.json` → the built-in default. `cctl settings` shows the effective value and
+which of the four produced it.
+
+`config.json` lives beside the vault (the same directory as `daemon.db`; run
+`cctl settings` to see the resolved path) and is the option that survives a reboot
+without a wrapper script or a machine-wide env var:
+
+```json
+{ "relayUrl": "wss://relay.example.com" }
+```
+
+A missing, corrupt, or wrong-shaped file is ignored rather than being a startup
+error, so a typo costs you the override, never the daemon. Do not confuse it with
+`daemon-settings.json` in the same directory: that one is written _by_ the daemon to
+report what it resolved, and editing it changes nothing.
 
 ## Building from source
 

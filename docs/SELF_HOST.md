@@ -33,9 +33,16 @@ Two services come up:
 - **`caddy`** — reverse proxy on 80/443, terminating automatic TLS for
   `RELAY_HOSTNAME` and forwarding to `bot`.
 
-Point your own `cctl daemon run --relay wss://<RELAY_HOSTNAME>` (or `CCTL_RELAY_URL`,
-or your own build's baked-in default — see `docs/CLI.md`'s relay precedence) at your
-hostname once it's up.
+Point your own `cctl daemon run --relay wss://<RELAY_HOSTNAME>` at your hostname once
+it's up. For a self-host you want to keep, prefer `relayUrl` in `config.json` beside
+the vault — unlike a flag it survives autostart and reboots, and unlike a baked-in
+default it needs no rebuild:
+
+```json
+{ "relayUrl": "wss://<RELAY_HOSTNAME>" }
+```
+
+See `docs/CLI.md`'s relay precedence for the full order.
 
 ## State and backup
 
