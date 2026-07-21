@@ -9,7 +9,9 @@
 
 import {
   Client,
+  Events,
   GatewayIntentBits,
+  MessageFlags,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type EmbedBuilder,
@@ -90,7 +92,10 @@ export class DiscordJsGateway implements DiscordGateway {
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
     this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-    this.client.once('ready', () => {
+    // `clientReady`, not `ready`: the latter is deprecated and stops firing in discord.js v15,
+    // which would leave slash commands unregistered and the emoji bars never upgraded — a
+    // silent degradation, since nothing throws when an event simply never arrives.
+    this.client.once(Events.ClientReady, () => {
       this.registerCommands().catch((err: unknown) => {
         this.logger.error({ err }, 'discord: failed to register slash commands');
       });
@@ -389,12 +394,16 @@ export class DiscordJsGateway implements DiscordGateway {
     interaction: ChatInputCommandInteraction | ButtonInteraction,
     result: CommandResult,
   ): Promise<void> {
+    // `flags: Ephemeral` rather than the deprecated `ephemeral: true`. These replies can carry
+    // account labels and usage figures, so if the option ever stopped being honored they would
+    // post visibly in a shared channel — worth not relying on a deprecated spelling.
+    const ephemeral = { flags: MessageFlags.Ephemeral } as const;
     if (result.kind === 'embed') {
-      await interaction.reply({ embeds: [result.embed], ephemeral: true });
+      await interaction.reply({ embeds: [result.embed], ...ephemeral });
     } else if (result.kind === 'text') {
-      await interaction.reply({ content: result.text, ephemeral: true });
+      await interaction.reply({ content: result.text, ...ephemeral });
     } else {
-      await interaction.reply({ content: `Error: ${result.message}`, ephemeral: true });
+      await interaction.reply({ content: `Error: ${result.message}`, ...ephemeral });
     }
   }
 }
