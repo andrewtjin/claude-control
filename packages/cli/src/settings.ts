@@ -11,6 +11,10 @@
 // sources only — never token material), so `cctl settings` can show what the last-started
 // daemon is ACTUALLY using rather than guessing from this shell's env. The Discord bot gets
 // the same report over the wire (`settings.snapshot`).
+//
+// Two JSON files sit beside the vault and must not be confused — they point opposite ways:
+// `config.json` is INPUT an operator writes (`readDaemonConfigFile`), and only it can change
+// behavior; `daemon-settings.json` is OUTPUT the daemon writes (`writeSettingsReport`).
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -72,7 +76,53 @@ function envSource(overridden: boolean): SettingSource {
 }
 
 // ---------------------------------------------------------------------------
-// Daemon configuration (flags + env), resolved once
+// The operator's config file (persisted overrides)
+// ---------------------------------------------------------------------------
+
+/** Settings an operator persists on this machine. Every field is optional: the file exists to
+ *  override selected defaults, never to restate them. Kept deliberately small — a knob only
+ *  belongs here when it must survive a reboot without an env var or a wrapper script. */
+export interface DaemonFileConfig {
+  /** The relay to dial. The reason this file exists: a published build bakes one default
+   *  relay URL, and a self-hoster must be able to point at their own without a rebuild. */
+  relayUrl?: string;
+}
+
+/** Where the operator's config lives: beside the vault, like daemon.db. Distinct from
+ *  `daemonSettingsPath` — this one is read, that one is written. */
+export function daemonConfigPath(paths: Paths = defaultPaths()): string {
+  return join(dirname(paths.vaultDir), 'config.json');
+}
+
+/** Reads the operator's config file. Missing, unreadable, corrupt, or wrong-shaped content
+ *  degrades to `undefined` — the same typo-tolerance stance as `envNumber`: a malformed
+ *  config falling back to the default beats a daemon that refuses to start. A blank or
+ *  whitespace-only `relayUrl` counts as unset rather than as an empty URL. */
+export async function readDaemonConfigFile(
+  filePath: string,
+): Promise<DaemonFileConfig | undefined> {
+  let raw: string;
+  try {
+    raw = await readFile(filePath, 'utf8');
+  } catch {
+    return undefined;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+
+  const relayUrl = (parsed as Record<string, unknown>)['relayUrl'];
+  if (typeof relayUrl !== 'string' || relayUrl.trim() === '') return {};
+  return { relayUrl: relayUrl.trim() };
+}
+
+// ---------------------------------------------------------------------------
+// Daemon configuration (flags + env + config file), resolved once
 // ---------------------------------------------------------------------------
 
 /** The daemon-run flags that shape settings. Absent flag = not passed. */
@@ -97,13 +147,19 @@ export interface DaemonConfig {
 }
 
 /**
- * Resolve every daemon knob from flags (highest precedence), then env, then defaults.
- * Called with real flags by `cctl daemon run`, and with no flags by `cctl settings` to
- * preview what a plain daemon start would use from this shell's environment.
+ * Resolve every daemon knob from flags (highest precedence), then env, then the operator's
+ * config file, then defaults. Called with real flags by `cctl daemon run`, and with no flags
+ * by `cctl settings` to preview what a plain daemon start would use from this shell's
+ * environment.
+ *
+ * Deliberately PURE and synchronous: the caller reads `config.json` (see
+ * `readDaemonConfigFile`) and passes the result in, so this function stays fully testable
+ * without touching a filesystem, and display can never diverge from behavior.
  */
 export function resolveDaemonConfig(
   env: NodeJS.ProcessEnv,
   flags: DaemonRunFlags = {},
+  fileConfig: DaemonFileConfig = {},
 ): DaemonConfig {
   const autoSwitch = flags.autoSwitch === true;
   const greedyFlag = flags.greedy === true;
@@ -113,7 +169,18 @@ export function resolveDaemonConfig(
   const minSessionHeadroomPct = envNumber(env, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
   const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
   const relayEnv = env['CCTL_RELAY_URL'];
-  const relayUrl = flags.relay ?? relayEnv ?? DEFAULT_RELAY_URL;
+  const relayFile = fileConfig.relayUrl;
+  const relayUrl = flags.relay ?? relayEnv ?? relayFile ?? DEFAULT_RELAY_URL;
+  // Attribute to the source that actually WON, so a config file that is being shadowed by an
+  // env var reads as 'env' rather than misleadingly claiming the file is in effect.
+  const relaySource: SettingSource =
+    flags.relay !== undefined
+      ? 'flag'
+      : relayEnv !== undefined
+        ? 'env'
+        : relayFile !== undefined
+          ? 'config'
+          : 'default';
 
   const rows: SettingRow[] = [
     {
@@ -150,8 +217,8 @@ export function resolveDaemonConfig(
     {
       name: 'relay url',
       value: relayUrl,
-      source: flags.relay !== undefined ? 'flag' : envSource(relayEnv !== undefined),
-      detail: '--relay or CCTL_RELAY_URL',
+      source: relaySource,
+      detail: '--relay, CCTL_RELAY_URL, or relayUrl in config.json',
     },
     {
       name: 'daemon log level',

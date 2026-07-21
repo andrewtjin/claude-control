@@ -63,6 +63,8 @@ import {
 } from './setup.js';
 import {
   daemonSettingsPath,
+  daemonConfigPath,
+  readDaemonConfigFile,
   readSettingsReport,
   renderSettings,
   reportSaysGreedyActive,
@@ -178,9 +180,12 @@ export function buildProgram(): Command {
         const since = new Date(report.startedAtMs).toLocaleString();
         sections.push({ title: `daemon (effective since ${since})`, rows: report.settings });
       } else {
+        // The preview must honor config.json too — otherwise it would report 'default' for a
+        // relay the daemon will actually take from the file.
+        const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
         sections.push({
           title: 'daemon (no daemon has run yet — what `cctl daemon run` would use)',
-          rows: resolveDaemonConfig(process.env).rows,
+          rows: resolveDaemonConfig(process.env, {}, fileConfig).rows,
         });
       }
       process.stdout.write(renderSettings(sections, detectPalette()) + '\n');
@@ -331,7 +336,10 @@ export function buildProgram(): Command {
         join(dataDir, 'daemon-identity.enc'),
         defaultProtector(),
       ).load();
-      const relayUrl = resolveDaemonConfig(process.env).values.relayUrl;
+      // Same reason as `cctl settings`: status must show the relay the daemon would dial,
+      // which means honoring config.json rather than env + defaults alone.
+      const statusFileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
+      const relayUrl = resolveDaemonConfig(process.env, {}, statusFileConfig).values.relayUrl;
 
       process.stdout.write(
         renderDaemonStatus(
