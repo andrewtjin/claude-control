@@ -38,7 +38,10 @@ import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 export type { SettingRow } from '@claude-control/shared-protocol';
 
-export const DEFAULT_RELAY_URL = 'ws://127.0.0.1:8765';
+/** The hosted control plane a published build dials with no configuration at all. This is the
+ *  last fallback in the precedence ladder, not a lock-in: `--relay`, `CCTL_RELAY_URL`, and
+ *  `relayUrl` in `config.json` each override it, so self-hosting never needs a rebuild. */
+export const DEFAULT_RELAY_URL = 'wss://cctl.andrewtjin.com';
 
 // ---------------------------------------------------------------------------
 // Env parsing (shared with daemonRun.ts — the single source of truth)

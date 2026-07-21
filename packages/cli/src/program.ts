@@ -63,6 +63,7 @@ import {
 } from './setup.js';
 import {
   daemonSettingsPath,
+  DEFAULT_RELAY_URL,
   daemonConfigPath,
   readDaemonConfigFile,
   readSettingsReport,
@@ -239,7 +240,8 @@ export function buildProgram(): Command {
     .option('--pair <code>', 'pairing code from Discord /pair (adopts a new identity)')
     .option(
       '--relay <url>',
-      'control-plane WebSocket url (default CCTL_RELAY_URL or ws://127.0.0.1:8765)',
+      // Derived from the constant, never restated, so help text cannot drift from behavior.
+      `control-plane WebSocket url (default CCTL_RELAY_URL, relayUrl in config.json, or ${DEFAULT_RELAY_URL})`,
     )
     .option(
       '--auto-switch',
