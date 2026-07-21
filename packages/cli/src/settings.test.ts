@@ -260,6 +260,17 @@ describe('operator config file', () => {
   });
 });
 
+describe('the published default relay', () => {
+  // Guards the one constant a published build cannot take back: shipping a loopback or
+  // plaintext default would leave every fresh install dialing nothing over an unencrypted
+  // socket. Asserts the PROPERTIES that must hold, not the literal hostname, so changing
+  // where the relay lives stays a one-line edit.
+  it('is a secure, non-loopback websocket url', () => {
+    expect(DEFAULT_RELAY_URL.startsWith('wss://')).toBe(true);
+    expect(DEFAULT_RELAY_URL).not.toMatch(/127\.0\.0\.1|localhost|\[::1\]/);
+  });
+});
+
 describe('relay url precedence', () => {
   const FILE = { relayUrl: 'wss://from-file.example.com' };
 
