@@ -40,3 +40,7 @@ export {
   type ActivateOptions,
   type RefreshFn,
 } from './switchEngine.js';
+// Not switch-engine domain logic, but the workspace's only fsync'd atomic writer. Exposed so
+// other packages replace a state file the way this one already does, instead of hand-rolling a
+// plain writeFile that a concurrent reader can catch half-written.
+export { atomicWriteFile } from './fsutil.js';

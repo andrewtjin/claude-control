@@ -42,7 +42,11 @@ describe('HeartbeatWriter', () => {
     });
     now = 2000;
     await vi.advanceTimersByTimeAsync(100);
-    expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 2000 });
+    // waitFor, like the first write above: an atomic replace is several fs operations, so the
+    // tick that starts the write is not the tick that finishes it.
+    await vi.waitFor(async () => {
+      expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 2000 });
+    });
     writer.stop();
   });
 
@@ -82,8 +86,10 @@ describe('HeartbeatWriter', () => {
 
   it('reports a write failure through onError instead of throwing out of the timer', async () => {
     const errors: unknown[] = [];
-    // A directory that does not exist makes every write fail.
-    const badPath = join(dir, 'missing-subdir', 'heartbeat.json');
+    // Writing ONTO an existing directory always fails. A merely-missing parent directory no
+    // longer does: the atomic writer creates it, which is a deliberate self-heal — a daemon
+    // whose data dir vanished should re-make it rather than warn every 30s forever.
+    const badPath = dir;
     const writer = new HeartbeatWriter(badPath, { onError: (err) => errors.push(err) });
     writer.start();
     await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
