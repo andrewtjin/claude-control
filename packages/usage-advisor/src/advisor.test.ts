@@ -52,6 +52,47 @@ describe('computePlan — degenerate inputs', () => {
   });
 });
 
+describe('computePlan — the ranking must survive JSON', () => {
+  // An unusable account scores -Infinity internally. JSON.stringify turns that into "null",
+  // which the numeric wire field rejects — and the transport drops the ENTIRE plan frame, so
+  // one quarantined account silently blinds every usage view until it is un-quarantined.
+  it('serializes an unusable account to a finite score that survives a JSON round-trip', () => {
+    const plan = computePlan(
+      [
+        acct('good', 'Good', [{ kind: 'weekly_all', percent: 10 }]),
+        acct('dead', 'Dead', [{ kind: 'weekly_all', percent: 0 }], { quarantined: true }),
+      ],
+      opts,
+    );
+
+    const dead = plan.ranking.find((r) => r.accountId === 'dead');
+    expect(dead).toBeDefined();
+    expect(Number.isFinite(dead?.score)).toBe(true);
+
+    // The real regression: every score must still be a number on the far side of the wire.
+    const roundTripped = JSON.parse(JSON.stringify(plan)) as typeof plan;
+    for (const rank of roundTripped.ranking) {
+      expect(typeof rank.score, `score for ${rank.accountId} must survive JSON`).toBe('number');
+    }
+  });
+
+  it('still ranks an unusable account below every usable one', () => {
+    const plan = computePlan(
+      [
+        acct('dead', 'Dead', [{ kind: 'weekly_all', percent: 0 }], { quarantined: true }),
+        // Near its cap, so the risk penalty drives its usable score negative — the unusable
+        // floor has to sit below even this, not merely below zero.
+        acct('thin', 'Thin', [{ kind: 'weekly_all', percent: 97 }]),
+      ],
+      opts,
+    );
+
+    const score = (id: string) => plan.ranking.find((r) => r.accountId === id)?.score ?? 0;
+    expect(score('dead')).toBeLessThan(score('thin'));
+    expect(plan.ranking[plan.ranking.length - 1]?.accountId).toBe('dead');
+  });
+});
+
 describe('computePlan — burn-before-reset (the core behavior)', () => {
   it('prefers the account whose unused weekly quota is about to reset over one with more headroom', () => {
     // A: 40% unused, resets in 2h (at risk). B: 80% unused, resets in 6 days (safe reserve).

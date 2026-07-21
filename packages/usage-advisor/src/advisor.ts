@@ -40,6 +40,14 @@ const DEFAULTS = {
 const URGENCY_WEIGHT = 2;
 const RISK_WEIGHT = 3;
 
+// An unusable account scores -Infinity internally so it can never be picked, but JSON has no
+// representation for it: `JSON.stringify(-Infinity)` is the string "null", which a numeric wire
+// field rejects — taking the WHOLE plan frame down with it, not just the one account. The
+// ranking therefore serializes non-finite scores as this finite floor. Nothing renders a score
+// (it exists only to sort), so the magnitude just has to stay below every reachable usable
+// score, which MIN_SAFE_INTEGER does unconditionally and no weight change can catch up to.
+const UNUSABLE_WIRE_SCORE = Number.MIN_SAFE_INTEGER;
+
 /** Internal per-account analysis, before it becomes an AccountScore. */
 interface Analysis {
   input: AccountUsageInput;
@@ -170,7 +178,8 @@ function toRanking(analyses: Analysis[]): AccountScore[] {
       const score: AccountScore = {
         accountId: a.input.accountId,
         label: a.input.label,
-        score: Math.round(a.score),
+        // Math.round passes -Infinity (and NaN) straight through; clamp before it reaches JSON.
+        score: Number.isFinite(a.score) ? Math.round(a.score) : UNUSABLE_WIRE_SCORE,
         headroomPct: roundPct(a.headroomPct),
         note: noteFor(a),
       };
