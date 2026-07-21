@@ -286,6 +286,28 @@ describe('relay url precedence', () => {
     expect(row(config.rows, 'relay url').source).toBe('env');
   });
 
+  // `CCTL_RELAY_URL=` left in a profile, or `--relay "$UNSET"` in a wrapper, must not win the
+  // chain with an empty string and point the daemon at nothing.
+  it('treats a blank override at any level as absent and falls through', () => {
+    const blankEnv = resolveDaemonConfig({ CCTL_RELAY_URL: '' }, {}, FILE);
+    expect(blankEnv.values.relayUrl).toBe(FILE.relayUrl);
+    expect(row(blankEnv.rows, 'relay url').source).toBe('config');
+
+    const blankFlag = resolveDaemonConfig({}, { relay: '   ' }, FILE);
+    expect(blankFlag.values.relayUrl).toBe(FILE.relayUrl);
+    expect(row(blankFlag.rows, 'relay url').source).toBe('config');
+
+    const allBlank = resolveDaemonConfig({ CCTL_RELAY_URL: '  ' }, { relay: '' }, { relayUrl: '' });
+    expect(allBlank.values.relayUrl).toBe(DEFAULT_RELAY_URL);
+    expect(row(allBlank.rows, 'relay url').source).toBe('default');
+  });
+
+  it('trims incidental whitespace around a real override', () => {
+    const config = resolveDaemonConfig({ CCTL_RELAY_URL: '  wss://padded.example.com\n' }, {}, {});
+    expect(config.values.relayUrl).toBe('wss://padded.example.com');
+    expect(row(config.rows, 'relay url').source).toBe('env');
+  });
+
   it('lets a flag beat both env and the config file', () => {
     const config = resolveDaemonConfig(
       { CCTL_RELAY_URL: 'wss://from-env.example.com' },
