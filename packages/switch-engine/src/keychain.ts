@@ -17,8 +17,9 @@
 // secret rides inside the stdin line, never in the process table.
 //
 // ⚠ WET-GATE NOTICE: everything touching the REAL `security(1)` or the REAL mac CLI is
-// unverified until `tasks/mac-wet-gate-runbook.md` runs on an actual Mac (assumptions A1-A4
-// in the mac-compatibility plan). The logic below is unit-tested against a fake runner only.
+// unverified until `claude-control-orchestrator/tasks/mac-wet-gate-runbook.md` (sibling repo)
+// runs on an actual Mac (assumptions A1-A4 in the mac-compatibility plan). The logic below is
+// unit-tested against a fake runner only.
 
 import { execFileSync } from 'node:child_process';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
@@ -183,6 +184,25 @@ export class KeychainProtector implements Protector {
 
 /** The mac CLI's own Keychain item (wet-gate assumption A1). */
 export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
+
+/** Effective service/account for the CLI's live Keychain item, applying operator env overrides
+ *  over the shipped defaults. Shared by the live-channel factory (`defaultLiveCredentialChannel`)
+ *  and `cctl doctor` so both ACT ON and REPORT the same target — an A1 (item-name/account) miss
+ *  becomes a config fix, not a code change. `env` is injected for testability; unset keys fall
+ *  back to the default service and the login user, i.e. identical to constructing the channel
+ *  with no options. These override names are the ones the mac wet-gate runbook documents. */
+export function resolveClaudeCliKeychainTarget(env: NodeJS.ProcessEnv = process.env): {
+  service: string;
+  account: string;
+} {
+  // `||` (not `??`): a set-but-blank override (`export CLAUDE_CLI_KEYCHAIN_SERVICE=`) is an
+  // operator slip, not an intentional empty item name — fall back to the default there too. An
+  // empty service/account is never a valid `security(1)` target, so this can only help.
+  return {
+    service: env.CLAUDE_CLI_KEYCHAIN_SERVICE || CLAUDE_CLI_KEYCHAIN_SERVICE,
+    account: env.CLAUDE_CLI_KEYCHAIN_ACCOUNT || userInfo().username,
+  };
+}
 
 /**
  * Live-credential channel backed by the Claude CLI's macOS Keychain item. Behavior mirrors

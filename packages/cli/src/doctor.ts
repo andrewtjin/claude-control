@@ -9,6 +9,8 @@ import { join } from 'node:path';
 import {
   defaultLiveCredentialChannel,
   defaultProtector,
+  resolveClaudeCliKeychainTarget,
+  type LiveCredentialChannel,
   type Paths,
 } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
@@ -182,17 +184,26 @@ export function checkVault(paths: Paths): DoctorCheck {
 export async function checkLiveLogin(
   paths: Paths,
   platform: NodeJS.Platform = process.platform,
+  channel: LiveCredentialChannel = defaultLiveCredentialChannel(paths, platform),
 ): Promise<DoctorCheck> {
-  const where = platform === 'darwin' ? "the CLI's Keychain item" : paths.credentialsPath;
+  // On darwin, name the EXACT Keychain target (service/account, env overrides applied) so an A1
+  // item-name/account miss self-diagnoses. The hint stays R16-safe: an ATTRIBUTE-ONLY dump —
+  // never `-w`/`-g`, which would print the live token — plus the env-override escape hatch.
+  const target = platform === 'darwin' ? resolveClaudeCliKeychainTarget() : undefined;
+  const where = target
+    ? `the CLI's Keychain item (service="${target.service}", account="${target.account}")`
+    : paths.credentialsPath;
+  const missDetail = target
+    ? `no live credentials in ${where} — verify with ` +
+      `\`security find-generic-password -s "${target.service}"\` (attribute-only; never -w/-g), ` +
+      `or set CLAUDE_CLI_KEYCHAIN_SERVICE / CLAUDE_CLI_KEYCHAIN_ACCOUNT`
+    : `no live credentials in ${where} — run \`claude\` and log in first`;
   try {
-    const live = await defaultLiveCredentialChannel(paths, platform).readLiveCredentials();
+    const live = await channel.readLiveCredentials();
     return {
       name: 'login',
       ok: live !== undefined,
-      detail:
-        live !== undefined
-          ? `live credentials found in ${where}`
-          : `no live credentials in ${where} — run \`claude\` and log in first`,
+      detail: live !== undefined ? `live credentials found in ${where}` : missDetail,
     };
   } catch (err) {
     return {

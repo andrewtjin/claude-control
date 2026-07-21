@@ -4,7 +4,11 @@
 // platform is one new case here — callers never change.
 
 import { DpapiProtector, type Protector } from './dpapi.js';
-import { KeychainCredentialChannel, KeychainProtector } from './keychain.js';
+import {
+  KeychainCredentialChannel,
+  KeychainProtector,
+  resolveClaudeCliKeychainTarget,
+} from './keychain.js';
 import { FileCredentialChannel, type LiveCredentialChannel } from './credentialStore.js';
 import { VaultError } from './errors.js';
 import type { Paths } from './paths.js';
@@ -34,7 +38,11 @@ export function defaultLiveCredentialChannel(
   paths: Paths,
   platform: NodeJS.Platform = process.platform,
 ): LiveCredentialChannel {
-  return platform === 'darwin'
-    ? new KeychainCredentialChannel()
-    : new FileCredentialChannel(paths.credentialsPath);
+  if (platform === 'darwin') {
+    // Operator env overrides (documented in the mac wet-gate runbook) let an A1 item-name/account
+    // miss be corrected without a code change; unset → the shipped defaults, identical to before.
+    const { service, account } = resolveClaudeCliKeychainTarget();
+    return new KeychainCredentialChannel({ service, account });
+  }
+  return new FileCredentialChannel(paths.credentialsPath);
 }

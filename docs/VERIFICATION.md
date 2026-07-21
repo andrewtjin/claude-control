@@ -174,6 +174,45 @@ wss://<hostname>`) end-to-end from a separate machine; confirm `/usage` and `/sw
 work over the VPS relay the same as gate 4 did over the shared one.
 **Result:** not yet run.
 
+### 12. macOS support (Keychain vault + live-credential channel) — OPEN
+
+Implemented in `48644ef` (Keychain-backed vault + `security(1)` live-credential channel),
+**unverified on real Mac hardware.** Every check below runs against a **faked `security(1)`**
+today; none is closed until run on a real Mac per
+`claude-control-orchestrator/tasks/mac-wet-gate-runbook.md` — the runbook lives in the
+orchestrator repo; results are stamped back **here**. Record the verdict as **arch-scoped**
+(arm64 ≠ Intel — do not generalize one to the other).
+
+**Verify (assumptions A1–A4, defined in the compatibility plan):**
+
+- **A1 — item name/account.** The CLI's live credentials live in Keychain service
+  `Claude Code-credentials`; confirm the exact account name the CLI uses via an
+  **attribute-only** dump (never `-w`/`-g` on the live item — that prints the token; §R16).
+- **A2 — payload shape.** The item decodes to the same `{claudeAiOauth:{…}}` shape as
+  `.credentials.json`, confirmed **keys-only**, never by echoing values.
+- **A3 — `CLAUDE_CONFIG_DIR` + `--fresh`.** A fresh login with `CLAUDE_CONFIG_DIR` set writes a
+  `.credentials.json` **into that dir** (the CLI respects it, as on Windows per WT-1) → `--fresh`
+  capture is safe. If instead the login mutates the global `Claude Code-credentials` Keychain item
+  (clobbering the live account), `--fresh` needs a mac-specific path — STOP and report, do not improvise.
+- **A4 — recurring Keychain GUI prompt.** Reading the CLI's **cross-app** item via
+  `/usr/bin/security` may raise a GUI prompt; the daemon reads it headlessly in steady state.
+  Probe with the three-observation differential (our own `vault-key` item stays silent / the
+  CLI item prompts / a post-token-refresh re-read isolates ACL-wipe-on-recreate). A red here
+  has **no `security(1)`-path code fix** — it routes to a documented terminal-fail caveat
+  ("daemon-on-mac needs a login-session Always-Allow / not headless-supportable"), never an
+  ACL workaround.
+
+**Pass (each stamped with evidence):**
+
+- `cctl doctor` reports `vault-crypto` and `login` green on darwin.
+- Switch round-trip: `accounts add` → `switch spare` → `claude -p` runs under the spare →
+  `switch` back, with sibling Keychain keys preserved.
+- Daemon steady-state: usage polls **both** accounts with **no** Keychain GUI prompt and no
+  loopback-firewall dialog.
+- **Negative invariant:** the vault directory copied to a second user / temp-keychain context
+  **fails** to decrypt — a stolen vault dir is useless without the owner's login keychain.
+- **Relay-from-darwin:** the daemon's outbound WebSocket client connects from macOS.
+
 ## Reminder
 
 The undocumented endpoints (2, 3) and hook names (5) can change without notice. Parsing
