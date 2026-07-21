@@ -1,8 +1,11 @@
 # claude-control
 
-Switch between multiple Claude Code subscription accounts, see usage across all of
-them at once, and drive your sessions from your phone — with the remote link
-surviving account switches.
+**Stop losing sessions to usage limits.** If you hold several Claude Code
+subscriptions, quota you don't spend before it resets is gone for good — and the
+account you're sitting in is rarely the one that's about to expire.
+`claude-control` runs that arithmetic for you: it spends the budget expiring
+soonest, hops accounts the moment the active one runs low, and keeps your phone
+link alive across the hop.
 
 Each person runs a **local daemon** on their own machine that manages 3–5 of their
 own accounts. A single **shared Discord bot** acts as a credential-free control
@@ -24,13 +27,23 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
 
 ## What it does
 
-- **Auto-switch.** At low remaining 5h usage, you'll switch sessions to maximize uptime. Or, switch on phone with one tap.
-- **Remote sessions.** Send live prompts or start a new session, and
-  watch milestones stream back.
-- **Cross-account usage optimization.** One view of every account's 5-hour, weekly, and per-model
-  limits, with optimal use calculations.
-- **Approve from anywhere.** permission prompts and "done / waiting" notices reach
-  your phone; approve or deny from Discord.
+- **Burns the expiring budget first.** A weekly limit is the only quota that truly
+  evaporates — a 5-hour window resets and hands the same capacity straight back.
+  So the optimizer ranks accounts by which weekly budget dies soonest, spends that
+  one, and holds the others in reserve. One line tells you which account to use
+  now, and why.
+- **Switches before you hit the wall, not after.** When the active account's worst
+  limit runs low, the daemon moves to the best eligible account on its own — one
+  with real session headroom, not already low itself, and with a reset clock it can
+  actually see. No prompt, no dropped session. Or switch from your phone with one
+  tap.
+- **The remote link survives the switch.** Changing accounts doesn't cost you the
+  session or the phone connection.
+- **Every limit in one view.** 5-hour, weekly, and per-model limits across all
+  accounts at once, with the reset clocks that make them actionable.
+- **Approve from anywhere.** Permission prompts and "done / waiting" notices reach
+  your phone; approve or deny from Discord. Send live prompts or start a fresh
+  session and watch milestones stream back.
 
 ## Platform
 
