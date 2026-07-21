@@ -78,6 +78,14 @@ function envSource(overridden: boolean): SettingSource {
   return overridden ? 'env' : 'default';
 }
 
+/** A blank or whitespace-only override is an ABSENT one. Without this, `CCTL_RELAY_URL=` in a
+ *  shell profile or an unsubstituted `--relay "$UNSET"` wins a `??` chain with '' and the
+ *  daemon dials nothing — the same typo-tolerance envNumber applies to numbers. */
+function blankAsUnset(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed === undefined || trimmed === '' ? undefined : trimmed;
+}
+
 // ---------------------------------------------------------------------------
 // The operator's config file (persisted overrides)
 // ---------------------------------------------------------------------------
@@ -171,13 +179,19 @@ export function resolveDaemonConfig(
   const triggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_TRIGGER_PCT');
   const minSessionHeadroomPct = envNumber(env, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
   const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
-  const relayEnv = env['CCTL_RELAY_URL'];
-  const relayFile = fileConfig.relayUrl;
-  const relayUrl = flags.relay ?? relayEnv ?? relayFile ?? DEFAULT_RELAY_URL;
+  // A blank override is an ABSENT override, not an empty relay url. `CCTL_RELAY_URL=` left in a
+  // shell profile, or `--relay "$SOMETHING_UNSET"` in a wrapper script, would otherwise win the
+  // `??` chain with '' and send the daemon to dial nothing — while the settings view reported
+  // the blank as the effective value.
+  const relayFlag = blankAsUnset(flags.relay);
+  const relayEnv = blankAsUnset(env['CCTL_RELAY_URL']);
+  const relayFile = blankAsUnset(fileConfig.relayUrl);
+  const relayUrl = relayFlag ?? relayEnv ?? relayFile ?? DEFAULT_RELAY_URL;
   // Attribute to the source that actually WON, so a config file that is being shadowed by an
-  // env var reads as 'env' rather than misleadingly claiming the file is in effect.
+  // env var reads as 'env' rather than misleadingly claiming the file is in effect — and a
+  // blank source is skipped here too, matching what actually got used.
   const relaySource: SettingSource =
-    flags.relay !== undefined
+    relayFlag !== undefined
       ? 'flag'
       : relayEnv !== undefined
         ? 'env'
