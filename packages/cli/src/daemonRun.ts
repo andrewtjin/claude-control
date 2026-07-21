@@ -45,7 +45,13 @@ import { createSessionManager } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath } from './context.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
-import { daemonSettingsPath, resolveDaemonConfig, writeSettingsReport } from './settings.js';
+import {
+  daemonConfigPath,
+  daemonSettingsPath,
+  readDaemonConfigFile,
+  resolveDaemonConfig,
+  writeSettingsReport,
+} from './settings.js';
 
 /** Token considered unusable for polling within this window before expiry — the poller then
  *  falls back to tier-0 rather than racing the expiry mid-request. */
@@ -171,13 +177,21 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const store = new Store(daemonDbPath(paths));
   const protector = defaultProtector();
 
+  // The operator's persisted overrides, read here (the edge) so the resolution below stays
+  // pure. A missing or malformed file degrades to no overrides, never to a failed start.
+  const fileConfig = (await readDaemonConfigFile(daemonConfigPath(paths))) ?? {};
+
   // One resolution feeds BOTH behavior (the values wired below) and visibility (the rows
   // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart.
-  const config = resolveDaemonConfig(process.env, {
-    autoSwitch: options.autoSwitch === true,
-    greedy: options.greedy === true,
-    ...(options.relay !== undefined ? { relay: options.relay } : {}),
-  });
+  const config = resolveDaemonConfig(
+    process.env,
+    {
+      autoSwitch: options.autoSwitch === true,
+      greedy: options.greedy === true,
+      ...(options.relay !== undefined ? { relay: options.relay } : {}),
+    },
+    fileConfig,
+  );
   const { relayUrl, triggerPercent, minSessionHeadroomPct, cooldownMs, greedy } = config.values;
   const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
   // Best-effort: the report is purely informational, so a write failure must not stop the

@@ -88,7 +88,8 @@ soon-to-be-stale entry here would just create work for step 7 to redo.
 
 ### [5/7] Relay
 
-Prints the effective relay URL (flag → `CCTL_RELAY_URL` env → built-in default) and
+Prints the effective relay URL (flag → `CCTL_RELAY_URL` env → `relayUrl` in
+`config.json` → built-in default) and
 probes its `/health` endpoint. An unreachable relay does not stop setup — it's a
 warning that pairing below may fail, with the same actionable detail `cctl doctor`
 would show.
