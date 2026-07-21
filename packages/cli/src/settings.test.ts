@@ -7,10 +7,12 @@ import type { SettingRow } from '@claude-control/shared-protocol';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import {
   DEFAULT_RELAY_URL,
+  daemonConfigPath,
   daemonSettingsPath,
   envBool,
   envFlag,
   envNumber,
+  readDaemonConfigFile,
   readSettingsReport,
   renderSettings,
   reportSaysGreedyActive,
@@ -305,6 +307,121 @@ describe('reportSaysGreedyActive', () => {
     // Greedy set but inactive renders as a longer string — correctly not "on".
     expect(reportSaysGreedyActive(report('off', 'on (inactive: needs --auto-switch)'))).toBe(false);
     expect(reportSaysGreedyActive(undefined)).toBe(false);
+  });
+});
+
+describe('operator config file', () => {
+  it('derives its path beside the vault, distinct from the settings report', () => {
+    const paths = { vaultDir: join('data', 'vault') } as Paths;
+    expect(daemonConfigPath(paths)).toBe(join('data', 'config.json'));
+    expect(daemonConfigPath(paths)).not.toBe(daemonSettingsPath(paths));
+  });
+
+  it('reads a relay url and degrades to undefined on missing, corrupt, or non-object files', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'config.json');
+      expect(await readDaemonConfigFile(file)).toBeUndefined(); // never written
+
+      await writeFile(file, JSON.stringify({ relayUrl: 'wss://relay.example.com' }), 'utf8');
+      expect(await readDaemonConfigFile(file)).toEqual({ relayUrl: 'wss://relay.example.com' });
+
+      await writeFile(file, '{not json', 'utf8');
+      expect(await readDaemonConfigFile(file)).toBeUndefined(); // corrupt
+
+      await writeFile(file, JSON.stringify(['nope']), 'utf8');
+      expect(await readDaemonConfigFile(file)).toBeUndefined(); // array, not an object
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a blank, whitespace-only, or non-string relayUrl as unset rather than as a value', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'config.json');
+
+      for (const bad of ['', '   ', 42, null] as const) {
+        await writeFile(file, JSON.stringify({ relayUrl: bad }), 'utf8');
+        // An object with no usable override — NOT undefined, since the file itself parsed.
+        expect(await readDaemonConfigFile(file)).toEqual({});
+      }
+
+      // Surrounding whitespace on a real value is trimmed, not preserved into a dial attempt.
+      await writeFile(file, JSON.stringify({ relayUrl: '  wss://relay.example.com  ' }), 'utf8');
+      expect(await readDaemonConfigFile(file)).toEqual({ relayUrl: 'wss://relay.example.com' });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the published default relay', () => {
+  // Guards the one constant a published build cannot take back: shipping a loopback or
+  // plaintext default would leave every fresh install dialing nothing over an unencrypted
+  // socket. Asserts the PROPERTIES that must hold, not the literal hostname, so changing
+  // where the relay lives stays a one-line edit.
+  it('is a secure, non-loopback websocket url', () => {
+    expect(DEFAULT_RELAY_URL.startsWith('wss://')).toBe(true);
+    expect(DEFAULT_RELAY_URL).not.toMatch(/127\.0\.0\.1|localhost|\[::1\]/);
+  });
+});
+
+describe('relay url precedence', () => {
+  const FILE = { relayUrl: 'wss://from-file.example.com' };
+
+  it('falls back to the config file when neither flag nor env is set, with source "config"', () => {
+    const config = resolveDaemonConfig({}, {}, FILE);
+    expect(config.values.relayUrl).toBe(FILE.relayUrl);
+    expect(row(config.rows, 'relay url').source).toBe('config');
+  });
+
+  it('lets env shadow the config file, and reports the source that actually won', () => {
+    const config = resolveDaemonConfig({ CCTL_RELAY_URL: 'wss://from-env.example.com' }, {}, FILE);
+    expect(config.values.relayUrl).toBe('wss://from-env.example.com');
+    expect(row(config.rows, 'relay url').source).toBe('env');
+  });
+
+  // `CCTL_RELAY_URL=` left in a profile, or `--relay "$UNSET"` in a wrapper, must not win the
+  // chain with an empty string and point the daemon at nothing.
+  it('treats a blank override at any level as absent and falls through', () => {
+    const blankEnv = resolveDaemonConfig({ CCTL_RELAY_URL: '' }, {}, FILE);
+    expect(blankEnv.values.relayUrl).toBe(FILE.relayUrl);
+    expect(row(blankEnv.rows, 'relay url').source).toBe('config');
+
+    const blankFlag = resolveDaemonConfig({}, { relay: '   ' }, FILE);
+    expect(blankFlag.values.relayUrl).toBe(FILE.relayUrl);
+    expect(row(blankFlag.rows, 'relay url').source).toBe('config');
+
+    const allBlank = resolveDaemonConfig({ CCTL_RELAY_URL: '  ' }, { relay: '' }, { relayUrl: '' });
+    expect(allBlank.values.relayUrl).toBe(DEFAULT_RELAY_URL);
+    expect(row(allBlank.rows, 'relay url').source).toBe('default');
+  });
+
+  it('trims incidental whitespace around a real override', () => {
+    const config = resolveDaemonConfig({ CCTL_RELAY_URL: '  wss://padded.example.com\n' }, {}, {});
+    expect(config.values.relayUrl).toBe('wss://padded.example.com');
+    expect(row(config.rows, 'relay url').source).toBe('env');
+  });
+
+  it('lets a flag beat both env and the config file', () => {
+    const config = resolveDaemonConfig(
+      { CCTL_RELAY_URL: 'wss://from-env.example.com' },
+      { relay: 'wss://from-flag.example.com' },
+      FILE,
+    );
+    expect(config.values.relayUrl).toBe('wss://from-flag.example.com');
+    expect(row(config.rows, 'relay url').source).toBe('flag');
+  });
+
+  it('still reaches the built-in default when no source supplies a relay', () => {
+    const config = resolveDaemonConfig({}, {}, {});
+    expect(config.values.relayUrl).toBe(DEFAULT_RELAY_URL);
+    expect(row(config.rows, 'relay url').source).toBe('default');
+  });
+
+  it('omitting the config argument entirely behaves exactly like an empty one', () => {
+    expect(resolveDaemonConfig({})).toEqual(resolveDaemonConfig({}, {}, {}));
   });
 });
 

@@ -13,7 +13,9 @@ import {
   ButtonBuilder,
   ButtonStyle,
   Client,
+  Events,
   GatewayIntentBits,
+  MessageFlags,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Interaction,
@@ -34,6 +36,7 @@ import type { PairingService } from '../pairing.js';
 import type { Logger } from '../logger.js';
 import { noopLogger } from '../logger.js';
 import { DaemonStateCache } from './stateCache.js';
+import { chunkMessage } from './messageChunks.js';
 import { emojiTrack, layeredBar, UNICODE_TRACK_STYLE } from './richFormat.js';
 import {
   ensureProgressEmojis,
@@ -203,7 +206,10 @@ export class DiscordJsGateway implements DiscordGateway {
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
     this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-    this.client.once('ready', () => {
+    // `clientReady`, not `ready`: the latter is deprecated and stops firing in discord.js v15,
+    // which would leave slash commands unregistered and the emoji bars never upgraded — a
+    // silent degradation, since nothing throws when an event simply never arrives.
+    this.client.once(Events.ClientReady, () => {
       this.registerCommands().catch((err: unknown) => {
         this.logger.error({ err }, 'discord: failed to register slash commands');
       });
@@ -243,8 +249,11 @@ export class DiscordJsGateway implements DiscordGateway {
    *  than sending anything new (see {@link applyPermissionLapse}). Everything else keeps the card
    *  behaviour — the pure `renderPush` decides the DM card and this class only inflates
    *  ButtonSpecs and sends it, recording where a permission card landed so a later lapse can find
-   *  it. The state cache is fed on EVERY envelope regardless, so `/usage`/`/sessions` keep
-   *  answering from it. */
+   *  it. Card content is chunked because Discord rejects an over-long message outright rather
+   *  than truncating it: without this, the longest and most valuable summaries are exactly the
+   *  ones that never arrive; embeds/buttons/files ride the first chunk so the notification still
+   *  leads with its rich card. The state cache is fed on EVERY envelope regardless, so
+   *  `/usage`/`/sessions` keep answering from it. */
   async deliver(discordUserId: string, envelope: Envelope): Promise<void> {
     this.cache.record(discordUserId, envelope);
     // Managed-session frames mutate shared per-route state (the planner view AND cardMessages), so
@@ -261,15 +270,24 @@ export class DiscordJsGateway implements DiscordGateway {
     if (!push) return; // cache-only: not worth a DM
     try {
       const user = await this.client.users.fetch(discordUserId);
-      const message = await user.send(this.toSendOptions(push));
-      // Remember where THIS permission card landed so a later permission.lapsed push (the hold
-      // ending without a phone decision) can find and edit it — the only place this envelope
-      // type's requestId->message mapping is populated.
-      if (isType(envelope, 'permission.request')) {
-        this.permissionCards.record(envelope.payload.requestId, {
-          channelId: message.channelId,
-          messageId: message.id,
+      const parts = push.content === undefined ? [undefined] : chunkMessage(push.content);
+      for (const [index, content] of parts.entries()) {
+        // Sent in sequence, not in parallel: Discord orders by arrival, and a summary that
+        // lands out of order is worse than one that takes an extra moment.
+        const message = await user.send({
+          ...(content === undefined ? {} : { content }),
+          ...(index === 0 ? this.toSendExtras(push) : {}),
         });
+        // Remember where THIS permission card landed so a later permission.lapsed push (the hold
+        // ending without a phone decision) can find and edit it — the only place this envelope
+        // type's requestId->message mapping is populated. The card rides the first chunk, so
+        // that is the message a lapse must edit.
+        if (index === 0 && isType(envelope, 'permission.request')) {
+          this.permissionCards.record(envelope.payload.requestId, {
+            channelId: message.channelId,
+            messageId: message.id,
+          });
+        }
       }
     } catch (err) {
       this.logger.warn({ err, discordUserId }, 'discord: failed to DM user');
@@ -536,13 +554,13 @@ export class DiscordJsGateway implements DiscordGateway {
     });
   }
 
-  /** Inflate a RenderedPush into discord.js send options (content + embeds + component rows +
-   *  file attachments). Return type is inferred from the conditional spreads so no key is ever
-   *  present-and-undefined — `exactOptionalPropertyTypes` rejects `embeds: undefined` at the
-   *  `user.send` boundary. */
-  private toSendOptions(push: RenderedPush) {
+  /** Inflate a RenderedPush's NON-content payload (embeds + component rows + file attachments)
+   *  into discord.js send options — content travels separately because it may be chunked across
+   *  several messages while these ride only the first. Return type is inferred from the
+   *  conditional spreads so no key is ever present-and-undefined — `exactOptionalPropertyTypes`
+   *  rejects `embeds: undefined` at the `user.send` boundary. */
+  private toSendExtras(push: RenderedPush) {
     return {
-      ...(push.content !== undefined ? { content: push.content } : {}),
       ...(push.embeds !== undefined ? { embeds: push.embeds } : {}),
       ...(push.components !== undefined ? { components: this.toRows(push.components) } : {}),
       ...(push.files !== undefined
@@ -799,7 +817,10 @@ export class DiscordJsGateway implements DiscordGateway {
     const outcome = resolveTap(interaction.customId, this.clock());
     switch (outcome.kind) {
       case 'ignore':
-        await interaction.reply({ content: `Error: ${outcome.reason}`, ephemeral: true });
+        await interaction.reply({
+          content: `Error: ${outcome.reason}`,
+          flags: MessageFlags.Ephemeral,
+        });
         return;
       case 'confirm':
         // First tap of a destructive action: swap in Confirm/Cancel — the new buttons ARE the
@@ -811,7 +832,7 @@ export class DiscordJsGateway implements DiscordGateway {
         // expired Confirm silently resetting to the original buttons reads as a bug, not a
         // timeout. Ephemeral keeps it feedback for the tapper, not card clutter.
         await interaction.update({ components: this.toRows(outcome.rows) });
-        await interaction.followUp({ content: outcome.note, ephemeral: true });
+        await interaction.followUp({ content: outcome.note, flags: MessageFlags.Ephemeral });
         return;
       case 'execute':
         await this.executeButton(interaction, userId, outcome);
@@ -828,7 +849,7 @@ export class DiscordJsGateway implements DiscordGateway {
   ): Promise<void> {
     const key = buttonIdempotencyKey(userId, outcome);
     if (!this.seenKeys.markIfNew(key)) {
-      await interaction.reply({ content: 'Already handled.', ephemeral: true });
+      await interaction.reply({ content: 'Already handled.', flags: MessageFlags.Ephemeral });
       return;
     }
     const result = this.dispatchButton(userId, outcome, key);
@@ -869,16 +890,19 @@ export class DiscordJsGateway implements DiscordGateway {
   /** Report a command result on a button interaction that has already been acknowledged via
    *  `update` — must use `followUp`, not `reply`. */
   private async followUp(interaction: ButtonInteraction, result: CommandResult): Promise<void> {
+    // Same non-deprecated `flags: Ephemeral` spelling as reply() below, for the same reason:
+    // these can carry account labels and usage figures.
+    const ephemeral = { flags: MessageFlags.Ephemeral } as const;
     if (result.kind === 'embed') {
-      await interaction.followUp({ embeds: [result.embed], ephemeral: true });
+      await interaction.followUp({ embeds: [result.embed], ...ephemeral });
     } else if (result.kind === 'text') {
       await interaction.followUp({
         content: result.text,
-        ephemeral: true,
+        ...ephemeral,
         ...(result.components !== undefined ? { components: this.toRows(result.components) } : {}),
       });
     } else {
-      await interaction.followUp({ content: `Error: ${result.message}`, ephemeral: true });
+      await interaction.followUp({ content: `Error: ${result.message}`, ...ephemeral });
     }
   }
 
@@ -886,18 +910,22 @@ export class DiscordJsGateway implements DiscordGateway {
     interaction: ChatInputCommandInteraction | ButtonInteraction,
     result: CommandResult,
   ): Promise<void> {
+    // `flags: Ephemeral` rather than the deprecated `ephemeral: true`. These replies can carry
+    // account labels and usage figures, so if the option ever stopped being honored they would
+    // post visibly in a shared channel — worth not relying on a deprecated spelling.
+    const ephemeral = { flags: MessageFlags.Ephemeral } as const;
     if (result.kind === 'embed') {
-      await interaction.reply({ embeds: [result.embed], ephemeral: true });
+      await interaction.reply({ embeds: [result.embed], ...ephemeral });
     } else if (result.kind === 'text') {
       await interaction.reply({
         content: result.text,
-        ephemeral: true,
+        ...ephemeral,
         // A text result may carry buttons (e.g. /prune's armed confirm control) — inflate
         // them exactly like every other ButtonSpec surface.
         ...(result.components !== undefined ? { components: this.toRows(result.components) } : {}),
       });
     } else {
-      await interaction.reply({ content: `Error: ${result.message}`, ephemeral: true });
+      await interaction.reply({ content: `Error: ${result.message}`, ...ephemeral });
     }
   }
 }

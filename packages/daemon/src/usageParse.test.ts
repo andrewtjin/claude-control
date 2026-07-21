@@ -285,6 +285,24 @@ describe('parseCachedUsage', () => {
     expect(unstamped.advisorInput.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
   });
 
+  // fetchedAtMs is copied onto a wire field declared `.int().nonnegative()`, and encoding
+  // throws on the SENDER — taking down the whole poll cycle rather than one field. The stamp
+  // comes from a file another program writes, so every shape it could hold must be survived.
+  it('ignores a cached fetchedAtMs that would violate the wire contract', () => {
+    for (const bad of [1234.5, -1, Number.NaN, Number.POSITIVE_INFINITY, '555', null]) {
+      const { accountUsage } = parseCachedUsage(
+        { fetchedAtMs: bad, limits: [{ kind: 'session', percent: 20 }] },
+        baseOpts,
+      );
+      expect(accountUsage.fetchedAtMs, `rejected stamp: ${String(bad)}`).toBe(baseOpts.fetchedAtMs);
+      expect(Number.isInteger(accountUsage.fetchedAtMs)).toBe(true);
+      expect(accountUsage.fetchedAtMs).toBeGreaterThanOrEqual(0);
+    }
+    // Zero is a legitimate epoch stamp, not a falsy value to discard.
+    const epoch = parseCachedUsage({ fetchedAtMs: 0, limits: [] }, baseOpts);
+    expect(epoch.accountUsage.fetchedAtMs).toBe(0);
+  });
+
   it('reports "no cached usage" plainly when the reader had nothing to offer', () => {
     const { accountUsage } = parseCachedUsage(undefined, baseOpts);
     expect(accountUsage.error).toBe('no cached usage available');

@@ -40,12 +40,13 @@ const DEFAULTS = {
 const URGENCY_WEIGHT = 2;
 const RISK_WEIGHT = 3;
 
-/** Wire-safe stand-in for the internal -Infinity "unusable" score. -Infinity is fine for
- *  in-process sorting but JSON.stringify renders it `null`, which fails the protocol's
- *  `score: z.number()` on the bot side and silently drops the WHOLE usage.snapshot frame —
- *  blinding the phone exactly when an account is quarantined/exhausted. Any finite value
- *  far below the real score range (roughly -45..300 given the weights above) works. */
-const UNUSABLE_SCORE = -10_000;
+// An unusable account scores -Infinity internally so it can never be picked, but JSON has no
+// representation for it: `JSON.stringify(-Infinity)` is the string "null", which a numeric wire
+// field rejects — taking the WHOLE plan frame down with it, not just the one account. The
+// ranking therefore serializes non-finite scores as this finite floor. Nothing renders a score
+// (it exists only to sort), so the magnitude just has to stay below every reachable usable
+// score, which MIN_SAFE_INTEGER does unconditionally and no weight change can catch up to.
+const UNUSABLE_WIRE_SCORE = Number.MIN_SAFE_INTEGER;
 
 /** Internal per-account analysis, before it becomes an AccountScore. */
 interface Analysis {
@@ -177,7 +178,8 @@ function toRanking(analyses: Analysis[]): AccountScore[] {
       const score: AccountScore = {
         accountId: a.input.accountId,
         label: a.input.label,
-        score: Number.isFinite(a.score) ? Math.round(a.score) : UNUSABLE_SCORE,
+        // Math.round passes -Infinity (and NaN) straight through; clamp before it reaches JSON.
+        score: Number.isFinite(a.score) ? Math.round(a.score) : UNUSABLE_WIRE_SCORE,
         headroomPct: roundPct(a.headroomPct),
         note: noteFor(a),
       };

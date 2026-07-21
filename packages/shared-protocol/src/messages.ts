@@ -98,8 +98,9 @@ export const UsagePlan = z.object({
 // ---------------------------------------------------------------------------
 
 /** Where a setting's effective value came from — the whole point of the settings view is
- *  distinguishing a deliberate override (env/flag) from a silent default. */
-export const SettingSource = z.enum(['default', 'env', 'flag']);
+ *  distinguishing a deliberate override (config/env/flag) from a silent default. Listed in
+ *  ascending precedence: when two sources supply a value, the later one wins. */
+export const SettingSource = z.enum(['default', 'config', 'env', 'flag']);
 
 /** One knob, pre-rendered by the daemon: a human name, the effective value as display text
  *  (e.g. "on", "94% used", "10m"), and its source. `detail` names how to change it (the env
