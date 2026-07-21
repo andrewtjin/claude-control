@@ -9,7 +9,8 @@
 // Write cadence is deliberately loose: liveness only needs to be "recently true", not
 // real-time, and a reader tolerates a few missed ticks before calling it stale.
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
+import { atomicWriteFile } from '@claude-control/switch-engine';
 
 /** How often the running daemon touches its heartbeat file. */
 export const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -65,7 +66,10 @@ export class HeartbeatWriter {
 
   private async writeOnce(): Promise<void> {
     const payload: HeartbeatFile = { writtenAtMs: this.clock() };
-    await writeFile(this.filePath, JSON.stringify(payload), 'utf8');
+    // Atomic replace, not a plain write: `cctl daemon status` reads this file on its own
+    // schedule, and a reader that catches a truncated write parses nothing and reports the
+    // daemon as having NEVER run — the most alarming possible reading of a live daemon.
+    await atomicWriteFile(this.filePath, JSON.stringify(payload));
   }
 }
 
