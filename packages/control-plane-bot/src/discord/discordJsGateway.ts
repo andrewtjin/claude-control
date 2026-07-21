@@ -27,6 +27,7 @@ import type { Logger } from '../logger.js';
 import { noopLogger } from '../logger.js';
 import { DaemonStateCache } from './stateCache.js';
 import { buildPermissionRequestEmbed, buildSwitchResultEmbed } from './embeds.js';
+import { chunkMessage } from './messageChunks.js';
 import { emojiTrack, layeredBar, UNICODE_TRACK_STYLE } from './richFormat.js';
 import {
   ensureProgressEmojis,
@@ -120,14 +121,27 @@ export class DiscordJsGateway implements DiscordGateway {
     await this.client.destroy();
   }
 
-  /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user. */
+  /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user.
+   *
+   *  Content is chunked because Discord rejects an over-long message outright rather than
+   *  truncating it: without this, the longest and most valuable summaries are exactly the ones
+   *  that never arrive. Embeds ride with the first message so the notification still leads with
+   *  its rich card. */
   async deliver(discordUserId: string, envelope: Envelope): Promise<void> {
     this.cache.record(discordUserId, envelope);
     const push = this.renderPush(envelope);
     if (!push) return; // cache-only: not worth a DM
     try {
       const user = await this.client.users.fetch(discordUserId);
-      await user.send(push);
+      const parts = push.content === undefined ? [undefined] : chunkMessage(push.content);
+      for (const [index, content] of parts.entries()) {
+        // Sent in sequence, not in parallel: Discord orders by arrival, and a summary that
+        // lands out of order is worse than one that takes an extra moment.
+        await user.send({
+          ...(content === undefined ? {} : { content }),
+          ...(index === 0 && push.embeds ? { embeds: push.embeds } : {}),
+        });
+      }
     } catch (err) {
       this.logger.warn({ err, discordUserId }, 'discord: failed to DM user');
     }
