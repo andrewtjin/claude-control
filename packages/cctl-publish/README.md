@@ -26,7 +26,7 @@ shared Discord bot, and registers a logon task so the daemon starts automaticall
 Your credentials never leave your machine: the daemon holds them locally, and the shared
 bot is a credential-free control plane that never sees session content.
 
-**Windows-only today** — macOS is a planned next milestone.
+**Windows-only v0.1.0**; Mac support coming soon.
 
 See the [project README](https://github.com/andrewtjin/claude-control#readme) for the
 full command reference, the architecture, and the self-host path.
@@ -37,4 +37,4 @@ This package is a single-file bundle of the `cctl` CLI, built from the
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT. See [LICENSE](./LICENSE).
