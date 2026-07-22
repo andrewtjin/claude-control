@@ -15,7 +15,7 @@ strictly by Discord user. Your credentials never leave your machine.
 ## Quick start
 
 ```
-npm i -g @claude-control/cctl
+npm i -g @andrewtjin/cctl
 cctl setup
 ```
 
