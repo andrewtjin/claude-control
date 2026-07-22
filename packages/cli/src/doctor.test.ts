@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
@@ -45,7 +47,9 @@ describe('checkVaultProtection', () => {
     { timeout: 30_000 },
     async () => {
       // Runs the REAL platform protector: DPAPI here on Windows, Keychain on a Mac. Either
-      // way the check must pass on any supported dev machine.
+      // way the check must pass on any supported dev machine. Gated off other platforms
+      // because the default file-key path would probe the REAL key file location — the
+      // file-key branch is covered below with a sandboxed path instead.
       if (process.platform !== 'win32' && process.platform !== 'darwin') return;
       const result = await checkVaultProtection();
       expect(result.ok).toBe(true);
@@ -53,11 +57,15 @@ describe('checkVaultProtection', () => {
     },
   );
 
-  it('names the gap on an unsupported platform instead of failing silently', async () => {
-    const result = await checkVaultProtection('freebsd');
-    expect(result.ok).toBe(false);
-    expect(result.detail).toMatch(/freebsd/);
-    expect(result.detail).toMatch(/win32 \(DPAPI\), darwin \(Keychain\)/);
+  it('round-trips through the file-key protector on OS-secret-store-less platforms', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-doctor-'));
+    try {
+      const result = await checkVaultProtection('linux', join(dir, 'vault.key'));
+      expect(result.ok).toBe(true);
+      expect(result.detail).toMatch(/file-key \(linux\) protect\/unprotect round-trip works/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

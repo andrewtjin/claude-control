@@ -24,7 +24,7 @@ flowchart LR
   end
   subgraph User machine [User's PC · daemon]
     G[control-plane client]
-    SE[switch-engine · vault/DPAPI]
+    SE[switch-engine · encrypted vault]
     UP[usage poller]
     UA[usage-advisor]
     SM[session manager]
@@ -47,15 +47,15 @@ flowchart LR
 Dependencies point **one way**, and the bot sits at the top of that order so it
 _cannot_ reach credential code:
 
-| Package             | Depends on                                                     | Role                                                           |
-| ------------------- | -------------------------------------------------------------- | -------------------------------------------------------------- |
-| `shared-protocol`   | —                                                              | zod-validated wire envelope + message union + codec.           |
-| `switch-engine`     | —                                                              | account vault (DPAPI), OAuth refresh, atomic switch, recovery. |
-| `usage-advisor`     | —                                                              | pure burn-down optimizer: which account to use now.            |
-| `session-runtime`   | Agent SDK                                                      | managed + observed Claude sessions behind one interface.       |
-| `daemon`            | shared-protocol, switch-engine, usage-advisor, session-runtime | wires it all together; owns state.                             |
-| `control-plane-bot` | **shared-protocol only**                                       | Discord bot + WS relay; zero credentials.                      |
-| `cli` (`cctl`)      | shared-protocol, switch-engine, daemon                         | local command-line control.                                    |
+| Package             | Depends on                                                     | Role                                                             |
+| ------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `shared-protocol`   | —                                                              | zod-validated wire envelope + message union + codec.             |
+| `switch-engine`     | —                                                              | encrypted account vault, OAuth refresh, atomic switch, recovery. |
+| `usage-advisor`     | —                                                              | pure burn-down optimizer: which account to use now.              |
+| `session-runtime`   | Agent SDK                                                      | managed + observed Claude sessions behind one interface.         |
+| `daemon`            | shared-protocol, switch-engine, usage-advisor, session-runtime | wires it all together; owns state.                               |
+| `control-plane-bot` | **shared-protocol only**                                       | Discord bot + WS relay; zero credentials.                        |
+| `cli` (`cctl`)      | shared-protocol, switch-engine, daemon                         | local command-line control.                                      |
 
 The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 "the bot holds zero credentials" a structural fact rather than a promise.
@@ -63,9 +63,10 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 ## Trust model
 
 - **Credentials never leave the user's machine.** Access/refresh tokens live only in
-  the DPAPI-encrypted vault (`%LOCALAPPDATA%\claude-control\vault`) and, transiently,
-  in the live files the CLI reads. They never enter a protocol message, the bot, or
-  Discord.
+  the encrypted vault (Windows: DPAPI at `%LOCALAPPDATA%\claude-control\vault`;
+  Linux: file-key at `~/.local/share/claude-control/vault` — see `docs/PLATFORM.md`)
+  and, transiently, in the live files the CLI reads. They never enter a protocol
+  message, the bot, or Discord.
 - **What may cross the wire:** usage percentages, the burn-down plan, session
   summaries, permission prompts/decisions, and control commands — never a token.
 - **ACL is enforced twice.** The bot routes every interaction by

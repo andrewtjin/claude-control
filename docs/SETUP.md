@@ -162,5 +162,6 @@ accounts list`.
 
 - `docs/CLI.md` — every command, including the daemon and pairing commands `cctl
 setup` wraps.
-- `docs/PLATFORM.md` — why this is Windows-only today and what `cctl doctor` checks.
+- `docs/PLATFORM.md` — which platforms are supported (Windows and Linux/WSL2 today)
+  and what `cctl doctor` checks.
 - `docs/VERIFICATION.md` — the fresh-machine wet gate this wizard exists to pass.

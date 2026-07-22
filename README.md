@@ -47,15 +47,18 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
 
 ## Platform
 
-**Windows-only today** (macOS is a planned next milestone). See `docs/PLATFORM.md`
-for the details and `cctl doctor` for a live report on your machine.
+**Windows and Linux (including WSL2) today** (macOS is a planned next milestone).
+Vault encryption is per-platform: DPAPI on Windows, an owner-only key file on Linux.
+See `docs/PLATFORM.md` for the details and `cctl doctor` for a live report on your
+machine.
 
 ## Docs
 
 - `docs/SETUP.md` — full `cctl setup` walkthrough, every step and unhappy path.
 - `docs/CLI.md` — complete command reference, plus building from source.
 - `docs/ARCHITECTURE.md` — system shape, package boundaries, trust model.
-- `docs/PLATFORM.md` — Windows-only caveats and the Node version floor.
+- `docs/PLATFORM.md` — per-platform caveats (vault encryption, autostart) and the
+  Node version floor.
 - `docs/SELF_HOST.md` — run your own control-plane bot instead of the shared one.
 - `docs/VERIFICATION.md` — what's unit-proven vs. what needs on-machine confirmation.
 
