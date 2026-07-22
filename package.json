@@ -18,8 +18,8 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "ci:check": "pnpm run lint && pnpm run format:check && pnpm run build && pnpm run test",
-    "bundle": "pnpm --filter claudecontrol run build",
-    "smoke-test": "pnpm --filter claudecontrol run smoke-test"
+    "bundle": "pnpm --filter @andrewtjin/cctl run build",
+    "smoke-test": "pnpm --filter @andrewtjin/cctl run smoke-test"
   },
   "devDependencies": {
     "@eslint/js": "^9.18.0",
