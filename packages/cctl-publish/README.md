@@ -1,4 +1,4 @@
-# claudecontrol
+# @claude-control/cctl
 
 `cctl` — stop losing sessions to Claude Code usage limits. If you hold several
 subscriptions, quota you don't spend before it resets is gone for good, and the account
@@ -7,7 +7,7 @@ soonest, hops accounts before the active one hits its wall, and keeps your phone
 alive across the hop.
 
 ```bash
-npm i -g claudecontrol
+npm i -g @claude-control/cctl
 cctl setup
 ```
 

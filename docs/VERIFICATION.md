@@ -194,7 +194,7 @@ writes are a polish backlog item.
 ### 9. Fresh-machine install ⏳ PENDING
 
 **Claim to verify:** on a fresh Windows profile (or fresh VM) with only Node ≥ 22.13
-present, `npm i -g claudecontrol` followed by `cctl setup` reaches a paired,
+present, `npm i -g @claude-control/cctl` followed by `cctl setup` reaches a paired,
 autostarted daemon with a working phone `/usage` in **≤ 10 minutes**, without opening
 any doc (README's quick start is the whole prompt).
 **Verify:** time the run start-to-finish; confirm every wizard step in

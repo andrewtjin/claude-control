@@ -1,10 +1,13 @@
 {
-  "name": "claudecontrol",
+  "name": "@claude-control/cctl",
   "version": "0.1.0",
   "private": false,
   "description": "cctl — switch Claude Code accounts, see cross-account usage, and drive sessions from your phone.",
   "type": "module",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/andrewtjin/claude-control.git",

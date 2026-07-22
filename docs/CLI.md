@@ -176,6 +176,6 @@ pnpm run test
 
 `cctl` is then available unbundled at `packages/cli/dist/bin.js`
 (`pnpm --filter @claude-control/cli build`, then `node packages/cli/dist/bin.js --help`).
-The published `claudecontrol` package (`packages/cctl-publish`) is a separate
+The published `@claude-control/cctl` package (`packages/cctl-publish`) is a separate
 single-file esbuild bundle of the same CLI + daemon — see that package for the
 prepublish smoke test that guards it.
