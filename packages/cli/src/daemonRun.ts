@@ -322,6 +322,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     ...(config.values.permissionHoldMs !== undefined
       ? { permissionHoldMs: config.values.permissionHoldMs }
       : {}),
+    ...(config.values.questionHoldMs !== undefined
+      ? { questionHoldMs: config.values.questionHoldMs }
+      : {}),
   });
 
   // Auto-switch is strictly opt-in (`--auto-switch`): unattended account hops are a policy

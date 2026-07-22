@@ -11,11 +11,13 @@ import {
   buildDoneEmbed,
   buildPermissionRequestEmbed,
   buildQuarantineEmbed,
+  buildQuestionEmbed,
   buildSwitchResultEmbed,
   buildToolOutputEmbed,
   buildWaitingEmbed,
 } from './embeds.js';
 import { permissionButtons, type ButtonSpec } from './buttons.js';
+import { questionSelectSpecs, type SelectSpec } from './questionCards.js';
 import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
 
 /** A text file to attach to the message — the same delivery session threads use for full
@@ -34,6 +36,11 @@ export interface RenderedPush {
   content?: string;
   embeds?: EmbedBuilder[];
   components?: ButtonSpec[][];
+  /** Select menus for an answerable question card — each spec is inflated into its own ActionRow
+   *  by the gateway (a select occupies a whole row). Kept separate from `components` (buttons) so
+   *  this module stays discord.js-free while the gateway merges both into the message's one
+   *  component array. */
+  selects?: SelectSpec[];
   files?: PushFile[];
 }
 
@@ -54,6 +61,15 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
     // the hook response open for a remote decision (see permissionButtons), so a tap always
     // takes effect honestly; the mode is context on the embed, not a gate.
     return { embeds: [embed], components: permissionButtons({ requestId: p.requestId }) };
+  }
+  if (isType(envelope, 'question.request')) {
+    const p = envelope.payload;
+    const mode = p.permissionMode ?? undefined;
+    const embed = buildQuestionEmbed(p.questions, mode);
+    // One string select per question (plus an Other entry), inflated by the gateway. Like the
+    // permission card, this envelope only exists while the daemon holds the answer channel open,
+    // so the pickers always take effect.
+    return { embeds: [embed], selects: questionSelectSpecs(p.requestId, p.questions) };
   }
   if (isType(envelope, 'hook.notification')) {
     return renderNotification(envelope.payload);
@@ -101,10 +117,16 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
   return undefined; // usage.snapshot / settings.snapshot / session.status / pair.result / control frames: cache-only
 }
 
-/** hook.notification → the right lifecycle card. Stop always wins (it carries the final message);
- *  otherwise the tolerant `notificationType` string selects tool-output/waiting/quarantine, and
- *  anything unknown falls back to the generic title/body content an N-1 bot would also show. */
-function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush {
+/** hook.notification → the right lifecycle card, or `undefined` to suppress a DM. Stop always wins
+ *  (it carries the final message); otherwise the tolerant `notificationType` string selects
+ *  tool-output/waiting/quarantine, and anything unknown falls back to the generic title/body
+ *  content an N-1 bot would also show. */
+function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | undefined {
+  // The daemon may send a `question_prompt` notification ALONGSIDE the richer question.request
+  // card for the same prompt. The card is the real, answerable UI, so the plain-text companion is
+  // suppressed here to avoid a confusing double render — the card, not this note, is what the user
+  // acts on.
+  if (p.notificationType === 'question_prompt') return undefined;
   if (p.event === 'stop') {
     return {
       embeds: [

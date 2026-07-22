@@ -15,6 +15,8 @@ import type {
   SessionHandle,
   SessionRecord,
   PermissionRequest,
+  QuestionRequest,
+  QuestionAnswer,
 } from '@claude-control/session-runtime';
 import {
   createAgentSdkClient as defaultCreateAgentSdkClient,
@@ -279,6 +281,12 @@ export class Daemon {
    *  when the owning session goes terminal (see {@link attachSessionPipes}), which bounds the
    *  map by the pending prompts of LIVE sessions. */
   private readonly managedPermissionRoutes = new Map<string, string>();
+  /** requestId → owning sessionId for AskUserQuestion requests that ORIGINATED from a managed
+   *  session's SDK `canUseTool` — the question analog of {@link managedPermissionRoutes}. Inbound
+   *  `question.response` routes on membership here (managed leg → the session handle's gate;
+   *  everything else → the held-hook receiver), for the same registry-not-id-prefix reason
+   *  documented on {@link handleQuestionResponse}. Swept when the owning session goes terminal. */
+  private readonly managedQuestionRoutes = new Map<string, string>();
   /** Recently seen `session.stop` idempotencyKeys, so a double-tapped/re-sent Stop never runs
    *  the escalation ladder twice. Bounded FIFO — see {@link rememberStopKey}. */
   private readonly seenStopKeys = new Set<string>();
@@ -410,6 +418,9 @@ export class Daemon {
       },
       onPermissionResponse: (msg) => {
         this.handlePermissionResponse(msg);
+      },
+      onQuestionResponse: (msg) => {
+        this.handleQuestionResponse(msg);
       },
       onPromptInject: (msg) => {
         this.handlePromptInject(msg).catch((err: unknown) => {
@@ -700,6 +711,60 @@ export class Daemon {
       // Exactly the security contract's job: a stale/forged/duplicate response is logged and
       // dropped, never applied. This is not an error in the daemon — it's the guard working.
       this.logger.warn({ requestId, error: result.error }, 'rejected permission.response');
+    }
+  }
+
+  /**
+   * The question analog of {@link handlePermissionResponse}, with the same two-origin routing and
+   * the same registry-not-id-prefix rationale (see that method): a `question.response` whose
+   * requestId is in {@link managedQuestionRoutes} came from a managed session's SDK gate and must
+   * be answered by the owning `SessionHandle.resolveQuestion` (the only place the parked tool's
+   * blocking promise lives); anything else is a held-hook question resolved through
+   * `hookReceiver.resolveQuestion` (the DB WHERE-guarded single-resolve path). Unknown ids answer
+   * NOTHING on either leg.
+   */
+  private handleQuestionResponse(msg: MessageOf<'question.response'>): void {
+    const { requestId, answers } = msg.payload;
+    // Normalize the wire answers into the runtime's domain shape once (nullish otherText → omit),
+    // used only on the managed leg; the hook leg consumes the wire shape directly.
+    const domainAnswers: QuestionAnswer[] = answers.map((a) => ({
+      question: a.question,
+      selected: a.selected,
+      ...(a.otherText != null ? { otherText: a.otherText } : {}),
+    }));
+
+    const owningSessionId = this.managedQuestionRoutes.get(requestId);
+    if (owningSessionId !== undefined) {
+      const handle = this.sessionManager.get(owningSessionId);
+      if (!handle?.resolveQuestion) {
+        // The session died between request and response — the runtime already denied the parked
+        // question fail-closed when its turn ended. Drop; never fall through to the hook path,
+        // where "resolving" the row would record an answer nothing ever applied.
+        this.logger.warn(
+          { requestId, sessionId: owningSessionId },
+          'question.response for a managed request whose session is gone; dropped',
+        );
+        return;
+      }
+      const outcome = handle.resolveQuestion(requestId, domainAnswers);
+      if (outcome === 'resolved') {
+        // Mark the audit row answered so it matches what the gate applied. The row is bookkeeping
+        // on this leg, not the guard (the runtime's gate is), so a 0-change result would only
+        // mean the row went missing.
+        this.store.resolvePendingQuestion(requestId, this.clock());
+      } else {
+        // 'already_handled' (double-tap) or 'unknown' (question ended with its turn): the
+        // idempotency/fail-closed guard working, not a daemon error.
+        this.logger.warn({ requestId, outcome }, 'managed question.response not applied');
+      }
+      return;
+    }
+
+    // Hook-originated (or entirely unknown) — the held-hook resolve, whose own contract rejects a
+    // stale/duplicate/expired/unanswered response and injects the answers as updatedInput.
+    const result = this.hookReceiver.resolveQuestion(requestId, answers);
+    if (!result.ok) {
+      this.logger.warn({ requestId, error: result.error }, 'rejected question.response');
     }
   }
 
@@ -1097,6 +1162,7 @@ export class Daemon {
     handle.onEvent((event) => {
       if (event.kind === 'status' && (event.state === 'done' || event.state === 'failed')) {
         this.sweepManagedPermissionRoutes(handle.id);
+        this.sweepManagedQuestionRoutes(handle.id);
       }
       this.forwardSessionEvent(handle.id, accountId, event);
     });
@@ -1104,6 +1170,11 @@ export class Daemon {
     // managed handles always implement it.
     handle.onPermissionRequest?.((req) => {
       this.handleManagedPermissionRequest(handle.id, req);
+    });
+    // The question seam, symmetric with the permission one — structured AskUserQuestion requests
+    // from a managed session's SDK gate.
+    handle.onQuestionRequest?.((req) => {
+      this.handleManagedQuestionRequest(handle.id, req);
     });
   }
 
@@ -1169,6 +1240,57 @@ export class Daemon {
       if (owner !== sessionId) continue;
       this.managedPermissionRoutes.delete(requestId);
       this.store.resolvePendingPermission(requestId, 'deny');
+    }
+  }
+
+  /**
+   * An SDK-originated AskUserQuestion request: the managed session's `canUseTool` has PARKED the
+   * tool awaiting the human's answers. The exact mirror of {@link handleManagedPermissionRequest}
+   * — a `pending_questions` row + a `question.request` envelope so the phone sees one kind of
+   * question card regardless of origin — but registered in {@link managedQuestionRoutes} because
+   * resolution travels back into the in-process SessionHandle, not the hook receiver's DB resolve.
+   *
+   * No `expiresAt`: an SDK-parked question deliberately has NO deadline (never auto-answer on
+   * timeout); it stays pending until a human answers or the turn/session ends, at which point the
+   * runtime denies it fail-closed. No companion `hook.notification` either: the managed session's
+   * own event stream already surfaces the "Question: …" milestone.
+   */
+  private handleManagedQuestionRequest(sessionId: string, req: QuestionRequest): void {
+    // The SDK can re-deliver a control_request for a still-pending id — a repeat must not
+    // re-insert the row or push a second card.
+    if (this.managedQuestionRoutes.has(req.requestId)) return;
+    this.managedQuestionRoutes.set(req.requestId, sessionId);
+    if (this.store.getPendingQuestion(req.requestId) === undefined) {
+      this.store.insertPendingQuestion({
+        requestId: req.requestId,
+        sessionId,
+        createdAtMs: this.clock(),
+        // SDK-owned so the hook receiver's resolve path refuses it — only THIS process's gate can
+        // answer a parked question.
+        origin: 'managed',
+      });
+    }
+    this.sendEnvelope({
+      type: 'question.request',
+      payload: {
+        requestId: req.requestId,
+        sessionId,
+        questions: req.questions,
+        ...(req.permissionMode !== undefined ? { permissionMode: req.permissionMode } : {}),
+      },
+    });
+  }
+
+  /** Drop every question route owned by `sessionId` once it ends — the mirror of
+   *  {@link sweepManagedPermissionRoutes}. The session's gate has already denied any still-pending
+   *  question when it went terminal, so the row must not linger unresolved, and a LATE phone
+   *  answer becomes harmless: with the route gone it falls through to the hook receiver's resolve,
+   *  whose already-resolved DB guard rejects it. */
+  private sweepManagedQuestionRoutes(sessionId: string): void {
+    for (const [requestId, owner] of this.managedQuestionRoutes) {
+      if (owner !== sessionId) continue;
+      this.managedQuestionRoutes.delete(requestId);
+      this.store.resolvePendingQuestion(requestId, this.clock());
     }
   }
 

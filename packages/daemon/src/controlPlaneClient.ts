@@ -51,6 +51,10 @@ export interface IdentityStore {
 export interface ControlPlaneHandlers {
   onSwitchCommand?: (msg: MessageOf<'switch.command'>) => void;
   onPermissionResponse?: (msg: MessageOf<'permission.response'>) => void;
+  /** The phone's answers to a `question.request`. Routing only, like every inbound command —
+   *  the daemon's handler owns which leg (managed gate vs held hook) applies them and the
+   *  single-resolve/security contract. */
+  onQuestionResponse?: (msg: MessageOf<'question.response'>) => void;
   onPromptInject?: (msg: MessageOf<'prompt.inject'>) => void;
   onSessionSpawn?: (msg: MessageOf<'session.spawn'>) => void;
   /** Phone-initiated stop of a managed session. Like every other inbound command, the
@@ -339,6 +343,8 @@ export class ControlPlaneClient {
     if (isType(envelope, 'switch.command')) this.opts.handlers.onSwitchCommand?.(envelope);
     else if (isType(envelope, 'permission.response'))
       this.opts.handlers.onPermissionResponse?.(envelope);
+    else if (isType(envelope, 'question.response'))
+      this.opts.handlers.onQuestionResponse?.(envelope);
     else if (isType(envelope, 'prompt.inject')) this.opts.handlers.onPromptInject?.(envelope);
     else if (isType(envelope, 'session.spawn')) this.opts.handlers.onSessionSpawn?.(envelope);
     else if (isType(envelope, 'session.stop')) this.opts.handlers.onSessionStop?.(envelope);
