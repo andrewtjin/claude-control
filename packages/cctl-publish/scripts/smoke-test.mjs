@@ -2,7 +2,7 @@
 // Prepublish smoke test: proves the bundle actually boots standalone, not just that esbuild
 // exited zero. Copies ONLY dist/bin.js into a throwaway directory outside the workspace — no
 // pnpm symlinks, no node_modules at all — then runs it with --version and --help, the same way
-// a fresh `npm i -g claudecontrol` install would be invoked. If the bundle secretly
+// a fresh `npm i -g @andrewtjin/cctl` install would be invoked. If the bundle secretly
 // still depended on a workspace-relative resolve (a missed `external`, a path that only
 // resolves inside this monorepo), it fails here instead of on a user's machine.
 //
