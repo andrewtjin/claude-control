@@ -160,6 +160,14 @@ const PermissionRequestPayload = z.object({
   detail: z.string().nullish(),
   cwd: z.string().nullish(),
   expiresAt: z.number().int().nonnegative().nullish(),
+  /** The session's Claude Code permission mode (hook field `permission_mode`), e.g.
+   *  'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'. A tolerant string, not an
+   *  enum: Claude ships new modes without notice, and rejecting the whole frame over an
+   *  unknown mode would blind the phone to a real request. Display context only: the card
+   *  keeps its Approve/Deny buttons in every mode — a request only exists while the CLI is
+   *  actually blocking on a prompt — so the bot shows the mode on the card instead of
+   *  gating the controls on it. */
+  permissionMode: z.string().min(1).nullish(),
 });
 
 const PermissionResponsePayload = z.object({
@@ -167,6 +175,17 @@ const PermissionResponsePayload = z.object({
   decision: z.enum(['allow', 'deny']),
   scope: z.enum(['once', 'session']).default('once'),
   idempotencyKey: IdempotencyKey,
+});
+
+/** A held permission's hold ended WITHOUT a phone decision — the daemon's honest signal that
+ *  the card's Approve/Deny buttons are now dead and must stop claiming otherwise. `reason`
+ *  names WHY so the bot's edit can say something true: `local` (the operator answered at the
+ *  terminal — detected where the hook's response socket closes while still held), `expired`
+ *  (the hold window's own timer fired first), `shutdown` (the daemon closed while the hold was
+ *  still open). Never sent for a permission the phone actually decided. */
+const PermissionLapsedPayload = z.object({
+  requestId: RequestId,
+  reason: z.enum(['local', 'expired', 'shutdown']),
 });
 
 const PromptInjectPayload = z.object({
@@ -184,12 +203,70 @@ const SessionSpawnPayload = z.object({
   idempotencyKey: IdempotencyKey,
 });
 
+/** Long output is a presentation problem, not a wire problem (decision: "no silent
+ *  truncation"): the daemon streams ALL output as ordered `seq` chunks and never drops text;
+ *  when accumulated output crosses its inline-display threshold the BOT re-materializes the
+ *  chunks as a file attachment. No attachment wire type exists — attachments would duplicate
+ *  the chunk stream's content while adding a second delivery path to keep honest. `truncated`
+ *  stays as the daemon's explicit marker for the rare case a source itself truncated (e.g. a
+ *  capped scrollback), so the UI can label the gap instead of pretending completeness. */
 const SessionOutputPayload = z.object({
   sessionId: SessionId,
   seq: z.number().int().nonnegative(),
   kind: z.enum(['stdout', 'milestone', 'summary', 'error']),
   text: z.string(),
   truncated: z.boolean().default(false),
+  /** One opaque token per daemon RUN (process lifetime), stamped on every chunk. The per-session
+   *  `seq` counter is in-memory and restarts at 0 when the daemon restarts, but a crashed daemon
+   *  never emitted a terminal `session.status`, so a long-lived bot still holds reassembly state
+   *  (its `nextSeq` advanced past 0) for that sessionId — and would silently swallow the resumed
+   *  turn's low-seq chunks. The bot compares this token across chunks: a CHANGE means "same session,
+   *  new daemon run" and it resets reassembly (with a visible marker) instead of dropping output.
+   *  Additive + tolerant like `permissionMode`/`notificationType`: a pre-epoch daemon omits it and
+   *  a current bot must treat its absence exactly as today (no reset). */
+  epoch: z.string().min(1).nullish(),
+});
+
+/** Phone-initiated stop of a managed session. Deliberately minimal: escalation semantics
+ *  (interrupt → grace window → hard stop) are a daemon policy, not a wire choice, and the
+ *  acknowledgment rides on the `session.status` transitions the daemon already emits
+ *  (running → done/failed) — a dedicated stop.result would be a second source of truth.
+ *  `idempotencyKey` lets a double-tapped Stop button resolve to "already handled". */
+const SessionStopPayload = z.object({
+  sessionId: SessionId,
+  idempotencyKey: IdempotencyKey,
+});
+
+/** Phone-initiated prune of DORMANT session records: every record resting in a terminal
+ *  state (done/failed/orphaned), plus non-terminal leftovers whose owning process is gone
+ *  (the daemon holds no live handle for them — records an earlier or parallel daemon run
+ *  wrote and abandoned). A live session is untouchable by construction — live work always
+ *  has a handle in the serving daemon. Pruning is registry-only: the underlying Claude
+ *  conversation on the host survives; only the daemon's memory of the session (including
+ *  its resume anchor) is dropped, so a pruned orphan can no longer be revived from the
+ *  phone. */
+const SessionPrunePayload = z.object({
+  requestId: RequestId,
+  idempotencyKey: IdempotencyKey,
+});
+
+/** The daemon's answer to session.prune. Unlike session.stop there IS a dedicated result
+ *  envelope: pruned records DISAPPEAR rather than transition, so no session.status ack will
+ *  ever come — and the bot needs the exact pruned ids to drop its own cached `/sessions`
+ *  rows (its cache is fed by status pushes and would otherwise show the rows forever). */
+const SessionPruneResultPayload = z.object({
+  requestId: RequestId,
+  ok: z.boolean(),
+  /** Exactly the records that were removed; empty on a failed or no-op prune. */
+  prunedSessionIds: z.array(SessionId),
+  /** The registry's FULL post-prune view (every id it still holds). The pruned ids alone
+   *  cannot clear a cached row for a session the daemon no longer knows AT ALL (its record
+   *  was lost rather than pruned — e.g. clobbered registry, wiped state dir), and such
+   *  ghosts would otherwise sit in the bot's `/sessions` list forever. When present, the
+   *  bot drops every cached session NOT listed here; optional so a result from a daemon
+   *  predating this field keeps its old pruned-ids-only meaning. */
+  remainingSessionIds: z.array(SessionId).nullish(),
+  error: z.string().nullish(),
 });
 
 const SessionStatusPayload = z.object({
@@ -208,12 +285,29 @@ const SessionStatusPayload = z.object({
   summary: z.string().nullish(),
 });
 
+/** Widened (not split into done/waiting variants) on purpose: title/body/level stays the one
+ *  required contract every bot version can render, so an N-1 bot shows a plain notification
+ *  where a current bot shows a rich done/waiting card. New variant TYPES would instead be
+ *  dropped whole by the older peer's envelope parse — a silent notification loss. */
 const HookNotificationPayload = z.object({
   event: z.enum(['permission', 'stop', 'notification']),
   sessionId: SessionId.nullish(),
+  /** The session's working directory, when the hook reported one. Several CLI windows can
+   *  notify at once and their cards are otherwise indistinguishable, so the bot renders the
+   *  directory's basename (with a sessionId prefix) as the card's origin tag. Additive +
+   *  tolerant like `notificationType`: an older daemon omits it and the card simply loses
+   *  the folder half of its tag. */
+  cwd: z.string().nullish(),
   title: z.string(),
   body: z.string(),
   level: z.enum(['info', 'warn', 'success']).default('info'),
+  /** Raw hook `notification_type` (e.g. 'idle_prompt'). Tolerant string for the same reason
+   *  as `permissionMode`: the bot keys "waiting on you" cards off known values and falls back
+   *  to the generic card for anything else — never rejects the frame. */
+  notificationType: z.string().min(1).nullish(),
+  /** On Stop events: the hook's `last_assistant_message`, so the done card can show WHAT
+   *  Claude finished saying rather than a bare "session ended". */
+  lastAssistantMessage: z.string().nullish(),
 });
 
 // ---- control frames (socket lifecycle; not user-facing) ----
@@ -281,10 +375,14 @@ export const messageSchemas = {
   'switch.result': frame('switch.result', SwitchResultPayload),
   'permission.request': frame('permission.request', PermissionRequestPayload),
   'permission.response': frame('permission.response', PermissionResponsePayload),
+  'permission.lapsed': frame('permission.lapsed', PermissionLapsedPayload),
   'prompt.inject': frame('prompt.inject', PromptInjectPayload),
   'session.spawn': frame('session.spawn', SessionSpawnPayload),
   'session.output': frame('session.output', SessionOutputPayload),
   'session.status': frame('session.status', SessionStatusPayload),
+  'session.stop': frame('session.stop', SessionStopPayload),
+  'session.prune': frame('session.prune', SessionPrunePayload),
+  'session.prune.result': frame('session.prune.result', SessionPruneResultPayload),
   'hook.notification': frame('hook.notification', HookNotificationPayload),
   hello: frame('hello', HelloPayload),
   'hello.result': frame('hello.result', HelloResultPayload),
@@ -303,10 +401,14 @@ export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['switch.result'],
   messageSchemas['permission.request'],
   messageSchemas['permission.response'],
+  messageSchemas['permission.lapsed'],
   messageSchemas['prompt.inject'],
   messageSchemas['session.spawn'],
   messageSchemas['session.output'],
   messageSchemas['session.status'],
+  messageSchemas['session.stop'],
+  messageSchemas['session.prune'],
+  messageSchemas['session.prune.result'],
   messageSchemas['hook.notification'],
   messageSchemas.hello,
   messageSchemas['hello.result'],

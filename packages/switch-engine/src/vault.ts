@@ -50,6 +50,9 @@ export class Vault {
     return (await this.listAccounts()).find((a) => a.id === id);
   }
 
+  /** The RAW registry record of the last committed switch. It can lag reality after a
+   *  `/login` inside the Claude CLI — consumers who need "who is live right now" must use
+   *  `SwitchEngine.getActiveId()`, which reconciles this against the live login identity. */
   async getActiveId(): Promise<string | null> {
     return (await this.loadRegistry()).activeId;
   }
@@ -152,7 +155,7 @@ export class Vault {
    *  the registry stays consistent with the bundle (e.g. after a token refresh). */
   async writeBundle(id: string, bundle: CredentialBundle): Promise<void> {
     ensureDir(join(this.vaultDir, id));
-    const blob = this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
+    const blob = await this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
     await atomicWriteFile(this.bundlePath(id), blob);
   }
 
@@ -160,7 +163,7 @@ export class Vault {
 
   /** Encrypt and stash the current live credentials so a failed switch can restore them. */
   async writeRollback(bundle: CredentialBundle): Promise<void> {
-    const blob = this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
+    const blob = await this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
     await atomicWriteFile(this.rollbackPath(), blob);
   }
 
@@ -179,9 +182,10 @@ export class Vault {
     await removeIfExists(this.rollbackPath());
   }
 
-  private decodeBundle(blob: string): CredentialBundle {
+  private async decodeBundle(blob: string): Promise<CredentialBundle> {
     try {
-      return JSON.parse(this.protector.unprotect(blob).toString('utf8')) as CredentialBundle;
+      const plain = await this.protector.unprotect(blob);
+      return JSON.parse(plain.toString('utf8')) as CredentialBundle;
     } catch (err) {
       throw new VaultError('failed to decrypt or parse credential bundle', { cause: err });
     }

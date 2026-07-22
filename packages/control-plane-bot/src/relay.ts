@@ -281,9 +281,15 @@ export class RelayServer implements RelaySender {
     }
 
     // A second connection from the same daemon id replaces the first — only one live socket
-    // per daemon is meaningful, and the prior one is almost certainly a dead/reconnecting peer.
+    // per daemon is meaningful, and the prior one is almost certainly a dead/reconnecting
+    // peer. Logged, never silent: replacement is also the only externally visible trace when
+    // TWO live processes present the same identity and steal delivery from each other on
+    // every reconnect, and diagnosing that starts from this line.
     const existing = this.connectionsByDaemon.get(daemonId);
-    if (existing) existing.socket.terminate();
+    if (existing) {
+      this.logger.info({ daemonId }, 'hello replaced an existing live socket for this daemon id');
+      existing.socket.terminate();
+    }
 
     state.daemonId = daemonId;
     if (state.handshakeTimer) {

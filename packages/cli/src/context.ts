@@ -35,7 +35,7 @@ export function buildEngine(paths: Paths = defaultPaths()): SwitchEngine {
     options.minSwitchIntervalMs = intervalEnv;
   }
   // Refresh-below-this-lifetime window (default 5 min). Setting it huge forces a refresh on
-  // the next activate — how the oauth.ts wet gate (docs/VERIFICATION.md §2) is exercised.
+  // the next activate — how oauth.ts's live refresh path (docs/VERIFICATION.md §2) is exercised.
   const skewEnv = Number(process.env.CCTL_REFRESH_SKEW_MS);
   if (Number.isFinite(skewEnv) && skewEnv >= 0) {
     options.refreshSkewMs = skewEnv;

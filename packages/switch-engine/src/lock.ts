@@ -1,15 +1,21 @@
 // Cross-process credential lock.
 //
 // The daemon and the `cctl` CLI are separate processes that may both try to switch at once,
-// so the lock lives on the filesystem, not in memory. Acquisition is an atomic `mkdir`:
-// exactly one process can create the lock directory; the rest retry. A lock records the
-// holder's pid and start time so a crashed holder's stale lock can be reclaimed instead of
-// deadlocking forever.
+// so the lock lives on the filesystem, not in memory. The lock is a DIRECTORY claimed by an
+// atomic rename: a process builds the directory privately — with its owner record already
+// inside — then renames it onto the public lock name. A rename onto an existing name fails,
+// so exactly one contender wins; the rest retry. Writing the owner record BEFORE the directory
+// is renamed into view is the crux: a contender can never observe the lock in a
+// claimed-but-ownerless state, so reclaim can safely treat a missing/corrupt owner record as a
+// genuinely broken lock instead of a half-finished acquisition it must tiptoe around. A lock
+// records the holder's pid and start time so a crashed holder's stale lock can be reclaimed
+// instead of deadlocking forever.
 //
 // This is a mutex between OUR processes. It cannot lock out the Claude CLI itself — that
 // race is handled separately by reconcile-by-reading in the switch engine.
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { ensureDir } from './fsutil.js';
 import { LockTimeoutError } from './errors.js';
@@ -82,35 +88,74 @@ export async function acquireLock(
   const deadline = clock() + timeoutMs;
   ensureDir(join(lockDir, '..'));
 
-  for (;;) {
-    try {
-      mkdirSync(lockDir); // atomic: succeeds for exactly one contender
+  // Build the lock in a private staging directory that shares the lock's parent, so the final
+  // rename is a same-filesystem move (atomic), never a cross-device copy. A per-call unique name
+  // means two processes — or two attempts — never collide on the staging dir itself.
+  const staging = `${lockDir}.staging-${randomUUID()}`;
+  mkdirSync(staging, { recursive: true });
+  try {
+    for (;;) {
+      // Refresh the owner record on every attempt so `startedAtMs` reflects the moment of the
+      // claim, not the (possibly much earlier) start of a long contended wait.
       const record: LockRecord = { pid: process.pid, startedAtMs: clock(), host: hostId() };
-      writeFileSync(join(lockDir, 'owner.json'), JSON.stringify(record));
-      return new Lock(lockDir);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      // Someone holds it. Reclaim if the holder is dead; otherwise wait and retry.
-      reclaimIfStale(lockDir, clock(), staleMs);
-      if (clock() >= deadline) {
-        throw new LockTimeoutError(
-          `could not acquire credential lock at ${lockDir} within ${timeoutMs}ms`,
-        );
+      writeFileSync(join(staging, 'owner.json'), JSON.stringify(record));
+      try {
+        // Atomic claim: rename fails if the lock already exists, so exactly one contender wins.
+        // The owner record is already inside the directory being moved, so the lock never
+        // becomes visible without it.
+        renameSync(staging, lockDir);
+        return new Lock(lockDir);
+      } catch (err) {
+        if (!isLockHeld(err)) throw err;
+        // Someone holds it. Reclaim if the holder is dead; otherwise wait and retry. The staging
+        // dir still exists (the rename failed), so the next attempt reuses it.
+        reclaimIfStale(lockDir, clock(), staleMs);
+        if (clock() >= deadline) {
+          throw new LockTimeoutError(
+            `could not acquire credential lock at ${lockDir} within ${timeoutMs}ms`,
+          );
+        }
+        await sleep(pollMs);
       }
-      await sleep(pollMs);
     }
+  } finally {
+    // Drop the staging dir if we still own it (timed out, or threw before a winning rename). A
+    // successful rename already consumed it, so `force` makes the now-absent path a no-op. This
+    // never touches `lockDir` — only our own staging path.
+    rmSync(staging, { recursive: true, force: true });
   }
+}
+
+/**
+ * rename failure codes that mean "the lock already exists" (a live or stale holder), as opposed
+ * to a genuine IO fault. Windows reports EEXIST/EPERM/EACCES for a rename onto an existing
+ * directory; POSIX reports ENOTEMPTY (the lock always holds an owner file, so it is never the
+ * empty dir POSIX would let a rename replace) or EEXIST. All route to reclaim-or-wait; any other
+ * code is a real error and propagates.
+ */
+function isLockHeld(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === 'EEXIST' || code === 'ENOTEMPTY' || code === 'EPERM' || code === 'EACCES';
 }
 
 function reclaimIfStale(lockDir: string, now: number, staleMs: number): void {
   try {
     const record = JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')) as LockRecord;
-    if (isStale(record, now, staleMs)) {
-      rmSync(lockDir, { recursive: true, force: true });
-    }
+    if (!isStale(record, now, staleMs)) return; // a live holder — leave it alone
   } catch {
-    // Owner file missing/corrupt: treat as stale so a broken lock can't wedge us forever.
+    // Missing or unparseable owner record. Because a lock only ever becomes visible with its
+    // owner record already inside it (the atomic rename above), this can NOT be a half-finished
+    // acquisition we would be racing — it is a genuinely broken lock, or one being released right
+    // now. Falling through to reclaim it is therefore safe, and keeps a broken lock from wedging
+    // every future acquirer forever.
+  }
+  try {
     rmSync(lockDir, { recursive: true, force: true });
+  } catch {
+    // The holder may still have the directory open (Windows can throw EBUSY/EPERM) or be partway
+    // through its own release. A failed reclaim is not fatal: leave the lock in place and let the
+    // caller's retry/backoff loop try again, or time out with a clean LockTimeoutError — never
+    // escalate a reclaim race into a thrown IO error.
   }
 }
 

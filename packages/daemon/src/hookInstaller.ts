@@ -1,4 +1,4 @@
-// Non-destructively wires our three hooks into a Claude Code profile's `settings.json`.
+// Non-destructively wires our hooks into a Claude Code profile's `settings.json`.
 //
 // `settings.json` is the CLI's own config file — it can carry hooks other tools installed,
 // plus unrelated keys (theme, permissions, etc.) that this module has no business touching.
@@ -10,13 +10,24 @@
 // Idempotent + self-healing: running `installHooks` again never duplicates an entry, and if
 // our own hook state was left malformed by e.g. a manual edit or a partial write, the next
 // call coalesces it back to canonical form rather than erroring or piling on a duplicate.
+// Exact-command dedup alone is NOT enough for that: our command has changed shape across
+// releases (an earlier generation was a curl one-liner embedding an OS-assigned per-run
+// port, minting a never-seen command every restart), and it still varies with the node and
+// script paths — a stale generation would accumulate forever. `ownedCommandMarker` closes
+// that hole — entries carrying the marker are recognizably OURS regardless of which
+// generation they came from, and any that don't match a current spec are pruned before the
+// merge.
 //
-// WET-GATED: the exact `settings.json` hooks schema (event names, matcher semantics, the
+// The exact `settings.json` hooks schema (event names, matcher semantics, the
 // installed CLI version's exact expectations) is reverse-engineered — see docs/VERIFICATION.md.
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { DEFAULT_HOOK_EVENT_NAMES, type HookEventNames } from './hookReceiver.js';
+import {
+  DEFAULT_HOOK_EVENT_NAMES,
+  DEFAULT_SECRET_HEADER,
+  type HookEventNames,
+} from './hookReceiver.js';
 
 /** Write via temp-then-rename in the same directory so a crash mid-write can never leave
  *  `settings.json` half-written — a reader sees either the whole old file or the whole new
@@ -85,8 +96,16 @@ function isHookGroup(value: unknown): value is HookGroup {
 const MANAGED_HEADER = 'x-claude-control-managed';
 const MANAGED_HEADER_VALUE = '1';
 
+/** Recognize a command as ours across EVERY generation we ever shipped: the early curl
+ *  one-liners carried the explicit managed header above, while the current forwarder command
+ *  carries only the secret header — whose NAME is equally unique to us and equally
+ *  secret-value-independent. Checking both means uninstall/prune can clean up any mix of
+ *  generations, and neither check can ever match another tool's hook. */
 function isOwnedHookCommand(command: string): boolean {
-  return command.includes(`${MANAGED_HEADER}: ${MANAGED_HEADER_VALUE}`);
+  return (
+    command.includes(`${MANAGED_HEADER}: ${MANAGED_HEADER_VALUE}`) ||
+    command.includes(DEFAULT_SECRET_HEADER)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +115,14 @@ function isOwnedHookCommand(command: string): boolean {
 export interface InstallHooksOptions {
   settingsPath: string;
   hooks: HookCommandSpec[];
+  /** Ownership fingerprint: a substring that appears in every command WE ever installed and
+   *  in nobody else's (the daemon passes its secret-header name). When set, entries carrying
+   *  it that don't exactly match a current spec are treated as stale generations of ours —
+   *  same hook, dead port from a previous run — and removed before the merge. Without it,
+   *  exact-command dedup can only recognize the CURRENT command, so every port rotation
+   *  would append a fresh entry and leave the old one behind. Optional because the marker is
+   *  meaningless for callers whose commands are stable across runs. */
+  ownedCommandMarker?: string;
 }
 
 export async function installHooks(options: InstallHooksOptions): Promise<void> {
@@ -105,6 +132,12 @@ export async function installHooks(options: InstallHooksOptions): Promise<void> 
   // with a fresh object rather than erroring — the rest of the file is untouched either way.
   const hooksSection: JsonObject = isRecord(settings.hooks) ? settings.hooks : {};
   settings.hooks = hooksSection;
+
+  // Prune BEFORE merging so a stale generation of our own command (old port) is replaced,
+  // not joined, by the current one. Only events we're installing into are touched.
+  if (options.ownedCommandMarker !== undefined) {
+    pruneStaleOwnedEntries(hooksSection, options.hooks, options.ownedCommandMarker);
+  }
 
   for (const spec of options.hooks) {
     mergeOneHook(hooksSection, spec);
@@ -148,6 +181,48 @@ function mergeOneHook(hooksSection: JsonObject, spec: HookCommandSpec): void {
   hooksSection[spec.event] = groups;
 }
 
+/** Remove stale generations of OUR OWN entries (marker present, command not current) from the
+ *  events we're about to install into. Foreign entries — no marker — are never touched, and
+ *  neither are events outside `specs`. A group this pruning empties is dropped (it existed
+ *  only to hold our stale entry); a group that was ALREADY empty is someone else's state and
+ *  is preserved as-is. */
+function pruneStaleOwnedEntries(
+  hooksSection: JsonObject,
+  specs: HookCommandSpec[],
+  marker: string,
+): void {
+  // The same event can appear in several specs, so staleness is judged against the full set
+  // of current commands for that event, not just one spec's.
+  const currentByEvent = new Map<string, Set<string>>();
+  for (const spec of specs) {
+    const set = currentByEvent.get(spec.event) ?? new Set<string>();
+    set.add(spec.command);
+    currentByEvent.set(spec.event, set);
+  }
+
+  for (const [event, currentCommands] of currentByEvent) {
+    const groups = hooksSection[event];
+    if (!Array.isArray(groups)) continue; // malformed per-event value; mergeOneHook self-heals it
+    hooksSection[event] = groups.filter((group) => {
+      if (!isHookGroup(group)) return true; // not recognizably a group — not ours to judge
+      const countBefore = group.hooks.length;
+      group.hooks = group.hooks.filter(
+        (entry) => !isStaleOwnedEntry(entry, marker, currentCommands),
+      );
+      return group.hooks.length > 0 || group.hooks.length === countBefore;
+    });
+  }
+}
+
+/** An entry is a stale generation of ours when its command carries the ownership marker but
+ *  isn't one of the commands being installed right now. Deliberately does NOT require
+ *  `type: 'command'`: a half-written entry whose command is recognizably ours is still ours
+ *  to heal away. */
+function isStaleOwnedEntry(entry: unknown, marker: string, currentCommands: Set<string>): boolean {
+  if (!isRecord(entry) || typeof entry.command !== 'string') return false;
+  return entry.command.includes(marker) && !currentCommands.has(entry.command);
+}
+
 async function readSettings(path: string): Promise<JsonObject> {
   let raw: string;
   try {
@@ -173,31 +248,34 @@ async function readSettings(path: string): Promise<JsonObject> {
 
 export interface UninstallHooksOptions {
   settingsPath: string;
-  /** Event names to prune our entries from. Defaults to the three daemon events (see
+  /** Event names to prune our entries from. Defaults to the five daemon events (see
    *  `buildDaemonHookSpecs`) — pass the same custom names here if the daemon was ever
    *  installed with `eventNames` overridden, otherwise those entries are left behind. */
   eventNames?: HookEventNames;
 }
 
 /**
- * Remove every hook entry `installHooks` is responsible for (recognized by the managed
- * marker, regardless of which secret it carries at the time), leaving everything else in
- * settings.json — other tools' hooks, unrelated keys, even our own groups' `matcher` —
- * completely untouched. A settings.json with nothing of ours to remove is left alone: no
- * rewrite, not even a re-serialize.
+ * Remove every hook entry `installHooks` is responsible for (recognized by the ownership
+ * marks in `isOwnedHookCommand`, regardless of which secret it carries at the time), leaving
+ * everything else in settings.json — other tools' hooks, unrelated keys, even our own groups'
+ * `matcher` — completely untouched. A settings.json with nothing of ours to remove is left
+ * alone: no rewrite, not even a re-serialize. The outcome says which case happened, so a
+ * caller reporting to a human never claims a removal that was actually a no-op.
  */
-export async function uninstallHooks(options: UninstallHooksOptions): Promise<void> {
+export async function uninstallHooks(options: UninstallHooksOptions): Promise<'removed' | 'none'> {
   const settings = await readSettings(options.settingsPath);
-  if (!isRecord(settings.hooks)) return; // nothing installed, nothing to remove
+  if (!isRecord(settings.hooks)) return 'none'; // nothing installed, nothing to remove
   const hooksSection: JsonObject = settings.hooks;
 
   // `HookEventNames` has no index signature, so `Object.values` can't infer a typed array from
-  // it (TypeScript silently falls back to `any[]`) — list the three fields explicitly instead.
+  // it (TypeScript silently falls back to `any[]`) — list the five fields explicitly instead.
   const activeEventNames = options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES;
   const events: string[] = [
     activeEventNames.permissionRequest,
     activeEventNames.stop,
     activeEventNames.notification,
+    activeEventNames.postToolUse,
+    activeEventNames.userPromptSubmit,
   ];
   let changed = false;
 
@@ -222,39 +300,51 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<vo
     hooksSection[event] = prunedGroups;
   }
 
-  if (changed) {
-    await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
-  }
+  if (!changed) return 'none';
+  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  return 'removed';
 }
 
 // ---------------------------------------------------------------------------
-// Building the daemon's own three hook specs
+// Building the daemon's own hook specs
 // ---------------------------------------------------------------------------
 
 export interface BuildDaemonHookSpecsOptions {
-  /** Loopback port `hookReceiver` is listening on. */
-  port: number;
   /** Shared secret `hookReceiver` requires (see hookReceiver.ts `secretHeader`). */
   secret: string;
+  /** Absolute path of the forwarder script (see hookForwarder.ts) the command runs. */
+  forwarderPath: string;
+  /** Node executable to run the forwarder with. Defaults to the running process's own
+   *  binary — the daemon IS Node, so its binary is known-good and needs no PATH lookup. */
+  nodePath?: string;
   eventNames?: typeof DEFAULT_HOOK_EVENT_NAMES;
   /** Header name the receiver expects the secret on; must match `HookReceiverOptions.secretHeader`. */
   secretHeader?: string;
 }
 
 /**
- * The three hook specs the daemon needs on every profile it manages: forward the CLI's hook
+ * The hook specs the daemon needs on every profile it manages: forward the CLI's hook
  * JSON (fed on stdin, per Claude Code's hook contract) as an HTTP POST to the loopback
- * receiver. Kept as a small, readable curl one-liner so a user inspecting settings.json can
- * see exactly what runs.
+ * receiver, via the forwarder script (hookForwarder.ts) so the daemon-down fast path and
+ * the connect-timeout policy live in ONE place instead of five duplicated one-liners.
+ * The command deliberately carries no port — the forwarder discovers the current one from
+ * the endpoint file at fire time, so the installed entries (and every running session's
+ * startup snapshot of them) stay valid across daemon restarts. The secret header stays on
+ * the command line both as the receiver's auth and as the ownership marker `installHooks`
+ * prunes stale generations by — including previous-shape curl entries, which carried the
+ * same header name. PostToolUse carries no matcher on purpose: it must observe every tool
+ * (the receiver decides which runs are worth forwarding, not the hook filter).
  */
 export function buildDaemonHookSpecs(options: BuildDaemonHookSpecsOptions): HookCommandSpec[] {
   const eventNames = options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES;
-  const secretHeader = options.secretHeader ?? 'x-claude-control-secret';
-  const url = `http://127.0.0.1:${options.port}/`;
-  const command = `curl -s -X POST -H "content-type: application/json" -H "${secretHeader}: ${options.secret}" -H "${MANAGED_HEADER}: ${MANAGED_HEADER_VALUE}" --data-binary @- ${url}`;
+  const secretHeader = options.secretHeader ?? DEFAULT_SECRET_HEADER;
+  const nodePath = options.nodePath ?? process.execPath;
+  const command = `"${nodePath}" "${options.forwarderPath}" --secret-header "${secretHeader}: ${options.secret}"`;
   return [
     { event: eventNames.permissionRequest, command },
     { event: eventNames.stop, command },
     { event: eventNames.notification, command },
+    { event: eventNames.postToolUse, command },
+    { event: eventNames.userPromptSubmit, command },
   ];
 }

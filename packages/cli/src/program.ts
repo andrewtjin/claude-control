@@ -6,7 +6,7 @@
 // which are unit-tested; here we only wire and print.
 
 import { Command } from 'commander';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, rmSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -28,6 +28,8 @@ import {
   Store,
   buildDaemonHookSpecs,
   readHeartbeat,
+  uninstallHooks,
+  type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import {
@@ -36,9 +38,16 @@ import {
   renderOutlook,
   renderPlanSummary,
   timelineInputFromWire,
+  type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
+import {
+  appendCrashLine,
+  buildDefaultProbeFn,
+  crashLogPath,
+  superviseDaemon,
+} from './daemonSupervise.js';
 import {
   installDaemonTask,
   queryDaemonTask,
@@ -47,7 +56,25 @@ import {
   uninstallDaemonTask,
 } from './daemonInstall.js';
 import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
-import { renderAccountsTable, renderDaemonStatus, renderUsage, type UsageRow } from './render.js';
+import {
+  renderAccountsTable,
+  renderDaemonStatus,
+  renderPacingLine,
+  renderUsage,
+  type UsageRow,
+} from './render.js';
+import {
+  renderSessionStatus,
+  type SessionStatusHeader,
+  type SessionStatusRow,
+} from './sessionRender.js';
+import {
+  callDaemonSession,
+  resolveSessionId,
+  SessionClientError,
+  type SessionCommandSuccess,
+  type SessionVerb,
+} from './sessionClient.js';
 import { checkLiveLogin, probeRelay, renderDoctor, runDoctor, summarize } from './doctor.js';
 import {
   connectWithTimeout,
@@ -81,10 +108,11 @@ export function buildProgram(): Command {
   const program = new Command();
   program
     .name('cctl')
-    .description('claude-control — switch Claude accounts, see usage, control sessions')
+    .description('claude-control - switch Claude accounts, see usage, control sessions')
     .version(VERSION);
 
   buildAccountCommands(program);
+  buildSessionCommands(program);
 
   program
     .command('switch <ref>')
@@ -118,7 +146,7 @@ export function buildProgram(): Command {
       const result = await buildEngine().recover();
       process.stdout.write(
         result.recovered
-          ? `Recovered: ${result.action}${result.detail ? ` — ${result.detail}` : ''}.\n`
+          ? `Recovered: ${result.action}${result.detail ? ` - ${result.detail}` : ''}.\n`
           : 'Nothing to recover.\n',
       );
     });
@@ -128,12 +156,19 @@ export function buildProgram(): Command {
     .description("show usage across all accounts (from the daemon's latest poll)")
     .action(async () => {
       const { accounts, activeId, usageFor } = await readUsageState();
+      const nowMs = Date.now();
       const rows: UsageRow[] = accounts.map((a) => ({
         label: a.label,
         active: a.id === activeId,
         usage: usageFor(a.id),
       }));
-      process.stdout.write(renderUsage(rows, Date.now(), detectPalette()) + '\n');
+      let text = renderUsage(rows, nowMs, detectPalette());
+      // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
+      // state), which UsageRow doesn't carry — build it separately rather than widen UsageRow
+      // for one trailing line.
+      const inputs = buildAdvisorInputs(accounts, activeId, usageFor);
+      if (inputs.length > 0) text += '\n\n' + renderPacingLine(inputs, nowMs);
+      process.stdout.write(text + '\n');
     });
 
   program
@@ -141,18 +176,8 @@ export function buildProgram(): Command {
     .description('5h-session budget per account + when every limit resets, with a usage plan')
     .action(async () => {
       const { accounts, activeId, usageFor } = await readUsageState();
-      // Registry data (label/active/quarantined) is authoritative and current; the persisted
-      // snapshot only contributes the limits, so a stale snapshot can't misreport which
-      // account is live. Accounts without a snapshot still appear (as "unknown").
-      const inputs = timelineInputFromWire(
-        accounts.map((a) => ({
-          accountId: a.id,
-          label: a.label,
-          active: a.id === activeId,
-          quarantined: a.quarantined,
-          limits: usageFor(a.id)?.limits ?? [],
-        })),
-      );
+      const nowMs = Date.now();
+      const inputs = buildAdvisorInputs(accounts, activeId, usageFor);
       const outlook = computeOutlook(inputs);
       let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to burn first and what to
@@ -162,6 +187,7 @@ export function buildProgram(): Command {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
         text +=
           '\n\n' + renderPlanSummary(computePlan(inputs, greedy ? { greedyAutoSwitch: true } : {}));
+        text += '\n\n' + renderPacingLine(inputs, nowMs);
       }
       process.stdout.write(text + '\n');
     });
@@ -265,6 +291,51 @@ export function buildProgram(): Command {
         }
       },
     );
+  daemon
+    .command('supervise')
+    .description(
+      'run the daemon and restart it automatically if it crashes (a clean exit ends supervision)',
+    )
+    .option('--pair <code>', 'pairing code from Discord /pair (adopts a new identity)')
+    .option(
+      '--relay <url>',
+      'control-plane WebSocket url (default CCTL_RELAY_URL or ws://127.0.0.1:8765)',
+    )
+    .option('--auto-switch', 'forwarded to `daemon run` - see its help')
+    .option('--greedy', 'forwarded to `daemon run` - see its help')
+    .action(
+      async (opts: { pair?: string; relay?: string; autoSwitch?: boolean; greedy?: boolean }) => {
+        if (opts.greedy && !opts.autoSwitch) fail('--greedy requires --auto-switch.');
+        // Reconstruct the child argv from the parsed flags: the supervisor and `daemon run`
+        // deliberately share an option surface so nothing can be forwarded wrong.
+        const childArgs = [
+          'daemon',
+          'run',
+          ...(opts.pair !== undefined ? ['--pair', opts.pair] : []),
+          ...(opts.relay !== undefined ? ['--relay', opts.relay] : []),
+          ...(opts.autoSwitch ? ['--auto-switch'] : []),
+          ...(opts.greedy ? ['--greedy'] : []),
+        ];
+        const dataDir = dirname(defaultPaths().vaultDir);
+        const crashFile = crashLogPath(dataDir);
+        const controller = new AbortController();
+        process.once('SIGINT', () => controller.abort());
+        process.once('SIGTERM', () => controller.abort());
+        await superviseDaemon({
+          // process.argv[1] is this CLI's own entry — the child is the same cctl, same node.
+          spawnChild: () =>
+            spawn(process.execPath, [process.argv[1] ?? '', ...childArgs], {
+              stdio: 'inherit',
+            }),
+          log: (line) => process.stdout.write(line + '\n'),
+          logCrash: (line) => appendCrashLine(crashFile, line),
+          signal: controller.signal,
+          // Catches a HUNG child (alive, unresponsive) that would otherwise stall every
+          // hook until a human noticed — a plain exit-code check never sees it.
+          probe: { probeFn: buildDefaultProbeFn(dataDir) },
+        });
+      },
+    );
 
   daemon
     .command('install')
@@ -302,8 +373,11 @@ export function buildProgram(): Command {
 
   daemon
     .command('uninstall')
-    .description('remove the logon Scheduled Task (does not stop an already-running daemon)')
-    .action(() => {
+    .description(
+      'remove the logon Scheduled Task and the daemon hook entries ' +
+        '(does not stop an already-running daemon)',
+    )
+    .action(async () => {
       let outcome: ReturnType<typeof uninstallDaemonTask>;
       try {
         outcome = uninstallDaemonTask();
@@ -315,6 +389,26 @@ export function buildProgram(): Command {
           ? 'Removed the logon task. A daemon already running keeps running until stopped.\n'
           : 'No logon task was registered.\n',
       );
+
+      // Same settings.json the daemon installs into (claudeDir honors CLAUDE_CONFIG_DIR).
+      // Best-effort: the task removal above already succeeded, so a hook-removal failure
+      // (e.g. a corrupt settings.json, which uninstallHooks refuses to touch) downgrades to
+      // a warning instead of turning that success into a failure exit.
+      const settingsPath = join(defaultPaths().claudeDir, 'settings.json');
+      try {
+        const hooks = await uninstallHooks({ settingsPath });
+        process.stdout.write(
+          hooks === 'removed'
+            ? 'Removed the daemon hook entries from settings.json. A daemon still ' +
+                'running reinstalls them on its next start.\n'
+            : 'No daemon hook entries were installed in settings.json.\n',
+        );
+      } catch (err) {
+        process.stdout.write(
+          `Warning: could not remove the daemon hook entries from ${settingsPath}: ` +
+            `${(err as Error).message}\n`,
+        );
+      }
     });
 
   daemon
@@ -404,7 +498,7 @@ export function buildProgram(): Command {
     .allowUnknownOption(true)
     .action(() =>
       fail(
-        '`cctl run` needs the daemon connected to the bot — an on-machine step; see docs/VERIFICATION.md.',
+        '`cctl run` needs the daemon connected to the bot - an on-machine step; see docs/VERIFICATION.md.',
       ),
     );
 
@@ -457,13 +551,14 @@ function resolveRelayUrl(relayFlag?: string): string {
     .values.relayUrl;
 }
 
-/** The marker header every daemon-installed hook command carries (see `buildDaemonHookSpecs`).
- *  Recovered from a throwaway spec rather than hardcoded so this reader can't silently drift
- *  from the daemon's literal — its presence in settings.json is how setup/status tell that
- *  hooks are wired, without re-deriving the live loopback port or secret. */
+/** The marker header every daemon-installed hook command carries: the secret-header NAME
+ *  (see `buildDaemonHookSpecs` — the name is unique to us and independent of the rotatable
+ *  secret value). Recovered from a throwaway spec rather than hardcoded so this reader can't
+ *  silently drift from the daemon's literal — its presence in settings.json is how
+ *  setup/status tell that hooks are wired, without re-deriving the live secret. */
 function managedHookMarker(): string {
-  const probe = buildDaemonHookSpecs({ port: 0, secret: 'probe' })[0]?.command ?? '';
-  return /x-[\w-]*managed:\s*\S+/i.exec(probe)?.[0] ?? 'x-claude-control-managed: 1';
+  const probe = buildDaemonHookSpecs({ secret: 'probe', forwarderPath: 'probe' })[0]?.command ?? '';
+  return /x-[\w-]*-secret/i.exec(probe)?.[0] ?? 'x-claude-control-secret';
 }
 
 /** Whether our managed hooks are present in a profile's settings.json. A missing/unreadable
@@ -625,8 +720,28 @@ async function readUsageState(): Promise<{
   return { accounts, activeId, usageFor: (accountId) => byId.get(accountId) };
 }
 
+/** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both
+ *  commands' pacing line. Registry data (label/active/quarantined) is authoritative and
+ *  current; the persisted snapshot only contributes the limits, so a stale snapshot can't
+ *  misreport which account is live. Accounts without a snapshot still appear (as "unknown"). */
+function buildAdvisorInputs(
+  accounts: StoredAccount[],
+  activeId: string | null,
+  usageFor: (accountId: string) => AccountUsage | undefined,
+): AccountUsageInput[] {
+  return timelineInputFromWire(
+    accounts.map((a) => ({
+      accountId: a.id,
+      label: a.label,
+      active: a.id === activeId,
+      quarantined: a.quarantined,
+      limits: usageFor(a.id)?.limits ?? [],
+    })),
+  );
+}
+
 /**
- * The `--fresh` capture flow (wet-verified WT-1): run an interactive `claude` inside a
+ * The `--fresh` capture flow: run an interactive `claude` inside a
  * throwaway `CLAUDE_CONFIG_DIR`, let the user /login as the NEW account there, then vault
  * what landed. The live login is never touched. The transient dir holds real tokens, so it
  * is deleted no matter how the flow ends.
@@ -638,7 +753,7 @@ async function addFreshAccount(label: string): Promise<void> {
   try {
     process.stdout.write(
       'Opening a throwaway Claude window. In it:\n' +
-        '  1. /login — pick the NEW account in the browser (it may preselect the current one).\n' +
+        '  1. /login - pick the NEW account in the browser (it may preselect the current one).\n' +
         '  2. Send one short message so the login completes.\n' +
         '  3. /exit\n\n',
     );
@@ -650,11 +765,56 @@ async function addFreshAccount(label: string): Promise<void> {
     if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
     const account = await buildEngine().captureFromConfigDir(label, captureDir);
     process.stdout.write(
-      `Added ${account.label} (${account.id}). Your current login was not touched — ` +
+      `Added ${account.label} (${account.id}). Your current login was not touched - ` +
         `\`cctl switch ${account.label}\` to use it.\n`,
     );
   } catch (err) {
     if (err instanceof SwitchEngineError && err.code === 'no_capture_login') fail(err.message);
+    throw err;
+  } finally {
+    // Token-bearing — must not outlive the capture, success or failure.
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * `cctl accounts relogin <ref>` — re-login an EXISTING account in place. Same transient-config-dir
+ * capture as `add --fresh`, but the captured credentials are written into the account's existing
+ * vault entry (SAME id) and its quarantine is cleared — which is exactly what `add --fresh` must
+ * NOT do (that mints a new id, orphaning the account's usage-attribution history). The engine's
+ * identity guard refuses if the user logs into a different account in the window.
+ */
+async function reloginAccount(ref: string): Promise<void> {
+  const engine = buildEngine();
+  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  if (!resolved.ok) fail(resolved.message);
+  const account = resolved.account;
+
+  const paths = defaultPaths();
+  const captureDir = join(dirname(paths.vaultDir), `relogin-${randomUUID()}`);
+  mkdirSync(captureDir, { recursive: true });
+  try {
+    process.stdout.write(
+      `Re-logging in "${account.label}" (${account.id}). A throwaway Claude window will open.\n` +
+        '  1. /login - pick the SAME account this entry belongs to (attribution is preserved).\n' +
+        '  2. Send one short message so the login completes.\n' +
+        '  3. /exit\n\n',
+    );
+    const run = spawnSync('claude', [], {
+      stdio: 'inherit',
+      env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
+      shell: true, // `claude` is a .cmd shim on Windows
+    });
+    if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
+    const updated = await engine.reloginFromConfigDir(account.id, captureDir);
+    process.stdout.write(
+      `Re-logged in ${updated.label} (${updated.id}). Quarantine cleared; usage history kept - ` +
+        `\`cctl switch ${updated.label}\` to use it.\n`,
+    );
+  } catch (err) {
+    // no_capture_login (login never completed) and relogin_identity_mismatch (wrong account) are
+    // expected, actionable failures — print the engine's message, don't stack-trace.
+    if (err instanceof SwitchEngineError) fail(err.message);
     throw err;
   } finally {
     // Token-bearing — must not outlive the capture, success or failure.
@@ -696,6 +856,13 @@ function buildAccountCommands(program: Command): void {
     });
 
   accounts
+    .command('relogin <ref>')
+    .description('re-login an existing (usually quarantined) account in place, keeping its id')
+    .action(async (ref: string) => {
+      await reloginAccount(ref);
+    });
+
+  accounts
     .command('remove <ref>')
     .alias('rm')
     .description('remove a stored account by id or label')
@@ -706,4 +873,179 @@ function buildAccountCommands(program: Command): void {
       await engine.removeAccount(resolved.account.id);
       process.stdout.write(`Removed ${resolved.account.label}.\n`);
     });
+}
+
+/**
+ * `cctl session <register|label|watch|status>` — the in-session control surface the `/cctl`
+ * plugin wraps.
+ *   - status reads the daemon db OFFLINE (like `usage`/`timeline`): it needs no running daemon.
+ *   - register/label/watch talk to the RUNNING daemon over its loopback CLI endpoints (see
+ *     sessionClient.ts) — they require the daemon to be up, and fail with an actionable message
+ *     otherwise (never silently no-op).
+ */
+function buildSessionCommands(program: Command): void {
+  const session = program
+    .command('session')
+    .description('track/label/stream the current Claude Code session, and show tracked sessions');
+
+  const sessionIdOption = '--session <id>';
+  const sessionIdHelp =
+    'session id (Claude Code does not reliably expose it to slash commands - pass it explicitly)';
+  // label/watch/unregister run daemon-side against a session already known to the registry, so
+  // (unlike register, which CREATES the row and must get the real id) they can also take that
+  // session's label — the daemon resolves it, preferring an exact id match if both match.
+  const sessionIdOrLabelHelp =
+    'session id, or the label of a registered session (id wins if both match)';
+
+  session
+    .command('register')
+    .description("opt this Claude Code session into the daemon's tracking + phone streaming")
+    .option(sessionIdOption, sessionIdHelp)
+    .option('--label <name>', 'set a human label at the same time')
+    .action(async (opts: { session?: string; label?: string }) => {
+      await runSessionCommand('register', opts, {
+        ...(opts.label !== undefined ? { label: opts.label } : {}),
+      });
+    });
+
+  session
+    .command('label <name>')
+    .description('name the current tracked session (shown in the phone session list)')
+    .option(sessionIdOption, sessionIdOrLabelHelp)
+    .action(async (name: string, opts: { session?: string }) => {
+      await runSessionCommand('label', opts, { label: name });
+    });
+
+  session
+    .command('watch')
+    .description('stream this session to Discord (use --off to stop streaming it)')
+    .option(sessionIdOption, sessionIdOrLabelHelp)
+    .option('--off', 'turn per-session streaming OFF (default is on)')
+    .action(async (opts: { session?: string; off?: boolean }) => {
+      await runSessionCommand('watch', opts, { watch: !opts.off });
+    });
+
+  session
+    .command('unregister')
+    .description("remove a session from the daemon's tracking (undo register, e.g. a mistyped id)")
+    .option(sessionIdOption, sessionIdOrLabelHelp)
+    .option('--label <label>', 'remove by registered label instead of id')
+    .action(async (opts: { session?: string; label?: string }) => {
+      if (opts.session !== undefined && opts.label !== undefined) {
+        fail('pass one of --session or --label, not both');
+      }
+      // Routing the label through the SAME `session` field (rather than a separate ref param)
+      // bypasses runSessionCommand's env-var fallback: an explicit --label must always win, the
+      // way an explicit --session already does.
+      const ref = opts.label !== undefined ? { session: opts.label } : opts;
+      await runSessionCommand('unregister', ref, {});
+    });
+
+  session
+    .command('status')
+    .description('show tracked sessions and the active account (reads the daemon db offline)')
+    .action(async () => {
+      const { accounts, activeId, usageFor } = await readUsageState();
+      const labelById = new Map(accounts.map((a) => [a.id, a.label] as const));
+
+      // Read the display-only sessions mirror. Opening a not-yet-created db yields an empty one;
+      // a corrupt row is skipped by sessionRowFromStore, never fatal.
+      const store = new Store(daemonDbPath());
+      let rows: SessionStatusRow[];
+      try {
+        rows = store.listSessions().map((s) => sessionRowFromStore(s, labelById));
+      } finally {
+        store.close();
+      }
+
+      const activeAccount = accounts.find((a) => a.id === activeId);
+      const header: SessionStatusHeader = {
+        ...(activeAccount ? { activeLabel: activeAccount.label } : {}),
+        ...(activeId ? fullWindowsFor(usageFor(activeId)) : {}),
+      };
+      process.stdout.write(renderSessionStatus(rows, header, detectPalette()) + '\n');
+    });
+}
+
+/** Turn one Store `sessions` row into a display row, resolving the account id to a label and
+ *  tolerating a corrupt/foreign `json` blob (fields simply stay absent). */
+function sessionRowFromStore(row: SessionRow, labelById: Map<string, string>): SessionStatusRow {
+  let parsed: Record<string, unknown> = {};
+  try {
+    parsed = JSON.parse(row.json) as Record<string, unknown>;
+  } catch {
+    // keep the empty object — the row's top-level columns still render
+  }
+  const accountId =
+    row.accountId ?? (typeof parsed.accountId === 'string' ? parsed.accountId : undefined);
+  const out: SessionStatusRow = { id: row.id, kind: row.kind, state: row.state };
+  if (typeof parsed.label === 'string') out.label = parsed.label;
+  if (typeof parsed.watch === 'boolean') out.watch = parsed.watch;
+  if (accountId !== undefined) out.accountLabel = labelById.get(accountId) ?? accountId;
+  return out;
+}
+
+/** The active account's whole-5h-windows-left, for the status header — same computation `cctl
+ *  usage` shows inline. Empty when there is no usage snapshot or no known weekly reset. */
+function fullWindowsFor(usage: AccountUsage | undefined): { fullWindowsLeft?: number } {
+  if (!usage) return {};
+  const outlook = computeOutlook(timelineInputFromWire([usage]), Date.now());
+  const budget = outlook.accounts[0]?.budget;
+  return budget ? { fullWindowsLeft: budget.fullWindows } : {};
+}
+
+/** Shared driver for register/label/watch: resolve the session id, POST to the daemon with a
+ *  fresh idempotency key, print the result — or fail with an actionable message. */
+async function runSessionCommand(
+  verb: SessionVerb,
+  opts: { session?: string },
+  extra: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = resolveSessionId(opts);
+  if (!sessionId) {
+    fail(
+      'could not determine the session id. Pass --session <id> - Claude Code does not reliably ' +
+        'expose it to slash commands.',
+    );
+  }
+  try {
+    const result = await callDaemonSession(verb, {
+      sessionId,
+      idempotencyKey: randomUUID(),
+      ...extra,
+    });
+    printSessionResult(verb, result);
+  } catch (err) {
+    // Every "can't reach the daemon" / daemon-4xx condition arrives as a SessionClientError with
+    // a ready-to-print message; anything else is a real bug and should surface loudly.
+    if (err instanceof SessionClientError) fail(err.message);
+    throw err;
+  }
+}
+
+/** Past-tense confirmation verb per command, for the one-line result print. */
+const SESSION_VERB_PAST: Record<SessionVerb, string> = {
+  register: 'Registered',
+  label: 'Labeled',
+  watch: 'Updated watch for',
+  unregister: 'Unregistered',
+};
+
+/** Print a one-line confirmation of a session command result. */
+function printSessionResult(verb: SessionVerb, result: SessionCommandSuccess): void {
+  const s = result.session;
+  const bits = [
+    s.label !== undefined ? `label: ${s.label}` : undefined,
+    `watch: ${s.watch ? 'on' : 'off'}`,
+    s.accountId !== undefined ? `account: ${s.accountId}` : undefined,
+  ]
+    .filter((b): b is string => b !== undefined)
+    .join(', ');
+  // A no-change re-register must not read as if something just happened — say what IS.
+  if (result.status === 'already_registered') {
+    process.stdout.write(`Session ${s.id} is already registered - ${bits}. Nothing changed.\n`);
+    return;
+  }
+  const already = result.status === 'already_handled' ? ' (already handled)' : '';
+  process.stdout.write(`${SESSION_VERB_PAST[verb]} session ${s.id}${already} - ${bits}.\n`);
 }

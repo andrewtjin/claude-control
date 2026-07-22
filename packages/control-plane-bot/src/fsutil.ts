@@ -16,6 +16,26 @@ export function ensureDir(dir: string): void {
   mkdirSync(dir, { recursive: true });
 }
 
+/** Rename with a short bounded retry on EPERM/EBUSY. Windows can transiently reject a rename onto
+ *  an existing file with one of these codes right after a prior rename to the same path settles —
+ *  typically an AV scanner or the search indexer holds a fleeting handle on the file just replaced.
+ *  This is a known Node-on-Windows quirk (the same reason write-file-atomic retries here); the file
+ *  itself is never corrupted by it, the call just needs re-issuing. A genuine permissions problem
+ *  keeps failing past the retry budget and still surfaces. Mirrors the daemon's sessionManager. */
+async function renameWithRetry(tmp: string, target: string): Promise<void> {
+  const maxAttempts = 8;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await rename(tmp, target);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt >= maxAttempts || (code !== 'EPERM' && code !== 'EBUSY')) throw err;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 15));
+    }
+  }
+}
+
 /** Atomically replace `target` with `data`. The temp file lives in the target's own
  *  directory so the final rename is a same-filesystem move, never a cross-device copy. */
 export async function atomicWriteFile(target: string, data: string): Promise<void> {
@@ -29,7 +49,7 @@ export async function atomicWriteFile(target: string, data: string): Promise<voi
   } finally {
     await handle.close();
   }
-  await rename(tmp, target);
+  await renameWithRetry(tmp, target);
 }
 
 /** Read and JSON-parse a file, or return `undefined` if it does not exist. Other IO errors

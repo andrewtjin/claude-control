@@ -37,6 +37,11 @@ export interface PendingPermissionRow {
   tool: string;
   summary: string;
   createdAtMs: number;
+  /** Which leg surfaced the request: 'hook' (a CLI hook's held HTTP response — the hook
+   *  receiver's resolve path answers it) or 'managed' (an SDK-parked `canUseTool` — ONLY the
+   *  daemon process holding the in-memory gate can apply a decision, so the hook receiver
+   *  must refuse to resolve these rows; see hookReceiver.resolvePermission). */
+  origin: string;
   /** `null` until `resolvePendingPermissionDecision` records an answer. */
   resolvedDecision: string | null;
 }
@@ -112,6 +117,17 @@ export class Store {
   }
 
   private migrate(): void {
+    // WAL keeps commits cheap (no per-commit journal-file create/delete + fsync — the daemon
+    // writes on every envelope via the outbox and on every hook event) and lets the CLI's
+    // offline readers (`cctl session status`, `usage`) read while the daemon writes. Applied
+    // before the DDL so even the first-ever migration commits in WAL. On `:memory:` databases
+    // (tests) the pragma is a no-op. synchronous=NORMAL is the documented safe pairing for
+    // WAL — a power loss can lose the last commit, never corrupt, and every table here is a
+    // cache/mirror/outbox that tolerates exactly that.
+    this.db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+    `);
     // Idempotent: every deploy of the daemon calls this on startup against a possibly
     // already-migrated file, so every statement is `IF NOT EXISTS`.
     this.db.exec(`
@@ -140,6 +156,7 @@ export class Store {
         tool TEXT NOT NULL,
         summary TEXT NOT NULL,
         createdAtMs INTEGER NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'hook',
         resolvedDecision TEXT
       );
 
@@ -158,6 +175,19 @@ export class Store {
         createdAtMs INTEGER NOT NULL
       );
     `);
+    // `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a database created
+    // before the `origin` column existed must be upgraded here. Legacy rows default to
+    // 'hook': the resolve path has always treated every row as hook-originated, so the
+    // default preserves exactly the behavior those rows already had — a legacy managed row
+    // loses only the new refuse-from-the-wrong-process protection, never its resolvability.
+    const pendingPermissionColumns = this.db
+      .prepare(`PRAGMA table_info(pending_permissions)`)
+      .all();
+    if (!pendingPermissionColumns.some((col) => col['name'] === 'origin')) {
+      this.db.exec(
+        `ALTER TABLE pending_permissions ADD COLUMN origin TEXT NOT NULL DEFAULT 'hook'`,
+      );
+    }
   }
 
   // ---- usage_snapshots ----
@@ -300,6 +330,7 @@ export class Store {
       tool: requireString(row, 'tool'),
       summary: requireString(row, 'summary'),
       createdAtMs: requireNumber(row, 'createdAtMs'),
+      origin: requireString(row, 'origin'),
       resolvedDecision: optionalString(row, 'resolvedDecision'),
     };
   }
@@ -307,10 +338,10 @@ export class Store {
   insertPendingPermission(row: Omit<PendingPermissionRow, 'resolvedDecision'>): void {
     this.db
       .prepare(
-        `INSERT INTO pending_permissions (requestId, sessionId, tool, summary, createdAtMs, resolvedDecision)
-         VALUES (?, ?, ?, ?, ?, NULL)`,
+        `INSERT INTO pending_permissions (requestId, sessionId, tool, summary, createdAtMs, origin, resolvedDecision)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
       )
-      .run(row.requestId, row.sessionId, row.tool, row.summary, row.createdAtMs);
+      .run(row.requestId, row.sessionId, row.tool, row.summary, row.createdAtMs, row.origin);
   }
 
   getPendingPermission(requestId: string): PendingPermissionRow | undefined {
@@ -345,6 +376,18 @@ export class Store {
   }
 
   // ---- sessions ----
+  //
+  // DECISION: this table is a DISPLAY-ONLY MIRROR for `cctl session status`, NOT a
+  // source of truth. Recovery NEVER reads it: session-runtime's `sessions.json` (atomic
+  // temp+rename) remains the single source of truth that recover()/resumeOrphan read, precisely
+  // because a mirror can diverge from it across a crash window. Wiring a writer was deferred
+  // until its reader existed ("a second source of truth with no reader is pure
+  // divergence risk"); both land together — the daemon mirrors managed-session state
+  // transitions here (see daemon.ts `mirrorManagedSession`) and registers interactive sessions
+  // here (see daemon.ts `registerSession`), and `cctl session status` reads it offline. Because
+  // it is observability-only, STALENESS AFTER A CRASH IS TOLERATED: a row left 'running' by a
+  // dead daemon is a cosmetic lie in `session status`, never a recovery hazard (recovery reads
+  // sessions.json, which is authoritative). Do not make anything on the recovery path read here.
 
   private toSessionRow(row: Record<string, unknown>): SessionRow {
     return {
@@ -357,8 +400,9 @@ export class Store {
     };
   }
 
-  /** Insert-or-replace by id — sessions are mirrored here on every state change, so the
-   *  latest write always wins. */
+  /** Insert-or-replace by id (latest write wins). Written by the daemon's display mirror only
+   *  (managed-session transitions + interactive-session registration) — see the section note
+   *  above: this is observability, never a recovery source. */
   upsertSession(row: SessionRow): void {
     this.db
       .prepare(
@@ -377,6 +421,13 @@ export class Store {
   getSession(id: string): SessionRow | undefined {
     const row = this.db.prepare(`SELECT * FROM sessions WHERE id = ?`).get(id);
     return row ? this.toSessionRow(row) : undefined;
+  }
+
+  /** Remove one row from the display mirror (the `cctl session unregister` path). Returns
+   *  whether a row was actually deleted, so the caller can answer "was never registered"
+   *  honestly instead of pretending an unregister of nothing succeeded. */
+  deleteSession(id: string): boolean {
+    return this.db.prepare(`DELETE FROM sessions WHERE id = ?`).run(id).changes > 0;
   }
 
   listSessions(): SessionRow[] {

@@ -4,12 +4,16 @@ export { computePlan } from './advisor.js';
 export {
   decideAutoSwitch,
   DEFAULT_TRIGGER_PERCENT,
+  DEFAULT_STALE_TRIGGER_PERCENT,
+  DEFAULT_STALE_AFTER_MS,
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
+  DEFAULT_GREEDY_RESET_MARGIN_MS,
   type AutoSwitchDecision,
   type AutoSwitchPolicy,
 } from './autoswitch.js';
 export { humanizeDuration, roundPct } from './format.js';
 export { severityOf, worstSeverity, type Severity } from './severity.js';
+export { computePacing, type AccountPacing, type Pacing, type PacingVerdict } from './pacing.js';
 export {
   PLAIN_OUTLOOK_STYLE,
   SESSION_WINDOW_MS,

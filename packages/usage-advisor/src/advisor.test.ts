@@ -50,6 +50,28 @@ describe('computePlan — degenerate inputs', () => {
     expect(plan.reason).toMatch(/quarantined/i);
     expect(plan.advisories.filter((x) => x.kind === 'quarantined')).toHaveLength(2);
   });
+
+  it('keeps unusable-account scores finite so the plan survives JSON serialization', () => {
+    // Regression: -Infinity scores JSON.stringify to null, which fails the wire schema's
+    // z.number() on the bot side and silently drops the whole usage.snapshot frame —
+    // exactly when an account is quarantined/exhausted and visibility matters most.
+    const plan = computePlan(
+      [
+        acct('a', 'Healthy', [{ kind: 'weekly_all', percent: 20 }]),
+        acct('b', 'Jailed', [{ kind: 'weekly_all', percent: 0 }], { quarantined: true }),
+        acct('c', 'Empty', [{ kind: 'weekly_all', percent: 100 }]),
+      ],
+      opts,
+    );
+    for (const entry of plan.ranking) expect(Number.isFinite(entry.score)).toBe(true);
+    // Unusable accounts still sink below every usable one.
+    const jailed = plan.ranking.find((r) => r.accountId === 'b');
+    const healthy = plan.ranking.find((r) => r.accountId === 'a');
+    expect(jailed && healthy && jailed.score < healthy.score).toBe(true);
+    // The full round-trip preserves numbers (no null holes where scores were).
+    const revived = JSON.parse(JSON.stringify(plan)) as typeof plan;
+    expect(revived.ranking.map((r) => typeof r.score)).toEqual(plan.ranking.map(() => 'number'));
+  });
 });
 
 describe('computePlan — the ranking must survive JSON', () => {

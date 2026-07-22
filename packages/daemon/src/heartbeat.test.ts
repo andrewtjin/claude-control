@@ -42,11 +42,10 @@ describe('HeartbeatWriter', () => {
     });
     now = 2000;
     await vi.advanceTimersByTimeAsync(100);
-    // waitFor, like the first write above: an atomic replace is several fs operations, so the
-    // tick that starts the write is not the tick that finishes it.
-    await vi.waitFor(async () => {
-      expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 2000 });
-    });
+    // The tick's fs write is real async work fake timers don't cover — without lining up
+    // behind it, this read can catch the write mid-flight and see the previous beat.
+    await writer.flush();
+    expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 2000 });
     writer.stop();
   });
 
@@ -82,6 +81,10 @@ describe('HeartbeatWriter', () => {
     // Exactly one more tick from the single live interval, not two.
     expect(ticks).toBe(ticksAfterFirstStart + 1);
     writer.stop();
+    // The tick above kicked off a real temp-file write + rename; on Windows, afterEach's
+    // recursive rm can walk the directory mid-rename and die with ENOTEMPTY unless the
+    // write settles first.
+    await writer.flush();
   });
 
   it('reports a write failure through onError instead of throwing out of the timer', async () => {

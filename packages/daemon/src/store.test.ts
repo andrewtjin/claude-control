@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Store } from './store.js';
 
@@ -90,10 +94,12 @@ describe('Store', () => {
         tool: 'Bash',
         summary: 'run ls',
         createdAtMs: 10,
+        origin: 'hook',
       });
 
       const row = store.getPendingPermission('req-1');
       expect(row?.resolvedDecision).toBeNull();
+      expect(row?.origin).toBe('hook');
 
       const changed = store.resolvePendingPermission('req-1', 'allow');
       expect(changed).toBe(1);
@@ -111,6 +117,7 @@ describe('Store', () => {
         tool: 'Bash',
         summary: 'run ls',
         createdAtMs: 10,
+        origin: 'hook',
       });
       expect(store.resolvePendingPermission('req-2', 'allow')).toBe(1);
       expect(store.resolvePendingPermission('req-2', 'deny')).toBe(0);
@@ -125,6 +132,7 @@ describe('Store', () => {
         tool: 't',
         summary: 'x',
         createdAtMs: 200,
+        origin: 'hook',
       });
       store.insertPendingPermission({
         requestId: 'r2',
@@ -132,8 +140,21 @@ describe('Store', () => {
         tool: 't',
         summary: 'x',
         createdAtMs: 100,
+        origin: 'hook',
       });
       expect(store.listPendingPermissions().map((r) => r.requestId)).toEqual(['r2', 'r1']);
+    });
+
+    it('round-trips a managed origin', () => {
+      store.insertPendingPermission({
+        requestId: 'req-m',
+        sessionId: 'sess-1',
+        tool: 'Write',
+        summary: 'write file',
+        createdAtMs: 10,
+        origin: 'managed',
+      });
+      expect(store.getPendingPermission('req-m')?.origin).toBe('managed');
     });
   });
 
@@ -177,6 +198,20 @@ describe('Store', () => {
     it('returns undefined for an unknown session id', () => {
       expect(store.getSession('missing')).toBeUndefined();
     });
+
+    it('deleteSession removes the row and reports whether anything was there', () => {
+      store.upsertSession({
+        id: 'sess-3',
+        kind: 'interactive',
+        state: 'active',
+        accountId: null,
+        json: '{}',
+        updatedAtMs: 1,
+      });
+      expect(store.deleteSession('sess-3')).toBe(true);
+      expect(store.getSession('sess-3')).toBeUndefined();
+      expect(store.deleteSession('sess-3')).toBe(false);
+    });
   });
 
   describe('outbox', () => {
@@ -213,5 +248,82 @@ describe('Store', () => {
       store.trimOutboxOldest(10);
       expect(store.countOutbox()).toBe(1);
     });
+  });
+});
+
+describe('Store migration', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cctl-store-migration-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('adds the origin column to a pre-origin database, defaulting legacy rows to hook', () => {
+    const dbPath = join(dir, 'daemon.db');
+    // Recreate the table shape a pre-`origin` deploy left behind, with one in-flight row —
+    // `CREATE TABLE IF NOT EXISTS` alone would never add the column to this file.
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE pending_permissions (
+        requestId TEXT PRIMARY KEY,
+        sessionId TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        createdAtMs INTEGER NOT NULL,
+        resolvedDecision TEXT
+      );
+    `);
+    legacy
+      .prepare(
+        `INSERT INTO pending_permissions (requestId, sessionId, tool, summary, createdAtMs, resolvedDecision)
+         VALUES ('legacy-1', 's', 'Bash', 'x', 10, NULL)`,
+      )
+      .run();
+    legacy.close();
+
+    const store = new Store(dbPath);
+    try {
+      // The legacy row survives the upgrade and reads as hook-originated — the resolve path
+      // treated every pre-upgrade row that way, so the default preserves its behavior.
+      expect(store.getPendingPermission('legacy-1')?.origin).toBe('hook');
+      // And post-upgrade inserts carry an explicit origin end to end.
+      store.insertPendingPermission({
+        requestId: 'new-1',
+        sessionId: 's',
+        tool: 'Write',
+        summary: 'y',
+        createdAtMs: 20,
+        origin: 'managed',
+      });
+      expect(store.getPendingPermission('new-1')?.origin).toBe('managed');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('is idempotent across reopenings of an already-migrated database', () => {
+    const dbPath = join(dir, 'daemon.db');
+    const first = new Store(dbPath);
+    first.insertPendingPermission({
+      requestId: 'r1',
+      sessionId: 's',
+      tool: 'Bash',
+      summary: 'x',
+      createdAtMs: 10,
+      origin: 'managed',
+    });
+    first.close();
+
+    // A second open must not attempt (and fail) a duplicate ALTER, and the data survives.
+    const second = new Store(dbPath);
+    try {
+      expect(second.getPendingPermission('r1')?.origin).toBe('managed');
+    } finally {
+      second.close();
+    }
   });
 });

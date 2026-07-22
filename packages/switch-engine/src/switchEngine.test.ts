@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, mkdir } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SwitchEngine, type RefreshFn } from './switchEngine.js';
@@ -8,7 +8,14 @@ import { CredentialStore } from './credentialStore.js';
 import { Vault } from './vault.js';
 import { IntentStore } from './intent.js';
 import { sandboxPaths, type Paths } from './paths.js';
-import { CadenceError, QuarantineError, UnknownAccountError, RefreshError } from './errors.js';
+import {
+  CadenceError,
+  QuarantineError,
+  UnknownAccountError,
+  RefreshError,
+  LockTimeoutError,
+} from './errors.js';
+import { acquireLock } from './lock.js';
 import type { ClaudeOauth, CredentialBundle } from './types.js';
 
 const NOW = 100_000_000;
@@ -113,7 +120,7 @@ describe('captureFromConfigDir', () => {
     const h = await harness();
     const { accountA } = await seedAActiveWithB(h);
 
-    // Simulate WT-1: a `claude` run under CLAUDE_CONFIG_DIR=<dir> left BOTH files there.
+    // Simulate a `claude` run under CLAUDE_CONFIG_DIR=<dir> leaving BOTH files there.
     const captureDir = join(h.paths.claudeDir, '..', 'capture');
     await mkdir(captureDir, { recursive: true });
     const fresh = bundleFor('FRESH', NOW + 10 * HOUR);
@@ -141,6 +148,98 @@ describe('captureFromConfigDir', () => {
     const emptyDir = join(h.paths.claudeDir, '..', 'empty-capture');
     await mkdir(emptyDir, { recursive: true });
     await expect(h.engine.captureFromConfigDir('x', emptyDir)).rejects.toBeInstanceOf(RefreshError);
+  });
+});
+
+describe('reloginFromConfigDir', () => {
+  /** A bundle whose account uuid is set explicitly, so a test can make the existing account and
+   *  the captured login share (or deliberately NOT share) an identity. */
+  function bundleWithUuid(access: string, uuid: string, expiresAt: number): CredentialBundle {
+    return {
+      claudeAiOauth: oauth(access, expiresAt),
+      oauthAccount: { accountUuid: uuid, emailAddress: `${access}@x.com` },
+    };
+  }
+
+  /** Write a transient-config-dir login (what a `claude` run under CLAUDE_CONFIG_DIR leaves). */
+  async function writeCapture(h: Harness, dir: string, bundle: CredentialBundle): Promise<void> {
+    await mkdir(dir, { recursive: true });
+    const store = new CredentialStore({
+      claudeDir: dir,
+      credentialsPath: join(dir, '.credentials.json'),
+      claudeJsonPath: join(dir, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+    await store.writeLiveCredentials(bundle.claudeAiOauth);
+    await store.writeOauthAccount(bundle.oauthAccount!);
+  }
+
+  it('rewrites the SAME account id in place and clears quarantine (attribution preserved)', async () => {
+    const h = await harness();
+    const existing = await h.engine.addAccount(
+      'work',
+      bundleWithUuid('OLD', 'uuid-work', NOW + HOUR),
+    );
+    await h.vault.quarantine(existing.id, 'refresh token died');
+
+    const captureDir = join(h.paths.claudeDir, '..', 'relogin-capture');
+    await writeCapture(h, captureDir, bundleWithUuid('NEW', 'uuid-work', NOW + 10 * HOUR));
+
+    const result = await h.engine.reloginFromConfigDir(existing.id, captureDir);
+
+    // The id is preserved — every activation_intervals / usage_snapshots row keyed to it stays
+    // valid, which is the whole reason this verb exists instead of add --fresh.
+    expect(result.id).toBe(existing.id);
+    expect(result.quarantined).toBe(false);
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('NEW');
+    // Still exactly one account — no new id was minted.
+    expect(await h.engine.listAccounts()).toHaveLength(1);
+  });
+
+  it('refuses (and changes nothing) when the captured login is a DIFFERENT account', async () => {
+    const h = await harness();
+    const existing = await h.engine.addAccount(
+      'work',
+      bundleWithUuid('OLD', 'uuid-work', NOW + HOUR),
+    );
+    await h.vault.quarantine(existing.id, 'refresh token died');
+
+    const captureDir = join(h.paths.claudeDir, '..', 'wrong-account');
+    await writeCapture(
+      h,
+      captureDir,
+      bundleWithUuid('WRONG', 'uuid-someone-else', NOW + 10 * HOUR),
+    );
+
+    await expect(h.engine.reloginFromConfigDir(existing.id, captureDir)).rejects.toBeInstanceOf(
+      RefreshError,
+    );
+    // The vault bundle and quarantine flag are untouched — a wrong-account capture must never
+    // corrupt the entry it was meant to heal.
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('OLD');
+    expect((await h.engine.listAccounts())[0]?.quarantined).toBe(true);
+  });
+
+  it('refuses when the transient dir has no credentials (login never completed)', async () => {
+    const h = await harness();
+    const existing = await h.engine.addAccount(
+      'work',
+      bundleWithUuid('OLD', 'uuid-work', NOW + HOUR),
+    );
+    const emptyDir = join(h.paths.claudeDir, '..', 'relogin-empty');
+    await mkdir(emptyDir, { recursive: true });
+    await expect(h.engine.reloginFromConfigDir(existing.id, emptyDir)).rejects.toBeInstanceOf(
+      RefreshError,
+    );
+  });
+
+  it('refuses for an unknown account id', async () => {
+    const h = await harness();
+    const someDir = join(h.paths.claudeDir, '..', 'unused-capture');
+    await mkdir(someDir, { recursive: true });
+    await expect(h.engine.reloginFromConfigDir('no-such-id', someDir)).rejects.toBeInstanceOf(
+      UnknownAccountError,
+    );
   });
 });
 
@@ -249,6 +348,122 @@ describe('activate — reconcile-by-reading', () => {
     const { accountB } = await seedAActiveWithB(h);
     const result = await h.engine.activate(accountB.id);
     expect(result.adoptedPreviousRotation).toBe(false);
+  });
+});
+
+describe('active-id reconciliation (external /login inside the Claude CLI)', () => {
+  /** Simulate a `/login` done INSIDE the Claude CLI: the live credential + identity files
+   *  change hands entirely outside this engine, so the registry is never told. */
+  async function externalLogin(h: Harness, bundle: CredentialBundle): Promise<void> {
+    await h.credStore.writeLiveCredentials(bundle.claudeAiOauth);
+    await h.credStore.writeOauthAccount(bundle.oauthAccount!);
+  }
+
+  it('getActiveId follows the live login to the stored account that owns it', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+
+    await externalLogin(h, bundleFor('B', NOW + 10 * HOUR));
+
+    expect(await h.engine.getActiveId()).toBe(accountB.id);
+    // The registry itself is NOT rewritten — reconciliation is a read-side judgment.
+    expect(await h.vault.getActiveId()).toBe(accountA.id);
+  });
+
+  it('getActiveId returns null when the live login was never captured here', async () => {
+    const h = await harness();
+    await seedAActiveWithB(h);
+
+    await externalLogin(h, bundleFor('STRANGER', NOW + 10 * HOUR));
+
+    expect(await h.engine.getActiveId()).toBeNull();
+  });
+
+  it('getActiveId falls back to the registry when no live identity is readable', async () => {
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+
+    // ~/.claude.json lost its oauthAccount block — the registry is the best remaining evidence.
+    await writeFile(h.paths.claudeJsonPath, JSON.stringify({ someOtherKey: true }));
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+    // Same for an outright corrupt file: degrade, never throw on a read path.
+    await writeFile(h.paths.claudeJsonPath, 'not json at all');
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+  });
+
+  it('refreshToken protects the ACTUALLY-live account after an external login', async () => {
+    const h = await harness();
+    const { accountB } = await seedAActiveWithB(h);
+    // The user /login'd as B in the CLI, which then rotated B's token: the vault copy is stale.
+    const b = bundleFor('B', NOW + 10 * HOUR);
+    await externalLogin(h, {
+      ...b,
+      claudeAiOauth: { ...b.claudeAiOauth, refreshToken: 'cli-rotated-B' },
+    });
+
+    const result = await h.engine.refreshToken(accountB.id);
+
+    // Adopt-only, never a network refresh — consuming B's single-use refresh token here would
+    // strand the live session the user is sitting in (the registry still names A, but A's
+    // credentials are no longer the live ones).
+    expect(result).toMatchObject({
+      refreshed: false,
+      skippedReason: 'active_account',
+      adoptedLiveRotation: true,
+    });
+    expect(h.refresh).not.toHaveBeenCalled();
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.refreshToken).toBe(
+      'cli-rotated-B',
+    );
+  });
+
+  it('activate after an external login adopts the live rotation into the account that owns it', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    const b = bundleFor('B', NOW + 10 * HOUR);
+    await externalLogin(h, {
+      ...b,
+      claudeAiOauth: { ...b.claudeAiOauth, refreshToken: 'cli-rotated-B' },
+    });
+
+    // The registry still says A — but B owns the live token, so this is a heal of the live
+    // account and the CLI's rotation must land in B's bundle, never A's.
+    const result = await h.engine.activate(accountB.id);
+
+    expect(result).toMatchObject({
+      ok: true,
+      activeAccountId: accountB.id,
+      adoptedPreviousRotation: true,
+    });
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.refreshToken).toBe(
+      'cli-rotated-B',
+    );
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('r-A');
+    // The committed switch heals the registry record.
+    expect(await h.vault.getActiveId()).toBe(accountB.id);
+  });
+
+  it('never adopts live credentials into a bundle that provably belongs to someone else', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    // Corrupt-state seam: A's registry row still carries uuid-A, but its BUNDLE was replaced
+    // by one with a different identity (e.g. a hand-restored backup). The live login (uuid-A,
+    // rotated) reconciles to A by row — adoption must still refuse to write into a bundle
+    // whose own identity disagrees.
+    await h.vault.writeBundle(accountA.id, {
+      claudeAiOauth: oauth('A2', NOW + 10 * HOUR),
+      oauthAccount: { accountUuid: 'uuid-ELSE', emailAddress: 'a2@x.com' },
+    });
+    const liveA = bundleFor('A', NOW + 10 * HOUR);
+    await externalLogin(h, {
+      ...liveA,
+      claudeAiOauth: { ...liveA.claudeAiOauth, refreshToken: 'cli-rotated' },
+    });
+
+    const result = await h.engine.activate(accountB.id);
+
+    expect(result.adoptedPreviousRotation).toBe(false);
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('r-A2');
   });
 });
 
@@ -471,5 +686,93 @@ describe('refreshToken — background refresh for polling', () => {
   it('rejects an unknown account id', async () => {
     const h = await harness();
     await expect(h.engine.refreshToken('nope')).rejects.toBeInstanceOf(UnknownAccountError);
+  });
+});
+
+describe('registry mutators serialize against the credential lock', () => {
+  /** An engine on `paths` whose registry mutators give up quickly under contention, so the test
+   *  observes the lock-contention error without waiting out a long timeout. */
+  function shortLockEngine(paths: Paths): SwitchEngine {
+    return new SwitchEngine({
+      paths,
+      protector: new InsecurePassthroughProtector(),
+      refresh: vi.fn(),
+      clock: Date.now,
+      lockOptions: { timeoutMs: 150, pollMs: 10 },
+    });
+  }
+
+  /** Hold the engine's credential lock (as a concurrent process would), run `call`, and require
+   *  it to fail with LockTimeoutError — proving the mutator waits on the same mutex activate()
+   *  uses instead of racing straight into an unlocked registry read-modify-write. */
+  async function expectBlockedWhileLocked(
+    paths: Paths,
+    call: (engine: SwitchEngine) => Promise<unknown>,
+  ): Promise<void> {
+    const engine = shortLockEngine(paths);
+    const lock = await acquireLock(join(paths.vaultDir, '.lock'), Date.now, {});
+    try {
+      await expect(call(engine)).rejects.toBeInstanceOf(LockTimeoutError);
+    } finally {
+      lock.release();
+    }
+  }
+
+  it('addAccount waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.addAccount('X', bundleFor('X', NOW + HOUR)));
+  });
+
+  it('removeAccount waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.removeAccount('any-id'));
+  });
+
+  it('clearQuarantine waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.clearQuarantine('any-id'));
+  });
+
+  it('captureCurrentLogin waits on the lock (the add + setActive path)', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.captureCurrentLogin('X'));
+  });
+
+  it('captureFromConfigDir waits on the lock', async () => {
+    const h = await harness();
+    // Seed a transient capture dir so the method reaches its registry write rather than failing
+    // earlier — though it blocks on lock acquisition before it even reads the dir.
+    const captureDir = join(h.paths.claudeDir, '..', 'locked-capture');
+    await mkdir(captureDir, { recursive: true });
+    const store = new CredentialStore({
+      claudeDir: captureDir,
+      credentialsPath: join(captureDir, '.credentials.json'),
+      claudeJsonPath: join(captureDir, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+    const fresh = bundleFor('FRESH', NOW + 10 * HOUR);
+    await store.writeLiveCredentials(fresh.claudeAiOauth);
+    await store.writeOauthAccount(fresh.oauthAccount!);
+    await expectBlockedWhileLocked(h.paths, (e) => e.captureFromConfigDir('fresh', captureDir));
+  });
+
+  it('reloginFromConfigDir waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) =>
+      e.reloginFromConfigDir('any-id', join(h.paths.claudeDir, '..', 'relogin-unused')),
+    );
+  });
+
+  it('a mutator succeeds once the lock is released', async () => {
+    const h = await harness();
+    const engine = shortLockEngine(h.paths);
+    const lock = await acquireLock(join(h.paths.vaultDir, '.lock'), Date.now, {});
+    // While held, the add is refused; after release it goes through and commits to the registry.
+    await expect(engine.addAccount('X', bundleFor('X', NOW + HOUR))).rejects.toBeInstanceOf(
+      LockTimeoutError,
+    );
+    lock.release();
+    const account = await engine.addAccount('X', bundleFor('X', NOW + HOUR));
+    expect((await engine.listAccounts()).map((a) => a.id)).toContain(account.id);
   });
 });

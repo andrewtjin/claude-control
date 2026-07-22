@@ -15,7 +15,7 @@ const baseOpts: ParseUsageOptions = {
 };
 
 describe('parseUsageEndpointResponse', () => {
-  it('parses the exact live payload observed at the M2 gate (2026-07-16 probe)', () => {
+  it('parses an exact payload observed from the live endpoint', () => {
     // Verbatim shape from a real 200 response: `limits` at the TOP level (no `utilization`
     // wrapper), alongside sibling fields the parser must ignore. Object-valued `scope` and
     // nullable resets_at appear in the wild too.
@@ -70,7 +70,7 @@ describe('parseUsageEndpointResponse', () => {
   });
 
   it('parses the `utilization`-wrapped variant (how the CLI caches the same payload)', () => {
-    // Same limit family nested one level down — WT-2 originally recorded this shape from the
+    // Same limit family nested one level down — an earlier live capture recorded this shape from the
     // CLI's `.claude.json` cache; the parser accepts both containers.
     const raw = {
       utilization: {
@@ -170,6 +170,7 @@ describe('parseUsageEndpointResponse', () => {
           { kind: 'weekly', percent: 1 },
           { kind: 'five_hour', percent: 2 },
           { kind: 'weekly_opus', percent: 3 },
+          { kind: 'weekly_fable', percent: 4 },
         ],
       },
     };
@@ -177,6 +178,7 @@ describe('parseUsageEndpointResponse', () => {
     expect(accountUsage.limits.map((l) => l.kind)).toEqual([
       'weekly_all',
       'session',
+      'weekly_scoped',
       'weekly_scoped',
     ]);
   });
@@ -232,7 +234,7 @@ describe('parseUsageEndpointResponse', () => {
   });
 
   it('carries accountId/label/active/source through to AccountUsage', () => {
-    const { accountUsage } = parseUsageEndpointResponse(
+    const { accountUsage, advisorInput } = parseUsageEndpointResponse(
       {},
       { ...baseOpts, source: 'cached', active: false },
     );
@@ -241,6 +243,7 @@ describe('parseUsageEndpointResponse', () => {
     expect(accountUsage.active).toBe(false);
     expect(accountUsage.source).toBe('cached');
     expect(accountUsage.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
+    expect(advisorInput.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
   });
 });
 
@@ -270,11 +273,16 @@ describe('parseCachedUsage', () => {
 
   it("honors the cache's own fetchedAtMs so stale data reports its true age", () => {
     const raw = { fetchedAtMs: 555, limits: [{ kind: 'session', percent: 20 }] };
-    const { accountUsage } = parseCachedUsage(raw, baseOpts);
+    const { accountUsage, advisorInput } = parseCachedUsage(raw, baseOpts);
     expect(accountUsage.fetchedAtMs).toBe(555);
+    // The advisor input carries the SAME honored stamp — the auto-switch policy's stale
+    // trigger judges data age from this field, so a cache re-stamped as fresh here would
+    // disable the preemptive hop exactly when it matters.
+    expect(advisorInput.fetchedAtMs).toBe(555);
     // A cache without its own stamp keeps the caller's poll time (pre-existing behavior).
     const unstamped = parseCachedUsage({ limits: [] }, baseOpts);
     expect(unstamped.accountUsage.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
+    expect(unstamped.advisorInput.fetchedAtMs).toBe(baseOpts.fetchedAtMs);
   });
 
   // fetchedAtMs is copied onto a wire field declared `.int().nonnegative()`, and encoding

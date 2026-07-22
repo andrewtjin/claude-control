@@ -11,6 +11,9 @@ export type {
   SessionRecord,
   SessionEvent,
   SessionHandle,
+  PermissionDecision,
+  PermissionResolveOutcome,
+  PermissionRequest,
 } from './types.js';
 
 export {
@@ -30,6 +33,10 @@ export type {
 } from './managedSession.js';
 
 export { createAgentSdkClient } from './agentSdkClient.js';
+export type { CreateAgentSdkClientDeps } from './agentSdkClient.js';
+
+export { escalateStop } from './stopEscalation.js';
+export type { StopRung, StopEscalationResult, EscalateStopOptions } from './stopEscalation.js';
 
 export { attachObservedSession, createNodePtyFactory } from './observedSession.js';
 export type {
@@ -47,4 +54,5 @@ export type {
   SessionManagerOptions,
   SpawnManagedOptions,
   AttachObservedOptions,
+  ResumeOrphanOptions,
 } from './sessionManager.js';

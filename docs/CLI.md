@@ -70,21 +70,51 @@ cctl daemon run --auto-switch          # auto-switch when the active account run
 cctl daemon run --auto-switch --greedy # also hop toward whichever account's weekly
                                         # quota expires soonest, even while healthy
 
+cctl daemon supervise                  # run + auto-restart on crash or hang (same flags
+                                        # as `daemon run`; a clean exit ends supervision)
+
 cctl daemon install     # register the logon Scheduled Task and start the daemon now
-cctl daemon uninstall   # remove the logon task (does not stop an already-running daemon)
+cctl daemon uninstall   # remove the logon task + the daemon's hook entries in settings.json
 cctl daemon status      # logon task, heartbeat, pairing, relay — at a glance
 ```
 
 `cctl daemon install`/`uninstall` are idempotent: install checks the current
 registration first and only calls `Register-ScheduledTask` when the resolved action
 actually differs, so re-running it (e.g. re-entering `cctl setup`) is a fast no-op. A
-second daemon instance is refused with an actionable message (the vault/db lock), not a
-raw exception.
+second daemon instance is refused up front with an actionable message naming the
+running daemon's pid, not a raw exception.
+
+`cctl daemon uninstall` also prunes the daemon's own hook entries from
+`~/.claude/settings.json` — only entries it installed; other tools' hooks and the rest
+of the file are untouched. Hook removal is best-effort: if settings.json can't be
+touched (e.g. it isn't valid JSON), the command prints a warning but the task removal
+still counts as a success. Neither step stops an already-running daemon, and a running
+daemon reinstalls its hooks on its next start — stop it for the removal to stick.
+
+`cctl daemon supervise` respawns the daemon a couple of seconds after a crash (with a
+cooldown if it crash-loops), probes its local health endpoint, and kills + respawns a
+daemon that is alive but unresponsive. Crashes leave a line in `daemon-crash.log`
+beside the vault.
 
 A running daemon writes a heartbeat roughly every 30 seconds; `cctl daemon status` and
 `cctl status` read it to tell "connected 12s ago" from "dead since 3h" apart from
 whether the logon task is registered at all. A stale heartbeat with a registered task
 reads as "will restart at next logon", not just a bare timestamp.
+
+## Session tracking
+
+```
+cctl session register       # opt the current session into daemon tracking + phone streaming
+cctl session label <name>   # name the current tracked session (shown in the phone list)
+cctl session watch [--off]  # stream the current session to Discord (--off to stop)
+cctl session unregister     # stop tracking (by the current session, --session <id>, or --label <name>)
+cctl session status         # show tracked sessions + active account (reads the daemon db offline)
+```
+
+`register`/`label`/`watch`/`unregister` talk to the running daemon over its loopback
+receiver; `status` reads the local database and works offline. The group is also
+exposed in-session as the `/cctl:*` slash commands shipped in `plugins/cctl/` — a
+self-contained Claude Code plugin that holds no secrets and only wraps the CLI.
 
 ## Pairing
 

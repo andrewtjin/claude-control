@@ -3,10 +3,17 @@
 //
 // The SDK boundary is the injectable `AgentSdkClient` interface below — a small domain
 // type this package owns, deliberately narrower than the real SDK's ~30-variant message
-// union (see agentSdkClient.ts, which is the WET-GATED adapter that maps one onto the
+// union (see agentSdkClient.ts, which is the live-boundary adapter that maps one onto the
 // other). Tests here use a fake client and never touch a real process.
 
-import type { SessionEvent, SessionHandle, SessionState } from './types.js';
+import type {
+  PermissionDecision,
+  PermissionRequest,
+  PermissionResolveOutcome,
+  SessionEvent,
+  SessionHandle,
+  SessionState,
+} from './types.js';
 import { summarizeText } from './summarizer.js';
 
 /**
@@ -19,7 +26,16 @@ export type AgentSdkEvent =
   | { type: 'assistant_text'; text: string }
   | { type: 'tool_use'; name: string; input?: unknown }
   | { type: 'tool_result'; name: string; ok: boolean; text?: string }
-  | { type: 'permission_required'; tool: string; summary: string }
+  /** A tool is blocked awaiting a permission decision. `requestId` is the SDK's own
+   *  control-request id — the anchor the daemon echoes back into `resolvePermission` to
+   *  unblock the tool. `permissionMode` is the mode the query is running under, when known. */
+  | {
+      type: 'permission_required';
+      requestId: string;
+      tool: string;
+      summary: string;
+      permissionMode?: string;
+    }
   /** One turn finished. `ok` is whether the turn itself succeeded; `false` is terminal
    *  (the session cannot continue), `true` leaves the session idle in `waiting_input`
    *  until `send()` starts another turn or `stop()` ends it. */
@@ -31,6 +47,10 @@ export interface AgentSdkQueryOptions {
   resumeSessionId?: string;
   cwd?: string;
   accountId?: string;
+  /** Claude Code permission mode to run the query under (e.g. 'default'). Controls whether
+   *  the SDK prompts (fires `canUseTool`) at all, and is echoed onto the emitted
+   *  `permission_required` events so the bot can render mode-aware cards. */
+  permissionMode?: string;
 }
 
 /** The seam managedSession depends on instead of the real SDK. */
@@ -42,6 +62,11 @@ export interface AgentSdkClient {
   interrupt(): Promise<void>;
   /** Release any resources held for the session. */
   end(): Promise<void>;
+  /** Resolve a pending SDK permission surfaced via a `permission_required` event. OPTIONAL so
+   *  minimal fakes and non-permission clients stay valid; the real adapter implements it. The
+   *  decision flows back into the in-flight `canUseTool` and unblocks (or denies) the tool.
+   *  Single-resolve (see `PermissionResolveOutcome`); never blocks, never times out. */
+  resolvePermission?(requestId: string, decision: PermissionDecision): PermissionResolveOutcome;
 }
 
 export interface ManagedSessionOptions {
@@ -51,29 +76,45 @@ export interface ManagedSessionOptions {
   resumeSessionId?: string;
   cwd?: string;
   accountId?: string;
+  /** See AgentSdkQueryOptions.permissionMode — threaded into every turn's query. */
+  permissionMode?: string;
+  /** Called with the SDK's own session id whenever a turn initializes (from `session_init`).
+   *  Lets a registry persist it as the resume anchor so a session can be re-attached after a
+   *  crash even if it was never itself started with a resume id. Fired once per turn init;
+   *  the value can change across a resume, so the last one wins. */
+  onSessionId?: (sdkSessionId: string) => void;
 }
 
-/** Turn a possibly-multi-block SDK event into plain-text lines the shared summarizer can
- *  classify. Kept as fixed, greppable prefixes ("Tool: ", "Session complete: ", …) so
- *  classifyLine can match them exactly instead of guessing from prose. */
-function agentEventToText(event: AgentSdkEvent): string | undefined {
+/** Map a structured SDK event straight to its display event. The kind is already known here,
+ *  so routing through the line classifier would be a lossy detour: it splits on newlines and
+ *  re-guesses each line, stranding every line after the first in the transcript (a multi-line
+ *  turn summary kept only its "Session complete:" head). Assistant prose is the one genuinely
+ *  unstructured event — it stays on the shared classifier (see handleEvent). The fixed
+ *  prefixes ("Tool: ", "Session complete: ", …) match what classifyLine recognizes, so
+ *  managed sessions and observed-terminal output still speak one vocabulary. */
+function agentEventToDisplay(event: AgentSdkEvent): SessionEvent | undefined {
   switch (event.type) {
     case 'session_init':
-      return undefined; // internal bookkeeping only, nothing worth surfacing to a phone
     case 'assistant_text':
-      return event.text;
+      return undefined; // init is internal bookkeeping; prose goes through the classifier
     case 'tool_use':
-      return `Tool: ${event.name}`;
+      return { kind: 'milestone', text: `Tool: ${event.name}` };
     case 'tool_result':
-      return event.ok
-        ? `Tool result: ${event.name} ok`
-        : `Tool result: ${event.name} failed${event.text ? `: ${event.text}` : ''}`;
+      return {
+        kind: 'milestone',
+        text: event.ok
+          ? `Tool result: ${event.name} ok`
+          : `Tool result: ${event.name} failed${event.text ? `: ${event.text}` : ''}`,
+      };
     case 'permission_required':
-      return `Permission required: ${event.tool} - ${event.summary}`;
+      return { kind: 'milestone', text: `Permission required: ${event.tool} - ${event.summary}` };
     case 'turn_result':
-      return event.ok ? `Session complete: ${event.summary}` : `Session failed: ${event.summary}`;
+      return {
+        kind: 'summary',
+        text: event.ok ? `Session complete: ${event.summary}` : `Session failed: ${event.summary}`,
+      };
     case 'error':
-      return `Error: ${event.message}`;
+      return { kind: 'error', text: `Error: ${event.message}` };
   }
 }
 
@@ -95,9 +136,18 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
   // deterministic accept/reject in call order.
   let busy = false;
   const listeners = new Set<(e: SessionEvent) => void>();
+  // Structured permission-request listeners, kept separate from the display `listeners` above
+  // because a permission request carries the `requestId` needed to resolve it — see the
+  // PermissionRequest doc in types.ts for why this is a second channel, not another
+  // SessionEvent kind.
+  const permissionListeners = new Set<(req: PermissionRequest) => void>();
 
   function emit(e: SessionEvent): void {
     for (const cb of listeners) cb(e);
+  }
+
+  function emitPermissionRequest(req: PermissionRequest): void {
+    for (const cb of permissionListeners) cb(req);
   }
 
   function setState(next: SessionState): void {
@@ -117,11 +167,18 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
 
     if (event.type === 'session_init') {
       resumeId = event.sessionId;
+      // Surface the SDK's session id so a registry can persist it as the resume anchor. Done
+      // here (not via a SessionEvent) so it never pollutes the phone-facing output stream.
+      opts.onSessionId?.(event.sessionId);
       return;
     }
 
-    const text = agentEventToText(event);
-    if (text !== undefined) emitText(text);
+    if (event.type === 'assistant_text') {
+      emitText(event.text);
+    } else {
+      const display = agentEventToDisplay(event);
+      if (display !== undefined) emit(display);
+    }
 
     switch (event.type) {
       case 'assistant_text':
@@ -130,6 +187,14 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
         setState('running');
         break;
       case 'permission_required':
+        // Fire the structured request (with its requestId) BEFORE flipping state, so a
+        // subscriber that reacts to `waiting_permission` already has the request in hand.
+        emitPermissionRequest({
+          requestId: event.requestId,
+          tool: event.tool,
+          summary: event.summary,
+          ...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
+        });
         setState('waiting_permission');
         break;
       case 'turn_result':
@@ -148,6 +213,7 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
         ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
         ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
         ...(opts.accountId !== undefined ? { accountId: opts.accountId } : {}),
+        ...(opts.permissionMode !== undefined ? { permissionMode: opts.permissionMode } : {}),
       };
       for await (const event of opts.client.query(prompt, queryOpts)) {
         handleEvent(event);
@@ -179,6 +245,17 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       listeners.add(cb);
       return () => listeners.delete(cb);
     },
+    onPermissionRequest(cb) {
+      permissionListeners.add(cb);
+      return () => permissionListeners.delete(cb);
+    },
+    resolvePermission(requestId: string, decision: PermissionDecision): PermissionResolveOutcome {
+      // Pure delegation to the client, which owns the actual blocking `canUseTool` promise
+      // (only the client talks to the SDK). A client that doesn't support permissions (a
+      // minimal fake, or a backend that never prompts) yields 'unknown' — never a throw, so a
+      // stale/duplicate phone response is a safe no-op, exactly like the hook path's contract.
+      return opts.client.resolvePermission?.(requestId, decision) ?? 'unknown';
+    },
     // Not `async` deliberately: the busy/terminal guards must reject *synchronously
     // relative to each other* (see the busy-flag note on runTurn) rather than after an
     // implicit microtask hop, so the check-then-kick sequence stays a single atomic tick.
@@ -186,7 +263,7 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       if (busy) {
         return Promise.reject(
           new Error(
-            `session '${opts.id}' is busy with an in-flight turn — wait for 'waiting_input' or call interrupt() first`,
+            `session '${opts.id}' is busy with an in-flight turn - wait for 'waiting_input' or call interrupt() first`,
           ),
         );
       }
@@ -202,7 +279,16 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       await opts.client.interrupt();
     },
     async stop(): Promise<void> {
-      await opts.client.end();
+      // Client teardown is best-effort: end() can reject when the transport is already dead
+      // (the SDK subprocess died out from under us), and the session is no less over for it.
+      // What MUST happen is the terminal state stamp — without it the registry keeps this
+      // record non-terminal and a later daemon run would treat a session the operator
+      // explicitly ended as still alive.
+      try {
+        await opts.client.end();
+      } catch {
+        // A dead transport cannot be torn down twice; there is nothing left to release.
+      }
       if (state !== 'done' && state !== 'failed') {
         setState('done');
       }

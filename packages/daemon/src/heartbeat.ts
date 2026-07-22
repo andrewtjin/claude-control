@@ -42,6 +42,7 @@ export class HeartbeatWriter {
   private readonly clock: () => number;
   private readonly onError: ((err: unknown) => void) | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
+  private pending: Promise<void> = Promise.resolve();
 
   constructor(filePath: string, options: HeartbeatWriterOptions = {}) {
     this.filePath = filePath;
@@ -53,7 +54,7 @@ export class HeartbeatWriter {
   start(): void {
     if (this.timer) return; // already running — start() is idempotent
     const tick = (): void => {
-      this.writeOnce().catch((err: unknown) => this.onError?.(err));
+      this.pending = this.writeOnce().catch((err: unknown) => this.onError?.(err));
     };
     tick();
     this.timer = setInterval(tick, this.intervalMs);
@@ -62,6 +63,13 @@ export class HeartbeatWriter {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+  }
+
+  /** Resolves once the most recently started write has settled (it never rejects — write
+   *  failures are routed to `onError`). The timer fires writes fire-and-forget, so this is
+   *  the only way a caller (a clean shutdown, a test) can line up behind the real fs work. */
+  flush(): Promise<void> {
+    return this.pending;
   }
 
   private async writeOnce(): Promise<void> {

@@ -1,130 +1,202 @@
 // The real `AgentSdkClient` — adapts `@anthropic-ai/claude-agent-sdk`'s `query()` onto the
 // minimal domain interface managedSession.ts depends on.
 //
-// WET-GATED: this file is checked for type-shape plausibility against the SDK's published
-// `.d.ts` (there is no lighter-weight or offline way to validate an interactive CLI
-// subprocess protocol) but is not exercised by the unit test suite — doing so would mean
-// actually spawning a Claude Code process and consuming API/plan quota. `managedSession.ts`
-// carries the real, fully unit-tested state machine and is fake-client-tested exhaustively;
-// this adapter's only job is the message-shape translation below.
+// LIVE BOUNDARY: this file is the ONLY one in the package that calls the real `sdkQuery()` /
+// hands the SDK a live `canUseTool` callback, so it is the only one that would spawn a
+// Claude Code subprocess and consume API/plan quota. It is checked for type-shape
+// plausibility against the SDK's published `.d.ts` but is NOT exercised by the unit suite.
 //
-// Known gap: the SDK's real `tool_result` blocks carry `tool_use_id`, not the tool's name.
-// A faithful `name` would require correlating that id back to the `tool_use` block that
-// requested it, which needs cross-message state this stateless mapper doesn't keep. Using
-// the id as a stand-in `name` is a deliberate simplification — good enough for a milestone
-// line ("Tool result: <id> ok"), not for anything that needs the real tool name.
+// Everything that CAN be tested without a real subprocess has been extracted so that it is:
+//   - message/options translation   -> agentSdkMapping.ts   (pure, unit-tested)
+//   - the blocking permission logic  -> permissionGate.ts     (pure, unit-tested)
+//   - the session state machine      -> managedSession.ts     (fake-client unit-tested)
+// What remains here is the irreducible wiring: merge the SDK message stream with
+// canUseTool-originated permission events, and route decisions back into the in-flight call.
 //
-// Known gap: `canUseTool` (the SDK's permission-prompt hook) is not wired here, so managed
-// sessions never actually emit `permission_required` against a live SDK today — permission
-// handling for managed sessions is deferred to a higher layer. The event and the state
-// machine support for it exist and are unit-tested for when that wiring lands.
+// The three historical gaps are now closed:
+//   1. `canUseTool` IS wired — a prompt becomes a `permission_required` event and the tool
+//      blocks on `permissionGate.register()` until `resolvePermission()` (never a timer).
+//   2. `tool_result` names the real tool via the id->name map mapSdkMessage keeps per turn.
+//   3. `accountId` is threaded via `buildSdkQueryOptions` (config-dir bind) or made LOUD —
+//      see agentSdkMapping.ts's BuildSdkQueryOptionsDeps for the full rationale.
 
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
-import type { Query as SdkQuery, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { PermissionResult, Query as SdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { AgentSdkClient, AgentSdkEvent } from './managedSession.js';
+import type { PermissionDecision, PermissionResolveOutcome } from './types.js';
+import { createPermissionGate, type PermissionGate } from './permissionGate.js';
+import {
+  buildSdkQueryOptions,
+  mapSdkMessage,
+  type BuildSdkQueryOptionsDeps,
+  type ToolNameMap,
+} from './agentSdkMapping.js';
 
-/** A content block, loosely typed. The real SDK's block union (text/tool_use/thinking/
- *  tool_result/…) is large and partly re-exported from `@anthropic-ai/sdk`; narrowing by
- *  hand on the couple of fields we actually read avoids taking on that whole surface. */
-interface LooseBlock {
-  type: string;
-  text?: string;
-  name?: string;
-  input?: unknown;
-  tool_use_id?: string;
-  is_error?: boolean;
-  content?: unknown;
+/** Construction-time dependencies. Identical to the option-builder's deps — how `accountId`
+ *  binds to credentials is a policy the daemon injects (a real config-dir resolver + a
+ *  logger-backed `onUnboundAccountId`); omitting them keeps the safe, loud defaults below. */
+export type CreateAgentSdkClientDeps = BuildSdkQueryOptionsDeps;
+
+/** Loud default so a dropped accountId is never silent even if the daemon injects nothing. */
+function defaultOnUnboundAccountId(accountId: string): void {
+  // Deliberate: the drop must be observable; a daemon with a real logger overrides this via
+  // deps.onUnboundAccountId.
+  console.warn(
+    `[agentSdkClient] accountId '${accountId}' is not bound to a config dir - this session ` +
+      `runs under whichever account the switch engine last activated globally. Confirm it was ` +
+      `activated before spawn (see agentSdkMapping.ts for the credential-selection rationale).`,
+  );
 }
 
-function asBlocks(content: unknown): LooseBlock[] {
-  return Array.isArray(content) ? (content as LooseBlock[]) : [];
-}
-
-function mapAssistantMessage(content: unknown): AgentSdkEvent[] {
-  const events: AgentSdkEvent[] = [];
-  for (const block of asBlocks(content)) {
-    if (block.type === 'text' && typeof block.text === 'string') {
-      events.push({ type: 'assistant_text', text: block.text });
-    } else if (block.type === 'tool_use' && typeof block.name === 'string') {
-      events.push({ type: 'tool_use', name: block.name, input: block.input });
-    }
+/** Map our domain decision onto the SDK's `PermissionResult`. `deny` requires a message; an
+ *  `allow` may carry a narrowed `updatedInput`. Trivial, but SDK-typed, so it stays here in
+ *  the live-boundary file rather than in the pure mapping module. */
+function decisionToPermissionResult(decision: PermissionDecision): PermissionResult {
+  if (decision.behavior === 'allow') {
+    return {
+      behavior: 'allow',
+      ...(decision.updatedInput !== undefined ? { updatedInput: decision.updatedInput } : {}),
+    };
   }
-  return events;
+  return { behavior: 'deny', message: decision.message ?? 'denied by remote operator' };
 }
 
-function mapUserMessage(content: unknown): AgentSdkEvent[] {
-  const events: AgentSdkEvent[] = [];
-  for (const block of asBlocks(content)) {
-    if (block.type !== 'tool_result') continue;
-    const name = typeof block.tool_use_id === 'string' ? block.tool_use_id : 'unknown';
-    const ok = block.is_error !== true;
-    events.push({
-      type: 'tool_result',
-      name,
-      ok,
-      ...(typeof block.content === 'string' ? { text: block.content } : {}),
-    });
-  }
-  return events;
+/** An async iterable a producer can push into and close. Used to interleave the SDK's own
+ *  message stream (pumped by a background loop) with `permission_required` events that arise
+ *  out-of-band inside the `canUseTool` callback — the two can't share a single `for await`
+ *  over the SDK query because canUseTool is a callback, not a message. */
+interface EventChannel<T> extends AsyncIterable<T> {
+  push(item: T): void;
+  close(): void;
 }
 
-/** Translate one raw SDK message into zero or more of our own domain events. Every
- *  message type this package doesn't act on (compaction boundaries, hook progress, task
- *  notifications, …) maps to `[]` — managedSession only needs the handful of signals that
- *  drive its state machine or are worth a milestone line. */
-function mapSdkMessage(msg: SDKMessage): AgentSdkEvent[] {
-  switch (msg.type) {
-    case 'system':
-      return msg.subtype === 'init' ? [{ type: 'session_init', sessionId: msg.session_id }] : [];
-    case 'assistant':
-      return mapAssistantMessage(msg.message.content);
-    case 'user':
-      return mapUserMessage(msg.message.content);
-    case 'result': {
-      // SDKResultMessage is success | error; only the success variant carries `result` —
-      // the error variant carries `errors: string[]` instead, so summary needs to branch.
-      const summary = msg.subtype === 'success' ? msg.result : (msg.errors[0] ?? msg.subtype);
-      return [{ type: 'turn_result', ok: !msg.is_error, summary }];
-    }
-    default:
-      return [];
-  }
+function createEventChannel<T>(): EventChannel<T> {
+  const queue: T[] = [];
+  const waiters: Array<(r: IteratorResult<T>) => void> = [];
+  let closed = false;
+  return {
+    push(item: T): void {
+      if (closed) return;
+      const waiter = waiters.shift();
+      if (waiter) waiter({ value: item, done: false });
+      else queue.push(item);
+    },
+    close(): void {
+      if (closed) return;
+      closed = true;
+      for (let waiter = waiters.shift(); waiter; waiter = waiters.shift()) {
+        waiter({ value: undefined as never, done: true });
+      }
+    },
+    async *[Symbol.asyncIterator](): AsyncGenerator<T> {
+      for (;;) {
+        // Items are never `undefined` (they are AgentSdkEvent objects), so a `shift()` of
+        // undefined unambiguously means "queue empty".
+        const item = queue.shift();
+        if (item !== undefined) {
+          yield item;
+          continue;
+        }
+        if (closed) return;
+        const result = await new Promise<IteratorResult<T>>((resolve) => waiters.push(resolve));
+        if (result.done) return;
+        yield result.value;
+      }
+    },
+  };
 }
 
-async function* mapQuery(q: SdkQuery): AsyncGenerator<AgentSdkEvent> {
-  for await (const msg of q) {
-    for (const event of mapSdkMessage(msg)) yield event;
-  }
-}
+/** Build a real `AgentSdkClient`. `interrupt()`/`end()`/`resolvePermission()` target whichever
+ *  `query()` call is currently in flight — managedSession never has two turns running
+ *  concurrently (see its `busy` guard), so "the current one" is unambiguous. */
+export function createAgentSdkClient(deps: CreateAgentSdkClientDeps = {}): AgentSdkClient {
+  const buildDeps: BuildSdkQueryOptionsDeps = {
+    onUnboundAccountId: deps.onUnboundAccountId ?? defaultOnUnboundAccountId,
+    ...(deps.configDirForAccount !== undefined
+      ? { configDirForAccount: deps.configDirForAccount }
+      : {}),
+    ...(deps.baseEnv !== undefined ? { baseEnv: deps.baseEnv } : {}),
+  };
 
-/** Build a real `AgentSdkClient`. `interrupt()`/`end()` target whichever `query()` call is
- *  currently in flight — managedSession never has two turns running concurrently (see its
- *  `busy` guard), so "the current one" is unambiguous. */
-export function createAgentSdkClient(): AgentSdkClient {
   let current: SdkQuery | undefined;
+  // Gate for the in-flight turn's permission prompts. Recreated per query; denied wholesale
+  // on end() so a stop with a prompt outstanding fails closed (no dangling canUseTool).
+  let currentGate: PermissionGate | undefined;
 
   return {
     query(prompt, opts) {
+      const channel = createEventChannel<AgentSdkEvent>();
+      const gate = createPermissionGate();
+      // Fresh per turn: tool_use ids are only unique within a turn's message sequence.
+      const toolNames: ToolNameMap = new Map();
+      const sdkOptions = buildSdkQueryOptions(opts, buildDeps);
+
       const q = sdkQuery({
         prompt,
         options: {
-          ...(opts.resumeSessionId !== undefined ? { resume: opts.resumeSessionId } : {}),
-          ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+          ...sdkOptions,
+          // The permission prompt hook. Emitting a `permission_required` event and then
+          // awaiting the gate is exactly "block the tool until the phone answers" — the SDK
+          // keeps the tool parked for as long as this promise is unresolved, with no deadline.
+          canUseTool: async (toolName, _input, o): Promise<PermissionResult> => {
+            const { requestId } = o;
+            channel.push({
+              type: 'permission_required',
+              requestId,
+              tool: toolName,
+              summary: o.title ?? o.displayName ?? toolName,
+              ...(opts.permissionMode !== undefined ? { permissionMode: opts.permissionMode } : {}),
+            });
+            // If the SDK aborts this request (interrupt/cancel), fail it closed rather than
+            // leave the awaited promise hanging. A later resolve() is a no-op by then.
+            o.signal.addEventListener('abort', () => {
+              gate.resolve(requestId, { behavior: 'deny', message: 'request aborted' });
+            });
+            const decision = await gate.register(requestId);
+            return decisionToPermissionResult(decision);
+          },
         },
       });
+
       current = q;
-      return {
-        [Symbol.asyncIterator]() {
-          return mapQuery(q);
-        },
-      };
+      currentGate = gate;
+
+      // Pump the SDK's message stream into the channel in the background; on the way out
+      // (normal end, error, or abort) deny any still-pending prompt so nothing dangles, then
+      // close the channel so managedSession's `for await` completes.
+      void (async () => {
+        try {
+          for await (const msg of q) {
+            for (const event of mapSdkMessage(msg, toolNames)) channel.push(event);
+          }
+        } catch (err) {
+          channel.push({
+            type: 'error',
+            message: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          gate.denyAll('turn ended before this permission was answered');
+          channel.close();
+        }
+      })();
+
+      return channel;
     },
+
     async interrupt(): Promise<void> {
       if (current) await current.interrupt();
     },
+
     end(): Promise<void> {
+      // Fail closed before tearing down: any prompt still parked in canUseTool is denied so
+      // the SDK subprocess is never left blocked on a decision that will never come.
+      currentGate?.denyAll('session ended');
       current?.close();
       return Promise.resolve();
+    },
+
+    resolvePermission(requestId: string, decision: PermissionDecision): PermissionResolveOutcome {
+      return currentGate?.resolve(requestId, decision) ?? 'unknown';
     },
   };
 }

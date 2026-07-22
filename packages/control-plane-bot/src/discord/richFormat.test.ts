@@ -3,11 +3,15 @@ import {
   accountMarker,
   discordRelative,
   emojiTrack,
+  EMBED_DESCRIPTION_LIMIT,
   layeredBar,
+  NOTIFICATION_COLOR,
+  NOTIFICATION_ICON,
   SEVERITY_COLOR,
   severityOf,
   TRACK,
   trackCells,
+  truncateLabeled,
   UNICODE_TRACK_STYLE,
   worstSeverity,
 } from './richFormat.js';
@@ -188,5 +192,39 @@ describe('accountMarker', () => {
     expect(accountMarker({ active: false })).toBe('⚪');
     expect(accountMarker({ active: true, error: 'refresh failed' })).toBe('⚠️');
     expect(accountMarker({ active: true, quarantined: true })).toBe('🚫');
+  });
+});
+
+describe('notification visual language', () => {
+  it('gives done/waiting/quarantine distinct colors and icons', () => {
+    expect(NOTIFICATION_COLOR.done).not.toBe(NOTIFICATION_COLOR.waiting);
+    expect(NOTIFICATION_COLOR.waiting).not.toBe(NOTIFICATION_COLOR.quarantine);
+    // Quarantine reuses the critical usage color on purpose (see richFormat comment).
+    expect(NOTIFICATION_COLOR.quarantine).toBe(SEVERITY_COLOR.critical);
+    const icons = new Set(Object.values(NOTIFICATION_ICON));
+    expect(icons.size).toBe(3); // all three icons are distinct
+  });
+});
+
+describe('truncateLabeled', () => {
+  it('returns short text unchanged', () => {
+    expect(truncateLabeled('hello', 100)).toBe('hello');
+    expect(truncateLabeled('exactly-ten', 'exactly-ten'.length)).toBe('exactly-ten');
+  });
+
+  it('labels the cut with the exact hidden count and never exceeds the limit', () => {
+    const text = 'a'.repeat(200);
+    const out = truncateLabeled(text, 50);
+    expect(out.length).toBeLessThanOrEqual(50);
+    expect(out).toMatch(/\[\+\d+ chars truncated\]$/);
+    // The marker's count is honest: kept chars + hidden chars === original length.
+    const hidden = Number(/\[\+(\d+) chars truncated\]/.exec(out)![1]);
+    const kept = out.slice(0, out.indexOf(' … '));
+    expect(kept.length + hidden).toBe(text.length);
+  });
+
+  it('stays within the real embed description ceiling for a huge message', () => {
+    const out = truncateLabeled('x'.repeat(10_000), EMBED_DESCRIPTION_LIMIT);
+    expect(out.length).toBeLessThanOrEqual(EMBED_DESCRIPTION_LIMIT);
   });
 });
