@@ -381,19 +381,16 @@ describe('question round-trip trio', () => {
   });
 
   it('question.response carries selected labels and defaults selected to empty for other-only answers', () => {
-    const env = stamp({
-      daemonId: 'daemon-1',
-      type: 'question.response',
-      payload: {
+    const result = decode(
+      rawFrame('question.response', {
         requestId: 'req-1',
         answers: [
           { question: 'Which color do you prefer?', selected: ['teal'] },
           { question: 'Anything else?', otherText: 'a custom reply' },
         ],
         idempotencyKey: 'idem-1',
-      },
-    });
-    const result = decode(encode(env));
+      }),
+    );
     expect(result.ok).toBe(true);
     if (result.ok && isType(result.envelope, 'question.response')) {
       expect(result.envelope.payload.answers[0]?.selected).toEqual(['teal']);

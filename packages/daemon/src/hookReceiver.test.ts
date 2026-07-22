@@ -627,6 +627,25 @@ describe('HookReceiver', () => {
       );
       expect((await held).status).toBe(200);
     });
+
+    it("answers a managed session's AskUserQuestion hook neutrally — the SDK gate owns it (no question.request)", async () => {
+      const res = await post(
+        mgPort,
+        '/',
+        {
+          event: 'PermissionRequest',
+          session_id: 'sess-managed',
+          tool_name: 'AskUserQuestion',
+          tool_input: { questions: [{ question: 'Pick?', options: [{ label: 'a' }] }] },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      // Neutral + immediate, no card and no question.request: the managed check runs BEFORE the
+      // AskUserQuestion branch, so the SDK's own question gate is the single channel.
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({});
+      expect(mgEmitted).toHaveLength(0);
+    });
   });
 
   describe('full tool output (CCTL_TOOL_OUTPUT_FULL)', () => {
@@ -1309,7 +1328,104 @@ describe('HookReceiver', () => {
       }
     });
 
-    it('AskUserQuestion is answered immediately with a waiting card, never a permission card', async () => {
+    it('THE question round-trip: holds the hook, emits question.request, and injects the answers as updatedInput', async () => {
+      const questions = [
+        {
+          question: 'Which color?',
+          header: 'Color',
+          options: [{ label: 'teal', description: 'blue-green' }, { label: 'red' }],
+        },
+        {
+          question: 'Which toppings?',
+          multiSelect: true,
+          options: [{ label: 'cheese' }, { label: 'olives' }, { label: 'ham' }],
+        },
+        { question: 'Anything else?', options: [{ label: 'no' }] },
+      ];
+      const held = post(
+        port,
+        '/',
+        {
+          hook_event_name: 'PermissionRequest',
+          session_id: 'sess-q',
+          tool_name: 'AskUserQuestion',
+          tool_input: { questions, extra: 'kept' },
+          permission_mode: 'default',
+          cwd: 'C:/proj',
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+
+      const request = await waitFor(() => emitted.find((e) => e.type === 'question.request'));
+      expect(request.payload).toMatchObject({
+        sessionId: 'sess-q',
+        permissionMode: 'default',
+        cwd: 'C:/proj',
+        questions: [
+          {
+            question: 'Which color?',
+            header: 'Color',
+            multiSelect: false,
+            options: [{ label: 'teal', description: 'blue-green' }, { label: 'red' }],
+          },
+          { question: 'Which toppings?', multiSelect: true },
+          { question: 'Anything else?', multiSelect: false },
+        ],
+      });
+      // A companion card rides alongside, tagged question_prompt with the first question.
+      const note = emitted.find(
+        (e) => e.type === 'hook.notification' && e.payload.notificationType === 'question_prompt',
+      );
+      expect(note?.payload).toMatchObject({
+        event: 'permission',
+        sessionId: 'sess-q',
+        body: 'Which color?',
+        notificationType: 'question_prompt',
+      });
+
+      const requestId = (request.payload as { requestId: string }).requestId;
+      const resolved = await post(
+        port,
+        '/resolve-question',
+        {
+          requestId,
+          answers: [
+            { question: 'Which color?', selected: ['teal'] },
+            // multiSelect joins with ", "
+            { question: 'Which toppings?', selected: ['cheese', 'olives'] },
+            // otherText WINS over selected
+            { question: 'Anything else?', selected: ['no'], otherText: 'a custom note' },
+          ],
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(resolved.status).toBe(200);
+
+      const hookRes = await held;
+      expect(hookRes.status).toBe(200);
+      // The held curl response IS the hook's stdout — allow with the composed answers map keyed
+      // by question TEXT, spread over the ORIGINAL tool_input (so `extra` survives).
+      expect(hookRes.body).toEqual({
+        hookSpecificOutput: {
+          hookEventName: 'PermissionRequest',
+          decision: {
+            behavior: 'allow',
+            updatedInput: {
+              questions,
+              extra: 'kept',
+              answers: {
+                'Which color?': 'teal',
+                'Which toppings?': 'cheese, olives',
+                'Anything else?': 'a custom note',
+              },
+            },
+          },
+        },
+      });
+      expect(store.getPendingQuestion(requestId)?.resolvedAtMs).not.toBeNull();
+    });
+
+    it('malformed AskUserQuestion tool_input falls back to notify-only (terminal picker), no question.request', async () => {
       const res = await post(
         port,
         '/',
@@ -1317,15 +1433,15 @@ describe('HookReceiver', () => {
           hook_event_name: 'PermissionRequest',
           session_id: 'sess-q',
           tool_name: 'AskUserQuestion',
-          tool_input: { questions: [{ question: 'Which option do you want?', header: 'Choice' }] },
+          // No options → not faithfully renderable → fall back to today's behavior.
+          tool_input: { questions: [{ question: 'Which option do you want?' }] },
           permission_mode: 'default',
         },
         { 'x-claude-control-secret': SECRET },
       );
-      // Immediate + neutral — a held response would freeze the terminal question UI.
       expect(res.status).toBe(200);
       expect(res.body).toEqual({});
-      expect(emitted.some((e) => e.type === 'permission.request')).toBe(false);
+      expect(emitted.some((e) => e.type === 'question.request')).toBe(false);
       const note = emitted.find((e) => e.type === 'hook.notification');
       expect(note?.payload).toMatchObject({
         event: 'notification',
@@ -1334,6 +1450,130 @@ describe('HookReceiver', () => {
         body: 'Which option do you want?',
         notificationType: 'question_prompt',
       });
+    });
+
+    it('rejects a double question.response for the same request (single-resolve)', async () => {
+      const held = post(
+        port,
+        '/',
+        {
+          hook_event_name: 'PermissionRequest',
+          session_id: 'sess-q',
+          tool_name: 'AskUserQuestion',
+          tool_input: { questions: [{ question: 'Pick?', options: [{ label: 'a' }] }] },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const request = await waitFor(() => emitted.find((e) => e.type === 'question.request'));
+      const requestId = (request.payload as { requestId: string }).requestId;
+      const answers = [{ question: 'Pick?', selected: ['a'] }];
+      const first = await post(
+        port,
+        '/resolve-question',
+        { requestId, answers },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(first.status).toBe(200);
+      await held;
+      const second = await post(
+        port,
+        '/resolve-question',
+        { requestId, answers },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(second.status).toBe(409);
+      expect(second.body).toMatchObject({ ok: false, error: 'already resolved' });
+    });
+
+    it('rejects a question.response that leaves a question unanswered', async () => {
+      const held = post(
+        port,
+        '/',
+        {
+          hook_event_name: 'PermissionRequest',
+          session_id: 'sess-q',
+          tool_name: 'AskUserQuestion',
+          tool_input: {
+            questions: [
+              { question: 'First?', options: [{ label: 'a' }] },
+              { question: 'Second?', options: [{ label: 'b' }] },
+            ],
+          },
+        },
+        { 'x-claude-control-secret': SECRET },
+      );
+      const request = await waitFor(() => emitted.find((e) => e.type === 'question.request'));
+      const requestId = (request.payload as { requestId: string }).requestId;
+      const res = await post(
+        port,
+        '/resolve-question',
+        { requestId, answers: [{ question: 'First?', selected: ['a'] }] },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ ok: false });
+      expect((res.body as { error: string }).error).toContain('Second?');
+      // The row stays pending — nothing was applied.
+      expect(store.getPendingQuestion(requestId)?.resolvedAtMs).toBeNull();
+      // Let the hold lapse cleanly at afterEach's close() rather than leaking the socket.
+      void held;
+    });
+
+    it('a question.response for an unknown requestId is rejected, not applied', async () => {
+      const res = await post(
+        port,
+        '/resolve-question',
+        { requestId: 'never-asked', answers: [{ question: 'q', selected: ['a'] }] },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ ok: false, error: 'unknown requestId' });
+    });
+
+    it('an unanswered question hold lapses to a NEUTRAL response and emits question.lapsed', async () => {
+      const lapsedEmitted: EnvelopeDraft[] = [];
+      const lapsing = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => lapsedEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        questionHoldMs: 100,
+      });
+      const lapsingPort = await lapsing.listen(0);
+      try {
+        const hookRes = await post(
+          lapsingPort,
+          '/',
+          {
+            hook_event_name: 'PermissionRequest',
+            session_id: 'sess-q',
+            tool_name: 'AskUserQuestion',
+            tool_input: { questions: [{ question: 'Pick?', options: [{ label: 'a' }] }] },
+          },
+          { 'x-claude-control-secret': SECRET },
+        );
+        // Neutral body → the terminal shows its own picker.
+        expect(hookRes.status).toBe(200);
+        expect(hookRes.body).toEqual({});
+
+        const request = lapsedEmitted.find((e) => e.type === 'question.request');
+        const requestId = (request?.payload as { requestId: string }).requestId;
+        const lapse = await waitFor(() => lapsedEmitted.find((e) => e.type === 'question.lapsed'));
+        expect(lapse.payload).toEqual({ requestId, reason: 'expired' });
+
+        // A late answer after the lapse is rejected — nothing recorded.
+        const late = await post(
+          lapsingPort,
+          '/resolve-question',
+          { requestId, answers: [{ question: 'Pick?', selected: ['a'] }] },
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(late.status).toBe(409);
+        expect(store.getPendingQuestion(requestId)?.resolvedAtMs).toBeNull();
+      } finally {
+        await lapsing.close();
+      }
     });
 
     it('a permission payload with no tool name is still rejected (nothing useful to card)', async () => {

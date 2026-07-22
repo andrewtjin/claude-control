@@ -16,13 +16,20 @@ import {
   Events,
   GatewayIntentBits,
   MessageFlags,
+  ModalBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Interaction,
   type EmbedBuilder,
   type Message,
   type MessageActionRowComponentBuilder,
+  type ModalSubmitInteraction,
   type SendableChannels,
+  type StringSelectMenuInteraction,
   SlashCommandBuilder,
 } from 'discord.js';
 import { randomUUID } from 'node:crypto';
@@ -45,8 +52,24 @@ import {
   renderEmojiTrack,
 } from './emojiBars.js';
 import { renderPush, type RenderedPush } from './pushRender.js';
-import { buildLapsedPermissionEmbed } from './embeds.js';
+import {
+  buildAnsweredQuestionEmbed,
+  buildLapsedPermissionEmbed,
+  buildLapsedQuestionEmbed,
+} from './embeds.js';
 import { PermissionCardRegistry, type CardRef } from './permissionCards.js';
+import {
+  QuestionCardRegistry,
+  QuestionAnswerCollector,
+  decodeQuestionModal,
+  decodeQuestionSelect,
+  encodeQuestionModal,
+  questionIdempotencyKey,
+  questionSubmitDedupeKey,
+  OTHER_VALUE,
+  QUESTION_MODAL_INPUT_ID,
+  type SelectSpec,
+} from './questionCards.js';
 import {
   buttonIdempotencyKey,
   resolveTap,
@@ -176,6 +199,14 @@ export class DiscordJsGateway implements DiscordGateway {
    *  (not `private`), same seam rationale as {@link sinkFor}: it lets a test subclass seed a
    *  known ref without opening a real Discord connection. */
   protected readonly permissionCards = new PermissionCardRegistry();
+  /** requestId -> card ref for a sent AskUserQuestion card, so a later question.lapsed can edit it
+   *  and a completed answer can find the card to mark answered. Same bounded, one-shot-on-resolve
+   *  shape and `protected` test-seam rationale as {@link permissionCards}. */
+  protected readonly questionCards = new QuestionCardRegistry();
+  /** Partial answers accumulated across a question card's several selects/modals, until every
+   *  question is answered. In-memory and bounded; an abandoned card's state ages out by FIFO or is
+   *  dropped when the card lapses. */
+  private readonly questionAnswers = new QuestionAnswerCollector();
   /** One pending coalesced-flush timer per session route; rescheduled, never stacked. */
   private readonly flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Per-session-route serialization chain for EVERY card mutation: managed-session frames
@@ -266,6 +297,9 @@ export class DiscordJsGateway implements DiscordGateway {
     if (isType(envelope, 'permission.lapsed')) {
       return this.applyPermissionLapse(envelope.payload);
     }
+    if (isType(envelope, 'question.lapsed')) {
+      return this.applyQuestionLapse(envelope.payload);
+    }
     const push = renderPush(envelope);
     if (!push) return; // cache-only: not worth a DM
     try {
@@ -287,6 +321,15 @@ export class DiscordJsGateway implements DiscordGateway {
             channelId: message.channelId,
             messageId: message.id,
           });
+        }
+        // Same mapping for a question card, plus the collector registration that lets its selects
+        // resolve option indices back to labels and carry each answer's question text.
+        if (index === 0 && isType(envelope, 'question.request')) {
+          this.questionCards.record(envelope.payload.requestId, {
+            channelId: message.channelId,
+            messageId: message.id,
+          });
+          this.questionAnswers.register(envelope.payload.requestId, envelope.payload.questions);
         }
       }
     } catch (err) {
@@ -330,6 +373,35 @@ export class DiscordJsGateway implements DiscordGateway {
       this.logger.warn(
         { err, requestId: payload.requestId },
         'discord: failed to edit a lapsed permission card',
+      );
+    }
+  }
+
+  /** question.lapsed: the hold ended without a phone answer, so the card must stop claiming its
+   *  pickers still work. Mirrors {@link applyPermissionLapse} — edit the ORIGINAL card (found via
+   *  `questionCards`) to the muted, reason-titled lapsed embed and strip every select; drop the
+   *  accumulated answer state too. An untracked requestId (restart, eviction, or a card already
+   *  answered) is dropped silently: never crash, never post a new message for a dead card. */
+  private async applyQuestionLapse(payload: PayloadOf<'question.lapsed'>): Promise<void> {
+    const ref = this.questionCards.take(payload.requestId);
+    this.questionAnswers.forget(payload.requestId);
+    if (!ref) {
+      this.logger.debug(
+        { requestId: payload.requestId },
+        'discord: question.lapsed for a card this bot never tracked (restart, or already evicted)',
+      );
+      return;
+    }
+    try {
+      const message = await this.resolveCardMessage(ref);
+      if (!message) return;
+      const original = message.embeds[0]?.toJSON();
+      const embed = buildLapsedQuestionEmbed(payload.reason, original);
+      await message.edit({ embeds: [embed], components: [] });
+    } catch (err) {
+      this.logger.warn(
+        { err, requestId: payload.requestId },
+        'discord: failed to edit a lapsed question card',
       );
     }
   }
@@ -560,9 +632,16 @@ export class DiscordJsGateway implements DiscordGateway {
    *  conditional spreads so no key is ever present-and-undefined — `exactOptionalPropertyTypes`
    *  rejects `embeds: undefined` at the `user.send` boundary. */
   private toSendExtras(push: RenderedPush) {
+    // Buttons and selects both live in the message's single `components` array; a card carries one
+    // or the other (permission buttons vs. question selects), but merging is the honest way to
+    // model "all this push's action rows" regardless.
+    const rows = [
+      ...(push.components !== undefined ? this.toRows(push.components) : []),
+      ...(push.selects !== undefined ? this.toSelectRows(push.selects) : []),
+    ];
     return {
       ...(push.embeds !== undefined ? { embeds: push.embeds } : {}),
-      ...(push.components !== undefined ? { components: this.toRows(push.components) } : {}),
+      ...(rows.length > 0 ? { components: rows } : {}),
       ...(push.files !== undefined
         ? {
             files: push.files.map(
@@ -571,6 +650,31 @@ export class DiscordJsGateway implements DiscordGateway {
           }
         : {}),
     };
+  }
+
+  /** SelectSpec list → discord.js ActionRows, one select per row (a string select occupies a whole
+   *  row). The only spot that touches StringSelectMenuBuilder, keeping the select DECISIONS
+   *  (questionCards.ts) discord.js-free and unit-tested. */
+  private toSelectRows(
+    selects: SelectSpec[],
+  ): ActionRowBuilder<MessageActionRowComponentBuilder>[] {
+    return selects.map((spec) => {
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(spec.customId)
+        .setPlaceholder(spec.placeholder)
+        .setMinValues(spec.minValues)
+        .setMaxValues(spec.maxValues)
+        .addOptions(
+          spec.options.map((option) => {
+            const built = new StringSelectMenuOptionBuilder()
+              .setLabel(option.label)
+              .setValue(option.value);
+            if (option.description !== undefined) built.setDescription(option.description);
+            return built;
+          }),
+        );
+      return new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(menu);
+    });
   }
 
   /** ButtonSpec rows → discord.js ActionRows. The only spot in the package that touches
@@ -693,6 +797,10 @@ export class DiscordJsGateway implements DiscordGateway {
       await this.onSlashCommand(interaction);
     } else if (interaction.isButton()) {
       await this.onButton(interaction);
+    } else if (interaction.isStringSelectMenu()) {
+      await this.onQuestionSelect(interaction);
+    } else if (interaction.isModalSubmit()) {
+      await this.onQuestionModal(interaction);
     }
   }
 
@@ -885,6 +993,155 @@ export class DiscordJsGateway implements DiscordGateway {
         // pruneButtons) — reuse it so the frame correlates back to that invocation.
         return commands.handlePruneConfirm(this.deps, userId, outcome.id, key);
     }
+  }
+
+  /** A select tap on a question card: record the chosen options, open the Other modal when Other
+   *  was picked, otherwise try to finalize. All DECISIONS (decode, resolve indices→labels,
+   *  completeness) are the pure questionCards module's; this method only performs the discord.js
+   *  side effects each names. */
+  private async onQuestionSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+    const decoded = decodeQuestionSelect(interaction.customId);
+    if (!decoded) {
+      await interaction.reply({
+        content: 'Error: unrecognized selection.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const { requestId, qIndex } = decoded;
+    if (this.questionAnswers.expectedCount(requestId) === undefined) {
+      await this.replyQuestionGone(interaction);
+      return;
+    }
+    this.questionAnswers.setSelection(requestId, qIndex, interaction.values);
+    if (interaction.values.includes(OTHER_VALUE)) {
+      // A modal can ONLY be shown from the select interaction that requested it — so the modal is
+      // the acknowledgment here, and the typed answer arrives later on its own submit.
+      await interaction.showModal(this.buildOtherModal(requestId, qIndex));
+      return;
+    }
+    await this.finalizeQuestion(interaction, interaction.user.id, requestId);
+  }
+
+  /** The Other modal's submit: record the typed free-text answer, then try to finalize the card. */
+  private async onQuestionModal(interaction: ModalSubmitInteraction): Promise<void> {
+    const decoded = decodeQuestionModal(interaction.customId);
+    if (!decoded) {
+      await interaction.reply({
+        content: 'Error: unrecognized submission.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const { requestId, qIndex } = decoded;
+    if (this.questionAnswers.expectedCount(requestId) === undefined) {
+      await this.replyQuestionGone(interaction);
+      return;
+    }
+    this.questionAnswers.setOther(
+      requestId,
+      qIndex,
+      interaction.fields.getTextInputValue(QUESTION_MODAL_INPUT_ID),
+    );
+    await this.finalizeQuestion(interaction, interaction.user.id, requestId);
+  }
+
+  /** Given an updated collector, either quietly acknowledge (more questions still to answer) or —
+   *  once every question is answered — relay the `question.response`, mark the ORIGINAL card
+   *  answered, and confirm ephemerally. Offline daemon: report the error and leave the card AND the
+   *  accumulated answers intact so the user can retry when it returns (the dedupe mark is rolled
+   *  back for the same reason). Consumes the card synchronously on success so a concurrent second
+   *  completion finds nothing and cannot double-post. */
+  private async finalizeQuestion(
+    interaction: StringSelectMenuInteraction | ModalSubmitInteraction,
+    userId: string,
+    requestId: string,
+  ): Promise<void> {
+    const count = this.questionAnswers.expectedCount(requestId);
+    if (count === undefined) {
+      await this.replyQuestionGone(interaction);
+      return;
+    }
+    if (!this.questionAnswers.isComplete(requestId, count)) {
+      // Quiet ack — the card keeps its remaining pickers for the user to fill.
+      await interaction.deferUpdate();
+      return;
+    }
+    const dedupeKey = questionSubmitDedupeKey(userId, requestId);
+    if (!this.seenKeys.markIfNew(dedupeKey)) {
+      await interaction.reply({ content: 'Already answered.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const ref = this.questionCards.get(requestId);
+    if (!ref) {
+      await this.replyQuestionGone(interaction);
+      return;
+    }
+    const answers = this.questionAnswers.answersOf(requestId);
+    const result = commands.handleQuestionAnswer(this.deps, userId, {
+      requestId,
+      answers,
+      idempotencyKey: questionIdempotencyKey(requestId),
+    });
+    if (result.kind === 'error') {
+      // Daemon offline / relay failure: keep everything answerable and roll back the dedupe mark
+      // so a retry once the daemon returns is not swallowed as a duplicate.
+      this.seenKeys.forget(dedupeKey);
+      await interaction.reply({
+        content: `Error: ${result.message}`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    // Success: consume the card and its state right away (before any await), so a concurrent second
+    // completion sees no ref and bails instead of editing/answering twice.
+    this.questionCards.take(requestId);
+    this.questionAnswers.forget(requestId);
+    await interaction.reply({
+      content: 'Answer sent to the session.',
+      flags: MessageFlags.Ephemeral,
+    });
+    await this.markQuestionAnswered(ref, answers);
+  }
+
+  /** Edit the original question card to its answered state (chosen answers shown, selects removed).
+   *  Best-effort like the lapse edit: a card that has since vanished is logged, never thrown. */
+  private async markQuestionAnswered(
+    ref: CardRef,
+    answers: PayloadOf<'question.response'>['answers'],
+  ): Promise<void> {
+    try {
+      const message = await this.resolveCardMessage(ref);
+      if (!message) return;
+      await message.edit({ embeds: [buildAnsweredQuestionEmbed(answers)], components: [] });
+    } catch (err) {
+      this.logger.warn({ err }, 'discord: failed to edit an answered question card');
+    }
+  }
+
+  /** The Other free-text modal: one required paragraph input, its customId encoding which held
+   *  question it answers so the submit routes back to the right card. */
+  private buildOtherModal(requestId: string, qIndex: number): ModalBuilder {
+    const input = new TextInputBuilder()
+      .setCustomId(QUESTION_MODAL_INPUT_ID)
+      .setLabel('Your answer')
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(true);
+    return new ModalBuilder()
+      .setCustomId(encodeQuestionModal(requestId, qIndex))
+      .setTitle('Your answer')
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+  }
+
+  /** Ephemeral "this card is no longer answerable" — for a select/modal whose card was already
+   *  answered, lapsed, evicted, or lost to a restart. */
+  private async replyQuestionGone(
+    interaction: StringSelectMenuInteraction | ModalSubmitInteraction,
+  ): Promise<void> {
+    await interaction.reply({
+      content: 'This question is no longer active.',
+      flags: MessageFlags.Ephemeral,
+    });
   }
 
   /** Report a command result on a button interaction that has already been acknowledged via

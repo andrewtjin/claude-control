@@ -222,3 +222,75 @@ describe('DiscordJsGateway — permission.lapsed', () => {
     expect(gw.resolveCalls).toEqual([]);
   });
 });
+
+/** DiscordJsGateway with the question-card seams exposed, mirroring PermissionTestGateway: seed the
+ *  bounded requestId→ref map that a real question.request send would have populated, and redirect
+ *  the card-message resolution to a fake message — so the lapse-edit path is exercised without a
+ *  real Discord connection (the send path itself is live-boundary, proven the same way permission
+ *  registration is: by seeding). */
+class QuestionTestGateway extends DiscordJsGateway {
+  resolveCalls: CardRef[] = [];
+  fakeMessage: FakePermissionMessage | undefined;
+
+  seedQuestionCard(requestId: string, ref: CardRef): void {
+    this.questionCards.record(requestId, ref);
+  }
+
+  cardCount(): number {
+    return this.questionCards.size();
+  }
+
+  protected override resolveCardMessage(ref: CardRef): Promise<Message | undefined> {
+    this.resolveCalls.push(ref);
+    return Promise.resolve(this.fakeMessage as unknown as Message | undefined);
+  }
+}
+
+describe('DiscordJsGateway — question.lapsed', () => {
+  it('edits the tracked card in place: selects stripped, reason title present, content kept', async () => {
+    const gw = new QuestionTestGateway({ relay: stubRelay, pairing: stubPairing });
+    gw.seedQuestionCard('req-1', { channelId: 'c1', messageId: 'm1' });
+    gw.fakeMessage = new FakePermissionMessage({
+      title: 'Claude has a question',
+      fields: [{ name: 'Color', value: 'Which color?' }],
+      color: 0xf1c40f,
+    });
+
+    await gw.deliver('u1', envelope('question.lapsed', { requestId: 'req-1', reason: 'expired' }));
+
+    expect(gw.resolveCalls).toEqual([{ channelId: 'c1', messageId: 'm1' }]);
+    expect(gw.fakeMessage.editCount).toBe(1);
+    const payload = gw.fakeMessage.lastEditPayload;
+    expect(payload?.components).toEqual([]); // every select removed
+    const editedEmbed = payload?.embeds?.[0]?.toJSON();
+    expect(editedEmbed?.title).toBe('Expired — answer at the terminal');
+    // Original question content preserved.
+    expect((editedEmbed?.fields as { value: string }[] | undefined)?.[0]?.value).toBe(
+      'Which color?',
+    );
+    // One-shot: the requestId is forgotten once its lapse card has been edited.
+    expect(gw.cardCount()).toBe(0);
+  });
+
+  it('a different reason picks a different title', async () => {
+    const gw = new QuestionTestGateway({ relay: stubRelay, pairing: stubPairing });
+    gw.seedQuestionCard('req-2', { channelId: 'c1', messageId: 'm2' });
+    gw.fakeMessage = new FakePermissionMessage({ title: 'Claude has a question' });
+
+    await gw.deliver('u1', envelope('question.lapsed', { requestId: 'req-2', reason: 'local' }));
+
+    expect(gw.fakeMessage.lastEditPayload?.embeds?.[0]?.toJSON().title).toBe(
+      'Answered at the terminal',
+    );
+  });
+
+  it('an unknown requestId is dropped silently: no crash, no card resolved', async () => {
+    const gw = new QuestionTestGateway({ relay: stubRelay, pairing: stubPairing });
+
+    await expect(
+      gw.deliver('u1', envelope('question.lapsed', { requestId: 'never', reason: 'shutdown' })),
+    ).resolves.toBeUndefined();
+
+    expect(gw.resolveCalls).toEqual([]);
+  });
+});

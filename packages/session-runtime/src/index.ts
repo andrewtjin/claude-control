@@ -14,7 +14,14 @@ export type {
   PermissionDecision,
   PermissionResolveOutcome,
   PermissionRequest,
+  QuestionOption,
+  QuestionPrompt,
+  QuestionRequest,
+  QuestionAnswer,
+  QuestionResolution,
 } from './types.js';
+
+export { parseQuestions, composeAnswers } from './questions.js';
 
 export {
   stripAnsi,
