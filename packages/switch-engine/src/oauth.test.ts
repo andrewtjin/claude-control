@@ -74,6 +74,18 @@ describe('refreshCredentials', () => {
     expect((err as RefreshError).code).toBe('network');
   });
 
+  it('maps a refresh timeout (abort) to a transient RefreshError, never a QuarantineError', async () => {
+    // What AbortSignal.timeout produces when the bound fires — it must land in the transient
+    // branch (safe to retry), keeping invalid_grant → QuarantineError semantics untouched.
+    const aborted = new Error('The operation was aborted due to timeout');
+    aborted.name = 'TimeoutError';
+    const fetch = vi.fn().mockRejectedValue(aborted);
+    const err = await refreshCredentials(current, { fetch }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RefreshError);
+    expect(err).not.toBeInstanceOf(QuarantineError);
+    expect((err as RefreshError).code).toBe('network');
+  });
+
   it('rejects a malformed (non-JSON) success body', async () => {
     const fetch = fakeFetch(200, 'not json');
     await expect(refreshCredentials(current, { fetch })).rejects.toBeInstanceOf(RefreshError);

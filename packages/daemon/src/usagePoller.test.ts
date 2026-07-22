@@ -13,6 +13,16 @@ function jsonResponse(status: number, body: unknown): FetchLikeResponse {
   return { ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) };
 }
 
+/** Poll a predicate on real timers (no fake timers) — used to observe that concurrent fetches
+ *  are both in flight before either is allowed to resolve. */
+async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error('timed out waiting for condition');
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 const liveBody = (percent: number) => ({ utilization: { limits: [{ kind: 'session', percent }] } });
 const cachedBody = (percent: number) => ({ limits: [{ kind: 'session', percent }] });
 
@@ -443,5 +453,76 @@ describe('UsagePoller', () => {
     expect(snapshot.accounts[0]?.limits[0]?.percent).toBe(60);
     expect(snapshot.accounts[0]?.fetchedAtMs).toBe(5000);
     expect(snapshot.accounts[0]?.error).toMatch(/rate-limited \(429\)/);
+  });
+
+  it('polls accounts concurrently — the second account starts before the first resolves', async () => {
+    // Each account's fetch parks on a promise this test controls, so a SEQUENTIAL poller would
+    // block on account 1 forever and account 2's fetch would never start. Observing both fetches
+    // in flight at once is therefore direct proof of concurrency.
+    const started: string[] = [];
+    const release: Record<string, (r: FetchLikeResponse) => void> = {};
+    const fetchFn: FetchLike = vi.fn(
+      (_url: string, init: { headers: Record<string, string>; signal?: AbortSignal }) => {
+        const auth = init.headers.authorization ?? '';
+        // The bound signal must ride through so a hung endpoint can be aborted.
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+        started.push(auth);
+        return new Promise<FetchLikeResponse>((resolve) => {
+          release[auth] = resolve;
+        });
+      },
+    );
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: (id: string) => Promise.resolve(id === 'acct-1' ? 'tok-1' : 'tok-2'),
+      getCachedUsage: () => Promise.resolve(cachedBody(0)),
+      clock: () => 0,
+      advisorOptions: { now: () => 0 },
+    });
+
+    const pending = poller.pollAll([account, account2]);
+    // Both fetches must be in flight before either has resolved.
+    await waitFor(() => started.length === 2);
+    expect(new Set(started)).toEqual(new Set(['Bearer tok-1', 'Bearer tok-2']));
+
+    release['Bearer tok-1']?.(jsonResponse(200, liveBody(10)));
+    release['Bearer tok-2']?.(jsonResponse(200, liveBody(20)));
+    const snapshot = await pending;
+    // Order is preserved despite concurrent resolution.
+    expect(snapshot.results.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2']);
+    expect(snapshot.accounts).toHaveLength(2);
+  });
+
+  it('an aborted (timed-out) fetch degrades only that account; others still succeed', async () => {
+    const fetchFn: FetchLike = vi.fn(
+      (_url: string, init: { headers: Record<string, string>; signal?: AbortSignal }) => {
+        if (init.headers.authorization === 'Bearer tok-1') {
+          // Shape of what AbortSignal.timeout produces when it fires.
+          const err = new Error('The operation was aborted due to timeout');
+          err.name = 'TimeoutError';
+          return Promise.reject(err);
+        }
+        return Promise.resolve(jsonResponse(200, liveBody(20)));
+      },
+    );
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: (id: string) => Promise.resolve(id === 'acct-1' ? 'tok-1' : 'tok-2'),
+      getCachedUsage: () => Promise.resolve(cachedBody(7)),
+      clock: () => 0,
+      advisorOptions: { now: () => 0 },
+    });
+
+    const snapshot = await poller.pollAll([account, account2]);
+    expect(snapshot.accounts).toHaveLength(2);
+    // The aborted account degrades to tier-0 with the abort reason surfaced...
+    const a1 = snapshot.results.find((r) => r.accountId === 'acct-1');
+    expect(a1?.outcome).toBe('cached');
+    expect(a1?.usage.accountUsage.error).toMatch(/aborted|timeout/i);
+    expect(a1?.usage.accountUsage.limits[0]?.percent).toBe(7);
+    // ...while the other account is wholly unaffected and reports live.
+    const a2 = snapshot.results.find((r) => r.accountId === 'acct-2');
+    expect(a2?.outcome).toBe('live');
+    expect(a2?.usage.accountUsage.limits[0]?.percent).toBe(20);
   });
 });

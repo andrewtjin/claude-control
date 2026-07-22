@@ -157,7 +157,7 @@ export function attachObservedSession(opts: ObservedSessionOptions): SessionHand
 }
 
 // ---------------------------------------------------------------------------
-// Real node-pty adapter — WET-GATED
+// Real node-pty adapter — live boundary
 // ---------------------------------------------------------------------------
 //
 // node-pty is a native module and is deliberately not installed for this package (see the

@@ -97,7 +97,7 @@ matches the real wire shape (see gate 3's shape correction). Notes: switching sh
 a `/switch` slash command (interactive buttons are M3 UX); there is no phone-side
 `--force`/cadence-retry yet — local `cctl switch <ref> --force` is the override (backlog).
 
-### 5. Hook event names ⚠ PARTIALLY CLOSED 2026-07-16
+### 5. Hook event names ✅ CLOSED 2026-07-19
 
 **Verify:** the exact `PermissionRequest` / `Stop` / `Notification` hook event names and
 payloads against the installed CLI version, and that merging our hooks into each
@@ -110,15 +110,65 @@ profile's `settings.json` is non-destructive.
 (global `permissions.defaultMode: "auto"` means no prompt ever fires). Confirm at M3 in
 `default` mode; the phone card set must be mode-aware (`PreToolUse.permission_mode` is on
 every payload).
-**Pass (remaining):** a permission prompt in a `default`-mode session reaches the loopback
-hook receiver and surfaces on the phone; approve/deny round-trips.
+**M3 landed on `feat/remote-control`** (daemon `hookInstaller`/`hookReceiver`/`hookSecret`,
+mode-aware cards, two-tap, quarantine debounce) and is unit-proven.
+**Result (owner-run 2026-07-17, `feat/remote-control` through `ba37019`):** the
+permission-time event is **`PermissionRequest`**, and it fires only while the CLI is
+actually blocking on a prompt. The daemon holds the hook's HTTP response open for the
+remote decision; the terminal prompt and the phone card race concurrently, first answer
+wins, and a late tap gets an honest refusal. Confirmed live: (1) non-destructive hook
+install with a stable secret across restarts; (2) a permission prompt surfaced a phone
+card; (3) Approve/Deny round-tripped, with the two-tap guard and the expired-confirm
+restore; (4) **correction to the original criterion** — non-`default` modes do NOT get
+button-less info cards: accept-edits still prompts for shell commands, so permission cards
+keep Approve/Deny in EVERY mode and show the mode as footer context (shipped @ `33e1baa`
+after the button-less design proved wrong live). Bonus, same run: every completed shell
+command delivers an output card in every permission mode (truncated by default;
+`CCTL_TOOL_OUTPUT_FULL` ships the rest as a file attachment).
+**Result (owner sign-off 2026-07-19):** the remaining item — done / waiting / quarantine
+notices, including the quarantine debounce and the `cctl accounts relogin <label>` guided
+copy — ran clean in the owner's live sessions (the quarantine path was exercised for real
+during a live vault repair). Gate closed on that confirmation, with no regressions
+outstanding at the merged tip.
 
-### 6. Managed sessions (Agent SDK)
+### 6. Managed sessions (Agent SDK) — the M4 question ✅ CLOSED 2026-07-19
 
-**Verify:** `session-runtime/src/managedSession.ts`'s adapter matches the real
-`@anthropic-ai/claude-agent-sdk` streaming API (message shapes, `interrupt`, input).
-**Pass:** `/run` starts a session that streams summarized milestones to a Discord
-thread; `/say` injects a prompt.
+**Verify:** the daemon-wired managed-session path matches the real
+`@anthropic-ai/claude-agent-sdk` streaming API — message shapes, `canUseTool` permission
+parking, `interrupt`, and input injection — end to end through the Discord live card.
+**M4 landed on `feat/remote-control`** (session-runtime permission gate + ordered output,
+daemon permission routing / stop / orphan resume, bot thread-per-session live card +
+attachments, C6 `cctl session` commands + `cctl accounts relogin`) and is unit-proven.
+**Progress (owner-run 2026-07-17, in flight):** item (1) confirmed live — `/run` streams a
+live card that edits in place, milestone lines post as their own messages, and `/say`
+injects a follow-up into the running session. Two live defects were found and fixed on the
+branch: a managed session's own Stop hook duplicated every turn's summary as a
+"Session stopped" card (the receiver now suppresses hook-driven cards for sessions the
+daemon manages — permission requests and armed output watches still forward), and a
+multi-line turn summary kept only its first line (structured SDK events now emit their
+display event directly instead of being re-classified line by line).
+**Result (owner sign-off 2026-07-19):** the pass criteria below were exercised across the
+owner's live runs — permission round-trips (exactly-once across a double-tap), Stop
+escalation, orphan resume, output attachments, the `cctl session` command set, and
+`accounts relogin` — and the owner confirmed the gate clean with no regressions
+outstanding at the merged tip. Kept for the record:
+**Pass — run `claude-control-orchestrator/tasks/m4-wet-gate-runbook.md`:** (1) `/run`
+starts a managed session that streams a live card to the phone (DM today — channel-per-user
+is not built) with real tool names and milestone lines; `/say` injects a follow-up prompt;
+(2) the managed permission gate blocks the tool with **no timer**, round-trips Approve/Deny,
+resolves exactly once across a two-device double-tap, and is **never** auto-resolved by any
+timeout; (3) the Stop button (two-tap) escalates interrupt → grace → hard and fail-closes a
+pending permission; a repeat `/stop` is ignored (seen-set); (4) killing the daemon
+mid-session and restarting resumes the orphan under the **same** session id; (5) a lost
+output `seq` surfaces a visible gap marker, and long output attaches as `session-<id>.log`;
+(6) `cctl session register|label|watch|status` behave online/offline as specified
+(`status` reads the db with the daemon down; `register` fails loudly when it is down;
+re-register is idempotent); (7) `cctl accounts relogin <ref>` rewrites the same id and its
+identity guard refuses a login as a different account.
+**Known non-defects the runbook flags** (do not read as failures): session cards always
+land in DM; `watch --off` is recorded but does not yet gate the stream; there is no
+verbosity control (no protocol field); `session-threads.json` defaults under `%TEMP%`
+because the bot's `bin.ts` does not set the gateway `stateDir`.
 
 ### 7. Observed sessions (ConPTY)
 

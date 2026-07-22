@@ -45,7 +45,7 @@ describe('createCachedUsageReader', () => {
     await expect(read('acct-2')).resolves.toBeUndefined();
   });
 
-  it('refuses a cache written by a DIFFERENT account (the 2026-07-17 wrong-3% incident)', async () => {
+  it('refuses a cache written by a DIFFERENT account (stale cross-account cache)', async () => {
     // The cache was written while another account was live; a switch back leaves it behind.
     const read = readerWith({ cachedUsageUtilization: cache }, fakeVault('acct-1', 'uuid-B'));
     await expect(read('acct-1')).resolves.toBeUndefined();

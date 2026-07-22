@@ -42,13 +42,32 @@ export { AttributionJournal, type AttributionJournalOptions } from './attributio
 export {
   HookReceiver,
   DEFAULT_HOOK_EVENT_NAMES,
+  DEFAULT_PERMISSION_HOLD_MS,
+  DEFAULT_SECRET_HEADER,
   type HookEventNames,
   type HookReceiverOptions,
   type ResolvePermissionResult,
+  type HookReceiverCliHandlers,
+  type SessionCommandBase,
+  type SessionRegisterInput,
+  type SessionLabelInput,
+  type SessionWatchInput,
+  type SessionCommandResult,
+  type TrackedSessionView,
 } from './hookReceiver.js';
 
 export {
+  hookEndpointPath,
+  readHookEndpoint,
+  writeHookEndpoint,
+  type HookEndpoint,
+} from './hookEndpoint.js';
+
+export { hookForwarderPath, writeHookForwarder, HOOK_FORWARDER_SOURCE } from './hookForwarder.js';
+
+export {
   ControlPlaneClient,
+  ControlPlaneRejectionError,
   type ConnectionState,
   type ControlPlaneClientOptions,
   type ControlPlaneHandlers,
@@ -66,8 +85,6 @@ export {
   type BuildDaemonHookSpecsOptions,
 } from './hookInstaller.js';
 
-export { loadOrCreateHookSecret } from './hookSecret.js';
-
 export {
   HeartbeatWriter,
   readHeartbeat,
@@ -77,6 +94,13 @@ export {
   type HeartbeatReading,
   type HeartbeatWriterOptions,
 } from './heartbeat.js';
+
+export {
+  hookSecretPath,
+  loadHookSecret,
+  loadOrCreateHookSecret,
+  type HookSecretOptions,
+} from './hookSecret.js';
 
 export {
   AutoSwitcher,

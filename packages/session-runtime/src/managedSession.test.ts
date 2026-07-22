@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { startManagedSession } from './managedSession.js';
 import type { AgentSdkClient, AgentSdkEvent, AgentSdkQueryOptions } from './managedSession.js';
-import type { SessionEvent } from './types.js';
+import type { PermissionDecision, PermissionRequest, SessionEvent } from './types.js';
 
 /** Let every currently-queued microtask (queueMicrotask kickoff, async generator steps)
  *  drain before assertions run. setTimeout is a macrotask, so it always runs after the
@@ -96,6 +96,39 @@ describe('startManagedSession', () => {
     ]);
   });
 
+  it('keeps a multi-line turn summary whole — one summary event, no lines stranded as output', async () => {
+    const { client } = fakeClient([
+      [{ type: 'turn_result', ok: true, summary: 'My cwd is:\nC:\\repos\\proj\nAll good.' }],
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    const events = collectEvents(handle);
+    await tick();
+
+    // Exactly one summary carrying every line — re-classifying per line would keep only the
+    // "Session complete:" head and demote the rest to transcript-only output.
+    expect(events).toEqual([
+      { kind: 'summary', text: 'Session complete: My cwd is:\nC:\\repos\\proj\nAll good.' },
+      { kind: 'status', state: 'waiting_input' },
+    ]);
+  });
+
+  it('keeps a multi-line tool failure whole in its milestone', async () => {
+    const { client } = fakeClient([
+      [
+        { type: 'tool_result', name: 'Bash', ok: false, text: 'exit 1\nstderr says no' },
+        { type: 'turn_result', ok: true, summary: 'done' },
+      ],
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(events[0]).toEqual({
+      kind: 'milestone',
+      text: 'Tool result: Bash failed: exit 1\nstderr says no',
+    });
+  });
+
   it('captures the resume session id from session_init and threads it into the next query', async () => {
     const { client, calls } = fakeClient([
       [
@@ -126,7 +159,7 @@ describe('startManagedSession', () => {
   it('transitions to waiting_permission on permission_required and back to running on the next activity event', async () => {
     const { client } = fakeClient([
       [
-        { type: 'permission_required', tool: 'Bash', summary: 'run tests' },
+        { type: 'permission_required', requestId: 'req-1', tool: 'Bash', summary: 'run tests' },
         { type: 'tool_use', name: 'Bash' },
         { type: 'turn_result', ok: true, summary: 'done' },
       ],
@@ -233,6 +266,23 @@ describe('startManagedSession', () => {
     expect(handle.getState()).toBe('done');
   });
 
+  it('stop() still reaches done when end() rejects (dead transport)', async () => {
+    const { client, counts } = fakeClient([[{ type: 'turn_result', ok: true, summary: 'done' }]]);
+    client.end = () => {
+      counts.end++;
+      return Promise.reject(new Error('transport already closed'));
+    };
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    await tick();
+    expect(handle.getState()).toBe('waiting_input');
+
+    // A rejecting teardown must not leave the session immortal: stop() resolves and the
+    // state is terminal regardless, so a registry restart can never resurrect it.
+    await handle.stop();
+    expect(counts.end).toBe(1);
+    expect(handle.getState()).toBe('done');
+  });
+
   it('stop() does not downgrade a session that already reached failed', async () => {
     const { client, counts } = fakeClient([[{ type: 'error', message: 'boom' }]]);
     const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
@@ -252,5 +302,77 @@ describe('startManagedSession', () => {
     unsubscribe();
     await tick();
     expect(events).toEqual([]);
+  });
+
+  it('surfaces a structured permission request (requestId + mode) via onPermissionRequest', async () => {
+    const { client } = fakeClient([
+      [
+        {
+          type: 'permission_required',
+          requestId: 'req-9',
+          tool: 'Bash',
+          summary: 'run tests',
+          permissionMode: 'default',
+        },
+        { type: 'turn_result', ok: true, summary: 'done' },
+      ],
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    expect(typeof handle.onPermissionRequest).toBe('function');
+    const reqs: PermissionRequest[] = [];
+    handle.onPermissionRequest!((r) => reqs.push(r));
+    await tick();
+    expect(reqs).toEqual([
+      { requestId: 'req-9', tool: 'Bash', summary: 'run tests', permissionMode: 'default' },
+    ]);
+  });
+
+  it('resolvePermission delegates to the client and returns its outcome', () => {
+    const resolveCalls: Array<{ requestId: string; decision: PermissionDecision }> = [];
+    const client: AgentSdkClient = {
+      query: () => ({
+        async *[Symbol.asyncIterator]() {
+          await Promise.resolve();
+          yield { type: 'turn_result', ok: true, summary: 'done' };
+        },
+      }),
+      interrupt: () => Promise.resolve(),
+      end: () => Promise.resolve(),
+      resolvePermission: (requestId, decision) => {
+        resolveCalls.push({ requestId, decision });
+        return 'resolved';
+      },
+    };
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    expect(handle.resolvePermission!('req-1', { behavior: 'allow' })).toBe('resolved');
+    expect(resolveCalls).toEqual([{ requestId: 'req-1', decision: { behavior: 'allow' } }]);
+  });
+
+  it('resolvePermission returns unknown when the client cannot resolve permissions', () => {
+    const { client } = fakeClient([[{ type: 'turn_result', ok: true, summary: 'done' }]]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    expect(handle.resolvePermission!('whatever', { behavior: 'deny', message: 'no' })).toBe(
+      'unknown',
+    );
+  });
+
+  it('threads permissionMode into every query', async () => {
+    const { client, calls } = fakeClient([[{ type: 'turn_result', ok: true, summary: 'done' }]]);
+    startManagedSession({ id: 's1', client, prompt: 'go', permissionMode: 'default' });
+    await tick();
+    expect(calls[0]?.opts.permissionMode).toBe('default');
+  });
+
+  it('reports the SDK session id via onSessionId when a turn initializes', async () => {
+    const seen: string[] = [];
+    const { client } = fakeClient([
+      [
+        { type: 'session_init', sessionId: 'sdk-77' },
+        { type: 'turn_result', ok: true, summary: 'done' },
+      ],
+    ]);
+    startManagedSession({ id: 's1', client, prompt: 'go', onSessionId: (sid) => seen.push(sid) });
+    await tick();
+    expect(seen).toEqual(['sdk-77']);
   });
 });

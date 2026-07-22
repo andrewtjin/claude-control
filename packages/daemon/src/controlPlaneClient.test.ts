@@ -13,6 +13,7 @@ import {
 import { Store } from './store.js';
 import {
   ControlPlaneClient,
+  ControlPlaneRejectionError,
   type DaemonIdentity,
   type IdentityStore,
 } from './controlPlaneClient.js';
@@ -30,12 +31,16 @@ interface FakeRelayOptions {
   validCodes?: Map<string, string>;
   /** When true, hello always fails (simulates a version mismatch). */
   rejectHello?: boolean;
+  /** When true, the relay accepts the socket and records the hello but never answers it —
+   *  simulates a hung relay that leaves the handshake unfinished. */
+  silentHello?: boolean;
 }
 
 class FakeRelay {
   private readonly wss: WebSocketServer;
   private readonly validCodes: Map<string, string>;
   private readonly rejectHello: boolean;
+  private readonly silentHello: boolean;
   private nextDaemonSeq = 1;
   readonly tokensByDaemonId = new Map<string, string>();
   /** Every envelope any connected socket has sent us, in receipt order — lets tests assert on
@@ -46,6 +51,7 @@ class FakeRelay {
   constructor(options: FakeRelayOptions = {}) {
     this.validCodes = options.validCodes ?? new Map([['code-1', 'assigned-daemon-1']]);
     this.rejectHello = options.rejectHello ?? false;
+    this.silentHello = options.silentHello ?? false;
     this.wss = new WebSocketServer({ port: 0 });
     this.wss.on('connection', (socket) => this.onConnection(socket));
   }
@@ -142,6 +148,9 @@ class FakeRelay {
   }
 
   private handleHello(socket: WebSocket, envelope: MessageOf<'hello'>): void {
+    // Accept the socket, record the hello (already pushed in onConnection), but never answer —
+    // the client's handshake bound must be what breaks the stall.
+    if (this.silentHello) return;
     const negotiated = negotiateVersion(envelope.payload.protocolVersion);
     const expectedToken = this.tokensByDaemonId.get(envelope.daemonId);
     if (this.rejectHello || negotiated === null || expectedToken !== envelope.payload.daemonToken) {
@@ -257,6 +266,44 @@ describe('ControlPlaneClient', () => {
     expect(helloFrame?.daemonId).toBe('assigned-daemon-1');
   });
 
+  it('unpaired with no pairing code: rejects with re-pair guidance before touching the network', async () => {
+    // The regression this pins: `cctl daemon run` (no --pair) with no persisted
+    // identity used to encode a pair.claim with an EMPTY pairingCode, and the wire schema's
+    // min-length throw inside the ws open handler crashed the whole process.
+    const identityStore = memoryIdentityStore();
+    let socketsOpened = 0;
+    client = new ControlPlaneClient({
+      url: relay.url(),
+      identityStore,
+      store,
+      hostLabel: 'h',
+      reconnectBaseMs: 10,
+      createSocket: (url) => {
+        socketsOpened += 1;
+        return new WebSocket(url);
+      },
+    });
+    await expect(client.connect()).rejects.toThrow(/not paired.*--pair/s);
+    // Typed as a terminal control-plane rejection so runDaemon keeps serving local-only
+    // instead of exiting (an exit under supervise would respawn-storm on an unfixable state).
+    await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
+    expect(socketsOpened).toBe(0); // failed up front — no connection attempt, no invalid frame
+  });
+
+  it('an explicit EMPTY pairing code is treated as unpaired, not sent on the wire', async () => {
+    const identityStore = memoryIdentityStore();
+    client = new ControlPlaneClient({
+      url: relay.url(),
+      identityStore,
+      store,
+      hostLabel: 'h',
+      pairingCode: '',
+      reconnectBaseMs: 10,
+    });
+    await expect(client.connect()).rejects.toThrow(/not paired/);
+    expect(relay.received).toHaveLength(0);
+  });
+
   it('rejects on a bad pairing code without adopting an identity', async () => {
     const identityStore = memoryIdentityStore();
     client = new ControlPlaneClient({
@@ -267,7 +314,7 @@ describe('ControlPlaneClient', () => {
       pairingCode: 'wrong-code',
       reconnectBaseMs: 10,
     });
-    await expect(client.connect()).rejects.toThrow();
+    await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
     expect(identityStore.current()).toBeUndefined();
   });
 
@@ -284,7 +331,7 @@ describe('ControlPlaneClient', () => {
         hostLabel: 'h',
         reconnectBaseMs: 10,
       });
-      await expect(client.connect()).rejects.toThrow();
+      await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
     } finally {
       await badRelay.close();
     }
@@ -326,6 +373,44 @@ describe('ControlPlaneClient', () => {
       expect(rejectionLogs.some((m) => /rejected hello/.test(m))).toBe(true);
     } finally {
       await badRelay.close();
+    }
+  });
+
+  it('a relay that accepts the socket but never answers hello times out and reconnects', async () => {
+    // The stall this pins: the WS handshake succeeds, the client sends hello, and the relay
+    // never replies — without the handshake bound, connect() would hang forever and startup
+    // would stick mid-boot while /healthz still reported OK.
+    const silentRelay = new FakeRelay({ silentHello: true });
+    await silentRelay.listen();
+    try {
+      const identity: DaemonIdentity = { daemonId: 'd1', daemonToken: 't1' };
+      silentRelay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+      const identityStore = memoryIdentityStore(identity);
+      client = new ControlPlaneClient({
+        url: silentRelay.url(),
+        identityStore,
+        store,
+        hostLabel: 'h',
+        helloTimeoutMs: 40, // tiny bound so the stall is broken fast
+        reconnectBaseMs: 10,
+        reconnectCapMs: 20,
+        heartbeatMs: 100_000, // heartbeat off — the handshake bound is what must fire
+      });
+
+      // connect() never resolves against a silent relay; observe the reconnect it drives instead
+      // of awaiting it (the daemon's `await connect()` is precisely what a hang would trap).
+      void client.connect();
+
+      // First hello goes unanswered; the bound fires, forces a reconnect, and a SECOND hello is
+      // sent — proof the client did not stall on the dead handshake.
+      await waitFor(() => silentRelay.received.filter((e) => e.type === 'hello').length >= 2);
+      expect(silentRelay.received.filter((e) => e.type === 'hello').length).toBeGreaterThanOrEqual(
+        2,
+      );
+      // It is retrying, not terminally stuck or self-closed.
+      expect(['connecting', 'reconnecting']).toContain(client.getState());
+    } finally {
+      await silentRelay.close();
     }
   });
 
@@ -421,7 +506,7 @@ describe('ControlPlaneClient', () => {
     expect(titles).toEqual(['n2', 'n3', 'n4']); // oldest (n0, n1) dropped
   });
 
-  it('dispatches inbound switch.command / permission.response / prompt.inject / session.spawn to handlers', async () => {
+  it('dispatches inbound switch.command / permission.response / prompt.inject / session.spawn / session.stop / session.prune to handlers', async () => {
     const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
     relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
     const identityStore = memoryIdentityStore(identity);
@@ -430,6 +515,8 @@ describe('ControlPlaneClient', () => {
     const onPermissionResponse = vi.fn();
     const onPromptInject = vi.fn();
     const onSessionSpawn = vi.fn();
+    const onSessionStop = vi.fn();
+    const onSessionPrune = vi.fn();
 
     client = new ControlPlaneClient({
       url: relay.url(),
@@ -437,7 +524,14 @@ describe('ControlPlaneClient', () => {
       store,
       hostLabel: 'h',
       reconnectBaseMs: 10,
-      handlers: { onSwitchCommand, onPermissionResponse, onPromptInject, onSessionSpawn },
+      handlers: {
+        onSwitchCommand,
+        onPermissionResponse,
+        onPromptInject,
+        onSessionSpawn,
+        onSessionStop,
+        onSessionPrune,
+      },
     });
     await client.connect();
 
@@ -462,12 +556,24 @@ describe('ControlPlaneClient', () => {
       type: 'session.spawn',
       payload: { requestId: 'r3', prompt: 'do it', idempotencyKey: 'k4' },
     });
+    send({
+      daemonId: identity.daemonId,
+      type: 'session.stop',
+      payload: { sessionId: 's1', idempotencyKey: 'k5' },
+    });
+    send({
+      daemonId: identity.daemonId,
+      type: 'session.prune',
+      payload: { requestId: 'r4', idempotencyKey: 'k6' },
+    });
 
-    await waitFor(() => onSessionSpawn.mock.calls.length > 0);
+    await waitFor(() => onSessionPrune.mock.calls.length > 0);
     expect(onSwitchCommand).toHaveBeenCalledTimes(1);
     expect(onPermissionResponse).toHaveBeenCalledTimes(1);
     expect(onPromptInject).toHaveBeenCalledTimes(1);
     expect(onSessionSpawn).toHaveBeenCalledTimes(1);
+    expect(onSessionStop).toHaveBeenCalledTimes(1);
+    expect(onSessionPrune).toHaveBeenCalledTimes(1);
   });
 
   it('drops an invalid/undecodable inbound frame without crashing the connection', async () => {

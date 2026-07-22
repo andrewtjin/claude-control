@@ -387,4 +387,21 @@ describe('runSetup', () => {
     expect(text()).toContain('has not reported in yet');
     expect(text()).toContain('will start at your next logon');
   });
+
+  it('completes with a warning and the retry path when task registration itself fails', async () => {
+    const { io, text } = makeIo(['', 'n', 's']);
+    const outcome = await runSetup(
+      makeDeps(io, {
+        installAutostart: () =>
+          Promise.reject(new Error('Register-ScheduledTask : Access is denied.')),
+        taskRegistered: () => Promise.resolve(false),
+      }),
+    );
+    expect(outcome).toBe('completed');
+    expect(text()).toContain('Could not register the logon task');
+    expect(text()).toContain('Access is denied');
+    expect(text()).toContain('cctl daemon install');
+    // The failure never claims success elsewhere: no "Registered the logon task" line.
+    expect(text()).not.toContain('Registered the logon task');
+  });
 });

@@ -51,6 +51,25 @@ export class DaemonStateCache {
       state.settings = envelope.payload;
     } else if (isType(envelope, 'session.status')) {
       state.sessions.set(envelope.payload.sessionId, envelope.payload);
+    } else if (isType(envelope, 'session.prune.result')) {
+      // The daemon names exactly what its registry dropped; mirror the removal so `/sessions`
+      // stops showing rows that no longer exist anywhere. Ids this cache never saw are no-ops.
+      for (const sessionId of envelope.payload.prunedSessionIds) {
+        state.sessions.delete(sessionId);
+      }
+      // When the daemon also reports its full post-prune registry view, drop every cached
+      // row it does NOT list: a session the daemon lost (rather than pruned) never appears
+      // in prunedSessionIds, so without this reconciliation its cached row would survive
+      // every prune. A session missing here only momentarily (spawned mid-prune) is re-added
+      // by its next session.status push. Old daemons omit the field — then only the named
+      // ids clear, exactly the pre-upgrade behavior.
+      const remaining = envelope.payload.remainingSessionIds;
+      if (envelope.payload.ok && remaining !== undefined && remaining !== null) {
+        const keep = new Set(remaining);
+        for (const sessionId of state.sessions.keys()) {
+          if (!keep.has(sessionId)) state.sessions.delete(sessionId);
+        }
+      }
     }
   }
 

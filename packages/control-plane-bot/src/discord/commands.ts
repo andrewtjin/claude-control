@@ -20,6 +20,7 @@ import {
 } from './embeds.js';
 import type { BarRenderer } from './emojiBars.js';
 import type { TimelineTrackStyle } from './richFormat.js';
+import { pruneButtons, type ButtonSpec } from './buttons.js';
 
 export interface CommandDeps {
   relay: RelaySender;
@@ -35,7 +36,9 @@ export interface CommandDeps {
 
 export type CommandResult =
   | { kind: 'embed'; embed: EmbedBuilder }
-  | { kind: 'text'; text: string }
+  /** `components` lets a reply carry buttons (e.g. `/prune`'s armed confirm control); plain
+   *  ButtonSpecs so this module stays free of discord.js component types — the gateway inflates. */
+  | { kind: 'text'; text: string; components?: ButtonSpec[][] }
   | { kind: 'error'; message: string };
 
 /** `/pair` — issue a fresh pairing code for the invoking user. No envelope is sent here;
@@ -149,7 +152,9 @@ export function handleRun(
     : { kind: 'error', message: result.error };
 }
 
-/** `/say <sessionId> <text>` — inject a message into a running session. */
+/** `/say <sessionId|label> <text>` — inject a message into a running session. `sessionId` is
+ *  passed through verbatim; a registered session's label resolves to its real id daemon-side
+ *  (Daemon.resolveInteractiveRef), so the bot itself stays oblivious to the distinction. */
 export function handleSay(
   deps: CommandDeps,
   discordUserId: string,
@@ -205,28 +210,97 @@ export function handleDeny(
   return handlePermissionResponse(deps, discordUserId, requestId, 'deny', scope, idempotencyKey);
 }
 
-/** `/stop <sessionId>` — protocol v1 has no dedicated "stop a session" payload (see
- *  shared-protocol/messages.ts): the only session-directed message is `prompt.inject`, which
- *  talks TO a running turn, not to the process supervisor. Misusing it as a stop signal
- *  would silently invent session-runtime behavior that package does not implement yet.
- *  Surface that honestly instead of guessing at semantics we don't control. */
+/** `/stop <sessionId>` and the Stop button — request an orderly stop of a managed session. The
+ *  `session.stop` wire type exists in the protocol; escalation (interrupt → grace →
+ *  hard stop) is the daemon's policy and the acknowledgment rides on the `session.status`
+ *  transitions the daemon already emits, so there is no dedicated stop.result to wait on here.
+ *  `idempotencyKey` lets a double-tapped Stop resolve to "already handled" (daemon-side too). */
 export function handleStop(
-  _deps: CommandDeps,
-  _discordUserId: string,
-  _sessionId: string,
+  deps: CommandDeps,
+  discordUserId: string,
+  sessionId: string,
+  idempotencyKey: string,
 ): CommandResult {
-  return { kind: 'error', message: 'stopping a session is not wired in protocol v1 yet.' };
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'session.stop',
+    payload: { sessionId, idempotencyKey },
+  }));
+  return result.ok
+    ? { kind: 'text', text: 'Stop requested.' }
+    : { kind: 'error', message: result.error };
+}
+
+/** Session states a prune ALWAYS removes — the registry's terminal states. The daemon also
+ *  prunes non-terminal leftovers it holds no live handle for (records an earlier daemon run
+ *  abandoned), which this cache cannot distinguish from live sessions, so the preview counts
+ *  only the certain set; the daemon's registry is the authority on what actually gets
+ *  pruned. */
+const DORMANT_STATES = new Set(['done', 'failed', 'orphaned']);
+
+/** `/prune` — the confirmation card. Nothing is sent to the daemon here: the reply carries an
+ *  ARMED Prune button (two-tap confirm, like every destructive control) and only the confirmed
+ *  tap sends the actual `session.prune` (see {@link handlePruneConfirm}). The preview counts the
+ *  BOT's cached view; the daemon may know dormant records this cache never saw (e.g. after a bot
+ *  restart), so the copy promises "all dormant records", not the listed count. */
+export function handlePruneRequest(
+  deps: CommandDeps,
+  discordUserId: string,
+  requestId: string,
+): CommandResult {
+  if (!deps.relay.isOnline(discordUserId)) {
+    return { kind: 'error', message: 'Daemon is offline or not paired.' };
+  }
+  const dormant = deps.cache.getSessions(discordUserId).filter((s) => DORMANT_STATES.has(s.state));
+  const listed = dormant.map((s) => `\`${s.sessionId.slice(0, 8)}\` (${s.state})`).join(', ');
+  const preview =
+    dormant.length > 0
+      ? `${dormant.length} dormant here: ${listed}.`
+      : 'None known here (the daemon may still hold some).';
+  return {
+    kind: 'text',
+    text:
+      `Prune removes ALL dormant session records (done / failed / orphaned, plus records ` +
+      `left behind by an earlier daemon run) from the daemon's registry. ${preview}\nA ` +
+      `pruned session can no longer be revived with \`/say\` — the conversation itself ` +
+      `stays on the host. Live sessions are untouched.`,
+    components: pruneButtons({ requestId }),
+  };
+}
+
+/** The confirmed Prune tap — the only place a `session.prune` frame is actually sent. */
+export function handlePruneConfirm(
+  deps: CommandDeps,
+  discordUserId: string,
+  requestId: string,
+  idempotencyKey: string,
+): CommandResult {
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'session.prune',
+    payload: { requestId, idempotencyKey },
+  }));
+  return result.ok
+    ? { kind: 'text', text: 'Prune requested.' }
+    : { kind: 'error', message: result.error };
 }
 
 /** `/reauth <accountId>` — re-authenticating a quarantined account is an interactive OAuth
  *  flow that must run on the host (the bot holds zero credentials by design — see the
  *  package-level architecture rule); there is no protocol message for it because the bot
- *  structurally cannot perform it. Point the user at the local command instead of pretending
- *  a Discord button could complete an OAuth login. */
+ *  structurally cannot perform it. Point the user at `cctl accounts relogin <label>`, which
+ *  re-logs into the EXISTING vault entry in place (same account id — usage attribution survives,
+ *  quarantine cleared). This copy is kept in lockstep with the quarantine card's `RELOGIN_COMMAND`. */
 export function handleReauth(
   _deps: CommandDeps,
   _discordUserId: string,
   accountId: string,
 ): CommandResult {
-  return { kind: 'text', text: `Re-auth must run on the host: \`cctl login ${accountId}\`.` };
+  return {
+    kind: 'text',
+    text:
+      `Re-auth must run on the host (the bot holds no credentials). Run ` +
+      `\`cctl accounts relogin <label>\` to re-login in place (usage history kept), then ` +
+      `\`cctl switch <label>\`. (quarantined account: ${accountId})`,
+  };
 }

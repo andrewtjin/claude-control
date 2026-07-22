@@ -251,11 +251,55 @@ describe('decideAutoSwitch — greedy mode', () => {
     expect(decideAutoSwitch([healthyActive(NOW + 30 * H), later], NOW, GREEDY)).toBeNull();
   });
 
-  it('treats a tie in reset times as "stay" — only a STRICTLY sooner reset moves', () => {
+  it('treats a tie in reset times as "stay" — only a MATERIALLY sooner reset moves', () => {
     const sameReset = acct('twin', {}, [
       { kind: 'weekly_all', percent: 10, resetsAt: NOW + 30 * H },
     ]);
     expect(decideAutoSwitch([healthyActive(NOW + 30 * H), sameReset], NOW, GREEDY)).toBeNull();
+  });
+
+  it('stays put across per-poll reset jitter — sub-second ordering flips never ping-pong', () => {
+    // Live-observed: the endpoint re-computes resets_at per response, so two accounts
+    // sharing a nominal weekly reset arrive with sub-second skew whose ORDER flips from
+    // poll to poll. Whichever side of the flip a poll lands on, greedy must stay put.
+    const jitterMs = 800;
+    const activeSoonerPoll = [
+      healthyActive(NOW + 30 * H - jitterMs),
+      acct('twin', {}, [{ kind: 'weekly_all', percent: 40, resetsAt: NOW + 30 * H + jitterMs }]),
+    ];
+    const twinSoonerPoll = [
+      healthyActive(NOW + 30 * H + jitterMs),
+      acct('twin', {}, [{ kind: 'weekly_all', percent: 40, resetsAt: NOW + 30 * H - jitterMs }]),
+    ];
+    expect(decideAutoSwitch(activeSoonerPoll, NOW, GREEDY)).toBeNull();
+    expect(decideAutoSwitch(twinSoonerPoll, NOW, GREEDY)).toBeNull();
+  });
+
+  it('hops only past the 15-minute default margin — at the margin stays, beyond it moves', () => {
+    const target = (advantageMs: number) =>
+      acct('sooner', {}, [
+        { kind: 'weekly_all', percent: 10, resetsAt: NOW + 30 * H - advantageMs },
+      ]);
+    const min = 15 * 60_000;
+    expect(decideAutoSwitch([healthyActive(NOW + 30 * H), target(min)], NOW, GREEDY)).toBeNull();
+    expect(
+      decideAutoSwitch([healthyActive(NOW + 30 * H), target(min + 60_000)], NOW, GREEDY)
+        ?.targetAccountId,
+    ).toBe('sooner');
+  });
+
+  it('honors a custom greedyResetMarginMs in both directions', () => {
+    const target = acct('sooner', {}, [
+      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 29 * H }, // 1h sooner than active
+    ]);
+    const accounts = [healthyActive(NOW + 30 * H), target];
+    // A 2h margin says 1h apart is the same deadline; margin 0 restores raw ordering.
+    expect(
+      decideAutoSwitch(accounts, NOW, { greedy: true, greedyResetMarginMs: 2 * H }),
+    ).toBeNull();
+    expect(
+      decideAutoSwitch(accounts, NOW, { greedy: true, greedyResetMarginMs: 0 })?.targetAccountId,
+    ).toBe('sooner');
   });
 
   it("hops when the active account's weekly reset is unknown but a candidate's is known", () => {
@@ -288,5 +332,96 @@ describe('decideAutoSwitch — greedy mode', () => {
     expect(greedy).toEqual(plain);
     expect(greedy?.reason).toContain('hot is at 96% used');
     expect(greedy?.reason).not.toContain('greedy:');
+  });
+});
+
+describe('decideAutoSwitch — stale snapshots', () => {
+  const MIN = 60_000;
+
+  /** An active account whose weekly reads `percent` as of `fetchedAtMs`. */
+  function activeAt(percent: number, fetchedAtMs?: number): AccountUsageInput {
+    return acct('debate', { active: true, ...(fetchedAtMs !== undefined ? { fetchedAtMs } : {}) }, [
+      { kind: 'weekly_all', percent, resetsAt: NOW + 48 * H },
+    ]);
+  }
+  const freshSpare = () =>
+    acct('spare', { fetchedAtMs: NOW }, [
+      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H },
+    ]);
+
+  it('hops preemptively when the weekly is near the wall on hours-old data', () => {
+    // The incident this block pins: the active account read 93% — under the 94% trigger —
+    // but that snapshot was 2h old; real usage crossed 100% unseen and the session died.
+    const decision = decideAutoSwitch([activeAt(93, NOW - 2 * H), freshSpare()], NOW);
+    expect(decision?.targetAccountId).toBe('spare');
+    expect(decision?.reason).toContain('debate is at 93% used on usage data 2h old');
+    expect(decision?.reason).toContain('hopping preemptively');
+    expect(decision?.reason).toContain('spare has the soonest weekly reset');
+  });
+
+  it('still holds at 93% when the data is fresh — the normal trigger governs', () => {
+    expect(decideAutoSwitch([activeAt(93, NOW)], NOW)).toBeNull();
+    expect(decideAutoSwitch([activeAt(93, NOW), freshSpare()], NOW)).toBeNull();
+  });
+
+  it('treats a snapshot with no timestamp as fresh (older callers never see the derate)', () => {
+    expect(decideAutoSwitch([activeAt(93), freshSpare()], NOW)).toBeNull();
+  });
+
+  it('applies the stale bar exactly at the 15-minute default age, not a second before', () => {
+    const spare = freshSpare();
+    expect(decideAutoSwitch([activeAt(93, NOW - 15 * MIN + 1000), spare], NOW)).toBeNull();
+    expect(decideAutoSwitch([activeAt(93, NOW - 15 * MIN), spare], NOW)?.targetAccountId).toBe(
+      'spare',
+    );
+  });
+
+  it('holds below the 85% default stale trigger even on very old data', () => {
+    const spare = freshSpare();
+    expect(decideAutoSwitch([activeAt(84.9, NOW - 12 * H), spare], NOW)).toBeNull();
+    expect(decideAutoSwitch([activeAt(85, NOW - 12 * H), spare], NOW)?.targetAccountId).toBe(
+      'spare',
+    );
+  });
+
+  it('keeps the plain fresh-data phrasing when the hop would have fired anyway', () => {
+    // At/above the normal trigger the derate explains nothing — stale or not, the reason
+    // must not imply the hop hinged on data age.
+    const decision = decideAutoSwitch([activeAt(96, NOW - 2 * H), freshSpare()], NOW);
+    expect(decision?.targetAccountId).toBe('spare');
+    expect(decision?.reason).toContain('debate is at 96% used — spare has the soonest');
+    expect(decision?.reason).not.toContain('preemptively');
+  });
+
+  it('never hops TO a candidate that is only healthy on stale data', () => {
+    // 88% is eligible on fresh data (under the 94% bar) but NOT on a 2h-old snapshot —
+    // its true usage may already be past the wall, making it no refuge at all.
+    const staleSpare = acct('staleSpare', { fetchedAtMs: NOW - 2 * H }, [
+      { kind: 'weekly_all', percent: 88, resetsAt: NOW + 24 * H },
+    ]);
+    expect(decideAutoSwitch([lowActive(), staleSpare], NOW)).toBeNull();
+    const freshTwin = acct('freshTwin', { fetchedAtMs: NOW }, [
+      { kind: 'weekly_all', percent: 88, resetsAt: NOW + 24 * H },
+    ]);
+    expect(decideAutoSwitch([lowActive(), freshTwin], NOW)?.targetAccountId).toBe('freshTwin');
+  });
+
+  it('honors custom staleTriggerPercent and staleAfterMs knobs', () => {
+    const accounts = [activeAt(75, NOW - 10 * MIN), freshSpare()];
+    expect(decideAutoSwitch(accounts, NOW)).toBeNull();
+    expect(
+      decideAutoSwitch(accounts, NOW, { staleTriggerPercent: 70, staleAfterMs: 5 * MIN })
+        ?.targetAccountId,
+    ).toBe('spare');
+  });
+
+  it('clamps the stale trigger to the fresh one — blindness can only tighten the bar', () => {
+    // A misconfigured stale threshold ABOVE triggerPercent must not make stale data a
+    // reason to tolerate MORE usage than fresh data would.
+    const decision = decideAutoSwitch([activeAt(82, NOW - 2 * H), freshSpare()], NOW, {
+      triggerPercent: 80,
+      staleTriggerPercent: 90,
+    });
+    expect(decision?.targetAccountId).toBe('spare');
   });
 });

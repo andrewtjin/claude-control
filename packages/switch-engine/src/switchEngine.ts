@@ -1,4 +1,4 @@
-// The switch engine: the safety-critical core of the whole system (milestone M0).
+// The switch engine: the safety-critical core of the whole system.
 //
 // `activate(id)` makes an account's credentials the live ones, with these guarantees:
 //   1. Mutual exclusion with our other processes (file lock).
@@ -114,22 +114,60 @@ export class SwitchEngine {
     this.log = options.logger ?? noopLogger;
   }
 
-  // ---- registry passthroughs ----
+  // ---- registry mutators (lock-guarded) ----
+  //
+  // The registry (accounts.json) is a read-modify-write file. Every method that writes it MUST
+  // hold the credential lock, or a separate CLI process mutating the registry (`cctl accounts
+  // add`/`remove`/`relogin`) would race the daemon's activate()/refreshToken()/recover() — which
+  // hold the lock across a multi-await sequence — and race other CLI writers, silently losing one
+  // side's update on whichever save() commits last. `listAccounts`/`getActiveId` are pure reads
+  // and intentionally stay unlocked (a torn read at worst returns slightly stale metadata, and
+  // saveRegistry writes the whole file atomically). None of these mutators are called from a
+  // context that already holds the lock — activate()/recover()/the capture verbs reach the vault
+  // directly — so wrapping them here cannot deadlock the (non-reentrant) lock.
 
   listAccounts(): Promise<StoredAccount[]> {
     return this.vault.listAccounts();
   }
-  getActiveId(): Promise<string | null> {
-    return this.vault.getActiveId();
-  }
   addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
-    return this.vault.addAccount(label, bundle);
+    return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
   }
   removeAccount(id: string): Promise<void> {
-    return this.vault.removeAccount(id);
+    return this.withCredentialLock(() => this.vault.removeAccount(id));
   }
   clearQuarantine(id: string): Promise<void> {
-    return this.vault.clearQuarantine(id);
+    return this.withCredentialLock(() => this.vault.clearQuarantine(id));
+  }
+
+  // ---- active account (live-login reconciled) ----
+
+  /**
+   * The id of the stored account whose credentials are live RIGHT NOW.
+   *
+   * The registry's `activeId` only records the last switch THIS engine committed — a `/login`
+   * inside the Claude CLI swaps the live login without telling us, and trusting the registry
+   * afterwards misreports who is active everywhere downstream (the accounts listing, the
+   * phone's active marker, usage attribution) and mis-routes the live-token protections in
+   * `activate()` / `refreshToken()` at whichever account the registry still names. So the
+   * registry answer is reconciled against the live login's identity (`oauthAccount.accountUuid`
+   * from `~/.claude.json` — the same signal the re-login guard trusts). Only a PROVABLE
+   * mismatch overrides the registry:
+   *   - the live identity matches the registry's account → the registry answer stands;
+   *   - it matches a DIFFERENT stored account → that account is the live one;
+   *   - it matches no stored account (a login never captured here) → null, because claiming
+   *     any stored account is active would be false;
+   *   - no live identity is readable → the registry record, the best remaining evidence.
+   */
+  async getActiveId(): Promise<string | null> {
+    const registryId = await this.vault.getActiveId();
+    // A corrupt/unreadable ~/.claude.json must degrade to the registry answer, never throw —
+    // this is a read path callers hit on every listing and poll cycle.
+    const live = await this.credStore.readOauthAccount().catch(() => undefined);
+    const liveUuid = live?.accountUuid;
+    if (liveUuid === undefined) return registryId;
+    const matches = (await this.vault.listAccounts()).filter((a) => a.accountUuid === liveUuid);
+    if (matches.some((m) => m.id === registryId)) return registryId;
+    return matches[0]?.id ?? null;
   }
 
   /**
@@ -137,30 +175,35 @@ export class SwitchEngine {
    * `cctl accounts add` right after an interactive login populated the live files.
    */
   async captureCurrentLogin(label: string): Promise<StoredAccount> {
-    const live = await this.credStore.readLiveCredentials();
-    if (!live)
-      throw new RefreshError('no live credentials to capture; log in first', 'no_live_login');
-    const oauthAccount = await this.credStore.readOauthAccount();
-    const bundle: CredentialBundle = oauthAccount
-      ? { claudeAiOauth: live, oauthAccount }
-      : { claudeAiOauth: live };
-    const account = await this.vault.addAccount(label, bundle);
-    // The just-captured account IS the live one; record that so the first switch reconciles.
-    await this.vault.setActive(account.id);
-    return account;
+    // Locked for the whole capture: the add + setActive pair below are two registry writes that
+    // must land as one atomic unit, and reading the live login while a switch is mid-flight would
+    // otherwise see a torn set of credential files.
+    return this.withCredentialLock(async () => {
+      const live = await this.credStore.readLiveCredentials();
+      if (!live)
+        throw new RefreshError('no live credentials to capture; log in first', 'no_live_login');
+      const oauthAccount = await this.credStore.readOauthAccount();
+      const bundle: CredentialBundle = oauthAccount
+        ? { claudeAiOauth: live, oauthAccount }
+        : { claudeAiOauth: live };
+      const account = await this.vault.addAccount(label, bundle);
+      // The just-captured account IS the live one; record that so the first switch reconciles.
+      await this.vault.setActive(account.id);
+      return account;
+    });
   }
 
   /**
    * Capture a login that was performed inside a TRANSIENT config dir (`CLAUDE_CONFIG_DIR`)
    * as a new stored account — without touching the live login or the active id. This is the
-   * wet-verified (WT-1, CLI 2.1.211) way to onboard extra accounts: the CLI writes both
+   * verified (CLI 2.1.211) way to onboard extra accounts: the CLI writes both
    * `.credentials.json` and `.claude.json` inside the transient dir, leaving the real ones
    * alone. The caller owns the transient dir and MUST delete it afterwards (token-bearing).
    */
   async captureFromConfigDir(label: string, configDir: string): Promise<StoredAccount> {
     // Deliberately FILE-based on every platform: the transient dir's contents are what we
     // capture. Whether the mac CLI honors CLAUDE_CONFIG_DIR with files (or still writes its
-    // Keychain item, which would make this flow read nothing) is mac wet-gate assumption A3.
+    // Keychain item, which would make this flow read nothing) is unverified on a real Mac.
     const store = new CredentialStore({
       claudeDir: configDir,
       credentialsPath: join(configDir, '.credentials.json'),
@@ -178,8 +221,92 @@ export class SwitchEngine {
     const bundle: CredentialBundle = oauthAccount
       ? { claudeAiOauth: creds, oauthAccount }
       : { claudeAiOauth: creds };
-    // Unlike captureCurrentLogin, the live account is unchanged — do NOT touch activeId.
-    return this.vault.addAccount(label, bundle);
+    // Unlike captureCurrentLogin, the live account is unchanged — do NOT touch activeId. The
+    // transient-dir reads above touch no shared state; only the registry write needs the lock.
+    return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
+  }
+
+  /**
+   * Re-login an EXISTING account in place. Reuses the same transient-config-dir capture the
+   * `accounts add --fresh` flow uses, but writes the freshly captured credentials into the
+   * account's EXISTING vault entry — SAME id — and lifts its quarantine flag on success.
+   *
+   * WHY a distinct verb from {@link captureFromConfigDir}: that one mints a NEW id via
+   * `addAccount`, which is exactly wrong for recovering a quarantined account. A new id would
+   * orphan every `activation_intervals` / `usage_snapshots` row keyed to the old id and split
+   * that account's usage history in two. Re-login exists precisely to keep the id (and thus all
+   * attribution) intact while swapping in a live token — so it overwrites the bundle in place.
+   *
+   * IDENTITY GUARD: if the existing account and the captured login BOTH report an `accountUuid`
+   * and they disagree, refuse. Writing a different account's tokens under this id would corrupt
+   * the very attribution this verb exists to protect (e.g. the user logged into the wrong
+   * account in the transient window). A missing uuid on either side skips the check — an older
+   * capture or a provider that doesn't report one shouldn't block recovery.
+   *
+   * The caller owns the transient `configDir` and MUST delete it afterwards (token-bearing) —
+   * same contract as {@link captureFromConfigDir}.
+   */
+  async reloginFromConfigDir(accountId: string, configDir: string): Promise<StoredAccount> {
+    // Locked end-to-end so the existence check, the in-place bundle overwrite, and the quarantine
+    // clear cannot interleave with a concurrent registry writer — which could remove the account
+    // between the check and the write, orphaning its freshly written bundle.
+    return this.withCredentialLock(() => this.reloginFromConfigDirLocked(accountId, configDir));
+  }
+
+  /** The unlocked core of {@link reloginFromConfigDir}; the public wrapper holds the lock. */
+  private async reloginFromConfigDirLocked(
+    accountId: string,
+    configDir: string,
+  ): Promise<StoredAccount> {
+    const existing = await this.vault.getAccount(accountId);
+    if (!existing) throw new UnknownAccountError(accountId);
+
+    // File-based capture on every platform (the mac Keychain caveat above applies here too):
+    // the transient dir is a plain CLAUDE_CONFIG_DIR the CLI populated with
+    // `.credentials.json` + `.claude.json`. Same seam add --fresh reads from.
+    const store = new CredentialStore({
+      claudeDir: configDir,
+      credentialsPath: join(configDir, '.credentials.json'),
+      claudeJsonPath: join(configDir, '.claude.json'),
+      vaultDir: this.paths.vaultDir,
+    });
+    const creds = await store.readLiveCredentials();
+    if (!creds) {
+      throw new RefreshError(
+        `no credentials found in "${configDir}"; did the login complete?`,
+        'no_capture_login',
+      );
+    }
+    const oauthAccount = await store.readOauthAccount();
+
+    // Attribution guard — see the method comment for why a mismatch is fatal, not a warning.
+    if (
+      existing.accountUuid !== undefined &&
+      oauthAccount?.accountUuid !== undefined &&
+      existing.accountUuid !== oauthAccount.accountUuid
+    ) {
+      throw new RefreshError(
+        `the captured login is a different account (${oauthAccount.emailAddress ?? oauthAccount.accountUuid}) ` +
+          `than "${existing.label}" - re-login must use the SAME account to keep its usage history intact`,
+        'relogin_identity_mismatch',
+      );
+    }
+
+    const bundle: CredentialBundle = oauthAccount
+      ? { claudeAiOauth: creds, oauthAccount }
+      : { claudeAiOauth: creds };
+    // Overwrite the encrypted bundle IN PLACE (same id) so every attribution row keyed to this
+    // id stays valid, then lift quarantine: a successful capture means the account can
+    // authenticate again. `clearQuarantine` is a no-op flag-wise if it was never quarantined
+    // (re-login is also a legitimate way to rotate a still-valid login) and bumps updatedAtMs,
+    // so the registry reflects the re-login.
+    await this.vault.writeBundle(accountId, bundle);
+    await this.vault.clearQuarantine(accountId);
+    const refreshed = await this.vault.getAccount(accountId);
+    // Only undefined if the account was removed concurrently mid-call — surface that as the
+    // unknown-account error rather than returning a stale record.
+    if (!refreshed) throw new UnknownAccountError(accountId);
+    return refreshed;
   }
 
   // ---- the state machine ----
@@ -194,7 +321,10 @@ export class SwitchEngine {
 
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
-      const prevActiveId = await this.vault.getActiveId();
+      // Live-reconciled, not the raw registry: `prevActiveId` names who OWNS the live token
+      // below (rotation adoption, audit), and after an external `/login` the registry's
+      // record points at an account whose credentials are no longer the live ones.
+      const prevActiveId = await this.getActiveId();
 
       // Cadence guard (ToS posture): switching ACCOUNTS faster than a human plausibly would
       // is refused. Re-activating the already-active account is a heal, not a hop — exempt.
@@ -326,7 +456,10 @@ export class SwitchEngine {
 
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
-      const activeId = await this.vault.getActiveId();
+      // Live-reconciled for the same reason as `activate()`: the adopt-only protection below
+      // must shield the account whose token is ACTUALLY live, not whichever one the registry
+      // last recorded — network-refreshing the live account's token would strand its session.
+      const activeId = await this.getActiveId();
 
       if (targetId === activeId) {
         // Active account: adopt-only (see the method comment for why we never refresh it).
@@ -403,7 +536,11 @@ export class SwitchEngine {
       const target = await this.vault.readBundle(pending.targetId).catch(() => undefined);
       const live = await this.credStore.readLiveCredentials();
       if (target && live && live.accessToken === target.claudeAiOauth.accessToken) {
-        // The target creds are already live and valid — roll forward and commit.
+        // The target creds are already live and valid — roll forward and commit. Finish the
+        // interrupted live write first: activate() lands the identity block AFTER the
+        // credentials, so a crash between the two leaves a live identity that still names the
+        // previous account (which would also mislead the live-login reconciliation).
+        if (target.oauthAccount) await this.credStore.writeOauthAccount(target.oauthAccount);
         await this.vault.setActive(pending.targetId);
         this.audit.append({
           ts: this.clock(),
@@ -448,6 +585,13 @@ export class SwitchEngine {
     if (!prevActiveId || !liveNow) return false;
     const prevBundle = await this.vault.readBundle(prevActiveId).catch(() => undefined);
     if (!prevBundle) return false;
+    // Identity guard: adoption WRITES the live credentials into this account's bundle, so a
+    // provable owner mismatch must skip — persisting another account's tokens under this id
+    // would corrupt both the bundle and every usage-attribution row keyed to it. Unprovable
+    // (either side missing a uuid) falls through to the token comparison, as before.
+    const prevUuid = prevBundle.oauthAccount?.accountUuid;
+    const liveUuid = liveOauthAccount?.accountUuid;
+    if (prevUuid !== undefined && liveUuid !== undefined && prevUuid !== liveUuid) return false;
     if (liveNow.refreshToken === prevBundle.claudeAiOauth.refreshToken) return false;
 
     await this.vault.writeBundle(prevActiveId, {
@@ -552,5 +696,21 @@ export class SwitchEngine {
 
   private lockDir(): string {
     return join(this.paths.vaultDir, '.lock');
+  }
+
+  /**
+   * Run a registry mutation while holding the credential lock, mirroring the acquire/try-finally
+   * that activate()/refreshToken()/recover() use (same {@link lockOptions}). This is how every
+   * registry writer — in-process and across separate CLI processes — funnels through one mutex.
+   * The lock is NOT reentrant, so only callers that do not already hold it may use this; the
+   * switch state machine holds the lock itself and reaches the vault directly instead.
+   */
+  private async withCredentialLock<T>(mutate: () => Promise<T>): Promise<T> {
+    const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
+    try {
+      return await mutate();
+    } finally {
+      lock.release();
+    }
   }
 }

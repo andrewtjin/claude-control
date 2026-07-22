@@ -4,9 +4,9 @@
 // logged in at write time — and a switch content-swaps the credentials + `oauthAccount` but
 // deliberately leaves this cache behind (it is the CLI's own file, not ours to rewrite). So
 // "the active account's cache" is only trustworthy when the cache's own `accountUuid` matches
-// the account being reported. Live incident 2026-07-17: a two-minute hop to another account
-// left THAT account's 3%-used cache in place, and the phone confidently showed the busy
-// active account at 3% for over an hour. Wrong data is worse than no data — on any PROVABLE
+// the account being reported. Otherwise a two-minute hop to another account leaves THAT
+// account's barely-used cache in place, and the phone confidently shows the busy active
+// account at 3% for hours. Wrong data is worse than no data — on any PROVABLE
 // owner mismatch this reader returns `undefined` (= "no cache for this account").
 
 import { readFile } from 'node:fs/promises';

@@ -150,12 +150,14 @@ export function summarize(checks: DoctorCheck[]): { passed: number; failed: numb
 /** Vault encryption availability, verified by a REAL protect/unprotect round-trip through
  *  this platform's protector (win32: DPAPI · darwin: Keychain+AES-GCM). On an unsupported
  *  platform the factory's error IS the report — the gap is stated, never silent. */
-export function checkVaultProtection(platform: NodeJS.Platform = process.platform): DoctorCheck {
+export async function checkVaultProtection(
+  platform: NodeJS.Platform = process.platform,
+): Promise<DoctorCheck> {
   const label = platform === 'win32' ? 'DPAPI' : platform === 'darwin' ? 'Keychain' : platform;
   try {
     const p = defaultProtector(platform);
     const probe = Buffer.from('cctl-doctor-probe');
-    const ok = p.unprotect(p.protect(probe)).equals(probe);
+    const ok = (await p.unprotect(await p.protect(probe))).equals(probe);
     return {
       name: 'vault-crypto',
       ok,
@@ -177,8 +179,8 @@ export function checkVault(paths: Paths): DoctorCheck {
 }
 
 /** Whether someone is currently logged in — read through this platform's live-credential
- *  channel, so on macOS this probes the CLI's Keychain item (which doubles as the wet-gate
- *  verifier for the item-name/shape assumptions), not a file that never exists there. */
+ *  channel, so on macOS this probes the CLI's Keychain item (which doubles as the live check
+ *  of the item-name/shape assumptions), not a file that never exists there. */
 export async function checkLiveLogin(
   paths: Paths,
   platform: NodeJS.Platform = process.platform,
@@ -192,7 +194,7 @@ export async function checkLiveLogin(
       detail:
         live !== undefined
           ? `live credentials found in ${where}`
-          : `no live credentials in ${where} — run \`claude\` and log in first`,
+          : `no live credentials in ${where} - run \`claude\` and log in first`,
     };
   } catch (err) {
     return {
@@ -217,7 +219,7 @@ export function checkClaudeJson(paths: Paths): DoctorCheck {
 export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
   return [
     checkNodeVersion(),
-    checkVaultProtection(),
+    await checkVaultProtection(),
     checkVault(paths),
     await checkLiveLogin(paths),
     checkClaudeJson(paths),

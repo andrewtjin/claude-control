@@ -13,7 +13,7 @@ export interface Paths {
   /** `<claudeDir>/.credentials.json` — the live `claudeAiOauth` block (Windows: plaintext). */
   credentialsPath: string;
   /** The CLI config file holding `oauthAccount`: `~/.claude.json` normally, but when
-   *  `CLAUDE_CONFIG_DIR` is set the CLI keeps it INSIDE that dir (wet-verified, WT-1). */
+   *  `CLAUDE_CONFIG_DIR` is set the CLI keeps it INSIDE that dir (observed on CLI 2.1.211). */
   claudeJsonPath: string;
   /** Root of our encrypted vault + registry + audit trail. */
   vaultDir: string;
@@ -40,9 +40,9 @@ export function defaultPaths(
   platform: NodeJS.Platform = process.platform,
 ): Paths {
   const home = homedir();
-  // WT-1 (CLI 2.1.211): CLAUDE_CONFIG_DIR relocates the whole config — .credentials.json
+  // Observed on CLI 2.1.211: CLAUDE_CONFIG_DIR relocates the whole config — .credentials.json
   // AND .claude.json both live inside it. Only the default (unset) case uses ~/.claude.json.
-  // (Platform-independent per the CLI's docs; the mac wet gate re-verifies — assumption A3.)
+  // (Platform-independent per the CLI's docs; re-verify on macOS.)
   const configDir = env.CLAUDE_CONFIG_DIR?.trim();
   const claudeDir = configDir || join(home, '.claude');
   return {

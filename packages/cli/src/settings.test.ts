@@ -9,6 +9,7 @@ import {
   DEFAULT_RELAY_URL,
   daemonConfigPath,
   daemonSettingsPath,
+  envBool,
   envFlag,
   envNumber,
   readDaemonConfigFile,
@@ -42,6 +43,15 @@ describe('envNumber / envFlag', () => {
     for (const off of ['0', 'false', 'nope', '']) expect(envFlag({ X: off }, 'X')).toBe(false);
     expect(envFlag({}, 'X')).toBe(false);
   });
+
+  it('envBool distinguishes explicit on, explicit off, and unset/garbage', () => {
+    for (const on of ['1', 'true', 'YES', 'On']) expect(envBool({ X: on }, 'X')).toBe(true);
+    for (const off of ['0', 'false', 'No', 'OFF']) expect(envBool({ X: off }, 'X')).toBe(false);
+    // Unset and typos fall back to the caller's default — and read as such in the view.
+    expect(envBool({}, 'X')).toBeUndefined();
+    expect(envBool({ X: 'nope' }, 'X')).toBeUndefined();
+    expect(envBool({ X: '  ' }, 'X')).toBeUndefined();
+  });
 });
 
 describe('resolveDaemonConfig', () => {
@@ -52,17 +62,103 @@ describe('resolveDaemonConfig', () => {
       autoSwitch: false,
       greedy: false,
       triggerPercent: undefined,
+      staleTriggerPercent: undefined,
+      staleAfterMs: undefined,
       minSessionHeadroomPct: undefined,
+      greedyResetMarginMs: undefined,
       cooldownMs: undefined,
+      waitingCards: false,
+      permissionHoldMs: undefined,
+      commandOutputCards: true,
+      fullToolOutput: false,
+      identityCheck: true,
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('off');
     expect(row(rows, 'greedy burn-back').value).toBe('off');
     expect(row(rows, 'switch trigger').value).toBe('94% used');
+    expect(row(rows, 'stale switch trigger').value).toBe('85% used');
+    expect(row(rows, 'stale snapshot age').value).toBe('15m');
     expect(row(rows, 'min session headroom').value).toBe('25% left');
+    expect(row(rows, 'greedy reset margin').value).toBe('15m');
     expect(row(rows, 'auto-switch cooldown').value).toBe('10m');
+    expect(row(rows, 'waiting cards').value).toBe('off');
+    expect(row(rows, 'permission hold').value).toBe('570s');
+    expect(row(rows, 'command output cards').value).toBe('on');
+    expect(row(rows, 'identity check').value).toBe('on');
+    expect(row(rows, 'full tool output').value).toBe('off');
     expect(row(rows, 'relay url').value).toBe(DEFAULT_RELAY_URL);
     expect(row(rows, 'daemon log level').value).toBe('info');
+  });
+
+  it('reads the permission hold window from CCTL_PERMISSION_HOLD_MS', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_PERMISSION_HOLD_MS: '60000' });
+    expect(values.permissionHoldMs).toBe(60_000);
+    expect(row(rows, 'permission hold')).toMatchObject({ value: '60s', source: 'env' });
+  });
+
+  it('reads the greedy reset margin from CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS', () => {
+    const { values, rows } = resolveDaemonConfig({
+      CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS: '3600000',
+    });
+    expect(values.greedyResetMarginMs).toBe(3_600_000);
+    expect(row(rows, 'greedy reset margin')).toMatchObject({ value: '1h', source: 'env' });
+  });
+
+  it('reads the stale-trigger knobs from their env vars', () => {
+    const { values, rows } = resolveDaemonConfig({
+      CCTL_AUTOSWITCH_STALE_TRIGGER_PCT: '80',
+      CCTL_AUTOSWITCH_STALE_AFTER_MS: '600000',
+    });
+    expect(values.staleTriggerPercent).toBe(80);
+    expect(values.staleAfterMs).toBe(600_000);
+    expect(row(rows, 'stale switch trigger')).toMatchObject({ value: '80% used', source: 'env' });
+    expect(row(rows, 'stale snapshot age')).toMatchObject({ value: '10m', source: 'env' });
+  });
+
+  it('shows the stale trigger CLAMPED to the fresh one, matching what the policy will run', () => {
+    // Stale data can only tighten the bar; a stale threshold configured above the fresh
+    // trigger is ignored by the policy, so the view must show the value that actually fires.
+    const { rows } = resolveDaemonConfig({
+      CCTL_AUTOSWITCH_TRIGGER_PCT: '75',
+      CCTL_AUTOSWITCH_STALE_TRIGGER_PCT: '90',
+    });
+    expect(row(rows, 'stale switch trigger').value).toBe('75% used');
+  });
+
+  it('enables waiting cards (the "Claude is waiting…" nag forwarding) only via env opt-in', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_WAITING_CARDS: '1' });
+    expect(values.waitingCards).toBe(true);
+    expect(row(rows, 'waiting cards')).toMatchObject({ value: 'on', source: 'env' });
+  });
+
+  it('silences command output cards via CCTL_COMMAND_OUTPUT=off (a default-on knob)', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_COMMAND_OUTPUT: 'off' });
+    expect(values.commandOutputCards).toBe(false);
+    expect(row(rows, 'command output cards')).toMatchObject({ value: 'off', source: 'env' });
+    // A typo'd value falls back to the on default — and the view says default, not env.
+    const typo = resolveDaemonConfig({ CCTL_COMMAND_OUTPUT: 'nope' });
+    expect(typo.values.commandOutputCards).toBe(true);
+    expect(row(typo.rows, 'command output cards')).toMatchObject({
+      value: 'on',
+      source: 'default',
+    });
+  });
+
+  it('disables the network identity check via CCTL_IDENTITY_CHECK=off (default stays on)', () => {
+    const off = resolveDaemonConfig({ CCTL_IDENTITY_CHECK: 'off' });
+    expect(off.values.identityCheck).toBe(false);
+    expect(row(off.rows, 'identity check')).toMatchObject({ value: 'off', source: 'env' });
+    // A typo is not an override — the safe default (on) stands, attributed as default.
+    const typo = resolveDaemonConfig({ CCTL_IDENTITY_CHECK: 'nah' });
+    expect(typo.values.identityCheck).toBe(true);
+    expect(row(typo.rows, 'identity check')).toMatchObject({ value: 'on', source: 'default' });
+  });
+
+  it('enables full tool output via CCTL_TOOL_OUTPUT_FULL', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_TOOL_OUTPUT_FULL: '1' });
+    expect(values.fullToolOutput).toBe(true);
+    expect(row(rows, 'full tool output')).toMatchObject({ value: 'on', source: 'env' });
   });
 
   it('reflects env overrides in both values and rows, with source "env"', () => {

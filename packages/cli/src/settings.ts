@@ -29,9 +29,12 @@ import {
   defaultPaths,
   type Paths,
 } from '@claude-control/switch-engine';
-import { DEFAULT_AUTOSWITCH_COOLDOWN_MS } from '@claude-control/daemon';
+import { DEFAULT_AUTOSWITCH_COOLDOWN_MS, DEFAULT_PERMISSION_HOLD_MS } from '@claude-control/daemon';
 import {
+  DEFAULT_GREEDY_RESET_MARGIN_MS,
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
+  DEFAULT_STALE_AFTER_MS,
+  DEFAULT_STALE_TRIGGER_PERCENT,
   DEFAULT_TRIGGER_PERCENT,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
@@ -61,6 +64,16 @@ export function envNumber(env: NodeJS.ProcessEnv, name: string): number | undefi
 export function envFlag(env: NodeJS.ProcessEnv, name: string): boolean {
   const raw = env[name]?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+/** A tri-state boolean from the environment, for knobs whose default is ON: explicit on,
+ *  explicit off (0/false/no/off), or undefined when unset/unparseable — the caller picks the
+ *  default, and the settings view attributes 'env' only to a parsed override. */
+export function envBool(env: NodeJS.ProcessEnv, name: string): boolean | undefined {
+  const raw = env[name]?.trim().toLowerCase();
+  if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return true;
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'off') return false;
+  return undefined;
 }
 
 /** Compact duration for display: "45s", "10m", "2h". Sub-second values are only reachable
@@ -151,8 +164,16 @@ export interface DaemonConfig {
     autoSwitch: boolean;
     greedy: boolean;
     triggerPercent: number | undefined;
+    staleTriggerPercent: number | undefined;
+    staleAfterMs: number | undefined;
     minSessionHeadroomPct: number | undefined;
+    greedyResetMarginMs: number | undefined;
     cooldownMs: number | undefined;
+    waitingCards: boolean;
+    permissionHoldMs: number | undefined;
+    commandOutputCards: boolean;
+    fullToolOutput: boolean;
+    identityCheck: boolean;
   };
   rows: SettingRow[];
 }
@@ -177,7 +198,10 @@ export function resolveDaemonConfig(
   const greedyEnv = envFlag(env, 'CCTL_AUTOSWITCH_GREEDY');
   const greedy = greedyFlag || greedyEnv;
   const triggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_TRIGGER_PCT');
+  const staleTriggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT');
+  const staleAfterMs = envNumber(env, 'CCTL_AUTOSWITCH_STALE_AFTER_MS');
   const minSessionHeadroomPct = envNumber(env, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
+  const greedyResetMarginMs = envNumber(env, 'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS');
   const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
   // A blank override is an ABSENT override, not an empty relay url. `CCTL_RELAY_URL=` left in a
   // shell profile, or `--relay "$SOMETHING_UNSET"` in a wrapper script, would otherwise win the
@@ -198,6 +222,23 @@ export function resolveDaemonConfig(
         : relayFile !== undefined
           ? 'config'
           : 'default';
+  // Default OFF: the CLI's Notification hook nags ("Claude is waiting for your input…")
+  // duplicate the real permission/done cards on the phone.
+  const waitingCards = envFlag(env, 'CCTL_WAITING_CARDS');
+  // The hook contract offers ONE decision channel: while a permission is held for a remote
+  // decision the terminal cannot prompt. A shorter hold favors keyboard-first use.
+  const permissionHoldMs = envNumber(env, 'CCTL_PERMISSION_HOLD_MS');
+  // Default ON: a remote operator can't see the terminal, so every shell command's output is
+  // pushed as a card in every permission mode; `off` silences chatty sessions.
+  const commandOutputEnv = envBool(env, 'CCTL_COMMAND_OUTPUT');
+  const commandOutputCards = commandOutputEnv ?? true;
+  // Default OFF: cards ship a phone-sized excerpt; full output arrives as a file attachment.
+  const fullToolOutput = envFlag(env, 'CCTL_TOOL_OUTPUT_FULL');
+  // Default ON: each poll verifies the vault token's OWNER against the OAuth profile
+  // endpoint and quarantines on mismatch — the guard against a bundle silently holding
+  // another account's credentials. The free local row-vs-bundle check runs regardless.
+  const identityCheckEnv = envBool(env, 'CCTL_IDENTITY_CHECK');
+  const identityCheck = identityCheckEnv ?? true;
 
   const rows: SettingRow[] = [
     {
@@ -220,16 +261,72 @@ export function resolveDaemonConfig(
       detail: 'CCTL_AUTOSWITCH_TRIGGER_PCT',
     },
     {
+      name: 'stale switch trigger',
+      // Mirrors the policy's clamp (stale can only tighten the bar) so the view shows the
+      // threshold that will actually fire, not a raw override the policy would ignore.
+      value: `${Math.min(
+        staleTriggerPercent ?? DEFAULT_STALE_TRIGGER_PERCENT,
+        triggerPercent ?? DEFAULT_TRIGGER_PERCENT,
+      )}% used`,
+      source: envSource(staleTriggerPercent !== undefined),
+      detail: 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT (tightened trigger while usage data is stale)',
+    },
+    {
+      name: 'stale snapshot age',
+      value: humanizeMs(staleAfterMs ?? DEFAULT_STALE_AFTER_MS),
+      source: envSource(staleAfterMs !== undefined),
+      detail: 'CCTL_AUTOSWITCH_STALE_AFTER_MS (usage data older than this counts as stale)',
+    },
+    {
       name: 'min session headroom',
       value: `${minSessionHeadroomPct ?? DEFAULT_MIN_SESSION_HEADROOM_PCT}% left`,
       source: envSource(minSessionHeadroomPct !== undefined),
       detail: 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT',
     },
     {
+      name: 'greedy reset margin',
+      value: humanizeMs(greedyResetMarginMs ?? DEFAULT_GREEDY_RESET_MARGIN_MS),
+      source: envSource(greedyResetMarginMs !== undefined),
+      detail:
+        'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS (weekly resets closer than this count as the same deadline - no greedy hop)',
+    },
+    {
       name: 'auto-switch cooldown',
       value: humanizeMs(cooldownMs ?? DEFAULT_AUTOSWITCH_COOLDOWN_MS),
       source: envSource(cooldownMs !== undefined),
       detail: 'CCTL_AUTOSWITCH_COOLDOWN_MS',
+    },
+    {
+      name: 'waiting cards',
+      value: waitingCards ? 'on' : 'off',
+      source: envSource(waitingCards),
+      detail: 'CCTL_WAITING_CARDS ("Claude is waiting..." terminal nags as phone cards)',
+    },
+    {
+      name: 'permission hold',
+      value: `${Math.round((permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS) / 1000)}s`,
+      source: envSource(permissionHoldMs !== undefined),
+      detail: 'CCTL_PERMISSION_HOLD_MS (remote-decision window; local prompt appears after)',
+    },
+    {
+      name: 'command output cards',
+      value: commandOutputCards ? 'on' : 'off',
+      source: envSource(commandOutputEnv !== undefined),
+      detail: "CCTL_COMMAND_OUTPUT (every shell command's output as a phone card; off silences)",
+    },
+    {
+      name: 'identity check',
+      value: identityCheck ? 'on' : 'off',
+      source: envSource(identityCheckEnv !== undefined),
+      detail:
+        'CCTL_IDENTITY_CHECK (verify each vault token really belongs to its account per poll; quarantine on mismatch)',
+    },
+    {
+      name: 'full tool output',
+      value: fullToolOutput ? 'on' : 'off',
+      source: envSource(fullToolOutput),
+      detail:
+        'CCTL_TOOL_OUTPUT_FULL (the attached output.txt carries the complete output instead of the phone-sized excerpt)',
     },
     {
       name: 'relay url',
@@ -246,7 +343,22 @@ export function resolveDaemonConfig(
   ];
 
   return {
-    values: { relayUrl, autoSwitch, greedy, triggerPercent, minSessionHeadroomPct, cooldownMs },
+    values: {
+      relayUrl,
+      autoSwitch,
+      greedy,
+      triggerPercent,
+      staleTriggerPercent,
+      staleAfterMs,
+      minSessionHeadroomPct,
+      greedyResetMarginMs,
+      cooldownMs,
+      waitingCards,
+      permissionHoldMs,
+      commandOutputCards,
+      fullToolOutput,
+      identityCheck,
+    },
     rows,
   };
 }

@@ -26,6 +26,12 @@ export interface AccountUsageInput {
   /** A quarantined account has a dead refresh token and cannot be used until re-login. */
   quarantined: boolean;
   limits: LimitInput[];
+  /** Epoch ms when this snapshot's limits were actually READ (live poll time, or the cache's
+   *  own stamp when serving fallback data). Usage only grows between reads, so an old stamp
+   *  means the true percents are AT LEAST what `limits` says — the auto-switch policy tightens
+   *  its trigger on stale data rather than trusting numbers from a blind spot. Absent = treat
+   *  as fresh (callers that predate the field never see derated behavior). */
+  fetchedAtMs?: number;
 }
 
 /** Knobs governing the recommendation. Defaults live in `advisor.ts`; override for tuning/tests. */

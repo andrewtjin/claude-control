@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSessionManager } from './sessionManager.js';
-import type { AgentSdkClient, AgentSdkEvent } from './managedSession.js';
+import type { AgentSdkClient, AgentSdkEvent, AgentSdkQueryOptions } from './managedSession.js';
 import type { PtyFactory, PtyHandle, PtyExitInfo } from './observedSession.js';
 import type { SessionRecord } from './types.js';
 
@@ -14,13 +14,14 @@ async function sandbox(): Promise<string> {
   return d;
 }
 afterEach(async () => {
-  // maxRetries: a session whose fake turn completes right at test end can have a
-  // fire-and-forget persist() (see sessionManager.ts) drop a fresh sessions.json into the
-  // tree BETWEEN rm's unlink pass and its rmdir — observed as an ENOTEMPTY flake on Linux
-  // CI. Retrying re-enumerates the directory, sweeping up any straggler write.
-  await Promise.all(
-    dirs.map((d) => rm(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
-  );
+  // Status/summary mirroring and persistResumeId persist fire-and-forget (see sessionManager.ts:
+  // `void persist().catch(...)`) — a test whose fake client actually completes a turn can leave
+  // an atomicWriteFile still mid mkdir/open/write/rename inside this same directory when the test
+  // body returns. On Windows an open handle or a directory entry that appears mid-walk turns a
+  // bare recursive rm into an intermittent ENOTEMPTY/EBUSY; retrying absorbs that instead of
+  // requiring every test to track and await each fire-and-forget write (same pattern hookForwarder
+  // .test.ts uses for its own real fs cleanup).
+  await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true, maxRetries: 5 })));
   dirs = [];
 });
 
@@ -71,6 +72,33 @@ function gatedFakeClient(gate: Promise<void>, events: AgentSdkEvent[]): AgentSdk
     interrupt: () => Promise.resolve(),
     end: () => Promise.resolve(),
   };
+}
+
+/** A client that records each query's prompt/opts and then BLOCKS forever (never yields), so
+ *  a resumed/spawned session stays deterministically at 'starting' and produces no further fs
+ *  writes to race afterEach cleanup — the same "permanently-pending is inert" pattern the
+ *  spawnManaged tests use. Lets a test assert how resume threaded the SDK session id. */
+function recordingBlockingClient(): {
+  client: AgentSdkClient;
+  calls: Array<{ prompt: string; opts: AgentSdkQueryOptions }>;
+} {
+  const calls: Array<{ prompt: string; opts: AgentSdkQueryOptions }> = [];
+  const client: AgentSdkClient = {
+    query(prompt, opts) {
+      calls.push({ prompt, opts });
+      // A never-resolving `next()` (not a yield-less generator) blocks the turn forever.
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise<IteratorResult<AgentSdkEvent>>(() => undefined),
+          };
+        },
+      };
+    },
+    interrupt: () => Promise.resolve(),
+    end: () => Promise.resolve(),
+  };
+  return { client, calls };
 }
 
 /** A fake PtyFactory whose spawned handle is driven by the returned emit* functions. */
@@ -167,11 +195,8 @@ describe('createSessionManager', () => {
   it('generates a random id when none is given', async () => {
     const dir = await sandbox();
     const manager = createSessionManager({ stateDir: dir });
-    // Inert (never-resolved) turn for the same reason as the state-directory test below:
-    // this test only reads the synchronous handle/registry, and a completing turn would
-    // queue a fire-and-forget disk write racing afterEach's rm.
     const handle = await manager.spawnManaged({
-      client: gatedFakeClient(deferred<void>().promise, []),
+      client: fakeClient([{ type: 'turn_result', ok: true, summary: 'done' }]),
       prompt: 'go',
     });
     expect(handle.id).toMatch(/^[0-9a-f-]{36}$/);
@@ -233,13 +258,9 @@ describe('createSessionManager', () => {
     const root = await sandbox();
     const dir = join(root, 'nested', 'state');
     const manager = createSessionManager({ stateDir: dir });
-    // Never-resolved gate: the turn stays pending, so the only registry write is the one
-    // spawnManaged itself awaits — an ungated client's turn_result would queue a SECOND,
-    // fire-and-forget write that races afterEach's rm (the CI ENOTEMPTY flake). This test
-    // is about directory creation, not turn completion, so an inert session is enough.
     await manager.spawnManaged({
       id: 'm1',
-      client: gatedFakeClient(deferred<void>().promise, []),
+      client: fakeClient([{ type: 'turn_result', ok: true, summary: 'done' }]),
       prompt: 'go',
     });
     const persisted = await readRegistryFile(dir);
@@ -328,6 +349,234 @@ describe('createSessionManager', () => {
       const second = await manager.recover();
 
       expect(second).toEqual([]);
+    });
+  });
+
+  describe('prune', () => {
+    it('removes every dormant record, persists, and returns exactly what it removed', async () => {
+      const dir = await sandbox();
+      const done: SessionRecord = { id: 'done-1', kind: 'managed', state: 'done', startedAtMs: 1 };
+      const failed: SessionRecord = {
+        id: 'failed-1',
+        kind: 'observed',
+        state: 'failed',
+        startedAtMs: 2,
+      };
+      const orphan: SessionRecord = {
+        id: 'orphan-1',
+        kind: 'managed',
+        state: 'orphaned',
+        startedAtMs: 3,
+        resumeId: 'sdk-1',
+      };
+      // Non-terminal but handle-less: no process owns it, so it is dormant too — exactly the
+      // leftover class that is never terminal, past startup reconciliation, and unreachable
+      // by stop(); prune is the only path that can ever retire it.
+      const resting: SessionRecord = {
+        id: 'resting-1',
+        kind: 'managed',
+        state: 'waiting_input',
+        startedAtMs: 4,
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([done, failed, orphan, resting]));
+
+      const manager = createSessionManager({ stateDir: dir });
+      const pruned = await manager.prune!();
+
+      expect(pruned.map((r) => r.id).sort()).toEqual([
+        'done-1',
+        'failed-1',
+        'orphan-1',
+        'resting-1',
+      ]);
+      expect(manager.list()).toEqual([]);
+      // The removal is durable, not just in-memory: a restarted manager must not resurrect them.
+      expect(await readRegistryFile(dir)).toEqual([]);
+    });
+
+    it('prunes a stuck non-terminal leftover no live handle backs (abandoned by its owner)', async () => {
+      // The reported shape: a record parked in waiting_permission whose owning process is
+      // gone (another daemon wrote it into the shared registry, or a wedge outlived its
+      // handle). It never goes terminal, recover() only runs at startup, and stop() has no
+      // handle to reach — before the dormancy rule covered it, nothing could EVER remove it.
+      const dir = await sandbox();
+      const stuck: SessionRecord = {
+        id: 'stuck-1',
+        kind: 'managed',
+        state: 'waiting_permission',
+        startedAtMs: 5,
+        resumeId: 'sdk-9',
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([stuck]));
+
+      const manager = createSessionManager({ stateDir: dir });
+      const pruned = await manager.prune!();
+
+      expect(pruned.map((r) => r.id)).toEqual(['stuck-1']);
+      expect(manager.list()).toEqual([]);
+      expect(await readRegistryFile(dir)).toEqual([]);
+    });
+
+    it('returns empty (and never writes) when nothing is dormant', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      // A live handle is what makes a non-terminal record NOT dormant — gated so the session
+      // is still deterministically mid-turn when prune runs.
+      const gate = deferred<void>();
+      await manager.spawnManaged({
+        id: 'live-1',
+        client: gatedFakeClient(gate.promise, [{ type: 'turn_result', ok: true, summary: 'ok' }]),
+        prompt: 'go',
+      });
+
+      expect(await manager.prune!()).toEqual([]);
+      expect(manager.list().map((r) => r.id)).toEqual(['live-1']);
+
+      // Deliberately never resolved — see the equivalent note in the recover test above.
+    });
+
+    it('drops the inert handle of a session that finished in this process', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      const handle = await manager.spawnManaged({
+        id: 'm1',
+        client: fakeClient([{ type: 'turn_result', ok: true, summary: 'ok' }]),
+        prompt: 'go',
+      });
+      await tick();
+      // Rest the finished turn's record in a terminal state (a completed turn parks at
+      // waiting_input by design, which prune must NOT touch — see the stop path).
+      await handle.stop();
+      expect(manager.list().find((r) => r.id === 'm1')?.state).toBe('done');
+
+      const pruned = await manager.prune!();
+
+      expect(pruned.map((r) => r.id)).toEqual(['m1']);
+      expect(manager.get('m1')).toBeUndefined();
+      expect(manager.list()).toEqual([]);
+    });
+
+    it('never touches a live session mid-turn', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      const gate = deferred<void>();
+      await manager.spawnManaged({
+        id: 'm1',
+        client: gatedFakeClient(gate.promise, [{ type: 'turn_result', ok: true, summary: 'ok' }]),
+        prompt: 'go',
+      });
+
+      expect(await manager.prune!()).toEqual([]);
+      expect(manager.get('m1')).toBeDefined();
+
+      // Deliberately never resolved — see the equivalent note in the recover test above.
+    });
+  });
+
+  describe('resume', () => {
+    it('persists the SDK session id as the record resumeId for a fresh spawn', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir, now: () => 1 });
+      await manager.spawnManaged({
+        id: 'm1',
+        client: fakeClient([
+          { type: 'session_init', sessionId: 'sdk-55' },
+          { type: 'turn_result', ok: true, summary: 'done' },
+        ]),
+        prompt: 'go',
+      });
+      await tick();
+
+      expect(manager.list().find((r) => r.id === 'm1')?.resumeId).toBe('sdk-55');
+      const persisted = await waitForRegistry(
+        dir,
+        (list) => list.find((r) => r.id === 'm1')?.resumeId === 'sdk-55',
+      );
+      expect(persisted.find((r) => r.id === 'm1')?.resumeId).toBe('sdk-55');
+    });
+
+    it('resumeOrphan re-spawns from the persisted resumeId, preserving record identity', async () => {
+      const dir = await sandbox();
+      const orphan: SessionRecord = {
+        id: 'crashed-1',
+        kind: 'managed',
+        state: 'orphaned',
+        startedAtMs: 111,
+        resumeId: 'sdk-abc',
+        accountId: 'acct-1',
+        cwd: '/work',
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([orphan]));
+      const manager = createSessionManager({ stateDir: dir, now: () => 999 });
+      await manager.recover();
+
+      const { client, calls } = recordingBlockingClient();
+      const handle = await manager.resumeOrphan!('crashed-1', { client, prompt: 'continue' });
+
+      // Identity preserved.
+      expect(handle.id).toBe('crashed-1');
+      expect(manager.get('crashed-1')).toBe(handle);
+      // Resumed from the SDK session id, with the caller's prompt — the whole point.
+      expect(calls[0]).toEqual({
+        prompt: 'continue',
+        opts: { resumeSessionId: 'sdk-abc', cwd: '/work', accountId: 'acct-1' },
+      });
+
+      const record = manager.list().find((r) => r.id === 'crashed-1');
+      expect(record?.kind).toBe('managed');
+      expect(record?.accountId).toBe('acct-1');
+      expect(record?.cwd).toBe('/work');
+      expect(record?.startedAtMs).toBe(111); // original start preserved, not re-clocked
+      expect(record?.resumeId).toBe('sdk-abc');
+      expect(record?.state).not.toBe('orphaned'); // now live again
+    });
+
+    it('resumeOrphan throws for an unknown session', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      await expect(
+        manager.resumeOrphan!('nope', { client: recordingBlockingClient().client, prompt: 'x' }),
+      ).rejects.toThrow(/unknown session/);
+    });
+
+    it('resumeOrphan refuses an observed session', async () => {
+      const dir = await sandbox();
+      const rec: SessionRecord = {
+        id: 'o1',
+        kind: 'observed',
+        state: 'orphaned',
+        startedAtMs: 1,
+        resumeId: 'x',
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([rec]));
+      const manager = createSessionManager({ stateDir: dir });
+      await expect(
+        manager.resumeOrphan!('o1', { client: recordingBlockingClient().client, prompt: 'x' }),
+      ).rejects.toThrow(/observed/);
+    });
+
+    it('resumeOrphan refuses a record with no persisted resumeId', async () => {
+      const dir = await sandbox();
+      const rec: SessionRecord = { id: 'm2', kind: 'managed', state: 'orphaned', startedAtMs: 1 };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([rec]));
+      const manager = createSessionManager({ stateDir: dir });
+      await expect(
+        manager.resumeOrphan!('m2', { client: recordingBlockingClient().client, prompt: 'x' }),
+      ).rejects.toThrow(/no persisted resumeId/);
+    });
+
+    it('resumeOrphan refuses a session that is already live in this process', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      await manager.spawnManaged({
+        id: 'm1',
+        client: recordingBlockingClient().client,
+        prompt: 'go',
+        resumeSessionId: 'sdk-1',
+      });
+      await expect(
+        manager.resumeOrphan!('m1', { client: recordingBlockingClient().client, prompt: 'x' }),
+      ).rejects.toThrow(/already live/);
     });
   });
 });

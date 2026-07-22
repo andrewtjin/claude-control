@@ -1,7 +1,7 @@
 // Protocol version negotiation.
 //
 // The daemon and bot are versioned independently and deployed at different times, so
-// every persistent socket negotiates a wire version on connect. Policy (per plan §ops):
+// every persistent socket negotiates a wire version on connect. Policy:
 // support the current version N and the previous N-1, so a daemon and bot that are one
 // release apart still interoperate. Anything older is refused loudly rather than
 // silently mis-parsed.

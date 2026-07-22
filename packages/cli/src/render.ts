@@ -8,7 +8,12 @@
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import type { HeartbeatReading } from '@claude-control/daemon';
-import { computeOutlook, timelineInputFromWire } from '@claude-control/usage-advisor';
+import {
+  computeOutlook,
+  computePacing,
+  timelineInputFromWire,
+  type AccountUsageInput,
+} from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
 
 /** Render the accounts registry as an aligned table. `activeId` is marked with `*`. */
@@ -22,7 +27,7 @@ export function renderAccountsTable(
   const rows = accounts.map((a) => ({
     active: a.id === activeId ? '*' : ' ',
     label: a.label,
-    email: a.emailAddress ?? '—',
+    email: a.emailAddress ?? '-',
     status: a.quarantined ? 'quarantined' : 'ok',
     id: a.id,
   }));
@@ -80,7 +85,7 @@ export function renderUsage(
       const marker = r.active ? palette.green('*') : ' ';
       const label = palette.bold(r.label);
       if (!r.usage) {
-        return `${marker} ${label} — no usage data yet (start the daemon: cctl daemon start)`;
+        return `${marker} ${label} - no usage data yet (start the daemon: cctl daemon start)`;
       }
       const age = ageLabel(nowMs - r.usage.fetchedAtMs);
       const limits = r.usage.limits.length
@@ -98,6 +103,14 @@ export function renderUsage(
     .join('\n');
 }
 
+/** "Pacing: 38% of the combined week elapsed, ..." — the one-line cross-account pacing
+ *  verdict appended after `cctl usage` and `cctl timeline`'s own output. Shares the same
+ *  AccountUsageInput view the burn plan is computed from, so the two never disagree on what
+ *  counts as "an account". */
+export function renderPacingLine(inputs: AccountUsageInput[], nowMs: number): string {
+  return `Pacing: ${computePacing(inputs, nowMs).headline}`;
+}
+
 /** "· 15x5h left" — how many 5h session windows still fit before this account's weekly
  *  reset. Empty when no weekly reset time is known (full detail lives in `cctl timeline`). */
 function windowsLeft(usage: AccountUsage, nowMs: number): string {
@@ -113,7 +126,8 @@ function limitShort(kind: AccountUsage['limits'][number]['kind']): string {
     case 'weekly_all':
       return 'week';
     case 'weekly_scoped':
-      return 'week*';
+      // The scoped weekly cap is the Fable-tier limit — name the model, not the wire kind.
+      return 'fable';
   }
 }
 

@@ -6,7 +6,7 @@
 // A hard `invalid_grant` means the token is permanently spent and the account must be
 // quarantined; anything else (network, 5xx) is transient and safe to retry later.
 //
-// WET-GATED: the endpoint URL, client id, and exact request/response shape are reverse-
+// The endpoint URL, client id, and exact request/response shape are reverse-
 // engineered from the CLI and MUST be confirmed against a real refresh before trusting.
 // Everything here is injectable so tests never hit the network. See docs/VERIFICATION.md.
 
@@ -17,15 +17,21 @@ import { QuarantineError, RefreshError } from './errors.js';
  *  a different value. */
 export const CLAUDE_CODE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
-/** Best-known token endpoint; confirm during wet verification. */
+/** Best-known token endpoint; confirm against the live service. */
 export const DEFAULT_TOKEN_ENDPOINT = 'https://console.anthropic.com/v1/oauth/token';
 
 /** Refresh below this remaining access-token lifetime. */
 export const DEFAULT_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
+/** Hard ceiling on the refresh network call. A hung token endpoint aborts here and surfaces as
+ *  a TRANSIENT {@link RefreshError} (safe to retry) rather than pinning the switch engine's
+ *  credential lock; invalid_grant → {@link QuarantineError} semantics are unaffected because
+ *  they only apply to a completed non-2xx response. */
+export const DEFAULT_REFRESH_TIMEOUT_MS = 30_000;
+
 type FetchLike = (
   input: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
 
 export interface RefreshDeps {
@@ -68,6 +74,8 @@ export async function refreshCredentials(
         ...deps.extraHeaders,
       },
       body,
+      // A timeout rejects into this catch as a transient RefreshError — never a QuarantineError.
+      signal: AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS),
     });
   } catch (err) {
     throw new RefreshError('network error during token refresh', 'network', { cause: err });
@@ -130,5 +138,5 @@ function mapTokenResponse(current: ClaudeOauth, parsed: unknown, nowMs: number):
 }
 
 function truncate(text: string, max = 200): string {
-  return text.length > max ? text.slice(0, max) + '…' : text;
+  return text.length > max ? text.slice(0, max) + '...' : text;
 }

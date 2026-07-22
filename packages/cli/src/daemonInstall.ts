@@ -31,19 +31,54 @@ function encodeCommand(script: string): string {
   return Buffer.from(script, 'utf16le').toString('base64');
 }
 
+/**
+ * PowerShell serializes its error stream as CLIXML when stderr is redirected, so a raw failure
+ * surfaces as an unreadable `#< CLIXML <Objs …` wall (plus the base64 -EncodedCommand in
+ * execFileSync's own message). Pull the actual error text back out — the `<S S="Error">` string
+ * elements, with PowerShell's `_x000D_`/`_x000A_` escapes and XML entities undone — so the
+ * operator sees "Register-ScheduledTask : Access is denied." instead. Anything that doesn't
+ * look like CLIXML passes through untouched.
+ */
+export function decodePowerShellStderr(stderr: string): string {
+  const lines = [...stderr.matchAll(/<S S="Error">(.*?)<\/S>/gs)]
+    .map((m) =>
+      (m[1] ?? '')
+        .replace(/_x000D_|_x000A_/g, '')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .trim(),
+    )
+    .filter((line) => line.length > 0);
+  return lines.length > 0 ? lines.join('\n') : stderr.trim();
+}
+
 /** Production runner. stderr is piped so PowerShell's error text lands in the thrown error
- *  rather than on the parent console (same rationale as dpapi.ts's runner). */
-export const defaultPowerShellRunner: PowerShellRunner = (script) =>
-  execFileSync(
-    'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(script)],
-    {
-      encoding: 'utf8',
-      windowsHide: true,
-      maxBuffer: 16 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
-  ).trim();
+ *  rather than on the parent console (same rationale as dpapi.ts's runner), decoded from
+ *  CLIXML into the human-readable error lines. */
+export const defaultPowerShellRunner: PowerShellRunner = (script) => {
+  try {
+    return execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(script)],
+      {
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    ).trim();
+  } catch (err) {
+    const stderr = (err as { stderr?: unknown }).stderr;
+    const raw =
+      typeof stderr === 'string' ? stderr : Buffer.isBuffer(stderr) ? stderr.toString('utf8') : '';
+    const decoded = decodePowerShellStderr(raw);
+    if (decoded.length === 0) throw err;
+    throw new Error(decoded, { cause: err });
+  }
+};
 
 /** Escape a value for interpolation into a PowerShell single-quoted string literal. */
 function psSingleQuote(value: string): string {
@@ -190,10 +225,14 @@ export function installDaemonTask(options: InstallDaemonTaskOptions): DaemonTask
     return 'unchanged';
   }
 
+  // The logon trigger MUST be scoped to the registering user: an un-scoped -AtLogOn means
+  // "any user logs on", and registering that requires elevation (Access is denied from a
+  // normal shell). Scoping to the current user registers without elevation and is what the
+  // daemon needs anyway — it can only run under this user's DPAPI scope.
   const script = `
 $ErrorActionPreference = 'Stop'
 $Action = New-ScheduledTaskAction -Execute '${psSingleQuote(options.shimPath)}' -Argument '${psSingleQuote(DAEMON_TASK_ARGUMENTS)}'
-$Trigger = New-ScheduledTaskTrigger -AtLogOn
+$Trigger = New-ScheduledTaskTrigger -AtLogOn -User ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 $Settings = New-ScheduledTaskSettingsSet -RestartCount ${RESTART_COUNT} -RestartInterval (New-TimeSpan -Minutes ${RESTART_INTERVAL_MINUTES}) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName '${psSingleQuote(taskName)}' -Action $Action -Trigger $Trigger -Settings $Settings -Description 'claude-control daemon (managed by cctl; see: cctl daemon uninstall)' -Force | Out-Null
 `;

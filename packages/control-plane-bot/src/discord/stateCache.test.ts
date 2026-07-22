@@ -101,6 +101,98 @@ describe('DaemonStateCache', () => {
     expect(sessions.find((s) => s.sessionId === 's2')?.state).toBe('done');
   });
 
+  it('session.prune.result removes exactly the pruned ids, leaving the rest', () => {
+    const cache = new DaemonStateCache();
+    const base: Omit<Envelope, 'payload' | 'type'> = {
+      v: 1,
+      id: 'id-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId: 'user-a',
+    };
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's1', state: 'orphaned' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's2', state: 'running' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.prune.result',
+      // 's-unknown' was never cached — removal of an unknown id must be a silent no-op
+      // (the daemon can legitimately prune records this cache never saw).
+      payload: { requestId: 'r1', ok: true, prunedSessionIds: ['s1', 's-unknown'] },
+    });
+
+    const sessions = cache.getSessions('user-a');
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.sessionId).toBe('s2');
+  });
+
+  it('a prune result carrying the remaining view also drops cached ghosts the daemon never named', () => {
+    const cache = new DaemonStateCache();
+    const base: Omit<Envelope, 'payload' | 'type'> = {
+      v: 1,
+      id: 'id-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId: 'user-a',
+    };
+    // 's-ghost' is a session the daemon holds NO record of (lost, not pruned): it can never
+    // appear in prunedSessionIds, so the remaining view is the only thing that can clear it.
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's-ghost', state: 'waiting_permission' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's-live', state: 'running' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.prune.result',
+      payload: {
+        requestId: 'r1',
+        ok: true,
+        prunedSessionIds: ['s-old'],
+        remainingSessionIds: ['s-live'],
+      },
+    });
+
+    const sessions = cache.getSessions('user-a');
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.sessionId).toBe('s-live');
+  });
+
+  it('a FAILED prune result never reconciles against its remaining view', () => {
+    const cache = new DaemonStateCache();
+    const base: Omit<Envelope, 'payload' | 'type'> = {
+      v: 1,
+      id: 'id-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId: 'user-a',
+    };
+    cache.record('user-a', {
+      ...base,
+      type: 'session.status',
+      payload: { sessionId: 's1', state: 'running' },
+    });
+    cache.record('user-a', {
+      ...base,
+      type: 'session.prune.result',
+      payload: { requestId: 'r1', ok: false, prunedSessionIds: [], remainingSessionIds: [] },
+    });
+
+    expect(cache.getSessions('user-a')).toHaveLength(1);
+  });
+
   it('records settings.snapshot per user, latest write wins', () => {
     const cache = new DaemonStateCache();
     const base: Omit<Envelope, 'payload' | 'type'> = {

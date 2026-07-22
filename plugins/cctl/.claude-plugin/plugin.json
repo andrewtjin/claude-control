@@ -1,0 +1,5 @@
+{
+  "name": "cctl",
+  "description": "claude-control in-session control: register/label/stream the current Claude Code session to your phone (Discord), and show tracked sessions + the active account. Thin wrappers over the local `cctl` CLI — this plugin holds no secrets.",
+  "version": "0.1.0"
+}

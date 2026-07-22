@@ -15,6 +15,7 @@ describe('buildProgram', () => {
     expect(names).toContain('timeline');
     expect(names).toContain('settings');
     expect(names).toContain('pair');
+    expect(names).toContain('session');
     // First-run + at-a-glance status surfaces.
     expect(names).toContain('setup');
     expect(names).toContain('status');
@@ -34,10 +35,34 @@ describe('buildProgram', () => {
     expect(pair?.registeredArguments.map((a) => a.name())).toContain('code');
   });
 
-  it('nests account subcommands', () => {
+  it('nests account subcommands including in-place relogin', () => {
     const accounts = buildProgram().commands.find((c) => c.name() === 'accounts');
     const subs = accounts?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['add', 'list', 'remove']);
+    expect(subs).toEqual(['add', 'list', 'relogin', 'remove']);
+  });
+
+  it('nests session subcommands', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const subs = session?.commands.map((c) => c.name()).sort();
+    expect(subs).toEqual(['label', 'register', 'status', 'unregister', 'watch']);
+  });
+
+  it('offers --session on the register/label/watch/unregister session commands', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    for (const name of ['register', 'label', 'watch', 'unregister']) {
+      const cmd = session?.commands.find((c) => c.name() === name);
+      expect(cmd?.options.map((o) => o.long)).toContain('--session');
+    }
+  });
+
+  it('offers --label on unregister as an alternative to --session', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const unregister = session?.commands.find((c) => c.name() === 'unregister');
+    expect(unregister?.options.map((o) => o.long)).toContain('--label');
+    // register already has its own --label (set at registration time) — unregister's is a
+    // distinct alternative-ref flag, not a naming collision to worry about across commands.
+    const register = session?.commands.find((c) => c.name() === 'register');
+    expect(register?.options.map((o) => o.long)).toContain('--label');
   });
 
   it('offers the --fresh capture flag on accounts add', () => {
@@ -60,10 +85,20 @@ describe('buildProgram', () => {
     );
   });
 
-  it('nests install, uninstall, and status alongside run under daemon', () => {
+  it('daemon supervise mirrors the run option surface (nothing can be forwarded wrong)', () => {
+    const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
+    const run = daemon?.commands.find((c) => c.name() === 'run');
+    const supervise = daemon?.commands.find((c) => c.name() === 'supervise');
+    expect(supervise).toBeDefined();
+    expect(supervise?.options.map((o) => o.long).sort()).toEqual(
+      run?.options.map((o) => o.long).sort(),
+    );
+  });
+
+  it('nests install, uninstall, status, and supervise alongside run under daemon', () => {
     const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
     const subs = daemon?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['install', 'run', 'status', 'uninstall']);
+    expect(subs).toEqual(['install', 'run', 'status', 'supervise', 'uninstall']);
   });
 
   it('reports its version', () => {

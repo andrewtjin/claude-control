@@ -2,7 +2,7 @@
 //
 // Kept as an interface — not a discord.js dependency — so RelayServer (and anything that
 // composes it) is unit-tested with a bare fake, and the real discord.js wiring lives
-// entirely in discordJsGateway.ts, which the WET-GATE excludes from headless unit tests.
+// entirely in discordJsGateway.ts, which stays out of headless unit tests (it drives the real Discord API).
 
 import type { Envelope } from '@claude-control/shared-protocol';
 
