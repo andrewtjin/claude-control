@@ -6,8 +6,9 @@
 // still depended on a workspace-relative resolve (a missed `external`, a path that only
 // resolves inside this monorepo), it fails here instead of on a user's machine.
 //
-// Deliberately does NOT run `doctor`: doctor's checks (DPAPI, vault, ConPTY) are Windows-only
-// surfaces and this runs on CI's ubuntu runner too.
+// Deliberately does NOT run `doctor`: doctor probes REAL machine surfaces (DPAPI, the vault
+// key store, live credentials) and on CI's ubuntu runner it would even create a real key
+// file in the runner's home — a smoke test must stay side-effect-free.
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, copyFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';

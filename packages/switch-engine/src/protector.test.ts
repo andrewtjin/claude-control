@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
 import { DpapiProtector } from './dpapi.js';
 import { KeychainCredentialChannel, KeychainProtector } from './keychain.js';
+import { FileKeyProtector } from './fileKey.js';
 import { FileCredentialChannel } from './credentialStore.js';
-import { VaultError } from './errors.js';
 import { sandboxPaths } from './paths.js';
 
 describe('defaultProtector', () => {
@@ -12,10 +12,10 @@ describe('defaultProtector', () => {
     expect(defaultProtector('darwin')).toBeInstanceOf(KeychainProtector);
   });
 
-  it('throws a named-gap VaultError on unsupported platforms', () => {
-    expect(() => defaultProtector('linux')).toThrow(VaultError);
-    expect(() => defaultProtector('linux')).toThrow(/linux/);
-    expect(() => defaultProtector('linux')).toThrow(/win32 \(DPAPI\), darwin \(Keychain\)/);
+  it('gives every other platform the file-key protector (linux, the BSDs)', () => {
+    // Construction is lazy — no key file is touched by the dispatch itself.
+    expect(defaultProtector('linux')).toBeInstanceOf(FileKeyProtector);
+    expect(defaultProtector('freebsd')).toBeInstanceOf(FileKeyProtector);
   });
 });
 
