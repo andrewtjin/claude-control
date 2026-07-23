@@ -117,18 +117,34 @@ function analyze(input: AccountUsageInput, now: number, cfg: Config): Analysis {
       ? 100
       : Math.min(...input.limits.map((l) => 100 - clampPct(l.percent)));
 
-  const weeklyResetAt = nearestResetOfKind(input.limits, ['weekly_all', 'weekly_scoped']);
+  // "Weekly resets" means the SHARED weekly budget (weekly_all — the bar every surface
+  // renders), never the model-scoped cap; the scoped reset stands in only for an account
+  // that reports no weekly_all limit at all. Same convention as pacing's weeklyLimitFor.
+  const weeklyResetAt =
+    nearestResetOfKind(input.limits, ['weekly_all']) ??
+    nearestResetOfKind(input.limits, ['weekly_scoped']);
   const sessionResetAt = nearestResetOfKind(input.limits, ['session']);
 
   // Find the most at-risk WEEKLY limit: the soonest-resetting one that still has meaningful
   // unused capacity. That unused capacity is what we'd waste by letting it reset. Session
   // limits are skipped on purpose: a session reset restores quota, it never destroys any,
   // so "unused session capacity resetting soon" is not a loss worth chasing.
+  //
+  // The scoped (Fable-tier) cap only ever spends THROUGH the shared weekly budget, so its
+  // burnable amount is capped by weekly_all's remaining headroom: "fable left" with the
+  // shared budget empty is stranded quota, not a burn target — advertising it as burnable
+  // (let alone as "% weekly left") recommends an account that cannot actually deliver it.
+  const weeklyAll = input.limits.find((l) => l.kind === 'weekly_all');
+  const weeklyAllUnusedPct =
+    weeklyAll !== undefined ? 100 - clampPct(weeklyAll.percent) : undefined;
   let burn: Analysis['burn'];
   for (const limit of input.limits) {
     if (limit.kind === 'session') continue;
     if (limit.resetsAt === undefined) continue;
-    const unusedPct = 100 - clampPct(limit.percent);
+    let unusedPct = 100 - clampPct(limit.percent);
+    if (limit.kind === 'weekly_scoped' && weeklyAllUnusedPct !== undefined) {
+      unusedPct = Math.min(unusedPct, weeklyAllUnusedPct);
+    }
     if (unusedPct < cfg.significantUnusedPct) continue;
     const msUntil = limit.resetsAt - now;
     if (msUntil <= 0 || msUntil > cfg.urgentWindowMs) continue;
@@ -189,11 +205,18 @@ function toRanking(analyses: Analysis[]): AccountScore[] {
     });
 }
 
+/** Name a burnable budget for humans: the shared weekly budget is "weekly", the scoped cap
+ *  is the Fable-tier limit — calling THAT "weekly" is how fable-left gets mistaken for
+ *  budget-left when the shared bar is already empty. */
+function budgetName(kind: LimitInput['kind']): string {
+  return kind === 'weekly_scoped' ? 'fable' : 'weekly';
+}
+
 /** One-line status for an account in the ranking. */
 function noteFor(a: Analysis): string {
   if (a.input.quarantined) return 'quarantined — re-login required';
   if (!a.usable) return 'exhausted';
-  if (a.burn) return `burn: ${roundPct(a.burn.unusedPct)}% weekly resets soon`;
+  if (a.burn) return `burn: ${roundPct(a.burn.unusedPct)}% ${budgetName(a.burn.kind)} resets soon`;
   if (a.headroomPct < DEFAULTS.riskHeadroomPct) return 'near cap';
   return `${roundPct(a.headroomPct)}% headroom`;
 }
@@ -286,7 +309,7 @@ function buildReason(
     const queue = burns
       .map((a, i) => {
         const b = a.burn as NonNullable<Analysis['burn']>;
-        const left = `${roundPct(b.unusedPct)}% weekly left`;
+        const left = `${roundPct(b.unusedPct)}% ${budgetName(b.kind)} left`;
         const when = humanizeDuration(b.resetsAt - now);
         // First entry spells everything out; later ones drop the repeated words.
         return i === 0

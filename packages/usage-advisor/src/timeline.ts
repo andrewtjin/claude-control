@@ -31,7 +31,9 @@ export interface ResetEvent {
 
 /** How many 5h windows an account can still open before its weekly reset. */
 export interface SessionWindowBudget {
-  /** The weekly reset that bounds the budget (soonest of weekly_all / weekly_scoped). */
+  /** The weekly reset that bounds the budget: the SHARED weekly budget's (weekly_all —
+   *  the bar every surface renders). The model-scoped cap only gates Fable-tier usage, so
+   *  its reset stands in only when the account reports no weekly_all limit at all. */
   weeklyResetAt: number;
   /** Full-length 5h windows that fit, INCLUDING a currently-open one. */
   fullWindows: number;
@@ -72,7 +74,13 @@ export function computeOutlook(accounts: AccountUsageInput[], now = Date.now()):
 
   for (const account of accounts) {
     const sessionLimit = soonestFutureLimit(account.limits, ['session'], now);
-    const weeklyLimit = soonestFutureLimit(account.limits, ['weekly_all', 'weekly_scoped'], now);
+    // The budget binds to the SHARED weekly reset ("weekly resets in …" must mean the bar),
+    // not to whichever weekly-flavored limit happens to reset soonest — the scoped Fable cap
+    // resetting first does not refresh the budget the 5h windows spend from. Scoped stands
+    // in only when no weekly_all limit exists. Same convention as pacing's weeklyLimitFor.
+    const weeklyLimit =
+      soonestFutureLimit(account.limits, ['weekly_all'], now) ??
+      soonestFutureLimit(account.limits, ['weekly_scoped'], now);
 
     const outlook: AccountOutlook = {
       accountId: account.accountId,
