@@ -550,3 +550,57 @@ describe('RelayServer', () => {
     });
   });
 });
+
+describe('RelayServer frame-size limit', () => {
+  // A dedicated server with a tiny cap so the bound can be exercised without allocating a
+  // multi-MiB payload. The default is 4 MiB (MAX_FRAME_BYTES) in production; the property under
+  // test is that an oversized frame is refused at the protocol layer BEFORE it is buffered and
+  // parsed — the pre-auth memory-amplification guard.
+  let bindings: BindingStore;
+  let pairing: PairingService;
+  let fake: ReturnType<typeof createFakeGateway>;
+  let relay: RelayServer;
+  let port: number;
+
+  beforeEach(async () => {
+    bindings = new BindingStore();
+    pairing = new PairingService({ bindings });
+    fake = createFakeGateway();
+    relay = new RelayServer({
+      bindings,
+      pairing,
+      gateway: fake.gateway,
+      heartbeatMs: 0,
+      port: 0,
+      maxFrameBytes: 1024,
+    });
+    port = await relay.listen();
+  });
+
+  afterEach(async () => {
+    await relay.close();
+  });
+
+  it('closes the socket with 1009 when an unauthenticated frame exceeds the cap', async () => {
+    const ws = await connect(port);
+    const closed = waitForClose(ws);
+    // 2 KiB > the 1 KiB cap; the frame is over-limit before any hello/pair.claim is even parsed.
+    ws.send('x'.repeat(2048));
+    // 1009 = "message too big" (ws refuses the frame at the protocol layer).
+    expect(await closed).toBe(1009);
+  });
+
+  it('still accepts a normal, well-under-cap frame', async () => {
+    const token = mintToken();
+    await bindings.bind('user-a', 'daemon-1', await hashToken(token), 'host', Date.now());
+    const ws = await connect(port);
+    sendEnvelope(ws, {
+      daemonId: 'daemon-1',
+      type: 'hello',
+      payload: { protocolVersion: PROTOCOL_VERSION, daemonToken: token },
+    });
+    const result = await nextMessage(ws);
+    expect(result.type).toBe('hello.result');
+    ws.close();
+  });
+});

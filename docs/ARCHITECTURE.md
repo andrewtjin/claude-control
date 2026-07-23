@@ -5,9 +5,12 @@
 Each **user** runs a **daemon** on their own machine. The daemon owns that user's 3–5
 Claude accounts: their encrypted credentials, the switch engine, usage polling, live
 sessions, and a loopback hook receiver. A single **control-plane bot** (one shared
-Discord app) is the phone-facing surface. The bot holds **no credentials and no
-session content** — it stores only which Discord user is bound to which daemon, plus a
-hash of each daemon's token, and it routes messages strictly by Discord user id.
+Discord app) is the phone-facing surface. The bot holds **no credentials** and
+**persists no session content** — it stores only which Discord user is bound to which
+daemon, plus a hash of each daemon's token, and it routes messages strictly by Discord
+user id. It does, in transit, see the content it must render into your phone cards
+(commands, tool output, prompts, session text); only your Anthropic tokens are
+structurally kept from it. See the trust model below and `docs/SELF_HOST.md`.
 
 Daemons connect **outbound** to the bot over a WebSocket, so nothing listens on an
 inbound port and everything works behind NAT. Local Claude Code use never depends on
@@ -66,8 +69,13 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   the DPAPI-encrypted vault (`%LOCALAPPDATA%\claude-control\vault`) and, transiently,
   in the live files the CLI reads. They never enter a protocol message, the bot, or
   Discord.
-- **What may cross the wire:** usage percentages, the burn-down plan, session
-  summaries, permission prompts/decisions, and control commands — never a token.
+- **What may cross the wire (and is therefore visible to whoever operates the bot):**
+  usage percentages, the burn-down plan, session output and summaries, the prompts you
+  send, control commands, and permission prompts/decisions — the last of which carry the
+  literal tool input, so a shell command's text, a file path, and the contents of a
+  Write/Edit all transit in cleartext. Never an OAuth token. On the shared default relay
+  that operator is us; self-host (`docs/SELF_HOST.md`) to keep that content on
+  infrastructure you control.
 - **ACL is enforced twice.** The bot routes every interaction by
   `interaction.user.id`; the daemon re-validates on ingress. A user literally cannot
   name another user's daemon, and the bot can only resolve request ids the daemon

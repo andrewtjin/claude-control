@@ -9,8 +9,10 @@ link alive across the hop.
 
 Each person runs a **local daemon** on their own machine that manages 3–5 of their
 own accounts. A single **shared Discord bot** acts as a credential-free control
-plane: it holds no tokens and never sees session content, routing every interaction
-strictly by Discord user. Your credentials never leave your machine.
+plane: it holds no tokens and routes every interaction strictly by Discord user. Your
+credentials never leave your machine. The bot does relay the session content your phone
+cards are built from — commands, tool output, and the prompts you send — so if you'd
+rather no shared operator see that, self-host it (see `docs/SELF_HOST.md`).
 
 ## Quick start
 
