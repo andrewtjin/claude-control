@@ -171,6 +171,7 @@ export interface DaemonConfig {
     cooldownMs: number | undefined;
     waitingCards: boolean;
     permissionHoldMs: number | undefined;
+    questionHoldMs: number | undefined;
     commandOutputCards: boolean;
     fullToolOutput: boolean;
     identityCheck: boolean;
@@ -228,6 +229,10 @@ export function resolveDaemonConfig(
   // The hook contract offers ONE decision channel: while a permission is held for a remote
   // decision the terminal cannot prompt. A shorter hold favors keyboard-first use.
   const permissionHoldMs = envNumber(env, 'CCTL_PERMISSION_HOLD_MS');
+  // Questions (AskUserQuestion) share the permission hold's tradeoff but not necessarily its
+  // tuning: a question is usually mid-flow, so an operator may want the terminal picker back
+  // sooner than they want permission prompts back. Falls back to the permission hold.
+  const questionHoldMs = envNumber(env, 'CCTL_QUESTION_HOLD_MS');
   // Default ON: a remote operator can't see the terminal, so every shell command's output is
   // pushed as a card in every permission mode; `off` silences chatty sessions.
   const commandOutputEnv = envBool(env, 'CCTL_COMMAND_OUTPUT');
@@ -309,6 +314,12 @@ export function resolveDaemonConfig(
       detail: 'CCTL_PERMISSION_HOLD_MS (remote-decision window; local prompt appears after)',
     },
     {
+      name: 'question hold',
+      value: `${Math.round((questionHoldMs ?? permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS) / 1000)}s`,
+      source: envSource(questionHoldMs !== undefined),
+      detail: 'CCTL_QUESTION_HOLD_MS (remote-answer window for questions; terminal picker appears after)',
+    },
+    {
       name: 'command output cards',
       value: commandOutputCards ? 'on' : 'off',
       source: envSource(commandOutputEnv !== undefined),
@@ -355,6 +366,7 @@ export function resolveDaemonConfig(
       cooldownMs,
       waitingCards,
       permissionHoldMs,
+      questionHoldMs,
       commandOutputCards,
       fullToolOutput,
       identityCheck,

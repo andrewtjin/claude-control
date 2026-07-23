@@ -55,6 +55,13 @@ export class SeenKeys {
     return true;
   }
 
+  /** Drop a key so a later attempt is treated as new again. Used when a marked action turned out
+   *  NOT to take effect (e.g. the daemon was offline when a question answer was submitted) and must
+   *  stay retryable — the mark is an optimistic "handled" that this call rolls back on failure. */
+  forget(key: string): void {
+    this.seen.delete(key);
+  }
+
   /** Current retained-key count — exposed for tests and diagnostics. */
   size(): number {
     return this.seen.size;

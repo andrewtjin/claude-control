@@ -8,6 +8,7 @@
 // dependency beyond the EmbedBuilder return type, so it is testable with a fake relay.
 
 import type { EmbedBuilder } from 'discord.js';
+import type { PayloadOf } from '@claude-control/shared-protocol';
 import type { RelaySender } from '../relay.js';
 import type { PairingService } from '../pairing.js';
 import type { DaemonStateCache } from './stateCache.js';
@@ -208,6 +209,39 @@ export function handleDeny(
   idempotencyKey: string,
 ): CommandResult {
   return handlePermissionResponse(deps, discordUserId, requestId, 'deny', scope, idempotencyKey);
+}
+
+/** The gateway's assembled answer for a question.request — the wire `answers` (each keyed by
+ *  question text, per the protocol) plus the deterministic idempotencyKey. Kept as a plain struct
+ *  so this module needs no knowledge of how the answers were collected across the card's selects
+ *  and modals. */
+export interface QuestionAnswerResponse {
+  requestId: string;
+  answers: PayloadOf<'question.response'>['answers'];
+  idempotencyKey: string;
+}
+
+/** The answer to an AskUserQuestion card — send `question.response` to the invoking user's daemon,
+ *  the same ACL-safe path as every other command (the caller never chooses a daemon id). An
+ *  offline daemon returns an error result unchanged: the gateway leaves the card answerable so the
+ *  user can retry once the daemon returns, rather than falsely marking it answered. */
+export function handleQuestionAnswer(
+  deps: CommandDeps,
+  discordUserId: string,
+  response: QuestionAnswerResponse,
+): CommandResult {
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'question.response',
+    payload: {
+      requestId: response.requestId,
+      answers: response.answers,
+      idempotencyKey: response.idempotencyKey,
+    },
+  }));
+  return result.ok
+    ? { kind: 'text', text: 'Answer sent to the session.' }
+    : { kind: 'error', message: result.error };
 }
 
 /** `/stop <sessionId>` and the Stop button — request an orderly stop of a managed session. The

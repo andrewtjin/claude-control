@@ -23,8 +23,10 @@
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { PermissionResult, Query as SdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { AgentSdkClient, AgentSdkEvent } from './managedSession.js';
-import type { PermissionDecision, PermissionResolveOutcome } from './types.js';
+import type { PermissionDecision, PermissionResolveOutcome, QuestionAnswer } from './types.js';
 import { createPermissionGate, type PermissionGate } from './permissionGate.js';
+import { createQuestionGate, type QuestionGate } from './questionGate.js';
+import { composeAnswers, parseQuestions } from './questions.js';
 import {
   buildSdkQueryOptions,
   mapSdkMessage,
@@ -122,11 +124,15 @@ export function createAgentSdkClient(deps: CreateAgentSdkClientDeps = {}): Agent
   // Gate for the in-flight turn's permission prompts. Recreated per query; denied wholesale
   // on end() so a stop with a prompt outstanding fails closed (no dangling canUseTool).
   let currentGate: PermissionGate | undefined;
+  // The question analog: the in-flight turn's AskUserQuestion gate. Same lifecycle — recreated
+  // per query, denied wholesale on turn-end/end() so a parked question never dangles.
+  let currentQuestionGate: QuestionGate | undefined;
 
   return {
     query(prompt, opts) {
       const channel = createEventChannel<AgentSdkEvent>();
       const gate = createPermissionGate();
+      const questionGate = createQuestionGate();
       // Fresh per turn: tool_use ids are only unique within a turn's message sequence.
       const toolNames: ToolNameMap = new Map();
       const sdkOptions = buildSdkQueryOptions(opts, buildDeps);
@@ -138,8 +144,44 @@ export function createAgentSdkClient(deps: CreateAgentSdkClientDeps = {}): Agent
           // The permission prompt hook. Emitting a `permission_required` event and then
           // awaiting the gate is exactly "block the tool until the phone answers" — the SDK
           // keeps the tool parked for as long as this promise is unresolved, with no deadline.
-          canUseTool: async (toolName, _input, o): Promise<PermissionResult> => {
+          canUseTool: async (toolName, input, o): Promise<PermissionResult> => {
             const { requestId } = o;
+            // AskUserQuestion is not a yes/no permission — it is a structured multiple-choice
+            // prompt. Route it through the QUESTION gate so the phone renders real pickers and
+            // the tool runs with the human's answers composed into its updatedInput. The parse
+            // is defensive: an unexpected tool_input shape falls back to the generic permission
+            // path (approve/deny), never throws, so a tool the phone can't answer faithfully at
+            // least stays remotely decidable rather than crashing the turn.
+            if (toolName === 'AskUserQuestion') {
+              const questions = parseQuestions(input);
+              if (questions !== undefined) {
+                channel.push({
+                  type: 'question_required',
+                  requestId,
+                  questions,
+                  ...(opts.permissionMode !== undefined
+                    ? { permissionMode: opts.permissionMode }
+                    : {}),
+                });
+                o.signal.addEventListener('abort', () => {
+                  questionGate.denyAll('request aborted');
+                });
+                const resolution = await questionGate.register(requestId);
+                if (resolution.kind === 'denied') {
+                  return { behavior: 'deny', message: resolution.message };
+                }
+                // Compose the human's answers into the CLI's answers map (keyed by question
+                // text) and run the tool with the original input plus those answers.
+                return {
+                  behavior: 'allow',
+                  updatedInput: {
+                    ...(typeof input === 'object' && input !== null ? input : {}),
+                    answers: composeAnswers(resolution.answers),
+                  },
+                };
+              }
+              // Fall through to the generic permission path on an unparseable shape.
+            }
             channel.push({
               type: 'permission_required',
               requestId,
@@ -160,10 +202,11 @@ export function createAgentSdkClient(deps: CreateAgentSdkClientDeps = {}): Agent
 
       current = q;
       currentGate = gate;
+      currentQuestionGate = questionGate;
 
       // Pump the SDK's message stream into the channel in the background; on the way out
-      // (normal end, error, or abort) deny any still-pending prompt so nothing dangles, then
-      // close the channel so managedSession's `for await` completes.
+      // (normal end, error, or abort) deny any still-pending prompt/question so nothing dangles,
+      // then close the channel so managedSession's `for await` completes.
       void (async () => {
         try {
           for await (const msg of q) {
@@ -176,6 +219,7 @@ export function createAgentSdkClient(deps: CreateAgentSdkClientDeps = {}): Agent
           });
         } finally {
           gate.denyAll('turn ended before this permission was answered');
+          questionGate.denyAll('turn ended before this question was answered');
           channel.close();
         }
       })();
@@ -188,15 +232,20 @@ export function createAgentSdkClient(deps: CreateAgentSdkClientDeps = {}): Agent
     },
 
     end(): Promise<void> {
-      // Fail closed before tearing down: any prompt still parked in canUseTool is denied so
-      // the SDK subprocess is never left blocked on a decision that will never come.
+      // Fail closed before tearing down: any prompt OR question still parked in canUseTool is
+      // denied so the SDK subprocess is never left blocked on a decision that will never come.
       currentGate?.denyAll('session ended');
+      currentQuestionGate?.denyAll('session ended');
       current?.close();
       return Promise.resolve();
     },
 
     resolvePermission(requestId: string, decision: PermissionDecision): PermissionResolveOutcome {
       return currentGate?.resolve(requestId, decision) ?? 'unknown';
+    },
+
+    resolveQuestion(requestId: string, answers: QuestionAnswer[]): PermissionResolveOutcome {
+      return currentQuestionGate?.resolve(requestId, answers) ?? 'unknown';
     },
   };
 }
