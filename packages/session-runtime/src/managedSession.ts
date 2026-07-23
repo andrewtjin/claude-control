@@ -10,6 +10,9 @@ import type {
   PermissionDecision,
   PermissionRequest,
   PermissionResolveOutcome,
+  QuestionAnswer,
+  QuestionPrompt,
+  QuestionRequest,
   SessionEvent,
   SessionHandle,
   SessionState,
@@ -34,6 +37,16 @@ export type AgentSdkEvent =
       requestId: string;
       tool: string;
       summary: string;
+      permissionMode?: string;
+    }
+  /** An AskUserQuestion is blocked awaiting the human's answers. `requestId` is the SDK's own
+   *  control-request id — the anchor the daemon echoes back into `resolveQuestion` to unblock
+   *  the tool. `questions` carries the full structured prompts so the phone renders real pickers.
+   *  `permissionMode` is the mode the query is running under, when known. */
+  | {
+      type: 'question_required';
+      requestId: string;
+      questions: QuestionPrompt[];
       permissionMode?: string;
     }
   /** One turn finished. `ok` is whether the turn itself succeeded; `false` is terminal
@@ -67,6 +80,11 @@ export interface AgentSdkClient {
    *  decision flows back into the in-flight `canUseTool` and unblocks (or denies) the tool.
    *  Single-resolve (see `PermissionResolveOutcome`); never blocks, never times out. */
   resolvePermission?(requestId: string, decision: PermissionDecision): PermissionResolveOutcome;
+  /** Answer a pending AskUserQuestion surfaced via a `question_required` event. OPTIONAL for the
+   *  same reason as `resolvePermission`. The answers flow back into the in-flight `canUseTool`,
+   *  which composes them into the tool's `updatedInput` and unblocks it. Single-resolve; never
+   *  blocks, never times out. */
+  resolveQuestion?(requestId: string, answers: QuestionAnswer[]): PermissionResolveOutcome;
 }
 
 export interface ManagedSessionOptions {
@@ -108,6 +126,13 @@ function agentEventToDisplay(event: AgentSdkEvent): SessionEvent | undefined {
       };
     case 'permission_required':
       return { kind: 'milestone', text: `Permission required: ${event.tool} - ${event.summary}` };
+    case 'question_required':
+      // The first question is the "what's being asked" preview; the full set rides the
+      // structured QuestionRequest channel (with its requestId), never this display line.
+      return {
+        kind: 'milestone',
+        text: `Question: ${event.questions[0]?.question ?? 'AskUserQuestion'}`,
+      };
     case 'turn_result':
       return {
         kind: 'summary',
@@ -141,6 +166,10 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
   // PermissionRequest doc in types.ts for why this is a second channel, not another
   // SessionEvent kind.
   const permissionListeners = new Set<(req: PermissionRequest) => void>();
+  // Structured AskUserQuestion listeners, kept separate from `listeners`/`permissionListeners`
+  // for the same reason the permission channel is separate: the request carries the `requestId`
+  // needed to resolve it (see the QuestionRequest doc in types.ts).
+  const questionListeners = new Set<(req: QuestionRequest) => void>();
 
   function emit(e: SessionEvent): void {
     for (const cb of listeners) cb(e);
@@ -148,6 +177,10 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
 
   function emitPermissionRequest(req: PermissionRequest): void {
     for (const cb of permissionListeners) cb(req);
+  }
+
+  function emitQuestionRequest(req: QuestionRequest): void {
+    for (const cb of questionListeners) cb(req);
   }
 
   function setState(next: SessionState): void {
@@ -193,6 +226,20 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
           requestId: event.requestId,
           tool: event.tool,
           summary: event.summary,
+          ...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
+        });
+        setState('waiting_permission');
+        break;
+      case 'question_required':
+        // Fire the structured request (with its requestId) BEFORE flipping state, so a
+        // subscriber reacting to the state change already has the request in hand. Reuses the
+        // 'waiting_permission' state deliberately: a question is a blocked-on-human wait just
+        // like a permission, and adding a distinct SessionState would have to widen the wire's
+        // status enum (which we must not touch) — questions are distinguished purely by which
+        // request channel fired, never by a new state value.
+        emitQuestionRequest({
+          requestId: event.requestId,
+          questions: event.questions,
           ...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
         });
         setState('waiting_permission');
@@ -255,6 +302,16 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       // minimal fake, or a backend that never prompts) yields 'unknown' — never a throw, so a
       // stale/duplicate phone response is a safe no-op, exactly like the hook path's contract.
       return opts.client.resolvePermission?.(requestId, decision) ?? 'unknown';
+    },
+    onQuestionRequest(cb) {
+      questionListeners.add(cb);
+      return () => questionListeners.delete(cb);
+    },
+    resolveQuestion(requestId: string, answers: QuestionAnswer[]): PermissionResolveOutcome {
+      // Same pure delegation and same safe-no-op contract as resolvePermission: a client that
+      // never surfaces questions yields 'unknown' rather than throwing, so a stale/duplicate
+      // phone answer is harmless.
+      return opts.client.resolveQuestion?.(requestId, answers) ?? 'unknown';
     },
     // Not `async` deliberately: the busy/terminal guards must reject *synchronously
     // relative to each other* (see the busy-flag note on runTurn) rather than after an

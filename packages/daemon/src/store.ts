@@ -46,6 +46,28 @@ export interface PendingPermissionRow {
   resolvedDecision: string | null;
 }
 
+/** A held AskUserQuestion awaiting the phone's answers — the question analog of
+ *  {@link PendingPermissionRow}. Deliberately a parallel table rather than a `kind` column on
+ *  pending_permissions: a question carries no tool/summary/allow-deny decision, and its
+ *  single-resolve guard is a resolved-timestamp rather than a decision string, so folding the
+ *  two shapes into one table would mean nullable columns that only ever apply to one kind. The
+ *  structured questions + answers themselves never touch the DB — they live on the held HTTP
+ *  response (hook leg) or the in-process gate (managed leg); this row is purely the WHERE-guarded
+ *  single-resolve + origin bookkeeping. */
+export interface PendingQuestionRow {
+  requestId: string;
+  sessionId: string;
+  createdAtMs: number;
+  /** Which leg surfaced it: 'hook' (a CLI hook's held HTTP response) or 'managed' (an
+   *  SDK-parked question — only the daemon process holding its gate can answer it; the hook
+   *  receiver's resolve path refuses these, mirroring pending_permissions). */
+  origin: string;
+  /** `null` until answered; the epoch-ms of the answer otherwise. The single-resolve guard is a
+   *  WHERE `resolvedAtMs IS NULL` on the UPDATE — a question has no allow/deny to record, so a
+   *  timestamp both marks it resolved and dates the answer for the audit trail. */
+  resolvedAtMs: number | null;
+}
+
 export interface SessionRow {
   id: string;
   kind: string;
@@ -158,6 +180,14 @@ export class Store {
         createdAtMs INTEGER NOT NULL,
         origin TEXT NOT NULL DEFAULT 'hook',
         resolvedDecision TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS pending_questions (
+        requestId TEXT PRIMARY KEY,
+        sessionId TEXT NOT NULL,
+        createdAtMs INTEGER NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'hook',
+        resolvedAtMs INTEGER
       );
 
       CREATE TABLE IF NOT EXISTS sessions (
@@ -373,6 +403,62 @@ export class Store {
       .prepare(`SELECT * FROM pending_permissions ORDER BY createdAtMs ASC`)
       .all()
       .map((r) => this.toPendingPermissionRow(r));
+  }
+
+  // ---- pending_questions ----
+  //
+  // Mirrors the pending_permissions surface exactly (insert / get / WHERE-guarded resolve /
+  // list), so the hook receiver's held-question path and the daemon's managed-question routing
+  // share the same single-resolve contract the permission machinery already relies on.
+
+  private toPendingQuestionRow(row: Record<string, unknown>): PendingQuestionRow {
+    return {
+      requestId: requireString(row, 'requestId'),
+      sessionId: requireString(row, 'sessionId'),
+      createdAtMs: requireNumber(row, 'createdAtMs'),
+      origin: requireString(row, 'origin'),
+      resolvedAtMs: optionalNumber(row, 'resolvedAtMs'),
+    };
+  }
+
+  insertPendingQuestion(row: Omit<PendingQuestionRow, 'resolvedAtMs'>): void {
+    this.db
+      .prepare(
+        `INSERT INTO pending_questions (requestId, sessionId, createdAtMs, origin, resolvedAtMs)
+         VALUES (?, ?, ?, ?, NULL)`,
+      )
+      .run(row.requestId, row.sessionId, row.createdAtMs, row.origin);
+  }
+
+  getPendingQuestion(requestId: string): PendingQuestionRow | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM pending_questions WHERE requestId = ?`)
+      .get(requestId);
+    return row ? this.toPendingQuestionRow(row) : undefined;
+  }
+
+  /**
+   * Record that a question was answered, but ONLY while still pending (`resolvedAtMs IS NULL`) —
+   * the WHERE clause is what makes this atomically reject a double-resolve. Returns the number of
+   * rows changed: 1 on success, 0 if the id doesn't exist or was already answered. The mirror of
+   * {@link resolvePendingPermission}, differing only in that a question records a timestamp (it
+   * has no allow/deny to store).
+   */
+  resolvePendingQuestion(requestId: string, resolvedAtMs: number): number {
+    const result = this.db
+      .prepare(
+        `UPDATE pending_questions SET resolvedAtMs = ?
+         WHERE requestId = ? AND resolvedAtMs IS NULL`,
+      )
+      .run(resolvedAtMs, requestId);
+    return Number(result.changes);
+  }
+
+  listPendingQuestions(): PendingQuestionRow[] {
+    return this.db
+      .prepare(`SELECT * FROM pending_questions ORDER BY createdAtMs ASC`)
+      .all()
+      .map((r) => this.toPendingQuestionRow(r));
   }
 
   // ---- sessions ----

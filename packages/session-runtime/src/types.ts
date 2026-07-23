@@ -66,6 +66,68 @@ export interface PermissionRequest {
   permissionMode?: string;
 }
 
+/**
+ * One selectable option of an AskUserQuestion question. `description` is display context for
+ * the picker; only `label` ever round-trips into an answer. Deliberately this package's own
+ * type (not shared-protocol's) — session-runtime knows nothing about the wire.
+ */
+export interface QuestionOption {
+  label: string;
+  description?: string;
+}
+
+/**
+ * One structured question surfaced by a managed session's AskUserQuestion tool. Mirrors the
+ * fields the CLI's `tool_input.questions[]` carries, narrowed to what the phone needs to render
+ * a picker. `multiSelect` is resolved (never optional here) so a consumer never has to re-derive
+ * the default; the parser (questions.ts) fills it. The tool's contract is 2-4 options, but the
+ * bound is left tolerant — the daemon clamps for Discord, the runtime never rejects.
+ */
+export interface QuestionPrompt {
+  question: string;
+  header?: string;
+  multiSelect: boolean;
+  options: QuestionOption[];
+}
+
+/**
+ * A structured AskUserQuestion request surfaced by a managed session — the question analog of
+ * {@link PermissionRequest}. Separate from the `SessionEvent` display stream for the same
+ * reason: it carries the `requestId` the daemon echoes back into {@link SessionHandle.resolveQuestion}
+ * to unblock the tool, which a display milestone deliberately omits.
+ */
+export interface QuestionRequest {
+  requestId: string;
+  questions: QuestionPrompt[];
+  /** The session's Claude Code permission mode, when known — threaded through like PermissionRequest. */
+  permissionMode?: string;
+}
+
+/**
+ * One answered question, in this package's own vocabulary. `selected` holds chosen option
+ * labels (exactly one unless the question was multiSelect); `otherText` is a free-form answer
+ * that WINS over `selected` when present, matching the terminal picker where "Other" replaces a
+ * listed choice. The adapter composes these into the CLI's `updatedInput.answers` map (keyed by
+ * question text) — see questions.ts.
+ */
+export interface QuestionAnswer {
+  question: string;
+  selected: string[];
+  otherText?: string;
+}
+
+/**
+ * How a parked AskUserQuestion resolves. `answers` is the human's structured reply (the tool
+ * runs with the composed answers map); `denied` is the fail-closed teardown reply when a turn
+ * or session ends before the human answered — the SDK gets a plain deny, so the parked tool is
+ * never left blocking a dead subprocess. The question analog of the allow/deny split a
+ * {@link PermissionDecision} carries, kept separate because a question "allow" is a set of
+ * answers, not an updatedInput the daemon could build (only the adapter holds the tool's input).
+ */
+export type QuestionResolution =
+  | { kind: 'answers'; answers: QuestionAnswer[] }
+  | { kind: 'denied'; message: string };
+
 /** The persisted, non-live view of a session — what survives a daemon restart. */
 export interface SessionRecord {
   id: string;
@@ -134,4 +196,20 @@ export interface SessionHandle {
    * (at which point it is denied, fail-closed) — it is never auto-allowed.
    */
   resolvePermission?(requestId: string, decision: PermissionDecision): PermissionResolveOutcome;
+  /**
+   * Subscribe to STRUCTURED AskUserQuestion requests (managed sessions only). The question
+   * analog of {@link onPermissionRequest}: separate from `onEvent` because the request carries
+   * the `requestId` that {@link resolveQuestion} needs. Optional for the same reason (an
+   * observed terminal has no structured seam). Subscribe synchronously right after obtaining the
+   * handle.
+   */
+  onQuestionRequest?(cb: (req: QuestionRequest) => void): () => void;
+  /**
+   * Answer a pending AskUserQuestion this session surfaced (managed only). Same single-resolve
+   * and never-blocks/never-times-out contract as {@link resolvePermission}: the first answer set
+   * wins and unblocks the tool; a repeat is `already_handled`; an unknown/expired id is
+   * `unknown`. An unanswered question stays pending until the session ends, at which point it is
+   * denied fail-closed — never auto-answered.
+   */
+  resolveQuestion?(requestId: string, answers: QuestionAnswer[]): PermissionResolveOutcome;
 }
