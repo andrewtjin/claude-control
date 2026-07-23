@@ -204,7 +204,16 @@ export class DiscordJsGateway implements DiscordGateway {
     );
     this.sessionChannelResolver = options.sessionChannelResolver;
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
-    this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    // `allowedMentions: { parse: [] }` is a process-wide default that neutralizes every
+    // @everyone/@here/role/user mention parsed from message CONTENT. Card and session text is
+    // built verbatim from wire payloads (e.g. a session's own output), which can carry mention
+    // syntax from untrusted material the session processed — so no wire-derived string may ever
+    // trigger a ping. A future path that legitimately needs to mention someone sets the `users`/
+    // `roles` array explicitly on that one message rather than relying on content parsing.
+    this.client = new Client({
+      intents: [GatewayIntentBits.Guilds],
+      allowedMentions: { parse: [] },
+    });
 
     // `clientReady`, not `ready`: the latter is deprecated and stops firing in discord.js v15,
     // which would leave slash commands unregistered and the emoji bars never upgraded — a
