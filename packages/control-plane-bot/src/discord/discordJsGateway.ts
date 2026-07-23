@@ -12,6 +12,7 @@ import {
   AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
   Client,
   Events,
   GatewayIntentBits,
@@ -72,7 +73,13 @@ import type { CommandDeps, CommandResult } from './commands.js';
  *  until channel-per-user lands — every session then falls back to DM, which is the sanctioned
  *  fallback path, not a failure). */
 export interface SessionThreadParent {
-  threads: { create(options: { name: string }): Promise<{ id: string }> };
+  threads: {
+    create(options: {
+      name: string;
+      type: ChannelType.PrivateThread;
+      invitable: boolean;
+    }): Promise<{ id: string; members: { add(userId: string): Promise<unknown> } }>;
+  };
 }
 
 /** Where a user's per-session threads should be created. Returns `undefined` (the default) when no
@@ -125,6 +132,10 @@ export interface DiscordJsGatewayOptions {
   /** How to obtain the channel a user's session threads are created in. Omitted → pure-DM
    *  deployment (thread creation always falls back to DM, which is remembered per session). */
   sessionChannelResolver?: SessionChannelResolver;
+  /** Channel id whose text channel hosts per-session private threads, for deployments that want
+   *  threads without supplying a full resolver. Ignored when `sessionChannelResolver` is given;
+   *  omitted (with no resolver) → pure-DM deployment. */
+  sessionChannelId?: string;
 }
 
 /** How long after a session goes terminal its in-memory streaming state is retained before being
@@ -202,7 +213,18 @@ export class DiscordJsGateway implements DiscordGateway {
     this.threadReg = new PersistentThreadRegistry(
       options.stateDir ?? join(tmpdir(), 'claude-control-bot'),
     );
-    this.sessionChannelResolver = options.sessionChannelResolver;
+    // An explicit resolver wins; a bare channel id gets the built-in resolver, which re-fetches
+    // per call so a deleted/retyped channel degrades to the DM fallback instead of caching a
+    // stale handle for the bot's lifetime.
+    const channelId = options.sessionChannelId;
+    this.sessionChannelResolver =
+      options.sessionChannelResolver ??
+      (channelId
+        ? async () => {
+            const channel = await this.client.channels.fetch(channelId);
+            return channel?.type === ChannelType.GuildText ? channel : undefined;
+          }
+        : undefined);
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
     this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -483,9 +505,17 @@ export class DiscordJsGateway implements DiscordGateway {
     try {
       const parent = await this.sessionChannelResolver?.(route.discordUserId);
       if (parent) {
+        // Session output is for the bound user only: a private, non-invitable thread keeps it
+        // out of the channel's public thread list. The bot must then add the user explicitly —
+        // a private thread is invisible even to its subject until they're a member — and that
+        // add stays inside the try so a failure still lands on the DM fallback, not a thread
+        // the user can never see.
         const thread = await parent.threads.create({
           name: `session ${route.sessionId.slice(0, 8)}`,
+          type: ChannelType.PrivateThread,
+          invitable: false,
         });
+        await thread.members.add(route.discordUserId);
         target = { kind: 'thread', threadId: thread.id };
       }
     } catch (err) {
