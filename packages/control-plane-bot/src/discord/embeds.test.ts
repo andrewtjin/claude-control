@@ -6,6 +6,9 @@ import {
   buildSessionListEmbed,
   buildPermissionRequestEmbed,
   buildLapsedPermissionEmbed,
+  buildQuestionEmbed,
+  buildAnsweredQuestionEmbed,
+  buildLapsedQuestionEmbed,
   buildSettingsEmbed,
   buildSwitchResultEmbed,
   buildTimelineEmbed,
@@ -527,6 +530,82 @@ describe('buildLapsedPermissionEmbed', () => {
     const lapsed = buildLapsedPermissionEmbed('shutdown').toJSON();
     expect(lapsed.title).toBe('Daemon stopped');
     expect(lapsed.description).toBeUndefined();
+  });
+});
+
+describe('buildQuestionEmbed', () => {
+  const twoQuestions = [
+    { question: 'Which color do you prefer?', header: 'Color', multiSelect: false, options: [{ label: 'Red' }] },
+    { question: 'Anything else?', multiSelect: false, options: [{ label: 'No' }] },
+  ];
+
+  it('is a warn card, one field per question, header (or ordinal) as the name', () => {
+    const embed = buildQuestionEmbed(twoQuestions).toJSON();
+    expect(embed.title).toBe('Claude has questions');
+    expect(embed.color).toBe(0xf1c40f);
+    expect(embed.fields?.[0]?.name).toBe('Color'); // header preferred
+    expect(embed.fields?.[0]?.value).toBe('Which color do you prefer?');
+    expect(embed.fields?.[1]?.name).toBe('Question 2'); // no header → ordinal
+    expect(embed.fields?.[1]?.value).toBe('Anything else?');
+  });
+
+  it('uses the singular title for one question and names a non-default mode', () => {
+    const embed = buildQuestionEmbed([twoQuestions[0]!], 'plan').toJSON();
+    expect(embed.title).toBe('Claude has a question');
+    expect(embed.footer?.text).toContain('plan mode');
+  });
+
+  it('omits the mode note in default mode', () => {
+    const embed = buildQuestionEmbed([twoQuestions[0]!], 'default').toJSON();
+    expect(embed.footer?.text).not.toContain('mode');
+  });
+
+  it('renders at most four questions', () => {
+    const many = Array.from({ length: 6 }, (_, i) => ({
+      question: `q${i}`,
+      multiSelect: false,
+      options: [{ label: 'a' }],
+    }));
+    expect(buildQuestionEmbed(many).toJSON().fields).toHaveLength(4);
+  });
+});
+
+describe('buildAnsweredQuestionEmbed', () => {
+  it('is a success card listing chosen labels and the typed Other on a marked line', () => {
+    const embed = buildAnsweredQuestionEmbed([
+      { question: 'Which color?', selected: ['Green'] },
+      { question: 'Which sizes?', selected: ['S', 'L'], otherText: 'XXL' },
+    ]).toJSON();
+    expect(embed.title).toBe('Answered');
+    expect(embed.color).toBe(0x2ecc71);
+    expect(embed.fields?.[0]?.value).toBe('• Green');
+    expect(embed.fields?.[1]?.value).toBe('• S\n• L\n✏️ XXL');
+  });
+
+  it('shows a placeholder for an answer with no selection', () => {
+    const embed = buildAnsweredQuestionEmbed([{ question: 'q', selected: [] }]).toJSON();
+    expect(embed.fields?.[0]?.value).toBe('(no selection)');
+  });
+});
+
+describe('buildLapsedQuestionEmbed', () => {
+  it('picks the right title per reason and recolors muted', () => {
+    expect(buildLapsedQuestionEmbed('local').toJSON().title).toBe('Answered at the terminal');
+    expect(buildLapsedQuestionEmbed('expired').toJSON().title).toBe(
+      'Expired — continuing without answers',
+    );
+    expect(buildLapsedQuestionEmbed('shutdown').toJSON().title).toBe('Daemon stopped');
+    expect(buildLapsedQuestionEmbed('expired').toJSON().color).toBe(0x95a5a6);
+  });
+
+  it('preserves the original card content — only title/color change', () => {
+    const original = buildQuestionEmbed([
+      { question: 'Which color?', header: 'Color', multiSelect: false, options: [{ label: 'Red' }] },
+    ]).toJSON();
+    const lapsed = buildLapsedQuestionEmbed('local', original).toJSON();
+    expect(lapsed.fields?.[0]?.value).toBe('Which color?');
+    expect(lapsed.title).toBe('Answered at the terminal');
+    expect(lapsed.color).toBe(0x95a5a6);
   });
 });
 

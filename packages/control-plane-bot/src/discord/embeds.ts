@@ -399,6 +399,81 @@ const LAPSE_TITLE: Record<PayloadOf<'permission.lapsed'>['reason'], string> = {
   shutdown: 'Daemon stopped',
 };
 
+/** Most questions a card renders — kept in lockstep with questionCards.MAX_QUESTIONS so the embed
+ *  shows exactly the questions the selects can carry, never a field with no picker under it. */
+const MAX_QUESTION_FIELDS = 4;
+
+/** Rendered for an incoming question.request push (AskUserQuestion): a warn-accent card mirroring
+ *  the permission card, one field per question (its header, or a fallback ordinal, as the name; the
+ *  question text as the value). The pickers themselves are attached by the caller (pushRender),
+ *  which owns the requestId; this only sets the copy so card and selects agree. Clamped to the
+ *  first few questions for the same reason the selects are — a Discord message holds a bounded
+ *  number of rows — and every value goes through the field clamp so a long question can't make the
+ *  embed throw. A non-default mode rides the footer as context, exactly like the permission card. */
+export function buildQuestionEmbed(
+  questions: PayloadOf<'question.request'>['questions'],
+  permissionMode?: string,
+): EmbedBuilder {
+  const shown = questions.slice(0, MAX_QUESTION_FIELDS);
+  const modeNote =
+    permissionMode !== undefined && permissionMode !== 'default' ? ` · ${permissionMode} mode` : '';
+  const embed = new EmbedBuilder()
+    .setTitle(shown.length <= 1 ? 'Claude has a question' : 'Claude has questions')
+    .setColor(COLOR_WARN)
+    .setFooter({ text: `Answer with the menus below${modeNote}` });
+  shown.forEach((q, i) => {
+    const name = q.header != null && q.header.length > 0 ? q.header : `Question ${i + 1}`;
+    addClampedField(embed, truncateLabeled(name, 256), q.question);
+  });
+  return embed;
+}
+
+/** Rendered onto the ORIGINAL card once every question is answered: a success-accent record of
+ *  WHAT was chosen, so the answered card reads as resolved at a glance. One field per question
+ *  (its text as the name), the chosen listed labels as bullet lines, and the typed Other answer
+ *  (when present) on its own marked line. The caller strips the select components on the same edit. */
+export function buildAnsweredQuestionEmbed(
+  answers: PayloadOf<'question.response'>['answers'],
+): EmbedBuilder {
+  const embed = new EmbedBuilder().setTitle('Answered').setColor(COLOR_OK);
+  for (const answer of answers) {
+    const lines = answer.selected.map((label) => `• ${label}`);
+    if (answer.otherText != null && answer.otherText.length > 0) {
+      lines.push(`✏️ ${answer.otherText}`);
+    }
+    addClampedField(
+      embed,
+      truncateLabeled(answer.question, 256),
+      lines.length > 0 ? lines.join('\n') : '(no selection)',
+    );
+  }
+  return embed;
+}
+
+/** Human title per question-lapse reason. Parity with LAPSE_TITLE (the permission version): the
+ *  reader's only cue for WHY the pickers went dead, since the wire reason is never shown. `local`
+ *  is "answered at the terminal" rather than "handled" because a question is answered, not
+ *  handled. `expired` means the daemon declined the question and the session moved on — there is
+ *  nothing left to answer anywhere, so the title must not send the reader to the terminal. */
+const QUESTION_LAPSE_TITLE: Record<PayloadOf<'question.lapsed'>['reason'], string> = {
+  local: 'Answered at the terminal',
+  expired: 'Expired — continuing without answers',
+  shutdown: 'Daemon stopped',
+};
+
+/** Rendered for a question.lapsed push: the hold ended with no phone answer, so the card must stop
+ *  claiming its pickers still work. Mirrors buildLapsedPermissionEmbed exactly — keep the original
+ *  card content, swap only the title (per reason) and the muted accent; the caller strips the
+ *  select components separately. `original` is the live card's embed read back from Discord (this
+ *  side stores no copy of the question text), `undefined` when the message had no embed. */
+export function buildLapsedQuestionEmbed(
+  reason: PayloadOf<'question.lapsed'>['reason'],
+  original?: APIEmbed,
+): EmbedBuilder {
+  const embed = original ? EmbedBuilder.from(original) : new EmbedBuilder();
+  return embed.setTitle(QUESTION_LAPSE_TITLE[reason]).setColor(COLOR_MUTED);
+}
+
 /** Rendered for a permission.lapsed push: the hold ended without a phone decision, so the card
  *  must stop claiming its Approve/Deny buttons still work. Keeps whatever the ORIGINAL card
  *  said (summary, detail, footer) — the reader should still be able to see WHAT was asked —

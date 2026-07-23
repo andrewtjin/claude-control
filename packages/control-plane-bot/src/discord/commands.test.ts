@@ -17,6 +17,7 @@ import {
   handleSay,
   handleApprove,
   handleDeny,
+  handleQuestionAnswer,
   handleStop,
   handlePruneRequest,
   handlePruneConfirm,
@@ -291,6 +292,42 @@ describe('command-to-envelope mapping and ACL', () => {
       type: 'permission.response',
       payload: { requestId: 'req-2', decision: 'deny', scope: 'session' },
     });
+  });
+});
+
+describe('handleQuestionAnswer sends question.response', () => {
+  const answers = [
+    { question: 'Which color?', selected: ['Green'] },
+    { question: 'Anything else?', selected: [], otherText: 'a custom reply' },
+  ];
+
+  it("emits a question.response to exactly the invoking user's daemon", () => {
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const deps = makeDeps(relay);
+    const result = handleQuestionAnswer(deps, 'user-a', {
+      requestId: 'req-1',
+      answers,
+      idempotencyKey: 'qans:req-1',
+    });
+    expect(result.kind).toBe('text');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.daemonId).toBe('daemon-1');
+    expect(sent[0]?.draft).toMatchObject({
+      type: 'question.response',
+      payload: { requestId: 'req-1', answers, idempotencyKey: 'qans:req-1' },
+    });
+  });
+
+  it('fails cleanly (no frame) when the daemon is offline, so the card stays retryable', () => {
+    const { relay, sent } = createFakeRelay({ online: {} });
+    const deps = makeDeps(relay);
+    const result = handleQuestionAnswer(deps, 'user-a', {
+      requestId: 'req-1',
+      answers,
+      idempotencyKey: 'qans:req-1',
+    });
+    expect(result.kind).toBe('error');
+    expect(sent).toHaveLength(0);
   });
 });
 

@@ -68,9 +68,18 @@ export class PairingService {
    *  collision so two live codes can never resolve to different users; a user who reruns
    *  `/pair` simply gets a new code (the old one stays valid until it expires or is claimed). */
   createCode(discordUserId: string): string {
+    const now = this.clock();
+    // Sweep expired codes before inserting. `claim()` only ever deletes a code that someone
+    // presents, so a code nobody redeems would otherwise sit in the Map past its TTL forever —
+    // and createCode is the one entry point with no throttle (unlike claim), so an unbounded
+    // `/pair` loop is a slow memory leak in the same long-lived process that holds every binding.
+    // (Deleting the current/visited key while iterating a Map is well-defined.)
+    for (const [existing, pending] of this.codes) {
+      if (now >= pending.expiresAtMs) this.codes.delete(existing);
+    }
     let code = this.generateCode();
     while (this.codes.has(code)) code = this.generateCode();
-    this.codes.set(code, { discordUserId, expiresAtMs: this.clock() + this.ttlMs, used: false });
+    this.codes.set(code, { discordUserId, expiresAtMs: now + this.ttlMs, used: false });
     return code;
   }
 

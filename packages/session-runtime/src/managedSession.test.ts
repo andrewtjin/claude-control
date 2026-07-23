@@ -1,7 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { startManagedSession } from './managedSession.js';
 import type { AgentSdkClient, AgentSdkEvent, AgentSdkQueryOptions } from './managedSession.js';
-import type { PermissionDecision, PermissionRequest, SessionEvent } from './types.js';
+import type {
+  PermissionDecision,
+  PermissionRequest,
+  QuestionAnswer,
+  QuestionPrompt,
+  QuestionRequest,
+  SessionEvent,
+} from './types.js';
 
 /** Let every currently-queued microtask (queueMicrotask kickoff, async generator steps)
  *  drain before assertions run. setTimeout is a macrotask, so it always runs after the
@@ -361,6 +368,63 @@ describe('startManagedSession', () => {
     startManagedSession({ id: 's1', client, prompt: 'go', permissionMode: 'default' });
     await tick();
     expect(calls[0]?.opts.permissionMode).toBe('default');
+  });
+
+  it('surfaces a structured question request via onQuestionRequest and enters waiting_permission', async () => {
+    const questions: QuestionPrompt[] = [
+      {
+        question: 'Which color?',
+        header: 'Color',
+        multiSelect: false,
+        options: [{ label: 'teal' }, { label: 'red' }],
+      },
+    ];
+    const { client } = fakeClient([
+      [
+        { type: 'question_required', requestId: 'q-1', questions, permissionMode: 'default' },
+        { type: 'turn_result', ok: true, summary: 'done' },
+      ],
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    expect(typeof handle.onQuestionRequest).toBe('function');
+    const reqs: QuestionRequest[] = [];
+    handle.onQuestionRequest!((r) => reqs.push(r));
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(reqs).toEqual([{ requestId: 'q-1', questions, permissionMode: 'default' }]);
+    // Reuses waiting_permission (a question is a blocked-on-human wait); the display shows the
+    // first question as the milestone preview.
+    expect(events).toContainEqual({ kind: 'status', state: 'waiting_permission' });
+    expect(events).toContainEqual({ kind: 'milestone', text: 'Question: Which color?' });
+  });
+
+  it('resolveQuestion delegates to the client and returns its outcome', () => {
+    const resolveCalls: Array<{ requestId: string; answers: QuestionAnswer[] }> = [];
+    const client: AgentSdkClient = {
+      query: () => ({
+        async *[Symbol.asyncIterator]() {
+          await Promise.resolve();
+          yield { type: 'turn_result', ok: true, summary: 'done' };
+        },
+      }),
+      interrupt: () => Promise.resolve(),
+      end: () => Promise.resolve(),
+      resolveQuestion: (requestId, answers) => {
+        resolveCalls.push({ requestId, answers });
+        return 'resolved';
+      },
+    };
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    const answers: QuestionAnswer[] = [{ question: 'Which color?', selected: ['teal'] }];
+    expect(handle.resolveQuestion!('q-1', answers)).toBe('resolved');
+    expect(resolveCalls).toEqual([{ requestId: 'q-1', answers }]);
+  });
+
+  it('resolveQuestion returns unknown when the client cannot resolve questions', () => {
+    const { client } = fakeClient([[{ type: 'turn_result', ok: true, summary: 'done' }]]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    expect(handle.resolveQuestion!('whatever', [{ question: 'q', selected: [] }])).toBe('unknown');
   });
 
   it('reports the SDK session id via onSessionId when a turn initializes', async () => {

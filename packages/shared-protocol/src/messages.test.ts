@@ -338,3 +338,117 @@ describe('session.prune / session.prune.result', () => {
     expect(pruneResult.success).toBe(true);
   });
 });
+
+describe('question round-trip trio', () => {
+  const questions = [
+    {
+      question: 'Which color do you prefer?',
+      header: 'Color',
+      options: [
+        { label: 'crimson', description: 'A deep, rich red.' },
+        { label: 'teal' },
+      ],
+    },
+  ];
+
+  it('question.request parses with defaults — multiSelect absent means false', () => {
+    const result = decode(
+      rawFrame('question.request', { requestId: 'req-1', sessionId: 'sess-1', questions }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'question.request')) {
+      expect(result.envelope.payload.questions[0]?.multiSelect).toBe(false);
+      expect(result.envelope.payload.questions[0]?.options).toHaveLength(2);
+    }
+  });
+
+  it('question.request rejects an empty questions array — an unanswerable card is a bug', () => {
+    const result = decode(
+      rawFrame('question.request', { requestId: 'req-1', sessionId: 'sess-1', questions: [] }),
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it('question.request tolerates more than 4 questions — the bot clamps, the wire never rejects', () => {
+    const many = Array.from({ length: 6 }, (_, i) => ({
+      question: `Q${i}?`,
+      options: [{ label: 'a' }, { label: 'b' }],
+    }));
+    const result = decode(
+      rawFrame('question.request', { requestId: 'req-1', sessionId: 'sess-1', questions: many }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('question.response carries selected labels and defaults selected to empty for other-only answers', () => {
+    const result = decode(
+      rawFrame('question.response', {
+        requestId: 'req-1',
+        answers: [
+          { question: 'Which color do you prefer?', selected: ['teal'] },
+          { question: 'Anything else?', otherText: 'a custom reply' },
+        ],
+        idempotencyKey: 'idem-1',
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'question.response')) {
+      expect(result.envelope.payload.answers[0]?.selected).toEqual(['teal']);
+      expect(result.envelope.payload.answers[1]?.selected).toEqual([]);
+      expect(result.envelope.payload.answers[1]?.otherText).toBe('a custom reply');
+    }
+  });
+
+  it('question.response rejects an empty answers array', () => {
+    const result = decode(
+      rawFrame('question.response', { requestId: 'req-1', answers: [], idempotencyKey: 'i-1' }),
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it('question.lapsed carries the same reason vocabulary as permission.lapsed', () => {
+    for (const reason of ['local', 'expired', 'shutdown'] as const) {
+      const result = decode(rawFrame('question.lapsed', { requestId: 'req-1', reason }));
+      expect(result.ok).toBe(true);
+    }
+    expect(decode(rawFrame('question.lapsed', { requestId: 'req-1', reason: 'nope' })).ok).toBe(
+      false,
+    );
+  });
+
+  it('all three are registered in both the schema map and the Envelope union', () => {
+    for (const type of ['question.request', 'question.response', 'question.lapsed']) {
+      expect(isMessageType(type)).toBe(true);
+    }
+    const parsed = Envelope.safeParse({
+      v: PROTOCOL_VERSION,
+      id: 'msg-1',
+      ts: 1,
+      daemonId: 'daemon-1',
+      type: 'question.request',
+      payload: { requestId: 'req-1', sessionId: 'sess-1', questions },
+    });
+    expect(parsed.success).toBe(true);
+  });
+});
+
+describe('pair.claim hostLabel bound', () => {
+  const base = { pairingCode: 'ABCDEFGH' };
+
+  it('accepts a normal short hostLabel', () => {
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'my-laptop' }));
+    expect(result.ok).toBe(true);
+  });
+
+  it('accepts a hostLabel at the 256-char bound', () => {
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'h'.repeat(256) }));
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects a hostLabel past the bound — the bot persists it verbatim, so it must be capped', () => {
+    // The label is written into the shared bindings.json and that whole file is rewritten on
+    // every pairing; an unbounded label would let one claimer bloat every other user's write.
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'h'.repeat(257) }));
+    expect(result.ok).toBe(false);
+  });
+});

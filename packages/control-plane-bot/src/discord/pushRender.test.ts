@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { Envelope } from '@claude-control/shared-protocol';
 import { decodeButton } from './buttons.js';
+import { decodeQuestionSelect, OTHER_VALUE } from './questionCards.js';
 import { renderPush, RELOGIN_COMMAND } from './pushRender.js';
 
 /** Minimal well-formed envelope wrapper so each test states only the payload that matters. */
@@ -51,6 +52,60 @@ describe('renderPush — permission.request', () => {
       env('permission.request', { requestId: 'r', sessionId: 's', tool: 'Bash', summary: 'x' }),
     );
     expect(push?.components?.[0]).toHaveLength(3);
+  });
+});
+
+describe('renderPush — question.request', () => {
+  it('renders a question embed plus one select per question with Other and indexed values', () => {
+    const push = renderPush(
+      env('question.request', {
+        requestId: 'req-1',
+        sessionId: 's1',
+        questions: [
+          {
+            question: 'Which color?',
+            header: 'Color',
+            multiSelect: false,
+            options: [{ label: 'Red' }, { label: 'Green' }],
+          },
+          {
+            question: 'Which sizes?',
+            multiSelect: true,
+            options: [{ label: 'S' }, { label: 'M' }],
+          },
+        ],
+        permissionMode: 'default',
+      }),
+    );
+    expect(push?.embeds?.[0]?.toJSON().title).toBe('Claude has questions');
+    expect(push?.components).toBeUndefined(); // question cards carry selects, not buttons
+    expect(push?.selects).toHaveLength(2);
+
+    const first = push!.selects![0]!;
+    // The select customId decodes back to this request and question index.
+    expect(decodeQuestionSelect(first.customId)).toEqual({ requestId: 'req-1', qIndex: 0 });
+    // Values are option indices as strings, then the Other sentinel.
+    expect(first.options.map((o) => o.value)).toEqual(['0', '1', OTHER_VALUE]);
+    expect(first.options.at(-1)!.label).toContain('Other');
+    // Single-select: exactly one; multi-select: min 1 / max = option count.
+    expect(first).toMatchObject({ minValues: 1, maxValues: 1 });
+    expect(push!.selects![1]).toMatchObject({ minValues: 1, maxValues: 3 });
+  });
+
+  it('suppresses the plain-text question_prompt notification (the card is the real UI)', () => {
+    // The daemon may send a companion hook.notification for the same prompt; it must not
+    // double-render alongside the question card.
+    expect(
+      renderPush(
+        env('hook.notification', {
+          event: 'notification',
+          title: 'Claude has a question',
+          body: 'pick one',
+          level: 'info',
+          notificationType: 'question_prompt',
+        }),
+      ),
+    ).toBeUndefined();
   });
 });
 

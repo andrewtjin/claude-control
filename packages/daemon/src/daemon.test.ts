@@ -34,6 +34,8 @@ import type {
   AgentSdkClient,
   PermissionDecision,
   PermissionRequest,
+  QuestionRequest,
+  QuestionAnswer,
   ResumeOrphanOptions,
 } from '@claude-control/session-runtime';
 import { Store } from './store.js';
@@ -179,9 +181,13 @@ interface FakeHandle extends SessionHandle {
   emit: (e: SessionEvent) => void;
   /** Synthesize a structured SDK permission request (the managed-session seam). */
   emitPermission: (req: PermissionRequest) => void;
+  /** Synthesize a structured SDK AskUserQuestion request (the question seam). */
+  emitQuestion: (req: QuestionRequest) => void;
   sent: string[];
   /** Decisions the daemon routed into resolvePermission, in arrival order. */
   resolved: Array<{ requestId: string; decision: PermissionDecision }>;
+  /** Answers the daemon routed into resolveQuestion, in arrival order. */
+  resolvedQuestions: Array<{ requestId: string; answers: QuestionAnswer[] }>;
   interruptCalls: number;
   stopCalls: number;
 }
@@ -195,11 +201,15 @@ interface FakeHandle extends SessionHandle {
 function makeFakeHandle(id: string, settleOnInterrupt = true): FakeHandle {
   const listeners = new Set<(e: SessionEvent) => void>();
   const permissionListeners = new Set<(req: PermissionRequest) => void>();
+  const questionListeners = new Set<(req: QuestionRequest) => void>();
   const sent: string[] = [];
   // Single-resolve bookkeeping mirroring the real permission gate: first decision wins,
   // repeats are 'already_handled', ids never requested are 'unknown'.
   const knownIds = new Set<string>();
   const settledIds = new Set<string>();
+  // The same bookkeeping for questions (a separate id-space, like the real gate).
+  const knownQuestionIds = new Set<string>();
+  const settledQuestionIds = new Set<string>();
   let state: SessionState = 'running';
   const emit = (e: SessionEvent): void => {
     for (const cb of listeners) cb(e);
@@ -208,6 +218,7 @@ function makeFakeHandle(id: string, settleOnInterrupt = true): FakeHandle {
     id,
     sent,
     resolved: [],
+    resolvedQuestions: [],
     interruptCalls: 0,
     stopCalls: 0,
     getState: () => state,
@@ -241,10 +252,25 @@ function makeFakeHandle(id: string, settleOnInterrupt = true): FakeHandle {
       handle.resolved.push({ requestId, decision });
       return 'resolved';
     },
+    onQuestionRequest(cb) {
+      questionListeners.add(cb);
+      return () => questionListeners.delete(cb);
+    },
+    resolveQuestion(requestId, answers) {
+      if (!knownQuestionIds.has(requestId)) return 'unknown';
+      if (settledQuestionIds.has(requestId)) return 'already_handled';
+      settledQuestionIds.add(requestId);
+      handle.resolvedQuestions.push({ requestId, answers });
+      return 'resolved';
+    },
     emit,
     emitPermission(req: PermissionRequest) {
       knownIds.add(req.requestId);
       for (const cb of permissionListeners) cb(req);
+    },
+    emitQuestion(req: QuestionRequest) {
+      knownQuestionIds.add(req.requestId);
+      for (const cb of questionListeners) cb(req);
     },
   };
   return handle;
@@ -902,6 +928,163 @@ describe('Daemon lifecycle', () => {
     await new Promise((r) => setTimeout(r, 60));
     expect(handle.resolved).toHaveLength(0);
     expect(store.getPendingPermission('sdk-req-5')?.resolvedDecision).toBe('deny');
+  });
+
+  // ---- managed-session question pipeline (mirror of the permission pipeline) ----
+
+  const sampleQuestions = [
+    {
+      question: 'Which color?',
+      multiSelect: false,
+      options: [{ label: 'teal' }, { label: 'red' }],
+    },
+  ];
+
+  it('forwards an SDK-originated AskUserQuestion as a question.request (row tagged managed, no TTL)', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emitQuestion({
+      requestId: 'sdk-q-1',
+      questions: sampleQuestions,
+      permissionMode: 'default',
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'question.request'));
+    const request = relay.received.find((e) => e.type === 'question.request');
+    if (request?.type === 'question.request') {
+      expect(request.payload).toMatchObject({
+        requestId: 'sdk-q-1',
+        sessionId: 'spawned-session',
+        questions: sampleQuestions,
+        permissionMode: 'default',
+      });
+      // No deadline on an SDK-parked question — timeout-based answers are banned.
+      expect(request.payload.expiresAt ?? undefined).toBeUndefined();
+    }
+    // A pending_questions row exists, awaiting the answer.
+    expect(store.getPendingQuestion('sdk-q-1')).toMatchObject({
+      sessionId: 'spawned-session',
+      origin: 'managed',
+      resolvedAtMs: null,
+    });
+  });
+
+  it('routes question.response for an SDK-originated request into the session handle', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emitQuestion({ requestId: 'sdk-q-2', questions: sampleQuestions });
+    await waitFor(() => store.getPendingQuestion('sdk-q-2') !== undefined);
+
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'question.response',
+      payload: {
+        requestId: 'sdk-q-2',
+        answers: [{ question: 'Which color?', selected: ['teal'] }],
+        idempotencyKey: 'kq',
+      },
+    });
+    await waitFor(() => handle.resolvedQuestions.length > 0);
+    expect(handle.resolvedQuestions[0]).toMatchObject({
+      requestId: 'sdk-q-2',
+      answers: [{ question: 'Which color?', selected: ['teal'] }],
+    });
+    // The audit row is marked answered.
+    await waitFor(() => store.getPendingQuestion('sdk-q-2')?.resolvedAtMs != null);
+  });
+
+  it('normalizes a nullish otherText to omitted when routing into the handle', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emitQuestion({ requestId: 'sdk-q-6', questions: sampleQuestions });
+    await waitFor(() => store.getPendingQuestion('sdk-q-6') !== undefined);
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'question.response',
+      payload: {
+        requestId: 'sdk-q-6',
+        // otherText omitted on the wire → must not surface as a null on the domain answer.
+        answers: [{ question: 'Which color?', selected: ['red'] }],
+        idempotencyKey: 'kq6',
+      },
+    });
+    await waitFor(() => handle.resolvedQuestions.length > 0);
+    expect(handle.resolvedQuestions[0]?.answers[0]).toEqual({
+      question: 'Which color?',
+      selected: ['red'],
+    });
+  });
+
+  it('a repeated question.response for a managed request is applied exactly once', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emitQuestion({ requestId: 'sdk-q-3', questions: sampleQuestions });
+    await waitFor(() => store.getPendingQuestion('sdk-q-3') !== undefined);
+
+    const answers = [{ question: 'Which color?', selected: ['teal'] }];
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'question.response',
+      payload: { requestId: 'sdk-q-3', answers, idempotencyKey: 'kq-first' },
+    });
+    await waitFor(() => handle.resolvedQuestions.length > 0);
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'question.response',
+      payload: { requestId: 'sdk-q-3', answers, idempotencyKey: 'kq-second' },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(handle.resolvedQuestions).toHaveLength(1);
+  });
+
+  it('a re-delivered SDK question produces exactly one card and one row', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    const req: QuestionRequest = { requestId: 'sdk-q-4', questions: sampleQuestions };
+    handle.emitQuestion(req);
+    handle.emitQuestion(req);
+    await waitFor(() => relay.received.some((e) => e.type === 'question.request'));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(relay.received.filter((e) => e.type === 'question.request')).toHaveLength(1);
+  });
+
+  it('sweeps managed question routes at session end: rows resolve and a late response is dropped', async () => {
+    await daemon.start();
+    const handle = await spawnFakeSession();
+    handle.emitQuestion({ requestId: 'sdk-q-5', questions: sampleQuestions });
+    await waitFor(() => store.getPendingQuestion('sdk-q-5') !== undefined);
+
+    handle.emit({ kind: 'status', state: 'done' }); // ends with the question pending
+    // The row is marked resolved (the gate denied it fail-closed on turn end).
+    expect(store.getPendingQuestion('sdk-q-5')?.resolvedAtMs).not.toBeNull();
+
+    // A late response now falls through to the hook path, whose already-resolved DB guard
+    // rejects it — it never reaches the handle.
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'question.response',
+      payload: {
+        requestId: 'sdk-q-5',
+        answers: [{ question: 'Which color?', selected: ['teal'] }],
+        idempotencyKey: 'kql',
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(handle.resolvedQuestions).toHaveLength(0);
+  });
+
+  it('a question.response for an unknown requestId is dropped, not applied', async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'question.response',
+      payload: {
+        requestId: 'never-asked-q',
+        answers: [{ question: 'q', selected: ['a'] }],
+        idempotencyKey: 'k',
+      },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(store.getPendingQuestion('never-asked-q')).toBeUndefined();
   });
 
   // ---- session.stop ----

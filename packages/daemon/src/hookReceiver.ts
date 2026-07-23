@@ -18,11 +18,18 @@
 // requestId's real job is correlating OUR pending-permission row with the phone's response,
 // not echoing anything the CLI knows about.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
-import type { EnvelopeDraft } from '@claude-control/shared-protocol';
+import type { EnvelopeDraft, PayloadOf } from '@claude-control/shared-protocol';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { Store } from './store.js';
+
+/** The structured questions carried on a `question.request` envelope. Aliased from the wire
+ *  schema so the receiver's defensive parser produces exactly what the envelope needs. */
+type WireQuestions = PayloadOf<'question.request'>['questions'];
+/** The structured answers carried on a `question.response`. `otherText` is nullish on the wire;
+ *  the composition below treats null/undefined identically (falls back to `selected`). */
+type WireAnswers = PayloadOf<'question.response'>['answers'];
 
 /** The hook events the CLI is expected to send, and the header/config the daemon
  *  expects on every request. Configurable because the real names were reverse-engineered from the installed CLI. */
@@ -57,6 +64,13 @@ export interface HookReceiverOptions {
   /** How long a permission hook's HTTP response is held open for a remote decision before a
    *  neutral answer lets the local prompt take over. See DEFAULT_PERMISSION_HOLD_MS. */
   permissionHoldMs?: number;
+  /** How long an AskUserQuestion hook's HTTP response is held open awaiting the phone's answers
+   *  before the question is declined so the session continues without answers (the same outcome
+   *  as choosing "chat about this" in the terminal picker). Same ceiling as
+   *  {@link permissionHoldMs} (the CLI kills the hook after ~600s), so it DEFAULTS to whatever
+   *  `permissionHoldMs` resolves to — a question and a permission are the same held-hook
+   *  round-trip. Split into its own knob only so a deployment can tune the two independently. */
+  questionHoldMs?: number;
   /** Forward the CLI's `Notification` hook events ("Claude is waiting for your input",
    *  "Claude needs your permission") as phone cards. Default OFF — they duplicate the real
    *  permission/done cards and read as nag noise; opt back in with CCTL_WAITING_CARDS.
@@ -99,6 +113,14 @@ export interface HookReceiverOptions {
 }
 
 export interface ResolvePermissionResult {
+  ok: boolean;
+  error?: string;
+}
+
+/** Outcome of {@link HookReceiver.resolveQuestion} — same shape and same never-throws contract
+ *  as {@link ResolvePermissionResult}: a stale/duplicate/expired/unanswered response is rejected
+ *  with a specific message, never applied. */
+export interface ResolveQuestionResult {
   ok: boolean;
   error?: string;
 }
@@ -194,11 +216,11 @@ const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
  *  for a faster local-prompt fallback when the operator is at the keyboard. */
 export const DEFAULT_PERMISSION_HOLD_MS = 570_000;
 
-/** Tools whose "permission" is really an interactive terminal exchange, not a remote-decidable
- *  yes/no. Holding these would freeze the terminal UI they need, and an approve/deny card is
- *  nonsense for a question the phone can't answer — so they get a "waiting on you"
- *  notification instead of a permission card, and no hold. */
-const INTERACTIVE_PROMPT_TOOLS = new Set(['AskUserQuestion']);
+/** The tool whose "permission" is really a structured multiple-choice prompt. It does not take
+ *  the yes/no permission path: instead the hook response is held while the phone answers, and the
+ *  chosen answers are injected into the tool's `updatedInput` — see the AskUserQuestion branch in
+ *  {@link HookReceiver.handlePermissionRequest} and {@link HookReceiver.resolveQuestion}. */
+const ASK_USER_QUESTION_TOOL = 'AskUserQuestion';
 
 /** How long after a remote allow the matching PostToolUse is still forwarded as an output
  *  card. PostToolUse fires only when the tool FINISHES, so the window must outlast a slow
@@ -238,6 +260,76 @@ function firstQuestionText(toolInput: Record<string, unknown> | undefined): stri
   if (!toolInput || !Array.isArray(toolInput.questions)) return undefined;
   const first: unknown = toolInput.questions[0];
   return isRecord(first) ? str(first.question) : undefined;
+}
+
+/** Parse one AskUserQuestion option, or `undefined` if it lacks a usable `label` — the only
+ *  field that round-trips into an answer, so a labelless option is unrenderable. */
+function parseQuestionOption(raw: unknown): { label: string; description?: string } | undefined {
+  if (!isRecord(raw)) return undefined;
+  const label = str(raw.label);
+  if (label === undefined || label === '') return undefined;
+  const description = str(raw.description);
+  return { label, ...(description !== undefined ? { description } : {}) };
+}
+
+/**
+ * Parse `tool_input.questions` into the wire's structured question shape, DEFENSIVELY. Returns
+ * `undefined` — the signal to fall back to today's notify-only behavior (the terminal picker
+ * handles it) — for anything other than a non-empty array of faithfully-renderable questions:
+ * a missing/empty array, a question with no text, or a question with no usable options. We refuse
+ * to emit a partial/lossy request because the `question.request` envelope is schema-validated on
+ * encode (a malformed one would throw in the sender), and because a question the phone can't
+ * render is worse than letting the terminal own it — the correct lapse. This mirrors the
+ * session-runtime parser (questions.ts); the shapes differ only in target type (wire vs domain).
+ */
+function parseQuestions(toolInput: Record<string, unknown> | undefined): WireQuestions | undefined {
+  if (!toolInput || !Array.isArray(toolInput.questions) || toolInput.questions.length === 0) {
+    return undefined;
+  }
+  const parsed: WireQuestions = [];
+  for (const raw of toolInput.questions) {
+    if (!isRecord(raw)) return undefined;
+    const question = str(raw.question);
+    if (question === undefined || question === '') return undefined;
+    if (!Array.isArray(raw.options)) return undefined;
+    const options: { label: string; description?: string }[] = [];
+    for (const rawOption of raw.options) {
+      const option = parseQuestionOption(rawOption);
+      if (option === undefined) return undefined;
+      options.push(option);
+    }
+    if (options.length === 0) return undefined;
+    const header = str(raw.header);
+    parsed.push({
+      question,
+      multiSelect: raw.multiSelect === true,
+      options,
+      ...(header !== undefined ? { header } : {}),
+    });
+  }
+  return parsed;
+}
+
+/** Narrow an inbound `answers` array (the `/resolve-question` body) to the wire answer shape, or
+ *  `undefined` if it is not a non-empty array of `{question, selected?, otherText?}`. Tolerant
+ *  like every other body narrower here: `selected` defaults to `[]` (its wire default) and a
+ *  non-string entry is dropped, so a malformed answer becomes an empty selection rather than a
+ *  throw. The daemon's own `question.response` handler passes already-validated wire answers, so
+ *  this only guards the direct HTTP resolve path. */
+function narrowAnswers(value: unknown): WireAnswers | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const answers: WireAnswers = [];
+  for (const raw of value) {
+    if (!isRecord(raw)) return undefined;
+    const question = str(raw.question);
+    if (question === undefined || question === '') return undefined;
+    const selected = Array.isArray(raw.selected)
+      ? raw.selected.filter((s): s is string => typeof s === 'string')
+      : [];
+    const otherText = str(raw.otherText);
+    answers.push({ question, selected, ...(otherText !== undefined ? { otherText } : {}) });
+  }
+  return answers;
 }
 /** Recursion bound for {@link stableKey}. `tool_input` is attacker-adjacent CLI input, and
  *  JSON.parse builds structures far deeper than the JS call stack tolerates, so an unbounded
@@ -311,6 +403,7 @@ export class HookReceiver {
   private readonly daemonId: () => string;
   private readonly logger: Logger;
   private readonly permissionHoldMs: number;
+  private readonly questionHoldMs: number;
   private readonly forwardNotificationCards: boolean;
   private readonly commandOutputCards: boolean;
   private readonly fullToolOutput: boolean;
@@ -359,6 +452,26 @@ export class HookReceiver {
    *  row would tell the phone "Approved." about a decision nothing ever applied. Entries
    *  self-clean after the TTL, when the store's own expiry makes the guard redundant. */
   private readonly lapsedHolds = new Set<string>();
+  /** Held AskUserQuestion hook responses awaiting the phone's answers — the question analog of
+   *  {@link heldPermissions}. `toolInput` is the CLI's original `tool_input`, spread into the
+   *  answered response's `updatedInput` alongside the injected `answers` map so the tool runs
+   *  with its original arguments plus the human's choices. `questions` is the parsed request set,
+   *  kept so `resolveQuestion` can reject a response that leaves any question unanswered. */
+  private readonly heldQuestions = new Map<
+    string,
+    {
+      res: ServerResponse;
+      timer: NodeJS.Timeout;
+      event: string;
+      sessionId: string;
+      toolInput?: Record<string, unknown>;
+      questions: WireQuestions;
+    }
+  >();
+  /** requestIds whose QUESTION hold ended without an answer — the question analog of
+   *  {@link lapsedHolds}, so a late phone answer is rejected honestly once the question has been
+   *  declined (expiry) or handed back to the terminal (shutdown). Self-cleans after the TTL. */
+  private readonly lapsedQuestionHolds = new Set<string>();
 
   constructor(options: HookReceiverOptions) {
     this.store = options.store;
@@ -371,6 +484,9 @@ export class HookReceiver {
     this.daemonId = options.daemonId;
     this.logger = options.logger ?? noopLogger;
     this.permissionHoldMs = options.permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS;
+    // A question is the same held-hook round-trip as a permission, so its hold defaults to the
+    // permission hold unless a deployment tunes it separately.
+    this.questionHoldMs = options.questionHoldMs ?? this.permissionHoldMs;
     this.forwardNotificationCards = options.forwardNotificationCards ?? false;
     this.commandOutputCards = options.commandOutputCards ?? true;
     this.fullToolOutput = options.fullToolOutput ?? false;
@@ -430,6 +546,16 @@ export class HookReceiver {
       this.respond(held.res, 200, {});
     }
     this.heldPermissions.clear();
+    // Held questions are open connections too — answer them all neutrally and emit
+    // question.lapsed 'shutdown', mirroring the permission drain above. Unlike an expiry lapse
+    // (which declines), a dying daemon hands the live picker back to the terminal: the
+    // operator did not walk away, the daemon did.
+    for (const [requestId, held] of this.heldQuestions) {
+      clearTimeout(held.timer);
+      this.markQuestionLapsed(requestId, 'shutdown');
+      this.respond(held.res, 200, {});
+    }
+    this.heldQuestions.clear();
     await new Promise<void>((resolve, reject) => {
       this.server?.close((err) => (err ? reject(err) : resolve()));
     });
@@ -552,6 +678,134 @@ export class HookReceiver {
     this.respond(held.res, 200, {});
   }
 
+  /**
+   * Record the phone's answers for a pending AskUserQuestion. Enforces the SAME security contract
+   * as {@link resolvePermission}: only a currently-pending, non-lapsed, non-expired request
+   * resolves, and only once; a managed-origin row is refused (only the process holding its SDK
+   * gate can answer it); and a response that leaves ANY of the request's questions unanswered is
+   * rejected (a partial answer set would make the CLI re-prompt in the terminal, silently
+   * contradicting the card's "answered" state). Returns `{ok:false}` — never throws, never applies
+   * — for anything else.
+   */
+  resolveQuestion(requestId: string, answers: WireAnswers): ResolveQuestionResult {
+    // Once a hold ended without an answer the request is gone — declined on expiry, or handed
+    // back to the terminal on shutdown. A late remote answer must not resolve the row (the
+    // phone would see "Answered." for something nothing applied).
+    if (this.lapsedQuestionHolds.has(requestId)) {
+      return { ok: false, error: 'hold lapsed — the question was already declined' };
+    }
+    const row = this.store.getPendingQuestion(requestId);
+    if (!row) return { ok: false, error: 'unknown requestId' };
+    // A managed-origin row mirrors an SDK-parked question whose blocking promise lives in the
+    // daemon process that spawned the session — only that process's gate can answer it, so
+    // "resolving" it here would record an answer nothing ever applied. Same refusal as the
+    // permission path.
+    if (row.origin === 'managed') {
+      return {
+        ok: false,
+        error:
+          'request belongs to a managed session - only the daemon process holding its SDK ' +
+          'gate can apply an answer (is a second daemon process running?)',
+      };
+    }
+    if (row.resolvedAtMs !== null) return { ok: false, error: 'already resolved' };
+    if (this.clock() - row.createdAtMs > this.permissionTtlMs) {
+      return { ok: false, error: 'expired' };
+    }
+    const held = this.heldQuestions.get(requestId);
+    // No held response means the hook call is already gone (lapsed/completed) even though the
+    // guards above passed only by a race; the DB WHERE-guard below is the real single-resolve, so
+    // treat a missing hold as already handled rather than answer a socket that no longer exists.
+    if (!held) return { ok: false, error: 'already resolved' };
+    // Every question the request posed must have an answer; a missing one is rejected so the CLI
+    // never falls back to its terminal picker behind an "answered" card.
+    const byQuestion = new Map(answers.map((a) => [a.question, a] as const));
+    for (const q of held.questions) {
+      if (!byQuestion.has(q.question)) {
+        return { ok: false, error: `no answer for question: ${q.question}` };
+      }
+    }
+    // The store's WHERE-guarded UPDATE is the atomic double-resolve guard; the checks above just
+    // produce a specific, honest error for each rejection reason.
+    const changed = this.store.resolvePendingQuestion(requestId, this.clock());
+    if (changed === 0) return { ok: false, error: 'already resolved' };
+    this.completeHeldQuestion(requestId, this.composeUpdatedInput(held.toolInput, answers));
+    return { ok: true };
+  }
+
+  /** Build the tool's `updatedInput`: the original `tool_input` plus an `answers` map keyed by
+   *  question TEXT (exactly the key the CLI's AskUserQuestion result requires), each value the
+   *  plain string the CLI expects — a free-form `otherText` when present, else the chosen labels
+   *  joined with ", " (which collapses to the one chosen label for a non-multiSelect question). */
+  private composeUpdatedInput(
+    toolInput: Record<string, unknown> | undefined,
+    answers: WireAnswers,
+  ): Record<string, unknown> {
+    const answerMap: Record<string, string> = {};
+    for (const answer of answers) {
+      answerMap[answer.question] = answer.otherText ?? answer.selected.join(', ');
+    }
+    return { ...(toolInput ?? {}), answers: answerMap };
+  }
+
+  /** Answer a held question hook response with the CLI's decision schema, injecting the composed
+   *  answers as `updatedInput`. The mirror of {@link completeHeldPermission}; a question has no
+   *  output watch to arm (it is never a shell run). No-op when the request isn't held. */
+  private completeHeldQuestion(requestId: string, updatedInput: Record<string, unknown>): void {
+    const held = this.heldQuestions.get(requestId);
+    if (!held) return;
+    clearTimeout(held.timer);
+    this.heldQuestions.delete(requestId);
+    this.respond(held.res, 200, {
+      hookSpecificOutput: {
+        hookEventName: held.event,
+        decision: { behavior: 'allow', updatedInput },
+      },
+    });
+    this.logger.info({ requestId }, 'held question response completed');
+  }
+
+  /** Record that a QUESTION hold ended with no answer, self-clean the marker after the TTL, and
+   *  tell the phone so its card can stop lying about live pickers. The mirror of
+   *  {@link markLapsed}: one call is exactly one `question.lapsed` (an answered question completes
+   *  through {@link completeHeldQuestion} and never reaches here). */
+  private markQuestionLapsed(requestId: string, reason: 'local' | 'expired' | 'shutdown'): void {
+    this.lapsedQuestionHolds.add(requestId);
+    const cleanup = setTimeout(
+      () => this.lapsedQuestionHolds.delete(requestId),
+      this.permissionTtlMs,
+    );
+    cleanup.unref();
+    this.emit({
+      daemonId: this.daemonId(),
+      type: 'question.lapsed',
+      payload: { requestId, reason },
+    });
+  }
+
+  /** The question hold window ended without an answer: decline the question so the session
+   *  continues the conversation without answers — the same outcome as the terminal picker's
+   *  "chat about this". NOT the neutral answer {@link lapseHeldPermission} uses: surfacing the
+   *  terminal picker after this long a wait serves no one, and a session that has moved to the
+   *  phone should resolve remotely or not at all. (Shutdown drain still answers neutrally —
+   *  a dying daemon hands the live picker back to the terminal rather than declining.) */
+  private lapseHeldQuestion(requestId: string): void {
+    const held = this.heldQuestions.get(requestId);
+    if (!held) return;
+    this.heldQuestions.delete(requestId);
+    this.markQuestionLapsed(requestId, 'expired');
+    this.logger.info({ requestId }, 'question hold lapsed; declined without answers');
+    this.respond(held.res, 200, {
+      hookSpecificOutput: {
+        hookEventName: held.event,
+        decision: {
+          behavior: 'deny',
+          message: 'User declined to answer; continue the conversation without these answers.',
+        },
+      },
+    });
+  }
+
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Liveness probe for supervisors and acceptance checks. Deliberately secret-free: the
     // server is loopback-only and the response carries nothing but "a process is listening" —
@@ -567,7 +821,7 @@ export class HookReceiver {
 
     const presented = req.headers[this.secretHeader.toLowerCase()];
     const presentedSecret = Array.isArray(presented) ? presented[0] : presented;
-    if (presentedSecret !== this.secret) {
+    if (!secretsMatch(presentedSecret, this.secret)) {
       // A stale secret in settings.json (or a stranger on loopback) — never log the value.
       this.logger.warn({ path: req.url }, 'hook POST rejected: bad or missing secret header');
       this.respond(res, 401, { ok: false, error: 'invalid secret' });
@@ -590,6 +844,10 @@ export class HookReceiver {
     const path = req.url ?? '/';
     if (path === '/resolve-permission') {
       this.handleResolvePermission(body, res);
+      return;
+    }
+    if (path === '/resolve-question') {
+      this.handleResolveQuestion(body, res);
       return;
     }
     if (path.startsWith('/cli/')) {
@@ -711,6 +969,28 @@ export class HookReceiver {
     this.respond(res, result.ok ? 200 : 409, result);
   }
 
+  /** The question analog of {@link handleResolvePermission}: parse `{requestId, answers}`,
+   *  narrowing the answers defensively (this body is attacker-adjacent), and map the domain
+   *  result onto a 200/409 exactly as the permission resolve does. */
+  private handleResolveQuestion(body: Record<string, unknown>, res: ServerResponse): void {
+    const requestId = str(body.requestId);
+    const answers = narrowAnswers(body.answers);
+    if (!requestId || answers === undefined) {
+      this.respond(res, 400, {
+        ok: false,
+        error: 'requestId and answers (a non-empty array of {question, selected, otherText?}) are required',
+      });
+      return;
+    }
+    const result = this.resolveQuestion(requestId, answers);
+    if (result.ok) {
+      this.logger.info({ requestId }, 'pending question resolved');
+    } else {
+      this.logger.warn({ requestId, error: result.error }, 'question resolve rejected');
+    }
+    this.respond(res, result.ok ? 200 : 409, result);
+  }
+
   private handleHookEvent(body: Record<string, unknown>, res: ServerResponse): void {
     // `hook_event_name` is the CLI's real field; the camelCase names are aliases kept for
     // internal senders and existing tests.
@@ -790,25 +1070,36 @@ export class HookReceiver {
       return;
     }
 
-    // An interactive-prompt tool (AskUserQuestion) is not a remote-decidable permission: the
-    // phone can't answer the question, and holding the response would freeze the terminal UI
-    // the question needs. Neutral answer immediately (normal flow shows the question) and
-    // push a "waiting on you" card naming what's being asked instead of approve/deny buttons.
-    if (INTERACTIVE_PROMPT_TOOLS.has(tool)) {
-      this.emit({
-        daemonId: this.daemonId(),
-        type: 'hook.notification',
-        payload: {
-          event: 'notification',
-          sessionId,
-          title: 'Waiting on you: Claude has a question in the terminal',
-          body: firstQuestionText(toolInput) ?? summary,
-          level: 'info',
-          notificationType: 'question_prompt',
-        },
-      });
-      this.logger.info({ sessionId, tool }, 'interactive-prompt tool; waiting card pushed');
-      this.respond(res, 200, {});
+    // AskUserQuestion is a structured multiple-choice prompt, not a yes/no permission. When its
+    // questions parse into a faithfully-renderable set, run the SAME held-hook round-trip as a
+    // permission: hold the response, emit a `question.request` the phone answers with real
+    // pickers, and inject the chosen answers into the tool's `updatedInput` on resolve. A shape
+    // we cannot render faithfully falls back to the pre-existing notify-only behavior — a neutral
+    // answer so the terminal shows its own picker, plus a "waiting on you" card — which is the
+    // correct lapse for a question the phone can't answer.
+    if (tool === ASK_USER_QUESTION_TOOL) {
+      const questions = parseQuestions(toolInput);
+      if (questions === undefined) {
+        this.emit({
+          daemonId: this.daemonId(),
+          type: 'hook.notification',
+          payload: {
+            event: 'notification',
+            sessionId,
+            title: 'Waiting on you: Claude has a question in the terminal',
+            body: firstQuestionText(toolInput) ?? summary,
+            level: 'info',
+            notificationType: 'question_prompt',
+          },
+        });
+        this.logger.info(
+          { sessionId, tool },
+          'AskUserQuestion tool_input not renderable; notify-only (terminal picker takes over)',
+        );
+        this.respond(res, 200, {});
+        return;
+      }
+      this.holdQuestion(requestId, sessionId, event, res, toolInput, questions, body);
       return;
     }
 
@@ -891,6 +1182,85 @@ export class HookReceiver {
     this.logger.info(
       { requestId, sessionId, tool, permissionMode },
       'permission hook received; card pushed; response held for remote decision',
+    );
+  }
+
+  /**
+   * Hold an AskUserQuestion hook response open for the phone's answers — the structural mirror of
+   * the permission hold in {@link handlePermissionRequest}: insert the pending row, emit the
+   * `question.request` the phone answers plus a companion card, arm the hold timer, and register
+   * the socket-close lapse. A phone answer lands in {@link resolveQuestion} (answered with the
+   * chosen answers as `updatedInput`); the hold expiring declines the question so the session
+   * continues without answers; the socket dying just marks the lapse (no response to send).
+   */
+  private holdQuestion(
+    requestId: string,
+    sessionId: string,
+    event: string,
+    res: ServerResponse,
+    toolInput: Record<string, unknown> | undefined,
+    questions: WireQuestions,
+    body: Record<string, unknown>,
+  ): void {
+    const now = this.clock();
+    this.store.insertPendingQuestion({ requestId, sessionId, createdAtMs: now, origin: 'hook' });
+
+    const cwd = str(body.cwd);
+    // Same tolerant `permission_mode` contract as the permission path (display context only).
+    const permissionMode = str(body.permission_mode) ?? str(body.permissionMode);
+    this.emit({
+      daemonId: this.daemonId(),
+      type: 'question.request',
+      payload: {
+        requestId,
+        sessionId,
+        questions,
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(permissionMode !== undefined ? { permissionMode } : {}),
+        expiresAt: now + this.permissionTtlMs,
+      },
+    });
+    // Companion card, mirroring the permission path's own `hook.notification` companion — event
+    // 'permission' so it groups with permission cards, but tagged `question_prompt` and titled
+    // with the first question so the phone can render it as a "Claude has a question" card.
+    const firstQuestion = questions[0]?.question;
+    this.emit({
+      daemonId: this.daemonId(),
+      type: 'hook.notification',
+      payload: {
+        event: 'permission',
+        sessionId,
+        title: 'Question requested',
+        body: firstQuestion ?? 'Claude has a question',
+        level: 'info',
+        notificationType: 'question_prompt',
+      },
+    });
+
+    const timer = setTimeout(() => this.lapseHeldQuestion(requestId), this.questionHoldMs);
+    timer.unref();
+    this.heldQuestions.set(requestId, {
+      res,
+      timer,
+      event,
+      sessionId,
+      questions,
+      ...(toolInput !== undefined ? { toolInput } : {}),
+    });
+    res.on('close', () => {
+      // Only a request STILL in the map is an abandoned socket (the CLI tore down the hook call
+      // because the operator answered at the terminal) — reason 'local', distinct from the hold
+      // timer firing. Fires on our own completion too, hence the membership check.
+      if (this.heldQuestions.has(requestId)) {
+        clearTimeout(timer);
+        this.heldQuestions.delete(requestId);
+        this.markQuestionLapsed(requestId, 'local');
+        this.logger.info({ requestId }, 'held question socket closed by the CLI side');
+      }
+    });
+    this.logger.info(
+      { requestId, sessionId, permissionMode },
+      'question hook received; card pushed; response held for the phone answers',
     );
   }
 
@@ -1119,6 +1489,20 @@ export class HookReceiver {
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(JSON.stringify(body));
   }
+}
+
+/** Constant-time equality for the loopback auth secret. The receiver binds 127.0.0.1, but a
+ *  loopback socket is not scoped to the owning OS user, so any local principal can reach the
+ *  port; a plain `!==` short-circuits at the first differing byte and leaks a timing signal about
+ *  how many leading bytes matched. Both sides are hashed to a fixed 32-byte digest first so the
+ *  compare is length-independent (timingSafeEqual throws on unequal lengths) and reveals nothing
+ *  about the secret's length or content — matching the constant-time posture tokens.ts already
+ *  uses for daemon tokens. A missing header is a plain miss. */
+function secretsMatch(presented: string | undefined, expected: string): boolean {
+  if (presented === undefined) return false;
+  const a = createHash('sha256').update(presented).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
 }
 
 /** Read and JSON-parse a request body, bounded so a misbehaving/malicious sender can't exhaust

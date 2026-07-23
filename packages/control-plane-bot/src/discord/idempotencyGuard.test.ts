@@ -9,6 +9,15 @@ describe('SeenKeys.markIfNew', () => {
     expect(seen.markIfNew('k2')).toBe(true);
   });
 
+  it('forget() rolls back a mark so a retry is treated as new again', () => {
+    const seen = new SeenKeys({ max: 10 });
+    expect(seen.markIfNew('k')).toBe(true);
+    expect(seen.markIfNew('k')).toBe(false); // marked
+    seen.forget('k'); // e.g. the marked action failed (daemon offline)
+    expect(seen.markIfNew('k')).toBe(true); // retryable again
+    expect(seen.size()).toBe(1);
+  });
+
   it('evicts the oldest key once the cap is exceeded (bounded memory)', () => {
     const seen = new SeenKeys({ max: 2 });
     expect(seen.markIfNew('a')).toBe(true);
