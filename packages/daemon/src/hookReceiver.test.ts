@@ -1530,7 +1530,7 @@ describe('HookReceiver', () => {
       expect(res.body).toMatchObject({ ok: false, error: 'unknown requestId' });
     });
 
-    it('an unanswered question hold lapses to a NEUTRAL response and emits question.lapsed', async () => {
+    it('an unanswered question hold lapses to a DECLINE and emits question.lapsed', async () => {
       const lapsedEmitted: EnvelopeDraft[] = [];
       const lapsing = new HookReceiver({
         store,
@@ -1553,9 +1553,19 @@ describe('HookReceiver', () => {
           },
           { 'x-claude-control-secret': SECRET },
         );
-        // Neutral body → the terminal shows its own picker.
+        // Deny decision → the session continues without answers, the same outcome as the
+        // terminal picker's "chat about this" (NOT the permission lapse's neutral body).
         expect(hookRes.status).toBe(200);
-        expect(hookRes.body).toEqual({});
+        expect(hookRes.body).toEqual({
+          hookSpecificOutput: {
+            hookEventName: 'PermissionRequest',
+            decision: {
+              behavior: 'deny',
+              message:
+                'User declined to answer; continue the conversation without these answers.',
+            },
+          },
+        });
 
         const request = lapsedEmitted.find((e) => e.type === 'question.request');
         const requestId = (request?.payload as { requestId: string }).requestId;

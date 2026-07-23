@@ -592,7 +592,7 @@ describe('buildLapsedQuestionEmbed', () => {
   it('picks the right title per reason and recolors muted', () => {
     expect(buildLapsedQuestionEmbed('local').toJSON().title).toBe('Answered at the terminal');
     expect(buildLapsedQuestionEmbed('expired').toJSON().title).toBe(
-      'Expired — answer at the terminal',
+      'Expired — continuing without answers',
     );
     expect(buildLapsedQuestionEmbed('shutdown').toJSON().title).toBe('Daemon stopped');
     expect(buildLapsedQuestionEmbed('expired').toJSON().color).toBe(0x95a5a6);
