@@ -30,12 +30,26 @@ services:
     pids_limit: 256
     security_opt:
       - no-new-privileges:true
-    # The bot listens on 8765 (a high port) and needs no Linux capabilities at all.
+    # Drop every Linux capability, then add back ONLY the three the entrypoint's root bootstrap
+    # needs: CHOWN (fix ownership of the persisted state volume) and SETUID/SETGID (su-exec dropping
+    # from root to the unprivileged `node` user). The bot PROCESS keeps none of these — the setuid()
+    # transition clears the capability sets and no-new-privileges above blocks reacquiring them — so
+    # the frame-parsing attack surface runs as uid 1000 with an empty capability set. They are live
+    # only for the brief root phase in packages/control-plane-bot/scripts/entrypoint.sh, which reads
+    # no untrusted input.
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
 
   caddy:
-    image: caddy:2-alpine
+    # Pinned by digest (multi-arch manifest list) so a redeploy resolves the exact image this was
+    # tested against and a re-pushed tag cannot change it silently. Refresh the tag AND digest
+    # together, the same way as the node base image (see packages/control-plane-bot/Dockerfile,
+    # substituting library/caddy and the 2-alpine tag).
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     restart: unless-stopped
     depends_on:
       - bot

@@ -8,6 +8,9 @@
 //   CCTL_BOT_STATE_DIR  (default ~/.claude-control-bot) where bindings.json and
 //                       session-threads.json live
 //   CCTL_LOG_LEVEL      (default info)
+//   CCTL_MAX_PENDING_CONNECTIONS  (optional) cap on concurrent unauthenticated daemon sockets;
+//                       unset uses the relay's built-in default. Raise it for a self-host serving
+//                       many daemons that may reconnect at once.
 //
 // This file preserves the package's structural zero-credential guarantee (see index.ts): it
 // imports only this package's own modules and declared deps — never switch-engine — so the
@@ -40,6 +43,17 @@ async function main(): Promise<void> {
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     fail(`CCTL_RELAY_PORT must be a port number, got "${process.env.CCTL_RELAY_PORT}"`);
   }
+  // Optional cap on concurrent unauthenticated daemon sockets (see relay.ts). Unset = the relay's
+  // built-in default; validated here like the port so a typo fails loudly at startup.
+  let maxPendingConnections: number | undefined;
+  const rawMaxPending = process.env.CCTL_MAX_PENDING_CONNECTIONS;
+  if (rawMaxPending !== undefined && rawMaxPending !== '') {
+    const parsed = Number(rawMaxPending);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      fail(`CCTL_MAX_PENDING_CONNECTIONS must be a positive integer, got "${rawMaxPending}"`);
+    }
+    maxPendingConnections = parsed;
+  }
   const stateDir = process.env.CCTL_BOT_STATE_DIR ?? join(homedir(), '.claude-control-bot');
   mkdirSync(stateDir, { recursive: true });
 
@@ -70,7 +84,17 @@ async function main(): Promise<void> {
   // stateDir makes the session→thread registry durable; omitting it would silently park
   // session-threads.json under the OS temp dir and lose thread routing on reboot.
   const gateway = new DiscordJsGateway({ relay: relayRef, pairing, logger, token, stateDir });
-  const relay = new RelayServer({ bindings, pairing, gateway, port, logger });
+  // Spread maxPendingConnections in only when set: exactOptionalPropertyTypes forbids passing an
+  // explicit `undefined` for an optional property, so an unset env must omit the key entirely and
+  // let RelayServer apply its own default.
+  const relay = new RelayServer({
+    bindings,
+    pairing,
+    gateway,
+    port,
+    logger,
+    ...(maxPendingConnections !== undefined ? { maxPendingConnections } : {}),
+  });
   holder.relay = relay;
 
   const boundPort = await relay.listen();
