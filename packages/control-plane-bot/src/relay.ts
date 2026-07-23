@@ -59,6 +59,13 @@ export interface RelayServerOptions {
    *  (close 1009) before it is buffered/parsed. Defaults to {@link MAX_FRAME_BYTES}; overridable
    *  so a test can exercise the bound without allocating a multi-MiB payload. */
   maxFrameBytes?: number;
+  /** Max concurrent UNAUTHENTICATED sockets (connected, no successful hello yet) before new
+   *  connections are shed with close 1013. Defaults to {@link MAX_PENDING_CONNECTIONS}; lowered in
+   *  tests to exercise the bound. */
+  maxPendingConnections?: number;
+  /** Max outbound backpressure (ws `bufferedAmount`) tolerated on one daemon socket before it is
+   *  dropped as unreachable. Defaults to {@link MAX_SOCKET_BUFFER_BYTES}; lowered in tests. */
+  maxSocketBufferBytes?: number;
   clock?: () => number;
 }
 
@@ -83,6 +90,20 @@ const DEFAULT_HEARTBEAT_MS = 30_000;
 // client can pull. 4 MiB stays comfortably above any real envelope while cutting that surface
 // ~25x; a larger frame is refused at the protocol layer (close 1009) before it reaches onMessage.
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+// Ceiling on concurrent UNAUTHENTICATED sockets (connected, no successful hello yet). Each pending
+// socket holds a handshake timer and can buffer up to one MAX_FRAME_BYTES frame before it is
+// parsed, so an unbounded flood of never-authenticating connections is a pre-auth memory/handle
+// amplifier the per-frame cap alone does not close. 64 keeps the worst case (64 x 4 MiB = 256 MiB)
+// comfortably under the bot container's mem_limit while dwarfing any real number of daemons
+// handshaking at once; past it the relay sheds new connections (close 1013) instead of allocating
+// more handshake state, and the FIRST_FRAME_TIMEOUT_MS reaper drains pending sockets so the cap
+// self-heals. Overridable via CCTL_MAX_PENDING_CONNECTIONS for a self-host with many daemons.
+const MAX_PENDING_CONNECTIONS = 64;
+// Ceiling on a single daemon socket's outbound backpressure. The relay is a non-accumulating
+// pass-through — it keeps no message queue — so the only way it grows memory without bound is ws's
+// own send buffer when a daemon stops draining its socket. 8 MiB is far above the KB-scale command
+// frames this direction actually carries, so only a genuinely stuck peer trips it.
+const MAX_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024;
 
 export class RelayServer implements RelaySender {
   private readonly httpServer: HttpServer;
@@ -92,6 +113,11 @@ export class RelayServer implements RelaySender {
   private readonly gateway: DiscordGateway;
   private readonly logger: Logger;
   private readonly connectionsByDaemon = new Map<string, Connection>();
+  // Unauthenticated sockets (connected, no successful hello yet). Bounded by maxPendingConnections
+  // so a handshake flood can't exhaust memory/handles; an entry leaves on hello, close, or timeout.
+  private readonly pendingConnections = new Set<WebSocket>();
+  private readonly maxPendingConnections: number;
+  private readonly maxSocketBufferBytes: number;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: RelayServerOptions) {
@@ -99,6 +125,8 @@ export class RelayServer implements RelaySender {
     this.pairing = options.pairing;
     this.gateway = options.gateway;
     this.logger = options.logger ?? noopLogger;
+    this.maxPendingConnections = options.maxPendingConnections ?? MAX_PENDING_CONNECTIONS;
+    this.maxSocketBufferBytes = options.maxSocketBufferBytes ?? MAX_SOCKET_BUFFER_BYTES;
     // An explicit http.Server (rather than letting WebSocketServer's `port` option create one
     // implicitly) so a plain GET can be answered on the same port the daemon sockets use —
     // ws only ever attaches an 'upgrade' handler to it, never a 'request' handler of its own.
@@ -163,6 +191,20 @@ export class RelayServer implements RelaySender {
     if (!conn || conn.socket.readyState !== WebSocket.OPEN) {
       return { ok: false, error: 'daemon is offline' };
     }
+    // Backpressure guard. The relay keeps no message queue of its own, so the ONLY way it grows
+    // memory without bound is ws's send buffer when a daemon stops draining its socket (a dead TCP
+    // peer, or a client that connected only to stall). Past the cap, treat the socket as unreachable
+    // and drop it rather than keep buffering; the daemon's normal reconnect replaces it. Reported to
+    // the caller as "offline" because from the user's point of view a daemon this far behind is.
+    if (conn.socket.bufferedAmount > this.maxSocketBufferBytes) {
+      this.logger.warn(
+        { daemonId: binding.daemonId, bufferedAmount: conn.socket.bufferedAmount },
+        'relay: daemon socket exceeded outbound buffer cap; dropping as unreachable',
+      );
+      conn.socket.terminate();
+      this.connectionsByDaemon.delete(binding.daemonId);
+      return { ok: false, error: 'daemon is offline' };
+    }
     conn.socket.send(encode(stamp(build(binding.daemonId))));
     return { ok: true };
   }
@@ -197,6 +239,16 @@ export class RelayServer implements RelaySender {
   }
 
   private onConnection(socket: WebSocket): void {
+    // Shed load BEFORE allocating any handshake state: a flood of sockets that connect and never
+    // authenticate would otherwise pin one handshake timer (and up to one buffered frame) each.
+    // 1013 = "try again later"; the FIRST_FRAME_TIMEOUT_MS reaper drains legitimate pending sockets
+    // so this capacity returns on its own.
+    if (this.pendingConnections.size >= this.maxPendingConnections) {
+      socket.close(1013, 'relay busy');
+      return;
+    }
+    this.pendingConnections.add(socket);
+
     const state: SocketState = { handshakeTimer: null };
     state.handshakeTimer = setTimeout(() => {
       if (!state.daemonId) socket.close(4008, 'handshake timeout');
@@ -209,6 +261,9 @@ export class RelayServer implements RelaySender {
     });
 
     socket.on('close', () => {
+      // Free the pending slot (a no-op once authenticated — the entry was removed on hello), so a
+      // clean disconnect and a timed-out handshake both return capacity to the pending cap.
+      this.pendingConnections.delete(socket);
       if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
       // Only evict the mapping if it still points at THIS socket. On a reconnect, handleHello
       // has already replaced the entry with the new socket; a late 'close' from the old socket
@@ -306,6 +361,8 @@ export class RelayServer implements RelaySender {
     }
 
     state.daemonId = daemonId;
+    // Authenticated: it no longer occupies an unauthenticated-handshake slot.
+    this.pendingConnections.delete(socket);
     if (state.handshakeTimer) {
       clearTimeout(state.handshakeTimer);
       state.handshakeTimer = null;
