@@ -111,4 +111,20 @@ describe('PairingService', () => {
     expect(pairing.createCode('user-a')).toBe('AAAAAAAA');
     expect(pairing.createCode('user-b')).toBe('BBBBBBBB');
   });
+
+  it('createCode sweeps expired codes so an unredeemed one cannot linger past its TTL', async () => {
+    const bindings = new BindingStore();
+    let now = 1_000_000;
+    const pairing = new PairingService({ bindings, clock: () => now, ttlMs: 60_000 });
+    const stale = pairing.createCode('user-a'); // expires at now + 60_000
+
+    now += 60_001; // stale is now past its TTL
+    pairing.createCode('user-b'); // the sweep runs here and evicts the expired `stale` entry
+
+    // The swept code is gone from the table entirely, so claiming it reads as UNKNOWN, not as the
+    // "expired" branch — which only fires for a code still present in the map. That difference is
+    // exactly what proves the entry was removed rather than merely lazily-expired on lookup.
+    const result = await pairing.claim(stale, 'host');
+    expect(result).toEqual({ ok: false, error: 'unknown or already-used pairing code' });
+  });
 });

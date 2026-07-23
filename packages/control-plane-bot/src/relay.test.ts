@@ -16,7 +16,7 @@ import {
 import { BindingStore } from './bindings.js';
 import { PairingService } from './pairing.js';
 import { hashToken, mintToken } from './tokens.js';
-import { RelayServer, type DiscordGateway } from './relay.js';
+import { RelayServer, type DiscordGateway, type SendResult } from './relay.js';
 
 /** Collects every envelope delivered to it and exposes a way to await N of them, so tests
  *  don't have to race the relay's internal async handling with a fixed sleep. Also records
@@ -548,5 +548,178 @@ describe('RelayServer', () => {
       const res = await fetch(`http://127.0.0.1:${port}/health`);
       expect(res.status).toBe(200);
     });
+  });
+});
+
+describe('RelayServer frame-size limit', () => {
+  // A dedicated server with a tiny cap so the bound can be exercised without allocating a
+  // multi-MiB payload. The default is 4 MiB (MAX_FRAME_BYTES) in production; the property under
+  // test is that an oversized frame is refused at the protocol layer BEFORE it is buffered and
+  // parsed — the pre-auth memory-amplification guard.
+  let bindings: BindingStore;
+  let pairing: PairingService;
+  let fake: ReturnType<typeof createFakeGateway>;
+  let relay: RelayServer;
+  let port: number;
+
+  beforeEach(async () => {
+    bindings = new BindingStore();
+    pairing = new PairingService({ bindings });
+    fake = createFakeGateway();
+    relay = new RelayServer({
+      bindings,
+      pairing,
+      gateway: fake.gateway,
+      heartbeatMs: 0,
+      port: 0,
+      maxFrameBytes: 1024,
+    });
+    port = await relay.listen();
+  });
+
+  afterEach(async () => {
+    await relay.close();
+  });
+
+  it('closes the socket with 1009 when an unauthenticated frame exceeds the cap', async () => {
+    const ws = await connect(port);
+    const closed = waitForClose(ws);
+    // 2 KiB > the 1 KiB cap; the frame is over-limit before any hello/pair.claim is even parsed.
+    ws.send('x'.repeat(2048));
+    // 1009 = "message too big" (ws refuses the frame at the protocol layer).
+    expect(await closed).toBe(1009);
+  });
+
+  it('still accepts a normal, well-under-cap frame', async () => {
+    const token = mintToken();
+    await bindings.bind('user-a', 'daemon-1', await hashToken(token), 'host', Date.now());
+    const ws = await connect(port);
+    sendEnvelope(ws, {
+      daemonId: 'daemon-1',
+      type: 'hello',
+      payload: { protocolVersion: PROTOCOL_VERSION, daemonToken: token },
+    });
+    const result = await nextMessage(ws);
+    expect(result.type).toBe('hello.result');
+    ws.close();
+  });
+});
+
+describe('RelayServer pending-connection cap', () => {
+  // A dedicated server with a tiny cap (2) so the unauthenticated-socket bound can be exercised
+  // without opening dozens of connections. The property under test: a flood of sockets that connect
+  // but never authenticate is shed once the cap is reached, and the slot returns when one leaves.
+  let bindings: BindingStore;
+  let pairing: PairingService;
+  let fake: ReturnType<typeof createFakeGateway>;
+  let relay: RelayServer;
+  let port: number;
+
+  beforeEach(async () => {
+    bindings = new BindingStore();
+    pairing = new PairingService({ bindings });
+    fake = createFakeGateway();
+    relay = new RelayServer({
+      bindings,
+      pairing,
+      gateway: fake.gateway,
+      heartbeatMs: 0,
+      port: 0,
+      maxPendingConnections: 2,
+    });
+    port = await relay.listen();
+  });
+
+  afterEach(async () => {
+    await relay.close();
+  });
+
+  it('accepts up to the cap of unauthenticated sockets, then sheds the next with 1013', async () => {
+    // Two sockets that connect but never say hello fill the cap; both stay open (not shed)...
+    const a = await connect(port);
+    const b = await connect(port);
+    expect(await expectSilenceFor(a, 150)).toBe('silence');
+    // ...and the third, over the cap, is closed immediately with 1013 ("try again later").
+    const c = await connect(port);
+    expect(await waitForClose(c)).toBe(1013);
+    a.close();
+    b.close();
+  });
+
+  it('frees a slot when a pending socket disconnects, so the cap self-heals', async () => {
+    const a = await connect(port);
+    const b = await connect(port);
+    // Cap reached; drop one and let the server's close handler return its slot to the pending pool.
+    a.close();
+    await waitForClose(a);
+    // A fresh connection is now back under the cap and must NOT be shed — it stays open. (A shed
+    // socket is closed, not sent a message, so we assert readyState rather than listen for silence.)
+    const c = await connect(port);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(c.readyState).toBe(WebSocket.OPEN);
+    b.close();
+    c.close();
+  });
+});
+
+describe('RelayServer outbound backpressure cap', () => {
+  // A dedicated server with a small outbound-buffer cap so a single oversized frame pushes one
+  // daemon socket over it. The property under test: a daemon that has stopped draining its socket
+  // is dropped as unreachable instead of letting ws buffer without bound.
+  let bindings: BindingStore;
+  let pairing: PairingService;
+  let fake: ReturnType<typeof createFakeGateway>;
+  let relay: RelayServer;
+  let port: number;
+
+  beforeEach(async () => {
+    bindings = new BindingStore();
+    pairing = new PairingService({ bindings });
+    fake = createFakeGateway();
+    relay = new RelayServer({
+      bindings,
+      pairing,
+      gateway: fake.gateway,
+      heartbeatMs: 0,
+      port: 0,
+      maxSocketBufferBytes: 256 * 1024,
+    });
+    port = await relay.listen();
+  });
+
+  afterEach(async () => {
+    await relay.close();
+  });
+
+  it('drops a daemon socket whose outbound buffer exceeds the cap and reports it offline', async () => {
+    const token = mintToken();
+    await bindings.bind('user-a', 'daemon-1', await hashToken(token), 'host', Date.now());
+    const ws = await connect(port);
+    sendEnvelope(ws, {
+      daemonId: 'daemon-1',
+      type: 'hello',
+      payload: { protocolVersion: PROTOCOL_VERSION, daemonToken: token },
+    });
+    expect((await nextMessage(ws)).type).toBe('hello.result');
+
+    // Push frames in a SYNCHRONOUS loop: sendToUser never awaits, so the event loop can't run
+    // between iterations and neither the client nor the OS can drain the socket. Once cumulative
+    // output overruns the kernel send/receive buffers, ws's bufferedAmount climbs past the cap and
+    // the next send's guard drops the socket. A single send can't be relied on — a large loopback
+    // socket buffer may absorb several MiB synchronously — so we accumulate instead, bounded so a
+    // pathologically large buffer can't loop forever.
+    const chunk = 'x'.repeat(4 * 1024 * 1024);
+    let result: SendResult = { ok: true };
+    for (let i = 0; i < 32 && result.ok; i++) {
+      result = relay.sendToUser('user-a', (daemonId) => ({
+        daemonId,
+        type: 'session.spawn',
+        payload: { requestId: `r${i}`, prompt: chunk, idempotencyKey: `i${i}` },
+      }));
+    }
+    // The guard tripped: the stuck socket was terminated and evicted, so the daemon reads offline.
+    expect(result.ok).toBe(false);
+    expect(relay.isOnline('user-a')).toBe(false);
+    ws.close();
   });
 });

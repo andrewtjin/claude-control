@@ -391,7 +391,11 @@ const HelloResultPayload = z.object({
 
 const PairClaimPayload = z.object({
   pairingCode: z.string().min(1),
-  hostLabel: z.string(),
+  // A short display label (the daemon sends its host name). Bounded because the bot persists it
+  // verbatim into the shared bindings.json and rewrites that whole file on every pairing — an
+  // unbounded label would let one claimer bloat every other user's pairing write. 256 covers any
+  // real hostname (DNS caps a name at 253) with room to spare.
+  hostLabel: z.string().max(256),
 });
 
 const PairResultPayload = z.object({
