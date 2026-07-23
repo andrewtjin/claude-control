@@ -252,3 +252,48 @@ describe('computePlan — determinism', () => {
     expect(one.ranking.map((r) => r.accountId)).toEqual(two.ranking.map((r) => r.accountId));
   });
 });
+
+describe('computePlan — the scoped (Fable) weekly cap is not the weekly budget', () => {
+  it('caps a scoped burn at the shared weekly headroom left to spend it through', () => {
+    // 90% fable unused, but only 40% of the shared weekly budget remains — only 40% is
+    // actually burnable, and it must be NAMED fable, never advertised as "weekly left".
+    const a = acct('a', 'Mixed', [
+      { kind: 'weekly_all', percent: 60 },
+      { kind: 'weekly_scoped', percent: 10, resetsAt: NOW + 2 * HOUR },
+    ]);
+    const plan = computePlan([a], opts);
+    expect(plan.reason).toBe('Burn Mixed (40% fable left, resets in 2h).');
+    expect(plan.ranking[0]?.note).toBe('burn: 40% fable resets soon');
+  });
+
+  it('does not advertise fable-left as burnable when the shared weekly budget is empty', () => {
+    // Andrew's live case: fable quota remains, weekly_all has none. The near-empty account
+    // must not be recommended as a burn target on the strength of stranded fable quota.
+    const stranded = acct('a', 'Stranded', [
+      { kind: 'weekly_all', percent: 97 },
+      { kind: 'weekly_scoped', percent: 20, resetsAt: NOW + 2 * HOUR },
+    ]);
+    const healthy = acct('b', 'Healthy', [{ kind: 'weekly_all', percent: 40 }]);
+    const plan = computePlan([stranded, healthy], opts);
+    expect(plan.recommendedAccountId).toBe('b');
+    expect(plan.reason).not.toContain('weekly left');
+    expect(plan.reason).not.toContain('fable left');
+  });
+
+  it('a scoped-only account (no weekly_all reported) still burns on its own terms', () => {
+    const a = acct('a', 'ScopedOnly', [
+      { kind: 'weekly_scoped', percent: 40, resetsAt: NOW + 3 * HOUR },
+    ]);
+    const plan = computePlan([a], opts);
+    expect(plan.reason).toBe('Burn ScopedOnly (60% fable left, resets in 3h).');
+  });
+
+  it("ranking's weeklyResetAt is the SHARED weekly reset, not the sooner scoped one", () => {
+    const a = acct('a', 'Aaa', [
+      { kind: 'weekly_scoped', percent: 50, resetsAt: NOW + 1 * DAY },
+      { kind: 'weekly_all', percent: 50, resetsAt: NOW + 4 * DAY },
+    ]);
+    const plan = computePlan([a], opts);
+    expect(plan.ranking[0]?.weeklyResetAt).toBe(NOW + 4 * DAY);
+  });
+});
