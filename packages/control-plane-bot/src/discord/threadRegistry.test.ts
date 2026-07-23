@@ -76,3 +76,51 @@ describe('PersistentThreadRegistry — survives a restart', () => {
     }
   });
 });
+
+describe('ThreadRegistry — latestForThread (reverse lookup)', () => {
+  it('answers undefined for a thread no session was ever bound to', () => {
+    const reg = new ThreadRegistry();
+    reg.set('u1', 's1', { kind: 'thread', threadId: 't1' });
+    expect(reg.latestForThread('t-unknown')).toBeUndefined();
+  });
+
+  it('maps a thread back to its (user, session)', () => {
+    const reg = new ThreadRegistry();
+    reg.set('u1', 's1', { kind: 'thread', threadId: 't1' });
+    expect(reg.latestForThread('t1')).toEqual({ discordUserId: 'u1', sessionId: 's1' });
+  });
+
+  it('ignores DM entries entirely', () => {
+    const reg = new ThreadRegistry();
+    reg.set('u1', 's1', { kind: 'dm' });
+    expect(reg.latestForThread('t1')).toBeUndefined();
+  });
+
+  it("the LAST session bound to a thread wins — the resume chain's newest link", () => {
+    const reg = new ThreadRegistry();
+    reg.set('u1', 's-old', { kind: 'thread', threadId: 't1' });
+    reg.set('u1', 's-new', { kind: 'thread', threadId: 't1' });
+    expect(reg.latestForThread('t1')).toEqual({ discordUserId: 'u1', sessionId: 's-new' });
+  });
+
+  it('last-wins order survives a snapshot/restore cycle', () => {
+    const reg = new ThreadRegistry();
+    reg.set('u1', 's-old', { kind: 'thread', threadId: 't1' });
+    reg.set('u1', 's-new', { kind: 'thread', threadId: 't1' });
+    const restored = ThreadRegistry.fromSnapshot(reg.snapshot());
+    expect(restored.latestForThread('t1')).toEqual({ discordUserId: 'u1', sessionId: 's-new' });
+  });
+});
+
+describe('PersistentThreadRegistry — latestForThread across a restart', () => {
+  it('still answers with the newest binding after reload from disk', async () => {
+    const dir = await tempDir();
+    const reg = new PersistentThreadRegistry(dir);
+    await reg.load();
+    await reg.record('u1', 's-old', { kind: 'thread', threadId: 't1' });
+    await reg.record('u1', 's-new', { kind: 'thread', threadId: 't1' });
+    const reloaded = new PersistentThreadRegistry(dir);
+    await reloaded.load();
+    expect(reloaded.latestForThread('t1')).toEqual({ discordUserId: 'u1', sessionId: 's-new' });
+  });
+});

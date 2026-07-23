@@ -11,6 +11,10 @@
 //                            threads; unset → session output is delivered by DM
 //   CCTL_LOG_LEVEL           (default info)
 //
+// Discord application prerequisite: the privileged MESSAGE CONTENT intent must be enabled in
+// the developer portal — replies typed in session threads are read as messages, and without
+// the portal toggle the gateway login is rejected outright.
+//
 // This file preserves the package's structural zero-credential guarantee (see index.ts): it
 // imports only this package's own modules and declared deps — never switch-engine — so the
 // bot process remains physically incapable of touching an OAuth token.
