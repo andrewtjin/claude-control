@@ -55,6 +55,10 @@ export interface RelayServerOptions {
   port?: number;
   /** ms between server-initiated ws pings; 0 disables the heartbeat entirely (tests). */
   heartbeatMs?: number;
+  /** Max bytes for a single inbound ws frame; anything larger is refused at the protocol layer
+   *  (close 1009) before it is buffered/parsed. Defaults to {@link MAX_FRAME_BYTES}; overridable
+   *  so a test can exercise the bound without allocating a multi-MiB payload. */
+  maxFrameBytes?: number;
   clock?: () => number;
 }
 
@@ -72,6 +76,13 @@ interface SocketState {
 
 const FIRST_FRAME_TIMEOUT_MS = 10_000;
 const DEFAULT_HEARTBEAT_MS = 30_000;
+// Hard ceiling on a single inbound frame. `ws` defaults to 100 MiB, but every legitimate
+// envelope is KB-scale (the largest realistic one is a managed session's output chunk), and a
+// frame is fully buffered, stringified, and parsed BEFORE the handshake authenticates the
+// socket — so an oversized default is a pre-auth memory-amplification lever any unauthenticated
+// client can pull. 4 MiB stays comfortably above any real envelope while cutting that surface
+// ~25x; a larger frame is refused at the protocol layer (close 1009) before it reaches onMessage.
+const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 
 export class RelayServer implements RelaySender {
   private readonly httpServer: HttpServer;
@@ -94,7 +105,10 @@ export class RelayServer implements RelaySender {
     this.httpServer = createServer((req, res) => {
       this.onHttpRequest(req, res);
     });
-    this.wss = new WebSocketServer({ server: this.httpServer });
+    this.wss = new WebSocketServer({
+      server: this.httpServer,
+      maxPayload: options.maxFrameBytes ?? MAX_FRAME_BYTES,
+    });
     this.wss.on('connection', (socket) => {
       this.onConnection(socket);
     });

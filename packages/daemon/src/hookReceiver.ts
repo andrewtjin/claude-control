@@ -18,7 +18,7 @@
 // requestId's real job is correlating OUR pending-permission row with the phone's response,
 // not echoing anything the CLI knows about.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { EnvelopeDraft } from '@claude-control/shared-protocol';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
@@ -567,7 +567,7 @@ export class HookReceiver {
 
     const presented = req.headers[this.secretHeader.toLowerCase()];
     const presentedSecret = Array.isArray(presented) ? presented[0] : presented;
-    if (presentedSecret !== this.secret) {
+    if (!secretsMatch(presentedSecret, this.secret)) {
       // A stale secret in settings.json (or a stranger on loopback) — never log the value.
       this.logger.warn({ path: req.url }, 'hook POST rejected: bad or missing secret header');
       this.respond(res, 401, { ok: false, error: 'invalid secret' });
@@ -1119,6 +1119,20 @@ export class HookReceiver {
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(JSON.stringify(body));
   }
+}
+
+/** Constant-time equality for the loopback auth secret. The receiver binds 127.0.0.1, but a
+ *  loopback socket is not scoped to the owning OS user, so any local principal can reach the
+ *  port; a plain `!==` short-circuits at the first differing byte and leaks a timing signal about
+ *  how many leading bytes matched. Both sides are hashed to a fixed 32-byte digest first so the
+ *  compare is length-independent (timingSafeEqual throws on unequal lengths) and reveals nothing
+ *  about the secret's length or content — matching the constant-time posture tokens.ts already
+ *  uses for daemon tokens. A missing header is a plain miss. */
+function secretsMatch(presented: string | undefined, expected: string): boolean {
+  if (presented === undefined) return false;
+  const a = createHash('sha256').update(presented).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
 }
 
 /** Read and JSON-parse a request body, bounded so a misbehaving/malicious sender can't exhaust

@@ -338,3 +338,24 @@ describe('session.prune / session.prune.result', () => {
     expect(pruneResult.success).toBe(true);
   });
 });
+
+describe('pair.claim hostLabel bound', () => {
+  const base = { pairingCode: 'ABCDEFGH' };
+
+  it('accepts a normal short hostLabel', () => {
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'my-laptop' }));
+    expect(result.ok).toBe(true);
+  });
+
+  it('accepts a hostLabel at the 256-char bound', () => {
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'h'.repeat(256) }));
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects a hostLabel past the bound — the bot persists it verbatim, so it must be capped', () => {
+    // The label is written into the shared bindings.json and that whole file is rewritten on
+    // every pairing; an unbounded label would let one claimer bloat every other user's write.
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'h'.repeat(257) }));
+    expect(result.ok).toBe(false);
+  });
+});
