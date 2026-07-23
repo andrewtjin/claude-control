@@ -42,7 +42,11 @@ export interface RelaySender {
   isOnline(discordUserId: string): boolean;
 }
 
-export type SendResult = { ok: true } | { ok: false; error: string };
+/** `id` is the stamped envelope id of the frame that went out — the value a daemon `error`
+ *  reply's `relatesTo` will carry, so a caller that needs to route that reply somewhere
+ *  specific (e.g. back into the thread a message was typed in) can remember it. `ok: true`
+ *  still only means "written to the socket", never "daemon processed it". */
+export type SendResult = { ok: true; id: string } | { ok: false; error: string };
 
 export interface RelayServerOptions {
   bindings: BindingStore;
@@ -149,8 +153,9 @@ export class RelayServer implements RelaySender {
     if (!conn || conn.socket.readyState !== WebSocket.OPEN) {
       return { ok: false, error: 'daemon is offline' };
     }
-    conn.socket.send(encode(stamp(build(binding.daemonId))));
-    return { ok: true };
+    const envelope = stamp(build(binding.daemonId));
+    conn.socket.send(encode(envelope));
+    return { ok: true, id: envelope.id };
   }
 
   isOnline(discordUserId: string): boolean {

@@ -35,7 +35,7 @@ function createFakeRelay(options: { online: Record<string, string | undefined> }
       const daemonId = options.online[discordUserId];
       if (!daemonId) return { ok: false, error: 'no daemon is paired to this account' };
       sent.push({ discordUserId, daemonId, draft: build(daemonId) });
-      return { ok: true } satisfies SendResult;
+      return { ok: true, id: `sent-${sent.length}` } satisfies SendResult;
     },
     isOnline(discordUserId) {
       return options.online[discordUserId] !== undefined;

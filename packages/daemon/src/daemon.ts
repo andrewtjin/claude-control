@@ -772,7 +772,25 @@ export class Daemon {
     const { sessionId, text } = msg.payload;
     const handle = this.sessionManager.get(sessionId);
     if (handle) {
-      await handle.send(text);
+      try {
+        await handle.send(text);
+      } catch (err) {
+        // A live handle can still refuse: mid-turn, or already wound down under us. This
+        // rejection used to die in the dispatcher's generic catch — a silent drop the sender
+        // reads as "the session ignored me". Answer the phone instead, same contract as every
+        // other refusal in this handler.
+        this.logger.warn({ sessionId, err }, 'prompt.inject rejected by live session handle');
+        this.sendEnvelope({
+          type: 'error',
+          payload: {
+            code: 'inject_failed',
+            message:
+              `prompt.inject: session '${sessionId}' did not accept the message ` +
+              `(${err instanceof Error ? err.message : String(err)})`,
+            relatesTo: msg.id,
+          },
+        });
+      }
       return;
     }
 
@@ -855,13 +873,19 @@ export class Daemon {
     record: SessionRecord | undefined,
   ): void {
     const { sessionId } = msg.payload;
-    const detail =
-      record !== undefined && (record.state === 'done' || record.state === 'failed')
-        ? `session '${sessionId}' already ended`
-        : `no live session '${sessionId}' in this daemon`;
+    // Two distinct CODES, not just two message strings: "ended" is actionable (the sender can
+    // resume via session.spawn + resumeSessionId) while "unknown" is not, and a program on the
+    // other end must not have to parse prose to tell them apart.
+    const ended = record !== undefined && (record.state === 'done' || record.state === 'failed');
     this.sendEnvelope({
       type: 'error',
-      payload: { code: 'unknown_session', message: `prompt.inject: ${detail}`, relatesTo: msg.id },
+      payload: {
+        code: ended ? 'session_ended' : 'unknown_session',
+        message: ended
+          ? `prompt.inject: session '${sessionId}' already ended`
+          : `prompt.inject: no live session '${sessionId}' in this daemon`,
+        relatesTo: msg.id,
+      },
     });
   }
 
@@ -969,20 +993,61 @@ export class Daemon {
   }
 
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
-    const { prompt, resumeSessionId, cwd, accountId } = msg.payload;
-    const client = this.createAgentSdkClient();
-    const handle = await this.sessionManager.spawnManaged({
-      client,
-      prompt,
-      // Always 'default' so remote approve/deny actually works — see the constant's decision
-      // comment for why the daemon (not the spawn payload) owns this policy in protocol v1.
-      permissionMode: MANAGED_SESSION_PERMISSION_MODE,
-      ...(resumeSessionId !== undefined && resumeSessionId !== null ? { resumeSessionId } : {}),
-      ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
-      ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
-    });
+    const { requestId, prompt, resumeSessionId, cwd, accountId } = msg.payload;
+    try {
+      const resumeAnchor = this.resolveSpawnResumeAnchor(resumeSessionId ?? undefined);
+      const client = this.createAgentSdkClient();
+      const handle = await this.sessionManager.spawnManaged({
+        client,
+        prompt,
+        // Always 'default' so remote approve/deny actually works — see the constant's decision
+        // comment for why the daemon (not the spawn payload) owns this policy in protocol v1.
+        permissionMode: MANAGED_SESSION_PERMISSION_MODE,
+        ...(resumeAnchor !== undefined ? { resumeSessionId: resumeAnchor } : {}),
+        ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
+        ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
+      });
+      // `requestId` rides every status frame the new session emits (see forwardSessionEvent):
+      // a spawn mints a sessionId the requester has no other way to learn, and the bot needs
+      // the link to keep a resumed conversation in the thread the user typed into.
+      this.attachSessionPipes(handle, accountId ?? undefined, requestId);
+    } catch (err) {
+      // A failed spawn previously died in the dispatcher's generic catch — logged locally,
+      // invisible to the phone, which sat waiting for session.status frames that would never
+      // come. Answer explicitly (`relatesTo` = this frame's id, the protocol's correlation
+      // anchor) so the requesting surface can say WHY nothing started.
+      this.logger.warn({ err, requestId }, 'session.spawn failed');
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'spawn_failed',
+          message: `session.spawn: ${err instanceof Error ? err.message : String(err)}`,
+          relatesTo: msg.id,
+        },
+      });
+    }
+  }
 
-    this.attachSessionPipes(handle, accountId ?? undefined);
+  /**
+   * Translate a spawn's `resumeSessionId` into the Agent SDK resume anchor it needs.
+   * The bot (and any remote caller) only ever learns the daemon-minted WIRE sessionId, but
+   * the SDK resumes by its own conversation id — the `resumeId` captured at session_init and
+   * persisted on the record. Passing the wire id straight through (the old behaviour) could
+   * never resume a bot-known session. A ref matching no managed record is passed through
+   * unchanged: a host-side caller may legitimately hold a raw SDK id. A known record that
+   * never reached session_init has nothing to resume from — refused loudly, not spawned
+   * fresh with the context silently dropped.
+   */
+  private resolveSpawnResumeAnchor(ref: string | undefined): string | undefined {
+    if (ref === undefined) return undefined;
+    const record = this.sessionManager.list().find((r) => r.id === ref && r.kind === 'managed');
+    if (!record) return ref;
+    if (record.resumeId === undefined || record.resumeId === null || record.resumeId === '') {
+      throw new Error(
+        `session '${ref}' cannot be resumed: it never reached session_init (no resume anchor)`,
+      );
+    }
+    return record.resumeId;
   }
 
   /**
@@ -1158,13 +1223,17 @@ export class Daemon {
    * sweeps the session's permission routes on terminal status — which is what keeps
    * `managedPermissionRoutes` bounded (a session's requests never outlive the session).
    */
-  private attachSessionPipes(handle: SessionHandle, accountId: string | undefined): void {
+  private attachSessionPipes(
+    handle: SessionHandle,
+    accountId: string | undefined,
+    spawnRequestId?: string,
+  ): void {
     handle.onEvent((event) => {
       if (event.kind === 'status' && (event.state === 'done' || event.state === 'failed')) {
         this.sweepManagedPermissionRoutes(handle.id);
         this.sweepManagedQuestionRoutes(handle.id);
       }
-      this.forwardSessionEvent(handle.id, accountId, event);
+      this.forwardSessionEvent(handle.id, accountId, event, spawnRequestId);
     });
     // Optional on SessionHandle (observed terminals have no structured permission seam);
     // managed handles always implement it.
@@ -1299,6 +1368,7 @@ export class Daemon {
     sessionId: string,
     accountId: string | undefined,
     event: SessionEvent,
+    spawnRequestId?: string,
   ): void {
     if (event.kind === 'status') {
       // Mirror the transition into the display-only Store table BEFORE shipping the envelope,
@@ -1311,6 +1381,7 @@ export class Daemon {
           sessionId,
           state: event.state,
           ...(accountId !== undefined ? { accountId } : {}),
+          ...(spawnRequestId !== undefined ? { spawnRequestId } : {}),
         },
       });
       return;

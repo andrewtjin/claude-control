@@ -314,3 +314,135 @@ describe('SessionPlanner — route isolation', () => {
     );
   });
 });
+
+describe('SessionPlanner — stream mode (per-session thread surface)', () => {
+  // Times start at 5000: with lastEditAtMs starting at 0, any real clock is "past the window"
+  // for a session's first emission, and these tests mirror that.
+  it('never posts a card and emits the first stdout immediately as a plain line', () => {
+    const p = new SessionPlanner();
+    const s0 = p.onStatus(ROUTE, status('running'), 5000, 'stream');
+    expect(cardSends(s0.ops)).toHaveLength(0);
+    expect(edits(s0.ops)).toHaveLength(0);
+    expect(lineSends(s0.ops)).toHaveLength(0); // starting→running is noise, not a line
+    const r = p.onOutput(ROUTE, output(0, 'stdout', 'hello world'), 5010, 'stream');
+    const lines = lineSends(r.ops);
+    expect(lines).toHaveLength(1);
+    expect((lines[0] as { content: string }).content).toBe('hello world');
+    expect(cardSends(r.ops)).toHaveLength(0);
+    expect(edits(r.ops)).toHaveLength(0);
+  });
+
+  it("the first frame's mode is sticky — a later frame cannot flip the surface to card", () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 5000, 'stream');
+    const r = p.onOutput(ROUTE, output(0, 'stdout', 'x'), 9000, 'card');
+    expect(cardSends(r.ops)).toHaveLength(0);
+    expect(lineSends(r.ops)).toHaveLength(1);
+  });
+
+  it('coalesces an in-window burst into one appended batch at the window boundary', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 2000 });
+    p.onOutput(ROUTE, output(0, 'stdout', 'first '), 5000, 'stream'); // emits, anchors the window
+    const a = p.onOutput(ROUTE, output(1, 'stdout', 'hel'), 5100, 'stream');
+    const b = p.onOutput(ROUTE, output(2, 'stdout', 'lo'), 5200, 'stream');
+    expect(lineSends(a.ops)).toHaveLength(0);
+    expect(lineSends(b.ops)).toHaveLength(0);
+    expect(a.flushAtMs).toBe(7000);
+    expect(b.flushAtMs).toBe(7000);
+    const f = p.flush(ROUTE, 7000);
+    const lines = lineSends(f.ops);
+    expect(lines).toHaveLength(1);
+    expect((lines[0] as { content: string }).content).toBe('hello');
+  });
+
+  it('splits an over-limit batch into multiple messages, each within the content cap', () => {
+    const p = new SessionPlanner();
+    const big = 'line\n'.repeat(700); // 3500 chars — needs 2 messages
+    const r = p.onOutput(ROUTE, output(0, 'stdout', big), 5000, 'stream');
+    const lines = lineSends(r.ops);
+    expect(lines.length).toBeGreaterThanOrEqual(2);
+    for (const line of lines) {
+      expect((line as { content: string }).content.length).toBeLessThanOrEqual(2000);
+    }
+  });
+
+  it('replaces an extreme burst with a visible skip marker, then attaches the FULL transcript at terminal', () => {
+    const p = new SessionPlanner();
+    const flood = 'x'.repeat(13_000); // past STREAM_SKIP_THRESHOLD_CHARS
+    const r = p.onOutput(ROUTE, output(0, 'stdout', flood), 5000, 'stream');
+    const lines = lineSends(r.ops);
+    expect(lines).toHaveLength(1);
+    expect((lines[0] as { content: string }).content).toContain('⏩');
+    expect((lines[0] as { content: string }).content).toContain('skipped');
+    const done = p.onStatus(ROUTE, status('done'), 6000, 'stream');
+    const ups = uploads(done.ops);
+    expect(ups).toHaveLength(1);
+    expect((ups[0] as { text: string }).text).toBe(flood); // complete, not a remainder
+  });
+
+  it('posts no attachment when everything streamed inline', () => {
+    const p = new SessionPlanner();
+    p.onOutput(ROUTE, output(0, 'stdout', 'short output'), 5000, 'stream');
+    const done = p.onStatus(ROUTE, status('done'), 6000, 'stream');
+    expect(uploads(done.ops)).toHaveLength(0);
+  });
+
+  it('drains the buffer ahead of the terminal summary so the transcript reads in order', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 2000 });
+    p.onOutput(ROUTE, output(0, 'stdout', 'a'), 5000, 'stream');
+    p.onOutput(ROUTE, output(1, 'stdout', 'b'), 5100, 'stream'); // buffered, in-window
+    const done = p.onStatus(ROUTE, status('done', { summary: 'fin' }), 5200, 'stream');
+    const lines = lineSends(done.ops);
+    // [drained 'b' line, summary embed line] — text strictly before the summary card.
+    expect(lines.length).toBe(2);
+    expect((lines[0] as { content?: string }).content).toBe('b');
+    expect('embed' in lines[1]! && lines[1].embed).toBeTruthy();
+  });
+
+  it('a declared gap surfaces as a visible marker IN the thread', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 100, gapGraceMs: 500 });
+    p.onOutput(ROUTE, output(0, 'stdout', 'a'), 5000, 'stream'); // emits
+    const hole = p.onOutput(ROUTE, output(2, 'stdout', 'c'), 5050, 'stream'); // seq 1 missing
+    expect(lineSends(hole.ops)).toHaveLength(0); // parked behind the hole
+    const f = p.flush(ROUTE, 6000); // grace elapsed
+    const lines = lineSends(f.ops);
+    expect(lines).toHaveLength(1);
+    const content = (lines[0] as { content: string }).content;
+    expect(content).toContain('⟨gap: output seq 1–1 lost⟩');
+    expect(content).toContain('c');
+  });
+
+  it('a daemon-run change mid-session writes the restart marker into the stream', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 100 });
+    p.onOutput(ROUTE, output(0, 'stdout', 'before', false, 'run-1'), 5000, 'stream');
+    const r = p.onOutput(ROUTE, output(0, 'stdout', 'after', false, 'run-2'), 9000, 'stream');
+    const lines = lineSends(r.ops);
+    expect(lines).toHaveLength(1);
+    const content = (lines[0] as { content: string }).content;
+    expect(content).toContain('output stream restarted');
+    expect(content).toContain('after');
+  });
+
+  it('posts action-worthy state changes as lines, exactly once per change', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 5000, 'stream');
+    const wait = p.onStatus(ROUTE, status('waiting_permission'), 6000, 'stream');
+    const lines = lineSends(wait.ops);
+    expect(lines).toHaveLength(1);
+    expect((lines[0] as { content: string }).content).toContain('🔐');
+    // The same state repeated is not a change — no repeat line.
+    const again = p.onStatus(ROUTE, status('waiting_permission'), 7000, 'stream');
+    expect(lineSends(again.ops)).toHaveLength(0);
+  });
+
+  it('acknowledges a stop request with a line, once', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 5000, 'stream');
+    const first = p.onStopRequested(ROUTE, 6000);
+    expect(lineSends(first.ops)).toHaveLength(1);
+    expect((lineSends(first.ops)[0] as { content: string }).content).toContain('stopping');
+    expect(edits(first.ops)).toHaveLength(0); // no card exists to edit
+    const second = p.onStopRequested(ROUTE, 6100);
+    expect(second.ops).toHaveLength(0);
+  });
+});

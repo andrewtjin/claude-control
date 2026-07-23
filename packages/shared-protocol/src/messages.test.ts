@@ -344,10 +344,7 @@ describe('question round-trip trio', () => {
     {
       question: 'Which color do you prefer?',
       header: 'Color',
-      options: [
-        { label: 'crimson', description: 'A deep, rich red.' },
-        { label: 'teal' },
-      ],
+      options: [{ label: 'crimson', description: 'A deep, rich red.' }, { label: 'teal' }],
     },
   ];
 
@@ -429,5 +426,38 @@ describe('question round-trip trio', () => {
       payload: { requestId: 'req-1', sessionId: 'sess-1', questions },
     });
     expect(parsed.success).toBe(true);
+  });
+});
+
+describe('session.status spawnRequestId (additive, N/N-1 tolerant)', () => {
+  const base: PayloadOf<'session.status'> = {
+    sessionId: 'sess-1',
+    state: 'running',
+  };
+
+  it('parses without spawnRequestId — frames from pre-echo daemons stay valid', () => {
+    const result = decode(rawFrame('session.status', base));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.spawnRequestId ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries the spawn requestId through a round-trip', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'session.status',
+      payload: { ...base, spawnRequestId: 'req-42' },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.spawnRequestId).toBe('req-42');
+    }
+  });
+
+  it('rejects an empty-string requestId — absent and empty must not be conflated', () => {
+    const result = decode(rawFrame('session.status', { ...base, spawnRequestId: '' }));
+    expect(result.ok).toBe(false);
   });
 });

@@ -83,6 +83,7 @@ import {
   SessionPlanner,
   sessionRouteKey,
   type GatewayOp,
+  type PlanMode,
   type PlanResult,
   type SessionRoute,
 } from './sessionPlanner.js';
@@ -101,9 +102,35 @@ export interface SessionThreadParent {
       name: string;
       type: ChannelType.PrivateThread;
       invitable: boolean;
+      autoArchiveDuration: number;
     }): Promise<{ id: string; members: { add(userId: string): Promise<unknown> } }>;
   };
 }
+
+/** Threads auto-archive after Discord's 3-day tier (minutes). Deliberately the LONGEST practical
+ *  window: a finished session's thread is a conversation the user can re-enter by typing (which
+ *  resumes it), so it should linger, not vanish behind the next morning's archive sweep. Archive
+ *  is Discord-side housekeeping only — the bot never archives, locks, or deletes a thread. */
+const THREAD_AUTO_ARCHIVE_MINUTES = 4320;
+
+/** Bot→daemon frames sent on behalf of a message TYPED in a session thread, keyed by the sent
+ *  envelope's id — the value a daemon `error` reply's `relatesTo` carries. Lets a refusal land in
+ *  the thread the user is looking at (not their DMs), and lets a 'session_ended' refusal escalate
+ *  to a resume-spawn without the user retyping. Bounded FIFO: a reply correlates within seconds;
+ *  anything older has lost its audience. */
+interface ThreadSendContext {
+  discordUserId: string;
+  threadId: string;
+  /** The triggering user message — failure reactions ride the exact message that failed. */
+  messageId: string;
+  sessionId: string;
+  text: string;
+  kind: 'inject' | 'spawn';
+}
+
+/** Bound for both thread-send correlation maps (sends awaiting a possible error reply, and spawn
+ *  requestIds awaiting their first correlated session.status). */
+const PENDING_THREAD_SENDS_MAX = 256;
 
 /** Where a user's per-session threads should be created. Returns `undefined` (the default) when no
  *  channel is available, in which case delivery falls back to the user's DM and remembers it. */
@@ -220,6 +247,16 @@ export class DiscordJsGateway implements DiscordGateway {
   private readonly questionAnswers = new QuestionAnswerCollector();
   /** One pending coalesced-flush timer per session route; rescheduled, never stacked. */
   private readonly flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Thread-originated sends awaiting a possible daemon error reply, keyed by sent envelope id
+   *  (see {@link ThreadSendContext}). Insertion-ordered; pruned FIFO at the bound. */
+  private readonly pendingThreadSends = new Map<string, ThreadSendContext>();
+  /** Thread-originated resume spawns awaiting their first correlated `session.status` (which
+   *  carries `spawnRequestId`), keyed by that requestId. The stored thread is what the NEW
+   *  sessionId gets bound to, keeping the resumed conversation in the thread it started in. */
+  private readonly pendingSpawnRebinds = new Map<
+    string,
+    { discordUserId: string; threadId: string }
+  >();
   /** Per-session-route serialization chain for EVERY card mutation: managed-session frames
    *  (status/output), the coalesced-flush timer, and the stop nudge. relay.ts fires `deliver()`
    *  from an un-awaited `socket.on('message')` handler, and the flush timer / stop nudge fire on
@@ -257,7 +294,17 @@ export class DiscordJsGateway implements DiscordGateway {
           }
         : undefined);
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
-    this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    // GuildMessages + MessageContent exist for exactly one purpose: reading messages typed in
+    // per-session threads so they can be forwarded to the session that owns the thread.
+    // MessageContent is a PRIVILEGED intent — it must also be enabled on the application in the
+    // Discord developer portal, or the gateway login is rejected outright.
+    this.client = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+      ],
+    });
 
     // `clientReady`, not `ready`: the latter is deprecated and stops firing in discord.js v15,
     // which would leave slash commands unregistered and the emoji bars never upgraded — a
@@ -275,6 +322,13 @@ export class DiscordJsGateway implements DiscordGateway {
     this.client.on('interactionCreate', (interaction) => {
       this.onInteraction(interaction).catch((err: unknown) => {
         this.logger.error({ err }, 'discord: unhandled interaction error');
+      });
+    });
+    // Free-text typed in a per-session thread is session input — the reverse direction of the
+    // thread-per-session surface. Routing/auth decisions live in onThreadMessage.
+    this.client.on(Events.MessageCreate, (message) => {
+      this.onThreadMessage(message).catch((err: unknown) => {
+        this.logger.error({ err }, 'discord: unhandled thread message error');
       });
     });
   }
@@ -314,6 +368,9 @@ export class DiscordJsGateway implements DiscordGateway {
     // else is stateless w.r.t. that surface and keeps the direct path.
     if (isType(envelope, 'session.status') || isType(envelope, 'session.output')) {
       const route: SessionRoute = { discordUserId, sessionId: envelope.payload.sessionId };
+      // No await between here and the enqueue: deliver() is called un-awaited, and yielding
+      // first would let another chain writer (a flush timer, a stop nudge) append AHEAD of
+      // this frame — the exact reordering chainOnRoute exists to prevent.
       return this.enqueueSessionDelivery(route, envelope);
     }
     if (isType(envelope, 'permission.lapsed')) {
@@ -321,6 +378,11 @@ export class DiscordJsGateway implements DiscordGateway {
     }
     if (isType(envelope, 'question.lapsed')) {
       return this.applyQuestionLapse(envelope.payload);
+    }
+    // An error reply to a frame a thread message originated goes back to THAT thread (and a
+    // "session ended" refusal escalates to a resume) instead of the generic DM card path.
+    if (isType(envelope, 'error') && (await this.routeThreadSendError(envelope.payload))) {
+      return;
     }
     const push = renderPush(envelope);
     if (!push) return; // cache-only: not worth a DM
@@ -472,13 +534,30 @@ export class DiscordJsGateway implements DiscordGateway {
    *  can't reject the route chain and stall every later frame for the session. */
   private async processSessionEnvelope(route: SessionRoute, envelope: Envelope): Promise<void> {
     try {
+      // FIRST, still inside this route's chain unit: a spawn born from a thread message must
+      // bind its new sessionId to that thread before the target is resolved, or ensureTarget
+      // would mint a second thread for it.
       if (isType(envelope, 'session.status')) {
-        await this.runPlan(route, this.planner.onStatus(route, envelope.payload, this.clock()));
+        await this.maybeRebindSpawnedSession(route.discordUserId, envelope.payload);
+      }
+      // Presentation follows where the frames actually land: thread → append-stream, DM → card.
+      // Resolved BEFORE planning (the registry pins it after the first call) so the planner's
+      // first-frame mode decision is made with the target known, never guessed.
+      const target = await this.ensureTarget(route);
+      const mode: PlanMode = target.kind === 'thread' ? 'stream' : 'card';
+      if (isType(envelope, 'session.status')) {
+        await this.runPlan(
+          route,
+          this.planner.onStatus(route, envelope.payload, this.clock(), mode),
+        );
         this.scheduleForget(route, envelope.payload.state);
         return;
       }
       if (isType(envelope, 'session.output')) {
-        await this.runPlan(route, this.planner.onOutput(route, envelope.payload, this.clock()));
+        await this.runPlan(
+          route,
+          this.planner.onOutput(route, envelope.payload, this.clock(), mode),
+        );
       }
     } catch (err) {
       this.logger.warn({ err, route }, 'discord: session envelope processing failed');
@@ -586,6 +665,7 @@ export class DiscordJsGateway implements DiscordGateway {
           name: `session ${route.sessionId.slice(0, 8)}`,
           type: ChannelType.PrivateThread,
           invitable: false,
+          autoArchiveDuration: THREAD_AUTO_ARCHIVE_MINUTES,
         });
         await thread.members.add(route.discordUserId);
         target = { kind: 'thread', threadId: thread.id };
@@ -594,7 +674,12 @@ export class DiscordJsGateway implements DiscordGateway {
       this.logger.warn({ err, route }, 'discord: thread creation failed, falling back to DM');
       target = { kind: 'dm' };
     }
-    await this.threadReg.record(route.discordUserId, route.sessionId, target);
+    // Write-behind: `record` updates the in-memory map synchronously (the authority for this
+    // process's routing) and only the durability write is async. Delivery must not queue behind
+    // disk I/O — this now runs ahead of EVERY frame's planning, not just the first send.
+    this.threadReg.record(route.discordUserId, route.sessionId, target).catch((err: unknown) => {
+      this.logger.warn({ err, route }, 'discord: failed to persist a session delivery target');
+    });
     return target;
   }
 
@@ -654,6 +739,224 @@ export class DiscordJsGateway implements DiscordGateway {
         this.logger.warn({ err, route }, 'discord: stop nudge failed');
       }
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Thread messages → session input (the reverse direction of thread-per-session)
+  // -------------------------------------------------------------------------
+
+  /** A message posted anywhere the bot can read. Only messages typed by the BOUND user inside one
+   *  of their session threads go anywhere: they become session input — `prompt.inject` while the
+   *  session can still hear (live or orphaned, which re-attaches), or a resume spawn once it has
+   *  ended, continuing the conversation in the same thread with a fresh sessionId. Everything else
+   *  is ignored without a ripple. Structural parameter type (not discord.js `Message`) +
+   *  `protected`, the same seam pattern as {@link sinkFor}: unit tests drive routing/auth with a
+   *  plain object and no gateway connection. */
+  protected async onThreadMessage(message: {
+    author: { id: string; bot: boolean };
+    channelId: string;
+    channel: { isThread(): boolean };
+    content: string;
+    id: string;
+  }): Promise<void> {
+    if (message.author.bot) return; // includes our own streamed output
+    if (!message.channel.isThread()) return;
+    const binding = this.threadReg.latestForThread(message.channelId);
+    if (!binding) return; // not a session thread this bot owns
+    // Only the bound user steers their sessions. A private non-invitable thread should make this
+    // unreachable for anyone else; if membership leaks anyway (admin tooling, future config), the
+    // wrong author is ignored rather than answered — replying would confirm the thread is live.
+    if (binding.discordUserId !== message.author.id) return;
+    const text = message.content.trim();
+    if (text.length === 0) {
+      // Attachment/sticker-only: nothing forwardable. A visible shrug beats a silent drop.
+      await this.reactInThread(message.channelId, message.id, '⚠️');
+      return;
+    }
+    const cached = this.cache
+      .getSessions(binding.discordUserId)
+      .find((s) => s.sessionId === binding.sessionId);
+    // done/failed → resume-spawn. Everything else — live, orphaned (prompt.inject re-attaches
+    // it), or absent from the cache (bot restarted; the daemon still knows more than we do) —
+    // goes as an inject, and a 'session_ended' refusal escalates to the resume automatically.
+    const ended = cached !== undefined && (cached.state === 'done' || cached.state === 'failed');
+    if (ended) {
+      await this.resumeFromThread({
+        discordUserId: binding.discordUserId,
+        sessionId: binding.sessionId,
+        threadId: message.channelId,
+        messageId: message.id,
+        text,
+      });
+      return;
+    }
+    const result = this.deps.relay.sendToUser(binding.discordUserId, (daemonId) => ({
+      daemonId,
+      type: 'prompt.inject',
+      payload: {
+        sessionId: binding.sessionId,
+        text,
+        // Deterministic per Discord message: this frame exists because THIS message exists.
+        idempotencyKey: `thread:${message.id}`,
+      },
+    }));
+    if (!result.ok) {
+      await this.reactInThread(message.channelId, message.id, '⚠️');
+      await this.sendInThread(message.channelId, `⚠️ ${result.error}`);
+      return;
+    }
+    this.rememberThreadSend(result.id, {
+      discordUserId: binding.discordUserId,
+      threadId: message.channelId,
+      messageId: message.id,
+      sessionId: binding.sessionId,
+      text,
+      kind: 'inject',
+    });
+    await this.reactInThread(message.channelId, message.id, '📨');
+  }
+
+  /** Continue an ENDED session's conversation from its thread: `session.spawn` with the old wire
+   *  sessionId as the resume ref (the daemon translates it to the SDK anchor) and the typed text
+   *  as the resumed turn's prompt. The spawn's requestId is parked so the first correlated
+   *  `session.status` binds the NEW sessionId to this same thread — see
+   *  {@link maybeRebindSpawnedSession}. */
+  private async resumeFromThread(opts: {
+    discordUserId: string;
+    sessionId: string;
+    threadId: string;
+    messageId: string;
+    text: string;
+  }): Promise<void> {
+    const requestId = randomUUID();
+    const result = this.deps.relay.sendToUser(opts.discordUserId, (daemonId) => ({
+      daemonId,
+      type: 'session.spawn',
+      payload: {
+        requestId,
+        prompt: opts.text,
+        resumeSessionId: opts.sessionId,
+        idempotencyKey: `thread:${opts.messageId}`,
+      },
+    }));
+    if (!result.ok) {
+      await this.reactInThread(opts.threadId, opts.messageId, '⚠️');
+      await this.sendInThread(opts.threadId, `⚠️ ${result.error}`);
+      return;
+    }
+    this.rememberSpawnRebind(requestId, {
+      discordUserId: opts.discordUserId,
+      threadId: opts.threadId,
+    });
+    this.rememberThreadSend(result.id, {
+      discordUserId: opts.discordUserId,
+      threadId: opts.threadId,
+      messageId: opts.messageId,
+      sessionId: opts.sessionId,
+      text: opts.text,
+      kind: 'spawn',
+    });
+    await this.reactInThread(opts.threadId, opts.messageId, '🔄');
+  }
+
+  /** First correlated `session.status` after a thread-originated resume spawn: bind the NEW
+   *  sessionId to the SAME thread (before the frame is planned — see the deliver() call site) and
+   *  post a one-line seam so the reader can tell where the old conversation's continuation begins
+   *  (and which id `/stop` now wants). Frames whose `spawnRequestId` matches nothing pending are
+   *  the overwhelmingly common case and return immediately. */
+  private async maybeRebindSpawnedSession(
+    discordUserId: string,
+    payload: PayloadOf<'session.status'>,
+  ): Promise<void> {
+    const requestId = payload.spawnRequestId ?? undefined;
+    if (requestId === undefined) return;
+    const pending = this.pendingSpawnRebinds.get(requestId);
+    if (!pending || pending.discordUserId !== discordUserId) return;
+    this.pendingSpawnRebinds.delete(requestId);
+    try {
+      await this.threadReg.record(discordUserId, payload.sessionId, {
+        kind: 'thread',
+        threadId: pending.threadId,
+      });
+    } catch (err) {
+      // The in-memory binding took effect before persistence — delivery still routes to the
+      // thread for this bot's lifetime; only a restart would fall back to a fresh thread.
+      this.logger.warn({ err, requestId }, 'discord: failed to persist a resumed-session rebind');
+    }
+    await this.sendInThread(
+      pending.threadId,
+      `🔄 resumed as session \`${payload.sessionId.slice(0, 8)}\``,
+    );
+  }
+
+  /** Route a daemon `error` reply to the thread whose typed message caused the refused frame.
+   *  Returns false when the error correlates to nothing thread-originated (caller falls through
+   *  to the generic push path). A 'session_ended' inject refusal escalates straight to the resume
+   *  spawn — the user's intent ("continue this conversation") is unambiguous, so making them
+   *  retype the same text would be pure ceremony. */
+  private async routeThreadSendError(payload: PayloadOf<'error'>): Promise<boolean> {
+    const relatesTo = payload.relatesTo ?? undefined;
+    if (relatesTo === undefined) return false;
+    const ctx = this.pendingThreadSends.get(relatesTo);
+    if (!ctx) return false;
+    this.pendingThreadSends.delete(relatesTo);
+    if (ctx.kind === 'inject' && payload.code === 'session_ended') {
+      await this.resumeFromThread({
+        discordUserId: ctx.discordUserId,
+        sessionId: ctx.sessionId,
+        threadId: ctx.threadId,
+        messageId: ctx.messageId,
+        text: ctx.text,
+      });
+      return true;
+    }
+    await this.reactInThread(ctx.threadId, ctx.messageId, '❗');
+    await this.sendInThread(ctx.threadId, `⚠️ ${payload.message}`);
+    return true;
+  }
+
+  /** Remember a thread-originated send for error correlation, FIFO-bounded. */
+  private rememberThreadSend(envelopeId: string, ctx: ThreadSendContext): void {
+    this.pendingThreadSends.set(envelopeId, ctx);
+    if (this.pendingThreadSends.size > PENDING_THREAD_SENDS_MAX) {
+      const oldest = this.pendingThreadSends.keys().next().value;
+      if (oldest !== undefined) this.pendingThreadSends.delete(oldest);
+    }
+  }
+
+  /** Remember a pending resume spawn for thread rebinding, FIFO-bounded like its sibling. */
+  private rememberSpawnRebind(
+    requestId: string,
+    pending: { discordUserId: string; threadId: string },
+  ): void {
+    this.pendingSpawnRebinds.set(requestId, pending);
+    if (this.pendingSpawnRebinds.size > PENDING_THREAD_SENDS_MAX) {
+      const oldest = this.pendingSpawnRebinds.keys().next().value;
+      if (oldest !== undefined) this.pendingSpawnRebinds.delete(oldest);
+    }
+  }
+
+  /** Best-effort reaction on a thread message — feedback, never load-bearing; a failure is
+   *  logged and swallowed. `protected` seam so unit tests observe reactions without discord.js. */
+  protected async reactInThread(threadId: string, messageId: string, emoji: string): Promise<void> {
+    try {
+      const channel = await this.client.channels.fetch(threadId);
+      if (!channel?.isTextBased()) return;
+      const message = await channel.messages.fetch(messageId);
+      await message.react(emoji);
+    } catch (err) {
+      this.logger.debug({ err, threadId, messageId }, 'discord: failed to react in thread');
+    }
+  }
+
+  /** Best-effort plain message into a thread — same contract and seam as {@link reactInThread}. */
+  protected async sendInThread(threadId: string, content: string): Promise<void> {
+    try {
+      const channel = await this.client.channels.fetch(threadId);
+      if (channel?.isSendable()) await channel.send({ content });
+    } catch (err) {
+      this.logger.warn({ err, threadId }, 'discord: failed to send into thread');
+    }
   }
 
   /** Inflate a RenderedPush's NON-content payload (embeds + component rows + file attachments)

@@ -349,6 +349,15 @@ const SessionStatusPayload = z.object({
   accountId: AccountId.nullish(),
   resumeId: SessionId.nullish(),
   summary: z.string().nullish(),
+  /** The `session.spawn` requestId this session was born from, echoed on its status frames.
+   *  A spawn mints a NEW sessionId the requester has no other way to learn, so without this
+   *  echo the bot cannot connect "the spawn I sent" to "the session now streaming" — which it
+   *  must, to keep a resumed conversation in the surface (thread) where the user asked for it.
+   *  Stamped on EVERY status frame of a spawned session, not just the first: the first frame
+   *  can be lost to a reconnect, and a late learner is still a correct learner. Additive +
+   *  tolerant like `epoch`: a pre-echo daemon omits it and the bot simply cannot correlate,
+   *  exactly as today. */
+  spawnRequestId: RequestId.nullish(),
 });
 
 /** Widened (not split into done/waiting variants) on purpose: title/body/level stays the one
