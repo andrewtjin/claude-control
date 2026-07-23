@@ -453,10 +453,11 @@ export function buildAnsweredQuestionEmbed(
 /** Human title per question-lapse reason. Parity with LAPSE_TITLE (the permission version): the
  *  reader's only cue for WHY the pickers went dead, since the wire reason is never shown. `local`
  *  is "answered at the terminal" rather than "handled" because a question is answered, not
- *  handled. */
+ *  handled. `expired` means the daemon declined the question and the session moved on — there is
+ *  nothing left to answer anywhere, so the title must not send the reader to the terminal. */
 const QUESTION_LAPSE_TITLE: Record<PayloadOf<'question.lapsed'>['reason'], string> = {
   local: 'Answered at the terminal',
-  expired: 'Expired — answer at the terminal',
+  expired: 'Expired — continuing without answers',
   shutdown: 'Daemon stopped',
 };
 

@@ -65,9 +65,10 @@ export interface HookReceiverOptions {
    *  neutral answer lets the local prompt take over. See DEFAULT_PERMISSION_HOLD_MS. */
   permissionHoldMs?: number;
   /** How long an AskUserQuestion hook's HTTP response is held open awaiting the phone's answers
-   *  before a neutral answer lets the terminal's own picker take over. Same trade-off and same
-   *  ceiling as {@link permissionHoldMs} (the CLI kills the hook after ~600s), so it DEFAULTS to
-   *  whatever `permissionHoldMs` resolves to — a question and a permission are the same held-hook
+   *  before the question is declined so the session continues without answers (the same outcome
+   *  as choosing "chat about this" in the terminal picker). Same ceiling as
+   *  {@link permissionHoldMs} (the CLI kills the hook after ~600s), so it DEFAULTS to whatever
+   *  `permissionHoldMs` resolves to — a question and a permission are the same held-hook
    *  round-trip. Split into its own knob only so a deployment can tune the two independently. */
   questionHoldMs?: number;
   /** Forward the CLI's `Notification` hook events ("Claude is waiting for your input",
@@ -468,8 +469,8 @@ export class HookReceiver {
     }
   >();
   /** requestIds whose QUESTION hold ended without an answer — the question analog of
-   *  {@link lapsedHolds}, so a late phone answer is rejected honestly once the terminal picker
-   *  has taken over. Self-cleans after the TTL. */
+   *  {@link lapsedHolds}, so a late phone answer is rejected honestly once the question has been
+   *  declined (expiry) or handed back to the terminal (shutdown). Self-cleans after the TTL. */
   private readonly lapsedQuestionHolds = new Set<string>();
 
   constructor(options: HookReceiverOptions) {
@@ -545,8 +546,10 @@ export class HookReceiver {
       this.respond(held.res, 200, {});
     }
     this.heldPermissions.clear();
-    // Held questions are open connections too — answer them all neutrally (the terminal picker
-    // takes over) and emit question.lapsed 'shutdown', mirroring the permission drain above.
+    // Held questions are open connections too — answer them all neutrally and emit
+    // question.lapsed 'shutdown', mirroring the permission drain above. Unlike an expiry lapse
+    // (which declines), a dying daemon hands the live picker back to the terminal: the
+    // operator did not walk away, the daemon did.
     for (const [requestId, held] of this.heldQuestions) {
       clearTimeout(held.timer);
       this.markQuestionLapsed(requestId, 'shutdown');
@@ -685,11 +688,11 @@ export class HookReceiver {
    * — for anything else.
    */
   resolveQuestion(requestId: string, answers: WireAnswers): ResolveQuestionResult {
-    // Once a hold ended without an answer the terminal picker owns this request — a late remote
-    // answer must not resolve the row (the phone would see "Answered." for something nothing
-    // applied).
+    // Once a hold ended without an answer the request is gone — declined on expiry, or handed
+    // back to the terminal on shutdown. A late remote answer must not resolve the row (the
+    // phone would see "Answered." for something nothing applied).
     if (this.lapsedQuestionHolds.has(requestId)) {
-      return { ok: false, error: 'hold lapsed — the terminal picker took over' };
+      return { ok: false, error: 'hold lapsed — the question was already declined' };
     }
     const row = this.store.getPendingQuestion(requestId);
     if (!row) return { ok: false, error: 'unknown requestId' };
@@ -780,15 +783,27 @@ export class HookReceiver {
     });
   }
 
-  /** The question hold window ended without an answer: answer neutrally (the terminal shows its
-   *  own picker) and mark the request lapsed. Mirror of {@link lapseHeldPermission}. */
+  /** The question hold window ended without an answer: decline the question so the session
+   *  continues the conversation without answers — the same outcome as the terminal picker's
+   *  "chat about this". NOT the neutral answer {@link lapseHeldPermission} uses: surfacing the
+   *  terminal picker after this long a wait serves no one, and a session that has moved to the
+   *  phone should resolve remotely or not at all. (Shutdown drain still answers neutrally —
+   *  a dying daemon hands the live picker back to the terminal rather than declining.) */
   private lapseHeldQuestion(requestId: string): void {
     const held = this.heldQuestions.get(requestId);
     if (!held) return;
     this.heldQuestions.delete(requestId);
     this.markQuestionLapsed(requestId, 'expired');
-    this.logger.info({ requestId }, 'question hold lapsed; terminal picker takes over');
-    this.respond(held.res, 200, {});
+    this.logger.info({ requestId }, 'question hold lapsed; declined without answers');
+    this.respond(held.res, 200, {
+      hookSpecificOutput: {
+        hookEventName: held.event,
+        decision: {
+          behavior: 'deny',
+          message: 'User declined to answer; continue the conversation without these answers.',
+        },
+      },
+    });
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1175,8 +1190,8 @@ export class HookReceiver {
    * the permission hold in {@link handlePermissionRequest}: insert the pending row, emit the
    * `question.request` the phone answers plus a companion card, arm the hold timer, and register
    * the socket-close lapse. A phone answer lands in {@link resolveQuestion} (answered with the
-   * chosen answers as `updatedInput`); the hold lapsing or the socket dying answers neutrally so
-   * the terminal picker takes over.
+   * chosen answers as `updatedInput`); the hold expiring declines the question so the session
+   * continues without answers; the socket dying just marks the lapse (no response to send).
    */
   private holdQuestion(
     requestId: string,

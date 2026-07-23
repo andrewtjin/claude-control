@@ -263,7 +263,7 @@ describe('DiscordJsGateway — question.lapsed', () => {
     const payload = gw.fakeMessage.lastEditPayload;
     expect(payload?.components).toEqual([]); // every select removed
     const editedEmbed = payload?.embeds?.[0]?.toJSON();
-    expect(editedEmbed?.title).toBe('Expired — answer at the terminal');
+    expect(editedEmbed?.title).toBe('Expired — continuing without answers');
     // Original question content preserved.
     expect((editedEmbed?.fields as { value: string }[] | undefined)?.[0]?.value).toBe(
       'Which color?',
