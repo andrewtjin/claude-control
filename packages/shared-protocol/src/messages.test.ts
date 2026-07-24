@@ -344,10 +344,7 @@ describe('question round-trip trio', () => {
     {
       question: 'Which color do you prefer?',
       header: 'Color',
-      options: [
-        { label: 'crimson', description: 'A deep, rich red.' },
-        { label: 'teal' },
-      ],
+      options: [{ label: 'crimson', description: 'A deep, rich red.' }, { label: 'teal' }],
     },
   ];
 

@@ -162,16 +162,16 @@ export function questionSelectSpecs(requestId: string, questions: WireQuestions)
         ? { description: clamp(o.description, OPTION_DESC_MAX) }
         : {}),
     }));
-    const options: SelectOptionSpec[] = [
-      ...listed,
-      { label: '✏️ Other…', value: OTHER_VALUE },
-    ];
+    const options: SelectOptionSpec[] = [...listed, { label: '✏️ Other…', value: OTHER_VALUE }];
     // Multi-select lets any subset (min 1) through; single-select forces exactly one. The Other
     // entry counts toward the max so a multi-select user can pick options AND Other together.
     const maxValues = q.multiSelect ? options.length : 1;
     return {
       customId: encodeQuestionSelect(requestId, qIndex),
-      placeholder: clamp(q.header != null && q.header.length > 0 ? q.header : q.question, PLACEHOLDER_MAX),
+      placeholder: clamp(
+        q.header != null && q.header.length > 0 ? q.header : q.question,
+        PLACEHOLDER_MAX,
+      ),
       minValues: 1,
       maxValues,
       options,
@@ -333,7 +333,11 @@ export class QuestionAnswerCollector {
     const state = this.byRequestId.get(requestId);
     if (!state) return [];
     return state.questions.map((q, i) => {
-      const answer = state.answers[i] ?? { selected: [], otherText: undefined, pendingOther: false };
+      const answer = state.answers[i] ?? {
+        selected: [],
+        otherText: undefined,
+        pendingOther: false,
+      };
       return {
         question: q.question,
         selected: answer.selected,
@@ -370,7 +374,9 @@ export class QuestionAnswerCollector {
  *  the Other modal. */
 function isAnswered(answer: AnswerState): boolean {
   if (answer.pendingOther) return false;
-  return answer.selected.length > 0 || (answer.otherText !== undefined && answer.otherText.length > 0);
+  return (
+    answer.selected.length > 0 || (answer.otherText !== undefined && answer.otherText.length > 0)
+  );
 }
 
 // ---------------------------------------------------------------------------
