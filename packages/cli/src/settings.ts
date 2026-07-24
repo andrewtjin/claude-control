@@ -317,7 +317,8 @@ export function resolveDaemonConfig(
       name: 'question hold',
       value: `${Math.round((questionHoldMs ?? permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS) / 1000)}s`,
       source: envSource(questionHoldMs !== undefined),
-      detail: 'CCTL_QUESTION_HOLD_MS (remote-answer window for questions; terminal picker appears after)',
+      detail:
+        'CCTL_QUESTION_HOLD_MS (remote-answer window for questions; terminal picker appears after)',
     },
     {
       name: 'command output cards',

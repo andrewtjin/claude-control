@@ -125,8 +125,7 @@ export interface QuestionAnswer {
  * answers, not an updatedInput the daemon could build (only the adapter holds the tool's input).
  */
 export type QuestionResolution =
-  | { kind: 'answers'; answers: QuestionAnswer[] }
-  | { kind: 'denied'; message: string };
+  { kind: 'answers'; answers: QuestionAnswer[] } | { kind: 'denied'; message: string };
 
 /** The persisted, non-live view of a session — what survives a daemon restart. */
 export interface SessionRecord {
