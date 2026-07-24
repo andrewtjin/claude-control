@@ -1561,8 +1561,7 @@ describe('HookReceiver', () => {
             hookEventName: 'PermissionRequest',
             decision: {
               behavior: 'deny',
-              message:
-                'User declined to answer; continue the conversation without these answers.',
+              message: 'User declined to answer; continue the conversation without these answers.',
             },
           },
         });

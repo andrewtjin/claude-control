@@ -112,6 +112,10 @@ export interface SessionPlannerConfig {
   attachThresholdChars?: number;
   /** Reorder grace before a missing seq is declared a gap (forwarded to OrderedOutput). */
   gapGraceMs?: number;
+  /** Stream mode: max characters per terminal-transcript attachment part (see
+   *  {@link SessionPlanner.attachIfNeeded}). Test seam; the default keeps every part far
+   *  below Discord's upload cap even at 4-bytes-per-char UTF-8. */
+  attachPartChars?: number;
 }
 
 const DEFAULT_COALESCE_WINDOW_MS = 2_000;
@@ -134,6 +138,24 @@ const STREAM_SKIP_THRESHOLD_CHARS = 12_000;
  *  never hit chunkMessage's truncation path (16 × ~1700 usable chars ≫ 12k): inline emission
  *  must be all-or-marker, never a silent partial. */
 const STREAM_FLUSH_MAX_CHUNKS = 16;
+
+/** Stream mode: characters per terminal-transcript attachment part. A skipped burst exists on
+ *  NO other surface, so its delivery must be un-failable by construction — one unbounded file
+ *  can exceed Discord's upload cap and be rejected WHOLE, which would be the exact silent loss
+ *  the skip marker promised against. 2M chars ≤ 8 MiB even at 4-byte worst-case UTF-8. */
+const DEFAULT_ATTACH_PART_CHARS = 2_000_000;
+
+/** The info string of the fence left OPEN at the end of `text`, or undefined when balanced.
+ *  Same line discipline as messageChunks' splitter: a fence line is ``` plus an optional info
+ *  string, and fence state toggles per fence line. */
+function openFenceAtEnd(text: string): string | undefined {
+  let open: string | undefined;
+  for (const line of text.split('\n')) {
+    const match = /^\s*```(.*)$/.exec(line);
+    if (match) open = open === undefined ? (match[1] ?? '').trim() : undefined;
+  }
+  return open;
+}
 
 /** Terminal states: no more edits follow, so the card is flushed to final immediately (bypassing
  *  the coalescing window) and a standalone summary card is posted. */
@@ -179,6 +201,10 @@ interface SessionView {
    *  terminal flush MUST deliver the complete transcript as an attachment — the skipped bytes
    *  exist on no other surface. */
   streamCut: boolean;
+  /** Stream mode: info string of the code fence the LAST emitted batch ended inside, if any.
+   *  Each Discord message renders in isolation, so a fence spanning two flushes must close at
+   *  the first batch's end and reopen (with this info string) at the next — see emitStream. */
+  openFence: string | undefined;
   /** The daemon-run token last seen on this session's output (see `session.output.epoch`).
    *  `undefined` until the first epoch-bearing chunk; a CHANGE means the daemon restarted and
    *  resumed the session, so reassembly is reset. Stays `undefined` forever for a pre-epoch
@@ -204,12 +230,14 @@ export class SessionPlanner {
   private readonly tailChars: number;
   private readonly attachThreshold: number;
   private readonly gapGraceMs: number | undefined;
+  private readonly attachPartChars: number;
 
   constructor(config: SessionPlannerConfig = {}) {
     this.window = config.coalesceWindowMs ?? DEFAULT_COALESCE_WINDOW_MS;
     this.tailChars = config.cardTailChars ?? DEFAULT_CARD_TAIL_CHARS;
     this.attachThreshold = config.attachThresholdChars ?? DEFAULT_ATTACH_THRESHOLD_CHARS;
     this.gapGraceMs = config.gapGraceMs;
+    this.attachPartChars = config.attachPartChars ?? DEFAULT_ATTACH_PART_CHARS;
   }
 
   /** A `session.status` update. Card mode: creates the card on the first-ever event for the
@@ -244,7 +272,7 @@ export class SessionPlanner {
       view.stopping = false;
       // Terminal: collapse every remaining reorder hole so the transcript is complete, posting any
       // milestone/error lines that were buffered behind a gap (dropping them would be silent loss).
-      this.applyItems(view, view.output.resolveGaps(now, true), ops);
+      this.applyItems(view, view.output.resolveGaps(now, true), ops, now);
       if (view.mode === 'card') {
         this.forceEditCard(view, ops, now);
       } else {
@@ -279,7 +307,7 @@ export class SessionPlanner {
       { seq: payload.seq, kind: payload.kind, text: payload.text, truncated: payload.truncated },
       now,
     );
-    this.applyItems(view, items, ops);
+    this.applyItems(view, items, ops, now);
     this.attachIfNeeded(view, ops, /*final*/ false);
     const at = this.planFlush(view, ops, now);
     return at !== undefined ? { ops, flushAtMs: at } : { ops };
@@ -314,7 +342,7 @@ export class SessionPlanner {
     const ops: GatewayOp[] = [];
     view.flushScheduledAtMs = undefined;
     // A gap that outlived its grace with no further output is surfaced here.
-    this.applyItems(view, view.output.resolveGaps(now, false), ops);
+    this.applyItems(view, view.output.resolveGaps(now, false), ops, now);
     this.attachIfNeeded(view, ops, /*final*/ false);
     const at = this.planFlush(view, ops, now);
     return at !== undefined ? { ops, flushAtMs: at } : { ops };
@@ -371,6 +399,7 @@ export class SessionPlanner {
         output: this.makeOrderedOutput(),
         pendingStream: '',
         streamCut: false,
+        openFence: undefined,
         outputEpoch: undefined,
         fullStdout: '',
         attached: false,
@@ -407,8 +436,17 @@ export class SessionPlanner {
 
   /** Route committed output items to their presentation: stdout/error into the transcript (and the
    *  coalesced card tail), milestone/summary/error also as their own standalone lines, gaps as
-   *  visible transcript markers. Never silent, never reordered. */
-  private applyItems(view: SessionView, items: CommittedItem[], ops?: GatewayOp[]): void {
+   *  visible transcript markers. Never silent, never reordered — in stream mode a standalone
+   *  line first DRAINS the buffered stdout ahead of it, so the thread never shows an
+   *  annotation apparently preceding output that in fact came before it. (The forced early
+   *  emission trades a little coalescing for the top-to-bottom ordering the surface promises;
+   *  annotation lines are rare, the ordering contract is permanent.) */
+  private applyItems(
+    view: SessionView,
+    items: CommittedItem[],
+    ops: GatewayOp[],
+    now: number,
+  ): void {
     for (const item of items) {
       if (item.kind === 'gap') {
         const marker = gapMarker(item.fromSeq, item.toSeq);
@@ -433,15 +471,18 @@ export class SessionPlanner {
           view.fullStdout += text;
           view.hadError = true;
           view.dirty = true;
-          if (ops) ops.push(this.line(view, `❗ ${formatTables(item.text)}`, item.truncated));
+          this.emitStream(view, ops, now); // keep seq order: buffered stdout first (no-op in card mode)
+          ops.push(this.line(view, `❗ ${formatTables(item.text)}`, item.truncated));
           break;
         case 'milestone':
-          if (ops) ops.push(this.line(view, `🔹 ${formatTables(item.text)}`, item.truncated));
+          this.emitStream(view, ops, now);
+          ops.push(this.line(view, `🔹 ${formatTables(item.text)}`, item.truncated));
           break;
         case 'summary':
           // Standalone lines post as plain proportional-font content, where a terminal
           // table is unreadable — re-render any tables phone-width inside a code fence.
-          if (ops) ops.push(this.line(view, `📝 ${formatTables(item.text)}`, item.truncated));
+          this.emitStream(view, ops, now);
+          ops.push(this.line(view, `📝 ${formatTables(item.text)}`, item.truncated));
           break;
       }
     }
@@ -474,13 +515,28 @@ export class SessionPlanner {
     if (len === 0) return;
     if (view.mode === 'stream') {
       if (!final || !view.streamCut) return;
-      ops.push({
-        kind: 'uploadAttachment',
-        route: view.route,
-        filename: `session-${view.route.sessionId}.log`,
-        text: view.fullStdout,
-        content: 'Complete transcript attached — parts were skipped inline above.',
-      });
+      // Split into parts each far below Discord's upload cap: the skipped bursts exist on NO
+      // other surface, so this delivery must be un-failable by construction — one unbounded
+      // file would be rejected WHOLE past the cap, the exact loss the skip marker promised
+      // against.
+      const parts: string[] = [];
+      for (let i = 0; i < view.fullStdout.length; i += this.attachPartChars) {
+        parts.push(view.fullStdout.slice(i, i + this.attachPartChars));
+      }
+      for (const [index, part] of parts.entries()) {
+        ops.push({
+          kind: 'uploadAttachment',
+          route: view.route,
+          filename:
+            parts.length === 1
+              ? `session-${view.route.sessionId}.log`
+              : `session-${view.route.sessionId}-part${index + 1}of${parts.length}.log`,
+          text: part,
+          ...(index === 0
+            ? { content: 'Complete transcript attached — parts were skipped inline above.' }
+            : {}),
+        });
+      }
       view.attached = true;
       view.attachedLen = len;
       return;
@@ -548,9 +604,18 @@ export class SessionPlanner {
    *  window. A no-op on an empty buffer, so terminal paths may call it unconditionally. */
   private emitStream(view: SessionView, ops: GatewayOp[], now: number): void {
     if (view.mode !== 'stream' || view.pendingStream.length === 0) return;
-    const text = view.pendingStream;
+    // Re-enter any fence the previous batch ended inside: each Discord message renders in
+    // isolation, so a fence spanning two flushes must be closed at the first batch's end
+    // (below) and reopened here with its original info string — otherwise the continuation
+    // renders its code as prose and its prose as code.
+    const prefix = view.openFence !== undefined ? `\`\`\`${view.openFence}\n` : '';
+    const text = prefix + view.pendingStream;
     view.pendingStream = '';
     view.lastEditAtMs = now;
+    // Track fence state across the SKIP path too: the skipped burst still advanced the
+    // source's fence state, and the next inline batch must continue from where it truly is.
+    const endFence = openFenceAtEnd(text);
+    view.openFence = endFence;
     if (text.length > STREAM_SKIP_THRESHOLD_CHARS) {
       view.streamCut = true;
       ops.push({
@@ -563,7 +628,8 @@ export class SessionPlanner {
       });
       return;
     }
-    for (const chunk of chunkMessage(text, { maxChunks: STREAM_FLUSH_MAX_CHUNKS })) {
+    const balanced = endFence !== undefined ? `${text}\n\`\`\`` : text;
+    for (const chunk of chunkMessage(balanced, { maxChunks: STREAM_FLUSH_MAX_CHUNKS })) {
       // A marker-only buffer can chunk to whitespace, and Discord rejects empty content.
       if (chunk.trim().length === 0) continue;
       ops.push({ kind: 'sendMessage', route: view.route, role: 'line', content: chunk });

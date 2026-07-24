@@ -112,10 +112,7 @@ describe('questionSelectSpecs', () => {
   });
 
   it('single-select is min/max 1; multi-select is min 1 / max = option count (incl. Other)', () => {
-    const [single] = questionSelectSpecs(
-      'r',
-      questions([{ question: 'q', options: ['a', 'b'] }]),
-    );
+    const [single] = questionSelectSpecs('r', questions([{ question: 'q', options: ['a', 'b'] }]));
     expect(single).toMatchObject({ minValues: 1, maxValues: 1 });
     const [multi] = questionSelectSpecs(
       'r',

@@ -446,3 +446,58 @@ describe('SessionPlanner — stream mode (per-session thread surface)', () => {
     expect(second.ops).toHaveLength(0);
   });
 });
+
+describe('SessionPlanner — stream mode ordering and fences', () => {
+  it('drains buffered stdout BEFORE an error line, preserving seq order in the thread', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 2000 });
+    p.onOutput(ROUTE, output(0, 'stdout', 'first'), 5000, 'stream'); // emits, anchors window
+    const buffered = p.onOutput(ROUTE, output(1, 'stdout', 'second'), 5100, 'stream');
+    expect(lineSends(buffered.ops)).toHaveLength(0); // in-window, buffered
+    const err = p.onOutput(ROUTE, output(2, 'error', 'boom'), 5150, 'stream');
+    const lines = lineSends(err.ops).map((l) => (l as { content: string }).content);
+    // The buffered 'second' must post ahead of the error annotation — the thread reads in
+    // the order the terminal produced it, never annotation-first.
+    expect(lines).toEqual(['second', '❗ boom']);
+  });
+
+  it('drains buffered stdout BEFORE a milestone line too', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 2000 });
+    p.onOutput(ROUTE, output(0, 'stdout', 'first'), 5000, 'stream');
+    p.onOutput(ROUTE, output(1, 'stdout', 'second'), 5100, 'stream');
+    const mile = p.onOutput(ROUTE, output(2, 'milestone', 'built'), 5150, 'stream');
+    const lines = lineSends(mile.ops).map((l) => (l as { content: string }).content);
+    expect(lines).toEqual(['second', '🔹 built']);
+  });
+
+  it('closes an open fence at a flush boundary and reopens it (with info string) at the next', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 100 });
+    const first = p.onOutput(ROUTE, output(0, 'stdout', '```js\nconst a = 1;'), 5000, 'stream');
+    const firstContent = (lineSends(first.ops)[0] as { content: string }).content;
+    expect(firstContent.endsWith('```')).toBe(true); // balanced for isolated rendering
+    const second = p.onOutput(
+      ROUTE,
+      output(1, 'stdout', '\nconst b = 2;\n```\nplain prose'),
+      9000,
+      'stream',
+    );
+    const secondContent = (lineSends(second.ops)[0] as { content: string }).content;
+    expect(secondContent.startsWith('```js\n')).toBe(true); // reopened with its language
+    expect(secondContent).toContain('plain prose');
+    // The reopened fence closes where the source closed it, so the prose stays prose.
+    expect(secondContent.endsWith('plain prose')).toBe(true);
+  });
+
+  it('splits an oversized terminal transcript into multiple attachment parts, losing nothing', () => {
+    const p = new SessionPlanner({ attachPartChars: 7000 });
+    const flood = 'x'.repeat(13_000); // triggers the inline skip AND spans two parts
+    p.onOutput(ROUTE, output(0, 'stdout', flood), 5000, 'stream');
+    const done = p.onStatus(ROUTE, status('done'), 6000, 'stream');
+    const ups = uploads(done.ops) as Array<{ filename: string; text: string; content?: string }>;
+    expect(ups).toHaveLength(2);
+    expect(ups[0]!.filename).toContain('part1of2');
+    expect(ups[1]!.filename).toContain('part2of2');
+    expect(ups.map((u) => u.text).join('')).toBe(flood);
+    expect(ups[0]!.content).toBeDefined(); // the note rides the first part only
+    expect(ups[1]!.content).toBeUndefined();
+  });
+});

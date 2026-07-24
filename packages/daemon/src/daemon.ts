@@ -134,6 +134,15 @@ const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
  */
 const MANAGED_SESSION_PERMISSION_MODE = 'default';
 
+/** How a phone-spawned session came to exist, echoed on its status frames so the requester
+ *  can (a) match the spawn it sent (`requestId`) and (b) route the new session into the
+ *  surface of the conversation it continues (`resumedFrom` — the caller's WIRE ref, never
+ *  the resolved SDK anchor). Absent entirely for sessions the phone did not spawn. */
+interface SpawnOrigin {
+  requestId: string;
+  resumedFrom?: string;
+}
+
 /** Bound on the session.stop and session.prune idempotency sets. These keys only need to
  *  survive the double/triple-tap window (seconds), so a few hundred remembered keys is
  *  generous while keeping each set trivially bounded across a long-lived daemon. */
@@ -1007,10 +1016,30 @@ export class Daemon {
         ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
         ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
       });
-      // `requestId` rides every status frame the new session emits (see forwardSessionEvent):
-      // a spawn mints a sessionId the requester has no other way to learn, and the bot needs
-      // the link to keep a resumed conversation in the thread the user typed into.
-      this.attachSessionPipes(handle, accountId ?? undefined, requestId);
+      // The spawn origin rides every status frame the new session emits (see
+      // forwardSessionEvent): a spawn mints a sessionId the requester has no other way to
+      // learn, and the bot needs the link to keep a resumed conversation in the thread the
+      // user typed into. `resumedFrom` echoes the CALLER'S ref (the wire id it knows), never
+      // the resolved SDK anchor.
+      const origin = {
+        requestId,
+        ...(resumeSessionId !== undefined && resumeSessionId !== null
+          ? { resumedFrom: resumeSessionId }
+          : {}),
+      };
+      this.attachSessionPipes(handle, accountId ?? undefined, origin);
+      // Announce the session NOW, before its first turn produces anything. The session
+      // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
+      // output BEFORE the starting→running transition — so without this frame the requester
+      // would meet the new sessionId through an anonymous output chunk it cannot yet route
+      // (the bot would mint a stray thread for it). The outbox preserves send order, so this
+      // status is guaranteed to arrive ahead of every event the pipes forward.
+      this.forwardSessionEvent(
+        handle.id,
+        accountId ?? undefined,
+        { kind: 'status', state: 'starting' },
+        origin,
+      );
     } catch (err) {
       // A failed spawn previously died in the dispatcher's generic catch — logged locally,
       // invisible to the phone, which sat waiting for session.status frames that would never
@@ -1226,14 +1255,14 @@ export class Daemon {
   private attachSessionPipes(
     handle: SessionHandle,
     accountId: string | undefined,
-    spawnRequestId?: string,
+    spawnOrigin?: SpawnOrigin,
   ): void {
     handle.onEvent((event) => {
       if (event.kind === 'status' && (event.state === 'done' || event.state === 'failed')) {
         this.sweepManagedPermissionRoutes(handle.id);
         this.sweepManagedQuestionRoutes(handle.id);
       }
-      this.forwardSessionEvent(handle.id, accountId, event, spawnRequestId);
+      this.forwardSessionEvent(handle.id, accountId, event, spawnOrigin);
     });
     // Optional on SessionHandle (observed terminals have no structured permission seam);
     // managed handles always implement it.
@@ -1368,7 +1397,7 @@ export class Daemon {
     sessionId: string,
     accountId: string | undefined,
     event: SessionEvent,
-    spawnRequestId?: string,
+    spawnOrigin?: SpawnOrigin,
   ): void {
     if (event.kind === 'status') {
       // Mirror the transition into the display-only Store table BEFORE shipping the envelope,
@@ -1381,7 +1410,10 @@ export class Daemon {
           sessionId,
           state: event.state,
           ...(accountId !== undefined ? { accountId } : {}),
-          ...(spawnRequestId !== undefined ? { spawnRequestId } : {}),
+          ...(spawnOrigin !== undefined ? { spawnRequestId: spawnOrigin.requestId } : {}),
+          ...(spawnOrigin?.resumedFrom !== undefined
+            ? { resumedFrom: spawnOrigin.resumedFrom }
+            : {}),
         },
       });
       return;

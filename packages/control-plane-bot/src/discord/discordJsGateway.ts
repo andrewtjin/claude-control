@@ -126,11 +126,35 @@ interface ThreadSendContext {
   sessionId: string;
   text: string;
   kind: 'inject' | 'spawn';
+  /** For `spawn` sends: the spawn's requestId, so a failure reply can release exactly the
+   *  single-flight resume guard it belongs to. */
+  spawnRequestId?: string;
 }
 
 /** Bound for both thread-send correlation maps (sends awaiting a possible error reply, and spawn
  *  requestIds awaiting their first correlated session.status). */
 const PENDING_THREAD_SENDS_MAX = 256;
+
+/** How long a thread's resume-spawn holds its single-flight guard with no answer before a new
+ *  message may try again. Generous against a slow SDK cold-start; short enough that a daemon
+ *  that silently died mid-resume does not wedge the thread until a bot restart. */
+const RESUME_IN_FLIGHT_TTL_MS = 2 * 60_000;
+
+/** Messages parked behind one in-flight resume. Mirrors the daemon's own steering-queue cap:
+ *  past this, the queue is a symptom (the resume is not coming up), not a buffer. */
+const RESUME_QUEUE_CAP = 8;
+
+/** The gateway intents a deployment needs. GuildMessages + MessageContent exist for exactly
+ *  one purpose — reading replies typed in per-session threads — and MessageContent is a
+ *  PRIVILEGED intent: requesting it without the developer-portal toggle rejects the login
+ *  outright, killing the whole bot at boot. A deployment with no session channel configured
+ *  has no threads to read, so it keeps the exact non-privileged intent set it had before
+ *  threads existed and keeps booting; only opting into threads takes on the portal toggle. */
+export function gatewayIntents(threadingEnabled: boolean): GatewayIntentBits[] {
+  return threadingEnabled
+    ? [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+    : [GatewayIntentBits.Guilds];
+}
 
 /** Where a user's per-session threads should be created. Returns `undefined` (the default) when no
  *  channel is available, in which case delivery falls back to the user's DM and remembers it. */
@@ -257,6 +281,19 @@ export class DiscordJsGateway implements DiscordGateway {
     string,
     { discordUserId: string; threadId: string }
   >();
+  /** Threads with a resume-spawn in flight. A second message racing the resume round-trip
+   *  must not fork a SECOND live session from the same conversation — it queues here and
+   *  delivers into the resumed session the moment its first status binds the thread (see
+   *  {@link drainResumeQueue}). Entries clear on rebind, on spawn failure, or via TTL. */
+  private readonly resumesInFlight = new Map<
+    string,
+    {
+      requestId: string;
+      discordUserId: string;
+      startedAtMs: number;
+      queued: Array<{ text: string; messageId: string }>;
+    }
+  >();
   /** Per-session-route serialization chain for EVERY card mutation: managed-session frames
    *  (status/output), the coalesced-flush timer, and the stop nudge. relay.ts fires `deliver()`
    *  from an un-awaited `socket.on('message')` handler, and the flush timer / stop nudge fire on
@@ -294,16 +331,9 @@ export class DiscordJsGateway implements DiscordGateway {
           }
         : undefined);
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
-    // GuildMessages + MessageContent exist for exactly one purpose: reading messages typed in
-    // per-session threads so they can be forwarded to the session that owns the thread.
-    // MessageContent is a PRIVILEGED intent — it must also be enabled on the application in the
-    // Discord developer portal, or the gateway login is rejected outright.
+    // Privileged intents only when threads are actually in play — see gatewayIntents.
     this.client = new Client({
-      intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-      ],
+      intents: gatewayIntents(this.sessionChannelResolver !== undefined),
     });
 
     // `clientReady`, not `ready`: the latter is deprecated and stops firing in discord.js v15,
@@ -828,7 +858,33 @@ export class DiscordJsGateway implements DiscordGateway {
     messageId: string;
     text: string;
   }): Promise<void> {
+    // Single-flight per thread: both entry points (the ended-session branch and the
+    // session_ended escalation) can race one resume's round-trip, and each would otherwise
+    // fork its own live session from the same conversation. The loser queues; its text
+    // delivers into the resumed session once the rebind lands. The TTL covers a daemon that
+    // never answers — a wedged entry would otherwise leave the thread permanently
+    // unresumable until a bot restart.
+    const inFlight = this.resumesInFlight.get(opts.threadId);
+    if (inFlight && this.clock() - inFlight.startedAtMs <= RESUME_IN_FLIGHT_TTL_MS) {
+      if (inFlight.queued.length >= RESUME_QUEUE_CAP) {
+        await this.reactInThread(opts.threadId, opts.messageId, '⚠️');
+        await this.sendInThread(
+          opts.threadId,
+          '⚠️ too many messages queued while the session resumes — resend this one once it is up.',
+        );
+        return;
+      }
+      inFlight.queued.push({ text: opts.text, messageId: opts.messageId });
+      await this.reactInThread(opts.threadId, opts.messageId, '📨');
+      return;
+    }
     const requestId = randomUUID();
+    this.resumesInFlight.set(opts.threadId, {
+      requestId,
+      discordUserId: opts.discordUserId,
+      startedAtMs: this.clock(),
+      queued: [],
+    });
     const result = this.deps.relay.sendToUser(opts.discordUserId, (daemonId) => ({
       daemonId,
       type: 'session.spawn',
@@ -840,6 +896,7 @@ export class DiscordJsGateway implements DiscordGateway {
       },
     }));
     if (!result.ok) {
+      this.resumesInFlight.delete(opts.threadId);
       await this.reactInThread(opts.threadId, opts.messageId, '⚠️');
       await this.sendInThread(opts.threadId, `⚠️ ${result.error}`);
       return;
@@ -855,38 +912,86 @@ export class DiscordJsGateway implements DiscordGateway {
       sessionId: opts.sessionId,
       text: opts.text,
       kind: 'spawn',
+      spawnRequestId: requestId,
     });
     await this.reactInThread(opts.threadId, opts.messageId, '🔄');
   }
 
-  /** First correlated `session.status` after a thread-originated resume spawn: bind the NEW
-   *  sessionId to the SAME thread (before the frame is planned — see the deliver() call site) and
-   *  post a one-line seam so the reader can tell where the old conversation's continuation begins
-   *  (and which id `/stop` now wants). Frames whose `spawnRequestId` matches nothing pending are
-   *  the overwhelmingly common case and return immediately. */
+  /** First correlated `session.status` for a phone-spawned session: when the spawn continued
+   *  a conversation that lives in a thread, bind the NEW sessionId to that thread (before the
+   *  frame is planned — see the deliver() call site), post a one-line seam so the reader can
+   *  tell where the continuation begins (and which id `/stop` now wants), then deliver any
+   *  messages typed while the resume was in flight. The thread is found via the parked
+   *  requestId when this bot sent the spawn, or via the wire-echoed `resumedFrom` origin when
+   *  it holds no memory of the spawn (restarted mid-resume, or a `/run` with a resume ref).
+   *  Frames matching neither are the overwhelmingly common case and return immediately. */
   private async maybeRebindSpawnedSession(
     discordUserId: string,
     payload: PayloadOf<'session.status'>,
   ): Promise<void> {
     const requestId = payload.spawnRequestId ?? undefined;
     if (requestId === undefined) return;
+    let threadId: string | undefined;
     const pending = this.pendingSpawnRebinds.get(requestId);
-    if (!pending || pending.discordUserId !== discordUserId) return;
-    this.pendingSpawnRebinds.delete(requestId);
+    if (pending && pending.discordUserId === discordUserId) {
+      this.pendingSpawnRebinds.delete(requestId);
+      threadId = pending.threadId;
+    } else if (this.threadReg.get(discordUserId, payload.sessionId) === undefined) {
+      const resumedFrom = payload.resumedFrom ?? undefined;
+      if (resumedFrom !== undefined) {
+        const origin = this.threadReg.get(discordUserId, resumedFrom);
+        if (origin?.kind === 'thread') threadId = origin.threadId;
+      }
+    }
+    if (threadId === undefined) return;
     try {
       await this.threadReg.record(discordUserId, payload.sessionId, {
         kind: 'thread',
-        threadId: pending.threadId,
+        threadId,
       });
     } catch (err) {
       // The in-memory binding took effect before persistence — delivery still routes to the
       // thread for this bot's lifetime; only a restart would fall back to a fresh thread.
       this.logger.warn({ err, requestId }, 'discord: failed to persist a resumed-session rebind');
     }
-    await this.sendInThread(
-      pending.threadId,
-      `🔄 resumed as session \`${payload.sessionId.slice(0, 8)}\``,
-    );
+    await this.sendInThread(threadId, `🔄 resumed as session \`${payload.sessionId.slice(0, 8)}\``);
+    await this.drainResumeQueue(discordUserId, requestId, threadId, payload.sessionId);
+  }
+
+  /** Deliver the messages queued behind an in-flight resume (see {@link resumeFromThread}'s
+   *  guard) into the session that resume produced, in arrival order. A failure surfaces in
+   *  the thread — a queued message must never vanish silently. */
+  private async drainResumeQueue(
+    discordUserId: string,
+    requestId: string,
+    threadId: string,
+    sessionId: string,
+  ): Promise<void> {
+    const inFlight = this.resumesInFlight.get(threadId);
+    if (!inFlight || inFlight.requestId !== requestId) return;
+    this.resumesInFlight.delete(threadId);
+    for (const queued of inFlight.queued) {
+      const result = this.deps.relay.sendToUser(discordUserId, (daemonId) => ({
+        daemonId,
+        type: 'prompt.inject',
+        payload: { sessionId, text: queued.text, idempotencyKey: `thread:${queued.messageId}` },
+      }));
+      if (result.ok) {
+        this.rememberThreadSend(result.id, {
+          discordUserId,
+          threadId,
+          messageId: queued.messageId,
+          sessionId,
+          text: queued.text,
+          kind: 'inject',
+        });
+      } else {
+        await this.sendInThread(
+          threadId,
+          `⚠️ ${result.error} — a queued message was not delivered; resend it.`,
+        );
+      }
+    }
   }
 
   /** Route a daemon `error` reply to the thread whose typed message caused the refused frame.
@@ -909,6 +1014,25 @@ export class DiscordJsGateway implements DiscordGateway {
         text: ctx.text,
       });
       return true;
+    }
+    if (ctx.kind === 'spawn') {
+      // The resume died — release the thread's single-flight guard so the next message can
+      // try again, and account for anything queued behind it (never a silent loss).
+      const inFlight = this.resumesInFlight.get(ctx.threadId);
+      if (
+        inFlight &&
+        (ctx.spawnRequestId === undefined || inFlight.requestId === ctx.spawnRequestId)
+      ) {
+        this.resumesInFlight.delete(ctx.threadId);
+        if (inFlight.queued.length > 0) {
+          await this.sendInThread(
+            ctx.threadId,
+            `⚠️ ${inFlight.queued.length} queued message${
+              inFlight.queued.length === 1 ? ' was' : 's were'
+            } not delivered — resend after the next attempt.`,
+          );
+        }
+      }
     }
     await this.reactInThread(ctx.threadId, ctx.messageId, '❗');
     await this.sendInThread(ctx.threadId, `⚠️ ${payload.message}`);
