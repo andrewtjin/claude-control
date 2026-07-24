@@ -535,7 +535,12 @@ describe('buildLapsedPermissionEmbed', () => {
 
 describe('buildQuestionEmbed', () => {
   const twoQuestions = [
-    { question: 'Which color do you prefer?', header: 'Color', multiSelect: false, options: [{ label: 'Red' }] },
+    {
+      question: 'Which color do you prefer?',
+      header: 'Color',
+      multiSelect: false,
+      options: [{ label: 'Red' }],
+    },
     { question: 'Anything else?', multiSelect: false, options: [{ label: 'No' }] },
   ];
 
@@ -600,7 +605,12 @@ describe('buildLapsedQuestionEmbed', () => {
 
   it('preserves the original card content — only title/color change', () => {
     const original = buildQuestionEmbed([
-      { question: 'Which color?', header: 'Color', multiSelect: false, options: [{ label: 'Red' }] },
+      {
+        question: 'Which color?',
+        header: 'Color',
+        multiSelect: false,
+        options: [{ label: 'Red' }],
+      },
     ]).toJSON();
     const lapsed = buildLapsedQuestionEmbed('local', original).toJSON();
     expect(lapsed.fields?.[0]?.value).toBe('Which color?');

@@ -978,7 +978,8 @@ export class HookReceiver {
     if (!requestId || answers === undefined) {
       this.respond(res, 400, {
         ok: false,
-        error: 'requestId and answers (a non-empty array of {question, selected, otherText?}) are required',
+        error:
+          'requestId and answers (a non-empty array of {question, selected, otherText?}) are required',
       });
       return;
     }
