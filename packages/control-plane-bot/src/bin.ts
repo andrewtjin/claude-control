@@ -3,14 +3,16 @@
 //
 // Assembles the tested pieces — BindingStore (persisted), PairingService, DiscordJsGateway,
 // RelayServer — reading config exclusively from the environment:
-//   DISCORD_BOT_TOKEN   (required) the Discord application's bot token
-//   CCTL_RELAY_PORT     (default 8765) WebSocket port daemons connect to
-//   CCTL_BOT_STATE_DIR  (default ~/.claude-control-bot) where bindings.json and
-//                       session-threads.json live
-//   CCTL_LOG_LEVEL      (default info)
+//   DISCORD_BOT_TOKEN        (required) the Discord application's bot token
+//   CCTL_RELAY_PORT          (default 8765) WebSocket port daemons connect to
+//   CCTL_BOT_STATE_DIR       (default ~/.claude-control-bot) where bindings.json and
+//                            session-threads.json live
+//   CCTL_SESSION_CHANNEL_ID  (optional) text channel that hosts per-session private
+//                            threads; unset → session output is delivered by DM
+//   CCTL_LOG_LEVEL           (default info)
 //   CCTL_MAX_PENDING_CONNECTIONS  (optional) cap on concurrent unauthenticated daemon sockets;
-//                       unset uses the relay's built-in default. Raise it for a self-host serving
-//                       many daemons that may reconnect at once.
+//                            unset uses the relay's built-in default. Raise it for a self-host
+//                            serving many daemons that may reconnect at once.
 //
 // This file preserves the package's structural zero-credential guarantee (see index.ts): it
 // imports only this package's own modules and declared deps — never switch-engine — so the
@@ -83,10 +85,18 @@ async function main(): Promise<void> {
   };
   // stateDir makes the session→thread registry durable; omitting it would silently park
   // session-threads.json under the OS temp dir and lose thread routing on reboot.
-  const gateway = new DiscordJsGateway({ relay: relayRef, pairing, logger, token, stateDir });
-  // Spread maxPendingConnections in only when set: exactOptionalPropertyTypes forbids passing an
-  // explicit `undefined` for an optional property, so an unset env must omit the key entirely and
-  // let RelayServer apply its own default.
+  // Spread the optional values in only when set: exactOptionalPropertyTypes forbids passing an
+  // explicit `undefined` for an optional property, so an unset env must omit the key entirely
+  // and let each constructor apply its own default.
+  const sessionChannelId = process.env.CCTL_SESSION_CHANNEL_ID;
+  const gateway = new DiscordJsGateway({
+    relay: relayRef,
+    pairing,
+    logger,
+    token,
+    stateDir,
+    ...(sessionChannelId ? { sessionChannelId } : {}),
+  });
   const relay = new RelayServer({
     bindings,
     pairing,
