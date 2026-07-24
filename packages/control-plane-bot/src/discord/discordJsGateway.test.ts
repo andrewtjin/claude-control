@@ -8,7 +8,8 @@
 import { describe, it, expect } from 'vitest';
 import type { EmbedBuilder, Message, SendableChannels } from 'discord.js';
 import type { Envelope, EnvelopeDraft } from '@claude-control/shared-protocol';
-import { DiscordJsGateway, type SessionThreadParent } from './discordJsGateway.js';
+import { DiscordJsGateway, gatewayIntents, type SessionThreadParent } from './discordJsGateway.js';
+import { GatewayIntentBits } from 'discord.js';
 import type { SessionRoute } from './sessionPlanner.js';
 import type { CardRef } from './permissionCards.js';
 import type { RelaySender } from '../relay.js';
@@ -487,5 +488,80 @@ describe('DiscordJsGateway — thread messages become session input', () => {
     expect(
       gw.threadSends.some((t) => t.threadId === 't1' && t.content.includes('did not accept')),
     ).toBe(true);
+  });
+});
+
+describe('gatewayIntents — privileged intents only when threads are configured', () => {
+  it('keeps the pre-thread non-privileged set for a DM-only deployment', () => {
+    expect(gatewayIntents(false)).toEqual([GatewayIntentBits.Guilds]);
+  });
+  it('adds GuildMessages + MessageContent only for a threaded deployment', () => {
+    expect(gatewayIntents(true)).toEqual([
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+    ]);
+  });
+});
+
+describe('DiscordJsGateway — resume is single-flight per thread', () => {
+  it('queues a second message behind an in-flight resume instead of forking a second session', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'done' }));
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'continue', id: 'm1' });
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'and also X', id: 'm2' });
+
+    expect(sent.filter((d) => d.type === 'session.spawn')).toHaveLength(1);
+    expect(gw.reactions).toContainEqual({ threadId: 't1', messageId: 'm2', emoji: '📨' });
+
+    // The rebind delivers the queued text into the RESUMED session, in order.
+    const spawn = sent.find((d) => d.type === 'session.spawn');
+    const requestId = (spawn?.payload as { requestId: string }).requestId;
+    await gw.deliver(
+      'u1',
+      envelope('session.status', { sessionId: 's2', state: 'running', spawnRequestId: requestId }),
+    );
+    const inject = sent.find((d) => d.type === 'prompt.inject');
+    expect(inject?.payload).toMatchObject({ sessionId: 's2', text: 'and also X' });
+  });
+
+  it('releases the single-flight guard when the spawn fails, so the next message retries', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'done' }));
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'continue', id: 'm1' });
+    const firstSpawnEnvelope = `env-${sent.length}`; // the spawn was the latest send
+    await gw.deliver(
+      'u1',
+      envelope('error', {
+        code: 'spawn_failed',
+        message: 'session.spawn: no account available',
+        relatesTo: firstSpawnEnvelope,
+      }),
+    );
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'try again', id: 'm2' });
+    expect(sent.filter((d) => d.type === 'session.spawn')).toHaveLength(2);
+  });
+});
+
+describe('DiscordJsGateway — rebind survives lost in-memory state via resumedFrom', () => {
+  it('binds a resumed session to its origin thread with NO pending entry (restart / external resume)', async () => {
+    const { gw, sent } = inboundSetup();
+    // s1 lives in thread t1; the bot then "forgets" everything in-memory about a resume it
+    // never saw (e.g. it restarted after the spawn went out, or the user ran /run resume).
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'done' }));
+    await gw.deliver(
+      'u1',
+      envelope('session.status', {
+        sessionId: 's2',
+        state: 'starting',
+        spawnRequestId: 'r-unknown-to-this-bot',
+        resumedFrom: 's1',
+      }),
+    );
+    expect(gw.threadSends.some((t) => t.threadId === 't1' && t.content.includes('s2'))).toBe(true);
+    // The thread now steers the resumed session.
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'go on', id: 'm9' });
+    const inject = sent.find((d) => d.type === 'prompt.inject');
+    expect(inject?.payload).toMatchObject({ sessionId: 's2', text: 'go on' });
   });
 });

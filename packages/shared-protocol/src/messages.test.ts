@@ -461,3 +461,28 @@ describe('session.status spawnRequestId (additive, N/N-1 tolerant)', () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe('session.status resumedFrom (additive, N/N-1 tolerant)', () => {
+  const base: PayloadOf<'session.status'> = { sessionId: 'sess-2', state: 'starting' };
+
+  it('parses without resumedFrom — frames from pre-echo daemons stay valid', () => {
+    const result = decode(rawFrame('session.status', base));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.resumedFrom ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries the resume origin through a round-trip', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'session.status',
+      payload: { ...base, spawnRequestId: 'req-7', resumedFrom: 'sess-1' },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.resumedFrom).toBe('sess-1');
+    }
+  });
+});

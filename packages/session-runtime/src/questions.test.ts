@@ -45,7 +45,10 @@ describe('parseQuestions', () => {
     ['a question with empty text', { questions: [{ question: '', options: [{ label: 'a' }] }] }],
     ['a question with no options array', { questions: [{ question: 'q' }] }],
     ['a question with empty options', { questions: [{ question: 'q', options: [] }] }],
-    ['an option with no label', { questions: [{ question: 'q', options: [{ description: 'd' }] }] }],
+    [
+      'an option with no label',
+      { questions: [{ question: 'q', options: [{ description: 'd' }] }] },
+    ],
   ])('returns undefined (fall back to terminal) for %s', (_label, input) => {
     expect(parseQuestions(input)).toBeUndefined();
   });

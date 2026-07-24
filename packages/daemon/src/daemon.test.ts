@@ -798,6 +798,52 @@ describe('Daemon lifecycle', () => {
     }
   });
 
+  it("announces a spawned session with an immediate 'starting' status, ahead of any event", async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-first', prompt: 'go', idempotencyKey: 'k' },
+    });
+    // No handle.emit at all: the announcement must not depend on the session producing
+    // anything — the first turn's first SDK event emits OUTPUT before any status, so without
+    // this frame the requester meets the new sessionId through an unroutable output chunk.
+    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
+    const st = relay.received.find((e) => e.type === 'session.status');
+    if (st?.type === 'session.status') {
+      expect(st.payload.state).toBe('starting');
+      expect(st.payload.spawnRequestId).toBe('r-first');
+      expect(st.payload.sessionId).toBe('spawned-session');
+    }
+  });
+
+  it("echoes resumedFrom — the caller's WIRE ref, never the resolved SDK anchor", async () => {
+    sessionManager.records.push({
+      id: 'wire-9',
+      kind: 'managed',
+      state: 'done',
+      startedAtMs: 0,
+      resumeId: 'sdk-xyz',
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r-res',
+        prompt: 'go on',
+        resumeSessionId: 'wire-9',
+        idempotencyKey: 'k',
+      },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
+    const st = relay.received.find((e) => e.type === 'session.status');
+    if (st?.type === 'session.status') {
+      expect(st.payload.resumedFrom).toBe('wire-9');
+      expect(st.payload.spawnRequestId).toBe('r-res');
+    }
+  });
+
   it('answers spawn_failed (relatesTo the spawn frame) when the spawn throws', async () => {
     await daemon.start();
     sessionManager.spawnManaged.mockRejectedValueOnce(new Error('no account available'));

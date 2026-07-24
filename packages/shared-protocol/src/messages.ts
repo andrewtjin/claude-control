@@ -358,6 +358,14 @@ const SessionStatusPayload = z.object({
    *  tolerant like `epoch`: a pre-echo daemon omits it and the bot simply cannot correlate,
    *  exactly as today. */
   spawnRequestId: RequestId.nullish(),
+  /** The caller-supplied `resumeSessionId` this spawn continued from, echoed verbatim (the
+   *  WIRE id the requester already knows, not the SDK anchor it resolved to). Where
+   *  `spawnRequestId` correlates "the spawn I sent", this correlates "the conversation it
+   *  continues" — and unlike a pending requestId map, the requester can act on it with no
+   *  in-memory state at all (e.g. a bot restarted between spawn and status still routes the
+   *  resumed session into the original session's thread). Same additive + tolerant contract
+   *  as its sibling. */
+  resumedFrom: SessionId.nullish(),
 });
 
 /** Widened (not split into done/waiting variants) on purpose: title/body/level stays the one
