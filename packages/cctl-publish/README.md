@@ -22,11 +22,14 @@ shared Discord bot, and registers a logon task so the daemon starts automaticall
   moves to an account with real headroom on its own. Or switch from your phone.
 - **Approve from anywhere.** Permission prompts and "done / waiting" notices reach
   Discord; approve or deny from there.
+- **Answer Claude's questions from your phone.** When a session asks you to choose,
+  the Discord card carries a select menu per question — multi-select and a free-text
+  "Other…" included — and your answers land back in the running session.
 
 Your credentials never leave your machine: the daemon holds them locally, and the shared
 bot is a credential-free control plane that never sees session content.
 
-**Windows-only v0.1.0**; Mac support coming soon.
+**Windows-only v0.2.0**; Mac support coming soon.
 
 See the [project README](https://github.com/andrewtjin/claude-control#readme) for the
 full command reference, the architecture, and the self-host path.
