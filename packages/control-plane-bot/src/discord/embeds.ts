@@ -174,12 +174,18 @@ export function buildUsageEmbed(
   return embed;
 }
 
-/** The "Pacing" field shared by `/usage` and `/timeline`: the aggregate cross-account verdict
- *  layered on top of the account-by-account view above it — same headline the CLI prints,
- *  computed from the same AccountUsage snapshot both embeds already render from. */
+/** The "Pacing" field shared by `/usage` and `/timeline`: the fleet verdict layered on top of
+ *  the account-by-account view above it, computed by the same pure model the CLI uses from the
+ *  same AccountUsage snapshot both embeds already render from.
+ *
+ *  The wire carries no plan tiers and no snapshot history, so the two history-derived inputs
+ *  (each account's predicted reset and the fleet's measured burn rate) are simply not available
+ *  here. The model reports that in `notes` rather than substituting a guess, so this field says
+ *  what it does not know instead of printing a verdict it cannot support. */
 function pacingField(accounts: AccountUsage[], nowMs: number): { name: string; value: string } {
-  const pacing = computePacing(timelineInputFromWire(accounts), nowMs);
-  return { name: 'Pacing', value: truncateLabeled(pacing.headline, EMBED_FIELD_VALUE_LIMIT) };
+  const pacing = computePacing(timelineInputFromWire(accounts), { nowMs });
+  const lines = [pacing.headline, ...pacing.notes.map((n) => `• ${n}`)];
+  return { name: 'Pacing', value: truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT) };
 }
 
 /** "12×5h windows left · weekly resets <t:...:R>" — the session budget line appended to

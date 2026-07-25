@@ -37,6 +37,7 @@
 // still rotates windows across equal accounts once the active one genuinely nears the wall.
 
 import { humanizeDuration, roundPct } from './format.js';
+import { selectWeeklyBudget } from './weekly.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 /** Knobs governing the auto-switch decision. Defaults live in this module. */
@@ -207,24 +208,14 @@ function sessionUsedPct(account: AccountUsageInput, now: number): number {
   return session?.percent ?? 0;
 }
 
-/** Percent of the weekly budget used — the max across live weekly limits (the binding
- *  one). No live weekly limit = 0 (only reachable in reason text, since eligibility
- *  already requires a known weekly reset). */
+/** Percent of the weekly budget used, and when that budget next resets — both from the one
+ *  fleet-wide rule (see weekly.ts), so the executor targets the same limit the Plan and Pacing
+ *  lines describe. No weekly limit at all = 0% used (only reachable in reason text, since
+ *  eligibility already requires a known weekly reset). */
 function weeklyUsedPct(account: AccountUsageInput, now: number): number {
-  const weekly = effectiveLimits(account, now).filter(
-    (l) => l.kind === 'weekly_all' || l.kind === 'weekly_scoped',
-  );
-  if (weekly.length === 0) return 0;
-  return Math.max(...weekly.map((l) => l.percent));
+  return selectWeeklyBudget(account.limits, now, account.predictedResetAt)?.percent ?? 0;
 }
 
-/** The soonest known FUTURE weekly reset (weekly_all or weekly_scoped), or undefined. */
 function weeklyResetAt(account: AccountUsageInput, now: number): number | undefined {
-  let best: number | undefined;
-  for (const l of effectiveLimits(account, now)) {
-    if (l.kind !== 'weekly_all' && l.kind !== 'weekly_scoped') continue;
-    if (l.resetsAt === undefined) continue;
-    if (best === undefined || l.resetsAt < best) best = l.resetsAt;
-  }
-  return best;
+  return selectWeeklyBudget(account.limits, now, account.predictedResetAt)?.resetsAt;
 }
