@@ -17,8 +17,9 @@
 // re-runs that lookup from the staged layout, which is the cheapest honest stand-in for a real
 // `npm i -g` short of installing from the registry.
 //
-// Deliberately does NOT run `doctor`: doctor's checks (DPAPI, vault, ConPTY) are Windows-only
-// surfaces and this runs on CI's ubuntu runner too.
+// Deliberately does NOT run `doctor`: doctor probes REAL machine surfaces (DPAPI, the vault
+// key store, live credentials) and on CI's ubuntu runner it would even create a real key
+// file in the runner's home — a smoke test must stay side-effect-free.
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import {
