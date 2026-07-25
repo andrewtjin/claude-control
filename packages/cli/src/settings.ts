@@ -41,6 +41,12 @@ import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 export type { SettingRow } from '@claude-control/shared-protocol';
 
+/** The build version, surfaced by `cctl --version` and as a settings row on both the CLI and
+ *  the phone. Lives here (not program.ts) so the daemon's settings report can carry it: after
+ *  an `npm i -g` update the running daemon keeps its old build until restarted, and the two
+ *  rows ('cli build' vs 'daemon build') are how an operator sees that skew. */
+export const VERSION = '0.2.1';
+
 /** The hosted control plane a published build dials with no configuration at all. This is the
  *  last fallback in the precedence ladder, not a lock-in: `--relay`, `CCTL_RELAY_URL`, and
  *  `relayUrl` in `config.json` each override it, so self-hosting never needs a rebuild. */
@@ -52,6 +58,13 @@ export const DEFAULT_RELAY_URL = 'wss://cctl.andrewtjin.com';
  *  bot can see its host channel and re-fetch its own cards). */
 export const BOT_INVITE_URL =
   'https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands';
+
+/** User-install variant of the invite: adds the app to a Discord ACCOUNT rather than a
+ *  server, so `/pair` and DM delivery work with no server at all. No `bot` scope and no
+ *  permission bits — a user-installed app has no guild presence (which is also why
+ *  private-thread mode still needs the server invite above). */
+export const BOT_USER_INSTALL_URL =
+  'https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands';
 
 // ---------------------------------------------------------------------------
 // Env parsing (shared with daemonRun.ts — the single source of truth)
@@ -254,6 +267,14 @@ export function resolveDaemonConfig(
 
   const rows: SettingRow[] = [
     {
+      // Resolved by the daemon at startup, so via the report/snapshot this names the build
+      // the RUNNING daemon is on — which can trail the CLI's after an npm update.
+      name: 'daemon build',
+      value: `v${VERSION}`,
+      source: 'default',
+      detail: 'update: npm i -g @andrewtjin/cctl, then restart the daemon',
+    },
+    {
       name: 'auto-switch',
       value: autoSwitch ? 'on' : 'off',
       source: autoSwitch ? 'flag' : 'default',
@@ -395,6 +416,12 @@ export function resolveCliSettings(env: NodeJS.ProcessEnv, colorOn: boolean): Se
   const noColorSet = env['NO_COLOR'] !== undefined && env['NO_COLOR'] !== '';
   const effectiveCadence = cadence ?? DEFAULT_MIN_SWITCH_INTERVAL_MS;
   return [
+    {
+      name: 'cli build',
+      value: `v${VERSION}`,
+      source: 'default',
+      detail: 'the build running this command (compare with daemon build below)',
+    },
     {
       name: 'color',
       value: colorOn ? 'on' : 'off',
