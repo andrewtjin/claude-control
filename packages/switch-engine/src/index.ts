@@ -4,8 +4,9 @@ export * from './errors.js';
 export * from './paths.js';
 export * from './logger.js';
 export { type Protector, DpapiProtector, InsecurePassthroughProtector } from './dpapi.js';
+export { AesGcmProtector } from './aesgcm.js';
+export { FileKeyProtector, FileKeySource } from './fileKey.js';
 export {
-  AesGcmProtector,
   KeychainKeySource,
   KeychainProtector,
   KeychainCredentialChannel,

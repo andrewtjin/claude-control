@@ -4,8 +4,9 @@
 //
 //  1. VAULT protection (our storage): a random 256-bit key is kept as a generic password in
 //     the user's login Keychain, and vault blobs are AES-256-GCM encrypted with it in-process
-//     (node:crypto). Same threat model as DPAPI on Windows: a stolen vault directory is
-//     useless without the owner's login keychain.
+//     (aesgcm.ts — the sealing primitive shared with the POSIX file-key protector). Same
+//     threat model as DPAPI on Windows: a stolen vault directory is useless without the
+//     owner's login keychain.
 //
 //  2. LIVE credentials (Claude Code's storage): on macOS the CLI keeps its `claudeAiOauth`
 //     block in the login Keychain — NOT in `<claudeDir>/.credentials.json` — so an account
@@ -24,8 +25,9 @@
 // runs on an actual Mac. The logic below is unit-tested against a fake runner only.
 
 import { spawn } from 'node:child_process';
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { userInfo } from 'node:os';
+import { AesGcmProtector } from './aesgcm.js';
 import { VaultError } from './errors.js';
 import type { Protector } from './dpapi.js';
 import type { ClaudeOauth } from './types.js';
@@ -83,52 +85,6 @@ function isNotFound(err: unknown): boolean {
 /** Where the vault key lives in the login Keychain. Ours — free to name as we like. */
 export const VAULT_KEY_SERVICE = 'claude-control';
 export const VAULT_KEY_ACCOUNT = 'vault-key';
-
-/**
- * AES-256-GCM protector over an injected 32-byte key. Pure node:crypto — unit-testable on
- * every platform. Blob format: `aesgcm:` + base64( iv(12) ‖ authTag(16) ‖ ciphertext ), so
- * tampering with ANY byte fails authentication rather than yielding garbage plaintext.
- * The crypto itself is fast in-process CPU; the async signatures exist to satisfy the
- * Protector contract, whose other implementations genuinely shell out.
- */
-export class AesGcmProtector implements Protector {
-  constructor(private readonly key: Buffer) {
-    if (key.length !== 32) throw new VaultError('AES-256-GCM requires a 32-byte key');
-  }
-
-  protect(plaintext: Buffer): Promise<string> {
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', this.key, iv);
-    const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-    return Promise.resolve(
-      `aesgcm:${Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64')}`,
-    );
-  }
-
-  unprotect(blob: string): Promise<Buffer> {
-    try {
-      if (!blob.startsWith('aesgcm:')) {
-        throw new VaultError('blob was not produced by AesGcmProtector');
-      }
-      const raw = Buffer.from(blob.slice('aesgcm:'.length), 'base64');
-      if (raw.length < 12 + 16) throw new VaultError('AES-GCM blob too short');
-      const decipher = createDecipheriv('aes-256-gcm', this.key, raw.subarray(0, 12));
-      decipher.setAuthTag(raw.subarray(12, 28));
-      try {
-        return Promise.resolve(
-          Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]),
-        );
-      } catch (err) {
-        // Wrong key or tampered blob — GCM authentication failed either way.
-        throw new VaultError('AES-GCM authentication failed (wrong key or corrupted blob)', {
-          cause: err,
-        });
-      }
-    } catch (err) {
-      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
-    }
-  }
-}
 
 /**
  * Get-or-create the vault key in the login Keychain. Read path puts only service/account on
