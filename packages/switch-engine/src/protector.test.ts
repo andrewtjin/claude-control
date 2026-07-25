@@ -33,6 +33,28 @@ describe('defaultLiveCredentialChannel', () => {
     expect(defaultLiveCredentialChannel(paths, 'win32')).toBeInstanceOf(FileCredentialChannel);
     expect(defaultLiveCredentialChannel(paths, 'linux')).toBeInstanceOf(FileCredentialChannel);
   });
+
+  it('threads an env override all the way to the constructed channel', () => {
+    // The wiring under test: defaultLiveCredentialChannel -> resolveClaudeCliKeychainTarget(env)
+    // -> KeychainCredentialChannel's constructor -> its public `target`. Asserting only
+    // `instanceof KeychainCredentialChannel` (above) cannot catch a broken link anywhere in that
+    // chain — an operator's CLAUDE_CLI_KEYCHAIN_SERVICE override could silently fail to reach
+    // the channel and every existing assertion would still pass. This one can't.
+    const env = {
+      CLAUDE_CLI_KEYCHAIN_SERVICE: 'Custom-Item',
+      CLAUDE_CLI_KEYCHAIN_ACCOUNT: 'alt-user',
+    };
+    const channel = defaultLiveCredentialChannel(paths, 'darwin', env) as KeychainCredentialChannel;
+    expect(channel.target).toEqual({ service: 'Custom-Item', account: 'alt-user' });
+  });
+
+  it('defaults the channel target to the shipped service and the login user with no env', () => {
+    const channel = defaultLiveCredentialChannel(paths, 'darwin', {}) as KeychainCredentialChannel;
+    expect(channel.target).toEqual({
+      service: CLAUDE_CLI_KEYCHAIN_SERVICE,
+      account: userInfo().username,
+    });
+  });
 });
 
 describe('resolveClaudeCliKeychainTarget', () => {
@@ -54,6 +76,15 @@ describe('resolveClaudeCliKeychainTarget', () => {
     const t = resolveClaudeCliKeychainTarget({
       CLAUDE_CLI_KEYCHAIN_SERVICE: '',
       CLAUDE_CLI_KEYCHAIN_ACCOUNT: '',
+    });
+    expect(t.service).toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
+    expect(t.account).toBe(userInfo().username);
+  });
+
+  it('treats a whitespace-only override as unset too (not just a bare empty string)', () => {
+    const t = resolveClaudeCliKeychainTarget({
+      CLAUDE_CLI_KEYCHAIN_SERVICE: '   ',
+      CLAUDE_CLI_KEYCHAIN_ACCOUNT: '\t',
     });
     expect(t.service).toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
     expect(t.account).toBe(userInfo().username);

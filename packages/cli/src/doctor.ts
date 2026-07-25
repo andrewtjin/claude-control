@@ -9,7 +9,6 @@ import { join } from 'node:path';
 import {
   defaultLiveCredentialChannel,
   defaultProtector,
-  resolveClaudeCliKeychainTarget,
   type LiveCredentialChannel,
   type Paths,
 } from '@claude-control/switch-engine';
@@ -193,11 +192,13 @@ export async function checkLiveLogin(
   platform: NodeJS.Platform = process.platform,
   channel: LiveCredentialChannel = defaultLiveCredentialChannel(paths, platform),
 ): Promise<DoctorCheck> {
-  // On darwin, name the EXACT Keychain target (service/account, env overrides applied) so a
-  // wrong item name self-diagnoses instead of reading as "you are not logged in". The suggested
-  // command is deliberately an ATTRIBUTE-ONLY dump: `-w`/`-g` would print the live OAuth token
-  // to the operator's terminal. The env overrides make a name mismatch a config fix.
-  const target = platform === 'darwin' ? resolveClaudeCliKeychainTarget() : undefined;
+  // Name the EXACT target the CHANNEL itself resolved to (service/account, env overrides
+  // applied), read off the channel rather than recomputed here — recomputing independently is
+  // exactly how a reported target can drift from what readLiveCredentials/writeLiveCredentials
+  // actually hit. Only the Keychain channel has one; the file channel leaves this undefined and
+  // `paths.credentialsPath` is the target. The suggested command is deliberately an
+  // ATTRIBUTE-ONLY dump: `-w`/`-g` would print the live OAuth token to the operator's terminal.
+  const target = channel.target;
   const where = target
     ? `the CLI's Keychain item (service="${target.service}", account="${target.account}")`
     : paths.credentialsPath;
