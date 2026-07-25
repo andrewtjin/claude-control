@@ -255,7 +255,7 @@ as **arch-scoped** (arm64 ≠ Intel — do not generalize one to the other).
 exact commands and per-step pass/fail criteria; results are stamped back **here**, the same
 cross-repo split gates 2, 4 and 6 use.
 
-**Verify (assumptions A1–A4, defined in `tasks/mac-compatibility-plan.md`):**
+**Verify (assumptions A1–A4, defined in `claude-control-orchestrator/tasks/mac-compatibility-plan.md`):**
 
 - **A1 — item name/account.** The CLI's live credentials are assumed to live in Keychain
   service `Claude Code-credentials` under the login user; confirm the exact account name via an
