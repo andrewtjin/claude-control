@@ -224,6 +224,21 @@ wss://<hostname>`) end-to-end from a separate machine; confirm `/usage` and `/sw
 work over the VPS relay the same as gate 4 did over the shared one.
 **Result:** not yet run.
 
+### 12. Linux file-key vault ✅ CLOSED 2026-07-22
+
+**Claim to verify:** on real Linux (WSL2 counts — it is the primary target), the
+published bundle's `cctl doctor` passes `vault-crypto` via the file-key protector, the
+key file is created `0600` inside a `0700` dir at
+`~/.local/share/claude-control/vault.key`, and the key is stable across runs.
+**Result (WSL2 Ubuntu, Node v22.23.1, standalone `dist/bin.js`):** CONFIRMED —
+`[ok] vault-crypto: file-key (linux) protect/unprotect round-trip works`; `stat`
+reports `600` on `vault.key` and `700` on `~/.local/share/claude-control`; the file
+holds a single 64-hex line and is byte-identical across repeated doctor runs. The full
+`packages/switch-engine` suite also passes on the same Linux install (123 passed — the
+POSIX permission tests run for real there, not skipped as on Windows). Remaining open
+slice: a keyring-less **desktop** distro is expected to behave identically (same code
+path, no D-Bus involved), but has not been separately exercised.
+
 ## Reminder
 
 The undocumented endpoints (2, 3) and hook names (5) can change without notice. Parsing

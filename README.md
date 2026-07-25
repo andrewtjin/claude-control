@@ -16,17 +16,24 @@ rather no shared operator see that, self-host it (see `docs/SELF_HOST.md`).
 
 ## Quick start
 
-First, [add the cctl bot to a Discord server you're in](https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands) —
-or, with no server at all, [add it to just your account](https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands)
+### Bot setup
+
+First, [add the cctl bot to your Discord server](https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands) or [add it to just your account](https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands)
 and DM it. Either way is where `/pair` runs and where approvals, questions, and usage
-cards reach you. (Discord is optional — see "Local-only" below.) Then:
+cards reach you.
+
+- For non-bot setups, see [Local-only](#local-only-no-discord) below.
+
+### Daemon setup
+
+Next, run:
 
 ```
 npm i -g @andrewtjin/cctl
 cctl setup
 ```
 
-That's it — `cctl setup` walks you through accounts, hooks, Discord pairing, and
+That's it. `cctl setup` will walk you through accounts, hooks, Discord pairing, and
 autostart. See `docs/SETUP.md` for the full walkthrough.
 
 If `cctl` isn't found after install, your npm global bin directory isn't on `PATH`;
@@ -62,15 +69,18 @@ switching — no Discord anywhere. Pair later anytime with `cctl setup --reconfi
 
 ## Platform
 
-**Windows-only today** (macOS is a planned next milestone). See `docs/PLATFORM.md`
-for the details and `cctl doctor` for a live report on your machine.
+**Windows and Linux (including WSL2) today** (macOS is a planned next milestone).
+Vault encryption is per-platform: DPAPI on Windows, an owner-only key file on Linux.
+See `docs/PLATFORM.md` for the details and `cctl doctor` for a live report on your
+machine.
 
 ## Docs
 
 - `docs/SETUP.md` — full `cctl setup` walkthrough, every step and unhappy path.
 - `docs/CLI.md` — complete command reference, plus building from source.
 - `docs/ARCHITECTURE.md` — system shape, package boundaries, trust model.
-- `docs/PLATFORM.md` — Windows-only caveats and the Node version floor.
+- `docs/PLATFORM.md` — per-platform caveats (vault encryption, autostart) and the
+  Node version floor.
 - `docs/SELF_HOST.md` — run your own control-plane bot instead of the shared one.
 - `docs/VERIFICATION.md` — what's unit-proven vs. what needs on-machine confirmation.
 

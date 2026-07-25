@@ -53,6 +53,17 @@ export function defaultPaths(
   };
 }
 
+/** Where the POSIX file-key protector (fileKey.ts) keeps the vault key: a SIBLING of
+ *  `vaultDir`, deliberately never inside it, so a copied vault directory doesn't carry its
+ *  own decryption key. Resolved here so filesystem locations keep a single authority; only
+ *  meaningful on platforms without an OS secret store (the file-key dispatch branch). */
+export function defaultVaultKeyPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return join(machineLocalDataRoot(env, platform), 'claude-control', 'vault.key');
+}
+
 /** Build a `Paths` rooted entirely inside `root` — used by tests to sandbox all IO. */
 export function sandboxPaths(root: string): Paths {
   const claudeDir = join(root, 'claude');
