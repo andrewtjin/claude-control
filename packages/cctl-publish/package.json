@@ -29,7 +29,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "smoke-test": "node scripts/smoke-test.mjs",
-    "prepublishOnly": "node scripts/build.mjs && node scripts/smoke-test.mjs"
+    "prepublishOnly": "pnpm -w run build && node scripts/build.mjs && node scripts/smoke-test.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.28.1"
