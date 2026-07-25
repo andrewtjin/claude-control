@@ -14,7 +14,7 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
-import pino from 'pino';
+import { createLogger } from '@claude-control/shared-protocol';
 import {
   Vault,
   defaultPaths,
@@ -190,13 +190,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       );
     }
   }
-  const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
-  const logger: Logger = {
-    debug: (obj, msg) => p.debug(obj, msg),
-    info: (obj, msg) => p.info(obj, msg),
-    warn: (obj, msg) => p.warn(obj, msg),
-    error: (obj, msg) => p.error(obj, msg),
-  };
+  const logger: Logger = createLogger({ defaultLevel: 'info' });
 
   const engine = buildEngine(paths);
   const store = new Store(daemonDbPath(paths));

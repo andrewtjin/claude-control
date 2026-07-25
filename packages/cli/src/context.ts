@@ -1,12 +1,12 @@
 // Construction of the switch engine for CLI use, plus tiny shared helpers.
 //
 // The CLI runs one-shot commands against the same vault the daemon uses, so it builds a
-// SwitchEngine on the real default paths. A `pino` logger is adapted to the engine's tiny
-// Logger interface; the CLI keeps it quiet by default (warn+).
+// SwitchEngine on the real default paths. `createLogger` builds the engine's tiny Logger
+// interface on top of pino; the CLI keeps it quiet by default (warn+).
 
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import pino from 'pino';
+import { createLogger } from '@claude-control/shared-protocol';
 import { SwitchEngine, defaultPaths, type Logger, type Paths } from '@claude-control/switch-engine';
 
 /** The daemon's sqlite database — a sibling of the vault under the claude-control data dir.
@@ -21,13 +21,7 @@ export function daemonDbPath(paths: Paths = defaultPaths()): string {
 
 /** Build a SwitchEngine on the real, production paths. */
 export function buildEngine(paths: Paths = defaultPaths()): SwitchEngine {
-  const logger = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'warn' });
-  const adapter: Logger = {
-    debug: (obj, msg) => logger.debug(obj, msg),
-    info: (obj, msg) => logger.info(obj, msg),
-    warn: (obj, msg) => logger.warn(obj, msg),
-    error: (obj, msg) => logger.error(obj, msg),
-  };
+  const adapter: Logger = createLogger({ defaultLevel: 'warn' });
   // The switch-cadence guard defaults to 60s; operators can tune (or 0-disable) it via env.
   const intervalEnv = Number(process.env.CCTL_SWITCH_MIN_INTERVAL_MS);
   const options: ConstructorParameters<typeof SwitchEngine>[0] = { paths, logger: adapter };
