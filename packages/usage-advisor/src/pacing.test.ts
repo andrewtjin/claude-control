@@ -1,12 +1,15 @@
-// Tests for cross-account pacing: the aggregate ratio, its verdict bands (and their exact
-// boundaries), account-level exclusion/clamping, and the never-NaN headline guarantee.
+// Tests for fleet pacing: the balance model, the reset simulation (waste, running dry), how
+// weights change every total, and the honesty notes that must appear whenever the model had to
+// assume something.
 
 import { describe, expect, it } from 'vitest';
-import { computePacing } from './pacing.js';
+import { computePacing, renderPacingSummary } from './pacing.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 const NOW = Date.parse('2026-07-16T12:00:00.000Z');
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const WEEK_MS = 7 * DAY_MS;
 
 /** Convenience account factory with sane defaults, matching timeline.test.ts's convention. */
 function account(overrides: Partial<AccountUsageInput> & { accountId: string }): AccountUsageInput {
@@ -19,279 +22,387 @@ function account(overrides: Partial<AccountUsageInput> & { accountId: string }):
   };
 }
 
-/** A weekly_all limit whose reset time encodes an exact elapsedFraction, so test numbers can
- *  be reasoned about by hand instead of guessed. */
-function weeklyLimit(percent: number, elapsedFraction: number): LimitInput {
+/** A weekly_all limit resetting `days` from NOW. Omit `days` for a dormant account: the
+ *  endpoint stops reporting a reset once the weekly window closes. */
+function weekly(percent: number, days?: number): LimitInput {
   return {
     kind: 'weekly_all',
     percent,
-    resetsAt: NOW + Math.round((1 - elapsedFraction) * WEEK_MS),
+    ...(days !== undefined ? { resetsAt: NOW + days * DAY_MS } : {}),
   };
 }
 
-describe('computePacing — verdict bands', () => {
-  it('reports ahead of pace when burn outruns elapsed time', () => {
+describe('computePacing — balances and capacity', () => {
+  it('counts a dormant account at its FULL allowance instead of dropping it', () => {
+    // The defect this model replaces: three untouched accounts were excluded for having no
+    // reset time, so the verdict came from the one account in use and read "slow down".
     const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(52, 0.38)] })],
-      NOW,
+      [
+        account({ accountId: 'a', weight: 20, limits: [weekly(0)] }),
+        account({ accountId: 'b', weight: 20, limits: [weekly(0)] }),
+        account({ accountId: 'c', weight: 20, limits: [weekly(0)] }),
+        account({ accountId: 'd', weight: 20, limits: [weekly(60, 4)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 5 },
     );
-    expect(pacing.verdict).toBe('ahead');
-    expect(pacing.weekElapsedPct).toBe(38);
-    expect(pacing.budgetUsedPct).toBe(52);
-    expect(pacing.paceRatio).toBeCloseTo(52 / 38, 5);
-    expect(pacing.headline).toBe(
-      '38% of the combined week elapsed, 52% of budget burned - ahead of pace (~1.4x): ' +
-        'slow down or expect an early wall.',
-    );
+    expect(pacing.capacityUnits).toBe(80);
+    expect(pacing.availableUnits).toBeCloseTo(68, 6);
+    expect(pacing.accounts.every((a) => a.contributing)).toBe(true);
+    expect(pacing.verdict).toBe('sustainable');
+    expect(pacing.headline).toContain('68u of 80u available (85%)');
   });
 
-  it('reports behind pace when there is headroom to spare', () => {
+  it('weights a Pro account and a Max 20x account by their allowances, not equally', () => {
     const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(41, 0.6)] })],
-      NOW,
+      [
+        account({ accountId: 'pro', weight: 1, limits: [weekly(0, 3)] }),
+        account({ accountId: 'max', weight: 20, limits: [weekly(50, 3)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 1 },
     );
-    expect(pacing.verdict).toBe('behind');
-    expect(pacing.headline).toBe(
-      '60% elapsed, 41% burned - behind pace (~0.7x): headroom to burn faster.',
-    );
+    expect(pacing.capacityUnits).toBe(21);
+    // 1 unit from the untouched Pro + 10 from the half-used Max. A mean of percentages would
+    // have said 75% available; the weighted truth is 11/21.
+    expect(pacing.availableUnits).toBeCloseTo(11, 6);
+    expect(pacing.headline).toContain('11u of 21u available (52%)');
   });
 
-  it('reports on pace inside the band', () => {
+  it('clamps a grace overage past 100% to a zero balance, never a negative one', () => {
     const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(49, 0.52)] })],
-      NOW,
+      [account({ accountId: 'a', weight: 20, limits: [weekly(140, 2)] })],
+      {
+        nowMs: NOW,
+        burnUnitsPerDay: 0,
+      },
     );
-    expect(pacing.verdict).toBe('on-pace');
-    expect(pacing.headline).toBe('on pace (52% elapsed, 49% burned).');
+    expect(pacing.availableUnits).toBe(0);
+    expect(pacing.accounts[0]?.usedPct).toBe(100);
   });
 
-  it('treats exactly 1.15 as on-pace, not ahead', () => {
-    // usedFraction 0.69 / elapsedFraction 0.6 = 1.15 exactly.
+  it('replenishes one full capacity per weekly cycle', () => {
     const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(69, 0.6)] })],
-      NOW,
+      [account({ accountId: 'a', weight: 21, limits: [weekly(0, 1)] })],
+      {
+        nowMs: NOW,
+        burnUnitsPerDay: 1,
+      },
     );
-    expect(pacing.paceRatio).toBeCloseTo(1.15, 5);
-    expect(pacing.verdict).toBe('on-pace');
-  });
-
-  it('treats exactly 0.85 as on-pace, not behind', () => {
-    // usedFraction 0.51 / elapsedFraction 0.6 = 0.85 exactly.
-    const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(51, 0.6)] })],
-      NOW,
-    );
-    expect(pacing.paceRatio).toBeCloseTo(0.85, 5);
-    expect(pacing.verdict).toBe('on-pace');
-  });
-
-  it('crosses to ahead just past the 1.15 boundary', () => {
-    const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(70, 0.6)] })], // ratio 1.1667
-      NOW,
-    );
-    expect(pacing.verdict).toBe('ahead');
-  });
-
-  it('crosses to behind just past the 0.85 boundary', () => {
-    const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(50, 0.6)] })], // ratio 0.8333
-      NOW,
-    );
-    expect(pacing.verdict).toBe('behind');
+    expect(pacing.replenishUnitsPerDay).toBeCloseTo(3, 6);
   });
 });
 
-describe('computePacing — fresh and unknown', () => {
-  it('reports fresh when the combined week just reset (elapsed ~0)', () => {
-    const pacing = computePacing([account({ accountId: 'a', limits: [weeklyLimit(10, 0)] })], NOW);
-    expect(pacing.verdict).toBe('fresh');
-    expect(pacing.paceRatio).toBeUndefined();
-    expect(pacing.weekElapsedPct).toBe(0);
-    expect(pacing.budgetUsedPct).toBe(10);
-    expect(pacing.headline).toBe(
-      '0% of the combined week elapsed - just reset, too early to gauge pace.',
+describe('computePacing — the simulation', () => {
+  it('reports sustainable when burn never outruns the resets in the horizon', () => {
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 20, limits: [weekly(0, 1)] })],
+      {
+        nowMs: NOW,
+        burnUnitsPerDay: 2,
+      },
     );
+    expect(pacing.verdict).toBe('sustainable');
+    expect(pacing.dryAtMs).toBeUndefined();
+    expect(pacing.headline).toContain('sustainable for the next 14d');
   });
 
-  it('guards the division when several accounts all sum to ~0 elapsed', () => {
+  it('runs dry, and dates it, when burn exceeds everything the fleet can hold', () => {
+    // 20 units on hand, 40/day burned: gone in half a day, well before the reset in 3d.
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 20, limits: [weekly(0, 3)] })],
+      {
+        nowMs: NOW,
+        burnUnitsPerDay: 40,
+      },
+    );
+    expect(pacing.verdict).toBe('runs-dry');
+    expect(pacing.dryAtMs).toBeCloseTo(NOW + 0.5 * DAY_MS, -2);
+    expect(pacing.headline).toContain('runs dry in 12h');
+  });
+
+  it('survives past a mid-horizon reset that a balance-only check would call exhaustion', () => {
+    // 1 unit left against 2/day: gone in half a day looking at the balance alone. The window
+    // rolls at exactly that half-day mark, and 2/day sits under the 2.86/day replenishment,
+    // so the fleet holds for the whole horizon.
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 20, limits: [weekly(95, 0.5)] })],
+      { nowMs: NOW, burnUnitsPerDay: 2 },
+    );
+    expect(pacing.verdict).toBe('sustainable');
+  });
+
+  it('draws from the soonest-expiring account first, leaving the later one untouched', () => {
+    // 5 units are burned over the first day. All of them must come from 'soon' (resetting in
+    // 1d) rather than 'late' (10d), because only soon's budget is about to be destroyed.
     const pacing = computePacing(
       [
-        account({ accountId: 'a', limits: [weeklyLimit(10, 0)] }),
-        account({ accountId: 'b', limits: [weeklyLimit(90, 0)] }),
+        account({ accountId: 'soon', weight: 20, limits: [weekly(0, 1)] }),
+        account({ accountId: 'late', weight: 20, limits: [weekly(0, 10)] }),
       ],
-      NOW,
+      { nowMs: NOW, burnUnitsPerDay: 5 },
     );
-    expect(pacing.verdict).toBe('fresh');
-    expect(pacing.paceRatio).toBeUndefined();
-    expect(Number.isNaN(pacing.weekElapsedPct)).toBe(false);
-    expect(Number.isFinite(pacing.budgetUsedPct)).toBe(true);
-    expect(pacing.budgetUsedPct).toBe(50);
+    expect(pacing.verdict).toBe('sustainable');
+    expect(pacing.waste[0]?.accountId).toBe('soon');
+    expect(pacing.waste[0]?.units).toBeCloseTo(15, 6);
   });
 
-  it('reports unknown with no accounts at all', () => {
-    const pacing = computePacing([], NOW);
+  it('re-orders the draw after a reset, so the account that just rolled is drawn last', () => {
+    // 'soon' resets on day 1 (next expiry day 8) and 'late' on day 6. From day 1 the burn must
+    // switch to 'late', whose budget is now the one about to be destroyed. If the draw kept
+    // using the stale day-1 clock, 'soon' would stay first and 'late' would waste all 20 units.
+    const pacing = computePacing(
+      [
+        account({ accountId: 'soon', weight: 20, limits: [weekly(0, 1)] }),
+        account({ accountId: 'late', weight: 20, limits: [weekly(0, 6)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 2, horizonDays: 7 },
+    );
+    const lateWaste = pacing.waste.find((w) => w.accountId === 'late');
+    expect(lateWaste?.units).toBeCloseTo(10, 6); // 5 days x 2/day drawn off 'late'
+  });
+
+  it('counts an account with no reset time at all as spendable but never replenished', () => {
+    const pacing = computePacing(
+      [account({ accountId: 'blind', weight: 20, limits: [weekly(0)] })],
+      { nowMs: NOW, burnUnitsPerDay: 10 },
+    );
+    expect(pacing.verdict).toBe('runs-dry');
+    expect(pacing.waste).toEqual([]);
+    expect(pacing.notes).toContain(
+      'no reset time for blind, so their budget is never modelled as expiring.',
+    );
+  });
+});
+
+describe('computePacing — waste', () => {
+  it('reports the units, the account, and the reset that destroys them', () => {
+    const pacing = computePacing(
+      [
+        account({ accountId: 'used', label: 'debate', weight: 20, limits: [weekly(60, 4)] }),
+        account({
+          accountId: 'idle',
+          label: 'tjin.29',
+          weight: 20,
+          predictedResetAt: NOW + 6 * DAY_MS,
+          limits: [weekly(0)],
+        }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 0 },
+    );
+    const first = pacing.waste[0];
+    expect(first?.label).toBe('debate');
+    expect(first?.units).toBeCloseTo(8, 6);
+    expect(first?.atMs).toBe(NOW + 4 * DAY_MS);
+    // Both accounts reset twice inside the 14d horizon; nothing is burned, so all of it goes.
+    expect(pacing.wastedUnits).toBeCloseTo(8 + 20 + 20 + 20, 6);
+    // Named once per ACCOUNT, biggest loss first, stamped with the deadline to act by: the two
+    // tjin.29 resets are one decision, not two entries crowding debate off the line.
+    expect(pacing.notes[0]).toBe(
+      '68u expires unused within 14d: 40u on tjin.29 in 6d, 28u on debate in 4d.',
+    );
+  });
+
+  it('counts the accounts it does not name rather than dropping them', () => {
+    const accounts = ['a', 'b', 'c', 'd'].map((id, i) =>
+      account({ accountId: id, weight: 20 - i, limits: [weekly(0, i + 1)] }),
+    );
+    const pacing = computePacing(accounts, { nowMs: NOW, burnUnitsPerDay: 0, horizonDays: 7 });
+    expect(pacing.waste).toHaveLength(4);
+    expect(pacing.notes[0]).toContain('and 1 more account.');
+  });
+
+  it('reports no waste note when every unit is spent before it expires', () => {
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 20, limits: [weekly(0, 1)] })],
+      {
+        nowMs: NOW,
+        burnUnitsPerDay: 20,
+      },
+    );
+    expect(pacing.wastedUnits).toBe(0);
+    expect(pacing.notes.some((n) => n.includes('expires unused'))).toBe(false);
+  });
+});
+
+describe('computePacing — degraded inputs are stated, never assumed', () => {
+  it('gives no verdict when the burn rate could not be measured', () => {
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 20, limits: [weekly(30, 3)] })],
+      {
+        nowMs: NOW,
+      },
+    );
     expect(pacing.verdict).toBe('unknown');
-    expect(pacing.weekElapsedPct).toBe(0);
-    expect(pacing.budgetUsedPct).toBe(0);
-    expect(pacing.headline).toBe('No weekly usage data yet - pace unknown.');
-    expect(pacing.accounts).toEqual([]);
+    expect(pacing.burnUnitsPerDay).toBeUndefined();
+    expect(pacing.headline).toContain('burn rate not measured yet');
+    expect(pacing.notes).toContain('no usage history to measure a burn rate from yet.');
   });
 
-  it('reports unknown when accounts exist but none carry weekly data', () => {
+  it('distinguishes a MEASURED zero burn from an unmeasurable one', () => {
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 20, limits: [weekly(30, 3)] })],
+      {
+        nowMs: NOW,
+        burnUnitsPerDay: 0,
+      },
+    );
+    expect(pacing.verdict).toBe('sustainable');
+    expect(pacing.notes).not.toContain('no usage history to measure a burn rate from yet.');
+  });
+
+  it('says so when plan tiers are unknown instead of weighting accounts equally in silence', () => {
+    const pacing = computePacing([account({ accountId: 'a', limits: [weekly(50, 3)] })], {
+      nowMs: NOW,
+      burnUnitsPerDay: 0,
+    });
+    expect(pacing.accounts[0]?.weightUnits).toBe(1);
+    expect(pacing.notes).toContain(
+      'plan tiers unknown, so accounts are weighted equally (1 unit each).',
+    );
+  });
+
+  it('labels a predicted reset as predicted, never as observed', () => {
     const pacing = computePacing(
       [
         account({
           accountId: 'a',
-          limits: [{ kind: 'session', percent: 20, resetsAt: NOW + 1000 }],
+          label: 'legoboy',
+          weight: 20,
+          predictedResetAt: NOW + 5 * DAY_MS,
+          limits: [weekly(0)],
         }),
       ],
-      NOW,
+      { nowMs: NOW, burnUnitsPerDay: 1 },
     );
-    expect(pacing.verdict).toBe('unknown');
-    expect(pacing.accounts).toEqual([
-      {
-        accountId: 'a',
-        label: 'a',
-        contributing: false,
-        reason: 'no weekly limit reported',
-      },
-    ]);
+    expect(pacing.accounts[0]?.resetPredicted).toBe(true);
+    expect(pacing.accounts[0]?.resetsAt).toBe(NOW + 5 * DAY_MS);
+    expect(pacing.notes).toContain('next weekly reset predicted from history for legoboy.');
   });
-});
 
-describe('computePacing — quarantine and missing data', () => {
-  it('excludes a quarantined account from the aggregate but lists it with a reason', () => {
+  it('refuses a prediction that is already in the past', () => {
+    const pacing = computePacing(
+      [
+        account({
+          accountId: 'a',
+          weight: 20,
+          predictedResetAt: NOW - DAY_MS,
+          limits: [weekly(0)],
+        }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 1 },
+    );
+    expect(pacing.accounts[0]?.resetsAt).toBeUndefined();
+    expect(pacing.accounts[0]?.resetPredicted).toBe(false);
+  });
+
+  it('excludes a quarantined account from the totals but lists it with a reason', () => {
     const pacing = computePacing(
       [
         account({
           accountId: 'dead',
+          label: 'dead',
           quarantined: true,
-          limits: [weeklyLimit(90, 0.5)],
+          weight: 20,
+          limits: [weekly(0, 3)],
         }),
-        account({ accountId: 'live', limits: [weeklyLimit(50, 0.5)] }),
+        account({ accountId: 'live', weight: 20, limits: [weekly(50, 3)] }),
       ],
-      NOW,
+      { nowMs: NOW, burnUnitsPerDay: 1 },
     );
-    // If the quarantined 90%/50% were included, the average would push ahead of pace
-    // (used avg 0.7 / elapsed avg 0.5 = 1.4); excluding it leaves exactly on-pace (1.0).
-    expect(pacing.verdict).toBe('on-pace');
-    expect(pacing.paceRatio).toBeCloseTo(1.0, 5);
-
+    expect(pacing.capacityUnits).toBe(20);
+    expect(pacing.availableUnits).toBeCloseTo(10, 6);
     const dead = pacing.accounts.find((a) => a.accountId === 'dead');
     expect(dead?.contributing).toBe(false);
-    expect(dead?.reason).toBe('quarantined - excluded from pacing until re-login');
-    // Still surfaced for context, even though excluded.
-    expect(dead?.usedPct).toBe(90);
-    expect(dead?.elapsedPct).toBe(50);
-
-    const live = pacing.accounts.find((a) => a.accountId === 'live');
-    expect(live?.contributing).toBe(true);
+    expect(dead?.balanceUnits).toBeUndefined();
+    expect(pacing.notes).toContain('dead excluded: quarantined - excluded until re-login.');
   });
 
-  it('marks an account with no weekly limit at all as non-contributing', () => {
+  it('excludes an account with no weekly limit at all, and names why', () => {
     const pacing = computePacing(
       [
         account({
           accountId: 'a',
-          limits: [{ kind: 'session', percent: 40, resetsAt: NOW + 3600_000 }],
+          limits: [{ kind: 'session', percent: 20, resetsAt: NOW + HOUR_MS }],
         }),
       ],
-      NOW,
+      { nowMs: NOW, burnUnitsPerDay: 1 },
     );
-    expect(pacing.accounts[0]).toEqual({
-      accountId: 'a',
-      label: 'a',
-      contributing: false,
-      reason: 'no weekly limit reported',
+    expect(pacing.verdict).toBe('unknown');
+    expect(pacing.headline).toBe('No weekly usage data yet - fleet pacing unknown.');
+    expect(pacing.notes).toContain('a excluded: no weekly limit reported.');
+  });
+
+  it('excludes a malformed weekly limit that reports no percent', () => {
+    const malformed = { kind: 'weekly_all', resetsAt: NOW + DAY_MS } as unknown as LimitInput;
+    const pacing = computePacing([account({ accountId: 'a', limits: [malformed] })], {
+      nowMs: NOW,
+      burnUnitsPerDay: 1,
     });
+    expect(pacing.accounts[0]?.contributing).toBe(false);
+    expect(pacing.notes).toContain('a excluded: weekly limit missing percent.');
   });
 
-  it('marks an account missing resetsAt as non-contributing but still shows usedPct', () => {
-    const pacing = computePacing(
-      [account({ accountId: 'a', limits: [{ kind: 'weekly_all', percent: 44 }] })],
-      NOW,
-    );
-    const a = pacing.accounts[0];
-    expect(a?.contributing).toBe(false);
-    expect(a?.reason).toBe('weekly limit missing reset time');
-    expect(a?.usedPct).toBe(44);
-    expect(a?.elapsedPct).toBeUndefined();
-  });
-
-  it('marks an account missing percent (a malformed snapshot) as non-contributing', () => {
-    // percent omitted at runtime despite the type declaring it required — a partial/corrupt
-    // snapshot must not be trusted just because TS says the field exists.
-    const malformed = { kind: 'weekly_all', resetsAt: NOW + 100_000 } as unknown as LimitInput;
-    const pacing = computePacing([account({ accountId: 'a', limits: [malformed] })], NOW);
-    const a = pacing.accounts[0];
-    expect(a?.contributing).toBe(false);
-    expect(a?.reason).toBe('weekly limit missing percent');
-    expect(a?.usedPct).toBeUndefined();
-    expect(a?.elapsedPct).toBeDefined();
-  });
-});
-
-describe('computePacing — clamping', () => {
-  it('clamps usedFraction when percent exceeds 100 (grace overage)', () => {
-    const pacing = computePacing(
-      [account({ accountId: 'a', limits: [weeklyLimit(140, 0.6)] })],
-      NOW,
-    );
-    expect(pacing.accounts[0]?.usedPct).toBe(100);
-    expect(pacing.budgetUsedPct).toBe(100);
-    expect(pacing.verdict).toBe('ahead');
-  });
-
-  it('clamps elapsedFraction to 100% when resetsAt is already in the past, without excluding it', () => {
-    const pacing = computePacing(
-      [
-        account({
-          accountId: 'a',
-          limits: [{ kind: 'weekly_all', percent: 30, resetsAt: NOW - 3_600_000 }],
-        }),
-      ],
-      NOW,
-    );
-    const a = pacing.accounts[0];
-    expect(a?.contributing).toBe(true);
-    expect(a?.elapsedPct).toBe(100);
-    expect(pacing.weekElapsedPct).toBe(100);
-    expect(pacing.verdict).toBe('behind'); // 30% used against a "fully elapsed" week
+  it('reports unknown with no accounts at all', () => {
+    const pacing = computePacing([], { nowMs: NOW });
+    expect(pacing.verdict).toBe('unknown');
+    expect(pacing.availableUnits).toBe(0);
+    expect(pacing.capacityUnits).toBe(0);
+    expect(pacing.headline).toBe('No weekly usage data yet - fleet pacing unknown.');
+    expect(pacing.accounts).toEqual([]);
   });
 });
 
 describe('computePacing — weekly_all vs weekly_scoped', () => {
-  it('prefers weekly_all when both are present', () => {
+  it('budgets against weekly_all when both are present', () => {
     const pacing = computePacing(
       [
         account({
           accountId: 'a',
+          weight: 20,
           limits: [
-            { kind: 'weekly_scoped', percent: 20, resetsAt: NOW + 1000 },
-            weeklyLimit(80, 0.5),
+            { kind: 'weekly_scoped', percent: 20, resetsAt: NOW + 3 * DAY_MS },
+            weekly(80, 3),
           ],
         }),
       ],
-      NOW,
+      { nowMs: NOW, burnUnitsPerDay: 0 },
     );
     expect(pacing.accounts[0]?.usedPct).toBe(80);
   });
 
-  it('falls back to weekly_scoped when weekly_all is absent', () => {
+  it('takes the reset from weekly_scoped when the weekly_all entry has none', () => {
+    // The shadowing defect: a weekly_all entry with a null reset used to hide a perfectly
+    // usable weekly_scoped reset, and the account fell out of the aggregate entirely.
     const pacing = computePacing(
       [
         account({
           accountId: 'a',
+          weight: 20,
           limits: [
-            { kind: 'weekly_scoped', percent: 33, resetsAt: NOW + Math.round(0.5 * WEEK_MS) },
+            { kind: 'weekly_all', percent: 40 },
+            { kind: 'weekly_scoped', percent: 20, resetsAt: NOW + 2 * DAY_MS },
           ],
         }),
       ],
-      NOW,
+      { nowMs: NOW, burnUnitsPerDay: 0 },
+    );
+    expect(pacing.accounts[0]?.usedPct).toBe(40); // percent still from weekly_all
+    expect(pacing.accounts[0]?.resetsAt).toBe(NOW + 2 * DAY_MS);
+    expect(pacing.accounts[0]?.resetPredicted).toBe(false);
+  });
+
+  it('falls back to weekly_scoped for the percent when weekly_all is absent', () => {
+    const pacing = computePacing(
+      [
+        account({
+          accountId: 'a',
+          weight: 20,
+          limits: [{ kind: 'weekly_scoped', percent: 25, resetsAt: NOW + WEEK_MS / 2 }],
+        }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 0 },
     );
     expect(pacing.accounts[0]?.contributing).toBe(true);
-    expect(pacing.accounts[0]?.usedPct).toBe(33);
+    expect(pacing.accounts[0]?.usedPct).toBe(25);
   });
 });
 
@@ -299,25 +410,45 @@ describe('computePacing — misc', () => {
   it('preserves input order and one entry per account in the output', () => {
     const pacing = computePacing(
       [
-        account({ accountId: 'b', limits: [weeklyLimit(10, 0.2)] }),
-        account({ accountId: 'a', limits: [weeklyLimit(20, 0.3)] }),
+        account({ accountId: 'b', limits: [weekly(10, 2)] }),
+        account({ accountId: 'a', limits: [weekly(20, 3)] }),
         account({ accountId: 'c', quarantined: true, limits: [] }),
       ],
-      NOW,
+      { nowMs: NOW, burnUnitsPerDay: 1 },
     );
     expect(pacing.accounts.map((a) => a.accountId)).toEqual(['b', 'a', 'c']);
   });
 
-  it('never produces a headline containing NaN, across every verdict', () => {
-    const scenarios: AccountUsageInput[][] = [
-      [account({ accountId: 'a', limits: [weeklyLimit(52, 0.38)] })], // ahead
-      [account({ accountId: 'a', limits: [weeklyLimit(41, 0.6)] })], // behind
-      [account({ accountId: 'a', limits: [weeklyLimit(49, 0.52)] })], // on-pace
-      [account({ accountId: 'a', limits: [weeklyLimit(10, 0)] })], // fresh
-      [], // unknown
+  it('never renders NaN, across every verdict', () => {
+    const scenarios: Array<[AccountUsageInput[], number | undefined]> = [
+      [[account({ accountId: 'a', weight: 20, limits: [weekly(0, 1)] })], 2],
+      [[account({ accountId: 'a', weight: 20, limits: [weekly(0, 3)] })], 40],
+      [[account({ accountId: 'a', weight: 20, limits: [weekly(30, 3)] })], undefined],
+      [[], undefined],
     ];
-    for (const accounts of scenarios) {
-      expect(computePacing(accounts, NOW).headline).not.toContain('NaN');
+    for (const [accounts, burnUnitsPerDay] of scenarios) {
+      const pacing = computePacing(accounts, {
+        nowMs: NOW,
+        ...(burnUnitsPerDay !== undefined ? { burnUnitsPerDay } : {}),
+      });
+      expect(renderPacingSummary(pacing)).not.toContain('NaN');
     }
+  });
+});
+
+describe('renderPacingSummary', () => {
+  it('prints the headline first, then every note as its own bullet', () => {
+    const pacing = computePacing(
+      [account({ accountId: 'a', label: 'legoboy', limits: [weekly(0, 2)] })],
+      { nowMs: NOW },
+    );
+    expect(renderPacingSummary(pacing)).toBe(
+      [
+        'Pacing: 1u of 1u available (100%), 0.1u/day replenished - burn rate not measured yet, ' +
+          'so no sustainability verdict.',
+        '  - no usage history to measure a burn rate from yet.',
+        '  - plan tiers unknown, so accounts are weighted equally (1 unit each).',
+      ].join('\n'),
+    );
   });
 });

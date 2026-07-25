@@ -158,11 +158,9 @@ describe('buildUsageEmbed', () => {
         accounts: [
           account({
             limits: [
-              // 38% elapsed, 52% used — the same "ahead of pace" fixture as usage-advisor's
-              // pacing tests, so the expected headline is known exactly.
               {
                 kind: 'weekly_all',
-                percent: 52,
+                percent: 50,
                 isActive: true,
                 resetsAt: new Date(NOW + Math.round(0.62 * WEEK_MS)).toISOString(),
               },
@@ -173,9 +171,19 @@ describe('buildUsageEmbed', () => {
       NOW,
     ).toJSON();
     const pacing = embed.fields?.find((f) => f.name === 'Pacing');
-    expect(pacing?.value).toBe(
-      '38% of the combined week elapsed, 52% of budget burned - ahead of pace (~1.4x): ' +
-        'slow down or expect an early wall.',
+    expect(pacing?.value).toContain('0.5u of 1u available (50%)');
+  });
+
+  it('states what the wire cannot tell it rather than printing an unsupported verdict', () => {
+    // Plan tiers and snapshot history do not cross the wire, so the bot can neither weight
+    // accounts nor measure a burn rate — both must be said, not silently assumed away.
+    const embed = buildUsageEmbed({
+      accounts: [account({ limits: [{ kind: 'weekly_all', percent: 20, isActive: true }] })],
+    }).toJSON();
+    const pacing = embed.fields?.find((f) => f.name === 'Pacing');
+    expect(pacing?.value).toContain('burn rate not measured yet');
+    expect(pacing?.value).toContain(
+      '• plan tiers unknown, so accounts are weighted equally (1 unit each).',
     );
   });
 

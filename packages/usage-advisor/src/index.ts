@@ -13,7 +13,17 @@ export {
 } from './autoswitch.js';
 export { humanizeDuration, roundPct } from './format.js';
 export { severityOf, worstSeverity, type Severity } from './severity.js';
-export { computePacing, type AccountPacing, type Pacing, type PacingVerdict } from './pacing.js';
+export {
+  computePacing,
+  renderPacingSummary,
+  PACING_HORIZON_DAYS,
+  type AccountPacing,
+  type Pacing,
+  type PacingOptions,
+  type PacingVerdict,
+  type PacingWaste,
+} from './pacing.js';
+export { selectWeeklyBudget, type WeeklyBudget } from './weekly.js';
 export {
   PLAIN_OUTLOOK_STYLE,
   SESSION_WINDOW_MS,

@@ -41,6 +41,14 @@ import {
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
+import {
+  BURN_WINDOW_MS,
+  RESET_LOOKBACK_MS,
+  measureBurnUnitsPerDay,
+  predictWeeklyReset,
+  readWeeklyObservations,
+  type AccountHistory,
+} from './usageHistory.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
   appendCrashLine,
@@ -154,19 +162,21 @@ export function buildProgram(): Command {
     .command('usage')
     .description("show usage across all accounts (from the daemon's latest poll)")
     .action(async () => {
-      const { accounts, activeId, usageFor } = await readUsageState();
       const nowMs = Date.now();
-      const rows: UsageRow[] = accounts.map((a) => ({
+      const state = await readUsageState(nowMs);
+      const rows: UsageRow[] = state.accounts.map((a) => ({
         label: a.label,
-        active: a.id === activeId,
-        usage: usageFor(a.id),
+        active: a.id === state.activeId,
+        usage: state.usageFor(a.id),
       }));
       let text = renderUsage(rows, nowMs, detectPalette());
       // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
       // state), which UsageRow doesn't carry — build it separately rather than widen UsageRow
       // for one trailing line.
-      const inputs = buildAdvisorInputs(accounts, activeId, usageFor);
-      if (inputs.length > 0) text += '\n\n' + renderPacingLine(inputs, nowMs);
+      const inputs = buildAdvisorInputs(state);
+      if (inputs.length > 0) {
+        text += '\n\n' + renderPacingLine(inputs, { nowMs, ...burnOption(state) });
+      }
       process.stdout.write(text + '\n');
     });
 
@@ -174,10 +184,10 @@ export function buildProgram(): Command {
     .command('timeline')
     .description('5h-session budget per account + when every limit resets, with a usage plan')
     .action(async () => {
-      const { accounts, activeId, usageFor } = await readUsageState();
       const nowMs = Date.now();
-      const inputs = buildAdvisorInputs(accounts, activeId, usageFor);
-      const outlook = computeOutlook(inputs);
+      const state = await readUsageState(nowMs);
+      const inputs = buildAdvisorInputs(state);
+      const outlook = computeOutlook(inputs, nowMs);
       let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to burn first and what to
       // hold. When the last-started daemon runs greedy auto-switch, the advice matches its
@@ -186,7 +196,7 @@ export function buildProgram(): Command {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
         text +=
           '\n\n' + renderPlanSummary(computePlan(inputs, greedy ? { greedyAutoSwitch: true } : {}));
-        text += '\n\n' + renderPacingLine(inputs, nowMs);
+        text += '\n\n' + renderPacingLine(inputs, { nowMs, ...burnOption(state) });
       }
       process.stdout.write(text + '\n');
     });
@@ -690,53 +700,85 @@ async function readStatusSummary(): Promise<SetupSummary> {
   };
 }
 
-/** Accounts + active id joined with the daemon's latest persisted usage snapshot per
- *  account. Read-only view shared by `usage` and `timeline`: it works whether or not the
- *  daemon is currently running (it shows the last poll), and opening a not-yet-created db
- *  just yields an empty one. A corrupt snapshot row is skipped, never fatal. */
-async function readUsageState(): Promise<{
+/** What `usage` and `timeline` read before rendering: the registry, the daemon's latest
+ *  persisted snapshot per account, and the two history-derived measurements the pure advisor
+ *  cannot make for itself (each account's predicted weekly reset and the fleet's burn rate).
+ *  Works whether or not the daemon is currently running (it shows the last poll), and opening
+ *  a not-yet-created db just yields an empty one. A corrupt snapshot row is skipped, never
+ *  fatal. */
+interface UsageState {
   accounts: StoredAccount[];
   activeId: string | null;
   usageFor: (accountId: string) => AccountUsage | undefined;
-}> {
+  /** Next weekly reset predicted from stored history, for accounts the endpoint has stopped
+   *  publishing one for. Absent when the account has no observed reset in history at all. */
+  predictedResetFor: (accountId: string) => number | undefined;
+  /** Fleet burn in Pro-equivalent units/day, or undefined when history cannot measure one. */
+  burnUnitsPerDay: number | undefined;
+}
+
+async function readUsageState(nowMs: number): Promise<UsageState> {
   const engine = buildEngine();
   const [accounts, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
   const store = new Store(daemonDbPath());
   const byId = new Map<string, AccountUsage>();
+  const predictedResetById = new Map<string, number>();
+  const histories: AccountHistory[] = [];
   try {
     for (const a of accounts) {
       const row = store.latestUsageSnapshot(a.id);
-      if (!row) continue;
-      try {
-        byId.set(a.id, JSON.parse(row.json) as AccountUsage);
-      } catch {
-        // a corrupt row must not crash the whole view
+      if (row) {
+        try {
+          byId.set(a.id, JSON.parse(row.json) as AccountUsage);
+        } catch {
+          // a corrupt row must not crash the whole view
+        }
       }
+      // One read per account covers both measurements: the reset lookback is the longer of the
+      // two windows, and the burn measurement filters the same observations down to its own.
+      const observations = readWeeklyObservations(
+        store.listUsageSnapshotsSince(a.id, nowMs - RESET_LOOKBACK_MS),
+      );
+      // Plan tiers are resolved elsewhere; until then every account weighs 1 Pro-equivalent
+      // unit, which the pacing renderer states outright rather than assuming silently.
+      histories.push({ accountId: a.id, weight: 1, observations });
+      const predicted = predictWeeklyReset(observations, nowMs);
+      if (predicted !== undefined) predictedResetById.set(a.id, predicted);
     }
   } finally {
     store.close();
   }
-  return { accounts, activeId, usageFor: (accountId) => byId.get(accountId) };
+  return {
+    accounts,
+    activeId,
+    usageFor: (accountId) => byId.get(accountId),
+    predictedResetFor: (accountId) => predictedResetById.get(accountId),
+    burnUnitsPerDay: measureBurnUnitsPerDay(histories, nowMs - BURN_WINDOW_MS, nowMs),
+  };
 }
 
 /** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both
  *  commands' pacing line. Registry data (label/active/quarantined) is authoritative and
  *  current; the persisted snapshot only contributes the limits, so a stale snapshot can't
  *  misreport which account is live. Accounts without a snapshot still appear (as "unknown"). */
-function buildAdvisorInputs(
-  accounts: StoredAccount[],
-  activeId: string | null,
-  usageFor: (accountId: string) => AccountUsage | undefined,
-): AccountUsageInput[] {
+function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
   return timelineInputFromWire(
-    accounts.map((a) => ({
+    state.accounts.map((a) => ({
       accountId: a.id,
       label: a.label,
-      active: a.id === activeId,
+      active: a.id === state.activeId,
       quarantined: a.quarantined,
-      limits: usageFor(a.id)?.limits ?? [],
+      limits: state.usageFor(a.id)?.limits ?? [],
+      predictedResetAt: state.predictedResetFor(a.id),
     })),
   );
+}
+
+/** Spread the measured burn into `PacingOptions` only when there IS one. `exactOptionalPropertyTypes`
+ *  forbids passing an explicit `undefined`, and the distinction is load-bearing: an absent burn
+ *  rate means "not measurable", which pacing reports rather than treating as zero. */
+function burnOption(state: UsageState): { burnUnitsPerDay?: number } {
+  return state.burnUnitsPerDay !== undefined ? { burnUnitsPerDay: state.burnUnitsPerDay } : {};
 }
 
 /**
@@ -944,7 +986,7 @@ function buildSessionCommands(program: Command): void {
     .command('status')
     .description('show tracked sessions and the active account (reads the daemon db offline)')
     .action(async () => {
-      const { accounts, activeId, usageFor } = await readUsageState();
+      const { accounts, activeId, usageFor } = await readUsageState(Date.now());
       const labelById = new Map(accounts.map((a) => [a.id, a.label] as const));
 
       // Read the display-only sessions mirror. Opening a not-yet-created db yields an empty one;
