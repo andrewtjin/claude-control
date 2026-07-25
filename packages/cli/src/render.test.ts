@@ -7,7 +7,7 @@ import {
   type DaemonStatusView,
   type UsageRow,
 } from './render.js';
-import { ANSI_PALETTE } from './ansi.js';
+import { ANSI_PALETTE, PLAIN_PALETTE } from './ansi.js';
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import type { AccountUsageInput } from '@claude-control/usage-advisor';
@@ -50,6 +50,157 @@ describe('renderAccountsTable', () => {
     expect(colored).toContain(ANSI_PALETTE.red('quarantined'));
     // Zero-width contract: stripping the codes reproduces the plain table exactly.
     expect(stripAnsi(colored)).toBe(plain);
+  });
+
+  describe('PLAN column', () => {
+    it('shows the derived weight when a rate-limit tier is present', () => {
+      const out = renderAccountsTable(
+        [acct('id-1', 'Work', { organizationRateLimitTier: 'default_claude_max_20x' })],
+        null,
+      );
+      expect(out).toMatch(/PLAN/);
+      expect(out).toMatch(/\bWork\s+.*\s20x\b/);
+    });
+
+    it('shows "?" — not a fabricated 1x — when no plan-tier signal is present', () => {
+      const out = renderAccountsTable([acct('id-1', 'Fresh')], null);
+      const dataLine = out.split('\n')[1];
+      expect(dataLine).toMatch(/\?/);
+    });
+  });
+
+  describe('BILLING column', () => {
+    const NOW = Date.parse('2026-07-25T00:00:00.000Z');
+
+    it('renders "unknown" when billingType was never captured', () => {
+      const out = renderAccountsTable([acct('id-1', 'Fresh')], null, PLAIN_PALETTE, NOW);
+      expect(out.split('\n')[1]).toMatch(/unknown/);
+    });
+
+    it('estimates the next monthly anniversary from subscriptionCreatedAt, clearly labeled', () => {
+      const out = renderAccountsTable(
+        [
+          acct('id-1', 'Work', {
+            billingType: 'stripe_subscription',
+            subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+          }),
+        ],
+        null,
+        PLAIN_PALETTE,
+        NOW,
+      );
+      // Anchored on the 15th, "now" is the 25th, so the next anniversary is Aug 15 - and it
+      // must carry an explicit estimate marker, never read as a bare fact.
+      expect(out).toMatch(/~Aug 15 \(est\.\)/);
+    });
+
+    it("prioritizes a live trial's end date over any billing estimate", () => {
+      const out = renderAccountsTable(
+        [
+          acct('id-1', 'Trialing', {
+            billingType: 'stripe_subscription',
+            subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+            claudeCodeTrialEndsAt: '2026-08-01T00:00:00.000Z',
+          }),
+        ],
+        null,
+        PLAIN_PALETTE,
+        NOW,
+      );
+      expect(out).toMatch(/trial->Aug 1\b/);
+      expect(out).not.toMatch(/est\./);
+    });
+
+    it('shows an unrecognized billingType verbatim rather than fabricating a date', () => {
+      const out = renderAccountsTable(
+        [acct('id-1', 'Weird', { billingType: 'some_future_type' })],
+        null,
+        PLAIN_PALETTE,
+        NOW,
+      );
+      expect(out.split('\n')[1]).toMatch(/some_future_type/);
+    });
+
+    /** The BILLING cell for one account, isolated from column padding. */
+    const billing = (extra: Partial<StoredAccount>, nowMs = NOW): string => {
+      const line = renderAccountsTable(
+        [acct('id-1', 'Work', extra)],
+        null,
+        PLAIN_PALETTE,
+        nowMs,
+      ).split('\n')[1];
+      return line ?? '';
+    };
+
+    it('keeps the anniversary day for subscriptions created on the 29th-31st', () => {
+      // Regression: rolling the estimate forward by mutating one Date with setUTCMonth let a
+      // short month overflow the day (Jan 31 -> Mar 3), and because each step rolled from the
+      // PREVIOUS corrupted value the damage compounded instead of correcting. A Jan 31
+      // subscription rendered ~Aug 3 when the real next anniversary is Jul 31 — over a month
+      // out, in the wrong month entirely, for roughly a tenth of all subscribers.
+      for (const [createdAt, expected] of [
+        ['2025-01-31T12:00:00.000Z', 'Jul 31'],
+        ['2025-03-31T12:00:00.000Z', 'Jul 31'],
+        ['2025-01-29T12:00:00.000Z', 'Jul 29'],
+        ['2025-01-30T12:00:00.000Z', 'Jul 30'],
+        ['2025-08-15T12:00:00.000Z', 'Aug 15'],
+      ] as const) {
+        expect(
+          billing({ billingType: 'stripe_subscription', subscriptionCreatedAt: createdAt }),
+          createdAt,
+        ).toContain(`~${expected} (est.)`);
+      }
+    });
+
+    it('clamps to the last day of a short target month rather than spilling into the next', () => {
+      // A Jan 31 subscription billed in February can only land on Feb 28 — never Mar 3.
+      expect(
+        billing(
+          { billingType: 'stripe_subscription', subscriptionCreatedAt: '2025-01-31T12:00:00.000Z' },
+          Date.parse('2026-02-01T00:00:00.000Z'),
+        ),
+      ).toContain('~Feb 28 (est.)');
+    });
+
+    it('renders "unknown" for a malformed subscriptionCreatedAt instead of a bogus date', () => {
+      for (const bad of ['not-a-date', '', '2026-13-45T00:00:00.000Z']) {
+        expect(billing({ billingType: 'stripe_subscription', subscriptionCreatedAt: bad })).toMatch(
+          /unknown/,
+        );
+      }
+    });
+
+    it('falls through an EXPIRED trial to the billing estimate', () => {
+      // A trial end in the past is no longer the next billing event; continuing to show it
+      // would tell the user a date that has already gone by.
+      const cell = billing({
+        billingType: 'stripe_subscription',
+        subscriptionCreatedAt: '2026-01-15T12:00:00.000Z',
+        claudeCodeTrialEndsAt: '2026-02-01T00:00:00.000Z',
+      });
+      expect(cell).toContain('~Aug 15 (est.)');
+      expect(cell).not.toContain('trial->');
+    });
+
+    it('caps an unbounded upstream billingType so one odd value cannot stretch the table', () => {
+      const long = 'x'.repeat(300);
+      const line = billing({ billingType: long });
+      expect(line).not.toContain(long);
+      expect(line).toContain('...');
+      expect(line.length).toBeLessThan(140);
+    });
+
+    it('never colors a billing estimate as if it were fact — plain dim, no red/green', () => {
+      const accounts = [
+        acct('id-1', 'Work', {
+          billingType: 'stripe_subscription',
+          subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+        }),
+      ];
+      const plain = renderAccountsTable(accounts, 'id-1', PLAIN_PALETTE, NOW);
+      const colored = renderAccountsTable(accounts, 'id-1', ANSI_PALETTE, NOW);
+      expect(stripAnsi(colored)).toBe(plain);
+    });
   });
 });
 

@@ -11,6 +11,16 @@
 // can still drift, so tolerance stays: a poll that returns something we don't recognize must
 // never crash the poller or blind the advisor to every OTHER account — every parse here
 // degrades to a best-effort result with an `error` note instead of throwing.
+//
+// The response body also carries a `spend` block (extra-usage credit overage) alongside
+// `limits`. It is deliberately NOT parsed: nothing renders it, and `AccountUsage` is relayed
+// in cleartext through a host the user does not own, so per-account dollar amounts stay out
+// of this pipeline until a reader exists to justify the exposure.
+//
+// TOLERANCE HAS A HARD FLOOR: every value that reaches a wire field must satisfy that field's
+// schema, because `encode()` THROWS on a mismatch and takes the whole poll cycle down with it
+// (see `parseCachedUsage` for the full blast radius). "Tolerant" means degrading a bad value
+// to absent/clamped — never widening what the schema accepts.
 
 import type { AccountUsage, UsageLimit } from '@claude-control/shared-protocol';
 import type { AccountUsageInput, LimitInput } from '@claude-control/usage-advisor';

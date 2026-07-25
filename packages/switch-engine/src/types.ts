@@ -32,6 +32,16 @@ export interface OauthAccount {
   organizationRole?: string;
   organizationName?: string;
   organizationRateLimitTier?: string;
+  /** e.g. `"stripe_subscription"` — how the account is billed. The set of values is
+   *  undocumented, so only that one is understood to recur monthly; anything else (or absent)
+   *  must render as unknown, never a guessed default. */
+  billingType?: string;
+  /** ISO timestamp of when the paid subscription started. The only anchor available for
+   *  estimating a monthly billing date — there is no authoritative next-invoice-date field. */
+  subscriptionCreatedAt?: string;
+  /** ISO timestamp a live trial ends, or `null` when the account isn't (or is no longer) on
+   *  a trial. */
+  claudeCodeTrialEndsAt?: string | null;
   [key: string]: unknown;
 }
 
@@ -51,6 +61,22 @@ export interface StoredAccount {
   emailAddress?: string;
   organizationUuid?: string;
   subscriptionType?: string;
+  /** From `claudeAiOauth.rateLimitTier` (`.credentials.json`) — carries a plan multiplier
+   *  (e.g. `default_claude_max_20x`) that `subscriptionType` alone does not. See
+   *  `usage-advisor`'s `planWeight()` for how this is turned into a capacity weight. */
+  rateLimitTier?: string;
+  /** From `oauthAccount.organizationRateLimitTier` (`.claude.json`) — the org-wide counterpart
+   *  of `rateLimitTier`, preferred over it when both are present (see `planWeight()`). */
+  organizationRateLimitTier?: string;
+  /** From `oauthAccount.billingType`. Only `"stripe_subscription"` is understood to recur
+   *  monthly; render anything else (or absent) as unknown rather than assuming that value. */
+  billingType?: string;
+  /** From `oauthAccount.subscriptionCreatedAt`. A DERIVATION anchor only — CLI rendering uses
+   *  it to estimate a monthly billing anniversary; it is never an authoritative invoice date
+   *  and must never be presented as one. */
+  subscriptionCreatedAt?: string;
+  /** From `oauthAccount.claudeCodeTrialEndsAt`, captured only when non-null (a live trial). */
+  claudeCodeTrialEndsAt?: string;
   /** A quarantined account has a dead refresh token and must be re-logged-in before use. */
   quarantined: boolean;
   quarantineReason?: string;
