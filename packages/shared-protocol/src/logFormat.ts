@@ -11,27 +11,17 @@
 //   - Headline keys (below) print first, in a fixed order, so the same kind of event always
 //     lines up in the same column across log lines; everything else follows in its original
 //     (insertion) order.
-//   - `err` collapses to its message only; the stack (if any) prints on an indented line
-//     below, and ONLY at debug level — the single biggest length win, and the direct answer to
-//     "diagnostic info at the back, main message at the front".
+//   - `err` collapses to its message plus its scalar diagnostics (code/errno/syscall); the
+//     stack is the single biggest length win, so it moves to an indented line below and only
+//     when the caller asks for it (see `includeStack`).
 
 /**
- * Keys worth aligning first because they carry the meaning of a line at a glance, ordered by
- * how often they are the thing an operator is scanning FOR. Chosen by grepping every
- * `logger.<level>(...)` call site across packages/daemon, packages/cli, packages/switch-engine,
- * and packages/control-plane-bot (not guessed):
- *   - sessionId, requestId  correlate almost every daemon/hook-receiver log line to the thing
- *     that triggered it; they are the two most common keys in the codebase by a wide margin.
- *   - accountId, daemonId, discordUserId  identify WHICH account/daemon/Discord user a line is
- *     about, the next most common "which one" axis after session/request.
- *   - event  the raw hook event name (hookReceiver.ts) driving a line.
- *   - decision, outcome, state, rung  the auto-switch and stop-escalation policy modules report
- *     their result under these names — the "what happened" half of a line, right after "which
- *     one" and "what triggered it".
- *   - reason  a short human explanation attached to a handful of warn/error lines.
- *   - port, count  small scalars worth seeing without hunting through the tail.
- * Everything else (err objects, route/op payloads, one-off fields) still prints, just after
- * these, in whatever order the call site built the object.
+ * Keys worth aligning first because they carry the meaning of a line at a glance, in the order
+ * an operator scans for them: which correlation id (sessionId/requestId), which subject
+ * (accountId/daemonId/discordUserId), what triggered it (event), what was decided
+ * (decision/outcome/state/rung), and the short scalars worth seeing without hunting
+ * (reason/port/count). Everything else still prints, just after these, in whatever order the
+ * call site built the object.
  */
 const HEADLINE_KEYS = [
   'sessionId',
@@ -49,9 +39,14 @@ const HEADLINE_KEYS = [
   'count',
 ];
 
-/** Values longer than this are truncated with a visible marker — never silently, per house
- *  rule. Long enough to keep a URL or a short JSON blob intact, short enough that one bad
- *  field (a giant buffer, a huge array) cannot blow out an entire line. */
+/** Scalar fields of a serialized error that are worth keeping on the summary line: they name
+ *  the failure precisely (`ECONNREFUSED`, `EACCES`, `connect`) without costing the length a
+ *  stack would. Everything else about the error lives in the stack or in the JSON output. */
+const ERR_DETAIL_KEYS = ['code', 'errno', 'syscall'];
+
+/** Values longer than this are truncated with a visible marker, never silently. Long enough to
+ *  keep a URL or a short JSON blob intact, short enough that one bad field (a giant buffer, a
+ *  huge array) cannot blow out an entire line. */
 const MAX_VALUE_LENGTH = 200;
 
 /** Local HH:MM:SS — no date, see module comment. */
@@ -70,8 +65,8 @@ function formatLevel(level: string): string {
   return upper.length >= 5 ? upper.slice(0, 5) : upper.padEnd(5);
 }
 
-/** Truncates a rendered value with a visible marker stating how much was cut — silent
- *  truncation is a house-rule violation, so the marker is not optional. */
+/** Truncates a rendered value with a visible marker stating how much was cut, so a reader can
+ *  always tell that something was dropped and how much. */
 function truncate(s: string): string {
   if (s.length <= MAX_VALUE_LENGTH) return s;
   const cut = s.length - MAX_VALUE_LENGTH;
@@ -106,35 +101,59 @@ function renderValue(value: unknown): string {
     const json = JSON.stringify(value, (_key, v: unknown) =>
       typeof v === 'bigint' ? v.toString() : v,
     );
-    return quoteIfNeeded(truncate(json ?? String(value)));
+    // JSON.stringify returns undefined for values it has no representation for (functions,
+    // symbols). Marking them beats stringifying them: `String(fn)` dumps the whole function
+    // body into the middle of a log line.
+    if (json === undefined) return `[unserializable ${Object.prototype.toString.call(value)}]`;
+    return quoteIfNeeded(truncate(json));
   } catch {
     return `[unserializable ${Object.prototype.toString.call(value)}]`;
   }
 }
 
-/** Pulls the message and, at debug level only, the stack out of a pino-serialized `err`
- *  value. Accepts a real `Error`, pino's default serialized shape
- *  (`{type,message,stack,...}`), or anything else (rendered via String() so a malformed `err`
- *  never throws while we are trying to make a log line readable). */
-function collapseErr(value: unknown): { message: string; stack: string | undefined } {
-  if (value instanceof Error) {
-    return { message: value.message, stack: value.stack };
+/** Splits an `err` value into the three things a reader needs at different depths: the message
+ *  (always on the summary line), the scalar detail fields (also on the summary line — cheap and
+ *  often the whole diagnosis), and the stack (only when `includeStack` asks for it). Accepts a
+ *  real `Error`, pino's default serialized shape (`{type,message,stack,...}`), or anything else
+ *  — a malformed `err` must never throw while we are trying to make a log line readable. */
+function collapseErr(value: unknown): {
+  message: string;
+  stack: string | undefined;
+  details: string[];
+} {
+  if (value === null || typeof value !== 'object') {
+    const message = typeof value === 'string' ? value : renderValue(value);
+    return { message, stack: undefined, details: [] };
   }
-  if (value !== null && typeof value === 'object') {
-    const v = value as Record<string, unknown>;
-    const message = typeof v.message === 'string' ? v.message : JSON.stringify(value);
-    const stack = typeof v.stack === 'string' ? v.stack : undefined;
-    return { message, stack };
+  const record = value as Record<string, unknown>;
+  const message =
+    typeof record.message === 'string' ? record.message : (JSON.stringify(value) ?? '');
+  const stack = typeof record.stack === 'string' ? record.stack : undefined;
+  const details: string[] = [];
+  for (const key of ERR_DETAIL_KEYS) {
+    const detail = record[key];
+    if (typeof detail === 'string' || typeof detail === 'number') {
+      details.push(`${key}=${renderValue(detail)}`);
+    }
   }
-  return { message: String(value), stack: undefined };
+  return { message, stack, details };
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+export interface FormatLogLineOptions {
+  /** Print an `err`'s stack on indented continuation lines. Off by default: the stack is the
+   *  bulk of what makes raw output unreadable, so it belongs behind the operator's own request
+   *  for verbose output (the CONFIGURED logger level, not the level of this one line — every
+   *  error in this codebase is logged at error/warn, so gating on the line's own level would
+   *  make the stack unreachable). */
+  includeStack?: boolean;
+}
+
 /**
- * Render one log call as a single (possibly two-line, see `err` below) text line.
+ * Render one log call as a single (possibly multi-line, see `includeStack`) text line.
  *
  * @param level  pino level name (e.g. 'info', 'warn') — case-insensitive, any string accepted.
  * @param timeMs epoch milliseconds.
@@ -142,7 +161,13 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  *               (null, an array, undefined) degrade to "no fields" rather than throwing.
  * @param msg    the message string; omitted messages simply produce no message segment.
  */
-export function formatLogLine(level: string, timeMs: number, obj: unknown, msg?: string): string {
+export function formatLogLine(
+  level: string,
+  timeMs: number,
+  obj: unknown,
+  msg?: string,
+  options: FormatLogLineOptions = {},
+): string {
   const safeObj = isPlainRecord(obj) ? obj : {};
   const keys = Object.keys(safeObj);
   // Headline keys first (in HEADLINE_KEYS order, only the ones actually present), then
@@ -154,13 +179,13 @@ export function formatLogLine(level: string, timeMs: number, obj: unknown, msg?:
   const orderedKeys = [...headline, ...rest];
 
   const parts: string[] = [];
-  let debugStack: string | undefined;
+  let errStack: string | undefined;
   for (const key of orderedKeys) {
     const value = safeObj[key];
     if (key === 'err') {
-      const { message, stack } = collapseErr(value);
-      parts.push(`err=${quoteIfNeeded(truncate(message))}`);
-      if (level.toLowerCase() === 'debug' && stack) debugStack = stack;
+      const { message, stack, details } = collapseErr(value);
+      parts.push(`err=${quoteIfNeeded(truncate(message))}`, ...details);
+      if (options.includeStack === true && stack !== undefined) errStack = stack;
       continue;
     }
     parts.push(`${key}=${renderValue(value)}`);
@@ -171,10 +196,10 @@ export function formatLogLine(level: string, timeMs: number, obj: unknown, msg?:
   if (parts.length > 0) segments.push(parts.join(' '));
   let line = segments.join('  ');
 
-  if (debugStack !== undefined) {
+  if (errStack !== undefined) {
     // Indented continuation line(s) so the stack is visually subordinate to the summary line
     // above it, and still greppable as a block (every line shares the same 4-space prefix).
-    line += `\n${debugStack
+    line += `\n${errStack
       .split('\n')
       .map((l) => `    ${l}`)
       .join('\n')}`;
