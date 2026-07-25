@@ -1,8 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <!-- claude-control mark: rotary account selector. Pointer + highlighted tick = active account. -->
-  <rect width="512" height="512" fill="#1F1E1D"/>
-  <g><line x1="256" y1="70" x2="256" y2="36" stroke="#57534A" stroke-width="24" stroke-linecap="round"/><line x1="442" y1="256" x2="476" y2="256" stroke="#57534A" stroke-width="24" stroke-linecap="round"/><line x1="387.5" y1="387.5" x2="411.6" y2="411.6" stroke="#57534A" stroke-width="24" stroke-linecap="round"/><line x1="256" y1="442" x2="256" y2="476" stroke="#57534A" stroke-width="24" stroke-linecap="round"/><line x1="124.5" y1="387.5" x2="100.4" y2="411.6" stroke="#57534A" stroke-width="24" stroke-linecap="round"/><line x1="70" y1="256" x2="36" y2="256" stroke="#57534A" stroke-width="24" stroke-linecap="round"/><line x1="124.5" y1="124.5" x2="100.4" y2="100.4" stroke="#57534A" stroke-width="24" stroke-linecap="round"/></g>
-  <line x1="383.3" y1="128.7" x2="417.2" y2="94.8" stroke="#D97757" stroke-width="30" stroke-linecap="round"/>
-  <circle cx="256" cy="256" r="140" fill="#F0EEE6"/>
-  <line x1="299.8" y1="212.2" x2="338" y2="174" stroke="#1F1E1D" stroke-width="30" stroke-linecap="round"/>
-</svg>
