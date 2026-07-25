@@ -42,6 +42,9 @@ export type {
 export { createAgentSdkClient } from './agentSdkClient.js';
 export type { CreateAgentSdkClientDeps } from './agentSdkClient.js';
 
+export { findClaudeCodeBinary, AGENT_SDK_PACKAGE } from './claudeCodeBinary.js';
+export type { ClaudeCodeBinaryLookup, ClaudeCodeBinaryDeps } from './claudeCodeBinary.js';
+
 export { escalateStop } from './stopEscalation.js';
 export type { StopRung, StopEscalationResult, EscalateStopOptions } from './stopEscalation.js';
 

@@ -35,7 +35,7 @@ alone (usage, burn advice, manual and automatic switching); pair later with
 Your credentials never leave your machine: the daemon holds them locally, and the shared
 bot is a credential-free control plane that never sees session content.
 
-**Windows-only v0.2.1**; Mac support coming soon.
+**Windows-only v0.2.2**; Mac support coming soon.
 
 See the [project README](https://github.com/andrewtjin/claude-control#readme) for the
 full command reference, the architecture, and the self-host path.
@@ -43,6 +43,12 @@ full command reference, the architecture, and the self-host path.
 This package is a single-file bundle of the `cctl` CLI, built from the
 [claude-control](https://github.com/andrewtjin/claude-control) monorepo
 (`packages/cli`) — it has no source of its own.
+
+Installing it also pulls in `@anthropic-ai/claude-agent-sdk` and, through it, the Claude
+Code binary for your platform (~250MB) — that binary is what a remote session actually
+runs. Installing with `--omit=optional` skips it, and `/run` will fail with "Native CLI
+binary not found" while every other command still works; `cctl doctor` reports this as
+the `session-runtime` check.
 
 ## License
 
