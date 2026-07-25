@@ -968,19 +968,49 @@ export class Daemon {
     return fresh.map((q) => q.text).join('\n\n');
   }
 
+  /**
+   * Phone-initiated spawn. The failure path matters as much as the success one: `/run`'s Discord
+   * reply is sent the moment the frame leaves the relay, so it says "Session spawn requested."
+   * whatever happens next. Everything that goes wrong AFTER a handle exists already reaches the
+   * phone — the session's own event stream carries it as text plus a `failed` status, which is
+   * how an unauthenticated spawn surfaces "Not logged in · Please run /login". Everything that
+   * goes wrong BEFORE one exists (the registry failing to load, its first persist failing, the
+   * SDK adapter refusing to construct) had no channel at all and died in the daemon's log,
+   * leaving the phone on that ack forever with nothing to retry and nothing to read.
+   *
+   * So this window gets an explicit envelope, exactly like the un-resumable orphan above. It
+   * stays a NARROW catch — once `attachSessionPipes` has run, the handle owns its own reporting
+   * and a second channel would double-report the same failure.
+   */
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
     const { prompt, resumeSessionId, cwd, accountId } = msg.payload;
-    const client = this.createAgentSdkClient();
-    const handle = await this.sessionManager.spawnManaged({
-      client,
-      prompt,
-      // Always 'default' so remote approve/deny actually works — see the constant's decision
-      // comment for why the daemon (not the spawn payload) owns this policy in protocol v1.
-      permissionMode: MANAGED_SESSION_PERMISSION_MODE,
-      ...(resumeSessionId !== undefined && resumeSessionId !== null ? { resumeSessionId } : {}),
-      ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
-      ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
-    });
+    let handle: SessionHandle;
+    try {
+      const client = this.createAgentSdkClient();
+      handle = await this.sessionManager.spawnManaged({
+        client,
+        prompt,
+        // Always 'default' so remote approve/deny actually works — see the constant's decision
+        // comment for why the daemon (not the spawn payload) owns this policy in protocol v1.
+        permissionMode: MANAGED_SESSION_PERMISSION_MODE,
+        ...(resumeSessionId !== undefined && resumeSessionId !== null ? { resumeSessionId } : {}),
+        ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
+        ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
+      });
+    } catch (err) {
+      this.logger.error({ err, requestId: msg.payload.requestId }, 'session.spawn failed to start');
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'spawn_failed',
+          message:
+            'session.spawn: the session could not be started ' +
+            `(${err instanceof Error ? err.message : String(err)})`,
+          relatesTo: msg.id,
+        },
+      });
+      return;
+    }
 
     this.attachSessionPipes(handle, accountId ?? undefined);
   }
