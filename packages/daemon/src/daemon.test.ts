@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -579,6 +579,160 @@ describe('Daemon lifecycle', () => {
     // The usage snapshot proves a full poll cycle ran — by then settings would have shipped.
     await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
     expect(relay.received.some((e) => e.type === 'settings.snapshot')).toBe(false);
+  });
+
+  it('trims usage snapshots past the retention window on every poll cycle', async () => {
+    // One ancient row and one current row. Only the cycle's retention step can remove the
+    // ancient one — nothing else in the daemon ever deletes from this table.
+    const ancient = Date.now() - 200 * 24 * 60 * 60_000;
+    store.insertUsageSnapshot({
+      accountId: 'acct-x',
+      fetchedAtMs: ancient,
+      source: 'live',
+      json: '{}',
+    });
+    store.insertUsageSnapshot({
+      accountId: 'acct-x',
+      fetchedAtMs: Date.now(),
+      source: 'live',
+      json: '{}',
+    });
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+
+    const kept = store.listUsageSnapshots('acct-x');
+    expect(kept.some((r) => r.fetchedAtMs === ancient)).toBe(false);
+    expect(kept.length).toBeGreaterThan(0);
+  });
+
+  it('scans transcripts and pushes a stats.snapshot, attributing turns to live accounts', async () => {
+    const now = Date.now();
+    // Attribution flows from the REAL journal, not a hand-seeded table: the poll cycle re-derives
+    // every interval from this audit log before it scans, so anything written straight into the
+    // store would be wiped. Writing the log is what proves the two halves are actually joined.
+    await writeFile(
+      join(vaultDir, 'switch-audit.jsonl'),
+      JSON.stringify({
+        ts: now - 60_000,
+        event: 'activated',
+        fromAccountId: null,
+        toAccountId: 'acct-x',
+      }) + '\n',
+      'utf8',
+    );
+    const scanTranscripts = vi.fn((sinceMs: number) => {
+      void sinceMs;
+      return Promise.resolve({
+        turns: [
+          {
+            tsMs: now - 30_000,
+            model: 'claude-opus-5',
+            inputTokens: 10,
+            outputTokens: 20,
+            cacheCreationTokens: 30,
+            cacheReadTokens: 40,
+          },
+        ],
+        filesScanned: 1,
+        filesSkippedByMtime: 2,
+        filesUnreadable: 0,
+        malformedLines: 0,
+        duplicateTurns: 3,
+      });
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.snapshot'));
+    const pushed = relay.received.find((e) => e.type === 'stats.snapshot');
+    expect(pushed?.type).toBe('stats.snapshot');
+    if (pushed?.type !== 'stats.snapshot') throw new Error('unreachable');
+    expect(pushed.payload.overall).toEqual({
+      input: 10,
+      output: 20,
+      cacheCreation: 30,
+      cacheRead: 40,
+      turns: 1,
+    });
+    // The registry label, not the raw id — the phone never sees account ids it cannot read.
+    expect(pushed.payload.byAccount).toEqual([
+      {
+        accountId: 'acct-x',
+        label: 'main',
+        totals: { input: 10, output: 20, cacheCreation: 30, cacheRead: 40, turns: 1 },
+      },
+    ]);
+    expect(pushed.payload.coverage.filesSkippedByMtime).toBe(2);
+    // The window the daemon asked for must be the window it advertises.
+    expect(scanTranscripts).toHaveBeenCalledWith(pushed.payload.windowStartMs);
+  });
+
+  it('pushes no stats.snapshot when no transcript scanner is wired', async () => {
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    expect(relay.received.some((e) => e.type === 'stats.snapshot')).toBe(false);
+  });
+
+  it('keeps polling when the transcript scan fails', async () => {
+    const scanTranscripts = vi.fn(() => Promise.reject(new Error('EPERM: projects dir locked')));
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 30,
+    });
+    await daemon.start();
+
+    // A dead scan must cost the phone its stats, never its usage: the cycle keeps running.
+    await waitFor(() => relay.received.filter((e) => e.type === 'usage.snapshot').length >= 2);
+    expect(relay.received.some((e) => e.type === 'stats.snapshot')).toBe(false);
+  });
+
+  it('throttles the transcript scan rather than re-running it every poll cycle', async () => {
+    const scanTranscripts = vi.fn(() =>
+      Promise.resolve({
+        turns: [],
+        filesScanned: 0,
+        filesSkippedByMtime: 0,
+        filesUnreadable: 0,
+        malformedLines: 0,
+        duplicateTurns: 0,
+      }),
+    );
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      statsIntervalMs: 60_000,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 30,
+    });
+    await daemon.start();
+
+    await waitFor(() => relay.received.filter((e) => e.type === 'usage.snapshot').length >= 3);
+    expect(scanTranscripts).toHaveBeenCalledTimes(1);
   });
 
   it("feeds each poll cycle's advisor inputs to the auto-switcher when one is wired", async () => {

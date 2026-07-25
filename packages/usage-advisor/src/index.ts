@@ -11,7 +11,7 @@ export {
   type AutoSwitchDecision,
   type AutoSwitchPolicy,
 } from './autoswitch.js';
-export { humanizeDuration, roundPct } from './format.js';
+export { formatTokens, humanizeDuration, roundPct } from './format.js';
 export { severityOf, worstSeverity, type Severity } from './severity.js';
 export { computePacing, type AccountPacing, type Pacing, type PacingVerdict } from './pacing.js';
 export {

@@ -3,13 +3,18 @@ import {
   renderAccountsTable,
   renderDaemonStatus,
   renderPacingLine,
+  renderTokenStats,
   renderUsage,
   type DaemonStatusView,
   type UsageRow,
 } from './render.js';
 import { ANSI_PALETTE } from './ansi.js';
 import type { StoredAccount } from '@claude-control/switch-engine';
-import type { AccountUsage } from '@claude-control/shared-protocol';
+import type {
+  AccountUsage,
+  TokenStatsSnapshot,
+  TokenTotals,
+} from '@claude-control/shared-protocol';
 import type { AccountUsageInput } from '@claude-control/usage-advisor';
 
 /** Remove ANSI SGR codes — used to prove color never changes the visible text/layout. */
@@ -243,5 +248,120 @@ describe('renderDaemonStatus', () => {
     const colored = renderDaemonStatus(healthy, ANSI_PALETTE);
     expect(colored).toContain(ANSI_PALETTE.green('[ok]'));
     expect(stripAnsi(colored)).toBe(plain);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cctl stats
+// ---------------------------------------------------------------------------
+
+function totals(over: Partial<TokenTotals> = {}): TokenTotals {
+  return { input: 0, output: 0, cacheCreation: 0, cacheRead: 0, turns: 0, ...over };
+}
+
+const STATS_END = new Date(2026, 6, 25, 12, 0, 0).getTime();
+
+function stats(over: Partial<TokenStatsSnapshot> = {}): TokenStatsSnapshot {
+  return {
+    windowStartMs: STATS_END - 7 * 86_400_000,
+    windowEndMs: STATS_END,
+    overall: totals({
+      input: 1000,
+      output: 2_000_000,
+      cacheCreation: 3000,
+      cacheRead: 4_000_000_000,
+      turns: 1234,
+    }),
+    byAccount: [
+      { accountId: 'acct-a', label: 'main', totals: totals({ output: 2_000_000, turns: 1000 }) },
+      { accountId: null, label: 'unattributed', totals: totals({ output: 500, turns: 234 }) },
+    ],
+    byModel: [{ label: 'claude-opus-5', totals: totals({ output: 2_000_500, turns: 1234 }) }],
+    byDay: [{ label: '2026-07-25', totals: totals({ output: 2_000_500, turns: 1234 }) }],
+    coverage: {
+      filesScanned: 42,
+      filesSkippedByMtime: 400,
+      filesUnreadable: 0,
+      malformedLines: 0,
+      duplicateTurns: 99,
+    },
+    ...over,
+  };
+}
+
+describe('renderTokenStats', () => {
+  it('renders every breakdown with a header and the window it covers', () => {
+    const out = renderTokenStats(stats());
+    expect(out).toMatch(/Token usage - last 7 days \(2026-07-18 to 2026-07-25\)/);
+    expect(out).toMatch(/By account/);
+    expect(out).toMatch(/By model/);
+    expect(out).toMatch(/By day/);
+    expect(out).toMatch(/ACCOUNT/);
+    expect(out).toMatch(/CACHE R/);
+    expect(out).toMatch(/claude-opus-5/);
+  });
+
+  it('renders the unattributed bucket rather than dropping it', () => {
+    expect(renderTokenStats(stats())).toMatch(/unattributed/);
+  });
+
+  it('states the measurement limits in the output itself, not only the docs', () => {
+    const out = renderTokenStats(stats());
+    expect(out).toMatch(/THIS machine/);
+    expect(out).toMatch(/web app/);
+    expect(out).toMatch(/before cctl recorded its first switch/);
+    expect(out).toMatch(/not an Anthropic billing figure/);
+    expect(out).toMatch(/42 transcript files read/);
+    expect(out).toMatch(/400 untouched since the window opened/);
+  });
+
+  it('surfaces read failures instead of quietly reporting a partial total', () => {
+    const out = renderTokenStats(
+      stats({
+        coverage: {
+          filesScanned: 5,
+          filesSkippedByMtime: 0,
+          filesUnreadable: 3,
+          malformedLines: 7,
+          duplicateTurns: 0,
+        },
+      }),
+    );
+    expect(out).toMatch(/3 could not be read/);
+    expect(out).toMatch(/7 malformed lines skipped/);
+  });
+
+  it('says so plainly when the window holds no local turns, keeping the caveats', () => {
+    const out = renderTokenStats(
+      stats({ overall: totals(), byAccount: [], byModel: [], byDay: [] }),
+    );
+    expect(out).toMatch(/No Claude Code turns recorded on this machine in this window/);
+    expect(out).toMatch(/not an Anthropic billing figure/);
+  });
+
+  it('is ASCII-only and plain by default', () => {
+    const out = renderTokenStats(stats());
+    // eslint-disable-next-line no-control-regex -- asserting there are no escape codes at all
+    expect(out).not.toMatch(/\u001b\[/);
+    expect(out).toMatch(/^[\x20-\x7e\n]*$/);
+  });
+
+  it('aligns columns on plain text, so color never shifts the layout', () => {
+    const plain = renderTokenStats(stats());
+    const colored = renderTokenStats(stats(), ANSI_PALETTE);
+    expect(stripAnsi(colored)).toBe(plain);
+    // And the numeric columns really are aligned: every data row in a table ends at the same
+    // column as its header row.
+    const lines = plain.split('\n');
+    const headerIndex = lines.findIndex((l) => l.startsWith('ACCOUNT'));
+    expect(headerIndex).toBeGreaterThan(-1);
+    const header = lines[headerIndex]!;
+    expect(lines[headerIndex + 1]!.length).toBe(header.length);
+    expect(lines[headerIndex + 2]!.length).toBe(header.length);
+  });
+
+  it('marks the unattributed row as a caveat under a palette', () => {
+    const colored = renderTokenStats(stats(), ANSI_PALETTE);
+    expect(colored).toContain(ANSI_PALETTE.yellow('unattributed'));
   });
 });

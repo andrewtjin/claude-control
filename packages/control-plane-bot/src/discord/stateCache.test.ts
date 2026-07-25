@@ -240,3 +240,52 @@ describe('DaemonStateCache', () => {
     expect(cache.getSessions('user-a')).toEqual([]);
   });
 });
+
+describe('DaemonStateCache stats.snapshot', () => {
+  function statsSnapshot(discordUserId: string, turns: number): Envelope {
+    return {
+      v: 1,
+      id: 'stats-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId,
+      type: 'stats.snapshot',
+      payload: {
+        windowStartMs: 0,
+        windowEndMs: 1000,
+        overall: { input: 1, output: 2, cacheCreation: 3, cacheRead: 4, turns },
+        byAccount: [],
+        byModel: [],
+        byDay: [],
+        coverage: {
+          filesScanned: 1,
+          filesSkippedByMtime: 0,
+          filesUnreadable: 0,
+          malformedLines: 0,
+          duplicateTurns: 0,
+        },
+      },
+    };
+  }
+
+  it('has nothing cached before a snapshot arrives', () => {
+    expect(new DaemonStateCache().getStats('user-a')).toBeUndefined();
+  });
+
+  it('records a snapshot per user and lets a later one overwrite it', () => {
+    const cache = new DaemonStateCache();
+    cache.record('user-a', statsSnapshot('user-a', 10));
+    expect(cache.getStats('user-a')?.overall.turns).toBe(10);
+    cache.record('user-a', statsSnapshot('user-a', 25));
+    expect(cache.getStats('user-a')?.overall.turns).toBe(25);
+    // Strictly per-user: one daemon's stats must never answer another user's /stats.
+    expect(cache.getStats('user-b')).toBeUndefined();
+  });
+
+  it('leaves the usage cache untouched', () => {
+    const cache = new DaemonStateCache();
+    cache.record('user-a', usageSnapshot('user-a'));
+    cache.record('user-a', statsSnapshot('user-a', 5));
+    expect(cache.getUsage('user-a')?.accounts).toHaveLength(1);
+  });
+});

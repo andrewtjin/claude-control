@@ -94,6 +94,73 @@ export const UsagePlan = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Token stats (absolute counts read from local Claude Code transcripts)
+// ---------------------------------------------------------------------------
+//
+// Every `AccountUsage` number above is a PERCENT of an opaque limit. These are absolute token
+// counts the daemon reads out of Claude Code's own transcript files on the host and attributes to
+// accounts through its switch-audit journal. Only the AGGREGATE crosses the wire: the bot must
+// never read a transcript (they contain conversation text, and the bot holds nothing privileged),
+// so it receives sums and nothing else.
+
+/** One bucket's token counts. The four token kinds stay separate all the way to the wire: they
+ *  are separate fields upstream, they are billed differently, and cache reads outweigh plain
+ *  input by orders of magnitude — folding them into one number destroys the only useful signal. */
+export const TokenTotals = z.object({
+  input: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  cacheCreation: z.number().nonnegative(),
+  cacheRead: z.number().nonnegative(),
+  /** Assistant turns counted (after de-duplication), so a reader can sanity-check the sums. */
+  turns: z.number().int().nonnegative(),
+});
+
+/** Totals for one account. `accountId` is null for the UNATTRIBUTED bucket — turns that happened
+ *  before cctl recorded its first switch, which have no account they can honestly be assigned to.
+ *  That bucket is carried on the wire (rather than dropped) precisely so every surface can render
+ *  it: silently omitting it would make the per-account numbers look like the whole truth. */
+export const TokenAccountRow = z.object({
+  accountId: AccountId.nullish(),
+  label: z.string(),
+  totals: TokenTotals,
+});
+
+/** Totals for one model id, or one local calendar day (`YYYY-MM-DD`). */
+export const TokenBucketRow = z.object({
+  label: z.string(),
+  totals: TokenTotals,
+});
+
+/** What the scan could and could not read. Sent so the phone can say so out loud — a total over
+ *  40 of 442 transcript files is a different claim from the same total over all 442. */
+export const TokenStatsCoverage = z.object({
+  filesScanned: z.number().int().nonnegative(),
+  filesSkippedByMtime: z.number().int().nonnegative(),
+  filesUnreadable: z.number().int().nonnegative(),
+  malformedLines: z.number().int().nonnegative(),
+  duplicateTurns: z.number().int().nonnegative(),
+});
+
+/**
+ * Absolute token usage over a window, broken down by account, model and day.
+ *
+ * HONEST LIMITS, which every renderer of this payload must state: these are the turns Claude Code
+ * wrote to disk ON THIS MACHINE. Work done from the web app, the mobile app or another machine is
+ * invisible here, turns predating the first recorded switch land in the unattributed bucket, and
+ * none of it is an authoritative billing figure from Anthropic.
+ */
+export const TokenStatsSnapshot = z.object({
+  windowStartMs: z.number().int().nonnegative(),
+  /** End of the window, i.e. when the scan ran — the payload's "as of". */
+  windowEndMs: z.number().int().nonnegative(),
+  overall: TokenTotals,
+  byAccount: z.array(TokenAccountRow),
+  byModel: z.array(TokenBucketRow),
+  byDay: z.array(TokenBucketRow),
+  coverage: TokenStatsCoverage,
+});
+
+// ---------------------------------------------------------------------------
 // Settings (the daemon's effective configuration, for visibility only)
 // ---------------------------------------------------------------------------
 
@@ -440,6 +507,7 @@ function frame<T extends string, P extends z.ZodTypeAny>(type: T, payload: P) {
 
 export const messageSchemas = {
   'usage.snapshot': frame('usage.snapshot', UsageSnapshotPayload),
+  'stats.snapshot': frame('stats.snapshot', TokenStatsSnapshot),
   'settings.snapshot': frame('settings.snapshot', SettingsSnapshot),
   'switch.command': frame('switch.command', SwitchCommandPayload),
   'switch.result': frame('switch.result', SwitchResultPayload),
@@ -469,6 +537,7 @@ export const messageSchemas = {
 /** The full frame schema. One `.parse` validates routing + type + payload together. */
 export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['usage.snapshot'],
+  messageSchemas['stats.snapshot'],
   messageSchemas['settings.snapshot'],
   messageSchemas['switch.command'],
   messageSchemas['switch.result'],
@@ -511,6 +580,11 @@ export type AccountUsage = z.infer<typeof AccountUsage>;
 export type SettingSource = z.infer<typeof SettingSource>;
 export type SettingRow = z.infer<typeof SettingRow>;
 export type SettingsSnapshot = z.infer<typeof SettingsSnapshot>;
+export type TokenTotals = z.infer<typeof TokenTotals>;
+export type TokenAccountRow = z.infer<typeof TokenAccountRow>;
+export type TokenBucketRow = z.infer<typeof TokenBucketRow>;
+export type TokenStatsCoverage = z.infer<typeof TokenStatsCoverage>;
+export type TokenStatsSnapshot = z.infer<typeof TokenStatsSnapshot>;
 export type UsageAdvisory = z.infer<typeof UsageAdvisory>;
 export type AccountScore = z.infer<typeof AccountScore>;
 export type UsagePlan = z.infer<typeof UsagePlan>;
