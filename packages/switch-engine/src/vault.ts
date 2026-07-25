@@ -22,6 +22,67 @@ function emptyRegistry(): Registry {
   return { activeId: null, accounts: [] };
 }
 
+/** Set an optional registry field, or DELETE it when the bundle no longer carries a value.
+ *  Deleting matters as much as setting: a lapsed trial or a downgraded plan must disappear from
+ *  the registry, not linger as a stale fact the CLI keeps rendering. Returns whether it changed,
+ *  so callers can skip a pointless registry write. `exactOptionalPropertyTypes` forbids
+ *  assigning an explicit `undefined`, hence the delete rather than a plain assignment. */
+function setOrDelete<K extends keyof StoredAccount>(
+  account: StoredAccount,
+  key: K,
+  value: StoredAccount[K] | undefined,
+): boolean {
+  if (value === undefined) {
+    if (!(key in account)) return false;
+    delete account[key];
+    return true;
+  }
+  if (account[key] === value) return false;
+  account[key] = value;
+  return true;
+}
+
+/**
+ * Copy the non-secret, bundle-DERIVED metadata onto a registry row so listing never has to
+ * decrypt. Returns whether anything actually changed.
+ *
+ * Called on every path that rewrites a bundle, not just on account creation — otherwise the
+ * registry is frozen at whatever the account looked like when it was added: accounts that
+ * predate a newly captured field render as unknown forever (fixable only by remove + re-add),
+ * and a plan upgrade or an expiring trial never shows up at all.
+ *
+ * `oauthAccount` is treated as authoritative ONLY when the bundle actually carries the block;
+ * when it is absent the fields it feeds are left untouched rather than deleted, because some
+ * write paths legitimately persist a credentials-only bundle and must not wipe good metadata.
+ */
+function applyBundleMetadata(account: StoredAccount, bundle: CredentialBundle): boolean {
+  let changed = false;
+  const oauth = bundle.claudeAiOauth;
+  changed = setOrDelete(account, 'subscriptionType', oauth.subscriptionType) || changed;
+  changed = setOrDelete(account, 'rateLimitTier', oauth.rateLimitTier) || changed;
+
+  const acct = bundle.oauthAccount;
+  if (acct === undefined) return changed;
+
+  changed = setOrDelete(account, 'accountUuid', acct.accountUuid) || changed;
+  changed = setOrDelete(account, 'emailAddress', acct.emailAddress) || changed;
+  changed = setOrDelete(account, 'organizationUuid', acct.organizationUuid) || changed;
+  changed =
+    setOrDelete(account, 'organizationRateLimitTier', acct.organizationRateLimitTier) || changed;
+  changed = setOrDelete(account, 'billingType', acct.billingType) || changed;
+  changed = setOrDelete(account, 'subscriptionCreatedAt', acct.subscriptionCreatedAt) || changed;
+  // `claudeCodeTrialEndsAt` is `string | null` on the bundle (null = no active trial) — only
+  // the string case is a value; null and absent both clear the registry field, which is what
+  // makes a trial that ended stop rendering as a live one.
+  changed =
+    setOrDelete(
+      account,
+      'claudeCodeTrialEndsAt',
+      typeof acct.claudeCodeTrialEndsAt === 'string' ? acct.claudeCodeTrialEndsAt : undefined,
+    ) || changed;
+  return changed;
+}
+
 export class Vault {
   constructor(
     private readonly vaultDir: string,
@@ -67,8 +128,6 @@ export class Vault {
   async addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
     const reg = await this.loadRegistry();
     const now = this.clock();
-    // Optional metadata is only set when present — exactOptionalPropertyTypes forbids
-    // assigning an explicit `undefined` to an optional field.
     const account: StoredAccount = {
       id: randomUUID(),
       label,
@@ -76,16 +135,14 @@ export class Vault {
       createdAtMs: now,
       updatedAtMs: now,
     };
-    if (bundle.oauthAccount?.accountUuid !== undefined)
-      account.accountUuid = bundle.oauthAccount.accountUuid;
-    if (bundle.oauthAccount?.emailAddress !== undefined)
-      account.emailAddress = bundle.oauthAccount.emailAddress;
-    if (bundle.oauthAccount?.organizationUuid !== undefined) {
-      account.organizationUuid = bundle.oauthAccount.organizationUuid;
-    }
-    if (bundle.claudeAiOauth.subscriptionType !== undefined) {
-      account.subscriptionType = bundle.claudeAiOauth.subscriptionType;
-    }
+    // Plan/billing metadata is derived by the same helper every later bundle write uses, so a
+    // freshly added account and a long-lived refreshed one can never disagree about how a
+    // bundle maps onto a registry row. Every field is independently absent-safe: a provider
+    // response missing one degrades to "unknown" in the CLI rather than crashing or forcing a
+    // re-login (see planWeight() / `cctl accounts list` for how absence renders).
+    applyBundleMetadata(account, bundle);
+    // Writes the blob only — the row is not in the registry yet, so its metadata refresh is a
+    // no-op here; `saveRegistry` below is what persists the row built above.
     await this.writeBundle(account.id, bundle);
     reg.accounts.push(account);
     await this.saveRegistry(reg);
@@ -152,11 +209,25 @@ export class Vault {
   }
 
   /** Encrypt and persist an account's credential bundle, and refresh its metadata row so
-   *  the registry stays consistent with the bundle (e.g. after a token refresh). */
+   *  the registry stays consistent with the bundle (e.g. after a token refresh).
+   *
+   *  The metadata refresh is best-effort and secondary: the encrypted blob is written FIRST
+   *  and unconditionally, because losing a rotated single-use token is unrecoverable whereas a
+   *  stale derived metadata row is cosmetic and self-heals on the next write. An id with no
+   *  registry row (an account mid-creation, or removed concurrently) simply skips the refresh
+   *  rather than erroring — this is not a lifecycle method. The registry is only rewritten when
+   *  a value actually changed, so routine token refreshes don't churn the file. */
   async writeBundle(id: string, bundle: CredentialBundle): Promise<void> {
     ensureDir(join(this.vaultDir, id));
     const blob = await this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
     await atomicWriteFile(this.bundlePath(id), blob);
+
+    const reg = await this.loadRegistry();
+    const account = reg.accounts.find((a) => a.id === id);
+    if (!account) return;
+    if (!applyBundleMetadata(account, bundle)) return;
+    account.updatedAtMs = this.clock();
+    await this.saveRegistry(reg);
   }
 
   // ---- rollback snapshot (mid-switch only) ----

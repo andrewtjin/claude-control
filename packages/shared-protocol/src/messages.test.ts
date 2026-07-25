@@ -449,3 +449,50 @@ describe('pair.claim hostLabel bound', () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe('usage.snapshot carries no monetary data', () => {
+  const account = {
+    accountId: 'acct-1',
+    label: 'Work',
+    active: true,
+    source: 'live' as const,
+    fetchedAtMs: 1,
+    limits: [],
+  };
+
+  it('strips a spend block off an account rather than relaying it', () => {
+    // The usage endpoint returns per-account credit spend, and the daemon deliberately does not
+    // carry it: this envelope is relayed in cleartext through a host the user does not own (see
+    // docs/THREAT_MODEL.md, "In-transit visibility"), so dollar amounts must not cross it while
+    // nothing renders them. The schema is the enforcement point — a sender that starts emitting
+    // the field (a rolled-back daemon, a future edit) has it dropped here, not forwarded.
+    const result = decode(
+      rawFrame('usage.snapshot', {
+        accounts: [
+          {
+            ...account,
+            spend: {
+              used: { amountMinor: 1234, currency: 'USD', exponent: 2 },
+              percent: 12,
+              enabled: true,
+              canPurchaseCredits: true,
+            },
+          },
+        ],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      const decoded = result.envelope.payload.accounts[0];
+      expect(decoded && 'spend' in decoded).toBe(false);
+      expect(JSON.stringify(result.envelope)).not.toContain('1234');
+    }
+  });
+
+  it('accepts an account with no monetary fields at all', () => {
+    const payload: PayloadOf<'usage.snapshot'> = { accounts: [account] };
+    const env = stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+  });
+});
