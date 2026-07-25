@@ -15,14 +15,19 @@ cards are built from — commands, tool output, and the prompts you send — so 
 rather no shared operator see that, self-host it (see `docs/SELF_HOST.md`).
 
 ## Quick start
+
 ### Bot setup
+
 First, [add the cctl bot to your Discord server](https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands) or [add it to just your account](https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands)
 and DM it. Either way is where `/pair` runs and where approvals, questions, and usage
-cards reach you. 
+cards reach you.
 
-* For non-bot setups, see [Local-only](#local-only-no-discord) below.
+- For non-bot setups, see [Local-only](#local-only-no-discord) below.
+
 ### Daemon setup
+
 Next, run:
+
 ```
 npm i -g @andrewtjin/cctl
 cctl setup
