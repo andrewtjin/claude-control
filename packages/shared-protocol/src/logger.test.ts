@@ -6,9 +6,11 @@ import { createLogger } from './logger.js';
 
 /** A stand-in for stdout that just records every chunk written to it, so tests can assert on
  *  exactly what a real terminal (or a real pipe) would have received — no real process I/O
- *  touched. */
+ *  touched. `isTTY` is part of the sink for the same reason it is on `process.stdout`: it is
+ *  what the format default keys off. */
 class CapturingStdout {
   chunks: string[] = [];
+  constructor(readonly isTTY = false) {}
   write(chunk: string): boolean {
     this.chunks.push(chunk);
     return true;
@@ -31,8 +33,8 @@ afterEach(() => {
 
 describe('createLogger: format mode selection', () => {
   it('defaults to pretty on a TTY', () => {
-    const stdout = new CapturingStdout();
-    const logger = createLogger({ defaultLevel: 'info', env: {}, isTTY: true, stdout });
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
     logger.info({ sessionId: 's1' }, 'started');
     expect(stdout.chunks).toHaveLength(1);
     expect(stdout.chunks[0]?.startsWith('{')).toBe(false);
@@ -41,8 +43,8 @@ describe('createLogger: format mode selection', () => {
   });
 
   it('defaults to NDJSON off a TTY (piped to a file, a service manager, a log collector)', () => {
-    const stdout = new CapturingStdout();
-    const logger = createLogger({ defaultLevel: 'info', env: {}, isTTY: false, stdout });
+    const stdout = new CapturingStdout(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
     logger.info({ sessionId: 's1' }, 'started');
     expect(stdout.chunks).toHaveLength(1);
     const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
@@ -52,23 +54,22 @@ describe('createLogger: format mode selection', () => {
   });
 
   it('CCTL_LOG_FORMAT=json forces NDJSON even on a TTY', () => {
-    const stdout = new CapturingStdout();
+    const stdout = new CapturingStdout(true);
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FORMAT: 'json' },
-      isTTY: true,
       stdout,
     });
     logger.info({}, 'x');
-    expect(() => JSON.parse(stdout.chunks[0]!)).not.toThrow();
+    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    expect(parsed.msg).toBe('x');
   });
 
   it('CCTL_LOG_FORMAT=pretty forces pretty even off a TTY', () => {
-    const stdout = new CapturingStdout();
+    const stdout = new CapturingStdout(false);
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FORMAT: 'pretty' },
-      isTTY: false,
       stdout,
     });
     logger.info({}, 'x');
@@ -79,12 +80,11 @@ describe('createLogger: format mode selection', () => {
 
 describe('createLogger: level', () => {
   it('honors CCTL_LOG_LEVEL over the caller-supplied default', () => {
-    const stdout = new CapturingStdout();
+    const stdout = new CapturingStdout(true);
     // defaultLevel is 'info' but the env override should win, silencing info entirely.
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_LEVEL: 'error' },
-      isTTY: true,
       stdout,
     });
     logger.info({}, 'quiet');
@@ -95,8 +95,8 @@ describe('createLogger: level', () => {
   });
 
   it('falls back to the caller-supplied default when CCTL_LOG_LEVEL is unset', () => {
-    const stdout = new CapturingStdout();
-    const logger = createLogger({ defaultLevel: 'warn', env: {}, isTTY: true, stdout });
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({ defaultLevel: 'warn', env: {}, stdout });
     logger.info({}, 'quiet');
     logger.warn({}, 'loud');
     expect(stdout.chunks).toHaveLength(1);
@@ -106,8 +106,8 @@ describe('createLogger: level', () => {
 
 describe('createLogger: pretty rendering of a real failure', () => {
   it('renders the ECONNREFUSED shape from a real Error the same way the daemon would log it', () => {
-    const stdout = new CapturingStdout();
-    const logger = createLogger({ defaultLevel: 'info', env: {}, isTTY: true, stdout });
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
     const err = new Error('connect ECONNREFUSED 127.0.0.1:8765') as Error & {
       errno: number;
       code: string;
@@ -131,7 +131,10 @@ describe('createLogger: pretty rendering of a real failure', () => {
     expect(content).toContain('ERROR');
     expect(content).toContain('control-plane socket error');
     expect(content).toContain('err="connect ECONNREFUSED 127.0.0.1:8765"');
-    // The whole point: no pid, no hostname, no inline stack at error level.
+    // The identifying scalars survive the collapse; only the stack is held back.
+    expect(content).toContain('code=ECONNREFUSED');
+    expect(content).toContain('syscall=connect');
+    // The whole point: no pid, no hostname, no inline stack at the default level.
     expect(content).not.toMatch(/\bpid=/);
     expect(content).not.toMatch(/\bhostname=/);
     expect(content.split('\n')).toHaveLength(1);
@@ -139,9 +142,25 @@ describe('createLogger: pretty rendering of a real failure', () => {
     expect(content.indexOf('control-plane socket error')).toBeLessThan(content.indexOf('err='));
   });
 
+  it('prints the stack of an error line once CCTL_LOG_LEVEL=debug asks for verbose output', () => {
+    // The stack must be reachable from the CONFIGURED level. Nothing in this codebase logs an
+    // error at debug level, so a gate on the line's own level would hide every stack forever.
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_LEVEL: 'debug' },
+      stdout,
+    });
+    logger.error({ err: new Error('boom') }, 'daemon failed to start');
+    const content = stdout.chunks[0]!;
+    expect(content).toContain('err=boom');
+    expect(content).toMatch(/\n {4}Error: boom/);
+    expect(content).toContain('logger.test.ts');
+  });
+
   it('still prints pid/hostname in NDJSON mode — pretty output is the only thing that drops them', () => {
-    const stdout = new CapturingStdout();
-    const logger = createLogger({ defaultLevel: 'info', env: {}, isTTY: false, stdout });
+    const stdout = new CapturingStdout(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
     logger.error({ err: new Error('boom') }, 'failed');
     const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
     expect(parsed).toHaveProperty('pid');
@@ -149,70 +168,84 @@ describe('createLogger: pretty rendering of a real failure', () => {
   });
 });
 
-/** The file sink writes through a real `fs.createWriteStream`, whose underlying disk write is
- *  asynchronous even though our `LogDestination.write()` call into it is synchronous — so
- *  tests poll for the content to land rather than guessing at a fixed delay. Bounded so a
- *  genuine regression fails the test instead of hanging it. */
-async function waitForFileContent(path: string, timeoutMs = 2000): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    try {
-      const content = readFileSync(path, 'utf8');
-      if (content.trim() !== '') return content;
-    } catch {
-      // Not created yet — keep polling.
-    }
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(`timed out waiting for content in ${path}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
+describe('createLogger: reserved payload keys', () => {
+  it("renames a payload field that would collide with pino's own level/time/msg", () => {
+    // Without the rename both the header and the field would be wrong: the duplicate JSON key
+    // wins the parse, so the payload silently rewrites the timestamp and then disappears.
+    const stdout = new CapturingStdout(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    logger.info({ level: 'shadow', time: 5, msg: 'hijack', sessionId: 's1' }, 'real message');
+    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    expect(parsed.msg).toBe('real message');
+    expect(typeof parsed.level).toBe('number');
+    expect(parsed.time).not.toBe(5);
+    expect(parsed.levelField).toBe('shadow');
+    expect(parsed.timeField).toBe(5);
+    expect(parsed.msgField).toBe('hijack');
+    expect(parsed.sessionId).toBe('s1');
+  });
+
+  it('leaves an ordinary payload untouched', () => {
+    const stdout = new CapturingStdout(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    logger.info({ sessionId: 's1' }, 'started');
+    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    expect(parsed.sessionId).toBe('s1');
+    expect(parsed).not.toHaveProperty('levelField');
+  });
+});
 
 describe('createLogger: file sink', () => {
-  it('appends NDJSON to CCTL_LOG_FILE in addition to pretty stdout output', async () => {
+  it('appends NDJSON to CCTL_LOG_FILE in addition to pretty stdout output', () => {
     const dir = freshTempDir();
     const filePath = join(dir, 'daemon.log');
-    const stdout = new CapturingStdout();
+    const stdout = new CapturingStdout(true);
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FILE: filePath },
-      isTTY: true,
       stdout,
     });
     logger.info({ sessionId: 's1' }, 'started');
     expect(stdout.chunks[0]).not.toMatch(/^\{/); // stdout stayed pretty
-    const fileContents = await waitForFileContent(filePath);
-    const parsed = JSON.parse(fileContents.trim()) as Record<string, unknown>;
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8').trim()) as Record<string, unknown>;
     expect(parsed.msg).toBe('started');
     expect(parsed.sessionId).toBe('s1');
   });
 
-  it('degrades to stdout-only with exactly one warning when CCTL_LOG_FILE cannot be opened', async () => {
+  it('has the line on disk the instant the log call returns, so process.exit cannot drop it', () => {
+    // `daemon failed to start` is logged and then the process exits immediately. A buffered
+    // write stream loses exactly that line, because process.exit flushes nothing.
     const dir = freshTempDir();
-    // A path whose parent directory does not exist: createWriteStream fails with ENOENT.
-    const filePath = join(dir, 'missing-parent', 'daemon.log');
-    const stdout = new CapturingStdout();
-    const warnings: string[] = [];
-    let resolveWarned: (() => void) | undefined;
-    const warned = new Promise<void>((resolve) => {
-      resolveWarned = resolve;
-    });
+    const filePath = join(dir, 'daemon.log');
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FILE: filePath },
-      isTTY: true,
-      stdout,
-      warn: (message) => {
-        warnings.push(message);
-        resolveWarned?.();
-      },
+      stdout: new CapturingStdout(true),
     });
-    await warned;
+    logger.error({ err: new Error('port in use') }, 'daemon failed to start');
+    // No await, no polling: if this needs either, the line would not survive an exit.
+    const contents = readFileSync(filePath, 'utf8');
+    expect(contents).toContain('daemon failed to start');
+    expect(contents).toContain('port in use');
+  });
+
+  it('degrades to stdout-only with exactly one warning when CCTL_LOG_FILE cannot be opened', () => {
+    const dir = freshTempDir();
+    // A path whose parent directory does not exist: opening it fails with ENOENT.
+    const filePath = join(dir, 'missing-parent', 'daemon.log');
+    const stdout = new CapturingStdout(true);
+    const warnings: string[] = [];
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FILE: filePath },
+      stdout,
+      warn: (message) => warnings.push(message),
+    });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(filePath);
     // The daemon must keep working: logging still reaches stdout, never throws.
     expect(() => logger.info({}, 'still alive')).not.toThrow();
     expect(stdout.chunks.some((c) => c.includes('still alive'))).toBe(true);
+    expect(warnings).toHaveLength(1);
   });
 });

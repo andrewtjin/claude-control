@@ -86,7 +86,7 @@ describe('formatLogLine', () => {
   });
 
   describe('err collapsing', () => {
-    it('collapses a real Error to just its message, no stack, at a non-debug level', () => {
+    it('collapses a real Error to its message, with no stack by default', () => {
       const { ms } = localTime(8, 8, 8);
       const err = new Error('connect ECONNREFUSED 127.0.0.1:8765');
       const line = formatLogLine('error', ms, { err }, 'control-plane socket error');
@@ -95,7 +95,7 @@ describe('formatLogLine', () => {
       expect(line).not.toContain(err.stack!.split('\n')[1] ?? '__unreachable__');
     });
 
-    it('collapses a pino-serialized err object (type/message/stack/errno/...) the same way', () => {
+    it('keeps the scalar diagnostics of a pino-serialized err on the summary line', () => {
       const { ms } = localTime(9, 9, 9);
       const err = {
         type: 'Error',
@@ -103,22 +103,34 @@ describe('formatLogLine', () => {
         stack: 'Error: connect ECONNREFUSED 127.0.0.1:8765\n    at TCPConnectWrap...',
         errno: -4078,
         code: 'ECONNREFUSED',
+        syscall: 'connect',
       };
       const line = formatLogLine('warn', ms, { err }, 'control-plane socket error');
-      expect(line).toContain('err="connect ECONNREFUSED 127.0.0.1:8765"');
-      expect(line).not.toContain('errno=');
+      expect(line).toContain(
+        'err="connect ECONNREFUSED 127.0.0.1:8765" code=ECONNREFUSED errno=-4078 syscall=connect',
+      );
+      // The stack is the only part held back; the identifying detail stays on the line.
       expect(line).not.toContain('TCPConnectWrap');
     });
 
-    it('prints the stack on an indented line, but ONLY at debug level', () => {
+    it('prints the stack on an indented line when includeStack asks for it', () => {
       const { ms } = localTime(10, 10, 10);
       const err = { message: 'boom', stack: 'Error: boom\n    at somewhere.js:1:1' };
-      const debugLine = formatLogLine('debug', ms, { err }, 'failed');
-      const errorLine = formatLogLine('error', ms, { err }, 'failed');
-      expect(debugLine).toContain('\n    Error: boom');
-      expect(debugLine).toContain('\n        at somewhere.js:1:1');
-      expect(errorLine).not.toContain('at somewhere.js:1:1');
-      expect(errorLine.split('\n')).toHaveLength(1);
+      const withStack = formatLogLine('debug', ms, { err }, 'failed', { includeStack: true });
+      const withoutStack = formatLogLine('debug', ms, { err }, 'failed');
+      expect(withStack).toContain('\n    Error: boom');
+      expect(withStack).toContain('\n        at somewhere.js:1:1');
+      expect(withoutStack).not.toContain('at somewhere.js:1:1');
+      expect(withoutStack.split('\n')).toHaveLength(1);
+    });
+
+    it('prints the stack of an error-level line too: the gate is the caller, not the level', () => {
+      // Errors are never logged at debug in this codebase, so gating the stack on the LINE's
+      // own level would make it unreachable however the operator configures logging.
+      const { ms } = localTime(10, 10, 11);
+      const err = { message: 'boom', stack: 'Error: boom\n    at somewhere.js:1:1' };
+      const line = formatLogLine('error', ms, { err }, 'failed', { includeStack: true });
+      expect(line).toContain('\n        at somewhere.js:1:1');
     });
 
     it('never throws on a malformed err value (string, number, undefined)', () => {
@@ -205,6 +217,22 @@ describe('formatLogLine', () => {
       const { ms } = localTime(0, 3, 3);
       expect(() => formatLogLine('info', ms, { circular }, 'm')).not.toThrow();
       expect(formatLogLine('info', ms, { circular }, 'm')).toContain('[unserializable');
+    });
+
+    it('marks a value JSON cannot represent instead of dumping its source', () => {
+      const { ms } = localTime(0, 3, 5);
+      const line = formatLogLine(
+        'info',
+        ms,
+        {
+          cb: function named(a: number) {
+            return a;
+          },
+        },
+        'm',
+      );
+      expect(line).toContain('[unserializable');
+      expect(line).not.toContain('return a');
     });
 
     it('never throws on a BigInt value and renders it via a safe replacer', () => {
