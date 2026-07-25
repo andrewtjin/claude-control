@@ -11,6 +11,7 @@ import {
   defaultProtector,
   type Paths,
 } from '@claude-control/switch-engine';
+import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 export interface DoctorCheck {
@@ -215,6 +216,23 @@ export function checkClaudeJson(paths: Paths): DoctorCheck {
   };
 }
 
+/** Whether a remote session could actually start. Managed sessions (`/run` from Discord) are the
+ *  one feature that depends on the Agent SDK's native Claude Code binary, which the SDK looks up
+ *  lazily at the first session — so an install missing it passes every other check here and
+ *  fails only on the phone, hours later, with no local symptom. This check does that lookup up
+ *  front. It is diagnostic: nothing consults it before spawning. */
+export function checkSessionRuntime(deps: ClaudeCodeBinaryDeps = {}): DoctorCheck {
+  const lookup = findClaudeCodeBinary(deps);
+  return {
+    name: 'session-runtime',
+    ok: lookup.path !== undefined,
+    detail:
+      lookup.path !== undefined
+        ? `Claude Code binary for remote sessions: ${lookup.path}`
+        : `remote sessions (/run) cannot start — ${lookup.error}`,
+  };
+}
+
 /** Run every check for the given paths. */
 export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
   return [
@@ -223,6 +241,7 @@ export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
     checkVault(paths),
     await checkLiveLogin(paths),
     checkClaudeJson(paths),
+    checkSessionRuntime(),
     { name: 'lock', ok: true, detail: join(paths.vaultDir, '.lock') },
   ];
 }

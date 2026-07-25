@@ -179,3 +179,9 @@ pnpm run test
 The published `@andrewtjin/cctl` package (`packages/cctl-publish`) is a separate
 single-file esbuild bundle of the same CLI + daemon — see that package for the
 prepublish smoke test that guards it.
+
+One dependency is deliberately NOT bundled: `@anthropic-ai/claude-agent-sdk`, which
+spawns the Claude Code binary that backs every remote session. The SDK finds that binary
+by resolving a per-platform package from its own module location, so inlining it produces
+a bundle that builds and boots but cannot start a session. It stays external and declared,
+and the smoke test re-runs that lookup against a staged install so the gap cannot ship.
