@@ -52,14 +52,14 @@ jobs:
         run: pnpm --filter @andrewtjin/cctl run smoke-test
 
   # First platform-specific leg: exercises the real `security(1)` vault-key path that ubuntu
-  # cannot. NON-BLOCKING by design (continue-on-error; not a required check) — the authoritative
-  # macOS gate is owner-run on real hardware (docs/VERIFICATION.md gate 13). A green here only
-  # proves that OUR OWN vault-key item round-trips through real `security`; it says nothing about
-  # the CLI's cross-app item or the Keychain GUI prompt, which reproduce only on hardware with a
-  # logged-in CLI. A green macOS leg is therefore not evidence of macOS support.
+  # cannot. Not a required check, and its one hardware-sensitive step is NON-BLOCKING by design
+  # (continue-on-error on that step only, see below) — the authoritative macOS gate is owner-run
+  # on real hardware (docs/VERIFICATION.md gate 13). A green here only proves that OUR OWN
+  # vault-key item round-trips through real `security`; it says nothing about the CLI's cross-app
+  # item or the Keychain GUI prompt, which reproduce only on hardware with a logged-in CLI. A
+  # green macOS leg is therefore not evidence of macOS support.
   check-macos:
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -93,4 +93,11 @@ jobs:
         # runner — so it can't pass here (an unrelated latent gap, not a vault-path signal). This
         # file runs only on darwin (skipIf) and is the automatable half of the owner-run gate
         # (docs/VERIFICATION.md gate 13); everywhere else it skips to 0 tests.
+        #
+        # continue-on-error lives on THIS STEP, not the job: Install/Build failing is a real,
+        # shared infra break and should still turn the job red. Only this one hardware-sensitive
+        # assertion is expected to diverge from real Mac hardware and allowed to fail without
+        # blocking a merge — scoping it here (rather than job-level) means a step failure upstream
+        # of this one can no longer hide behind a job that reports green regardless.
+        continue-on-error: true
         run: pnpm exec vitest run packages/switch-engine/src/keychain.darwin.test.ts
