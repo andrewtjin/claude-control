@@ -17,7 +17,9 @@ rather no shared operator see that, self-host it (see `docs/SELF_HOST.md`).
 ## Quick start
 
 First, [add the cctl bot to a Discord server you're in](https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands) —
-that's where `/pair` runs and where approvals, questions, and usage cards reach you. Then:
+or, with no server at all, [add it to just your account](https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands)
+and DM it. Either way is where `/pair` runs and where approvals, questions, and usage
+cards reach you. (Discord is optional — see "Local-only" below.) Then:
 
 ```
 npm i -g @andrewtjin/cctl
@@ -49,6 +51,14 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
 - **Approve from anywhere.** Permission prompts and "done / waiting" notices reach
   your phone; approve or deny from Discord. Send live prompts or start a fresh
   session and watch milestones stream back.
+
+## Local-only (no Discord)
+
+Just want the daemon, with everything in your terminal? Skip the pairing step in
+`cctl setup` (type `s`) and nothing else changes: `cctl usage` and `cctl timeline`
+show every limit and which account to burn, `cctl switch` hops accounts manually,
+and `cctl daemon run --auto-switch` gives you the same before-the-wall automatic
+switching — no Discord anywhere. Pair later anytime with `cctl setup --reconfigure`.
 
 ## Platform
 

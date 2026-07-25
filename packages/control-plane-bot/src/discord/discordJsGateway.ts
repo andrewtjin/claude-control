@@ -9,10 +9,12 @@
 
 import {
   ActionRowBuilder,
+  ApplicationIntegrationType,
   AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
+  InteractionContextType,
   Client,
   Events,
   GatewayIntentBits,
@@ -828,7 +830,19 @@ export class DiscordJsGateway implements DiscordGateway {
           o.setName('request').setDescription('Request id').setRequired(true),
         ),
       account('reauth', 'Re-authenticate a quarantined account'),
-    ].map((c) => c.toJSON());
+      // Every command works identically from a server or from a DM with a user-installed
+      // app (handlers key solely off interaction.user.id, and delivery defaults to DM), so
+      // both contexts are declared on all of them. Without these, the commands stay
+      // guild-install-only and the portal's "User Install" toggle does nothing.
+    ].map((c) =>
+      c
+        .setIntegrationTypes(
+          ApplicationIntegrationType.GuildInstall,
+          ApplicationIntegrationType.UserInstall,
+        )
+        .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM)
+        .toJSON(),
+    );
   }
 
   private async onInteraction(interaction: Interaction): Promise<void> {
