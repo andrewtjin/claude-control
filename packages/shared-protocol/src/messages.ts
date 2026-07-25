@@ -188,6 +188,72 @@ const PermissionLapsedPayload = z.object({
   reason: z.enum(['local', 'expired', 'shutdown']),
 });
 
+/** One selectable option of an AskUserQuestion question, as the CLI's tool_input carries
+ *  it. `description` is display context for the picker; only `label` round-trips into the
+ *  answer. */
+const QuestionOption = z.object({
+  label: z.string().min(1),
+  description: z.string().nullish(),
+});
+
+/** One question from AskUserQuestion's `tool_input.questions`. The CLI contract says 2–4
+ *  options and an optional short `header`, but both bounds are left tolerant here — the
+ *  tool ships new shapes without notice, and rejecting the frame would strand the session
+ *  on an unanswerable prompt. The BOT clamps whatever arrives to what Discord can render;
+ *  the daemon never re-validates the CLI's own input. */
+const Question = z.object({
+  question: z.string().min(1),
+  header: z.string().nullish(),
+  multiSelect: z.boolean().default(false),
+  options: z.array(QuestionOption).min(1),
+});
+
+/** Claude asked the user something (AskUserQuestion) and the session is blocked on the
+ *  answer. Mirrors `permission.request`: same hold-and-resolve lifecycle, but the payload
+ *  carries the full structured questions so the phone can render real pickers instead of
+ *  Approve/Deny. Questions are capped at 4 by the tool's contract; the bot additionally
+ *  clamps (never rejects) oversized frames because a lost question card blocks the
+ *  session until the hold lapses. */
+const QuestionRequestPayload = z.object({
+  requestId: RequestId,
+  sessionId: SessionId,
+  questions: z.array(Question).min(1),
+  cwd: z.string().nullish(),
+  expiresAt: z.number().int().nonnegative().nullish(),
+  /** Same tolerant-string contract as permission.request's permissionMode. */
+  permissionMode: z.string().min(1).nullish(),
+});
+
+/** One answered question. `question` echoes the question TEXT (not an index) because that
+ *  is exactly the key the CLI's `updatedInput.answers` map requires — indexes would make
+ *  the daemon re-derive the mapping and drift if the tool reorders. `selected` holds
+ *  chosen option labels (exactly 1 unless multiSelect); `otherText` is the free-form
+ *  answer and wins over `selected` when present, matching the terminal picker where
+ *  "Other" replaces a listed choice. */
+const QuestionAnswer = z.object({
+  question: z.string().min(1),
+  selected: z.array(z.string()).default([]),
+  otherText: z.string().nullish(),
+});
+
+/** The phone's answers for a `question.request`. Requires an entry per answered question;
+ *  the daemon rejects a response that leaves any of the request's questions unanswered
+ *  (a partial answer set would make the CLI re-prompt in the terminal, silently
+ *  contradicting the card's "answered" state). */
+const QuestionResponsePayload = z.object({
+  requestId: RequestId,
+  answers: z.array(QuestionAnswer).min(1),
+  idempotencyKey: IdempotencyKey,
+});
+
+/** Same contract as permission.lapsed, for a held question: the hold ended with NO phone
+ *  answer (`local`: answered at the terminal / socket died, `expired`: hold timer fired,
+ *  `shutdown`: daemon closed) and the card's pickers are now dead. */
+const QuestionLapsedPayload = z.object({
+  requestId: RequestId,
+  reason: z.enum(['local', 'expired', 'shutdown']),
+});
+
 const PromptInjectPayload = z.object({
   sessionId: SessionId,
   text: z.string().min(1),
@@ -325,7 +391,11 @@ const HelloResultPayload = z.object({
 
 const PairClaimPayload = z.object({
   pairingCode: z.string().min(1),
-  hostLabel: z.string(),
+  // A short display label (the daemon sends its host name). Bounded because the bot persists it
+  // verbatim into the shared bindings.json and rewrites that whole file on every pairing — an
+  // unbounded label would let one claimer bloat every other user's pairing write. 256 covers any
+  // real hostname (DNS caps a name at 253) with room to spare.
+  hostLabel: z.string().max(256),
 });
 
 const PairResultPayload = z.object({
@@ -376,6 +446,9 @@ export const messageSchemas = {
   'permission.request': frame('permission.request', PermissionRequestPayload),
   'permission.response': frame('permission.response', PermissionResponsePayload),
   'permission.lapsed': frame('permission.lapsed', PermissionLapsedPayload),
+  'question.request': frame('question.request', QuestionRequestPayload),
+  'question.response': frame('question.response', QuestionResponsePayload),
+  'question.lapsed': frame('question.lapsed', QuestionLapsedPayload),
   'prompt.inject': frame('prompt.inject', PromptInjectPayload),
   'session.spawn': frame('session.spawn', SessionSpawnPayload),
   'session.output': frame('session.output', SessionOutputPayload),
@@ -402,6 +475,9 @@ export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['permission.request'],
   messageSchemas['permission.response'],
   messageSchemas['permission.lapsed'],
+  messageSchemas['question.request'],
+  messageSchemas['question.response'],
+  messageSchemas['question.lapsed'],
   messageSchemas['prompt.inject'],
   messageSchemas['session.spawn'],
   messageSchemas['session.output'],

@@ -101,7 +101,9 @@ If already paired: informational only, with the re-pair command for later.
 Otherwise, the invite/instructions come **before** the code prompt:
 
 ```
-In your Discord server, run `/pair` to get a one-time code.
+In your Discord server (or a DM with the bot), run `/pair` to get a one-time code.
+No server with the bot yet? Add it first: <bot invite URL>
+Or add it to just your account (no server needed) and DM it: <user-install URL>
 Enter it below, or type s to skip and set up local-only.
 Pairing code (or `s` to skip):
 ```

@@ -102,6 +102,6 @@ describe('buildProgram', () => {
   });
 
   it('reports its version', () => {
-    expect(buildProgram().version()).toBe('0.1.0');
+    expect(buildProgram().version()).toBe('0.2.1');
   });
 });

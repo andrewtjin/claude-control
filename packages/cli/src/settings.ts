@@ -41,10 +41,30 @@ import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 export type { SettingRow } from '@claude-control/shared-protocol';
 
+/** The build version, surfaced by `cctl --version` and as a settings row on both the CLI and
+ *  the phone. Lives here (not program.ts) so the daemon's settings report can carry it: after
+ *  an `npm i -g` update the running daemon keeps its old build until restarted, and the two
+ *  rows ('cli build' vs 'daemon build') are how an operator sees that skew. */
+export const VERSION = '0.2.1';
+
 /** The hosted control plane a published build dials with no configuration at all. This is the
  *  last fallback in the precedence ladder, not a lock-in: `--relay`, `CCTL_RELAY_URL`, and
  *  `relayUrl` in `config.json` each override it, so self-hosting never needs a rebuild. */
 export const DEFAULT_RELAY_URL = 'wss://cctl.andrewtjin.com';
+
+/** OAuth2 install link for the shared Discord bot. `applications.commands` is required or
+ *  `/pair` never appears in the invited server; the permission bits cover message/embed/file
+ *  delivery plus private-thread mode (View Channel and Read Message History included so the
+ *  bot can see its host channel and re-fetch its own cards). */
+export const BOT_INVITE_URL =
+  'https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands';
+
+/** User-install variant of the invite: adds the app to a Discord ACCOUNT rather than a
+ *  server, so `/pair` and DM delivery work with no server at all. No `bot` scope and no
+ *  permission bits — a user-installed app has no guild presence (which is also why
+ *  private-thread mode still needs the server invite above). */
+export const BOT_USER_INSTALL_URL =
+  'https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands';
 
 // ---------------------------------------------------------------------------
 // Env parsing (shared with daemonRun.ts — the single source of truth)
@@ -171,6 +191,7 @@ export interface DaemonConfig {
     cooldownMs: number | undefined;
     waitingCards: boolean;
     permissionHoldMs: number | undefined;
+    questionHoldMs: number | undefined;
     commandOutputCards: boolean;
     fullToolOutput: boolean;
     identityCheck: boolean;
@@ -228,6 +249,10 @@ export function resolveDaemonConfig(
   // The hook contract offers ONE decision channel: while a permission is held for a remote
   // decision the terminal cannot prompt. A shorter hold favors keyboard-first use.
   const permissionHoldMs = envNumber(env, 'CCTL_PERMISSION_HOLD_MS');
+  // Questions (AskUserQuestion) share the permission hold's tradeoff but not necessarily its
+  // tuning: a question is usually mid-flow, so an operator may want the terminal picker back
+  // sooner than they want permission prompts back. Falls back to the permission hold.
+  const questionHoldMs = envNumber(env, 'CCTL_QUESTION_HOLD_MS');
   // Default ON: a remote operator can't see the terminal, so every shell command's output is
   // pushed as a card in every permission mode; `off` silences chatty sessions.
   const commandOutputEnv = envBool(env, 'CCTL_COMMAND_OUTPUT');
@@ -241,6 +266,14 @@ export function resolveDaemonConfig(
   const identityCheck = identityCheckEnv ?? true;
 
   const rows: SettingRow[] = [
+    {
+      // Resolved by the daemon at startup, so via the report/snapshot this names the build
+      // the RUNNING daemon is on — which can trail the CLI's after an npm update.
+      name: 'daemon build',
+      value: `v${VERSION}`,
+      source: 'default',
+      detail: 'update: npm i -g @andrewtjin/cctl, then restart the daemon',
+    },
     {
       name: 'auto-switch',
       value: autoSwitch ? 'on' : 'off',
@@ -309,6 +342,13 @@ export function resolveDaemonConfig(
       detail: 'CCTL_PERMISSION_HOLD_MS (remote-decision window; local prompt appears after)',
     },
     {
+      name: 'question hold',
+      value: `${Math.round((questionHoldMs ?? permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS) / 1000)}s`,
+      source: envSource(questionHoldMs !== undefined),
+      detail:
+        'CCTL_QUESTION_HOLD_MS (remote-answer window for questions; terminal picker appears after)',
+    },
+    {
       name: 'command output cards',
       value: commandOutputCards ? 'on' : 'off',
       source: envSource(commandOutputEnv !== undefined),
@@ -355,6 +395,7 @@ export function resolveDaemonConfig(
       cooldownMs,
       waitingCards,
       permissionHoldMs,
+      questionHoldMs,
       commandOutputCards,
       fullToolOutput,
       identityCheck,
@@ -375,6 +416,12 @@ export function resolveCliSettings(env: NodeJS.ProcessEnv, colorOn: boolean): Se
   const noColorSet = env['NO_COLOR'] !== undefined && env['NO_COLOR'] !== '';
   const effectiveCadence = cadence ?? DEFAULT_MIN_SWITCH_INTERVAL_MS;
   return [
+    {
+      name: 'cli build',
+      value: `v${VERSION}`,
+      source: 'default',
+      detail: 'the build running this command (compare with daemon build below)',
+    },
     {
       name: 'color',
       value: colorOn ? 'on' : 'off',
