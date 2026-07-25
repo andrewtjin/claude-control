@@ -33,6 +33,12 @@ Two services come up:
 - **`caddy`** — reverse proxy on 80/443, terminating automatic TLS for
   `RELAY_HOSTNAME` and forwarding to `bot`.
 
+Optional: to get per-session **private threads** instead of DM delivery, set
+`CCTL_SESSION_CHANNEL_ID` in `.env` to the id of a text channel the bot can see (right-click
+the channel → Copy Channel ID, with Developer Mode on) and enable the **Message Content
+intent** on your Discord application (Developer Portal → Bot → Message Content Intent) so
+replies typed into a thread reach the session. Left unset, everything arrives by DM.
+
 Point your own `cctl daemon run --relay wss://<RELAY_HOSTNAME>` at your hostname once
 it's up. For a self-host you want to keep, prefer `relayUrl` in `config.json` beside
 the vault — unlike a flag it survives autostart and reboots, and unlike a baked-in
