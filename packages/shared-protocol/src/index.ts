@@ -3,3 +3,5 @@
 export * from './version.js';
 export * from './messages.js';
 export * from './codec.js';
+export * from './logFormat.js';
+export * from './logger.js';

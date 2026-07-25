@@ -10,6 +10,12 @@
 //   CCTL_SESSION_CHANNEL_ID  (optional) text channel that hosts per-session private
 //                            threads; unset → session output is delivered by DM
 //   CCTL_LOG_LEVEL           (default info)
+//   CCTL_LOG_FORMAT          (default: pretty on a TTY, json otherwise) 'pretty' or 'json'
+//                            overrides the auto-detection either way; see shared-protocol's
+//                            createLogger.
+//   CCTL_LOG_FILE            (optional) path to also append NDJSON logs to, regardless of
+//                            CCTL_LOG_FORMAT — useful since this process's stdout is not a TTY
+//                            when run under Docker/Compose and it defaults to json anyway.
 //   CCTL_MAX_PENDING_CONNECTIONS  (optional) cap on concurrent unauthenticated daemon sockets;
 //                            unset uses the relay's built-in default. Raise it for a self-host
 //                            serving many daemons that may reconnect at once.
@@ -21,7 +27,7 @@
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import pino from 'pino';
+import { createLogger } from '@claude-control/shared-protocol';
 import { BindingStore } from './bindings.js';
 import { PairingService } from './pairing.js';
 import { RelayServer, type RelaySender } from './relay.js';
@@ -59,13 +65,7 @@ async function main(): Promise<void> {
   const stateDir = process.env.CCTL_BOT_STATE_DIR ?? join(homedir(), '.claude-control-bot');
   mkdirSync(stateDir, { recursive: true });
 
-  const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
-  const logger: Logger = {
-    debug: (obj, msg) => p.debug(obj, msg),
-    info: (obj, msg) => p.info(obj, msg),
-    warn: (obj, msg) => p.warn(obj, msg),
-    error: (obj, msg) => p.error(obj, msg),
-  };
+  const logger: Logger = createLogger({ defaultLevel: 'info' });
 
   const bindings = new BindingStore(join(stateDir, 'bindings.json'));
   await bindings.load();
