@@ -102,6 +102,7 @@ Otherwise, the invite/instructions come **before** the code prompt:
 
 ```
 In your Discord server, run `/pair` to get a one-time code.
+No server with the bot yet? Add it first: <bot invite URL>
 Enter it below, or type s to skip and set up local-only.
 Pairing code (or `s` to skip):
 ```
