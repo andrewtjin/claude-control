@@ -217,12 +217,24 @@ describe('checkLiveLogin (darwin)', () => {
     else process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT = saved.a;
   });
   // Inject a fake channel so the check never touches real `security(1)`, which on a Mac could
-  // raise the Keychain GUI prompt this check has no way to answer.
-  const fakeChannel = (creds: unknown): LiveCredentialChannel =>
-    ({
-      readLiveCredentials: () => Promise.resolve(creds),
-      writeLiveCredentials: () => Promise.resolve(),
-    }) as LiveCredentialChannel;
+  // raise the Keychain GUI prompt this check has no way to answer. `target` defaults to the
+  // shipped default so the existing assertions read naturally, but callers can override it to
+  // prove `checkLiveLogin` reports the CHANNEL's target, not a value it recomputed itself.
+  const fakeChannel = (
+    creds: unknown,
+    target: { service: string; account: string } = {
+      service: 'Claude Code-credentials',
+      account: 'login-user',
+    },
+  ): LiveCredentialChannel => ({
+    // `checkLiveLogin` only checks `!== undefined`, so test callers pass a partial credential
+    // shape; cast just this return value rather than the whole object, so `target`'s shape is
+    // still checked structurally against `LiveCredentialChannel`.
+    readLiveCredentials: () =>
+      Promise.resolve(creds) as ReturnType<LiveCredentialChannel['readLiveCredentials']>,
+    writeLiveCredentials: () => Promise.resolve(),
+    target,
+  });
 
   it('names the effective Keychain service/account so a wrong item name self-diagnoses', async () => {
     const res = await checkLiveLogin(paths, 'darwin', fakeChannel(undefined));
@@ -237,5 +249,17 @@ describe('checkLiveLogin (darwin)', () => {
     const res = await checkLiveLogin(paths, 'darwin', fakeChannel({ accessToken: 'x' }));
     expect(res.ok).toBe(true);
     expect(res.detail).toContain('service="Claude Code-credentials"');
+  });
+
+  it('reports the CHANNEL target, not a value recomputed independently of it', async () => {
+    // A channel configured with a non-default target (as an operator's env override would
+    // produce) must show up verbatim in `detail`. If `checkLiveLogin` ever went back to
+    // recomputing the target itself instead of reading `channel.target`, this target would
+    // never appear and the assertion below would fail.
+    const custom = { service: 'Custom-Item', account: 'alt-user' };
+    const res = await checkLiveLogin(paths, 'darwin', fakeChannel(undefined, custom));
+    expect(res.detail).toContain('service="Custom-Item"');
+    expect(res.detail).toContain('account="alt-user"');
+    expect(res.detail).not.toContain('Claude Code-credentials');
   });
 });

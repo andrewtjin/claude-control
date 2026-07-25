@@ -182,12 +182,16 @@ export function resolveClaudeCliKeychainTarget(env: NodeJS.ProcessEnv = process.
   service: string;
   account: string;
 } {
-  // `||` (not `??`): a set-but-blank override (`export CLAUDE_CLI_KEYCHAIN_SERVICE=`) is an
-  // operator slip, not an intentional empty item name — fall back to the default there too. An
-  // empty service/account is never a valid `security(1)` target, so this can only help.
+  // Trim first: a set-but-blank-or-whitespace override (`export CLAUDE_CLI_KEYCHAIN_SERVICE=`,
+  // or a stray space from a copy-pasted config line) is an operator slip, not an intentional
+  // empty item name — fall back to the default there too. `||` (not `??`) then treats the
+  // trimmed-empty result the same as unset. An empty/blank service or account is never a valid
+  // `security(1)` target, so this can only help.
+  const service = env.CLAUDE_CLI_KEYCHAIN_SERVICE?.trim();
+  const account = env.CLAUDE_CLI_KEYCHAIN_ACCOUNT?.trim();
   return {
-    service: env.CLAUDE_CLI_KEYCHAIN_SERVICE || CLAUDE_CLI_KEYCHAIN_SERVICE,
-    account: env.CLAUDE_CLI_KEYCHAIN_ACCOUNT || userInfo().username,
+    service: service || CLAUDE_CLI_KEYCHAIN_SERVICE,
+    account: account || userInfo().username,
   };
 }
 
@@ -201,13 +205,18 @@ export function resolveClaudeCliKeychainTarget(env: NodeJS.ProcessEnv = process.
  * A missing item reads as `undefined` ("nobody logged in"), exactly like a missing file.
  */
 export class KeychainCredentialChannel implements LiveCredentialChannel {
-  private readonly service: string;
-  private readonly account: string;
+  /** The exact service/account this instance reads and writes. Public (not just internal
+   *  state) so a caller — `cctl doctor` in particular — can report the EXACT target that will
+   *  actually be hit, instead of recomputing it via a second, independent call that could drift
+   *  out of sync with what this channel was actually constructed with. */
+  readonly target: { service: string; account: string };
   private readonly run: ExecRunner;
 
   constructor(options?: { service?: string; account?: string; run?: ExecRunner }) {
-    this.service = options?.service ?? CLAUDE_CLI_KEYCHAIN_SERVICE;
-    this.account = options?.account ?? userInfo().username;
+    this.target = {
+      service: options?.service ?? CLAUDE_CLI_KEYCHAIN_SERVICE,
+      account: options?.account ?? userInfo().username,
+    };
     this.run = options?.run ?? defaultExecRunner;
   }
 
@@ -232,7 +241,7 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
       await this.run(
         'security',
         ['-i'],
-        `add-generic-password -U -s ${quoteSecurityArg(this.service)} -a ${quoteSecurityArg(this.account)} -w ${quoteSecurityArg(json)}\n`,
+        `add-generic-password -U -s ${quoteSecurityArg(this.target.service)} -a ${quoteSecurityArg(this.target.account)} -w ${quoteSecurityArg(json)}\n`,
       );
     } catch (err) {
       throw new VaultError('failed to write live credentials to the login Keychain', {
@@ -248,9 +257,9 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
       out = await this.run('security', [
         'find-generic-password',
         '-s',
-        this.service,
+        this.target.service,
         '-a',
-        this.account,
+        this.target.account,
         '-w',
       ]);
     } catch (err) {
