@@ -181,6 +181,63 @@ describe('Vault registry + bundles', () => {
       expect(after?.billingType).toBe('stripe_subscription');
     });
 
+    it('keeps identity anchors when the bundle carries a PARTIAL oauthAccount block', async () => {
+      // The live `~/.claude.json` block is unvalidated and legitimately arrives without a uuid —
+      // the switch engine designs for exactly that case. Treating "not reported" as "no longer
+      // true" would erase the anchors that relogin attribution, active-account reconciliation,
+      // usage-cache attribution and token-ownership all gate on. Each of those reads "if
+      // present", so losing an anchor turns the check off silently instead of failing.
+      const v = await vault();
+      const acct = await v.addAccount(
+        'work',
+        withOauth({
+          accountUuid: 'uuid-1',
+          emailAddress: 'me@x.com',
+          organizationUuid: 'org-1',
+        }),
+      );
+
+      await v.writeBundle(acct.id, withOauth({ organizationRole: 'admin' }));
+
+      const after = await v.getAccount(acct.id);
+      expect(after?.accountUuid).toBe('uuid-1');
+      expect(after?.emailAddress).toBe('me@x.com');
+      expect(after?.organizationUuid).toBe('org-1');
+    });
+
+    it('adopts a CHANGED identity anchor, since set-only must not mean write-once', async () => {
+      const v = await vault();
+      const acct = await v.addAccount('work', withOauth({ emailAddress: 'old@x.com' }));
+      await v.writeBundle(acct.id, withOauth({ emailAddress: 'new@x.com' }));
+      expect((await v.getAccount(acct.id))?.emailAddress).toBe('new@x.com');
+    });
+
+    it('drops non-string upstream values instead of persisting them for the renderer to hit', async () => {
+      // `oauthAccount` is an open JSON block, so any type can arrive. A non-string reaching the
+      // registry is stored permanently and throws in the accounts-list renderer on every later
+      // run — unrecoverable without hand-editing the registry file.
+      const v = await vault();
+      const acct = await v.addAccount(
+        'work',
+        withOauth({ billingType: 12345, subscriptionCreatedAt: 1700000000000 }),
+      );
+      expect(acct).not.toHaveProperty('billingType');
+      expect(acct).not.toHaveProperty('subscriptionCreatedAt');
+
+      // Same guard on the refresh path, and a bad value must also clear a previously good one
+      // rather than leaving a stale fact rendering.
+      const ok = await v.addAccount('other', withOauth({ billingType: 'stripe_subscription' }));
+      await v.writeBundle(ok.id, withOauth({ billingType: { nested: true } }));
+      expect(await v.getAccount(ok.id)).not.toHaveProperty('billingType');
+    });
+
+    it('ignores a non-string identity anchor rather than adopting or erasing it', async () => {
+      const v = await vault();
+      const acct = await v.addAccount('work', withOauth({ accountUuid: 'uuid-1' }));
+      await v.writeBundle(acct.id, withOauth({ accountUuid: 42 }));
+      expect((await v.getAccount(acct.id))?.accountUuid).toBe('uuid-1');
+    });
+
     it('never writes token material into the registry while refreshing', async () => {
       // The registry is plaintext by design. The refresh path reads a decrypted bundle, so it
       // is exactly where a token could leak into it by accident.

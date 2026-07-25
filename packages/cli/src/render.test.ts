@@ -170,6 +170,23 @@ describe('renderAccountsTable', () => {
       }
     });
 
+    it('renders "unknown" rather than hanging when the caller passes a non-finite clock', () => {
+      // The estimate walks candidate anniversaries forward until one passes `nowMs`. A NaN or
+      // Infinity `nowMs` makes that comparison unsatisfiable, so an unguarded loop would spin
+      // forever and wedge the CLI instead of failing.
+      for (const badNow of [Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(
+          billing(
+            {
+              billingType: 'stripe_subscription',
+              subscriptionCreatedAt: '2026-01-15T12:00:00.000Z',
+            },
+            badNow,
+          ),
+        ).toMatch(/unknown/);
+      }
+    });
+
     it('falls through an EXPIRED trial to the billing estimate', () => {
       // A trial end in the past is no longer the next billing event; continuing to show it
       // would tell the user a date that has already gone by.
