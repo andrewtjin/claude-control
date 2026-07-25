@@ -1,6 +1,6 @@
 {
   "name": "@andrewtjin/cctl",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "cctl — switch Claude Code accounts, see cross-account usage, and drive sessions from your phone.",
   "type": "module",

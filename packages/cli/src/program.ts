@@ -101,7 +101,7 @@ import {
   type SettingsSection,
 } from './settings.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 /** Build the full `cctl` program. Exported so tests can introspect the command tree. */
 export function buildProgram(): Command {
