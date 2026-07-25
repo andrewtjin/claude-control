@@ -16,6 +16,9 @@ rather no shared operator see that, self-host it (see `docs/SELF_HOST.md`).
 
 ## Quick start
 
+First, [add the cctl bot to a Discord server you're in](https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands) —
+that's where `/pair` runs and where approvals, questions, and usage cards reach you. Then:
+
 ```
 npm i -g @andrewtjin/cctl
 cctl setup
