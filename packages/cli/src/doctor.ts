@@ -148,14 +148,18 @@ export function summarize(checks: DoctorCheck[]): { passed: number; failed: numb
 }
 
 /** Vault encryption availability, verified by a REAL protect/unprotect round-trip through
- *  this platform's protector (win32: DPAPI · darwin: Keychain+AES-GCM). On an unsupported
- *  platform the factory's error IS the report — the gap is stated, never silent. */
+ *  this platform's protector (win32: DPAPI · darwin: Keychain+AES-GCM · everywhere else:
+ *  file-key+AES-GCM). The key stores are get-or-create, so on a first run a green check is
+ *  also proof the key store is writable. `vaultKeyPath` is a test seam for the file-key
+ *  branch; production omits it and probes the real key file. */
 export async function checkVaultProtection(
   platform: NodeJS.Platform = process.platform,
+  vaultKeyPath?: string,
 ): Promise<DoctorCheck> {
-  const label = platform === 'win32' ? 'DPAPI' : platform === 'darwin' ? 'Keychain' : platform;
+  const label =
+    platform === 'win32' ? 'DPAPI' : platform === 'darwin' ? 'Keychain' : `file-key (${platform})`;
   try {
-    const p = defaultProtector(platform);
+    const p = defaultProtector(platform, vaultKeyPath);
     const probe = Buffer.from('cctl-doctor-probe');
     const ok = (await p.unprotect(await p.protect(probe))).equals(probe);
     return {

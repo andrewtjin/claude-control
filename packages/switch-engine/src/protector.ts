@@ -5,24 +5,29 @@
 
 import { DpapiProtector, type Protector } from './dpapi.js';
 import { KeychainCredentialChannel, KeychainProtector } from './keychain.js';
+import { FileKeyProtector, FileKeySource } from './fileKey.js';
 import { FileCredentialChannel, type LiveCredentialChannel } from './credentialStore.js';
-import { VaultError } from './errors.js';
-import type { Paths } from './paths.js';
+import { defaultVaultKeyPath, type Paths } from './paths.js';
 
 /** The credential-at-rest protector for this platform:
- *  win32 → DPAPI (PowerShell ProtectedData) · darwin → login-Keychain key + AES-256-GCM.
- *  Anything else throws a VaultError naming the gap — `cctl doctor` surfaces this as the
- *  platform report instead of failing silently (README "Platform" contract). */
-export function defaultProtector(platform: NodeJS.Platform = process.platform): Protector {
+ *  win32 → DPAPI (PowerShell ProtectedData) · darwin → login-Keychain key + AES-256-GCM ·
+ *  everything else (linux incl. WSL2, the BSDs) → machine-local key file + AES-256-GCM
+ *  (fileKey.ts explains why no OS secret store can be assumed off win32/darwin).
+ *  `vaultKeyPath` matters only on the file-key branch: production takes the default,
+ *  tests inject a sandbox path so no real key file is ever touched. */
+export function defaultProtector(
+  platform: NodeJS.Platform = process.platform,
+  vaultKeyPath: string = defaultVaultKeyPath(process.env, platform),
+): Protector {
   switch (platform) {
     case 'win32':
       return new DpapiProtector();
     case 'darwin':
       return new KeychainProtector();
     default:
-      throw new VaultError(
-        `no credential-at-rest protector for platform "${platform}" - supported: win32 (DPAPI), darwin (Keychain)`,
-      );
+      // The dispatch platform rides along so the protector's own win32/darwin downgrade
+      // guard judges the platform this factory chose, not the machine tests run on.
+      return new FileKeyProtector(new FileKeySource(vaultKeyPath), platform);
   }
 }
 
