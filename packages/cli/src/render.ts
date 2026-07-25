@@ -92,6 +92,10 @@ function estimateNextBillingMs(
 ): number | undefined {
   const created = new Date(subscriptionCreatedAtIso);
   if (Number.isNaN(created.getTime())) return undefined;
+  // The loop below terminates by walking candidates PAST `nowMs`; a non-finite one makes that
+  // comparison unsatisfiable and would hang the CLI rather than fail. `nowMs` is a public
+  // parameter of `renderAccountsTable`, so guard it here instead of trusting every caller.
+  if (!Number.isFinite(nowMs)) return undefined;
 
   const year = created.getUTCFullYear();
   const month = created.getUTCMonth();
