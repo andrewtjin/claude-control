@@ -43,6 +43,10 @@ importers:
         version: 3.2.7(@types/node@22.20.1)(tsx@4.23.1)
 
   packages/cctl-publish:
+    dependencies:
+      '@anthropic-ai/claude-agent-sdk':
+        specifier: ^0.3.211
+        version: 0.3.211(@anthropic-ai/sdk@0.111.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))(zod@3.25.76)
     devDependencies:
       esbuild:
         specifier: ^0.28.1

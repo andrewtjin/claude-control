@@ -9,6 +9,7 @@ import {
   summarize,
   checkVaultProtection,
   checkNodeVersion,
+  checkSessionRuntime,
   healthUrlFromRelay,
   probeRelay,
   MIN_NODE_VERSION,
@@ -116,6 +117,38 @@ describe('checkNodeVersion', () => {
   it('honors an injected floor', () => {
     expect(checkNodeVersion('v22.13.0', '23.0.0').ok).toBe(false);
     expect(checkNodeVersion('v23.0.0', '23.0.0').ok).toBe(true);
+  });
+});
+
+describe('checkSessionRuntime', () => {
+  const MANIFEST = JSON.stringify({ platforms: { 'win32-x64': { binary: 'claude.exe' } } });
+
+  it('passes and names the binary a remote session would run', () => {
+    const check = checkSessionRuntime({
+      platform: 'win32',
+      arch: 'x64',
+      readManifest: () => MANIFEST,
+      resolveFromSdk: () => 'C:/n_m/claude.exe',
+    });
+    expect(check.name).toBe('session-runtime');
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('C:/n_m/claude.exe');
+  });
+
+  it('fails with the reason when the native binary is missing', () => {
+    // The `--omit=optional` install: every other doctor check passes and only /run is broken,
+    // which is exactly the state this check exists to make visible locally.
+    const check = checkSessionRuntime({
+      platform: 'win32',
+      arch: 'x64',
+      readManifest: () => MANIFEST,
+      resolveFromSdk: () => {
+        throw new Error('Cannot find module');
+      },
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('/run');
+    expect(check.detail).toContain('--omit=optional');
   });
 });
 

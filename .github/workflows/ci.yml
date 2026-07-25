@@ -44,7 +44,9 @@ jobs:
         run: pnpm --filter @andrewtjin/cctl run build
 
       - name: Smoke test the bundle
-        # Boots the bundle standalone (no workspace symlinks) with --version/--help. Not
+        # Boots the bundle against a staged install holding only its declared dependencies (no
+        # workspace symlinks), then re-runs the Agent SDK's own native-binary lookup from that
+        # layout — the part that fails on a user's machine rather than in a build. Not
         # `doctor`: its checks (DPAPI, vault, ConPTY) are Windows-only and this runner is
         # ubuntu.
         run: pnpm --filter @andrewtjin/cctl run smoke-test
