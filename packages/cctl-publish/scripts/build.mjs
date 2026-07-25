@@ -2,9 +2,9 @@
 // Bundles the cctl CLI into one publishable file. The entry point is the *source*
 // packages/cli/src/bin.ts, not that package's own tsc output — esbuild transpiles TypeScript
 // itself, and bundling from source lets it inline every `@claude-control/*` workspace import
-// (resolved through each package's "main", so run `pnpm run build` first so those dist/
-// folders exist) into a single dist/bin.js with no workspace symlinks left to resolve at
-// install time.
+// (resolved through each package's "main" — compiled dist/, which is why prepublishOnly runs
+// the workspace `pnpm build` first: a stale dist would silently ship outdated package code)
+// into a single dist/bin.js with no workspace symlinks left to resolve at install time.
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
