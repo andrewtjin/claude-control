@@ -40,6 +40,7 @@ import {
   hookSecretPath,
   installHooks,
   readHookEndpoint,
+  readTranscriptTurns,
   writeHookForwarder,
   loadOrCreateHookSecret,
   writeHookEndpoint,
@@ -389,6 +390,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // Rewritten every start; the shutdown handler removes it so a stopped daemon leaves no
     // stale pointer. The secret file is the auth gate — this only answers "where".
     publishHookEndpoint: (port) => writeHookEndpoint(hookEndpointPath(dataDir), { port }),
+    // Absolute token counts for `/stats` on the phone, read from the transcripts Claude Code
+    // writes under this same config dir. Local file reads only; the bot receives only the sums.
+    scanTranscripts: (sinceMs) => readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs }),
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),

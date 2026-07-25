@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import type { AccountUsage, UsagePlan } from '@claude-control/shared-protocol';
+import type {
+  AccountUsage,
+  TokenStatsSnapshot,
+  TokenTotals,
+  UsagePlan,
+} from '@claude-control/shared-protocol';
 import {
   buildUsageEmbed,
   buildAccountsEmbed,
@@ -10,6 +15,7 @@ import {
   buildAnsweredQuestionEmbed,
   buildLapsedQuestionEmbed,
   buildSettingsEmbed,
+  buildStatsEmbed,
   buildSwitchResultEmbed,
   buildTimelineEmbed,
   buildDoneEmbed,
@@ -853,5 +859,97 @@ describe('session card / summary embeds — table re-rendering', () => {
     const boxLines = description.split('\n').filter((l) => /^[┌│├└]/.test(l));
     expect(boxLines.length).toBeGreaterThan(0);
     for (const line of boxLines) expect(line.length).toBeLessThanOrEqual(40);
+  });
+});
+
+describe('buildStatsEmbed', () => {
+  const t = (over: Partial<TokenTotals> = {}): TokenTotals => ({
+    input: 0,
+    output: 0,
+    cacheCreation: 0,
+    cacheRead: 0,
+    turns: 0,
+    ...over,
+  });
+
+  const snapshot = (over: Partial<TokenStatsSnapshot> = {}): TokenStatsSnapshot => ({
+    windowStartMs: 1_000_000_000_000,
+    windowEndMs: 1_000_000_000_000 + 7 * 86_400_000,
+    overall: t({
+      input: 1000,
+      output: 2_000_000,
+      cacheCreation: 3000,
+      cacheRead: 1_900_000_000,
+      turns: 1234,
+    }),
+    byAccount: [
+      { accountId: 'acct-a', label: 'main', totals: t({ cacheRead: 1_900_000_000, turns: 1000 }) },
+      { accountId: null, label: 'unattributed', totals: t({ output: 2_000_000, turns: 234 }) },
+    ],
+    byModel: [{ label: 'claude-opus-5', totals: t({ output: 2_000_000, turns: 1234 }) }],
+    byDay: [
+      { label: '2026-07-18', totals: t({ output: 1, turns: 1 }) },
+      { label: '2026-07-25', totals: t({ output: 2, turns: 2 }) },
+    ],
+    coverage: {
+      filesScanned: 42,
+      filesSkippedByMtime: 400,
+      filesUnreadable: 0,
+      malformedLines: 0,
+      duplicateTurns: 0,
+    },
+    ...over,
+  });
+
+  it('breaks the window down by account, model, day and token kind', () => {
+    const json = buildStatsEmbed(snapshot()).toJSON();
+    expect(json.title).toBe('Token usage');
+    expect(json.description).toMatch(/Last 7 days/);
+    expect(json.description).toMatch(/1\.9B/);
+    const names = (json.fields ?? []).map((f) => f.name);
+    expect(names).toEqual(['By account', 'By model', 'By day', 'Token kinds']);
+    const byAccount = (json.fields ?? []).find((f) => f.name === 'By account');
+    expect(byAccount?.value).toMatch(/\*\*main\*\*/);
+    expect(byAccount?.value).toMatch(/unattributed/);
+    const kinds = (json.fields ?? []).find((f) => f.name === 'Token kinds');
+    expect(kinds?.value).toMatch(/cache read 1\.9B/);
+  });
+
+  it('puts the most recent day first, so the clamp drops the far tail', () => {
+    const byDay = (buildStatsEmbed(snapshot()).toJSON().fields ?? []).find(
+      (f) => f.name === 'By day',
+    );
+    expect(byDay?.value.indexOf('2026-07-25')).toBeLessThan(
+      byDay?.value.indexOf('2026-07-18') ?? 0,
+    );
+  });
+
+  it('states the measurement limits on every render', () => {
+    const json = buildStatsEmbed(snapshot()).toJSON();
+    expect(json.footer?.text).toMatch(/Local Claude Code turns on the host only/);
+    expect(json.footer?.text).toMatch(/cannot be attributed/);
+    expect(json.footer?.text).toMatch(/Not a billing figure/);
+  });
+
+  it('says nothing was recorded rather than rendering empty tables', () => {
+    const json = buildStatsEmbed(
+      snapshot({ overall: t(), byAccount: [], byModel: [], byDay: [] }),
+    ).toJSON();
+    expect(json.description).toMatch(/No Claude Code turns recorded on the host/);
+    expect(json.fields ?? []).toHaveLength(0);
+    // The caveats survive the empty case — an absent number still needs its context.
+    expect(json.footer?.text).toMatch(/Not a billing figure/);
+  });
+
+  it('clamps a bucket list too long for a Discord field instead of throwing', () => {
+    const many = Array.from({ length: 400 }, (_, i) => ({
+      label: `account-with-a-long-label-${i}`,
+      accountId: `acct-${i}`,
+      totals: t({ output: 400 - i, turns: 1 }),
+    }));
+    const json = buildStatsEmbed(snapshot({ byAccount: many })).toJSON();
+    const byAccount = (json.fields ?? []).find((f) => f.name === 'By account');
+    expect(byAccount?.value.length).toBeLessThanOrEqual(1024);
+    expect(byAccount?.value).toMatch(/… \+\d+ more/);
   });
 });

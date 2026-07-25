@@ -23,6 +23,10 @@ interface UsageState {
 
 interface UserState {
   usage?: UsageState;
+  /** The daemon's last token-stats snapshot. Pushed on its own (much slower) cadence than usage
+   *  because producing one means scanning transcript files on the host, so `/stats` answers from
+   *  whatever arrived last — the payload carries its own window, which is what keeps that honest. */
+  stats?: PayloadOf<'stats.snapshot'>;
   /** The daemon's effective-settings report; a new push overwrites (a daemon restart may
    *  legitimately carry different flags). */
   settings?: PayloadOf<'settings.snapshot'>;
@@ -47,6 +51,8 @@ export class DaemonStateCache {
         usage.plan = envelope.payload.plan;
       }
       state.usage = usage;
+    } else if (isType(envelope, 'stats.snapshot')) {
+      state.stats = envelope.payload;
     } else if (isType(envelope, 'settings.snapshot')) {
       state.settings = envelope.payload;
     } else if (isType(envelope, 'session.status')) {
@@ -79,6 +85,10 @@ export class DaemonStateCache {
 
   getUsage(discordUserId: string): UsageState | undefined {
     return this.byUser.get(discordUserId)?.usage;
+  }
+
+  getStats(discordUserId: string): PayloadOf<'stats.snapshot'> | undefined {
+    return this.byUser.get(discordUserId)?.stats;
   }
 
   getSessions(discordUserId: string): SessionStatus[] {

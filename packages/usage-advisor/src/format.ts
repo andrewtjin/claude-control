@@ -23,3 +23,29 @@ export function humanizeDuration(ms: number): string {
 export function roundPct(pct: number): number {
   return Math.max(0, Math.min(100, Math.round(pct)));
 }
+
+/** Units for {@link formatTokens}, largest first. */
+const TOKEN_UNITS: readonly (readonly [number, string])[] = [
+  [1e9, 'B'],
+  [1e6, 'M'],
+  [1e3, 'k'],
+];
+
+/**
+ * Compact a token count for display: `0`, `847`, `1.2k`, `847k`, `1.2M`, `1.9B`.
+ *
+ * One decimal only while the scaled value is under 10, which is where it still carries
+ * information — "1.2M" says something "1M" does not, but "847.3k" is just noise next to "847k".
+ * Lives here rather than in either renderer because the CLI table and the Discord embed both
+ * print these counts, and the same number reading differently on the phone than in the terminal
+ * would look like two different measurements of the same thing.
+ */
+export function formatTokens(value: number): string {
+  for (const [scale, suffix] of TOKEN_UNITS) {
+    if (Math.abs(value) >= scale) {
+      const scaled = value / scale;
+      return `${scaled < 10 ? scaled.toFixed(1) : Math.round(scaled)}${suffix}`;
+    }
+  }
+  return String(Math.round(value));
+}

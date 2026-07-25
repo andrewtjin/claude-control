@@ -17,6 +17,7 @@ import {
   buildAccountsEmbed,
   buildSessionListEmbed,
   buildSettingsEmbed,
+  buildStatsEmbed,
   buildTimelineEmbed,
 } from './embeds.js';
 import type { BarRenderer } from './emojiBars.js';
@@ -71,6 +72,21 @@ export function handleTimeline(deps: CommandDeps, discordUserId: string): Comman
     kind: 'embed',
     embed: buildTimelineEmbed(usage, undefined, deps.barRenderer, deps.trackStyle),
   };
+}
+
+/** `/stats` — absolute token counts, from the last `stats.snapshot` the daemon pushed. Same
+ *  cache-answer pattern as `/usage`, but the snapshots arrive far less often (each one costs the
+ *  host a transcript scan), so the "not reported yet" copy says what to wait for rather than
+ *  implying something is broken. */
+export function handleStats(deps: CommandDeps, discordUserId: string): CommandResult {
+  const stats = deps.cache.getStats(discordUserId);
+  if (!stats) {
+    return {
+      kind: 'text',
+      text: 'No token stats yet — the daemon reports these every 15 minutes once it is running.',
+    };
+  }
+  return { kind: 'embed', embed: buildStatsEmbed(stats) };
 }
 
 /** `/settings` — the daemon's effective configuration, from the settings.snapshot it pushes

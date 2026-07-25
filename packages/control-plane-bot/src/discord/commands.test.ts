@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import type { EnvelopeDraft } from '@claude-control/shared-protocol';
+import type { Envelope, EnvelopeDraft } from '@claude-control/shared-protocol';
 import type { RelaySender, SendResult } from '../relay.js';
 import { BindingStore } from '../bindings.js';
 import { PairingService } from '../pairing.js';
@@ -11,6 +11,7 @@ import {
   handleAccounts,
   handleSessions,
   handleSettings,
+  handleStats,
   handleStatus,
   handleSwitch,
   handleRun,
@@ -429,5 +430,64 @@ describe('handleReauth stays host-only and prints the REAL CLI verb', () => {
     expect(result.kind === 'text' && result.text).not.toContain('--fresh');
     expect(result.kind === 'text' && result.text).not.toContain('cctl login');
     expect(sent).toHaveLength(0);
+  });
+});
+
+describe('handleStats', () => {
+  function statsEnvelope(discordUserId: string): Envelope {
+    return {
+      v: 1,
+      id: 'stats-1',
+      ts: 0,
+      daemonId: 'daemon-1',
+      discordUserId,
+      type: 'stats.snapshot',
+      payload: {
+        windowStartMs: 0,
+        windowEndMs: 7 * 86_400_000,
+        overall: { input: 1, output: 2, cacheCreation: 3, cacheRead: 4, turns: 5 },
+        byAccount: [
+          {
+            accountId: 'acct-a',
+            label: 'main',
+            totals: { input: 1, output: 2, cacheCreation: 3, cacheRead: 4, turns: 5 },
+          },
+        ],
+        byModel: [],
+        byDay: [],
+        coverage: {
+          filesScanned: 1,
+          filesSkippedByMtime: 0,
+          filesUnreadable: 0,
+          malformedLines: 0,
+          duplicateTurns: 0,
+        },
+      },
+    };
+  }
+
+  it('says what to wait for when no snapshot has arrived yet', () => {
+    const { relay } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const result = handleStats(makeDeps(relay), 'user-a');
+    expect(result.kind).toBe('text');
+    expect(result.kind === 'text' && result.text).toMatch(/every 15 minutes/);
+  });
+
+  it('renders the last snapshot the daemon pushed, sending nothing to the daemon', () => {
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const deps = makeDeps(relay);
+    deps.cache.record('user-a', statsEnvelope('user-a'));
+    const result = handleStats(deps, 'user-a');
+    expect(result.kind).toBe('embed');
+    expect(result.kind === 'embed' && result.embed.toJSON().title).toBe('Token usage');
+    // A cache read, never a round trip — /stats must answer with the daemon offline.
+    expect(sent).toHaveLength(0);
+  });
+
+  it('never answers one user with another user daemon stats', () => {
+    const { relay } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const deps = makeDeps(relay);
+    deps.cache.record('user-a', statsEnvelope('user-a'));
+    expect(handleStats(deps, 'user-b').kind).toBe('text');
   });
 });
