@@ -778,6 +778,51 @@ describe('Daemon lifecycle', () => {
     }
   });
 
+  it('answers spawn_failed with the cause when the session never starts', async () => {
+    // `/run`'s Discord reply is sent when the frame leaves the relay, so a spawn that dies before
+    // a handle exists would otherwise leave the phone on "Session spawn requested." forever with
+    // the reason only in the daemon's local log.
+    sessionManager.spawnManaged.mockImplementationOnce(() =>
+      Promise.reject(new Error('registry is locked')),
+    );
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-fail', prompt: 'do the thing', idempotencyKey: 'k' },
+    });
+
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const error = relay.received.find((e) => e.type === 'error');
+    if (error?.type === 'error') {
+      expect(error.payload.code).toBe('spawn_failed');
+      expect(error.payload.message).toContain('registry is locked');
+    }
+  });
+
+  it('does not double-report a failure the running session already owns', async () => {
+    // Once a handle exists the session's own event stream carries its failures (text + a `failed`
+    // status). A second envelope from the spawn path would report the same thing twice, so the
+    // catch above must stay narrow.
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-late', prompt: 'do the thing', idempotencyKey: 'k' },
+    });
+    await waitFor(() => sessionManager.spawnManaged.mock.calls.length > 0);
+
+    const handle = sessionManager.get('spawned-session') as
+      ReturnType<typeof makeFakeHandle> | undefined;
+    handle?.emit({ kind: 'output', text: 'Error: Not logged in · Please run /login' });
+    handle?.emit({ kind: 'status', state: 'failed' });
+
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'session.status' && e.payload.state === 'failed'),
+    );
+    expect(relay.received.some((e) => e.type === 'error')).toBe(false);
+  });
+
   it('stamps a stable per-run epoch on every session.output envelope', async () => {
     // The epoch lets the bot tell a restart-induced seq reset (re-numbered from 0) apart from real
     // output loss. It must be present and CONSTANT within a single daemon run.
