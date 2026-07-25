@@ -46,6 +46,13 @@ export type { SettingRow } from '@claude-control/shared-protocol';
  *  `relayUrl` in `config.json` each override it, so self-hosting never needs a rebuild. */
 export const DEFAULT_RELAY_URL = 'wss://cctl.andrewtjin.com';
 
+/** OAuth2 install link for the shared Discord bot. `applications.commands` is required or
+ *  `/pair` never appears in the invited server; the permission bits cover message/embed/file
+ *  delivery plus private-thread mode (View Channel and Read Message History included so the
+ *  bot can see its host channel and re-fetch its own cards). */
+export const BOT_INVITE_URL =
+  'https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands';
+
 // ---------------------------------------------------------------------------
 // Env parsing (shared with daemonRun.ts — the single source of truth)
 // ---------------------------------------------------------------------------
