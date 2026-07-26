@@ -12,6 +12,12 @@ export {
   type AutoSwitchPolicy,
 } from './autoswitch.js';
 export { humanizeDuration, roundPct } from './format.js';
+export {
+  planWeight,
+  type PlanTierSignals,
+  type PlanWeightResult,
+  type PlanWeightSource,
+} from './planWeight.js';
 export { severityOf, worstSeverity, type Severity } from './severity.js';
 export { computePacing, type AccountPacing, type Pacing, type PacingVerdict } from './pacing.js';
 export {

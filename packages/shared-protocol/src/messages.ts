@@ -41,7 +41,13 @@ export const UsageLimit = z.object({
 
 /** Per-account usage as the daemon reports it to the phone. `source` records whether the
  *  numbers are live (endpoint) or cached (tier-0 `~/.claude.json`), with a fetch timestamp
- *  so the UI can label staleness rather than pretend cached data is fresh. */
+ *  so the UI can label staleness rather than pretend cached data is fresh.
+ *
+ *  Deliberately carries NO monetary fields. The usage endpoint also returns an extra-usage
+ *  credit `spend` block, but this envelope is relayed in cleartext through a host that is not
+ *  the user's (see `docs/THREAT_MODEL.md`, "In-transit visibility"), so per-account dollar
+ *  amounts must not ride along until something actually renders them — the privacy cost is
+ *  paid the moment the field is populated, not the moment it is read. */
 export const AccountUsage = z.object({
   accountId: AccountId,
   label: z.string(),
