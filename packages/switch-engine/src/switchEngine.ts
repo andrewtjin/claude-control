@@ -98,8 +98,9 @@ export class SwitchEngine {
   constructor(options: SwitchEngineOptions) {
     this.paths = options.paths;
     this.clock = options.clock ?? Date.now;
+    this.log = options.logger ?? noopLogger;
     const protector = options.protector ?? defaultProtector();
-    this.vault = new Vault(this.paths.vaultDir, protector, this.clock);
+    this.vault = new Vault(this.paths.vaultDir, protector, this.clock, this.log);
     this.credStore = new CredentialStore(
       this.paths,
       options.liveCredentialChannel ?? defaultLiveCredentialChannel(this.paths),
@@ -111,7 +112,6 @@ export class SwitchEngine {
     this.refreshSkewMs = options.refreshSkewMs ?? DEFAULT_REFRESH_SKEW_MS;
     this.minSwitchIntervalMs = options.minSwitchIntervalMs ?? DEFAULT_MIN_SWITCH_INTERVAL_MS;
     this.lockOptions = options.lockOptions ?? {};
-    this.log = options.logger ?? noopLogger;
   }
 
   // ---- registry mutators (lock-guarded) ----
@@ -594,11 +594,19 @@ export class SwitchEngine {
     if (prevUuid !== undefined && liveUuid !== undefined && prevUuid !== liveUuid) return false;
     if (liveNow.refreshToken === prevBundle.claudeAiOauth.refreshToken) return false;
 
+    // Identity precedence: the live block goes into this account's bundle only when it PROVABLY
+    // belongs to it — both sides report a uuid and they agree. Otherwise the bundle keeps its own
+    // block, because an unprovable live block (partial, or belonging to whoever the CLI logged in
+    // last) would stamp a foreign identity onto this bundle, and identity is what every
+    // downstream attribution check keys on. Adoption exists to save a rotated TOKEN, so it has no
+    // business re-identifying the account it saves it into; when neither side has a block the
+    // write carries none rather than inventing one.
+    const provenLive =
+      liveUuid !== undefined && liveUuid === prevUuid ? liveOauthAccount : undefined;
+    const oauthAccount = provenLive ?? prevBundle.oauthAccount;
     await this.vault.writeBundle(prevActiveId, {
       claudeAiOauth: liveNow,
-      ...((liveOauthAccount ?? prevBundle.oauthAccount)
-        ? { oauthAccount: liveOauthAccount ?? prevBundle.oauthAccount }
-        : {}),
+      ...(oauthAccount ? { oauthAccount } : {}),
     });
     this.audit.append({
       ts: this.clock(),

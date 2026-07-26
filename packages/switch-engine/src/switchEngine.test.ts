@@ -349,6 +349,27 @@ describe('activate — reconcile-by-reading', () => {
     const result = await h.engine.activate(accountB.id);
     expect(result.adoptedPreviousRotation).toBe(false);
   });
+
+  it('adopts the rotated token without taking an unprovable live identity with it', async () => {
+    // The live identity block is unvalidated and can be partial — here it reports no uuid, so
+    // nothing proves it describes A. Adoption exists to save a rotated TOKEN; carrying that
+    // block into A's bundle would re-identify A off evidence that does not name it, and the
+    // identity in a bundle is what every attribution check downstream keys on.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    const liveA = (await h.credStore.readLiveCredentials())!;
+    await h.credStore.writeLiveCredentials({ ...liveA, refreshToken: 'cli-rotated' });
+    await h.credStore.writeOauthAccount({ emailAddress: 'stranger@x.com' });
+
+    const result = await h.engine.activate(accountB.id);
+
+    expect(result.adoptedPreviousRotation).toBe(true);
+    const adopted = await h.vault.readBundle(accountA.id);
+    expect(adopted.claudeAiOauth.refreshToken).toBe('cli-rotated');
+    expect(adopted.oauthAccount?.accountUuid).toBe('uuid-A');
+    expect(adopted.oauthAccount?.emailAddress).toBe('A@x.com');
+    expect((await h.vault.getAccount(accountA.id))?.emailAddress).toBe('A@x.com');
+  });
 });
 
 describe('active-id reconciliation (external /login inside the Claude CLI)', () => {

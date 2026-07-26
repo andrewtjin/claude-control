@@ -15,6 +15,7 @@ import type { CredentialBundle, Registry, StoredAccount } from './types.js';
 import type { Protector } from './dpapi.js';
 import { atomicWriteFile, ensureDir, readJsonIfExists, removeIfExists } from './fsutil.js';
 import { UnknownAccountError, VaultError } from './errors.js';
+import { noopLogger, type Logger } from './logger.js';
 
 /** A fresh empty registry. MUST be a factory, not a shared constant — callers mutate the
  *  `accounts` array in place, and a shared array would leak accounts between vaults. */
@@ -22,8 +23,8 @@ function emptyRegistry(): Registry {
   return { activeId: null, accounts: [] };
 }
 
-/** Registry fields that identify WHICH account a row is. Written once and never removed by a
- *  later bundle write — see `setIfPresent`. */
+/** Registry fields that identify WHICH account a row is. Filled once and never changed or
+ *  removed by a later bundle write — see `fillAnchor`. */
 type IdentityKey = 'accountUuid' | 'emailAddress' | 'organizationUuid';
 
 /** Registry fields describing an account's CURRENT plan/billing state — mutable, and meaningful
@@ -47,18 +48,45 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
-/** Set an identity anchor, or leave it alone when the bundle does not carry one. NEVER deletes.
+/** FILL an identity anchor the registry does not have yet. Never deletes it, and never CHANGES
+ *  one that is already stored.
  *
  *  These anchors gate correctness checks elsewhere — relogin attribution (a mismatch is fatal),
  *  `getActiveId()` reconciliation, usage-cache attribution, poll token ownership — and every one
  *  of those is written as "if present", so a missing anchor does not fail loudly, it silently
  *  turns the check off. Live config blocks legitimately arrive partial, so "not reported on this
- *  write" must never be read as "no longer true about this account". */
-function setIfPresent(account: StoredAccount, key: IdentityKey, value: unknown): boolean {
+ *  write" must never be read as "no longer true about this account".
+ *
+ *  A DIFFERENT value is refused for the mirror-image reason. An account's identity is stable by
+ *  definition, so a bundle write carrying another one is evidence that the bundle picked up
+ *  someone else's block — not a fact to absorb. Absorbing it would re-key the very row those
+ *  checks compare a bundle AGAINST, so the contaminated bundle would start agreeing with its own
+ *  registry row and a detectable mis-attribution would become a permanent invisible one.
+ *  Re-identifying an account on purpose has its own guarded paths (`addAccount`, and the relogin
+ *  verb's fatal-mismatch check), so nothing legitimate needs this to overwrite.
+ *
+ *  The conflict is logged, not thrown: bundle writes carry rotated single-use tokens that must
+ *  land no matter what, and turning a recoverable attribution problem into a failed refresh
+ *  would lose one. Returns whether the row changed. */
+function fillAnchor(
+  account: StoredAccount,
+  key: IdentityKey,
+  value: unknown,
+  log: Logger,
+): boolean {
   const next = asString(value);
-  if (next === undefined || account[key] === next) return false;
-  account[key] = next;
-  return true;
+  if (next === undefined) return false;
+  const stored = account[key];
+  if (stored === undefined) {
+    account[key] = next;
+    return true;
+  }
+  if (stored === next) return false;
+  log.warn(
+    { accountId: account.id, field: key, stored, refused: next },
+    'bundle write carries an identity that disagrees with the registry; keeping the stored one',
+  );
+  return false;
 }
 
 /** Set a plan/billing field, or DELETE it when the bundle no longer carries a value.
@@ -90,10 +118,15 @@ function setOrDelete(account: StoredAccount, key: PlanKey, value: unknown): bool
  * `oauthAccount` is treated as authoritative ONLY when the bundle actually carries the block;
  * when it is absent the fields it feeds are left untouched rather than deleted, because some
  * write paths legitimately persist a credentials-only bundle and must not wipe good metadata.
- * Even when the block IS present it may be partial, so identity anchors go through the set-only
- * `setIfPresent` and only plan/billing state is clearable.
+ * Even when the block IS present it may be partial and it may not even be this account's, so
+ * identity anchors go through the fill-only `fillAnchor` and only plan/billing state is
+ * freely rewritable.
  */
-function applyBundleMetadata(account: StoredAccount, bundle: CredentialBundle): boolean {
+function applyBundleMetadata(
+  account: StoredAccount,
+  bundle: CredentialBundle,
+  log: Logger,
+): boolean {
   let changed = false;
   const oauth = bundle.claudeAiOauth;
   changed = setOrDelete(account, 'subscriptionType', oauth.subscriptionType) || changed;
@@ -102,9 +135,9 @@ function applyBundleMetadata(account: StoredAccount, bundle: CredentialBundle): 
   const acct = bundle.oauthAccount;
   if (acct === undefined) return changed;
 
-  changed = setIfPresent(account, 'accountUuid', acct.accountUuid) || changed;
-  changed = setIfPresent(account, 'emailAddress', acct.emailAddress) || changed;
-  changed = setIfPresent(account, 'organizationUuid', acct.organizationUuid) || changed;
+  changed = fillAnchor(account, 'accountUuid', acct.accountUuid, log) || changed;
+  changed = fillAnchor(account, 'emailAddress', acct.emailAddress, log) || changed;
+  changed = fillAnchor(account, 'organizationUuid', acct.organizationUuid, log) || changed;
   changed =
     setOrDelete(account, 'organizationRateLimitTier', acct.organizationRateLimitTier) || changed;
   changed = setOrDelete(account, 'billingType', acct.billingType) || changed;
@@ -118,6 +151,9 @@ export class Vault {
     private readonly vaultDir: string,
     private readonly protector: Protector,
     private readonly clock: () => number = Date.now,
+    /** Where a refused identity conflict is surfaced (see `fillAnchor`). Defaults to discarding
+     *  it, so read-only vault handles and tests stay one-liners; the engine passes its own. */
+    private readonly log: Logger = noopLogger,
   ) {}
 
   // ---- registry (non-secret) ----
@@ -170,7 +206,7 @@ export class Vault {
     // bundle maps onto a registry row. Every field is independently absent-safe: a provider
     // response missing one degrades to "unknown" in the CLI rather than crashing or forcing a
     // re-login (see planWeight() / `cctl accounts list` for how absence renders).
-    applyBundleMetadata(account, bundle);
+    applyBundleMetadata(account, bundle, this.log);
     // Writes the blob only — the row is not in the registry yet, so its metadata refresh is a
     // no-op here; `saveRegistry` below is what persists the row built above.
     await this.writeBundle(account.id, bundle);
@@ -239,7 +275,9 @@ export class Vault {
   }
 
   /** Encrypt and persist an account's credential bundle, and refresh its metadata row so
-   *  the registry stays consistent with the bundle (e.g. after a token refresh).
+   *  the registry stays consistent with the bundle (e.g. after a token refresh). Refresh means
+   *  plan/billing state only — this method can fill a missing identity anchor but never
+   *  re-identifies an existing row (see `fillAnchor`).
    *
    *  The metadata refresh is best-effort and secondary: the encrypted blob is written FIRST
    *  and unconditionally, because losing a rotated single-use token is unrecoverable whereas a
@@ -259,7 +297,7 @@ export class Vault {
     const reg = await this.loadRegistry();
     const account = reg.accounts.find((a) => a.id === id);
     if (!account) return;
-    if (!applyBundleMetadata(account, bundle)) return;
+    if (!applyBundleMetadata(account, bundle, this.log)) return;
     account.updatedAtMs = this.clock();
     await this.saveRegistry(reg);
   }
