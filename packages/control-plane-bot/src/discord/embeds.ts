@@ -8,6 +8,8 @@ import type {
   AccountUsage,
   PayloadOf,
   SettingsSnapshot,
+  TokenStatsSnapshot,
+  TokenTotals,
   UsagePlan,
 } from '@claude-control/shared-protocol';
 // usage-advisor is a pure, credential-free library — importing it preserves the bot's
@@ -15,6 +17,7 @@ import type {
 import {
   computeOutlook,
   computePacing,
+  formatTokens,
   timelineInputFromWire,
   type ResetOutlook,
 } from '@claude-control/usage-advisor';
@@ -310,6 +313,95 @@ function describeEvent(kind: string, percentUsed: number): string {
   const label = kind === 'weekly_scoped' ? 'weekly (fable)' : 'weekly';
   const unused = 100 - percentUsed;
   return unused > 0 ? `${label} quota resets — ${unused}% unused expires` : `${label} quota resets`;
+}
+
+// ---------------------------------------------------------------------------
+// /stats — absolute token counts
+// ---------------------------------------------------------------------------
+
+function tokenSum(totals: TokenTotals): number {
+  return totals.input + totals.output + totals.cacheCreation + totals.cacheRead;
+}
+
+/** One bucket line: "**main** — 1.3B · 8.4k turns". Discord reflows text, so this is a bullet
+ *  list rather than a padded table — a monospace table would need a code fence, which costs the
+ *  bold/emphasis that makes the list scannable on a phone. */
+function statsLines(rows: readonly { label: string; totals: TokenTotals }[]): string {
+  if (rows.length === 0) return 'nothing recorded';
+  return rows
+    .map((r) => `**${r.label}** — ${formatTokens(tokenSum(r.totals))} · ${r.totals.turns} turns`)
+    .join('\n');
+}
+
+/** What the scan could and could not read — the CLI's honesty footer, adapted for a field. A
+ *  total over 142 of 442 transcript files is a different claim than the same total over all 442,
+ *  and the phone must say so as plainly as the terminal does; the static disclaimers ("not a
+ *  billing figure", etc.) already live in the embed's footer, so only the per-scan counts belong
+ *  here. */
+function coverageLine(coverage: TokenStatsSnapshot['coverage']): string {
+  const notes = [
+    `${coverage.filesScanned} transcript file${coverage.filesScanned === 1 ? '' : 's'} read`,
+    `${coverage.filesSkippedByMtime} untouched since the window opened`,
+  ];
+  // Only surface the failure counts when there ARE failures — but never hide one.
+  if (coverage.filesUnreadable > 0) notes.push(`${coverage.filesUnreadable} could not be read`);
+  if (coverage.dirsUnreadable > 0) {
+    notes.push(
+      `${coverage.dirsUnreadable} project folder${coverage.dirsUnreadable === 1 ? '' : 's'} could not be read`,
+    );
+  }
+  if (coverage.malformedLines > 0) notes.push(`${coverage.malformedLines} malformed lines skipped`);
+  if (coverage.duplicateTurns > 0) notes.push(`${coverage.duplicateTurns} duplicate turns skipped`);
+  return `${notes.join(', ')}.`;
+}
+
+/**
+ * `/stats` — absolute token counts for the window the daemon last scanned, by account, model and
+ * day, plus the split across the four token kinds.
+ *
+ * The bot computes nothing here and reads nothing from the host: the daemon does the transcript
+ * scan and sends only sums, so this surface stays credential-free AND conversation-free. The
+ * footer states what the numbers are not, on every render — these are the turns Claude Code
+ * recorded on one machine, not an Anthropic billing figure.
+ */
+export function buildStatsEmbed(stats: TokenStatsSnapshot): EmbedBuilder {
+  const days = Math.max(1, Math.round((stats.windowEndMs - stats.windowStartMs) / 86_400_000));
+  const embed = new EmbedBuilder()
+    .setTitle('Token usage')
+    .setColor(COLOR_INFO)
+    .setTimestamp(stats.windowEndMs)
+    .setFooter({
+      text:
+        'Local Claude Code turns on the host only - web, phone and other machines are not ' +
+        'counted, and turns before the first recorded switch cannot be attributed. Not a ' +
+        'billing figure.',
+    });
+
+  if (stats.overall.turns === 0) {
+    addClampedField(embed, 'Coverage', coverageLine(stats.coverage));
+    return embed.setDescription(
+      `No Claude Code turns recorded on the host in the last ${days} day${days === 1 ? '' : 's'}.`,
+    );
+  }
+
+  embed.setDescription(
+    `Last ${days} day${days === 1 ? '' : 's'} · **${formatTokens(tokenSum(stats.overall))}** ` +
+      `tokens over ${formatTokens(stats.overall.turns)} turns · scanned ${discordRelative(stats.windowEndMs)}`,
+  );
+  addClampedField(embed, 'By account', statsLines(stats.byAccount));
+  addClampedField(embed, 'By model', statsLines(stats.byModel));
+  // Newest day first: the phone reader wants today, and the clamp drops from the END, so the
+  // far tail of the window is what gets cut rather than the day they came to look at.
+  addClampedField(embed, 'By day', statsLines([...stats.byDay].reverse()));
+  addClampedField(
+    embed,
+    'Token kinds',
+    `input ${formatTokens(stats.overall.input)} · output ${formatTokens(stats.overall.output)} · ` +
+      `cache write ${formatTokens(stats.overall.cacheCreation)} · ` +
+      `cache read ${formatTokens(stats.overall.cacheRead)}`,
+  );
+  addClampedField(embed, 'Coverage', coverageLine(stats.coverage));
+  return embed;
 }
 
 /** `/accounts` — a lighter listing than `/usage`: which accounts exist and whether each is

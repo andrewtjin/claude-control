@@ -30,6 +30,8 @@ import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
 import { UsagePoller, type PollAccount } from './usagePoller.js';
 import type { AttributionJournal } from './attributionJournal.js';
+import type { TranscriptScan } from './transcriptTokens.js';
+import { aggregateTokenStats } from './tokenStats.js';
 import type {
   HookReceiver,
   HookReceiverCliHandlers,
@@ -109,10 +111,30 @@ export interface DaemonOptions {
   sessionStopOnShutdownMs?: number;
   /** How often to poll usage and re-sync attribution. */
   pollIntervalMs?: number;
+  /** Scan local Claude Code transcripts for absolute token counts (see transcriptTokens.ts).
+   *  Injected rather than called directly because the scan reads gigabytes off the disk: tests
+   *  must be able to fake it, and a deployment that does not want the read can omit it, in which
+   *  case the daemon pushes no `stats.snapshot` at all (`cctl stats` is unaffected — it scans
+   *  in-process and needs no daemon). */
+  scanTranscripts?: (sinceMs: number) => Promise<TranscriptScan>;
+  /** How often that scan may re-run (default 15 min). Deliberately far slower than the poll
+   *  interval: the numbers move slowly, the scan is seconds of disk IO, and `/stats` renders the
+   *  last pushed snapshot rather than triggering a fresh one. */
+  statsIntervalMs?: number;
   logger?: Logger;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
+/** How long a usage snapshot is kept before the poll cycle trims it. The poller appends one row
+ *  per account per cycle (~1,900/day on a real machine) and nothing reads a snapshot older than
+ *  the current view, so without a cutoff this table is the one thing the daemon grows without
+ *  bound. 90 days keeps a full quarter of history for any future backfill while bounding the file. */
+const USAGE_SNAPSHOT_RETENTION_MS = 90 * 24 * 60 * 60_000;
+/** The window every pushed `stats.snapshot` covers. Matches `cctl stats`'s own default so the
+ *  phone and the terminal answer the same question. */
+const STATS_WINDOW_MS = 7 * 24 * 60 * 60_000;
+/** Default gap between transcript scans — see `DaemonOptions.statsIntervalMs`. */
+const DEFAULT_STATS_INTERVAL_MS = 15 * 60_000;
 /** How long {@link Daemon.stop} waits for live session handles to tear down before closing
  *  the rest anyway. Generous for a normal `client.end()` (subprocess exit is fast), tight
  *  enough that one wedged transport cannot hold Ctrl+C hostage; a handle that misses the
@@ -258,8 +280,13 @@ export class Daemon {
   private readonly stopGraceMs: number | undefined;
   private readonly sessionStopOnShutdownMs: number;
   private readonly pollIntervalMs: number;
+  private readonly scanTranscripts: ((sinceMs: number) => Promise<TranscriptScan>) | undefined;
+  private readonly statsIntervalMs: number;
   private readonly logger: Logger;
 
+  /** When the last transcript scan finished; `undefined` until the first one runs, so the very
+   *  first poll cycle after startup always produces a snapshot. */
+  private lastStatsAtMs: number | undefined;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   /** Tear-down for the event-loop lag watchdog started in {@link start}. */
   private stopLoopLagMonitor: (() => void) | undefined;
@@ -330,6 +357,8 @@ export class Daemon {
     this.sessionStopOnShutdownMs =
       options.sessionStopOnShutdownMs ?? DEFAULT_SESSION_STOP_ON_SHUTDOWN_MS;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.scanTranscripts = options.scanTranscripts;
+    this.statsIntervalMs = options.statsIntervalMs ?? DEFAULT_STATS_INTERVAL_MS;
     this.logger = options.logger ?? noopLogger;
   }
 
@@ -546,6 +575,16 @@ export class Daemon {
         json: JSON.stringify(result.usage.accountUsage),
       });
     }
+    // Retention runs on the same cadence as the writes that make it necessary, right after them,
+    // so the table can never outgrow its cutoff by more than one cycle. A failure is logged and
+    // swallowed: an untrimmed table is a disk-space problem, never a reason to skip the push
+    // below (which is what the phone is actually waiting on).
+    try {
+      const dropped = this.store.trimUsageSnapshots(this.clock() - USAGE_SNAPSHOT_RETENTION_MS);
+      if (dropped > 0) this.logger.info({ dropped }, 'trimmed expired usage snapshots');
+    } catch (err) {
+      this.logger.warn({ err }, 'usage snapshot retention failed; retrying next cycle');
+    }
 
     this.sendEnvelope({
       type: 'usage.snapshot',
@@ -568,6 +607,46 @@ export class Daemon {
       await this.autoSwitcher.evaluate(inputs).catch((err: unknown) => {
         this.logger.error({ err }, 'auto-switch evaluation failed');
       });
+    }
+
+    // LAST in the cycle, deliberately: the transcript scan is seconds of disk IO, and everything
+    // above it is either time-sensitive (auto-switch) or what the phone polls for (the usage
+    // push). Its own throttle means most cycles skip it entirely.
+    await this.maybePushTokenStats(accounts);
+  }
+
+  /**
+   * Re-scan local transcripts and push a `stats.snapshot`, at most once per
+   * {@link statsIntervalMs}. Absolute token counts come from files Claude Code writes on this
+   * host; the bot receives only the aggregate — it never sees a transcript, which is what keeps
+   * "the bot holds zero credentials (and zero conversation text)" structural rather than polite.
+   *
+   * A scan failure is logged and swallowed: it means the phone keeps rendering the previous
+   * snapshot (already labeled with its own window), which is strictly better than a poll loop
+   * that dies over an unreadable transcript directory.
+   */
+  private async maybePushTokenStats(accounts: StoredAccount[]): Promise<void> {
+    if (this.scanTranscripts === undefined) return;
+    const now = this.clock();
+    if (this.lastStatsAtMs !== undefined && now - this.lastStatsAtMs < this.statsIntervalMs) return;
+    // Stamped BEFORE the await, so a scan slower than the interval cannot queue a second one
+    // behind itself on the next cycle.
+    this.lastStatsAtMs = now;
+    const windowStartMs = now - STATS_WINDOW_MS;
+    try {
+      const scan = await this.scanTranscripts(windowStartMs);
+      this.sendEnvelope({
+        type: 'stats.snapshot',
+        payload: aggregateTokenStats({
+          scan,
+          intervals: this.store.listActivationIntervals(),
+          windowStartMs,
+          windowEndMs: this.clock(),
+          labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+        }),
+      });
+    } catch (err) {
+      this.logger.warn({ err }, 'transcript token scan failed; keeping the previous stats');
     }
   }
 

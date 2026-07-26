@@ -11,7 +11,7 @@ export {
   type AutoSwitchDecision,
   type AutoSwitchPolicy,
 } from './autoswitch.js';
-export { humanizeDuration, roundPct } from './format.js';
+export { formatTokens, humanizeDuration, roundPct } from './format.js';
 export {
   planWeight,
   type PlanTierSignals,

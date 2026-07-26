@@ -26,8 +26,10 @@ import {
 import {
   ControlPlaneClient,
   Store,
+  aggregateTokenStats,
   buildDaemonHookSpecs,
   readHeartbeat,
+  readTranscriptTurns,
   uninstallHooks,
   type SessionRow,
 } from '@claude-control/daemon';
@@ -60,6 +62,7 @@ import {
   renderAccountsTable,
   renderDaemonStatus,
   renderPacingLine,
+  renderTokenStats,
   renderUsage,
   type UsageRow,
 } from './render.js';
@@ -101,6 +104,10 @@ import {
   VERSION,
   type SettingsSection,
 } from './settings.js';
+
+/** Default `cctl stats` window. A week is the span the weekly limits themselves run on, so it is
+ *  the window a "did I overspend?" reading is actually asked in. */
+const DEFAULT_STATS_DAYS = 7;
 
 /** Build the full `cctl` program. Exported so tests can introspect the command tree. */
 export function buildProgram(): Command {
@@ -189,6 +196,53 @@ export function buildProgram(): Command {
         text += '\n\n' + renderPacingLine(inputs, nowMs);
       }
       process.stdout.write(text + '\n');
+    });
+
+  // `usage`/`timeline` answer "how much of my LIMIT is gone" (a percent from Anthropic's
+  // endpoint). `stats` answers the different question "how many tokens did I actually spend, and
+  // on which account" — read from the turn records Claude Code writes on this machine and joined
+  // against the daemon's switch journal. Nothing here touches the network.
+  program
+    .command('stats')
+    .description('absolute token counts per account, model and day (from local transcripts)')
+    .option('--days <n>', 'how many days back to count', String(DEFAULT_STATS_DAYS))
+    .action(async (opts: { days?: string }) => {
+      const days = Number(opts.days);
+      if (!Number.isFinite(days) || days <= 0) fail('--days must be a positive number.');
+      const paths = defaultPaths();
+      const windowEndMs = Date.now();
+      const windowStartMs = windowEndMs - days * 86_400_000;
+
+      // The scan reads every transcript touched inside the window, which is seconds of disk IO on
+      // a machine with real history. Say so — but only to a terminal, so piping stdout still
+      // yields nothing but the table.
+      if (process.stderr.isTTY) {
+        process.stderr.write(`Reading transcripts under ${paths.claudeDir} ...\n`);
+      }
+      const [accounts, scan] = await Promise.all([
+        buildEngine(paths).listAccounts(),
+        readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs: windowStartMs }),
+      ]);
+
+      // Attribution comes from the daemon's journal, read offline like `usage`/`timeline` do:
+      // no running daemon is required, and an empty journal simply means every turn lands in the
+      // unattributed bucket (which the renderer shows rather than hides).
+      const store = new Store(daemonDbPath(paths));
+      let intervals;
+      try {
+        intervals = store.listActivationIntervals();
+      } finally {
+        store.close();
+      }
+
+      const stats = aggregateTokenStats({
+        scan,
+        intervals,
+        windowStartMs,
+        windowEndMs,
+        labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+      });
+      process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });
 
   program

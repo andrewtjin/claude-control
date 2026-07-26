@@ -13,12 +13,20 @@ describe('buildProgram', () => {
     // Daemon-backed placeholders are present so the surface is discoverable.
     expect(names).toContain('usage');
     expect(names).toContain('timeline');
+    expect(names).toContain('stats');
     expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
     // First-run + at-a-glance status surfaces.
     expect(names).toContain('setup');
     expect(names).toContain('status');
+  });
+
+  it('offers a --days window on stats, defaulting to a week', () => {
+    const stats = buildProgram().commands.find((c) => c.name() === 'stats');
+    const days = stats?.options.find((o) => o.long === '--days');
+    expect(days).toBeDefined();
+    expect(days?.defaultValue).toBe('7');
   });
 
   it('offers --reconfigure and --relay on setup', () => {

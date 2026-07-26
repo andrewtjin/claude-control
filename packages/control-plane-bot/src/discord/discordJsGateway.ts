@@ -136,6 +136,7 @@ const PAIRING_PRIMER_MESSAGE = [
   "Paired. Here's what works right now:",
   '`/usage` — usage across accounts',
   '`/timeline` — 5h-session budget and reset timeline',
+  '`/stats` — token counts per account, model and day',
   '`/switch <account>` — switch the active account',
   '`/run <prompt>` — start a Claude Code session',
   '`/status` — daemon connection status',
@@ -782,6 +783,9 @@ export class DiscordJsGateway implements DiscordGateway {
       new SlashCommandBuilder()
         .setName('timeline')
         .setDescription('5h-session budget and reset timeline across accounts'),
+      new SlashCommandBuilder()
+        .setName('stats')
+        .setDescription('Token counts per account, model and day (last 7 days)'),
       new SlashCommandBuilder().setName('accounts').setDescription('List paired accounts'),
       new SlashCommandBuilder().setName('sessions').setDescription('List known sessions'),
       new SlashCommandBuilder()
@@ -874,6 +878,9 @@ export class DiscordJsGateway implements DiscordGateway {
         break;
       case 'timeline':
         result = commands.handleTimeline(this.deps, userId);
+        break;
+      case 'stats':
+        result = commands.handleStats(this.deps, userId);
         break;
       case 'accounts':
         result = commands.handleAccounts(this.deps, userId);

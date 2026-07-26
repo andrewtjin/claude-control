@@ -50,6 +50,38 @@ describe('Store', () => {
     it('returns undefined for an account with no snapshots', () => {
       expect(store.latestUsageSnapshot('missing')).toBeUndefined();
     });
+
+    it('trims snapshots strictly older than the cutoff, across every account', () => {
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 100, source: 'live', json: '{}' });
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 500, source: 'live', json: '{}' });
+      store.insertUsageSnapshot({ accountId: 'b', fetchedAtMs: 100, source: 'live', json: '{}' });
+      // Exactly at the cutoff survives — the predicate is `<`, so a boundary row is kept.
+      store.insertUsageSnapshot({ accountId: 'b', fetchedAtMs: 400, source: 'live', json: '{}' });
+
+      expect(store.trimUsageSnapshots(400)).toBe(2);
+      expect(store.listUsageSnapshots().map((r) => [r.accountId, r.fetchedAtMs])).toEqual([
+        ['a', 500],
+        ['b', 400],
+      ]);
+    });
+
+    it('reports zero and changes nothing when everything is inside the retention window', () => {
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 900, source: 'live', json: '{}' });
+      expect(store.trimUsageSnapshots(500)).toBe(0);
+      expect(store.listUsageSnapshots()).toHaveLength(1);
+    });
+
+    it('leaves the account-scoped reads working after a trim', () => {
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 100, source: 'live', json: '{}' });
+      store.insertUsageSnapshot({
+        accountId: 'a',
+        fetchedAtMs: 900,
+        source: 'live',
+        json: '{"x":1}',
+      });
+      store.trimUsageSnapshots(500);
+      expect(store.latestUsageSnapshot('a')?.json).toBe('{"x":1}');
+    });
   });
 
   describe('activation_intervals', () => {
@@ -248,6 +280,65 @@ describe('Store', () => {
       store.trimOutboxOldest(10);
       expect(store.countOutbox()).toBe(1);
     });
+  });
+});
+
+// Retention has to stay cheap on the table it exists to bound, so this checks the PLAN, not just
+// the result. It runs against a database the real `Store` migration built, so the index it asserts
+// on is the shipped one. The SQL text is restated here on purpose: this is a guard on the
+// schema/query PAIR, and it must be updated in step with `Store.trimUsageSnapshots`.
+describe('usage snapshot retention query plan', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cctl-store-plan-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('finds expired rows through the (accountId, fetchedAtMs) index, not a table scan', () => {
+    const dbPath = join(dir, 'daemon.db');
+    const store = new Store(dbPath);
+    for (let i = 0; i < 500; i++) {
+      store.insertUsageSnapshot({
+        accountId: `acct-${i % 3}`,
+        fetchedAtMs: i * 1000,
+        source: 'live',
+        json: '{}',
+      });
+    }
+    store.close();
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      const plan = (sql: string): string =>
+        db
+          .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+          .all()
+          .map((row) => String(row['detail']))
+          .join(' | ');
+
+      const shipped = plan(
+        `DELETE FROM usage_snapshots WHERE id IN (
+           SELECT id FROM usage_snapshots WHERE fetchedAtMs < 100000
+         )`,
+      );
+      expect(shipped).toContain('idx_usage_snapshots_account');
+      // COVERING means the candidate ids come out of the index alone; the table is touched only
+      // for the rows actually being deleted.
+      expect(shipped).toContain('COVERING INDEX');
+
+      // WHY the sub-select shape exists at all: `fetchedAtMs` is the SECOND column of the only
+      // index, so without ANALYZE statistics (the normal state of a daemon database) the obvious
+      // form degrades to reading every row of the table.
+      expect(plan(`DELETE FROM usage_snapshots WHERE fetchedAtMs < 100000`)).toBe(
+        'SCAN usage_snapshots',
+      );
+    } finally {
+      db.close();
+    }
   });
 });
 
