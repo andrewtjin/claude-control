@@ -91,6 +91,27 @@ export class CredentialStore {
     file.oauthAccount = account;
     await atomicWriteFile(this.paths.claudeJsonPath, JSON.stringify(file));
   }
+
+  /**
+   * REMOVE the `oauthAccount` block from `~/.claude.json`, preserving every other key — the
+   * surgical counterpart of {@link writeOauthAccount}, and a no-op when the file or the block
+   * is already absent (so it never creates a file just to say nothing).
+   *
+   * Exists because there is no third option. Whoever writes the live credentials must leave the
+   * identity block describing the account those credentials belong to; when there is no block to
+   * write, the one already on disk names the PREVIOUS account and is a positive false statement
+   * about who is logged in. Absence states nothing, and it is a state the CLI recovers from on
+   * its own: it re-derives the block from whoever the live access token resolves to (CLI 2.1.220
+   * fetches the OAuth profile and writes the block back) and it gates "logged in" on the token,
+   * not on this block. A stale block gets no such correction — the CLI skips the re-derivation
+   * while the block looks complete.
+   */
+  async clearOauthAccount(): Promise<void> {
+    const file = await readJson(this.paths.claudeJsonPath);
+    if (!file || !('oauthAccount' in file)) return;
+    delete file.oauthAccount;
+    await atomicWriteFile(this.paths.claudeJsonPath, JSON.stringify(file));
+  }
 }
 
 async function readJson(path: string): Promise<JsonObject | undefined> {

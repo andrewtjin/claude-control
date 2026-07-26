@@ -153,10 +153,20 @@ export class SwitchEngine {
    * from `~/.claude.json` — the same signal the re-login guard trusts). Only a PROVABLE
    * mismatch overrides the registry:
    *   - the live identity matches the registry's account → the registry answer stands;
-   *   - it matches a DIFFERENT stored account → that account is the live one;
+   *   - it matches a DIFFERENT stored account → that account is the live one, UNLESS the live
+   *     token still belongs to the registry's account (see below);
    *   - it matches no stored account (a login never captured here) → null, because claiming
    *     any stored account is active would be false;
    *   - no live identity is readable → the registry record, the best remaining evidence.
+   *
+   * The identity block and the credentials live in two different files, so they can disagree,
+   * and the block is the one that goes stale: the CLI rewrites it only on a login, while the
+   * token changes under every rotation. Believing a stale block here is not a cosmetic error —
+   * it hands the live token's owner the wrong id, which then routes `adoptRotationIfNeeded()`
+   * at the wrong bundle and lets `refreshToken()` network-refresh the token the live session is
+   * holding. So an override is corroborated against the one artifact that cannot be stale: if
+   * the live refresh token is still the registry account's stored token, that account is live
+   * and the block is merely out of date.
    */
   async getActiveId(): Promise<string | null> {
     const registryId = await this.vault.getActiveId();
@@ -167,7 +177,26 @@ export class SwitchEngine {
     if (liveUuid === undefined) return registryId;
     const matches = (await this.vault.listAccounts()).filter((a) => a.accountUuid === liveUuid);
     if (matches.some((m) => m.id === registryId)) return registryId;
+    if (registryId !== null && (await this.liveTokenBelongsTo(registryId))) return registryId;
     return matches[0]?.id ?? null;
+  }
+
+  /**
+   * Whether the live refresh token is the one stored for `accountId`. A refresh token is issued
+   * to exactly one account, so a match is proof of ownership; anything else (no live token, no
+   * bundle, an unreadable one) is simply not proof and answers false — this corroborates an
+   * override, it does not gate one.
+   *
+   * Deliberately asked ONLY from `getActiveId()`'s disagreement branch: it decrypts a bundle,
+   * which on Windows is a PowerShell spawn (see dpapi.ts), and the agreeing case is every normal
+   * call. The disagreement branch means the live login is out of step with the last committed
+   * switch, which a switch heals.
+   */
+  private async liveTokenBelongsTo(accountId: string): Promise<boolean> {
+    const live = await this.credStore.readLiveCredentials().catch(() => undefined);
+    if (!live) return false;
+    const bundle = await this.vault.readBundle(accountId).catch(() => undefined);
+    return bundle?.claudeAiOauth.refreshToken === live.refreshToken;
   }
 
   /**
@@ -388,7 +417,7 @@ export class SwitchEngine {
 
       // Write the live files atomically, then record that the point of no easy return passed.
       await this.credStore.writeLiveCredentials(bundle.claudeAiOauth);
-      if (bundle.oauthAccount) await this.credStore.writeOauthAccount(bundle.oauthAccount);
+      await this.writeLiveIdentity(bundle.oauthAccount);
       await this.intent.write({
         phase: 'written',
         targetId,
@@ -540,7 +569,7 @@ export class SwitchEngine {
         // interrupted live write first: activate() lands the identity block AFTER the
         // credentials, so a crash between the two leaves a live identity that still names the
         // previous account (which would also mislead the live-login reconciliation).
-        if (target.oauthAccount) await this.credStore.writeOauthAccount(target.oauthAccount);
+        await this.writeLiveIdentity(target.oauthAccount);
         await this.vault.setActive(pending.targetId);
         this.audit.append({
           ts: this.clock(),
@@ -665,12 +694,38 @@ export class SwitchEngine {
     }
   }
 
+  /**
+   * Land `oauthAccount` as the live identity block — or REMOVE the one already there when the
+   * credentials we just wrote came with none.
+   *
+   * The removal is the whole point. `~/.claude.json` is the only statement of who is logged in,
+   * and a bundle legitimately carries no block (a credentials-only capture, or an account added
+   * before its config block existed). Writing nothing in that case leaves the block naming the
+   * PREVIOUS account, and it stays that way: `getActiveId()` then reads a live identity that
+   * contradicts the switch that just committed, `adoptRotationIfNeeded()` inherits that wrong
+   * owner, and the next CLI-side rotation is written into the wrong account's bundle — the
+   * ownership mismatch surfacing later as a quarantine, far from the switch that caused it.
+   * Removing the block cannot lie about who is live, and the CLI rebuilds it from the live
+   * token (see `CredentialStore.clearOauthAccount`).
+   *
+   * Every path that writes live credentials goes through here — the switch itself, the
+   * roll-forward, and the rollback — because leaving a stale identity behind is exactly as
+   * wrong when undoing a switch as when committing one.
+   */
+  private async writeLiveIdentity(oauthAccount: OauthAccount | undefined): Promise<void> {
+    if (oauthAccount) await this.credStore.writeOauthAccount(oauthAccount);
+    else await this.credStore.clearOauthAccount();
+  }
+
   /** Restore the previous live credentials from the encrypted rollback snapshot. */
   private async restoreRollback(): Promise<boolean> {
     const snapshot = await this.vault.readRollback();
     if (!snapshot) return false;
     await this.credStore.writeLiveCredentials(snapshot.claudeAiOauth);
-    if (snapshot.oauthAccount) await this.credStore.writeOauthAccount(snapshot.oauthAccount);
+    // The snapshot omits the block exactly when the live file had none, so restoring it means
+    // removing whatever the failed switch wrote — not leaving the target's identity behind on
+    // the previous account's credentials.
+    await this.writeLiveIdentity(snapshot.oauthAccount);
     return true;
   }
 

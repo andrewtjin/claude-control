@@ -372,6 +372,59 @@ describe('activate — reconcile-by-reading', () => {
   });
 });
 
+describe('activate — a target whose bundle carries no identity block', () => {
+  /** Seed A live+active, plus an account captured CREDENTIALS-ONLY: no `~/.claude.json` block
+   *  was readable when it was captured, so its bundle has no identity to make live. */
+  async function seedBlocklessTarget(h: Harness) {
+    const { accountA } = await seedAActiveWithB(h);
+    const blockless = await h.engine.addAccount('C', {
+      claudeAiOauth: oauth('C', NOW + 10 * HOUR),
+    });
+    return { accountA, blockless };
+  }
+
+  it('removes the live identity rather than leaving it naming the previous account', async () => {
+    const h = await harness();
+    const { blockless } = await seedBlocklessTarget(h);
+
+    await h.engine.activate(blockless.id);
+
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('C');
+    // Leaving uuid-A here would be a live statement that A is logged in while C's token is.
+    expect(await h.credStore.readOauthAccount()).toBeUndefined();
+  });
+
+  it('leaves nothing that reconciles the active account back to the previous one', async () => {
+    const h = await harness();
+    const { blockless } = await seedBlocklessTarget(h);
+    await h.engine.activate(blockless.id);
+    expect(await h.engine.getActiveId()).toBe(blockless.id);
+  });
+
+  it('adopts a later CLI rotation into the account that owns it, not the previous one', async () => {
+    // The full cascade this guards: a live identity left naming A makes A the "previous active"
+    // for the NEXT switch, and the adoption guard there compares that block against itself and
+    // agrees — so the rotated token of whoever is really live lands in A's bundle, and only a
+    // network ownership check much later can see it.
+    const h = await harness();
+    const { accountA, blockless } = await seedBlocklessTarget(h);
+    await h.engine.activate(blockless.id);
+
+    // The CLI rotates the live (C's) refresh token, then the operator switches back to A.
+    const live = (await h.credStore.readLiveCredentials())!;
+    await h.credStore.writeLiveCredentials({ ...live, refreshToken: 'cli-rotated-C' });
+    h.setNow(NOW + 61_000);
+
+    const result = await h.engine.activate(accountA.id);
+
+    expect(result.adoptedPreviousRotation).toBe(true);
+    expect((await h.vault.readBundle(blockless.id)).claudeAiOauth.refreshToken).toBe(
+      'cli-rotated-C',
+    );
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('r-A');
+  });
+});
+
 describe('active-id reconciliation (external /login inside the Claude CLI)', () => {
   /** Simulate a `/login` done INSIDE the Claude CLI: the live credential + identity files
    *  change hands entirely outside this engine, so the registry is never told. */
@@ -398,6 +451,24 @@ describe('active-id reconciliation (external /login inside the Claude CLI)', () 
     await externalLogin(h, bundleFor('STRANGER', NOW + 10 * HOUR));
 
     expect(await h.engine.getActiveId()).toBeNull();
+  });
+
+  it('getActiveId keeps the registry when a stale identity is contradicted by the live token', async () => {
+    // The disk state this bug left behind: the identity block still names A while B's
+    // credentials are live and the registry records B. The block is the only evidence pointing
+    // at A, and the token it sits beside contradicts it — believing the block would hand B's
+    // live token to A everywhere downstream.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.engine.activate(accountB.id);
+    await h.credStore.writeOauthAccount({ accountUuid: 'uuid-A', emailAddress: 'A@x.com' });
+
+    expect(await h.engine.getActiveId()).toBe(accountB.id);
+
+    // A genuine /login as A rewrites the token as well, and then the block is believed again —
+    // this must stay a reconcile-by-reading engine, not a registry-only one.
+    await h.credStore.writeLiveCredentials(oauth('A-fresh', NOW + 10 * HOUR));
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
   });
 
   it('getActiveId falls back to the registry when no live identity is readable', async () => {
@@ -597,6 +668,53 @@ describe('recover', () => {
     expect(result.action).toBe('rolled_forward');
     expect(await h.engine.getActiveId()).toBe(accountB.id);
     expect(await h.intent.read()).toBeUndefined();
+  });
+
+  it('rolls forward a target with no identity block by clearing the stale one', async () => {
+    // Roll-forward FINISHES the interrupted live write, and the write it finishes is now a
+    // removal when the target has no block — skipping it would commit the switch on top of the
+    // previous account's identity, which is the state this engine refuses to leave behind.
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+    const blockless = await h.engine.addAccount('C', {
+      claudeAiOauth: oauth('C', NOW + 10 * HOUR),
+    });
+    await h.credStore.writeLiveCredentials(oauth('C', NOW + 10 * HOUR));
+    await h.intent.write({
+      phase: 'written',
+      targetId: blockless.id,
+      prevActiveId: accountA.id,
+      hasRollback: false,
+      startedAtMs: NOW,
+    });
+
+    expect((await h.engine.recover()).action).toBe('rolled_forward');
+    expect(await h.engine.getActiveId()).toBe(blockless.id);
+    expect(await h.credStore.readOauthAccount()).toBeUndefined();
+  });
+
+  it('rolls back the live identity too, removing one the snapshot never carried', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    // The live files had no identity block when the switch began, so the snapshot has none
+    // either; the switch then wrote B's identity before its credential write went wrong.
+    const a = await h.vault.readBundle(accountA.id);
+    await h.vault.writeRollback({ claudeAiOauth: a.claudeAiOauth });
+    await h.credStore.writeLiveCredentials(oauth('CORRUPT', NOW + HOUR));
+    await h.credStore.writeOauthAccount({ accountUuid: 'uuid-B', emailAddress: 'B@x.com' });
+    await h.intent.write({
+      phase: 'written',
+      targetId: accountB.id,
+      prevActiveId: accountA.id,
+      hasRollback: true,
+      startedAtMs: NOW,
+    });
+
+    expect((await h.engine.recover()).action).toBe('rolled_back');
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    // Restoring A's credentials under B's identity would recreate the exact mismatch the
+    // forward path refuses to create.
+    expect(await h.credStore.readOauthAccount()).toBeUndefined();
   });
 
   it('rolls back to the snapshot when the live write is inconsistent', async () => {
