@@ -148,7 +148,10 @@ function markTruncated(chunks: string[], max: number): string[] {
   if (countFences(trimmed) % 2 !== 0) {
     const room = max - note.length - (FENCE.length + 1);
     if (trimmed.length > room) trimmed = trimmed.slice(0, Math.max(0, room));
-    trimmed += `\n${FENCE}`;
+    // Making room can itself drop a whole fence and flip the parity back to even, so the decision
+    // to append is taken against the FINAL text. Appending on the pre-trim reading would be the
+    // same unbalanced-fence bug one level down.
+    if (countFences(trimmed) % 2 !== 0) trimmed += `\n${FENCE}`;
   }
 
   chunks[last] = trimmed + note;
