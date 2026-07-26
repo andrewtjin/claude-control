@@ -35,6 +35,26 @@ if (declaredRange !== sourceRange) {
   process.exit(1);
 }
 
+// Same class of hazard, second instance: the version a user sees from `cctl --version` is a
+// constant in the CLI source, while the version npm actually publishes is this package's
+// "version" field. Nothing linked them, and they HAD drifted — a 0.3.0 tarball packed cleanly
+// while the bundle inside it still reported 0.2.2, which would have shipped a release that
+// misreports itself and made the 'cli build' / 'daemon build' skew rows (see cli/src/settings.ts)
+// lie about which build is running. Refuse to produce a bundle until they agree.
+const publishedVersion = readPackageJson('../package.json').version;
+const sourceVersion = /export const VERSION = '([^']+)'/.exec(
+  readFileSync(join(here, '../../cli/src/settings.ts'), 'utf8'),
+)?.[1];
+if (publishedVersion !== sourceVersion) {
+  process.stderr.write(
+    'error: the published version and the version the CLI reports differ.\n' +
+      `  cctl-publish/package.json (what npm publishes):      ${publishedVersion ?? '<absent>'}\n` +
+      `  cli/src/settings.ts VERSION (what --version prints): ${sourceVersion ?? '<unparseable>'}\n` +
+      'Make them identical, then rebuild.\n',
+  );
+  process.exit(1);
+}
+
 await build({
   entryPoints: [join(here, '../../cli/src/bin.ts')],
   outfile: join(here, '../dist/bin.js'),

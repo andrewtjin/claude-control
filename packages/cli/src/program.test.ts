@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { buildProgram } from './program.js';
 
 describe('buildProgram', () => {
@@ -109,7 +110,14 @@ describe('buildProgram', () => {
     expect(subs).toEqual(['install', 'run', 'status', 'supervise', 'uninstall']);
   });
 
-  it('reports its version', () => {
-    expect(buildProgram().version()).toBe('0.2.2');
+  // Asserting a version literal here only restated the constant one import away, so it stayed
+  // green while the publishable package sat on a different number — a 0.3.0 tarball packed a
+  // bundle that reported 0.2.2. The invariant worth holding is that the version a user is told
+  // they are running is the version npm published, so read the real manifest instead.
+  it('reports the version that gets published', () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL('../../cctl-publish/package.json', import.meta.url), 'utf8'),
+    ) as { version: string };
+    expect(buildProgram().version()).toBe(manifest.version);
   });
 });
