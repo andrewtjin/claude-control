@@ -149,3 +149,141 @@ describe('formatTables — markdown pipe input', () => {
     for (const line of out.split('\n')) expect(line.length).toBeLessThanOrEqual(60);
   });
 });
+
+// The card that motivated the record layout: a 2-column markdown table whose second column is
+// whole sentences. Discord renders none of it, and a 40-column grid would give each sentence a
+// third of a line. Kept verbatim as the primary fixture for that layout.
+const PROSE_MD_TABLE = [
+  '| Action | Detail |',
+  '|---|---|',
+  '| `probe_attention.py` -> `scripts/` | Self-contained, no relative imports - runs unchanged. |',
+  "| `main.py` + `qwen3-gen-smoke.py` -> `scripts/smoke_generate.py` | Collapsed the duplicate; kept the thinking-split behavior, took `main.py`'s `dtype=` and its bounded token cap. |",
+  '| `pyrightconfig.json` -> deleted | Folded into `[tool.pyright]`. If a `pyrightconfig.json` ever reappears it wins and the pyproject table is silently ignored. Added `extraPaths = ["src"]` so `steez_ttt` resolves before the editable install. |',
+  '| `README.md`, `tasks/todo.md` | Updated the dangling paths the moves created. |',
+  '| `.ruff_cache/` | Deleted - two stale ruff versions of pure garbage. |',
+].join('\n');
+
+/** Every rendered character that is not a fence or layout whitespace — the roundtrip form for
+ *  asserting a record layout dropped nothing and reordered nothing. */
+function recordText(rendered: string): string {
+  return rendered
+    .split('\n')
+    .filter((l) => l !== '```')
+    .join('')
+    .replace(/\s+/g, '');
+}
+
+describe('formatTables — long-cell tables render as records, not a grid', () => {
+  it('renders the prose table as one record per row', () => {
+    expect(formatTables(PROSE_MD_TABLE)).toBe(
+      [
+        '```',
+        'Action',
+        '  Detail',
+        '',
+        '`probe_attention.py` -> `scripts/`',
+        '  Self-contained, no relative imports -',
+        '  runs unchanged.',
+        '',
+        '`main.py` + `qwen3-gen-smoke.py` ->',
+        '`scripts/smoke_generate.py`',
+        '  Collapsed the duplicate; kept the',
+        '  thinking-split behavior, took',
+        "  `main.py`'s `dtype=` and its bounded",
+        '  token cap.',
+        '',
+        '`pyrightconfig.json` -> deleted',
+        '  Folded into `[tool.pyright]`. If a',
+        '  `pyrightconfig.json` ever reappears it',
+        '  wins and the pyproject table is',
+        '  silently ignored. Added `extraPaths =',
+        '  ["src"]` so `steez_ttt` resolves',
+        '  before the editable install.',
+        '',
+        '`README.md`, `tasks/todo.md`',
+        '  Updated the dangling paths the moves',
+        '  created.',
+        '',
+        '`.ruff_cache/`',
+        '  Deleted - two stale ruff versions of',
+        '  pure garbage.',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('keeps every record line inside the width budget', () => {
+    for (const line of formatTables(PROSE_MD_TABLE).split('\n')) {
+      expect(line.length).toBeLessThanOrEqual(DEFAULT_TABLE_WIDTH);
+    }
+  });
+
+  it('loses no cell content and keeps source order — full roundtrip', () => {
+    // Header row included: with two fields it renders as the first record rather than vanishing.
+    const cells = PROSE_MD_TABLE.split('\n')
+      .filter((l) => !/^\|?[\s:|-]+\|?$/.test(l))
+      .flatMap((l) => l.split('|').slice(1, -1));
+    expect(recordText(formatTables(PROSE_MD_TABLE))).toBe(cells.join('').replace(/\s+/g, ''));
+  });
+
+  it('labels each field past two columns, taking the labels from the header row', () => {
+    const three = [
+      '| Action | Detail | Owner |',
+      '|---|---|---|',
+      '| `probe_attention.py` -> `scripts/` | Self-contained, no relative imports so it runs unchanged. | platform |',
+      '| `pyrightconfig.json` -> deleted | Folded into the pyproject table; a stray config file would silently win. | tooling |',
+    ].join('\n');
+    expect(formatTables(three)).toBe(
+      [
+        '```',
+        'ACTION: `probe_attention.py` ->',
+        '        `scripts/`',
+        'DETAIL: Self-contained, no relative',
+        '        imports so it runs unchanged.',
+        'OWNER:  platform',
+        '',
+        'ACTION: `pyrightconfig.json` -> deleted',
+        'DETAIL: Folded into the pyproject table;',
+        '        a stray config file would',
+        '        silently win.',
+        'OWNER:  tooling',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('never eats a first DATA row as labels when the source declared no header', () => {
+    const long = (n: string): string =>
+      `${n} cell that runs on well past any column a phone-width grid could give it`;
+    const headerless = [
+      '┌──────┬──────┬──────┐',
+      `│ ${long('first')} │ ${long('second')} │ ${long('third')} │`,
+      `│ ${long('fourth')} │ ${long('fifth')} │ ${long('sixth')} │`,
+      '└──────┴──────┴──────┘',
+    ].join('\n');
+    const blocks = formatTables(headerless)
+      .split('\n')
+      .filter((l) => l !== '```')
+      .join('\n')
+      .split('\n\n');
+    // Two rows in, two records out — the first row is data, not a legend.
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]?.startsWith('first cell')).toBe(true);
+    expect(formatTables(headerless)).not.toContain('FIRST');
+  });
+
+  it('keeps the grid for a table whose cells stay short (the boundary the layout turns on)', () => {
+    // The 88-column fixture squeezes hard but its cells are still labels, not paragraphs.
+    expect(formatTables(WIDE_BOX_TABLE)).toContain('┌');
+    expect(formatTables(PROSE_MD_TABLE)).not.toContain('┌');
+  });
+
+  it('defuses a cell that would otherwise close the fence around it', () => {
+    const table = ['| Cmd | Note |', '| --- | --- |', '| ``` | ends a fence |'].join('\n');
+    const out = formatTables(table);
+    // Exactly the opening and closing fences: the cell's backticks can no longer terminate ours,
+    // and the characters are still all there.
+    expect(out.match(/```/g)).toHaveLength(2);
+    expect(out).toContain('`' + String.fromCharCode(0x200b) + '``');
+  });
+});

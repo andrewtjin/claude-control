@@ -545,7 +545,10 @@ export function buildQuestionEmbed(
     .setFooter({ text: `Answer with the menus below${modeNote}` });
   shown.forEach((q, i) => {
     const name = q.header != null && q.header.length > 0 ? q.header : `Question ${i + 1}`;
-    addClampedField(embed, truncateLabeled(name, 256), q.question);
+    // The question is verbatim model text and a "which of these?" question is exactly the shape
+    // that arrives as a comparison table, so it is re-rendered BEFORE the field clamp — clamping
+    // first would cut the source table and leave the formatter a fragment to parse.
+    addClampedField(embed, truncateLabeled(name, 256), formatTables(q.question));
   });
   return embed;
 }
@@ -636,8 +639,11 @@ export function buildToolOutputEmbed(p: {
 }
 
 /** `hook.notification` Stop event → the "done" card: WHAT Claude finished saying, not a bare
- *  "session ended". `lastAssistantMessage` can be long, so it is truncated with a visible marker
- *  (no silent cut). Falls back to the daemon-supplied body when no final message was captured. */
+ *  "session ended". `lastAssistantMessage` is a whole assistant turn, so it routinely carries a
+ *  markdown table — which Discord does not render at all — and is re-rendered before it is
+ *  truncated, so the cap cuts finished rows rather than half a table. Long messages are truncated
+ *  with a visible marker (no silent cut). Falls back to the daemon-supplied body when no final
+ *  message was captured. */
 export function buildDoneEmbed(p: {
   sessionId?: string;
   lastAssistantMessage?: string;
@@ -648,14 +654,16 @@ export function buildDoneEmbed(p: {
   const embed = new EmbedBuilder()
     .setTitle(`${NOTIFICATION_ICON.done} ${p.title ?? 'Done'}`)
     .setColor(NOTIFICATION_COLOR.done)
-    .setDescription(truncateLabeled(message, EMBED_DESCRIPTION_LIMIT));
+    .setDescription(truncateLabeled(formatTables(message), EMBED_DESCRIPTION_LIMIT));
   if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
   return embed;
 }
 
 /** `hook.notification` with `notification_type: 'idle_prompt'` → the "waiting on you" card: the
  *  session is blocked awaiting the user's next input. Distinct blue/🔔 language so it reads as
- *  "your turn", never as an error or a completion. */
+ *  "your turn", never as an error or a completion. The body is assistant prose (it is what the
+ *  session is waiting on you about), so its tables are re-rendered before the cap, exactly as on
+ *  the done card. */
 export function buildWaitingEmbed(p: {
   sessionId?: string;
   title?: string;
@@ -666,7 +674,7 @@ export function buildWaitingEmbed(p: {
     .setColor(NOTIFICATION_COLOR.waiting)
     .setDescription(
       truncateLabeled(
-        p.body && p.body.length > 0 ? p.body : 'A session is waiting for your reply.',
+        p.body && p.body.length > 0 ? formatTables(p.body) : 'A session is waiting for your reply.',
         EMBED_DESCRIPTION_LIMIT,
       ),
     );
