@@ -19,8 +19,10 @@ import {
   computePacing,
   formatTokens,
   planWeight,
+  renderPacingSummary,
   timelineInputFromWire,
   type AccountUsageInput,
+  type PacingOptions,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
 
@@ -252,12 +254,13 @@ export function renderUsage(
     .join('\n');
 }
 
-/** "Pacing: 38% of the combined week elapsed, ..." — the one-line cross-account pacing
- *  verdict appended after `cctl usage` and `cctl timeline`'s own output. Shares the same
- *  AccountUsageInput view the burn plan is computed from, so the two never disagree on what
- *  counts as "an account". */
-export function renderPacingLine(inputs: AccountUsageInput[], nowMs: number): string {
-  return `Pacing: ${computePacing(inputs, nowMs).headline}`;
+/** "Pacing: 67u of 80u available ..." — the cross-account pacing block appended after `cctl
+ *  usage` and `cctl timeline`'s own output: the fleet verdict, then whatever the model had to
+ *  assume. Shares the same AccountUsageInput view the burn plan is computed from, so the two
+ *  never disagree on what counts as "an account", and the same renderer the Discord embed
+ *  reads its headline and notes from. */
+export function renderPacingLine(inputs: AccountUsageInput[], options: PacingOptions): string {
+  return renderPacingSummary(computePacing(inputs, options));
 }
 
 /** "· 15x5h left" — how many 5h session windows still fit before this account's weekly

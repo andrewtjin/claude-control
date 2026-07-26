@@ -40,6 +40,7 @@ describe('computeOutlook — 5h window budget', () => {
       weeklyResetAt: NOW + 76 * HOUR,
       fullWindows: 15,
       hasPartialWindow: true,
+      resetPredicted: false,
     });
     expect(outlook.accounts[0]?.openWindowEndsAt).toBeUndefined();
   });
@@ -65,6 +66,7 @@ describe('computeOutlook — 5h window budget', () => {
       weeklyResetAt: NOW + 12 * HOUR,
       fullWindows: 3,
       hasPartialWindow: false,
+      resetPredicted: false,
     });
   });
 
@@ -85,15 +87,64 @@ describe('computeOutlook — 5h window budget', () => {
       weeklyResetAt: NOW + 1 * HOUR,
       fullWindows: 1,
       hasPartialWindow: false,
+      resetPredicted: false,
     });
   });
 
-  it('reports no budget when the weekly reset time is unknown', () => {
+  it('reports no budget when the weekly reset time is unknown and unpredictable', () => {
     const outlook = computeOutlook(
       [account({ accountId: 'a', limits: [{ kind: 'weekly_all', percent: 10 }] })],
       NOW,
     );
     expect(outlook.accounts[0]?.budget).toBeUndefined();
+  });
+
+  it('budgets against a PREDICTED reset when the endpoint stopped reporting one', () => {
+    // A dormant account: the endpoint drops `resets_at` once the weekly window closes, and
+    // used to leave the whole idle week reading "weekly reset time unknown".
+    const outlook = computeOutlook(
+      [
+        account({
+          accountId: 'a',
+          predictedResetAt: NOW + 10 * HOUR,
+          limits: [{ kind: 'weekly_all', percent: 0 }],
+        }),
+      ],
+      NOW,
+    );
+    expect(outlook.accounts[0]?.budget).toEqual({
+      weeklyResetAt: NOW + 10 * HOUR,
+      fullWindows: 2,
+      hasPartialWindow: false,
+      resetPredicted: true,
+    });
+    // The predicted reset is a timeline event too, marked as predicted.
+    expect(outlook.events).toEqual([
+      {
+        atMs: NOW + 10 * HOUR,
+        accountId: 'a',
+        label: 'a',
+        kind: 'weekly_all',
+        percentUsed: 0,
+        predicted: true,
+      },
+    ]);
+  });
+
+  it('prefers an observed reset over a prediction, and never marks it predicted', () => {
+    const outlook = computeOutlook(
+      [
+        account({
+          accountId: 'a',
+          predictedResetAt: NOW + 100 * HOUR,
+          limits: [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 10 * HOUR }],
+        }),
+      ],
+      NOW,
+    );
+    expect(outlook.accounts[0]?.budget?.weeklyResetAt).toBe(NOW + 10 * HOUR);
+    expect(outlook.accounts[0]?.budget?.resetPredicted).toBe(false);
+    expect(outlook.events).toHaveLength(1);
   });
 
   it('ignores reset times in the past (stale cached snapshots carry them)', () => {

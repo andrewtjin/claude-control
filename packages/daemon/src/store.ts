@@ -257,6 +257,20 @@ export class Store {
     return rows.map((r) => this.toUsageSnapshotRow(r));
   }
 
+  /** Snapshots for one account from `sinceMs` onward, OLDEST first — the order a time series
+   *  is differenced in. Bounded by the caller's window rather than a row count, so a burn
+   *  measurement covers the span it claims to instead of however many rows happened to fit.
+   *  Served by the (accountId, fetchedAtMs) index. */
+  listUsageSnapshotsSince(accountId: string, sinceMs: number): UsageSnapshotRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM usage_snapshots WHERE accountId = ? AND fetchedAtMs >= ?
+         ORDER BY fetchedAtMs ASC`,
+      )
+      .all(accountId, sinceMs);
+    return rows.map((r) => this.toUsageSnapshotRow(r));
+  }
+
   latestUsageSnapshot(accountId: string): UsageSnapshotRow | undefined {
     const row = this.db
       .prepare(
