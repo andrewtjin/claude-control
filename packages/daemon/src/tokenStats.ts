@@ -128,6 +128,7 @@ export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenS
     filesScanned: options.scan.filesScanned,
     filesSkippedByMtime: options.scan.filesSkippedByMtime,
     filesUnreadable: options.scan.filesUnreadable,
+    dirsUnreadable: options.scan.dirsUnreadable,
     malformedLines: options.scan.malformedLines,
     duplicateTurns: options.scan.duplicateTurns,
   };

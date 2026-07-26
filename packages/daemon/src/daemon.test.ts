@@ -636,6 +636,7 @@ describe('Daemon lifecycle', () => {
         filesScanned: 1,
         filesSkippedByMtime: 2,
         filesUnreadable: 0,
+        dirsUnreadable: 0,
         malformedLines: 0,
         duplicateTurns: 3,
       });
@@ -712,6 +713,7 @@ describe('Daemon lifecycle', () => {
         filesScanned: 0,
         filesSkippedByMtime: 0,
         filesUnreadable: 0,
+        dirsUnreadable: 0,
         malformedLines: 0,
         duplicateTurns: 0,
       }),

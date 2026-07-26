@@ -137,6 +137,9 @@ export const TokenStatsCoverage = z.object({
   filesScanned: z.number().int().nonnegative(),
   filesSkippedByMtime: z.number().int().nonnegative(),
   filesUnreadable: z.number().int().nonnegative(),
+  /** Project directories that could not even be listed (permission denied, a stale mount) — a
+   *  distinct failure mode from an unreadable FILE: it can hide an entire project's transcripts. */
+  dirsUnreadable: z.number().int().nonnegative(),
   malformedLines: z.number().int().nonnegative(),
   duplicateTurns: z.number().int().nonnegative(),
 });

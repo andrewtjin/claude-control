@@ -463,6 +463,7 @@ describe('stats.snapshot', () => {
       filesScanned: 42,
       filesSkippedByMtime: 400,
       filesUnreadable: 1,
+      dirsUnreadable: 1,
       malformedLines: 2,
       duplicateTurns: 3,
     },

@@ -261,6 +261,7 @@ describe('DaemonStateCache stats.snapshot', () => {
           filesScanned: 1,
           filesSkippedByMtime: 0,
           filesUnreadable: 0,
+          dirsUnreadable: 0,
           malformedLines: 0,
           duplicateTurns: 0,
         },
