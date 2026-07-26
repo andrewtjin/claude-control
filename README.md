@@ -69,8 +69,9 @@ switching — no Discord anywhere. Pair later anytime with `cctl setup --reconfi
 
 ## Platform
 
-**Windows and Linux (including WSL2) today** (macOS is a planned next milestone).
-Vault encryption is per-platform: DPAPI on Windows, an owner-only key file on Linux.
+**Windows and Linux (including WSL2) today.** Vault encryption is per-platform: DPAPI
+on Windows, an owner-only key file on Linux. The macOS Keychain path is written and
+unit-tested but has never run on a Mac, so macOS is not a supported platform yet.
 See `docs/PLATFORM.md` for the details and `cctl doctor` for a live report on your
 machine.
 

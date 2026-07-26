@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege GITHUB_TOKEN. Every job here only reads the repo — checkout, install, lint,
+# build, test, bundle — so none of them needs write scope, and without this key they would
+# inherit whatever the repository default happens to be. Declared at the root so a job added
+# later starts restricted rather than silently widening the token.
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref to save minutes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -50,3 +57,54 @@ jobs:
         # `doctor`: its checks (DPAPI, vault, ConPTY) are Windows-only and this runner is
         # ubuntu.
         run: pnpm --filter @andrewtjin/cctl run smoke-test
+
+  # First platform-specific leg: exercises the real `security(1)` vault-key path that ubuntu
+  # cannot. Not a required check, and its one hardware-sensitive step is NON-BLOCKING by design
+  # (continue-on-error on that step only, see below) — the authoritative macOS gate is owner-run
+  # on real hardware (docs/VERIFICATION.md gate 13). A green here only proves that OUR OWN
+  # vault-key item round-trips through real `security`; it says nothing about the CLI's cross-app
+  # item or the Keychain GUI prompt, which reproduce only on hardware with a logged-in CLI. A
+  # green macOS leg is therefore not evidence of macOS support.
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare an unlocked CI keychain
+        # A fresh keychain set as default (unlocked with an empty password) avoids guessing the
+        # runner's login-keychain password. `security add/find-generic-password` with no -keychain
+        # arg then targets this one. A bare `unlock-keychain` would prompt and HANG in CI.
+        run: |
+          security create-keychain -p "" ci.keychain
+          security set-keychain-settings ci.keychain
+          security unlock-keychain -p "" ci.keychain
+          security list-keychains -d user -s ci.keychain "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -s ci.keychain
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Darwin-only real-security(1) vault-key round-trip
+        # Just this one darwin test, NOT the full suite: switchEngine.test.ts seeds a live account
+        # from a file fixture, but on darwin the live channel is the Keychain — empty on a headless
+        # runner — so it can't pass here (an unrelated latent gap, not a vault-path signal). This
+        # file runs only on darwin (skipIf) and is the automatable half of the owner-run gate
+        # (docs/VERIFICATION.md gate 13); everywhere else it skips to 0 tests.
+        #
+        # continue-on-error lives on THIS STEP, not the job: Install/Build failing is a real,
+        # shared infra break and should still turn the job red. Only this one hardware-sensitive
+        # assertion is expected to diverge from real Mac hardware and allowed to fail without
+        # blocking a merge — scoping it here (rather than job-level) means a step failure upstream
+        # of this one can no longer hide behind a job that reports green regardless.
+        continue-on-error: true
+        run: pnpm exec vitest run packages/switch-engine/src/keychain.darwin.test.ts

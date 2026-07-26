@@ -4,7 +4,11 @@
 // platform is one new case here — callers never change.
 
 import { DpapiProtector, type Protector } from './dpapi.js';
-import { KeychainCredentialChannel, KeychainProtector } from './keychain.js';
+import {
+  KeychainCredentialChannel,
+  KeychainProtector,
+  resolveClaudeCliKeychainTarget,
+} from './keychain.js';
 import { FileKeyProtector, FileKeySource } from './fileKey.js';
 import { FileCredentialChannel, type LiveCredentialChannel } from './credentialStore.js';
 import { defaultVaultKeyPath, type Paths } from './paths.js';
@@ -34,12 +38,19 @@ export function defaultProtector(
 /** Where this platform's LIVE credentials live: darwin → the CLI's Keychain item; everywhere
  *  else → `<claudeDir>/.credentials.json`. Unknown platforms get the file channel too — the
  *  file location is the CLI's documented Linux behavior, and reading it can't destroy
- *  anything (the protector above is the load-bearing platform gate). */
+ *  anything (the protector above is the load-bearing platform gate). `env` is injected so
+ *  tests can prove an operator override actually reaches the constructed channel; production
+ *  omits it and reads the real `process.env`. */
 export function defaultLiveCredentialChannel(
   paths: Paths,
   platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
 ): LiveCredentialChannel {
-  return platform === 'darwin'
-    ? new KeychainCredentialChannel()
-    : new FileCredentialChannel(paths.credentialsPath);
+  if (platform === 'darwin') {
+    // The item name/account the CLI actually uses is an assumption until macOS is verified on
+    // hardware, so it is operator-overridable by env; unset resolves to the shipped defaults.
+    const { service, account } = resolveClaudeCliKeychainTarget(env);
+    return new KeychainCredentialChannel({ service, account });
+  }
+  return new FileCredentialChannel(paths.credentialsPath);
 }
