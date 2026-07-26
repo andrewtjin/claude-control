@@ -5,14 +5,26 @@ import { join } from 'node:path';
 import { Vault } from './vault.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { UnknownAccountError } from './errors.js';
+import { noopLogger, type Logger } from './logger.js';
 import type { CredentialBundle } from './types.js';
 
 let dirs: string[] = [];
-async function vault() {
+async function vault(log: Logger = noopLogger) {
   const dir = await mkdtemp(join(tmpdir(), 'ce-vault-'));
   dirs.push(dir);
   let t = 1000;
-  return new Vault(join(dir, 'vault'), new InsecurePassthroughProtector(), () => t++);
+  return new Vault(join(dir, 'vault'), new InsecurePassthroughProtector(), () => t++, log);
+}
+
+/** A logger that keeps every warning, so a refused identity conflict can be asserted as
+ *  SURFACED rather than merely not-applied. */
+function warnCapturingLogger(): { logger: Logger; warnings: string[] } {
+  const warnings: string[] = [];
+  const logger: Logger = {
+    ...noopLogger,
+    warn: (obj, msg) => warnings.push(`${msg ?? ''} ${JSON.stringify(obj)}`),
+  };
+  return { logger, warnings };
 }
 afterEach(async () => {
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
@@ -205,11 +217,70 @@ describe('Vault registry + bundles', () => {
       expect(after?.organizationUuid).toBe('org-1');
     });
 
-    it('adopts a CHANGED identity anchor, since set-only must not mean write-once', async () => {
+    it('fills an identity anchor the registry does not have yet', async () => {
+      // Backfill is the ONE identity write a bundle write may make: an account added before a
+      // field was captured otherwise stays unattributable forever, and no existing value is at
+      // risk because there is none.
       const v = await vault();
-      const acct = await v.addAccount('work', withOauth({ emailAddress: 'old@x.com' }));
-      await v.writeBundle(acct.id, withOauth({ emailAddress: 'new@x.com' }));
-      expect((await v.getAccount(acct.id))?.emailAddress).toBe('new@x.com');
+      const acct = await v.addAccount('work', withOauth({ accountUuid: 'uuid-1' }));
+      expect(acct.emailAddress).toBeUndefined();
+
+      await v.writeBundle(acct.id, withOauth({ accountUuid: 'uuid-1', emailAddress: 'me@x.com' }));
+
+      const after = await v.getAccount(acct.id);
+      expect(after?.emailAddress).toBe('me@x.com');
+      expect(after?.accountUuid).toBe('uuid-1');
+    });
+
+    it('does not rewrite the registry when the anchors merely repeat what is stored', async () => {
+      // Every token refresh replays the same identity block; rewriting the row for it would
+      // churn the file and make updatedAtMs meaningless as a "something changed" signal.
+      const v = await vault();
+      const acct = await v.addAccount('work', withOauth({ accountUuid: 'uuid-1' }));
+      const before = (await v.getAccount(acct.id))?.updatedAtMs;
+      await v.writeBundle(acct.id, withOauth({ accountUuid: 'uuid-1' }));
+      expect((await v.getAccount(acct.id))?.updatedAtMs).toBe(before);
+    });
+
+    it('refuses a CHANGED identity anchor and surfaces the conflict', async () => {
+      // An account's identity is stable by definition, so a different one arriving on a bundle
+      // write means the bundle picked up another account's block — the adoption path can hand
+      // over whatever the CLI last logged in. Absorbing it would re-key the registry row that
+      // relogin attribution, active-id reconciliation, usage-cache attribution and poll token
+      // ownership all compare a bundle AGAINST, so the contaminated bundle would start agreeing
+      // with its own row and the mis-attribution would go permanently undetectable. Refusing
+      // keeps it visible; logging keeps it from being silent.
+      const { logger, warnings } = warnCapturingLogger();
+      const v = await vault(logger);
+      const acct = await v.addAccount(
+        'work',
+        withOauth({ accountUuid: 'uuid-1', emailAddress: 'old@x.com' }),
+      );
+
+      await v.writeBundle(acct.id, withOauth({ accountUuid: 'uuid-2', emailAddress: 'new@x.com' }));
+
+      const after = await v.getAccount(acct.id);
+      expect(after?.accountUuid).toBe('uuid-1');
+      expect(after?.emailAddress).toBe('old@x.com');
+      // The refusal is reported per field, naming both the kept and the rejected value.
+      expect(warnings).toHaveLength(2);
+      expect(warnings[0]).toContain('accountUuid');
+      expect(warnings[0]).toContain('uuid-1');
+      expect(warnings[0]).toContain('uuid-2');
+    });
+
+    it('still persists the bundle when an identity anchor is refused', async () => {
+      // The refusal must never cost a token: bundle writes carry rotated single-use refresh
+      // tokens, so a conflicting identity block is logged and dropped, not thrown.
+      const v = await vault();
+      const acct = await v.addAccount('work', withOauth({ accountUuid: 'uuid-1' }));
+      await v.writeBundle(acct.id, {
+        claudeAiOauth: { accessToken: 'rotated', refreshToken: 'r-rotated', expiresAt: 999 },
+        oauthAccount: { accountUuid: 'uuid-2' },
+      });
+      const stored = await v.readBundle(acct.id);
+      expect(stored.claudeAiOauth.refreshToken).toBe('r-rotated');
+      expect((await v.getAccount(acct.id))?.accountUuid).toBe('uuid-1');
     });
 
     it('drops non-string upstream values instead of persisting them for the renderer to hit', async () => {
