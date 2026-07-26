@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { chunkMessage, DISCORD_CONTENT_MAX } from './messageChunks.js';
+import { chunkMessage, clampBalanced, DISCORD_CONTENT_MAX } from './messageChunks.js';
+import { truncateLabeled } from './richFormat.js';
 
 /** Every chunk must be independently sendable: within the cap and fence-balanced. */
 function expectSendable(chunks: string[], max = DISCORD_CONTENT_MAX): void {
@@ -98,5 +99,33 @@ describe('chunkMessage', () => {
       .split('\n')
       .filter((l) => !l.startsWith('```') && l !== '');
     expect(seen).toEqual(original.filter((l) => l !== ''));
+  });
+});
+
+describe('clampBalanced', () => {
+  const fenced = (rows: number): string =>
+    [
+      '```',
+      ...Array.from({ length: rows }, (_, i) => `| row ${i} | ${'v'.repeat(30)} |`),
+      '```',
+    ].join('\n');
+
+  it('passes a value that already fits through byte-identical', () => {
+    const text = fenced(2);
+    expect(clampBalanced(text, 1000, truncateLabeled)).toBe(text);
+  });
+
+  it('closes the fence the cut opened, and still fits the cap', () => {
+    const clamped = clampBalanced(fenced(50), 300, truncateLabeled);
+    expect(clamped.length).toBeLessThanOrEqual(300);
+    expect((clamped.match(/```/g) ?? []).length % 2).toBe(0);
+    // The closer is appended, so the clamp's own visible marker survives the rebalance.
+    expect(clamped).toContain('chars truncated');
+  });
+
+  it('adds nothing to fence-free text beyond the clamp itself', () => {
+    const clamped = clampBalanced('x'.repeat(500), 100, truncateLabeled);
+    expect(clamped.length).toBeLessThanOrEqual(100);
+    expect(clamped).not.toContain('```');
   });
 });

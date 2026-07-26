@@ -149,3 +149,193 @@ describe('formatTables — markdown pipe input', () => {
     for (const line of out.split('\n')) expect(line.length).toBeLessThanOrEqual(60);
   });
 });
+
+// The shape that motivated the record layout: a 2-column markdown table whose second column is
+// whole sentences. Discord renders none of it, and a 40-column grid would give each sentence a
+// third of a line. Synthetic file names — the fixture is about the SHAPE (code spans in the first
+// cell, a paragraph in the second), not about any particular repository.
+const PROSE_MD_TABLE = [
+  '| Action | Detail |',
+  '|---|---|',
+  '| `widget.ts` -> `src/parts/` | Self-contained, no relative imports - moves unchanged. |',
+  "| `loader.ts` + `loader-old.ts` -> `src/parts/loader.ts` | Collapsed the duplicate; kept the streaming path, took the older file's bounded retry cap. |",
+  '| `legacy.config.json` -> deleted | Folded into the package config. A stray `legacy.config.json` would win over it and the merged settings would be ignored without a word. Added `roots = ["src"]` so `example_pkg` resolves before the local install. |',
+  '| `README.md`, `tasks/todo.md` | Updated the dangling paths the moves created. |',
+  '| `.cache/` | Deleted - two stale build caches of pure garbage. |',
+].join('\n');
+
+/** Every rendered character that is not a fence or layout whitespace — the roundtrip form for
+ *  asserting a record layout dropped nothing and reordered nothing. */
+function recordText(rendered: string): string {
+  return rendered
+    .split('\n')
+    .filter((l) => l !== '```')
+    .join('')
+    .replace(/\s+/g, '');
+}
+
+describe('formatTables — long-cell tables render as records, not a grid', () => {
+  it('renders the prose table as one record per row', () => {
+    expect(formatTables(PROSE_MD_TABLE)).toBe(
+      [
+        '```',
+        'Action',
+        '  Detail',
+        '',
+        '`widget.ts` -> `src/parts/`',
+        '  Self-contained, no relative imports -',
+        '  moves unchanged.',
+        '',
+        '`loader.ts` + `loader-old.ts` ->',
+        '`src/parts/loader.ts`',
+        '  Collapsed the duplicate; kept the',
+        "  streaming path, took the older file's",
+        '  bounded retry cap.',
+        '',
+        '`legacy.config.json` -> deleted',
+        '  Folded into the package config. A',
+        '  stray `legacy.config.json` would win',
+        '  over it and the merged settings would',
+        '  be ignored without a word. Added',
+        '  `roots = ["src"]` so `example_pkg`',
+        '  resolves before the local install.',
+        '',
+        '`README.md`, `tasks/todo.md`',
+        '  Updated the dangling paths the moves',
+        '  created.',
+        '',
+        '`.cache/`',
+        '  Deleted - two stale build caches of',
+        '  pure garbage.',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('keeps every record line inside the width budget', () => {
+    for (const line of formatTables(PROSE_MD_TABLE).split('\n')) {
+      expect(line.length).toBeLessThanOrEqual(DEFAULT_TABLE_WIDTH);
+    }
+  });
+
+  it('loses no cell content and keeps source order — full roundtrip', () => {
+    // Header row included: with two fields it renders as the first record rather than vanishing.
+    const cells = PROSE_MD_TABLE.split('\n')
+      .filter((l) => !/^\|?[\s:|-]+\|?$/.test(l))
+      .flatMap((l) => l.split('|').slice(1, -1));
+    expect(recordText(formatTables(PROSE_MD_TABLE))).toBe(cells.join('').replace(/\s+/g, ''));
+  });
+
+  it('labels each field past two columns, taking the labels from the header row', () => {
+    const three = [
+      '| Action | Detail | Owner |',
+      '|---|---|---|',
+      '| `widget.ts` -> `src/parts/` | Self-contained, no relative imports so it moves unchanged. | platform |',
+      '| `legacy.config.json` -> deleted | Folded into the package config; a stray file would silently win. | tooling |',
+    ].join('\n');
+    expect(formatTables(three)).toBe(
+      [
+        '```',
+        'ACTION: `widget.ts` -> `src/parts/`',
+        'DETAIL: Self-contained, no relative',
+        '        imports so it moves unchanged.',
+        'OWNER:  platform',
+        '',
+        'ACTION: `legacy.config.json` -> deleted',
+        'DETAIL: Folded into the package config;',
+        '        a stray file would silently win.',
+        'OWNER:  tooling',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('leaves a blank header cell unlabeled instead of printing a bare colon', () => {
+    // `| | Tradeoff | Recommendation |` is a common idiom: the corner names nothing, so it must
+    // pad to the label column rather than label every record with a lone `:`.
+    const blankCorner = [
+      '| | Tradeoff | Recommendation |',
+      '|---|---|---|',
+      '| Option A | Costs more up front, but it avoids a rewrite in the next quarter. | Take it |',
+      '| Option B | Cheaper today, and the rewrite lands squarely on the next team. | Skip it |',
+    ].join('\n');
+    const lines = formatTables(blankCorner).split('\n');
+    expect(lines[1]).toBe('                Option A');
+    expect(lines[2]).toBe('TRADEOFF:       Costs more up front, but');
+  });
+
+  it('drops the grid when the columns cannot be squeezed to the target width', () => {
+    // Twenty one-word cells: no cell wraps at all, so the height gate never fires, yet every
+    // column sits at its floor and the box still renders past 100 columns — the shredded grid
+    // this module exists to replace. Width has to gate the layout too.
+    const columns = 20;
+    const wide = [
+      `| ${Array.from({ length: columns }, (_, i) => `c${i}`).join(' | ')} |`,
+      `|${'---|'.repeat(columns)}`,
+      `| ${Array.from({ length: columns }, (_, i) => `v${i}`).join(' | ')} |`,
+    ].join('\n');
+    const out = formatTables(wide);
+    expect(out).not.toContain('┌');
+    for (const line of out.split('\n'))
+      expect(line.length).toBeLessThanOrEqual(DEFAULT_TABLE_WIDTH);
+    expect(out).toContain('C19: v19');
+  });
+
+  it('hard-splits an astral token on code points, never through a surrogate pair', () => {
+    // A record wraps at `maxWidth - lead.length`, which is odd whenever the padded label is — and
+    // a UTF-16 slice at an odd offset lands INSIDE an emoji, replacing it with two broken halves.
+    const glyph = '\u{1F600}';
+    const table = [
+      '| Label | Detail |',
+      '|---|---|',
+      `| ${glyph.repeat(40)} | ${'a sentence long enough to force the record layout '.repeat(3)}|`,
+    ].join('\n');
+    const out = formatTables(table);
+    expect([...out].filter((c) => c === glyph)).toHaveLength(40);
+    // Nothing but complete pairs: a lone surrogate is what renders as U+FFFD.
+    expect(out.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')).not.toMatch(/[\uD800-\uDFFF]/);
+  });
+
+  it('never eats a first DATA row as labels when the source declared no header', () => {
+    const long = (n: string): string =>
+      `${n} cell that runs on well past any column a phone-width grid could give it`;
+    const headerless = [
+      '┌──────┬──────┬──────┐',
+      `│ ${long('first')} │ ${long('second')} │ ${long('third')} │`,
+      `│ ${long('fourth')} │ ${long('fifth')} │ ${long('sixth')} │`,
+      '└──────┴──────┴──────┘',
+    ].join('\n');
+    const blocks = formatTables(headerless)
+      .split('\n')
+      .filter((l) => l !== '```')
+      .join('\n')
+      .split('\n\n');
+    // Two rows in, two records out — the first row is data, not a legend.
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]?.startsWith('first cell')).toBe(true);
+    expect(formatTables(headerless)).not.toContain('FIRST');
+  });
+
+  it('keeps the grid for a table whose cells stay short (the boundary the layout turns on)', () => {
+    // The 88-column fixture squeezes hard but its cells are still labels, not paragraphs.
+    expect(formatTables(WIDE_BOX_TABLE)).toContain('┌');
+    expect(formatTables(PROSE_MD_TABLE)).not.toContain('┌');
+  });
+
+  it('defuses a fence-closing backtick run of any length', () => {
+    // Three is the fence itself; four is the idiom for fencing a block that CONTAINS a fence, so
+    // a longer run is the case that matters — defusing only the leading three would leave the
+    // rest adjacent to the backticks just emitted and rebuild a ``` inside the body.
+    const zeroWidthSpace = String.fromCharCode(0x200b);
+    for (const run of ['```', '````', '`````', '``````']) {
+      const table = ['| Cmd | Note |', '| --- | --- |', `| ${run} | ends a fence |`].join('\n');
+      const out = formatTables(table);
+      // Exactly the opening and closing fences: nothing in the body can terminate ours.
+      expect(out.match(/```/g)).toHaveLength(2);
+      const body = out.split('\n').slice(1, -1).join('\n');
+      // Every backtick is still there — the defusal separates them, it never drops them.
+      expect(body.match(/`/g)).toHaveLength(run.length);
+      expect(body).toContain([...run].join(zeroWidthSpace));
+    }
+  });
+});
