@@ -333,6 +333,28 @@ function statsLines(rows: readonly { label: string; totals: TokenTotals }[]): st
     .join('\n');
 }
 
+/** What the scan could and could not read — the CLI's honesty footer, adapted for a field. A
+ *  total over 142 of 442 transcript files is a different claim than the same total over all 442,
+ *  and the phone must say so as plainly as the terminal does; the static disclaimers ("not a
+ *  billing figure", etc.) already live in the embed's footer, so only the per-scan counts belong
+ *  here. */
+function coverageLine(coverage: TokenStatsSnapshot['coverage']): string {
+  const notes = [
+    `${coverage.filesScanned} transcript file${coverage.filesScanned === 1 ? '' : 's'} read`,
+    `${coverage.filesSkippedByMtime} untouched since the window opened`,
+  ];
+  // Only surface the failure counts when there ARE failures — but never hide one.
+  if (coverage.filesUnreadable > 0) notes.push(`${coverage.filesUnreadable} could not be read`);
+  if (coverage.dirsUnreadable > 0) {
+    notes.push(
+      `${coverage.dirsUnreadable} project folder${coverage.dirsUnreadable === 1 ? '' : 's'} could not be read`,
+    );
+  }
+  if (coverage.malformedLines > 0) notes.push(`${coverage.malformedLines} malformed lines skipped`);
+  if (coverage.duplicateTurns > 0) notes.push(`${coverage.duplicateTurns} duplicate turns skipped`);
+  return `${notes.join(', ')}.`;
+}
+
 /**
  * `/stats` — absolute token counts for the window the daemon last scanned, by account, model and
  * day, plus the split across the four token kinds.
@@ -356,6 +378,7 @@ export function buildStatsEmbed(stats: TokenStatsSnapshot): EmbedBuilder {
     });
 
   if (stats.overall.turns === 0) {
+    addClampedField(embed, 'Coverage', coverageLine(stats.coverage));
     return embed.setDescription(
       `No Claude Code turns recorded on the host in the last ${days} day${days === 1 ? '' : 's'}.`,
     );
@@ -377,6 +400,7 @@ export function buildStatsEmbed(stats: TokenStatsSnapshot): EmbedBuilder {
       `cache write ${formatTokens(stats.overall.cacheCreation)} · ` +
       `cache read ${formatTokens(stats.overall.cacheRead)}`,
   );
+  addClampedField(embed, 'Coverage', coverageLine(stats.coverage));
   return embed;
 }
 

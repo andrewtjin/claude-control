@@ -282,6 +282,7 @@ function stats(over: Partial<TokenStatsSnapshot> = {}): TokenStatsSnapshot {
       filesScanned: 42,
       filesSkippedByMtime: 400,
       filesUnreadable: 0,
+      dirsUnreadable: 0,
       malformedLines: 0,
       duplicateTurns: 99,
     },
@@ -322,13 +323,20 @@ describe('renderTokenStats', () => {
           filesScanned: 5,
           filesSkippedByMtime: 0,
           filesUnreadable: 3,
+          dirsUnreadable: 1,
           malformedLines: 7,
           duplicateTurns: 0,
         },
       }),
     );
     expect(out).toMatch(/3 could not be read/);
+    expect(out).toMatch(/1 project folder could not be read/);
     expect(out).toMatch(/7 malformed lines skipped/);
+  });
+
+  it('surfaces the duplicate-turn count so the de-duplication rule can be sanity-checked', () => {
+    const out = renderTokenStats(stats({ coverage: { ...stats().coverage, duplicateTurns: 42 } }));
+    expect(out).toMatch(/42 duplicate turns skipped/);
   });
 
   it('says so plainly when the window holds no local turns, keeping the caveats', () => {

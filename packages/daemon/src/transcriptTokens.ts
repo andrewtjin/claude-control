@@ -74,6 +74,11 @@ export interface TranscriptScan {
   malformedLines: number;
   /** Turn lines dropped as a repeat of an already-counted `message.id` (see rule 1 above). */
   duplicateTurns: number;
+  /** Directories that could not be listed at all (permission denied, a stale mount) — NOT the
+   *  ordinary "this project/session has no subagents" case, which is a missing directory and
+   *  contributes nothing here. One unreadable project folder must show up somewhere, or its
+   *  entire spend goes missing while every count claims nothing failed. */
+  dirsUnreadable: number;
 }
 
 export interface ReadTranscriptTurnsOptions {
@@ -95,19 +100,24 @@ const READ_CHUNK_BYTES = 1 << 20;
 
 /**
  * Every `*.jsonl` under `<claudeDir>/projects`, at any depth — top-level session transcripts AND
- * the nested `subagents/**` sub-agent transcripts (see rule 2). A missing projects dir means
- * "Claude Code has never run under this config dir", which is an empty result, not an error; any
- * other directory-level failure is likewise swallowed per-directory so one unreadable project
- * folder cannot blind the whole scan.
+ * the nested `subagents/**` sub-agent transcripts (see rule 2). A MISSING projects dir means
+ * "Claude Code has never run under this config dir" (or "this session has no subagents"), which
+ * is an empty result, not an error. Any OTHER directory-level failure (permission denied, a stale
+ * mount) is a real gap in the scan and is counted in `dirsUnreadable` rather than swallowed —
+ * distinguished by `ENOENT` so the routine "no subagents here" case stays silent.
  */
-async function discoverTranscriptFiles(claudeDir: string): Promise<string[]> {
+async function discoverTranscriptFiles(
+  claudeDir: string,
+): Promise<{ files: string[]; dirsUnreadable: number }> {
   const found: string[] = [];
+  let dirsUnreadable = 0;
   const walk = async (dir: string): Promise<void> => {
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return; // missing / unreadable directory — nothing to contribute
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') dirsUnreadable++;
+      return;
     }
     for (const entry of entries) {
       const path = join(dir, entry.name);
@@ -116,7 +126,7 @@ async function discoverTranscriptFiles(claudeDir: string): Promise<string[]> {
     }
   };
   await walk(join(claudeDir, 'projects'));
-  return found;
+  return { files: found, dirsUnreadable };
 }
 
 /** Pull a turn out of one already-parsed line, or `undefined` when the line is not a turn we can
@@ -170,7 +180,7 @@ function countOf(value: unknown): number {
 export async function readTranscriptTurns(
   options: ReadTranscriptTurnsOptions,
 ): Promise<TranscriptScan> {
-  const files = await discoverTranscriptFiles(options.claudeDir);
+  const { files, dirsUnreadable } = await discoverTranscriptFiles(options.claudeDir);
   const scan: TranscriptScan = {
     turns: [],
     filesScanned: 0,
@@ -178,6 +188,7 @@ export async function readTranscriptTurns(
     filesUnreadable: 0,
     malformedLines: 0,
     duplicateTurns: 0,
+    dirsUnreadable,
   };
   // Global across ALL files, not per file — a forked/resumed session copies earlier turns into a
   // new file, so a per-file set would let those through (see rule 1).

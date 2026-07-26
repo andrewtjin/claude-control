@@ -7,11 +7,32 @@
 // no `usage` all occur in a real transcript corpus, and each one silently corrupts a total if
 // mishandled.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readTranscriptTurns } from './transcriptTokens.js';
+
+// A directory listing failure has to be simulated rather than triggered with real OS
+// permissions: chmod does not reliably deny a folder's own owner on every platform CI runs on,
+// so a flaky permission-based test would prove nothing. Mocking `readdir` by path keeps the
+// failure deterministic while every other directory still goes through the real filesystem.
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readdir: vi.fn((path: string, options: { withFileTypes: true }) => {
+      if (path.endsWith('locked')) {
+        const err = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
+        err.code = 'EACCES';
+        throw err;
+      }
+      // discoverTranscriptFiles only ever calls readdir with { withFileTypes: true }, so the
+      // mock only needs to support that one shape.
+      return actual.readdir(path, options);
+    }),
+  };
+});
 
 let root: string;
 let claudeDir: string;
@@ -72,6 +93,22 @@ describe('readTranscriptTurns', () => {
     const scan = await readTranscriptTurns({ claudeDir: join(root, 'nope'), sinceMs: SINCE });
     expect(scan.turns).toEqual([]);
     expect(scan.filesScanned).toBe(0);
+    expect(scan.filesUnreadable).toBe(0);
+    // A missing directory is "Claude Code never ran here" / "no subagents for this session" —
+    // an empty result, not a failure, so it must NOT count toward dirsUnreadable.
+    expect(scan.dirsUnreadable).toBe(0);
+  });
+
+  it('counts an unreadable project directory instead of silently omitting its turns', async () => {
+    await writeTranscript('good/session.jsonl', [turnLine({ id: 'msg_good', ts: IN_WINDOW })]);
+    await mkdir(join(projectsDir, 'locked'), { recursive: true });
+    const scan = await readTranscriptTurns({ claudeDir, sinceMs: SINCE });
+    // The readable sibling directory's turn must still surface — one locked project cannot
+    // blind the whole scan.
+    expect(scan.turns).toHaveLength(1);
+    expect(scan.turns[0]?.tsMs).toBe(Date.parse(IN_WINDOW));
+    expect(scan.dirsUnreadable).toBe(1);
+    // Distinct failure mode from an unreadable FILE — must not be folded into that counter.
     expect(scan.filesUnreadable).toBe(0);
   });
 

@@ -26,6 +26,7 @@ function scanOf(turns: TranscriptTurn[], overrides: Partial<TranscriptScan> = {}
     filesScanned: turns.length,
     filesSkippedByMtime: 0,
     filesUnreadable: 0,
+    dirsUnreadable: 0,
     malformedLines: 0,
     duplicateTurns: 0,
     ...overrides,
@@ -185,6 +186,7 @@ describe('aggregateTokenStats', () => {
       filesScanned: 12,
       filesSkippedByMtime: 400,
       filesUnreadable: 2,
+      dirsUnreadable: 0,
       malformedLines: 3,
       duplicateTurns: 99,
     });

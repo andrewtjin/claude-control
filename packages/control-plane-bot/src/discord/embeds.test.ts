@@ -895,6 +895,7 @@ describe('buildStatsEmbed', () => {
       filesScanned: 42,
       filesSkippedByMtime: 400,
       filesUnreadable: 0,
+      dirsUnreadable: 0,
       malformedLines: 0,
       duplicateTurns: 0,
     },
@@ -907,12 +908,33 @@ describe('buildStatsEmbed', () => {
     expect(json.description).toMatch(/Last 7 days/);
     expect(json.description).toMatch(/1\.9B/);
     const names = (json.fields ?? []).map((f) => f.name);
-    expect(names).toEqual(['By account', 'By model', 'By day', 'Token kinds']);
+    expect(names).toEqual(['By account', 'By model', 'By day', 'Token kinds', 'Coverage']);
     const byAccount = (json.fields ?? []).find((f) => f.name === 'By account');
     expect(byAccount?.value).toMatch(/\*\*main\*\*/);
     expect(byAccount?.value).toMatch(/unattributed/);
     const kinds = (json.fields ?? []).find((f) => f.name === 'Token kinds');
     expect(kinds?.value).toMatch(/cache read 1\.9B/);
+  });
+
+  it('renders the coverage block instead of silently dropping a partial scan', () => {
+    const json = buildStatsEmbed(
+      snapshot({
+        coverage: {
+          filesScanned: 142,
+          filesSkippedByMtime: 0,
+          filesUnreadable: 300,
+          dirsUnreadable: 2,
+          malformedLines: 5,
+          duplicateTurns: 7,
+        },
+      }),
+    ).toJSON();
+    const coverage = (json.fields ?? []).find((f) => f.name === 'Coverage');
+    expect(coverage?.value).toMatch(/142 transcript files read/);
+    expect(coverage?.value).toMatch(/300 could not be read/);
+    expect(coverage?.value).toMatch(/2 project folders could not be read/);
+    expect(coverage?.value).toMatch(/5 malformed lines skipped/);
+    expect(coverage?.value).toMatch(/7 duplicate turns skipped/);
   });
 
   it('puts the most recent day first, so the clamp drops the far tail', () => {
@@ -931,12 +953,15 @@ describe('buildStatsEmbed', () => {
     expect(json.footer?.text).toMatch(/Not a billing figure/);
   });
 
-  it('says nothing was recorded rather than rendering empty tables', () => {
+  it('says nothing was recorded rather than rendering empty tables, but keeps coverage', () => {
     const json = buildStatsEmbed(
       snapshot({ overall: t(), byAccount: [], byModel: [], byDay: [] }),
     ).toJSON();
     expect(json.description).toMatch(/No Claude Code turns recorded on the host/);
-    expect(json.fields ?? []).toHaveLength(0);
+    // Coverage is the one field that still belongs here: zero turns can mean an empty window
+    // OR a scan that failed to read anything, and those are different claims.
+    const names = (json.fields ?? []).map((f) => f.name);
+    expect(names).toEqual(['Coverage']);
     // The caveats survive the empty case — an absent number still needs its context.
     expect(json.footer?.text).toMatch(/Not a billing figure/);
   });

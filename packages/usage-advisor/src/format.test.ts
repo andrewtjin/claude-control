@@ -46,4 +46,18 @@ describe('formatTokens', () => {
     expect(formatTokens(0.4)).toBe('0');
     expect(formatTokens(999.6)).toBe('1000');
   });
+
+  it('promotes to the next unit when rounding would otherwise print one that does not exist', () => {
+    // 999.6k and 999_999k both round to "1000k" pre-fix — a unit this function never
+    // otherwise emits, right next to rows reading "1.9B".
+    expect(formatTokens(999_600)).toBe('1.0M');
+    expect(formatTokens(999_999)).toBe('1.0M');
+    expect(formatTokens(999_999_999)).toBe('1.0B');
+  });
+
+  it('drops the decimal at the top unit once rounding reaches double digits', () => {
+    // 9.999999999B rounds to "10.0" at one decimal place, which must read "10B" (still the
+    // same unit, just no decimal), not the self-contradictory "10.0B".
+    expect(formatTokens(9_999_999_999)).toBe('10B');
+  });
 });

@@ -259,7 +259,15 @@ function coverageLines(stats: TokenStatsSnapshot, palette: Palette): string[] {
   ];
   // Only surface the failure counts when there ARE failures — but never hide one.
   if (c.filesUnreadable > 0) notes.push(`${c.filesUnreadable} could not be read`);
+  if (c.dirsUnreadable > 0) {
+    notes.push(
+      `${c.dirsUnreadable} project folder${c.dirsUnreadable === 1 ? '' : 's'} could not be read`,
+    );
+  }
   if (c.malformedLines > 0) notes.push(`${c.malformedLines} malformed lines skipped`);
+  // The one number that lets an operator sanity-check the de-duplication the whole module is
+  // built around (rule 1: summing lines instead of responses over-counts by ~3.3x).
+  if (c.duplicateTurns > 0) notes.push(`${c.duplicateTurns} duplicate turns skipped`);
   return [
     palette.dim(`${notes.join(', ')}.`),
     palette.dim(
