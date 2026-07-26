@@ -75,10 +75,23 @@ function truncate(s: string): string {
 
 /** Bare tokens read fine unquoted (`sessionId=abc123`); anything with whitespace, a quote, or
  *  the empty string needs quoting so the line stays unambiguous to read and to split on
- *  whitespace by a human or a quick `awk`. */
+ *  whitespace by a human or a quick `awk`.
+ *
+ *  A raw `\n`/`\r` inside the quotes would be worse than not quoting at all: the continuation
+ *  line(s) carry no prefix and no indent, so `tail`/`grep`/any line-based collector cannot tell
+ *  them apart from a fresh record. `err` messages routinely contain one — third-party library
+ *  errors (zod's pretty-printed `ZodError.message`, a `JSON.parse` failure on a large body) are
+ *  multi-line text, unlike every `msg` in this codebase, which is always a string literal.
+ *  Backslashes are escaped FIRST so the escapes added for `"`/`\n`/`\r` below aren't themselves
+ *  re-escaped, which also makes the result round-trippable (unescaping reverses cleanly). */
 function quoteIfNeeded(s: string): string {
   if (s === '' || /[\s"]/.test(s)) {
-    return `"${s.replace(/"/g, '\\"')}"`;
+    const escaped = s
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\r/g, '\\r')
+      .replace(/\n/g, '\\n');
+    return `"${escaped}"`;
   }
   return s;
 }

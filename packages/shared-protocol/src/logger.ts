@@ -62,12 +62,27 @@ type LogFormat = 'pretty' | 'json';
  *  output entirely. Renaming the collision keeps both. */
 const RESERVED_KEYS = ['level', 'time', 'msg'];
 
+/** True only for a plain `{}`-literal-shaped object (including `Object.create(null)`), never for
+ *  an `Error`, `Map`, or other class instance. The rename below rebuilds its input via
+ *  `Object.entries`, which only sees own ENUMERABLE keys — fine for a plain payload object, but
+ *  for an `Error` it silently drops `message`/`stack` (own but non-enumerable) and the
+ *  prototype, destroying the very thing pino's `err` serializer needs. Restricting the rename
+ *  to plain objects means anything else (a bare Error passed as the whole payload) is returned
+ *  untouched instead of being quietly gutted. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
 function renameReservedKeys(obj: unknown): unknown {
-  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return obj;
-  const record = obj as Record<string, unknown>;
-  if (!RESERVED_KEYS.some((key) => key in record)) return obj;
+  if (!isPlainObject(obj)) return obj;
+  // `Object.hasOwn` (own-enumerable-or-not) must agree with the `Object.entries` rebuild below
+  // (own-enumerable-only) on which keys exist — using `in` here would trigger the rebuild for a
+  // key that then never survives it (see the module comment above).
+  if (!RESERVED_KEYS.some((key) => Object.hasOwn(obj, key))) return obj;
   const renamed: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(record)) {
+  for (const [key, value] of Object.entries(obj)) {
     renamed[RESERVED_KEYS.includes(key) ? `${key}Field` : key] = value;
   }
   return renamed;
@@ -75,73 +90,122 @@ function renameReservedKeys(obj: unknown): unknown {
 
 /** Resolves pretty vs JSON: CCTL_LOG_FORMAT wins outright when set to a recognized value;
  *  otherwise a real terminal gets pretty output and anything else (piped to a file, a service
- *  manager, a log collector) gets NDJSON it can actually parse. */
-function resolveFormat(env: NodeJS.ProcessEnv, isTTY: boolean): LogFormat {
-  if (env.CCTL_LOG_FORMAT === 'json') return 'json';
-  if (env.CCTL_LOG_FORMAT === 'pretty') return 'pretty';
+ *  manager, a log collector) gets NDJSON it can actually parse. An unrecognized value (typo'd
+ *  or wrong-cased) is exactly the same class of operator mistake as a bad CCTL_LOG_FILE, so it
+ *  gets the same treatment: fall back safely AND warn, rather than silently auto-detecting
+ *  while `cctl settings` goes on reporting the (unhonored) raw value. */
+function resolveFormat(
+  env: NodeJS.ProcessEnv,
+  isTTY: boolean,
+  warn: (message: string) => void,
+): LogFormat {
+  const raw = env.CCTL_LOG_FORMAT;
+  if (raw === undefined || raw === '') return isTTY ? 'pretty' : 'json';
+  if (raw === 'json') return 'json';
+  if (raw === 'pretty') return 'pretty';
+  warn(`CCTL_LOG_FORMAT=${raw} is not "json" or "pretty"; falling back to auto-detection`);
   return isTTY ? 'pretty' : 'json';
 }
 
+/** Per-process cache of open file sinks, keyed by the absolute CCTL_LOG_FILE path. A single
+ *  process builds more than one logger through `createLogger` (the daemon's own plus the
+ *  switch-engine adapter `buildEngine` builds alongside it — both target the SAME operator-
+ *  configured file since both read the same env), so without this every logger would open its
+ *  own fd on the same file and print its own copy of the degradation warning. Keyed by path
+ *  (not a singleton) so unrelated file paths — as every test uses, via a fresh temp dir per
+ *  test — stay fully independent. */
+const fileSinks = new Map<string, FileSink>();
+
+function getFileSink(filePath: string, warn: (message: string) => void): FileSink {
+  const existing = fileSinks.get(filePath);
+  if (existing !== undefined) return existing;
+  const sink = new FileSink(filePath, warn);
+  fileSinks.set(filePath, sink);
+  return sink;
+}
+
 /**
- * The pino destination: a plain object with a synchronous `write`, which is all pino requires
- * (see pino's DestinationStream docs) — no stream machinery, no worker thread.
+ * Owns the raw fd for one CCTL_LOG_FILE path: opening it, writing to it, and degrading to
+ * stdout-only (with exactly one warning) if it ever fails. Every line reaches this sink
+ * verbatim as NDJSON regardless of stdout's mode, since the file exists for later machine
+ * consumption (log collectors, `grep`) even when a human is watching pretty output live in the
+ * terminal — which also means the full stack of every error is always in the file even when
+ * pretty stdout is showing only the summary.
  *
- * Every line reaches the file sink verbatim as NDJSON regardless of stdout's mode, since the
- * file exists for later machine consumption (log collectors, `grep`) even when a human is
- * watching pretty output live in the terminal — which also means the full stack of every error
- * is always in the file even when pretty stdout is showing only the summary.
- *
- * The file is written with `writeSync` to a raw fd rather than through `fs.createWriteStream`.
- * A write stream buffers, and the lines that matter most are the ones emitted immediately
- * before `process.exit` (`daemon failed to start`) — a buffered stream drops those on the
- * floor, since `process.exit` runs no flush of its own.
+ * Written with `writeSync` to a raw fd rather than through `fs.createWriteStream`. A write
+ * stream buffers, and the lines that matter most are the ones emitted immediately before
+ * `process.exit` (`daemon failed to start`) — a buffered stream drops those on the floor, since
+ * `process.exit` runs no flush of its own.
  */
-class LogDestination {
-  private fileFd: number | undefined;
-  private fileSinkWarned = false;
+class FileSink {
+  private fd: number | undefined;
+  private warned = false;
 
   constructor(
-    private readonly mode: LogFormat,
-    private readonly includeStack: boolean,
-    private readonly filePath: string | undefined,
+    private readonly filePath: string,
     private readonly warn: (message: string) => void,
-    private readonly stdout: LogSink,
   ) {
-    if (filePath === undefined || filePath === '') return;
     try {
-      this.fileFd = openSync(filePath, 'a');
+      this.fd = openSync(filePath, 'a');
     } catch (err) {
-      this.degradeToStdoutOnly(err);
+      this.degrade(err);
     }
   }
 
   /** A bad CCTL_LOG_FILE (missing parent directory, no permission, disk full, ...) must never
-   *  crash the daemon over logging — degrade to stdout-only with exactly one warning. */
-  private degradeToStdoutOnly(err: unknown): void {
-    if (this.fileFd !== undefined) {
+   *  crash the daemon over logging — degrade to stdout-only with exactly one warning, shared by
+   *  every logger writing to this path. */
+  private degrade(err: unknown): void {
+    if (this.fd !== undefined) {
       try {
-        closeSync(this.fileFd);
+        closeSync(this.fd);
       } catch {
         // Already unusable; nothing left to salvage by reporting a second failure.
       }
     }
-    this.fileFd = undefined;
-    if (this.fileSinkWarned) return;
-    this.fileSinkWarned = true;
+    this.fd = undefined;
+    if (this.warned) return;
+    this.warned = true;
     const reason = err instanceof Error ? err.message : String(err);
     this.warn(
-      `CCTL_LOG_FILE=${this.filePath ?? ''} could not be written (${reason}); logging to stdout only`,
+      `CCTL_LOG_FILE=${this.filePath} could not be written (${reason}); logging to stdout only`,
     );
   }
 
-  write(chunk: string): boolean {
-    if (this.fileFd !== undefined) {
-      try {
-        writeSync(this.fileFd, chunk);
-      } catch (err) {
-        this.degradeToStdoutOnly(err);
+  write(chunk: string): void {
+    if (this.fd === undefined) return;
+    try {
+      // `writeSync` is not guaranteed to write the whole buffer in one call (a pipe/FIFO can
+      // accept less than it's given); looping on its return value is what `fs.createWriteStream`
+      // did for us before and what this raw-fd replacement must keep doing, or a short write
+      // truncates a log line with nothing to show for it.
+      const buffer = Buffer.from(chunk, 'utf8');
+      let offset = 0;
+      while (offset < buffer.length) {
+        offset += writeSync(this.fd, buffer, offset, buffer.length - offset);
       }
+    } catch (err) {
+      this.degrade(err);
     }
+  }
+}
+
+class LogDestination {
+  private readonly fileSink: FileSink | undefined;
+
+  constructor(
+    private readonly mode: LogFormat,
+    private readonly includeStack: boolean,
+    filePath: string | undefined,
+    warn: (message: string) => void,
+    private readonly stdout: LogSink,
+  ) {
+    this.fileSink =
+      filePath === undefined || filePath === '' ? undefined : getFileSink(filePath, warn);
+  }
+
+  write(chunk: string): boolean {
+    this.fileSink?.write(chunk);
     if (this.mode === 'json') {
       this.stdout.write(chunk);
     } else {
@@ -194,8 +258,8 @@ export function createLogger(options: CreateLoggerOptions): LoggerLike {
   const env = options.env ?? process.env;
   const level = env.CCTL_LOG_LEVEL ?? options.defaultLevel;
   const stdout = options.stdout ?? process.stdout;
-  const format = resolveFormat(env, stdout.isTTY === true);
   const warn = options.warn ?? ((message: string) => process.stderr.write(`warn: ${message}\n`));
+  const format = resolveFormat(env, stdout.isTTY === true, warn);
 
   const destination = new LogDestination(
     format,

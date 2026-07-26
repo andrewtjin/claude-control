@@ -193,6 +193,27 @@ describe('createLogger: reserved payload keys', () => {
     expect(parsed.sessionId).toBe('s1');
     expect(parsed).not.toHaveProperty('levelField');
   });
+
+  it('leaves a bare Error payload untouched instead of gutting it via the rename rebuild', () => {
+    // message/stack are own-but-non-enumerable on Error, so a rebuild via Object.entries (which
+    // only sees own enumerable keys) would silently drop them along with the prototype pino's
+    // `instanceof Error` special-case (and its err serializer) rely on — even though this Error
+    // also carries an enumerable `level` field that would otherwise trip the reserved-key guard.
+    const stdout = new CapturingStdout(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    const err = new Error('kaboom') as Error & { level: string };
+    err.level = 'critical';
+    logger.error(err);
+    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    // pino's own numeric error level, untouched — the Error's OWN `level` field lives nested
+    // under `err.level` below, so it never collides with this one.
+    expect(parsed.level).toBe(50);
+    expect(parsed.msg).toBe('kaboom');
+    const serializedErr = parsed.err as Record<string, unknown>;
+    expect(serializedErr.message).toBe('kaboom');
+    expect(serializedErr.stack).toContain('Error: kaboom');
+    expect(serializedErr.level).toBe('critical');
+  });
 });
 
 describe('createLogger: file sink', () => {
@@ -247,5 +268,67 @@ describe('createLogger: file sink', () => {
     expect(() => logger.info({}, 'still alive')).not.toThrow();
     expect(stdout.chunks.some((c) => c.includes('still alive'))).toBe(true);
     expect(warnings).toHaveLength(1);
+  });
+
+  it('shares one file sink across every logger a single process builds for the same path', () => {
+    // `cctl daemon run` builds two loggers (its own, plus the switch-engine adapter inside
+    // buildEngine) that both read the same CCTL_LOG_FILE — this is the invariant that actually
+    // matters: one process, one CCTL_LOG_FILE, one fd, one warning, no matter how many loggers
+    // it builds, not "one warning per logger instance".
+    const dir = freshTempDir();
+    const filePath = join(dir, 'daemon.log');
+    const warnings: string[] = [];
+    const warn = (message: string): void => {
+      warnings.push(message);
+    };
+    const first = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FILE: filePath },
+      stdout: new CapturingStdout(true),
+      warn,
+    });
+    const second = createLogger({
+      defaultLevel: 'warn',
+      env: { CCTL_LOG_FILE: filePath },
+      stdout: new CapturingStdout(true),
+      warn,
+    });
+    first.info({ sessionId: 's1' }, 'from the daemon logger');
+    second.warn({ sessionId: 's2' }, 'from the engine logger');
+    const lines = readFileSync(filePath, 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('from the daemon logger');
+    expect(lines[1]).toContain('from the engine logger');
+    // Neither logger's file sink ever failed, so no degradation warning fires at all — proving
+    // the sink is genuinely shared rather than each logger silently opening (and leaking) its
+    // own fd on the same path.
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('degrading one logger onto an unopenable path warns exactly once for every logger sharing it', () => {
+    const dir = freshTempDir();
+    const filePath = join(dir, 'missing-parent', 'daemon.log');
+    const warnings: string[] = [];
+    const warn = (message: string): void => {
+      warnings.push(message);
+    };
+    const first = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FILE: filePath },
+      stdout: new CapturingStdout(true),
+      warn,
+    });
+    const second = createLogger({
+      defaultLevel: 'warn',
+      env: { CCTL_LOG_FILE: filePath },
+      stdout: new CapturingStdout(true),
+      warn,
+    });
+    expect(() => first.info({}, 'still alive (first)')).not.toThrow();
+    expect(() => second.warn({}, 'still alive (second)')).not.toThrow();
+    // One shared sink, one shared warning latch: two loggers on the same broken path still
+    // produce exactly one warning for the whole process, not one apiece.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(filePath);
   });
 });
