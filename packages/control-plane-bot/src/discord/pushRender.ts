@@ -19,6 +19,7 @@ import {
 import { permissionButtons, type ButtonSpec } from './buttons.js';
 import { questionSelectSpecs, type SelectSpec } from './questionCards.js';
 import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
+import { defuseFences, formatTables } from './tableFormat.js';
 
 /** A text file to attach to the message — the same delivery session threads use for full
  *  stdout. Plain data (no discord.js types) so this module stays unit-testable; the gateway
@@ -101,7 +102,10 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
   if (isType(envelope, 'session.output')) {
     // Raw stdout is far too high-volume to DM; milestones/summaries/errors are worth it.
     if (envelope.payload.kind === 'stdout') return undefined;
-    return { content: envelope.payload.text };
+    // A summary is assistant prose posted as plain content, where Discord renders neither a
+    // markdown table nor a terminal-width box — re-render before the gateway chunks it, so a
+    // chunk boundary lands between finished lines instead of inside a table it then has to fence.
+    return { content: formatTables(envelope.payload.text) };
   }
   if (isType(envelope, 'error')) {
     // A protocol `error` envelope is the daemon telling the phone something explicitly failed
@@ -146,10 +150,10 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
       // Compact by design: full-length fenced messages were flooding the DM, so the card is
       // a fixed-height embed — a glanceable preview behind a fence, the origin tag in the
       // footer, and the COMPLETE raw text as a .txt attachment the reader taps to expand
-      // (a real file needs no fence defusing). Embedded ``` sequences in the preview are
-      // defused with a zero-width space so output text cannot terminate its own fence.
-      const zeroWidthSpace = String.fromCharCode(0x200b);
-      const safeBody = p.body.replaceAll('```', '`' + zeroWidthSpace + '``');
+      // (a real file needs no fence defusing). Fence-closing backtick runs in the preview are
+      // taken apart by the formatter's `defuseFences` so output text cannot terminate its own
+      // fence — one shared defusal, so this card and a fenced table can never disagree.
+      const safeBody = defuseFences(p.body);
       const { text: preview, clipped } = previewOf(safeBody);
       const tag = sessionTag(p);
       const embed = buildToolOutputEmbed({
@@ -180,7 +184,10 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
         ],
       };
     default:
-      return { content: `**${p.title}**\n${p.body}` };
+      // The generic card is a bold title over relayed body text; that body is whatever the
+      // session had to say, tables included, so it goes through the formatter like every other
+      // prose surface.
+      return { content: `**${p.title}**\n${formatTables(p.body)}` };
   }
 }
 

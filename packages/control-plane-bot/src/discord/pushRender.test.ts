@@ -261,25 +261,31 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(push?.files).toEqual([{ filename: 'output.txt', text: body }]);
   });
 
-  it('tool_output defuses embedded ``` so output cannot terminate its preview fence', () => {
-    const push = renderPush(
-      env('hook.notification', {
-        event: 'notification',
-        title: 'Output — tricky',
-        body: 'before\n```\nafter',
-        level: 'info',
-        notificationType: 'tool_output',
-      }),
-    );
-    // Everything between the opening and closing fence must contain no raw ``` run.
-    const description = push!.embeds![0]!.toJSON().description!;
-    const interior = description.slice(
-      description.indexOf('```\n') + 4,
-      description.lastIndexOf('\n```'),
-    );
-    expect(interior).not.toContain('```');
-    expect(interior).toContain('before');
-    expect(interior).toContain('after');
+  it('tool_output defuses an embedded backtick run of any length', () => {
+    // Four backticks is how a block that itself contains a fence is written, so the RUN — not the
+    // literal triple — is what has to come apart. The card shares one defusal with the table
+    // formatter, so the two can never disagree about that.
+    for (const run of ['```', '````', '`````', '``````']) {
+      const push = renderPush(
+        env('hook.notification', {
+          event: 'notification',
+          title: 'Output — tricky',
+          body: `before\n${run}\nafter`,
+          level: 'info',
+          notificationType: 'tool_output',
+        }),
+      );
+      // Everything between the opening and closing fence must contain no raw ``` run.
+      const description = push!.embeds![0]!.toJSON().description!;
+      const interior = description.slice(
+        description.indexOf('```\n') + 4,
+        description.lastIndexOf('\n```'),
+      );
+      expect(interior).not.toContain('```');
+      expect(interior.match(/`/g)).toHaveLength(run.length);
+      expect(interior).toContain('before');
+      expect(interior).toContain('after');
+    }
   });
 
   it('falls back to the generic content card for an unknown notificationType', () => {
@@ -294,6 +300,20 @@ describe('renderPush — lifecycle notification cards', () => {
     );
     expect(push?.embeds).toBeUndefined();
     expect(push?.content).toBe('**Heads up**\nsomething happened');
+  });
+
+  it('re-renders a table in the generic card body, which Discord renders not at all', () => {
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        title: 'Moves',
+        body: ['| Flag | Meaning |', '| --- | --- |', '| --greedy | burn soonest |'].join('\n'),
+        level: 'info',
+        notificationType: 'some_new_type',
+      }),
+    );
+    expect(push?.content).not.toContain('| --- |');
+    expect(push?.content?.startsWith('**Moves**\n```\n┌')).toBe(true);
   });
 });
 
@@ -333,6 +353,20 @@ describe('renderPush — routing of other envelopes', () => {
       }),
     );
     expect(milestone?.content).toBe('built');
+  });
+
+  it('session.output summaries have their tables re-rendered before the gateway chunks them', () => {
+    const push = renderPush(
+      env('session.output', {
+        sessionId: 's',
+        seq: 2,
+        kind: 'summary',
+        text: ['| Flag | Meaning |', '| --- | --- |', '| --greedy | burn soonest |'].join('\n'),
+        truncated: false,
+      }),
+    );
+    expect(push?.content).not.toContain('| --- |');
+    expect(push?.content?.startsWith('```\n┌')).toBe(true);
   });
 
   it('usage.snapshot is cache-only (no DM)', () => {
