@@ -17,6 +17,11 @@
     `~/.claude/.credentials.json` on Linux). Anything stronger is full-disk
     encryption's job.
 
+  - **macOS** uses a random key held in the login Keychain, with the vault blobs
+    AES-256-GCM sealed in-process — the same threat model as DPAPI. This code path
+    ships today but is **not a supported platform**: see "macOS" below for exactly
+    what that means.
+
   `cctl doctor` runs a real protect/unprotect round-trip through this platform's
   protector and reports the result outright, instead of failing silently later.
 
@@ -50,10 +55,32 @@ it turns into a confusing runtime error.
 - **Observed sessions** target ConPTY and stay Windows-only; everything else —
   daemon, CLI, usage polling, remote/managed sessions — runs as-is.
 
-## Coming later
+## macOS: implemented, unverified
 
-- **macOS** (Keychain-backed vault) is the next planned milestone; its own gated
-  verification tracks separately and does not block anything documented here.
+macOS is **not a supported platform**, and it is also not absent — the docs should
+imply neither extreme:
+
+- **What exists.** `KeychainProtector` (vault key in the login Keychain, blobs sealed
+  with the same AES-256-GCM primitive the Linux file-key protector uses) and
+  `KeychainCredentialChannel` (on macOS the CLI keeps its live `claudeAiOauth` block in
+  a Keychain item, not in `.credentials.json`, so a switch must content-swap the item).
+  The platform dispatch in `switch-engine/src/protector.ts` selects both on `darwin`
+  today, and `cctl doctor` names the exact Keychain service/account it targets so a
+  wrong item name reads as a config problem rather than a mystery.
+- **What is proven.** Unit tests only, driving a **fake `security(1)` runner**. They
+  prove argument construction, the surgical read-modify-write of the item, payload-shape
+  preservation, and error mapping. They prove nothing about how the real `security`
+  binary or a real login Keychain behaves, because no test here has ever talked to one.
+- **What is unproven.** Everything needing real hardware: the CLI's actual Keychain item
+  name and payload shape, whether an isolated `CLAUDE_CONFIG_DIR` login lands in a file
+  (which is what makes `cctl accounts add --fresh` safe), the switch round-trip, and the
+  vault's negative invariant. The known-hard one: reading the CLI's **cross-app** item
+  may raise a Keychain GUI prompt, and a headless daemon cannot answer a GUI prompt.
+  There is no `security(1)`-path workaround for that — if it reproduces, the honest
+  outcome is a documented caveat, not an ACL hack.
+
+Until that gate closes (`docs/VERIFICATION.md` gate 13), macOS is unverified: the commands
+may well work on your Mac, and nothing about them is claimed here.
 
 On an unsupported platform, `cctl doctor` reports the gap instead of failing
 silently, and setup can still run for anything platform-independent.

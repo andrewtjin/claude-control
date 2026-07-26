@@ -30,6 +30,11 @@ export interface LiveCredentialChannel {
   readLiveCredentials(): Promise<ClaudeOauth | undefined>;
   /** Replace the live token block, preserving any sibling data the CLI stores with it. */
   writeLiveCredentials(oauth: ClaudeOauth): Promise<void>;
+  /** Diagnostic only: the exact identity this channel reads/writes, for channels that have one
+   *  (KeychainCredentialChannel's service/account). Absent on channels a plain path already
+   *  identifies (FileCredentialChannel) — callers reporting a target must read it from HERE,
+   *  never recompute it independently, or the two can drift apart. */
+  readonly target?: { service: string; account: string };
 }
 
 /** The `.credentials.json` channel — the historical (Windows) behavior, verbatim. */

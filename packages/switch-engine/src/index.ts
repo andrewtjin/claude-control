@@ -11,6 +11,7 @@ export {
   KeychainProtector,
   KeychainCredentialChannel,
   defaultExecRunner,
+  quoteSecurityArg,
   VAULT_KEY_SERVICE,
   VAULT_KEY_ACCOUNT,
   CLAUDE_CLI_KEYCHAIN_SERVICE,
