@@ -39,7 +39,7 @@ import {
 } from './richFormat.js';
 import type { BarRenderer } from './emojiBars.js';
 import { clampBalanced } from './messageChunks.js';
-import { formatTables } from './tableFormat.js';
+import { defuseFences, formatTables } from './tableFormat.js';
 
 const COLOR_OK = 0x2ecc71;
 const COLOR_WARN = 0xf1c40f;
@@ -816,9 +816,11 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
   const tail = model.outputTail;
   if (tail && tail.length > 0) {
     const fenceOverhead = '```\n'.length + '\n```'.length; // fence wrapping the inner text
-    const inner = truncateLabeled(
-      tail,
-      Math.max(16, EMBED_DESCRIPTION_LIMIT - prefix.length - fenceOverhead),
+    // Raw stdout is arbitrary bytes from whatever the session ran, so it can contain a fence of
+    // its own; defused here for the same reason the tool-output card does it, or one ``` in a
+    // build log closes this block early and the rest of the card renders as loose markdown.
+    const inner = defuseFences(
+      truncateLabeled(tail, Math.max(16, EMBED_DESCRIPTION_LIMIT - prefix.length - fenceOverhead)),
     );
     embed.setDescription(`${prefix}\`\`\`\n${inner}\n\`\`\``);
   } else {
