@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege GITHUB_TOKEN. Every job here only reads the repo — checkout, install, lint,
+# build, test, bundle — so none of them needs write scope, and without this key they would
+# inherit whatever the repository default happens to be. Declared at the root so a job added
+# later starts restricted rather than silently widening the token.
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref to save minutes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
