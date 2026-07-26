@@ -11,7 +11,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { CredentialBundle, Registry, StoredAccount } from './types.js';
+import type { CredentialBundle, OauthAccount, Registry, StoredAccount } from './types.js';
 import type { Protector } from './dpapi.js';
 import { atomicWriteFile, ensureDir, readJsonIfExists, removeIfExists } from './fsutil.js';
 import { UnknownAccountError, VaultError } from './errors.js';
@@ -23,8 +23,8 @@ function emptyRegistry(): Registry {
   return { activeId: null, accounts: [] };
 }
 
-/** Registry fields that identify WHICH account a row is. Filled once and never changed or
- *  removed by a later bundle write — see `fillAnchor`. */
+/** Registry fields that identify WHICH account a row is. Never removed by a bundle write, and
+ *  only written at all once the block carrying them is accepted — see `identityMatches`. */
 type IdentityKey = 'accountUuid' | 'emailAddress' | 'organizationUuid';
 
 /** Registry fields describing an account's CURRENT plan/billing state — mutable, and meaningful
@@ -48,8 +48,7 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
-/** FILL an identity anchor the registry does not have yet. Never deletes it, and never CHANGES
- *  one that is already stored.
+/** Set an identity anchor, or leave it alone when the block does not carry one. NEVER deletes.
  *
  *  These anchors gate correctness checks elsewhere — relogin attribution (a mismatch is fatal),
  *  `getActiveId()` reconciliation, usage-cache attribution, poll token ownership — and every one
@@ -57,34 +56,42 @@ function asString(value: unknown): string | undefined {
  *  turns the check off. Live config blocks legitimately arrive partial, so "not reported on this
  *  write" must never be read as "no longer true about this account".
  *
- *  A DIFFERENT value is refused for the mirror-image reason. An account's identity is stable by
- *  definition, so a bundle write carrying another one is evidence that the bundle picked up
- *  someone else's block — not a fact to absorb. Absorbing it would re-key the very row those
- *  checks compare a bundle AGAINST, so the contaminated bundle would start agreeing with its own
- *  registry row and a detectable mis-attribution would become a permanent invisible one.
- *  Re-identifying an account on purpose has its own guarded paths (`addAccount`, and the relogin
- *  verb's fatal-mismatch check), so nothing legitimate needs this to overwrite.
+ *  Whether the block may be believed AT ALL is decided once, before any of these run — see
+ *  `identityMatches`. Past that gate a changed value is a legitimately changed fact, not an
+ *  intruder, so it is applied. Returns whether the row changed. */
+function setIfPresent(account: StoredAccount, key: IdentityKey, value: unknown): boolean {
+  const next = asString(value);
+  if (next === undefined || account[key] === next) return false;
+  account[key] = next;
+  return true;
+}
+
+/** Whether a bundle's `oauthAccount` block may update this registry row at all.
+ *
+ *  Identity is validated ONCE, here, and on `accountUuid` alone, because that is the only field
+ *  the guards downstream key on. A block whose uuid contradicts the stored one is not this
+ *  account's, so NOTHING it carries may be believed: absorbing it would re-key the very row
+ *  those guards compare a bundle AGAINST, and the contaminated bundle would then agree with its
+ *  own row — turning a detectable mis-attribution into a permanently invisible one. Deciding
+ *  this per field instead would also refuse a legitimately changed `emailAddress`, which is
+ *  display metadata, not an identity gate; past this check the block is provably this account's
+ *  and a renamed address should render, not be held back as if it were an intrusion.
+ *
+ *  An unproven block — either side missing a uuid — passes: live blocks legitimately arrive
+ *  partial, and the writers that could hand over someone else's block are guarded where the
+ *  handover happens (`adoptRotationIfNeeded`'s identity precedence, the relogin verb's fatal
+ *  mismatch), not here.
  *
  *  The conflict is logged, not thrown: bundle writes carry rotated single-use tokens that must
  *  land no matter what, and turning a recoverable attribution problem into a failed refresh
- *  would lose one. Returns whether the row changed. */
-function fillAnchor(
-  account: StoredAccount,
-  key: IdentityKey,
-  value: unknown,
-  log: Logger,
-): boolean {
-  const next = asString(value);
-  if (next === undefined) return false;
-  const stored = account[key];
-  if (stored === undefined) {
-    account[key] = next;
-    return true;
-  }
-  if (stored === next) return false;
+ *  would lose one. */
+function identityMatches(account: StoredAccount, acct: OauthAccount, log: Logger): boolean {
+  const incoming = asString(acct.accountUuid);
+  if (incoming === undefined || account.accountUuid === undefined) return true;
+  if (account.accountUuid === incoming) return true;
   log.warn(
-    { accountId: account.id, field: key, stored, refused: next },
-    'bundle write carries an identity that disagrees with the registry; keeping the stored one',
+    { accountId: account.id, stored: account.accountUuid, refused: incoming },
+    'bundle write carries a different account identity; leaving the registry row unchanged',
   );
   return false;
 }
@@ -118,26 +125,28 @@ function setOrDelete(account: StoredAccount, key: PlanKey, value: unknown): bool
  * `oauthAccount` is treated as authoritative ONLY when the bundle actually carries the block;
  * when it is absent the fields it feeds are left untouched rather than deleted, because some
  * write paths legitimately persist a credentials-only bundle and must not wipe good metadata.
- * Even when the block IS present it may be partial and it may not even be this account's, so
- * identity anchors go through the fill-only `fillAnchor` and only plan/billing state is
- * freely rewritable.
+ * Even when the block IS present it may not be this account's, so it is admitted or refused as
+ * a whole by `identityMatches` before any of it is copied — a block that fails that check taints
+ * the plan/billing fields alongside the identity ones, since the two arrive together.
  */
 function applyBundleMetadata(
   account: StoredAccount,
   bundle: CredentialBundle,
   log: Logger,
 ): boolean {
+  const acct = bundle.oauthAccount;
+  if (acct !== undefined && !identityMatches(account, acct, log)) return false;
+
   let changed = false;
   const oauth = bundle.claudeAiOauth;
   changed = setOrDelete(account, 'subscriptionType', oauth.subscriptionType) || changed;
   changed = setOrDelete(account, 'rateLimitTier', oauth.rateLimitTier) || changed;
 
-  const acct = bundle.oauthAccount;
   if (acct === undefined) return changed;
 
-  changed = fillAnchor(account, 'accountUuid', acct.accountUuid, log) || changed;
-  changed = fillAnchor(account, 'emailAddress', acct.emailAddress, log) || changed;
-  changed = fillAnchor(account, 'organizationUuid', acct.organizationUuid, log) || changed;
+  changed = setIfPresent(account, 'accountUuid', acct.accountUuid) || changed;
+  changed = setIfPresent(account, 'emailAddress', acct.emailAddress) || changed;
+  changed = setIfPresent(account, 'organizationUuid', acct.organizationUuid) || changed;
   changed =
     setOrDelete(account, 'organizationRateLimitTier', acct.organizationRateLimitTier) || changed;
   changed = setOrDelete(account, 'billingType', acct.billingType) || changed;
@@ -151,8 +160,9 @@ export class Vault {
     private readonly vaultDir: string,
     private readonly protector: Protector,
     private readonly clock: () => number = Date.now,
-    /** Where a refused identity conflict is surfaced (see `fillAnchor`). Defaults to discarding
-     *  it, so read-only vault handles and tests stay one-liners; the engine passes its own. */
+    /** Where a refused identity block is surfaced (see `identityMatches`). Defaults to
+     *  discarding it, so read-only vault handles and tests stay one-liners; the engine passes
+     *  its own. */
     private readonly log: Logger = noopLogger,
   ) {}
 
@@ -275,9 +285,8 @@ export class Vault {
   }
 
   /** Encrypt and persist an account's credential bundle, and refresh its metadata row so
-   *  the registry stays consistent with the bundle (e.g. after a token refresh). Refresh means
-   *  plan/billing state only — this method can fill a missing identity anchor but never
-   *  re-identifies an existing row (see `fillAnchor`).
+   *  the registry stays consistent with the bundle (e.g. after a token refresh). A bundle whose
+   *  identity block names a different account refreshes nothing (see `identityMatches`).
    *
    *  The metadata refresh is best-effort and secondary: the encrypted blob is written FIRST
    *  and unconditionally, because losing a rotated single-use token is unrecoverable whereas a
