@@ -425,3 +425,121 @@ describe('decideAutoSwitch — stale snapshots', () => {
     expect(decision?.targetAccountId).toBe('spare');
   });
 });
+
+describe('decideAutoSwitch — dormant accounts and predicted resets', () => {
+  const GREEDY = { greedy: true };
+
+  /** A dormant account: its weekly window closed, so the endpoint publishes NO reset for it
+   *  and it reports 0% used — a full untouched allowance with no visible clock. */
+  function dormant(id: string, predictedResetAt?: number): AccountUsageInput {
+    return acct(id, predictedResetAt !== undefined ? { predictedResetAt } : {}, [
+      { kind: 'weekly_all', percent: 0 },
+    ]);
+  }
+
+  it('cannot see a dormant account at all without a prediction', () => {
+    // The whole reason the prediction is wired in: an unknown weekly clock disqualifies an
+    // account outright, so the one holding a FULL allowance is the one that never gets used.
+    expect(decideAutoSwitch([lowActive(), dormant('idle')], NOW)).toBeNull();
+  });
+
+  it('hops to the dormant account once its reset is predicted', () => {
+    const decision = decideAutoSwitch([lowActive(), dormant('idle', NOW + 20 * H)], NOW);
+    expect(decision?.targetAccountId).toBe('idle');
+    expect(decision?.reason).toContain('100% weekly budget left');
+    // The card the phone shows must not present the derived reset as an endpoint reading.
+    expect(decision?.reason).toContain('in 20h (predicted)');
+  });
+
+  it('prefers the dormant account holding the most headroom among equal deadlines', () => {
+    const half = acct('half', { predictedResetAt: NOW + 20 * H }, [
+      { kind: 'weekly_all', percent: 55 },
+    ]);
+    const full = dormant('full', NOW + 20 * H);
+    expect(decideAutoSwitch([lowActive(), half, full], NOW)?.targetAccountId).toBe('full');
+  });
+
+  it('sends live work to the REPORTED reset when a prediction ties it', () => {
+    const reported = acct('reported', {}, [
+      { kind: 'weekly_all', percent: 0, resetsAt: NOW + 20 * H },
+    ]);
+    const predicted = dormant('predicted', NOW + 20 * H);
+    // Both hold a full allowance and expire at the same moment; confidence breaks the tie.
+    expect(decideAutoSwitch([lowActive(), predicted, reported], NOW)?.targetAccountId).toBe(
+      'reported',
+    );
+  });
+
+  it('refuses a stale prediction — a reset already past is not a clock', () => {
+    expect(decideAutoSwitch([lowActive(), dormant('idle', NOW - H)], NOW)).toBeNull();
+  });
+
+  it('never invents a clock for an account with no history to predict from', () => {
+    // No predictedResetAt at all: it stays ineligible rather than being treated as "resets now".
+    const decision = decideAutoSwitch(
+      [lowActive(), dormant('no-history'), dormant('predictable', NOW + 20 * H)],
+      NOW,
+    );
+    expect(decision?.targetAccountId).toBe('predictable');
+  });
+
+  it('greedy demands a wider margin of a prediction than of a reported reset', () => {
+    const activeReset = NOW + 30 * H;
+    const active = acct('current', { active: true }, [
+      { kind: 'session', percent: 20, resetsAt: NOW + 3 * H },
+      { kind: 'weekly_all', percent: 40, resetsAt: activeReset },
+    ]);
+    const leadOf = (ms: number) => dormant('idle', activeReset - ms);
+    // A 1h lead clears the 15m reported margin but not the 5h predicted one: nothing is wrong
+    // with the active account, so an unprompted hop must not turn on a hair's difference.
+    expect(decideAutoSwitch([active, leadOf(1 * H)], NOW, GREEDY)).toBeNull();
+    const moved = decideAutoSwitch([active, leadOf(9 * H)], NOW, GREEDY);
+    expect(moved?.targetAccountId).toBe('idle');
+    expect(moved?.reason).toContain('greedy:');
+  });
+
+  it('never lets the predicted margin fall below the reported one', () => {
+    const activeReset = NOW + 30 * H;
+    const active = acct('current', { active: true }, [
+      { kind: 'session', percent: 20, resetsAt: NOW + 3 * H },
+      { kind: 'weekly_all', percent: 40, resetsAt: activeReset },
+    ]);
+    const target = dormant('idle', activeReset - 3 * H);
+    // Configured looser than the reported margin, the prediction is still held to the wider
+    // bar — a derived number can only raise what an unprompted hop must prove.
+    expect(
+      decideAutoSwitch([active, target], NOW, {
+        greedy: true,
+        greedyResetMarginMs: 6 * H,
+        greedyPredictedResetMarginMs: 0,
+      }),
+    ).toBeNull();
+  });
+
+  it('will not greedily hop on a prediction alone when the active clock is invisible', () => {
+    // No weekly limit on the active account, so there is no margin for the prediction to
+    // clear. A REPORTED reset may still take that hop; a derived one may not.
+    const blindActive = acct('mystery', { active: true }, [
+      { kind: 'session', percent: 20, resetsAt: NOW + 3 * H },
+    ]);
+    expect(decideAutoSwitch([blindActive, dormant('idle', NOW + 20 * H)], NOW, GREEDY)).toBeNull();
+    const reported = acct('known', {}, [
+      { kind: 'weekly_all', percent: 0, resetsAt: NOW + 20 * H },
+    ]);
+    expect(decideAutoSwitch([blindActive, reported], NOW, GREEDY)?.targetAccountId).toBe('known');
+  });
+
+  it('still refuses a predicted candidate that is itself already low', () => {
+    const burned = acct('burned', { predictedResetAt: NOW + 2 * H }, [
+      { kind: 'weekly_all', percent: 96 },
+    ]);
+    expect(decideAutoSwitch([lowActive(), burned], NOW)).toBeNull();
+  });
+
+  it('still refuses a quarantined account however much budget it is predicted to hold', () => {
+    const jailed = acct('jailed', { quarantined: true, predictedResetAt: NOW + 2 * H }, [
+      { kind: 'weekly_all', percent: 0 },
+    ]);
+    expect(decideAutoSwitch([lowActive(), jailed], NOW)).toBeNull();
+  });
+});

@@ -8,6 +8,7 @@ export {
   DEFAULT_STALE_AFTER_MS,
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
   DEFAULT_GREEDY_RESET_MARGIN_MS,
+  DEFAULT_GREEDY_PREDICTED_RESET_MARGIN_MS,
   type AutoSwitchDecision,
   type AutoSwitchPolicy,
 } from './autoswitch.js';
