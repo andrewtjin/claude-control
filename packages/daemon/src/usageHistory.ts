@@ -3,8 +3,11 @@
 //
 // Both answers come from stored snapshot history, so they belong at the edge — the advisor
 // stays a pure function of a moment and never touches the database. This module is the seam:
-// the functions below are pure over already-read rows, so they are unit-testable without a
-// store, and `program.ts` supplies the rows.
+// the measurements below are pure over already-read rows, so they are unit-testable without a
+// store, and `readFleetHistory` is the one place that pairs them with a reader. The daemon
+// calls it once per poll cycle and ships the answers on the snapshot it already sends, which
+// is how the phone gets inputs it could never measure for itself; the CLI calls it against
+// the same store for its own views.
 //
 // Reset prediction. The usage endpoint stops reporting `resets_at` for an account once its
 // weekly window closes, and does not republish until the account is used again. The cadence is
@@ -133,4 +136,51 @@ export function readWeeklyObservations(rows: SnapshotRowLike[]): WeeklyObservati
     });
   }
   return observations.sort((a, b) => a.fetchedAtMs - b.fetchedAtMs);
+}
+
+/** The slice of the daemon's store these measurements read. Structural so the same code
+ *  serves the daemon (which owns the store) and the CLI (which opens it to read the last
+ *  poll), without either needing the other's wiring. */
+export interface UsageHistoryReader {
+  listUsageSnapshotsSince(accountId: string, sinceMs: number): SnapshotRowLike[];
+}
+
+/** Everything history can say about the fleet at one moment. */
+export interface FleetHistory {
+  /** Next weekly reset per account, for the accounts history can predict one for. An account
+   *  with no observed reset in the lookback is ABSENT rather than defaulted — it has no
+   *  known clock, and every consumer says so instead of inventing one. */
+  predictedResetByAccount: Map<string, number>;
+  /** Fleet burn in Pro-equivalent units/day. Absent = not measurable, never zero. */
+  burnUnitsPerDay?: number;
+}
+
+/**
+ * Read both history-derived measurements for a fleet in one pass. Pure apart from `reader`,
+ * and `nowMs` is a parameter, so a caller with a fake reader gets fully deterministic answers.
+ */
+export function readFleetHistory(
+  reader: UsageHistoryReader,
+  accountIds: string[],
+  nowMs: number,
+): FleetHistory {
+  const predictedResetByAccount = new Map<string, number>();
+  const histories: AccountHistory[] = [];
+  for (const accountId of accountIds) {
+    // One read per account covers both measurements: the reset lookback is the longer of the
+    // two windows, and the burn measurement filters the same observations down to its own.
+    const observations = readWeeklyObservations(
+      reader.listUsageSnapshotsSince(accountId, nowMs - RESET_LOOKBACK_MS),
+    );
+    // Plan tiers are resolved elsewhere; until then every account weighs 1 Pro-equivalent
+    // unit, which the pacing renderer states outright rather than assuming silently.
+    histories.push({ accountId, weight: 1, observations });
+    const predicted = predictWeeklyReset(observations, nowMs);
+    if (predicted !== undefined) predictedResetByAccount.set(accountId, predicted);
+  }
+  const burnUnitsPerDay = measureBurnUnitsPerDay(histories, nowMs - BURN_WINDOW_MS, nowMs);
+  return {
+    predictedResetByAccount,
+    ...(burnUnitsPerDay !== undefined ? { burnUnitsPerDay } : {}),
+  };
 }

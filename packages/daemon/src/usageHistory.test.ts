@@ -6,7 +6,9 @@ import { describe, expect, it } from 'vitest';
 import {
   measureBurnUnitsPerDay,
   predictWeeklyReset,
+  readFleetHistory,
   readWeeklyObservations,
+  type SnapshotRowLike,
   type WeeklyObservation,
 } from './usageHistory.js';
 
@@ -201,5 +203,61 @@ describe('readWeeklyObservations', () => {
       row(NOW, [{ kind: 'weekly_all', percent: 10, resetsAt: 'never' }]),
     ]);
     expect(observations[0]?.resetsAtMs).toBeUndefined();
+  });
+});
+
+describe('readFleetHistory', () => {
+  const weeklyRow = (fetchedAtMs: number, percent: number, resetsAt?: string): SnapshotRowLike => ({
+    fetchedAtMs,
+    json: JSON.stringify({
+      limits: [{ kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resetsAt } : {}) }],
+    }),
+  });
+
+  /** A store stand-in honoring the same `sinceMs` bound the real query applies. */
+  function reader(rows: Record<string, SnapshotRowLike[]>) {
+    return {
+      listUsageSnapshotsSince: (accountId: string, sinceMs: number) =>
+        (rows[accountId] ?? []).filter((r) => r.fetchedAtMs >= sinceMs),
+    };
+  }
+
+  it('predicts each account from its OWN anchor and measures burn across the fleet', () => {
+    const anchor = '2026-07-19T05:00:00.000Z';
+    const history = readFleetHistory(
+      reader({
+        // In use: the endpoint still reports its reset, and usage climbed 20% over 2 days.
+        live: [
+          weeklyRow(NOW - 2 * DAY_MS, 40, '2026-07-29T05:00:00.000Z'),
+          weeklyRow(NOW, 60, '2026-07-29T05:00:00.000Z'),
+        ],
+        // Dormant: its window closed, so the newest rows carry no reset at all.
+        dormant: [weeklyRow(NOW - 9 * DAY_MS, 90, anchor), weeklyRow(NOW - DAY_MS, 0)],
+      }),
+      ['live', 'dormant'],
+      NOW,
+    );
+
+    expect(history.predictedResetByAccount.get('dormant')).toBe(Date.parse(anchor) + WEEK_MS);
+    expect(history.predictedResetByAccount.get('live')).toBe(
+      Date.parse('2026-07-29T05:00:00.000Z'),
+    );
+    // 20% of a 1-unit account over the 3-day burn window.
+    expect(history.burnUnitsPerDay).toBeCloseTo(0.2 / 3, 9);
+  });
+
+  it('omits an account with no observed reset instead of inventing a clock for it', () => {
+    const history = readFleetHistory(
+      reader({ fresh: [weeklyRow(NOW - DAY_MS, 0), weeklyRow(NOW, 0)] }),
+      ['fresh'],
+      NOW,
+    );
+    expect(history.predictedResetByAccount.has('fresh')).toBe(false);
+  });
+
+  it('reports an unmeasurable burn as absent, never as zero', () => {
+    const history = readFleetHistory(reader({ empty: [] }), ['empty'], NOW);
+    expect(history.burnUnitsPerDay).toBeUndefined();
+    expect(history.predictedResetByAccount.size).toBe(0);
   });
 });

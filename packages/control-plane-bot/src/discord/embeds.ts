@@ -143,6 +143,7 @@ export function buildUsageEmbed(
   usage: {
     accounts: AccountUsage[];
     plan?: UsagePlan;
+    burnUnitsPerDay?: number;
   },
   nowMs = Date.now(),
   barRenderer: BarRenderer = DEFAULT_BAR_RENDERER,
@@ -170,20 +171,33 @@ export function buildUsageEmbed(
     const lines = [usage.plan.reason, ...usage.plan.advisories.map((a) => `• ${a.message}`)];
     addClampedField(embed, 'Plan', lines.join('\n'));
   }
-  if (usage.accounts.length > 0) embed.addFields(pacingField(usage.accounts, nowMs));
+  if (usage.accounts.length > 0) {
+    embed.addFields(pacingField(usage.accounts, nowMs, usage.burnUnitsPerDay));
+  }
   return embed;
 }
 
 /** The "Pacing" field shared by `/usage` and `/timeline`: the fleet verdict layered on top of
  *  the account-by-account view above it, computed by the same pure model the CLI uses from the
- *  same AccountUsage snapshot both embeds already render from.
+ *  same snapshot both embeds already render from — so the phone and the terminal print the same
+ *  sentence, not two independently-derived ones.
  *
- *  The wire carries no plan tiers and no snapshot history, so the two history-derived inputs
- *  (each account's predicted reset and the fleet's measured burn rate) are simply not available
- *  here. The model reports that in `notes` rather than substituting a guess, so this field says
- *  what it does not know instead of printing a verdict it cannot support. */
-function pacingField(accounts: AccountUsage[], nowMs: number): { name: string; value: string } {
-  const pacing = computePacing(timelineInputFromWire(accounts), { nowMs });
+ *  The two inputs the model cannot derive from a moment (each account's predicted weekly reset
+ *  and the fleet's measured burn rate) come from snapshot history, which only the daemon holds;
+ *  they ride in on the snapshot. When a daemon predates them they are simply absent, and the
+ *  model says so in `notes` rather than substituting a guess — this field never prints a
+ *  verdict it cannot support. */
+function pacingField(
+  accounts: AccountUsage[],
+  nowMs: number,
+  burnUnitsPerDay: number | undefined,
+): { name: string; value: string } {
+  const pacing = computePacing(timelineInputFromWire(accounts), {
+    nowMs,
+    // exactOptionalPropertyTypes forbids an explicit `undefined`, and the distinction is
+    // load-bearing: absent means "not measurable", which is not the same as a measured zero.
+    ...(burnUnitsPerDay !== undefined ? { burnUnitsPerDay } : {}),
+  });
   const lines = [pacing.headline, ...pacing.notes.map((n) => `• ${n}`)];
   return { name: 'Pacing', value: truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT) };
 }
@@ -196,8 +210,15 @@ function windowsLine(outlook: ResetOutlook, accountId: string): string {
   if (!budget) return '';
   return (
     `\n${budget.fullWindows}×5h window${budget.fullWindows === 1 ? '' : 's'} left` +
-    ` · weekly resets ${discordRelative(budget.weeklyResetAt)}`
+    ` · weekly resets ${discordRelative(budget.weeklyResetAt)}${predictedMark(budget.resetPredicted)}`
   );
+}
+
+/** " (predicted)" for a reset derived from history rather than reported by the endpoint. The
+ *  budget it bounds is a projection, and a reader must be able to tell that at a glance —
+ *  every surface that shows a reset time carries the same mark. */
+function predictedMark(resetPredicted: boolean): string {
+  return resetPredicted ? ' (predicted)' : '';
 }
 
 /** `/timeline` — the 5h-window budget and cross-account reset timeline, fully rendered
@@ -210,6 +231,7 @@ export function buildTimelineEmbed(
   usage: {
     accounts: AccountUsage[];
     plan?: UsagePlan;
+    burnUnitsPerDay?: number;
   },
   nowMs = Date.now(),
   barRenderer: BarRenderer = DEFAULT_BAR_RENDERER,
@@ -251,7 +273,8 @@ export function buildTimelineEmbed(
         lines.push(
           `${a.budget.fullWindows}×5h window${a.budget.fullWindows === 1 ? '' : 's'} left` +
             `${a.budget.hasPartialWindow ? ' +1 partial' : ''}` +
-            ` · weekly resets ${discordRelative(a.budget.weeklyResetAt)}`,
+            ` · weekly resets ${discordRelative(a.budget.weeklyResetAt)}` +
+            predictedMark(a.budget.resetPredicted),
         );
       } else if (!a.quarantined) {
         lines.push('weekly reset time unknown');
@@ -286,7 +309,7 @@ export function buildTimelineEmbed(
       outlook.events
         .map((e) => {
           const mark = e.kind === 'session' ? style.session : style.weekly;
-          return `${mark} ${discordRelative(e.atMs)} — **${e.label}** · ${describeEvent(e.kind, e.percentUsed)}`;
+          return `${mark} ${discordRelative(e.atMs)} — **${e.label}** · ${describeEvent(e.kind, e.percentUsed, e.predicted)}`;
         })
         .join('\n');
     embed.addFields({
@@ -302,20 +325,21 @@ export function buildTimelineEmbed(
     for (const adv of usage.plan.advisories) planLines.push(`• ${adv.message}`);
     addClampedField(embed, 'Plan', planLines.join('\n'));
   }
-  embed.addFields(pacingField(usage.accounts, nowMs));
+  embed.addFields(pacingField(usage.accounts, nowMs, usage.burnUnitsPerDay));
   return embed;
 }
 
 /** What a reset means for planning: a session reset frees the window; a weekly reset
  *  wastes whatever headroom went unburned — that asymmetry is the "use them efficiently"
  *  signal (same semantics as the CLI's text renderer). */
-function describeEvent(kind: string, percentUsed: number): string {
+function describeEvent(kind: string, percentUsed: number, predicted = false): string {
   if (kind === 'session') return `5h window resets (${percentUsed}% used clears)`;
   // The scoped weekly cap is the Fable-tier limit, so name the model rather than the
   // opaque wire kind.
   const label = kind === 'weekly_scoped' ? 'weekly (fable)' : 'weekly';
+  const when = `${label} quota resets${predictedMark(predicted)}`;
   const unused = 100 - percentUsed;
-  return unused > 0 ? `${label} quota resets — ${unused}% unused expires` : `${label} quota resets`;
+  return unused > 0 ? `${when} — ${unused}% unused expires` : when;
 }
 
 /** `/accounts` — a lighter listing than `/usage`: which accounts exist and whether each is

@@ -28,7 +28,8 @@ import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { EnvelopeDraft, MessageOf, PayloadOf } from '@claude-control/shared-protocol';
 import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
-import { UsagePoller, type PollAccount } from './usagePoller.js';
+import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
+import { readFleetHistory } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
 import type {
   HookReceiver,
@@ -547,9 +548,18 @@ export class Daemon {
       });
     }
 
+    // Measure AFTER persisting, so this cycle's own readings are part of the history. The
+    // daemon owns the store, so it is the only party that can make these measurements at all —
+    // it makes them once here and both the phone and its own advisor consume the same numbers.
+    const history = readFleetHistory(
+      this.store,
+      pollAccounts.map((a) => a.accountId),
+      this.clock(),
+    );
+
     this.sendEnvelope({
       type: 'usage.snapshot',
-      payload: { accounts: snapshot.accounts, plan: snapshot.plan },
+      payload: toUsageSnapshotPayload(snapshot, history),
     });
 
     // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
