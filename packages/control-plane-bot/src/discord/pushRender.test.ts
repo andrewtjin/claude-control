@@ -295,6 +295,20 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(push?.embeds).toBeUndefined();
     expect(push?.content).toBe('**Heads up**\nsomething happened');
   });
+
+  it('re-renders a table in the generic card body, which Discord renders not at all', () => {
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        title: 'Moves',
+        body: ['| Flag | Meaning |', '| --- | --- |', '| --greedy | burn soonest |'].join('\n'),
+        level: 'info',
+        notificationType: 'some_new_type',
+      }),
+    );
+    expect(push?.content).not.toContain('| --- |');
+    expect(push?.content?.startsWith('**Moves**\n```\n┌')).toBe(true);
+  });
 });
 
 describe('renderPush — routing of other envelopes', () => {
@@ -333,6 +347,20 @@ describe('renderPush — routing of other envelopes', () => {
       }),
     );
     expect(milestone?.content).toBe('built');
+  });
+
+  it('session.output summaries have their tables re-rendered before the gateway chunks them', () => {
+    const push = renderPush(
+      env('session.output', {
+        sessionId: 's',
+        seq: 2,
+        kind: 'summary',
+        text: ['| Flag | Meaning |', '| --- | --- |', '| --greedy | burn soonest |'].join('\n'),
+        truncated: false,
+      }),
+    );
+    expect(push?.content).not.toContain('| --- |');
+    expect(push?.content?.startsWith('```\n┌')).toBe(true);
   });
 
   it('usage.snapshot is cache-only (no DM)', () => {

@@ -4,15 +4,20 @@
 // box alignment entirely; inside one, a phone shows ~40 monospace columns and wraps the
 // BORDERS instead of the text, which reads as garbage.
 //
-// This module finds both table forms and re-renders them as a compact box that fits a
-// target width, wrapping text INSIDE cells (multi-line rows) so the frame always survives,
-// then wraps the result in a code fence for monospaced alignment. Everything else in the
-// text passes through untouched. Pure string transforms — no discord.js — so it unit-tests
-// without a bot.
+// This module finds both table forms and re-renders them at a target width, then wraps the
+// result in a code fence for monospaced alignment. Everything else in the text passes through
+// untouched. Pure string transforms — no discord.js — so it unit-tests without a bot.
+//
+// TWO layouts, because a grid is only right for one shape of table. Short cells become a
+// compact box, text wrapped INSIDE cells so the frame always survives. Cells holding whole
+// SENTENCES cannot: a phone-width box gives each of them a fifth of the line, every cell wraps
+// into a tall stack, and the borders end up outnumbering the words. Those tables render as
+// records instead — one block per row, first cell as its heading — which is how prose wants to
+// be read on a phone anyway.
 //
 // Honesty rules: content is never dropped. A run of box-drawing lines that fails to parse
-// as a consistent table is still fenced verbatim (monospace beats soup); text already
-// inside a code fence is left exactly as authored.
+// as a consistent table is still fenced as-is (monospace beats soup); text already inside a
+// code fence is left exactly as authored.
 
 /** Target rendered width. Chosen for the narrowest real surface — a phone-width embed
  *  description shows roughly this many monospace columns before Discord wraps the line. */
@@ -21,6 +26,10 @@ export const DEFAULT_TABLE_WIDTH = 40;
 /** Columns never shrink below this: a narrower column wraps every word and reads worse
  *  than letting the whole table run slightly past the target width. */
 const MIN_COL_WIDTH = 6;
+
+/** Continuation indent for a record's non-heading fields — enough to read as "this belongs to
+ *  the line above" without eating width the prose needs. */
+const RECORD_INDENT = '  ';
 
 /** A parsed table: rows of cell text, plus which row gaps had a horizontal separator in
  *  the source (markdown tables get one after the header; box tables keep their own). */
@@ -178,10 +187,9 @@ function border(widths: number[], left: string, joint: string, right: string): s
   return left + widths.map((w) => '─'.repeat(w + 2)).join(joint) + right;
 }
 
-/** Render parsed rows back into an aligned box at the target width, wrapping cell text into
+/** Render parsed rows into an aligned box at the given column widths, wrapping cell text into
  *  multi-line rows where columns had to shrink. */
-function renderTable(table: ParsedTable, maxWidth: number): string {
-  const widths = columnWidths(table.rows, maxWidth);
+function renderGrid(table: ParsedTable, widths: number[]): string {
   const lines: string[] = [border(widths, '┌', '┬', '┐')];
   table.rows.forEach((row, rowIndex) => {
     const wrapped = row.map((cell, i) => wrapCell(cell, widths[i] as number));
@@ -202,17 +210,104 @@ function renderTable(table: ParsedTable, maxWidth: number): string {
   return lines.join('\n');
 }
 
-/** Fence a block of already-monospace-shaped lines verbatim — the fallback for box runs
- *  that would not parse as one consistent table. */
-function fenceRaw(lines: string[]): string {
-  return '```\n' + lines.join('\n') + '\n```';
+/**
+ * How many wrapped lines one cell may take before the grid stops being a grid. The width budget
+ * already bottoms out at MIN_COL_WIDTH per column, so a target of `maxWidth` holds at most this
+ * many columns — 6 at the default width. Allow a cell the same number of LINES: one that wraps
+ * TALLER than the table could ever be WIDE has stopped being a label and become a paragraph, and
+ * a paragraph reads better as a record than as a column of five-word fragments.
+ */
+function fitsGrid(rows: string[][], widths: number[], maxWidth: number): boolean {
+  const maxLines = Math.floor(maxWidth / MIN_COL_WIDTH);
+  return rows.every((row) =>
+    row.every((cell, i) => wrapCell(cell, widths[i] as number).length <= maxLines),
+  );
+}
+
+/** One field of a record: `lead` prefixes its first line (a `LABEL: `, or the indent that marks a
+ *  continuation field) and every wrapped line after it is padded to the same offset, so the field
+ *  reads as one block however far it wraps. An empty cell contributes nothing — no content to lose.
+ *  A pathologically long label still leaves MIN_COL_WIDTH of text: the same "a slightly-too-wide
+ *  line beats a mangled one" trade the grid's column floors make. */
+function renderField(cell: string, lead: string, maxWidth: number): string[] {
+  if (cell.length === 0) return [];
+  const pad = ' '.repeat(lead.length);
+  return wrapCell(cell, Math.max(MIN_COL_WIDTH, maxWidth - lead.length)).map(
+    (line, i) => (i === 0 ? lead : pad) + line,
+  );
 }
 
 /**
- * Re-render every table in `text` for Discord: box-drawing and markdown pipe tables become
- * compact fenced boxes at most ~`maxWidth` columns wide; all other lines (and anything the
- * author already fenced) pass through byte-identical. Returns the input unchanged when no
- * table is found, so callers can apply this unconditionally.
+ * Render parsed rows as one RECORD per row: the first cell is the record's heading, the rest sit
+ * under it, and each field gets the FULL target width to wrap into — where the grid would have
+ * given it a fifth of that.
+ *
+ * Past two fields, position alone no longer says which cell is which, so each field is prefixed
+ * with its column's header. That header is taken only from a row the SOURCE marked as one, so a
+ * headerless table never has its first data row eaten as labels. With two fields the shape is
+ * unambiguous, so no prefixes — and the header row simply renders as the first record, since
+ * dropping it would lose content.
+ */
+function renderRecords(table: ParsedTable, maxWidth: number): string {
+  const header = table.separatorAfterRow[0] === true ? table.rows[0] : undefined;
+  const labels =
+    header !== undefined && header.length > 2
+      ? header.map((h) => `${h.toUpperCase()}:`)
+      : undefined;
+  // Every label is padded to the widest so the values start in one column and the record scans
+  // vertically, the way the grid's cells used to.
+  const labelWidth = Math.max(0, ...(labels ?? []).map((l) => l.length)) + 1;
+  const rows = labels ? table.rows.slice(1) : table.rows;
+  return (
+    rows
+      .map((row) =>
+        row.flatMap((cell, i) => {
+          const lead = labels
+            ? (labels[i] ?? '').padEnd(labelWidth)
+            : i === 0
+              ? '' // the record's heading owns the full width
+              : RECORD_INDENT;
+          return renderField(cell, lead, maxWidth);
+        }),
+      )
+      // A blank line is the record boundary, so an all-empty row must not emit an empty block.
+      .filter((block) => block.length > 0)
+      .map((block) => block.join('\n'))
+      .join('\n\n')
+  );
+}
+
+/**
+ * Wrap a rendered block in a code fence. The fence is what guarantees monospace — and what keeps
+ * cell text INERT: model-authored cells are full of `|`, `*`, `_` and backticks that Discord would
+ * otherwise render as live markdown, letting one unbalanced cell corrupt every line after it. The
+ * one sequence that could still escape is a literal ``` inside a cell, so it is defused with a
+ * zero-width space (the same defusal the tool-output card uses): the characters stay, their effect
+ * does not. The cost is that inline code spans show their backticks instead of becoming chips —
+ * cheap, since everything inside a fence is already monospace.
+ */
+function fence(body: string): string {
+  const zeroWidthSpace = String.fromCharCode(0x200b);
+  return '```\n' + body.replaceAll('```', '`' + zeroWidthSpace + '``') + '\n```';
+}
+
+/** Render one parsed table: a compact box while its cells stay short, a record list once they do
+ *  not, fenced either way. */
+function renderParsed(table: ParsedTable, maxWidth: number): string {
+  const widths = columnWidths(table.rows, maxWidth);
+  return fence(
+    fitsGrid(table.rows, widths, maxWidth)
+      ? renderGrid(table, widths)
+      : renderRecords(table, maxWidth),
+  );
+}
+
+/**
+ * Re-render every table in `text` for Discord: box-drawing and markdown pipe tables become fenced
+ * blocks at most ~`maxWidth` columns wide — a compact box, or a record list when the cells are
+ * long prose. All other lines (and anything the author already fenced) pass through
+ * byte-identical. Returns the input unchanged when no table is found, so callers can apply this
+ * unconditionally.
  */
 export function formatTables(text: string, maxWidth = DEFAULT_TABLE_WIDTH): string {
   const lines = text.split('\n');
@@ -243,7 +338,7 @@ export function formatTables(text: string, maxWidth = DEFAULT_TABLE_WIDTH): stri
         continue;
       }
       const parsed = parseBoxBlock(block);
-      out.push(parsed ? '```\n' + renderTable(parsed, maxWidth) + '\n```' : fenceRaw(block));
+      out.push(parsed ? renderParsed(parsed, maxWidth) : fence(block.join('\n')));
       continue;
     }
 
@@ -264,7 +359,7 @@ export function formatTables(text: string, maxWidth = DEFAULT_TABLE_WIDTH): stri
       const block = lines.slice(start, i);
       const parsed = parseMarkdownBlock(block);
       if (parsed) {
-        out.push('```\n' + renderTable(parsed, maxWidth) + '\n```');
+        out.push(renderParsed(parsed, maxWidth));
         continue;
       }
       out.push(...block);

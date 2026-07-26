@@ -625,6 +625,18 @@ describe('buildQuestionEmbed', () => {
     expect(embed.footer?.text).not.toContain('mode');
   });
 
+  it('re-renders a table inside a question, before the field clamp', () => {
+    const embed = buildQuestionEmbed([
+      {
+        question: ['Which?', '| Option | Cost |', '| --- | --- |', '| a | cheap |'].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    expect(embed.fields?.[0]?.value).not.toContain('| --- |');
+    expect(embed.fields?.[0]?.value).toContain('┌');
+  });
+
   it('renders at most four questions', () => {
     const many = Array.from({ length: 6 }, (_, i) => ({
       question: `q${i}`,
@@ -722,11 +734,38 @@ describe('lifecycle cards (done / waiting / quarantine)', () => {
     expect(embed.description).toContain('chars truncated');
   });
 
+  it('buildDoneEmbed re-renders a markdown table Discord would show as raw pipes', () => {
+    // A final assistant message routinely ends in a summary table, and Discord renders markdown
+    // tables not at all — so the card must never ship the source text.
+    const embed = buildDoneEmbed({
+      lastAssistantMessage: [
+        'Here is what moved.',
+        '',
+        '| Action | Detail |',
+        '|---|---|',
+        '| `probe_attention.py` -> `scripts/` | Self-contained, no relative imports - runs unchanged. |',
+        '| `pyrightconfig.json` -> deleted | Folded into `[tool.pyright]`. If a `pyrightconfig.json` ever reappears it wins and the pyproject table is silently ignored. |',
+      ].join('\n'),
+    }).toJSON();
+    expect(embed.description).toContain('Here is what moved.');
+    expect(embed.description).not.toContain('|---|');
+    // Long cells, so the record layout: a heading line with its detail indented under it.
+    expect(embed.description).toContain('`probe_attention.py` -> `scripts/`\n  Self-contained,');
+  });
+
   it('buildWaitingEmbed is a blue 🔔 "your turn" card', () => {
     const embed = buildWaitingEmbed({ sessionId: 's1', body: 'Reply to continue.' }).toJSON();
     expect(embed.title).toContain('🔔');
     expect(embed.color).toBe(NOTIFICATION_COLOR.waiting);
     expect(embed.description).toBe('Reply to continue.');
+  });
+
+  it('buildWaitingEmbed re-renders tables in the prompt it is waiting on', () => {
+    const embed = buildWaitingEmbed({
+      body: ['| Flag | Meaning |', '| --- | --- |', '| --greedy | burn the soonest |'].join('\n'),
+    }).toJSON();
+    expect(embed.description).not.toContain('| --- |');
+    expect(embed.description?.startsWith('```\n┌')).toBe(true);
   });
 
   it('buildQuarantineEmbed prints the injected host re-login command verbatim', () => {
