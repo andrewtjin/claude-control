@@ -13,7 +13,8 @@
 // an unterminated fence and the next starting mid-fence, so both render as garbage — and the
 // daemon's text is full of fenced tables and command output. Chunks therefore close an open
 // fence on the way out and reopen it (with its original info string, so highlighting survives)
-// on the way in.
+// on the way in. An embed field or description faces the same cut with nowhere to continue into,
+// so `clampBalanced` exports that half of the care to the embed builders.
 //
 // Shape: pre-split the text into units no larger than a chunk can hold, then greedily pack them.
 // Doing the hard-splitting up front is what keeps the packing loop simple and obviously
@@ -87,6 +88,30 @@ export function chunkMessage(text: string, options: ChunkOptions = {}): string[]
   if (!truncated && current !== '') chunks.push(closed(current));
 
   return truncated ? markTruncated(chunks, max) : chunks;
+}
+
+/**
+ * Clamp `text` to `max` with its code fences left BALANCED — the single-message form of the care
+ * `chunkMessage` takes at every cut, for surfaces that have no next message to continue into.
+ *
+ * An embed description or field value is clamped, not split, and both clamps this package uses
+ * cut blind: `truncateLabeled` slices, `clampFieldValue` drops trailing lines. Either can land
+ * between a ``` and its closer, and Discord then reads the unterminated fence as swallowing
+ * everything after it. That is not hypothetical for prose surfaces — `formatTables` fences every
+ * table it re-renders, so an ordinary comparison table is enough.
+ *
+ * Room for the closer is reserved BEFORE clamping (rather than trimmed off afterwards) so the
+ * visible truncation marker the clamp appended survives intact, and the result still fits `max`.
+ */
+export function clampBalanced(
+  text: string,
+  max: number,
+  clamp: (value: string, max: number) => string,
+): string {
+  if (text.length <= max) return text; // nothing was cut, so nothing can be half-cut
+  const closer = `\n${FENCE}`;
+  const clamped = clamp(text, max - closer.length);
+  return countFences(clamped) % 2 === 0 ? clamped : clamped + closer;
 }
 
 /** Break `text` into lines, hard-splitting any line that could never fit in a chunk. The cap

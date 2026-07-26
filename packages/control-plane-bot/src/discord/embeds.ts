@@ -38,6 +38,7 @@ import {
   type TrackEvent,
 } from './richFormat.js';
 import type { BarRenderer } from './emojiBars.js';
+import { clampBalanced } from './messageChunks.js';
 import { formatTables } from './tableFormat.js';
 
 const COLOR_OK = 0x2ecc71;
@@ -547,8 +548,13 @@ export function buildQuestionEmbed(
     const name = q.header != null && q.header.length > 0 ? q.header : `Question ${i + 1}`;
     // The question is verbatim model text and a "which of these?" question is exactly the shape
     // that arrives as a comparison table, so it is re-rendered BEFORE the field clamp — clamping
-    // first would cut the source table and leave the formatter a fragment to parse.
-    addClampedField(embed, truncateLabeled(name, 256), formatTables(q.question));
+    // first would cut the source table and leave the formatter a fragment to parse. The clamp
+    // then has to close what it cut (`clampBalanced` rather than the plain `addClampedField`):
+    // the formatter's output is fenced, and an eight-row table already overruns a field.
+    embed.addFields({
+      name: truncateLabeled(name, 256),
+      value: clampBalanced(formatTables(q.question), FIELD_VALUE_MAX, clampFieldValue),
+    });
   });
   return embed;
 }
@@ -642,8 +648,8 @@ export function buildToolOutputEmbed(p: {
  *  "session ended". `lastAssistantMessage` is a whole assistant turn, so it routinely carries a
  *  markdown table — which Discord does not render at all — and is re-rendered before it is
  *  truncated, so the cap cuts finished rows rather than half a table. Long messages are truncated
- *  with a visible marker (no silent cut). Falls back to the daemon-supplied body when no final
- *  message was captured. */
+ *  with a visible marker (no silent cut) and with the re-rendered table's fence closed behind the
+ *  cut. Falls back to the daemon-supplied body when no final message was captured. */
 export function buildDoneEmbed(p: {
   sessionId?: string;
   lastAssistantMessage?: string;
@@ -654,7 +660,7 @@ export function buildDoneEmbed(p: {
   const embed = new EmbedBuilder()
     .setTitle(`${NOTIFICATION_ICON.done} ${p.title ?? 'Done'}`)
     .setColor(NOTIFICATION_COLOR.done)
-    .setDescription(truncateLabeled(formatTables(message), EMBED_DESCRIPTION_LIMIT));
+    .setDescription(clampBalanced(formatTables(message), EMBED_DESCRIPTION_LIMIT, truncateLabeled));
   if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
   return embed;
 }
@@ -662,8 +668,8 @@ export function buildDoneEmbed(p: {
 /** `hook.notification` with `notification_type: 'idle_prompt'` → the "waiting on you" card: the
  *  session is blocked awaiting the user's next input. Distinct blue/🔔 language so it reads as
  *  "your turn", never as an error or a completion. The body is assistant prose (it is what the
- *  session is waiting on you about), so its tables are re-rendered before the cap, exactly as on
- *  the done card. */
+ *  session is waiting on you about), so its tables are re-rendered before the cap and the cap
+ *  closes any fence it cut, exactly as on the done card. */
 export function buildWaitingEmbed(p: {
   sessionId?: string;
   title?: string;
@@ -673,9 +679,10 @@ export function buildWaitingEmbed(p: {
     .setTitle(`${NOTIFICATION_ICON.waiting} ${p.title ?? 'Waiting on you'}`)
     .setColor(NOTIFICATION_COLOR.waiting)
     .setDescription(
-      truncateLabeled(
+      clampBalanced(
         p.body && p.body.length > 0 ? formatTables(p.body) : 'A session is waiting for your reply.',
         EMBED_DESCRIPTION_LIMIT,
+        truncateLabeled,
       ),
     );
   if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
@@ -804,7 +811,8 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
         : undefined;
   // Hard-cap the body (a session summary is short; the cap defends the card against a runaway one)
   // then reserve its length so the fenced tail below can never push the description over the limit.
-  const prefix = rawBody ? `${truncateLabeled(rawBody, 512)}\n` : '';
+  // The cap closes a fence it cut, or the re-rendered table would swallow the tail block below it.
+  const prefix = rawBody ? `${clampBalanced(rawBody, 512, truncateLabeled)}\n` : '';
   const tail = model.outputTail;
   if (tail && tail.length > 0) {
     const fenceOverhead = '```\n'.length + '\n```'.length; // fence wrapping the inner text
@@ -833,9 +841,10 @@ export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder 
     .setTitle(`${icon} Session ${model.state === 'done' ? 'complete' : model.state}`)
     .setColor(SESSION_STATE_COLOR[model.state])
     .setDescription(
-      truncateLabeled(
+      clampBalanced(
         model.summary !== undefined ? formatTables(model.summary) : 'Session ended.',
         EMBED_DESCRIPTION_LIMIT,
+        truncateLabeled,
       ),
     );
   embed.addFields({ name: 'Session', value: model.sessionId });

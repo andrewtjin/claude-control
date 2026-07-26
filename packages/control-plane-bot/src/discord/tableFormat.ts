@@ -134,13 +134,17 @@ function wrapCell(text: string, width: number): string[] {
     current = '';
   };
   for (const word of text.split(/\s+/).filter((w) => w.length > 0)) {
-    let w = word;
+    // Measured and cut by CODE POINT, not by UTF-16 unit: `slice` cuts units, so a cut landing
+    // inside a surrogate pair turns one astral character (emoji, rarer CJK) into two orphaned
+    // halves that render as U+FFFD. That is content destroyed, which this module does not do.
+    let chars = [...word];
     // Hard-split an over-long token into width-sized chunks; the last chunk flows normally.
-    while (w.length > width) {
+    while (chars.length > width) {
       if (current.length > 0) push();
-      out.push(w.slice(0, width));
-      w = w.slice(width);
+      out.push(chars.slice(0, width).join(''));
+      chars = chars.slice(width);
     }
+    const w = chars.join('');
     if (current.length === 0) current = w;
     else if (current.length + 1 + w.length <= width) current += ` ${w}`;
     else {
@@ -150,6 +154,13 @@ function wrapCell(text: string, width: number): string[] {
   }
   if (current.length > 0 || out.length === 0) push();
   return out;
+}
+
+/** Everything in a rendered grid line that is not cell text: a space either side of every cell,
+ *  a '│' between adjacent cells, and the two outer '│'. Shared by the width budget and the
+ *  fits-the-target check so the two can never disagree about what a grid costs. */
+function scaffoldWidth(cols: number): number {
+  return 3 * cols + 1;
 }
 
 /** Column widths for the target: natural (widest cell) when they fit; otherwise the widest
@@ -162,7 +173,7 @@ function columnWidths(rows: string[][], maxWidth: number): number[] {
   const natural = Array.from({ length: cols }, (_, i) =>
     Math.max(1, ...rows.map((r) => (r[i] ?? '').length)),
   );
-  const budget = maxWidth - (3 * cols + 1); // '│ ' + ' │ ' joints + closing '│'
+  const budget = maxWidth - scaffoldWidth(cols);
   const floors = natural.map((w) => Math.min(w, MIN_COL_WIDTH));
   const widths = [...natural];
   let sum = widths.reduce((a, b) => a + b, 0);
@@ -211,13 +222,23 @@ function renderGrid(table: ParsedTable, widths: number[]): string {
 }
 
 /**
- * How many wrapped lines one cell may take before the grid stops being a grid. The width budget
- * already bottoms out at MIN_COL_WIDTH per column, so a target of `maxWidth` holds at most this
- * many columns — 6 at the default width. Allow a cell the same number of LINES: one that wraps
- * TALLER than the table could ever be WIDE has stopped being a label and become a paragraph, and
- * a paragraph reads better as a record than as a column of five-word fragments.
+ * Whether the grid layout still works for this table. Two gates, because a grid fails in two
+ * directions.
+ *
+ * WIDTH: `columnWidths` lets the per-column floors win when even they overflow the budget, so a
+ * table of many short cells renders a box far wider than the target — twenty one-word columns
+ * still run past a hundred. That is precisely the phone-shredding grid this module exists to
+ * replace, and the record layout handles it, so a grid that cannot be made to fit is not kept.
+ *
+ * HEIGHT: the width budget bottoms out at MIN_COL_WIDTH per column, so a target of `maxWidth`
+ * holds at most this many columns — 6 at the default width. Allow a cell the same number of
+ * LINES: one that wraps TALLER than the table could ever be WIDE has stopped being a label and
+ * become a paragraph, and a paragraph reads better as a record than as a column of five-word
+ * fragments.
  */
 function fitsGrid(rows: string[][], widths: number[], maxWidth: number): boolean {
+  const rendered = widths.reduce((a, b) => a + b, 0) + scaffoldWidth(widths.length);
+  if (rendered > maxWidth) return false;
   const maxLines = Math.floor(maxWidth / MIN_COL_WIDTH);
   return rows.every((row) =>
     row.every((cell, i) => wrapCell(cell, widths[i] as number).length <= maxLines),
@@ -252,7 +273,9 @@ function renderRecords(table: ParsedTable, maxWidth: number): string {
   const header = table.separatorAfterRow[0] === true ? table.rows[0] : undefined;
   const labels =
     header !== undefined && header.length > 2
-      ? header.map((h) => `${h.toUpperCase()}:`)
+      ? // A blank corner cell (`| | Tradeoff | Recommendation |`) is a common header idiom: it
+        // names nothing, so it contributes padding and not a bare `:` in front of every record.
+        header.map((h) => (h.length > 0 ? `${h.toUpperCase()}:` : ''))
       : undefined;
   // Every label is padded to the widest so the values start in one column and the record scans
   // vertically, the way the grid's cells used to.
@@ -278,17 +301,32 @@ function renderRecords(table: ParsedTable, maxWidth: number): string {
 }
 
 /**
+ * Neutralize every backtick RUN long enough to close a code fence, so text placed inside one can
+ * never terminate it: a zero-width space goes between the backticks of any run of three or more.
+ * Every character stays; only the adjacency that Discord reads as a fence is gone.
+ *
+ * Runs, not each literal ```, because four backticks is the ordinary way to fence a block that
+ * itself contains a fence — and defusing only the first three leaves the fourth sitting against
+ * the two that were emitted, rebuilding a ``` a character further along. Separating every
+ * backtick in the run leaves no two adjacent, so nothing can reassemble at any length.
+ *
+ * The cost is that a three-plus backtick span shows its backticks instead of becoming a chip —
+ * cheap, since everything inside a fence is already monospace.
+ */
+export function defuseFences(body: string): string {
+  const zeroWidthSpace = String.fromCharCode(0x200b);
+  return body.replace(/`{3,}/g, (run) => [...run].join(zeroWidthSpace));
+}
+
+/**
  * Wrap a rendered block in a code fence. The fence is what guarantees monospace — and what keeps
  * cell text INERT: model-authored cells are full of `|`, `*`, `_` and backticks that Discord would
  * otherwise render as live markdown, letting one unbalanced cell corrupt every line after it. The
- * one sequence that could still escape is a literal ``` inside a cell, so it is defused with a
- * zero-width space (the same defusal the tool-output card uses): the characters stay, their effect
- * does not. The cost is that inline code spans show their backticks instead of becoming chips —
- * cheap, since everything inside a fence is already monospace.
+ * one sequence that could still escape is a fence-closing backtick run inside a cell, which
+ * `defuseFences` takes apart (the same defusal the tool-output card uses).
  */
 function fence(body: string): string {
-  const zeroWidthSpace = String.fromCharCode(0x200b);
-  return '```\n' + body.replaceAll('```', '`' + zeroWidthSpace + '``') + '\n```';
+  return '```\n' + defuseFences(body) + '\n```';
 }
 
 /** Render one parsed table: a compact box while its cells stay short, a record list once they do

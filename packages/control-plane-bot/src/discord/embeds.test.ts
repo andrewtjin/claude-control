@@ -743,14 +743,14 @@ describe('lifecycle cards (done / waiting / quarantine)', () => {
         '',
         '| Action | Detail |',
         '|---|---|',
-        '| `probe_attention.py` -> `scripts/` | Self-contained, no relative imports - runs unchanged. |',
-        '| `pyrightconfig.json` -> deleted | Folded into `[tool.pyright]`. If a `pyrightconfig.json` ever reappears it wins and the pyproject table is silently ignored. |',
+        '| `widget.ts` -> `src/parts/` | Self-contained, no relative imports - moves unchanged. |',
+        '| `legacy.config.json` -> deleted | Folded into the package config. A stray `legacy.config.json` would win over it and the merged settings would be ignored without a word. |',
       ].join('\n'),
     }).toJSON();
     expect(embed.description).toContain('Here is what moved.');
     expect(embed.description).not.toContain('|---|');
     // Long cells, so the record layout: a heading line with its detail indented under it.
-    expect(embed.description).toContain('`probe_attention.py` -> `scripts/`\n  Self-contained,');
+    expect(embed.description).toContain('`widget.ts` -> `src/parts/`\n  Self-contained,');
   });
 
   it('buildWaitingEmbed is a blue 🔔 "your turn" card', () => {
@@ -953,6 +953,68 @@ describe('session card / summary embeds — table re-rendering', () => {
     expect(boxLines.length).toBeGreaterThan(0);
     for (const line of boxLines) expect(line.length).toBeLessThanOrEqual(40);
   });
+});
+
+describe('clamping a re-rendered table leaves no fence open', () => {
+  // Every prose surface arrives fenced now (formatTables), and both clamps cut blind — so a cut
+  // landing inside a table leaves an unterminated ```, and Discord swallows the rest of the card
+  // into one code block. An eight-row comparison table already overruns a field.
+  const proseTable = (rows: number): string =>
+    [
+      '| Action | Detail |',
+      '|---|---|',
+      ...Array.from(
+        { length: rows },
+        (_, i) =>
+          `| \`module_${i}.ts\` | A sentence of explanation long enough to read as real prose and to push this row past any column a phone-width grid could give it, row ${i}. |`,
+      ),
+    ].join('\n');
+
+  const fenceCount = (text: string): number => (text.match(/```/g) ?? []).length;
+
+  const sessionModel = (summary: string): SessionCardModel => ({
+    sessionId: 's1',
+    state: 'running',
+    stopping: false,
+    summary,
+    outputTail: 'the last lines of stdout',
+    totalOutputChars: 24,
+    attached: false,
+    hasGap: false,
+    sourceTruncated: false,
+    hadError: false,
+  });
+
+  for (const rows of [8, 60]) {
+    it(`balances every clamped card at ${rows} rows`, () => {
+      const source = proseTable(rows);
+      const clamped: [string, string, number][] = [
+        ['done', buildDoneEmbed({ lastAssistantMessage: source }).toJSON().description ?? '', 4096],
+        ['waiting', buildWaitingEmbed({ body: source }).toJSON().description ?? '', 4096],
+        [
+          'question',
+          buildQuestionEmbed([
+            { question: source, multiSelect: false, options: [{ label: 'a' }] },
+          ]).toJSON().fields?.[0]?.value ?? '',
+          1024,
+        ],
+        ['card', buildSessionCardEmbed(sessionModel(source)).toJSON().description ?? '', 4096],
+        [
+          'summary',
+          buildSessionSummaryEmbed(sessionModel(source)).toJSON().description ?? '',
+          4096,
+        ],
+      ];
+      for (const [name, rendered, max] of clamped) {
+        expect(`${name}: ${fenceCount(rendered) % 2}`).toBe(`${name}: 0`);
+        expect(rendered.length).toBeLessThanOrEqual(max);
+      }
+      // The clamp really fired at both sizes — otherwise balance proves nothing.
+      const question = clamped[2]?.[1] ?? '';
+      expect(question).toMatch(/… \+\d+ more/);
+      expect(question.length).toBeGreaterThan(900);
+    });
+  }
 });
 
 describe('buildStatsEmbed', () => {
