@@ -496,3 +496,60 @@ describe('usage.snapshot carries no monetary data', () => {
     expect(result.ok).toBe(true);
   });
 });
+
+describe('stats.snapshot', () => {
+  const totals = { input: 1, output: 2, cacheCreation: 3, cacheRead: 4, turns: 5 };
+  const payload = {
+    windowStartMs: 0,
+    windowEndMs: 604_800_000,
+    overall: totals,
+    byAccount: [{ accountId: 'acct-a', label: 'main', totals }],
+    byModel: [{ label: 'claude-opus-5', totals }],
+    byDay: [{ label: '2026-07-25', totals }],
+    coverage: {
+      filesScanned: 42,
+      filesSkippedByMtime: 400,
+      filesUnreadable: 1,
+      dirsUnreadable: 1,
+      malformedLines: 2,
+      duplicateTurns: 3,
+    },
+  };
+
+  it('is a registered message type', () => {
+    expect(isMessageType('stats.snapshot')).toBe(true);
+  });
+
+  it('round-trips a full snapshot', () => {
+    const result = decode(encode(stamp({ daemonId: 'daemon-1', type: 'stats.snapshot', payload })));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'stats.snapshot')) {
+      expect(result.envelope.payload).toEqual(payload);
+    }
+  });
+
+  it('carries the unattributed bucket as a null accountId rather than dropping the row', () => {
+    const result = decode(
+      rawFrame('stats.snapshot', {
+        ...payload,
+        byAccount: [{ accountId: null, label: 'unattributed', totals }],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'stats.snapshot')) {
+      expect(result.envelope.payload.byAccount[0]?.accountId ?? null).toBeNull();
+      expect(result.envelope.payload.byAccount[0]?.label).toBe('unattributed');
+    }
+  });
+
+  it('rejects a frame missing its coverage, so a total can never arrive uncontextualized', () => {
+    const { coverage: _coverage, ...withoutCoverage } = payload;
+    expect(decode(rawFrame('stats.snapshot', withoutCoverage)).ok).toBe(false);
+  });
+
+  it('rejects negative token counts', () => {
+    expect(
+      decode(rawFrame('stats.snapshot', { ...payload, overall: { ...totals, output: -1 } })).ok,
+    ).toBe(false);
+  });
+});

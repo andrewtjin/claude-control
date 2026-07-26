@@ -103,6 +103,13 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 - **Attribution.** Transcripts carry no account identity, so the switch engine's
   append-only audit trail (`switch-audit.jsonl`) records when each account was live;
   the daemon joins it against transcript timestamps.
+- **Token stats.** Claude Code writes a per-turn `usage` block into its own transcripts.
+  `transcriptTokens` streams those files (de-duplicated by `message.id`, since one API
+  response spans several lines and a resumed session copies its history) and
+  `tokenStats` attributes each turn through the intervals above — the absolute counts
+  behind `cctl stats` and `/stats`. Local reads only; the bot receives sums, never text.
+  Everything the machine did outside Claude Code on this host is invisible, and every
+  surface says so.
 - **Sessions.** Phone-started work runs as an Agent-SDK **managed** session (clean
   structured streaming to Discord); a user's own terminal is a **observed** ConPTY
   session (notify/approve/inject only). Switching mid-session interrupts, activates,
@@ -112,5 +119,7 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 
 The daemon persists to `node:sqlite` (`daemon.db`): the attribution journal, usage
 snapshots, pending permissions, the session registry, and a bounded outbox that buffers
-messages during a bot outage. The switch engine keeps its own file-based vault, intent,
-and audit trail so it works even when the daemon isn't running (e.g. from `cctl`).
+messages during a bot outage. Both growing tables are bounded — the outbox by row count,
+usage snapshots by a 90-day cutoff trimmed on each poll cycle. The switch engine keeps its
+own file-based vault, intent, and audit trail so it works even when the daemon isn't
+running (e.g. from `cctl`).

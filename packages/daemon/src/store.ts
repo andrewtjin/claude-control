@@ -266,6 +266,29 @@ export class Store {
     return row ? this.toUsageSnapshotRow(row) : undefined;
   }
 
+  /**
+   * Drop usage snapshots older than `cutoffMs`, returning how many rows went. The poller appends
+   * one row per account per cycle forever, so without this the table is the only unbounded thing
+   * the daemon writes; nothing reads a snapshot older than the current view.
+   *
+   * The `id IN (SELECT ...)` shape is not decoration. A bare `DELETE ... WHERE fetchedAtMs < ?`
+   * plans as a full table SCAN on a database that has never been ANALYZEd (the normal state of a
+   * daemon db), because `fetchedAtMs` is the SECOND column of the only index. Selecting the ids
+   * first plans as `SCAN ... USING COVERING INDEX idx_usage_snapshots_account` — the candidate
+   * rows are found in the index alone, and only the rows actually being deleted are touched.
+   * Same reason and same shape as {@link trimOutboxOldest}.
+   */
+  trimUsageSnapshots(cutoffMs: number): number {
+    const result = this.db
+      .prepare(
+        `DELETE FROM usage_snapshots WHERE id IN (
+           SELECT id FROM usage_snapshots WHERE fetchedAtMs < ?
+         )`,
+      )
+      .run(cutoffMs);
+    return Number(result.changes);
+  }
+
   // ---- activation_intervals ----
 
   private toActivationIntervalRow(row: Record<string, unknown>): ActivationIntervalRow {

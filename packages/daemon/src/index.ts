@@ -40,6 +40,22 @@ export {
 export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
 
 export {
+  readTranscriptTurns,
+  type ReadTranscriptTurnsOptions,
+  type TranscriptScan,
+  type TranscriptTurn,
+} from './transcriptTokens.js';
+
+export {
+  aggregateTokenStats,
+  localDayKey,
+  totalTokens,
+  UNATTRIBUTED_LABEL,
+  type ActivationWindow,
+  type AggregateTokenStatsOptions,
+} from './tokenStats.js';
+
+export {
   HookReceiver,
   DEFAULT_HOOK_EVENT_NAMES,
   DEFAULT_PERMISSION_HOLD_MS,
