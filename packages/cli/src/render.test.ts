@@ -324,40 +324,51 @@ describe('renderUsage', () => {
 
 describe('renderPacingLine', () => {
   const NOW = Date.parse('2026-07-16T12:00:00.000Z');
-  const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+  const DAY_MS = 24 * 60 * 60 * 1000;
 
-  function input(accountId: string, percent: number, elapsedFraction: number): AccountUsageInput {
+  function input(accountId: string, percent: number, resetInDays?: number): AccountUsageInput {
     return {
       accountId,
       label: accountId,
       active: false,
       quarantined: false,
+      weight: 20,
       limits: [
         {
           kind: 'weekly_all',
           percent,
-          resetsAt: NOW + Math.round((1 - elapsedFraction) * WEEK_MS),
+          ...(resetInDays !== undefined ? { resetsAt: NOW + resetInDays * DAY_MS } : {}),
         },
       ],
     };
   }
 
-  it('prints a "Pacing: " line matching the computed verdict', () => {
-    // 52% used / 38% elapsed = ahead of pace — same fixture as usage-advisor's pacing tests.
-    const line = renderPacingLine([input('a', 52, 0.38)], NOW);
-    expect(line).toBe(
-      'Pacing: 38% of the combined week elapsed, 52% of budget burned - ahead of pace (~1.4x): ' +
-        'slow down or expect an early wall.',
+  it('prints the fleet verdict under a "Pacing: " prefix', () => {
+    const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW, burnUnitsPerDay: 2 });
+    expect(line).toContain('Pacing: 10u of 20u available (50%)');
+    expect(line).toContain('sustainable for the next 14d');
+  });
+
+  it('counts a dormant account at full allowance instead of dropping it', () => {
+    // The account with no reset time used to be excluded outright, which inverted the verdict.
+    const line = renderPacingLine([input('idle', 0), input('busy', 80, 2)], {
+      nowMs: NOW,
+      burnUnitsPerDay: 1,
+    });
+    expect(line).toContain('24u of 40u available (60%)');
+  });
+
+  it('indents every honesty note under the headline', () => {
+    const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW });
+    expect(line.split('\n').slice(1)).toEqual([
+      '  - no usage history to measure a burn rate from yet.',
+    ]);
+  });
+
+  it('reports pacing unknown with no accounts', () => {
+    expect(renderPacingLine([], { nowMs: NOW })).toBe(
+      'Pacing: No weekly usage data yet - fleet pacing unknown.',
     );
-  });
-
-  it('reports the on-pace headline when burn tracks elapsed time', () => {
-    const line = renderPacingLine([input('a', 49, 0.52)], NOW);
-    expect(line).toBe('Pacing: on pace (52% elapsed, 49% burned).');
-  });
-
-  it('reports pace unknown with no accounts', () => {
-    expect(renderPacingLine([], NOW)).toBe('Pacing: No weekly usage data yet - pace unknown.');
   });
 });
 

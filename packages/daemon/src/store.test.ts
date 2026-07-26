@@ -82,6 +82,18 @@ describe('Store', () => {
       store.trimUsageSnapshots(500);
       expect(store.latestUsageSnapshot('a')?.json).toBe('{"x":1}');
     });
+
+    it('lists a time window oldest-first, scoped to an account', () => {
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 100, source: 'live', json: '{}' });
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 300, source: 'live', json: '{}' });
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 200, source: 'live', json: '{}' });
+      store.insertUsageSnapshot({ accountId: 'b', fetchedAtMs: 250, source: 'live', json: '{}' });
+
+      // Inclusive lower bound; 'b' never leaks in; ascending order is what a series needs.
+      expect(store.listUsageSnapshotsSince('a', 200).map((r) => r.fetchedAtMs)).toEqual([200, 300]);
+      expect(store.listUsageSnapshotsSince('a', 999)).toEqual([]);
+      expect(store.listUsageSnapshotsSince('missing', 0)).toEqual([]);
+    });
   });
 
   describe('activation_intervals', () => {

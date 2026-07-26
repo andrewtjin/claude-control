@@ -56,6 +56,14 @@ export const AccountUsage = z.object({
   fetchedAtMs: z.number().int().nonnegative(),
   limits: z.array(UsageLimit),
   error: z.string().nullish(),
+  /** Epoch ms of this account's next weekly reset, DERIVED by the daemon from its stored
+   *  snapshot history. The endpoint stops publishing `resets_at` once an account's weekly
+   *  window closes, so the accounts holding a full untouched allowance are exactly the ones
+   *  that report no reset — and only the daemon holds the history to derive one. Additive and
+   *  tolerant like `epoch`/`permissionMode`: a daemon predating this field omits it and the
+   *  phone says the reset is unknown rather than inventing one. Consumers must always label
+   *  it as predicted; it is never an endpoint observation. */
+  predictedResetAt: z.number().int().nonnegative().nullish(),
 });
 
 // ---------------------------------------------------------------------------
@@ -197,6 +205,13 @@ const UsageSnapshotPayload = z.object({
   accounts: z.array(AccountUsage),
   /** The optimizer's recommendation, when the daemon has computed one. */
   plan: UsagePlan.nullish(),
+  /** Fleet-wide burn in Pro-equivalent units/day, MEASURED by the daemon from stored snapshot
+   *  history. The pacing model returns no sustainability verdict without it, and the bot can
+   *  never measure it itself: it holds no history and must not read the daemon's database.
+   *  Fractional by nature (a rate), and finite-bounded because a non-finite number serializes
+   *  to `null` and would fail the peer's own parse. Absent means "not measurable", which the
+   *  model reports as such — never as zero, which would read as "nothing is being used". */
+  burnUnitsPerDay: z.number().finite().nonnegative().nullish(),
 });
 
 /** The daemon's effective settings, resolved once at startup (flags and env are read only

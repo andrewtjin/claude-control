@@ -18,6 +18,7 @@
 // not a recommendation heading plus a per-account advisory list.
 
 import { humanizeDuration, roundPct } from './format.js';
+import { selectWeeklyBudget } from './weekly.js';
 import type {
   AccountScore,
   AccountUsageInput,
@@ -117,7 +118,9 @@ function analyze(input: AccountUsageInput, now: number, cfg: Config): Analysis {
       ? 100
       : Math.min(...input.limits.map((l) => 100 - clampPct(l.percent)));
 
-  const weeklyResetAt = nearestResetOfKind(input.limits, ['weekly_all', 'weekly_scoped']);
+  // The weekly clock comes from the one fleet-wide rule (see weekly.ts) so the Plan line and
+  // the Pacing line in the same view can never quote different limits for one account.
+  const weeklyResetAt = selectWeeklyBudget(input.limits, now, input.predictedResetAt)?.resetsAt;
   const sessionResetAt = nearestResetOfKind(input.limits, ['session']);
 
   // Find the most at-risk WEEKLY limit: the soonest-resetting one that still has meaningful

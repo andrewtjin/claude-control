@@ -1,249 +1,471 @@
-// Cross-account pacing: is combined usage burning faster or slower than the calendar week
-// allows?
+// Fleet pacing: at the measured burn rate, does the fleet hold out, and what expires unused?
 //
-// advisor.ts answers "use which account right now"; timeline.ts answers "when does each
-// limit refresh". Neither answers the owner's actual planning question: across every
-// registered account, are we on track to land the week with headroom to spare, or heading
-// for a wall before the reset? Pacing collapses every account's weekly budget into one
-// ratio — used-so-far vs. time-elapsed-so-far — so a single verdict answers it. Pure, like
-// its siblings: `nowMs` is a parameter, never read from the clock internally, so the CLI and
-// the Discord bot render identical, unit-tested output from the same snapshot.
+// advisor.ts answers "use which account right now"; timeline.ts answers "when does each limit
+// refresh". Neither answers the owner's planning question: across every registered account, is
+// the fleet sustainable, and how much budget am I about to throw away? Pacing answers both by
+// simulating the fleet forward over a horizon.
+//
+// Why a simulation rather than a ratio. The old model averaged per-account "fraction of the
+// week used / fraction of the week elapsed". That is not a fleet metric: the denominator goes
+// to zero for every account that just reset, so a fleet sitting on four nearly-full budgets
+// reads as "ahead of pace, slow down" — the exact opposite of the truth. It also silently
+// dropped every account the endpoint had stopped publishing a reset for, which is precisely
+// the set of accounts holding a FULL untouched allowance.
+//
+// The model, in Pro-equivalent units (a "Wx Pro" plan holds W units per weekly window):
+//   - balance      = weight * (1 - usedFraction), the budget left in the current window. An
+//                    account whose window has closed reports 0% used, so it holds its full
+//                    allowance and this one formula covers it with no special case.
+//   - burn         = MEASURED at the edge from snapshot history, in units/day. Passed in.
+//   - draw-down    = spend from the account whose quota EXPIRES SOONEST, mirroring the
+//                    daemon's greedy auto-switch, because unused weekly budget is destroyed
+//                    at reset rather than banked.
+//   - at reset     = the account returns to its full allowance and whatever it still held is
+//                    LOST. Modelling that loss is what produces the waste figure, which is the
+//                    single most actionable output: "use tjin.29 before Friday or lose a week
+//                    of it" is advice a ratio can never give.
+//
+// Every input the simulation cannot see is reported as a note rather than assumed away: an
+// unmeasured burn rate yields no verdict, unknown plan tiers are called out as equal
+// weighting, and a predicted reset is always labelled predicted. Pure, like its siblings:
+// `nowMs` is a parameter, never read from the clock internally, so the CLI and the Discord bot
+// render identical, unit-tested output from the same snapshot.
 
-import { roundPct } from './format.js';
-import type { AccountUsageInput, LimitInput } from './types.js';
+import { humanizeDuration, roundPct } from './format.js';
+import type { AccountUsageInput } from './types.js';
+import { selectWeeklyBudget } from './weekly.js';
 
-/** One weekly quota cycle. Every account's weekly budget resets on this cadence, so it is
- *  the fixed denominator "how much of the week is behind us" is measured against. */
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** Above this ratio, budget is being burned faster than the week is passing — the account(s)
- *  risk hitting a wall before the reset. Below the lower bound, there is headroom to spare. */
-const AHEAD_THRESHOLD = 1.15;
-const BEHIND_THRESHOLD = 0.85;
+/** One weekly quota cycle: the fixed cadence every account's weekly window repeats on. */
+const WEEK_MS = 7 * DAY_MS;
 
-/** Treat the combined elapsed-fraction denominator as zero below this — guards the ratio
- *  against a divide-by-near-zero blowup right after a reset, rather than trusting float noise. */
-const ELAPSED_EPSILON = 1e-9;
+/** How far ahead the simulation runs. Two weekly cycles: long enough that every account resets
+ *  at least once (so its waste is visible) and short enough that a measured burn rate is still
+ *  a defensible extrapolation. */
+export const PACING_HORIZON_DAYS = 14;
 
-export type PacingVerdict = 'ahead' | 'on-pace' | 'behind' | 'fresh' | 'unknown';
+/** Balances below this are floating-point residue from the draw-down, not real budget — never
+ *  reported as waste and never counted as "still has balance". */
+const UNIT_EPSILON = 1e-9;
 
-/** One account's contribution to the pacing verdict, or why it has none. Always present in
- *  the result — even a non-contributing account is listed, so a renderer can show why the
- *  aggregate excludes it rather than silently dropping it from view. */
+/** Accounts named individually in the rendered waste note; the rest are counted, never dropped. */
+const MAX_NAMED_WASTE = 3;
+
+export type PacingVerdict = 'sustainable' | 'runs-dry' | 'unknown';
+
+/** One account's place in the fleet. Always present in the result — even a non-contributing
+ *  account is listed, so a renderer can show WHY the totals exclude it instead of silently
+ *  dropping it from view. */
 export interface AccountPacing {
   accountId: string;
   label: string;
-  /** Percent of the weekly budget used, when known — shown even for a non-contributing
-   *  account (e.g. quarantined) so the reader can see what it would have contributed. */
+  /** Weekly allowance in Pro-equivalent units (the resolved plan weight, or 1 when unknown). */
+  weightUnits: number;
+  /** Units still held in the current weekly window. Absent when the account contributes none. */
+  balanceUnits?: number;
+  /** Percent of the weekly budget used, when known. */
   usedPct?: number;
-  /** Percent of the week elapsed against that account's weekly reset, when known. */
-  elapsedPct?: number;
+  /** Epoch ms of the next weekly reset, observed or predicted, when either is known. */
+  resetsAt?: number;
+  /** True when `resetsAt` is a prediction from history, not an endpoint reading. */
+  resetPredicted: boolean;
   contributing: boolean;
-  /** Why this account was excluded from the aggregate. Absent when contributing. */
+  /** Why this account was excluded from the totals. Absent when contributing. */
   reason?: string;
 }
 
-/** The aggregate pacing verdict for a moment across every registered account. */
+/** One weekly reset that arrives with budget still unspent — the budget it destroys. */
+export interface PacingWaste {
+  accountId: string;
+  label: string;
+  /** Units that expire unused at this reset. */
+  units: number;
+  /** Epoch ms of the reset that destroys them. */
+  atMs: number;
+}
+
+/** The fleet's pacing outlook for a moment. */
 export interface Pacing {
   verdict: PacingVerdict;
-  /** sum(used)/sum(elapsed) across contributing accounts. Absent for 'fresh' (denominator
-   *  ~0) and 'unknown' (no contributing account at all) — there is nothing to ratio. */
-  paceRatio?: number;
-  /** Aggregate week-elapsed percent (mean across contributing accounts), 0-100. */
-  weekElapsedPct: number;
-  /** Aggregate budget-used percent (mean across contributing accounts), 0-100. */
-  budgetUsedPct: number;
-  /** One human sentence carrying the whole verdict — the line frontends print as-is. */
+  /** Units the fleet holds right now, summed across contributing accounts. */
+  availableUnits: number;
+  /** Units the fleet would hold with every window untouched. */
+  capacityUnits: number;
+  /** Measured burn in units/day. Absent = not measurable, which forces verdict 'unknown'. */
+  burnUnitsPerDay?: number;
+  /** Units the fleet regains per day on average: one full capacity every weekly cycle. */
+  replenishUnitsPerDay: number;
+  /** Epoch ms the fleet runs out of budget. Present only for verdict 'runs-dry'. */
+  dryAtMs?: number;
+  horizonDays: number;
+  /** Units that expire unused inside the horizon (0 when the simulation did not run). */
+  wastedUnits: number;
+  /** Every wasting reset inside the horizon, soonest first. */
+  waste: PacingWaste[];
+  /** One human sentence carrying the verdict — the line frontends print as-is. */
   headline: string;
+  /** Honesty markers: unmeasured burn, unknown plan tiers, predicted resets, excluded
+   *  accounts. Rendered under the headline; never empty when something was assumed. */
+  notes: string[];
   accounts: AccountPacing[];
 }
 
-/** Per-account fractions feeding the aggregate, kept separate from the public AccountPacing
- *  shape so the aggregate can sum raw [0,1] fractions while the public shape reports rounded
- *  percents — rounding before summing would drift the aggregate off the true ratio. */
-interface Contribution {
-  used: number;
-  elapsed: number;
+/** Knobs for the simulation. `nowMs` is required (the purity contract); the rest are the
+ *  history-derived measurements the caller made at the edge. */
+export interface PacingOptions {
+  nowMs: number;
+  /** Fleet-wide burn in Pro-equivalent units/day, measured from stored snapshots. Omit when
+   *  there is not enough history to measure one — the result then carries no verdict. */
+  burnUnitsPerDay?: number;
+  /** Override the simulation horizon (days). Defaults to {@link PACING_HORIZON_DAYS}. */
+  horizonDays?: number;
+}
+
+/** A contributing account as the simulation carries it: mutable balance, fixed allowance. */
+interface SimAccount {
+  accountId: string;
+  label: string;
+  weight: number;
+  balance: number;
+  resetsAt?: number;
 }
 
 /**
- * Compute the pacing verdict for a snapshot. Pure and deterministic: same accounts + same
- * `nowMs` always yield the same result. Quarantined accounts and accounts with no usable
- * weekly data are excluded from the aggregate but still appear in `accounts` with a reason,
- * so a renderer can explain why the totals don't cover every registered account.
+ * Compute the fleet's pacing outlook. Pure and deterministic: same accounts + same options
+ * always yield the same result. Quarantined accounts and accounts with no weekly usage data
+ * are excluded from the totals but still appear in `accounts` with a reason.
  */
-export function computePacing(accounts: AccountUsageInput[], nowMs: number): Pacing {
-  const analyzed = accounts.map((account) => analyzeAccount(account, nowMs));
-  const outAccounts = analyzed.map((a) => a.pacing);
-  const contributions = analyzed
-    .map((a) => a.contribution)
-    .filter((c): c is Contribution => c !== undefined);
+export function computePacing(accounts: AccountUsageInput[], options: PacingOptions): Pacing {
+  const { nowMs, burnUnitsPerDay } = options;
+  const horizonDays = options.horizonDays ?? PACING_HORIZON_DAYS;
 
-  if (contributions.length === 0) {
+  const analyzed = accounts.map((a) => analyzeAccount(a, nowMs));
+  const outAccounts = analyzed.map((a) => a.pacing);
+  const sim = analyzed.map((a) => a.sim).filter((s): s is SimAccount => s !== undefined);
+
+  const availableUnits = sim.reduce((sum, a) => sum + a.balance, 0);
+  const capacityUnits = sim.reduce((sum, a) => sum + a.weight, 0);
+  const replenishUnitsPerDay = (capacityUnits / WEEK_MS) * DAY_MS;
+  const notes = buildNotes(accounts, outAccounts, sim.length, burnUnitsPerDay);
+
+  if (sim.length === 0 || burnUnitsPerDay === undefined) {
     return {
       verdict: 'unknown',
-      weekElapsedPct: 0,
-      budgetUsedPct: 0,
-      headline: 'No weekly usage data yet - pace unknown.',
+      availableUnits,
+      capacityUnits,
+      replenishUnitsPerDay,
+      horizonDays,
+      wastedUnits: 0,
+      waste: [],
+      headline: unknownHeadline(sim.length, availableUnits, capacityUnits, replenishUnitsPerDay),
+      notes,
       accounts: outAccounts,
     };
   }
 
-  const n = contributions.length;
-  const usedSum = contributions.reduce((sum, c) => sum + c.used, 0);
-  const elapsedSum = contributions.reduce((sum, c) => sum + c.elapsed, 0);
-  const weekElapsedPct = roundPct((elapsedSum / n) * 100);
-  const budgetUsedPct = roundPct((usedSum / n) * 100);
-
-  // sum(used)/sum(elapsed) equals mean(used)/mean(elapsed) (the /n cancels) — computed from
-  // the sums directly so there is exactly one division, not one per account.
-  if (elapsedSum < ELAPSED_EPSILON) {
-    return {
-      verdict: 'fresh',
-      weekElapsedPct,
-      budgetUsedPct,
-      headline: `${weekElapsedPct}% of the combined week elapsed - just reset, too early to gauge pace.`,
-      accounts: outAccounts,
-    };
-  }
-
-  const paceRatio = usedSum / elapsedSum;
-  const verdict: PacingVerdict =
-    paceRatio > AHEAD_THRESHOLD ? 'ahead' : paceRatio < BEHIND_THRESHOLD ? 'behind' : 'on-pace';
-
+  const { dryAtMs, waste } = simulate(sim, burnUnitsPerDay, nowMs, horizonDays);
+  const wastedUnits = waste.reduce((sum, w) => sum + w.units, 0);
   return {
-    verdict,
-    paceRatio,
-    weekElapsedPct,
-    budgetUsedPct,
-    headline: buildHeadline(verdict, weekElapsedPct, budgetUsedPct, paceRatio),
+    verdict: dryAtMs === undefined ? 'sustainable' : 'runs-dry',
+    availableUnits,
+    capacityUnits,
+    burnUnitsPerDay,
+    replenishUnitsPerDay,
+    ...(dryAtMs !== undefined ? { dryAtMs } : {}),
+    horizonDays,
+    wastedUnits,
+    waste,
+    headline: buildHeadline({
+      availableUnits,
+      capacityUnits,
+      burnUnitsPerDay,
+      replenishUnitsPerDay,
+      horizonDays,
+      nowMs,
+      ...(dryAtMs !== undefined ? { dryAtMs } : {}),
+    }),
+    notes:
+      wastedUnits > UNIT_EPSILON
+        ? [wasteNote(waste, wastedUnits, horizonDays, nowMs), ...notes]
+        : notes,
     accounts: outAccounts,
   };
 }
 
-/** One account's pacing analysis: its public-facing entry, plus its raw [0,1] contribution
- *  when it has one (undefined when excluded). */
+// ---------------------------------------------------------------------------
+// Per-account analysis
+// ---------------------------------------------------------------------------
+
+/** One account's public entry, plus its simulation state when it contributes. */
 function analyzeAccount(
   account: AccountUsageInput,
   nowMs: number,
-): { pacing: AccountPacing; contribution?: Contribution } {
-  const limit = weeklyLimitFor(account.limits);
-  const { percent, resetsAt } = weeklyFields(limit);
-  const usedPct = percent !== undefined ? roundPct(clamp01(percent / 100) * 100) : undefined;
-  const elapsedPct =
-    resetsAt !== undefined ? roundPct(elapsedFraction(resetsAt, nowMs) * 100) : undefined;
+): { pacing: AccountPacing; sim?: SimAccount } {
+  // An absent plan weight means 1 Pro-equivalent unit. That default is SURFACED as a note by
+  // the caller (see buildNotes) — equal weighting applied silently is the original bug.
+  const weightUnits = account.weight !== undefined && account.weight > 0 ? account.weight : 1;
+  const weekly = selectWeeklyBudget(account.limits, nowMs, account.predictedResetAt);
+  // Clamped for the arithmetic (the endpoint grants overage past 100%), rounded only for
+  // display — rounding before the sum would drift the fleet totals off the true balance.
+  const usedFraction = weekly?.percent !== undefined ? clamp01(weekly.percent / 100) : undefined;
+  const usedPct = weekly?.percent !== undefined ? roundPct(weekly.percent) : undefined;
+
+  const base: AccountPacing = {
+    accountId: account.accountId,
+    label: account.label,
+    weightUnits,
+    ...(usedPct !== undefined ? { usedPct } : {}),
+    ...(weekly?.resetsAt !== undefined ? { resetsAt: weekly.resetsAt } : {}),
+    resetPredicted: weekly?.predicted === true,
+    contributing: false,
+  };
 
   if (account.quarantined) {
+    return { pacing: { ...base, reason: 'quarantined - excluded until re-login' } };
+  }
+  if (usedFraction === undefined) {
     return {
       pacing: {
-        accountId: account.accountId,
-        label: account.label,
-        ...(usedPct !== undefined ? { usedPct } : {}),
-        ...(elapsedPct !== undefined ? { elapsedPct } : {}),
-        contributing: false,
-        reason: 'quarantined - excluded from pacing until re-login',
+        ...base,
+        reason: weekly === undefined ? 'no weekly limit reported' : 'weekly limit missing percent',
       },
     };
   }
 
-  if (percent === undefined || resetsAt === undefined) {
-    return {
-      pacing: {
-        accountId: account.accountId,
-        label: account.label,
-        ...(usedPct !== undefined ? { usedPct } : {}),
-        ...(elapsedPct !== undefined ? { elapsedPct } : {}),
-        contributing: false,
-        reason: missingDataReason(limit, percent !== undefined, resetsAt !== undefined),
-      },
-    };
-  }
-
-  // Both narrowed to `number` by the guard above — no assertions needed past this point.
-  const used = clamp01(percent / 100);
-  const elapsed = elapsedFraction(resetsAt, nowMs);
+  // One formula covers both states: an account whose weekly window has closed reports 0% used,
+  // so it holds its full allowance and needs no dormant special case.
+  const balanceUnits = weightUnits * (1 - usedFraction);
   return {
-    pacing: {
+    pacing: { ...base, balanceUnits, contributing: true },
+    sim: {
       accountId: account.accountId,
       label: account.label,
-      usedPct: roundPct(used * 100),
-      elapsedPct: roundPct(elapsed * 100),
-      contributing: true,
+      weight: weightUnits,
+      balance: balanceUnits,
+      ...(weekly?.resetsAt !== undefined ? { resetsAt: weekly.resetsAt } : {}),
     },
-    contribution: { used, elapsed },
   };
 }
 
-/** The limit pacing budgets against: weekly_all, falling back to weekly_scoped only when no
- *  weekly_all entry exists at all (matches the advisor's "weekly is the budget" convention). */
-function weeklyLimitFor(limits: LimitInput[]): LimitInput | undefined {
+// ---------------------------------------------------------------------------
+// The simulation
+// ---------------------------------------------------------------------------
+
+/**
+ * Walk the fleet forward to the horizon. The only events are weekly resets: between them the
+ * measured burn is drawn from the soonest-expiring account with balance, and at each one the
+ * resetting account's leftover balance is recorded as waste and its allowance restored.
+ * An account with no known reset never resets inside the horizon — its budget is spendable but
+ * never replenished, which is the honest reading of "we cannot see its clock".
+ */
+function simulate(
+  sim: SimAccount[],
+  burnUnitsPerDay: number,
+  nowMs: number,
+  horizonDays: number,
+): { dryAtMs?: number; waste: PacingWaste[] } {
+  const endMs = nowMs + horizonDays * DAY_MS;
+  const events: Array<{ atMs: number; accountId: string }> = [];
+  for (const a of sim) {
+    if (a.resetsAt === undefined) continue;
+    for (let t = a.resetsAt; t <= endMs; t += WEEK_MS)
+      events.push({ atMs: t, accountId: a.accountId });
+  }
+  events.sort((x, y) => x.atMs - y.atMs);
+
+  const waste: PacingWaste[] = [];
+  let clock = nowMs;
+  for (const event of events) {
+    const dryAtMs = draw(sim, burnUnitsPerDay, clock, event.atMs);
+    if (dryAtMs !== undefined) return { dryAtMs, waste };
+    const account = sim.find((a) => a.accountId === event.accountId);
+    if (account === undefined) continue; // unreachable: events are built from `sim`
+    if (account.balance > UNIT_EPSILON) {
+      waste.push({
+        accountId: account.accountId,
+        label: account.label,
+        units: account.balance,
+        atMs: event.atMs,
+      });
+    }
+    // The window rolls: full again, remainder destroyed, and the next expiry is one cadence
+    // out. Advancing it matters for the draw order — an account that just reset is now the
+    // LAST one whose budget is about to be lost, not the first.
+    account.balance = account.weight;
+    account.resetsAt = event.atMs + WEEK_MS;
+    clock = event.atMs;
+  }
+  const dryAtMs = draw(sim, burnUnitsPerDay, clock, endMs);
+  return { ...(dryAtMs !== undefined ? { dryAtMs } : {}), waste };
+}
+
+/** Spend the burn accrued between `fromMs` and `toMs`, always from the account whose quota
+ *  expires soonest (unused weekly budget is destroyed at reset, so it must go first; an
+ *  account with no known reset is drawn last). Returns the moment the fleet ran out, or
+ *  undefined when the whole interval was covered. */
+function draw(
+  sim: SimAccount[],
+  burnUnitsPerDay: number,
+  fromMs: number,
+  toMs: number,
+): number | undefined {
+  const days = (toMs - fromMs) / DAY_MS;
+  if (days <= 0) return undefined;
+  let remaining = burnUnitsPerDay * days;
+  if (remaining <= UNIT_EPSILON) return undefined;
+
+  const order = [...sim]
+    .filter((a) => a.balance > UNIT_EPSILON)
+    .sort((x, y) => (x.resetsAt ?? Infinity) - (y.resetsAt ?? Infinity));
+  for (const account of order) {
+    const take = Math.min(account.balance, remaining);
+    account.balance -= take;
+    remaining -= take;
+    if (remaining <= UNIT_EPSILON) return undefined;
+  }
+  // Ran out partway through the interval; burn is constant, so the moment is linear in the
+  // units actually spent. `burnUnitsPerDay` is provably > 0 here (`remaining` started above
+  // the epsilon and is proportional to it).
+  const spent = burnUnitsPerDay * days - remaining;
+  return fromMs + (spent / burnUnitsPerDay) * DAY_MS;
+}
+
+// ---------------------------------------------------------------------------
+// Copy. ASCII only (no em dashes) — this is operator-facing runtime text.
+// ---------------------------------------------------------------------------
+
+/** The verdict sentence for a fleet the simulation could actually run. */
+function buildHeadline(p: {
+  availableUnits: number;
+  capacityUnits: number;
+  burnUnitsPerDay: number;
+  replenishUnitsPerDay: number;
+  horizonDays: number;
+  nowMs: number;
+  dryAtMs?: number;
+}): string {
+  const stock =
+    `${units(p.availableUnits)} of ${units(p.capacityUnits)} available (${share(p.availableUnits, p.capacityUnits)}), ` +
+    `burning ${rate(p.burnUnitsPerDay)} against ${rate(p.replenishUnitsPerDay)} replenished`;
+  return p.dryAtMs === undefined
+    ? `${stock} - sustainable for the next ${p.horizonDays}d.`
+    : `${stock} - runs dry in ${humanizeDuration(p.dryAtMs - p.nowMs)}.`;
+}
+
+/** The verdict sentence when the simulation could not run: say what IS known and why the rest
+ *  is missing, rather than falling back to a number that would look like a verdict. */
+function unknownHeadline(
+  contributing: number,
+  availableUnits: number,
+  capacityUnits: number,
+  replenishUnitsPerDay: number,
+): string {
+  if (contributing === 0) return 'No weekly usage data yet - fleet pacing unknown.';
   return (
-    limits.find((l) => l.kind === 'weekly_all') ?? limits.find((l) => l.kind === 'weekly_scoped')
+    `${units(availableUnits)} of ${units(capacityUnits)} available (${share(availableUnits, capacityUnits)}), ` +
+    `${rate(replenishUnitsPerDay)} replenished - burn rate not measured yet, so no sustainability verdict.`
   );
 }
 
-/** Pull percent/resetsAt off the selected limit, treating a non-finite or absent value as not
- *  reported — the wire declares `percent` required, but a malformed/partial snapshot must not
- *  be trusted just because the type says so. Returns real `undefined`-narrowed fields (not
- *  `NaN`), so every downstream check is a plain `!== undefined`. */
-function weeklyFields(limit: LimitInput | undefined): { percent?: number; resetsAt?: number } {
-  if (!limit) return {};
-  return {
-    ...(isFiniteNumber(limit.percent) ? { percent: limit.percent } : {}),
-    ...(isFiniteNumber(limit.resetsAt) ? { resetsAt: limit.resetsAt } : {}),
-  };
-}
-
-/** Why an account with no quarantine flag still failed to contribute. */
-function missingDataReason(
-  limit: LimitInput | undefined,
-  hasPercent: boolean,
-  hasReset: boolean,
+/** "38u expires unused within 14d: 20u on tjin.29 in 6d, 18u on legoboy in 5d 3h."
+ *
+ *  Aggregated PER ACCOUNT rather than per reset: an account that wastes at two resets inside
+ *  the horizon is one decision ("use tjin.29"), not two, and naming it twice buries the other
+ *  accounts. Ranked by units lost, because the biggest loss is the one worth acting on, and
+ *  stamped with that account's FIRST wasting reset, which is the deadline to act by. The named
+ *  entries are capped, but the remainder is COUNTED in the sentence, never dropped. */
+function wasteNote(
+  waste: PacingWaste[],
+  wastedUnits: number,
+  horizonDays: number,
+  nowMs: number,
 ): string {
-  if (!limit) return 'no weekly limit reported';
-  if (!hasPercent && !hasReset) return 'weekly limit missing percent and reset time';
-  return hasPercent ? 'weekly limit missing reset time' : 'weekly limit missing percent';
+  const byAccount = new Map<string, { label: string; units: number; firstAtMs: number }>();
+  for (const w of waste) {
+    const entry = byAccount.get(w.accountId);
+    if (entry === undefined) {
+      byAccount.set(w.accountId, { label: w.label, units: w.units, firstAtMs: w.atMs });
+      continue;
+    }
+    entry.units += w.units;
+    entry.firstAtMs = Math.min(entry.firstAtMs, w.atMs);
+  }
+  const ranked = [...byAccount.values()].sort(
+    (a, b) => b.units - a.units || a.firstAtMs - b.firstAtMs || a.label.localeCompare(b.label),
+  );
+  const named = ranked
+    .slice(0, MAX_NAMED_WASTE)
+    .map((w) => `${units(w.units)} on ${w.label} in ${humanizeDuration(w.firstAtMs - nowMs)}`)
+    .join(', ');
+  const rest = Math.max(0, ranked.length - MAX_NAMED_WASTE);
+  const tail = rest > 0 ? `, and ${rest} more account${rest === 1 ? '' : 's'}` : '';
+  return `${units(wastedUnits)} expires unused within ${horizonDays}d: ${named}${tail}.`;
 }
 
-/** Fraction of the week elapsed, given when this limit resets. A reset a full week out is
- *  0% elapsed (just reset); a reset landing now is 100% elapsed; a reset already in the past
- *  clamps to 100% rather than going negative — a stale-but-still-informative reading, not an
- *  excluded one (see the module header: pacing treats it as "fully elapsed", not unusable). */
-function elapsedFraction(resetsAt: number, nowMs: number): number {
-  return clamp01((WEEK_MS - (resetsAt - nowMs)) / WEEK_MS);
+/** Every assumption the result rests on, stated outright. Order is fixed so the rendered
+ *  block is stable between polls. */
+function buildNotes(
+  inputs: AccountUsageInput[],
+  accounts: AccountPacing[],
+  contributing: number,
+  burnUnitsPerDay: number | undefined,
+): string[] {
+  const notes: string[] = [];
+  // A missing burn rate is only worth reporting when there is a fleet to measure: with no
+  // contributing account the headline already says the whole story.
+  if (burnUnitsPerDay === undefined && contributing > 0) {
+    notes.push('no usage history to measure a burn rate from yet.');
+  }
+  if (inputs.some((a) => a.weight === undefined)) {
+    notes.push('plan tiers unknown, so accounts are weighted equally (1 unit each).');
+  }
+  const predicted = accounts.filter((a) => a.contributing && a.resetPredicted);
+  if (predicted.length > 0) {
+    notes.push(`next weekly reset predicted from history for ${labels(predicted)}.`);
+  }
+  const blind = accounts.filter((a) => a.contributing && a.resetsAt === undefined);
+  if (blind.length > 0) {
+    notes.push(
+      `no reset time for ${labels(blind)}, so their budget is never modelled as expiring.`,
+    );
+  }
+  for (const a of accounts) {
+    if (a.reason !== undefined) notes.push(`${a.label} excluded: ${a.reason}.`);
+  }
+  return notes;
 }
 
-/** True width-checked runtime guard: the wire's `percent` is typed as a required number, but
- *  a malformed/partial snapshot can still omit it at runtime — never trust the type alone. */
-function isFiniteNumber(x: unknown): x is number {
-  return typeof x === 'number' && Number.isFinite(x);
+function labels(accounts: AccountPacing[]): string {
+  return accounts.map((a) => a.label).join(', ');
+}
+
+/** "20u" / "6.5u" — whole units read cleanly, fractions keep one decimal. */
+function units(value: number): string {
+  const rounded = Math.round(value * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}u`;
+}
+
+function rate(unitsPerDay: number): string {
+  return `${units(unitsPerDay)}/day`;
+}
+
+/** Share of capacity as a whole percent. Capacity is 0 only when nothing contributes, which
+ *  the caller has already routed to the no-data headline. */
+function share(part: number, whole: number): string {
+  return whole > 0 ? `${Math.round((part / whole) * 100)}%` : '0%';
 }
 
 function clamp01(x: number): number {
   return Math.max(0, Math.min(1, x));
 }
 
-/** The one-sentence verdict, in the voice frontends print verbatim. ASCII only (no em
- *  dashes) — this is operator-facing runtime copy, not a comment. */
-function buildHeadline(
-  verdict: 'ahead' | 'behind' | 'on-pace',
-  weekElapsedPct: number,
-  budgetUsedPct: number,
-  paceRatio: number,
-): string {
-  const ratio = paceRatio.toFixed(1);
-  switch (verdict) {
-    case 'ahead':
-      return (
-        `${weekElapsedPct}% of the combined week elapsed, ${budgetUsedPct}% of budget burned - ` +
-        `ahead of pace (~${ratio}x): slow down or expect an early wall.`
-      );
-    case 'behind':
-      return (
-        `${weekElapsedPct}% elapsed, ${budgetUsedPct}% burned - behind pace (~${ratio}x): ` +
-        `headroom to burn faster.`
-      );
-    case 'on-pace':
-      return `on pace (${weekElapsedPct}% elapsed, ${budgetUsedPct}% burned).`;
-  }
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/** Compact rendering of the pacing outlook, printed under the timeline and usage views.
+ *  Mirrors `renderPlanSummary`: one headline line, then the honesty notes as bullets. */
+export function renderPacingSummary(pacing: Pick<Pacing, 'headline' | 'notes'>): string {
+  return [`Pacing: ${pacing.headline}`, ...pacing.notes.map((n) => `  - ${n}`)].join('\n');
 }

@@ -32,6 +32,21 @@ export interface AccountUsageInput {
    *  its trigger on stale data rather than trusting numbers from a blind spot. Absent = treat
    *  as fresh (callers that predate the field never see derated behavior). */
   fetchedAtMs?: number;
+  /** This account's weekly allowance in Pro-equivalent units: a "Wx Pro" plan holds W units
+   *  per weekly window. The usage endpoint reports `percent` of the account's OWN limit and
+   *  carries no absolute allowance anywhere, so averaging percents across a Pro account and a
+   *  Max 20x account would weight them equally — wrong by up to 20x. Resolved by the caller
+   *  from the registry's plan tier. Absent = unknown, which every consumer must treat as 1
+   *  AND say so: silent equal-weighting is the bug this field exists to kill. */
+  weight?: number;
+  /** Epoch ms of this account's next weekly reset as PREDICTED from stored history, used only
+   *  when the endpoint reports no future reset of its own. The endpoint stops publishing
+   *  `resets_at` once an account's weekly window closes and does not republish until the
+   *  account is used again — but the cadence is a fixed 7 days anchored per account, so the
+   *  next reset is derivable by advancing the last observed one. Prediction reads history, so
+   *  it happens at the edge (see the CLI's usage-history helpers); this module only consumes
+   *  the result and always labels it as predicted, never as observed. */
+  predictedResetAt?: number;
 }
 
 /** Knobs governing the recommendation. Defaults live in `advisor.ts`; override for tuning/tests. */

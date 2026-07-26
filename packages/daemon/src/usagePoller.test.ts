@@ -1,13 +1,18 @@
 import { describe, it, expect, vi } from 'vitest';
+import { decode, encode, stamp, type PayloadOf } from '@claude-control/shared-protocol';
 import {
   UsagePoller,
+  toUsageSnapshotPayload,
   POLL_FLOOR_MS,
   BACKOFF_BASE_MS,
   BACKOFF_CAP_MS,
   type FetchLike,
   type FetchLikeResponse,
   type PollAccount,
+  type SnapshotResult,
 } from './usagePoller.js';
+import { readFleetHistory } from './usageHistory.js';
+import { parseUsageEndpointResponse } from './usageParse.js';
 
 function jsonResponse(status: number, body: unknown): FetchLikeResponse {
   return { ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) };
@@ -524,5 +529,149 @@ describe('UsagePoller', () => {
     const a2 = snapshot.results.find((r) => r.accountId === 'acct-2');
     expect(a2?.outcome).toBe('live');
     expect(a2?.usage.accountUsage.limits[0]?.percent).toBe(20);
+  });
+});
+
+describe('toUsageSnapshotPayload — what actually goes on the wire', () => {
+  const NOW = Date.parse('2026-07-25T19:00:00.000Z');
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const WEEK_MS = 7 * DAY_MS;
+
+  /** A live endpoint body carrying both weekly kinds, with an optional reported reset. */
+  const weeklyBody = (percent: number, resetsAt?: string) => ({
+    limits: [
+      { kind: 'session', percent: 10, resets_at: '2026-07-25T22:00:00.000Z' },
+      { kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resets_at: resetsAt } : {}) },
+    ],
+  });
+
+  /** Snapshot rows in the exact shape the daemon persists: `JSON.stringify` of the tolerant
+   *  parser's own `AccountUsage`. Reading them back is what the history measurements do. */
+  function storedRows(
+    accountId: string,
+    readings: Array<{ atMs: number; percent: number; resetsAt?: string }>,
+  ): Array<{ fetchedAtMs: number; json: string }> {
+    return readings.map((r) => ({
+      fetchedAtMs: r.atMs,
+      json: JSON.stringify(
+        parseUsageEndpointResponse(weeklyBody(r.percent, r.resetsAt), {
+          accountId,
+          label: accountId,
+          active: false,
+          quarantined: false,
+          fetchedAtMs: r.atMs,
+          source: 'live',
+        }).accountUsage,
+      ),
+    }));
+  }
+
+  function readerFor(rows: Map<string, Array<{ fetchedAtMs: number; json: string }>>) {
+    return {
+      listUsageSnapshotsSince: (accountId: string, sinceMs: number) =>
+        (rows.get(accountId) ?? []).filter((r) => r.fetchedAtMs >= sinceMs),
+    };
+  }
+
+  async function pollTwoAccounts(): Promise<SnapshotResult> {
+    const poller = new UsagePoller({
+      fetch: (_url, init) =>
+        Promise.resolve(
+          jsonResponse(
+            200,
+            init.headers.authorization === 'Bearer tok-1'
+              ? weeklyBody(68, '2026-07-29T05:00:00.000Z')
+              : weeklyBody(0),
+          ),
+        ),
+      getToken: (id: string) => Promise.resolve(id === 'acct-1' ? 'tok-1' : 'tok-2'),
+      getCachedUsage: () => Promise.resolve(undefined),
+      clock: () => NOW,
+      advisorOptions: { now: () => NOW },
+    });
+    return poller.pollAll([account, account2]);
+  }
+
+  // The regression this whole test exists for: `encode()` VALIDATES before serializing, and a
+  // payload field looser than the schema throws on the SENDING side. That throw is absorbed by
+  // the poll cycle's catch, so the usage.snapshot frame for EVERY account would stop being sent
+  // with nothing on screen to say why. Real parser output, real measurements, real encode.
+  it('survives encode/decode with real parser output and real history measurements', () => {
+    const rows = new Map([
+      // acct-1 is in use and the endpoint still reports its reset.
+      [
+        'acct-1',
+        storedRows('acct-1', [
+          { atMs: NOW - 2 * DAY_MS, percent: 50, resetsAt: '2026-07-29T05:00:00.000Z' },
+          { atMs: NOW - DAY_MS, percent: 60, resetsAt: '2026-07-29T05:00:00.000Z' },
+        ]),
+      ],
+      // acct-2 went dormant: its window closed, so the endpoint stopped publishing a reset and
+      // the only anchor left is the one observed before it closed.
+      [
+        'acct-2',
+        storedRows('acct-2', [
+          { atMs: NOW - 9 * DAY_MS, percent: 80, resetsAt: '2026-07-19T05:00:00.000Z' },
+          { atMs: NOW - DAY_MS, percent: 0 },
+        ]),
+      ],
+    ]);
+    const history = readFleetHistory(readerFor(rows), ['acct-1', 'acct-2'], NOW);
+    // Pre-condition: history really did produce both inputs, or the encode below proves nothing.
+    expect(history.predictedResetByAccount.get('acct-2')).toBe(
+      Date.parse('2026-07-19T05:00:00.000Z') + WEEK_MS,
+    );
+    expect(history.burnUnitsPerDay).toBeGreaterThan(0);
+
+    return pollTwoAccounts().then((snapshot) => {
+      const payload = toUsageSnapshotPayload(snapshot, history);
+      const envelope = stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload });
+      const decoded = decode(encode(envelope));
+
+      expect(decoded.ok).toBe(true);
+      if (!decoded.ok) return;
+      const wire = decoded.envelope.payload as PayloadOf<'usage.snapshot'>;
+      expect(wire.burnUnitsPerDay).toBeCloseTo(history.burnUnitsPerDay as number, 9);
+      expect(wire.accounts.find((a) => a.accountId === 'acct-2')?.predictedResetAt).toBe(
+        Date.parse('2026-07-19T05:00:00.000Z') + WEEK_MS,
+      );
+      // An account the endpoint still reports a reset for gets a prediction too; consumers
+      // prefer the observed one, so carrying it costs nothing and losing it would blind them
+      // the moment that account goes quiet.
+      expect(wire.accounts.find((a) => a.accountId === 'acct-1')?.predictedResetAt).toBeTypeOf(
+        'number',
+      );
+    });
+  });
+
+  it('normalizes a fractional prediction to the integer the schema declares', async () => {
+    const snapshot = await pollTwoAccounts();
+    const payload = toUsageSnapshotPayload(snapshot, {
+      predictedResetByAccount: new Map([['acct-1', NOW + 0.5]]),
+      burnUnitsPerDay: 1.25,
+    });
+    expect(payload.accounts[0]?.predictedResetAt).toBe(NOW + 1);
+    expect(() =>
+      encode(stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload })),
+    ).not.toThrow();
+  });
+
+  it('omits a non-finite burn rate rather than shipping a field that serializes to null', async () => {
+    const snapshot = await pollTwoAccounts();
+    const payload = toUsageSnapshotPayload(snapshot, {
+      predictedResetByAccount: new Map(),
+      burnUnitsPerDay: Number.POSITIVE_INFINITY,
+    });
+    expect(payload.burnUnitsPerDay).toBeUndefined();
+    expect(() =>
+      encode(stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload })),
+    ).not.toThrow();
+  });
+
+  it('carries nothing extra when the daemon measured nothing', async () => {
+    const snapshot = await pollTwoAccounts();
+    const payload = toUsageSnapshotPayload(snapshot);
+    expect(payload.burnUnitsPerDay).toBeUndefined();
+    expect(payload.accounts.every((a) => a.predictedResetAt === undefined)).toBe(true);
   });
 });

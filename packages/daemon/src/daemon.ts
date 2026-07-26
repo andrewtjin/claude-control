@@ -28,7 +28,8 @@ import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { EnvelopeDraft, MessageOf, PayloadOf } from '@claude-control/shared-protocol';
 import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
-import { UsagePoller, type PollAccount } from './usagePoller.js';
+import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
+import { readFleetHistory } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
 import type { TranscriptScan } from './transcriptTokens.js';
 import { aggregateTokenStats } from './tokenStats.js';
@@ -586,9 +587,18 @@ export class Daemon {
       this.logger.warn({ err }, 'usage snapshot retention failed; retrying next cycle');
     }
 
+    // Measure AFTER persisting, so this cycle's own readings are part of the history. The
+    // daemon owns the store, so it is the only party that can make these measurements at all —
+    // it makes them once here and both the phone and its own advisor consume the same numbers.
+    const history = readFleetHistory(
+      this.store,
+      pollAccounts.map((a) => a.accountId),
+      this.clock(),
+    );
+
     this.sendEnvelope({
       type: 'usage.snapshot',
-      payload: { accounts: snapshot.accounts, plan: snapshot.plan },
+      payload: toUsageSnapshotPayload(snapshot, history),
     });
 
     // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
@@ -603,7 +613,18 @@ export class Daemon {
     // engine failures itself; this catch only guards against bugs in the evaluator so a
     // broken policy can never take down the poll loop.
     if (this.autoSwitcher) {
-      const inputs = snapshot.results.map((r) => r.usage.advisorInput);
+      // The prediction rides along because without it a DORMANT account is invisible to the
+      // policy: the endpoint publishes no reset once a weekly window closes, and an unknown
+      // weekly clock disqualifies an account outright — so the accounts holding a full
+      // untouched allowance are exactly the ones auto-switch would never reach. The policy
+      // labels a predicted reset and holds it to a stricter bar (see autoswitch.ts); an
+      // account with no history at all stays absent here and is skipped as before.
+      const inputs = snapshot.results.map((r) => {
+        const predicted = history.predictedResetByAccount.get(r.accountId);
+        return predicted === undefined
+          ? r.usage.advisorInput
+          : { ...r.usage.advisorInput, predictedResetAt: predicted };
+      });
       await this.autoSwitcher.evaluate(inputs).catch((err: unknown) => {
         this.logger.error({ err }, 'auto-switch evaluation failed');
       });
