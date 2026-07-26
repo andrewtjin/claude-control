@@ -170,6 +170,43 @@ describe('formatLogLine', () => {
       const { ms } = localTime(0, 1, 5);
       expect(formatLogLine('info', ms, { reason: '' }, 'm')).toContain('reason=""');
     });
+
+    it('escapes a newline so a multi-line err message stays on one physical line', () => {
+      // Third-party error text (zod's ZodError.message, a JSON.parse failure on a large body)
+      // is routinely multi-line, unlike every msg literal in this codebase — an unescaped `\n`
+      // would let a continuation line masquerade as a fresh log record to any line-based reader.
+      const { ms } = localTime(0, 1, 6);
+      const err = new Error('Invalid input:\n  - field a required\n  - field b required');
+      const line = formatLogLine('error', ms, { err }, 'validation failed');
+      expect(line.split('\n')).toHaveLength(1);
+      expect(line).toContain('err="Invalid input:\\n  - field a required\\n  - field b required"');
+    });
+
+    it('escapes a carriage return the same way as a newline', () => {
+      const { ms } = localTime(0, 1, 7);
+      const line = formatLogLine('info', ms, { reason: 'a\r\nb' }, 'm');
+      expect(line.split('\n')).toHaveLength(1);
+      expect(line).toContain('reason="a\\r\\nb"');
+    });
+
+    it('escapes a literal backslash so the quoted value round-trips unambiguously', () => {
+      // Without this, a source backslash immediately followed by a real `"` would be
+      // indistinguishable from the `\"` this function itself emits to escape a quote — the
+      // round trip is the actual invariant that matters, so this test reverses the escaping
+      // instead of asserting one hand-typed literal.
+      const { ms } = localTime(0, 1, 8);
+      const raw = 'C:\\logs\\daemon.log with "quote"\nand a newline';
+      const line = formatLogLine('info', ms, { reason: raw }, 'm');
+      const match = /reason="([\s\S]*)"$/.exec(line);
+      expect(match).not.toBeNull();
+      const unescaped = match![1]!.replace(/\\\\|\\"|\\r|\\n/g, (token) => {
+        if (token === '\\\\') return '\\';
+        if (token === '\\"') return '"';
+        if (token === '\\r') return '\r';
+        return '\n';
+      });
+      expect(unescaped).toBe(raw);
+    });
   });
 
   describe('truncation', () => {
