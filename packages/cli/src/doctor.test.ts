@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -200,22 +200,6 @@ describe('probeRelay', () => {
 
 describe('checkLiveLogin (darwin)', () => {
   const paths = sandboxPaths('root');
-  // Isolate the override env so an ambient CLAUDE_CLI_KEYCHAIN_* on a dev box or CI runner can't
-  // flip these default-target assertions into spurious failures.
-  const saved = {
-    s: process.env.CLAUDE_CLI_KEYCHAIN_SERVICE,
-    a: process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT,
-  };
-  beforeEach(() => {
-    delete process.env.CLAUDE_CLI_KEYCHAIN_SERVICE;
-    delete process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT;
-  });
-  afterEach(() => {
-    if (saved.s === undefined) delete process.env.CLAUDE_CLI_KEYCHAIN_SERVICE;
-    else process.env.CLAUDE_CLI_KEYCHAIN_SERVICE = saved.s;
-    if (saved.a === undefined) delete process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT;
-    else process.env.CLAUDE_CLI_KEYCHAIN_ACCOUNT = saved.a;
-  });
   // Inject a fake channel so the check never touches real `security(1)`, which on a Mac could
   // raise the Keychain GUI prompt this check has no way to answer. `target` defaults to the
   // shipped default so the existing assertions read naturally, but callers can override it to

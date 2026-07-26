@@ -68,7 +68,7 @@ export const defaultExecRunner: ExecRunner = (file, args, input) =>
 /** `security -i` tokenizes stdin lines like a shell: to pass an arbitrary string as one
  *  argument it must be double-quoted with `\` and `"` escaped. (Assumed to match the real
  *  parser — exercise on a real Mac before the first real switch.) */
-function quoteSecurityArg(value: string): string {
+export function quoteSecurityArg(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
@@ -172,12 +172,13 @@ export class KeychainProtector implements Protector {
 export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
 /** Effective service/account for the CLI's live Keychain item, applying operator env overrides
- *  over the shipped defaults. Shared by the live-channel factory (`defaultLiveCredentialChannel`)
- *  and `cctl doctor` so both ACT ON and REPORT the same target: if the CLI turns out to use a
- *  different item name than assumed above, the operator corrects it with an env var instead of
- *  waiting on a code change. `env` is injected for testability; unset keys fall back to the
- *  default service and the login user, i.e. identical to constructing the channel with no
- *  options. */
+ *  over the shipped defaults: if the CLI turns out to use a different item name than assumed
+ *  above, the operator corrects it with an env var instead of waiting on a code change. Used by
+ *  the live-channel factory (`defaultLiveCredentialChannel`) to construct the channel; callers
+ *  that need to REPORT the target (e.g. `cctl doctor`) read it off the constructed channel's
+ *  `.target` instead of calling this a second time, so the two can never drift apart. `env` is
+ *  injected for testability; unset keys fall back to the default service and the login user,
+ *  i.e. identical to constructing the channel with no options. */
 export function resolveClaudeCliKeychainTarget(env: NodeJS.ProcessEnv = process.env): {
   service: string;
   account: string;
