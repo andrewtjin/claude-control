@@ -11,16 +11,142 @@ import type { HeartbeatReading } from '@claude-control/daemon';
 import {
   computeOutlook,
   computePacing,
+  planWeight,
   timelineInputFromWire,
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
 
-/** Render the accounts registry as an aligned table. `activeId` is marked with `*`. */
+/** Short month names for date cells — spelled out manually rather than via `Intl` so the
+ *  format is locale-independent and deterministic under test (matches `humanizeDuration`'s
+ *  Intl-free precedent in usage-advisor). */
+const MONTH_NAMES = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+] as const;
+
+/** Longest a passthrough upstream string may be in a table cell, with an ellipsis marking the
+ *  cut. Bounds a value we do not control so one long string can't dominate the table's width. */
+const MAX_CELL_CHARS = 24;
+
+function truncateCell(value: string): string {
+  return value.length <= MAX_CELL_CHARS ? value : `${value.slice(0, MAX_CELL_CHARS - 3)}...`;
+}
+
+/** "Aug 15" from an epoch ms, in UTC (the source timestamps are all UTC ISO strings). */
+function formatMonthDay(ms: number): string {
+  const d = new Date(ms);
+  return `${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCDate()}`;
+}
+
+/** The compact plan-tier cell for `cctl accounts list`: the relative capacity weight from
+ *  `planWeight()`, e.g. "20x", or "?" when no signal let us derive one — the account still
+ *  gets weight 1 in any aggregate math, but the table must say so rather than implying we
+ *  KNOW it's 1x (silent equal-weighting is exactly the bug `planWeight` exists to fix). */
+function planCell(account: StoredAccount): string {
+  // Conditionally spread rather than assigning each field directly: exactOptionalPropertyTypes
+  // forbids passing an explicit `undefined` for an optional string field.
+  const result = planWeight({
+    ...(account.organizationRateLimitTier !== undefined
+      ? { organizationRateLimitTier: account.organizationRateLimitTier }
+      : {}),
+    ...(account.rateLimitTier !== undefined ? { rateLimitTier: account.rateLimitTier } : {}),
+    ...(account.subscriptionType !== undefined
+      ? { subscriptionType: account.subscriptionType }
+      : {}),
+  });
+  return result.known ? `${result.weight}x` : '?';
+}
+
+/** Days in a given UTC month. Day 0 of the NEXT month is the last day of this one. */
+function daysInUtcMonth(year: number, monthIndex: number): number {
+  return new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+}
+
+/**
+ * Estimate the next monthly billing anniversary from `subscriptionCreatedAt`, rolled forward
+ * to the first occurrence strictly after `nowMs`. This is a DERIVATION, not an authoritative
+ * invoice date — no endpoint exposes one — so every caller must render it with an "est."/"~"
+ * marker, never as a bare fact.
+ *
+ * Each candidate is built from the ORIGINAL date plus a month offset, never by mutating the
+ * previous candidate. Cumulative `setUTCMonth` would let a short month permanently corrupt the
+ * day: a Jan 31 subscription overflows to Mar 3 crossing February, and every later step then
+ * rolls from the 3rd, so the estimate drifts weeks away from the true anniversary and never
+ * recovers. The day is clamped to the target month's length instead (Jan 31 -> Feb 28), which
+ * is also what a monthly subscription actually does.
+ */
+function estimateNextBillingMs(
+  subscriptionCreatedAtIso: string,
+  nowMs: number,
+): number | undefined {
+  const created = new Date(subscriptionCreatedAtIso);
+  if (Number.isNaN(created.getTime())) return undefined;
+  // The loop below terminates by walking candidates PAST `nowMs`; a non-finite one makes that
+  // comparison unsatisfiable and would hang the CLI rather than fail. `nowMs` is a public
+  // parameter of `renderAccountsTable`, so guard it here instead of trusting every caller.
+  if (!Number.isFinite(nowMs)) return undefined;
+
+  const year = created.getUTCFullYear();
+  const month = created.getUTCMonth();
+  const day = created.getUTCDate();
+
+  // Bounded: each step advances one month from a fixed origin, so this terminates as soon as
+  // the candidate passes `nowMs` regardless of how old the subscription is.
+  for (let offset = 0; ; offset++) {
+    const target = new Date(Date.UTC(year, month + offset, 1));
+    const clampedDay = Math.min(day, daysInUtcMonth(target.getUTCFullYear(), target.getUTCMonth()));
+    const candidate = Date.UTC(
+      target.getUTCFullYear(),
+      target.getUTCMonth(),
+      clampedDay,
+      created.getUTCHours(),
+      created.getUTCMinutes(),
+      created.getUTCSeconds(),
+      created.getUTCMilliseconds(),
+    );
+    if (candidate > nowMs) return candidate;
+  }
+}
+
+/** The compact billing cell for `cctl accounts list`: a live trial's end date takes priority
+ *  (there's no subscription to bill yet), then a `stripe_subscription`-derived estimate, then
+ *  an honest "unknown" for any other or absent `billingType` — never a fabricated date for a
+ *  billing type we haven't seen. */
+function billingCell(account: StoredAccount, nowMs: number): string {
+  if (account.claudeCodeTrialEndsAt !== undefined) {
+    const trialEndMs = Date.parse(account.claudeCodeTrialEndsAt);
+    if (!Number.isNaN(trialEndMs) && trialEndMs > nowMs) {
+      return `trial->${formatMonthDay(trialEndMs)}`;
+    }
+  }
+  if (account.billingType === undefined) return 'unknown';
+  // Anything other than the known recurring type is shown verbatim rather than guessed at,
+  // since we don't know how (or whether) it recurs monthly — but it is upstream text of
+  // unbounded length, so it is truncated to keep one odd value from stretching the column.
+  if (account.billingType !== 'stripe_subscription') return truncateCell(account.billingType);
+  if (account.subscriptionCreatedAt === undefined) return 'unknown';
+  const nextMs = estimateNextBillingMs(account.subscriptionCreatedAt, nowMs);
+  return nextMs === undefined ? 'unknown' : `~${formatMonthDay(nextMs)} (est.)`;
+}
+
+/** Render the accounts registry as an aligned table. `activeId` is marked with `*`. `nowMs`
+ *  drives the PLAN/BILLING columns' estimates and defaults to the real clock; tests pin it. */
 export function renderAccountsTable(
   accounts: StoredAccount[],
   activeId: string | null,
   palette: Palette = PLAIN_PALETTE,
+  nowMs: number = Date.now(),
 ): string {
   if (accounts.length === 0) return 'No accounts yet. Add one with: cctl accounts add <label>';
 
@@ -28,15 +154,27 @@ export function renderAccountsTable(
     active: a.id === activeId ? '*' : ' ',
     label: a.label,
     email: a.emailAddress ?? '-',
+    plan: planCell(a),
+    billing: billingCell(a, nowMs),
     status: a.quarantined ? 'quarantined' : 'ok',
     id: a.id,
   }));
 
-  const headers = { active: ' ', label: 'LABEL', email: 'EMAIL', status: 'STATUS', id: 'ID' };
+  const headers = {
+    active: ' ',
+    label: 'LABEL',
+    email: 'EMAIL',
+    plan: 'PLAN',
+    billing: 'BILLING',
+    status: 'STATUS',
+    id: 'ID',
+  };
   const widths = {
     active: 1,
     label: colWidth(rows, headers, 'label'),
     email: colWidth(rows, headers, 'email'),
+    plan: colWidth(rows, headers, 'plan'),
+    billing: colWidth(rows, headers, 'billing'),
     status: colWidth(rows, headers, 'status'),
     id: colWidth(rows, headers, 'id'),
   };
@@ -46,16 +184,20 @@ export function renderAccountsTable(
     r.active.padEnd(widths.active),
     r.label.padEnd(widths.label),
     r.email.padEnd(widths.email),
+    r.plan.padEnd(widths.plan),
+    r.billing.padEnd(widths.billing),
     r.status.padEnd(widths.status),
     r.id.padEnd(widths.id),
   ];
   const rowLine = (r: (typeof rows)[number]) => {
-    const [active, label, email, status, id] = cells(r);
+    const [active, label, email, plan, billing, status, id] = cells(r);
     const paintStatus = r.status === 'quarantined' ? palette.red : (t: string) => t;
     return [
       palette.green(active ?? ''),
       palette.bold(label ?? ''),
       email ?? '',
+      plan ?? '',
+      palette.dim(billing ?? ''),
       paintStatus(status ?? ''),
       palette.dim(id ?? ''),
     ].join('  ');
