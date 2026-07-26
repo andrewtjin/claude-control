@@ -574,7 +574,18 @@ export class Daemon {
     // engine failures itself; this catch only guards against bugs in the evaluator so a
     // broken policy can never take down the poll loop.
     if (this.autoSwitcher) {
-      const inputs = snapshot.results.map((r) => r.usage.advisorInput);
+      // The prediction rides along because without it a DORMANT account is invisible to the
+      // policy: the endpoint publishes no reset once a weekly window closes, and an unknown
+      // weekly clock disqualifies an account outright — so the accounts holding a full
+      // untouched allowance are exactly the ones auto-switch would never reach. The policy
+      // labels a predicted reset and holds it to a stricter bar (see autoswitch.ts); an
+      // account with no history at all stays absent here and is skipped as before.
+      const inputs = snapshot.results.map((r) => {
+        const predicted = history.predictedResetByAccount.get(r.accountId);
+        return predicted === undefined
+          ? r.usage.advisorInput
+          : { ...r.usage.advisorInput, predictedResetAt: predicted };
+      });
       await this.autoSwitcher.evaluate(inputs).catch((err: unknown) => {
         this.logger.error({ err }, 'auto-switch evaluation failed');
       });

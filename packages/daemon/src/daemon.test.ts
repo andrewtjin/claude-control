@@ -646,6 +646,55 @@ describe('Daemon lifecycle', () => {
     expect(inputs?.map((i) => i.accountId)).toEqual(['acct-x', 'acct-y']);
   });
 
+  it("gives the auto-switcher each account's predicted reset, so a dormant one is reachable", async () => {
+    // Without this the policy cannot see a dormant account at all: the endpoint stops
+    // publishing a reset once its weekly window closes, and an unknown weekly clock
+    // disqualifies a candidate outright.
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const anchorIso = new Date(now - 3 * DAY_MS).toISOString();
+    for (const row of [
+      {
+        fetchedAtMs: now - 5 * DAY_MS,
+        json: JSON.stringify({
+          limits: [{ kind: 'weekly_all', percent: 70, resetsAt: anchorIso }],
+        }),
+      },
+      {
+        fetchedAtMs: now - 60_000,
+        json: JSON.stringify({ limits: [{ kind: 'weekly_all', percent: 0 }] }),
+      },
+    ]) {
+      store.insertUsageSnapshot({ accountId: 'acct-x', source: 'live', ...row });
+    }
+
+    const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
+      void accounts;
+      return Promise.resolve();
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      autoSwitcher: { evaluate },
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => evaluate.mock.calls.length > 0);
+    const inputs = evaluate.mock.calls[0]?.[0];
+    expect(inputs?.find((i) => i.accountId === 'acct-x')?.predictedResetAt).toBe(
+      Date.parse(anchorIso) + 7 * DAY_MS,
+    );
+    // An account with no stored history keeps NO prediction — never a borrowed clock.
+    expect(inputs?.find((i) => i.accountId === 'acct-y')?.predictedResetAt).toBeUndefined();
+  });
+
   it('start() is idempotent — calling it twice does not double-connect or double-recover', async () => {
     await daemon.start();
     await daemon.start();
