@@ -581,6 +581,44 @@ describe('Daemon lifecycle', () => {
     expect(relay.received.some((e) => e.type === 'settings.snapshot')).toBe(false);
   });
 
+  it('stamps the history-derived pacing inputs onto the usage snapshot it pushes', async () => {
+    // A dormant account's history: an observed reset from before its weekly window closed,
+    // then readings the endpoint no longer publishes any reset alongside. Only the daemon can
+    // see this, which is why the phone has to be told rather than left to work it out.
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const anchorIso = new Date(now - 2 * DAY_MS).toISOString();
+    const weeklyJson = (percent: number, resetsAt?: string): string =>
+      JSON.stringify({
+        limits: [{ kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resetsAt } : {}) }],
+      });
+    for (const row of [
+      { fetchedAtMs: now - 4 * DAY_MS, json: weeklyJson(80, anchorIso) },
+      { fetchedAtMs: now - 2 * DAY_MS, json: weeklyJson(0) },
+      { fetchedAtMs: now - 60_000, json: weeklyJson(10) },
+    ]) {
+      store.insertUsageSnapshot({ accountId: 'acct-x', source: 'live', ...row });
+    }
+
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    const pushed = relay.received.find((e) => e.type === 'usage.snapshot');
+    if (pushed?.type !== 'usage.snapshot') throw new Error('no usage.snapshot pushed');
+
+    // The anchor advanced by one whole cadence — a strictly future reset the endpoint is not
+    // reporting for this account at all.
+    const predicted = pushed.payload.accounts.find(
+      (a) => a.accountId === 'acct-x',
+    )?.predictedResetAt;
+    expect(predicted).toBe(Date.parse(anchorIso) + 7 * DAY_MS);
+    // An account with no stored history stays absent rather than borrowing another's clock.
+    expect(
+      pushed.payload.accounts.find((a) => a.accountId === 'acct-y')?.predictedResetAt,
+    ).toBeUndefined();
+    // 10% of one Pro-equivalent unit over the trailing burn window.
+    expect(pushed.payload.burnUnitsPerDay).toBeGreaterThan(0);
+  });
+
   it("feeds each poll cycle's advisor inputs to the auto-switcher when one is wired", async () => {
     const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
       void accounts;

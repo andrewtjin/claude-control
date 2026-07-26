@@ -19,6 +19,9 @@ export type SessionStatus = PayloadOf<'session.status'>;
 interface UsageState {
   accounts: AccountUsage[];
   plan?: UsagePlan;
+  /** The daemon's measured fleet burn (Pro-equivalent units/day). Absent when the daemon could
+   *  not measure one, or predates the field — the pacing model then withholds its verdict. */
+  burnUnitsPerDay?: number;
 }
 
 interface UserState {
@@ -46,6 +49,10 @@ export class DaemonStateCache {
       if (envelope.payload.plan !== undefined && envelope.payload.plan !== null) {
         usage.plan = envelope.payload.plan;
       }
+      // Same reason `plan` is conditional: an older daemon sends no burn rate, and "absent"
+      // has to stay distinguishable from a measured zero all the way to the renderer.
+      const burn = envelope.payload.burnUnitsPerDay;
+      if (burn !== undefined && burn !== null) usage.burnUnitsPerDay = burn;
       state.usage = usage;
     } else if (isType(envelope, 'settings.snapshot')) {
       state.settings = envelope.payload;

@@ -48,6 +48,19 @@ describe('DaemonStateCache', () => {
     expect(cache.getUsage('user-a')?.plan).toEqual(plan);
   });
 
+  it('carries the daemon-measured burn rate, and leaves it absent when none was sent', () => {
+    const cache = new DaemonStateCache();
+    // A daemon predating the field sends no burn rate, and "absent" has to reach the renderer
+    // distinguishable from a measured zero — which is a real verdict, not a missing one.
+    cache.record('user-a', usageSnapshot('user-a'));
+    expect(cache.getUsage('user-a')?.burnUnitsPerDay).toBeUndefined();
+
+    const withBurn = usageSnapshot('user-b');
+    (withBurn.payload as { burnUnitsPerDay?: number }).burnUnitsPerDay = 0;
+    cache.record('user-b', withBurn);
+    expect(cache.getUsage('user-b')?.burnUnitsPerDay).toBe(0);
+  });
+
   it('a later snapshot overwrites the earlier one', () => {
     const cache = new DaemonStateCache();
     cache.record('user-a', usageSnapshot('user-a'));

@@ -184,11 +184,13 @@ export interface WireUsageLike {
   /** Callers that know quarantine state (e.g. the CLI reading the registry) pass it; the
    *  wire snapshot doesn't carry it, so it defaults to false. */
   quarantined?: boolean | undefined;
-  /** Plan weight and predicted reset, when the caller resolved them (registry plan tier and
-   *  stored snapshot history respectively). Neither crosses the wire, so a caller working
-   *  from a wire snapshot alone leaves both absent and the consumers say so. */
+  /** Plan weight and predicted reset, when the caller resolved them. Plan tiers come from the
+   *  registry and do not cross the wire, so a caller working from a wire snapshot alone leaves
+   *  `weight` absent and the consumers say so. The predicted reset DOES cross the wire (the
+   *  daemon measures it from stored history), which is why it tolerates `null` here — that is
+   *  the shape a nullish wire field arrives in. */
   weight?: number | undefined;
-  predictedResetAt?: number | undefined;
+  predictedResetAt?: number | null | undefined;
   limits: Array<{
     kind: LimitInput['kind'];
     percent: number;
@@ -207,7 +209,7 @@ export function timelineInputFromWire(accounts: WireUsageLike[]): AccountUsageIn
     active: a.active,
     quarantined: a.quarantined ?? false,
     ...(a.weight !== undefined ? { weight: a.weight } : {}),
-    ...(a.predictedResetAt !== undefined ? { predictedResetAt: a.predictedResetAt } : {}),
+    ...(a.predictedResetAt != null ? { predictedResetAt: a.predictedResetAt } : {}),
     limits: a.limits.map((l) => {
       const ms = l.resetsAt != null ? Date.parse(l.resetsAt) : NaN;
       return {

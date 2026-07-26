@@ -175,8 +175,8 @@ describe('buildUsageEmbed', () => {
   });
 
   it('states what the wire cannot tell it rather than printing an unsupported verdict', () => {
-    // Plan tiers and snapshot history do not cross the wire, so the bot can neither weight
-    // accounts nor measure a burn rate — both must be said, not silently assumed away.
+    // Plan tiers never cross the wire, and a daemon predating the burn field sends none — so
+    // the bot can neither weight accounts nor measure a rate. Both must be said outright.
     const embed = buildUsageEmbed({
       accounts: [account({ limits: [{ kind: 'weekly_all', percent: 20, isActive: true }] })],
     }).toJSON();
@@ -185,6 +185,52 @@ describe('buildUsageEmbed', () => {
     expect(pacing?.value).toContain(
       '• plan tiers unknown, so accounts are weighted equally (1 unit each).',
     );
+  });
+
+  it('reaches a real verdict once the daemon sends the pacing inputs', () => {
+    const NOW = Date.parse('2026-07-16T12:00:00.000Z');
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    // One account in use with a reported reset, one dormant holding its whole allowance — and
+    // the dormant one's reset exists ONLY as the daemon's prediction.
+    const embed = buildUsageEmbed(
+      {
+        accounts: [
+          account({
+            limits: [
+              {
+                kind: 'weekly_all',
+                percent: 80,
+                isActive: true,
+                resetsAt: new Date(NOW + 2 * DAY_MS).toISOString(),
+              },
+            ],
+          }),
+          account({
+            accountId: 'acct-2',
+            label: 'Spare',
+            active: false,
+            limits: [{ kind: 'weekly_all', percent: 0, isActive: true }],
+            predictedResetAt: NOW + DAY_MS,
+          }),
+        ],
+        burnUnitsPerDay: 0.1,
+      },
+      NOW,
+    ).toJSON();
+
+    const pacing = embed.fields?.find((f) => f.name === 'Pacing');
+    // The verdict and the waste figure that names the account to act on — neither is
+    // computable without the two inputs the daemon just supplied.
+    expect(pacing?.value).toContain('1.2u of 2u available (60%)');
+    expect(pacing?.value).toContain('sustainable for the next 14d.');
+    expect(pacing?.value).toContain('on Spare in 1d');
+    expect(pacing?.value).toContain('• next weekly reset predicted from history for Spare.');
+    expect(pacing?.value).not.toContain('burn rate not measured yet');
+    // The account's own field carries that reset too, labelled — a prediction is never
+    // rendered as though the endpoint had reported it.
+    const spare = embed.fields?.find((f) => f.name?.startsWith('Spare'));
+    expect(spare?.value).toContain('weekly resets <t:');
+    expect(spare?.value).toContain('(predicted)');
   });
 
   it('omits the Pacing field when there are no accounts', () => {

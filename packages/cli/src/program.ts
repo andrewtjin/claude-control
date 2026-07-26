@@ -27,6 +27,7 @@ import {
   ControlPlaneClient,
   Store,
   buildDaemonHookSpecs,
+  readFleetHistory,
   readHeartbeat,
   uninstallHooks,
   type SessionRow,
@@ -41,14 +42,6 @@ import {
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
-import {
-  BURN_WINDOW_MS,
-  RESET_LOOKBACK_MS,
-  measureBurnUnitsPerDay,
-  predictWeeklyReset,
-  readWeeklyObservations,
-  type AccountHistory,
-} from './usageHistory.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
   appendCrashLine,
@@ -721,40 +714,34 @@ async function readUsageState(nowMs: number): Promise<UsageState> {
   const engine = buildEngine();
   const [accounts, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
   const store = new Store(daemonDbPath());
-  const byId = new Map<string, AccountUsage>();
-  const predictedResetById = new Map<string, number>();
-  const histories: AccountHistory[] = [];
   try {
+    const byId = new Map<string, AccountUsage>();
     for (const a of accounts) {
       const row = store.latestUsageSnapshot(a.id);
-      if (row) {
-        try {
-          byId.set(a.id, JSON.parse(row.json) as AccountUsage);
-        } catch {
-          // a corrupt row must not crash the whole view
-        }
+      if (!row) continue;
+      try {
+        byId.set(a.id, JSON.parse(row.json) as AccountUsage);
+      } catch {
+        // a corrupt row must not crash the whole view
       }
-      // One read per account covers both measurements: the reset lookback is the longer of the
-      // two windows, and the burn measurement filters the same observations down to its own.
-      const observations = readWeeklyObservations(
-        store.listUsageSnapshotsSince(a.id, nowMs - RESET_LOOKBACK_MS),
-      );
-      // Plan tiers are resolved elsewhere; until then every account weighs 1 Pro-equivalent
-      // unit, which the pacing renderer states outright rather than assuming silently.
-      histories.push({ accountId: a.id, weight: 1, observations });
-      const predicted = predictWeeklyReset(observations, nowMs);
-      if (predicted !== undefined) predictedResetById.set(a.id, predicted);
     }
+    // The same measurement the daemon makes each poll cycle, over the same store and the one
+    // implementation — so a number the CLI prints can never disagree with the one the phone got.
+    const history = readFleetHistory(
+      store,
+      accounts.map((a) => a.id),
+      nowMs,
+    );
+    return {
+      accounts,
+      activeId,
+      usageFor: (accountId) => byId.get(accountId),
+      predictedResetFor: (accountId) => history.predictedResetByAccount.get(accountId),
+      burnUnitsPerDay: history.burnUnitsPerDay,
+    };
   } finally {
     store.close();
   }
-  return {
-    accounts,
-    activeId,
-    usageFor: (accountId) => byId.get(accountId),
-    predictedResetFor: (accountId) => predictedResetById.get(accountId),
-    burnUnitsPerDay: measureBurnUnitsPerDay(histories, nowMs - BURN_WINDOW_MS, nowMs),
-  };
 }
 
 /** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both

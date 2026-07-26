@@ -449,3 +449,60 @@ describe('pair.claim hostLabel bound', () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe('usage.snapshot pacing inputs (additive, N/N-1 tolerant)', () => {
+  const account = {
+    accountId: 'acct-1',
+    label: 'Work',
+    active: true,
+    source: 'live',
+    fetchedAtMs: 1,
+    limits: [{ kind: 'weekly_all', percent: 40 }],
+  };
+
+  it('parses without them — frames from daemons predating the fields stay valid', () => {
+    const result = decode(rawFrame('usage.snapshot', { accounts: [account] }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.burnUnitsPerDay ?? undefined).toBeUndefined();
+      expect(result.envelope.payload.accounts[0]?.predictedResetAt ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries a predicted reset and a fractional burn rate through a round-trip', () => {
+    const result = decode(
+      rawFrame('usage.snapshot', {
+        accounts: [{ ...account, predictedResetAt: 1_800_000_000_000 }],
+        burnUnitsPerDay: 2.75,
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.accounts[0]?.predictedResetAt).toBe(1_800_000_000_000);
+      expect(result.envelope.payload.burnUnitsPerDay).toBe(2.75);
+    }
+  });
+
+  it('a measured zero survives — it is a verdict ("idle"), not a missing value', () => {
+    const result = decode(rawFrame('usage.snapshot', { accounts: [account], burnUnitsPerDay: 0 }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.burnUnitsPerDay).toBe(0);
+    }
+  });
+
+  it('refuses a fractional predicted reset and a non-finite burn rate at encode time', () => {
+    // encode() validates BEFORE serializing, so a sender whose value is looser than the schema
+    // throws here rather than shipping a frame the peer will drop. Both shapes are the ones a
+    // careless producer actually reaches: a rate is fractional by nature and a reset is not.
+    const frame = (payload: PayloadOf<'usage.snapshot'>) =>
+      stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload });
+    expect(() =>
+      encode(frame({ accounts: [{ ...account, predictedResetAt: 1.5 }] } as never)),
+    ).toThrow();
+    expect(() =>
+      encode(frame({ accounts: [account], burnUnitsPerDay: Infinity } as never)),
+    ).toThrow();
+    expect(() => encode(frame({ accounts: [account], burnUnitsPerDay: -1 } as never))).toThrow();
+  });
+});
