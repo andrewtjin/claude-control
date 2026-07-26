@@ -68,7 +68,7 @@ export const defaultExecRunner: ExecRunner = (file, args, input) =>
 /** `security -i` tokenizes stdin lines like a shell: to pass an arbitrary string as one
  *  argument it must be double-quoted with `\` and `"` escaped. (Assumed to match the real
  *  parser — exercise on a real Mac before the first real switch.) */
-function quoteSecurityArg(value: string): string {
+export function quoteSecurityArg(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
@@ -171,6 +171,31 @@ export class KeychainProtector implements Protector {
 /** The mac CLI's own Keychain item (assumed name — verify on a real Mac). */
 export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
+/** Effective service/account for the CLI's live Keychain item, applying operator env overrides
+ *  over the shipped defaults: if the CLI turns out to use a different item name than assumed
+ *  above, the operator corrects it with an env var instead of waiting on a code change. Used by
+ *  the live-channel factory (`defaultLiveCredentialChannel`) to construct the channel; callers
+ *  that need to REPORT the target (e.g. `cctl doctor`) read it off the constructed channel's
+ *  `.target` instead of calling this a second time, so the two can never drift apart. `env` is
+ *  injected for testability; unset keys fall back to the default service and the login user,
+ *  i.e. identical to constructing the channel with no options. */
+export function resolveClaudeCliKeychainTarget(env: NodeJS.ProcessEnv = process.env): {
+  service: string;
+  account: string;
+} {
+  // Trim first: a set-but-blank-or-whitespace override (`export CLAUDE_CLI_KEYCHAIN_SERVICE=`,
+  // or a stray space from a copy-pasted config line) is an operator slip, not an intentional
+  // empty item name — fall back to the default there too. `||` (not `??`) then treats the
+  // trimmed-empty result the same as unset. An empty/blank service or account is never a valid
+  // `security(1)` target, so this can only help.
+  const service = env.CLAUDE_CLI_KEYCHAIN_SERVICE?.trim();
+  const account = env.CLAUDE_CLI_KEYCHAIN_ACCOUNT?.trim();
+  return {
+    service: service || CLAUDE_CLI_KEYCHAIN_SERVICE,
+    account: account || userInfo().username,
+  };
+}
+
 /**
  * Live-credential channel backed by the Claude CLI's macOS Keychain item. Behavior mirrors
  * the file channel's SURGICAL rule: read the existing payload, replace exactly the
@@ -181,13 +206,18 @@ export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
  * A missing item reads as `undefined` ("nobody logged in"), exactly like a missing file.
  */
 export class KeychainCredentialChannel implements LiveCredentialChannel {
-  private readonly service: string;
-  private readonly account: string;
+  /** The exact service/account this instance reads and writes. Public (not just internal
+   *  state) so a caller — `cctl doctor` in particular — can report the EXACT target that will
+   *  actually be hit, instead of recomputing it via a second, independent call that could drift
+   *  out of sync with what this channel was actually constructed with. */
+  readonly target: { service: string; account: string };
   private readonly run: ExecRunner;
 
   constructor(options?: { service?: string; account?: string; run?: ExecRunner }) {
-    this.service = options?.service ?? CLAUDE_CLI_KEYCHAIN_SERVICE;
-    this.account = options?.account ?? userInfo().username;
+    this.target = {
+      service: options?.service ?? CLAUDE_CLI_KEYCHAIN_SERVICE,
+      account: options?.account ?? userInfo().username,
+    };
     this.run = options?.run ?? defaultExecRunner;
   }
 
@@ -212,7 +242,7 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
       await this.run(
         'security',
         ['-i'],
-        `add-generic-password -U -s ${quoteSecurityArg(this.service)} -a ${quoteSecurityArg(this.account)} -w ${quoteSecurityArg(json)}\n`,
+        `add-generic-password -U -s ${quoteSecurityArg(this.target.service)} -a ${quoteSecurityArg(this.target.account)} -w ${quoteSecurityArg(json)}\n`,
       );
     } catch (err) {
       throw new VaultError('failed to write live credentials to the login Keychain', {
@@ -228,9 +258,9 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
       out = await this.run('security', [
         'find-generic-password',
         '-s',
-        this.service,
+        this.target.service,
         '-a',
-        this.account,
+        this.target.account,
         '-w',
       ]);
     } catch (err) {
