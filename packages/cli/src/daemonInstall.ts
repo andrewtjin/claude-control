@@ -99,7 +99,7 @@ export interface ResolveCctlShimPathOptions {
 const defaultNpmPrefix = (): string =>
   execFileSync('npm', ['prefix', '-g'], {
     encoding: 'utf8',
-    shell: true, // npm is a .cmd shim on Windows, same as `claude` in program.ts's addFreshAccount
+    shell: true, // npm is a .cmd shim on Windows; the daemon install flow that calls this is Windows-only
     windowsHide: true,
   }).trim();
 

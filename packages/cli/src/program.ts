@@ -842,7 +842,7 @@ async function addFreshAccount(label: string): Promise<void> {
     const run = spawnSync('claude', [], {
       stdio: 'inherit',
       env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
-      shell: true, // `claude` is a .cmd shim on Windows
+      shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
     });
     if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
     const account = await buildEngine().captureFromConfigDir(label, captureDir);
@@ -885,7 +885,7 @@ async function reloginAccount(ref: string): Promise<void> {
     const run = spawnSync('claude', [], {
       stdio: 'inherit',
       env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
-      shell: true, // `claude` is a .cmd shim on Windows
+      shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
     });
     if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
     const updated = await engine.reloginFromConfigDir(account.id, captureDir);
