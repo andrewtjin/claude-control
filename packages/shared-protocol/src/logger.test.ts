@@ -168,6 +168,104 @@ describe('createLogger: pretty rendering of a real failure', () => {
   });
 });
 
+describe('createLogger: color', () => {
+  /** The literal CSI (`\u001b[`) every real ANSI paint opens with — asserted on directly rather
+   *  than a specific code, since the point of these tests is presence/absence of *any* escape
+   *  sequence, not which one. */
+  const ESC = '\u001b[';
+
+  it('colors pretty output on a TTY with NO_COLOR unset (the daemon-run default)', () => {
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    logger.error({}, 'boom');
+    expect(stdout.chunks[0]).toContain(ESC);
+  });
+
+  it('never colors NDJSON output, even on a colorable TTY — machine format stays plain', () => {
+    // json mode is chosen when isTTY is false, so force pretty conditions (TTY, no NO_COLOR)
+    // and pin CCTL_LOG_FORMAT=json explicitly: this is the one combination where a caller who
+    // conflated "colorable" with "pretty" would leak escape codes into a machine-parsed stream.
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FORMAT: 'json' },
+      stdout,
+    });
+    logger.error({}, 'boom');
+    expect(stdout.chunks[0]).not.toContain(ESC);
+    // And it must still be valid, parseable JSON — not merely escape-free by accident.
+    expect(() => {
+      JSON.parse(stdout.chunks[0]!);
+    }).not.toThrow();
+  });
+
+  it('never colors NDJSON appended to CCTL_LOG_FILE, even while stdout renders pretty+color', () => {
+    const dir = freshTempDir();
+    const filePath = join(dir, 'daemon.log');
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({ defaultLevel: 'info', env: { CCTL_LOG_FILE: filePath }, stdout });
+    logger.error({}, 'boom');
+    // stdout got color (pretty + TTY + no NO_COLOR)...
+    expect(stdout.chunks[0]).toContain(ESC);
+    // ...but the file sink — which always receives pino's raw NDJSON regardless of stdout's
+    // mode — must not, since it exists for later machine consumption.
+    const fileContents = readFileSync(filePath, 'utf8');
+    expect(fileContents).not.toContain(ESC);
+    expect(() => {
+      JSON.parse(fileContents.trim());
+    }).not.toThrow();
+  });
+
+  it('respects NO_COLOR even on a TTY', () => {
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { NO_COLOR: '1' },
+      stdout,
+    });
+    logger.error({}, 'boom');
+    expect(stdout.chunks[0]).not.toContain(ESC);
+    expect(stdout.chunks[0]).toContain('boom'); // still fully readable, just plain
+  });
+
+  it('never colors when pretty is forced off a real TTY (CCTL_LOG_FORMAT=pretty piped to a file)', () => {
+    // Forcing pretty format does not fabricate a terminal: escape codes written into a redirected
+    // file/pipe would be a regression identical in kind to leaking them into NDJSON.
+    const stdout = new CapturingStdout(false);
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FORMAT: 'pretty' },
+      stdout,
+    });
+    logger.error({}, 'boom');
+    expect(stdout.chunks[0]).not.toContain(ESC);
+    expect(stdout.chunks[0]).toContain('boom');
+  });
+
+  it('colors the ERROR level token red and the WARN level token yellow', () => {
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    logger.error({}, 'e');
+    logger.warn({}, 'w');
+    expect(stdout.chunks[0]).toContain('\u001b[31mERROR\u001b[0m');
+    expect(stdout.chunks[1]).toContain('\u001b[33mWARN \u001b[0m');
+  });
+
+  it('dims the timestamp and the key=val tail, but leaves the message unpainted', () => {
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    logger.info({ sessionId: 's1' }, 'started');
+    const line = stdout.chunks[0]!;
+    // The line opens already dim-wrapped: the timestamp is the very first thing on it.
+    expect(line.startsWith('[2m')).toBe(true);
+    // The message string appears with no dim-open code immediately before it — it stands out
+    // in the terminal default color while everything around it is dimmed.
+    expect(line).not.toContain('[2mstarted');
+    // The tail is wrapped in one dim span covering the whole key=val list.
+    expect(line).toContain('[2msessionId=s1[0m');
+  });
+});
+
 describe('createLogger: reserved payload keys', () => {
   it("renames a payload field that would collide with pino's own level/time/msg", () => {
     // Without the rename both the header and the field would be wrong: the duplicate JSON key

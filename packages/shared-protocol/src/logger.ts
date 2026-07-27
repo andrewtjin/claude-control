@@ -15,7 +15,8 @@
 
 import { closeSync, openSync, writeSync } from 'node:fs';
 import pino from 'pino';
-import { formatLogLine } from './logFormat.js';
+import { formatLogLine, type LogLineColors } from './logFormat.js';
+import { ansiLogColors, colorEnabled } from './ansiColor.js';
 
 /** Structural shape both switch-engine's and control-plane-bot's `Logger` interfaces satisfy.
  *  Declared locally rather than imported from either — importing switch-engine's would give
@@ -199,6 +200,9 @@ class LogDestination {
     filePath: string | undefined,
     warn: (message: string) => void,
     private readonly stdout: LogSink,
+    /** Undefined means plain (no color) — either mode is 'json' (color never applies there;
+     *  see the class comment) or the caller's own `colorEnabled` check came back false. */
+    private readonly colors: LogLineColors | undefined,
   ) {
     this.fileSink =
       filePath === undefined || filePath === '' ? undefined : getFileSink(filePath, warn);
@@ -238,6 +242,7 @@ class LogDestination {
     const timeMs = typeof time === 'number' ? time : Date.now();
     return formatLogLine(levelLabel, timeMs, rest, typeof msg === 'string' ? msg : undefined, {
       includeStack: this.includeStack,
+      ...(this.colors !== undefined ? { colors: this.colors } : {}),
     });
   }
 }
@@ -260,6 +265,11 @@ export function createLogger(options: CreateLoggerOptions): LoggerLike {
   const stdout = options.stdout ?? process.stdout;
   const warn = options.warn ?? ((message: string) => process.stderr.write(`warn: ${message}\n`));
   const format = resolveFormat(env, stdout.isTTY === true, warn);
+  // Color is pretty-mode-only (see `LogDestination.write`) and gated on the exact same
+  // NO_COLOR/TTY check the CLI's own tables/summaries use — `colorEnabled` is shared-protocol's
+  // single source of truth for that decision (see ansiColor.ts's module comment) precisely so
+  // this never has to re-derive it.
+  const colors = format === 'pretty' && colorEnabled(stdout, env) ? ansiLogColors() : undefined;
 
   const destination = new LogDestination(
     format,
@@ -267,6 +277,7 @@ export function createLogger(options: CreateLoggerOptions): LoggerLike {
     env.CCTL_LOG_FILE,
     warn,
     stdout,
+    colors,
   );
   const p = pino({ level }, destination);
   return {

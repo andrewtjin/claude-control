@@ -8,7 +8,14 @@
 //  - color is only enabled on a real TTY with NO_COLOR unset, so piped/redirected output
 //    and CI logs remain byte-for-byte plain.
 
+import { colorEnabled } from '@claude-control/shared-protocol';
 import { severityOf, type OutlookStyle } from '@claude-control/usage-advisor';
+
+// `colorEnabled` (the NO_COLOR/TTY gate) is defined once in shared-protocol and re-exported
+// here rather than redeclared: shared-protocol's own pretty-log renderer (`createLogger`) makes
+// the identical decision for the exact same reason, and the two must never disagree about
+// whether a given stream is colorable. See shared-protocol's ansiColor.ts.
+export { colorEnabled };
 
 /** A text decorator. Must not change the visible width of its input. */
 export type Paint = (text: string) => string;
@@ -59,16 +66,6 @@ export const PLAIN_PALETTE: Palette = {
   cyan: (t) => t,
   orange: (t) => t,
 };
-
-/** Should output to `stream` be colored? True only on a TTY with NO_COLOR unset — the
- *  no-color.org convention: NO_COLOR set to any non-empty value disables color. */
-export function colorEnabled(
-  stream: { isTTY?: boolean | undefined } = process.stdout,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  if (env.NO_COLOR !== undefined && env.NO_COLOR !== '') return false;
-  return stream.isTTY === true;
-}
 
 /** The palette for this process's stdout — the one call sites in program.ts make. */
 export function detectPalette(

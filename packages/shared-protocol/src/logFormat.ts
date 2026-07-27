@@ -156,6 +156,30 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** A text decorator that adds ANSI styling without changing the string's rendered WIDTH (escape
+ *  codes are zero-width) — padding computed on plain text (see `formatLevel`) stays aligned once
+ *  wrapped. Declared independently here rather than imported from `packages/cli/src/ansi.ts`:
+ *  shared-protocol has no workspace dependencies (control-plane-bot's credential-firewalled
+ *  composition root may import ONLY this package — see its bin.ts module comment), so it cannot
+ *  depend on the CLI, and the CLI's `Paint` is structurally identical anyway. */
+export type Paint = (text: string) => string;
+
+/** The palette a caller injects to color pretty-mode output. Deliberately tiny — just enough to
+ *  make an error/warn line findable while scrolling (`level`) and to recede the reference-only
+ *  key=val tail behind the human-readable message (`dim`) — not a general styling kit. Building
+ *  one is the CALLER's job (see shared-protocol's `ansiColor.ts`): this module stays pure, so it
+ *  never reads `process`/tty state itself, only renders whatever palette it is handed. */
+export interface LogLineColors {
+  /** Picks a paint for the level token by the line's OWN level (case-insensitive): color is the
+   *  reader's error/warn radar, so only those levels earn one — everything else renders plain,
+   *  which is also why this colors just the 5-char level word and never the rest of the line (a
+   *  wall of one color per line is the "overwhelming" this is built to avoid). */
+  level: (level: string) => Paint;
+  /** Applied to the timestamp and to the whole key=val tail: both are reference material a
+   *  reader consults rather than reads top-to-bottom, so both recede behind the message. */
+  dim: Paint;
+}
+
 export interface FormatLogLineOptions {
   /** Print an `err`'s stack on indented continuation lines. Off by default: the stack is the
    *  bulk of what makes raw output unreadable, so it belongs behind the operator's own request
@@ -163,6 +187,10 @@ export interface FormatLogLineOptions {
    *  error in this codebase is logged at error/warn, so gating on the line's own level would
    *  make the stack unreachable). */
   includeStack?: boolean;
+  /** Pretty-mode-only styling. Omitted (the default) renders exactly the plain text this module
+   *  always rendered — NDJSON callers must never pass this, since color belongs to pretty mode
+   *  alone (see logger.ts's `LogDestination`, the only thing allowed to decide mode). */
+  colors?: LogLineColors;
 }
 
 /**
@@ -204,14 +232,31 @@ export function formatLogLine(
     parts.push(`${key}=${renderValue(value)}`);
   }
 
-  const segments = [`${formatTime(timeMs)} ${formatLevel(level)}`];
+  // Timestamp and level are colored INDIVIDUALLY (not the header segment as a whole) so the
+  // space between them stays plain, same as every other join below. `msg` is deliberately never
+  // painted: leaving it in the terminal's default color is what makes it stand out against the
+  // dimmed tail — see `LogLineColors`'s doc comment.
+  const timeText = formatTime(timeMs);
+  const levelText = formatLevel(level);
+  const header =
+    options.colors === undefined
+      ? `${timeText} ${levelText}`
+      : `${options.colors.dim(timeText)} ${options.colors.level(level)(levelText)}`;
+
+  const segments = [header];
   if (msg) segments.push(msg);
-  if (parts.length > 0) segments.push(parts.join(' '));
+  if (parts.length > 0) {
+    const tailText = parts.join(' ');
+    segments.push(options.colors === undefined ? tailText : options.colors.dim(tailText));
+  }
   let line = segments.join('  ');
 
   if (errStack !== undefined) {
     // Indented continuation line(s) so the stack is visually subordinate to the summary line
-    // above it, and still greppable as a block (every line shares the same 4-space prefix).
+    // above it, and still greppable as a block (every line shares the same 4-space prefix). Left
+    // uncolored even in pretty mode — it only ever appears behind an explicit `includeStack`
+    // request (verbose levels), already the operator asking to see everything, not the
+    // at-a-glance case colors exist for.
     line += `\n${errStack
       .split('\n')
       .map((l) => `    ${l}`)
