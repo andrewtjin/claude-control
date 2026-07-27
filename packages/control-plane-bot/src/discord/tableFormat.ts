@@ -19,6 +19,8 @@
 // as a consistent table is still fenced as-is (monospace beats soup); text already inside a
 // code fence is left exactly as authored.
 
+import { clampBalanced } from './messageChunks.js';
+
 /** Target rendered width. Chosen for the narrowest real surface — a phone-width embed
  *  description shows roughly this many monospace columns before Discord wraps the line. */
 export const DEFAULT_TABLE_WIDTH = 40;
@@ -31,8 +33,12 @@ const MIN_COL_WIDTH = 6;
  *  the line above" without eating width the prose needs. */
 const RECORD_INDENT = '  ';
 
-/** A parsed table: rows of cell text, plus which row gaps had a horizontal separator in
- *  the source (markdown tables get one after the header; box tables keep their own). */
+/** A parsed table: rows of cell text, plus which row gaps carry a horizontal separator in the
+ *  render. A box source states its own gaps, and those are mirrored exactly. Markdown states
+ *  none — its single delimiter row marks where the HEADER ends, not where rules belong — so for
+ *  markdown the gaps are chosen, not read: a rule at every gap so no two rows touch, or at the
+ *  header alone when dropping the rest is what lets the surface show the rows (see
+ *  `formatTables`). */
 interface ParsedTable {
   rows: string[][];
   separatorAfterRow: boolean[];
@@ -105,23 +111,29 @@ function parseBoxBlock(lines: string[]): ParsedTable | undefined {
   return { rows, separatorAfterRow: separatorAfterRow.slice(0, rows.length) };
 }
 
-/** Parse a markdown pipe table (header, separator, body) into rows. The separator row is
- *  dropped; its position is remembered as "separator after the header". */
-function parseMarkdownBlock(lines: string[]): ParsedTable | undefined {
+/** Parse a markdown pipe table (header, delimiter, body) into rows. The delimiter row carries no
+ *  content, so it is dropped; where it sat is kept only as the fallback gap placement. Markdown
+ *  puts every row on its own line and offers no way to mark a gap between two of them, so with
+ *  `separateEveryRow` every gap is a boundary and adjacent rows can never run together; without
+ *  it the render falls back to the delimiter's own position — a rule under the header only. */
+function parseMarkdownBlock(lines: string[], separateEveryRow: boolean): ParsedTable | undefined {
   const rows: string[][] = [];
-  const separatorAfterRow: boolean[] = [];
+  const delimiterAfterRow: boolean[] = [];
   for (const line of lines) {
     if (isMarkdownSeparator(line)) {
-      if (rows.length > 0) separatorAfterRow[rows.length - 1] = true;
+      if (rows.length > 0) delimiterAfterRow[rows.length - 1] = true;
       continue;
     }
     rows.push(markdownCells(line));
-    separatorAfterRow.push(false);
+    delimiterAfterRow.push(false);
   }
   if (rows.length < 2) return undefined;
   const cols = rows[0]?.length ?? 0;
   if (cols < 2 || rows.some((r) => r.length !== cols)) return undefined;
-  return { rows, separatorAfterRow: separatorAfterRow.slice(0, rows.length) };
+  const separatorAfterRow = separateEveryRow
+    ? rows.map((_, i) => i < rows.length - 1)
+    : delimiterAfterRow.slice(0, rows.length);
+  return { rows, separatorAfterRow };
 }
 
 /** Greedy word-wrap of one cell to `width`, hard-splitting tokens longer than the width
@@ -340,14 +352,110 @@ function renderParsed(table: ParsedTable, maxWidth: number): string {
   );
 }
 
+export interface TableFormatOptions {
+  /** Target rendered width in monospace columns. Defaults to `DEFAULT_TABLE_WIDTH`. */
+  maxWidth?: number;
+  /** What the caller's surface will really SHOW of a render: its own clamp or chunker, applied
+   *  exactly as it will be applied to the string this returns — heading, reserved room and all.
+   *  Given one, the rules decision is measured through it rather than predicted (see
+   *  `formatTables`). Omit when the caller displays the result whole. */
+  deliver?: (rendered: string) => string;
+}
+
 /**
  * Re-render every table in `text` for Discord: box-drawing and markdown pipe tables become fenced
  * blocks at most ~`maxWidth` columns wide — a compact box, or a record list when the cells are
  * long prose. All other lines (and anything the author already fenced) pass through
  * byte-identical. Returns the input unchanged when no table is found, so callers can apply this
  * unconditionally.
+ *
+ * ROWS OUTRANK RULES. A markdown source says nothing about where horizontal rules belong, so the
+ * render puts one in every gap: it is the only thing stopping one body row from reading as a
+ * continuation of the one above it. But each rule costs a whole line, which on a long table is
+ * the difference between a surface showing every row and showing two thirds of them under a
+ * "+N more" — and a reader who can see all sixteen accounts is better served than one looking at
+ * thirteen prettier ones. So the rules are kept only while they cost the reader nothing.
+ *
+ * Whether they cost anything is MEASURED, never predicted. A formatter cannot reason about a
+ * truncation it does not have: these surfaces drop whole LINES and spend a further ten characters
+ * on a "… +N more" marker, so any rule about characters ("does the ruled render fit?", "how much
+ * of it fits?") disagrees with the real cut by up to a line — and that is exactly the margin the
+ * last rule sits in. `deliver` closes the gap by handing over the real thing: both candidate
+ * renders are pushed through the CALLER'S OWN clamp and the one that gets more content out the
+ * other side wins. It cannot drift from the clamp, because it is the clamp.
+ *
+ * Content is counted in delivered LINES, rows and prose alike — a rule kept in front of a table
+ * pushes the paragraph after it past the cut just as readily as it pushes a row, and a policy
+ * that only watched rows would trade the reader's prose away for free. Scaffolding (fences,
+ * borders, the rules themselves) is not content and is not counted, or the ruled render would
+ * win every comparison by being the more decorated one. A genuine tie keeps the rules: they are
+ * the feature, and a tie means nothing was traded for them.
+ *
+ * The retreat is all-or-nothing across the whole text rather than per table. Deliberate: which
+ * of several tables should pay is not a question the delivered line count can answer, and a mixed
+ * render — some tables ruled, some not — reads as a bug rather than as a budget.
  */
-export function formatTables(text: string, maxWidth = DEFAULT_TABLE_WIDTH): string {
+export function formatTables(text: string, options: TableFormatOptions = {}): string {
+  const maxWidth = options.maxWidth ?? DEFAULT_TABLE_WIDTH;
+  const ruled = render(text, maxWidth, true);
+  const deliver = options.deliver;
+  if (deliver === undefined) return ruled;
+  const bare = render(text, maxWidth, false);
+  // Box sources state their own gaps and record layouts draw none, so for those two the policy
+  // changes nothing and there is no trade to measure.
+  if (bare === ruled) return ruled;
+  return deliveredContent(bare, deliver(bare)) > deliveredContent(ruled, deliver(ruled))
+    ? bare
+    : ruled;
+}
+
+/**
+ * Re-render `text`'s tables for a surface that CLAMPS what it can show, and return the clamped
+ * result — the whole exchange in one call, so the clamp that decides the render is by construction
+ * the clamp that produces the value. Splitting the two is what lets them drift.
+ *
+ * `clampBalanced` rather than `clamp` directly because every render here is fenced: a clamp that
+ * cut between a ``` and its closer would leave Discord swallowing everything after the card.
+ */
+export function formatTablesClamped(
+  text: string,
+  max: number,
+  clamp: (value: string, max: number) => string,
+  options: Omit<TableFormatOptions, 'deliver'> = {},
+): string {
+  const deliver = (rendered: string): string => clampBalanced(rendered, max, clamp);
+  return deliver(formatTables(text, { ...options, deliver }));
+}
+
+/** A line carrying something the SOURCE said, as opposed to scaffolding this module drew. Whitespace,
+ *  code-fence backticks and box glyphs are the entire vocabulary of the fences, borders, rules and
+ *  record gaps; a line made of nothing else told the reader nothing. */
+function isContentLine(line: string): boolean {
+  return /[^\s`─│┌┬┐├┼┤└┴┘╭╮╰╯]/.test(line);
+}
+
+/**
+ * How many of `rendered`'s content lines survive into `delivered` — that same render after the
+ * caller's clamp has had it.
+ *
+ * Matching by line rather than by position because a clamp is free to add its own text around what
+ * it kept: a marker line, a fence it had to re-close, a heading the caller prepends. Anything in
+ * `delivered` that is not a line of `rendered`, in order and whole, simply does not count — which
+ * is also the right reading of a line the clamp cut in half, since half a row is not a row the
+ * reader received.
+ */
+function deliveredContent(rendered: string, delivered: string): number {
+  const want = rendered.split('\n').filter(isContentLine);
+  let matched = 0;
+  for (const line of delivered.split('\n')) {
+    if (matched < want.length && line === want[matched]) matched++;
+  }
+  return matched;
+}
+
+/** One rendering pass at a fixed markdown gap policy; see `formatTables` for how the policy is
+ *  chosen. Box tables ignore the policy — their gaps come from the source. */
+function render(text: string, maxWidth: number, separateEveryRow: boolean): string {
   const lines = text.split('\n');
   const out: string[] = [];
   let inFence = false;
@@ -395,7 +503,7 @@ export function formatTables(text: string, maxWidth = DEFAULT_TABLE_WIDTH): stri
         i++;
       }
       const block = lines.slice(start, i);
-      const parsed = parseMarkdownBlock(block);
+      const parsed = parseMarkdownBlock(block, separateEveryRow);
       if (parsed) {
         out.push(renderParsed(parsed, maxWidth));
         continue;

@@ -6,9 +6,71 @@
 // the whole old file or the whole new one. The write is fsync'd before the rename so the
 // durable on-disk state is always the new bytes, never a truncated temp.
 
-import { mkdirSync } from 'node:fs';
-import { open, readFile, rename, rm } from 'node:fs/promises';
+import { constants, mkdirSync } from 'node:fs';
+import { access, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+
+/**
+ * Whether a failed rename means "someone else has this file open right now" — the one condition
+ * that clears on its own and is therefore worth waiting out. Everything else is a real fault and
+ * must surface at once, at the speed of the syscall that produced it.
+ *
+ * The condition is a Windows one: Windows refuses to replace a file while any handle to it is
+ * open — including a reader doing nothing but a single `readFile` — and reports that refusal as
+ * EPERM or EBUSY (the same pair the daemon's session registry and the bot's bindings file wait
+ * out, for the same reason). POSIX has no such rule: `rename(2)` is unaffected by open handles,
+ * so the very same codes there describe a permission or mount fault on the directory, and those
+ * are permanent. Retrying them would spend the whole ladder on a failure whose answer is already
+ * final — on the switch path, in front of a credential write, holding the credential lock.
+ *
+ * Decides on the CODE alone, which is as far as the code can take it: on Windows the same EPERM
+ * also covers a target nothing will ever be able to replace. `targetRefusesWrites` is the second
+ * half of the decision and rules those out before any waiting happens.
+ *
+ * `platform` is a parameter rather than a read of `process.platform` so both branches are
+ * reachable from a test on either kind of machine.
+ */
+export function isTransientRenameError(code: string, platform: NodeJS.Platform): boolean {
+  return platform === 'win32' && (code === 'EPERM' || code === 'EBUSY');
+}
+
+/**
+ * Waits, in ms, before each rename retry — doubling, ~255ms of patience in total.
+ *
+ * Sized against what it is waiting for: a concurrent read of the same small file, which holds its
+ * handle for microseconds. A budget this short outlasts any number of such readers while staying
+ * far below the point where a caller would notice; it is deliberately NOT long enough to wait out
+ * a process that holds the file open indefinitely, because that is not a race and no amount of
+ * waiting resolves it.
+ */
+const RENAME_RETRY_DELAYS_MS = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/**
+ * Whether the target itself refuses to be written — the half of Windows' EPERM that no amount of
+ * waiting resolves.
+ *
+ * `isTransientRenameError` can only read the error code, and on Windows that code is ambiguous:
+ * a target held open by a reader and a target marked read-only both come back as EPERM. Only the
+ * first clears on its own, so the second spends the entire ladder before reporting a refusal that
+ * was final at the first attempt. One `access` call separates them — a read-only target fails it,
+ * a merely-open one passes it, because checking writability does not open the file and so cannot
+ * lose the same race the rename just lost.
+ *
+ * Answers `false` for anything it cannot prove, which keeps the ladder's reach unchanged wherever
+ * the probe is uninformative. ENOENT is the case that matters: renaming ONTO a path that does not
+ * exist is exactly what succeeds, so an absent target cannot be what refused the write, and
+ * reading its absence as a denial would turn a real race into an instant failure.
+ */
+async function targetRefusesWrites(target: string): Promise<boolean> {
+  try {
+    await access(target, constants.W_OK);
+    return false;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === 'EPERM' || code === 'EACCES';
+  }
+}
 
 /** Ensure a directory exists (recursively). No-op if already present. Sync so that callers
  *  in sync contexts (audit append, lock acquisition) can use it too. */
@@ -17,9 +79,43 @@ export function ensureDir(dir: string): void {
 }
 
 /**
+ * Rename `tmp` over `target`, waiting out a losing race with a concurrent reader.
+ *
+ * A rename that fails because another process momentarily has the target open has not been
+ * rejected — it has been asked to come back. Surfacing that as an error makes every caller carry
+ * a race it cannot do anything about, and makes correctness depend on nothing ever reading the
+ * file at the wrong instant. Retrying resolves it where waiting can; where it cannot — every
+ * failure `isTransientRenameError` does not claim, including all of them off Windows, plus the
+ * target `targetRefusesWrites` proves unwritable — the original error reaches the caller
+ * unchanged and immediately.
+ */
+async function renameWithRetry(tmp: string, target: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(tmp, target);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      const exhausted = attempt >= RENAME_RETRY_DELAYS_MS.length;
+      if (exhausted || !isTransientRenameError(code, process.platform)) throw err;
+      // The code said "maybe transient"; this asks the target whether it is. One extra syscall
+      // per tolerated failure, on the failure path only, and it costs a fraction of the delay it
+      // decides whether to spend.
+      if (await targetRefusesWrites(target)) throw err;
+      await delay(RENAME_RETRY_DELAYS_MS[attempt] ?? 0);
+    }
+  }
+}
+
+/**
  * Atomically replace `target` with `data`. The temp file is created in the target's own
  * directory so the final rename is a same-filesystem move (atomic), never a cross-device
  * copy. The handle is fsync'd before the rename so the durable state is the new content.
+ *
+ * Either the replace happens or nothing is left behind: a rename that ultimately fails takes its
+ * temp file with it. The temp lives in the target's own directory — for credentials that is the
+ * vault — so leaking one per failed write turns a directory the user is meant to be able to read
+ * into a growing pile of partial copies of that same file.
  */
 export async function atomicWriteFile(
   target: string,
@@ -37,7 +133,15 @@ export async function atomicWriteFile(
   } finally {
     await handle.close();
   }
-  await rename(tmp, target);
+  try {
+    await renameWithRetry(tmp, target);
+  } catch (err) {
+    // The rename is the only step that can fail with the temp still on disk. A cleanup that
+    // itself fails is swallowed on purpose: the caller needs to know why the WRITE failed, and
+    // replacing that reason with a secondary one would hide it.
+    await rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
 }
 
 /** Read and JSON-parse a file, or return `undefined` if it does not exist. Other IO errors

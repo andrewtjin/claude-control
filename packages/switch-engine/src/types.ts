@@ -77,6 +77,17 @@ export interface StoredAccount {
   subscriptionCreatedAt?: string;
   /** From `oauthAccount.claudeCodeTrialEndsAt`, captured only when non-null (a live trial). */
   claudeCodeTrialEndsAt?: string;
+  /** Which revision of the bundle -> row mapping last computed the derived fields above (see
+   *  `ACCOUNT_METADATA_REV`). Absent on rows written before the stamp existed. Rows behind the
+   *  current revision are recomputed once from their stored bundle; without the stamp there is
+   *  no way to tell "this build captured everything it could" from "this row predates the
+   *  field", and a row frozen by an older build would render as unknown forever. */
+  metadataRev?: number;
+  /** When the last attempt to recompute this row from its stored bundle FAILED — an absent or
+   *  undecryptable blob. Rows behind `metadataRev` that no attempt can advance would otherwise be
+   *  rescanned on every listing forever, so this timestamp backs the sweep off (see
+   *  `METADATA_BACKFILL_RETRY_MS`). Cleared the moment a recompute succeeds. */
+  metadataBackfillFailedAtMs?: number;
   /** A quarantined account has a dead refresh token and must be re-logged-in before use. */
   quarantined: boolean;
   quarantineReason?: string;

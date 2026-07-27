@@ -58,7 +58,7 @@ import {
   startDaemonTaskNow,
   uninstallDaemonTask,
 } from './daemonInstall.js';
-import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
+import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
   renderAccountsTable,
   renderDaemonStatus,
@@ -175,7 +175,9 @@ export function buildProgram(): Command {
       // for one trailing line.
       const inputs = buildAdvisorInputs(state);
       if (inputs.length > 0) {
-        text += '\n\n' + renderPacingLine(inputs, { nowMs, ...burnOption(state) });
+        text +=
+          '\n\n' +
+          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       process.stdout.write(text + '\n');
     });
@@ -196,7 +198,9 @@ export function buildProgram(): Command {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
         text +=
           '\n\n' + renderPlanSummary(computePlan(inputs, greedy ? { greedyAutoSwitch: true } : {}));
-        text += '\n\n' + renderPacingLine(inputs, { nowMs, ...burnOption(state) });
+        text +=
+          '\n\n' +
+          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       process.stdout.write(text + '\n');
     });
@@ -915,6 +919,17 @@ function buildAccountCommands(program: Command): void {
     .description('list stored accounts')
     .action(async () => {
       const engine = buildEngine();
+      // Self-heal before rendering. The PLAN/BILLING columns read fields that a row only gains
+      // when its bundle is rewritten, so an account stored by an earlier build shows "?" and
+      // "unknown" indefinitely even though its vaulted bundle has carried the answer all along.
+      // This call IS the repair mechanism for every account that is never switched to — nothing
+      // else reaches them. The sweep decrypts only rows that are actually behind, stamps each one
+      // whether or not it could be repaired, and yields the credential lock instead of waiting on
+      // it, so it costs nothing once healed and cannot stall a listing behind an in-flight switch.
+      // Unguarded on purpose: the engine's contract is that this never throws and logs whatever
+      // went wrong, so a listing the user asked for still renders whatever is already on record —
+      // without a `catch` here throwing the reason away on the way past.
+      await engine.backfillAccountMetadata();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
       process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
     });
