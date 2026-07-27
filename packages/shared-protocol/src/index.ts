@@ -4,3 +4,4 @@ export * from './version.js';
 export * from './messages.js';
 export * from './codec.js';
 export * from './logger.js';
+export * from './ansiColor.js';
