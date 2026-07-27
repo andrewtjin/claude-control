@@ -8,7 +8,6 @@
 import { Command } from 'commander';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -44,6 +43,7 @@ import {
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
+import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
   appendCrashLine,
@@ -830,9 +830,9 @@ function burnOption(state: UsageState): { burnUnitsPerDay?: number } {
  */
 async function addFreshAccount(label: string): Promise<void> {
   const paths = defaultPaths();
-  const captureDir = join(dirname(paths.vaultDir), `capture-${randomUUID()}`);
-  mkdirSync(captureDir, { recursive: true });
-  try {
+  // Failures are RETURNED, not `fail()`ed, so the dir is deleted before the process exits —
+  // `fail()` is `process.exit`, which skips `finally`. See captureDir.ts.
+  const failure = await withCaptureDir(dirname(paths.vaultDir), 'capture', async (captureDir) => {
     process.stdout.write(
       'Opening a throwaway Claude window. In it:\n' +
         '  1. /login - pick the NEW account in the browser (it may preselect the current one).\n' +
@@ -844,19 +844,20 @@ async function addFreshAccount(label: string): Promise<void> {
       env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
       shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
     });
-    if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
-    const account = await buildEngine().captureFromConfigDir(label, captureDir);
-    process.stdout.write(
-      `Added ${account.label} (${account.id}). Your current login was not touched - ` +
-        `\`cctl switch ${account.label}\` to use it.\n`,
-    );
-  } catch (err) {
-    if (err instanceof SwitchEngineError && err.code === 'no_capture_login') fail(err.message);
-    throw err;
-  } finally {
-    // Token-bearing — must not outlive the capture, success or failure.
-    rmSync(captureDir, { recursive: true, force: true });
-  }
+    if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
+    try {
+      const account = await buildEngine().captureFromConfigDir(label, captureDir);
+      process.stdout.write(
+        `Added ${account.label} (${account.id}). Your current login was not touched - ` +
+          `\`cctl switch ${account.label}\` to use it.\n`,
+      );
+    } catch (err) {
+      if (err instanceof SwitchEngineError && err.code === 'no_capture_login') return err.message;
+      throw err;
+    }
+    return undefined;
+  });
+  if (failure) fail(failure);
 }
 
 /**
@@ -873,9 +874,9 @@ async function reloginAccount(ref: string): Promise<void> {
   const account = resolved.account;
 
   const paths = defaultPaths();
-  const captureDir = join(dirname(paths.vaultDir), `relogin-${randomUUID()}`);
-  mkdirSync(captureDir, { recursive: true });
-  try {
+  // Same return-don't-fail contract as addFreshAccount: cleanup has to outlive every failure
+  // path, and `fail()` (process.exit) would skip it. See captureDir.ts.
+  const failure = await withCaptureDir(dirname(paths.vaultDir), 'relogin', async (captureDir) => {
     process.stdout.write(
       `Re-logging in "${account.label}" (${account.id}). A throwaway Claude window will open.\n` +
         '  1. /login - pick the SAME account this entry belongs to (attribution is preserved).\n' +
@@ -887,21 +888,22 @@ async function reloginAccount(ref: string): Promise<void> {
       env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
       shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
     });
-    if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
-    const updated = await engine.reloginFromConfigDir(account.id, captureDir);
-    process.stdout.write(
-      `Re-logged in ${updated.label} (${updated.id}). Quarantine cleared; usage history kept - ` +
-        `\`cctl switch ${updated.label}\` to use it.\n`,
-    );
-  } catch (err) {
-    // no_capture_login (login never completed) and relogin_identity_mismatch (wrong account) are
-    // expected, actionable failures — print the engine's message, don't stack-trace.
-    if (err instanceof SwitchEngineError) fail(err.message);
-    throw err;
-  } finally {
-    // Token-bearing — must not outlive the capture, success or failure.
-    rmSync(captureDir, { recursive: true, force: true });
-  }
+    if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
+    try {
+      const updated = await engine.reloginFromConfigDir(account.id, captureDir);
+      process.stdout.write(
+        `Re-logged in ${updated.label} (${updated.id}). Quarantine cleared; usage history kept - ` +
+          `\`cctl switch ${updated.label}\` to use it.\n`,
+      );
+    } catch (err) {
+      // no_capture_login (login never completed) and relogin_identity_mismatch (wrong account) are
+      // expected, actionable failures — print the engine's message, don't stack-trace.
+      if (err instanceof SwitchEngineError) return err.message;
+      throw err;
+    }
+    return undefined;
+  });
+  if (failure) fail(failure);
 }
 
 function buildAccountCommands(program: Command): void {
