@@ -251,18 +251,34 @@ describe('createLogger: color', () => {
     expect(stdout.chunks[1]).toContain('\u001b[33mWARN \u001b[0m');
   });
 
+  it('never colors the level token for a non-error, non-warn level, only error/fatal/warn earn one', () => {
+    // The two tests above pin what DOES get a color; this pins what must NOT — a level with no
+    // matching branch in ansiLogColors must render as bare padded text.
+    const stdout = new CapturingStdout(true);
+    const logger = createLogger({ defaultLevel: 'debug', env: {}, stdout });
+    logger.info({}, 'i');
+    logger.debug({}, 'd');
+    // The level token's own 5-char padded form (`INFO `/`DEBUG`) is bounded only by ordinary
+    // spaces (the header's own join, then the segment join before the message) — a colored
+    // token would insert an SGR escape between those spaces and the letters, breaking this
+    // exact substring match even though a blanket "no ESC anywhere" assertion would not (the
+    // timestamp on the same line is legitimately dimmed).
+    expect(stdout.chunks[0]).toContain(' INFO   i');
+    expect(stdout.chunks[1]).toContain(' DEBUG  d');
+  });
+
   it('dims the timestamp and the key=val tail, but leaves the message unpainted', () => {
     const stdout = new CapturingStdout(true);
     const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
     logger.info({ sessionId: 's1' }, 'started');
     const line = stdout.chunks[0]!;
     // The line opens already dim-wrapped: the timestamp is the very first thing on it.
-    expect(line.startsWith('[2m')).toBe(true);
+    expect(line.startsWith(`${ESC}2m`)).toBe(true);
     // The message string appears with no dim-open code immediately before it — it stands out
     // in the terminal default color while everything around it is dimmed.
-    expect(line).not.toContain('[2mstarted');
+    expect(line).not.toContain(`${ESC}2mstarted`);
     // The tail is wrapped in one dim span covering the whole key=val list.
-    expect(line).toContain('[2msessionId=s1[0m');
+    expect(line).toContain(`${ESC}2msessionId=s1${ESC}0m`);
   });
 });
 
