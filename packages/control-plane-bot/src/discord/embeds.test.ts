@@ -683,6 +683,30 @@ describe('buildQuestionEmbed', () => {
     expect(value.length).toBeLessThanOrEqual(1024);
   });
 
+  it('keeps every paragraph beside a short table when the rules are what would cost one', () => {
+    // The same shape at the width where the rules DO cost something. They sit above the prose, so
+    // what they push past the cut is a paragraph rather than a row — invisible to anything that
+    // measures the trade in rows, and a whole paragraph of the reader's answer either way.
+    const table = [
+      '| Account | Status | Reset |',
+      '| --- | --- | --- |',
+      '| alpha | ok | 3h |',
+      '| beta | ok | 5h |',
+      '| gamma | busy | 9h |',
+    ];
+    const prose = Array.from({ length: 12 }, (_, i) => `p${i}. ${'x'.repeat(58)}`);
+    const embed = buildQuestionEmbed([
+      {
+        question: [...table, '', ...prose].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    for (let i = 0; i < 12; i++) expect(value).toContain(`p${i}.`);
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
   it('renders at most four questions', () => {
     const many = Array.from({ length: 6 }, (_, i) => ({
       question: `q${i}`,

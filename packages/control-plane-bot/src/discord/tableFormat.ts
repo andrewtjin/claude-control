@@ -19,6 +19,8 @@
 // as a consistent table is still fenced as-is (monospace beats soup); text already inside a
 // code fence is left exactly as authored.
 
+import { clampBalanced } from './messageChunks.js';
+
 /** Target rendered width. Chosen for the narrowest real surface — a phone-width embed
  *  description shows roughly this many monospace columns before Discord wraps the line. */
 export const DEFAULT_TABLE_WIDTH = 40;
@@ -353,10 +355,11 @@ function renderParsed(table: ParsedTable, maxWidth: number): string {
 export interface TableFormatOptions {
   /** Target rendered width in monospace columns. Defaults to `DEFAULT_TABLE_WIDTH`. */
   maxWidth?: number;
-  /** How many characters of the result the caller's surface will actually SHOW — a field cap, a
-   *  description cap, the total a chunked DM delivers before it truncates. Omit when the caller
-   *  has no bound. */
-  budget?: number;
+  /** What the caller's surface will really SHOW of a render: its own clamp or chunker, applied
+   *  exactly as it will be applied to the string this returns — heading, reserved room and all.
+   *  Given one, the rules decision is measured through it rather than predicted (see
+   *  `formatTables`). Omit when the caller displays the result whole. */
+  deliver?: (rendered: string) => string;
 }
 
 /**
@@ -371,55 +374,83 @@ export interface TableFormatOptions {
  * continuation of the one above it. But each rule costs a whole line, which on a long table is
  * the difference between a surface showing every row and showing two thirds of them under a
  * "+N more" — and a reader who can see all sixteen accounts is better served than one looking at
- * thirteen prettier ones. So `budget` makes the choice: rules everywhere while the result fits
- * what the caller can display, and a rule under the header alone once dropping them is what puts
- * rows back on the reader's screen.
+ * thirteen prettier ones. So the rules are kept only while they cost the reader nothing.
  *
- * That last clause is the whole condition, and a character count alone cannot state it: a budget
- * is overrun by everything the text contains, so an overrun says nothing about WHOSE lines are at
- * fault. A three-row table beside eight paragraphs of prose overruns a field cap exactly as a
- * forty-row table does, and there the two rules are 26 characters against a surface that cuts
- * whole 190-character lines — shedding them delivers the reader the identical content, minus the
- * rules. So the policies are compared on the only thing the rules can ever buy back: how many ROW
- * lines each one actually gets inside the budget. Equal rows means the cut landed somewhere the
- * rules had no say over, and the table keeps them.
+ * Whether they cost anything is MEASURED, never predicted. A formatter cannot reason about a
+ * truncation it does not have: these surfaces drop whole LINES and spend a further ten characters
+ * on a "… +N more" marker, so any rule about characters ("does the ruled render fit?", "how much
+ * of it fits?") disagrees with the real cut by up to a line — and that is exactly the margin the
+ * last rule sits in. `deliver` closes the gap by handing over the real thing: both candidate
+ * renders are pushed through the CALLER'S OWN clamp and the one that gets more content out the
+ * other side wins. It cannot drift from the clamp, because it is the clamp.
+ *
+ * Content is counted in delivered LINES, rows and prose alike — a rule kept in front of a table
+ * pushes the paragraph after it past the cut just as readily as it pushes a row, and a policy
+ * that only watched rows would trade the reader's prose away for free. Scaffolding (fences,
+ * borders, the rules themselves) is not content and is not counted, or the ruled render would
+ * win every comparison by being the more decorated one. A genuine tie keeps the rules: they are
+ * the feature, and a tie means nothing was traded for them.
  *
  * The retreat is all-or-nothing across the whole text rather than per table. Deliberate: which
- * of several tables should pay is not a question the character count can answer, and a mixed
+ * of several tables should pay is not a question the delivered line count can answer, and a mixed
  * render — some tables ruled, some not — reads as a bug rather than as a budget.
  */
 export function formatTables(text: string, options: TableFormatOptions = {}): string {
   const maxWidth = options.maxWidth ?? DEFAULT_TABLE_WIDTH;
   const ruled = render(text, maxWidth, true);
-  const budget = options.budget;
-  if (budget === undefined || ruled.length <= budget) return ruled;
+  const deliver = options.deliver;
+  if (deliver === undefined) return ruled;
   const bare = render(text, maxWidth, false);
-  return rowLinesWithin(bare, budget) > rowLinesWithin(ruled, budget) ? bare : ruled;
+  // Box sources state their own gaps and record layouts draw none, so for those two the policy
+  // changes nothing and there is no trade to measure.
+  if (bare === ruled) return ruled;
+  return deliveredContent(bare, deliver(bare)) > deliveredContent(ruled, deliver(ruled))
+    ? bare
+    : ruled;
 }
 
 /**
- * How many lines of table ROW text `rendered` still delivers to a surface capped at `budget`.
+ * Re-render `text`'s tables for a surface that CLAMPS what it can show, and return the clamped
+ * result — the whole exchange in one call, so the clamp that decides the render is by construction
+ * the clamp that produces the value. Splitting the two is what lets them drift.
  *
- * Every clamp these renders reach keeps a prefix and cuts the tail (a field value drops whole
- * trailing lines, a description slices), so what a reader receives is the longest prefix that
- * fits. Row lines are counted because they are the only thing shedding a rule can win back: a
- * rule pushes the lines BELOW it past the cut, and inside a table those are rows. When both
- * policies deliver the same rows, the cut fell past the table — on prose, or on a second table
- * the surface was never going to reach — and no rule is standing in front of anything.
+ * `clampBalanced` rather than `clamp` directly because every render here is fenced: a clamp that
+ * cut between a ``` and its closer would leave Discord swallowing everything after the card.
  */
-function rowLinesWithin(rendered: string, budget: number): number {
-  const lines = rendered.split('\n');
-  let used = 0;
-  let rows = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i] as string;
-    used += (i === 0 ? 0 : 1) + line.length; // the '\n' that rejoins this line to the one before
-    if (used > budget) break;
-    // A rendered row: cell text between verticals. Rules ('├'), borders ('┌', '└') and prose
-    // start with something else.
-    if (line.startsWith('│')) rows++;
+export function formatTablesClamped(
+  text: string,
+  max: number,
+  clamp: (value: string, max: number) => string,
+  options: Omit<TableFormatOptions, 'deliver'> = {},
+): string {
+  const deliver = (rendered: string): string => clampBalanced(rendered, max, clamp);
+  return deliver(formatTables(text, { ...options, deliver }));
+}
+
+/** A line carrying something the SOURCE said, as opposed to scaffolding this module drew. Whitespace,
+ *  code-fence backticks and box glyphs are the entire vocabulary of the fences, borders, rules and
+ *  record gaps; a line made of nothing else told the reader nothing. */
+function isContentLine(line: string): boolean {
+  return /[^\s`─│┌┬┐├┼┤└┴┘╭╮╰╯]/.test(line);
+}
+
+/**
+ * How many of `rendered`'s content lines survive into `delivered` — that same render after the
+ * caller's clamp has had it.
+ *
+ * Matching by line rather than by position because a clamp is free to add its own text around what
+ * it kept: a marker line, a fence it had to re-close, a heading the caller prepends. Anything in
+ * `delivered` that is not a line of `rendered`, in order and whole, simply does not count — which
+ * is also the right reading of a line the clamp cut in half, since half a row is not a row the
+ * reader received.
+ */
+function deliveredContent(rendered: string, delivered: string): number {
+  const want = rendered.split('\n').filter(isContentLine);
+  let matched = 0;
+  for (const line of delivered.split('\n')) {
+    if (matched < want.length && line === want[matched]) matched++;
   }
-  return rows;
+  return matched;
 }
 
 /** One rendering pass at a fixed markdown gap policy; see `formatTables` for how the policy is

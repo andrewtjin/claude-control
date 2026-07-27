@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { Envelope } from '@claude-control/shared-protocol';
 import { decodeButton } from './buttons.js';
 import { decodeQuestionSelect, OTHER_VALUE } from './questionCards.js';
-import { CHUNKED_CONTENT_BUDGET } from './messageChunks.js';
+import { chunkMessage } from './messageChunks.js';
 import { renderPush, RELOGIN_COMMAND } from './pushRender.js';
 import { formatTables } from './tableFormat.js';
 
@@ -318,33 +318,44 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(push?.content?.startsWith('**Moves**\n```\n┌')).toBe(true);
   });
 
-  it('counts the generic card heading against the budget it quotes the formatter', () => {
-    // The heading is delivered out of the same chunk budget as the body, so quoting the whole
-    // budget to the formatter claims room the heading has already taken — and the table then
-    // keeps rules it has no room for, at the cost of the rows below the real cut.
+  it('measures the generic card against the chunker that delivers it, heading included', () => {
+    // The heading rides in the same chunks as the body, and the chunker spends further lines
+    // reopening the fence it cut and marking what it dropped — none of which a row count reasoned
+    // out in advance can see. Sweeping walks the ruled render across the chunk cap one row at a
+    // time, so the answer cannot rest on a size where the two policies happen to agree.
     const title = 'T'.repeat(100);
     const table = (bodyRows: number): string =>
       [
         '| Account | Plan | Left |',
         '| --- | --- | --- |',
-        ...Array.from({ length: bodyRows }, (_, i) => `| account-${i} | max20x | ${i}% |`),
+        ...Array.from({ length: bodyRows }, (_, i) => `| acct-${i}. | max20x | ${i}% |`),
       ].join('\n');
-    // The widest table whose fully-ruled render still fits the raw chunk budget: every row of it
-    // survives on its own, and only the heading pushes it over.
-    let rows = 2;
-    while (formatTables(table(rows + 1)).length <= CHUNKED_CONTENT_BUDGET) rows++;
-    const push = renderPush(
-      env('hook.notification', {
-        event: 'notification',
-        title,
-        body: table(rows),
-        level: 'info',
-        notificationType: 'some_new_type',
-      }),
-    );
-    const content = push?.content ?? '';
-    expect(content.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(1);
-    for (let i = 0; i < rows; i++) expect(content).toContain(`account-${i}`);
+    /** What the reader really receives: the gateway sends `content` through `chunkMessage`. */
+    const delivered = (content: string): string => chunkMessage(content).join('\n');
+    /** The pre-fix render — a rule under the header and nowhere else. */
+    const bare = (text: string): string => {
+      let kept = 0;
+      return formatTables(text)
+        .split('\n')
+        .filter((line) => !line.startsWith('├') || kept++ === 0)
+        .join('\n');
+    };
+    for (let rows = 100; rows <= 200; rows++) {
+      const push = renderPush(
+        env('hook.notification', {
+          event: 'notification',
+          title,
+          body: table(rows),
+          level: 'info',
+          notificationType: 'some_new_type',
+        }),
+      );
+      const tokens = Array.from({ length: rows }, (_, i) => `acct-${i}.`);
+      const seen = (text: string): number => tokens.filter((t) => text.includes(t)).length;
+      const chosen = seen(delivered(push?.content ?? ''));
+      const baseline = seen(delivered(`**${title}**\n${bare(table(rows))}`));
+      expect({ rows, chosen }).toEqual({ rows, chosen: Math.max(chosen, baseline) });
+    }
   });
 });
 
