@@ -4,6 +4,7 @@ import {
   colorEnabled,
   detectPalette,
   outlookStyle,
+  pacingStyle,
   PLAIN_PALETTE,
   severityPaint,
   type Palette,
@@ -75,5 +76,31 @@ describe('outlookStyle', () => {
     expect(style.heading('h')).toBe('h');
     expect(style.alert('a')).toBe('a');
     expect(style.percent('42%', 42)).toBe('42%');
+  });
+});
+
+describe('pacingStyle', () => {
+  it('colors the verdict marker by what it says: green sustainable, red runs-dry, dim unknown', () => {
+    const style = pacingStyle(ANSI_PALETTE);
+    expect(style.marker('[ok]', 'sustainable')).toBe(ANSI_PALETTE.green('[ok]'));
+    expect(style.marker('[!!]', 'runs-dry')).toBe(ANSI_PALETTE.red('[!!]'));
+    expect(style.marker('[--]', 'unknown')).toBe(ANSI_PALETTE.dim('[--]'));
+  });
+
+  it('grades headroom by severity and marks waste yellow, never changing the visible text', () => {
+    const style = pacingStyle(ANSI_PALETTE);
+    // eslint-disable-next-line no-control-regex -- matching ESC codes is the whole point
+    const strip = (s: string) => s.replace(/\[[0-9;]*m/g, '');
+    expect(strip(style.percent('50%', 50))).toBe('50%');
+    expect(style.percent('critical', 97)).toBe(ANSI_PALETTE.red('critical'));
+    expect(style.waste('waste 1u: a in 5d')).toBe(ANSI_PALETTE.yellow('waste 1u: a in 5d'));
+  });
+
+  it('is the identity end-to-end over the plain palette', () => {
+    const style = pacingStyle(PLAIN_PALETTE);
+    expect(style.marker('[ok]', 'sustainable')).toBe('[ok]');
+    expect(style.percent('50%', 50)).toBe('50%');
+    expect(style.waste('w')).toBe('w');
+    expect(style.dim('d')).toBe('d');
   });
 });

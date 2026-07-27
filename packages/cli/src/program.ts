@@ -58,7 +58,7 @@ import {
   startDaemonTaskNow,
   uninstallDaemonTask,
 } from './daemonInstall.js';
-import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
+import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
   renderAccountsTable,
   renderDaemonStatus,
@@ -175,7 +175,9 @@ export function buildProgram(): Command {
       // for one trailing line.
       const inputs = buildAdvisorInputs(state);
       if (inputs.length > 0) {
-        text += '\n\n' + renderPacingLine(inputs, { nowMs, ...burnOption(state) });
+        text +=
+          '\n\n' +
+          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       process.stdout.write(text + '\n');
     });
@@ -196,7 +198,9 @@ export function buildProgram(): Command {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
         text +=
           '\n\n' + renderPlanSummary(computePlan(inputs, greedy ? { greedyAutoSwitch: true } : {}));
-        text += '\n\n' + renderPacingLine(inputs, { nowMs, ...burnOption(state) });
+        text +=
+          '\n\n' +
+          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       process.stdout.write(text + '\n');
     });

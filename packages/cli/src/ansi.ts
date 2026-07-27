@@ -8,7 +8,7 @@
 //  - color is only enabled on a real TTY with NO_COLOR unset, so piped/redirected output
 //    and CI logs remain byte-for-byte plain.
 
-import { severityOf, type OutlookStyle } from '@claude-control/usage-advisor';
+import { severityOf, type OutlookStyle, type PacingStyle } from '@claude-control/usage-advisor';
 
 /** A text decorator. Must not change the visible width of its input. */
 export type Paint = (text: string) => string;
@@ -108,5 +108,22 @@ export function outlookStyle(palette: Palette): OutlookStyle {
     both: palette.yellow,
     percent: (text, pct) => severityPaint(palette, pct)(text),
     alert: palette.red,
+  };
+}
+
+/** Adapt a palette to `renderPacingSummary`'s style hooks. The verdict marker takes the same
+ *  ok/bad/unknown-quiet split as `heartbeatLine`'s `[ok]`/`[!!]` daemon-status marks, headroom
+ *  reuses the shared severity bands, and the waste line gets yellow — it names a real loss, but
+ *  one still inside the horizon, not an active problem (that's `alert`/red territory above). */
+export function pacingStyle(palette: Palette): PacingStyle {
+  return {
+    marker: (text, verdict) => {
+      if (verdict === 'runs-dry') return palette.red(text);
+      if (verdict === 'sustainable') return palette.green(text);
+      return palette.dim(text);
+    },
+    percent: (text, pct) => severityPaint(palette, pct)(text),
+    waste: palette.yellow,
+    dim: palette.dim,
   };
 }

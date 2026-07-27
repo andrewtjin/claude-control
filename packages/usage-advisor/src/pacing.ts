@@ -109,6 +109,12 @@ export interface Pacing {
    *  accounts. Rendered under the headline; never empty when something was assumed. */
   notes: string[];
   accounts: AccountPacing[];
+  /** True when any input account's plan weight was unresolved, so the fleet math fell back to
+   *  weighting it equally (1 unit). Split out from `notes` as its own field because the compact
+   *  CLI view (`renderPacingSummary`) must never let this caveat get lost while the rest of the
+   *  prose notes are compressed away — it is the one assumption a reader cannot detect from the
+   *  numbers alone. */
+  tiersUnknown: boolean;
 }
 
 /** Knobs for the simulation. `nowMs` is required (the purity contract); the rest are the
@@ -148,6 +154,7 @@ export function computePacing(accounts: AccountUsageInput[], options: PacingOpti
   const capacityUnits = sim.reduce((sum, a) => sum + a.weight, 0);
   const replenishUnitsPerDay = (capacityUnits / WEEK_MS) * DAY_MS;
   const notes = buildNotes(accounts, outAccounts, sim.length, burnUnitsPerDay);
+  const tiersUnknown = accounts.some((a) => a.weight === undefined);
 
   if (sim.length === 0 || burnUnitsPerDay === undefined) {
     return {
@@ -161,6 +168,7 @@ export function computePacing(accounts: AccountUsageInput[], options: PacingOpti
       headline: unknownHeadline(sim.length, availableUnits, capacityUnits, replenishUnitsPerDay),
       notes,
       accounts: outAccounts,
+      tiersUnknown,
     };
   }
 
@@ -190,6 +198,7 @@ export function computePacing(accounts: AccountUsageInput[], options: PacingOpti
         ? [wasteNote(waste, wastedUnits, horizonDays, nowMs), ...notes]
         : notes,
     accounts: outAccounts,
+    tiersUnknown,
   };
 }
 
@@ -368,20 +377,23 @@ function unknownHeadline(
   );
 }
 
-/** "38u expires unused within 14d: 20u on tjin.29 in 6d, 18u on legoboy in 5d 3h."
- *
- *  Aggregated PER ACCOUNT rather than per reset: an account that wastes at two resets inside
- *  the horizon is one decision ("use tjin.29"), not two, and naming it twice buries the other
- *  accounts. Ranked by units lost, because the biggest loss is the one worth acting on, and
- *  stamped with that account's FIRST wasting reset, which is the deadline to act by. The named
- *  entries are capped, but the remainder is COUNTED in the sentence, never dropped. */
-function wasteNote(
-  waste: PacingWaste[],
-  wastedUnits: number,
-  horizonDays: number,
-  nowMs: number,
-): string {
-  const byAccount = new Map<string, { label: string; units: number; firstAtMs: number }>();
+/** One account's total loss inside the horizon, aggregated from however many individual resets
+ *  it wastes budget at. */
+interface WasteByAccount {
+  label: string;
+  units: number;
+  /** The account's FIRST wasting reset — the deadline to act by. */
+  firstAtMs: number;
+}
+
+/** Aggregate waste events PER ACCOUNT rather than per reset: an account that wastes at two
+ *  resets inside the horizon is one decision ("use tjin.29"), not two, and naming it twice
+ *  buries the other accounts. Ranked by units lost, because the biggest loss is the one worth
+ *  acting on first. Shared by the prose note (`wasteNote`) and the compact dashboard line
+ *  (`renderPacingSummary`) so the two views never disagree on which account is "the" one to
+ *  name. */
+function rankWasteByAccount(waste: PacingWaste[]): WasteByAccount[] {
+  const byAccount = new Map<string, WasteByAccount>();
   for (const w of waste) {
     const entry = byAccount.get(w.accountId);
     if (entry === undefined) {
@@ -391,9 +403,20 @@ function wasteNote(
     entry.units += w.units;
     entry.firstAtMs = Math.min(entry.firstAtMs, w.atMs);
   }
-  const ranked = [...byAccount.values()].sort(
+  return [...byAccount.values()].sort(
     (a, b) => b.units - a.units || a.firstAtMs - b.firstAtMs || a.label.localeCompare(b.label),
   );
+}
+
+/** "38u expires unused within 14d: 20u on tjin.29 in 6d, 18u on legoboy in 5d 3h." The named
+ *  entries are capped, but the remainder is COUNTED in the sentence, never dropped. */
+function wasteNote(
+  waste: PacingWaste[],
+  wastedUnits: number,
+  horizonDays: number,
+  nowMs: number,
+): string {
+  const ranked = rankWasteByAccount(waste);
   const named = ranked
     .slice(0, MAX_NAMED_WASTE)
     .map((w) => `${units(w.units)} on ${w.label} in ${humanizeDuration(w.firstAtMs - nowMs)}`)
@@ -464,8 +487,103 @@ function clamp01(x: number): number {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/** Compact rendering of the pacing outlook, printed under the timeline and usage views.
- *  Mirrors `renderPlanSummary`: one headline line, then the honesty notes as bullets. */
-export function renderPacingSummary(pacing: Pick<Pacing, 'headline' | 'notes'>): string {
-  return [`Pacing: ${pacing.headline}`, ...pacing.notes.map((n) => `  - ${n}`)].join('\n');
+/** Style hooks for `renderPacingSummary`, mirroring `OutlookStyle` in timeline.ts (same
+ *  identity-default, pure-decorator contract) rather than inventing a second convention. */
+export interface PacingStyle {
+  /** The `[ok]`/`[!!]`/`[--]` verdict marker, colored by what it says rather than by a fixed
+   *  role — sustainable, runs-dry and unknown are different colors, so the mark carries the
+   *  verdict that produced it. */
+  marker(text: string, verdict: PacingVerdict): string;
+  /** The headroom phrase, colorable by its severity band (mirrors `OutlookStyle.percent`). */
+  percent(text: string, pct: number): string;
+  /** The waste line: budget about to be destroyed unused. Loud because it is the single most
+   *  actionable line in the block. */
+  waste(text: string): string;
+  /** Low-salience furniture: the tier caveat, separators. */
+  dim(text: string): string;
+}
+
+/** The identity style — plain text, the default everywhere. */
+export const PLAIN_PACING_STYLE: PacingStyle = {
+  marker: (t) => t,
+  percent: (t) => t,
+  waste: (t) => t,
+  dim: (t) => t,
+};
+
+/**
+ * Compact, dashboard-style rendering of the pacing outlook, printed under `cctl usage` and
+ * `cctl timeline`. One line for what the fleet is doing (verdict, headroom, burn vs replenish),
+ * plus one more ONLY when there is something actionable beyond that: budget about to be wasted
+ * (which account, how soon) and whether plan tiers were assumed rather than known.
+ *
+ * This deliberately does not print `pacing.notes` — those are the full-prose honesty markers
+ * (predicted resets, excluded accounts, missing burn history) that `Pacing.headline`/`notes`
+ * still carry for the Discord embed, which has room for prose and no on-call operator staring
+ * at it for pacing decisions every few minutes. The CLI reader gets the four facts worth
+ * acting on: the rest is still visible in `cctl timeline`'s own per-account detail.
+ */
+export function renderPacingSummary(
+  pacing: Pick<
+    Pacing,
+    | 'verdict'
+    | 'availableUnits'
+    | 'capacityUnits'
+    | 'burnUnitsPerDay'
+    | 'replenishUnitsPerDay'
+    | 'horizonDays'
+    | 'dryAtMs'
+    | 'wastedUnits'
+    | 'waste'
+    | 'tiersUnknown'
+  >,
+  nowMs: number,
+  style: PacingStyle = PLAIN_PACING_STYLE,
+): string {
+  // Nothing to report yet (no account has contributed a weekly reading): say so and stop,
+  // rather than printing "0u of 0u (0%)" which reads like a real, alarming zero.
+  if (pacing.capacityUnits <= 0) return 'Pacing: no usage data yet.';
+
+  const pct = Math.round((pacing.availableUnits / pacing.capacityUnits) * 100);
+  const marker =
+    pacing.verdict === 'runs-dry' ? '[!!]' : pacing.verdict === 'unknown' ? '[--]' : '[ok]';
+  // `pct` is headroom (available/capacity) — high is GOOD. `style.percent`'s severity bands
+  // (shared with every other percent in the CLI) are keyed on percent USED — high is bad. Feed
+  // it the inverse so a fleet sitting on 90% headroom reads green, not a false-alarm red.
+  const headroom = style.percent(
+    `${units(pacing.availableUnits)}/${units(pacing.capacityUnits)} (${pct}%)`,
+    100 - pct,
+  );
+  const burn =
+    pacing.burnUnitsPerDay === undefined
+      ? 'burn unmeasured'
+      : `burn ${units(pacing.burnUnitsPerDay)}/d ${
+          pacing.burnUnitsPerDay > pacing.replenishUnitsPerDay ? '>' : '<'
+        } ${units(pacing.replenishUnitsPerDay)}/d`;
+  const outcome =
+    pacing.verdict === 'runs-dry' && pacing.dryAtMs !== undefined
+      ? `dry in ${humanizeDuration(pacing.dryAtMs - nowMs)}`
+      : pacing.verdict === 'sustainable'
+        ? `${pacing.horizonDays}d`
+        : `replenish ${units(pacing.replenishUnitsPerDay)}/d`;
+
+  const head = `Pacing: ${style.marker(marker, pacing.verdict)} ${headroom} - ${burn} - ${outcome}`;
+
+  const caveats: string[] = [];
+  if (pacing.wastedUnits > UNIT_EPSILON) {
+    const ranked = rankWasteByAccount(pacing.waste);
+    const top = ranked[0];
+    if (top !== undefined) {
+      const more = ranked.length - 1;
+      caveats.push(
+        style.waste(
+          `waste ${units(pacing.wastedUnits)}: ${top.label} in ${humanizeDuration(top.firstAtMs - nowMs)}` +
+            `${more > 0 ? ` +${more}` : ''}`,
+        ),
+      );
+    }
+  }
+  if (pacing.tiersUnknown) caveats.push(style.dim('tiers unknown'));
+
+  return caveats.length > 0 ? `${head}\n  ${caveats.join('  ')}` : head;
 }

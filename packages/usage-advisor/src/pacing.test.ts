@@ -431,24 +431,129 @@ describe('computePacing — misc', () => {
         nowMs: NOW,
         ...(burnUnitsPerDay !== undefined ? { burnUnitsPerDay } : {}),
       });
-      expect(renderPacingSummary(pacing)).not.toContain('NaN');
+      expect(renderPacingSummary(pacing, NOW)).not.toContain('NaN');
     }
   });
 });
 
 describe('renderPacingSummary', () => {
-  it('prints the headline first, then every note as its own bullet', () => {
+  it('prints headroom, burn vs replenish, and the sustainable horizon on one line', () => {
+    // Reset lands outside the horizon (no in-horizon replenishment) and the burn rate never
+    // drains the balance across the full 14d, so this stays sustainable throughout.
     const pacing = computePacing(
-      [account({ accountId: 'a', label: 'legoboy', limits: [weekly(0, 2)] })],
-      { nowMs: NOW },
+      [account({ accountId: 'a', weight: 7, limits: [weekly(50, 20)] })],
+      { nowMs: NOW, burnUnitsPerDay: 0.2 },
     );
-    expect(renderPacingSummary(pacing)).toBe(
+    expect(renderPacingSummary(pacing, NOW)).toBe(
+      'Pacing: [ok] 3.5u/7u (50%) - burn 0.2u/d < 1u/d - 14d',
+    );
+  });
+
+  it('prints a countdown for a fleet that runs dry inside the horizon', () => {
+    // Reset lands outside the horizon so this exercises the dry-out path in isolation from
+    // the waste path (the fleet burns out before any account ever resets).
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 1, limits: [weekly(0, 20)] })],
+      {
+        nowMs: NOW,
+        burnUnitsPerDay: 1,
+      },
+    );
+    expect(renderPacingSummary(pacing, NOW)).toBe(
+      'Pacing: [!!] 1u/1u (100%) - burn 1u/d > 0.1u/d - dry in 1d',
+    );
+  });
+
+  it('prints "burn unmeasured" and no verdict when there is no burn history yet', () => {
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 2, limits: [weekly(50, 10)] })],
+      {
+        nowMs: NOW,
+      },
+    );
+    expect(renderPacingSummary(pacing, NOW)).toBe(
+      'Pacing: [--] 1u/2u (50%) - burn unmeasured - replenish 0.3u/d',
+    );
+  });
+
+  it('says so and stops when no account has contributed a weekly reading yet', () => {
+    const pacing = computePacing([account({ accountId: 'a', quarantined: true })], { nowMs: NOW });
+    expect(pacing.capacityUnits).toBe(0);
+    expect(renderPacingSummary(pacing, NOW)).toBe('Pacing: no usage data yet.');
+  });
+
+  it('adds a waste line naming the account and deadline, without narrating the rest', () => {
+    // A weekly reset every 7d inside a 14d horizon fires twice (day 5, day 12); with nothing
+    // burned, the account's full 1u allowance is lost at each — 2u total, one account named.
+    const pacing = computePacing([account({ accountId: 'a', weight: 1, limits: [weekly(0, 5)] })], {
+      nowMs: NOW,
+      burnUnitsPerDay: 0,
+    });
+    expect(renderPacingSummary(pacing, NOW)).toBe(
+      ['Pacing: [ok] 1u/1u (100%) - burn 0u/d < 0.1u/d - 14d', '  waste 2u: a in 5d'].join('\n'),
+    );
+  });
+
+  it('compresses the plan-tier caveat to a short marker instead of dropping it', () => {
+    // `weight` omitted on purpose: the model falls back to 1 unit and must say so.
+    const pacing = computePacing([account({ accountId: 'a', limits: [weekly(0, 20)] })], {
+      nowMs: NOW,
+      burnUnitsPerDay: 0,
+    });
+    expect(pacing.tiersUnknown).toBe(true);
+    expect(renderPacingSummary(pacing, NOW)).toBe(
+      ['Pacing: [ok] 1u/1u (100%) - burn 0u/d < 0.1u/d - 14d', '  tiers unknown'].join('\n'),
+    );
+  });
+
+  it('ranks waste by units lost, names the top account, and counts the rest', () => {
+    // Each account's weekly reset also fires twice inside the 14d horizon (see the previous
+    // test): a loses 2u twice (4u), b loses 1u twice (2u) — a outranks b on total units lost.
+    const pacing = computePacing(
       [
-        'Pacing: 1u of 1u available (100%), 0.1u/day replenished - burn rate not measured yet, ' +
-          'so no sustainability verdict.',
-        '  - no usage history to measure a burn rate from yet.',
-        '  - plan tiers unknown, so accounts are weighted equally (1 unit each).',
+        account({ accountId: 'a', label: 'a', weight: 2, limits: [weekly(0, 3)] }),
+        // No weight on b: also exercises both caveats sharing one line.
+        account({ accountId: 'b', label: 'b', limits: [weekly(0, 4)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 0 },
+    );
+    expect(renderPacingSummary(pacing, NOW)).toBe(
+      [
+        'Pacing: [ok] 3u/3u (100%) - burn 0u/d < 0.4u/d - 14d',
+        '  waste 6u: a in 3d +1  tiers unknown',
       ].join('\n'),
     );
+  });
+
+  it('routes exactly the marker, headroom and waste segments through an injected style', () => {
+    const pacing = computePacing([account({ accountId: 'a', weight: 1, limits: [weekly(0, 5)] })], {
+      nowMs: NOW,
+      burnUnitsPerDay: 0,
+    });
+    const calls: string[] = [];
+    const spy = renderPacingSummary(pacing, NOW, {
+      marker: (t, v) => {
+        calls.push(`marker:${v}`);
+        return `<${t}>`;
+      },
+      percent: (t) => {
+        calls.push('percent');
+        return `[${t}]`;
+      },
+      waste: (t) => {
+        calls.push('waste');
+        return `{${t}}`;
+      },
+      dim: (t) => {
+        calls.push('dim');
+        return `(${t})`;
+      },
+    });
+    // Execution order follows source order, not call-site prominence: headroom is computed
+    // (and painted) before the marker is embedded into the headline template, so `percent`
+    // fires before `marker` here. `dim` never fires — this scenario has a known plan tier.
+    expect(calls).toEqual(['percent', 'marker:sustainable', 'waste']);
+    expect(spy).toContain('<[ok]>');
+    expect(spy).toContain('{waste 2u: a in 5d}');
   });
 });
