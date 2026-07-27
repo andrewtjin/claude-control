@@ -552,8 +552,11 @@ export interface PacingStyle {
   waste(text: string): string;
   /** A state the operator has to repair before pacing can say anything at all. */
   warn(text: string): string;
-  /** Low-salience furniture: the tier caveat, separators. */
+  /** Low-salience furniture: the unit legend, separators. */
   dim(text: string): string;
+  /** The row labels down the left edge. These are what the eye lands on first when scanning the
+   *  block, so they are emphasized rather than dimmed — the label is the index, not furniture. */
+  label(text: string): string;
 }
 
 /** The identity style — plain text, the default everywhere. */
@@ -563,13 +566,33 @@ export const PLAIN_PACING_STYLE: PacingStyle = {
   waste: (t) => t,
   warn: (t) => t,
   dim: (t) => t,
+  label: (t) => t,
 };
+
+/** Width of the row-label column. Sized to the longest label ("expires") so the value columns
+ *  line up under each other; alignment is computed on plain text, which is safe because every
+ *  `PacingStyle` hook is width-preserving. */
+const ROW_LABEL_WIDTH = 7;
 
 /**
  * Compact, dashboard-style rendering of the pacing outlook, printed under `cctl usage` and
- * `cctl timeline`. One line for what the fleet is doing (verdict, headroom, burn vs replenish),
- * plus one more ONLY when there is something actionable beyond that: budget about to be wasted
- * (which account, how soon) and whether plan tiers were assumed rather than known.
+ * `cctl timeline`: a verdict line, then labelled rows.
+ *
+ *   Pacing  [ok] sustainable past 14d (6u/11.4u burned per day)
+ *     left     54u of 80u (67%)
+ *     expires  jina25 9.6u in 4d 1h, then 2 more - 72u total over 14d
+ *     1u = one Pro account-week (a Max 20x counts 20)
+ *
+ * EVERY NUMBER IS LABELLED, which the first compact version did not manage: it printed
+ * "burn 0.3u/d < 0.6u/d - 14d", where the second figure named nothing (a reader cannot tell
+ * replenishment from a threshold or a recommendation) and the bare "14d" carried no verb. The
+ * burn pair now sits inside the verdict it explains, as the fraction of the daily refill being
+ * consumed, which is the one comparison that decides sustainable-vs-dry.
+ *
+ * The unit needs the legend because it is not a quantity anyone can eyeball: 1u is one Pro
+ * account's weekly allowance, so the SAME fleet reads "2.7u of 4u" while plan tiers are unknown
+ * and "54u of 80u" once they resolve to Max 20x. Percentages and the burn fraction are stable
+ * across that change; the absolute figures are not.
  *
  * This deliberately does not print `pacing.notes` — those are the full-prose honesty markers
  * (predicted resets, excluded accounts, missing burn history) that `Pacing.headline`/`notes`
@@ -607,57 +630,102 @@ export function renderPacingSummary(
   const pct = Math.round((pacing.availableUnits / pacing.capacityUnits) * 100);
   const marker =
     pacing.verdict === 'runs-dry' ? '[!!]' : pacing.verdict === 'unknown' ? '[--]' : '[ok]';
+
+  // The verdict, then the burn pair that produced it. Naming the outcome BEFORE the arithmetic
+  // is the whole point of a dashboard line: the reader who only reads three words still learns
+  // whether anything is wrong.
+  const outcome =
+    pacing.verdict === 'runs-dry' && pacing.dryAtMs !== undefined
+      ? `runs dry in ${humanizeDuration(pacing.dryAtMs - nowMs)}`
+      : pacing.verdict === 'sustainable'
+        ? `sustainable past ${pacing.horizonDays}d`
+        : 'burn rate not measured yet';
+  const head =
+    `Pacing  ${style.marker(marker, pacing.verdict)} ${outcome}` +
+    `${burnFraction(pacing.burnUnitsPerDay, pacing.replenishUnitsPerDay, style)}`;
+
   // `pct` is headroom (available/capacity) — high is GOOD. `style.percent`'s severity bands
   // (shared with every other percent in the CLI) are keyed on percent USED — high is bad. Feed
   // it the inverse so a fleet sitting on 90% headroom reads green, not a false-alarm red.
-  const headroom = style.percent(
-    `${units(pacing.availableUnits)}/${units(pacing.capacityUnits)} (${pct}%)`,
-    100 - pct,
-  );
-  const burn =
-    pacing.burnUnitsPerDay === undefined
-      ? 'burn unmeasured'
-      : `burn ${units(pacing.burnUnitsPerDay)}/d ${compareUnits(
-          pacing.burnUnitsPerDay,
-          pacing.replenishUnitsPerDay,
-        )} ${units(pacing.replenishUnitsPerDay)}/d`;
-  const outcome =
-    pacing.verdict === 'runs-dry' && pacing.dryAtMs !== undefined
-      ? `dry in ${humanizeDuration(pacing.dryAtMs - nowMs)}`
-      : pacing.verdict === 'sustainable'
-        ? `${pacing.horizonDays}d`
-        : `replenish ${units(pacing.replenishUnitsPerDay)}/d`;
+  const rows = [
+    row(
+      'left',
+      style.percent(
+        `${units(pacing.availableUnits)} of ${units(pacing.capacityUnits)} (${pct}%)`,
+        100 - pct,
+      ),
+      style,
+    ),
+  ];
 
-  const head = `Pacing: ${style.marker(marker, pacing.verdict)} ${headroom} - ${burn} - ${outcome}`;
-
-  const caveats: string[] = [];
   if (pacing.wastedUnits > UNIT_EPSILON) {
-    // The total is fleet-wide, so the one deadline printed beside it must be the EARLIEST of the
-    // accounts feeding it, and the account named must be the one that deadline belongs to. Any
-    // other pairing reads as "all of this is safe until then" and lets the first budget expire.
-    const soonest = rankWasteByDeadline(pacing.waste)[0];
-    if (soonest !== undefined) {
-      const more = wasteByAccount(pacing.waste).length - 1;
-      caveats.push(
-        style.waste(
-          `waste ${units(pacing.wastedUnits)}: soonest ${soonest.label} in ${humanizeDuration(soonest.firstAtMs - nowMs)}` +
-            `${more > 0 ? ` +${more}` : ''}`,
-        ),
-      );
-    }
+    const expiring = renderExpiring(pacing.waste, pacing.wastedUnits, pacing.horizonDays, nowMs);
+    if (expiring !== undefined) rows.push(row('expires', style.waste(expiring), style));
   }
-  if (pacing.tiersUnknown) caveats.push(style.dim('tiers unknown'));
+  rows.push(`  ${style.dim(unitLegend(pacing.tiersUnknown))}`);
 
-  return caveats.length > 0 ? `${head}\n  ${caveats.join('  ')}` : head;
+  return [head, ...rows].join('\n');
 }
 
-/** `>`/`<`/`=` between two unit figures, decided on the values the line PRINTS. Equality is a
- *  real outcome twice over: a burn that exactly matches replenishment, and two different rates
- *  that round to the same displayed figure. */
-function compareUnits(left: number, right: number): string {
-  const shownLeft = roundUnits(left);
-  const shownRight = roundUnits(right);
-  return shownLeft > shownRight ? '>' : shownLeft < shownRight ? '<' : '=';
+/** One labelled row, padded on the PLAIN label so the value columns align regardless of style. */
+function row(label: string, value: string, style: PacingStyle): string {
+  return `  ${style.label(label.padEnd(ROW_LABEL_WIDTH))}  ${value}`;
+}
+
+/** "(6u/11.4u burned per day)" — what is being spent against what arrives, as a fraction, since
+ *  the ratio is what decides the verdict it sits beside. Colored by the share of the refill
+ *  consumed, so a fleet burning faster than it refills reads hot even when the stock is still
+ *  healthy: `severityOf`-style bands are keyed on percent USED, and burn/refill IS that percent.
+ *  Empty when burn was never measured — the verdict already says so, and inventing a zero would
+ *  read as "nothing is being used". */
+function burnFraction(
+  burnUnitsPerDay: number | undefined,
+  replenishUnitsPerDay: number,
+  style: PacingStyle,
+): string {
+  if (burnUnitsPerDay === undefined) return '';
+  const shareOfRefill =
+    replenishUnitsPerDay > 0 ? Math.round((burnUnitsPerDay / replenishUnitsPerDay) * 100) : 100;
+  const text = `${units(burnUnitsPerDay)}/${units(replenishUnitsPerDay)} burned per day`;
+  return ` (${style.percent(text, shareOfRefill)})`;
+}
+
+/** "jina25 9.6u in 4d 1h, then 2 more - 72u total over 14d".
+ *
+ *  The named account is the one whose budget expires FIRST, paired with ITS OWN loss and ITS OWN
+ *  deadline. That pairing is the load-bearing part: an earlier version printed the fleet-wide
+ *  total beside one account's date, which reads as "all of it keeps until then".
+ *
+ *  Note the first waster is NOT generally the first account to reset. The simulation spends from
+ *  whichever account expires soonest, so the earliest-resetting accounts are typically drained to
+ *  nothing and lose NOTHING; the first real loss belongs to the first account still holding
+ *  budget when its reset lands. Naming it "soonest" invited exactly the reading it deserves —
+ *  that it resets first — so the row says what expires, not what is soonest. */
+function renderExpiring(
+  waste: PacingWaste[],
+  wastedUnits: number,
+  horizonDays: number,
+  nowMs: number,
+): string | undefined {
+  const first = rankWasteByDeadline(waste)[0];
+  if (first === undefined) return undefined;
+  const others = wasteByAccount(waste).length - 1;
+  const head = `${first.label} ${units(first.units)} in ${humanizeDuration(first.firstAtMs - nowMs)}`;
+  // With a single waster the fleet total IS the named figure, so repeating it would just invite
+  // the reader to look for the difference between two identical numbers.
+  return others > 0
+    ? `${head}, then ${others} more - ${units(wastedUnits)} total over ${horizonDays}d`
+    : `${head} - nothing else expires within ${horizonDays}d`;
+}
+
+/** The unit legend. `u` is unguessable — it is one Pro account's WEEKLY allowance, which is why
+ *  the same fleet reads "4u" and "80u" either side of resolving its plan tiers. When a tier could
+ *  not be resolved the legend states the fallback instead of the multiplier, because quoting the
+ *  20x rule to a reader whose accounts were all counted as 1u describes math that did not run. */
+function unitLegend(tiersUnknown: boolean): string {
+  return tiersUnknown
+    ? '1u = one Pro account-week; plan tiers unknown, so every account counts 1u'
+    : '1u = one Pro account-week (a Max 20x counts 20)';
 }
 
 /** The line for a fleet with no measurable capacity. An account excluded for quarantine holds
