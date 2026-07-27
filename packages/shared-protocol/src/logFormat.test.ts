@@ -1,5 +1,19 @@
 import { describe, it, expect } from 'vitest';
-import { formatLogLine } from './logFormat.js';
+import { formatLogLine, type LogLineColors } from './logFormat.js';
+
+/** A test palette that wraps text in a distinct bracketed tag per paint instead of real ANSI
+ *  codes — assertions can then read intent (`[DIM]...[/DIM]`) instead of matching opaque escape
+ *  bytes, while still exercising exactly the same wrapping contract a real palette uses. */
+function tagPalette(): LogLineColors {
+  const tag =
+    (name: string) =>
+    (text: string): string =>
+      `[${name}]${text}[/${name}]`;
+  return {
+    dim: tag('DIM'),
+    level: (level) => tag(level.toUpperCase() === 'ERROR' ? 'RED' : 'YELLOW'),
+  };
+}
 
 /** A fixed instant with distinct H/M/S so every test asserts on the same, unambiguous time
  *  text — built from local Date components so the test passes in any timezone the CI runner
@@ -224,6 +238,58 @@ describe('formatLogLine', () => {
       const line = formatLogLine('info', ms, { detail: 'short' }, 'm');
       expect(line).toContain('detail=short');
       expect(line).not.toContain('…');
+    });
+  });
+
+  describe('color (pretty-mode-only styling)', () => {
+    it('renders exactly the plain string when colors is omitted, regardless of level', () => {
+      // The default must stay byte-identical to every other test in this file — color is
+      // strictly opt-in per call, never inferred from the level or the environment here.
+      const { ms, text } = localTime(13, 13, 13);
+      expect(formatLogLine('error', ms, { sessionId: 's1' }, 'boom')).toBe(
+        `${text} ${pad5('error')}  boom  sessionId=s1`,
+      );
+    });
+
+    it('paints the timestamp and the key=val tail dim, and leaves the message unpainted', () => {
+      const { ms } = localTime(14, 14, 14);
+      const line = formatLogLine('info', ms, { sessionId: 's1' }, 'started', {
+        colors: tagPalette(),
+      });
+      expect(line).toContain('[DIM]');
+      expect(line).toContain('sessionId=s1[/DIM]');
+      // The message itself carries no tag on either side.
+      expect(line).toContain('  started  ');
+      expect(line).not.toContain('[DIM]started');
+    });
+
+    it("colors the level token by the line's own level, not by a fixed color", () => {
+      const { ms } = localTime(15, 15, 15);
+      const errorLine = formatLogLine('error', ms, {}, 'm', { colors: tagPalette() });
+      const infoLine = formatLogLine('info', ms, {}, 'm', { colors: tagPalette() });
+      expect(errorLine).toContain('[RED]ERROR[/RED]');
+      expect(infoLine).toContain('[YELLOW]INFO ');
+    });
+
+    it('colors the level word AFTER padding, so alignment is unaffected by the paint', () => {
+      // A regression here would mean a palette that adds characters (like real ANSI codes)
+      // shifts the message's start column depending on level-word length.
+      const { ms } = localTime(16, 16, 16);
+      const line = formatLogLine('info', ms, {}, 'm', { colors: tagPalette() });
+      expect(line).toContain('[YELLOW]INFO [/YELLOW]');
+    });
+
+    it('never paints the err stack, even when both includeStack and colors are supplied', () => {
+      const { ms } = localTime(17, 17, 17);
+      const err = { message: 'boom', stack: 'Error: boom\n    at somewhere.js:1:1' };
+      const line = formatLogLine('debug', ms, { err }, 'failed', {
+        includeStack: true,
+        colors: tagPalette(),
+      });
+      // The stack's own indentation is untouched by the palette — no tag characters inserted
+      // between the newline and the 4-space prefix.
+      expect(line).toContain('\n    Error: boom');
+      expect(line).toContain('\n        at somewhere.js:1:1');
     });
   });
 
