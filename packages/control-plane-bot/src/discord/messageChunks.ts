@@ -30,6 +30,14 @@ export const DISCORD_CONTENT_MAX = 2000;
 const DEFAULT_MAX_CHUNKS = 4;
 
 const FENCE = '```';
+
+/** How much text a chunked send actually delivers before the chunk cap starts dropping it — the
+ *  bound a caller sizes its content against (see `formatTables`'s `budget`). Every chunk after a
+ *  cut may spend a line reopening a fence and another closing it, so the usable room per message
+ *  is short of the raw cap; counting it out is deliberate, since guessing HIGH here is paid for
+ *  in content the reader never sees. */
+export const CHUNKED_CONTENT_BUDGET = DEFAULT_MAX_CHUNKS * (DISCORD_CONTENT_MAX - 2 * FENCE.length);
+
 const TRUNCATION_NOTE = '… (truncated)';
 const FENCE_LINE = /^\s*```(.*)$/;
 

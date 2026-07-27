@@ -18,6 +18,7 @@ import {
 } from './embeds.js';
 import { permissionButtons, type ButtonSpec } from './buttons.js';
 import { questionSelectSpecs, type SelectSpec } from './questionCards.js';
+import { CHUNKED_CONTENT_BUDGET } from './messageChunks.js';
 import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
 import { defuseFences, formatTables } from './tableFormat.js';
 
@@ -105,7 +106,9 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
     // A summary is assistant prose posted as plain content, where Discord renders neither a
     // markdown table nor a terminal-width box — re-render before the gateway chunks it, so a
     // chunk boundary lands between finished lines instead of inside a table it then has to fence.
-    return { content: formatTables(envelope.payload.text) };
+    // What the chunker will really deliver is the formatter's budget, so a table long enough to
+    // reach the chunk cap sheds its rules rather than its last rows.
+    return { content: formatTables(envelope.payload.text, { budget: CHUNKED_CONTENT_BUDGET }) };
   }
   if (isType(envelope, 'error')) {
     // A protocol `error` envelope is the daemon telling the phone something explicitly failed
@@ -187,7 +190,9 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
       // The generic card is a bold title over relayed body text; that body is whatever the
       // session had to say, tables included, so it goes through the formatter like every other
       // prose surface.
-      return { content: `**${p.title}**\n${formatTables(p.body)}` };
+      return {
+        content: `**${p.title}**\n${formatTables(p.body, { budget: CHUNKED_CONTENT_BUDGET })}`,
+      };
   }
 }
 

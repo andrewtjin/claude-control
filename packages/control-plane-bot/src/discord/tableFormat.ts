@@ -31,10 +31,11 @@ const MIN_COL_WIDTH = 6;
  *  the line above" without eating width the prose needs. */
 const RECORD_INDENT = '  ';
 
-/** A parsed table: rows of cell text, plus which row gaps get a horizontal separator in the
- *  render (markdown tables separate every row — the syntax has no way to say "no separator
- *  here" past the header delimiter, so leaving later gaps unmarked ran every body row after
- *  the first into the next; box tables keep whatever the source itself drew). */
+/** A parsed table: rows of cell text, plus which row gaps carry a horizontal separator in the
+ *  render. A box source states its own gaps, and those are mirrored exactly. Markdown states
+ *  none — its single delimiter row marks where the HEADER ends, not where rules belong — so for
+ *  markdown the gaps are chosen, not read: a rule at every gap so no two rows touch, or at the
+ *  header alone when the rules cost more room than the surface has (see `formatTables`). */
 interface ParsedTable {
   rows: string[][];
   separatorAfterRow: boolean[];
@@ -107,20 +108,29 @@ function parseBoxBlock(lines: string[]): ParsedTable | undefined {
   return { rows, separatorAfterRow: separatorAfterRow.slice(0, rows.length) };
 }
 
-/** Parse a markdown pipe table (header, separator, body) into rows. The delimiter row is
- *  dropped entirely — its only job was marking where the header ends, not how many separators
- *  the render gets. Markdown syntax puts every row on its own line with no way to opt a pair of
- *  them out of a separator, so every gap is a boundary; see `ParsedTable`. */
-function parseMarkdownBlock(lines: string[]): ParsedTable | undefined {
+/** Parse a markdown pipe table (header, delimiter, body) into rows. The delimiter row carries no
+ *  content, so it is dropped; where it sat is kept only as the fallback gap placement. Markdown
+ *  puts every row on its own line and offers no way to mark a gap between two of them, so with
+ *  `separateEveryRow` every gap is a boundary and adjacent rows can never run together; without
+ *  it the render falls back to the delimiter's own position — a rule under the header only. */
+function parseMarkdownBlock(lines: string[], separateEveryRow: boolean): ParsedTable | undefined {
   const rows: string[][] = [];
+  const delimiterAfterRow: boolean[] = [];
   for (const line of lines) {
-    if (isMarkdownSeparator(line)) continue;
+    if (isMarkdownSeparator(line)) {
+      if (rows.length > 0) delimiterAfterRow[rows.length - 1] = true;
+      continue;
+    }
     rows.push(markdownCells(line));
+    delimiterAfterRow.push(false);
   }
   if (rows.length < 2) return undefined;
   const cols = rows[0]?.length ?? 0;
   if (cols < 2 || rows.some((r) => r.length !== cols)) return undefined;
-  return { rows, separatorAfterRow: rows.map((_, i) => i < rows.length - 1) };
+  const separatorAfterRow = separateEveryRow
+    ? rows.map((_, i) => i < rows.length - 1)
+    : delimiterAfterRow.slice(0, rows.length);
+  return { rows, separatorAfterRow };
 }
 
 /** Greedy word-wrap of one cell to `width`, hard-splitting tokens longer than the width
@@ -339,14 +349,44 @@ function renderParsed(table: ParsedTable, maxWidth: number): string {
   );
 }
 
+export interface TableFormatOptions {
+  /** Target rendered width in monospace columns. Defaults to `DEFAULT_TABLE_WIDTH`. */
+  maxWidth?: number;
+  /** How many characters of the result the caller's surface will actually SHOW — a field cap, a
+   *  description cap, the total a chunked DM delivers before it truncates. Omit when the caller
+   *  has no bound. */
+  budget?: number;
+}
+
 /**
  * Re-render every table in `text` for Discord: box-drawing and markdown pipe tables become fenced
  * blocks at most ~`maxWidth` columns wide — a compact box, or a record list when the cells are
  * long prose. All other lines (and anything the author already fenced) pass through
  * byte-identical. Returns the input unchanged when no table is found, so callers can apply this
  * unconditionally.
+ *
+ * ROWS OUTRANK RULES. A markdown source says nothing about where horizontal rules belong, so the
+ * render puts one in every gap: it is the only thing stopping one body row from reading as a
+ * continuation of the one above it. But each rule costs a whole line, which on a long table is
+ * the difference between a surface showing every row and showing two thirds of them under a
+ * "+N more" — and a reader who can see all sixteen accounts is better served than one looking at
+ * thirteen prettier ones. So `budget` makes the choice: rules everywhere while the result fits
+ * what the caller can display, and a rule under the header alone once it does not.
+ *
+ * The retreat is all-or-nothing across the whole text rather than per table. Deliberate: which
+ * of several tables should pay is not a question the character count can answer, and a mixed
+ * render — some tables ruled, some not — reads as a bug rather than as a budget.
  */
-export function formatTables(text: string, maxWidth = DEFAULT_TABLE_WIDTH): string {
+export function formatTables(text: string, options: TableFormatOptions = {}): string {
+  const maxWidth = options.maxWidth ?? DEFAULT_TABLE_WIDTH;
+  const ruled = render(text, maxWidth, true);
+  if (options.budget === undefined || ruled.length <= options.budget) return ruled;
+  return render(text, maxWidth, false);
+}
+
+/** One rendering pass at a fixed markdown gap policy; see `formatTables` for how the policy is
+ *  chosen. Box tables ignore the policy — their gaps come from the source. */
+function render(text: string, maxWidth: number, separateEveryRow: boolean): string {
   const lines = text.split('\n');
   const out: string[] = [];
   let inFence = false;
@@ -394,7 +434,7 @@ export function formatTables(text: string, maxWidth = DEFAULT_TABLE_WIDTH): stri
         i++;
       }
       const block = lines.slice(start, i);
-      const parsed = parseMarkdownBlock(block);
+      const parsed = parseMarkdownBlock(block, separateEveryRow);
       if (parsed) {
         out.push(renderParsed(parsed, maxWidth));
         continue;

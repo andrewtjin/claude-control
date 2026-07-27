@@ -74,10 +74,9 @@ describe('formatTables — box-drawing input', () => {
   });
 
   it('keeps a separator between every body row for a fully-separated box source (3 rows)', () => {
-    // The exact shape from the phone report: three single-character body rows with a separator
-    // already drawn between each. Box-drawing input mirrors whatever the source drew (unlike
-    // markdown, which has no per-gap separator to mirror), and a fully-separated source has one
-    // at every gap — this confirms that fidelity holds and stays narrowed to natural width.
+    // A box source states its own gaps and the render mirrors them exactly — unlike markdown,
+    // which states none. A source ruled at every gap therefore comes back ruled at every gap,
+    // and narrowing the columns to their natural width must not cost a single rule.
     const threeRows = [
       '┌─────┬─────┬─────┐',
       '│  A  │  A  │  A  │',
@@ -173,10 +172,10 @@ describe('formatTables — markdown pipe input', () => {
   });
 
   it('separates every body row, not just the header — a markdown table has no way to mark a gap as unseparated', () => {
-    // The exact symptom reported from a phone render: a table with 3+ body rows where only the
-    // header/body boundary got a separator, so every row after the first one ran into the next.
-    // A single-column-per-cell fixture keeps the box narrow enough that nothing wraps, isolating
-    // the separator count from the width/wrap behavior covered elsewhere.
+    // With a rule only under the header, every body row past the first sits flush against the
+    // next and the three of them read as one three-line row. A single-character cell keeps the
+    // box narrow enough that nothing wraps, isolating the rule count from the width/wrap
+    // behavior covered elsewhere.
     const threeBodyRows = [
       '| Col | Val |',
       '| --- | --- |',
@@ -202,8 +201,61 @@ describe('formatTables — markdown pipe input', () => {
   });
 
   it('honors a custom width', () => {
-    const out = formatTables(MD_TABLE, 60);
+    const out = formatTables(MD_TABLE, { maxWidth: 60 });
     for (const line of out.split('\n')) expect(line.length).toBeLessThanOrEqual(60);
+  });
+});
+
+describe('formatTables — budget', () => {
+  /** A markdown table whose cells are short enough to stay a grid, so the only thing that grows
+   *  with `bodyRows` is the row count and the rules between them. */
+  const mdTable = (bodyRows: number): string =>
+    [
+      '| Account | Plan | Left |',
+      '| --- | --- | --- |',
+      ...Array.from({ length: bodyRows }, (_, i) => `| account-${i} | max20x | ${i}% |`),
+    ].join('\n');
+
+  it('rules every gap while the result fits the budget', () => {
+    const out = formatTables(mdTable(3), { budget: 4096 });
+    expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
+  });
+
+  it('drops the rules to a single header one once they no longer fit', () => {
+    const source = mdTable(20);
+    const ruled = formatTables(source);
+    const budgeted = formatTables(source, { budget: ruled.length - 1 });
+    expect(budgeted.length).toBeLessThan(ruled.length);
+    // Down to the delimiter's own gap, and not one rule further: the header must stay divided
+    // from the body even when there is no room for anything else.
+    expect(budgeted.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(1);
+  });
+
+  it('keeps every row when the rules are what had to go', () => {
+    const source = mdTable(20);
+    const budgeted = formatTables(source, { budget: 1024 });
+    expect(budgeted.length).toBeLessThanOrEqual(1024);
+    for (let i = 0; i < 20; i++) expect(budgeted).toContain(`account-${i}`);
+  });
+
+  it('leaves a box source ruled as it was drawn even under a budget it overruns', () => {
+    // A box source states its gaps, so shedding them would be dropping information the sender
+    // supplied — a budget buys back what this module chose to add, never what it was given.
+    const box = [
+      '┌─────┬─────┐',
+      '│ a   │ b   │',
+      '├─────┼─────┤',
+      '│ c   │ d   │',
+      '├─────┼─────┤',
+      '│ e   │ f   │',
+      '└─────┴─────┘',
+    ].join('\n');
+    const out = formatTables(box, { budget: 1 });
+    expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(2);
+  });
+
+  it('is unchanged by a budget it never reaches', () => {
+    expect(formatTables(mdTable(2), { budget: 4096 })).toBe(formatTables(mdTable(2)));
   });
 });
 
