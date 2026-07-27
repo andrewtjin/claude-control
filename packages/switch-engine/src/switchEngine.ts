@@ -20,13 +20,14 @@ import { type Protector } from './dpapi.js';
 import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
 import {
   CadenceError,
+  LockTimeoutError,
   QuarantineError,
   RefreshError,
   UnknownAccountError,
   VerifyError,
 } from './errors.js';
 import { IntentStore } from './intent.js';
-import { acquireLock, type LockOptions } from './lock.js';
+import { acquireLock, type Lock, type LockOptions } from './lock.js';
 import { noopLogger, type Logger } from './logger.js';
 import {
   DEFAULT_REFRESH_SKEW_MS,
@@ -46,7 +47,7 @@ import type {
   RefreshTokenResult,
   StoredAccount,
 } from './types.js';
-import { Vault } from './vault.js';
+import { needsMetadataBackfill, Vault } from './vault.js';
 
 /** Signature of the refresh function, so tests can inject a fake. */
 export type RefreshFn = (current: ClaudeOauth, deps?: RefreshDeps) => Promise<ClaudeOauth>;
@@ -80,6 +81,13 @@ export interface ActivateOptions {
 
 /** Default minimum interval between switches — see `minSwitchIntervalMs`. */
 export const DEFAULT_MIN_SWITCH_INTERVAL_MS = 60_000;
+
+/** A thrown value reduced to one loggable line. The message only — a stack in a log field says
+ *  nothing an operator can act on about an IO failure, and a non-Error throw still has to render
+ *  as something rather than `[object Object]`. */
+function errorReason(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export class SwitchEngine {
   private readonly paths: Paths;
@@ -137,6 +145,87 @@ export class SwitchEngine {
   }
   clearQuarantine(id: string): Promise<void> {
     return this.withCredentialLock(() => this.vault.clearQuarantine(id));
+  }
+
+  /**
+   * Recompute the derived (plan/billing/identity) row of every account whose metadata predates
+   * the current bundle -> row mapping, reading each one's ALREADY STORED bundle. Returns how many
+   * rows were repaired.
+   *
+   * The repair exists because nothing else can perform it. A row is refreshed only when its
+   * bundle is rewritten, so an account added by a build that captured fewer fields keeps
+   * rendering "unknown" until the day its token happens to rotate — and for fields the earlier
+   * build never captured at all, that day never comes, because the data was in the bundle the
+   * whole time and only the mapping was behind. Recomputing from the stored bundle (rather than
+   * from the live `~/.claude.json`) is what makes this correct for EVERY account instead of only
+   * whichever one is currently logged in.
+   *
+   * Cost is bounded and self-limiting: `needsMetadataBackfill` filters to rows that are actually
+   * behind, and the lock is not taken at all when there is nothing to do — so the steady state is
+   * a single registry read. EVERY selected row is stamped, whether or not it could be repaired: a
+   * repaired one with the current revision, an unrepairable one (missing blob, a key this machine
+   * cannot decrypt, an identity block that refuses the row) with a failure time that backs the
+   * sweep off for `METADATA_BACKFILL_RETRY_MS`. Leaving an unrepairable row unstamped is what
+   * turns "sweep once" into "sweep on every listing forever", because that row alone keeps the
+   * stale set non-empty. An unreadable bundle is skipped rather than thrown: a listing must still
+   * render for the accounts that ARE readable.
+   *
+   * Opportunistic by design: this is repair nobody asked for, running inside a read command, so
+   * it SKIPS when another process holds the credential lock instead of queueing behind an
+   * in-flight switch and stalling the caller for the whole acquire timeout. The lock is still
+   * required when the work does run — `syncMetadata` is a registry read-modify-write, and doing
+   * it unlocked would silently drop a concurrent switch's update. Returns 0 when it skipped;
+   * nothing is lost, because the next invocation retries.
+   *
+   * NEVER THROWS, so a caller can run it ahead of a read without guarding it. Best-effort is a
+   * property of this repair, not of the call sites, and expressing it here is what keeps the
+   * reason for a failure visible: a caller reduced to `catch {}` discards the only evidence that
+   * the self-heal has stopped healing, which is indistinguishable from having nothing left to do.
+   * Every failure — one row's or the whole sweep's — is logged at warn instead.
+   */
+  async backfillAccountMetadata(): Promise<number> {
+    try {
+      return await this.sweepAccountMetadata();
+    } catch (err) {
+      this.log.warn({ reason: errorReason(err) }, 'account metadata sweep did not run');
+      return 0;
+    }
+  }
+
+  /** The sweep proper — see {@link backfillAccountMetadata}, which owns its no-throw contract. */
+  private async sweepAccountMetadata(): Promise<number> {
+    const now = this.clock();
+    const stale = (await this.vault.listAccounts()).filter((a) => needsMetadataBackfill(a, now));
+    if (stale.length === 0) return 0;
+    const repaired = await this.withCredentialLockIfFree(async () => {
+      let count = 0;
+      for (const account of stale) {
+        try {
+          const bundle = await this.vault.readBundle(account.id).catch(() => undefined);
+          // Both calls re-read the registry per account, so a row removed since the scan above is
+          // a no-op. `syncMetadata` returning false for a row known to be behind the revision
+          // means the bundle was refused (its identity block names a different account) —
+          // unrepairable from here, so it backs off exactly like an unreadable blob.
+          if (bundle && (await this.vault.syncMetadata(account.id, bundle))) {
+            count += 1;
+            continue;
+          }
+          await this.vault.markMetadataBackfillFailed(account.id);
+        } catch (err) {
+          // Each row is repaired by its own registry write, so one that cannot be written says
+          // nothing about the next. Abandoning the remaining rows would make which accounts get
+          // repaired depend on their position in the list, and leave the ones behind the failure
+          // waiting for a later sweep that hits the same wall at the same place.
+          this.log.warn(
+            { accountId: account.id, reason: errorReason(err) },
+            'could not repair account metadata',
+          );
+        }
+      }
+      if (count > 0) this.log.info({ repaired: count }, 'backfilled account metadata from vault');
+      return count;
+    });
+    return repaired ?? 0;
   }
 
   // ---- active account (live-login reconciled) ----
@@ -402,6 +491,11 @@ export class SwitchEngine {
       // Load the target and refresh it if the access token is near expiry. The rotated token
       // is persisted to the vault the instant we get it — single-use tokens die if dropped.
       let bundle = await this.vault.readBundle(targetId);
+      // Reconcile the target's derived row from the bundle just decrypted. A switch is the one
+      // moment this account's bundle is guaranteed to be open, and the refresh below runs only
+      // when the token is near expiry — so without this a fresh-token switch leaves plan/billing
+      // metadata frozen at whatever mapping first wrote the row.
+      await this.vault.syncMetadata(targetId, bundle);
       let refreshed = false;
       if (bundle.claudeAiOauth.expiresAt - this.clock() < this.refreshSkewMs) {
         bundle = await this.refreshTarget(targetId, bundle, hasRollback);
@@ -770,6 +864,33 @@ export class SwitchEngine {
    */
   private async withCredentialLock<T>(mutate: () => Promise<T>): Promise<T> {
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
+    try {
+      return await mutate();
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Same as {@link withCredentialLock}, but claims the lock only if it is free RIGHT NOW: a lock
+   * someone else holds yields `undefined` and `mutate` never runs.
+   *
+   * For opportunistic work a user is waiting on. Waiting out the full acquire timeout is the
+   * right trade for a mutation the caller explicitly asked for and nothing else can perform; it
+   * is the wrong one for background self-healing, where queueing behind an in-flight switch turns
+   * a fast read command into a stall for a result the caller never requested. A zero timeout
+   * makes `acquireLock` attempt the claim exactly once — still reclaiming a dead holder's lock on
+   * the way — and report contention as {@link LockTimeoutError}, which is a routine outcome here
+   * rather than a failure. Any other acquisition error is a real fault and propagates.
+   */
+  private async withCredentialLockIfFree<T>(mutate: () => Promise<T>): Promise<T | undefined> {
+    let lock: Lock;
+    try {
+      lock = await acquireLock(this.lockDir(), this.clock, { ...this.lockOptions, timeoutMs: 0 });
+    } catch (err) {
+      if (err instanceof LockTimeoutError) return undefined;
+      throw err;
+    }
     try {
       return await mutate();
     } finally {

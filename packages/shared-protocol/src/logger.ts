@@ -47,8 +47,11 @@ export interface CreateLoggerOptions {
   /** Defaults to the real process environment; overridable so tests can pin CCTL_LOG_* without
    *  mutating global state. */
   env?: NodeJS.ProcessEnv;
-  /** Defaults to real stdout; overridable so tests can capture output and simulate a terminal. */
-  stdout?: LogSink;
+  /** Where rendered lines go. Defaults to `process.stdout`; a composition root whose stdout
+   *  carries its OWN output (every one-shot CLI command) passes `process.stderr` instead, and
+   *  tests pass a double to capture output and simulate a terminal. Named for the role, not for
+   *  a stream, precisely because it is not always stdout. */
+  sink?: LogSink;
   /** Where fallback warnings (e.g. an unopenable CCTL_LOG_FILE) are printed. Defaults to
    *  stderr; overridable so tests can assert on them without spamming real stderr. */
   warn?: (message: string) => void;
@@ -127,11 +130,11 @@ function getFileSink(filePath: string, warn: (message: string) => void): FileSin
 
 /**
  * Owns the raw fd for one CCTL_LOG_FILE path: opening it, writing to it, and degrading to
- * stdout-only (with exactly one warning) if it ever fails. Every line reaches this sink
- * verbatim as NDJSON regardless of stdout's mode, since the file exists for later machine
- * consumption (log collectors, `grep`) even when a human is watching pretty output live in the
- * terminal — which also means the full stack of every error is always in the file even when
- * pretty stdout is showing only the summary.
+ * console-only (with exactly one warning) if it ever fails. Every line reaches this sink
+ * verbatim as NDJSON regardless of the console sink's mode, since the file exists for later
+ * machine consumption (log collectors, `grep`) even when a human is watching pretty output live
+ * in the terminal — which also means the full stack of every error is always in the file even
+ * when the pretty console output is showing only the summary.
  *
  * Written with `writeSync` to a raw fd rather than through `fs.createWriteStream`. A write
  * stream buffers, and the lines that matter most are the ones emitted immediately before
@@ -154,7 +157,7 @@ class FileSink {
   }
 
   /** A bad CCTL_LOG_FILE (missing parent directory, no permission, disk full, ...) must never
-   *  crash the daemon over logging — degrade to stdout-only with exactly one warning, shared by
+   *  crash the daemon over logging — degrade to console-only with exactly one warning, shared by
    *  every logger writing to this path. */
   private degrade(err: unknown): void {
     if (this.fd !== undefined) {
@@ -169,7 +172,7 @@ class FileSink {
     this.warned = true;
     const reason = err instanceof Error ? err.message : String(err);
     this.warn(
-      `CCTL_LOG_FILE=${this.filePath} could not be written (${reason}); logging to stdout only`,
+      `CCTL_LOG_FILE=${this.filePath} could not be written (${reason}); logging to the console only`,
     );
   }
 
@@ -199,7 +202,7 @@ class LogDestination {
     private readonly includeStack: boolean,
     filePath: string | undefined,
     warn: (message: string) => void,
-    private readonly stdout: LogSink,
+    private readonly sink: LogSink,
     /** Undefined means plain (no color) — either mode is 'json' (color never applies there;
      *  see the class comment) or the caller's own `colorEnabled` check came back false. */
     private readonly colors: LogLineColors | undefined,
@@ -211,9 +214,9 @@ class LogDestination {
   write(chunk: string): boolean {
     this.fileSink?.write(chunk);
     if (this.mode === 'json') {
-      this.stdout.write(chunk);
+      this.sink.write(chunk);
     } else {
-      this.stdout.write(this.renderPretty(chunk) + '\n');
+      this.sink.write(this.renderPretty(chunk) + '\n');
     }
     return true;
   }
@@ -262,21 +265,23 @@ function wantsStacks(level: string): boolean {
 export function createLogger(options: CreateLoggerOptions): LoggerLike {
   const env = options.env ?? process.env;
   const level = env.CCTL_LOG_LEVEL ?? options.defaultLevel;
-  const stdout = options.stdout ?? process.stdout;
+  const sink = options.sink ?? process.stdout;
   const warn = options.warn ?? ((message: string) => process.stderr.write(`warn: ${message}\n`));
-  const format = resolveFormat(env, stdout.isTTY === true, warn);
+  const format = resolveFormat(env, sink.isTTY === true, warn);
   // Color is pretty-mode-only (see `LogDestination.write`) and gated on the exact same
   // NO_COLOR/TTY check the CLI's own tables/summaries use — `colorEnabled` is shared-protocol's
   // single source of truth for that decision (see ansiColor.ts's module comment) precisely so
-  // this never has to re-derive it.
-  const colors = format === 'pretty' && colorEnabled(stdout, env) ? ansiLogColors() : undefined;
+  // this never has to re-derive it. It reads the SINK the caller named, not `process.stdout`:
+  // a daemon writing to a redirected stream and a command writing to stderr must each be judged
+  // on the stream they actually use.
+  const colors = format === 'pretty' && colorEnabled(sink, env) ? ansiLogColors() : undefined;
 
   const destination = new LogDestination(
     format,
     wantsStacks(level),
     env.CCTL_LOG_FILE,
     warn,
-    stdout,
+    sink,
     colors,
   );
   const p = pino({ level }, destination);
