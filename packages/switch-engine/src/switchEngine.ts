@@ -20,13 +20,14 @@ import { type Protector } from './dpapi.js';
 import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
 import {
   CadenceError,
+  LockTimeoutError,
   QuarantineError,
   RefreshError,
   UnknownAccountError,
   VerifyError,
 } from './errors.js';
 import { IntentStore } from './intent.js';
-import { acquireLock, type LockOptions } from './lock.js';
+import { acquireLock, type Lock, type LockOptions } from './lock.js';
 import { noopLogger, type Logger } from './logger.js';
 import {
   DEFAULT_REFRESH_SKEW_MS,
@@ -46,7 +47,7 @@ import type {
   RefreshTokenResult,
   StoredAccount,
 } from './types.js';
-import { Vault } from './vault.js';
+import { needsMetadataBackfill, Vault } from './vault.js';
 
 /** Signature of the refresh function, so tests can inject a fake. */
 export type RefreshFn = (current: ClaudeOauth, deps?: RefreshDeps) => Promise<ClaudeOauth>;
@@ -81,6 +82,13 @@ export interface ActivateOptions {
 /** Default minimum interval between switches — see `minSwitchIntervalMs`. */
 export const DEFAULT_MIN_SWITCH_INTERVAL_MS = 60_000;
 
+/** A thrown value reduced to one loggable line. The message only — a stack in a log field says
+ *  nothing an operator can act on about an IO failure, and a non-Error throw still has to render
+ *  as something rather than `[object Object]`. */
+function errorReason(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export class SwitchEngine {
   private readonly paths: Paths;
   private readonly vault: Vault;
@@ -98,8 +106,9 @@ export class SwitchEngine {
   constructor(options: SwitchEngineOptions) {
     this.paths = options.paths;
     this.clock = options.clock ?? Date.now;
+    this.log = options.logger ?? noopLogger;
     const protector = options.protector ?? defaultProtector();
-    this.vault = new Vault(this.paths.vaultDir, protector, this.clock);
+    this.vault = new Vault(this.paths.vaultDir, protector, this.clock, this.log);
     this.credStore = new CredentialStore(
       this.paths,
       options.liveCredentialChannel ?? defaultLiveCredentialChannel(this.paths),
@@ -111,7 +120,6 @@ export class SwitchEngine {
     this.refreshSkewMs = options.refreshSkewMs ?? DEFAULT_REFRESH_SKEW_MS;
     this.minSwitchIntervalMs = options.minSwitchIntervalMs ?? DEFAULT_MIN_SWITCH_INTERVAL_MS;
     this.lockOptions = options.lockOptions ?? {};
-    this.log = options.logger ?? noopLogger;
   }
 
   // ---- registry mutators (lock-guarded) ----
@@ -139,6 +147,87 @@ export class SwitchEngine {
     return this.withCredentialLock(() => this.vault.clearQuarantine(id));
   }
 
+  /**
+   * Recompute the derived (plan/billing/identity) row of every account whose metadata predates
+   * the current bundle -> row mapping, reading each one's ALREADY STORED bundle. Returns how many
+   * rows were repaired.
+   *
+   * The repair exists because nothing else can perform it. A row is refreshed only when its
+   * bundle is rewritten, so an account added by a build that captured fewer fields keeps
+   * rendering "unknown" until the day its token happens to rotate — and for fields the earlier
+   * build never captured at all, that day never comes, because the data was in the bundle the
+   * whole time and only the mapping was behind. Recomputing from the stored bundle (rather than
+   * from the live `~/.claude.json`) is what makes this correct for EVERY account instead of only
+   * whichever one is currently logged in.
+   *
+   * Cost is bounded and self-limiting: `needsMetadataBackfill` filters to rows that are actually
+   * behind, and the lock is not taken at all when there is nothing to do — so the steady state is
+   * a single registry read. EVERY selected row is stamped, whether or not it could be repaired: a
+   * repaired one with the current revision, an unrepairable one (missing blob, a key this machine
+   * cannot decrypt, an identity block that refuses the row) with a failure time that backs the
+   * sweep off for `METADATA_BACKFILL_RETRY_MS`. Leaving an unrepairable row unstamped is what
+   * turns "sweep once" into "sweep on every listing forever", because that row alone keeps the
+   * stale set non-empty. An unreadable bundle is skipped rather than thrown: a listing must still
+   * render for the accounts that ARE readable.
+   *
+   * Opportunistic by design: this is repair nobody asked for, running inside a read command, so
+   * it SKIPS when another process holds the credential lock instead of queueing behind an
+   * in-flight switch and stalling the caller for the whole acquire timeout. The lock is still
+   * required when the work does run — `syncMetadata` is a registry read-modify-write, and doing
+   * it unlocked would silently drop a concurrent switch's update. Returns 0 when it skipped;
+   * nothing is lost, because the next invocation retries.
+   *
+   * NEVER THROWS, so a caller can run it ahead of a read without guarding it. Best-effort is a
+   * property of this repair, not of the call sites, and expressing it here is what keeps the
+   * reason for a failure visible: a caller reduced to `catch {}` discards the only evidence that
+   * the self-heal has stopped healing, which is indistinguishable from having nothing left to do.
+   * Every failure — one row's or the whole sweep's — is logged at warn instead.
+   */
+  async backfillAccountMetadata(): Promise<number> {
+    try {
+      return await this.sweepAccountMetadata();
+    } catch (err) {
+      this.log.warn({ reason: errorReason(err) }, 'account metadata sweep did not run');
+      return 0;
+    }
+  }
+
+  /** The sweep proper — see {@link backfillAccountMetadata}, which owns its no-throw contract. */
+  private async sweepAccountMetadata(): Promise<number> {
+    const now = this.clock();
+    const stale = (await this.vault.listAccounts()).filter((a) => needsMetadataBackfill(a, now));
+    if (stale.length === 0) return 0;
+    const repaired = await this.withCredentialLockIfFree(async () => {
+      let count = 0;
+      for (const account of stale) {
+        try {
+          const bundle = await this.vault.readBundle(account.id).catch(() => undefined);
+          // Both calls re-read the registry per account, so a row removed since the scan above is
+          // a no-op. `syncMetadata` returning false for a row known to be behind the revision
+          // means the bundle was refused (its identity block names a different account) —
+          // unrepairable from here, so it backs off exactly like an unreadable blob.
+          if (bundle && (await this.vault.syncMetadata(account.id, bundle))) {
+            count += 1;
+            continue;
+          }
+          await this.vault.markMetadataBackfillFailed(account.id);
+        } catch (err) {
+          // Each row is repaired by its own registry write, so one that cannot be written says
+          // nothing about the next. Abandoning the remaining rows would make which accounts get
+          // repaired depend on their position in the list, and leave the ones behind the failure
+          // waiting for a later sweep that hits the same wall at the same place.
+          this.log.warn(
+            { accountId: account.id, reason: errorReason(err) },
+            'could not repair account metadata',
+          );
+        }
+      }
+      if (count > 0) this.log.info({ repaired: count }, 'backfilled account metadata from vault');
+      return count;
+    });
+    return repaired ?? 0;
+  }
+
   // ---- active account (live-login reconciled) ----
 
   /**
@@ -153,10 +242,20 @@ export class SwitchEngine {
    * from `~/.claude.json` — the same signal the re-login guard trusts). Only a PROVABLE
    * mismatch overrides the registry:
    *   - the live identity matches the registry's account → the registry answer stands;
-   *   - it matches a DIFFERENT stored account → that account is the live one;
+   *   - it matches a DIFFERENT stored account → that account is the live one, UNLESS the live
+   *     token still belongs to the registry's account (see below);
    *   - it matches no stored account (a login never captured here) → null, because claiming
    *     any stored account is active would be false;
    *   - no live identity is readable → the registry record, the best remaining evidence.
+   *
+   * The identity block and the credentials live in two different files, so they can disagree,
+   * and the block is the one that goes stale: the CLI rewrites it only on a login, while the
+   * token changes under every rotation. Believing a stale block here is not a cosmetic error —
+   * it hands the live token's owner the wrong id, which then routes `adoptRotationIfNeeded()`
+   * at the wrong bundle and lets `refreshToken()` network-refresh the token the live session is
+   * holding. So an override is corroborated against the one artifact that cannot be stale: if
+   * the live refresh token is still the registry account's stored token, that account is live
+   * and the block is merely out of date.
    */
   async getActiveId(): Promise<string | null> {
     const registryId = await this.vault.getActiveId();
@@ -167,7 +266,26 @@ export class SwitchEngine {
     if (liveUuid === undefined) return registryId;
     const matches = (await this.vault.listAccounts()).filter((a) => a.accountUuid === liveUuid);
     if (matches.some((m) => m.id === registryId)) return registryId;
+    if (registryId !== null && (await this.liveTokenBelongsTo(registryId))) return registryId;
     return matches[0]?.id ?? null;
+  }
+
+  /**
+   * Whether the live refresh token is the one stored for `accountId`. A refresh token is issued
+   * to exactly one account, so a match is proof of ownership; anything else (no live token, no
+   * bundle, an unreadable one) is simply not proof and answers false — this corroborates an
+   * override, it does not gate one.
+   *
+   * Deliberately asked ONLY from `getActiveId()`'s disagreement branch: it decrypts a bundle,
+   * which on Windows is a PowerShell spawn (see dpapi.ts), and the agreeing case is every normal
+   * call. The disagreement branch means the live login is out of step with the last committed
+   * switch, which a switch heals.
+   */
+  private async liveTokenBelongsTo(accountId: string): Promise<boolean> {
+    const live = await this.credStore.readLiveCredentials().catch(() => undefined);
+    if (!live) return false;
+    const bundle = await this.vault.readBundle(accountId).catch(() => undefined);
+    return bundle?.claudeAiOauth.refreshToken === live.refreshToken;
   }
 
   /**
@@ -373,6 +491,11 @@ export class SwitchEngine {
       // Load the target and refresh it if the access token is near expiry. The rotated token
       // is persisted to the vault the instant we get it — single-use tokens die if dropped.
       let bundle = await this.vault.readBundle(targetId);
+      // Reconcile the target's derived row from the bundle just decrypted. A switch is the one
+      // moment this account's bundle is guaranteed to be open, and the refresh below runs only
+      // when the token is near expiry — so without this a fresh-token switch leaves plan/billing
+      // metadata frozen at whatever mapping first wrote the row.
+      await this.vault.syncMetadata(targetId, bundle);
       let refreshed = false;
       if (bundle.claudeAiOauth.expiresAt - this.clock() < this.refreshSkewMs) {
         bundle = await this.refreshTarget(targetId, bundle, hasRollback);
@@ -388,7 +511,7 @@ export class SwitchEngine {
 
       // Write the live files atomically, then record that the point of no easy return passed.
       await this.credStore.writeLiveCredentials(bundle.claudeAiOauth);
-      if (bundle.oauthAccount) await this.credStore.writeOauthAccount(bundle.oauthAccount);
+      await this.writeLiveIdentity(bundle.oauthAccount);
       await this.intent.write({
         phase: 'written',
         targetId,
@@ -540,7 +663,7 @@ export class SwitchEngine {
         // interrupted live write first: activate() lands the identity block AFTER the
         // credentials, so a crash between the two leaves a live identity that still names the
         // previous account (which would also mislead the live-login reconciliation).
-        if (target.oauthAccount) await this.credStore.writeOauthAccount(target.oauthAccount);
+        await this.writeLiveIdentity(target.oauthAccount);
         await this.vault.setActive(pending.targetId);
         this.audit.append({
           ts: this.clock(),
@@ -594,11 +717,19 @@ export class SwitchEngine {
     if (prevUuid !== undefined && liveUuid !== undefined && prevUuid !== liveUuid) return false;
     if (liveNow.refreshToken === prevBundle.claudeAiOauth.refreshToken) return false;
 
+    // Identity precedence: the live block goes into this account's bundle only when it PROVABLY
+    // belongs to it — both sides report a uuid and they agree. Otherwise the bundle keeps its own
+    // block, because an unprovable live block (partial, or belonging to whoever the CLI logged in
+    // last) would stamp a foreign identity onto this bundle, and identity is what every
+    // downstream attribution check keys on. Adoption exists to save a rotated TOKEN, so it has no
+    // business re-identifying the account it saves it into; when neither side has a block the
+    // write carries none rather than inventing one.
+    const provenLive =
+      liveUuid !== undefined && liveUuid === prevUuid ? liveOauthAccount : undefined;
+    const oauthAccount = provenLive ?? prevBundle.oauthAccount;
     await this.vault.writeBundle(prevActiveId, {
       claudeAiOauth: liveNow,
-      ...((liveOauthAccount ?? prevBundle.oauthAccount)
-        ? { oauthAccount: liveOauthAccount ?? prevBundle.oauthAccount }
-        : {}),
+      ...(oauthAccount ? { oauthAccount } : {}),
     });
     this.audit.append({
       ts: this.clock(),
@@ -657,12 +788,38 @@ export class SwitchEngine {
     }
   }
 
+  /**
+   * Land `oauthAccount` as the live identity block — or REMOVE the one already there when the
+   * credentials we just wrote came with none.
+   *
+   * The removal is the whole point. `~/.claude.json` is the only statement of who is logged in,
+   * and a bundle legitimately carries no block (a credentials-only capture, or an account added
+   * before its config block existed). Writing nothing in that case leaves the block naming the
+   * PREVIOUS account, and it stays that way: `getActiveId()` then reads a live identity that
+   * contradicts the switch that just committed, `adoptRotationIfNeeded()` inherits that wrong
+   * owner, and the next CLI-side rotation is written into the wrong account's bundle — the
+   * ownership mismatch surfacing later as a quarantine, far from the switch that caused it.
+   * Removing the block cannot lie about who is live, and the CLI rebuilds it from the live
+   * token (see `CredentialStore.clearOauthAccount`).
+   *
+   * Every path that writes live credentials goes through here — the switch itself, the
+   * roll-forward, and the rollback — because leaving a stale identity behind is exactly as
+   * wrong when undoing a switch as when committing one.
+   */
+  private async writeLiveIdentity(oauthAccount: OauthAccount | undefined): Promise<void> {
+    if (oauthAccount) await this.credStore.writeOauthAccount(oauthAccount);
+    else await this.credStore.clearOauthAccount();
+  }
+
   /** Restore the previous live credentials from the encrypted rollback snapshot. */
   private async restoreRollback(): Promise<boolean> {
     const snapshot = await this.vault.readRollback();
     if (!snapshot) return false;
     await this.credStore.writeLiveCredentials(snapshot.claudeAiOauth);
-    if (snapshot.oauthAccount) await this.credStore.writeOauthAccount(snapshot.oauthAccount);
+    // The snapshot omits the block exactly when the live file had none, so restoring it means
+    // removing whatever the failed switch wrote — not leaving the target's identity behind on
+    // the previous account's credentials.
+    await this.writeLiveIdentity(snapshot.oauthAccount);
     return true;
   }
 
@@ -707,6 +864,33 @@ export class SwitchEngine {
    */
   private async withCredentialLock<T>(mutate: () => Promise<T>): Promise<T> {
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
+    try {
+      return await mutate();
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Same as {@link withCredentialLock}, but claims the lock only if it is free RIGHT NOW: a lock
+   * someone else holds yields `undefined` and `mutate` never runs.
+   *
+   * For opportunistic work a user is waiting on. Waiting out the full acquire timeout is the
+   * right trade for a mutation the caller explicitly asked for and nothing else can perform; it
+   * is the wrong one for background self-healing, where queueing behind an in-flight switch turns
+   * a fast read command into a stall for a result the caller never requested. A zero timeout
+   * makes `acquireLock` attempt the claim exactly once — still reclaiming a dead holder's lock on
+   * the way — and report contention as {@link LockTimeoutError}, which is a routine outcome here
+   * rather than a failure. Any other acquisition error is a real fault and propagates.
+   */
+  private async withCredentialLockIfFree<T>(mutate: () => Promise<T>): Promise<T | undefined> {
+    let lock: Lock;
+    try {
+      lock = await acquireLock(this.lockDir(), this.clock, { ...this.lockOptions, timeoutMs: 0 });
+    } catch (err) {
+      if (err instanceof LockTimeoutError) return undefined;
+      throw err;
+    }
     try {
       return await mutate();
     } finally {

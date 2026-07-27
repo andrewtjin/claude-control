@@ -113,4 +113,32 @@ describe('AutoSwitcher', () => {
     await switcher.evaluate(lowSnapshot()); // 96% < 99% custom trigger
     expect(activate).not.toHaveBeenCalled();
   });
+
+  it('hops to a dormant account reachable only by prediction, under the same cooldown', async () => {
+    // The spare's weekly window has closed, so the endpoint reports no reset for it — only the
+    // caller's predicted reset makes it a candidate at all.
+    const [hot] = lowSnapshot() as [AccountUsageInput];
+    const snapshot: AccountUsageInput[] = [
+      hot,
+      {
+        accountId: 'dormant',
+        label: 'dormant',
+        active: false,
+        quarantined: false,
+        limits: [{ kind: 'weekly_all', percent: 0 }],
+        predictedResetAt: NOW + 20 * H,
+      },
+    ];
+    const { switcher, activate, advance } = makeSwitcher();
+
+    await switcher.evaluate(snapshot);
+    expect(activate).toHaveBeenCalledWith('dormant');
+
+    // Reaching a new class of target buys no faster cadence: the cooldown is untouched.
+    await switcher.evaluate(snapshot);
+    expect(activate).toHaveBeenCalledTimes(1);
+    advance(DEFAULT_AUTOSWITCH_COOLDOWN_MS + 1);
+    await switcher.evaluate(snapshot);
+    expect(activate).toHaveBeenCalledTimes(2);
+  });
 });

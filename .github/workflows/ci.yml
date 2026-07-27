@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `dev` is staging for `main` and runs the identical suite: `main` is fast-forwarded from
+    # `dev` and a push there publishes, so anything red on `dev` would be red on a release.
+    branches: [main, dev]
   pull_request:
 
 # Least-privilege GITHUB_TOKEN. Every job here only reads the repo — checkout, install, lint,

@@ -92,4 +92,39 @@ describe('CredentialStore oauthAccount (~/.claude.json)', () => {
     };
     expect(file.oauthAccount).toEqual({ accountUuid: 'x' });
   });
+
+  it('surgically removes oauthAccount while preserving unrelated config', async () => {
+    const { paths, store } = await sandbox();
+    await writeFile(
+      paths.claudeJsonPath,
+      JSON.stringify({
+        numStartups: 42,
+        projects: { 'C:/x': { history: [1, 2, 3] } },
+        oauthAccount: { accountUuid: 'old' },
+      }),
+    );
+
+    await store.clearOauthAccount();
+
+    const file = JSON.parse(await readFile(paths.claudeJsonPath, 'utf8')) as {
+      numStartups: number;
+      projects: Record<string, { history: number[] }>;
+    };
+    expect(await store.readOauthAccount()).toBeUndefined();
+    expect(file).not.toHaveProperty('oauthAccount');
+    expect(file.numStartups).toBe(42);
+    expect(file.projects['C:/x']!.history).toEqual([1, 2, 3]);
+  });
+
+  it('leaves the file untouched when there is no block to remove', async () => {
+    // Clearing runs on every switch whose target carries no identity block, so it must not
+    // rewrite — or create — the CLI's config just to say nothing.
+    const { paths, store } = await sandbox();
+    await store.clearOauthAccount();
+    await expect(readFile(paths.claudeJsonPath, 'utf8')).rejects.toThrow();
+
+    await writeFile(paths.claudeJsonPath, JSON.stringify({ numStartups: 1 }));
+    await store.clearOauthAccount();
+    expect(JSON.parse(await readFile(paths.claudeJsonPath, 'utf8'))).toEqual({ numStartups: 1 });
+  });
 });

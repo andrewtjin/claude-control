@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -581,6 +581,200 @@ describe('Daemon lifecycle', () => {
     expect(relay.received.some((e) => e.type === 'settings.snapshot')).toBe(false);
   });
 
+  it('trims usage snapshots past the retention window on every poll cycle', async () => {
+    // One ancient row and one current row. Only the cycle's retention step can remove the
+    // ancient one — nothing else in the daemon ever deletes from this table.
+    const ancient = Date.now() - 200 * 24 * 60 * 60_000;
+    store.insertUsageSnapshot({
+      accountId: 'acct-x',
+      fetchedAtMs: ancient,
+      source: 'live',
+      json: '{}',
+    });
+    store.insertUsageSnapshot({
+      accountId: 'acct-x',
+      fetchedAtMs: Date.now(),
+      source: 'live',
+      json: '{}',
+    });
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+
+    const kept = store.listUsageSnapshots('acct-x');
+    expect(kept.some((r) => r.fetchedAtMs === ancient)).toBe(false);
+    expect(kept.length).toBeGreaterThan(0);
+  });
+
+  it('scans transcripts and pushes a stats.snapshot, attributing turns to live accounts', async () => {
+    const now = Date.now();
+    // Attribution flows from the REAL journal, not a hand-seeded table: the poll cycle re-derives
+    // every interval from this audit log before it scans, so anything written straight into the
+    // store would be wiped. Writing the log is what proves the two halves are actually joined.
+    await writeFile(
+      join(vaultDir, 'switch-audit.jsonl'),
+      JSON.stringify({
+        ts: now - 60_000,
+        event: 'activated',
+        fromAccountId: null,
+        toAccountId: 'acct-x',
+      }) + '\n',
+      'utf8',
+    );
+    const scanTranscripts = vi.fn((sinceMs: number) => {
+      void sinceMs;
+      return Promise.resolve({
+        turns: [
+          {
+            tsMs: now - 30_000,
+            model: 'claude-opus-5',
+            inputTokens: 10,
+            outputTokens: 20,
+            cacheCreationTokens: 30,
+            cacheReadTokens: 40,
+          },
+        ],
+        filesScanned: 1,
+        filesSkippedByMtime: 2,
+        filesUnreadable: 0,
+        dirsUnreadable: 0,
+        malformedLines: 0,
+        duplicateTurns: 3,
+      });
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.snapshot'));
+    const pushed = relay.received.find((e) => e.type === 'stats.snapshot');
+    expect(pushed?.type).toBe('stats.snapshot');
+    if (pushed?.type !== 'stats.snapshot') throw new Error('unreachable');
+    expect(pushed.payload.overall).toEqual({
+      input: 10,
+      output: 20,
+      cacheCreation: 30,
+      cacheRead: 40,
+      turns: 1,
+    });
+    // The registry label, not the raw id — the phone never sees account ids it cannot read.
+    expect(pushed.payload.byAccount).toEqual([
+      {
+        accountId: 'acct-x',
+        label: 'main',
+        totals: { input: 10, output: 20, cacheCreation: 30, cacheRead: 40, turns: 1 },
+      },
+    ]);
+    expect(pushed.payload.coverage.filesSkippedByMtime).toBe(2);
+    // The window the daemon asked for must be the window it advertises.
+    expect(scanTranscripts).toHaveBeenCalledWith(pushed.payload.windowStartMs);
+  });
+
+  it('pushes no stats.snapshot when no transcript scanner is wired', async () => {
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    expect(relay.received.some((e) => e.type === 'stats.snapshot')).toBe(false);
+  });
+
+  it('keeps polling when the transcript scan fails', async () => {
+    const scanTranscripts = vi.fn(() => Promise.reject(new Error('EPERM: projects dir locked')));
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 30,
+    });
+    await daemon.start();
+
+    // A dead scan must cost the phone its stats, never its usage: the cycle keeps running.
+    await waitFor(() => relay.received.filter((e) => e.type === 'usage.snapshot').length >= 2);
+    expect(relay.received.some((e) => e.type === 'stats.snapshot')).toBe(false);
+  });
+
+  it('throttles the transcript scan rather than re-running it every poll cycle', async () => {
+    const scanTranscripts = vi.fn(() =>
+      Promise.resolve({
+        turns: [],
+        filesScanned: 0,
+        filesSkippedByMtime: 0,
+        filesUnreadable: 0,
+        dirsUnreadable: 0,
+        malformedLines: 0,
+        duplicateTurns: 0,
+      }),
+    );
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      statsIntervalMs: 60_000,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 30,
+    });
+    await daemon.start();
+
+    await waitFor(() => relay.received.filter((e) => e.type === 'usage.snapshot').length >= 3);
+    expect(scanTranscripts).toHaveBeenCalledTimes(1);
+  });
+
+  it('stamps the history-derived pacing inputs onto the usage snapshot it pushes', async () => {
+    // A dormant account's history: an observed reset from before its weekly window closed,
+    // then readings the endpoint no longer publishes any reset alongside. Only the daemon can
+    // see this, which is why the phone has to be told rather than left to work it out.
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const anchorIso = new Date(now - 2 * DAY_MS).toISOString();
+    const weeklyJson = (percent: number, resetsAt?: string): string =>
+      JSON.stringify({
+        limits: [{ kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resetsAt } : {}) }],
+      });
+    for (const row of [
+      { fetchedAtMs: now - 4 * DAY_MS, json: weeklyJson(80, anchorIso) },
+      { fetchedAtMs: now - 2 * DAY_MS, json: weeklyJson(0) },
+      { fetchedAtMs: now - 60_000, json: weeklyJson(10) },
+    ]) {
+      store.insertUsageSnapshot({ accountId: 'acct-x', source: 'live', ...row });
+    }
+
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    const pushed = relay.received.find((e) => e.type === 'usage.snapshot');
+    if (pushed?.type !== 'usage.snapshot') throw new Error('no usage.snapshot pushed');
+
+    // The anchor advanced by one whole cadence — a strictly future reset the endpoint is not
+    // reporting for this account at all.
+    const predicted = pushed.payload.accounts.find(
+      (a) => a.accountId === 'acct-x',
+    )?.predictedResetAt;
+    expect(predicted).toBe(Date.parse(anchorIso) + 7 * DAY_MS);
+    // An account with no stored history stays absent rather than borrowing another's clock.
+    expect(
+      pushed.payload.accounts.find((a) => a.accountId === 'acct-y')?.predictedResetAt,
+    ).toBeUndefined();
+    // 10% of one Pro-equivalent unit over the trailing burn window.
+    expect(pushed.payload.burnUnitsPerDay).toBeGreaterThan(0);
+  });
+
   it("feeds each poll cycle's advisor inputs to the auto-switcher when one is wired", async () => {
     const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
       void accounts;
@@ -606,6 +800,55 @@ describe('Daemon lifecycle', () => {
     const inputs = evaluate.mock.calls[0]?.[0];
     // One advisor input per account the fake engine reports, in poll order.
     expect(inputs?.map((i) => i.accountId)).toEqual(['acct-x', 'acct-y']);
+  });
+
+  it("gives the auto-switcher each account's predicted reset, so a dormant one is reachable", async () => {
+    // Without this the policy cannot see a dormant account at all: the endpoint stops
+    // publishing a reset once its weekly window closes, and an unknown weekly clock
+    // disqualifies a candidate outright.
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const anchorIso = new Date(now - 3 * DAY_MS).toISOString();
+    for (const row of [
+      {
+        fetchedAtMs: now - 5 * DAY_MS,
+        json: JSON.stringify({
+          limits: [{ kind: 'weekly_all', percent: 70, resetsAt: anchorIso }],
+        }),
+      },
+      {
+        fetchedAtMs: now - 60_000,
+        json: JSON.stringify({ limits: [{ kind: 'weekly_all', percent: 0 }] }),
+      },
+    ]) {
+      store.insertUsageSnapshot({ accountId: 'acct-x', source: 'live', ...row });
+    }
+
+    const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
+      void accounts;
+      return Promise.resolve();
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      autoSwitcher: { evaluate },
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => evaluate.mock.calls.length > 0);
+    const inputs = evaluate.mock.calls[0]?.[0];
+    expect(inputs?.find((i) => i.accountId === 'acct-x')?.predictedResetAt).toBe(
+      Date.parse(anchorIso) + 7 * DAY_MS,
+    );
+    // An account with no stored history keeps NO prediction — never a borrowed clock.
+    expect(inputs?.find((i) => i.accountId === 'acct-y')?.predictedResetAt).toBeUndefined();
   });
 
   it('start() is idempotent — calling it twice does not double-connect or double-recover', async () => {

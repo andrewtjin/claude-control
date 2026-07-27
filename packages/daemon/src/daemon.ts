@@ -26,10 +26,13 @@ import type { AgentSdkClient } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { EnvelopeDraft, MessageOf, PayloadOf } from '@claude-control/shared-protocol';
-import type { AccountUsageInput } from '@claude-control/usage-advisor';
+import { planWeight, type AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
-import { UsagePoller, type PollAccount } from './usagePoller.js';
+import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
+import { readFleetHistory } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
+import type { TranscriptScan } from './transcriptTokens.js';
+import { aggregateTokenStats } from './tokenStats.js';
 import type {
   HookReceiver,
   HookReceiverCliHandlers,
@@ -109,10 +112,30 @@ export interface DaemonOptions {
   sessionStopOnShutdownMs?: number;
   /** How often to poll usage and re-sync attribution. */
   pollIntervalMs?: number;
+  /** Scan local Claude Code transcripts for absolute token counts (see transcriptTokens.ts).
+   *  Injected rather than called directly because the scan reads gigabytes off the disk: tests
+   *  must be able to fake it, and a deployment that does not want the read can omit it, in which
+   *  case the daemon pushes no `stats.snapshot` at all (`cctl stats` is unaffected — it scans
+   *  in-process and needs no daemon). */
+  scanTranscripts?: (sinceMs: number) => Promise<TranscriptScan>;
+  /** How often that scan may re-run (default 15 min). Deliberately far slower than the poll
+   *  interval: the numbers move slowly, the scan is seconds of disk IO, and `/stats` renders the
+   *  last pushed snapshot rather than triggering a fresh one. */
+  statsIntervalMs?: number;
   logger?: Logger;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
+/** How long a usage snapshot is kept before the poll cycle trims it. The poller appends one row
+ *  per account per cycle (~1,900/day on a real machine) and nothing reads a snapshot older than
+ *  the current view, so without a cutoff this table is the one thing the daemon grows without
+ *  bound. 90 days keeps a full quarter of history for any future backfill while bounding the file. */
+const USAGE_SNAPSHOT_RETENTION_MS = 90 * 24 * 60 * 60_000;
+/** The window every pushed `stats.snapshot` covers. Matches `cctl stats`'s own default so the
+ *  phone and the terminal answer the same question. */
+const STATS_WINDOW_MS = 7 * 24 * 60 * 60_000;
+/** Default gap between transcript scans — see `DaemonOptions.statsIntervalMs`. */
+const DEFAULT_STATS_INTERVAL_MS = 15 * 60_000;
 /** How long {@link Daemon.stop} waits for live session handles to tear down before closing
  *  the rest anyway. Generous for a normal `client.end()` (subprocess exit is fast), tight
  *  enough that one wedged transport cannot hold Ctrl+C hostage; a handle that misses the
@@ -258,8 +281,13 @@ export class Daemon {
   private readonly stopGraceMs: number | undefined;
   private readonly sessionStopOnShutdownMs: number;
   private readonly pollIntervalMs: number;
+  private readonly scanTranscripts: ((sinceMs: number) => Promise<TranscriptScan>) | undefined;
+  private readonly statsIntervalMs: number;
   private readonly logger: Logger;
 
+  /** When the last transcript scan finished; `undefined` until the first one runs, so the very
+   *  first poll cycle after startup always produces a snapshot. */
+  private lastStatsAtMs: number | undefined;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   /** Tear-down for the event-loop lag watchdog started in {@link start}. */
   private stopLoopLagMonitor: (() => void) | undefined;
@@ -330,6 +358,8 @@ export class Daemon {
     this.sessionStopOnShutdownMs =
       options.sessionStopOnShutdownMs ?? DEFAULT_SESSION_STOP_ON_SHUTDOWN_MS;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.scanTranscripts = options.scanTranscripts;
+    this.statsIntervalMs = options.statsIntervalMs ?? DEFAULT_STATS_INTERVAL_MS;
     this.logger = options.logger ?? noopLogger;
   }
 
@@ -546,10 +576,33 @@ export class Daemon {
         json: JSON.stringify(result.usage.accountUsage),
       });
     }
+    // Retention runs on the same cadence as the writes that make it necessary, right after them,
+    // so the table can never outgrow its cutoff by more than one cycle. A failure is logged and
+    // swallowed: an untrimmed table is a disk-space problem, never a reason to skip the push
+    // below (which is what the phone is actually waiting on).
+    try {
+      const dropped = this.store.trimUsageSnapshots(this.clock() - USAGE_SNAPSHOT_RETENTION_MS);
+      if (dropped > 0) this.logger.info({ dropped }, 'trimmed expired usage snapshots');
+    } catch (err) {
+      this.logger.warn({ err }, 'usage snapshot retention failed; retrying next cycle');
+    }
+
+    // Measure AFTER persisting, so this cycle's own readings are part of the history. The
+    // daemon owns the store, so it is the only party that can make these measurements at all —
+    // it makes them once here and both the phone and its own advisor consume the same numbers.
+    // Weighted by plan tier, so a Max 20x account's one percent of weekly quota counts for
+    // twenty times a Pro account's. The burn rate and the fleet capacity it is judged against
+    // MUST use the same weights: measuring burn at 1x while pacing sizes the fleet at 20x
+    // understates consumption by the plan multiplier and reports every fleet as sustainable.
+    const history = readFleetHistory(
+      this.store,
+      accounts.map((a) => ({ accountId: a.id, ...planWeightOf(a) })),
+      this.clock(),
+    );
 
     this.sendEnvelope({
       type: 'usage.snapshot',
-      payload: { accounts: snapshot.accounts, plan: snapshot.plan },
+      payload: toUsageSnapshotPayload(snapshot, history, accounts, this.clock()),
     });
 
     // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
@@ -564,10 +617,61 @@ export class Daemon {
     // engine failures itself; this catch only guards against bugs in the evaluator so a
     // broken policy can never take down the poll loop.
     if (this.autoSwitcher) {
-      const inputs = snapshot.results.map((r) => r.usage.advisorInput);
+      // The prediction rides along because without it a DORMANT account is invisible to the
+      // policy: the endpoint publishes no reset once a weekly window closes, and an unknown
+      // weekly clock disqualifies an account outright — so the accounts holding a full
+      // untouched allowance are exactly the ones auto-switch would never reach. The policy
+      // labels a predicted reset and holds it to a stricter bar (see autoswitch.ts); an
+      // account with no history at all stays absent here and is skipped as before.
+      const inputs = snapshot.results.map((r) => {
+        const predicted = history.predictedResetByAccount.get(r.accountId);
+        return predicted === undefined
+          ? r.usage.advisorInput
+          : { ...r.usage.advisorInput, predictedResetAt: predicted };
+      });
       await this.autoSwitcher.evaluate(inputs).catch((err: unknown) => {
         this.logger.error({ err }, 'auto-switch evaluation failed');
       });
+    }
+
+    // LAST in the cycle, deliberately: the transcript scan is seconds of disk IO, and everything
+    // above it is either time-sensitive (auto-switch) or what the phone polls for (the usage
+    // push). Its own throttle means most cycles skip it entirely.
+    await this.maybePushTokenStats(accounts);
+  }
+
+  /**
+   * Re-scan local transcripts and push a `stats.snapshot`, at most once per
+   * {@link statsIntervalMs}. Absolute token counts come from files Claude Code writes on this
+   * host; the bot receives only the aggregate — it never sees a transcript, which is what keeps
+   * "the bot holds zero credentials (and zero conversation text)" structural rather than polite.
+   *
+   * A scan failure is logged and swallowed: it means the phone keeps rendering the previous
+   * snapshot (already labeled with its own window), which is strictly better than a poll loop
+   * that dies over an unreadable transcript directory.
+   */
+  private async maybePushTokenStats(accounts: StoredAccount[]): Promise<void> {
+    if (this.scanTranscripts === undefined) return;
+    const now = this.clock();
+    if (this.lastStatsAtMs !== undefined && now - this.lastStatsAtMs < this.statsIntervalMs) return;
+    // Stamped BEFORE the await, so a scan slower than the interval cannot queue a second one
+    // behind itself on the next cycle.
+    this.lastStatsAtMs = now;
+    const windowStartMs = now - STATS_WINDOW_MS;
+    try {
+      const scan = await this.scanTranscripts(windowStartMs);
+      this.sendEnvelope({
+        type: 'stats.snapshot',
+        payload: aggregateTokenStats({
+          scan,
+          intervals: this.store.listActivationIntervals(),
+          windowStartMs,
+          windowEndMs: this.clock(),
+          labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+        }),
+      });
+    } catch (err) {
+      this.logger.warn({ err }, 'transcript token scan failed; keeping the previous stats');
     }
   }
 
@@ -1740,4 +1844,12 @@ export function reconcileQuarantineNotices(
   }
 
   return { notices, nextState };
+}
+
+/** `{ weight }` for an account whose plan tier resolves, `{}` otherwise — the present-or-absent
+ *  contract the burn measurement and the pacing model share, so an unreadable tier degrades to
+ *  the 1x fallback in ONE place and is reported rather than silently applied. */
+function planWeightOf(account: Parameters<typeof planWeight>[0]): { weight?: number } {
+  const result = planWeight(account);
+  return result.known ? { weight: result.weight } : {};
 }

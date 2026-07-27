@@ -8,6 +8,8 @@ import type {
   AccountUsage,
   PayloadOf,
   SettingsSnapshot,
+  TokenStatsSnapshot,
+  TokenTotals,
   UsagePlan,
 } from '@claude-control/shared-protocol';
 // usage-advisor is a pure, credential-free library — importing it preserves the bot's
@@ -15,6 +17,7 @@ import type {
 import {
   computeOutlook,
   computePacing,
+  formatTokens,
   timelineInputFromWire,
   type ResetOutlook,
 } from '@claude-control/usage-advisor';
@@ -35,7 +38,7 @@ import {
   type TrackEvent,
 } from './richFormat.js';
 import type { BarRenderer } from './emojiBars.js';
-import { formatTables } from './tableFormat.js';
+import { defuseFences, formatTablesClamped } from './tableFormat.js';
 
 const COLOR_OK = 0x2ecc71;
 const COLOR_WARN = 0xf1c40f;
@@ -113,6 +116,22 @@ function errorSuffix(account: Pick<AccountUsage, 'error'> | undefined): string {
   return account?.error ? `\n⚠️ ${account.error}` : '';
 }
 
+/** "\nplan 20x · billing ~Aug 11 (est.)" — the two registry facts the terminal has always shown
+ *  and the phone could not, because the tier signals and subscription dates live in the local
+ *  vault and only reach here because the daemon now resolves them onto the snapshot.
+ *
+ *  Empty when the snapshot carries NEITHER field, which is exactly how a daemon predating them
+ *  reports: an older daemon then renders as it always did instead of captioning every account
+ *  "plan ? · billing unknown". Once either field arrives, both are shown — "?" and "unknown"
+ *  are real answers there, and hiding them would imply the question was never asked. */
+function planBillingSuffix(
+  account: Pick<AccountUsage, 'planWeight' | 'billing'> | undefined,
+): string {
+  if (account?.planWeight == null && account?.billing == null) return '';
+  const plan = account.planWeight != null ? `${account.planWeight}x` : '?';
+  return `\nplan ${plan} · billing ${account.billing ?? 'unknown'}`;
+}
+
 /** Embed accent color for a usage snapshot: the worst severity across every limit of
  *  every account, or neutral blue when no limit data exists yet. */
 function usageColor(accounts: AccountUsage[]): number {
@@ -143,6 +162,7 @@ export function buildUsageEmbed(
   usage: {
     accounts: AccountUsage[];
     plan?: UsagePlan;
+    burnUnitsPerDay?: number;
   },
   nowMs = Date.now(),
   barRenderer: BarRenderer = DEFAULT_BAR_RENDERER,
@@ -160,7 +180,7 @@ export function buildUsageEmbed(
       name: `${account.label} — ${marker}${cachedSuffix(account)}`,
       value: fitFieldValue(
         (unicodeFallback) =>
-          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${errorSuffix(account)}`,
+          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${planBillingSuffix(account)}${errorSuffix(account)}`,
       ),
     });
   }
@@ -170,16 +190,35 @@ export function buildUsageEmbed(
     const lines = [usage.plan.reason, ...usage.plan.advisories.map((a) => `• ${a.message}`)];
     addClampedField(embed, 'Plan', lines.join('\n'));
   }
-  if (usage.accounts.length > 0) embed.addFields(pacingField(usage.accounts, nowMs));
+  if (usage.accounts.length > 0) {
+    embed.addFields(pacingField(usage.accounts, nowMs, usage.burnUnitsPerDay));
+  }
   return embed;
 }
 
-/** The "Pacing" field shared by `/usage` and `/timeline`: the aggregate cross-account verdict
- *  layered on top of the account-by-account view above it — same headline the CLI prints,
- *  computed from the same AccountUsage snapshot both embeds already render from. */
-function pacingField(accounts: AccountUsage[], nowMs: number): { name: string; value: string } {
-  const pacing = computePacing(timelineInputFromWire(accounts), nowMs);
-  return { name: 'Pacing', value: truncateLabeled(pacing.headline, EMBED_FIELD_VALUE_LIMIT) };
+/** The "Pacing" field shared by `/usage` and `/timeline`: the fleet verdict layered on top of
+ *  the account-by-account view above it, computed by the same pure model the CLI uses from the
+ *  same snapshot both embeds already render from — so the phone and the terminal print the same
+ *  sentence, not two independently-derived ones.
+ *
+ *  The two inputs the model cannot derive from a moment (each account's predicted weekly reset
+ *  and the fleet's measured burn rate) come from snapshot history, which only the daemon holds;
+ *  they ride in on the snapshot. When a daemon predates them they are simply absent, and the
+ *  model says so in `notes` rather than substituting a guess — this field never prints a
+ *  verdict it cannot support. */
+function pacingField(
+  accounts: AccountUsage[],
+  nowMs: number,
+  burnUnitsPerDay: number | undefined,
+): { name: string; value: string } {
+  const pacing = computePacing(timelineInputFromWire(accounts), {
+    nowMs,
+    // exactOptionalPropertyTypes forbids an explicit `undefined`, and the distinction is
+    // load-bearing: absent means "not measurable", which is not the same as a measured zero.
+    ...(burnUnitsPerDay !== undefined ? { burnUnitsPerDay } : {}),
+  });
+  const lines = [pacing.headline, ...pacing.notes.map((n) => `• ${n}`)];
+  return { name: 'Pacing', value: truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT) };
 }
 
 /** "12×5h windows left · weekly resets <t:...:R>" — the session budget line appended to
@@ -190,8 +229,15 @@ function windowsLine(outlook: ResetOutlook, accountId: string): string {
   if (!budget) return '';
   return (
     `\n${budget.fullWindows}×5h window${budget.fullWindows === 1 ? '' : 's'} left` +
-    ` · weekly resets ${discordRelative(budget.weeklyResetAt)}`
+    ` · weekly resets ${discordRelative(budget.weeklyResetAt)}${predictedMark(budget.resetPredicted)}`
   );
+}
+
+/** " (predicted)" for a reset derived from history rather than reported by the endpoint. The
+ *  budget it bounds is a projection, and a reader must be able to tell that at a glance —
+ *  every surface that shows a reset time carries the same mark. */
+function predictedMark(resetPredicted: boolean): string {
+  return resetPredicted ? ' (predicted)' : '';
 }
 
 /** `/timeline` — the 5h-window budget and cross-account reset timeline, fully rendered
@@ -204,6 +250,7 @@ export function buildTimelineEmbed(
   usage: {
     accounts: AccountUsage[];
     plan?: UsagePlan;
+    burnUnitsPerDay?: number;
   },
   nowMs = Date.now(),
   barRenderer: BarRenderer = DEFAULT_BAR_RENDERER,
@@ -245,11 +292,16 @@ export function buildTimelineEmbed(
         lines.push(
           `${a.budget.fullWindows}×5h window${a.budget.fullWindows === 1 ? '' : 's'} left` +
             `${a.budget.hasPartialWindow ? ' +1 partial' : ''}` +
-            ` · weekly resets ${discordRelative(a.budget.weeklyResetAt)}`,
+            ` · weekly resets ${discordRelative(a.budget.weeklyResetAt)}` +
+            predictedMark(a.budget.resetPredicted),
         );
       } else if (!a.quarantined) {
         lines.push('weekly reset time unknown');
       }
+      // Same two registry facts /usage and /accounts now carry, so the three account views
+      // agree — `planBillingSuffix` leads with a newline, which is already the separator here.
+      const planBilling = planBillingSuffix(wire);
+      if (planBilling !== '') lines.push(planBilling.slice(1));
       if (spanMs > 0) {
         const events: TrackEvent[] = outlook.events
           .filter((e) => e.accountId === a.accountId)
@@ -280,7 +332,7 @@ export function buildTimelineEmbed(
       outlook.events
         .map((e) => {
           const mark = e.kind === 'session' ? style.session : style.weekly;
-          return `${mark} ${discordRelative(e.atMs)} — **${e.label}** · ${describeEvent(e.kind, e.percentUsed)}`;
+          return `${mark} ${discordRelative(e.atMs)} — **${e.label}** · ${describeEvent(e.kind, e.percentUsed, e.predicted)}`;
         })
         .join('\n');
     embed.addFields({
@@ -296,20 +348,110 @@ export function buildTimelineEmbed(
     for (const adv of usage.plan.advisories) planLines.push(`• ${adv.message}`);
     addClampedField(embed, 'Plan', planLines.join('\n'));
   }
-  embed.addFields(pacingField(usage.accounts, nowMs));
+  embed.addFields(pacingField(usage.accounts, nowMs, usage.burnUnitsPerDay));
   return embed;
 }
 
 /** What a reset means for planning: a session reset frees the window; a weekly reset
  *  wastes whatever headroom went unburned — that asymmetry is the "use them efficiently"
  *  signal (same semantics as the CLI's text renderer). */
-function describeEvent(kind: string, percentUsed: number): string {
+function describeEvent(kind: string, percentUsed: number, predicted = false): string {
   if (kind === 'session') return `5h window resets (${percentUsed}% used clears)`;
   // The scoped weekly cap is the Fable-tier limit, so name the model rather than the
   // opaque wire kind.
   const label = kind === 'weekly_scoped' ? 'weekly (fable)' : 'weekly';
+  const when = `${label} quota resets${predictedMark(predicted)}`;
   const unused = 100 - percentUsed;
-  return unused > 0 ? `${label} quota resets — ${unused}% unused expires` : `${label} quota resets`;
+  return unused > 0 ? `${when} — ${unused}% unused expires` : when;
+}
+
+// ---------------------------------------------------------------------------
+// /stats — absolute token counts
+// ---------------------------------------------------------------------------
+
+function tokenSum(totals: TokenTotals): number {
+  return totals.input + totals.output + totals.cacheCreation + totals.cacheRead;
+}
+
+/** One bucket line: "**main** — 1.3B · 8.4k turns". Discord reflows text, so this is a bullet
+ *  list rather than a padded table — a monospace table would need a code fence, which costs the
+ *  bold/emphasis that makes the list scannable on a phone. */
+function statsLines(rows: readonly { label: string; totals: TokenTotals }[]): string {
+  if (rows.length === 0) return 'nothing recorded';
+  return rows
+    .map((r) => `**${r.label}** — ${formatTokens(tokenSum(r.totals))} · ${r.totals.turns} turns`)
+    .join('\n');
+}
+
+/** What the scan could and could not read — the CLI's honesty footer, adapted for a field. A
+ *  total over 142 of 442 transcript files is a different claim than the same total over all 442,
+ *  and the phone must say so as plainly as the terminal does; the static disclaimers ("not a
+ *  billing figure", etc.) already live in the embed's footer, so only the per-scan counts belong
+ *  here. */
+function coverageLine(coverage: TokenStatsSnapshot['coverage']): string {
+  const notes = [
+    `${coverage.filesScanned} transcript file${coverage.filesScanned === 1 ? '' : 's'} read`,
+    `${coverage.filesSkippedByMtime} untouched since the window opened`,
+  ];
+  // Only surface the failure counts when there ARE failures — but never hide one.
+  if (coverage.filesUnreadable > 0) notes.push(`${coverage.filesUnreadable} could not be read`);
+  if (coverage.dirsUnreadable > 0) {
+    notes.push(
+      `${coverage.dirsUnreadable} project folder${coverage.dirsUnreadable === 1 ? '' : 's'} could not be read`,
+    );
+  }
+  if (coverage.malformedLines > 0) notes.push(`${coverage.malformedLines} malformed lines skipped`);
+  if (coverage.duplicateTurns > 0) notes.push(`${coverage.duplicateTurns} duplicate turns skipped`);
+  return `${notes.join(', ')}.`;
+}
+
+/**
+ * `/stats` — absolute token counts for the window the daemon last scanned, by account, model and
+ * day, plus the split across the four token kinds.
+ *
+ * The bot computes nothing here and reads nothing from the host: the daemon does the transcript
+ * scan and sends only sums, so this surface stays credential-free AND conversation-free. The
+ * footer states what the numbers are not, on every render — these are the turns Claude Code
+ * recorded on one machine, not an Anthropic billing figure.
+ */
+export function buildStatsEmbed(stats: TokenStatsSnapshot): EmbedBuilder {
+  const days = Math.max(1, Math.round((stats.windowEndMs - stats.windowStartMs) / 86_400_000));
+  const embed = new EmbedBuilder()
+    .setTitle('Token usage')
+    .setColor(COLOR_INFO)
+    .setTimestamp(stats.windowEndMs)
+    .setFooter({
+      text:
+        'Local Claude Code turns on the host only - web, phone and other machines are not ' +
+        'counted, and turns before the first recorded switch cannot be attributed. Not a ' +
+        'billing figure.',
+    });
+
+  if (stats.overall.turns === 0) {
+    addClampedField(embed, 'Coverage', coverageLine(stats.coverage));
+    return embed.setDescription(
+      `No Claude Code turns recorded on the host in the last ${days} day${days === 1 ? '' : 's'}.`,
+    );
+  }
+
+  embed.setDescription(
+    `Last ${days} day${days === 1 ? '' : 's'} · **${formatTokens(tokenSum(stats.overall))}** ` +
+      `tokens over ${formatTokens(stats.overall.turns)} turns · scanned ${discordRelative(stats.windowEndMs)}`,
+  );
+  addClampedField(embed, 'By account', statsLines(stats.byAccount));
+  addClampedField(embed, 'By model', statsLines(stats.byModel));
+  // Newest day first: the phone reader wants today, and the clamp drops from the END, so the
+  // far tail of the window is what gets cut rather than the day they came to look at.
+  addClampedField(embed, 'By day', statsLines([...stats.byDay].reverse()));
+  addClampedField(
+    embed,
+    'Token kinds',
+    `input ${formatTokens(stats.overall.input)} · output ${formatTokens(stats.overall.output)} · ` +
+      `cache write ${formatTokens(stats.overall.cacheCreation)} · ` +
+      `cache read ${formatTokens(stats.overall.cacheRead)}`,
+  );
+  addClampedField(embed, 'Coverage', coverageLine(stats.coverage));
+  return embed;
 }
 
 /** `/accounts` — a lighter listing than `/usage`: which accounts exist and whether each is
@@ -327,7 +469,7 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
     addClampedField(
       embed,
       `${accountMarker(account)} ${account.label}`,
-      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${errorSuffix(account)}`,
+      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${planBillingSuffix(account)}${errorSuffix(account)}`,
     );
   }
   return embed;
@@ -423,7 +565,16 @@ export function buildQuestionEmbed(
     .setFooter({ text: `Answer with the menus below${modeNote}` });
   shown.forEach((q, i) => {
     const name = q.header != null && q.header.length > 0 ? q.header : `Question ${i + 1}`;
-    addClampedField(embed, truncateLabeled(name, 256), q.question);
+    // The question is verbatim model text and a "which of these?" question is exactly the shape
+    // that arrives as a comparison table, so it is re-rendered BEFORE the field clamp — clamping
+    // first would cut the source table and leave the formatter a fragment to parse. This field's
+    // own clamp goes to the formatter (rather than the plain `addClampedField`) so it can measure
+    // its row-rule choice through the real cut, and so what it cut is closed behind it: the
+    // output is fenced, and an eight-row table already overruns a field.
+    embed.addFields({
+      name: truncateLabeled(name, 256),
+      value: formatTablesClamped(q.question, FIELD_VALUE_MAX, clampFieldValue),
+    });
   });
   return embed;
 }
@@ -514,8 +665,11 @@ export function buildToolOutputEmbed(p: {
 }
 
 /** `hook.notification` Stop event → the "done" card: WHAT Claude finished saying, not a bare
- *  "session ended". `lastAssistantMessage` can be long, so it is truncated with a visible marker
- *  (no silent cut). Falls back to the daemon-supplied body when no final message was captured. */
+ *  "session ended". `lastAssistantMessage` is a whole assistant turn, so it routinely carries a
+ *  markdown table — which Discord does not render at all — and is re-rendered before it is
+ *  truncated, so the cap cuts finished rows rather than half a table. Long messages are truncated
+ *  with a visible marker (no silent cut) and with the re-rendered table's fence closed behind the
+ *  cut. Falls back to the daemon-supplied body when no final message was captured. */
 export function buildDoneEmbed(p: {
   sessionId?: string;
   lastAssistantMessage?: string;
@@ -526,14 +680,16 @@ export function buildDoneEmbed(p: {
   const embed = new EmbedBuilder()
     .setTitle(`${NOTIFICATION_ICON.done} ${p.title ?? 'Done'}`)
     .setColor(NOTIFICATION_COLOR.done)
-    .setDescription(truncateLabeled(message, EMBED_DESCRIPTION_LIMIT));
+    .setDescription(formatTablesClamped(message, EMBED_DESCRIPTION_LIMIT, truncateLabeled));
   if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
   return embed;
 }
 
 /** `hook.notification` with `notification_type: 'idle_prompt'` → the "waiting on you" card: the
  *  session is blocked awaiting the user's next input. Distinct blue/🔔 language so it reads as
- *  "your turn", never as an error or a completion. */
+ *  "your turn", never as an error or a completion. The body is assistant prose (it is what the
+ *  session is waiting on you about), so its tables are re-rendered before the cap and the cap
+ *  closes any fence it cut, exactly as on the done card. */
 export function buildWaitingEmbed(p: {
   sessionId?: string;
   title?: string;
@@ -543,10 +699,10 @@ export function buildWaitingEmbed(p: {
     .setTitle(`${NOTIFICATION_ICON.waiting} ${p.title ?? 'Waiting on you'}`)
     .setColor(NOTIFICATION_COLOR.waiting)
     .setDescription(
-      truncateLabeled(
-        p.body && p.body.length > 0 ? p.body : 'A session is waiting for your reply.',
-        EMBED_DESCRIPTION_LIMIT,
-      ),
+      // The fallback is a fixed short line — nothing to re-render and nothing to clamp.
+      p.body && p.body.length > 0
+        ? formatTablesClamped(p.body, EMBED_DESCRIPTION_LIMIT, truncateLabeled)
+        : 'A session is waiting for your reply.',
     );
   if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
   return embed;
@@ -653,6 +809,10 @@ function sessionNotes(model: SessionCardModel): string | undefined {
   return notes.length > 0 ? notes.join('\n') : undefined;
 }
 
+/** How much of the live card's description the session summary may take. The rest of the budget
+ *  belongs to the stdout tail below it, which is the part a reader watches change. */
+const SESSION_SUMMARY_MAX = 512;
+
 /** The live, edited-in-place card for one managed session. One of these per session is created on
  *  the first status/output and re-rendered (via an edit) as the session progresses. The stdout
  *  tail is fenced as a code block for monospaced readability; it is bounded by the caller and
@@ -664,23 +824,26 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
     .setTitle(`${icon} Session ${label}`)
     .setColor(model.stopping ? COLOR_WARN : SESSION_STATE_COLOR[model.state]);
 
-  const rawBody =
+  // Tables in a summary arrive terminal-sized; re-render them phone-width and fenced before
+  // capping, so a capped body cuts wrapped rows rather than shredded borders. The body cap is
+  // hard (a session summary is short; the cap defends the card against a runaway one) and its
+  // length is reserved below so the fenced tail can never push the description over the limit.
+  // The cap closes a fence it cut, or the re-rendered table would swallow the tail block.
+  const body =
     model.summary !== undefined
-      ? // Tables in a summary arrive terminal-sized; re-render them phone-width and fenced
-        // before capping, so a capped body cuts wrapped rows rather than shredded borders.
-        formatTables(model.summary)
+      ? formatTablesClamped(model.summary, SESSION_SUMMARY_MAX, truncateLabeled)
       : model.stopping
         ? 'Stop requested — waiting for the session to end.'
         : undefined;
-  // Hard-cap the body (a session summary is short; the cap defends the card against a runaway one)
-  // then reserve its length so the fenced tail below can never push the description over the limit.
-  const prefix = rawBody ? `${truncateLabeled(rawBody, 512)}\n` : '';
+  const prefix = body ? `${body}\n` : '';
   const tail = model.outputTail;
   if (tail && tail.length > 0) {
     const fenceOverhead = '```\n'.length + '\n```'.length; // fence wrapping the inner text
-    const inner = truncateLabeled(
-      tail,
-      Math.max(16, EMBED_DESCRIPTION_LIMIT - prefix.length - fenceOverhead),
+    // Raw stdout is arbitrary bytes from whatever the session ran, so it can contain a fence of
+    // its own; defused here for the same reason the tool-output card does it, or one ``` in a
+    // build log closes this block early and the rest of the card renders as loose markdown.
+    const inner = defuseFences(
+      truncateLabeled(tail, Math.max(16, EMBED_DESCRIPTION_LIMIT - prefix.length - fenceOverhead)),
     );
     embed.setDescription(`${prefix}\`\`\`\n${inner}\n\`\`\``);
   } else {
@@ -703,10 +866,9 @@ export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder 
     .setTitle(`${icon} Session ${model.state === 'done' ? 'complete' : model.state}`)
     .setColor(SESSION_STATE_COLOR[model.state])
     .setDescription(
-      truncateLabeled(
-        model.summary !== undefined ? formatTables(model.summary) : 'Session ended.',
-        EMBED_DESCRIPTION_LIMIT,
-      ),
+      model.summary !== undefined
+        ? formatTablesClamped(model.summary, EMBED_DESCRIPTION_LIMIT, truncateLabeled)
+        : 'Session ended.',
     );
   embed.addFields({ name: 'Session', value: model.sessionId });
   if (model.accountId) embed.addFields({ name: 'Account', value: model.accountId });

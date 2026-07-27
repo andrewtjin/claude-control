@@ -35,7 +35,9 @@ alone (usage, burn advice, manual and automatic switching); pair later with
 Your credentials never leave your machine: the daemon holds them locally, and the shared
 bot is a credential-free control plane that never sees session content.
 
-**Windows and Linux (incl. WSL2) v0.2.2**; Mac support coming soon.
+**Windows and Linux (incl. WSL2) v0.3.0.** macOS is at a very early stage: the Keychain
+vault and switch paths ship and are unit-tested, but they have not been exercised on real
+Mac hardware, so treat macOS as experimental rather than supported.
 
 See the [project README](https://github.com/andrewtjin/claude-control#readme) for the
 full command reference, the architecture, and the self-host path.

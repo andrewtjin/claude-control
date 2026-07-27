@@ -89,6 +89,20 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'full tool output').value).toBe('off');
     expect(row(rows, 'relay url').value).toBe(DEFAULT_RELAY_URL);
     expect(row(rows, 'daemon log level').value).toBe('info');
+    expect(row(rows, 'daemon log format').value).toBe('auto');
+    expect(row(rows, 'daemon log file').value).toBe('off');
+  });
+
+  it('reports the logging env overrides an operator has actually set', () => {
+    const { rows } = resolveDaemonConfig({
+      CCTL_LOG_FORMAT: 'json',
+      CCTL_LOG_FILE: '/var/log/cctl.log',
+    });
+    expect(row(rows, 'daemon log format')).toMatchObject({ value: 'json', source: 'env' });
+    expect(row(rows, 'daemon log file')).toMatchObject({
+      value: '/var/log/cctl.log',
+      source: 'env',
+    });
   });
 
   it('reads the permission hold window from CCTL_PERMISSION_HOLD_MS', () => {
@@ -219,6 +233,8 @@ describe('resolveCliSettings', () => {
     expect(row(rows, 'switch cadence').value).toBe('1m between switches');
     expect(row(rows, 'token refresh skew').value).toBe('5m');
     expect(row(rows, 'cli log level').value).toBe('warn');
+    expect(row(rows, 'cli log format').value).toBe('auto');
+    expect(row(rows, 'cli log file').value).toBe('off');
   });
 
   it('attributes color-off to NO_COLOR only when it is actually set', () => {

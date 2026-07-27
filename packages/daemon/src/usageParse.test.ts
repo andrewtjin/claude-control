@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { encode, stamp } from '@claude-control/shared-protocol';
 import {
   parseUsageEndpointResponse,
   parseCachedUsage,
@@ -233,6 +234,27 @@ describe('parseUsageEndpointResponse', () => {
     }
   });
 
+  it('keeps the endpoint spend block off the wire shape entirely', () => {
+    // The live endpoint really does return this block; it is deliberately not carried. The
+    // envelope is relayed in cleartext through a host the user does not own, so per-account
+    // dollar amounts must not ride along while nothing renders them. It must also not be
+    // mistaken for a parse failure: the sibling limits parse cleanly and no error is reported.
+    const raw = {
+      spend: {
+        used: { amount_minor: 500, currency: 'USD', exponent: 2 },
+        percent: 25,
+        enabled: true,
+        can_purchase_credits: true,
+      },
+      limits: [{ kind: 'session', percent: 5 }],
+    };
+    const { accountUsage } = parseUsageEndpointResponse(raw, baseOpts);
+    expect('spend' in accountUsage).toBe(false);
+    expect(JSON.stringify(accountUsage)).not.toContain('500');
+    expect(accountUsage.limits).toHaveLength(1);
+    expect(accountUsage.error).toBeUndefined();
+  });
+
   it('carries accountId/label/active/source through to AccountUsage', () => {
     const { accountUsage, advisorInput } = parseUsageEndpointResponse(
       {},
@@ -306,5 +328,66 @@ describe('parseCachedUsage', () => {
   it('reports "no cached usage" plainly when the reader had nothing to offer', () => {
     const { accountUsage } = parseCachedUsage(undefined, baseOpts);
     expect(accountUsage.error).toBe('no cached usage available');
+  });
+});
+
+describe('parsed usage must survive the wire codec', () => {
+  // The two halves of this contract live in different packages: the tolerant parser here, and
+  // the schema in shared-protocol. Testing each alone cannot catch the parser accepting a value
+  // the schema rejects — and that gap is not cosmetic. `encode()` THROWS on a mismatch, and it
+  // is called on the SENDING side before anything is queued, so a single bad field from ONE
+  // account aborts the whole poll cycle: every account's usage snapshot, the piggybacked
+  // settings snapshot, and the auto-switch evaluation all die with it, silently, every cycle.
+  // So the composition itself is the thing under test.
+  const send = (accountUsage: ReturnType<typeof parseUsageEndpointResponse>['accountUsage']) =>
+    encode(
+      stamp({
+        type: 'usage.snapshot',
+        daemonId: 'd1',
+        discordUserId: 'u1',
+        payload: { accounts: [accountUsage], plan: null },
+      }),
+    );
+
+  it('encodes cleanly for every hostile payload the parser tolerates', () => {
+    // Each entry is a shape the endpoint could plausibly return; the parser is expected to
+    // absorb it, and whatever it produces must satisfy the wire schema.
+    const hostile: unknown[] = [
+      // Money-shaped fields the parser must not carry onto the wire at all.
+      {
+        limits: [{ kind: 'session', percent: 5 }],
+        spend: {
+          used: { amount_minor: 12.5, currency: 'USD', exponent: 2 },
+          balance: { amount_minor: 0.5, currency: 'USD', exponent: 2 },
+          percent: 1.5,
+          enabled: true,
+          can_purchase_credits: true,
+        },
+      },
+      // Fractional / out-of-range / negative percents.
+      { limits: [{ kind: 'session', percent: 33.33 }] },
+      { limits: [{ kind: 'weekly_all', percent: -5 }] },
+      { limits: [{ kind: 'weekly_all', percent: 1e9 }] },
+      { limits: [{ kind: 'session', utilization: 0.5 }] },
+      // Unusable entries, nested container, and outright garbage.
+      { limits: [{ kind: 'nonsense', percent: 5 }, null, 42] },
+      { utilization: { limits: [{ kind: 'session', percent: 5, scope: { a: 1 } }] } },
+      {},
+      null,
+      'not an object',
+    ];
+
+    for (const raw of hostile) {
+      const { accountUsage } = parseUsageEndpointResponse(raw, baseOpts);
+      expect(() => send(accountUsage), `payload: ${JSON.stringify(raw)}`).not.toThrow();
+    }
+  });
+
+  it('encodes cleanly for a cached payload carrying a wire-illegal fetch stamp', () => {
+    const { accountUsage } = parseCachedUsage(
+      { fetchedAtMs: 1234.5, limits: [{ kind: 'session', percent: 20 }] },
+      baseOpts,
+    );
+    expect(() => send(accountUsage)).not.toThrow();
   });
 });

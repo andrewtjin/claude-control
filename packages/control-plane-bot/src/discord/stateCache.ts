@@ -19,10 +19,17 @@ export type SessionStatus = PayloadOf<'session.status'>;
 interface UsageState {
   accounts: AccountUsage[];
   plan?: UsagePlan;
+  /** The daemon's measured fleet burn (Pro-equivalent units/day). Absent when the daemon could
+   *  not measure one, or predates the field — the pacing model then withholds its verdict. */
+  burnUnitsPerDay?: number;
 }
 
 interface UserState {
   usage?: UsageState;
+  /** The daemon's last token-stats snapshot. Pushed on its own (much slower) cadence than usage
+   *  because producing one means scanning transcript files on the host, so `/stats` answers from
+   *  whatever arrived last — the payload carries its own window, which is what keeps that honest. */
+  stats?: PayloadOf<'stats.snapshot'>;
   /** The daemon's effective-settings report; a new push overwrites (a daemon restart may
    *  legitimately carry different flags). */
   settings?: PayloadOf<'settings.snapshot'>;
@@ -46,7 +53,13 @@ export class DaemonStateCache {
       if (envelope.payload.plan !== undefined && envelope.payload.plan !== null) {
         usage.plan = envelope.payload.plan;
       }
+      // Same reason `plan` is conditional: an older daemon sends no burn rate, and "absent"
+      // has to stay distinguishable from a measured zero all the way to the renderer.
+      const burn = envelope.payload.burnUnitsPerDay;
+      if (burn !== undefined && burn !== null) usage.burnUnitsPerDay = burn;
       state.usage = usage;
+    } else if (isType(envelope, 'stats.snapshot')) {
+      state.stats = envelope.payload;
     } else if (isType(envelope, 'settings.snapshot')) {
       state.settings = envelope.payload;
     } else if (isType(envelope, 'session.status')) {
@@ -79,6 +92,10 @@ export class DaemonStateCache {
 
   getUsage(discordUserId: string): UsageState | undefined {
     return this.byUser.get(discordUserId)?.usage;
+  }
+
+  getStats(discordUserId: string): PayloadOf<'stats.snapshot'> | undefined {
+    return this.byUser.get(discordUserId)?.stats;
   }
 
   getSessions(discordUserId: string): SessionStatus[] {

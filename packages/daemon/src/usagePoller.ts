@@ -10,13 +10,18 @@
 // from the CLI (see docs/VERIFICATION.md) — this module only ever calls the INJECTED `fetch`,
 // never `globalThis.fetch`, so tests can fully control what "the endpoint" returns.
 
-import type { AccountUsage, UsagePlan } from '@claude-control/shared-protocol';
+import type { AccountUsage, PayloadOf, UsagePlan } from '@claude-control/shared-protocol';
 import {
+  billingLabel,
   computePlan,
+  planWeight,
   type AccountUsageInput,
   type AdvisorOptions,
+  type BillingSignals,
+  type PlanTierSignals,
 } from '@claude-control/usage-advisor';
 import { parseUsageEndpointResponse, parseCachedUsage, type ParsedUsage } from './usageParse.js';
+import type { FleetHistory } from './usageHistory.js';
 
 export const USAGE_ENDPOINT = 'https://api.anthropic.com/api/oauth/usage';
 export const ANTHROPIC_BETA_HEADER = 'oauth-2025-04-20';
@@ -55,6 +60,32 @@ export interface PollAccount {
   label: string;
   active: boolean;
   quarantined: boolean;
+}
+
+/** The registry-only facts that ride out on the usage snapshot beside the polled numbers.
+ *  Structural (not `StoredAccount`) so the daemon's wire builder does not drag the vault's type
+ *  into a payload shape — and so tests can supply two fields instead of a whole account.
+ *
+ *  These exist on the wire because they CANNOT be derived downstream: the plan tier and billing
+ *  fields live in the local registry, which the phone never sees. Without them `/usage` and
+ *  `/accounts` could only ever show what the terminal already showed better. */
+export interface RegistryFacts extends PlanTierSignals, BillingSignals {
+  id: string;
+}
+
+/** The wire's plan/billing pair for one account. Both are omitted rather than nulled when
+ *  unresolvable: an absent `planWeight` is what makes every consumer print "?" and keeps pacing
+ *  reporting the tier as unknown, instead of a "1x" that reads like a reading. */
+function registryFields(
+  facts: RegistryFacts | undefined,
+  nowMs: number,
+): { planWeight?: number; billing?: string } {
+  if (facts === undefined) return {};
+  const weight = planWeight(facts);
+  return {
+    ...(weight.known ? { planWeight: weight.weight } : {}),
+    billing: billingLabel(facts, nowMs),
+  };
 }
 
 export interface UsagePollerOptions {
@@ -402,11 +433,37 @@ function restampIdentity(usage: ParsedUsage, account: PollAccount): ParsedUsage 
   };
 }
 
-/** Build the `usage.snapshot` envelope payload from a poll result — kept separate from
- *  `UsagePoller` so daemon.ts can wire it without the poller needing to know about envelopes. */
-export function toUsageSnapshotPayload(snapshot: SnapshotResult): {
-  accounts: AccountUsage[];
-  plan: UsagePlan;
-} {
-  return { accounts: snapshot.accounts, plan: snapshot.plan };
+/**
+ * Build the `usage.snapshot` envelope payload from a poll result plus the measurements only
+ * the store can make — kept separate from `UsagePoller` so daemon.ts can wire it without the
+ * poller needing to know about envelopes.
+ *
+ * Carrying the history-derived inputs is what lets the phone run the SAME pacing model the CLI
+ * runs: the bot holds no history and must never read the database, so without them it can only
+ * report what it does not know. Values are normalized to exactly what the wire schema declares
+ * (integer epoch ms; a finite, non-negative rate) — a payload looser than the schema makes
+ * `encode()` throw, and the poll cycle's catch would then drop the snapshot for EVERY account
+ * silently instead of surfacing one bad field.
+ */
+export function toUsageSnapshotPayload(
+  snapshot: SnapshotResult,
+  history: FleetHistory = { predictedResetByAccount: new Map() },
+  registry: readonly RegistryFacts[] = [],
+  nowMs: number = Date.now(),
+): PayloadOf<'usage.snapshot'> {
+  const factsById = new Map(registry.map((a) => [a.id, a]));
+  const accounts = snapshot.accounts.map((account) => {
+    const predicted = history.predictedResetByAccount.get(account.accountId);
+    const withReset =
+      predicted !== undefined && Number.isFinite(predicted) && predicted >= 0
+        ? { ...account, predictedResetAt: Math.round(predicted) }
+        : account;
+    return { ...withReset, ...registryFields(factsById.get(account.accountId), nowMs) };
+  });
+  const burn = history.burnUnitsPerDay;
+  return {
+    accounts,
+    plan: snapshot.plan,
+    ...(burn !== undefined && Number.isFinite(burn) && burn >= 0 ? { burnUnitsPerDay: burn } : {}),
+  };
 }

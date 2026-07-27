@@ -18,7 +18,18 @@ import {
 } from './embeds.js';
 import { permissionButtons, type ButtonSpec } from './buttons.js';
 import { questionSelectSpecs, type SelectSpec } from './questionCards.js';
+import { chunkMessage } from './messageChunks.js';
 import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
+import { defuseFences, formatTables } from './tableFormat.js';
+
+/** Everything a `content` push actually reaches the reader as: the gateway sends it through
+ *  `chunkMessage`, which caps the number of messages and marks the rest as cut. Handed to
+ *  `formatTables` so its row-rule choice is measured against the real delivery rather than a
+ *  guess at how much room four messages leave — the reopened fences and the truncation marker
+ *  are part of that room, and only the chunker knows them. */
+function chunkedDelivery(content: string): string {
+  return chunkMessage(content).join('\n');
+}
 
 /** A text file to attach to the message — the same delivery session threads use for full
  *  stdout. Plain data (no discord.js types) so this module stays unit-testable; the gateway
@@ -101,7 +112,13 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
   if (isType(envelope, 'session.output')) {
     // Raw stdout is far too high-volume to DM; milestones/summaries/errors are worth it.
     if (envelope.payload.kind === 'stdout') return undefined;
-    return { content: envelope.payload.text };
+    // A summary is assistant prose posted as plain content, where Discord renders neither a
+    // markdown table nor a terminal-width box — re-render before the gateway chunks it, so a
+    // chunk boundary lands between finished lines instead of inside a table it then has to fence.
+    // The gateway's own chunker is what decides how much of this arrives, so it is handed to the
+    // formatter as the measure: a table long enough to reach the chunk cap sheds its rules only
+    // when that is what the chunker then gives the reader back.
+    return { content: formatTables(envelope.payload.text, { deliver: chunkedDelivery }) };
   }
   if (isType(envelope, 'error')) {
     // A protocol `error` envelope is the daemon telling the phone something explicitly failed
@@ -146,10 +163,10 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
       // Compact by design: full-length fenced messages were flooding the DM, so the card is
       // a fixed-height embed — a glanceable preview behind a fence, the origin tag in the
       // footer, and the COMPLETE raw text as a .txt attachment the reader taps to expand
-      // (a real file needs no fence defusing). Embedded ``` sequences in the preview are
-      // defused with a zero-width space so output text cannot terminate its own fence.
-      const zeroWidthSpace = String.fromCharCode(0x200b);
-      const safeBody = p.body.replaceAll('```', '`' + zeroWidthSpace + '``');
+      // (a real file needs no fence defusing). Fence-closing backtick runs in the preview are
+      // taken apart by the formatter's `defuseFences` so output text cannot terminate its own
+      // fence — one shared defusal, so this card and a fenced table can never disagree.
+      const safeBody = defuseFences(p.body);
       const { text: preview, clipped } = previewOf(safeBody);
       const tag = sessionTag(p);
       const embed = buildToolOutputEmbed({
@@ -179,8 +196,19 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
           buildQuarantineEmbed({ title: p.title, body: p.body, reloginCommand: RELOGIN_COMMAND }),
         ],
       };
-    default:
-      return { content: `**${p.title}**\n${p.body}` };
+    default: {
+      // The generic card is a bold title over relayed body text; that body is whatever the
+      // session had to say, tables included, so it goes through the formatter like every other
+      // prose surface. The heading is delivered out of the same chunks as the body, so it is part
+      // of what the formatter measures against — measuring the body alone would credit it room
+      // the heading has already spent.
+      const heading = `**${p.title}**\n`;
+      return {
+        content: `${heading}${formatTables(p.body, {
+          deliver: (rendered) => chunkedDelivery(`${heading}${rendered}`),
+        })}`,
+      };
+    }
   }
 }
 

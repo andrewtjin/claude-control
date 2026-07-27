@@ -72,9 +72,6 @@ importers:
       commander:
         specifier: ^15.0.0
         version: 15.0.0
-      pino:
-        specifier: ^10.3.1
-        version: 10.3.1
 
   packages/control-plane-bot:
     dependencies:
@@ -87,9 +84,6 @@ importers:
       discord.js:
         specifier: ^14.27.0
         version: 14.27.0
-      pino:
-        specifier: ^10.3.1
-        version: 10.3.1
       ws:
         specifier: ^8.21.1
         version: 8.21.1
@@ -123,6 +117,9 @@ importers:
 
   packages/shared-protocol:
     dependencies:
+      pino:
+        specifier: ^10.3.1
+        version: 10.3.1
       zod:
         specifier: ^3.24.1
         version: 3.25.76

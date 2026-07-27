@@ -24,7 +24,6 @@
     "@claude-control/daemon": "workspace:*",
     "@claude-control/session-runtime": "workspace:*",
     "@claude-control/usage-advisor": "workspace:*",
-    "commander": "^15.0.0",
-    "pino": "^10.3.1"
+    "commander": "^15.0.0"
   }
 }
