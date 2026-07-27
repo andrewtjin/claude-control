@@ -616,7 +616,11 @@ describe('toUsageSnapshotPayload — what actually goes on the wire', () => {
         ]),
       ],
     ]);
-    const history = readFleetHistory(readerFor(rows), ['acct-1', 'acct-2'], NOW);
+    const history = readFleetHistory(
+      readerFor(rows),
+      [{ accountId: 'acct-1' }, { accountId: 'acct-2' }],
+      NOW,
+    );
     // Pre-condition: history really did produce both inputs, or the encode below proves nothing.
     expect(history.predictedResetByAccount.get('acct-2')).toBe(
       Date.parse('2026-07-19T05:00:00.000Z') + WEEK_MS,
@@ -673,5 +677,57 @@ describe('toUsageSnapshotPayload — what actually goes on the wire', () => {
     const payload = toUsageSnapshotPayload(snapshot);
     expect(payload.burnUnitsPerDay).toBeUndefined();
     expect(payload.accounts.every((a) => a.predictedResetAt === undefined)).toBe(true);
+    // No registry supplied means no plan/billing either — an older wiring must not start
+    // captioning every account "?"/"unknown" as though the question had been asked and failed.
+    expect(payload.accounts.every((a) => a.planWeight === undefined)).toBe(true);
+    expect(payload.accounts.every((a) => a.billing === undefined)).toBe(true);
+  });
+
+  // The phone showed neither plan tier nor billing date while the terminal showed both, because
+  // these two facts live in the local registry and nothing put them on the wire. They cannot be
+  // derived downstream: the bot never sees the vault.
+  it('resolves plan tier and billing from the registry onto the wire, and survives encode', async () => {
+    const snapshot = await pollTwoAccounts();
+    const payload = toUsageSnapshotPayload(
+      snapshot,
+      { predictedResetByAccount: new Map() },
+      [
+        {
+          id: 'acct-1',
+          organizationRateLimitTier: 'default_claude_max_20x',
+          billingType: 'stripe_subscription',
+          subscriptionCreatedAt: '2026-01-11T00:00:00.000Z',
+        },
+        // Tier unreadable: the weight must stay ABSENT so consumers print "?" rather than a
+        // "1x" that reads like a reading of the account rather than a fallback.
+        { id: 'acct-2', subscriptionType: 'max' },
+      ],
+      NOW,
+    );
+
+    const first = payload.accounts.find((a) => a.accountId === 'acct-1');
+    expect(first?.planWeight).toBe(20);
+    expect(first?.billing).toBe('~Aug 11 (est.)');
+
+    const second = payload.accounts.find((a) => a.accountId === 'acct-2');
+    expect(second?.planWeight).toBeUndefined();
+    expect(second?.billing).toBe('unknown');
+
+    expect(() =>
+      encode(stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload })),
+    ).not.toThrow();
+  });
+
+  it('leaves an account absent from the registry untouched rather than inventing a tier', async () => {
+    const snapshot = await pollTwoAccounts();
+    const payload = toUsageSnapshotPayload(
+      snapshot,
+      { predictedResetByAccount: new Map() },
+      [{ id: 'acct-1', organizationRateLimitTier: 'default_claude_max_5x' }],
+      NOW,
+    );
+    expect(payload.accounts.find((a) => a.accountId === 'acct-1')?.planWeight).toBe(5);
+    expect(payload.accounts.find((a) => a.accountId === 'acct-2')?.planWeight).toBeUndefined();
+    expect(payload.accounts.find((a) => a.accountId === 'acct-2')?.billing).toBeUndefined();
   });
 });
