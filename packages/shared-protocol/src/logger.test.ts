@@ -4,11 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLogger } from './logger.js';
 
-/** A stand-in for stdout that just records every chunk written to it, so tests can assert on
- *  exactly what a real terminal (or a real pipe) would have received — no real process I/O
- *  touched. `isTTY` is part of the sink for the same reason it is on `process.stdout`: it is
+/** A stand-in for the console stream that just records every chunk written to it, so tests can
+ *  assert on exactly what a real terminal (or a real pipe) would have received — no real process
+ *  I/O touched. `isTTY` is part of the sink for the same reason it is on `process.stdout`: it is
  *  what the format default keys off. */
-class CapturingStdout {
+class CapturingSink {
   chunks: string[] = [];
   constructor(readonly isTTY = false) {}
   write(chunk: string): boolean {
@@ -33,81 +33,81 @@ afterEach(() => {
 
 describe('createLogger: format mode selection', () => {
   it('defaults to pretty on a TTY', () => {
-    const stdout = new CapturingStdout(true);
-    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    const sink = new CapturingSink(true);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, sink });
     logger.info({ sessionId: 's1' }, 'started');
-    expect(stdout.chunks).toHaveLength(1);
-    expect(stdout.chunks[0]?.startsWith('{')).toBe(false);
-    expect(stdout.chunks[0]).toContain('started');
-    expect(stdout.chunks[0]).toContain('sessionId=s1');
+    expect(sink.chunks).toHaveLength(1);
+    expect(sink.chunks[0]?.startsWith('{')).toBe(false);
+    expect(sink.chunks[0]).toContain('started');
+    expect(sink.chunks[0]).toContain('sessionId=s1');
   });
 
   it('defaults to NDJSON off a TTY (piped to a file, a service manager, a log collector)', () => {
-    const stdout = new CapturingStdout(false);
-    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    const sink = new CapturingSink(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, sink });
     logger.info({ sessionId: 's1' }, 'started');
-    expect(stdout.chunks).toHaveLength(1);
-    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    expect(sink.chunks).toHaveLength(1);
+    const parsed = JSON.parse(sink.chunks[0]!) as Record<string, unknown>;
     expect(parsed.msg).toBe('started');
     expect(parsed.sessionId).toBe('s1');
     expect(typeof parsed.level).toBe('number');
   });
 
   it('CCTL_LOG_FORMAT=json forces NDJSON even on a TTY', () => {
-    const stdout = new CapturingStdout(true);
+    const sink = new CapturingSink(true);
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FORMAT: 'json' },
-      stdout,
+      sink,
     });
     logger.info({}, 'x');
-    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    const parsed = JSON.parse(sink.chunks[0]!) as Record<string, unknown>;
     expect(parsed.msg).toBe('x');
   });
 
   it('CCTL_LOG_FORMAT=pretty forces pretty even off a TTY', () => {
-    const stdout = new CapturingStdout(false);
+    const sink = new CapturingSink(false);
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FORMAT: 'pretty' },
-      stdout,
+      sink,
     });
     logger.info({}, 'x');
-    expect(stdout.chunks[0]?.startsWith('{')).toBe(false);
-    expect(stdout.chunks[0]).toContain('x');
+    expect(sink.chunks[0]?.startsWith('{')).toBe(false);
+    expect(sink.chunks[0]).toContain('x');
   });
 });
 
 describe('createLogger: level', () => {
   it('honors CCTL_LOG_LEVEL over the caller-supplied default', () => {
-    const stdout = new CapturingStdout(true);
+    const sink = new CapturingSink(true);
     // defaultLevel is 'info' but the env override should win, silencing info entirely.
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_LEVEL: 'error' },
-      stdout,
+      sink,
     });
     logger.info({}, 'quiet');
     logger.warn({}, 'still quiet');
     logger.error({}, 'loud');
-    expect(stdout.chunks).toHaveLength(1);
-    expect(stdout.chunks[0]).toContain('loud');
+    expect(sink.chunks).toHaveLength(1);
+    expect(sink.chunks[0]).toContain('loud');
   });
 
   it('falls back to the caller-supplied default when CCTL_LOG_LEVEL is unset', () => {
-    const stdout = new CapturingStdout(true);
-    const logger = createLogger({ defaultLevel: 'warn', env: {}, stdout });
+    const sink = new CapturingSink(true);
+    const logger = createLogger({ defaultLevel: 'warn', env: {}, sink });
     logger.info({}, 'quiet');
     logger.warn({}, 'loud');
-    expect(stdout.chunks).toHaveLength(1);
-    expect(stdout.chunks[0]).toContain('loud');
+    expect(sink.chunks).toHaveLength(1);
+    expect(sink.chunks[0]).toContain('loud');
   });
 });
 
 describe('createLogger: pretty rendering of a real failure', () => {
   it('renders the ECONNREFUSED shape from a real Error the same way the daemon would log it', () => {
-    const stdout = new CapturingStdout(true);
-    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    const sink = new CapturingSink(true);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, sink });
     const err = new Error('connect ECONNREFUSED 127.0.0.1:8765') as Error & {
       errno: number;
       code: string;
@@ -125,7 +125,7 @@ describe('createLogger: pretty rendering of a real failure', () => {
     // Every written chunk is one terminated line (the destination appends '\n' the same way
     // pino's own destination convention does); strip it before asserting there is exactly one
     // rendered line of content, not two.
-    const line = stdout.chunks[0]!;
+    const line = sink.chunks[0]!;
     expect(line.endsWith('\n')).toBe(true);
     const content = line.slice(0, -1);
     expect(content).toContain('ERROR');
@@ -145,24 +145,24 @@ describe('createLogger: pretty rendering of a real failure', () => {
   it('prints the stack of an error line once CCTL_LOG_LEVEL=debug asks for verbose output', () => {
     // The stack must be reachable from the CONFIGURED level. Nothing in this codebase logs an
     // error at debug level, so a gate on the line's own level would hide every stack forever.
-    const stdout = new CapturingStdout(true);
+    const sink = new CapturingSink(true);
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_LEVEL: 'debug' },
-      stdout,
+      sink,
     });
     logger.error({ err: new Error('boom') }, 'daemon failed to start');
-    const content = stdout.chunks[0]!;
+    const content = sink.chunks[0]!;
     expect(content).toContain('err=boom');
     expect(content).toMatch(/\n {4}Error: boom/);
     expect(content).toContain('logger.test.ts');
   });
 
   it('still prints pid/hostname in NDJSON mode — pretty output is the only thing that drops them', () => {
-    const stdout = new CapturingStdout(false);
-    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    const sink = new CapturingSink(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, sink });
     logger.error({ err: new Error('boom') }, 'failed');
-    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    const parsed = JSON.parse(sink.chunks[0]!) as Record<string, unknown>;
     expect(parsed).toHaveProperty('pid');
     expect(parsed).toHaveProperty('hostname');
   });
@@ -286,10 +286,10 @@ describe('createLogger: reserved payload keys', () => {
   it("renames a payload field that would collide with pino's own level/time/msg", () => {
     // Without the rename both the header and the field would be wrong: the duplicate JSON key
     // wins the parse, so the payload silently rewrites the timestamp and then disappears.
-    const stdout = new CapturingStdout(false);
-    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    const sink = new CapturingSink(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, sink });
     logger.info({ level: 'shadow', time: 5, msg: 'hijack', sessionId: 's1' }, 'real message');
-    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    const parsed = JSON.parse(sink.chunks[0]!) as Record<string, unknown>;
     expect(parsed.msg).toBe('real message');
     expect(typeof parsed.level).toBe('number');
     expect(parsed.time).not.toBe(5);
@@ -300,10 +300,10 @@ describe('createLogger: reserved payload keys', () => {
   });
 
   it('leaves an ordinary payload untouched', () => {
-    const stdout = new CapturingStdout(false);
-    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    const sink = new CapturingSink(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, sink });
     logger.info({ sessionId: 's1' }, 'started');
-    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    const parsed = JSON.parse(sink.chunks[0]!) as Record<string, unknown>;
     expect(parsed.sessionId).toBe('s1');
     expect(parsed).not.toHaveProperty('levelField');
   });
@@ -313,12 +313,12 @@ describe('createLogger: reserved payload keys', () => {
     // only sees own enumerable keys) would silently drop them along with the prototype pino's
     // `instanceof Error` special-case (and its err serializer) rely on — even though this Error
     // also carries an enumerable `level` field that would otherwise trip the reserved-key guard.
-    const stdout = new CapturingStdout(false);
-    const logger = createLogger({ defaultLevel: 'info', env: {}, stdout });
+    const sink = new CapturingSink(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, sink });
     const err = new Error('kaboom') as Error & { level: string };
     err.level = 'critical';
     logger.error(err);
-    const parsed = JSON.parse(stdout.chunks[0]!) as Record<string, unknown>;
+    const parsed = JSON.parse(sink.chunks[0]!) as Record<string, unknown>;
     // pino's own numeric error level, untouched — the Error's OWN `level` field lives nested
     // under `err.level` below, so it never collides with this one.
     expect(parsed.level).toBe(50);
@@ -331,17 +331,17 @@ describe('createLogger: reserved payload keys', () => {
 });
 
 describe('createLogger: file sink', () => {
-  it('appends NDJSON to CCTL_LOG_FILE in addition to pretty stdout output', () => {
+  it('appends NDJSON to CCTL_LOG_FILE in addition to the pretty console output', () => {
     const dir = freshTempDir();
     const filePath = join(dir, 'daemon.log');
-    const stdout = new CapturingStdout(true);
+    const sink = new CapturingSink(true);
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FILE: filePath },
-      stdout,
+      sink,
     });
     logger.info({ sessionId: 's1' }, 'started');
-    expect(stdout.chunks[0]).not.toMatch(/^\{/); // stdout stayed pretty
+    expect(sink.chunks[0]).not.toMatch(/^\{/); // the console sink stayed pretty
     const parsed = JSON.parse(readFileSync(filePath, 'utf8').trim()) as Record<string, unknown>;
     expect(parsed.msg).toBe('started');
     expect(parsed.sessionId).toBe('s1');
@@ -355,7 +355,7 @@ describe('createLogger: file sink', () => {
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FILE: filePath },
-      stdout: new CapturingStdout(true),
+      sink: new CapturingSink(true),
     });
     logger.error({ err: new Error('port in use') }, 'daemon failed to start');
     // No await, no polling: if this needs either, the line would not survive an exit.
@@ -364,23 +364,23 @@ describe('createLogger: file sink', () => {
     expect(contents).toContain('port in use');
   });
 
-  it('degrades to stdout-only with exactly one warning when CCTL_LOG_FILE cannot be opened', () => {
+  it('degrades to console-only with exactly one warning when CCTL_LOG_FILE cannot be opened', () => {
     const dir = freshTempDir();
     // A path whose parent directory does not exist: opening it fails with ENOENT.
     const filePath = join(dir, 'missing-parent', 'daemon.log');
-    const stdout = new CapturingStdout(true);
+    const sink = new CapturingSink(true);
     const warnings: string[] = [];
     const logger = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FILE: filePath },
-      stdout,
+      sink,
       warn: (message) => warnings.push(message),
     });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(filePath);
-    // The daemon must keep working: logging still reaches stdout, never throws.
+    // The daemon must keep working: logging still reaches the console, never throws.
     expect(() => logger.info({}, 'still alive')).not.toThrow();
-    expect(stdout.chunks.some((c) => c.includes('still alive'))).toBe(true);
+    expect(sink.chunks.some((c) => c.includes('still alive'))).toBe(true);
     expect(warnings).toHaveLength(1);
   });
 
@@ -398,13 +398,13 @@ describe('createLogger: file sink', () => {
     const first = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FILE: filePath },
-      stdout: new CapturingStdout(true),
+      sink: new CapturingSink(true),
       warn,
     });
     const second = createLogger({
       defaultLevel: 'warn',
       env: { CCTL_LOG_FILE: filePath },
-      stdout: new CapturingStdout(true),
+      sink: new CapturingSink(true),
       warn,
     });
     first.info({ sessionId: 's1' }, 'from the daemon logger');
@@ -429,13 +429,13 @@ describe('createLogger: file sink', () => {
     const first = createLogger({
       defaultLevel: 'info',
       env: { CCTL_LOG_FILE: filePath },
-      stdout: new CapturingStdout(true),
+      sink: new CapturingSink(true),
       warn,
     });
     const second = createLogger({
       defaultLevel: 'warn',
       env: { CCTL_LOG_FILE: filePath },
-      stdout: new CapturingStdout(true),
+      sink: new CapturingSink(true),
       warn,
     });
     expect(() => first.info({}, 'still alive (first)')).not.toThrow();

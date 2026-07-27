@@ -919,6 +919,17 @@ function buildAccountCommands(program: Command): void {
     .description('list stored accounts')
     .action(async () => {
       const engine = buildEngine();
+      // Self-heal before rendering. The PLAN/BILLING columns read fields that a row only gains
+      // when its bundle is rewritten, so an account stored by an earlier build shows "?" and
+      // "unknown" indefinitely even though its vaulted bundle has carried the answer all along.
+      // This call IS the repair mechanism for every account that is never switched to — nothing
+      // else reaches them. The sweep decrypts only rows that are actually behind, stamps each one
+      // whether or not it could be repaired, and yields the credential lock instead of waiting on
+      // it, so it costs nothing once healed and cannot stall a listing behind an in-flight switch.
+      // Unguarded on purpose: the engine's contract is that this never throws and logs whatever
+      // went wrong, so a listing the user asked for still renders whatever is already on record —
+      // without a `catch` here throwing the reason away on the way past.
+      await engine.backfillAccountMetadata();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
       process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
     });
