@@ -158,10 +158,10 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 /** A text decorator that adds ANSI styling without changing the string's rendered WIDTH (escape
  *  codes are zero-width) — padding computed on plain text (see `formatLevel`) stays aligned once
- *  wrapped. Declared independently here rather than imported from `packages/cli/src/ansi.ts`:
- *  shared-protocol has no workspace dependencies (control-plane-bot's credential-firewalled
- *  composition root may import ONLY this package — see its bin.ts module comment), so it cannot
- *  depend on the CLI, and the CLI's `Paint` is structurally identical anyway. */
+ *  wrapped. It is declared HERE, in the package with no workspace dependencies, because the
+ *  direction of reuse only works one way: control-plane-bot's credential-firewalled composition
+ *  root may import ONLY this package (see its bin.ts module comment), so shared-protocol cannot
+ *  reach into the CLI. The CLI imports this type rather than redeclaring it. */
 export type Paint = (text: string) => string;
 
 /** The palette a caller injects to color pretty-mode output. Deliberately tiny — just enough to
