@@ -2,7 +2,12 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ACCOUNT_METADATA_REV, needsMetadataBackfill, Vault } from './vault.js';
+import {
+  ACCOUNT_METADATA_REV,
+  METADATA_BACKFILL_RETRY_MS,
+  needsMetadataBackfill,
+  Vault,
+} from './vault.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { UnknownAccountError } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
@@ -425,7 +430,7 @@ describe('Vault registry + bundles', () => {
 
       const stale = await v.getAccount(acct.id);
       expect(stale).toBeDefined();
-      expect(needsMetadataBackfill(stale!)).toBe(true);
+      expect(needsMetadataBackfill(stale!, 0)).toBe(true);
       expect(stale).not.toHaveProperty('organizationRateLimitTier');
 
       expect(await v.syncMetadata(acct.id, await v.readBundle(acct.id))).toBe(true);
@@ -434,7 +439,7 @@ describe('Vault registry + bundles', () => {
       expect(after?.billingType).toBe('stripe_subscription');
       expect(after?.subscriptionCreatedAt).toBe('2026-07-15T20:35:34.215673Z');
       expect(after?.metadataRev).toBe(ACCOUNT_METADATA_REV);
-      expect(needsMetadataBackfill(after!)).toBe(false);
+      expect(needsMetadataBackfill(after!, 0)).toBe(false);
     });
 
     it('leaves the encrypted bundle exactly as it was', async () => {
@@ -491,6 +496,62 @@ describe('Vault registry + bundles', () => {
       await degradeRegistryRow(registryPath, []);
       expect(await v.syncMetadata(acct.id, await v.readBundle(acct.id))).toBe(true);
       expect((await v.getAccount(acct.id))?.metadataRev).toBe(ACCOUNT_METADATA_REV);
+    });
+  });
+
+  describe('backfill back-off for rows that cannot be repaired', () => {
+    it('stops selecting a row for a while after a failed attempt, then selects it again', async () => {
+      // A row nothing can advance (its blob is gone) keeps the stale set non-empty forever if a
+      // failed attempt leaves no trace, so the sweep — and the credential lock it takes — runs on
+      // every listing. The back-off is a TIMER, not a tombstone: the same row must come back.
+      const { v, registryPath } = await vaultAt();
+      const acct = await v.addAccount('work', bundle('a'));
+      await degradeRegistryRow(registryPath, []);
+      await v.markMetadataBackfillFailed(acct.id);
+
+      const failed = await v.getAccount(acct.id);
+      const at = failed?.metadataBackfillFailedAtMs;
+      expect(at).toBeDefined();
+      expect(needsMetadataBackfill(failed!, at!)).toBe(false);
+      expect(needsMetadataBackfill(failed!, at! + METADATA_BACKFILL_RETRY_MS - 1)).toBe(false);
+      expect(needsMetadataBackfill(failed!, at! + METADATA_BACKFILL_RETRY_MS)).toBe(true);
+    });
+
+    it('does not present a failed repair attempt as an update to the account', async () => {
+      const v = await vault();
+      const acct = await v.addAccount('work', bundle('a'));
+      const before = (await v.getAccount(acct.id))?.updatedAtMs;
+      await v.markMetadataBackfillFailed(acct.id);
+      expect((await v.getAccount(acct.id))?.updatedAtMs).toBe(before);
+    });
+
+    it('is a no-op for an id with no registry row', async () => {
+      const v = await vault();
+      await expect(v.markMetadataBackfillFailed('no-such-id')).resolves.toBeUndefined();
+      expect(await v.listAccounts()).toEqual([]);
+    });
+
+    it('drops the back-off as soon as a recompute succeeds', async () => {
+      // A restored blob or a re-paired machine must heal on the spot rather than serve out a
+      // timer that describes a failure which no longer applies.
+      const { v, registryPath } = await vaultAt();
+      const acct = await v.addAccount('work', bundle('a'));
+      await degradeRegistryRow(registryPath, []);
+      await v.markMetadataBackfillFailed(acct.id);
+
+      expect(await v.syncMetadata(acct.id, await v.readBundle(acct.id))).toBe(true);
+      const healed = await v.getAccount(acct.id);
+      expect(healed).not.toHaveProperty('metadataBackfillFailedAtMs');
+      expect(needsMetadataBackfill(healed!, 0)).toBe(false);
+    });
+
+    it('ignores a back-off stamped in the future by a clock that has since moved back', async () => {
+      const { v, registryPath } = await vaultAt();
+      const acct = await v.addAccount('work', bundle('a'));
+      await degradeRegistryRow(registryPath, []);
+      await v.markMetadataBackfillFailed(acct.id);
+      const failed = await v.getAccount(acct.id);
+      expect(needsMetadataBackfill(failed!, failed!.metadataBackfillFailedAtMs! - 1)).toBe(true);
     });
   });
 

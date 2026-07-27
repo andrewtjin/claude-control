@@ -20,13 +20,14 @@ import { type Protector } from './dpapi.js';
 import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
 import {
   CadenceError,
+  LockTimeoutError,
   QuarantineError,
   RefreshError,
   UnknownAccountError,
   VerifyError,
 } from './errors.js';
 import { IntentStore } from './intent.js';
-import { acquireLock, type LockOptions } from './lock.js';
+import { acquireLock, type Lock, type LockOptions } from './lock.js';
 import { noopLogger, type Logger } from './logger.js';
 import {
   DEFAULT_REFRESH_SKEW_MS,
@@ -152,26 +153,45 @@ export class SwitchEngine {
    * from the live `~/.claude.json`) is what makes this correct for EVERY account instead of only
    * whichever one is currently logged in.
    *
-   * Cost is bounded and one-shot: `needsMetadataBackfill` filters to rows that are actually
-   * behind, each repaired row is stamped with the current revision, and the lock is not taken at
-   * all when there is nothing to do — so the steady state is a single registry read. An
-   * unreadable bundle (missing blob, a key this machine cannot decrypt) is skipped rather than
-   * thrown: a listing must still render for the accounts that ARE readable.
+   * Cost is bounded and self-limiting: `needsMetadataBackfill` filters to rows that are actually
+   * behind, and the lock is not taken at all when there is nothing to do — so the steady state is
+   * a single registry read. EVERY selected row is stamped, whether or not it could be repaired: a
+   * repaired one with the current revision, an unrepairable one (missing blob, a key this machine
+   * cannot decrypt, an identity block that refuses the row) with a failure time that backs the
+   * sweep off for `METADATA_BACKFILL_RETRY_MS`. Leaving an unrepairable row unstamped is what
+   * turns "sweep once" into "sweep on every listing forever", because that row alone keeps the
+   * stale set non-empty. An unreadable bundle is skipped rather than thrown: a listing must still
+   * render for the accounts that ARE readable.
+   *
+   * Opportunistic by design: this is repair nobody asked for, running inside a read command, so
+   * it SKIPS when another process holds the credential lock instead of queueing behind an
+   * in-flight switch and stalling the caller for the whole acquire timeout. The lock is still
+   * required when the work does run — `syncMetadata` is a registry read-modify-write, and doing
+   * it unlocked would silently drop a concurrent switch's update. Returns 0 when it skipped;
+   * nothing is lost, because the next invocation retries.
    */
   async backfillAccountMetadata(): Promise<number> {
-    const stale = (await this.vault.listAccounts()).filter(needsMetadataBackfill);
+    const now = this.clock();
+    const stale = (await this.vault.listAccounts()).filter((a) => needsMetadataBackfill(a, now));
     if (stale.length === 0) return 0;
-    return this.withCredentialLock(async () => {
-      let repaired = 0;
+    const repaired = await this.withCredentialLockIfFree(async () => {
+      let count = 0;
       for (const account of stale) {
         const bundle = await this.vault.readBundle(account.id).catch(() => undefined);
-        if (!bundle) continue;
-        // Re-reads the registry per account, so a row removed since the scan above is a no-op.
-        if (await this.vault.syncMetadata(account.id, bundle)) repaired += 1;
+        // Both calls re-read the registry per account, so a row removed since the scan above is a
+        // no-op. `syncMetadata` returning false for a row known to be behind the revision means
+        // the bundle was refused (its identity block names a different account) — unrepairable
+        // from here, so it backs off exactly like an unreadable blob.
+        if (bundle && (await this.vault.syncMetadata(account.id, bundle))) {
+          count += 1;
+          continue;
+        }
+        await this.vault.markMetadataBackfillFailed(account.id);
       }
-      if (repaired > 0) this.log.info({ repaired }, 'backfilled account metadata from vault');
-      return repaired;
+      if (count > 0) this.log.info({ repaired: count }, 'backfilled account metadata from vault');
+      return count;
     });
+    return repaired ?? 0;
   }
 
   // ---- active account (live-login reconciled) ----
@@ -810,6 +830,33 @@ export class SwitchEngine {
    */
   private async withCredentialLock<T>(mutate: () => Promise<T>): Promise<T> {
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
+    try {
+      return await mutate();
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Same as {@link withCredentialLock}, but claims the lock only if it is free RIGHT NOW: a lock
+   * someone else holds yields `undefined` and `mutate` never runs.
+   *
+   * For opportunistic work a user is waiting on. Waiting out the full acquire timeout is the
+   * right trade for a mutation the caller explicitly asked for and nothing else can perform; it
+   * is the wrong one for background self-healing, where queueing behind an in-flight switch turns
+   * a fast read command into a stall for a result the caller never requested. A zero timeout
+   * makes `acquireLock` attempt the claim exactly once — still reclaiming a dead holder's lock on
+   * the way — and report contention as {@link LockTimeoutError}, which is a routine outcome here
+   * rather than a failure. Any other acquisition error is a real fault and propagates.
+   */
+  private async withCredentialLockIfFree<T>(mutate: () => Promise<T>): Promise<T | undefined> {
+    let lock: Lock;
+    try {
+      lock = await acquireLock(this.lockDir(), this.clock, { ...this.lockOptions, timeoutMs: 0 });
+    } catch (err) {
+      if (err instanceof LockTimeoutError) return undefined;
+      throw err;
+    }
     try {
       return await mutate();
     } finally {
