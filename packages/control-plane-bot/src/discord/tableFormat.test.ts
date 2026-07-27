@@ -73,6 +73,36 @@ describe('formatTables — box-drawing input', () => {
     expect(separators).toHaveLength(4); // 5 rows, a separator after each but the last
   });
 
+  it('keeps a separator between every body row for a fully-separated box source (3 rows)', () => {
+    // The exact shape from the phone report: three single-character body rows with a separator
+    // already drawn between each. Box-drawing input mirrors whatever the source drew (unlike
+    // markdown, which has no per-gap separator to mirror), and a fully-separated source has one
+    // at every gap — this confirms that fidelity holds and stays narrowed to natural width.
+    const threeRows = [
+      '┌─────┬─────┬─────┐',
+      '│  A  │  A  │  A  │',
+      '├─────┼─────┼─────┤',
+      '│ A   │ A   │ A   │',
+      '├─────┼─────┼─────┤',
+      '│ A   │ A   │ A   │',
+      '└─────┴─────┴─────┘',
+    ].join('\n');
+    const out = formatTables(threeRows);
+    expect(out).toBe(
+      [
+        '```',
+        '┌───┬───┬───┐',
+        '│ A │ A │ A │',
+        '├───┼───┼───┤',
+        '│ A │ A │ A │',
+        '├───┼───┼───┤',
+        '│ A │ A │ A │',
+        '└───┴───┴───┘',
+        '```',
+      ].join('\n'),
+    );
+  });
+
   it('renders a table that already fits at its natural width', () => {
     const narrow = ['┌────┬────┐', '│ ab │ cd │', '├────┼────┤', '│ ef │ gh │', '└────┴────┘'].join(
       '\n',
@@ -135,8 +165,35 @@ describe('formatTables — markdown pipe input', () => {
     expect(lines[1]?.startsWith('┌')).toBe(true);
     for (const line of lines) expect(line.length).toBeLessThanOrEqual(DEFAULT_TABLE_WIDTH);
     expect(columnText(out, 0)).toBe('Flag--auto-switch--greedy'.replace(/\s+/g, ''));
-    // Header separator only — markdown tables have exactly one.
-    expect(lines.filter((l) => l.startsWith('├'))).toHaveLength(1);
+    // Markdown has exactly one delimiter row (header/body), but that delimiter marks where the
+    // HEADER ends, not how many separators the grid gets: every row still sits on its own line
+    // in the source, so the render separates every gap — one after the header, one between the
+    // two body rows.
+    expect(lines.filter((l) => l.startsWith('├'))).toHaveLength(2);
+  });
+
+  it('separates every body row, not just the header — a markdown table has no way to mark a gap as unseparated', () => {
+    // The exact symptom reported from a phone render: a table with 3+ body rows where only the
+    // header/body boundary got a separator, so every row after the first one ran into the next.
+    // A single-column-per-cell fixture keeps the box narrow enough that nothing wraps, isolating
+    // the separator count from the width/wrap behavior covered elsewhere.
+    const threeBodyRows = [
+      '| Col | Val |',
+      '| --- | --- |',
+      '| A | A |',
+      '| A | A |',
+      '| A | A |',
+    ].join('\n');
+    const out = formatTables(threeBodyRows);
+    const lines = out.split('\n');
+    // 4 rows total (header + 3 body) means 3 gaps, every one of them separated.
+    expect(lines.filter((l) => l.startsWith('├'))).toHaveLength(3);
+    // And no two data rows are adjacent without a separator between them.
+    const dataOrSep = lines.filter((l) => l.startsWith('│') || l.startsWith('├'));
+    for (let i = 0; i + 1 < dataOrSep.length; i++) {
+      const both = [dataOrSep[i], dataOrSep[i + 1]];
+      expect(both.every((l) => l?.startsWith('│'))).toBe(false);
+    }
   });
 
   it('does not fire on a stray pipe in prose (no separator line follows)', () => {
