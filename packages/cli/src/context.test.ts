@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { sandboxPaths } from '@claude-control/switch-engine';
+import { sandboxPaths, type Paths } from '@claude-control/switch-engine';
 import { buildEngine } from './context.js';
 
 const tempDirs: string[] = [];
@@ -45,6 +45,16 @@ async function captureConsole(
   return { stdout, stderr };
 }
 
+/** A sandbox whose registry cannot be parsed — the cheapest deterministic way to make the engine
+ *  log through the adapter `buildEngine` gave it: the metadata sweep's read throws, and the
+ *  no-throw wrapper turns that into exactly one warn line. */
+function pathsWithUnreadableRegistry(): Paths {
+  const paths = sandboxPaths(freshTempDir());
+  mkdirSync(paths.vaultDir, { recursive: true });
+  writeFileSync(join(paths.vaultDir, 'accounts.json'), '{ this is not json');
+  return paths;
+}
+
 describe('buildEngine: where the engine writes its diagnostics', () => {
   it('keeps an engine warning off stdout, so a command can be piped', async () => {
     // A command's stdout is its OUTPUT — the accounts table, a `--json` document — and the engine
@@ -52,13 +62,7 @@ describe('buildEngine: where the engine writes its diagnostics', () => {
     // breaks every non-human consumer of it, while being no more visible to the operator than it
     // is on stderr.
     //
-    // An unparseable registry is the cheapest deterministic way to make the engine log through
-    // the adapter `buildEngine` gave it: the sweep's read throws, and the no-throw wrapper turns
-    // that into exactly one warn line.
-    const paths = sandboxPaths(freshTempDir());
-    mkdirSync(paths.vaultDir, { recursive: true });
-    writeFileSync(join(paths.vaultDir, 'accounts.json'), '{ this is not json');
-    const engine = buildEngine(paths);
+    const engine = buildEngine(pathsWithUnreadableRegistry());
 
     const { stdout, stderr } = await captureConsole(async () => {
       await engine.backfillAccountMetadata();
@@ -66,5 +70,20 @@ describe('buildEngine: where the engine writes its diagnostics', () => {
 
     expect(stdout).toEqual([]);
     expect(stderr.join('')).toContain('account metadata sweep did not run');
+  });
+
+  it('renders to the stream the caller names, so a daemon keeps its whole log on one', async () => {
+    // `cctl daemon run` writes nothing but log, and `cctl daemon run > daemon.log` is a
+    // documented way to capture it. Its engine diagnostics therefore have to reach the SAME
+    // stream its own logger uses (stdout) — on stderr they would escape the redirect and land
+    // on the terminal, splitting the daemon's log across two places with nothing to say so.
+    const engine = buildEngine(pathsWithUnreadableRegistry(), process.stdout);
+
+    const { stdout, stderr } = await captureConsole(async () => {
+      await engine.backfillAccountMetadata();
+    });
+
+    expect(stdout.join('')).toContain('account metadata sweep did not run');
+    expect(stderr).toEqual([]);
   });
 });

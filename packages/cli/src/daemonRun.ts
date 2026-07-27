@@ -71,6 +71,15 @@ import {
  *  falls back to tier-0 rather than racing the expiry mid-request. */
 const POLL_TOKEN_MIN_TTL_MS = 60_000;
 
+/** The one stream every logger in this process renders to.
+ *
+ *  A foreground daemon writes nothing but log — it has no command output to keep a pipe clean
+ *  for — and `cctl daemon run > daemon.log` is a documented way to capture it, so ALL of it has
+ *  to be on the redirected stream. This process builds two loggers (its own, below, and the
+ *  switch engine's, through `buildEngine`); naming their destination once is what stops them
+ *  drifting onto different streams and splitting the log in half. */
+const DAEMON_LOG_SINK = process.stdout;
+
 export interface DaemonRunOptions {
   pair?: string;
   relay?: string;
@@ -191,9 +200,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       );
     }
   }
-  const logger: Logger = createLogger({ defaultLevel: 'info' });
+  const logger: Logger = createLogger({ defaultLevel: 'info', sink: DAEMON_LOG_SINK });
 
-  const engine = buildEngine(paths);
+  const engine = buildEngine(paths, DAEMON_LOG_SINK);
   const store = new Store(daemonDbPath(paths));
   const protector = defaultProtector();
 
