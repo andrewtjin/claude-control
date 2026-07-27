@@ -1,6 +1,19 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { buildProgram } from './program.js';
+
+// `buildEngine` is the CLI's single seam onto the switch engine, so stubbing it lets an action
+// body run for real — commander dispatch, the action, the render — with nothing near a real
+// vault. Hoisted because the mock factory is evaluated during the import above.
+const engine = vi.hoisted(() => ({
+  backfillAccountMetadata: vi.fn(() => Promise.resolve(0)),
+  listAccounts: vi.fn(() => Promise.resolve([])),
+  getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
+}));
+vi.mock('./context.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./context.js')>()),
+  buildEngine: () => engine,
+}));
 
 describe('buildProgram', () => {
   it('exposes the expected command surface', () => {
@@ -119,5 +132,29 @@ describe('buildProgram', () => {
       readFileSync(new URL('../../cctl-publish/package.json', import.meta.url), 'utf8'),
     ) as { version: string };
     expect(buildProgram().version()).toBe(manifest.version);
+  });
+
+  // Asserting the command SURFACE (above) says nothing about what an action does, and the engine's
+  // own tests pass with the listing's call to it deleted — which is exactly the seam the original
+  // defect shipped through: the bundle -> row mapping was right all along and only the wiring that
+  // reaches non-live accounts was missing. So the wiring itself is the invariant to hold.
+  it('repairs stale account metadata before reading the rows it renders', async () => {
+    const order: string[] = [];
+    engine.backfillAccountMetadata.mockImplementation(() => {
+      order.push('repair');
+      return Promise.resolve(0);
+    });
+    engine.listAccounts.mockImplementation(() => {
+      order.push('read');
+      return Promise.resolve([]);
+    });
+    const write = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    try {
+      await buildProgram().parseAsync(['accounts', 'list'], { from: 'user' });
+    } finally {
+      write.mockRestore();
+    }
+    // Order, not just invocation: a repair that lands after the read still renders the stale rows.
+    expect(order).toEqual(['repair', 'read']);
   });
 });

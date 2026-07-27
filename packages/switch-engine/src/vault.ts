@@ -37,11 +37,39 @@ function emptyRegistry(): Registry {
  */
 export const ACCOUNT_METADATA_REV = 1;
 
+/**
+ * How long the sweep leaves a row alone after an attempt to recompute it FAILED.
+ *
+ * Some rows can never be advanced by any amount of retrying — a half-removed account whose blob
+ * is gone, or a vault copied from another machine whose blobs this one holds no key for. Those
+ * rows stay behind `ACCOUNT_METADATA_REV` permanently, so a sweep gated on the revision alone
+ * rescans them (and takes the credential lock to do it) on every single listing.
+ *
+ * Backing off on a TIMER rather than giving up permanently is deliberate: "cannot decrypt today"
+ * is not "cannot decrypt ever". A restored blob or a re-paired machine makes the same row
+ * repairable, and a permanent tombstone would leave it rendering as unknown with no way back
+ * short of remove-and-re-add. An hour is short enough that such a repair is picked up within the
+ * session that performed it, and long enough that a scripted listing loop cannot turn a broken
+ * row into a stream of registry writes. A DELIBERATE repair does not wait for it at all:
+ * `accounts add`/`relogin`/a switch all write the bundle, and any successful recompute clears the
+ * back-off immediately.
+ */
+export const METADATA_BACKFILL_RETRY_MS = 60 * 60 * 1000;
+
 /** Whether this row's derived metadata predates the current mapping and should be recomputed
- *  from its stored bundle. Recomputation costs a decrypt, so this gate is what keeps the repair
- *  a one-time cost per row instead of a per-listing one. */
-export function needsMetadataBackfill(account: StoredAccount): boolean {
-  return account.metadataRev !== ACCOUNT_METADATA_REV;
+ *  from its stored bundle now. Recomputation costs a decrypt and the credential lock, so this
+ *  gate is what keeps the repair a one-time cost per row instead of a per-listing one — both for
+ *  rows that repair successfully (stamped with the current revision) and for rows that cannot
+ *  (stamped with a failure time, retried once `METADATA_BACKFILL_RETRY_MS` has passed).
+ *
+ *  A failure time in the FUTURE is treated as no back-off at all rather than one that expires
+ *  after the wait: it can only come from a clock that has since moved backwards, and honouring it
+ *  would suspend the repair for however far ahead the old clock ran. */
+export function needsMetadataBackfill(account: StoredAccount, nowMs: number): boolean {
+  if (account.metadataRev === ACCOUNT_METADATA_REV) return false;
+  const failedAtMs = account.metadataBackfillFailedAtMs;
+  if (failedAtMs === undefined) return true;
+  return !(failedAtMs <= nowMs && nowMs - failedAtMs < METADATA_BACKFILL_RETRY_MS);
 }
 
 /** Registry fields that identify WHICH account a row is. Never removed by a bundle write, and
@@ -164,6 +192,14 @@ function applyBundleMetadata(
   // would suppress the backfill that eventually repairs it.
   let changed = account.metadataRev !== ACCOUNT_METADATA_REV;
   account.metadataRev = ACCOUNT_METADATA_REV;
+  // The row just recomputed, so any record of an earlier failed attempt describes a state that no
+  // longer exists. Dropping it here — rather than only in the sweep — means every write path
+  // (a switch, a relogin, a token rotation) heals a backed-off row immediately instead of leaving
+  // it waiting out a timer it no longer needs.
+  if (account.metadataBackfillFailedAtMs !== undefined) {
+    delete account.metadataBackfillFailedAtMs;
+    changed = true;
+  }
   const oauth = bundle.claudeAiOauth;
   changed = setOrDelete(account, 'subscriptionType', oauth.subscriptionType) || changed;
   changed = setOrDelete(account, 'rateLimitTier', oauth.rateLimitTier) || changed;
@@ -354,6 +390,26 @@ export class Vault {
     account.updatedAtMs = this.clock();
     await this.saveRegistry(reg);
     return true;
+  }
+
+  /**
+   * Record that a recompute of this row from its stored bundle could not be performed, so
+   * {@link needsMetadataBackfill} stops selecting it until the back-off expires.
+   *
+   * Without this the sweep has no memory of trying: a row it can never advance stays selected,
+   * and every later listing pays the scan and the credential lock again. `updatedAtMs` is
+   * deliberately NOT bumped — nothing about the account changed, and this is bookkeeping about a
+   * repair attempt, not a fact a user should see rendered as a recent update.
+   *
+   * An id with no registry row is a no-op rather than an error (the row may have been removed
+   * since the scan), and — being a registry read-modify-write — the credential lock MUST be held.
+   */
+  async markMetadataBackfillFailed(id: string): Promise<void> {
+    const reg = await this.loadRegistry();
+    const account = reg.accounts.find((a) => a.id === id);
+    if (!account) return;
+    account.metadataBackfillFailedAtMs = this.clock();
+    await this.saveRegistry(reg);
   }
 
   // ---- rollback snapshot (mid-switch only) ----

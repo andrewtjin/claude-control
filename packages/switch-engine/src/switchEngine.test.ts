@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { SwitchEngine, type RefreshFn } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore } from './credentialStore.js';
-import { Vault } from './vault.js';
+import { METADATA_BACKFILL_RETRY_MS, Vault } from './vault.js';
 import { IntentStore } from './intent.js';
 import { sandboxPaths, type Paths } from './paths.js';
 import {
@@ -360,6 +360,54 @@ describe('derived account metadata is repaired from the stored bundle', () => {
     expect(await h.engine.backfillAccountMetadata()).toBe(1);
     expect((await h.vault.getAccount(accountB.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
     expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+  });
+
+  it('backs a permanently unreadable row off, then retries it once the window passes', async () => {
+    // Skipping an unreadable row without recording the attempt leaves it selected forever, so the
+    // stale set never empties and every later listing takes the credential lock again. Recording
+    // it must not become a tombstone either: the blob can come back.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+    // Keep A's blob so it can be put back the way a restored vault or a re-paired machine would —
+    // out of band, without any write path running to heal the row as a side effect.
+    const blobPath = join(h.paths.vaultDir, accountA.id, 'cred.enc');
+    const blob = await readFile(blobPath, 'utf8');
+    await rm(join(h.paths.vaultDir, accountA.id), { recursive: true, force: true });
+
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+
+    // Even with the blob back, the row waits out its back-off rather than being retried per call.
+    await mkdir(join(h.paths.vaultDir, accountA.id), { recursive: true });
+    await writeFile(blobPath, blob);
+    expect(await h.engine.backfillAccountMetadata()).toBe(0);
+    expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+
+    h.setNow(NOW + METADATA_BACKFILL_RETRY_MS);
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+    expect((await h.vault.getAccount(accountA.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+  });
+
+  it('skips the sweep while another process holds the credential lock', async () => {
+    // The sweep runs inside `cctl accounts list`, a read command. Queueing behind an in-flight
+    // switch would make a listing sit out the whole acquire timeout for repair nobody asked for.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+
+    const held = await acquireLock(join(h.paths.vaultDir, '.lock'), () => NOW);
+    try {
+      expect(await h.engine.backfillAccountMetadata()).toBe(0);
+      expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+    } finally {
+      held.release();
+    }
+    // Skipping gives nothing up — the rows are untouched, so the next call still repairs them.
+    expect(await h.engine.backfillAccountMetadata()).toBe(2);
   });
 });
 
