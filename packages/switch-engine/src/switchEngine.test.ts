@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SwitchEngine, type RefreshFn } from './switchEngine.js';
@@ -17,11 +17,43 @@ import {
 } from './errors.js';
 import { acquireLock } from './lock.js';
 import type { ClaudeOauth, CredentialBundle } from './types.js';
+import type { Logger } from './logger.js';
+
+// A seam to make one atomic write's `rename` fail the way a Windows sharing violation does — the
+// registry is open in another process, so the replace is refused until that handle closes. Keyed
+// to the SOURCE path (unique per `atomicWriteFile` call), so arming it fails exactly one write and
+// all of its retries while every other write proceeds normally. Disarmed except in the test that
+// needs it, so every other test here sees the real `rename`.
+const renameFault = vi.hoisted(() => ({ armed: false, source: '' }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    rename: ((from: string, to: string): Promise<void> => {
+      if (renameFault.armed) {
+        if (renameFault.source === '') renameFault.source = String(from);
+        if (renameFault.source === String(from)) {
+          const err: NodeJS.ErrnoException = new Error('EPERM: operation not permitted, rename');
+          err.code = 'EPERM';
+          return Promise.reject(err);
+        }
+      }
+      return actual.rename(from, to);
+    }) as typeof actual.rename,
+  };
+});
 
 const NOW = 100_000_000;
 const HOUR = 3_600_000;
 
 let dirs: string[] = [];
+
+/** One line the engine logged, flattened enough to assert on. */
+interface LogLine {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  obj: unknown;
+  msg: string | undefined;
+}
 
 interface Harness {
   paths: Paths;
@@ -31,6 +63,9 @@ interface Harness {
   vault: Vault;
   intent: IntentStore;
   setNow: (n: number) => void;
+  /** Everything the engine logged, in order — the only place a best-effort repair can report
+   *  that it failed, since by contract it does not fail its caller. */
+  logs: LogLine[];
 }
 
 async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
@@ -52,6 +87,19 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
     });
   const refresh = vi.fn(refreshImpl ?? defaultRefresh);
 
+  const logs: LogLine[] = [];
+  const record =
+    (level: LogLine['level']) =>
+    (obj: unknown, msg?: string): void => {
+      logs.push({ level, obj, msg });
+    };
+  const logger: Logger = {
+    debug: record('debug'),
+    info: record('info'),
+    warn: record('warn'),
+    error: record('error'),
+  };
+
   const engine = new SwitchEngine({
     paths,
     protector,
@@ -59,6 +107,7 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
     clock,
     refreshSkewMs: 5 * 60 * 1000,
     lockOptions: { timeoutMs: 2000, pollMs: 10 },
+    logger,
   });
 
   return {
@@ -69,10 +118,13 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
     vault: new Vault(paths.vaultDir, protector, clock),
     intent: new IntentStore(paths.vaultDir),
     setNow: (n) => (now = n),
+    logs,
   };
 }
 
 afterEach(async () => {
+  renameFault.armed = false;
+  renameFault.source = '';
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
   dirs = [];
 });
@@ -408,6 +460,49 @@ describe('derived account metadata is repaired from the stored bundle', () => {
     }
     // Skipping gives nothing up — the rows are untouched, so the next call still repairs them.
     expect(await h.engine.backfillAccountMetadata()).toBe(2);
+  });
+
+  it('repairs the remaining rows after one of them cannot be written, and says which', async () => {
+    // Every row is repaired by its own registry write, so a write that loses a race with a
+    // concurrent reader says nothing about the next row. Stopping there would make which accounts
+    // get repaired depend on their position in the list — and leave every row after the failure
+    // waiting on a later sweep that hits the same wall in the same place.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+
+    // The sweep's first registry write is A's; nothing between arming and it renames anything.
+    renameFault.armed = true;
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+    renameFault.armed = false;
+
+    expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+    expect((await h.vault.getAccount(accountB.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+    // A failed write must not leave its temp copy of the registry in the vault directory.
+    const left = (await readdir(h.paths.vaultDir)).filter((f) => f.startsWith('.tmp-'));
+    expect(left).toEqual([]);
+    // Best-effort does not mean unaccountable: the row that could not be repaired is named.
+    const warned = h.logs.filter((l) => l.level === 'warn');
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.obj).toMatchObject({ accountId: accountA.id });
+    // A is untouched, so the next sweep repairs it too — nothing is permanently skipped.
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+    expect((await h.vault.getAccount(accountA.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+  });
+
+  it('logs rather than throws when the sweep cannot run at all', async () => {
+    // The sweep runs ahead of a read command the user DID ask for, so it must never fail that
+    // command. Reporting best-effort by throwing forces every call site into a bare `catch`, and a
+    // discarded reason makes a self-heal that has stopped healing look exactly like one with
+    // nothing left to do.
+    const h = await harness();
+    await seedAActiveWithB(h);
+    await writeFile(join(h.paths.vaultDir, 'accounts.json'), '{ not json');
+
+    await expect(h.engine.backfillAccountMetadata()).resolves.toBe(0);
+    expect(h.logs.filter((l) => l.level === 'warn')).toHaveLength(1);
   });
 });
 

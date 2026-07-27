@@ -922,9 +922,10 @@ function buildAccountCommands(program: Command): void {
       // else reaches them. The sweep decrypts only rows that are actually behind, stamps each one
       // whether or not it could be repaired, and yields the credential lock instead of waiting on
       // it, so it costs nothing once healed and cannot stall a listing behind an in-flight switch.
-      // Any remaining failure renders whatever is already on record rather than failing the
-      // command: a listing the user asked for outranks a repair they did not.
-      await engine.backfillAccountMetadata().catch(() => 0);
+      // Unguarded on purpose: the engine's contract is that this never throws and logs whatever
+      // went wrong, so a listing the user asked for still renders whatever is already on record —
+      // without a `catch` here throwing the reason away on the way past.
+      await engine.backfillAccountMetadata();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
       process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
     });
