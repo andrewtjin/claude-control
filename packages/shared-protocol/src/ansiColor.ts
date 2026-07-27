@@ -9,11 +9,14 @@
 
 import type { LogLineColors, Paint } from './logFormat.js';
 
-/** SGR wrapper: every paint resets fully afterwards so styles never bleed across segments. */
-const sgr =
+/** SGR wrapper: every paint resets fully afterwards so styles never bleed across segments.
+ *  Exported so the CLI palette (packages/cli/src/ansi.ts) builds on this one primitive instead
+ *  of redeclaring it -- two independent SGR wrappers is how a reset-code edit here would
+ *  silently stop matching the CLI's, with no test able to catch the drift. */
+export const sgr =
   (code: string): Paint =>
   (text) =>
-    `[${code}m${text}[0m`;
+    `\u001b[${code}m${text}\u001b[0m`;
 
 const RED = sgr('31');
 const YELLOW = sgr('33');

@@ -5,3 +5,6 @@ export * from './messages.js';
 export * from './codec.js';
 export * from './logger.js';
 export * from './ansiColor.js';
+// `Paint`/`LogLineColors` are the CLI's palette primitives too (see ansi.ts) — exported here so
+// the CLI imports them instead of redeclaring structurally-identical copies that could drift.
+export * from './logFormat.js';

@@ -8,17 +8,20 @@
 //  - color is only enabled on a real TTY with NO_COLOR unset, so piped/redirected output
 //    and CI logs remain byte-for-byte plain.
 
-import { colorEnabled } from '@claude-control/shared-protocol';
+import { colorEnabled, sgr, type Paint } from '@claude-control/shared-protocol';
 import { severityOf, type OutlookStyle } from '@claude-control/usage-advisor';
 
-// `colorEnabled` (the NO_COLOR/TTY gate) is defined once in shared-protocol and re-exported
-// here rather than redeclared: shared-protocol's own pretty-log renderer (`createLogger`) makes
-// the identical decision for the exact same reason, and the two must never disagree about
-// whether a given stream is colorable. See shared-protocol's ansiColor.ts.
+// `colorEnabled` (the NO_COLOR/TTY gate) and `sgr` (the SGR wrapper every paint below is built
+// from) are defined once in shared-protocol and re-exported/reused here rather than redeclared:
+// shared-protocol's own pretty-log renderer (`createLogger`) makes the identical decisions for
+// the exact same reason, and the two must never disagree — on colorability, or on how a reset
+// code is written — about output hitting the same terminal. See shared-protocol's ansiColor.ts.
 export { colorEnabled };
 
-/** A text decorator. Must not change the visible width of its input. */
-export type Paint = (text: string) => string;
+/** A text decorator. Must not change the visible width of its input. Re-exported from
+ *  shared-protocol (see the import above) rather than redeclared, for the same reason as
+ *  `colorEnabled`. */
+export type { Paint };
 
 /** The named paints the CLI renders with. Kept small on purpose — a palette is a THEME,
  *  not a general styling library. */
@@ -34,12 +37,6 @@ export interface Palette {
   /** 256-color orange — the 'high' severity band (16-color ANSI has no orange). */
   orange: Paint;
 }
-
-/** SGR wrapper: every paint resets fully afterwards so styles never bleed across segments. */
-const sgr =
-  (code: string): Paint =>
-  (text) =>
-    `\u001b[${code}m${text}\u001b[0m`;
 
 /** Real ANSI colors. */
 export const ANSI_PALETTE: Palette = {
