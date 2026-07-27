@@ -550,10 +550,15 @@ export function buildQuestionEmbed(
     // that arrives as a comparison table, so it is re-rendered BEFORE the field clamp — clamping
     // first would cut the source table and leave the formatter a fragment to parse. The clamp
     // then has to close what it cut (`clampBalanced` rather than the plain `addClampedField`):
-    // the formatter's output is fenced, and an eight-row table already overruns a field.
+    // the formatter's output is fenced, and an eight-row table already overruns a field. The
+    // field cap is handed to the formatter too, so it spends the room on rows before rules.
     embed.addFields({
       name: truncateLabeled(name, 256),
-      value: clampBalanced(formatTables(q.question), FIELD_VALUE_MAX, clampFieldValue),
+      value: clampBalanced(
+        formatTables(q.question, { budget: FIELD_VALUE_MAX }),
+        FIELD_VALUE_MAX,
+        clampFieldValue,
+      ),
     });
   });
   return embed;
@@ -660,7 +665,13 @@ export function buildDoneEmbed(p: {
   const embed = new EmbedBuilder()
     .setTitle(`${NOTIFICATION_ICON.done} ${p.title ?? 'Done'}`)
     .setColor(NOTIFICATION_COLOR.done)
-    .setDescription(clampBalanced(formatTables(message), EMBED_DESCRIPTION_LIMIT, truncateLabeled));
+    .setDescription(
+      clampBalanced(
+        formatTables(message, { budget: EMBED_DESCRIPTION_LIMIT }),
+        EMBED_DESCRIPTION_LIMIT,
+        truncateLabeled,
+      ),
+    );
   if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
   return embed;
 }
@@ -680,7 +691,9 @@ export function buildWaitingEmbed(p: {
     .setColor(NOTIFICATION_COLOR.waiting)
     .setDescription(
       clampBalanced(
-        p.body && p.body.length > 0 ? formatTables(p.body) : 'A session is waiting for your reply.',
+        p.body && p.body.length > 0
+          ? formatTables(p.body, { budget: EMBED_DESCRIPTION_LIMIT })
+          : 'A session is waiting for your reply.',
         EMBED_DESCRIPTION_LIMIT,
         truncateLabeled,
       ),
@@ -790,6 +803,10 @@ function sessionNotes(model: SessionCardModel): string | undefined {
   return notes.length > 0 ? notes.join('\n') : undefined;
 }
 
+/** How much of the live card's description the session summary may take. The rest of the budget
+ *  belongs to the stdout tail below it, which is the part a reader watches change. */
+const SESSION_SUMMARY_MAX = 512;
+
 /** The live, edited-in-place card for one managed session. One of these per session is created on
  *  the first status/output and re-rendered (via an edit) as the session progresses. The stdout
  *  tail is fenced as a code block for monospaced readability; it is bounded by the caller and
@@ -804,15 +821,16 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
   const rawBody =
     model.summary !== undefined
       ? // Tables in a summary arrive terminal-sized; re-render them phone-width and fenced
-        // before capping, so a capped body cuts wrapped rows rather than shredded borders.
-        formatTables(model.summary)
+        // before capping, so a capped body cuts wrapped rows rather than shredded borders. The
+        // body cap is the formatter's budget as well, so a long table keeps rows over rules.
+        formatTables(model.summary, { budget: SESSION_SUMMARY_MAX })
       : model.stopping
         ? 'Stop requested — waiting for the session to end.'
         : undefined;
   // Hard-cap the body (a session summary is short; the cap defends the card against a runaway one)
   // then reserve its length so the fenced tail below can never push the description over the limit.
   // The cap closes a fence it cut, or the re-rendered table would swallow the tail block below it.
-  const prefix = rawBody ? `${clampBalanced(rawBody, 512, truncateLabeled)}\n` : '';
+  const prefix = rawBody ? `${clampBalanced(rawBody, SESSION_SUMMARY_MAX, truncateLabeled)}\n` : '';
   const tail = model.outputTail;
   if (tail && tail.length > 0) {
     const fenceOverhead = '```\n'.length + '\n```'.length; // fence wrapping the inner text
@@ -844,7 +862,9 @@ export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder 
     .setColor(SESSION_STATE_COLOR[model.state])
     .setDescription(
       clampBalanced(
-        model.summary !== undefined ? formatTables(model.summary) : 'Session ended.',
+        model.summary !== undefined
+          ? formatTables(model.summary, { budget: EMBED_DESCRIPTION_LIMIT })
+          : 'Session ended.',
         EMBED_DESCRIPTION_LIMIT,
         truncateLabeled,
       ),

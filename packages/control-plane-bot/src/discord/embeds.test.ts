@@ -637,6 +637,25 @@ describe('buildQuestionEmbed', () => {
     expect(embed.fields?.[0]?.value).toContain('┌');
   });
 
+  it('shows every row of a long table rather than rules on a clamped one', () => {
+    // A question that arrives as a twenty-account comparison is the whole reason this field goes
+    // through the formatter, and the field cap is hard: rendering a rule between every row costs
+    // more than the cap can hold, and the rows past the cap are the ones the reader loses. The
+    // rules are what must go.
+    const rows = Array.from({ length: 20 }, (_, i) => `| account-${i} | max20x | ${i}% |`);
+    const embed = buildQuestionEmbed([
+      {
+        question: ['| Account | Plan | Left |', '| --- | --- | --- |', ...rows].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    for (let i = 0; i < 20; i++) expect(value).toContain(`account-${i}`);
+    expect(value).not.toContain('more');
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
   it('renders at most four questions', () => {
     const many = Array.from({ length: 6 }, (_, i) => ({
       question: `q${i}`,
