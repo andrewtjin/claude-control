@@ -116,6 +116,22 @@ function errorSuffix(account: Pick<AccountUsage, 'error'> | undefined): string {
   return account?.error ? `\n⚠️ ${account.error}` : '';
 }
 
+/** "\nplan 20x · billing ~Aug 11 (est.)" — the two registry facts the terminal has always shown
+ *  and the phone could not, because the tier signals and subscription dates live in the local
+ *  vault and only reach here because the daemon now resolves them onto the snapshot.
+ *
+ *  Empty when the snapshot carries NEITHER field, which is exactly how a daemon predating them
+ *  reports: an older daemon then renders as it always did instead of captioning every account
+ *  "plan ? · billing unknown". Once either field arrives, both are shown — "?" and "unknown"
+ *  are real answers there, and hiding them would imply the question was never asked. */
+function planBillingSuffix(
+  account: Pick<AccountUsage, 'planWeight' | 'billing'> | undefined,
+): string {
+  if (account?.planWeight == null && account?.billing == null) return '';
+  const plan = account.planWeight != null ? `${account.planWeight}x` : '?';
+  return `\nplan ${plan} · billing ${account.billing ?? 'unknown'}`;
+}
+
 /** Embed accent color for a usage snapshot: the worst severity across every limit of
  *  every account, or neutral blue when no limit data exists yet. */
 function usageColor(accounts: AccountUsage[]): number {
@@ -164,7 +180,7 @@ export function buildUsageEmbed(
       name: `${account.label} — ${marker}${cachedSuffix(account)}`,
       value: fitFieldValue(
         (unicodeFallback) =>
-          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${errorSuffix(account)}`,
+          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${planBillingSuffix(account)}${errorSuffix(account)}`,
       ),
     });
   }
@@ -282,6 +298,10 @@ export function buildTimelineEmbed(
       } else if (!a.quarantined) {
         lines.push('weekly reset time unknown');
       }
+      // Same two registry facts /usage and /accounts now carry, so the three account views
+      // agree — `planBillingSuffix` leads with a newline, which is already the separator here.
+      const planBilling = planBillingSuffix(wire);
+      if (planBilling !== '') lines.push(planBilling.slice(1));
       if (spanMs > 0) {
         const events: TrackEvent[] = outlook.events
           .filter((e) => e.accountId === a.accountId)
@@ -449,7 +469,7 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
     addClampedField(
       embed,
       `${accountMarker(account)} ${account.label}`,
-      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${errorSuffix(account)}`,
+      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${planBillingSuffix(account)}${errorSuffix(account)}`,
     );
   }
   return embed;

@@ -234,7 +234,7 @@ describe('readFleetHistory', () => {
         // Dormant: its window closed, so the newest rows carry no reset at all.
         dormant: [weeklyRow(NOW - 9 * DAY_MS, 90, anchor), weeklyRow(NOW - DAY_MS, 0)],
       }),
-      ['live', 'dormant'],
+      [{ accountId: 'live' }, { accountId: 'dormant' }],
       NOW,
     );
 
@@ -249,14 +249,34 @@ describe('readFleetHistory', () => {
   it('omits an account with no observed reset instead of inventing a clock for it', () => {
     const history = readFleetHistory(
       reader({ fresh: [weeklyRow(NOW - DAY_MS, 0), weeklyRow(NOW, 0)] }),
-      ['fresh'],
+      [{ accountId: 'fresh' }],
       NOW,
     );
     expect(history.predictedResetByAccount.has('fresh')).toBe(false);
   });
 
+  // Burn and the capacity it is judged against MUST be denominated in the same units. Measuring
+  // a Max 20x account's burn at 1x while pacing sizes its allowance at 20x understates
+  // consumption by the plan multiplier, and every fleet then reads as sustainable.
+  it('scales measured burn by the account plan weight', () => {
+    const rows = { big: [weeklyRow(NOW - 3 * DAY_MS, 0), weeklyRow(NOW, 20)] };
+    const atOneX = readFleetHistory(reader(rows), [{ accountId: 'big' }], NOW);
+    const atTwentyX = readFleetHistory(reader(rows), [{ accountId: 'big', weight: 20 }], NOW);
+
+    expect(atOneX.burnUnitsPerDay).toBeCloseTo(0.2 / 3, 9);
+    expect(atTwentyX.burnUnitsPerDay).toBeCloseTo((0.2 * 20) / 3, 9);
+  });
+
+  it('falls back to 1x for an unresolved tier rather than dropping the account', () => {
+    // An absent weight is the same fallback pacing applies to capacity, so a half-known fleet
+    // still has both sides of the comparison in one unit.
+    const rows = { mixed: [weeklyRow(NOW - 3 * DAY_MS, 0), weeklyRow(NOW, 20)] };
+    const history = readFleetHistory(reader(rows), [{ accountId: 'mixed', weight: 0 }], NOW);
+    expect(history.burnUnitsPerDay).toBeCloseTo(0.2 / 3, 9);
+  });
+
   it('reports an unmeasurable burn as absent, never as zero', () => {
-    const history = readFleetHistory(reader({ empty: [] }), ['empty'], NOW);
+    const history = readFleetHistory(reader({ empty: [] }), [{ accountId: 'empty' }], NOW);
     expect(history.burnUnitsPerDay).toBeUndefined();
     expect(history.predictedResetByAccount.size).toBe(0);
   });

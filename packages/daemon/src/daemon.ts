@@ -26,7 +26,7 @@ import type { AgentSdkClient } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { EnvelopeDraft, MessageOf, PayloadOf } from '@claude-control/shared-protocol';
-import type { AccountUsageInput } from '@claude-control/usage-advisor';
+import { planWeight, type AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
 import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
 import { readFleetHistory } from './usageHistory.js';
@@ -590,15 +590,19 @@ export class Daemon {
     // Measure AFTER persisting, so this cycle's own readings are part of the history. The
     // daemon owns the store, so it is the only party that can make these measurements at all —
     // it makes them once here and both the phone and its own advisor consume the same numbers.
+    // Weighted by plan tier, so a Max 20x account's one percent of weekly quota counts for
+    // twenty times a Pro account's. The burn rate and the fleet capacity it is judged against
+    // MUST use the same weights: measuring burn at 1x while pacing sizes the fleet at 20x
+    // understates consumption by the plan multiplier and reports every fleet as sustainable.
     const history = readFleetHistory(
       this.store,
-      pollAccounts.map((a) => a.accountId),
+      accounts.map((a) => ({ accountId: a.id, ...planWeightOf(a) })),
       this.clock(),
     );
 
     this.sendEnvelope({
       type: 'usage.snapshot',
-      payload: toUsageSnapshotPayload(snapshot, history),
+      payload: toUsageSnapshotPayload(snapshot, history, accounts, this.clock()),
     });
 
     // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
@@ -1840,4 +1844,12 @@ export function reconcileQuarantineNotices(
   }
 
   return { notices, nextState };
+}
+
+/** `{ weight }` for an account whose plan tier resolves, `{}` otherwise — the present-or-absent
+ *  contract the burn measurement and the pacing model share, so an unreadable tier degrades to
+ *  the 1x fallback in ONE place and is reported rather than silently applied. */
+function planWeightOf(account: Parameters<typeof planWeight>[0]): { weight?: number } {
+  const result = planWeight(account);
+  return result.known ? { weight: result.weight } : {};
 }
