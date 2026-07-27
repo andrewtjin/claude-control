@@ -136,6 +136,7 @@ const PAIRING_PRIMER_MESSAGE = [
   "Paired. Here's what works right now:",
   '`/usage` — usage across accounts',
   '`/timeline` — 5h-session budget and reset timeline',
+  '`/stats` — token counts per account, model and day',
   '`/switch <account>` — switch the active account',
   '`/run <prompt>` — start a Claude Code session',
   '`/status` — daemon connection status',
@@ -735,10 +736,29 @@ export class DiscordJsGateway implements DiscordGateway {
     });
   }
 
+  /** Publish the slash-command list to Discord on every start.
+   *
+   *  Both outcomes are logged, because the two failure modes here are invisible from the outside.
+   *  A registration that never ran and one that ran successfully look identical to an operator —
+   *  the commands simply are not there — and the list is published GLOBALLY (`commands.set` with
+   *  no guild argument), so Discord can take up to an hour to surface a newly added one. Without
+   *  a success line naming what was published, a missing command is indistinguishable from a
+   *  command that is merely still propagating, and the only way to tell them apart is to wait. */
   private async registerCommands(): Promise<void> {
     const application = this.client.application;
-    if (!application) return;
-    await application.commands.set(this.commandDefinitions());
+    if (!application) {
+      // Reachable whenever the gateway hands us a client whose application is not resolved yet.
+      // Silently returning would leave Discord serving whatever list it stored on a previous run,
+      // which reads as a stale deploy rather than as the no-op it actually is.
+      this.logger.warn('discord: no application on the client, slash commands not registered');
+      return;
+    }
+    const definitions = this.commandDefinitions();
+    await application.commands.set(definitions);
+    this.logger.info(
+      { count: definitions.length, commands: definitions.map((d) => d.name).join(' ') },
+      'discord: slash commands registered globally (new ones can take up to an hour to appear)',
+    );
   }
 
   /** Ensure the progress-bar application emojis exist, then swap the injected bar renderer
@@ -782,6 +802,9 @@ export class DiscordJsGateway implements DiscordGateway {
       new SlashCommandBuilder()
         .setName('timeline')
         .setDescription('5h-session budget and reset timeline across accounts'),
+      new SlashCommandBuilder()
+        .setName('stats')
+        .setDescription('Token counts per account, model and day (last 7 days)'),
       new SlashCommandBuilder().setName('accounts').setDescription('List paired accounts'),
       new SlashCommandBuilder().setName('sessions').setDescription('List known sessions'),
       new SlashCommandBuilder()
@@ -874,6 +897,9 @@ export class DiscordJsGateway implements DiscordGateway {
         break;
       case 'timeline':
         result = commands.handleTimeline(this.deps, userId);
+        break;
+      case 'stats':
+        result = commands.handleStats(this.deps, userId);
         break;
       case 'accounts':
         result = commands.handleAccounts(this.deps, userId);

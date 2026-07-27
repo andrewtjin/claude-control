@@ -37,7 +37,37 @@ export {
   type SnapshotResult,
 } from './usagePoller.js';
 
+export {
+  readFleetHistory,
+  measureBurnUnitsPerDay,
+  predictWeeklyReset,
+  readWeeklyObservations,
+  BURN_WINDOW_MS,
+  RESET_LOOKBACK_MS,
+  type AccountHistory,
+  type FleetHistory,
+  type SnapshotRowLike,
+  type UsageHistoryReader,
+  type WeeklyObservation,
+} from './usageHistory.js';
+
 export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
+
+export {
+  readTranscriptTurns,
+  type ReadTranscriptTurnsOptions,
+  type TranscriptScan,
+  type TranscriptTurn,
+} from './transcriptTokens.js';
+
+export {
+  aggregateTokenStats,
+  localDayKey,
+  totalTokens,
+  UNATTRIBUTED_LABEL,
+  type ActivationWindow,
+  type AggregateTokenStatsOptions,
+} from './tokenStats.js';
 
 export {
   HookReceiver,

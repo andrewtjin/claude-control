@@ -45,7 +45,7 @@ export type { SettingRow } from '@claude-control/shared-protocol';
  *  the phone. Lives here (not program.ts) so the daemon's settings report can carry it: after
  *  an `npm i -g` update the running daemon keeps its old build until restarted, and the two
  *  rows ('cli build' vs 'daemon build') are how an operator sees that skew. */
-export const VERSION = '0.2.2';
+export const VERSION = '0.3.0';
 
 /** The hosted control plane a published build dials with no configuration at all. This is the
  *  last fallback in the precedence ladder, not a lock-in: `--relay`, `CCTL_RELAY_URL`, and
@@ -378,7 +378,20 @@ export function resolveDaemonConfig(
       name: 'daemon log level',
       value: env['CCTL_LOG_LEVEL'] ?? 'info',
       source: envSource(env['CCTL_LOG_LEVEL'] !== undefined),
-      detail: 'CCTL_LOG_LEVEL',
+      detail: 'CCTL_LOG_LEVEL (debug also prints the stack under every error line)',
+    },
+    {
+      name: 'daemon log format',
+      value: env['CCTL_LOG_FORMAT'] ?? 'auto',
+      source: envSource(env['CCTL_LOG_FORMAT'] !== undefined),
+      detail: "CCTL_LOG_FORMAT ('pretty' or 'json'; auto is pretty on a terminal, json otherwise)",
+    },
+    {
+      name: 'daemon log file',
+      value: env['CCTL_LOG_FILE'] ?? 'off',
+      source: envSource(env['CCTL_LOG_FILE'] !== undefined),
+      detail:
+        'CCTL_LOG_FILE (path NDJSON logs are also appended to; an installed daemon has no console)',
     },
   ];
 
@@ -446,7 +459,19 @@ export function resolveCliSettings(env: NodeJS.ProcessEnv, colorOn: boolean): Se
       name: 'cli log level',
       value: env['CCTL_LOG_LEVEL'] ?? 'warn',
       source: envSource(env['CCTL_LOG_LEVEL'] !== undefined),
-      detail: 'CCTL_LOG_LEVEL',
+      detail: 'CCTL_LOG_LEVEL (debug also prints the stack under every error line)',
+    },
+    {
+      name: 'cli log format',
+      value: env['CCTL_LOG_FORMAT'] ?? 'auto',
+      source: envSource(env['CCTL_LOG_FORMAT'] !== undefined),
+      detail: "CCTL_LOG_FORMAT ('pretty' or 'json'; auto is pretty on a terminal, json otherwise)",
+    },
+    {
+      name: 'cli log file',
+      value: env['CCTL_LOG_FILE'] ?? 'off',
+      source: envSource(env['CCTL_LOG_FILE'] !== undefined),
+      detail: 'CCTL_LOG_FILE (path NDJSON logs are also appended to)',
     },
   ];
 }

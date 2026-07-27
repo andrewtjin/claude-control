@@ -13,7 +13,8 @@
 // an unterminated fence and the next starting mid-fence, so both render as garbage — and the
 // daemon's text is full of fenced tables and command output. Chunks therefore close an open
 // fence on the way out and reopen it (with its original info string, so highlighting survives)
-// on the way in.
+// on the way in. An embed field or description faces the same cut with nowhere to continue into,
+// so `clampBalanced` exports that half of the care to the embed builders.
 //
 // Shape: pre-split the text into units no larger than a chunk can hold, then greedily pack them.
 // Doing the hard-splitting up front is what keeps the packing loop simple and obviously
@@ -29,6 +30,7 @@ export const DISCORD_CONTENT_MAX = 2000;
 const DEFAULT_MAX_CHUNKS = 4;
 
 const FENCE = '```';
+
 const TRUNCATION_NOTE = '… (truncated)';
 const FENCE_LINE = /^\s*```(.*)$/;
 
@@ -89,6 +91,30 @@ export function chunkMessage(text: string, options: ChunkOptions = {}): string[]
   return truncated ? markTruncated(chunks, max) : chunks;
 }
 
+/**
+ * Clamp `text` to `max` with its code fences left BALANCED — the single-message form of the care
+ * `chunkMessage` takes at every cut, for surfaces that have no next message to continue into.
+ *
+ * An embed description or field value is clamped, not split, and both clamps this package uses
+ * cut blind: `truncateLabeled` slices, `clampFieldValue` drops trailing lines. Either can land
+ * between a ``` and its closer, and Discord then reads the unterminated fence as swallowing
+ * everything after it. That is not hypothetical for prose surfaces — `formatTables` fences every
+ * table it re-renders, so an ordinary comparison table is enough.
+ *
+ * Room for the closer is reserved BEFORE clamping (rather than trimmed off afterwards) so the
+ * visible truncation marker the clamp appended survives intact, and the result still fits `max`.
+ */
+export function clampBalanced(
+  text: string,
+  max: number,
+  clamp: (value: string, max: number) => string,
+): string {
+  if (text.length <= max) return text; // nothing was cut, so nothing can be half-cut
+  const closer = `\n${FENCE}`;
+  const clamped = clamp(text, max - closer.length);
+  return countFences(clamped) % 2 === 0 ? clamped : clamped + closer;
+}
+
 /** Break `text` into lines, hard-splitting any line that could never fit in a chunk. The cap
  *  leaves room for the fence scaffolding a continuation chunk may need to add. */
 function toUnits(text: string, max: number): string[] {
@@ -123,7 +149,10 @@ function markTruncated(chunks: string[], max: number): string[] {
   if (countFences(trimmed) % 2 !== 0) {
     const room = max - note.length - (FENCE.length + 1);
     if (trimmed.length > room) trimmed = trimmed.slice(0, Math.max(0, room));
-    trimmed += `\n${FENCE}`;
+    // Making room can itself drop a whole fence and flip the parity back to even, so the decision
+    // to append is taken against the FINAL text. Appending on the pre-trim reading would be the
+    // same unbalanced-fence bug one level down.
+    if (countFences(trimmed) % 2 !== 0) trimmed += `\n${FENCE}`;
   }
 
   chunks[last] = trimmed + note;

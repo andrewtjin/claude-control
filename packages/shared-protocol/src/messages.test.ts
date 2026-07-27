@@ -449,3 +449,164 @@ describe('pair.claim hostLabel bound', () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe('usage.snapshot carries no monetary data', () => {
+  const account = {
+    accountId: 'acct-1',
+    label: 'Work',
+    active: true,
+    source: 'live' as const,
+    fetchedAtMs: 1,
+    limits: [],
+  };
+
+  it('strips a spend block off an account rather than relaying it', () => {
+    // The usage endpoint returns per-account credit spend, and the daemon deliberately does not
+    // carry it: this envelope is relayed in cleartext through a host the user does not own (see
+    // docs/THREAT_MODEL.md, "In-transit visibility"), so dollar amounts must not cross it while
+    // nothing renders them. The schema is the enforcement point — a sender that starts emitting
+    // the field (a rolled-back daemon, a future edit) has it dropped here, not forwarded.
+    const result = decode(
+      rawFrame('usage.snapshot', {
+        accounts: [
+          {
+            ...account,
+            spend: {
+              used: { amountMinor: 1234, currency: 'USD', exponent: 2 },
+              percent: 12,
+              enabled: true,
+              canPurchaseCredits: true,
+            },
+          },
+        ],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      const decoded = result.envelope.payload.accounts[0];
+      expect(decoded && 'spend' in decoded).toBe(false);
+      expect(JSON.stringify(result.envelope)).not.toContain('1234');
+    }
+  });
+
+  it('accepts an account with no monetary fields at all', () => {
+    const payload: PayloadOf<'usage.snapshot'> = { accounts: [account] };
+    const env = stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe('stats.snapshot', () => {
+  const totals = { input: 1, output: 2, cacheCreation: 3, cacheRead: 4, turns: 5 };
+  const payload = {
+    windowStartMs: 0,
+    windowEndMs: 604_800_000,
+    overall: totals,
+    byAccount: [{ accountId: 'acct-a', label: 'main', totals }],
+    byModel: [{ label: 'claude-opus-5', totals }],
+    byDay: [{ label: '2026-07-25', totals }],
+    coverage: {
+      filesScanned: 42,
+      filesSkippedByMtime: 400,
+      filesUnreadable: 1,
+      dirsUnreadable: 1,
+      malformedLines: 2,
+      duplicateTurns: 3,
+    },
+  };
+
+  it('is a registered message type', () => {
+    expect(isMessageType('stats.snapshot')).toBe(true);
+  });
+
+  it('round-trips a full snapshot', () => {
+    const result = decode(encode(stamp({ daemonId: 'daemon-1', type: 'stats.snapshot', payload })));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'stats.snapshot')) {
+      expect(result.envelope.payload).toEqual(payload);
+    }
+  });
+
+  it('carries the unattributed bucket as a null accountId rather than dropping the row', () => {
+    const result = decode(
+      rawFrame('stats.snapshot', {
+        ...payload,
+        byAccount: [{ accountId: null, label: 'unattributed', totals }],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'stats.snapshot')) {
+      expect(result.envelope.payload.byAccount[0]?.accountId ?? null).toBeNull();
+      expect(result.envelope.payload.byAccount[0]?.label).toBe('unattributed');
+    }
+  });
+
+  it('rejects a frame missing its coverage, so a total can never arrive uncontextualized', () => {
+    const { coverage: _coverage, ...withoutCoverage } = payload;
+    expect(decode(rawFrame('stats.snapshot', withoutCoverage)).ok).toBe(false);
+  });
+
+  it('rejects negative token counts', () => {
+    expect(
+      decode(rawFrame('stats.snapshot', { ...payload, overall: { ...totals, output: -1 } })).ok,
+    ).toBe(false);
+  });
+});
+
+describe('usage.snapshot pacing inputs (additive, N/N-1 tolerant)', () => {
+  const account = {
+    accountId: 'acct-1',
+    label: 'Work',
+    active: true,
+    source: 'live',
+    fetchedAtMs: 1,
+    limits: [{ kind: 'weekly_all', percent: 40 }],
+  };
+
+  it('parses without them — frames from daemons predating the fields stay valid', () => {
+    const result = decode(rawFrame('usage.snapshot', { accounts: [account] }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.burnUnitsPerDay ?? undefined).toBeUndefined();
+      expect(result.envelope.payload.accounts[0]?.predictedResetAt ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries a predicted reset and a fractional burn rate through a round-trip', () => {
+    const result = decode(
+      rawFrame('usage.snapshot', {
+        accounts: [{ ...account, predictedResetAt: 1_800_000_000_000 }],
+        burnUnitsPerDay: 2.75,
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.accounts[0]?.predictedResetAt).toBe(1_800_000_000_000);
+      expect(result.envelope.payload.burnUnitsPerDay).toBe(2.75);
+    }
+  });
+
+  it('a measured zero survives — it is a verdict ("idle"), not a missing value', () => {
+    const result = decode(rawFrame('usage.snapshot', { accounts: [account], burnUnitsPerDay: 0 }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.burnUnitsPerDay).toBe(0);
+    }
+  });
+
+  it('refuses a fractional predicted reset and a non-finite burn rate at encode time', () => {
+    // encode() validates BEFORE serializing, so a sender whose value is looser than the schema
+    // throws here rather than shipping a frame the peer will drop. Both shapes are the ones a
+    // careless producer actually reaches: a rate is fractional by nature and a reset is not.
+    const frame = (payload: PayloadOf<'usage.snapshot'>) =>
+      stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload });
+    expect(() =>
+      encode(frame({ accounts: [{ ...account, predictedResetAt: 1.5 }] } as never)),
+    ).toThrow();
+    expect(() =>
+      encode(frame({ accounts: [account], burnUnitsPerDay: Infinity } as never)),
+    ).toThrow();
+    expect(() => encode(frame({ accounts: [account], burnUnitsPerDay: -1 } as never))).toThrow();
+  });
+});

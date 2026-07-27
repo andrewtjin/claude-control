@@ -26,6 +26,15 @@
 // sooner weekly reset makes it the greedy target again, so B's budget is spared and A's
 // expiring quota gets fully burned.
 //
+// PREDICTED resets are ranked, but never trusted as far as reported ones. A dormant account
+// publishes no reset at all, so without the caller's history-derived prediction it is not a
+// candidate — which means the one account holding a full untouched allowance is exactly the one
+// auto-switch cannot see. Feeding the prediction in fixes that, and the confidence gap is paid
+// for in the two places it could move live work: between equal candidates the reported reset
+// wins, and GREEDY (the trigger that fires while nothing is wrong) demands a wider margin before
+// a prediction alone earns a hop. The low-quota trigger applies no such penalty — that hop is
+// happening regardless, and a predicted candidate is strictly better than none.
+//
 // "Materially" is the anti-flap guarantee, and it must be a TIME MARGIN, not strict `<`:
 // live-observed, the usage endpoint re-computes `resets_at` per response with sub-second
 // jitter (the same nominal Wednesday-05:00 reset arrives as 04:59:59.70 on one poll and
@@ -37,6 +46,7 @@
 // still rotates windows across equal accounts once the active one genuinely nears the wall.
 
 import { humanizeDuration, roundPct } from './format.js';
+import { selectWeeklyBudget } from './weekly.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 /** Knobs governing the auto-switch decision. Defaults live in this module. */
@@ -61,6 +71,10 @@ export interface AutoSwitchPolicy {
    *  this margin. Resets closer together than this count as the same budget deadline —
    *  see the module header for why raw ordering can't be trusted (per-poll jitter). */
   greedyResetMarginMs?: number;
+  /** The margin greedy demands instead when the target's reset is PREDICTED rather than
+   *  reported. Clamped to never fall below `greedyResetMarginMs` — a derived number can only
+   *  raise the bar for an unprompted hop, never lower it. */
+  greedyPredictedResetMarginMs?: number;
 }
 
 // 94: hop only when the account is genuinely near the wall — fewer premature hops, still
@@ -78,6 +92,11 @@ export const DEFAULT_MIN_SESSION_HEADROOM_PCT = 25;
 // 15 minutes: orders of magnitude above the endpoint's observed sub-second reset jitter,
 // far below any reset gap that would make burn order actually matter within a week.
 export const DEFAULT_GREEDY_RESET_MARGIN_MS = 15 * 60_000;
+// 5 hours for a predicted reset — one full session window. The prediction is derived from an
+// anchor the endpoint stopped refreshing, so a lead too small to buy even one more usable
+// window is not worth spending an unprompted hop on. Wide enough to refuse hair-splitting,
+// far short of the day-scale gaps that make burning the dormant account first actually matter.
+export const DEFAULT_GREEDY_PREDICTED_RESET_MARGIN_MS = 5 * 60 * 60_000;
 
 /** A concrete "switch now" verdict. `null` from `decideAutoSwitch` means "do nothing". */
 export interface AutoSwitchDecision {
@@ -138,20 +157,25 @@ export function decideAutoSwitch(
   );
   if (candidates.length === 0) return null;
 
-  // Soonest weekly reset wins — weekly is the budget. Ties (same reset moment) go to the
-  // account with MORE weekly budget remaining (the larger expiring asset), then label so
-  // the decision is deterministic. The 5h window deliberately never ranks.
+  // Soonest weekly reset wins — weekly is the budget. On the same reset moment a REPORTED
+  // reset outranks a predicted one (live work goes to the account whose clock we can actually
+  // see), then the account with MORE weekly budget remaining (the larger expiring asset), then
+  // label so the decision is deterministic. The 5h window deliberately never ranks.
   candidates.sort((a, b) => {
     const resetDelta = (weeklyResetAt(a, now) as number) - (weeklyResetAt(b, now) as number);
     if (resetDelta !== 0) return resetDelta;
+    const confidenceDelta = Number(weeklyPredicted(a, now)) - Number(weeklyPredicted(b, now));
+    if (confidenceDelta !== 0) return confidenceDelta;
     const weeklyDelta = weeklyUsedPct(a, now) - weeklyUsedPct(b, now);
     if (weeklyDelta !== 0) return weeklyDelta;
     return a.label.localeCompare(b.label);
   });
   const target = candidates[0] as AccountUsageInput;
   const targetReset = weeklyResetAt(target, now) as number;
+  // The reason ships verbatim to the phone, so a derived reset is labelled there too — a
+  // switch card must never present a prediction as something the endpoint reported.
   const targetBudget =
-    `in ${humanizeDuration(targetReset - now)}, ` +
+    `in ${humanizeDuration(targetReset - now)}${weeklyPredicted(target, now) ? ' (predicted)' : ''}, ` +
     `${roundPct(100 - weeklyUsedPct(target, now))}% weekly budget left`;
 
   // Primary trigger: the active account is nearly out of quota. On a stale snapshot the
@@ -169,13 +193,28 @@ export function decideAutoSwitch(
   }
 
   // Greedy trigger: the active account is fine, but someone else's weekly budget expires
-  // MATERIALLY sooner (beyond the anti-flap margin) — burn that first. An active account
-  // with NO known weekly reset never outranks a known one (its budget clock is invisible,
-  // so any known expiry is "sooner").
+  // MATERIALLY sooner (beyond the anti-flap margin) — burn that first. An active account with
+  // NO known weekly reset does not outrank a REPORTED expiry (its budget clock is invisible,
+  // so any observed expiry is "sooner").
   if (policy.greedy) {
-    const marginMs = policy.greedyResetMarginMs ?? DEFAULT_GREEDY_RESET_MARGIN_MS;
+    const baseMarginMs = policy.greedyResetMarginMs ?? DEFAULT_GREEDY_RESET_MARGIN_MS;
+    const targetPredicted = weeklyPredicted(target, now);
+    // A predicted target has to clear the wider bar. Clamped upward, mirroring the stale-data
+    // trigger: a derived number can only tighten what an unprompted hop must prove.
+    const marginMs = targetPredicted
+      ? Math.max(
+          baseMarginMs,
+          policy.greedyPredictedResetMarginMs ?? DEFAULT_GREEDY_PREDICTED_RESET_MARGIN_MS,
+        )
+      : baseMarginMs;
     const activeReset = weeklyResetAt(active, now);
-    if (activeReset === undefined || targetReset < activeReset - marginMs) {
+    // With no reset on the active account there is no margin to clear, so a prediction has
+    // nothing to prove itself against — and greedy would be moving live work on a derived
+    // number alone. Only a reported reset may hop into that blind spot; the low-quota trigger
+    // above still reaches a predicted candidate when the active account actually runs down.
+    const decisive =
+      activeReset === undefined ? !targetPredicted : targetReset < activeReset - marginMs;
+    if (decisive) {
       const reason =
         `greedy: ${target.label}'s weekly quota expires soonest (${targetBudget})` +
         (activeReset === undefined
@@ -207,24 +246,21 @@ function sessionUsedPct(account: AccountUsageInput, now: number): number {
   return session?.percent ?? 0;
 }
 
-/** Percent of the weekly budget used — the max across live weekly limits (the binding
- *  one). No live weekly limit = 0 (only reachable in reason text, since eligibility
- *  already requires a known weekly reset). */
+/** Percent of the weekly budget used, and when that budget next resets — both from the one
+ *  fleet-wide rule (see weekly.ts), so the executor targets the same limit the Plan and Pacing
+ *  lines describe. No weekly limit at all = 0% used (only reachable in reason text, since
+ *  eligibility already requires a known weekly reset). */
 function weeklyUsedPct(account: AccountUsageInput, now: number): number {
-  const weekly = effectiveLimits(account, now).filter(
-    (l) => l.kind === 'weekly_all' || l.kind === 'weekly_scoped',
-  );
-  if (weekly.length === 0) return 0;
-  return Math.max(...weekly.map((l) => l.percent));
+  return selectWeeklyBudget(account.limits, now, account.predictedResetAt)?.percent ?? 0;
 }
 
-/** The soonest known FUTURE weekly reset (weekly_all or weekly_scoped), or undefined. */
 function weeklyResetAt(account: AccountUsageInput, now: number): number | undefined {
-  let best: number | undefined;
-  for (const l of effectiveLimits(account, now)) {
-    if (l.kind !== 'weekly_all' && l.kind !== 'weekly_scoped') continue;
-    if (l.resetsAt === undefined) continue;
-    if (best === undefined || l.resetsAt < best) best = l.resetsAt;
-  }
-  return best;
+  return selectWeeklyBudget(account.limits, now, account.predictedResetAt)?.resetsAt;
+}
+
+/** True when the reset `weeklyResetAt` returned came from the caller's history-derived
+ *  prediction rather than the endpoint. False for an account with no reset at all — there is
+ *  nothing to be less confident about. */
+function weeklyPredicted(account: AccountUsageInput, now: number): boolean {
+  return selectWeeklyBudget(account.limits, now, account.predictedResetAt)?.predicted === true;
 }
