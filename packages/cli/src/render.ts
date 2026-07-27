@@ -18,11 +18,13 @@ import {
   computeOutlook,
   computePacing,
   formatTokens,
+  PLAIN_PACING_STYLE,
   planWeight,
   renderPacingSummary,
   timelineInputFromWire,
   type AccountUsageInput,
   type PacingOptions,
+  type PacingStyle,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
 
@@ -254,13 +256,20 @@ export function renderUsage(
     .join('\n');
 }
 
-/** "Pacing: 67u of 80u available ..." — the cross-account pacing block appended after `cctl
- *  usage` and `cctl timeline`'s own output: the fleet verdict, then whatever the model had to
- *  assume. Shares the same AccountUsageInput view the burn plan is computed from, so the two
- *  never disagree on what counts as "an account", and the same renderer the Discord embed
- *  reads its headline and notes from. */
-export function renderPacingLine(inputs: AccountUsageInput[], options: PacingOptions): string {
-  return renderPacingSummary(computePacing(inputs, options));
+/** "Pacing: [ok] 67u/80u (84%) - burn 2u/d < 5u/d - 14d" — the cross-account pacing block
+ *  appended after `cctl usage` and `cctl timeline`'s own output: the fleet verdict, then
+ *  whatever is actionable beyond it. Shares the same AccountUsageInput view the burn plan is
+ *  computed from, so the two never disagree on what counts as "an account". `computePacing`
+ *  also feeds the Discord embed's own (separately-rendered, prose) pacing field from the same
+ *  snapshot — only the compact CLI presentation lives here. Takes an already-adapted
+ *  `PacingStyle` (see `ansi.ts`'s `pacingStyle`), the same shape `renderOutlook` takes for its
+ *  own `OutlookStyle` — one adaptation convention, not two. */
+export function renderPacingLine(
+  inputs: AccountUsageInput[],
+  options: PacingOptions,
+  style: PacingStyle = PLAIN_PACING_STYLE,
+): string {
+  return renderPacingSummary(computePacing(inputs, options), options.nowMs, style);
 }
 
 /** "· 15x5h left" — how many 5h session windows still fit before this account's weekly
@@ -476,7 +485,8 @@ function taskLine(task: DaemonStatusView['task'], palette: Palette): string {
 function heartbeatLine(view: DaemonStatusView, palette: Palette): string {
   const { heartbeat, task } = view;
   if (heartbeat.state === 'never') {
-    return `${palette.dim('[--]')} daemon has never run on this machine — run: cctl daemon install`;
+    // Yellow, not dim: the line hands the reader a command, and the mark colors say so (ansi.ts).
+    return `${palette.yellow('[--]')} daemon has never run on this machine — run: cctl daemon install`;
   }
   const age = ageLabel(heartbeat.ageMs);
   if (heartbeat.state === 'alive') {

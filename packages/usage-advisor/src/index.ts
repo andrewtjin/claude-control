@@ -24,9 +24,12 @@ export {
   computePacing,
   renderPacingSummary,
   PACING_HORIZON_DAYS,
+  PLAIN_PACING_STYLE,
   type AccountPacing,
   type Pacing,
+  type PacingExclusion,
   type PacingOptions,
+  type PacingStyle,
   type PacingVerdict,
   type PacingWaste,
 } from './pacing.js';
