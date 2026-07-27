@@ -3,7 +3,7 @@
 // assume something.
 
 import { describe, expect, it } from 'vitest';
-import { computePacing, renderPacingSummary } from './pacing.js';
+import { computePacing, PLAIN_PACING_STYLE, renderPacingSummary } from './pacing.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 const NOW = Date.parse('2026-07-16T12:00:00.000Z');
@@ -260,6 +260,35 @@ describe('computePacing — degraded inputs are stated, never assumed', () => {
     );
   });
 
+  it('does not claim tiers were assumed when the weightless account never entered the math', () => {
+    // 'dead' has no weight AND is quarantined, so no total ever used a fallback weight. Claiming
+    // otherwise puts a permanent caveat on a fleet whose arithmetic is entirely known.
+    const pacing = computePacing(
+      [
+        account({ accountId: 'known', weight: 20, limits: [weekly(50, 20)] }),
+        account({ accountId: 'dead', quarantined: true, limits: [weekly(0, 3)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 1 },
+    );
+    expect(pacing.tiersUnknown).toBe(false);
+    expect(pacing.notes).not.toContain(
+      'plan tiers unknown, so accounts are weighted equally (1 unit each).',
+    );
+    expect(renderPacingSummary(pacing, NOW)).not.toContain('tiers unknown');
+  });
+
+  it('treats a non-positive weight as an assumed tier, since the fallback did fire', () => {
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 0, limits: [weekly(50, 3)] })],
+      {
+        nowMs: NOW,
+        burnUnitsPerDay: 1,
+      },
+    );
+    expect(pacing.accounts[0]?.weightUnits).toBe(1);
+    expect(pacing.tiersUnknown).toBe(true);
+  });
+
   it('labels a predicted reset as predicted, never as observed', () => {
     const pacing = computePacing(
       [
@@ -476,10 +505,36 @@ describe('renderPacingSummary', () => {
     );
   });
 
-  it('says so and stops when no account has contributed a weekly reading yet', () => {
-    const pacing = computePacing([account({ accountId: 'a', quarantined: true })], { nowMs: NOW });
+  it('says so and stops when no account has ever reported a weekly limit', () => {
+    const pacing = computePacing([account({ accountId: 'a' })], { nowMs: NOW });
     expect(pacing.capacityUnits).toBe(0);
     expect(renderPacingSummary(pacing, NOW)).toBe('Pacing: no usage data yet.');
+  });
+
+  it('says the fleet is locked out, not dataless, when every account is quarantined', () => {
+    // The usage data is there and readable; the logins are not. "No usage data yet" sends the
+    // operator looking for a poll that already happened instead of re-logging in.
+    const pacing = computePacing(
+      [
+        account({ accountId: 'tjin.29', quarantined: true, weight: 20, limits: [weekly(40, 3)] }),
+        account({ accountId: 'legoboy', quarantined: true, weight: 20, limits: [weekly(10, 5)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 1 },
+    );
+    expect(pacing.capacityUnits).toBe(0);
+    expect(renderPacingSummary(pacing, NOW)).toBe(
+      'Pacing: [--] no usable accounts - tjin.29, legoboy quarantined; run: cctl accounts relogin <label>',
+    );
+  });
+
+  it('counts the quarantined accounts it does not name', () => {
+    const pacing = computePacing(
+      ['a', 'b', 'c', 'd'].map((id) =>
+        account({ accountId: id, quarantined: true, weight: 20, limits: [weekly(0, 3)] }),
+      ),
+      { nowMs: NOW, burnUnitsPerDay: 1 },
+    );
+    expect(renderPacingSummary(pacing, NOW)).toContain('a, b, c +1 quarantined');
   });
 
   it('adds a waste line naming the account and deadline, without narrating the rest', () => {
@@ -490,8 +545,25 @@ describe('renderPacingSummary', () => {
       burnUnitsPerDay: 0,
     });
     expect(renderPacingSummary(pacing, NOW)).toBe(
-      ['Pacing: [ok] 1u/1u (100%) - burn 0u/d < 0.1u/d - 14d', '  waste 2u: a in 5d'].join('\n'),
+      ['Pacing: [ok] 1u/1u (100%) - burn 0u/d < 0.1u/d - 14d', '  waste 2u: soonest a in 5d'].join(
+        '\n',
+      ),
     );
+  });
+
+  it('stamps the fleet-wide waste total with the SOONEST deadline, not the biggest loser', () => {
+    // 'big' loses the most units but expires last. Printing its deadline beside the fleet total
+    // tells the reader all of it keeps until then, and 'early' burns to nothing meanwhile.
+    const pacing = computePacing(
+      [
+        account({ accountId: 'big', weight: 20, limits: [weekly(0, 6)] }),
+        account({ accountId: 'early', weight: 2, limits: [weekly(0, 2)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 0, horizonDays: 7 },
+    );
+    // Both waste their whole allowance once inside the 7d horizon: 22u fleet-wide.
+    expect(pacing.wastedUnits).toBeCloseTo(22, 6);
+    expect(renderPacingSummary(pacing, NOW)).toContain('waste 22u: soonest early in 2d +1');
   });
 
   it('compresses the plan-tier caveat to a short marker instead of dropping it', () => {
@@ -520,9 +592,29 @@ describe('renderPacingSummary', () => {
     expect(renderPacingSummary(pacing, NOW)).toBe(
       [
         'Pacing: [ok] 3u/3u (100%) - burn 0u/d < 0.4u/d - 14d',
-        '  waste 6u: a in 3d +1  tiers unknown',
+        '  waste 6u: soonest a in 3d +1  tiers unknown',
       ].join('\n'),
     );
+  });
+
+  it('renders "=" when burn and replenishment are equal', () => {
+    // weight 7 replenishes exactly 1u/day; "1u/d < 1u/d" asserts 1 < 1.
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 7, limits: [weekly(50, 20)] })],
+      { nowMs: NOW, burnUnitsPerDay: 1 },
+    );
+    expect(renderPacingSummary(pacing, NOW)).toContain('burn 1u/d = 1u/d');
+  });
+
+  it('renders "=" when unequal rates round to the same printed figure', () => {
+    // 0.62 burned against 0.58 replenished: both print "0.6u", so any inequality sign puts the
+    // line at odds with the two numbers it just printed.
+    const pacing = computePacing(
+      [account({ accountId: 'a', weight: 4.06, limits: [weekly(50, 20)] })],
+      { nowMs: NOW, burnUnitsPerDay: 0.62 },
+    );
+    expect(pacing.burnUnitsPerDay).toBeGreaterThan(pacing.replenishUnitsPerDay);
+    expect(renderPacingSummary(pacing, NOW)).toContain('burn 0.6u/d = 0.6u/d');
   });
 
   it('routes exactly the marker, headroom and waste segments through an injected style', () => {
@@ -544,6 +636,10 @@ describe('renderPacingSummary', () => {
         calls.push('waste');
         return `{${t}}`;
       },
+      warn: (t) => {
+        calls.push('warn');
+        return `!${t}!`;
+      },
       dim: (t) => {
         calls.push('dim');
         return `(${t})`;
@@ -551,9 +647,24 @@ describe('renderPacingSummary', () => {
     });
     // Execution order follows source order, not call-site prominence: headroom is computed
     // (and painted) before the marker is embedded into the headline template, so `percent`
-    // fires before `marker` here. `dim` never fires — this scenario has a known plan tier.
+    // fires before `marker` here. `dim` never fires — this scenario has a known plan tier — and
+    // neither does `warn`, which belongs to the no-capacity line this fleet never reaches.
     expect(calls).toEqual(['percent', 'marker:sustainable', 'waste']);
     expect(spy).toContain('<[ok]>');
-    expect(spy).toContain('{waste 2u: a in 5d}');
+    expect(spy).toContain('{waste 2u: soonest a in 5d}');
+  });
+
+  it('routes the locked-out marker through `warn`, not the verdict marker', () => {
+    const pacing = computePacing([account({ accountId: 'a', quarantined: true, limits: [] })], {
+      nowMs: NOW,
+      burnUnitsPerDay: 1,
+    });
+    const line = renderPacingSummary(pacing, NOW, {
+      ...PLAIN_PACING_STYLE,
+      warn: (t) => `!${t}!`,
+      marker: (t) => `<${t}>`,
+    });
+    expect(line).toContain('![--]!');
+    expect(line).not.toContain('<[--]>');
   });
 });

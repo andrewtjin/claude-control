@@ -27,6 +27,7 @@ export {
   PLAIN_PACING_STYLE,
   type AccountPacing,
   type Pacing,
+  type PacingExclusion,
   type PacingOptions,
   type PacingStyle,
   type PacingVerdict,
