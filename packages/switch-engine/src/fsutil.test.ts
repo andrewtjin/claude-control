@@ -18,6 +18,14 @@ const renameFault = vi.hoisted(() => ({
   calls: 0,
   maxFailures: Number.POSITIVE_INFINITY,
 }));
+
+// The companion seam for the writability probe. A real read-only target would work only on the
+// platform whose permission model the test happens to be running under — chmod is advisory to a
+// root CI user, and the Windows read-only attribute has no POSIX equivalent — so the answer is
+// injected instead. `calls` counts the probes, which is what proves the extra syscall happens on
+// the failure path and nowhere else.
+const accessFault = vi.hoisted(() => ({ code: '', calls: 0 }));
+
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -36,6 +44,13 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       }
       return actual.rename(from, to);
     }) as typeof actual.rename,
+    access: ((path: string, mode?: number): Promise<void> => {
+      accessFault.calls += 1;
+      if (accessFault.code === '') return actual.access(path, mode);
+      const err: NodeJS.ErrnoException = new Error(`${accessFault.code}: access`);
+      err.code = accessFault.code;
+      return Promise.reject(err);
+    }) as typeof actual.access,
   };
 });
 
@@ -61,6 +76,8 @@ beforeEach(() => {
   renameFault.code = 'EPERM';
   renameFault.calls = 0;
   renameFault.maxFailures = Number.POSITIVE_INFINITY;
+  accessFault.code = '';
+  accessFault.calls = 0;
 });
 afterEach(async () => {
   if (realPlatform) Object.defineProperty(process, 'platform', realPlatform);
@@ -94,6 +111,9 @@ describe('atomicWriteFile', () => {
     renameFault.armed = true;
     await atomicWriteFile(target, 'new');
     expect(renameFault.calls).toBe(3);
+    // One writability probe per tolerated failure, and none once the rename goes through: a
+    // target that is merely open passes the probe, which is what keeps the ladder available to it.
+    expect(accessFault.calls).toBe(3);
     expect(await readFile(target, 'utf8')).toBe('new');
     expect(await strayTempFiles(dir)).toEqual([]);
   });
@@ -110,8 +130,48 @@ describe('atomicWriteFile', () => {
     expect(await strayTempFiles(dir)).toEqual([]);
     // Atomic in the failure case too: a reader still sees the whole old file, never a partial one.
     expect(await readFile(target, 'utf8')).toBe('old');
-    // The wait is bounded — an unresolvable fault must surface, not retry forever.
-    expect(renameFault.calls).toBeLessThan(50);
+    // The wait is bounded, and bounded at exactly the ladder's length: 8 tolerated failures, then
+    // the 9th attempt throws. Pinned rather than bracketed because a ladder that silently grew
+    // would be a real change to how long a credential write blocks while holding the credential
+    // lock, and a loose bound is exactly what would let it through unnoticed.
+    expect(renameFault.calls).toBe(9);
+    // One probe per tolerated failure — the 9th attempt throws on exhaustion before probing.
+    expect(accessFault.calls).toBe(8);
+  });
+
+  it('gives up at once on a Windows target that refuses writes, not after the whole ladder', async () => {
+    // Windows reports a read-only target and a target held open by a reader with the SAME EPERM,
+    // so the code alone cannot say which one it is looking at — and it spends the full ladder,
+    // holding the credential lock, on the one that was never going to clear. Asking the target
+    // whether it accepts writes separates them: the read-only one fails that check, the open one
+    // passes it (checking writability does not open the file, so it cannot lose the same race).
+    pretendPlatform('win32');
+    const dir = await sandbox();
+    const target = join(dir, 'registry.json');
+    await writeFile(target, 'old');
+    accessFault.code = 'EPERM';
+    renameFault.armed = true;
+    await expect(atomicWriteFile(target, 'new')).rejects.toMatchObject({ code: 'EPERM' });
+    // The first rename, one probe, and out — no retry, no delay.
+    expect(renameFault.calls).toBe(1);
+    expect(accessFault.calls).toBe(1);
+    expect(await strayTempFiles(dir)).toEqual([]);
+    expect(await readFile(target, 'utf8')).toBe('old');
+  });
+
+  it('keeps waiting when the probe cannot prove the target is at fault', async () => {
+    // An absent target is the case that must not be read as a denial: renaming ONTO a path that
+    // does not exist is precisely what succeeds, so its ENOENT says nothing about the EPERM, and
+    // treating it as final would collapse a genuine race into an instant failure.
+    pretendPlatform('win32');
+    const dir = await sandbox();
+    const target = join(dir, 'registry.json');
+    accessFault.code = 'ENOENT';
+    renameFault.armed = true;
+    await expect(atomicWriteFile(target, 'new')).rejects.toMatchObject({ code: 'EPERM' });
+    expect(renameFault.calls).toBe(9);
+    expect(accessFault.calls).toBe(8);
+    expect(await strayTempFiles(dir)).toEqual([]);
   });
 
   it('reports a rename fault that waiting cannot clear without retrying it', async () => {
@@ -140,6 +200,9 @@ describe('atomicWriteFile', () => {
     renameFault.armed = true;
     await expect(atomicWriteFile(target, 'new')).rejects.toMatchObject({ code: 'EPERM' });
     expect(renameFault.calls).toBe(1);
+    // The writability probe is a Windows-only tiebreak; off Windows the code is already decisive,
+    // so the failure path costs no extra syscall at all.
+    expect(accessFault.calls).toBe(0);
     expect(await strayTempFiles(dir)).toEqual([]);
   });
 
