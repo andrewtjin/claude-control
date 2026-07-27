@@ -38,8 +38,7 @@ import {
   type TrackEvent,
 } from './richFormat.js';
 import type { BarRenderer } from './emojiBars.js';
-import { clampBalanced } from './messageChunks.js';
-import { defuseFences, formatTables } from './tableFormat.js';
+import { defuseFences, formatTablesClamped } from './tableFormat.js';
 
 const COLOR_OK = 0x2ecc71;
 const COLOR_WARN = 0xf1c40f;
@@ -548,12 +547,13 @@ export function buildQuestionEmbed(
     const name = q.header != null && q.header.length > 0 ? q.header : `Question ${i + 1}`;
     // The question is verbatim model text and a "which of these?" question is exactly the shape
     // that arrives as a comparison table, so it is re-rendered BEFORE the field clamp — clamping
-    // first would cut the source table and leave the formatter a fragment to parse. The clamp
-    // then has to close what it cut (`clampBalanced` rather than the plain `addClampedField`):
-    // the formatter's output is fenced, and an eight-row table already overruns a field.
+    // first would cut the source table and leave the formatter a fragment to parse. This field's
+    // own clamp goes to the formatter (rather than the plain `addClampedField`) so it can measure
+    // its row-rule choice through the real cut, and so what it cut is closed behind it: the
+    // output is fenced, and an eight-row table already overruns a field.
     embed.addFields({
       name: truncateLabeled(name, 256),
-      value: clampBalanced(formatTables(q.question), FIELD_VALUE_MAX, clampFieldValue),
+      value: formatTablesClamped(q.question, FIELD_VALUE_MAX, clampFieldValue),
     });
   });
   return embed;
@@ -660,7 +660,7 @@ export function buildDoneEmbed(p: {
   const embed = new EmbedBuilder()
     .setTitle(`${NOTIFICATION_ICON.done} ${p.title ?? 'Done'}`)
     .setColor(NOTIFICATION_COLOR.done)
-    .setDescription(clampBalanced(formatTables(message), EMBED_DESCRIPTION_LIMIT, truncateLabeled));
+    .setDescription(formatTablesClamped(message, EMBED_DESCRIPTION_LIMIT, truncateLabeled));
   if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
   return embed;
 }
@@ -679,11 +679,10 @@ export function buildWaitingEmbed(p: {
     .setTitle(`${NOTIFICATION_ICON.waiting} ${p.title ?? 'Waiting on you'}`)
     .setColor(NOTIFICATION_COLOR.waiting)
     .setDescription(
-      clampBalanced(
-        p.body && p.body.length > 0 ? formatTables(p.body) : 'A session is waiting for your reply.',
-        EMBED_DESCRIPTION_LIMIT,
-        truncateLabeled,
-      ),
+      // The fallback is a fixed short line — nothing to re-render and nothing to clamp.
+      p.body && p.body.length > 0
+        ? formatTablesClamped(p.body, EMBED_DESCRIPTION_LIMIT, truncateLabeled)
+        : 'A session is waiting for your reply.',
     );
   if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
   return embed;
@@ -790,6 +789,10 @@ function sessionNotes(model: SessionCardModel): string | undefined {
   return notes.length > 0 ? notes.join('\n') : undefined;
 }
 
+/** How much of the live card's description the session summary may take. The rest of the budget
+ *  belongs to the stdout tail below it, which is the part a reader watches change. */
+const SESSION_SUMMARY_MAX = 512;
+
 /** The live, edited-in-place card for one managed session. One of these per session is created on
  *  the first status/output and re-rendered (via an edit) as the session progresses. The stdout
  *  tail is fenced as a code block for monospaced readability; it is bounded by the caller and
@@ -801,18 +804,18 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
     .setTitle(`${icon} Session ${label}`)
     .setColor(model.stopping ? COLOR_WARN : SESSION_STATE_COLOR[model.state]);
 
-  const rawBody =
+  // Tables in a summary arrive terminal-sized; re-render them phone-width and fenced before
+  // capping, so a capped body cuts wrapped rows rather than shredded borders. The body cap is
+  // hard (a session summary is short; the cap defends the card against a runaway one) and its
+  // length is reserved below so the fenced tail can never push the description over the limit.
+  // The cap closes a fence it cut, or the re-rendered table would swallow the tail block.
+  const body =
     model.summary !== undefined
-      ? // Tables in a summary arrive terminal-sized; re-render them phone-width and fenced
-        // before capping, so a capped body cuts wrapped rows rather than shredded borders.
-        formatTables(model.summary)
+      ? formatTablesClamped(model.summary, SESSION_SUMMARY_MAX, truncateLabeled)
       : model.stopping
         ? 'Stop requested — waiting for the session to end.'
         : undefined;
-  // Hard-cap the body (a session summary is short; the cap defends the card against a runaway one)
-  // then reserve its length so the fenced tail below can never push the description over the limit.
-  // The cap closes a fence it cut, or the re-rendered table would swallow the tail block below it.
-  const prefix = rawBody ? `${clampBalanced(rawBody, 512, truncateLabeled)}\n` : '';
+  const prefix = body ? `${body}\n` : '';
   const tail = model.outputTail;
   if (tail && tail.length > 0) {
     const fenceOverhead = '```\n'.length + '\n```'.length; // fence wrapping the inner text
@@ -843,11 +846,9 @@ export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder 
     .setTitle(`${icon} Session ${model.state === 'done' ? 'complete' : model.state}`)
     .setColor(SESSION_STATE_COLOR[model.state])
     .setDescription(
-      clampBalanced(
-        model.summary !== undefined ? formatTables(model.summary) : 'Session ended.',
-        EMBED_DESCRIPTION_LIMIT,
-        truncateLabeled,
-      ),
+      model.summary !== undefined
+        ? formatTablesClamped(model.summary, EMBED_DESCRIPTION_LIMIT, truncateLabeled)
+        : 'Session ended.',
     );
   embed.addFields({ name: 'Session', value: model.sessionId });
   if (model.accountId) embed.addFields({ name: 'Account', value: model.accountId });
