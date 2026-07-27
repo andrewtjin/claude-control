@@ -8,7 +8,7 @@ import {
   type DaemonStatusView,
   type UsageRow,
 } from './render.js';
-import { ANSI_PALETTE, PLAIN_PALETTE } from './ansi.js';
+import { ANSI_PALETTE, pacingStyle, PLAIN_PALETTE } from './ansi.js';
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type {
   AccountUsage,
@@ -343,10 +343,11 @@ describe('renderPacingLine', () => {
     };
   }
 
-  it('prints the fleet verdict under a "Pacing: " prefix', () => {
+  it('prints the verdict marker, headroom and a waste line under a "Pacing: " prefix', () => {
     const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW, burnUnitsPerDay: 2 });
-    expect(line).toContain('Pacing: 10u of 20u available (50%)');
-    expect(line).toContain('sustainable for the next 14d');
+    expect(line).toBe(
+      ['Pacing: [ok] 10u/20u (50%) - burn 2u/d < 2.9u/d - 14d', '  waste 10u: a in 3d'].join('\n'),
+    );
   });
 
   it('counts a dormant account at full allowance instead of dropping it', () => {
@@ -355,20 +356,30 @@ describe('renderPacingLine', () => {
       nowMs: NOW,
       burnUnitsPerDay: 1,
     });
-    expect(line).toContain('24u of 40u available (60%)');
+    expect(line).toContain('24u/40u (60%)');
   });
 
-  it('indents every honesty note under the headline', () => {
+  it('is one line, with no caveats, when nothing is wasted and tiers are known', () => {
     const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW });
-    expect(line.split('\n').slice(1)).toEqual([
-      '  - no usage history to measure a burn rate from yet.',
-    ]);
+    expect(line).toBe('Pacing: [--] 10u/20u (50%) - burn unmeasured - replenish 2.9u/d');
   });
 
   it('reports pacing unknown with no accounts', () => {
-    expect(renderPacingLine([], { nowMs: NOW })).toBe(
-      'Pacing: No weekly usage data yet - fleet pacing unknown.',
-    );
+    expect(renderPacingLine([], { nowMs: NOW })).toBe('Pacing: no usage data yet.');
+  });
+
+  it('colors the marker, headroom and waste line when given an ANSI style, and stays plain by default', () => {
+    const opts = { nowMs: NOW, burnUnitsPerDay: 2 };
+    const plain = renderPacingLine([input('a', 50, 3)], opts);
+    const colored = renderPacingLine([input('a', 50, 3)], opts, pacingStyle(ANSI_PALETTE));
+    expect(colored).not.toBe(plain);
+    expect(colored).toContain(ANSI_PALETTE.green('[ok]'));
+    expect(colored).toContain(ANSI_PALETTE.yellow('waste 10u: a in 3d'));
+    // Color never changes the visible text, only wraps it.
+    expect(stripAnsi(colored)).toBe(plain);
+    // The identity style (what every command falls back to off a TTY / under NO_COLOR) is
+    // byte-for-byte the same as passing no style at all.
+    expect(renderPacingLine([input('a', 50, 3)], opts, pacingStyle(PLAIN_PALETTE))).toBe(plain);
   });
 });
 
