@@ -135,5 +135,8 @@ export function pacingStyle(palette: Palette): PacingStyle {
     waste: palette.yellow,
     warn: palette.yellow,
     dim: palette.dim,
+    // Bold, not dim: the row labels are the block's index, and a reader scanning for "expires"
+    // is scanning the label column. Dimming what you scan by is the wrong end of the contrast.
+    label: palette.bold,
   };
 }

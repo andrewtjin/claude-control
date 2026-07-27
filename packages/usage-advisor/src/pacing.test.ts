@@ -466,7 +466,7 @@ describe('computePacing — misc', () => {
 });
 
 describe('renderPacingSummary', () => {
-  it('prints headroom, burn vs replenish, and the sustainable horizon on one line', () => {
+  it('leads with the verdict, then labels the burn pair and the headroom row', () => {
     // Reset lands outside the horizon (no in-horizon replenishment) and the burn rate never
     // drains the balance across the full 14d, so this stays sustainable throughout.
     const pacing = computePacing(
@@ -474,7 +474,11 @@ describe('renderPacingSummary', () => {
       { nowMs: NOW, burnUnitsPerDay: 0.2 },
     );
     expect(renderPacingSummary(pacing, NOW)).toBe(
-      'Pacing: [ok] 3.5u/7u (50%) - burn 0.2u/d < 1u/d - 14d',
+      [
+        'Pacing  [ok] sustainable past 14d (0.2u/1u burned per day)',
+        '  left     3.5u of 7u (50%)',
+        '  1u = one Pro account-week (a Max 20x counts 20)',
+      ].join('\n'),
     );
   });
 
@@ -489,11 +493,17 @@ describe('renderPacingSummary', () => {
       },
     );
     expect(renderPacingSummary(pacing, NOW)).toBe(
-      'Pacing: [!!] 1u/1u (100%) - burn 1u/d > 0.1u/d - dry in 1d',
+      [
+        'Pacing  [!!] runs dry in 1d (1u/0.1u burned per day)',
+        '  left     1u of 1u (100%)',
+        '  1u = one Pro account-week (a Max 20x counts 20)',
+      ].join('\n'),
     );
   });
 
-  it('prints "burn unmeasured" and no verdict when there is no burn history yet', () => {
+  it('drops the burn fraction entirely when there is no burn history yet', () => {
+    // An unmeasured burn has no fraction to print, and a "0u/0.3u" would read as a measured
+    // zero — the opposite claim. The verdict line says the rate is missing and stops.
     const pacing = computePacing(
       [account({ accountId: 'a', weight: 2, limits: [weekly(50, 10)] })],
       {
@@ -501,7 +511,11 @@ describe('renderPacingSummary', () => {
       },
     );
     expect(renderPacingSummary(pacing, NOW)).toBe(
-      'Pacing: [--] 1u/2u (50%) - burn unmeasured - replenish 0.3u/d',
+      [
+        'Pacing  [--] burn rate not measured yet',
+        '  left     1u of 2u (50%)',
+        '  1u = one Pro account-week (a Max 20x counts 20)',
+      ].join('\n'),
     );
   });
 
@@ -545,15 +559,18 @@ describe('renderPacingSummary', () => {
       burnUnitsPerDay: 0,
     });
     expect(renderPacingSummary(pacing, NOW)).toBe(
-      ['Pacing: [ok] 1u/1u (100%) - burn 0u/d < 0.1u/d - 14d', '  waste 2u: soonest a in 5d'].join(
-        '\n',
-      ),
+      [
+        'Pacing  [ok] sustainable past 14d (0u/0.1u burned per day)',
+        '  left     1u of 1u (100%)',
+        '  expires  a 2u in 5d - nothing else expires within 14d',
+        '  1u = one Pro account-week (a Max 20x counts 20)',
+      ].join('\n'),
     );
   });
 
-  it('stamps the fleet-wide waste total with the SOONEST deadline, not the biggest loser', () => {
-    // 'big' loses the most units but expires last. Printing its deadline beside the fleet total
-    // tells the reader all of it keeps until then, and 'early' burns to nothing meanwhile.
+  it('pairs the named account with ITS OWN loss and ITS OWN deadline, not the fleet total', () => {
+    // 'big' loses the most units but expires last. Printing the 22u fleet total beside 'early's
+    // date tells the reader all of it keeps until then, and 'early' burns to nothing meanwhile.
     const pacing = computePacing(
       [
         account({ accountId: 'big', weight: 20, limits: [weekly(0, 6)] }),
@@ -563,58 +580,95 @@ describe('renderPacingSummary', () => {
     );
     // Both waste their whole allowance once inside the 7d horizon: 22u fleet-wide.
     expect(pacing.wastedUnits).toBeCloseTo(22, 6);
-    expect(renderPacingSummary(pacing, NOW)).toContain('waste 22u: soonest early in 2d +1');
+    // 2u is early's own loss; the 22u fleet figure is stated separately and labelled "total".
+    expect(renderPacingSummary(pacing, NOW)).toContain(
+      'expires  early 2u in 2d, then 1 more - 22u total over 7d',
+    );
   });
 
-  it('compresses the plan-tier caveat to a short marker instead of dropping it', () => {
-    // `weight` omitted on purpose: the model falls back to 1 unit and must say so.
+  it('names the FIRST ACCOUNT TO LOSE budget, which need not be the first to reset', () => {
+    // 'drained' resets first (2d) but the burn empties it before then, so it loses nothing.
+    // 'holder' resets later (5d) still holding budget, and is the first real loss. A row that
+    // ranked by reset time would name 'drained' and send the reader to guard budget that was
+    // always going to be spent.
+    const pacing = computePacing(
+      [
+        account({ accountId: 'drained', weight: 2, limits: [weekly(0, 2)] }),
+        account({ accountId: 'holder', weight: 20, limits: [weekly(0, 5)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 1, horizonDays: 6 },
+    );
+    expect(pacing.waste.map((w) => w.label)).toEqual(['holder']);
+    expect(renderPacingSummary(pacing, NOW)).toContain('expires  holder ');
+    expect(renderPacingSummary(pacing, NOW)).not.toContain('drained');
+  });
+
+  it('states the equal-weighting fallback in the legend rather than quoting the 20x rule', () => {
+    // `weight` omitted on purpose: the model falls back to 1 unit and must say so. Printing
+    // "a Max 20x counts 20" here would describe arithmetic that did not run.
     const pacing = computePacing([account({ accountId: 'a', limits: [weekly(0, 20)] })], {
       nowMs: NOW,
       burnUnitsPerDay: 0,
     });
     expect(pacing.tiersUnknown).toBe(true);
     expect(renderPacingSummary(pacing, NOW)).toBe(
-      ['Pacing: [ok] 1u/1u (100%) - burn 0u/d < 0.1u/d - 14d', '  tiers unknown'].join('\n'),
+      [
+        'Pacing  [ok] sustainable past 14d (0u/0.1u burned per day)',
+        '  left     1u of 1u (100%)',
+        '  1u = one Pro account-week; plan tiers unknown, so every account counts 1u',
+      ].join('\n'),
     );
   });
 
-  it('ranks waste by units lost, names the top account, and counts the rest', () => {
-    // Each account's weekly reset also fires twice inside the 14d horizon (see the previous
-    // test): a loses 2u twice (4u), b loses 1u twice (2u) — a outranks b on total units lost.
+  it('counts the accounts it does not name, and keeps the fleet total labelled as a total', () => {
+    // Each account's weekly reset fires twice inside the 14d horizon: a loses 2u twice (4u),
+    // b loses 1u twice (2u). 'a' expires first, so 'a' is named with its own 4u.
     const pacing = computePacing(
       [
         account({ accountId: 'a', label: 'a', weight: 2, limits: [weekly(0, 3)] }),
-        // No weight on b: also exercises both caveats sharing one line.
+        // No weight on b: also exercises the unknown-tier legend alongside a waste row.
         account({ accountId: 'b', label: 'b', limits: [weekly(0, 4)] }),
       ],
       { nowMs: NOW, burnUnitsPerDay: 0 },
     );
     expect(renderPacingSummary(pacing, NOW)).toBe(
       [
-        'Pacing: [ok] 3u/3u (100%) - burn 0u/d < 0.4u/d - 14d',
-        '  waste 6u: soonest a in 3d +1  tiers unknown',
+        'Pacing  [ok] sustainable past 14d (0u/0.4u burned per day)',
+        '  left     3u of 3u (100%)',
+        '  expires  a 4u in 3d, then 1 more - 6u total over 14d',
+        '  1u = one Pro account-week; plan tiers unknown, so every account counts 1u',
       ].join('\n'),
     );
   });
 
-  it('renders "=" when burn and replenishment are equal', () => {
-    // weight 7 replenishes exactly 1u/day; "1u/d < 1u/d" asserts 1 < 1.
+  it('prints both figures of the burn pair even when they are equal', () => {
+    // weight 7 replenishes exactly 1u/day. The pair is printed as a fraction precisely so a
+    // reader never has to decide what an operator between two bare numbers meant.
     const pacing = computePacing(
       [account({ accountId: 'a', weight: 7, limits: [weekly(50, 20)] })],
       { nowMs: NOW, burnUnitsPerDay: 1 },
     );
-    expect(renderPacingSummary(pacing, NOW)).toContain('burn 1u/d = 1u/d');
+    expect(renderPacingSummary(pacing, NOW)).toContain('(1u/1u burned per day)');
   });
 
-  it('renders "=" when unequal rates round to the same printed figure', () => {
-    // 0.62 burned against 0.58 replenished: both print "0.6u", so any inequality sign puts the
-    // line at odds with the two numbers it just printed.
+  it('colors the burn pair by the share of the refill consumed, not by the stock left', () => {
+    // A full fleet burning double what it refills: the headroom is 100% (green) while the burn
+    // pair is 200% of refill, which must read hot. One percent painted by the other's band is
+    // how a fleet gets called healthy right up to the moment it isn't.
     const pacing = computePacing(
-      [account({ accountId: 'a', weight: 4.06, limits: [weekly(50, 20)] })],
-      { nowMs: NOW, burnUnitsPerDay: 0.62 },
+      [account({ accountId: 'a', weight: 7, limits: [weekly(0, 20)] })],
+      { nowMs: NOW, burnUnitsPerDay: 2 },
     );
-    expect(pacing.burnUnitsPerDay).toBeGreaterThan(pacing.replenishUnitsPerDay);
-    expect(renderPacingSummary(pacing, NOW)).toContain('burn 0.6u/d = 0.6u/d');
+    const bands: number[] = [];
+    renderPacingSummary(pacing, NOW, {
+      ...PLAIN_PACING_STYLE,
+      percent: (t, pct) => {
+        bands.push(pct);
+        return t;
+      },
+    });
+    // Burn pair first (200% of a 1u/d refill), then headroom as percent USED (0% of 7u gone).
+    expect(bands).toEqual([200, 0]);
   });
 
   it('routes exactly the marker, headroom and waste segments through an injected style', () => {
@@ -644,14 +698,30 @@ describe('renderPacingSummary', () => {
         calls.push('dim');
         return `(${t})`;
       },
+      label: (t) => {
+        calls.push('label');
+        return `_${t.trim()}_`;
+      },
     });
-    // Execution order follows source order, not call-site prominence: headroom is computed
-    // (and painted) before the marker is embedded into the headline template, so `percent`
-    // fires before `marker` here. `dim` never fires — this scenario has a known plan tier — and
-    // neither does `warn`, which belongs to the no-capacity line this fleet never reaches.
-    expect(calls).toEqual(['percent', 'marker:sustainable', 'waste']);
+    // Order follows the rendered block top-down: the verdict line (marker, then the burn
+    // fraction through `percent`), then each labelled row, then the dim unit legend. `warn`
+    // never fires — it belongs to the no-capacity line this fleet never reaches. A burn of 0
+    // still routes through `percent`: measured-zero is a reading, and only an ABSENT burn
+    // suppresses the fraction.
+    // Within a row the VALUE is painted before its label — it is an argument to the row
+    // builder, so it evaluates first — which is why the two `percent` calls sit together.
+    expect(calls).toEqual([
+      'marker:sustainable',
+      'percent',
+      'percent',
+      'label',
+      'waste',
+      'label',
+      'dim',
+    ]);
     expect(spy).toContain('<[ok]>');
-    expect(spy).toContain('{waste 2u: soonest a in 5d}');
+    expect(spy).toContain('_expires_');
+    expect(spy).toContain('{a 2u in 5d - nothing else expires within 14d}');
   });
 
   it('routes the locked-out marker through `warn`, not the verdict marker', () => {

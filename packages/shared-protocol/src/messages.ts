@@ -64,6 +64,18 @@ export const AccountUsage = z.object({
    *  phone says the reset is unknown rather than inventing one. Consumers must always label
    *  it as predicted; it is never an endpoint observation. */
   predictedResetAt: z.number().int().nonnegative().nullish(),
+  /** The account's relative plan capacity (Pro = 1, Max 20x = 20), resolved by the daemon from
+   *  the registry's tier signals. The bot cannot derive it: the signals live in the local vault,
+   *  never on the wire. Absent means the tier could not be resolved, which every renderer shows
+   *  as "?" — an account of unknown tier is still weighted 1 in aggregate math, and saying "1x"
+   *  would present that fallback as a reading. Additive and tolerant like `predictedResetAt`. */
+  planWeight: z.number().positive().finite().nullish(),
+  /** The billing cell as the daemon rendered it, e.g. "~Aug 11 (est.)" / "trial->Aug 3" /
+   *  "unknown". Pre-rendered rather than sent as raw dates because the estimate is a derivation
+   *  with rules (anniversary roll-forward, short-month clamping, trials outranking
+   *  subscriptions) that must not be reimplemented on a second surface — the same reason
+   *  `SettingRow` ships display text. Display-only: nothing routes or authorizes on it. */
+  billing: z.string().nullish(),
 });
 
 // ---------------------------------------------------------------------------

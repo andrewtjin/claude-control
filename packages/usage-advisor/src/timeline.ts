@@ -184,12 +184,15 @@ export interface WireUsageLike {
   /** Callers that know quarantine state (e.g. the CLI reading the registry) pass it; the
    *  wire snapshot doesn't carry it, so it defaults to false. */
   quarantined?: boolean | undefined;
-  /** Plan weight and predicted reset, when the caller resolved them. Plan tiers come from the
-   *  registry and do not cross the wire, so a caller working from a wire snapshot alone leaves
-   *  `weight` absent and the consumers say so. The predicted reset DOES cross the wire (the
-   *  daemon measures it from stored history), which is why it tolerates `null` here — that is
-   *  the shape a nullish wire field arrives in. */
+  /** Plan weight and predicted reset, when the caller resolved them. Both now cross the wire —
+   *  the daemon resolves the tier from the registry (`planWeight`) and measures the reset from
+   *  stored history — which is why they tolerate `null` here: that is the shape a nullish wire
+   *  field arrives in. A caller reading the registry directly (the CLI) sets `weight` instead;
+   *  `planWeight` is preferred when both are present, since it is the wire's spelling of the
+   *  same fact. Absent from both leaves the account unweighted, and consumers say so rather
+   *  than silently counting it as 1x. */
   weight?: number | undefined;
+  planWeight?: number | null | undefined;
   predictedResetAt?: number | null | undefined;
   limits: Array<{
     kind: LimitInput['kind'];
@@ -202,13 +205,22 @@ export interface WireUsageLike {
 
 /** Adapt wire usage snapshots to advisor inputs: ISO reset times become epoch ms, and an
  *  unparseable timestamp is dropped rather than poisoning the math with NaN. */
+/** The account's plan weight from whichever field carried it, or nothing. Spread rather than
+ *  assigned so an unresolved tier leaves the property ABSENT: `weight: undefined` and no
+ *  `weight` at all are the same to a reader but not to `exactOptionalPropertyTypes`, and the
+ *  absence is what makes pacing report the tier as unknown instead of quietly using 1. */
+function weightOf(a: WireUsageLike): { weight?: number } {
+  const resolved = a.planWeight ?? a.weight;
+  return resolved != null && resolved > 0 ? { weight: resolved } : {};
+}
+
 export function timelineInputFromWire(accounts: WireUsageLike[]): AccountUsageInput[] {
   return accounts.map((a) => ({
     accountId: a.accountId,
     label: a.label,
     active: a.active,
     quarantined: a.quarantined ?? false,
-    ...(a.weight !== undefined ? { weight: a.weight } : {}),
+    ...weightOf(a),
     ...(a.predictedResetAt != null ? { predictedResetAt: a.predictedResetAt } : {}),
     limits: a.limits.map((l) => {
       const ms = l.resetsAt != null ? Date.parse(l.resetsAt) : NaN;
