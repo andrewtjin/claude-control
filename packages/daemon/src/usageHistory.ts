@@ -161,20 +161,25 @@ export interface FleetHistory {
  */
 export function readFleetHistory(
   reader: UsageHistoryReader,
-  accountIds: string[],
+  accounts: ReadonlyArray<{ accountId: string; weight?: number }>,
   nowMs: number,
 ): FleetHistory {
   const predictedResetByAccount = new Map<string, number>();
   const histories: AccountHistory[] = [];
-  for (const accountId of accountIds) {
+  for (const { accountId, weight } of accounts) {
     // One read per account covers both measurements: the reset lookback is the longer of the
     // two windows, and the burn measurement filters the same observations down to its own.
     const observations = readWeeklyObservations(
       reader.listUsageSnapshotsSince(accountId, nowMs - RESET_LOOKBACK_MS),
     );
-    // Plan tiers are resolved elsewhere; until then every account weighs 1 Pro-equivalent
-    // unit, which the pacing renderer states outright rather than assuming silently.
-    histories.push({ accountId, weight: 1, observations });
+    // An unresolved plan tier weighs 1 Pro-equivalent unit — the same fallback pacing applies to
+    // capacity, so burn and capacity stay denominated in the same units even for a fleet whose
+    // tiers are half known. The pacing renderer states the fallback outright.
+    histories.push({
+      accountId,
+      weight: weight !== undefined && weight > 0 ? weight : 1,
+      observations,
+    });
     const predicted = predictWeeklyReset(observations, nowMs);
     if (predicted !== undefined) predictedResetByAccount.set(accountId, predicted);
   }

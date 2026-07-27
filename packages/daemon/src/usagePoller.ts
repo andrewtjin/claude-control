@@ -12,9 +12,13 @@
 
 import type { AccountUsage, PayloadOf, UsagePlan } from '@claude-control/shared-protocol';
 import {
+  billingLabel,
   computePlan,
+  planWeight,
   type AccountUsageInput,
   type AdvisorOptions,
+  type BillingSignals,
+  type PlanTierSignals,
 } from '@claude-control/usage-advisor';
 import { parseUsageEndpointResponse, parseCachedUsage, type ParsedUsage } from './usageParse.js';
 import type { FleetHistory } from './usageHistory.js';
@@ -56,6 +60,32 @@ export interface PollAccount {
   label: string;
   active: boolean;
   quarantined: boolean;
+}
+
+/** The registry-only facts that ride out on the usage snapshot beside the polled numbers.
+ *  Structural (not `StoredAccount`) so the daemon's wire builder does not drag the vault's type
+ *  into a payload shape — and so tests can supply two fields instead of a whole account.
+ *
+ *  These exist on the wire because they CANNOT be derived downstream: the plan tier and billing
+ *  fields live in the local registry, which the phone never sees. Without them `/usage` and
+ *  `/accounts` could only ever show what the terminal already showed better. */
+export interface RegistryFacts extends PlanTierSignals, BillingSignals {
+  id: string;
+}
+
+/** The wire's plan/billing pair for one account. Both are omitted rather than nulled when
+ *  unresolvable: an absent `planWeight` is what makes every consumer print "?" and keeps pacing
+ *  reporting the tier as unknown, instead of a "1x" that reads like a reading. */
+function registryFields(
+  facts: RegistryFacts | undefined,
+  nowMs: number,
+): { planWeight?: number; billing?: string } {
+  if (facts === undefined) return {};
+  const weight = planWeight(facts);
+  return {
+    ...(weight.known ? { planWeight: weight.weight } : {}),
+    billing: billingLabel(facts, nowMs),
+  };
 }
 
 export interface UsagePollerOptions {
@@ -418,12 +448,17 @@ function restampIdentity(usage: ParsedUsage, account: PollAccount): ParsedUsage 
 export function toUsageSnapshotPayload(
   snapshot: SnapshotResult,
   history: FleetHistory = { predictedResetByAccount: new Map() },
+  registry: readonly RegistryFacts[] = [],
+  nowMs: number = Date.now(),
 ): PayloadOf<'usage.snapshot'> {
+  const factsById = new Map(registry.map((a) => [a.id, a]));
   const accounts = snapshot.accounts.map((account) => {
     const predicted = history.predictedResetByAccount.get(account.accountId);
-    return predicted !== undefined && Number.isFinite(predicted) && predicted >= 0
-      ? { ...account, predictedResetAt: Math.round(predicted) }
-      : account;
+    const withReset =
+      predicted !== undefined && Number.isFinite(predicted) && predicted >= 0
+        ? { ...account, predictedResetAt: Math.round(predicted) }
+        : account;
+    return { ...withReset, ...registryFields(factsById.get(account.accountId), nowMs) };
   });
   const burn = history.burnUnitsPerDay;
   return {
