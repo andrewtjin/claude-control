@@ -31,8 +31,10 @@ const MIN_COL_WIDTH = 6;
  *  the line above" without eating width the prose needs. */
 const RECORD_INDENT = '  ';
 
-/** A parsed table: rows of cell text, plus which row gaps had a horizontal separator in
- *  the source (markdown tables get one after the header; box tables keep their own). */
+/** A parsed table: rows of cell text, plus which row gaps get a horizontal separator in the
+ *  render (markdown tables separate every row — the syntax has no way to say "no separator
+ *  here" past the header delimiter, so leaving later gaps unmarked ran every body row after
+ *  the first into the next; box tables keep whatever the source itself drew). */
 interface ParsedTable {
   rows: string[][];
   separatorAfterRow: boolean[];
@@ -105,23 +107,20 @@ function parseBoxBlock(lines: string[]): ParsedTable | undefined {
   return { rows, separatorAfterRow: separatorAfterRow.slice(0, rows.length) };
 }
 
-/** Parse a markdown pipe table (header, separator, body) into rows. The separator row is
- *  dropped; its position is remembered as "separator after the header". */
+/** Parse a markdown pipe table (header, separator, body) into rows. The delimiter row is
+ *  dropped entirely — its only job was marking where the header ends, not how many separators
+ *  the render gets. Markdown syntax puts every row on its own line with no way to opt a pair of
+ *  them out of a separator, so every gap is a boundary; see `ParsedTable`. */
 function parseMarkdownBlock(lines: string[]): ParsedTable | undefined {
   const rows: string[][] = [];
-  const separatorAfterRow: boolean[] = [];
   for (const line of lines) {
-    if (isMarkdownSeparator(line)) {
-      if (rows.length > 0) separatorAfterRow[rows.length - 1] = true;
-      continue;
-    }
+    if (isMarkdownSeparator(line)) continue;
     rows.push(markdownCells(line));
-    separatorAfterRow.push(false);
   }
   if (rows.length < 2) return undefined;
   const cols = rows[0]?.length ?? 0;
   if (cols < 2 || rows.some((r) => r.length !== cols)) return undefined;
-  return { rows, separatorAfterRow: separatorAfterRow.slice(0, rows.length) };
+  return { rows, separatorAfterRow: rows.map((_, i) => i < rows.length - 1) };
 }
 
 /** Greedy word-wrap of one cell to `width`, hard-splitting tokens longer than the width
