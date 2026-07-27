@@ -23,6 +23,27 @@ function emptyRegistry(): Registry {
   return { activeId: null, accounts: [] };
 }
 
+/**
+ * Revision of the bundle -> registry-row mapping implemented by `applyBundleMetadata`, stamped
+ * onto every row it accepts.
+ *
+ * Bump it whenever a field joins (or changes meaning in) `PlanKey`/`IdentityKey`. The registry is
+ * a CACHE of what a bundle says, and it is only ever recomputed as a side effect of WRITING that
+ * bundle — which happens on a token rotation and nowhere else, so a stored bundle can sit unread
+ * for weeks. Without a stamp, a row written by a build that captured fewer fields is
+ * indistinguishable from a row whose bundle genuinely carries none, so the missing fields can
+ * never be backfilled and the account renders as unknown forever. With it, `needsMetadataBackfill`
+ * names exactly the rows to recompute, once each.
+ */
+export const ACCOUNT_METADATA_REV = 1;
+
+/** Whether this row's derived metadata predates the current mapping and should be recomputed
+ *  from its stored bundle. Recomputation costs a decrypt, so this gate is what keeps the repair
+ *  a one-time cost per row instead of a per-listing one. */
+export function needsMetadataBackfill(account: StoredAccount): boolean {
+  return account.metadataRev !== ACCOUNT_METADATA_REV;
+}
+
 /** Registry fields that identify WHICH account a row is. Never removed by a bundle write, and
  *  only written at all once the block carrying them is accepted — see `identityMatches`. */
 type IdentityKey = 'accountUuid' | 'emailAddress' | 'organizationUuid';
@@ -137,7 +158,12 @@ function applyBundleMetadata(
   const acct = bundle.oauthAccount;
   if (acct !== undefined && !identityMatches(account, acct, log)) return false;
 
-  let changed = false;
+  // Stamped before any copying so it lands on every ACCEPTED write, including the credentials-only
+  // early return below — the stamp records which mapping ran, not how much it happened to find.
+  // A refused block (above) never reaches here: that row was not recomputed, so claiming it was
+  // would suppress the backfill that eventually repairs it.
+  let changed = account.metadataRev !== ACCOUNT_METADATA_REV;
+  account.metadataRev = ACCOUNT_METADATA_REV;
   const oauth = bundle.claudeAiOauth;
   changed = setOrDelete(account, 'subscriptionType', oauth.subscriptionType) || changed;
   changed = setOrDelete(account, 'rateLimitTier', oauth.rateLimitTier) || changed;
@@ -284,16 +310,14 @@ export class Vault {
     return this.decodeBundle(blob);
   }
 
-  /** Encrypt and persist an account's credential bundle, and refresh its metadata row so
-   *  the registry stays consistent with the bundle (e.g. after a token refresh). A bundle whose
-   *  identity block names a different account refreshes nothing (see `identityMatches`).
+  /** Encrypt and persist an account's credential bundle, then refresh its metadata row via
+   *  {@link syncMetadata} so the registry stays consistent with the bundle (e.g. after a token
+   *  refresh).
    *
-   *  The metadata refresh is best-effort and secondary: the encrypted blob is written FIRST
-   *  and unconditionally, because losing a rotated single-use token is unrecoverable whereas a
-   *  stale derived metadata row is cosmetic and self-heals on the next write. An id with no
-   *  registry row (an account mid-creation, or removed concurrently) simply skips the refresh
-   *  rather than erroring — this is not a lifecycle method. The registry is only rewritten when
-   *  a value actually changed, so routine token refreshes don't churn the file.
+   *  ORDER IS DELIBERATE: the encrypted blob is written FIRST and unconditionally, because losing
+   *  a rotated single-use token is unrecoverable whereas a stale derived row is cosmetic and
+   *  self-heals on the next reconcile. The registry is only rewritten when a value actually
+   *  changed, so routine token refreshes don't churn the file.
    *
    *  Because of that refresh this method is a registry read-modify-write, so like the other
    *  registry writers it MUST be called with the credential lock held (see the "registry
@@ -302,13 +326,34 @@ export class Vault {
     ensureDir(join(this.vaultDir, id));
     const blob = await this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
     await atomicWriteFile(this.bundlePath(id), blob);
+    await this.syncMetadata(id, bundle);
+  }
 
+  /**
+   * Reconcile a registry row with a bundle the caller ALREADY holds decrypted, without touching
+   * the encrypted blob. Returns whether the row changed.
+   *
+   * Exists because {@link writeBundle} was the only thing that ever refreshed a row, which ties
+   * the freshness of derived metadata to token rotation — an unrelated event. Every path that
+   * merely READS a bundle (activating an account whose token is still fresh, polling one that
+   * needs no refresh, the backfill sweep) left the row at whatever mapping first wrote it, so a
+   * field added later never appeared for an existing account no matter how often it was switched
+   * to. Splitting the reconcile out lets those paths fix the row at no extra cost: they have
+   * already paid for the decrypt, and nothing here can disturb a rotated token because nothing
+   * here re-encrypts.
+   *
+   * Same contracts as `writeBundle`: a bundle whose identity block names a different account
+   * refreshes nothing (see `identityMatches`), an id with no registry row is a no-op rather than
+   * an error, and — being a registry read-modify-write — the credential lock MUST be held.
+   */
+  async syncMetadata(id: string, bundle: CredentialBundle): Promise<boolean> {
     const reg = await this.loadRegistry();
     const account = reg.accounts.find((a) => a.id === id);
-    if (!account) return;
-    if (!applyBundleMetadata(account, bundle, this.log)) return;
+    if (!account) return false;
+    if (!applyBundleMetadata(account, bundle, this.log)) return false;
     account.updatedAtMs = this.clock();
     await this.saveRegistry(reg);
+    return true;
   }
 
   // ---- rollback snapshot (mid-switch only) ----

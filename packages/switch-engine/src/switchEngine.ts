@@ -46,7 +46,7 @@ import type {
   RefreshTokenResult,
   StoredAccount,
 } from './types.js';
-import { Vault } from './vault.js';
+import { needsMetadataBackfill, Vault } from './vault.js';
 
 /** Signature of the refresh function, so tests can inject a fake. */
 export type RefreshFn = (current: ClaudeOauth, deps?: RefreshDeps) => Promise<ClaudeOauth>;
@@ -137,6 +137,41 @@ export class SwitchEngine {
   }
   clearQuarantine(id: string): Promise<void> {
     return this.withCredentialLock(() => this.vault.clearQuarantine(id));
+  }
+
+  /**
+   * Recompute the derived (plan/billing/identity) row of every account whose metadata predates
+   * the current bundle -> row mapping, reading each one's ALREADY STORED bundle. Returns how many
+   * rows were repaired.
+   *
+   * The repair exists because nothing else can perform it. A row is refreshed only when its
+   * bundle is rewritten, so an account added by a build that captured fewer fields keeps
+   * rendering "unknown" until the day its token happens to rotate — and for fields the earlier
+   * build never captured at all, that day never comes, because the data was in the bundle the
+   * whole time and only the mapping was behind. Recomputing from the stored bundle (rather than
+   * from the live `~/.claude.json`) is what makes this correct for EVERY account instead of only
+   * whichever one is currently logged in.
+   *
+   * Cost is bounded and one-shot: `needsMetadataBackfill` filters to rows that are actually
+   * behind, each repaired row is stamped with the current revision, and the lock is not taken at
+   * all when there is nothing to do — so the steady state is a single registry read. An
+   * unreadable bundle (missing blob, a key this machine cannot decrypt) is skipped rather than
+   * thrown: a listing must still render for the accounts that ARE readable.
+   */
+  async backfillAccountMetadata(): Promise<number> {
+    const stale = (await this.vault.listAccounts()).filter(needsMetadataBackfill);
+    if (stale.length === 0) return 0;
+    return this.withCredentialLock(async () => {
+      let repaired = 0;
+      for (const account of stale) {
+        const bundle = await this.vault.readBundle(account.id).catch(() => undefined);
+        if (!bundle) continue;
+        // Re-reads the registry per account, so a row removed since the scan above is a no-op.
+        if (await this.vault.syncMetadata(account.id, bundle)) repaired += 1;
+      }
+      if (repaired > 0) this.log.info({ repaired }, 'backfilled account metadata from vault');
+      return repaired;
+    });
   }
 
   // ---- active account (live-login reconciled) ----
@@ -402,6 +437,11 @@ export class SwitchEngine {
       // Load the target and refresh it if the access token is near expiry. The rotated token
       // is persisted to the vault the instant we get it — single-use tokens die if dropped.
       let bundle = await this.vault.readBundle(targetId);
+      // Reconcile the target's derived row from the bundle just decrypted. A switch is the one
+      // moment this account's bundle is guaranteed to be open, and the refresh below runs only
+      // when the token is near expiry — so without this a fresh-token switch leaves plan/billing
+      // metadata frozen at whatever mapping first wrote the row.
+      await this.vault.syncMetadata(targetId, bundle);
       let refreshed = false;
       if (bundle.claudeAiOauth.expiresAt - this.clock() < this.refreshSkewMs) {
         bundle = await this.refreshTarget(targetId, bundle, hasRollback);

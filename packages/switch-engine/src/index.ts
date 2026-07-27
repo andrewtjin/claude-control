@@ -25,7 +25,7 @@ export {
   DEFAULT_REFRESH_SKEW_MS,
   type RefreshDeps,
 } from './oauth.js';
-export { Vault } from './vault.js';
+export { Vault, ACCOUNT_METADATA_REV, needsMetadataBackfill } from './vault.js';
 export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
 export {
   CredentialStore,
