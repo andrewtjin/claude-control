@@ -1,19 +1,42 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Vault } from './vault.js';
+import { ACCOUNT_METADATA_REV, needsMetadataBackfill, Vault } from './vault.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { UnknownAccountError } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
 import type { CredentialBundle } from './types.js';
 
 let dirs: string[] = [];
-async function vault(log: Logger = noopLogger) {
+/** A vault plus the directory its registry lives in, so a test can rewrite `accounts.json` the
+ *  way an older build left it on disk. */
+async function vaultAt(log: Logger = noopLogger) {
   const dir = await mkdtemp(join(tmpdir(), 'ce-vault-'));
   dirs.push(dir);
   let t = 1000;
-  return new Vault(join(dir, 'vault'), new InsecurePassthroughProtector(), () => t++, log);
+  const vaultDir = join(dir, 'vault');
+  return {
+    v: new Vault(vaultDir, new InsecurePassthroughProtector(), () => t++, log),
+    registryPath: join(vaultDir, 'accounts.json'),
+  };
+}
+async function vault(log: Logger = noopLogger) {
+  return (await vaultAt(log)).v;
+}
+
+/** Rewrite the registry as a build predating a metadata field would have left it: the derived
+ *  keys absent and no revision stamp. This is the exact on-disk shape the backfill exists to
+ *  repair, so tests reproduce it rather than approximating it. */
+async function degradeRegistryRow(registryPath: string, drop: string[]): Promise<void> {
+  const reg = JSON.parse(await readFile(registryPath, 'utf8')) as {
+    accounts: Record<string, unknown>[];
+  };
+  for (const account of reg.accounts) {
+    delete account.metadataRev;
+    for (const key of drop) delete account[key];
+  }
+  await writeFile(registryPath, JSON.stringify(reg, null, 2));
 }
 
 /** A logger that keeps every warning, so a refused identity block can be asserted as
@@ -368,6 +391,106 @@ describe('Vault registry + bundles', () => {
       const v = await vault();
       await expect(v.writeBundle('no-such-id', bundle('v1'))).resolves.toBeUndefined();
       expect(await v.listAccounts()).toEqual([]);
+    });
+  });
+
+  describe('syncMetadata reconciles a row without rewriting the bundle', () => {
+    // Tying the row's freshness to a bundle WRITE means a field added after an account was
+    // stored never reaches its row: nothing rewrites a bundle except a token rotation, and the
+    // data was already inside the stored bundle the whole time.
+    const full: CredentialBundle = {
+      claudeAiOauth: {
+        accessToken: 'a',
+        refreshToken: 'r',
+        expiresAt: 999,
+        subscriptionType: 'max',
+      },
+      oauthAccount: {
+        accountUuid: 'uuid-1',
+        emailAddress: 'me@x.com',
+        organizationRateLimitTier: 'default_claude_max_20x',
+        billingType: 'stripe_subscription',
+        subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+      },
+    };
+
+    it('recovers plan and billing fields an older build never wrote to the row', async () => {
+      const { v, registryPath } = await vaultAt();
+      const acct = await v.addAccount('work', full);
+      await degradeRegistryRow(registryPath, [
+        'organizationRateLimitTier',
+        'billingType',
+        'subscriptionCreatedAt',
+      ]);
+
+      const stale = await v.getAccount(acct.id);
+      expect(stale).toBeDefined();
+      expect(needsMetadataBackfill(stale!)).toBe(true);
+      expect(stale).not.toHaveProperty('organizationRateLimitTier');
+
+      expect(await v.syncMetadata(acct.id, await v.readBundle(acct.id))).toBe(true);
+      const after = await v.getAccount(acct.id);
+      expect(after?.organizationRateLimitTier).toBe('default_claude_max_20x');
+      expect(after?.billingType).toBe('stripe_subscription');
+      expect(after?.subscriptionCreatedAt).toBe('2026-07-15T20:35:34.215673Z');
+      expect(after?.metadataRev).toBe(ACCOUNT_METADATA_REV);
+      expect(needsMetadataBackfill(after!)).toBe(false);
+    });
+
+    it('leaves the encrypted bundle exactly as it was', async () => {
+      // The whole point of a separate verb: reconciling a row must never re-encrypt, because the
+      // bundle holds a single-use refresh token and a stray write is how one gets lost.
+      const v = await vault();
+      const acct = await v.addAccount('work', full);
+      await v.syncMetadata(acct.id, {
+        ...full,
+        claudeAiOauth: { ...full.claudeAiOauth, refreshToken: 'r-not-persisted' },
+      });
+      expect((await v.readBundle(acct.id)).claudeAiOauth.refreshToken).toBe('r');
+    });
+
+    it('refuses a block naming another account, exactly as a bundle write does', async () => {
+      // The reconcile runs on read paths that never validated a bundle before, so it must carry
+      // the same identity guard — a foreign block would otherwise re-key the row that every
+      // attribution check compares a bundle against.
+      const { logger, warnings } = warnCapturingLogger();
+      const v = await vault(logger);
+      const acct = await v.addAccount('work', full);
+      expect(
+        await v.syncMetadata(acct.id, {
+          claudeAiOauth: { accessToken: 'a', refreshToken: 'r', expiresAt: 999 },
+          oauthAccount: { accountUuid: 'uuid-2', billingType: 'other' },
+        }),
+      ).toBe(false);
+      const after = await v.getAccount(acct.id);
+      expect(after?.accountUuid).toBe('uuid-1');
+      expect(after?.billingType).toBe('stripe_subscription');
+      expect(warnings).toHaveLength(1);
+    });
+
+    it('reports no change when the row already matches the bundle', async () => {
+      const v = await vault();
+      const acct = await v.addAccount('work', full);
+      const before = (await v.getAccount(acct.id))?.updatedAtMs;
+      expect(await v.syncMetadata(acct.id, full)).toBe(false);
+      expect((await v.getAccount(acct.id))?.updatedAtMs).toBe(before);
+    });
+
+    it('is a no-op for an id with no registry row', async () => {
+      const v = await vault();
+      expect(await v.syncMetadata('no-such-id', full)).toBe(false);
+    });
+
+    it('stamps the revision even when the bundle carries no identity block', async () => {
+      // A credentials-only bundle has already given up everything this mapping can derive, so
+      // leaving it unstamped would make the backfill re-decrypt it on every single listing.
+      const { v, registryPath } = await vaultAt();
+      const acct = await v.addAccount('work', {
+        claudeAiOauth: { accessToken: 'a', refreshToken: 'r', expiresAt: 999 },
+      });
+      await degradeRegistryRow(registryPath, []);
+      expect(await v.syncMetadata(acct.id, await v.readBundle(acct.id))).toBe(true);
+      expect((await v.getAccount(acct.id))?.metadataRev).toBe(ACCOUNT_METADATA_REV);
     });
   });
 

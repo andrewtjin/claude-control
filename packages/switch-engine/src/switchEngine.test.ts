@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SwitchEngine, type RefreshFn } from './switchEngine.js';
@@ -277,6 +277,89 @@ describe('activate — happy path', () => {
     const { accountB } = await seedAActiveWithB(h);
     await h.vault.quarantine(accountB.id, 'invalid_grant');
     await expect(h.engine.activate(accountB.id)).rejects.toBeInstanceOf(QuarantineError);
+  });
+});
+
+describe('derived account metadata is repaired from the stored bundle', () => {
+  // The registry is a cache of what a bundle says, and the only thing that used to refresh it was
+  // WRITING that bundle — an event tied to token rotation, not to metadata. So an account stored
+  // by a build that captured fewer fields rendered "?" / "unknown" indefinitely, even though its
+  // vaulted bundle had carried the answer since the day it was captured.
+  const PLAN_TIER = 'default_claude_max_20x';
+  const planBundle = (access: string, expiresAt: number): CredentialBundle => ({
+    claudeAiOauth: { ...oauth(access, expiresAt), subscriptionType: 'max' },
+    oauthAccount: {
+      accountUuid: 'uuid-' + access,
+      emailAddress: access + '@x.com',
+      organizationRateLimitTier: PLAN_TIER,
+      billingType: 'stripe_subscription',
+      subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+    },
+  });
+
+  /** Rewrite the registry the way a build predating these fields left it on disk: derived keys
+   *  absent, no revision stamp — while the encrypted bundles keep carrying the values. */
+  async function degradeRegistry(paths: Paths): Promise<void> {
+    const path = join(paths.vaultDir, 'accounts.json');
+    const reg = JSON.parse(await readFile(path, 'utf8')) as {
+      accounts: Record<string, unknown>[];
+    };
+    for (const account of reg.accounts) {
+      delete account.metadataRev;
+      delete account.organizationRateLimitTier;
+      delete account.billingType;
+      delete account.subscriptionCreatedAt;
+    }
+    await writeFile(path, JSON.stringify(reg, null, 2));
+  }
+
+  it('repairs the target during a switch that needs no token refresh', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+    expect(await h.vault.getAccount(accountB.id)).not.toHaveProperty('organizationRateLimitTier');
+
+    await h.engine.activate(accountB.id);
+
+    // B's token was nowhere near expiry, so nothing rewrote its bundle — the row is repaired
+    // from the copy the switch already had to decrypt.
+    expect(h.refresh).not.toHaveBeenCalled();
+    const b = await h.vault.getAccount(accountB.id);
+    expect(b?.organizationRateLimitTier).toBe(PLAN_TIER);
+    expect(b?.billingType).toBe('stripe_subscription');
+    // The account NOT being switched to is untouched by the switch — that is what the sweep is
+    // for, and asserting it keeps the two mechanisms from being confused for one another.
+    expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+  });
+
+  it('sweeps every stale account once, then costs nothing', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+
+    expect(await h.engine.backfillAccountMetadata()).toBe(2);
+    for (const id of [accountA.id, accountB.id]) {
+      expect((await h.vault.getAccount(id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+    }
+    // Stamped rows are skipped, so a listing does not pay for a decrypt on every run.
+    expect(await h.engine.backfillAccountMetadata()).toBe(0);
+  });
+
+  it('skips an account whose bundle cannot be read instead of failing the sweep', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+    // A missing blob is a real state (a half-removed account, a vault restored without it); one
+    // unreadable account must not deny every other account its metadata.
+    await rm(join(h.paths.vaultDir, accountA.id), { recursive: true, force: true });
+
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+    expect((await h.vault.getAccount(accountB.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+    expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
   });
 });
 

@@ -915,6 +915,13 @@ function buildAccountCommands(program: Command): void {
     .description('list stored accounts')
     .action(async () => {
       const engine = buildEngine();
+      // Self-heal before rendering. The PLAN/BILLING columns read fields that a row only gains
+      // when its bundle is rewritten, so an account stored by an earlier build shows "?" and
+      // "unknown" indefinitely even though its vaulted bundle has carried the answer all along.
+      // The sweep decrypts only rows that are actually behind and stamps them, so it costs
+      // nothing once healed; a busy credential lock (a switch mid-flight) must never fail a
+      // listing, so a failure just renders whatever is already on record.
+      await engine.backfillAccountMetadata().catch(() => 0);
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
       process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
     });
