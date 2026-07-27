@@ -7,9 +7,22 @@
 //    padding computed on plain text stays aligned when styled afterwards;
 //  - color is only enabled on a real TTY with NO_COLOR unset, so piped/redirected output
 //    and CI logs remain byte-for-byte plain.
+//
+// The CLI's status marks read as one vocabulary: the glyph carries the state, the color carries
+// how much the reader owes it.
+//   [ok] green   - fine, nothing to do.
+//   [!!] red     - broken now.
+//   [--] yellow  - no positive signal, and the reader is expected to act on it.
+//   [--] dim     - no positive signal, but there is nothing to act on; it resolves itself once
+//                  the daemon has been up long enough to measure.
+// On the steady-state surfaces (`status` and the pacing line) the one glyph with two colors
+// splits on whether a command is offered, so a dim line never leaves the reader hunting for one.
+// `setup` is deliberately not held to that split: mid-first-run every unfinished step is yellow,
+// because there the incomplete step IS what the reader is working through even when no single
+// command clears it. Do not read setup's yellow as a promise that a command follows.
 
 import { colorEnabled, sgr, type Paint } from '@claude-control/shared-protocol';
-import { severityOf, type OutlookStyle } from '@claude-control/usage-advisor';
+import { severityOf, type OutlookStyle, type PacingStyle } from '@claude-control/usage-advisor';
 
 // `colorEnabled` (the NO_COLOR/TTY gate) and `sgr` (the SGR wrapper every paint below is built
 // from) are defined once in shared-protocol and re-exported/reused here rather than redeclared:
@@ -102,5 +115,25 @@ export function outlookStyle(palette: Palette): OutlookStyle {
     both: palette.yellow,
     percent: (text, pct) => severityPaint(palette, pct)(text),
     alert: palette.red,
+  };
+}
+
+/** Adapt a palette to `renderPacingSummary`'s style hooks. The verdict marker follows the
+ *  status-mark convention above — green `[ok]` sustainable, red `[!!]` running dry, dim `[--]`
+ *  merely not measurable yet — while a fleet locked behind expired logins is a yellow `[--]`,
+ *  because that one waits on a command. Headroom reuses the shared severity bands,
+ *  and the waste line gets yellow: it names a real loss, but one still inside the horizon, not
+ *  an active problem (that's `alert`/red territory above). */
+export function pacingStyle(palette: Palette): PacingStyle {
+  return {
+    marker: (text, verdict) => {
+      if (verdict === 'runs-dry') return palette.red(text);
+      if (verdict === 'sustainable') return palette.green(text);
+      return palette.dim(text);
+    },
+    percent: (text, pct) => severityPaint(palette, pct)(text),
+    waste: palette.yellow,
+    warn: palette.yellow,
+    dim: palette.dim,
   };
 }
