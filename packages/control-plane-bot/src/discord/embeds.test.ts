@@ -652,7 +652,34 @@ describe('buildQuestionEmbed', () => {
     ]).toJSON();
     const value = embed.fields?.[0]?.value ?? '';
     for (let i = 0; i < 20; i++) expect(value).toContain(`account-${i}`);
-    expect(value).not.toContain('more');
+    // The clamp's own marker, matched by its shape — a cell that happens to say "more" is
+    // content, not evidence that anything was dropped.
+    expect(value).not.toMatch(/… \+\d+ more/);
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
+  it('keeps a short table ruled when the prose beside it is what overruns the field', () => {
+    // The cap is overrun by the prose, not by the table, and this field's clamp drops whole
+    // LINES — so freeing the two rules (26 characters) can never buy back a 200-character line.
+    // The reader receives identical content either way, and should receive it with the rows
+    // still divided.
+    const table = [
+      '| Account | Status | Reset |',
+      '| --- | --- | --- |',
+      '| alpha | ok | 3h |',
+      '| beta | ok | 5h |',
+      '| gamma | busy | 9h |',
+    ];
+    const prose = Array.from({ length: 8 }, (_, i) => `${i}. ${'x'.repeat(197)}`);
+    const embed = buildQuestionEmbed([
+      {
+        question: [...table, '', ...prose].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    expect(value.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
     expect(value.length).toBeLessThanOrEqual(1024);
   });
 

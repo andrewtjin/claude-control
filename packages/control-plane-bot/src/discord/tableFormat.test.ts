@@ -221,14 +221,38 @@ describe('formatTables — budget', () => {
     expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
   });
 
-  it('drops the rules to a single header one once they no longer fit', () => {
+  it('drops the rules to a single header one once the rows cannot fit beside them', () => {
     const source = mdTable(20);
     const ruled = formatTables(source);
-    const budgeted = formatTables(source, { budget: ruled.length - 1 });
+    const budgeted = formatTables(source, { budget: Math.floor(ruled.length / 2) });
     expect(budgeted.length).toBeLessThan(ruled.length);
     // Down to the delimiter's own gap, and not one rule further: the header must stay divided
     // from the body even when there is no room for anything else.
     expect(budgeted.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(1);
+  });
+
+  it('keeps the rules when the budget is overrun by text they stand in front of nothing of', () => {
+    // Prose beside the table overruns the field cap on its own. The rules are 26 characters
+    // against a surface that cuts whole 200-character lines, so shedding them puts no line back
+    // on the screen — it only takes the rules off it. The render must therefore be the one the
+    // same text gets with no budget at all.
+    const prose = Array.from({ length: 8 }, (_, i) => `${i}. ${'x'.repeat(197)}`).join('\n');
+    const text = `${mdTable(3)}\n\n${prose}`;
+    expect(formatTables(text, { budget: 1024 })).toBe(formatTables(text));
+    expect(
+      formatTables(text, { budget: 1024 })
+        .split('\n')
+        .filter((l) => l.startsWith('├')),
+    ).toHaveLength(3);
+  });
+
+  it('still sheds the rules when the table is what the budget cannot hold', () => {
+    // Prose around the table changes nothing about whose lines are being lost: the cut lands
+    // inside the table, so the rules are exactly what is standing in front of the rows.
+    const text = `Here is how the accounts compare:\n\n${mdTable(20)}\n\nPick one.`;
+    const out = formatTables(text, { budget: 1024 });
+    expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(1);
+    for (let i = 0; i < 20; i++) expect(out).toContain(`account-${i}`);
   });
 
   it('keeps every row when the rules are what had to go', () => {

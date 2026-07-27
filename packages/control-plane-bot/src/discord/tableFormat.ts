@@ -35,7 +35,8 @@ const RECORD_INDENT = '  ';
  *  render. A box source states its own gaps, and those are mirrored exactly. Markdown states
  *  none — its single delimiter row marks where the HEADER ends, not where rules belong — so for
  *  markdown the gaps are chosen, not read: a rule at every gap so no two rows touch, or at the
- *  header alone when the rules cost more room than the surface has (see `formatTables`). */
+ *  header alone when dropping the rest is what lets the surface show the rows (see
+ *  `formatTables`). */
 interface ParsedTable {
   rows: string[][];
   separatorAfterRow: boolean[];
@@ -371,7 +372,17 @@ export interface TableFormatOptions {
  * the difference between a surface showing every row and showing two thirds of them under a
  * "+N more" — and a reader who can see all sixteen accounts is better served than one looking at
  * thirteen prettier ones. So `budget` makes the choice: rules everywhere while the result fits
- * what the caller can display, and a rule under the header alone once it does not.
+ * what the caller can display, and a rule under the header alone once dropping them is what puts
+ * rows back on the reader's screen.
+ *
+ * That last clause is the whole condition, and a character count alone cannot state it: a budget
+ * is overrun by everything the text contains, so an overrun says nothing about WHOSE lines are at
+ * fault. A three-row table beside eight paragraphs of prose overruns a field cap exactly as a
+ * forty-row table does, and there the two rules are 26 characters against a surface that cuts
+ * whole 190-character lines — shedding them delivers the reader the identical content, minus the
+ * rules. So the policies are compared on the only thing the rules can ever buy back: how many ROW
+ * lines each one actually gets inside the budget. Equal rows means the cut landed somewhere the
+ * rules had no say over, and the table keeps them.
  *
  * The retreat is all-or-nothing across the whole text rather than per table. Deliberate: which
  * of several tables should pay is not a question the character count can answer, and a mixed
@@ -380,8 +391,35 @@ export interface TableFormatOptions {
 export function formatTables(text: string, options: TableFormatOptions = {}): string {
   const maxWidth = options.maxWidth ?? DEFAULT_TABLE_WIDTH;
   const ruled = render(text, maxWidth, true);
-  if (options.budget === undefined || ruled.length <= options.budget) return ruled;
-  return render(text, maxWidth, false);
+  const budget = options.budget;
+  if (budget === undefined || ruled.length <= budget) return ruled;
+  const bare = render(text, maxWidth, false);
+  return rowLinesWithin(bare, budget) > rowLinesWithin(ruled, budget) ? bare : ruled;
+}
+
+/**
+ * How many lines of table ROW text `rendered` still delivers to a surface capped at `budget`.
+ *
+ * Every clamp these renders reach keeps a prefix and cuts the tail (a field value drops whole
+ * trailing lines, a description slices), so what a reader receives is the longest prefix that
+ * fits. Row lines are counted because they are the only thing shedding a rule can win back: a
+ * rule pushes the lines BELOW it past the cut, and inside a table those are rows. When both
+ * policies deliver the same rows, the cut fell past the table — on prose, or on a second table
+ * the surface was never going to reach — and no rule is standing in front of anything.
+ */
+function rowLinesWithin(rendered: string, budget: number): number {
+  const lines = rendered.split('\n');
+  let used = 0;
+  let rows = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    used += (i === 0 ? 0 : 1) + line.length; // the '\n' that rejoins this line to the one before
+    if (used > budget) break;
+    // A rendered row: cell text between verticals. Rules ('├'), borders ('┌', '└') and prose
+    // start with something else.
+    if (line.startsWith('│')) rows++;
+  }
+  return rows;
 }
 
 /** One rendering pass at a fixed markdown gap policy; see `formatTables` for how the policy is
