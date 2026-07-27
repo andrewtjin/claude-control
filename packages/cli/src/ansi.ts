@@ -8,15 +8,18 @@
 //  - color is only enabled on a real TTY with NO_COLOR unset, so piped/redirected output
 //    and CI logs remain byte-for-byte plain.
 //
-// The CLI's status marks (`doctor`, `status`, `setup`, the pacing line) read as one vocabulary:
-// the glyph carries the state and the color carries what the reader owes it.
+// The CLI's status marks read as one vocabulary: the glyph carries the state, the color carries
+// how much the reader owes it.
 //   [ok] green   - fine, nothing to do.
 //   [!!] red     - broken now.
-//   [--] yellow  - no positive signal AND a command that fixes it: pair, install, re-login.
-//   [--] dim     - no positive signal and nothing to run; it resolves itself once the daemon
-//                  has been up long enough to measure.
-// The one glyph with two colors is split strictly on that test, so a line that prints a command
-// is never dim and a dim line never leaves the reader hunting for one to run.
+//   [--] yellow  - no positive signal, and the reader is expected to act on it.
+//   [--] dim     - no positive signal, but there is nothing to act on; it resolves itself once
+//                  the daemon has been up long enough to measure.
+// On the steady-state surfaces (`status` and the pacing line) the one glyph with two colors
+// splits on whether a command is offered, so a dim line never leaves the reader hunting for one.
+// `setup` is deliberately not held to that split: mid-first-run every unfinished step is yellow,
+// because there the incomplete step IS what the reader is working through even when no single
+// command clears it. Do not read setup's yellow as a promise that a command follows.
 
 import { severityOf, type OutlookStyle, type PacingStyle } from '@claude-control/usage-advisor';
 
