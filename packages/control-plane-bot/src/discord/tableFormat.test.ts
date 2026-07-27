@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { formatTables, DEFAULT_TABLE_WIDTH } from './tableFormat.js';
+import { clampFieldValue } from './embeds.js';
+import { clampBalanced } from './messageChunks.js';
+import { formatTables, formatTablesClamped, DEFAULT_TABLE_WIDTH } from './tableFormat.js';
 
 // The real card that motivated this module: a terminal-sized comparison table (88 columns)
 // that a phone-width Discord surface shredded. Kept verbatim as the primary fixture.
@@ -206,65 +208,152 @@ describe('formatTables — markdown pipe input', () => {
   });
 });
 
-describe('formatTables — budget', () => {
-  /** A markdown table whose cells are short enough to stay a grid, so the only thing that grows
-   *  with `bodyRows` is the row count and the rules between them. */
-  const mdTable = (bodyRows: number): string =>
+describe('formatTables — the rules are kept or shed by what the surface DELIVERS', () => {
+  /** Discord's embed-field cap, and the real clamp that enforces it: whole trailing LINES dropped
+   *  and a "… +N more" marker appended. Every case here runs through that clamp rather than a
+   *  stand-in, because the trade being measured lives entirely in how the clamp cuts. */
+  const FIELD_MAX = 1024;
+  const deliverField = (rendered: string): string =>
+    clampBalanced(rendered, FIELD_MAX, clampFieldValue);
+
+  /** A markdown table whose cells stay short enough to keep the grid layout, so the only thing
+   *  `bodyRows` grows is the row count and the rules between them. `pad` widens every cell by a
+   *  fixed amount, which walks the ruled render's overrun past the clamp's line boundary — the
+   *  boundary is where every character-counting model of the clamp has gone wrong. */
+  const mdTable = (bodyRows: number, pad = 0): string =>
     [
       '| Account | Plan | Left |',
       '| --- | --- | --- |',
-      ...Array.from({ length: bodyRows }, (_, i) => `| account-${i} | max20x | ${i}% |`),
+      ...Array.from(
+        { length: bodyRows },
+        (_, i) => `| acct-${i}. | max20x${'x'.repeat(pad)} | ${i}% |`,
+      ),
     ].join('\n');
 
-  it('rules every gap while the result fits the budget', () => {
-    const out = formatTables(mdTable(3), { budget: 4096 });
+  /** The pre-fix render: a rule under the header and nowhere else. Built by deleting the rules a
+   *  fully-ruled render draws past the first, which is exactly the line set the unruled policy
+   *  emits — the two policies differ in nothing else. Pinned by the equality assertion below. */
+  const bareBaseline = (text: string): string => {
+    let kept = 0;
+    return formatTables(text)
+      .split('\n')
+      .filter((line) => !line.startsWith('├') || kept++ === 0)
+      .join('\n');
+  };
+
+  /** How many of `tokens` a delivered value still shows. The reader's-eye measure of content:
+   *  observable in the output, and stated in the source's own words rather than in any notion of
+   *  a line the module might hold. */
+  const shown = (value: string, tokens: string[]): number =>
+    tokens.filter((t) => value.includes(t)).length;
+
+  const accountTokens = (rows: number): string[] =>
+    Array.from({ length: rows }, (_, i) => `acct-${i}.`);
+
+  it('rules every gap while the surface shows the whole render', () => {
+    const out = formatTablesClamped(mdTable(3), FIELD_MAX, clampFieldValue);
     expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
   });
 
-  it('drops the rules to a single header one once the rows cannot fit beside them', () => {
+  it('sheds the rules — and only down to the header rule — once they cost rows', () => {
     const source = mdTable(20);
-    const ruled = formatTables(source);
-    const budgeted = formatTables(source, { budget: Math.floor(ruled.length / 2) });
-    expect(budgeted.length).toBeLessThan(ruled.length);
-    // Down to the delimiter's own gap, and not one rule further: the header must stay divided
-    // from the body even when there is no room for anything else.
-    expect(budgeted.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(1);
-  });
-
-  it('keeps the rules when the budget is overrun by text they stand in front of nothing of', () => {
-    // Prose beside the table overruns the field cap on its own. The rules are 26 characters
-    // against a surface that cuts whole 200-character lines, so shedding them puts no line back
-    // on the screen — it only takes the rules off it. The render must therefore be the one the
-    // same text gets with no budget at all.
-    const prose = Array.from({ length: 8 }, (_, i) => `${i}. ${'x'.repeat(197)}`).join('\n');
-    const text = `${mdTable(3)}\n\n${prose}`;
-    expect(formatTables(text, { budget: 1024 })).toBe(formatTables(text));
-    expect(
-      formatTables(text, { budget: 1024 })
-        .split('\n')
-        .filter((l) => l.startsWith('├')),
-    ).toHaveLength(3);
-  });
-
-  it('still sheds the rules when the table is what the budget cannot hold', () => {
-    // Prose around the table changes nothing about whose lines are being lost: the cut lands
-    // inside the table, so the rules are exactly what is standing in front of the rows.
-    const text = `Here is how the accounts compare:\n\n${mdTable(20)}\n\nPick one.`;
-    const out = formatTables(text, { budget: 1024 });
+    const out = formatTablesClamped(source, FIELD_MAX, clampFieldValue);
+    // Down to the delimiter's own gap and not one rule further: the header must stay divided from
+    // the body even when there is no room for anything else.
     expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(1);
-    for (let i = 0; i < 20; i++) expect(out).toContain(`account-${i}`);
+    expect(out).toBe(deliverField(bareBaseline(source)));
+    for (const token of accountTokens(20)) expect(out).toContain(token);
+    expect(out).not.toMatch(/… \+\d+ more/);
+    expect(out.length).toBeLessThanOrEqual(FIELD_MAX);
   });
 
-  it('keeps every row when the rules are what had to go', () => {
-    const source = mdTable(20);
-    const budgeted = formatTables(source, { budget: 1024 });
-    expect(budgeted.length).toBeLessThanOrEqual(1024);
-    for (let i = 0; i < 20; i++) expect(budgeted).toContain(`account-${i}`);
+  it('keeps every row of a table whose ruled render overruns by less than one line', () => {
+    // The boundary case. A sixteen-row table one character wider per cell overruns the cap by a
+    // few characters — less than the line the clamp then drops, plus the ten it spends on the
+    // marker. Any model that asks "how much of the ruled render fits?" reads that as a tie with
+    // the unruled one and keeps the rules; the clamp then charges the reader a whole row for it.
+    const source = mdTable(16, 1);
+    expect(formatTables(source).length).toBeGreaterThan(FIELD_MAX);
+    const out = formatTablesClamped(source, FIELD_MAX, clampFieldValue);
+    for (const token of accountTokens(16)) expect(out).toContain(token);
+    // The clamp's own marker, matched by its shape — a cell that happens to say "more" is content.
+    expect(out).not.toMatch(/… \+\d+ more/);
   });
 
-  it('leaves a box source ruled as it was drawn even under a budget it overruns', () => {
+  /** A three-row table followed by twelve paragraphs of `width` characters. The prose alone
+   *  overruns the field cap, so the cut lands well past the table and the only question is
+   *  whether the three rules above the prose cost the reader a paragraph. */
+  const tableThenProse = (width: number): string =>
+    [
+      mdTable(3),
+      '',
+      ...Array.from({ length: 12 }, (_, i) => `p${i}. ${'x'.repeat(width - 4)}`),
+    ].join('\n');
+
+  it('keeps the rules when what overruns is prose they stand in front of none of', () => {
+    // 73-character paragraphs: the ruled render overruns the cap by more than a hundred
+    // characters, and every line the clamp then drops is prose it would have dropped without the
+    // rules too. Shedding them buys the reader nothing and costs them the divisions, so the
+    // render must be the one this text gets on a surface with no cap at all.
+    const text = tableThenProse(73);
+    expect(formatTables(text).length).toBeGreaterThan(FIELD_MAX);
+    const out = formatTablesClamped(text, FIELD_MAX, clampFieldValue);
+    expect(out).toBe(deliverField(formatTables(text)));
+    expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
+  });
+
+  it('sheds them one character of prose either side, where they do cost a paragraph', () => {
+    // The two widths bracketing the case above, where the rules are exactly what pushes a
+    // paragraph past the cut. This is the half of the trade a rows-only measure cannot see at
+    // all: the rules sit ABOVE the prose, so what they push off the screen is paragraphs.
+    for (const width of [63, 72]) {
+      const text = tableThenProse(width);
+      const out = formatTablesClamped(text, FIELD_MAX, clampFieldValue);
+      expect({ width, rules: out.split('\n').filter((l) => l.startsWith('├')).length }).toEqual({
+        width,
+        rules: 1,
+      });
+      // The paragraph the rules would have cost, on the reader's screen.
+      const kept = Array.from({ length: 12 }, (_, i) => `p${i}.`).filter((t) => out.includes(t));
+      const ruledKept = Array.from({ length: 12 }, (_, i) => `p${i}.`).filter((t) =>
+        deliverField(formatTables(text)).includes(t),
+      );
+      expect({ width, kept: kept.length }).toEqual({ width, kept: ruledKept.length + 1 });
+    }
+  });
+
+  it('shows at least as much as the unruled baseline, sweeping cell width and row count', () => {
+    for (let pad = 0; pad <= 10; pad++) {
+      for (const rows of [4, 8, 12, 16, 20, 24]) {
+        const source = mdTable(rows, pad);
+        const tokens = accountTokens(rows);
+        const chosen = shown(formatTablesClamped(source, FIELD_MAX, clampFieldValue), tokens);
+        expect({ pad, rows, chosen }).toEqual({
+          pad,
+          rows,
+          chosen: Math.max(chosen, shown(deliverField(bareBaseline(source)), tokens)),
+        });
+      }
+    }
+  });
+
+  it('shows at least as much as the unruled baseline, sweeping prose width', () => {
+    // Every width from a short bullet to a wrapped paragraph: the widths where the two policies
+    // tie are the ones every previous rule got wrong, so none of them may be skipped.
+    const tokens = [...accountTokens(3), ...Array.from({ length: 12 }, (_, i) => `p${i}.`)];
+    for (let width = 40; width <= 300; width++) {
+      const source = tableThenProse(width);
+      const chosen = shown(formatTablesClamped(source, FIELD_MAX, clampFieldValue), tokens);
+      expect({ width, chosen }).toEqual({
+        width,
+        chosen: Math.max(chosen, shown(deliverField(bareBaseline(source)), tokens)),
+      });
+    }
+  });
+
+  it('leaves a box source ruled as it was drawn however hard the surface cuts', () => {
     // A box source states its gaps, so shedding them would be dropping information the sender
-    // supplied — a budget buys back what this module chose to add, never what it was given.
+    // supplied — a clamp buys back what this module chose to add, never what it was given.
     const box = [
       '┌─────┬─────┐',
       '│ a   │ b   │',
@@ -274,12 +363,24 @@ describe('formatTables — budget', () => {
       '│ e   │ f   │',
       '└─────┴─────┘',
     ].join('\n');
-    const out = formatTables(box, { budget: 1 });
-    expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(2);
+    // The harshest surface there is — one that shows none of the render at all.
+    expect(
+      formatTables(box, { deliver: () => '' })
+        .split('\n')
+        .filter((l) => l.startsWith('├')),
+    ).toHaveLength(2);
   });
 
-  it('is unchanged by a budget it never reaches', () => {
-    expect(formatTables(mdTable(2), { budget: 4096 })).toBe(formatTables(mdTable(2)));
+  it('is unchanged by a surface that shows the whole render', () => {
+    expect(formatTablesClamped(mdTable(2), 4096, clampFieldValue)).toBe(formatTables(mdTable(2)));
+  });
+
+  it('rules every gap when the caller states no delivery at all', () => {
+    expect(
+      formatTables(mdTable(20))
+        .split('\n')
+        .filter((l) => l.startsWith('├')),
+    ).toHaveLength(20);
   });
 });
 

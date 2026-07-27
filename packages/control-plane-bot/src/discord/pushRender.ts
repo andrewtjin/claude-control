@@ -18,9 +18,18 @@ import {
 } from './embeds.js';
 import { permissionButtons, type ButtonSpec } from './buttons.js';
 import { questionSelectSpecs, type SelectSpec } from './questionCards.js';
-import { CHUNKED_CONTENT_BUDGET } from './messageChunks.js';
+import { chunkMessage } from './messageChunks.js';
 import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
 import { defuseFences, formatTables } from './tableFormat.js';
+
+/** Everything a `content` push actually reaches the reader as: the gateway sends it through
+ *  `chunkMessage`, which caps the number of messages and marks the rest as cut. Handed to
+ *  `formatTables` so its row-rule choice is measured against the real delivery rather than a
+ *  guess at how much room four messages leave — the reopened fences and the truncation marker
+ *  are part of that room, and only the chunker knows them. */
+function chunkedDelivery(content: string): string {
+  return chunkMessage(content).join('\n');
+}
 
 /** A text file to attach to the message — the same delivery session threads use for full
  *  stdout. Plain data (no discord.js types) so this module stays unit-testable; the gateway
@@ -106,9 +115,10 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
     // A summary is assistant prose posted as plain content, where Discord renders neither a
     // markdown table nor a terminal-width box — re-render before the gateway chunks it, so a
     // chunk boundary lands between finished lines instead of inside a table it then has to fence.
-    // What the chunker will really deliver is the formatter's budget, so a table long enough to
-    // reach the chunk cap sheds its rules rather than its last rows.
-    return { content: formatTables(envelope.payload.text, { budget: CHUNKED_CONTENT_BUDGET }) };
+    // The gateway's own chunker is what decides how much of this arrives, so it is handed to the
+    // formatter as the measure: a table long enough to reach the chunk cap sheds its rules only
+    // when that is what the chunker then gives the reader back.
+    return { content: formatTables(envelope.payload.text, { deliver: chunkedDelivery }) };
   }
   if (isType(envelope, 'error')) {
     // A protocol `error` envelope is the daemon telling the phone something explicitly failed
@@ -189,14 +199,13 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
     default: {
       // The generic card is a bold title over relayed body text; that body is whatever the
       // session had to say, tables included, so it goes through the formatter like every other
-      // prose surface.
-      // The heading shares the chunker's budget with the body, so it is subtracted rather than
-      // counted twice — a budget quoted larger than the room really left is spent on rules the
-      // reader then loses rows to.
+      // prose surface. The heading is delivered out of the same chunks as the body, so it is part
+      // of what the formatter measures against — measuring the body alone would credit it room
+      // the heading has already spent.
       const heading = `**${p.title}**\n`;
       return {
         content: `${heading}${formatTables(p.body, {
-          budget: Math.max(0, CHUNKED_CONTENT_BUDGET - heading.length),
+          deliver: (rendered) => chunkedDelivery(`${heading}${rendered}`),
         })}`,
       };
     }
