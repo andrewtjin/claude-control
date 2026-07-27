@@ -215,6 +215,25 @@ describe('computeOutlook — merged events', () => {
 });
 
 describe('timelineInputFromWire', () => {
+  // The wire spelling of the plan weight. Without this mapping the phone's pacing model
+  // equal-weighted every account no matter what the daemon resolved, and reported plan tiers as
+  // unknown while the same daemon's `accounts list` printed "20x".
+  it('takes the plan weight off the wire, preferring it over a caller-supplied one', () => {
+    const base = { accountId: 'a', label: 'main', active: true, limits: [] };
+    expect(timelineInputFromWire([{ ...base, planWeight: 20 }])[0]?.weight).toBe(20);
+    expect(timelineInputFromWire([{ ...base, planWeight: 20, weight: 1 }])[0]?.weight).toBe(20);
+    expect(timelineInputFromWire([{ ...base, weight: 5 }])[0]?.weight).toBe(5);
+  });
+
+  it('leaves the weight ABSENT for an unresolved tier rather than defaulting it to 1', () => {
+    // `weight: 1` and no weight at all render identically but mean opposite things: a real Pro
+    // account versus a tier nothing could read. Only the absence makes pacing say so.
+    const base = { accountId: 'a', label: 'main', active: true, limits: [] };
+    for (const wire of [{ ...base }, { ...base, planWeight: null }, { ...base, planWeight: 0 }]) {
+      expect(timelineInputFromWire([wire])[0]).not.toHaveProperty('weight');
+    }
+  });
+
   it('parses ISO reset times to epoch ms and defaults quarantined to false', () => {
     const inputs = timelineInputFromWire([
       {

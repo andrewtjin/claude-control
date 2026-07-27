@@ -37,6 +37,7 @@ import type { AccountUsage } from '@claude-control/shared-protocol';
 import {
   computeOutlook,
   computePlan,
+  planWeight,
   renderOutlook,
   renderPlanSummary,
   timelineInputFromWire,
@@ -787,7 +788,7 @@ async function readUsageState(nowMs: number): Promise<UsageState> {
     // implementation — so a number the CLI prints can never disagree with the one the phone got.
     const history = readFleetHistory(
       store,
-      accounts.map((a) => a.id),
+      accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) })),
       nowMs,
     );
     return {
@@ -815,8 +816,20 @@ function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
       quarantined: a.quarantined,
       limits: state.usageFor(a.id)?.limits ?? [],
       predictedResetAt: state.predictedResetFor(a.id),
+      // The registry is right here, so resolve the tier from it rather than leaving the fleet
+      // math equal-weighting a Max 20x against a Pro. Only a KNOWN weight is passed: an
+      // unresolved one must stay absent so pacing reports the assumption instead of burying it.
+      ...resolvedWeight(a),
     })),
   );
+}
+
+/** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same
+ *  present-or-absent contract `timelineInputFromWire` relies on to tell a real 1x Pro account
+ *  from one whose tier nothing could read. */
+function resolvedWeight(account: StoredAccount): { weight?: number } {
+  const result = planWeight(account);
+  return result.known ? { weight: result.weight } : {};
 }
 
 /** Spread the measured burn into `PacingOptions` only when there IS one. `exactOptionalPropertyTypes`
