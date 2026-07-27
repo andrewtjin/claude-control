@@ -343,12 +343,14 @@ describe('renderPacingLine', () => {
     };
   }
 
-  it('prints the verdict marker, headroom and a waste line under a "Pacing: " prefix', () => {
+  it('renders the verdict line, the labelled rows and the unit legend', () => {
     const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW, burnUnitsPerDay: 2 });
     expect(line).toBe(
       [
-        'Pacing: [ok] 10u/20u (50%) - burn 2u/d < 2.9u/d - 14d',
-        '  waste 10u: soonest a in 3d',
+        'Pacing  [ok] sustainable past 14d (2u/2.9u burned per day)',
+        '  left     10u of 20u (50%)',
+        '  expires  a 10u in 3d - nothing else expires within 14d',
+        '  1u = one Pro account-week (a Max 20x counts 20)',
       ].join('\n'),
     );
   });
@@ -359,12 +361,18 @@ describe('renderPacingLine', () => {
       nowMs: NOW,
       burnUnitsPerDay: 1,
     });
-    expect(line).toContain('24u/40u (60%)');
+    expect(line).toContain('24u of 40u (60%)');
   });
 
-  it('is one line, with no caveats, when nothing is wasted and tiers are known', () => {
+  it('omits the expires row, but never the legend, when nothing is wasted', () => {
     const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW });
-    expect(line).toBe('Pacing: [--] 10u/20u (50%) - burn unmeasured - replenish 2.9u/d');
+    expect(line).toBe(
+      [
+        'Pacing  [--] burn rate not measured yet',
+        '  left     10u of 20u (50%)',
+        '  1u = one Pro account-week (a Max 20x counts 20)',
+      ].join('\n'),
+    );
   });
 
   it('reports pacing unknown with no accounts', () => {
@@ -393,7 +401,10 @@ describe('renderPacingLine', () => {
     const colored = renderPacingLine([input('a', 50, 3)], opts, pacingStyle(ANSI_PALETTE));
     expect(colored).not.toBe(plain);
     expect(colored).toContain(ANSI_PALETTE.green('[ok]'));
-    expect(colored).toContain(ANSI_PALETTE.yellow('waste 10u: soonest a in 3d'));
+    expect(colored).toContain(ANSI_PALETTE.yellow('a 10u in 3d - nothing else expires within 14d'));
+    // The row labels are bold, and the legend dim — the block's two furniture tiers.
+    expect(colored).toContain(ANSI_PALETTE.bold('expires'));
+    expect(colored).toContain(ANSI_PALETTE.dim('1u = one Pro account-week (a Max 20x counts 20)'));
     // Color never changes the visible text, only wraps it.
     expect(stripAnsi(colored)).toBe(plain);
     // The identity style (what every command falls back to off a TTY / under NO_COLOR) is
