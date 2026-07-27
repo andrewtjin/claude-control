@@ -30,6 +30,7 @@ export const DISCORD_CONTENT_MAX = 2000;
 const DEFAULT_MAX_CHUNKS = 4;
 
 const FENCE = '```';
+
 const TRUNCATION_NOTE = '… (truncated)';
 const FENCE_LINE = /^\s*```(.*)$/;
 

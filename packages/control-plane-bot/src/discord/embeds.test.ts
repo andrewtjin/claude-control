@@ -637,6 +637,76 @@ describe('buildQuestionEmbed', () => {
     expect(embed.fields?.[0]?.value).toContain('┌');
   });
 
+  it('shows every row of a long table rather than rules on a clamped one', () => {
+    // A question that arrives as a twenty-account comparison is the whole reason this field goes
+    // through the formatter, and the field cap is hard: rendering a rule between every row costs
+    // more than the cap can hold, and the rows past the cap are the ones the reader loses. The
+    // rules are what must go.
+    const rows = Array.from({ length: 20 }, (_, i) => `| account-${i} | max20x | ${i}% |`);
+    const embed = buildQuestionEmbed([
+      {
+        question: ['| Account | Plan | Left |', '| --- | --- | --- |', ...rows].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    for (let i = 0; i < 20; i++) expect(value).toContain(`account-${i}`);
+    // The clamp's own marker, matched by its shape — a cell that happens to say "more" is
+    // content, not evidence that anything was dropped.
+    expect(value).not.toMatch(/… \+\d+ more/);
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
+  it('keeps a short table ruled when the prose beside it is what overruns the field', () => {
+    // The cap is overrun by the prose, not by the table, and this field's clamp drops whole
+    // LINES — so freeing the two rules (26 characters) can never buy back a 200-character line.
+    // The reader receives identical content either way, and should receive it with the rows
+    // still divided.
+    const table = [
+      '| Account | Status | Reset |',
+      '| --- | --- | --- |',
+      '| alpha | ok | 3h |',
+      '| beta | ok | 5h |',
+      '| gamma | busy | 9h |',
+    ];
+    const prose = Array.from({ length: 8 }, (_, i) => `${i}. ${'x'.repeat(197)}`);
+    const embed = buildQuestionEmbed([
+      {
+        question: [...table, '', ...prose].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    expect(value.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
+  it('keeps every paragraph beside a short table when the rules are what would cost one', () => {
+    // The same shape at the width where the rules DO cost something. They sit above the prose, so
+    // what they push past the cut is a paragraph rather than a row — invisible to anything that
+    // measures the trade in rows, and a whole paragraph of the reader's answer either way.
+    const table = [
+      '| Account | Status | Reset |',
+      '| --- | --- | --- |',
+      '| alpha | ok | 3h |',
+      '| beta | ok | 5h |',
+      '| gamma | busy | 9h |',
+    ];
+    const prose = Array.from({ length: 12 }, (_, i) => `p${i}. ${'x'.repeat(58)}`);
+    const embed = buildQuestionEmbed([
+      {
+        question: [...table, '', ...prose].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    for (let i = 0; i < 12; i++) expect(value).toContain(`p${i}.`);
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
   it('renders at most four questions', () => {
     const many = Array.from({ length: 6 }, (_, i) => ({
       question: `q${i}`,
@@ -1015,6 +1085,103 @@ describe('clamping a re-rendered table leaves no fence open', () => {
       expect(question.length).toBeGreaterThan(900);
     });
   }
+});
+
+describe('the slicing clamp (truncateLabeled) — the same rules-vs-content trade, on the clamp none of the above exercise', () => {
+  // Every decision test elsewhere in this file and in tableFormat.test.ts runs the rules-vs-content
+  // trade through `clampFieldValue`, which only ever drops whole trailing LINES. `truncateLabeled`
+  // is the OTHER clamp `formatTablesClamped` is measured through — it backs the description on
+  // every lifecycle card (buildDoneEmbed / buildWaitingEmbed / buildSessionSummaryEmbed) and the
+  // live session card's summary — and it clamps by raw CHARACTER SLICE instead. A suite that only
+  // ever drives the line-dropping clamp would go green on a regression confined to this one, so the
+  // ordinary shed/keep behavior is repeated here against a real slicing surface, not just measured
+  // through a stand-in.
+  const mdTable = (bodyRows: number): string =>
+    [
+      '| Account | Plan | Left |',
+      '| --- | --- | --- |',
+      ...Array.from({ length: bodyRows }, (_, i) => `| acct-${i}. | max20x | ${i}% |`),
+    ].join('\n');
+
+  function model(overrides: Partial<SessionCardModel> = {}): SessionCardModel {
+    return {
+      sessionId: 's1',
+      state: 'running',
+      stopping: false,
+      totalOutputChars: 0,
+      attached: false,
+      hasGap: false,
+      sourceTruncated: false,
+      hadError: false,
+      ...overrides,
+    };
+  }
+
+  it('rules every gap while the live card shows the whole render', () => {
+    const embed = buildSessionCardEmbed(model({ summary: mdTable(3) })).toJSON();
+    expect(embed.description).toBe(
+      [
+        '```',
+        '┌─────────┬────────┬──────┐',
+        '│ Account │ Plan   │ Left │',
+        '├─────────┼────────┼──────┤',
+        '│ acct-0. │ max20x │ 0%   │',
+        '├─────────┼────────┼──────┤',
+        '│ acct-1. │ max20x │ 1%   │',
+        '├─────────┼────────┼──────┤',
+        '│ acct-2. │ max20x │ 2%   │',
+        '└─────────┴────────┴──────┘',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('sheds the rules — down to the header rule only — once they cost rows', () => {
+    const embed = buildSessionCardEmbed(model({ summary: mdTable(8) })).toJSON();
+    expect(embed.description).toBe(
+      [
+        '```',
+        '┌─────────┬────────┬──────┐',
+        '│ Account │ Plan   │ Left │',
+        '├─────────┼────────┼──────┤',
+        '│ acct-0. │ max20x │ 0%   │',
+        '│ acct-1. │ max20x │ 1%   │',
+        '│ acct-2. │ max20x │ 2%   │',
+        '│ acct-3. │ max20x │ 3%   │',
+        '│ acct-4. │ max20x │ 4%   │',
+        '│ acct-5. │ max20x │ 5%   │',
+        '│ acct-6. │ max20x │ 6%   │',
+        '│ acct-7. │ max20x │ 7%   │',
+        '└─────────┴────────┴──────┘',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('ties on a mid-paragraph slice and keeps every rule — the accepted line-splitting tradeoff', () => {
+    // A character slice can cut mid-line, where a whole-line drop never does: the resulting final
+    // partial line matches no full line of EITHER candidate render, so `deliveredContent` credits
+    // it to neither, the two candidates tie, and `formatTables` resolves a tie in the rules' favor
+    // (see its final comparison: `bare` only wins on a STRICT excess, not a tie). What the reader
+    // loses is confined to the un-credited tail of the one paragraph already being cut in both
+    // renders — never a whole paragraph, and never a row. INVARIANT: this stays a tie kept in the
+    // rules' favor; a future change that turns it into a strict loss (fewer whole paragraphs than
+    // the unruled render would have delivered) is a regression in the trade, not a fixture to
+    // reshape around the new numbers.
+    const table = mdTable(3);
+    const paragraphs = Array.from({ length: 60 }, (_, i) => `p${i}. ${'x'.repeat(87)}`);
+    const message = [table, '', ...paragraphs].join('\n');
+    const embed = buildDoneEmbed({ lastAssistantMessage: message }).toJSON();
+    const value = embed.description ?? '';
+    expect(value.length).toBe(4092);
+    expect(value.split('\n')).toHaveLength(54);
+    expect(value.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
+    // Paragraph 40 is the last one delivered whole; 41 is the shared partial tail neither
+    // candidate is credited for.
+    expect(value).toContain('p40.');
+    expect(value).not.toContain('p41.');
+    expect(value).toContain('… [+1764 chars truncated]');
+  });
 });
 
 describe('buildStatsEmbed', () => {
