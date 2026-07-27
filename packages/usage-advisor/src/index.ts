@@ -19,6 +19,12 @@ export {
   type PlanWeightResult,
   type PlanWeightSource,
 } from './planWeight.js';
+export {
+  billingLabel,
+  estimateNextBillingMs,
+  planLabel,
+  type BillingSignals,
+} from './planBilling.js';
 export { severityOf, worstSeverity, type Severity } from './severity.js';
 export {
   computePacing,

@@ -459,6 +459,42 @@ describe('emoji-width overflow fallback', () => {
   });
 });
 
+// The phone showed neither the plan tier nor the billing date the terminal had always shown,
+// on all three account views. Both facts live in the local registry and reach the bot only
+// because the daemon resolves them onto the snapshot — so each surface is asserted separately:
+// they render from one helper, but nothing structural stops one of them from dropping it.
+describe('plan tier and billing across the account views', () => {
+  const withPlan = account({ planWeight: 20, billing: '~Aug 11 (est.)' });
+
+  it('shows both on /accounts', () => {
+    const embed = buildAccountsEmbed([withPlan]).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('plan 20x · billing ~Aug 11 (est.)');
+  });
+
+  it('shows both on /usage', () => {
+    const embed = buildUsageEmbed({ accounts: [withPlan] }).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('plan 20x · billing ~Aug 11 (est.)');
+  });
+
+  it('shows both on /timeline', () => {
+    const embed = buildTimelineEmbed({ accounts: [withPlan] }).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('plan 20x · billing ~Aug 11 (est.)');
+  });
+
+  it('renders an unresolved tier as "?" rather than implying a 1x reading', () => {
+    const embed = buildAccountsEmbed([account({ billing: 'unknown' })]).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('plan ? · billing unknown');
+  });
+
+  it('stays silent when a daemon predating the fields reports neither', () => {
+    // Otherwise every account on an older daemon gains a "plan ? · billing unknown" caption
+    // for a question that was never asked.
+    const embed = buildAccountsEmbed([account()]).toJSON();
+    expect(embed.fields?.[0]?.value).not.toContain('plan ');
+    expect(embed.fields?.[0]?.value).not.toContain('billing');
+  });
+});
+
 describe('buildAccountsEmbed', () => {
   it('lists each account with its source', () => {
     const embed = buildAccountsEmbed([account({ source: 'cached' })]).toJSON();
