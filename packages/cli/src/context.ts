@@ -2,11 +2,12 @@
 //
 // The CLI runs one-shot commands against the same vault the daemon uses, so it builds a
 // SwitchEngine on the real default paths. `createLogger` builds the engine's tiny Logger
-// interface on top of pino; the CLI keeps it quiet by default (warn+).
+// interface on top of pino; the CLI keeps it quiet by default (warn+) and leaves the stream it
+// renders to up to the caller (see `buildEngine`).
 
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { createLogger } from '@claude-control/shared-protocol';
+import { createLogger, type LogSink } from '@claude-control/shared-protocol';
 import { SwitchEngine, defaultPaths, type Logger, type Paths } from '@claude-control/switch-engine';
 
 /** The daemon's sqlite database — a sibling of the vault under the claude-control data dir.
@@ -19,9 +20,30 @@ export function daemonDbPath(paths: Paths = defaultPaths()): string {
   return join(dir, 'daemon.db');
 }
 
-/** Build a SwitchEngine on the real, production paths. */
-export function buildEngine(paths: Paths = defaultPaths()): SwitchEngine {
-  const adapter: Logger = createLogger({ defaultLevel: 'warn' });
+/**
+ * Where the engine renders its diagnostics — a decision that belongs to the caller, because the
+ * two composition roots that build engines want opposite answers and neither can be defaulted
+ * into the other's.
+ *
+ * A one-shot command (the default, STDERR) owns its stdout: the accounts table, the `--json`
+ * document, whatever the caller is piping into `jq` or a script. The engine can emit a warn line
+ * at any point during a plain read (a metadata repair that could not complete, for instance); on
+ * stdout it lands in the middle of that output and corrupts it for every non-human consumer,
+ * while being no more visible to the operator than it is on stderr.
+ *
+ * `cctl daemon run` has no output of its own — everything it writes is log — so it passes the
+ * SAME sink its own logger renders to (see daemonRun.ts's `DAEMON_LOG_SINK`). Both loggers in
+ * that process must land in one place or `cctl daemon run > daemon.log` captures only half the
+ * daemon's log and quietly leaves the rest on the terminal.
+ *
+ * Nothing is silenced either way: the level is unchanged, CCTL_LOG_FILE still receives the same
+ * lines, and CCTL_LOG_LEVEL still turns more of them on.
+ */
+export function buildEngine(
+  paths: Paths = defaultPaths(),
+  logSink: LogSink = process.stderr,
+): SwitchEngine {
+  const adapter: Logger = createLogger({ defaultLevel: 'warn', sink: logSink });
   // The switch-cadence guard defaults to 60s; operators can tune (or 0-disable) it via env.
   const intervalEnv = Number(process.env.CCTL_SWITCH_MIN_INTERVAL_MS);
   const options: ConstructorParameters<typeof SwitchEngine>[0] = { paths, logger: adapter };
