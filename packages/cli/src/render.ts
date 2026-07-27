@@ -485,7 +485,8 @@ function taskLine(task: DaemonStatusView['task'], palette: Palette): string {
 function heartbeatLine(view: DaemonStatusView, palette: Palette): string {
   const { heartbeat, task } = view;
   if (heartbeat.state === 'never') {
-    return `${palette.dim('[--]')} daemon has never run on this machine — run: cctl daemon install`;
+    // Yellow, not dim: the line hands the reader a command, and the mark colors say so (ansi.ts).
+    return `${palette.yellow('[--]')} daemon has never run on this machine — run: cctl daemon install`;
   }
   const age = ageLabel(heartbeat.ageMs);
   if (heartbeat.state === 'alive') {

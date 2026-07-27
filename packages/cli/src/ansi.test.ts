@@ -96,11 +96,18 @@ describe('pacingStyle', () => {
     expect(style.waste('waste 1u: a in 5d')).toBe(ANSI_PALETTE.yellow('waste 1u: a in 5d'));
   });
 
+  it('separates `warn` from `dim`: a mark with a command to run is never quiet', () => {
+    const style = pacingStyle(ANSI_PALETTE);
+    expect(style.warn('[--]')).toBe(ANSI_PALETTE.yellow('[--]'));
+    expect(style.warn('[--]')).not.toBe(style.dim('[--]'));
+  });
+
   it('is the identity end-to-end over the plain palette', () => {
     const style = pacingStyle(PLAIN_PALETTE);
     expect(style.marker('[ok]', 'sustainable')).toBe('[ok]');
     expect(style.percent('50%', 50)).toBe('50%');
     expect(style.waste('w')).toBe('w');
+    expect(style.warn('w')).toBe('w');
     expect(style.dim('d')).toBe('d');
   });
 });

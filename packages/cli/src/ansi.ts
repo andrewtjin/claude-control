@@ -7,6 +7,16 @@
 //    padding computed on plain text stays aligned when styled afterwards;
 //  - color is only enabled on a real TTY with NO_COLOR unset, so piped/redirected output
 //    and CI logs remain byte-for-byte plain.
+//
+// The CLI's status marks (`doctor`, `status`, `setup`, the pacing line) read as one vocabulary:
+// the glyph carries the state and the color carries what the reader owes it.
+//   [ok] green   - fine, nothing to do.
+//   [!!] red     - broken now.
+//   [--] yellow  - no positive signal AND a command that fixes it: pair, install, re-login.
+//   [--] dim     - no positive signal and nothing to run; it resolves itself once the daemon
+//                  has been up long enough to measure.
+// The one glyph with two colors is split strictly on that test, so a line that prints a command
+// is never dim and a dim line never leaves the reader hunting for one to run.
 
 import { severityOf, type OutlookStyle, type PacingStyle } from '@claude-control/usage-advisor';
 
@@ -111,10 +121,12 @@ export function outlookStyle(palette: Palette): OutlookStyle {
   };
 }
 
-/** Adapt a palette to `renderPacingSummary`'s style hooks. The verdict marker takes the same
- *  ok/bad/unknown-quiet split as `heartbeatLine`'s `[ok]`/`[!!]` daemon-status marks, headroom
- *  reuses the shared severity bands, and the waste line gets yellow — it names a real loss, but
- *  one still inside the horizon, not an active problem (that's `alert`/red territory above). */
+/** Adapt a palette to `renderPacingSummary`'s style hooks. The verdict marker follows the
+ *  status-mark convention above — green `[ok]` sustainable, red `[!!]` running dry, dim `[--]`
+ *  merely not measurable yet — while a fleet locked behind expired logins is a yellow `[--]`,
+ *  because that one waits on a command. Headroom reuses the shared severity bands,
+ *  and the waste line gets yellow: it names a real loss, but one still inside the horizon, not
+ *  an active problem (that's `alert`/red territory above). */
 export function pacingStyle(palette: Palette): PacingStyle {
   return {
     marker: (text, verdict) => {
@@ -124,6 +136,7 @@ export function pacingStyle(palette: Palette): PacingStyle {
     },
     percent: (text, pct) => severityPaint(palette, pct)(text),
     waste: palette.yellow,
+    warn: palette.yellow,
     dim: palette.dim,
   };
 }

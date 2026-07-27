@@ -49,10 +49,22 @@ export const PACING_HORIZON_DAYS = 14;
  *  reported as waste and never counted as "still has balance". */
 const UNIT_EPSILON = 1e-9;
 
-/** Accounts named individually in the rendered waste note; the rest are counted, never dropped. */
-const MAX_NAMED_WASTE = 3;
+/** Accounts named individually in any rendered list; the rest are counted, never dropped. */
+const MAX_NAMED_ACCOUNTS = 3;
 
 export type PacingVerdict = 'sustainable' | 'runs-dry' | 'unknown';
+
+/** Why an account contributes nothing to the totals. Carried alongside the prose `reason` so a
+ *  renderer can branch on the cause without parsing English — a fleet that is entirely
+ *  quarantined needs different advice from one that has simply never been polled. */
+export type PacingExclusion = 'quarantined' | 'no-weekly-limit' | 'no-percent';
+
+/** The one place each exclusion's prose lives, so the code and the sentence can never drift. */
+const EXCLUSION_REASON: Record<PacingExclusion, string> = {
+  quarantined: 'quarantined - excluded until re-login',
+  'no-weekly-limit': 'no weekly limit reported',
+  'no-percent': 'weekly limit missing percent',
+};
 
 /** One account's place in the fleet. Always present in the result — even a non-contributing
  *  account is listed, so a renderer can show WHY the totals exclude it instead of silently
@@ -71,8 +83,10 @@ export interface AccountPacing {
   /** True when `resetsAt` is a prediction from history, not an endpoint reading. */
   resetPredicted: boolean;
   contributing: boolean;
-  /** Why this account was excluded from the totals. Absent when contributing. */
+  /** Why this account was excluded from the totals, in prose. Absent when contributing. */
   reason?: string;
+  /** The same exclusion as a code. Absent when contributing. */
+  excluded?: PacingExclusion;
 }
 
 /** One weekly reset that arrives with budget still unspent — the budget it destroys. */
@@ -109,11 +123,12 @@ export interface Pacing {
    *  accounts. Rendered under the headline; never empty when something was assumed. */
   notes: string[];
   accounts: AccountPacing[];
-  /** True when any input account's plan weight was unresolved, so the fleet math fell back to
-   *  weighting it equally (1 unit). Split out from `notes` as its own field because the compact
-   *  CLI view (`renderPacingSummary`) must never let this caveat get lost while the rest of the
-   *  prose notes are compressed away — it is the one assumption a reader cannot detect from the
-   *  numbers alone. */
+  /** True when a CONTRIBUTING account's plan weight was unresolved, so the fleet math actually
+   *  fell back to weighting it equally (1 unit). Excluded accounts cannot trigger it: their
+   *  weight never entered a total, so claiming the math was assumed would be false. Split out
+   *  from `notes` as its own field because the compact CLI view (`renderPacingSummary`) must
+   *  never let this caveat get lost while the rest of the prose notes are compressed away — it
+   *  is the one assumption a reader cannot detect from the numbers alone. */
   tiersUnknown: boolean;
 }
 
@@ -153,8 +168,12 @@ export function computePacing(accounts: AccountUsageInput[], options: PacingOpti
   const availableUnits = sim.reduce((sum, a) => sum + a.balance, 0);
   const capacityUnits = sim.reduce((sum, a) => sum + a.weight, 0);
   const replenishUnitsPerDay = (capacityUnits / WEEK_MS) * DAY_MS;
-  const notes = buildNotes(accounts, outAccounts, sim.length, burnUnitsPerDay);
-  const tiersUnknown = accounts.some((a) => a.weight === undefined);
+  // The equal-weighting caveat is about the arithmetic, so only an account that entered the
+  // arithmetic can raise it. One excluded weightless account beside one contributing account of
+  // known tier means nothing was assumed, and saying otherwise sends a reader hunting for a
+  // fallback that never happened.
+  const tiersUnknown = analyzed.some((a) => a.pacing.contributing && a.weightAssumed);
+  const notes = buildNotes(outAccounts, sim.length, burnUnitsPerDay, tiersUnknown);
 
   if (sim.length === 0 || burnUnitsPerDay === undefined) {
     return {
@@ -206,14 +225,19 @@ export function computePacing(accounts: AccountUsageInput[], options: PacingOpti
 // Per-account analysis
 // ---------------------------------------------------------------------------
 
-/** One account's public entry, plus its simulation state when it contributes. */
+/** One account's public entry, its simulation state when it contributes, and whether its plan
+ *  weight had to be assumed. */
 function analyzeAccount(
   account: AccountUsageInput,
   nowMs: number,
-): { pacing: AccountPacing; sim?: SimAccount } {
-  // An absent plan weight means 1 Pro-equivalent unit. That default is SURFACED as a note by
+): { pacing: AccountPacing; weightAssumed: boolean; sim?: SimAccount } {
+  // An unresolved plan weight means 1 Pro-equivalent unit. That default is SURFACED as a note by
   // the caller (see buildNotes) — equal weighting applied silently is the original bug.
   const weightUnits = account.weight !== undefined && account.weight > 0 ? account.weight : 1;
+  // Read the fallback off the RESULT rather than re-testing the input, so "we assumed a tier"
+  // can never disagree with the tier actually used. A genuine Pro account (weight 1) is not a
+  // fallback; an absent or non-positive weight is.
+  const weightAssumed = weightUnits !== account.weight;
   const weekly = selectWeeklyBudget(account.limits, nowMs, account.predictedResetAt);
   // Clamped for the arithmetic (the endpoint grants overage past 100%), rounded only for
   // display — rounding before the sum would drift the fleet totals off the true balance.
@@ -231,14 +255,12 @@ function analyzeAccount(
   };
 
   if (account.quarantined) {
-    return { pacing: { ...base, reason: 'quarantined - excluded until re-login' } };
+    return { pacing: exclude(base, 'quarantined'), weightAssumed };
   }
   if (usedFraction === undefined) {
     return {
-      pacing: {
-        ...base,
-        reason: weekly === undefined ? 'no weekly limit reported' : 'weekly limit missing percent',
-      },
+      pacing: exclude(base, weekly === undefined ? 'no-weekly-limit' : 'no-percent'),
+      weightAssumed,
     };
   }
 
@@ -247,6 +269,7 @@ function analyzeAccount(
   const balanceUnits = weightUnits * (1 - usedFraction);
   return {
     pacing: { ...base, balanceUnits, contributing: true },
+    weightAssumed,
     sim: {
       accountId: account.accountId,
       label: account.label,
@@ -255,6 +278,12 @@ function analyzeAccount(
       ...(weekly?.resetsAt !== undefined ? { resetsAt: weekly.resetsAt } : {}),
     },
   };
+}
+
+/** Mark an account as contributing nothing, tagging it with both the code and its one canonical
+ *  sentence — the pair always travels together so no caller can report one without the other. */
+function exclude(base: AccountPacing, excluded: PacingExclusion): AccountPacing {
+  return { ...base, excluded, reason: EXCLUSION_REASON[excluded] };
 }
 
 // ---------------------------------------------------------------------------
@@ -388,11 +417,8 @@ interface WasteByAccount {
 
 /** Aggregate waste events PER ACCOUNT rather than per reset: an account that wastes at two
  *  resets inside the horizon is one decision ("use tjin.29"), not two, and naming it twice
- *  buries the other accounts. Ranked by units lost, because the biggest loss is the one worth
- *  acting on first. Shared by the prose note (`wasteNote`) and the compact dashboard line
- *  (`renderPacingSummary`) so the two views never disagree on which account is "the" one to
- *  name. */
-function rankWasteByAccount(waste: PacingWaste[]): WasteByAccount[] {
+ *  buries the other accounts. */
+function wasteByAccount(waste: PacingWaste[]): WasteByAccount[] {
   const byAccount = new Map<string, WasteByAccount>();
   for (const w of waste) {
     const entry = byAccount.get(w.accountId);
@@ -403,8 +429,24 @@ function rankWasteByAccount(waste: PacingWaste[]): WasteByAccount[] {
     entry.units += w.units;
     entry.firstAtMs = Math.min(entry.firstAtMs, w.atMs);
   }
-  return [...byAccount.values()].sort(
+  return [...byAccount.values()];
+}
+
+/** Biggest loss first — the ordering for the prose note, which prints EVERY named account's own
+ *  deadline, so leading with the largest loss costs the reader no accuracy. */
+function rankWasteByUnits(waste: PacingWaste[]): WasteByAccount[] {
+  return wasteByAccount(waste).sort(
     (a, b) => b.units - a.units || a.firstAtMs - b.firstAtMs || a.label.localeCompare(b.label),
+  );
+}
+
+/** Soonest deadline first — the ordering for the compact dashboard line, which prints ONE
+ *  deadline beside a fleet-wide total. Only the earliest deadline is safe there: any later one
+ *  tells a reader the whole total keeps until then, and the budget expiring first burns while
+ *  they wait. Ties break on the larger loss, then the label, so the line is stable poll to poll. */
+function rankWasteByDeadline(waste: PacingWaste[]): WasteByAccount[] {
+  return wasteByAccount(waste).sort(
+    (a, b) => a.firstAtMs - b.firstAtMs || b.units - a.units || a.label.localeCompare(b.label),
   );
 }
 
@@ -416,12 +458,12 @@ function wasteNote(
   horizonDays: number,
   nowMs: number,
 ): string {
-  const ranked = rankWasteByAccount(waste);
+  const ranked = rankWasteByUnits(waste);
   const named = ranked
-    .slice(0, MAX_NAMED_WASTE)
+    .slice(0, MAX_NAMED_ACCOUNTS)
     .map((w) => `${units(w.units)} on ${w.label} in ${humanizeDuration(w.firstAtMs - nowMs)}`)
     .join(', ');
-  const rest = Math.max(0, ranked.length - MAX_NAMED_WASTE);
+  const rest = Math.max(0, ranked.length - MAX_NAMED_ACCOUNTS);
   const tail = rest > 0 ? `, and ${rest} more account${rest === 1 ? '' : 's'}` : '';
   return `${units(wastedUnits)} expires unused within ${horizonDays}d: ${named}${tail}.`;
 }
@@ -429,10 +471,10 @@ function wasteNote(
 /** Every assumption the result rests on, stated outright. Order is fixed so the rendered
  *  block is stable between polls. */
 function buildNotes(
-  inputs: AccountUsageInput[],
   accounts: AccountPacing[],
   contributing: number,
   burnUnitsPerDay: number | undefined,
+  tiersUnknown: boolean,
 ): string[] {
   const notes: string[] = [];
   // A missing burn rate is only worth reporting when there is a fleet to measure: with no
@@ -440,7 +482,9 @@ function buildNotes(
   if (burnUnitsPerDay === undefined && contributing > 0) {
     notes.push('no usage history to measure a burn rate from yet.');
   }
-  if (inputs.some((a) => a.weight === undefined)) {
+  // Taken from the caller's already-computed flag rather than re-derived, so the prose bullet
+  // and the dashboard marker can never claim different things about the same fleet.
+  if (tiersUnknown) {
     notes.push('plan tiers unknown, so accounts are weighted equally (1 unit each).');
   }
   const predicted = accounts.filter((a) => a.contributing && a.resetPredicted);
@@ -463,9 +507,16 @@ function labels(accounts: AccountPacing[]): string {
   return accounts.map((a) => a.label).join(', ');
 }
 
+/** The unit value AS DISPLAYED. Anything that compares two unit figures a reader can see side
+ *  by side must compare these, not the raw ones: 0.62 and 0.58 both print "0.6u", so a raw
+ *  comparison renders an operator its own operands contradict. */
+function roundUnits(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
 /** "20u" / "6.5u" — whole units read cleanly, fractions keep one decimal. */
 function units(value: number): string {
-  const rounded = Math.round(value * 10) / 10;
+  const rounded = roundUnits(value);
   return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}u`;
 }
 
@@ -499,6 +550,8 @@ export interface PacingStyle {
   /** The waste line: budget about to be destroyed unused. Loud because it is the single most
    *  actionable line in the block. */
   waste(text: string): string;
+  /** A state the operator has to repair before pacing can say anything at all. */
+  warn(text: string): string;
   /** Low-salience furniture: the tier caveat, separators. */
   dim(text: string): string;
 }
@@ -508,6 +561,7 @@ export const PLAIN_PACING_STYLE: PacingStyle = {
   marker: (t) => t,
   percent: (t) => t,
   waste: (t) => t,
+  warn: (t) => t,
   dim: (t) => t,
 };
 
@@ -520,8 +574,12 @@ export const PLAIN_PACING_STYLE: PacingStyle = {
  * This deliberately does not print `pacing.notes` — those are the full-prose honesty markers
  * (predicted resets, excluded accounts, missing burn history) that `Pacing.headline`/`notes`
  * still carry for the Discord embed, which has room for prose and no on-call operator staring
- * at it for pacing decisions every few minutes. The CLI reader gets the four facts worth
- * acting on: the rest is still visible in `cctl timeline`'s own per-account detail.
+ * at it for pacing decisions every few minutes.
+ *
+ * Compaction is only safe for a caveat the reader can act on LATER. `cctl timeline` prints its
+ * own per-account rows (quarantine included), but `cctl usage` prints nothing of the sort, so on
+ * that surface this block is the only pacing signal there is: anything that stops the fleet from
+ * being measurable at all has to survive compaction here, or the operator is told nothing.
  */
 export function renderPacingSummary(
   pacing: Pick<
@@ -536,13 +594,15 @@ export function renderPacingSummary(
     | 'wastedUnits'
     | 'waste'
     | 'tiersUnknown'
+    | 'accounts'
   >,
   nowMs: number,
   style: PacingStyle = PLAIN_PACING_STYLE,
 ): string {
-  // Nothing to report yet (no account has contributed a weekly reading): say so and stop,
-  // rather than printing "0u of 0u (0%)" which reads like a real, alarming zero.
-  if (pacing.capacityUnits <= 0) return 'Pacing: no usage data yet.';
+  // No contributing account, so there are no totals to print — but "no data" and "the data is
+  // fine and every account is locked out" are opposite situations with opposite fixes, and only
+  // the accounts themselves say which one this is.
+  if (pacing.capacityUnits <= 0) return renderNoCapacity(pacing.accounts, style);
 
   const pct = Math.round((pacing.availableUnits / pacing.capacityUnits) * 100);
   const marker =
@@ -557,9 +617,10 @@ export function renderPacingSummary(
   const burn =
     pacing.burnUnitsPerDay === undefined
       ? 'burn unmeasured'
-      : `burn ${units(pacing.burnUnitsPerDay)}/d ${
-          pacing.burnUnitsPerDay > pacing.replenishUnitsPerDay ? '>' : '<'
-        } ${units(pacing.replenishUnitsPerDay)}/d`;
+      : `burn ${units(pacing.burnUnitsPerDay)}/d ${compareUnits(
+          pacing.burnUnitsPerDay,
+          pacing.replenishUnitsPerDay,
+        )} ${units(pacing.replenishUnitsPerDay)}/d`;
   const outcome =
     pacing.verdict === 'runs-dry' && pacing.dryAtMs !== undefined
       ? `dry in ${humanizeDuration(pacing.dryAtMs - nowMs)}`
@@ -571,13 +632,15 @@ export function renderPacingSummary(
 
   const caveats: string[] = [];
   if (pacing.wastedUnits > UNIT_EPSILON) {
-    const ranked = rankWasteByAccount(pacing.waste);
-    const top = ranked[0];
-    if (top !== undefined) {
-      const more = ranked.length - 1;
+    // The total is fleet-wide, so the one deadline printed beside it must be the EARLIEST of the
+    // accounts feeding it, and the account named must be the one that deadline belongs to. Any
+    // other pairing reads as "all of this is safe until then" and lets the first budget expire.
+    const soonest = rankWasteByDeadline(pacing.waste)[0];
+    if (soonest !== undefined) {
+      const more = wasteByAccount(pacing.waste).length - 1;
       caveats.push(
         style.waste(
-          `waste ${units(pacing.wastedUnits)}: ${top.label} in ${humanizeDuration(top.firstAtMs - nowMs)}` +
+          `waste ${units(pacing.wastedUnits)}: soonest ${soonest.label} in ${humanizeDuration(soonest.firstAtMs - nowMs)}` +
             `${more > 0 ? ` +${more}` : ''}`,
         ),
       );
@@ -586,4 +649,30 @@ export function renderPacingSummary(
   if (pacing.tiersUnknown) caveats.push(style.dim('tiers unknown'));
 
   return caveats.length > 0 ? `${head}\n  ${caveats.join('  ')}` : head;
+}
+
+/** `>`/`<`/`=` between two unit figures, decided on the values the line PRINTS. Equality is a
+ *  real outcome twice over: a burn that exactly matches replenishment, and two different rates
+ *  that round to the same displayed figure. */
+function compareUnits(left: number, right: number): string {
+  const shownLeft = roundUnits(left);
+  const shownRight = roundUnits(right);
+  return shownLeft > shownRight ? '>' : shownLeft < shownRight ? '<' : '=';
+}
+
+/** The line for a fleet with no measurable capacity. An account excluded for quarantine holds
+ *  real, readable usage data behind a login the operator has to redo, so it gets named with the
+ *  command that fixes it; every other cause genuinely is missing data and says so. */
+function renderNoCapacity(accounts: AccountPacing[], style: PacingStyle): string {
+  const locked = accounts.filter((a) => a.excluded === 'quarantined');
+  if (locked.length === 0) return 'Pacing: no usage data yet.';
+  const named = locked
+    .slice(0, MAX_NAMED_ACCOUNTS)
+    .map((a) => a.label)
+    .join(', ');
+  const rest = locked.length - MAX_NAMED_ACCOUNTS;
+  return (
+    `Pacing: ${style.warn('[--]')} no usable accounts - ${named}${rest > 0 ? ` +${rest}` : ''} ` +
+    `quarantined; run: cctl accounts relogin <label>`
+  );
 }
