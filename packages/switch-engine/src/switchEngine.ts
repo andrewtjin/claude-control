@@ -82,6 +82,13 @@ export interface ActivateOptions {
 /** Default minimum interval between switches — see `minSwitchIntervalMs`. */
 export const DEFAULT_MIN_SWITCH_INTERVAL_MS = 60_000;
 
+/** A thrown value reduced to one loggable line. The message only — a stack in a log field says
+ *  nothing an operator can act on about an IO failure, and a non-Error throw still has to render
+ *  as something rather than `[object Object]`. */
+function errorReason(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export class SwitchEngine {
   private readonly paths: Paths;
   private readonly vault: Vault;
@@ -169,24 +176,51 @@ export class SwitchEngine {
    * required when the work does run — `syncMetadata` is a registry read-modify-write, and doing
    * it unlocked would silently drop a concurrent switch's update. Returns 0 when it skipped;
    * nothing is lost, because the next invocation retries.
+   *
+   * NEVER THROWS, so a caller can run it ahead of a read without guarding it. Best-effort is a
+   * property of this repair, not of the call sites, and expressing it here is what keeps the
+   * reason for a failure visible: a caller reduced to `catch {}` discards the only evidence that
+   * the self-heal has stopped healing, which is indistinguishable from having nothing left to do.
+   * Every failure — one row's or the whole sweep's — is logged at warn instead.
    */
   async backfillAccountMetadata(): Promise<number> {
+    try {
+      return await this.sweepAccountMetadata();
+    } catch (err) {
+      this.log.warn({ reason: errorReason(err) }, 'account metadata sweep did not run');
+      return 0;
+    }
+  }
+
+  /** The sweep proper — see {@link backfillAccountMetadata}, which owns its no-throw contract. */
+  private async sweepAccountMetadata(): Promise<number> {
     const now = this.clock();
     const stale = (await this.vault.listAccounts()).filter((a) => needsMetadataBackfill(a, now));
     if (stale.length === 0) return 0;
     const repaired = await this.withCredentialLockIfFree(async () => {
       let count = 0;
       for (const account of stale) {
-        const bundle = await this.vault.readBundle(account.id).catch(() => undefined);
-        // Both calls re-read the registry per account, so a row removed since the scan above is a
-        // no-op. `syncMetadata` returning false for a row known to be behind the revision means
-        // the bundle was refused (its identity block names a different account) — unrepairable
-        // from here, so it backs off exactly like an unreadable blob.
-        if (bundle && (await this.vault.syncMetadata(account.id, bundle))) {
-          count += 1;
-          continue;
+        try {
+          const bundle = await this.vault.readBundle(account.id).catch(() => undefined);
+          // Both calls re-read the registry per account, so a row removed since the scan above is
+          // a no-op. `syncMetadata` returning false for a row known to be behind the revision
+          // means the bundle was refused (its identity block names a different account) —
+          // unrepairable from here, so it backs off exactly like an unreadable blob.
+          if (bundle && (await this.vault.syncMetadata(account.id, bundle))) {
+            count += 1;
+            continue;
+          }
+          await this.vault.markMetadataBackfillFailed(account.id);
+        } catch (err) {
+          // Each row is repaired by its own registry write, so one that cannot be written says
+          // nothing about the next. Abandoning the remaining rows would make which accounts get
+          // repaired depend on their position in the list, and leave the ones behind the failure
+          // waiting for a later sweep that hits the same wall at the same place.
+          this.log.warn(
+            { accountId: account.id, reason: errorReason(err) },
+            'could not repair account metadata',
+          );
         }
-        await this.vault.markMetadataBackfillFailed(account.id);
       }
       if (count > 0) this.log.info({ repaired: count }, 'backfilled account metadata from vault');
       return count;
