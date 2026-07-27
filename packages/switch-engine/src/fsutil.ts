@@ -12,13 +12,24 @@ import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 /**
- * Rename failures that mean "someone else has this file open right now" rather than "this write
- * is invalid". Windows refuses to replace a file while any handle to it is open — including a
- * reader doing nothing but a single `readFile` — and reports that as EPERM; EACCES and EBUSY are
- * the same sharing condition surfacing through a different path. It clears as soon as that handle
- * closes, so it is worth waiting out. Every other code is a real fault and must surface at once.
+ * Whether a failed rename means "someone else has this file open right now" — the one condition
+ * that clears on its own and is therefore worth waiting out. Everything else is a real fault and
+ * must surface at once, at the speed of the syscall that produced it.
+ *
+ * The condition is a Windows one: Windows refuses to replace a file while any handle to it is
+ * open — including a reader doing nothing but a single `readFile` — and reports that refusal as
+ * EPERM or EBUSY (the same pair the daemon's session registry and the bot's bindings file wait
+ * out, for the same reason). POSIX has no such rule: `rename(2)` is unaffected by open handles,
+ * so the very same codes there describe a permission or mount fault on the directory, and those
+ * are permanent. Retrying them would spend the whole ladder on a failure whose answer is already
+ * final — on the switch path, in front of a credential write, holding the credential lock.
+ *
+ * `platform` is a parameter rather than a read of `process.platform` so both branches are
+ * reachable from a test on either kind of machine.
  */
-const RENAME_CONTENTION_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+export function isTransientRenameError(code: string, platform: NodeJS.Platform): boolean {
+  return platform === 'win32' && (code === 'EPERM' || code === 'EBUSY');
+}
 
 /**
  * Waits, in ms, before each rename retry — doubling, ~255ms of patience in total.
@@ -43,8 +54,9 @@ export function ensureDir(dir: string): void {
  * A rename that fails because another process momentarily has the target open has not been
  * rejected — it has been asked to come back. Surfacing that as an error makes every caller carry
  * a race it cannot do anything about, and makes correctness depend on nothing ever reading the
- * file at the wrong instant. Retrying resolves it where waiting can; where it cannot, the
- * original error still reaches the caller unchanged.
+ * file at the wrong instant. Retrying resolves it where waiting can; where it cannot — every
+ * failure `isTransientRenameError` does not claim, including all of them off Windows — the
+ * original error reaches the caller unchanged and immediately.
  */
 async function renameWithRetry(tmp: string, target: string): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
@@ -54,7 +66,7 @@ async function renameWithRetry(tmp: string, target: string): Promise<void> {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code ?? '';
       const exhausted = attempt >= RENAME_RETRY_DELAYS_MS.length;
-      if (exhausted || !RENAME_CONTENTION_CODES.has(code)) throw err;
+      if (exhausted || !isTransientRenameError(code, process.platform)) throw err;
       await delay(RENAME_RETRY_DELAYS_MS[attempt] ?? 0);
     }
   }
