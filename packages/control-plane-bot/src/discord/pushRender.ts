@@ -186,13 +186,20 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
           buildQuarantineEmbed({ title: p.title, body: p.body, reloginCommand: RELOGIN_COMMAND }),
         ],
       };
-    default:
+    default: {
       // The generic card is a bold title over relayed body text; that body is whatever the
       // session had to say, tables included, so it goes through the formatter like every other
       // prose surface.
+      // The heading shares the chunker's budget with the body, so it is subtracted rather than
+      // counted twice — a budget quoted larger than the room really left is spent on rules the
+      // reader then loses rows to.
+      const heading = `**${p.title}**\n`;
       return {
-        content: `**${p.title}**\n${formatTables(p.body, { budget: CHUNKED_CONTENT_BUDGET })}`,
+        content: `${heading}${formatTables(p.body, {
+          budget: Math.max(0, CHUNKED_CONTENT_BUDGET - heading.length),
+        })}`,
       };
+    }
   }
 }
 
