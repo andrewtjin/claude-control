@@ -16,8 +16,7 @@
 export interface LoopLagMonitorOptions {
   /** Called with the observed stall length whenever drift exceeds the threshold. */
   onStall: (lagMs: number) => void;
-  /** Drift above this is a stall worth reporting. Default 150ms — comfortably above timer
-   *  jitter and GC pauses, well below the multi-second stalls that tax hook latency. */
+  /** Drift above this is a stall worth reporting. Defaults to {@link LOOP_LAG_THRESHOLD_MS}. */
   thresholdMs?: number;
   /** Probe cadence. Default 500ms — a stall shorter than this can still be caught (drift is
    *  measured against the wall clock), and the idle cost is one timer tick per interval. */
@@ -27,7 +26,16 @@ export interface LoopLagMonitorOptions {
   clock?: () => number;
 }
 
-const DEFAULT_THRESHOLD_MS = 150;
+/**
+ * What counts as a stall, in milliseconds of drift. Comfortably above timer jitter and GC pauses,
+ * well below the multi-second stalls that tax hook latency.
+ *
+ * Exported because the poll cycle's own per-phase timing warns at the same bar (see
+ * `POLL_PHASE_SLOW_MS` in daemon.ts). One number, so a phase can never be "slow" by one
+ * definition and fine by the other — which is exactly the confusion that makes an attributed
+ * stall hard to read.
+ */
+export const LOOP_LAG_THRESHOLD_MS = 150;
 const DEFAULT_INTERVAL_MS = 500;
 const DEFAULT_REPORT_FLOOR_MS = 10_000;
 
@@ -36,7 +44,7 @@ const DEFAULT_REPORT_FLOOR_MS = 10_000;
  * a monitor must never keep the process alive on its own.
  */
 export function startLoopLagMonitor(options: LoopLagMonitorOptions): () => void {
-  const thresholdMs = options.thresholdMs ?? DEFAULT_THRESHOLD_MS;
+  const thresholdMs = options.thresholdMs ?? LOOP_LAG_THRESHOLD_MS;
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
   const reportFloorMs = options.reportFloorMs ?? DEFAULT_REPORT_FLOOR_MS;
   const clock = options.clock ?? Date.now;
