@@ -23,6 +23,7 @@ import {
 import type { BarRenderer } from './emojiBars.js';
 import type { TimelineTrackStyle } from './richFormat.js';
 import { pruneButtons, type ButtonSpec } from './buttons.js';
+import type { SessionChannelSource } from './sessionChannels.js';
 
 export interface CommandDeps {
   relay: RelaySender;
@@ -87,6 +88,31 @@ export function handleStats(deps: CommandDeps, discordUserId: string): CommandRe
     };
   }
   return { kind: 'embed', embed: buildStatsEmbed(stats) };
+}
+
+/** `/stats days:N` — ask the daemon to scan its transcripts over an explicitly chosen window.
+ *
+ *  The cached-snapshot answer above cannot serve this: the cache holds ONE window (the 7 days the
+ *  daemon pushes), and the per-account/per-model breakdowns are aggregates that cannot be re-sliced
+ *  into a different window after the fact. So an explicit `days` is a real round trip to the host.
+ *
+ *  This function only SENDS. The answer arrives later on the delivery path and is matched back to
+ *  the waiting interaction by `requestId` (see PendingStatsScans) — so a caller must register its
+ *  wait before calling this, and the returned result reports only whether the request got out. */
+export function handleStatsScan(
+  deps: CommandDeps,
+  discordUserId: string,
+  days: number,
+  requestId: string,
+): CommandResult {
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'stats.request',
+    payload: { requestId, days },
+  }));
+  return result.ok
+    ? { kind: 'text', text: `Scanning the last ${days} day${days === 1 ? '' : 's'} on the host…` }
+    : { kind: 'error', message: result.error };
 }
 
 /** `/settings` — the daemon's effective configuration, from the settings.snapshot it pushes
@@ -353,4 +379,284 @@ export function handleReauth(
       `\`cctl accounts relogin <label>\` to re-login in place (usage history kept), then ` +
       `\`cctl switch <label>\`. (quarantined account: ${accountId})`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// `/thread-here` — a user pinning their own session-thread channel from inside Discord.
+//
+// Unlike every other command here, this one reaches no daemon: it decides where the BOT delivers a
+// user's future session threads. What it shares with the rest of the module is the split — the
+// decision tree and every reply string are pure and live here; the three things that need a live
+// Discord connection (reading the invoking channel, probing that a private thread can actually be
+// created in it, and checking a channel's health for the status reply) stay behind seams in the
+// gateway and arrive here as plain data. That is what makes the tree exhaustively testable, and it
+// is the tree — not the Discord calls — that carries the guarantees.
+
+/** What the user asked for. `pin` is the default because the command names a place. */
+export type ThreadHereAction = 'pin' | 'clear' | 'show';
+
+/** Everything about the invoking channel that the pin decision depends on, gathered by the gateway
+ *  from the interaction. Deliberately booleans-and-labels rather than a discord.js channel: the
+ *  decision must be reproducible in a test without a Discord connection, and every one of these
+ *  facts is either present on the interaction payload or one cached lookup away. */
+export interface ThreadHereChannelFacts {
+  /** The command ran in a server, not a DM. */
+  inGuild: boolean;
+  /** The bot itself is a member of that server. False when a user-installed app is used in a server
+   *  the bot was never added to — Discord then reports only a fixed baseline for the bot's
+   *  permissions, so "grant these permissions" would be advice that cannot work. */
+  botInGuild: boolean;
+  /** The channel could be read at all (from the interaction, or a fetch by id). */
+  channelResolved: boolean;
+  /** The command ran inside a thread. Threads cannot host threads of their own. */
+  isThread: boolean;
+  /** An ordinary guild text channel — the same narrowing session-thread creation itself applies, so
+   *  anything else would be pinned and then silently unusable. */
+  isGuildText: boolean;
+  /** Human-readable names of the thread permissions the bot lacks here, in fix order. */
+  missingPermissions: readonly string[];
+}
+
+/** Why a `/thread-here` invocation changed nothing. Every one of these is reported to the user with
+ *  what to do about it — the point of the command's preflight is that a channel the bot cannot post
+ *  in fails LOUDLY at command time instead of silently at delivery time hours later. */
+export type ThreadHereRejection =
+  | { kind: 'not-in-guild' }
+  | { kind: 'bot-not-in-guild' }
+  | { kind: 'channel-unresolved' }
+  | { kind: 'inside-thread' }
+  | { kind: 'not-text-channel' }
+  | { kind: 'missing-permissions'; missing: readonly string[] }
+  /** A real thread create + member add was attempted here and Discord refused it. */
+  | { kind: 'probe-failed'; detail: string }
+  /** The choice could not be written to disk, so it would not survive a restart. */
+  | { kind: 'save-failed' };
+
+/** The subset {@link rejectThreadHereChannel} can return: everything decidable from the interaction
+ *  alone, before anything live is attempted and long before anything is written. */
+export type ThreadHereChannelRejection = Exclude<
+  ThreadHereRejection,
+  { kind: 'probe-failed' } | { kind: 'save-failed' }
+>;
+
+/** Whether a pinned channel is actually usable right now, for the status reply. Separated from the
+ *  rejection union because these are observations about a channel the user is NOT currently
+ *  standing in — nothing is being changed, so nothing is being refused.
+ *
+ *  `user-cannot-access` exists because a session thread is only half the bot's doing: it creates a
+ *  private thread and then admits the USER to it, and that second half fails the moment the user
+ *  leaves the server or loses sight of the channel — with the bot's own permissions untouched. That
+ *  is the likeliest reason someone's output quietly reverts to DMs long after they pinned, so a
+ *  status reply that only inspected the bot's side would answer "all fine" to the very question it
+ *  exists to answer. */
+export type ThreadHereChannelHealth =
+  | { kind: 'ok' }
+  | { kind: 'unreachable' }
+  | { kind: 'missing-permissions'; missing: readonly string[] }
+  | { kind: 'user-cannot-access' };
+
+/** Where this user's next session thread would go, and why. `source` is what turns the status reply
+ *  from an answer into an explanation — "pinned by you" and "this deployment's default" call for
+ *  completely different next steps. */
+export type ThreadHereStatus =
+  | {
+      destination: 'channel';
+      channelId: string;
+      source: SessionChannelSource;
+      health: ThreadHereChannelHealth;
+    }
+  | { destination: 'dm'; source: SessionChannelSource };
+
+/** Everything a `/thread-here` invocation can end as. `already-pinned` and `already-dm` are
+ *  distinct from `pinned`/`cleared` because a no-op that says "done" reads as a change that did not
+ *  happen; naming them lets the reply say the preflight was re-run and the answer still holds.
+ *
+ *  `already-dm` means the DM choice is already RECORDED — not merely that the user's output happens
+ *  to arrive by DM today. Clearing with no pin at all still writes one, so that a later operator
+ *  edit cannot sweep up someone who explicitly asked for DMs. */
+export type ThreadHereOutcome =
+  | { kind: 'pinned'; channelId: string; previousChannelId?: string }
+  | { kind: 'already-pinned'; channelId: string }
+  | { kind: 'cleared'; overriddenChannelId?: string }
+  | { kind: 'already-dm' }
+  | { kind: 'status'; status: ThreadHereStatus }
+  | { kind: 'rejected'; rejection: ThreadHereRejection };
+
+/** Closing sentence on every rejection. The preflight's whole promise is that a refused pin leaves
+ *  routing exactly as it was, and a user cannot verify that from the outside — so it is stated,
+ *  every time, in the same words. */
+const NOTHING_CHANGED = 'Nothing was changed.';
+
+/** Decide whether the invoking channel can host this user's session threads, from the interaction
+ *  alone.
+ *
+ *  The order is fixed and runs most-actionable-first, which matters because these overlap: a DM has
+ *  no permissions at all, and a channel that failed to resolve has no type. Reporting "I am missing
+ *  View Channel" to someone who ran the command in a DM would send them to edit permissions that
+ *  were never the problem. */
+export function rejectThreadHereChannel(
+  facts: ThreadHereChannelFacts,
+): ThreadHereChannelRejection | undefined {
+  if (!facts.inGuild) return { kind: 'not-in-guild' };
+  if (!facts.botInGuild) return { kind: 'bot-not-in-guild' };
+  if (!facts.channelResolved) return { kind: 'channel-unresolved' };
+  if (facts.isThread) return { kind: 'inside-thread' };
+  if (!facts.isGuildText) return { kind: 'not-text-channel' };
+  if (facts.missingPermissions.length > 0) {
+    return { kind: 'missing-permissions', missing: facts.missingPermissions };
+  }
+  return undefined;
+}
+
+/** The reply text for each rejection: what went wrong, who can fix it, and that nothing changed. */
+function threadHereRejectionMessage(rejection: ThreadHereRejection): string {
+  switch (rejection.kind) {
+    case 'not-in-guild':
+      return (
+        '`/thread-here` pins a server text channel, so run it in one. To send your session ' +
+        `threads to your DMs instead, run \`/thread-here action:clear\` from anywhere. ${NOTHING_CHANGED}`
+      );
+    case 'bot-not-in-guild':
+      return (
+        'This server does not have the bot added, so I cannot create threads in it. Ask a ' +
+        `server admin to add the bot, then run \`/thread-here\` again. ${NOTHING_CHANGED}`
+      );
+    case 'channel-unresolved':
+      return `I could not read this channel just now. Try again in a moment. ${NOTHING_CHANGED}`;
+    case 'inside-thread':
+      return (
+        'Run `/thread-here` in the channel itself, not inside a thread — a thread cannot host ' +
+        `threads of its own. ${NOTHING_CHANGED}`
+      );
+    case 'not-text-channel':
+      return (
+        'I can only pin an ordinary server text channel. Voice, stage, forum, category and ' +
+        `announcement channels cannot host private threads. ${NOTHING_CHANGED}`
+      );
+    case 'missing-permissions':
+      return (
+        `I cannot create private threads in this channel — I am missing: ${rejection.missing.join(', ')}. ` +
+        `Ask a server admin to grant those to the bot here, then run \`/thread-here\` again. ${NOTHING_CHANGED}`
+      );
+    case 'probe-failed':
+      return (
+        `Discord refused a test thread in this channel (${rejection.detail}). Your session ` +
+        'threads will keep going where they go now. Try again in a moment, or pick another ' +
+        `channel. ${NOTHING_CHANGED}`
+      );
+    case 'save-failed':
+      return `I could not save that just now — try again in a moment. ${NOTHING_CHANGED}`;
+  }
+}
+
+/** The status reply. Every branch names the destination, the authority behind it, and the two ways
+ *  out — a user reading this because their output turned up somewhere unexpected needs all three. */
+function threadHereStatusMessage(status: ThreadHereStatus): string {
+  if (status.destination === 'dm') {
+    return status.source === 'pin'
+      ? 'Your session threads go to your DMs, cleared by you. Run `/thread-here` in a channel to pin one.'
+      : 'Your session threads go to your DMs. Run `/thread-here` in a channel to send them there instead.';
+  }
+  const where = `<#${status.channelId}>`;
+  if (status.source === 'pin') {
+    // A pin the bot cannot honour is the case worth spelling out: delivery has silently degraded to
+    // DMs and the setting still says otherwise, so say both halves and how to repair either.
+    if (status.health.kind === 'unreachable') {
+      return (
+        `Your session threads are pinned to ${where}, but I cannot use that channel right now — ` +
+        'it may have been deleted, or I may have lost access to it. New sessions are going to ' +
+        'your DMs until that is fixed. Run `/thread-here` in a working channel to move them, or ' +
+        '`/thread-here action:clear` for DMs.'
+      );
+    }
+    if (status.health.kind === 'missing-permissions') {
+      return (
+        `Your session threads are pinned to ${where}, but I am missing: ${status.health.missing.join(', ')}. ` +
+        'New sessions are going to your DMs until a server admin grants those. Run ' +
+        '`/thread-here` in another channel to move them, or `/thread-here action:clear` for DMs.'
+      );
+    }
+    if (status.health.kind === 'user-cannot-access') {
+      return (
+        `Your session threads are pinned to ${where}, but you cannot see that channel any more — ` +
+        'you may have left the server, or lost access to the channel. A session thread is private ' +
+        'and I have to add you to it, so new sessions are going to your DMs until that changes. ' +
+        'Run `/thread-here` in a channel you can see to move them, or `/thread-here action:clear` ' +
+        'for DMs.'
+      );
+    }
+    return (
+      `Your session threads go to ${where}, pinned by you. Run \`/thread-here\` in another ` +
+      'channel to move them, or `/thread-here action:clear` for DMs.'
+    );
+  }
+  if (status.health.kind === 'unreachable') {
+    return (
+      `This deployment sends your session threads to ${where}, but I cannot use that channel ` +
+      'right now, so new sessions are going to your DMs. Run `/thread-here` in a channel to pin ' +
+      'your own.'
+    );
+  }
+  if (status.health.kind === 'missing-permissions') {
+    return (
+      `This deployment sends your session threads to ${where}, but I am missing: ` +
+      `${status.health.missing.join(', ')}, so new sessions are going to your DMs. Run ` +
+      '`/thread-here` in a channel to pin your own.'
+    );
+  }
+  if (status.health.kind === 'user-cannot-access') {
+    return (
+      `This deployment sends your session threads to ${where}, but you cannot see that channel, ` +
+      'and a session thread is private so I have to add you to it — new sessions are going to ' +
+      'your DMs. Run `/thread-here` in a channel you can see to pin your own.'
+    );
+  }
+  return (
+    `Your session threads go to ${where}, this deployment's default. Run \`/thread-here\` in a ` +
+    'channel to pin your own, or `/thread-here action:clear` for DMs.'
+  );
+}
+
+/** Render a settled `/thread-here` invocation.
+ *
+ *  Every success says what happens to sessions ALREADY running, because the honest answer is
+ *  "nothing" — a session's thread is pinned for its life the moment it is created, and a user who
+ *  expects their in-flight session to move would otherwise read the silence as a bug. */
+export function buildThreadHereResult(outcome: ThreadHereOutcome): CommandResult {
+  switch (outcome.kind) {
+    case 'rejected':
+      return { kind: 'error', message: threadHereRejectionMessage(outcome.rejection) };
+    case 'status':
+      return { kind: 'text', text: threadHereStatusMessage(outcome.status) };
+    case 'pinned':
+      return {
+        kind: 'text',
+        text:
+          `Pinned. New session threads will be created in <#${outcome.channelId}>` +
+          `${outcome.previousChannelId !== undefined ? ` instead of <#${outcome.previousChannelId}>` : ''}. ` +
+          'Sessions already running keep the thread or DM they started in. Run ' +
+          '`/thread-here action:clear` to go back to DMs.',
+      };
+    case 'already-pinned':
+      return {
+        kind: 'text',
+        text:
+          `Still pinned to <#${outcome.channelId}> — I rechecked, and I can still create threads ` +
+          'here. Nothing changed.',
+      };
+    case 'cleared':
+      return {
+        kind: 'text',
+        text:
+          'Cleared. New session threads will be delivered to your DMs' +
+          `${outcome.overriddenChannelId !== undefined ? ` instead of <#${outcome.overriddenChannelId}>` : ''}. ` +
+          'Sessions already running keep the thread they started in. Run `/thread-here` in a ' +
+          'channel to pin one again.',
+      };
+    case 'already-dm':
+      return {
+        kind: 'text',
+        text: 'Your session threads already go to your DMs. Nothing changed.',
+      };
+  }
 }

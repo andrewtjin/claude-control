@@ -109,7 +109,10 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   `tokenStats` attributes each turn through the intervals above — the absolute counts
   behind `cctl stats` and `/stats`. Local reads only; the bot receives sums, never text.
   Everything the machine did outside Claude Code on this host is invisible, and every
-  surface says so.
+  surface says so. The daemon pushes a 7-day snapshot on a slow cadence, which is what a
+  bare `/stats` renders; `/stats days:N` is the one command that round-trips
+  (`stats.request` → `stats.result`) because a window nobody has scanned yet cannot be
+  answered from a cache. One scan runs at a time — the disk is the shared resource.
 - **Sessions.** Phone-started work runs as an Agent-SDK **managed** session (clean
   structured streaming to Discord); a user's own terminal is a **observed** ConPTY
   session (notify/approve/inject only). Switching mid-session interrupts, activates,

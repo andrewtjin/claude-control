@@ -102,9 +102,6 @@ importers:
       '@claude-control/usage-advisor':
         specifier: workspace:*
         version: link:../usage-advisor
-      pino:
-        specifier: ^10.3.1
-        version: 10.3.1
       ws:
         specifier: ^8.21.1
         version: 8.21.1

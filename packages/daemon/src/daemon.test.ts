@@ -41,6 +41,7 @@ import type {
 import { Store } from './store.js';
 import { UsagePoller } from './usagePoller.js';
 import { AttributionJournal } from './attributionJournal.js';
+import { LOOP_LAG_THRESHOLD_MS } from './loopLagMonitor.js';
 import { HookReceiver } from './hookReceiver.js';
 import {
   ControlPlaneClient,
@@ -53,6 +54,7 @@ import {
   type SwitchEngineLike,
   type QuarantineNoticeState,
 } from './daemon.js';
+import type { TranscriptScan } from './transcriptTokens.js';
 
 // ---------------------------------------------------------------------------
 // A minimal steady-state relay: accepts `hello` unconditionally, collects every envelope it
@@ -735,6 +737,168 @@ describe('Daemon lifecycle', () => {
 
     await waitFor(() => relay.received.filter((e) => e.type === 'usage.snapshot').length >= 3);
     expect(scanTranscripts).toHaveBeenCalledTimes(1);
+  });
+
+  /** An empty scan — these tests are about the request/reply contract and the window, never the
+   *  arithmetic (tokenStats.test.ts owns that). */
+  function emptyScan() {
+    return Promise.resolve({
+      turns: [],
+      filesScanned: 4,
+      filesSkippedByMtime: 0,
+      filesUnreadable: 0,
+      dirsUnreadable: 0,
+      malformedLines: 0,
+      duplicateTurns: 0,
+    });
+  }
+
+  /** A daemon whose transcript scan is exactly what the test wants, with the push cadence turned
+   *  down far enough that a scheduled push can never be mistaken for the requested one. */
+  function daemonWithScan(scanTranscripts: (sinceMs: number) => Promise<TranscriptScan>): Daemon {
+    return new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+      statsIntervalMs: 100_000,
+    });
+  }
+
+  it('stats.request answers with a snapshot over exactly the requested window', async () => {
+    const scanTranscripts = vi.fn(emptyScan);
+    daemon = daemonWithScan(scanTranscripts);
+    await daemon.start();
+    // The startup poll cycle pushes its own 7-day snapshot; wait it out so the assertions below
+    // cannot accidentally read it instead of the requested window.
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.snapshot'));
+
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-1', days: 30 },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.result'));
+
+    const result = relay.received.find((e) => e.type === 'stats.result');
+    if (result?.type !== 'stats.result') throw new Error('unreachable');
+    expect(result.payload.requestId).toBe('sr-1');
+    expect(result.payload.ok).toBe(true);
+    const snapshot = result.payload.snapshot;
+    if (snapshot === undefined || snapshot === null) throw new Error('expected a snapshot');
+    // 30 days, not the pushed default — and the window it advertises is the window it read.
+    expect(snapshot.windowEndMs - snapshot.windowStartMs).toBeCloseTo(30 * 86_400_000, -4);
+    expect(scanTranscripts).toHaveBeenLastCalledWith(snapshot.windowStartMs);
+    expect(snapshot.coverage.filesScanned).toBe(4);
+  });
+
+  it('answers a stats.request with ok:false when no transcript scanner is wired', async () => {
+    // The default daemon has no scanner — it can never answer this, and must say so rather than
+    // leave the phone holding a deferred reply open until it expires.
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-none', days: 7 },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.result'));
+
+    const result = relay.received.find((e) => e.type === 'stats.result');
+    if (result?.type !== 'stats.result') throw new Error('unreachable');
+    expect(result.payload.ok).toBe(false);
+    expect(result.payload.requestId).toBe('sr-none');
+    expect(result.payload.error).toMatch(/does not scan transcripts/);
+  });
+
+  it('answers a failing scan with ok:false rather than going silent', async () => {
+    daemon = daemonWithScan(() => Promise.reject(new Error('EPERM: projects dir locked')));
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-err', days: 7 },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.result'));
+
+    const result = relay.received.find((e) => e.type === 'stats.result');
+    if (result?.type !== 'stats.result') throw new Error('unreachable');
+    expect(result.payload.ok).toBe(false);
+    expect(result.payload.snapshot ?? null).toBeNull();
+    // The reason reaches the phone, but the host's raw errno does not.
+    expect(result.payload.error).toMatch(/scan failed/);
+    expect(result.payload.error).not.toMatch(/EPERM/);
+  });
+
+  it('refuses a second scan while one is already running, instead of stacking disk reads', async () => {
+    // A scan that never finishes on its own: the point is to hold the in-flight slot open while
+    // the second request arrives, which is exactly the shape a real long scan has.
+    let releaseScan: (() => void) | undefined;
+    const scanTranscripts = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        releaseScan = resolve;
+      });
+      return emptyScan();
+    });
+    daemon = daemonWithScan(scanTranscripts);
+    await daemon.start();
+
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-first', days: 7 },
+    });
+    await waitFor(() => scanTranscripts.mock.calls.length >= 1);
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-second', days: 7 },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.result'));
+
+    // The second request is answered immediately and never became a second scan.
+    const refusal = relay.received.find((e) => e.type === 'stats.result');
+    if (refusal?.type !== 'stats.result') throw new Error('unreachable');
+    expect(refusal.payload.requestId).toBe('sr-second');
+    expect(refusal.payload.ok).toBe(false);
+    expect(refusal.payload.error).toMatch(/already running/);
+    expect(scanTranscripts).toHaveBeenCalledTimes(1);
+
+    // Releasing the first scan still produces its own answer — a refusal must not have consumed
+    // or cancelled the request that was legitimately in flight.
+    releaseScan?.();
+    await waitFor(() => relay.received.filter((e) => e.type === 'stats.result').length >= 2);
+    const answered = relay.received.filter(
+      (e) => e.type === 'stats.result' && e.payload.requestId === 'sr-first',
+    );
+    expect(answered).toHaveLength(1);
+    expect(answered[0]?.type === 'stats.result' && answered[0].payload.ok).toBe(true);
+  });
+
+  it('frees the in-flight slot after a scan, so a later request is served', async () => {
+    const scanTranscripts = vi.fn(emptyScan);
+    daemon = daemonWithScan(scanTranscripts);
+    await daemon.start();
+
+    for (const requestId of ['sr-a', 'sr-b']) {
+      relay.push({
+        daemonId: 'daemon-under-test',
+        type: 'stats.request',
+        payload: { requestId, days: 7 },
+      });
+      await waitFor(() =>
+        relay.received.some((e) => e.type === 'stats.result' && e.payload.requestId === requestId),
+      );
+    }
+    const results = relay.received.filter((e) => e.type === 'stats.result');
+    expect(results).toHaveLength(2);
+    // Both answered on their own merits — the guard is per-scan, not a one-shot latch.
+    expect(results.every((e) => e.type === 'stats.result' && e.payload.ok)).toBe(true);
   });
 
   it('stamps the history-derived pacing inputs onto the usage snapshot it pushes', async () => {
@@ -1437,6 +1601,50 @@ describe('Daemon lifecycle', () => {
     await waitFor(() => entries.some((e) => e.msg === 'session.stop escalation finished'));
     const finished = entries.find((e) => e.msg === 'session.stop escalation finished');
     expect((finished?.obj as { rung?: string }).rung).toBe('hard_stopped');
+  });
+
+  it('attributes each poll-cycle phase in the log, and warns on one that runs long', async () => {
+    // The loop-lag monitor can say THAT the loop stalled but never WHERE — which is why the
+    // multi-second stall that motivated this instrumentation was never attributed to a phase.
+    // A phase slower than that monitor's own threshold has to name itself, at warn level.
+    const { logger, entries } = capturingLogger();
+    const slowJournal = {
+      sync: async () => {
+        await new Promise((r) => setTimeout(r, LOOP_LAG_THRESHOLD_MS + 40));
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal: slowJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000, // the startup cycle is the one under test
+      logger,
+    });
+    await daemon.start();
+
+    await waitFor(() => entries.some((e) => e.msg === 'poll cycle phase ran long'));
+    const slow = entries.find((e) => e.msg === 'poll cycle phase ran long');
+    expect((slow?.obj as { phase?: string }).phase).toBe('attributionJournal.sync');
+    expect((slow?.obj as { elapsedMs?: number }).elapsedMs).toBeGreaterThanOrEqual(
+      LOOP_LAG_THRESHOLD_MS,
+    );
+
+    // Every other phase still reports, at debug — a cycle that logged only its slow phase would
+    // leave the next anomaly with nothing to compare against.
+    await waitFor(() => entries.some((e) => e.msg === 'poll cycle phase'));
+    const timed = new Set(
+      entries
+        .filter((e) => e.msg === 'poll cycle phase')
+        .map((e) => (e.obj as { phase: string }).phase),
+    );
+    expect(timed).toContain('pollAll');
+    expect(timed).toContain('readFleetHistory');
   });
 
   it('session.stop for an unknown session emits an error envelope correlated via relatesTo', async () => {

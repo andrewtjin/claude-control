@@ -5,10 +5,23 @@
 // RelayServer — reading config exclusively from the environment:
 //   DISCORD_BOT_TOKEN        (required) the Discord application's bot token
 //   CCTL_RELAY_PORT          (default 8765) WebSocket port daemons connect to
-//   CCTL_BOT_STATE_DIR       (default ~/.claude-control-bot) where bindings.json and
-//                            session-threads.json live
-//   CCTL_SESSION_CHANNEL_ID  (optional) text channel that hosts per-session private
-//                            threads; unset → session output is delivered by DM
+//   CCTL_BOT_STATE_DIR       (default ~/.claude-control-bot) where bindings.json,
+//                            session-threads.json and session-channel-pins.json live
+//   CCTL_SESSION_CHANNEL_ID  (optional) text channel that hosts per-session private threads
+//                            for every paired user WITHOUT a CCTL_SESSION_CHANNELS entry;
+//                            unset → those users' session output is delivered by DM
+//   CCTL_SESSION_CHANNELS    (optional) per-user overrides, as a comma-separated
+//                            <discordUserId>:<channelId> list. Named users get threads in
+//                            their own channel; everyone else falls back to
+//                            CCTL_SESSION_CHANNEL_ID, or to DM when that is unset. Setting
+//                            only this one is the mixed deployment: threads for the operator,
+//                            DMs for every other paired user.
+//                            Both of these are DEFAULTS: a user's own `/thread-here` outranks
+//                            them in both directions (their own channel, or back to DMs), and
+//                            that choice lives in session-channel-pins.json. Neither env var
+//                            is an access control — they cannot stop someone reading their own
+//                            session output — so the operator's real lever over where the bot
+//                            may post is the channel's Discord permissions.
 //   CCTL_LOG_LEVEL           (default info)
 //   CCTL_LOG_FORMAT          (default: pretty on a TTY, json otherwise) 'pretty' or 'json'
 //                            overrides the auto-detection either way; see shared-protocol's
@@ -32,6 +45,7 @@ import { BindingStore } from './bindings.js';
 import { PairingService } from './pairing.js';
 import { RelayServer, type RelaySender } from './relay.js';
 import { DiscordJsGateway } from './discord/discordJsGateway.js';
+import { parseSessionChannelMap } from './discord/sessionChannels.js';
 import type { Logger } from './logger.js';
 
 /** Print an error and exit non-zero — the single failure path for startup problems. */
@@ -89,6 +103,16 @@ async function main(): Promise<void> {
   // explicit `undefined` for an optional property, so an unset env must omit the key entirely
   // and let each constructor apply its own default.
   const sessionChannelId = process.env.CCTL_SESSION_CHANNEL_ID;
+  // Every malformed pair is reported at once: an operator editing a multi-user map in a .env
+  // should not have to restart the bot per typo. Failing at all matters more than it looks —
+  // a mistyped id does not crash anything, it just never matches, and that user silently keeps
+  // getting DMs, which is precisely the symptom this map exists to fix.
+  const sessionChannels = parseSessionChannelMap(process.env.CCTL_SESSION_CHANNELS);
+  if (sessionChannels.errors.length > 0) {
+    fail(
+      `CCTL_SESSION_CHANNELS is malformed (expected "<userId>:<channelId>" pairs separated by commas): ${sessionChannels.errors.join('; ')}`,
+    );
+  }
   const gateway = new DiscordJsGateway({
     relay: relayRef,
     pairing,
@@ -96,6 +120,7 @@ async function main(): Promise<void> {
     token,
     stateDir,
     ...(sessionChannelId ? { sessionChannelId } : {}),
+    ...(sessionChannels.entries.size > 0 ? { sessionChannelsByUser: sessionChannels.entries } : {}),
   });
   const relay = new RelayServer({
     bindings,

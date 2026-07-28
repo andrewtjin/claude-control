@@ -83,16 +83,70 @@ describe('Store', () => {
       expect(store.latestUsageSnapshot('a')?.json).toBe('{"x":1}');
     });
 
-    it('lists a time window oldest-first, scoped to an account', () => {
-      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 100, source: 'live', json: '{}' });
-      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 300, source: 'live', json: '{}' });
-      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 200, source: 'live', json: '{}' });
-      store.insertUsageSnapshot({ accountId: 'b', fetchedAtMs: 250, source: 'live', json: '{}' });
+    it('lists a weekly-observation window oldest-first, scoped to an account', () => {
+      const weekly = (percent: number, resetsAt?: string): string =>
+        JSON.stringify({
+          limits: [
+            { kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resetsAt } : {}) },
+          ],
+        });
+      const at = (fetchedAtMs: number, accountId: string, json: string): void => {
+        store.insertUsageSnapshot({ accountId, fetchedAtMs, source: 'live', json });
+      };
+      at(100, 'a', weekly(10));
+      at(300, 'a', weekly(30, '2026-07-30T05:00:00.000Z'));
+      at(200, 'a', weekly(20));
+      at(250, 'b', weekly(99));
 
       // Inclusive lower bound; 'b' never leaks in; ascending order is what a series needs.
-      expect(store.listUsageSnapshotsSince('a', 200).map((r) => r.fetchedAtMs)).toEqual([200, 300]);
-      expect(store.listUsageSnapshotsSince('a', 999)).toEqual([]);
-      expect(store.listUsageSnapshotsSince('missing', 0)).toEqual([]);
+      expect(store.listWeeklyObservationsSince('a', 200)).toEqual([
+        { fetchedAtMs: 200, percent: 20 },
+        { fetchedAtMs: 300, percent: 30, resetsAtMs: Date.parse('2026-07-30T05:00:00.000Z') },
+      ]);
+      expect(store.listWeeklyObservationsSince('a', 999)).toEqual([]);
+      expect(store.listWeeklyObservationsSince('missing', 0)).toEqual([]);
+    });
+
+    it('omits a snapshot that carries no weekly reading rather than reading it as zero', () => {
+      // A degraded poll persists an error record, and a tier-0 cache entry can carry no weekly
+      // limit. Both are real rows; neither is an observation. Surfacing them as percent 0 would
+      // register as a full weekly reset and show up in the burn measurement as replenishment.
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 100, source: 'live', json: '{}' });
+      store.insertUsageSnapshot({
+        accountId: 'a',
+        fetchedAtMs: 200,
+        source: 'live',
+        json: 'not json at all',
+      });
+      store.insertUsageSnapshot({
+        accountId: 'a',
+        fetchedAtMs: 300,
+        source: 'live',
+        json: JSON.stringify({ limits: [{ kind: 'weekly_all', percent: 42 }] }),
+      });
+
+      expect(store.listWeeklyObservationsSince('a', 0)).toEqual([
+        { fetchedAtMs: 300, percent: 42 },
+      ]);
+      // The rows themselves are still there — only the OBSERVATION view drops them.
+      expect(store.listUsageSnapshots('a')).toHaveLength(3);
+    });
+
+    it('reads the observation window through a covering index, never touching the table', () => {
+      // The whole point of the denormalization. If a future change reintroduces the json blob to
+      // this query (a `SELECT *`, a dropped column from the index), the plan stops saying
+      // COVERING and the 238-974ms per-cycle main-loop stall comes straight back.
+      const explained = (store as unknown as { db: DatabaseSync }).db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT fetchedAtMs, weeklyPercent, weeklyResetsAtMs FROM usage_snapshots
+           WHERE accountId = ? AND fetchedAtMs >= ? AND weeklyPercent IS NOT NULL
+           ORDER BY fetchedAtMs ASC`,
+        )
+        .all('a', 0)
+        .map((r) => String(r['detail']))
+        .join(' ');
+      expect(explained).toContain('COVERING INDEX idx_usage_snapshots_account');
     });
   });
 
@@ -425,6 +479,111 @@ describe('Store migration', () => {
     const second = new Store(dbPath);
     try {
       expect(second.getPendingPermission('r1')?.origin).toBe('managed');
+    } finally {
+      second.close();
+    }
+  });
+
+  /** Rebuild the exact usage_snapshots shape a pre-denormalization deploy left on disk: blob-only
+   *  columns and the narrow two-column index. `CREATE TABLE/INDEX IF NOT EXISTS` are both no-ops
+   *  against it, so everything asserted below has to come from the upgrade path. */
+  function writeLegacySnapshotDb(
+    dbPath: string,
+    rows: Array<{ accountId: string; fetchedAtMs: number; json: string }>,
+  ): void {
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE usage_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        accountId TEXT NOT NULL,
+        fetchedAtMs INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        json TEXT NOT NULL
+      );
+      CREATE INDEX idx_usage_snapshots_account ON usage_snapshots (accountId, fetchedAtMs);
+    `);
+    const insert = legacy.prepare(
+      `INSERT INTO usage_snapshots (accountId, fetchedAtMs, source, json) VALUES (?, ?, 'live', ?)`,
+    );
+    for (const row of rows) insert.run(row.accountId, row.fetchedAtMs, row.json);
+    legacy.close();
+  }
+
+  const weeklyJson = (percent: number, resetsAt?: string): string =>
+    JSON.stringify({
+      limits: [{ kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resetsAt } : {}) }],
+    });
+
+  it('backfills the weekly columns for rows written before they existed', () => {
+    const dbPath = join(dir, 'daemon.db');
+    writeLegacySnapshotDb(dbPath, [
+      { accountId: 'a', fetchedAtMs: 100, json: weeklyJson(10) },
+      { accountId: 'a', fetchedAtMs: 200, json: weeklyJson(20, '2026-07-30T05:00:00.000Z') },
+      // No weekly reading to recover — must stay absent from the observation view forever, not
+      // become a zero that the burn measurement reads as a weekly reset.
+      { accountId: 'a', fetchedAtMs: 300, json: '{}' },
+    ]);
+
+    const store = new Store(dbPath);
+    try {
+      // Without the backfill this is empty and burn goes unmeasurable for the whole lookback —
+      // the upgrade would silently blind the pacing advisor for ten days.
+      expect(store.listWeeklyObservationsSince('a', 0)).toEqual([
+        { fetchedAtMs: 100, percent: 10 },
+        { fetchedAtMs: 200, percent: 20, resetsAtMs: Date.parse('2026-07-30T05:00:00.000Z') },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('widens the legacy two-column index so the history read is actually covered', () => {
+    // The failure this guards is silent: `CREATE INDEX IF NOT EXISTS` leaves the narrow index in
+    // place, every query still returns the right answer, and the machines that already have
+    // months of history — the only ones slow enough to care — keep paying the full stall.
+    const dbPath = join(dir, 'daemon.db');
+    writeLegacySnapshotDb(dbPath, [{ accountId: 'a', fetchedAtMs: 100, json: weeklyJson(10) }]);
+
+    const store = new Store(dbPath);
+    try {
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      expect(db.prepare(`PRAGMA index_info(idx_usage_snapshots_account)`).all()).toHaveLength(4);
+      const explained = db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT fetchedAtMs, weeklyPercent, weeklyResetsAtMs FROM usage_snapshots
+           WHERE accountId = ? AND fetchedAtMs >= ? AND weeklyPercent IS NOT NULL
+           ORDER BY fetchedAtMs ASC`,
+        )
+        .all('a', 0)
+        .map((r) => String(r['detail']))
+        .join(' ');
+      expect(explained).toContain('COVERING INDEX idx_usage_snapshots_account');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('re-reads only the unreadable remainder on every later open, never the whole backlog', () => {
+    const dbPath = join(dir, 'daemon.db');
+    writeLegacySnapshotDb(dbPath, [
+      { accountId: 'a', fetchedAtMs: 100, json: weeklyJson(10) },
+      { accountId: 'a', fetchedAtMs: 200, json: '{}' },
+    ]);
+    new Store(dbPath).close();
+
+    // Second open: the filled row must NOT be revisited (the backfill is gated on the data, so a
+    // row that already has its reading is invisible to it), and the unreadable one stays null
+    // rather than being written as some placeholder that would later read as an observation.
+    const second = new Store(dbPath);
+    try {
+      const db = (second as unknown as { db: DatabaseSync }).db;
+      expect(
+        db.prepare(`SELECT COUNT(*) AS c FROM usage_snapshots WHERE weeklyPercent IS NULL`).get(),
+      ).toEqual({ c: 1 });
+      expect(second.listWeeklyObservationsSince('a', 0)).toEqual([
+        { fetchedAtMs: 100, percent: 10 },
+      ]);
     } finally {
       second.close();
     }

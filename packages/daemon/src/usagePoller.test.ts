@@ -11,7 +11,7 @@ import {
   type PollAccount,
   type SnapshotResult,
 } from './usagePoller.js';
-import { readFleetHistory } from './usageHistory.js';
+import { extractWeeklyReading, readFleetHistory } from './usageHistory.js';
 import { parseUsageEndpointResponse } from './usageParse.js';
 
 function jsonResponse(status: number, body: unknown): FetchLikeResponse {
@@ -566,10 +566,25 @@ describe('toUsageSnapshotPayload — what actually goes on the wire', () => {
     }));
   }
 
+  /** Stands in for the store by running the persisted payload through the SAME extraction the
+   *  store runs at insert time. That is what keeps this a round-trip test: the endpoint body is
+   *  parsed, serialized as the daemon serializes it, and then read back through production's own
+   *  denormalization — so a field-name drift anywhere along that chain still fails here. */
   function readerFor(rows: Map<string, Array<{ fetchedAtMs: number; json: string }>>) {
     return {
-      listUsageSnapshotsSince: (accountId: string, sinceMs: number) =>
-        (rows.get(accountId) ?? []).filter((r) => r.fetchedAtMs >= sinceMs),
+      listWeeklyObservationsSince: (accountId: string, sinceMs: number) =>
+        (rows.get(accountId) ?? [])
+          .filter((r) => r.fetchedAtMs >= sinceMs)
+          .map((r) => ({ fetchedAtMs: r.fetchedAtMs, reading: extractWeeklyReading(r.json) }))
+          .filter((r) => r.reading.weeklyPercent !== null)
+          .map((r) => ({
+            fetchedAtMs: r.fetchedAtMs,
+            percent: r.reading.weeklyPercent as number,
+            ...(r.reading.weeklyResetsAtMs !== null
+              ? { resetsAtMs: r.reading.weeklyResetsAtMs }
+              : {}),
+          }))
+          .sort((a, b) => a.fetchedAtMs - b.fetchedAtMs),
     };
   }
 
