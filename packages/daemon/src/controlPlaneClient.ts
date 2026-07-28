@@ -65,6 +65,10 @@ export interface ControlPlaneHandlers {
    *  with every other inbound command — what "dormant" means and the result reply live in
    *  the daemon's handler. */
   onSessionPrune?: (msg: MessageOf<'session.prune'>) => void;
+  /** Phone-initiated request for a token-stats window other than the pushed default. Routing
+   *  only, as with every other inbound command — the scan, the day bound, and the result reply
+   *  live in the daemon's handler. */
+  onStatsRequest?: (msg: MessageOf<'stats.request'>) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +353,7 @@ export class ControlPlaneClient {
     else if (isType(envelope, 'session.spawn')) this.opts.handlers.onSessionSpawn?.(envelope);
     else if (isType(envelope, 'session.stop')) this.opts.handlers.onSessionStop?.(envelope);
     else if (isType(envelope, 'session.prune')) this.opts.handlers.onSessionPrune?.(envelope);
+    else if (isType(envelope, 'stats.request')) this.opts.handlers.onStatsRequest?.(envelope);
     // Any other type (usage.snapshot, session.output, etc.) is bot->phone traffic the daemon
     // itself never receives from the relay; silently ignored rather than treated as an error.
   }
