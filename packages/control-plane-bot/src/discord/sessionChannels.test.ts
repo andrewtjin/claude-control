@@ -1,15 +1,23 @@
 // Per-user session-channel config and resolution.
 //
-// Two properties carry the feature and are therefore what these tests defend:
+// Four properties carry the feature and are therefore what these tests defend:
 //   1. malformed config is LOUD (a mistyped id silently reverts a user to DMs — invisible)
 //   2. an unlisted user resolves to `undefined`, which is the gateway's DM fallback — the whole
 //      point of a mixed deployment, and a regression that would look like "threads work fine"
 //      right up until someone else pairs and their output lands in the operator's channel.
+//   3. a user's own pin outranks both env vars, and an explicit DM pin ENDS the chain rather than
+//      falling through to a deployment channel — otherwise "send my threads back to my DMs" is a
+//      lie told with a confirmation message
+//   4. a pin accessor alone is enough to build a resolver, because the ordinary deployment
+//      configures no session channels at all and a config-only guard would leave every pin on
+//      those deployments written to disk and then silently ignored
 
 import { describe, it, expect, vi } from 'vitest';
 import {
   parseSessionChannelMap,
   createSessionChannelResolver,
+  chooseSessionChannel,
+  type SessionChannelPin,
   type SessionThreadParent,
 } from './sessionChannels.js';
 
@@ -126,7 +134,7 @@ describe('parseSessionChannelMap', () => {
 describe('createSessionChannelResolver', () => {
   // "No resolver" is what the gateway reads as a pure-DM deployment, so this must stay undefined
   // rather than becoming a resolver that always resolves to nothing.
-  it('is undefined when neither a map nor a fallback is configured', () => {
+  it('is undefined when neither a pin accessor, a map, nor a fallback is configured', () => {
     expect(
       createSessionChannelResolver({ fetchParent: () => Promise.resolve(undefined) }),
     ).toBeUndefined();
@@ -200,5 +208,124 @@ describe('createSessionChannelResolver', () => {
     await resolve?.(USER_A);
     await resolve?.(USER_A);
     expect(fetchParent).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("chooseSessionChannel - who decides where a user's threads go", () => {
+  const none = { pin: undefined, byUser: undefined, fallbackChannelId: undefined } as const;
+
+  // The contested case, and the one the whole feature turns on: a user the operator already
+  // configured is exactly the user who most needs to be able to move themselves.
+  it("a user's own pinned channel beats the operator per-user map", () => {
+    expect(
+      chooseSessionChannel(USER_A, {
+        ...none,
+        pin: { kind: 'channel', channelId: CHANNEL_A },
+        byUser: new Map([[USER_A, CHANNEL_B]]),
+      }),
+    ).toEqual({ destination: 'channel', channelId: CHANNEL_A, source: 'pin' });
+  });
+
+  it("a user's own pinned channel beats the shared fallback channel", () => {
+    expect(
+      chooseSessionChannel(USER_A, {
+        ...none,
+        pin: { kind: 'channel', channelId: CHANNEL_A },
+        fallbackChannelId: CHANNEL_B,
+      }),
+    ).toEqual({ destination: 'channel', channelId: CHANNEL_A, source: 'pin' });
+  });
+
+  // A cleared pin that fell through would confirm "back to your DMs" and then deliver to a
+  // channel anyway on the very next session — the revocation path has to be unconditional.
+  it.each([
+    ['the operator map names a channel', { byUser: new Map([[USER_A, CHANNEL_A]]) }],
+    ['a shared fallback is set', { fallbackChannelId: CHANNEL_B }],
+    ['both are set', { byUser: new Map([[USER_A, CHANNEL_A]]), fallbackChannelId: CHANNEL_B }],
+  ])('an explicit DM pin routes to DMs even when %s', (_label, config) => {
+    expect(chooseSessionChannel(USER_A, { ...none, ...config, pin: { kind: 'dm' } })).toEqual({
+      destination: 'dm',
+      source: 'pin',
+    });
+  });
+
+  // Constraint on the whole change: env-configured deployments keep behaving exactly as before for
+  // anyone who has never touched /thread-here.
+  it('a user with no pin still follows the operator map, then the shared fallback', () => {
+    const config = { byUser: new Map([[USER_A, CHANNEL_A]]), fallbackChannelId: CHANNEL_B };
+    expect(chooseSessionChannel(USER_A, { ...none, ...config })).toEqual({
+      destination: 'channel',
+      channelId: CHANNEL_A,
+      source: 'deployment',
+    });
+    expect(chooseSessionChannel(USER_B, { ...none, ...config })).toEqual({
+      destination: 'channel',
+      channelId: CHANNEL_B,
+      source: 'deployment',
+    });
+  });
+
+  // Two ways to end up on DMs that call for completely different replies: one was chosen.
+  it('separates DMs by deployment default from DMs the user asked for', () => {
+    expect(chooseSessionChannel(USER_A, none)).toEqual({
+      destination: 'dm',
+      source: 'deployment',
+    });
+    expect(chooseSessionChannel(USER_A, { ...none, pin: { kind: 'dm' } })).toEqual({
+      destination: 'dm',
+      source: 'pin',
+    });
+  });
+});
+
+describe("createSessionChannelResolver - a user's own pin", () => {
+  // The highest-regression line in the change. The ordinary deployment sets NEITHER env var, so a
+  // guard that only counted config would build no resolver at all there — and the gateway holds
+  // the resolver in a field assigned once, so every pin would be persisted and then ignored until
+  // a restart, with nothing thrown and nothing logged.
+  it('builds a resolver from a pin accessor alone, so a first pin needs no restart', async () => {
+    const fetchParent = vi.fn((id: string) => Promise.resolve(fakeParent(id)));
+    const resolve = createSessionChannelResolver({
+      fetchParent,
+      resolvePin: () => ({ kind: 'channel', channelId: CHANNEL_A }),
+    });
+    expect(resolve).toBeDefined();
+    expect(await resolve?.(USER_A)).toMatchObject({ label: CHANNEL_A });
+  });
+
+  it('still returns no resolver when nothing at all is configured', () => {
+    expect(
+      createSessionChannelResolver({ fetchParent: () => Promise.resolve(undefined) }),
+    ).toBeUndefined();
+  });
+
+  // The accessor is read per call, not captured: the resolver is built once during construction
+  // and never rebuilt, so a snapshot would make every pin take effect one restart late.
+  it('reads the pin accessor on every call, so a pin made after construction is honoured', async () => {
+    const pins = new Map<string, SessionChannelPin>();
+    const fetchParent = vi.fn((id: string) => Promise.resolve(fakeParent(id)));
+    const resolve = createSessionChannelResolver({
+      fetchParent,
+      resolvePin: (id) => pins.get(id),
+      fallbackChannelId: CHANNEL_B,
+    });
+    expect(await resolve?.(USER_A)).toMatchObject({ label: CHANNEL_B });
+
+    pins.set(USER_A, { kind: 'channel', channelId: CHANNEL_A });
+    expect(await resolve?.(USER_A)).toMatchObject({ label: CHANNEL_A });
+
+    pins.set(USER_A, { kind: 'dm' });
+    expect(await resolve?.(USER_A)).toBeUndefined();
+  });
+
+  it('leaves an unpinned user on the deployment channel', async () => {
+    const fetchParent = vi.fn((id: string) => Promise.resolve(fakeParent(id)));
+    const resolve = createSessionChannelResolver({
+      fetchParent,
+      resolvePin: () => undefined,
+      byUser: new Map([[USER_A, CHANNEL_A]]),
+    });
+    expect(await resolve?.(USER_A)).toMatchObject({ label: CHANNEL_A });
+    expect(await resolve?.(USER_B)).toBeUndefined();
   });
 });
