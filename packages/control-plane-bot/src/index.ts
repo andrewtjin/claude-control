@@ -127,9 +127,12 @@ export {
   PersistentThreadRegistry,
   type DeliveryTarget,
 } from './discord/threadRegistry.js';
+export { DiscordJsGateway, type DiscordJsGatewayOptions } from './discord/discordJsGateway.js';
 export {
-  DiscordJsGateway,
-  type DiscordJsGatewayOptions,
+  parseSessionChannelMap,
+  createSessionChannelResolver,
+  type SessionChannelMapParse,
+  type SessionChannelResolverOptions,
   type SessionChannelResolver,
   type SessionThreadParent,
-} from './discord/discordJsGateway.js';
+} from './discord/sessionChannels.js';

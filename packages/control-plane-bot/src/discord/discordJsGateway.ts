@@ -91,27 +91,7 @@ import {
 import { PersistentThreadRegistry, type DeliveryTarget } from './threadRegistry.js';
 import * as commands from './commands.js';
 import type { CommandDeps, CommandResult } from './commands.js';
-
-/** A channel-like object that can host per-session threads. Kept structural (not a discord.js
- *  channel class) so wiring a real per-user text channel later needs no change here, and so the
- *  gateway compiles today with the default resolver that returns `undefined` (pure-DM deployment
- *  until channel-per-user lands — every session then falls back to DM, which is the sanctioned
- *  fallback path, not a failure). */
-export interface SessionThreadParent {
-  threads: {
-    create(options: {
-      name: string;
-      type: ChannelType.PrivateThread;
-      invitable: boolean;
-    }): Promise<{ id: string; members: { add(userId: string): Promise<unknown> } }>;
-  };
-}
-
-/** Where a user's per-session threads should be created. Returns `undefined` (the default) when no
- *  channel is available, in which case delivery falls back to the user's DM and remembers it. */
-export type SessionChannelResolver = (
-  discordUserId: string,
-) => Promise<SessionThreadParent | undefined>;
+import { createSessionChannelResolver, type SessionChannelResolver } from './sessionChannels.js';
 
 /** The content/embeds/components subset common to `channel.send` and `message.edit`, so one built
  *  payload drives both the initial card send and every subsequent in-place edit. */
@@ -184,9 +164,15 @@ export interface DiscordJsGatewayOptions {
    *  deployment (thread creation always falls back to DM, which is remembered per session). */
   sessionChannelResolver?: SessionChannelResolver;
   /** Channel id whose text channel hosts per-session private threads, for deployments that want
-   *  threads without supplying a full resolver. Ignored when `sessionChannelResolver` is given;
-   *  omitted (with no resolver) → pure-DM deployment. */
+   *  threads without supplying a full resolver. Applies to every user WITHOUT a
+   *  {@link DiscordJsGatewayOptions.sessionChannelsByUser} entry. Ignored when
+   *  `sessionChannelResolver` is given; omitted (with no resolver, no map) → pure-DM deployment. */
   sessionChannelId?: string;
+  /** Per-user channel overrides (discordUserId → channelId), taking precedence over
+   *  `sessionChannelId`. This is what makes a MIXED deployment possible: name the users who should
+   *  get threads, leave `sessionChannelId` unset, and everyone else keeps getting DMs. Ignored when
+   *  `sessionChannelResolver` is given. */
+  sessionChannelsByUser?: ReadonlyMap<string, string>;
 }
 
 /** How long after a session goes terminal its in-memory streaming state is retained before being
@@ -225,7 +211,12 @@ export class DiscordJsGateway implements DiscordGateway {
   private readonly planner = new SessionPlanner();
   /** Persisted sessionId→thread map; loaded on start(), survives restart. */
   private readonly threadReg: PersistentThreadRegistry;
-  private readonly sessionChannelResolver: SessionChannelResolver | undefined;
+  /** How this deployment answers "which channel hosts this user's session threads?", or
+   *  `undefined` for a pure-DM deployment. `protected` (not `private`) for the same reason as
+   *  {@link sinkFor}: a test subclass can read back what the constructor wired, so the mixed
+   *  per-user/fallback/DM config is verified through the real construction path rather than by
+   *  re-deriving it. */
+  protected readonly sessionChannelResolver: SessionChannelResolver | undefined;
   /** Live-card message per session route, so `editMessage ref:'card'` targets the right message.
    *  In-memory only: after a restart the card id is gone and the first edit posts a fresh card
    *  (a benign visual re-anchor, not a lost update). */
@@ -272,18 +263,20 @@ export class DiscordJsGateway implements DiscordGateway {
     this.threadReg = new PersistentThreadRegistry(
       options.stateDir ?? join(tmpdir(), 'claude-control-bot'),
     );
-    // An explicit resolver wins; a bare channel id gets the built-in resolver, which re-fetches
-    // per call so a deleted/retyped channel degrades to the DM fallback instead of caching a
-    // stale handle for the bot's lifetime.
-    const channelId = options.sessionChannelId;
+    // An explicit resolver wins; otherwise the per-user map and/or the shared channel id build one
+    // (see createSessionChannelResolver for the precedence and the undefined-means-DM contract).
+    // Only the discord.js fetch-and-narrow lives here — the channel a fetch is issued FOR is a pure
+    // decision, and keeping it that way is what makes the mixed deployment testable headlessly.
     this.sessionChannelResolver =
       options.sessionChannelResolver ??
-      (channelId
-        ? async () => {
-            const channel = await this.client.channels.fetch(channelId);
-            return channel?.type === ChannelType.GuildText ? channel : undefined;
-          }
-        : undefined);
+      createSessionChannelResolver({
+        fetchParent: async (channelId) => {
+          const channel = await this.client.channels.fetch(channelId);
+          return channel?.type === ChannelType.GuildText ? channel : undefined;
+        },
+        ...(options.sessionChannelsByUser ? { byUser: options.sessionChannelsByUser } : {}),
+        ...(options.sessionChannelId ? { fallbackChannelId: options.sessionChannelId } : {}),
+      });
     this.deps = { relay: options.relay, pairing: options.pairing, cache: this.cache };
     // `allowedMentions: { parse: [] }` is a process-wide default that neutralizes every
     // @everyone/@here/role/user mention parsed from message CONTENT. Card and session text is

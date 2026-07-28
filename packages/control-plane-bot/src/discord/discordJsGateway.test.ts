@@ -1,10 +1,12 @@
 // discordJsGateway is otherwise a live boundary (see its file header): start()/deliver() make real
-// Discord API calls, so it is not unit-tested. Two deliberate exceptions live here. The first
+// Discord API calls, so it is not unit-tested. Three deliberate exceptions live here. The first
 // proves the per-session-route SERIALIZATION of deliver(), which is gateway-local state (the
 // promise chain + the cardMessages map) that no pure module can hold; it exercises that
 // serialization through the single `protected sinkFor` seam by returning a controllable fake sink.
 // The second is pure data — it holds the pairing primer and the registered command list to each
-// other. Neither touches a real Discord connection.
+// other. The third reads back the session-channel resolver the CONSTRUCTOR wired, so the option
+// plumbing is covered without re-deriving the precedence rules already proven in
+// sessionChannels.test.ts. None touches a real Discord connection.
 
 import { describe, it, expect } from 'vitest';
 import type { EmbedBuilder, Message, SendableChannels } from 'discord.js';
@@ -336,5 +338,67 @@ describe('pairing primer', () => {
     // Discord rejects a body over 2000 characters and sendPrimer posts this in a single send, so
     // an over-long primer fails as a DM the user never sees rather than truncating.
     expect(PAIRING_PRIMER_MESSAGE.length).toBeLessThanOrEqual(2000);
+  });
+});
+
+// Constructor wiring for session-channel routing. The precedence rules themselves live in
+// sessionChannels.test.ts; what is unproven there is that each option actually REACHES the
+// factory — a spread into the wrong key would leave the operator on DMs with nothing logged.
+describe('DiscordJsGateway session channel wiring', () => {
+  const USER = '111111111111111111';
+  const OTHER = '222222222222222222';
+
+  /** Exposes the constructor-wired resolver (see its `protected` note in the gateway). */
+  class ResolverProbe extends DiscordJsGateway {
+    resolver(): ((id: string) => Promise<unknown>) | undefined {
+      return this.sessionChannelResolver;
+    }
+  }
+  const build = (extra: Partial<ConstructorParameters<typeof DiscordJsGateway>[0]>) =>
+    new ResolverProbe({
+      relay: stubRelay,
+      pairing: stubPairing,
+      token: 'not-used-without-start',
+      ...extra,
+    });
+
+  it('leaves a deployment with no channel config on pure DMs', () => {
+    expect(build({}).resolver()).toBeUndefined();
+  });
+
+  it('builds a resolver from the shared channel id alone', () => {
+    expect(build({ sessionChannelId: '333333333333333333' }).resolver()).toBeDefined();
+  });
+
+  it('builds a resolver from a per-user map alone', () => {
+    const byUser = new Map([[USER, '333333333333333333']]);
+    expect(build({ sessionChannelsByUser: byUser }).resolver()).toBeDefined();
+  });
+
+  // The mixed deployment, end to end through the real constructor: a mapped user resolves to a
+  // channel (the fetch fails against no client, which is fine — reaching the fetch at all is the
+  // proof), while an unmapped user short-circuits to undefined and lands on the DM fallback.
+  it('routes only mapped users toward a channel when no shared fallback is set', async () => {
+    const resolve = build({
+      sessionChannelsByUser: new Map([[USER, '333333333333333333']]),
+    }).resolver();
+    expect(await resolve?.(OTHER)).toBeUndefined();
+    await expect(Promise.resolve(resolve?.(USER))).rejects.toThrow();
+  });
+
+  it('lets an explicit resolver override both the map and the shared channel id', async () => {
+    const sentinel = {
+      threads: {
+        create: () =>
+          Promise.resolve({ id: 't', members: { add: () => Promise.resolve(undefined) } }),
+      },
+    };
+    const resolve = build({
+      sessionChannelResolver: () => Promise.resolve(sentinel),
+      sessionChannelsByUser: new Map([[USER, '333333333333333333']]),
+      sessionChannelId: '444444444444444444',
+    }).resolver();
+    expect(await resolve?.(USER)).toBe(sentinel);
+    expect(await resolve?.(OTHER)).toBe(sentinel);
   });
 });
