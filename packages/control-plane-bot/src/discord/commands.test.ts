@@ -12,6 +12,7 @@ import {
   handleSessions,
   handleSettings,
   handleStats,
+  handleStatsScan,
   handleStatus,
   handleSwitch,
   handleRun,
@@ -490,5 +491,54 @@ describe('handleStats', () => {
     const deps = makeDeps(relay);
     deps.cache.record('user-a', statsEnvelope('user-a'));
     expect(handleStats(deps, 'user-b').kind).toBe('text');
+  });
+
+  it('still answers from cache when a cached snapshot exists, sending no request', () => {
+    // Guards the fast path against the days-option work: /stats with no window must never
+    // become a host scan.
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const deps = makeDeps(relay);
+    deps.cache.record('user-a', statsEnvelope('user-a'));
+    expect(handleStats(deps, 'user-a').kind).toBe('embed');
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe('handleStatsScan', () => {
+  it('asks the daemon for the requested window', () => {
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const result = handleStatsScan(makeDeps(relay), 'user-a', 30, 'req-1');
+
+    expect(result.kind).toBe('text');
+    expect(result.kind === 'text' && result.text).toContain('30 days');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.draft.type).toBe('stats.request');
+    expect(sent[0]?.draft.payload).toEqual({ requestId: 'req-1', days: 30 });
+  });
+
+  it('addresses only the invoking user daemon', () => {
+    const { relay, sent } = createFakeRelay({
+      online: { 'user-a': 'daemon-a', 'user-b': 'daemon-b' },
+    });
+    handleStatsScan(makeDeps(relay), 'user-b', 14, 'req-1');
+    // The handler never names a daemon; the relay resolves it from the invoking user alone.
+    expect(sent[0]?.daemonId).toBe('daemon-b');
+  });
+
+  it('reports an offline daemon as an error rather than pretending a scan started', () => {
+    const { relay, sent } = createFakeRelay({ online: {} });
+    const result = handleStatsScan(makeDeps(relay), 'user-a', 7, 'req-1');
+
+    // The caller uses this to stop waiting immediately — a "scanning…" reply here would leave
+    // the interaction spinning for the full timeout on a request that never left the bot.
+    expect(result.kind).toBe('error');
+    expect(sent).toHaveLength(0);
+  });
+
+  it('says "day" rather than "days" for a one-day window', () => {
+    const { relay } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const result = handleStatsScan(makeDeps(relay), 'user-a', 1, 'req-1');
+    expect(result.kind === 'text' && result.text).toContain('1 day');
+    expect(result.kind === 'text' && result.text).not.toContain('1 days');
   });
 });
