@@ -39,6 +39,25 @@ the channel → Copy Channel ID, with Developer Mode on) and enable the **Messag
 intent** on your Discord application (Developer Portal → Bot → Message Content Intent) so
 replies typed into a thread reach the session. Left unset, everything arrives by DM.
 
+`CCTL_SESSION_CHANNEL_ID` applies to **every** paired user, which is not always what you
+want on a relay that other people pair against. `CCTL_SESSION_CHANNELS` overrides it per
+user, as comma-separated `<discordUserId>:<channelId>` pairs:
+
+```
+CCTL_SESSION_CHANNELS=123456789012345678:987654321098765432
+```
+
+A user named there gets threads in their own channel; anyone else falls back to
+`CCTL_SESSION_CHANNEL_ID`, or to DM when that is unset. So setting **only**
+`CCTL_SESSION_CHANNELS` is the mixed deployment: threads for you, DMs for everyone else.
+Copy your own user id the same way as a channel id (right-click yourself → Copy User ID).
+A malformed pair fails startup with the offending entries listed — deliberately, because a
+mistyped id would otherwise just never match and leave that user silently on DMs.
+
+Routing is per **user**, not per server: session output arrives from your daemon over the
+relay socket and carries no guild, so the bot cannot infer "this belongs to server X". Adding
+the bot to a second server changes nothing on its own; name the channel you want.
+
 Point your own `cctl daemon run --relay wss://<RELAY_HOSTNAME>` at your hostname once
 it's up. For a self-host you want to keep, prefer `relayUrl` in `config.json` beside
 the vault — unlike a flag it survives autostart and reboots, and unlike a baked-in
