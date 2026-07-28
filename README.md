@@ -43,7 +43,7 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
 
 - **Burns the expiring budget first.** Maximize your usage by burning close resets
   first. The optimizer tracks, ranks, and plans the optimal usage across your
-  accounts, holding other accounts in reserve. 
+  accounts, holding other accounts in reserve.
 - **Switches before you hit the wall.** When the active account's worst
   limit runs low, the daemon moves to the best eligible account on its own.
   No prompt, no dropped session. Or, manually switch from your phone with one
