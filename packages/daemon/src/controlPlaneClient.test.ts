@@ -506,7 +506,7 @@ describe('ControlPlaneClient', () => {
     expect(titles).toEqual(['n2', 'n3', 'n4']); // oldest (n0, n1) dropped
   });
 
-  it('dispatches inbound switch.command / permission.response / prompt.inject / session.spawn / session.stop / session.prune to handlers', async () => {
+  it('dispatches every inbound command type to its handler', async () => {
     const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
     relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
     const identityStore = memoryIdentityStore(identity);
@@ -517,6 +517,9 @@ describe('ControlPlaneClient', () => {
     const onSessionSpawn = vi.fn();
     const onSessionStop = vi.fn();
     const onSessionPrune = vi.fn();
+    // Typed, unlike its neighbours, because this one's recorded payload is asserted on below —
+    // an untyped mock would make that read an `any`.
+    const onStatsRequest = vi.fn<(msg: MessageOf<'stats.request'>) => void>();
 
     client = new ControlPlaneClient({
       url: relay.url(),
@@ -531,6 +534,7 @@ describe('ControlPlaneClient', () => {
         onSessionSpawn,
         onSessionStop,
         onSessionPrune,
+        onStatsRequest,
       },
     });
     await client.connect();
@@ -567,13 +571,23 @@ describe('ControlPlaneClient', () => {
       payload: { requestId: 'r4', idempotencyKey: 'k6' },
     });
 
-    await waitFor(() => onSessionPrune.mock.calls.length > 0);
+    send({
+      daemonId: identity.daemonId,
+      type: 'stats.request',
+      payload: { requestId: 'r5', days: 30 },
+    });
+
+    await waitFor(() => onStatsRequest.mock.calls.length > 0);
     expect(onSwitchCommand).toHaveBeenCalledTimes(1);
     expect(onPermissionResponse).toHaveBeenCalledTimes(1);
     expect(onPromptInject).toHaveBeenCalledTimes(1);
     expect(onSessionSpawn).toHaveBeenCalledTimes(1);
     expect(onSessionStop).toHaveBeenCalledTimes(1);
     expect(onSessionPrune).toHaveBeenCalledTimes(1);
+    expect(onStatsRequest).toHaveBeenCalledTimes(1);
+    // Routing must carry the requested window through untouched — the daemon's handler is what
+    // decides what to do with it, and it cannot decide on a value it never received.
+    expect(onStatsRequest.mock.calls[0]?.[0]?.payload).toEqual({ requestId: 'r5', days: 30 });
   });
 
   it('drops an invalid/undecodable inbound frame without crashing the connection', async () => {

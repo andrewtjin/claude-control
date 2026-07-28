@@ -21,21 +21,32 @@ choice — most notably, whether to trust the shared relay or self-host their ow
    but ephemeral; see "In-transit visibility" below.
 5. **Discord ↔ daemon bindings.** Routing metadata on the bot. Not a credential, but integrity
    matters (a corrupted binding could misroute a command).
+6. **Session-thread routing** — each user's own `/thread-here` choice, persisted on the bot. Not a
+   credential either, but it is the only bot state a _user_ can write, and it decides where their
+   session output is delivered; a cross-user write would be a way to redirect someone else's
+   output into a channel of the attacker's choosing.
 
 ## Trust boundaries
 
-| Actor                       | Trusted to                                                  | Explicitly NOT able to                                                                      |
-| --------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| **Daemon** (user's machine) | Hold vault tokens, run sessions, decrypt credentials        | —                                                                                           |
-| **Relay/bot** (shared host) | Route by Discord user id, store bindings + token **hashes** | Read any OAuth token; import credential code (structural — see `dependencyClosure.test.ts`) |
-| **Discord**                 | Authenticate the human, deliver messages                    | Reach a daemon it isn't bound to                                                            |
-| **Caddy** (edge)            | Terminate TLS for the relay hostname                        | See the Discord bot token (least-privilege env)                                             |
+| Actor                       | Trusted to                                                                                           | Explicitly NOT able to                                                                      |
+| --------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| **Daemon** (user's machine) | Hold vault tokens, run sessions, decrypt credentials                                                 | —                                                                                           |
+| **Relay/bot** (shared host) | Route by Discord user id, store bindings, token **hashes** and each user's own session-thread choice | Read any OAuth token; import credential code (structural — see `dependencyClosure.test.ts`) |
+| **Discord**                 | Authenticate the human, deliver messages                                                             | Reach a daemon it isn't bound to                                                            |
+| **Caddy** (edge)            | Terminate TLS for the relay hostname                                                                 | See the Discord bot token (least-privilege env)                                             |
 
 ## What is defended (and how)
 
 - **Cross-user daemon hijack** — the bot mints daemon ids server-side; a client cannot name
   another user's daemon. ACL is enforced at the bot (route by `interaction.user.id`) and
   re-validated at the daemon on ingress.
+- **Cross-user redirection of session output** — `/thread-here` writes the pin store, and it is
+  keyed solely by `interaction.user.id`. The command declares **no user option**, so there is no
+  input that could name someone else's mapping: the property is structural, in the same sense as
+  the daemon ACL above, rather than a check a later edit could drop. Pinning a channel also grants
+  nothing new — a user could already read their own session output — and what the bot may do in a
+  channel is still bounded by that channel's Discord permissions, which the command verifies (and
+  really exercises, by creating and deleting a throwaway thread) before it pins anything.
 - **Daemon-token theft from the bot** — tokens are stored only as scrypt hashes (N=16384);
   verification is constant-time with a dummy-hash path so a missing daemon id and a wrong token
   are indistinguishable by timing.

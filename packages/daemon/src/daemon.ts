@@ -25,11 +25,21 @@ import {
 import type { AgentSdkClient } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
-import type { EnvelopeDraft, MessageOf, PayloadOf } from '@claude-control/shared-protocol';
+import type {
+  EnvelopeDraft,
+  MessageOf,
+  PayloadOf,
+  TokenStatsSnapshot,
+} from '@claude-control/shared-protocol';
+import {
+  DEFAULT_STATS_DAYS,
+  MAX_STATS_DAYS,
+  MIN_STATS_DAYS,
+} from '@claude-control/shared-protocol';
 import { planWeight, type AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
 import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
-import { readFleetHistory } from './usageHistory.js';
+import { readFleetHistory, RESET_LOOKBACK_MS } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
 import type { TranscriptScan } from './transcriptTokens.js';
 import { aggregateTokenStats } from './tokenStats.js';
@@ -44,7 +54,7 @@ import type {
   TrackedSessionView,
 } from './hookReceiver.js';
 import { ControlPlaneClient } from './controlPlaneClient.js';
-import { startLoopLagMonitor } from './loopLagMonitor.js';
+import { LOOP_LAG_THRESHOLD_MS, startLoopLagMonitor } from './loopLagMonitor.js';
 
 /** The subset of `SwitchEngine`'s public surface the daemon depends on — narrower than the
  *  concrete class so tests can fake it without building a whole real engine. The real
@@ -126,14 +136,32 @@ export interface DaemonOptions {
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
+/** A poll-cycle phase slower than this is logged at warn rather than debug. Deliberately the
+ *  loop-lag monitor's own threshold: a phase that outlasts it is, by that monitor's definition,
+ *  long enough to be a stall worth naming, so the two never disagree about what counts as slow. */
+const POLL_PHASE_SLOW_MS = LOOP_LAG_THRESHOLD_MS;
+/** One day, the unit every window below is counted in. */
+const DAY_MS = 24 * 60 * 60_000;
 /** How long a usage snapshot is kept before the poll cycle trims it. The poller appends one row
  *  per account per cycle (~1,900/day on a real machine) and nothing reads a snapshot older than
  *  the current view, so without a cutoff this table is the one thing the daemon grows without
- *  bound. 90 days keeps a full quarter of history for any future backfill while bounding the file. */
-const USAGE_SNAPSHOT_RETENTION_MS = 90 * 24 * 60 * 60_000;
-/** The window every pushed `stats.snapshot` covers. Matches `cctl stats`'s own default so the
- *  phone and the terminal answer the same question. */
-const STATS_WINDOW_MS = 7 * 24 * 60 * 60_000;
+ *  bound.
+ *
+ *  Sized against the longest window anything actually READS — `RESET_LOOKBACK_MS`, ten days —
+ *  plus four days of margin, rather than the quarter of history it used to keep for a backfill
+ *  nothing ever wrote. At the observed ~1,900 rows/day the old 90-day figure trends to ~170k rows
+ *  and tens of MB of payload that no code path can reach.
+ *
+ *  Expressed as the read window PLUS a margin, not as a bare number of days, so the two can never
+ *  drift apart in a later edit. The margin is not decoration and must not be tuned to zero:
+ *  {@link Daemon.runPollCycle} trims BEFORE it reads, both against the same `clock()`, so a cutoff
+ *  equal to the read window would race the read it feeds. It also absorbs clock skew and a daemon
+ *  that was off over a weekend. */
+const USAGE_SNAPSHOT_RETENTION_MARGIN_MS = 4 * DAY_MS;
+const USAGE_SNAPSHOT_RETENTION_MS = RESET_LOOKBACK_MS + USAGE_SNAPSHOT_RETENTION_MARGIN_MS;
+/** The window every pushed `stats.snapshot` covers. Reads the shared default rather than
+ *  restating 7 so the phone, the terminal (`cctl stats`) and `/stats` cannot drift apart. */
+const STATS_WINDOW_MS = DEFAULT_STATS_DAYS * DAY_MS;
 /** Default gap between transcript scans — see `DaemonOptions.statsIntervalMs`. */
 const DEFAULT_STATS_INTERVAL_MS = 15 * 60_000;
 /** How long {@link Daemon.stop} waits for live session handles to tear down before closing
@@ -288,6 +316,13 @@ export class Daemon {
   /** When the last transcript scan finished; `undefined` until the first one runs, so the very
    *  first poll cycle after startup always produces a snapshot. */
   private lastStatsAtMs: number | undefined;
+  /** Whether a transcript scan is running right now. Both scan paths (the throttled push and a
+   *  phone-requested window) read the same gigabytes off the same disk, so exactly one may run at
+   *  a time: without this, a spammed `/stats days:N` stacks full-history scans until the disk is
+   *  the bottleneck for every other subsystem. The push path skips its turn; a request is answered
+   *  with an explicit "already scanning" rather than being queued, because the phone is holding a
+   *  deferred reply open and a fast honest answer beats an unbounded wait. */
+  private statsScanInFlight = false;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   /** Tear-down for the event-loop lag watchdog started in {@link start}. */
   private stopLoopLagMonitor: (() => void) | undefined;
@@ -472,6 +507,11 @@ export class Daemon {
           this.logger.error({ err }, 'error handling session.prune');
         });
       },
+      onStatsRequest: (msg) => {
+        this.handleStatsRequest(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling stats.request');
+        });
+      },
     });
 
     await this.controlPlaneClient.connect();
@@ -547,13 +587,39 @@ export class Daemon {
 
   // ---- poll cycle ----
 
-  private async runPollCycle(): Promise<void> {
-    await this.attributionJournal.sync();
+  /**
+   * Time one phase of the poll cycle and warn if it alone blocked past the lag threshold.
+   *
+   * The loop-lag monitor can only say THAT the loop stalled, never WHERE — which is why the
+   * regression it was built for still took a forensic hunt to attribute, and why one multi-second
+   * outlier in that same log remains unexplained. This closes that gap for the only periodic path
+   * long enough to matter: every phase reports its own duration, so the next anomaly names the
+   * phase in the log instead of being re-derived from cadence arithmetic after the fact.
+   *
+   * Costs two `clock()` reads per phase. Deliberately measures the phase's whole span — awaits
+   * included — rather than only its synchronous part: a phase that is slow for either reason is
+   * worth seeing, and the lag monitor beside it is what distinguishes the two.
+   */
+  private async timePhase<T>(phase: string, run: () => Promise<T> | T): Promise<T> {
+    const startedAt = this.clock();
+    try {
+      return await run();
+    } finally {
+      const elapsedMs = this.clock() - startedAt;
+      if (elapsedMs >= POLL_PHASE_SLOW_MS) {
+        this.logger.warn({ phase, elapsedMs }, 'poll cycle phase ran long');
+      } else {
+        this.logger.debug({ phase, elapsedMs }, 'poll cycle phase');
+      }
+    }
+  }
 
-    const [accounts, activeId] = await Promise.all([
-      this.switchEngine.listAccounts(),
-      this.switchEngine.getActiveId(),
-    ]);
+  private async runPollCycle(): Promise<void> {
+    await this.timePhase('attributionJournal.sync', () => this.attributionJournal.sync());
+
+    const [accounts, activeId] = await this.timePhase('listAccounts+getActiveId', () =>
+      Promise.all([this.switchEngine.listAccounts(), this.switchEngine.getActiveId()]),
+    );
     const pollAccounts: PollAccount[] = accounts.map((a) => ({
       accountId: a.id,
       label: a.label,
@@ -566,26 +632,28 @@ export class Daemon {
     // that account degrades. Ordered before pollAll so a poll failure can't skip the alert.
     this.emitQuarantineNotices(pollAccounts);
 
-    const snapshot = await this.poller.pollAll(pollAccounts);
-    for (const result of snapshot.results) {
-      if (result.outcome === 'skipped') continue; // nothing new to persist
-      this.store.insertUsageSnapshot({
-        accountId: result.accountId,
-        fetchedAtMs: result.usage.accountUsage.fetchedAtMs,
-        source: result.usage.accountUsage.source,
-        json: JSON.stringify(result.usage.accountUsage),
-      });
-    }
-    // Retention runs on the same cadence as the writes that make it necessary, right after them,
-    // so the table can never outgrow its cutoff by more than one cycle. A failure is logged and
-    // swallowed: an untrimmed table is a disk-space problem, never a reason to skip the push
-    // below (which is what the phone is actually waiting on).
-    try {
-      const dropped = this.store.trimUsageSnapshots(this.clock() - USAGE_SNAPSHOT_RETENTION_MS);
-      if (dropped > 0) this.logger.info({ dropped }, 'trimmed expired usage snapshots');
-    } catch (err) {
-      this.logger.warn({ err }, 'usage snapshot retention failed; retrying next cycle');
-    }
+    const snapshot = await this.timePhase('pollAll', () => this.poller.pollAll(pollAccounts));
+    await this.timePhase('persistSnapshots', () => {
+      for (const result of snapshot.results) {
+        if (result.outcome === 'skipped') continue; // nothing new to persist
+        this.store.insertUsageSnapshot({
+          accountId: result.accountId,
+          fetchedAtMs: result.usage.accountUsage.fetchedAtMs,
+          source: result.usage.accountUsage.source,
+          json: JSON.stringify(result.usage.accountUsage),
+        });
+      }
+      // Retention runs on the same cadence as the writes that make it necessary, right after
+      // them, so the table can never outgrow its cutoff by more than one cycle. A failure is
+      // logged and swallowed: an untrimmed table is a disk-space problem, never a reason to skip
+      // the push below (which is what the phone is actually waiting on).
+      try {
+        const dropped = this.store.trimUsageSnapshots(this.clock() - USAGE_SNAPSHOT_RETENTION_MS);
+        if (dropped > 0) this.logger.info({ dropped }, 'trimmed expired usage snapshots');
+      } catch (err) {
+        this.logger.warn({ err }, 'usage snapshot retention failed; retrying next cycle');
+      }
+    });
 
     // Measure AFTER persisting, so this cycle's own readings are part of the history. The
     // daemon owns the store, so it is the only party that can make these measurements at all —
@@ -594,15 +662,19 @@ export class Daemon {
     // twenty times a Pro account's. The burn rate and the fleet capacity it is judged against
     // MUST use the same weights: measuring burn at 1x while pacing sizes the fleet at 20x
     // understates consumption by the plan multiplier and reports every fleet as sustainable.
-    const history = readFleetHistory(
-      this.store,
-      accounts.map((a) => ({ accountId: a.id, ...planWeightOf(a) })),
-      this.clock(),
+    const history = await this.timePhase('readFleetHistory', () =>
+      readFleetHistory(
+        this.store,
+        accounts.map((a) => ({ accountId: a.id, ...planWeightOf(a) })),
+        this.clock(),
+      ),
     );
 
-    this.sendEnvelope({
-      type: 'usage.snapshot',
-      payload: toUsageSnapshotPayload(snapshot, history, accounts, this.clock()),
+    await this.timePhase('sendUsageSnapshot', () => {
+      this.sendEnvelope({
+        type: 'usage.snapshot',
+        payload: toUsageSnapshotPayload(snapshot, history, accounts, this.clock()),
+      });
     });
 
     // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
@@ -629,15 +701,19 @@ export class Daemon {
           ? r.usage.advisorInput
           : { ...r.usage.advisorInput, predictedResetAt: predicted };
       });
-      await this.autoSwitcher.evaluate(inputs).catch((err: unknown) => {
-        this.logger.error({ err }, 'auto-switch evaluation failed');
-      });
+      await this.timePhase('autoSwitch', () =>
+        this.autoSwitcher?.evaluate(inputs).catch((err: unknown) => {
+          this.logger.error({ err }, 'auto-switch evaluation failed');
+        }),
+      );
     }
 
     // LAST in the cycle, deliberately: the transcript scan is seconds of disk IO, and everything
     // above it is either time-sensitive (auto-switch) or what the phone polls for (the usage
-    // push). Its own throttle means most cycles skip it entirely.
-    await this.maybePushTokenStats(accounts);
+    // push). Its own throttle means most cycles skip it entirely. Timed like the rest, so the one
+    // cycle in fifteen that carries the scan is identifiable in the log rather than looking like
+    // an unexplained spike on an otherwise ordinary cycle.
+    await this.timePhase('tokenStats', () => this.maybePushTokenStats(accounts));
   }
 
   /**
@@ -651,28 +727,110 @@ export class Daemon {
    * that dies over an unreadable transcript directory.
    */
   private async maybePushTokenStats(accounts: StoredAccount[]): Promise<void> {
-    if (this.scanTranscripts === undefined) return;
+    const scanTranscripts = this.scanTranscripts;
+    if (scanTranscripts === undefined) return;
     const now = this.clock();
     if (this.lastStatsAtMs !== undefined && now - this.lastStatsAtMs < this.statsIntervalMs) return;
+    // A phone-requested window is already reading these same files — skip this turn rather than
+    // double the disk load. The next cycle picks it up; nothing is lost but freshness, and the
+    // requested scan is about to refresh the same numbers anyway.
+    if (this.statsScanInFlight) return;
     // Stamped BEFORE the await, so a scan slower than the interval cannot queue a second one
     // behind itself on the next cycle.
     this.lastStatsAtMs = now;
-    const windowStartMs = now - STATS_WINDOW_MS;
+    this.statsScanInFlight = true;
     try {
-      const scan = await this.scanTranscripts(windowStartMs);
       this.sendEnvelope({
         type: 'stats.snapshot',
-        payload: aggregateTokenStats({
-          scan,
-          intervals: this.store.listActivationIntervals(),
-          windowStartMs,
-          windowEndMs: this.clock(),
-          labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
-        }),
+        payload: await this.scanTokenStats(now - STATS_WINDOW_MS, accounts, scanTranscripts),
       });
     } catch (err) {
       this.logger.warn({ err }, 'transcript token scan failed; keeping the previous stats');
+    } finally {
+      this.statsScanInFlight = false;
     }
+  }
+
+  /**
+   * Phone-initiated token stats over an explicitly chosen window (`/stats days:N`).
+   *
+   * Unlike the pushed snapshot this is a REQUEST/REPLY: the asking surface is one Discord
+   * interaction holding a deferred reply open, so every path here must end in exactly one
+   * `stats.result` carrying the same requestId — including the failures. Silence is the one
+   * unacceptable outcome: it leaves a spinner on the phone until the interaction expires.
+   *
+   * The window is re-clamped here even though nothing can currently reach this handler with an
+   * out-of-range value: the Envelope schema bounds `days` at decode, so a hand-crafted frame is
+   * rejected before it arrives. That makes this clamp defence in depth rather than validation —
+   * it costs two comparisons, and it is the last thing standing between a future loosening of
+   * that schema and an unbounded scan of every transcript on the host. The daemon is the only
+   * one of the three enforcement points that actually pays the IO, so it is the one that keeps
+   * a redundant guard.
+   */
+  private async handleStatsRequest(msg: MessageOf<'stats.request'>): Promise<void> {
+    const { requestId } = msg.payload;
+    const scanTranscripts = this.scanTranscripts;
+    if (scanTranscripts === undefined) {
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: { requestId, ok: false, error: 'this daemon does not scan transcripts' },
+      });
+      return;
+    }
+    if (this.statsScanInFlight) {
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: {
+          requestId,
+          ok: false,
+          error: 'a transcript scan is already running — try again in a moment',
+        },
+      });
+      return;
+    }
+    const days = Math.min(Math.max(Math.round(msg.payload.days), MIN_STATS_DAYS), MAX_STATS_DAYS);
+    this.statsScanInFlight = true;
+    try {
+      // Accounts are fetched per request rather than captured from the poll cycle: a requested
+      // scan is not tied to one, and a label that changed since the last poll should show up.
+      const accounts = await this.switchEngine.listAccounts();
+      const snapshot = await this.scanTokenStats(
+        this.clock() - days * DAY_MS,
+        accounts,
+        scanTranscripts,
+      );
+      this.logger.info({ requestId, days }, 'answered a phone-requested token stats window');
+      this.sendEnvelope({ type: 'stats.result', payload: { requestId, ok: true, snapshot } });
+    } catch (err) {
+      this.logger.warn({ err, requestId, days }, 'requested transcript token scan failed');
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: { requestId, ok: false, error: 'the transcript scan failed on the host' },
+      });
+    } finally {
+      this.statsScanInFlight = false;
+    }
+  }
+
+  /** One transcript scan turned into a wire-ready snapshot — the single place a window becomes
+   *  numbers, shared by the pushed snapshot and the phone-requested one so the two can never
+   *  disagree about attribution, labeling, or what a window means. Takes the already-narrowed
+   *  scan function rather than re-checking `this.scanTranscripts`, so each caller keeps ownership
+   *  of what "this daemon cannot scan" means for its own surface. Throws whatever the scan throws;
+   *  a push swallows it, a request reports it. */
+  private async scanTokenStats(
+    windowStartMs: number,
+    accounts: StoredAccount[],
+    scanTranscripts: (sinceMs: number) => Promise<TranscriptScan>,
+  ): Promise<TokenStatsSnapshot> {
+    const scan = await scanTranscripts(windowStartMs);
+    return aggregateTokenStats({
+      scan,
+      intervals: this.store.listActivationIntervals(),
+      windowStartMs,
+      windowEndMs: this.clock(),
+      labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+    });
   }
 
   /** Emit a `hook.notification` (level 'warn') for each account that just entered quarantine,

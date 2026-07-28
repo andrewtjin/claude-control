@@ -12,6 +12,7 @@ import {
   handleSessions,
   handleSettings,
   handleStats,
+  handleStatsScan,
   handleStatus,
   handleSwitch,
   handleRun,
@@ -23,7 +24,12 @@ import {
   handlePruneRequest,
   handlePruneConfirm,
   handleReauth,
+  rejectThreadHereChannel,
+  buildThreadHereResult,
   type CommandDeps,
+  type ThreadHereChannelFacts,
+  type ThreadHereRejection,
+  type ThreadHereStatus,
 } from './commands.js';
 import { decodeButton } from './buttons.js';
 
@@ -490,5 +496,366 @@ describe('handleStats', () => {
     const deps = makeDeps(relay);
     deps.cache.record('user-a', statsEnvelope('user-a'));
     expect(handleStats(deps, 'user-b').kind).toBe('text');
+  });
+
+  it('still answers from cache when a cached snapshot exists, sending no request', () => {
+    // Guards the fast path against the days-option work: /stats with no window must never
+    // become a host scan.
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const deps = makeDeps(relay);
+    deps.cache.record('user-a', statsEnvelope('user-a'));
+    expect(handleStats(deps, 'user-a').kind).toBe('embed');
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe('handleStatsScan', () => {
+  it('asks the daemon for the requested window', () => {
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const result = handleStatsScan(makeDeps(relay), 'user-a', 30, 'req-1');
+
+    expect(result.kind).toBe('text');
+    expect(result.kind === 'text' && result.text).toContain('30 days');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.draft.type).toBe('stats.request');
+    expect(sent[0]?.draft.payload).toEqual({ requestId: 'req-1', days: 30 });
+  });
+
+  it('addresses only the invoking user daemon', () => {
+    const { relay, sent } = createFakeRelay({
+      online: { 'user-a': 'daemon-a', 'user-b': 'daemon-b' },
+    });
+    handleStatsScan(makeDeps(relay), 'user-b', 14, 'req-1');
+    // The handler never names a daemon; the relay resolves it from the invoking user alone.
+    expect(sent[0]?.daemonId).toBe('daemon-b');
+  });
+
+  it('reports an offline daemon as an error rather than pretending a scan started', () => {
+    const { relay, sent } = createFakeRelay({ online: {} });
+    const result = handleStatsScan(makeDeps(relay), 'user-a', 7, 'req-1');
+
+    // The caller uses this to stop waiting immediately — a "scanning…" reply here would leave
+    // the interaction spinning for the full timeout on a request that never left the bot.
+    expect(result.kind).toBe('error');
+    expect(sent).toHaveLength(0);
+  });
+
+  it('says "day" rather than "days" for a one-day window', () => {
+    const { relay } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const result = handleStatsScan(makeDeps(relay), 'user-a', 1, 'req-1');
+    expect(result.kind === 'text' && result.text).toContain('1 day');
+    expect(result.kind === 'text' && result.text).not.toContain('1 days');
+  });
+});
+
+// `/thread-here` — the decision tree and every reply string. This is the whole feature except for
+// three thin live adapters in the gateway (read the invoking channel, probe it, inspect a pinned
+// channel's health), which is exactly why the tree is shaped as pure functions over plain data: the
+// guarantees the command makes are guarantees about ORDER and about what it says, and both are
+// testable here without a Discord connection.
+describe('rejectThreadHereChannel', () => {
+  /** A channel that would be accepted; each test spoils exactly the one fact it is about. */
+  function usableChannel(over: Partial<ThreadHereChannelFacts> = {}): ThreadHereChannelFacts {
+    return {
+      inGuild: true,
+      botInGuild: true,
+      channelResolved: true,
+      isThread: false,
+      isGuildText: true,
+      missingPermissions: [],
+      ...over,
+    };
+  }
+
+  it('accepts an ordinary guild text channel the bot has every thread permission in', () => {
+    expect(rejectThreadHereChannel(usableChannel())).toBeUndefined();
+  });
+
+  it.each([
+    ['a DM invocation', { inGuild: false }, 'not-in-guild'],
+    ['a server the bot was never added to', { botInGuild: false }, 'bot-not-in-guild'],
+    ['an unreadable channel', { channelResolved: false }, 'channel-unresolved'],
+    ['being run inside a thread', { isThread: true }, 'inside-thread'],
+    ['a non-text channel', { isGuildText: false }, 'not-text-channel'],
+    [
+      'a channel the bot lacks permissions in',
+      { missingPermissions: ['Manage Threads'] },
+      'missing-permissions',
+    ],
+  ])('rejects %s', (_label, over, kind) => {
+    expect(rejectThreadHereChannel(usableChannel(over))?.kind).toBe(kind);
+  });
+
+  it('names every missing permission in the rejection', () => {
+    const rejection = rejectThreadHereChannel(
+      usableChannel({ missingPermissions: ['Create Private Threads', 'Manage Threads'] }),
+    );
+    expect(rejection).toEqual({
+      kind: 'missing-permissions',
+      missing: ['Create Private Threads', 'Manage Threads'],
+    });
+  });
+
+  // These overlap in practice — a DM has no permissions at all, an unresolved channel has no type —
+  // so the ORDER is what decides whether the user is told something they can act on. Each row makes
+  // several checks fail at once and asserts which one is reported.
+  it.each([
+    [
+      'a DM outranks the permissions it structurally cannot have',
+      { inGuild: false, botInGuild: false, missingPermissions: ['View Channel'] },
+      'not-in-guild',
+    ],
+    [
+      'a missing bot outranks the baseline permissions Discord reports for it',
+      { botInGuild: false, missingPermissions: ['Manage Threads'] },
+      'bot-not-in-guild',
+    ],
+    [
+      'an unreadable channel outranks its unknown type',
+      { channelResolved: false, isGuildText: false },
+      'channel-unresolved',
+    ],
+    [
+      'being inside a thread outranks the thread not being a text channel',
+      { isThread: true, isGuildText: false },
+      'inside-thread',
+    ],
+    [
+      'the wrong channel type outranks the permissions on it',
+      { isGuildText: false, missingPermissions: ['Manage Threads'] },
+      'not-text-channel',
+    ],
+  ])('applies the checks in a fixed order: %s', (_label, over, kind) => {
+    expect(rejectThreadHereChannel(usableChannel(over))?.kind).toBe(kind);
+  });
+});
+
+describe('buildThreadHereResult — rejections', () => {
+  /** Every rejection the command can produce, including the two the channel check cannot reach. */
+  const ALL_REJECTIONS: ThreadHereRejection[] = [
+    { kind: 'not-in-guild' },
+    { kind: 'bot-not-in-guild' },
+    { kind: 'channel-unresolved' },
+    { kind: 'inside-thread' },
+    { kind: 'not-text-channel' },
+    { kind: 'missing-permissions', missing: ['Manage Threads'] },
+    { kind: 'probe-failed', detail: 'Missing Permissions' },
+    { kind: 'save-failed' },
+  ];
+
+  // The preflight's promise is that a refused pin leaves routing exactly as it was, and a user
+  // cannot check that from the outside — so every refusal says it, in the same words.
+  it.each(ALL_REJECTIONS.map((r) => [r.kind, r] as const))(
+    '%s tells the user nothing was changed',
+    (_kind, rejection) => {
+      const result = buildThreadHereResult({ kind: 'rejected', rejection });
+      expect(result.kind).toBe('error');
+      expect(result.kind === 'error' && result.message).toContain('Nothing was changed.');
+    },
+  );
+
+  it('points a DM invocation at the clear action rather than leaving it a dead end', () => {
+    const result = buildThreadHereResult({ kind: 'rejected', rejection: { kind: 'not-in-guild' } });
+    expect(result.kind === 'error' && result.message).toContain('/thread-here action:clear');
+  });
+
+  // Adding the bot is a different action from granting it permissions, and telling someone to
+  // change permissions for a bot that is not in the server is advice that cannot work.
+  it('distinguishes a server without the bot from a permissions problem', () => {
+    const absent = buildThreadHereResult({
+      kind: 'rejected',
+      rejection: { kind: 'bot-not-in-guild' },
+    });
+    const perms = buildThreadHereResult({
+      kind: 'rejected',
+      rejection: { kind: 'missing-permissions', missing: ['Manage Threads'] },
+    });
+    expect(absent.kind === 'error' && absent.message).toContain('add the bot');
+    expect(perms.kind === 'error' && perms.message).toContain('Manage Threads');
+    expect(perms.kind === 'error' && perms.message).not.toContain('add the bot');
+  });
+
+  it('quotes what Discord actually refused when the live probe failed', () => {
+    const result = buildThreadHereResult({
+      kind: 'rejected',
+      rejection: { kind: 'probe-failed', detail: 'Missing Permissions' },
+    });
+    expect(result.kind === 'error' && result.message).toContain('Missing Permissions');
+  });
+
+  // Never claim success on a write that did not reach the disk.
+  it('reports a save failure as an error rather than a confirmation', () => {
+    const result = buildThreadHereResult({ kind: 'rejected', rejection: { kind: 'save-failed' } });
+    expect(result.kind).toBe('error');
+    expect(result.kind === 'error' && result.message).toContain('could not save');
+  });
+});
+
+describe('buildThreadHereResult — successes', () => {
+  const CHANNEL = '333333333333333333';
+  const OTHER_CHANNEL = '444444444444444444';
+
+  it('confirms a fresh pin with the channel and the way back', () => {
+    const result = buildThreadHereResult({ kind: 'pinned', channelId: CHANNEL });
+    expect(result.kind).toBe('text');
+    if (result.kind !== 'text') throw new Error('unreachable');
+    expect(result.text).toContain(`<#${CHANNEL}>`);
+    expect(result.text).toContain('/thread-here action:clear');
+    // Sessions already running do not move, and silence about that reads as a bug.
+    expect(result.text).toContain('Sessions already running');
+    expect(result.text).not.toContain('instead of');
+  });
+
+  it('names the previous channel when a pin moves', () => {
+    const result = buildThreadHereResult({
+      kind: 'pinned',
+      channelId: CHANNEL,
+      previousChannelId: OTHER_CHANNEL,
+    });
+    expect(result.kind === 'text' && result.text).toContain(
+      `<#${CHANNEL}> instead of <#${OTHER_CHANNEL}>`,
+    );
+  });
+
+  // A re-pin is a no-op on disk but NOT a no-op in what it proves, so the reply says so.
+  it('says a re-pin of the same channel was rechecked', () => {
+    const result = buildThreadHereResult({ kind: 'already-pinned', channelId: CHANNEL });
+    expect(result.kind === 'text' && result.text).toContain('rechecked');
+    expect(result.kind === 'text' && result.text).toContain(`<#${CHANNEL}>`);
+  });
+
+  it('confirms a clear and names the deployment channel it overrides', () => {
+    const result = buildThreadHereResult({ kind: 'cleared', overriddenChannelId: CHANNEL });
+    expect(result.kind).toBe('text');
+    if (result.kind !== 'text') throw new Error('unreachable');
+    expect(result.text).toContain('your DMs');
+    expect(result.text).toContain(`instead of <#${CHANNEL}>`);
+  });
+
+  it('confirms a clear with no channel to name when the user only had their own pin', () => {
+    const result = buildThreadHereResult({ kind: 'cleared' });
+    expect(result.kind === 'text' && result.text).toContain('your DMs');
+    expect(result.kind === 'text' && result.text).not.toContain('instead of');
+  });
+
+  // `already-dm` is now reserved for a DM choice that is already ON DISK — clearing with no pin at
+  // all still records one, so this reply only appears when there is genuinely nothing to write.
+  it('says nothing changed when the DM choice was already recorded', () => {
+    const result = buildThreadHereResult({ kind: 'already-dm' });
+    expect(result.kind).toBe('text');
+    expect(result.kind === 'text' && result.text).toContain('Nothing changed.');
+  });
+});
+
+describe('buildThreadHereResult — status', () => {
+  const CHANNEL = '333333333333333333';
+
+  // Every row of the routing status. The reply has to name the destination, the authority behind
+  // it, and a way to change it — a user reading this because their output turned up somewhere
+  // unexpected needs all three, and a broken channel needs the reason too.
+  it.each<[string, ThreadHereStatus, string[]]>([
+    [
+      'a healthy channel the user pinned',
+      {
+        destination: 'channel',
+        channelId: CHANNEL,
+        source: 'pin',
+        health: { kind: 'ok' },
+      },
+      ['pinned by you', `<#${CHANNEL}>`],
+    ],
+    [
+      'a pinned channel that has gone away',
+      {
+        destination: 'channel',
+        channelId: CHANNEL,
+        source: 'pin',
+        health: { kind: 'unreachable' },
+      },
+      ['pinned to', 'cannot use that channel', 'your DMs'],
+    ],
+    [
+      'a pinned channel the bot lost permissions in',
+      {
+        destination: 'channel',
+        channelId: CHANNEL,
+        source: 'pin',
+        health: { kind: 'missing-permissions', missing: ['Manage Threads'] },
+      },
+      ['pinned to', 'Manage Threads', 'server admin'],
+    ],
+    [
+      'a pinned channel the user themselves can no longer see',
+      {
+        destination: 'channel',
+        channelId: CHANNEL,
+        source: 'pin',
+        health: { kind: 'user-cannot-access' },
+      },
+      // The bot's own permissions are fine here, so the reply must point at the user's access
+      // instead of sending them to an admin who has nothing to grant.
+      ['pinned to', 'cannot see that channel', 'your DMs'],
+    ],
+    [
+      'a healthy deployment channel',
+      {
+        destination: 'channel',
+        channelId: CHANNEL,
+        source: 'deployment',
+        health: { kind: 'ok' },
+      },
+      ["this deployment's default", 'pin your own'],
+    ],
+    [
+      'a deployment channel that has gone away',
+      {
+        destination: 'channel',
+        channelId: CHANNEL,
+        source: 'deployment',
+        health: { kind: 'unreachable' },
+      },
+      ['This deployment sends', 'cannot use that channel', 'your DMs'],
+    ],
+    [
+      'a deployment channel the bot lost permissions in',
+      {
+        destination: 'channel',
+        channelId: CHANNEL,
+        source: 'deployment',
+        health: { kind: 'missing-permissions', missing: ['View Channel'] },
+      },
+      ['This deployment sends', 'View Channel', 'your DMs'],
+    ],
+    [
+      'a deployment channel the user themselves can no longer see',
+      {
+        destination: 'channel',
+        channelId: CHANNEL,
+        source: 'deployment',
+        health: { kind: 'user-cannot-access' },
+      },
+      ['This deployment sends', 'cannot see that channel', 'your DMs'],
+    ],
+    ['DMs the user asked for', { destination: 'dm', source: 'pin' }, ['cleared by you', 'pin one']],
+    [
+      'DMs as the deployment default',
+      { destination: 'dm', source: 'deployment' },
+      ['your DMs', 'send them there instead'],
+    ],
+  ])('reports %s', (_label, status, expected) => {
+    const result = buildThreadHereResult({ kind: 'status', status });
+    expect(result.kind).toBe('text');
+    if (result.kind !== 'text') throw new Error('unreachable');
+    for (const fragment of expected) expect(result.text).toContain(fragment);
+  });
+
+  // Status is read-only: it must never be phrased as though it did something.
+  it('never claims a change', () => {
+    const result = buildThreadHereResult({
+      kind: 'status',
+      status: { destination: 'dm', source: 'deployment' },
+    });
+    expect(result.kind === 'text' && result.text).not.toContain('Pinned.');
+    expect(result.kind === 'text' && result.text).not.toContain('Cleared.');
   });
 });

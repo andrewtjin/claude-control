@@ -24,7 +24,11 @@ unit tests over a mock never close a wet gate. Do not mark a wet gate done from 
   quarantine handling, binding-limit headroom, determinism.
 - **control-plane-bot** — token mint/verify (constant-time), pairing (single-use,
   expiry, isolation), and WS relay routing/ACL over **real in-process sockets** (cross-
-  user isolation, bad-token/old-version rejection, invalid-frame drop).
+  user isolation, bad-token/old-version rejection, invalid-frame drop). Session-thread
+  routing is proven as far as it can be headlessly: the four-tier precedence, the
+  `/thread-here` decision tree and every reply string, the persisted pin store (concurrent
+  writes, a genuinely failed write, restart survival), and the command → store → resolver
+  path with no restart in between. Its three live Discord adapters are **not** — gate 14.
 - **session-runtime** — the summarizer, session state machine, and manager persistence,
   against injected fakes.
 
@@ -290,6 +294,43 @@ cross-repo split gates 2, 4 and 6 use.
 **Result:** not yet run — no Mac available. Nothing on this gate may be marked closed from
 the fake-runner unit tests or from the `macos-latest` CI leg (that leg exercises only our own
 `vault-key` item, which is the half that was never in doubt).
+
+### 14. `/thread-here` — the live Discord half ⏳ OPEN
+
+**State of the code:** the command, its precedence, its persistence and its whole decision tree
+are unit-proven. Its three live adapters are not: `gatherThreadHereFacts`, `probeThreadHere` and
+`inspectChannelHealth` are replaced by stand-ins in every test, so the guarantee that a channel
+the bot cannot use is refused at command time rests entirely on assumptions about Discord that
+no headless test can check.
+
+**Verify (each is an assumption the preflight is built on):**
+
+- **`interaction.appPermissions` reflects channel OVERWRITES**, not just the bot's guild-wide
+  role permissions. If it reports the role baseline, a channel that denies the bot by overwrite
+  passes stage one — the probe still catches it, but the reply names no permission and is
+  therefore unactionable.
+- **`interaction.guild === null` with a non-null `guildId` really is "the bot is not in this
+  server"** (user-installed app in a foreign guild). If it can also be null for a bot that IS a
+  member, that rejection tells a fixable case it cannot be fixed.
+- **The four required bits are exactly right.** Create a channel granting only View Channel,
+  Create Private Threads, Send Messages in Threads and Manage Threads — nothing else — and
+  confirm `/thread-here` pins and a real session thread is then created AND the user admitted.
+  Then revoke **Manage Threads alone** and confirm the pin is refused, which is the non-obvious
+  bit the whole preflight exists for (`invitable: false` + admitting a non-member).
+- **The probe cleans up.** After a successful pin, no `cctl channel check` thread remains. Then
+  force a cleanup failure and confirm a second `/thread-here` in the same channel reaps the
+  leftover rather than adding another.
+- **`action:show` names a user-side loss.** With the bot's permissions untouched, remove the
+  user's access to the pinned channel (leave the server, or deny View Channel for them) and
+  confirm `show` reports that they cannot see it — not `ok` — and that a new session lands in
+  their DMs.
+- **The three-second window.** A `pin` in a busy guild answers with a real reply, never "The
+  application did not respond". The path defers first, so this is a check that the deferral is
+  actually reached and edited, not that it is fast.
+
+**Pass:** every bullet above observed on a real Discord app, with a spare account.
+
+**Result:** not yet run.
 
 ## Reminder
 
