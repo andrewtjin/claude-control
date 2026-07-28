@@ -517,7 +517,9 @@ describe('ControlPlaneClient', () => {
     const onSessionSpawn = vi.fn();
     const onSessionStop = vi.fn();
     const onSessionPrune = vi.fn();
-    const onStatsRequest = vi.fn();
+    // Typed, unlike its neighbours, because this one's recorded payload is asserted on below —
+    // an untyped mock would make that read an `any`.
+    const onStatsRequest = vi.fn<(msg: MessageOf<'stats.request'>) => void>();
 
     client = new ControlPlaneClient({
       url: relay.url(),
