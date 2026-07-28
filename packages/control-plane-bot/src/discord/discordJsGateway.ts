@@ -128,19 +128,44 @@ const PROGRESS_ASSETS_DIR = join(
   '../../assets/progress-bar',
 );
 
-// Sent once, right after a daemon successfully claims a pairing code. Lists only commands
-// that are wired to something today — `/stop` and `/reauth` both reply with an explanatory
-// error (see commands.ts) rather than doing the thing their name implies, so they're left off
-// a message whose entire job is telling a brand-new user what to try first.
-const PAIRING_PRIMER_MESSAGE = [
+// Sent once, right after a daemon successfully claims a pairing code. Lists every command that
+// actually reaches the daemon, grouped so a brand-new user can find the one they want rather
+// than reading a flat wall of sixteen. {@link PRIMER_OMITTED_COMMANDS} records the ones
+// deliberately absent and why. A hand-written list beside a separately-declared command surface
+// drifts the moment someone adds a command and forgets this file, so a unit test holds the two to
+// each other rather than trusting the next author to remember.
+export const PAIRING_PRIMER_MESSAGE = [
   "Paired. Here's what works right now:",
+  '',
+  '**Usage**',
   '`/usage` — usage across accounts',
   '`/timeline` — 5h-session budget and reset timeline',
   '`/stats` — token counts per account, model and day',
-  '`/switch <account>` — switch the active account',
+  '`/accounts` — the accounts this daemon can switch between',
+  '',
+  '**Sessions**',
   '`/run <prompt>` — start a Claude Code session',
+  '`/say <session> <text>` — send a message into a running session',
+  '`/stop <session>` — stop a running session',
+  '`/sessions` — every session this daemon has reported',
+  '`/prune` — clear out dormant session records (asks first)',
+  '',
+  '**Daemon**',
+  '`/switch <account>` — switch the active account',
   '`/status` — daemon connection status',
+  '`/settings` — effective settings and where each came from',
+  '`/approve <request>` · `/deny <request>` — answer a pending permission request',
+  '',
+  'Permission prompts and questions arrive here as cards — tap the buttons, no command needed.',
 ].join('\n');
+
+/** Registered commands deliberately left out of {@link PAIRING_PRIMER_MESSAGE}, each for a reason
+ *  that outlives the current command list. `pair` is the command the reader just finished using.
+ *  `reauth` cannot do what its name implies — the bot holds no credentials by design, so it only
+ *  replies with the host-side CLI command to run (see commands.ts) — and the primer's entire job
+ *  is telling a new user what to try first. Read by the test that keeps the primer and the
+ *  registered list in step, so dropping a name from here is what makes that command required. */
+export const PRIMER_OMITTED_COMMANDS = new Set(['pair', 'reauth']);
 
 export interface DiscordJsGatewayOptions {
   relay: RelaySender;
@@ -753,7 +778,7 @@ export class DiscordJsGateway implements DiscordGateway {
       this.logger.warn('discord: no application on the client, slash commands not registered');
       return;
     }
-    const definitions = this.commandDefinitions();
+    const definitions = commandDefinitions();
     await application.commands.set(definitions);
     this.logger.info(
       { count: definitions.length, commands: definitions.map((d) => d.name).join(' ') },
@@ -785,87 +810,6 @@ export class DiscordJsGateway implements DiscordGateway {
       both: resolve('tl_mb') ?? UNICODE_TRACK_STYLE.both,
     };
     this.logger.info({ count: byName.size }, 'discord: progress emoji bars enabled');
-  }
-
-  private commandDefinitions() {
-    const account = (name: string, description: string) =>
-      new SlashCommandBuilder()
-        .setName(name)
-        .setDescription(description)
-        .addStringOption((o) =>
-          o.setName('account').setDescription('Account id').setRequired(true),
-        );
-
-    return [
-      new SlashCommandBuilder().setName('pair').setDescription('Pair a new daemon to your account'),
-      new SlashCommandBuilder().setName('usage').setDescription('Show usage across accounts'),
-      new SlashCommandBuilder()
-        .setName('timeline')
-        .setDescription('5h-session budget and reset timeline across accounts'),
-      new SlashCommandBuilder()
-        .setName('stats')
-        .setDescription('Token counts per account, model and day (last 7 days)'),
-      new SlashCommandBuilder().setName('accounts').setDescription('List paired accounts'),
-      new SlashCommandBuilder().setName('sessions').setDescription('List known sessions'),
-      new SlashCommandBuilder()
-        .setName('prune')
-        .setDescription('Remove dormant session records (asks to confirm)'),
-      new SlashCommandBuilder()
-        .setName('settings')
-        .setDescription("Show the daemon's effective settings and where each came from"),
-      new SlashCommandBuilder().setName('status').setDescription('Show daemon connection status'),
-      account('switch', 'Switch the active account'),
-      new SlashCommandBuilder()
-        .setName('run')
-        .setDescription('Start a Claude Code session')
-        .addStringOption((o) =>
-          o.setName('prompt').setDescription('Initial prompt').setRequired(true),
-        )
-        .addStringOption((o) =>
-          o.setName('cwd').setDescription('Working directory').setRequired(false),
-        )
-        .addStringOption((o) =>
-          o.setName('resume').setDescription('Session id to resume').setRequired(false),
-        ),
-      new SlashCommandBuilder()
-        .setName('say')
-        .setDescription('Send a message into a running session')
-        .addStringOption((o) =>
-          o.setName('session').setDescription('Session id or label').setRequired(true),
-        )
-        .addStringOption((o) => o.setName('text').setDescription('Message').setRequired(true)),
-      new SlashCommandBuilder()
-        .setName('stop')
-        .setDescription('Stop a running session')
-        .addStringOption((o) =>
-          o.setName('session').setDescription('Session id').setRequired(true),
-        ),
-      new SlashCommandBuilder()
-        .setName('approve')
-        .setDescription('Approve a pending permission request')
-        .addStringOption((o) =>
-          o.setName('request').setDescription('Request id').setRequired(true),
-        ),
-      new SlashCommandBuilder()
-        .setName('deny')
-        .setDescription('Deny a pending permission request')
-        .addStringOption((o) =>
-          o.setName('request').setDescription('Request id').setRequired(true),
-        ),
-      account('reauth', 'Re-authenticate a quarantined account'),
-      // Every command works identically from a server or from a DM with a user-installed
-      // app (handlers key solely off interaction.user.id, and delivery defaults to DM), so
-      // both contexts are declared on all of them. Without these, the commands stay
-      // guild-install-only and the portal's "User Install" toggle does nothing.
-    ].map((c) =>
-      c
-        .setIntegrationTypes(
-          ApplicationIntegrationType.GuildInstall,
-          ApplicationIntegrationType.UserInstall,
-        )
-        .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM)
-        .toJSON(),
-    );
   }
 
   private async onInteraction(interaction: Interaction): Promise<void> {
@@ -1264,4 +1208,82 @@ export class DiscordJsGateway implements DiscordGateway {
       await interaction.reply({ content: `Error: ${result.message}`, ...ephemeral });
     }
   }
+}
+
+/** The full slash-command surface this bot publishes to Discord, as REST payloads. Module-level
+ *  and exported rather than a method: it reads no gateway state, and the primer's drift test needs
+ *  the registered names without opening a Discord connection. Adding a command here is what makes
+ *  {@link PAIRING_PRIMER_MESSAGE} require a matching line (or an entry in
+ *  {@link PRIMER_OMITTED_COMMANDS}). */
+export function commandDefinitions() {
+  const account = (name: string, description: string) =>
+    new SlashCommandBuilder()
+      .setName(name)
+      .setDescription(description)
+      .addStringOption((o) => o.setName('account').setDescription('Account id').setRequired(true));
+
+  return [
+    new SlashCommandBuilder().setName('pair').setDescription('Pair a new daemon to your account'),
+    new SlashCommandBuilder().setName('usage').setDescription('Show usage across accounts'),
+    new SlashCommandBuilder()
+      .setName('timeline')
+      .setDescription('5h-session budget and reset timeline across accounts'),
+    new SlashCommandBuilder()
+      .setName('stats')
+      .setDescription('Token counts per account, model and day (last 7 days)'),
+    new SlashCommandBuilder().setName('accounts').setDescription('List paired accounts'),
+    new SlashCommandBuilder().setName('sessions').setDescription('List known sessions'),
+    new SlashCommandBuilder()
+      .setName('prune')
+      .setDescription('Remove dormant session records (asks to confirm)'),
+    new SlashCommandBuilder()
+      .setName('settings')
+      .setDescription("Show the daemon's effective settings and where each came from"),
+    new SlashCommandBuilder().setName('status').setDescription('Show daemon connection status'),
+    account('switch', 'Switch the active account'),
+    new SlashCommandBuilder()
+      .setName('run')
+      .setDescription('Start a Claude Code session')
+      .addStringOption((o) =>
+        o.setName('prompt').setDescription('Initial prompt').setRequired(true),
+      )
+      .addStringOption((o) =>
+        o.setName('cwd').setDescription('Working directory').setRequired(false),
+      )
+      .addStringOption((o) =>
+        o.setName('resume').setDescription('Session id to resume').setRequired(false),
+      ),
+    new SlashCommandBuilder()
+      .setName('say')
+      .setDescription('Send a message into a running session')
+      .addStringOption((o) =>
+        o.setName('session').setDescription('Session id or label').setRequired(true),
+      )
+      .addStringOption((o) => o.setName('text').setDescription('Message').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('stop')
+      .setDescription('Stop a running session')
+      .addStringOption((o) => o.setName('session').setDescription('Session id').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('approve')
+      .setDescription('Approve a pending permission request')
+      .addStringOption((o) => o.setName('request').setDescription('Request id').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('deny')
+      .setDescription('Deny a pending permission request')
+      .addStringOption((o) => o.setName('request').setDescription('Request id').setRequired(true)),
+    account('reauth', 'Re-authenticate a quarantined account'),
+    // Every command works identically from a server or from a DM with a user-installed
+    // app (handlers key solely off interaction.user.id, and delivery defaults to DM), so
+    // both contexts are declared on all of them. Without these, the commands stay
+    // guild-install-only and the portal's "User Install" toggle does nothing.
+  ].map((c) =>
+    c
+      .setIntegrationTypes(
+        ApplicationIntegrationType.GuildInstall,
+        ApplicationIntegrationType.UserInstall,
+      )
+      .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM)
+      .toJSON(),
+  );
 }
