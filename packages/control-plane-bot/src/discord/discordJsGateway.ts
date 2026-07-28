@@ -20,17 +20,20 @@ import {
   GatewayIntentBits,
   MessageFlags,
   ModalBuilder,
+  PermissionFlagsBits,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
   TextInputBuilder,
   TextInputStyle,
   type ButtonInteraction,
+  type Channel,
   type ChatInputCommandInteraction,
   type Interaction,
   type EmbedBuilder,
   type Message,
   type MessageActionRowComponentBuilder,
   type ModalSubmitInteraction,
+  type PermissionsBitField,
   type SendableChannels,
   type StringSelectMenuInteraction,
   SlashCommandBuilder,
@@ -97,8 +100,20 @@ import {
 } from './sessionPlanner.js';
 import { PersistentThreadRegistry, type DeliveryTarget } from './threadRegistry.js';
 import * as commands from './commands.js';
-import type { CommandDeps, CommandResult } from './commands.js';
-import { createSessionChannelResolver, type SessionChannelResolver } from './sessionChannels.js';
+import type {
+  CommandDeps,
+  CommandResult,
+  ThreadHereAction,
+  ThreadHereChannelFacts,
+  ThreadHereChannelHealth,
+  ThreadHereStatus,
+} from './commands.js';
+import {
+  chooseSessionChannel,
+  createSessionChannelResolver,
+  type SessionChannelResolver,
+} from './sessionChannels.js';
+import { PersistentSessionChannelPinStore } from './sessionChannelPins.js';
 
 /** The content/embeds/components subset common to `channel.send` and `message.edit`, so one built
  *  payload drives both the initial card send and every subsequent in-place edit. */
@@ -144,6 +159,7 @@ export const PAIRING_PRIMER_MESSAGE = [
   '`/stop <session>` — stop a running session',
   '`/sessions` — every session this daemon has reported',
   '`/prune` — clear out dormant session records (asks first)',
+  '`/thread-here` — send your session threads to this channel, or back to your DMs',
   '',
   '**Daemon**',
   '`/switch <account>` — switch the active account',
@@ -204,6 +220,54 @@ const BUTTON_STYLE: Record<ButtonSpecStyle, ButtonStyle> = {
   danger: ButtonStyle.Danger,
 };
 
+/** Exactly what {@link DiscordJsGateway.ensureTarget}'s create-then-add needs from a channel, in
+ *  the order a reader should fix them.
+ *
+ *  `ManageThreads` is the non-obvious one and the reason this preflight exists at all: session
+ *  threads are created with `invitable: false`, and admitting a non-member to a non-invitable
+ *  private thread requires it. Without it the create SUCCEEDS and the add throws, so delivery lands
+ *  on DMs with nothing but a log line to show for it — a channel that looks correctly configured
+ *  from every angle except the one that matters. `SendMessagesInThreads` fails later still: the
+ *  thread exists, the user is in it, and every frame the bot tries to post into it is refused. */
+const REQUIRED_THREAD_PERMISSIONS: readonly (readonly [bigint, string])[] = [
+  [PermissionFlagsBits.ViewChannel, 'View Channel'],
+  [PermissionFlagsBits.CreatePrivateThreads, 'Create Private Threads'],
+  [PermissionFlagsBits.SendMessagesInThreads, 'Send Messages in Threads'],
+  [PermissionFlagsBits.ManageThreads, 'Manage Threads'],
+];
+
+/** Name of the throwaway thread `/thread-here` creates to prove a channel really works. Self-
+ *  describing on purpose: if the cleanup delete ever fails, what is left behind says what it is. */
+const THREAD_HERE_PROBE_NAME = 'cctl channel check';
+
+/** How much of a Discord rejection to quote back to the user. Long enough to be diagnosable, short
+ *  enough that a stack-trace-shaped message cannot swallow the actionable half of the reply. */
+const PROBE_DETAIL_MAX_CHARS = 150;
+
+/** Which of the thread permissions the bot lacks, as the names shown in Discord's own permission
+ *  editor — the reply is an instruction to go and tick boxes, so it has to use the box labels.
+ *  A null permission set (no computed permissions for this context at all) reports every one as
+ *  missing rather than none: unknown is not the same as granted. Exported for its own unit test —
+ *  it is a bit filter, and the bit that matters most is the one nobody expects to need. */
+export function missingThreadPermissionLabels(
+  permissions: Readonly<PermissionsBitField> | null,
+): string[] {
+  if (!permissions) return REQUIRED_THREAD_PERMISSIONS.map(([, label]) => label);
+  return REQUIRED_THREAD_PERMISSIONS.filter(([flag]) => !permissions.has(flag)).map(
+    ([, label]) => label,
+  );
+}
+
+/** Flatten a thrown Discord error into one quotable line. Newlines collapse because the reply is a
+ *  sentence with the detail in parentheses, and a multi-line message would break it apart. */
+function describeProbeFailure(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const flattened = message.replace(/\s+/g, ' ').trim();
+  return flattened.length > PROBE_DETAIL_MAX_CHARS
+    ? `${flattened.slice(0, PROBE_DETAIL_MAX_CHARS - 1)}…`
+    : flattened;
+}
+
 /** Bot-side dedupe bounds: keep the last 2000 executed button keys for 15 minutes — comfortably
  *  longer than the daemon's permission TTL, so a double-tap is caught for as long as the original
  *  request could still be live, without unbounded growth. */
@@ -226,6 +290,18 @@ export class DiscordJsGateway implements DiscordGateway {
   private readonly planner = new SessionPlanner();
   /** Persisted sessionId→thread map; loaded on start(), survives restart. */
   private readonly threadReg: PersistentThreadRegistry;
+  /** Persisted per-user `/thread-here` choices; loaded on start(), survives restart. `protected`
+   *  (not `private`), same seam rationale as {@link sinkFor}: the command tests assert what a
+   *  `/thread-here` invocation actually WROTE, which is the only way to prove a rejected pin left
+   *  routing untouched. */
+  protected readonly sessionChannelPins: PersistentSessionChannelPinStore;
+  /** The deployment's own session-channel configuration, kept so `/thread-here action:show` can
+   *  name the channel a user would fall back to and say it came from the deployment rather than
+   *  from them. Routing itself reads these through the resolver; these fields exist for the
+   *  explanation, not the decision. A deployment that injects its own `sessionChannelResolver`
+   *  bypasses both, and its routing is correspondingly not introspectable here. */
+  private readonly deploymentChannelsByUser: ReadonlyMap<string, string> | undefined;
+  private readonly deploymentChannelId: string | undefined;
   /** How this deployment answers "which channel hosts this user's session threads?", or
    *  `undefined` for a pure-DM deployment. `protected` (not `private`) for the same reason as
    *  {@link sinkFor}: a test subclass can read back what the constructor wired, so the mixed
@@ -278,13 +354,16 @@ export class DiscordJsGateway implements DiscordGateway {
       ttlMs: SEEN_KEYS_TTL_MS,
       clock: this.clock,
     });
-    this.threadReg = new PersistentThreadRegistry(
-      options.stateDir ?? join(tmpdir(), 'claude-control-bot'),
-    );
-    // An explicit resolver wins; otherwise the per-user map and/or the shared channel id build one
-    // (see createSessionChannelResolver for the precedence and the undefined-means-DM contract).
-    // Only the discord.js fetch-and-narrow lives here — the channel a fetch is issued FOR is a pure
-    // decision, and keeping it that way is what makes the mixed deployment testable headlessly.
+    const stateDir = options.stateDir ?? join(tmpdir(), 'claude-control-bot');
+    this.threadReg = new PersistentThreadRegistry(stateDir);
+    this.sessionChannelPins = new PersistentSessionChannelPinStore(stateDir);
+    this.deploymentChannelsByUser = options.sessionChannelsByUser;
+    this.deploymentChannelId = options.sessionChannelId;
+    // An explicit resolver wins; otherwise the users' own pins, the per-user map and/or the shared
+    // channel id build one (see createSessionChannelResolver for the precedence and the
+    // undefined-means-DM contract). Only the discord.js fetch-and-narrow lives here — the channel a
+    // fetch is issued FOR is a pure decision, and keeping it that way is what makes the mixed
+    // deployment testable headlessly.
     this.sessionChannelResolver =
       options.sessionChannelResolver ??
       createSessionChannelResolver({
@@ -292,6 +371,10 @@ export class DiscordJsGateway implements DiscordGateway {
           const channel = await this.client.channels.fetch(channelId);
           return channel?.type === ChannelType.GuildText ? channel : undefined;
         },
+        // Bound to the store's live read rather than a snapshot of it: this resolver is built once
+        // and never rebuilt, so a pin set by /thread-here has to be observable through the accessor
+        // or it would not apply until the next restart.
+        resolvePin: (discordUserId) => this.sessionChannelPins.get(discordUserId),
         ...(options.sessionChannelsByUser ? { byUser: options.sessionChannelsByUser } : {}),
         ...(options.sessionChannelId ? { fallbackChannelId: options.sessionChannelId } : {}),
       });
@@ -328,13 +411,17 @@ export class DiscordJsGateway implements DiscordGateway {
   }
 
   /** Log in and start handling interactions. Never call from a test — it opens a real
-   *  connection to Discord's gateway. Loads the persisted session→thread map first so sessions
-   *  streamed before a restart keep delivering to their existing threads. */
+   *  connection to Discord's gateway. Loads both persisted maps first: the session→thread map so
+   *  sessions streamed before a restart keep delivering to their existing threads, and the
+   *  `/thread-here` pins so users keep the channel they chose. Neither load may be skipped for the
+   *  same reason — an unloaded store reads as empty, which is not a crash and not a log line, just
+   *  every user quietly reverted to the deployment's defaults. */
   async start(): Promise<void> {
     if (!this.token) {
       throw new Error('DISCORD_BOT_TOKEN is not set and no token was provided');
     }
     await this.threadReg.load();
+    await this.sessionChannelPins.load();
     await this.client.login(this.token);
   }
 
@@ -631,8 +718,15 @@ export class DiscordJsGateway implements DiscordGateway {
 
   /** The persisted delivery target for a route, creating a thread the first time (or pinning a DM
    *  fallback when no channel is available / creation fails). Never throws — the DM fallback is the
-   *  never-crash, never-drop guarantee. */
-  private async ensureTarget(route: SessionRoute): Promise<DeliveryTarget> {
+   *  never-crash, never-drop guarantee.
+   *
+   *  The early return on an existing registry entry is not just a cache: it is what makes a session
+   *  keep the thread it started in when the user later moves their channel, because the resolver is
+   *  consulted at most ONCE per session, on its first frame. `protected` (not `private`), same seam
+   *  rationale as {@link sinkFor}: a test drives it directly with a fake parent channel to hold that
+   *  invariant down, since removing the guard would look like a harmless refactor and would silently
+   *  start re-resolving live sessions. */
+  protected async ensureTarget(route: SessionRoute): Promise<DeliveryTarget> {
     const existing = this.threadReg.get(route.discordUserId, route.sessionId);
     if (existing) return existing;
     let target: DeliveryTarget = { kind: 'dm' };
@@ -849,7 +943,11 @@ export class DiscordJsGateway implements DiscordGateway {
     }
   }
 
-  private async onSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  /** `protected` (not `private`), same seam rationale as {@link sinkFor}: a test drives a whole
+   *  command through this method with a stand-in interaction, which is the only place the
+   *  acknowledgement discipline below is observable — every handler returns a `CommandResult` and
+   *  none of them knows whether the interaction was deferred first. */
+  protected async onSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     // The ONLY identity source for every handler below — never a command option, never
     // anything the interaction's author could spoof.
     const userId = interaction.user.id;
@@ -964,6 +1062,24 @@ export class DiscordJsGateway implements DiscordGateway {
           interaction.options.getString('account', true),
         );
         break;
+      case 'thread-here': {
+        // Parsed against the known values rather than cast: an unrecognised string can then only
+        // ever mean the default, never a fourth behaviour arriving through a command definition
+        // Discord still has registered from an older deploy.
+        const raw = interaction.options.getString('action');
+        const action: ThreadHereAction =
+          raw === 'clear' ? 'clear' : raw === 'show' ? 'show' : 'pin';
+        // The one command here that talks to Discord before it can answer: reading the channel,
+        // minting a probe thread, admitting the user, deleting it, then persisting — each a round
+        // trip, and thread creation is among the more aggressively rate-limited endpoints. Discord
+        // gives an unacknowledged interaction three seconds, and overrunning it would show "The
+        // application did not respond" over a pin that DID persist: the exact inverse of the
+        // guarantee every reply on this path makes. Deferring buys fifteen minutes and costs a
+        // thinking indicator. Every other branch is synchronous and needs none of this.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        result = await this.onThreadHere(interaction, userId, action);
+        break;
+      }
       default:
         result = { kind: 'error', message: `unknown command: ${interaction.commandName}` };
     }
@@ -1036,6 +1152,257 @@ export class DiscordJsGateway implements DiscordGateway {
       return;
     }
     await interaction.editReply({ embeds: [buildStatsEmbed(snapshot)] });
+  }
+
+  /** `/thread-here` — where this user's future session threads are created, chosen by the user.
+   *
+   *  Orchestration only: the live seams below gather facts, probe and inspect; commands.ts decides
+   *  and renders; this store is what gets written. The one thing that lives here and nowhere else
+   *  is the ORDER — nothing is persisted until every preflight stage has passed — which is what
+   *  makes each rejection's "nothing was changed" a statement rather than a hope.
+   *
+   *  `discordUserId` is the caller's own `interaction.user.id` and the command declares no user
+   *  option, so a user can only read or write THEIR OWN routing: structurally, not by a check that
+   *  a later edit could drop. `protected` (not `private`), same seam rationale as {@link sinkFor} —
+   *  a test drives the whole tree, the write and the resolver end to end with no Discord
+   *  connection.
+   *
+   *  Deliberately NOT gated on being paired, unlike every daemon-facing command here. This one
+   *  reaches no daemon and reads no binding: it records a preference in the bot's own state, and
+   *  choosing where your output should land before you own anything that produces output is a
+   *  reasonable order to do things in. Refusing an unpaired user would also mean the first thing a
+   *  new user is told about their routing is that they may not have an opinion on it yet. */
+  protected async onThreadHere(
+    interaction: ChatInputCommandInteraction,
+    discordUserId: string,
+    action: ThreadHereAction,
+  ): Promise<CommandResult> {
+    if (action === 'show') {
+      return commands.buildThreadHereResult({
+        kind: 'status',
+        status: await this.threadHereStatus(discordUserId),
+      });
+    }
+    if (action === 'clear') return this.clearThreadHere(discordUserId);
+    return this.pinThreadHere(interaction, discordUserId);
+  }
+
+  /** Pin the invoking channel, after proving the bot can really use it. */
+  private async pinThreadHere(
+    interaction: ChatInputCommandInteraction,
+    discordUserId: string,
+  ): Promise<CommandResult> {
+    const facts = await this.gatherThreadHereFacts(interaction);
+    const rejection = commands.rejectThreadHereChannel(facts);
+    if (rejection) return commands.buildThreadHereResult({ kind: 'rejected', rejection });
+    // Stage two. The bits above can NAME what is wrong, which is what makes the reply actionable,
+    // but only a real create-and-add can show that nothing else is: a guild's active-thread
+    // ceiling, a rate limit and an overwrite subtlety are all invisible to a permission check.
+    const probe = await this.probeThreadHere(interaction);
+    if (!probe.ok) {
+      return commands.buildThreadHereResult({
+        kind: 'rejected',
+        rejection: { kind: 'probe-failed', detail: probe.detail },
+      });
+    }
+    const channelId = interaction.channelId;
+    const existing = this.sessionChannelPins.get(discordUserId);
+    // Re-pinning the same channel still runs the full preflight above rather than short-circuiting
+    // on the stored value: permissions get revoked after the fact, and "it is already pinned" is
+    // only worth saying once it has been rechecked.
+    if (existing?.kind === 'channel' && existing.channelId === channelId) {
+      return commands.buildThreadHereResult({ kind: 'already-pinned', channelId });
+    }
+    try {
+      await this.sessionChannelPins.record(discordUserId, { kind: 'channel', channelId });
+    } catch (err) {
+      this.logger.warn({ err, discordUserId }, 'discord: thread-here pin write failed');
+      return commands.buildThreadHereResult({
+        kind: 'rejected',
+        rejection: { kind: 'save-failed' },
+      });
+    }
+    this.logger.info({ discordUserId, channelId }, 'discord: thread-here pin updated');
+    return commands.buildThreadHereResult({
+      kind: 'pinned',
+      channelId,
+      ...(existing?.kind === 'channel' ? { previousChannelId: existing.channelId } : {}),
+    });
+  }
+
+  /** Send this user's future session threads back to their DMs. No channel is involved, so this
+   *  works from a DM as well as a server — the way out must not require standing anywhere.
+   *
+   *  A user who is already on DMs still gets the `{dm}` choice RECORDED, even on a deployment that
+   *  configures no session channel at all and where the write therefore changes nothing today. The
+   *  reason is tomorrow: an operator who later sets `CCTL_SESSION_CHANNEL_ID` would otherwise sweep
+   *  that user into a channel they had explicitly asked not to be in, while a user who happened to
+   *  pin-then-clear stays on DMs — two people who performed the same visible action getting
+   *  different futures out of an edit neither of them saw. `already-dm` is reserved for the case
+   *  where the decision is already on disk, so it is a true no-op rather than a silent one. */
+  private async clearThreadHere(discordUserId: string): Promise<CommandResult> {
+    const existing = this.sessionChannelPins.get(discordUserId);
+    if (existing?.kind === 'dm') return commands.buildThreadHereResult({ kind: 'already-dm' });
+    const overridden =
+      existing === undefined ? this.deploymentChannelFor(discordUserId) : undefined;
+    try {
+      await this.sessionChannelPins.record(discordUserId, { kind: 'dm' });
+    } catch (err) {
+      this.logger.warn({ err, discordUserId }, 'discord: thread-here pin write failed');
+      return commands.buildThreadHereResult({
+        kind: 'rejected',
+        rejection: { kind: 'save-failed' },
+      });
+    }
+    this.logger.info({ discordUserId }, 'discord: thread-here pin cleared');
+    return commands.buildThreadHereResult({
+      kind: 'cleared',
+      ...(overridden !== undefined ? { overriddenChannelId: overridden } : {}),
+    });
+  }
+
+  /** Where this user's next session thread would go, why, and whether that is currently possible.
+   *  Runs the SAME precedence function routing does, so the answer cannot drift from the behaviour
+   *  it describes — a status reply that confidently reports routing the bot no longer performs is
+   *  worse than no status reply. */
+  private async threadHereStatus(discordUserId: string): Promise<ThreadHereStatus> {
+    const choice = chooseSessionChannel(discordUserId, {
+      pin: this.sessionChannelPins.get(discordUserId),
+      byUser: this.deploymentChannelsByUser,
+      fallbackChannelId: this.deploymentChannelId,
+    });
+    if (choice.destination === 'dm') return { destination: 'dm', source: choice.source };
+    return {
+      destination: 'channel',
+      channelId: choice.channelId,
+      source: choice.source,
+      health: await this.inspectChannelHealth(choice.channelId, discordUserId),
+    };
+  }
+
+  /** The channel this user would fall back to with no pin of their own, or `undefined` for a
+   *  deployment that configures none — what a clear is overriding, and only ever used to SAY so. */
+  private deploymentChannelFor(discordUserId: string): string | undefined {
+    const choice = chooseSessionChannel(discordUserId, {
+      pin: undefined,
+      byUser: this.deploymentChannelsByUser,
+      fallbackChannelId: this.deploymentChannelId,
+    });
+    return choice.destination === 'channel' ? choice.channelId : undefined;
+  }
+
+  /** Live seam: everything about the invoking channel the pin decision needs, as plain data.
+   *  `appPermissions` is computed by Discord and delivered on the interaction payload, so the
+   *  ordinary case costs no API call; the channel fetch is only for one the client has not cached.
+   *  `protected` so a test can supply the facts directly and exercise the decision tree. */
+  protected async gatherThreadHereFacts(
+    interaction: ChatInputCommandInteraction,
+  ): Promise<ThreadHereChannelFacts> {
+    const channel = await this.resolveInteractionChannel(interaction);
+    return {
+      inGuild: interaction.guildId !== null,
+      // Null `guild` with a non-null `guildId` is the user-installed app in a server the bot was
+      // never added to. Discord cannot compute channel-overwrite permissions for a bot with no
+      // presence there, so the permission list would be a fixed baseline and "ask an admin to grant
+      // these" would be advice that cannot work — hence its own rejection, not a permissions one.
+      botInGuild: interaction.guild !== null,
+      channelResolved: channel !== undefined,
+      isThread: channel?.isThread() ?? false,
+      // The same narrowing thread creation itself applies, so a channel that passes here is a
+      // channel `ensureTarget` will accept later.
+      isGuildText: channel?.type === ChannelType.GuildText,
+      missingPermissions: missingThreadPermissionLabels(interaction.appPermissions),
+    };
+  }
+
+  /** Live seam: create a private thread here, admit the user, delete it. The project's standing
+   *  rule is to verify in the real target rather than a convenient proxy, and a permission check is
+   *  exactly a convenient proxy — every argument matches {@link ensureTarget}'s real create,
+   *  because the argument that would otherwise differ (`invitable: false`) is precisely what makes
+   *  the member add require Manage Threads. Costs one thread created and deleted per pin, on a
+   *  manually-invoked command. `protected` so a test can stand in for it. */
+  protected async probeThreadHere(
+    interaction: ChatInputCommandInteraction,
+  ): Promise<{ ok: true } | { ok: false; detail: string }> {
+    const channel = await this.resolveInteractionChannel(interaction);
+    if (channel === undefined || channel.type !== ChannelType.GuildText) {
+      // The fact-gathering pass already rejected everything but a text channel, so getting here
+      // means the channel stopped resolving between the two reads.
+      return { ok: false, detail: 'the channel could not be read' };
+    }
+    // Reap anything an earlier probe failed to delete before minting another, so a channel whose
+    // cleanup keeps failing accumulates one leftover rather than one per invocation. Only the
+    // client's own thread cache is consulted (no extra API call), and only threads this bot owns
+    // under the probe's exact name are touched — a human's identically-named thread is not ours to
+    // delete. Best-effort by design: a channel the bot cannot tidy is still a channel it can prove.
+    for (const stale of channel.threads.cache.values()) {
+      if (stale.name !== THREAD_HERE_PROBE_NAME || stale.ownerId !== this.client.user?.id) continue;
+      await stale.delete().catch((err: unknown) => {
+        this.logger.warn({ err }, 'discord: thread-here stale probe cleanup failed');
+      });
+    }
+    try {
+      const thread = await channel.threads.create({
+        name: THREAD_HERE_PROBE_NAME,
+        type: ChannelType.PrivateThread,
+        invitable: false,
+      });
+      await thread.members.add(interaction.user.id);
+      // A failed cleanup does not fail the command: the thing under test already succeeded, and the
+      // leftover thread announces what it is by name.
+      await thread.delete().catch((err: unknown) => {
+        this.logger.warn({ err }, 'discord: thread-here probe cleanup failed');
+      });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, detail: describeProbeFailure(err) };
+    }
+  }
+
+  /** Live seam: can this user's session threads still be delivered to an already-chosen channel?
+   *  Unlike the pin path this channel is not the one the command was invoked in, so the
+   *  interaction's `appPermissions` says nothing about it and permissions have to be computed
+   *  against the channel itself. Read-only — no thread is created, because `show` must stay safe to
+   *  run at any time.
+   *
+   *  BOTH sides are checked, in the order a reader should act on them. The bot's own permissions
+   *  come first because they block delivery for everyone in the channel and only an admin can fix
+   *  them. The user's own access comes second and is the half a bot-only check would miss entirely:
+   *  {@link ensureTarget} creates the thread AND admits the user to it, and that add fails once the
+   *  user has left the server or lost sight of the channel — bot permissions unchanged, pin intact,
+   *  every session silently on DMs. That is the likeliest cause of "why am I suddenly getting DMs?",
+   *  so it is exactly what this must be able to name. */
+  protected async inspectChannelHealth(
+    channelId: string,
+    discordUserId: string,
+  ): Promise<ThreadHereChannelHealth> {
+    const channel = await this.client.channels.fetch(channelId).catch(() => null);
+    if (channel === null || channel.type !== ChannelType.GuildText) return { kind: 'unreachable' };
+    const me =
+      channel.guild.members.me ?? (await channel.guild.members.fetchMe().catch(() => null));
+    if (!me) return { kind: 'unreachable' };
+    const missing = missingThreadPermissionLabels(channel.permissionsFor(me));
+    if (missing.length > 0) return { kind: 'missing-permissions', missing };
+    // A failed member fetch and a member who cannot see the channel collapse to one answer on
+    // purpose: "you have left the server" and "you can no longer see that channel" have the same
+    // consequence, the same repair, and the bot cannot always distinguish them anyway.
+    const member = await channel.guild.members.fetch(discordUserId).catch(() => null);
+    if (!member || channel.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel) !== true) {
+      return { kind: 'user-cannot-access' };
+    }
+    return { kind: 'ok' };
+  }
+
+  /** The channel an interaction fired in. Cached for anything the bot can see with the Guilds
+   *  intent; the fetch covers the case where it is not, using the id the interaction always
+   *  carries. Both failure modes collapse to `undefined` — the caller reports "could not read this
+   *  channel", which is true either way and actionable in the same way (try again). */
+  private async resolveInteractionChannel(
+    interaction: ChatInputCommandInteraction,
+  ): Promise<Channel | undefined> {
+    if (interaction.channel) return interaction.channel;
+    const fetched = await this.client.channels.fetch(interaction.channelId).catch(() => null);
+    return fetched ?? undefined;
   }
 
   /** Button routing is the whole two-tap + dedupe surface, but every DECISION is made by the pure
@@ -1287,23 +1654,31 @@ export class DiscordJsGateway implements DiscordGateway {
     interaction: ChatInputCommandInteraction | ButtonInteraction,
     result: CommandResult,
   ): Promise<void> {
+    const body =
+      result.kind === 'embed'
+        ? { embeds: [result.embed] }
+        : result.kind === 'text'
+          ? {
+              content: result.text,
+              // A text result may carry buttons (e.g. /prune's armed confirm control) — inflate
+              // them exactly like every other ButtonSpec surface.
+              ...(result.components !== undefined
+                ? { components: this.toRows(result.components) }
+                : {}),
+            }
+          : { content: `Error: ${result.message}` };
+    // A deferred interaction has already been acknowledged, so its placeholder must be EDITED —
+    // `reply` on it is rejected as "already acknowledged" and the user is left watching the
+    // thinking indicator forever. The deferral already carried the ephemeral flag; repeating it
+    // here is not possible and not needed, since a reply's visibility is fixed at acknowledgement.
+    if (interaction.deferred) {
+      await interaction.editReply(body);
+      return;
+    }
     // `flags: Ephemeral` rather than the deprecated `ephemeral: true`. These replies can carry
     // account labels and usage figures, so if the option ever stopped being honored they would
     // post visibly in a shared channel — worth not relying on a deprecated spelling.
-    const ephemeral = { flags: MessageFlags.Ephemeral } as const;
-    if (result.kind === 'embed') {
-      await interaction.reply({ embeds: [result.embed], ...ephemeral });
-    } else if (result.kind === 'text') {
-      await interaction.reply({
-        content: result.text,
-        ...ephemeral,
-        // A text result may carry buttons (e.g. /prune's armed confirm control) — inflate
-        // them exactly like every other ButtonSpec surface.
-        ...(result.components !== undefined ? { components: this.toRows(result.components) } : {}),
-      });
-    } else {
-      await interaction.reply({ content: `Error: ${result.message}`, ...ephemeral });
-    }
+    await interaction.reply({ ...body, flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -1354,6 +1729,23 @@ export function commandDefinitions() {
     new SlashCommandBuilder()
       .setName('settings')
       .setDescription("Show the daemon's effective settings and where each came from"),
+    // Routing sits beside configuration. Verb-less like /usage and /settings because it names a
+    // place rather than an action, and one command with an action option rather than a pair of
+    // commands so pinning and un-pinning stay visibly the same setting.
+    new SlashCommandBuilder()
+      .setName('thread-here')
+      .setDescription('Send your session threads to this channel, or back to your DMs')
+      .addStringOption((o) =>
+        o
+          .setName('action')
+          .setDescription('Default: pin this channel')
+          .setRequired(false)
+          .addChoices(
+            { name: 'pin this channel', value: 'pin' },
+            { name: 'clear — send my session threads back to my DMs', value: 'clear' },
+            { name: 'show — where do my session threads go right now?', value: 'show' },
+          ),
+      ),
     new SlashCommandBuilder().setName('status').setDescription('Show daemon connection status'),
     account('switch', 'Switch the active account'),
     new SlashCommandBuilder()
