@@ -4,11 +4,10 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  extractWeeklyReading,
   measureBurnUnitsPerDay,
   predictWeeklyReset,
   readFleetHistory,
-  readWeeklyObservations,
-  type SnapshotRowLike,
   type WeeklyObservation,
 } from './usageHistory.js';
 
@@ -167,58 +166,91 @@ describe('measureBurnUnitsPerDay', () => {
   });
 });
 
-describe('readWeeklyObservations', () => {
-  const row = (fetchedAtMs: number, limits: unknown): { fetchedAtMs: number; json: string } => ({
-    fetchedAtMs,
-    json: JSON.stringify({ limits }),
+describe('extractWeeklyReading', () => {
+  const payload = (limits: unknown): string => JSON.stringify({ limits });
+
+  it('pulls percent and reset off the weekly_all limit', () => {
+    expect(
+      extractWeeklyReading(
+        payload([{ kind: 'weekly_all', percent: 60, resetsAt: '2026-07-30T05:00:00.000Z' }]),
+      ),
+    ).toEqual({ weeklyPercent: 60, weeklyResetsAtMs: Date.parse('2026-07-30T05:00:00.000Z') });
   });
 
-  it('pulls percent and reset off the weekly_all limit, sorted oldest first', () => {
-    const observations = readWeeklyObservations([
-      row(NOW, [{ kind: 'weekly_all', percent: 60, resetsAt: '2026-07-30T05:00:00.000Z' }]),
-      row(NOW - DAY_MS, [{ kind: 'weekly_all', percent: 40 }]),
-    ]);
-    expect(observations).toEqual([
-      { fetchedAtMs: NOW - DAY_MS, percent: 40 },
-      { fetchedAtMs: NOW, percent: 60, resetsAtMs: Date.parse('2026-07-30T05:00:00.000Z') },
-    ]);
+  it('reads a reading with no reset as a reading, not as an absence', () => {
+    expect(extractWeeklyReading(payload([{ kind: 'weekly_all', percent: 40 }]))).toEqual({
+      weeklyPercent: 40,
+      weeklyResetsAtMs: null,
+    });
   });
 
-  it('skips a corrupt row instead of blinding the whole measurement', () => {
-    const observations = readWeeklyObservations([
-      { fetchedAtMs: NOW - DAY_MS, json: 'not json' },
-      row(NOW, [{ kind: 'weekly_all', percent: 10 }]),
-    ]);
-    expect(observations).toHaveLength(1);
-    expect(observations[0]?.percent).toBe(10);
+  it('answers "no reading" for a corrupt payload instead of throwing on the write path', () => {
+    // Total by construction: this runs inside insertUsageSnapshot, so a throw here would fail the
+    // write carrying the snapshot, not merely lose one observation.
+    expect(extractWeeklyReading('not json')).toEqual({
+      weeklyPercent: null,
+      weeklyResetsAtMs: null,
+    });
+    expect(extractWeeklyReading('{}')).toEqual({ weeklyPercent: null, weeklyResetsAtMs: null });
   });
 
-  it('skips rows with no weekly_all limit or a non-numeric percent', () => {
-    expect(readWeeklyObservations([row(NOW, [{ kind: 'session', percent: 20 }])])).toEqual([]);
-    expect(readWeeklyObservations([row(NOW, [{ kind: 'weekly_all' }])])).toEqual([]);
+  it('answers "no reading" with no weekly_all limit or a non-numeric percent', () => {
+    expect(extractWeeklyReading(payload([{ kind: 'session', percent: 20 }])).weeklyPercent).toBe(
+      null,
+    );
+    expect(extractWeeklyReading(payload([{ kind: 'weekly_all' }])).weeklyPercent).toBe(null);
   });
 
   it('drops an unparseable reset timestamp rather than poisoning the anchor with NaN', () => {
-    const observations = readWeeklyObservations([
-      row(NOW, [{ kind: 'weekly_all', percent: 10, resetsAt: 'never' }]),
-    ]);
-    expect(observations[0]?.resetsAtMs).toBeUndefined();
+    expect(
+      extractWeeklyReading(payload([{ kind: 'weekly_all', percent: 10, resetsAt: 'never' }]))
+        .weeklyResetsAtMs,
+    ).toBe(null);
+  });
+
+  it('reads weekly_all only, never the Fable-scoped meter beside it', () => {
+    expect(
+      extractWeeklyReading(
+        payload([
+          { kind: 'weekly_scoped', percent: 99 },
+          { kind: 'weekly_all', percent: 12 },
+        ]),
+      ).weeklyPercent,
+    ).toBe(12);
   });
 });
 
 describe('readFleetHistory', () => {
-  const weeklyRow = (fetchedAtMs: number, percent: number, resetsAt?: string): SnapshotRowLike => ({
-    fetchedAtMs,
-    json: JSON.stringify({
-      limits: [{ kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resetsAt } : {}) }],
-    }),
-  });
-
-  /** A store stand-in honoring the same `sinceMs` bound the real query applies. */
-  function reader(rows: Record<string, SnapshotRowLike[]>) {
+  /** Fixtures stay written as the PAYLOAD the endpoint actually returns, then go through the same
+   *  `extractWeeklyReading` the store now runs at insert time — so these tests keep covering the
+   *  real weekly_all semantics end to end, rather than hand-building the denormalized answer and
+   *  asserting against a shape no production write ever produced. */
+  const weeklyRow = (
+    fetchedAtMs: number,
+    percent: number,
+    resetsAt?: string,
+  ): WeeklyObservation => {
+    const reading = extractWeeklyReading(
+      JSON.stringify({
+        limits: [{ kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resetsAt } : {}) }],
+      }),
+    );
     return {
-      listUsageSnapshotsSince: (accountId: string, sinceMs: number) =>
-        (rows[accountId] ?? []).filter((r) => r.fetchedAtMs >= sinceMs),
+      fetchedAtMs,
+      percent: reading.weeklyPercent as number,
+      ...(reading.weeklyResetsAtMs !== null ? { resetsAtMs: reading.weeklyResetsAtMs } : {}),
+    };
+  };
+
+  /** A store stand-in honoring the same `sinceMs` bound and ascending order the real query
+   *  applies — the sort is the store's job now, so a reader that returned them shuffled would be
+   *  testing a contract the production reader does not have. */
+  function reader(rows: Record<string, WeeklyObservation[]>) {
+    return {
+      listWeeklyObservationsSince: (accountId: string, sinceMs: number) =>
+        (rows[accountId] ?? [])
+          .filter((r) => r.fetchedAtMs >= sinceMs)
+          .sort((a, b) => a.fetchedAtMs - b.fetchedAtMs),
     };
   }
 
