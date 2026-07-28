@@ -1,14 +1,20 @@
 // discordJsGateway is otherwise a live boundary (see its file header): start()/deliver() make real
-// Discord API calls, so it is not unit-tested. This ONE test is the deliberate exception — it
-// proves the per-session-route SERIALIZATION of deliver(), which is gateway-local
-// state (the promise chain + the cardMessages map) that no pure module can hold. It exercises that
-// serialization through the single `protected sinkFor` seam by returning a controllable fake sink,
-// so nothing here touches a real Discord connection.
+// Discord API calls, so it is not unit-tested. Two deliberate exceptions live here. The first
+// proves the per-session-route SERIALIZATION of deliver(), which is gateway-local state (the
+// promise chain + the cardMessages map) that no pure module can hold; it exercises that
+// serialization through the single `protected sinkFor` seam by returning a controllable fake sink.
+// The second is pure data — it holds the pairing primer and the registered command list to each
+// other. Neither touches a real Discord connection.
 
 import { describe, it, expect } from 'vitest';
 import type { EmbedBuilder, Message, SendableChannels } from 'discord.js';
 import type { Envelope } from '@claude-control/shared-protocol';
-import { DiscordJsGateway } from './discordJsGateway.js';
+import {
+  DiscordJsGateway,
+  PAIRING_PRIMER_MESSAGE,
+  PRIMER_OMITTED_COMMANDS,
+  commandDefinitions,
+} from './discordJsGateway.js';
 import type { SessionRoute } from './sessionPlanner.js';
 import type { CardRef } from './permissionCards.js';
 import type { RelaySender } from '../relay.js';
@@ -292,5 +298,43 @@ describe('DiscordJsGateway — question.lapsed', () => {
     ).resolves.toBeUndefined();
 
     expect(gw.resolveCalls).toEqual([]);
+  });
+});
+
+/** The post-pairing primer is the first thing a new user reads, and it is a hand-written list of
+ *  a surface declared somewhere else — the shape that goes stale without anyone noticing, because
+ *  nothing fails when it does. These tests are what fails: they tie the primer to the registered
+ *  commands in both directions, so neither adding nor removing a command can leave it wrong. Pure
+ *  data on both sides — no Discord connection is involved. */
+describe('pairing primer', () => {
+  /** Command names the primer mentions. Matches the `/name` opening a backticked command
+   *  reference then drops the two leading punctuation chars, so option placeholders (`<prompt>`)
+   *  and surrounding prose are ignored. */
+  const mentioned = new Set(
+    (PAIRING_PRIMER_MESSAGE.match(/`\/[a-z]+/g) ?? []).map((token) => token.slice(2)),
+  );
+  const registered = new Set(commandDefinitions().map((c) => c.name));
+
+  it('mentions no command that is not registered', () => {
+    expect([...mentioned].filter((name) => !registered.has(name))).toEqual([]);
+  });
+
+  it('mentions every registered command except the documented omissions', () => {
+    const unmentioned = [...registered].filter(
+      (name) => !mentioned.has(name) && !PRIMER_OMITTED_COMMANDS.has(name),
+    );
+    expect(unmentioned).toEqual([]);
+  });
+
+  it('omits only commands that still exist', () => {
+    // The reverse drift: deleting a command must retire its omission entry too, or the set
+    // quietly excuses a name nothing would have mentioned anyway.
+    expect([...PRIMER_OMITTED_COMMANDS].filter((name) => !registered.has(name))).toEqual([]);
+  });
+
+  it('fits in one Discord message', () => {
+    // Discord rejects a body over 2000 characters and sendPrimer posts this in a single send, so
+    // an over-long primer fails as a DM the user never sees rather than truncating.
+    expect(PAIRING_PRIMER_MESSAGE.length).toBeLessThanOrEqual(2000);
   });
 });
