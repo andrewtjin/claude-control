@@ -5,8 +5,8 @@
 // RelayServer — reading config exclusively from the environment:
 //   DISCORD_BOT_TOKEN        (required) the Discord application's bot token
 //   CCTL_RELAY_PORT          (default 8765) WebSocket port daemons connect to
-//   CCTL_BOT_STATE_DIR       (default ~/.claude-control-bot) where bindings.json and
-//                            session-threads.json live
+//   CCTL_BOT_STATE_DIR       (default ~/.claude-control-bot) where bindings.json,
+//                            session-threads.json and session-channel-pins.json live
 //   CCTL_SESSION_CHANNEL_ID  (optional) text channel that hosts per-session private threads
 //                            for every paired user WITHOUT a CCTL_SESSION_CHANNELS entry;
 //                            unset → those users' session output is delivered by DM
@@ -16,6 +16,12 @@
 //                            CCTL_SESSION_CHANNEL_ID, or to DM when that is unset. Setting
 //                            only this one is the mixed deployment: threads for the operator,
 //                            DMs for every other paired user.
+//                            Both of these are DEFAULTS: a user's own `/thread-here` outranks
+//                            them in both directions (their own channel, or back to DMs), and
+//                            that choice lives in session-channel-pins.json. Neither env var
+//                            is an access control — they cannot stop someone reading their own
+//                            session output — so the operator's real lever over where the bot
+//                            may post is the channel's Discord permissions.
 //   CCTL_LOG_LEVEL           (default info)
 //   CCTL_LOG_FORMAT          (default: pretty on a TTY, json otherwise) 'pretty' or 'json'
 //                            overrides the auto-detection either way; see shared-protocol's
