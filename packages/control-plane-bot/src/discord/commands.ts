@@ -89,6 +89,31 @@ export function handleStats(deps: CommandDeps, discordUserId: string): CommandRe
   return { kind: 'embed', embed: buildStatsEmbed(stats) };
 }
 
+/** `/stats days:N` — ask the daemon to scan its transcripts over an explicitly chosen window.
+ *
+ *  The cached-snapshot answer above cannot serve this: the cache holds ONE window (the 7 days the
+ *  daemon pushes), and the per-account/per-model breakdowns are aggregates that cannot be re-sliced
+ *  into a different window after the fact. So an explicit `days` is a real round trip to the host.
+ *
+ *  This function only SENDS. The answer arrives later on the delivery path and is matched back to
+ *  the waiting interaction by `requestId` (see PendingStatsScans) — so a caller must register its
+ *  wait before calling this, and the returned result reports only whether the request got out. */
+export function handleStatsScan(
+  deps: CommandDeps,
+  discordUserId: string,
+  days: number,
+  requestId: string,
+): CommandResult {
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'stats.request',
+    payload: { requestId, days },
+  }));
+  return result.ok
+    ? { kind: 'text', text: `Scanning the last ${days} day${days === 1 ? '' : 's'} on the host…` }
+    : { kind: 'error', message: result.error };
+}
+
 /** `/settings` — the daemon's effective configuration, from the settings.snapshot it pushes
  *  alongside every usage snapshot (same cache-answer pattern as `/usage`). */
 export function handleSettings(deps: CommandDeps, discordUserId: string): CommandResult {

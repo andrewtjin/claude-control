@@ -40,6 +40,11 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { isType, type Envelope, type PayloadOf } from '@claude-control/shared-protocol';
+import {
+  DEFAULT_STATS_DAYS,
+  MAX_STATS_DAYS,
+  MIN_STATS_DAYS,
+} from '@claude-control/shared-protocol';
 import type { DiscordGateway } from './gateway.js';
 import type { RelaySender } from '../relay.js';
 import type { PairingService } from '../pairing.js';
@@ -59,8 +64,10 @@ import {
   buildAnsweredQuestionEmbed,
   buildLapsedPermissionEmbed,
   buildLapsedQuestionEmbed,
+  buildStatsEmbed,
 } from './embeds.js';
 import { PermissionCardRegistry, type CardRef } from './permissionCards.js';
+import { PendingStatsScans } from './pendingStatsScans.js';
 import {
   QuestionCardRegistry,
   QuestionAnswerCollector,
@@ -121,6 +128,14 @@ interface SessionMessagePayload {
   components?: ActionRowBuilder<MessageActionRowComponentBuilder>[];
 }
 
+/** How long a `/stats days:N` reply waits for the host's scan before saying so.
+ *
+ *  Sized against the WORST legitimate case, not the typical one: a 90-day window on a machine with
+ *  real history re-reads a lot of transcript. Well inside Discord's 15-minute edit window for a
+ *  deferred reply, so the bound that fires first is always this one — which means the user gets a
+ *  written explanation rather than an interaction that silently expires. */
+const STATS_SCAN_TIMEOUT_MS = 120_000;
+
 // Where the committed progress-bar sprites live, relative to this compiled file
 // (dist/discord/discordJsGateway.js → ../../assets/progress-bar → the package's assets dir).
 const PROGRESS_ASSETS_DIR = join(
@@ -140,7 +155,7 @@ export const PAIRING_PRIMER_MESSAGE = [
   '**Usage**',
   '`/usage` — usage across accounts',
   '`/timeline` — 5h-session budget and reset timeline',
-  '`/stats` — token counts per account, model and day',
+  '`/stats` — token counts per account, model and day (add `days:30` for a longer window)',
   '`/accounts` — the accounts this daemon can switch between',
   '',
   '**Sessions**',
@@ -259,6 +274,9 @@ export class DiscordJsGateway implements DiscordGateway {
    *  surface — see {@link chainOnRoute}. The entry is deleted once it drains (bounded by LIVE
    *  routes) and the chain NEVER rejects, so one bad unit can't stall the route. */
   private readonly deliverChains = new Map<string, Promise<void>>();
+  /** requestId -> the `/stats days:N` interaction waiting on a host transcript scan. The only
+   *  command whose answer does not exist at reply time (see {@link runStatsScan}). */
+  private readonly pendingStats = new PendingStatsScans();
 
   constructor(options: DiscordJsGatewayOptions) {
     this.logger = options.logger ?? noopLogger;
@@ -358,6 +376,20 @@ export class DiscordJsGateway implements DiscordGateway {
     }
     if (isType(envelope, 'question.lapsed')) {
       return this.applyQuestionLapse(envelope.payload);
+    }
+    if (isType(envelope, 'stats.result')) {
+      // Answers a specific waiting interaction rather than the user in general, so it is handed
+      // to that waiter and never DM'd. An unmatched result (the wait timed out, or this bot
+      // restarted since the request) is dropped: its only intended surface no longer exists, and
+      // a stray "here are your token stats" DM for a question the user asked minutes ago and
+      // already got a timeout for is worse than nothing.
+      if (!this.pendingStats.settle(envelope.payload.requestId, envelope.payload)) {
+        this.logger.debug(
+          { requestId: envelope.payload.requestId },
+          'discord: stats.result with no waiting interaction (timed out, or a restart since)',
+        );
+      }
+      return;
     }
     const push = renderPush(envelope);
     if (!push) return; // cache-only: not worth a DM
@@ -832,6 +864,18 @@ export class DiscordJsGateway implements DiscordGateway {
     const idempotencyKey = randomUUID();
     let result: CommandResult;
 
+    // `/stats days:N` owns its whole reply lifecycle (defer now, edit in when the host answers),
+    // so it is handled before the switch rather than folded into the shared synchronous reply
+    // below. Without an explicit `days` it falls through to the cached snapshot like every other
+    // command — the fast path stays exactly as it was.
+    if (interaction.commandName === 'stats') {
+      const days = interaction.options.getInteger('days');
+      if (days !== null) {
+        await this.runStatsScan(interaction, userId, days, requestId);
+        return;
+      }
+    }
+
     switch (interaction.commandName) {
       case 'pair':
         result = commands.handlePair(this.deps, userId);
@@ -939,6 +983,66 @@ export class DiscordJsGateway implements DiscordGateway {
         sessionId: interaction.options.getString('session', true),
       });
     }
+  }
+
+  /**
+   * `/stats days:N` — the one command that round-trips to the host before it can answer.
+   *
+   * The shape is forced by two hard limits pulling opposite ways: Discord invalidates an
+   * interaction that goes 3 seconds without acknowledgement, and re-reading the host's transcripts
+   * over an arbitrary window takes far longer than that. So the reply is DEFERRED immediately and
+   * edited in when the daemon's `stats.result` arrives on the delivery path (see {@link deliver}),
+   * matched back here by requestId.
+   *
+   * Every path ends in exactly one edited reply, including the failures — a deferred interaction
+   * that is never edited leaves the user watching a spinner with no explanation until Discord
+   * quietly expires it.
+   */
+  private async runStatsScan(
+    interaction: ChatInputCommandInteraction,
+    userId: string,
+    days: number,
+    requestId: string,
+  ): Promise<void> {
+    // Ephemeral for the same reason every other reply here is: these carry account labels and
+    // real token figures, which do not belong in a shared channel's history.
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // Registered BEFORE the frame goes out. The daemon's answer arrives through `deliver()` on the
+    // relay's socket, entirely independently of this method, and a result that lands with no
+    // waiter registered is dropped — so the wait must exist first, not merely be created "soon".
+    const waiting = this.pendingStats.awaitResult(requestId, STATS_SCAN_TIMEOUT_MS);
+    const sent = commands.handleStatsScan(this.deps, userId, days, requestId);
+    if (sent.kind === 'error') {
+      // The request never left the bot (offline daemon, no binding) — nothing will ever answer it.
+      this.pendingStats.abandon(requestId);
+      await interaction.editReply({ content: `Error: ${sent.message}` });
+      return;
+    }
+
+    const outcome = await waiting;
+    if (outcome.kind === 'busy') {
+      await interaction.editReply({
+        content: 'Too many stats scans are already running — try again in a moment.',
+      });
+      return;
+    }
+    if (outcome.kind === 'timeout') {
+      await interaction.editReply({
+        content:
+          `The host did not finish scanning within ${Math.round(STATS_SCAN_TIMEOUT_MS / 1000)}s. ` +
+          `It may still be working — try a smaller \`days\` value, or \`/stats\` for the last ` +
+          `pushed snapshot.`,
+      });
+      return;
+    }
+    const { ok, snapshot, error } = outcome.payload;
+    // `ok` and a snapshot are sent together by every daemon that answers at all; the null check
+    // is what keeps a truncated or older-daemon reply from rendering as an empty table.
+    if (!ok || snapshot === undefined || snapshot === null) {
+      await interaction.editReply({ content: `Error: ${error ?? 'the host could not scan'}` });
+      return;
+    }
+    await interaction.editReply({ embeds: [buildStatsEmbed(snapshot)] });
   }
 
   /** Button routing is the whole two-tap + dedupe surface, but every DECISION is made by the pure
@@ -1230,7 +1334,25 @@ export function commandDefinitions() {
       .setDescription('5h-session budget and reset timeline across accounts'),
     new SlashCommandBuilder()
       .setName('stats')
-      .setDescription('Token counts per account, model and day (last 7 days)'),
+      .setDescription(
+        `Token counts per account, model and day (last ${DEFAULT_STATS_DAYS} days by default)`,
+      )
+      // Optional on purpose: omitting it answers instantly from the snapshot the daemon already
+      // pushed, while supplying it costs a live scan on the host. The min/max are declared here so
+      // Discord rejects an out-of-range value in the client — no round trip, no wasted scan — but
+      // they are only the FIRST of three checks: a frame that never passed through this
+      // declaration is still bounded by the wire schema at decode, and clamped again by the daemon
+      // that actually pays the disk IO.
+      .addIntegerOption((o) =>
+        o
+          .setName('days')
+          .setDescription(
+            `How many days back to count (${MIN_STATS_DAYS}-${MAX_STATS_DAYS}); scans the host live`,
+          )
+          .setMinValue(MIN_STATS_DAYS)
+          .setMaxValue(MAX_STATS_DAYS)
+          .setRequired(false),
+      ),
     new SlashCommandBuilder().setName('accounts').setDescription('List paired accounts'),
     new SlashCommandBuilder().setName('sessions').setDescription('List known sessions'),
     new SlashCommandBuilder()

@@ -302,4 +302,33 @@ describe('DaemonStateCache stats.snapshot', () => {
     cache.record('user-a', statsSnapshot('user-a', 5));
     expect(cache.getUsage('user-a')?.accounts).toHaveLength(1);
   });
+
+  /** The answer to one `/stats days:N` interaction. Deliberately NOT a tracked envelope type —
+   *  see the tests below for why. */
+  function statsResult(discordUserId: string, turns: number): Envelope {
+    const snapshot = statsSnapshot(discordUserId, turns);
+    if (snapshot.type !== 'stats.snapshot') throw new Error('unreachable');
+    return {
+      ...snapshot,
+      id: 'stats-result-1',
+      type: 'stats.result',
+      payload: { requestId: 'req-1', ok: true, snapshot: snapshot.payload },
+    };
+  }
+
+  it('never lets a requested window overwrite the cached default one', () => {
+    const cache = new DaemonStateCache();
+    cache.record('user-a', statsSnapshot('user-a', 10));
+    // `/stats days:90` answers ONE interaction, over a window that user chose for that question.
+    // Caching it would silently redefine what a later bare `/stats` means — the next reader would
+    // get a 90-day total under a card presented as the daemon's regular snapshot.
+    cache.record('user-a', statsResult('user-a', 999));
+    expect(cache.getStats('user-a')?.overall.turns).toBe(10);
+  });
+
+  it('caches nothing at all for a user whose only stats traffic was a requested window', () => {
+    const cache = new DaemonStateCache();
+    cache.record('user-a', statsResult('user-a', 999));
+    expect(cache.getStats('user-a')).toBeUndefined();
+  });
 });

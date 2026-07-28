@@ -189,6 +189,43 @@ export const TokenStatsSnapshot = z.object({
   coverage: TokenStatsCoverage,
 });
 
+/** How many days back a stats window covers when nobody says otherwise — the daemon's pushed
+ *  snapshot, `cctl stats`, and `/stats` with no `days` all use this one number. Lives in the wire
+ *  contract rather than in each package because the three surfaces are only comparable if their
+ *  default window is literally the same; three local copies would drift silently. */
+export const DEFAULT_STATS_DAYS = 7;
+/** Bounds on an explicitly requested window. The floor is one day because a window is counted in
+ *  whole local days. The ceiling is a real cost guard, not a formality: a request makes the HOST
+ *  re-read every transcript touched inside the window, so an unbounded value turns one slash
+ *  command into a full-history disk scan. 90 days answers any "what did this quarter cost" question
+ *  while keeping the worst case bounded. Enforced in three places, deliberately: Discord rejects
+ *  out-of-range input client-side, this schema rejects a hand-crafted frame, and the daemon clamps
+ *  what it actually scans — the outer two are UX, the daemon's is the one that protects the disk. */
+export const MIN_STATS_DAYS = 1;
+export const MAX_STATS_DAYS = 90;
+
+/** Phone-initiated request for a token-stats window OTHER than the one the daemon pushes on its
+ *  own schedule. There is no idempotency key: a scan is read-only and changes nothing, so a
+ *  replayed frame costs a redundant scan at worst — and unlike a prune, silently ignoring a
+ *  duplicate would strand the phone's deferred reply waiting for a result that never comes. */
+const TokenStatsRequestPayload = z.object({
+  requestId: RequestId,
+  days: z.number().int().min(MIN_STATS_DAYS).max(MAX_STATS_DAYS),
+});
+
+/** The daemon's answer to stats.request. Correlated by `requestId` because the asking surface is
+ *  a single Discord interaction waiting on THIS scan — unlike the pushed `stats.snapshot`, which
+ *  is addressed to nobody in particular and answers whoever asks next. A failure is reported
+ *  explicitly (`ok: false` + reason) rather than by silence: the phone is holding a deferred reply
+ *  open, and "the scan failed" is a far better thing to show than a spinner that times out. */
+const TokenStatsResultPayload = z.object({
+  requestId: RequestId,
+  ok: z.boolean(),
+  /** The window that was actually scanned; absent when `ok` is false. */
+  snapshot: TokenStatsSnapshot.nullish(),
+  error: z.string().nullish(),
+});
+
 // ---------------------------------------------------------------------------
 // Settings (the daemon's effective configuration, for visibility only)
 // ---------------------------------------------------------------------------
@@ -544,6 +581,8 @@ function frame<T extends string, P extends z.ZodTypeAny>(type: T, payload: P) {
 export const messageSchemas = {
   'usage.snapshot': frame('usage.snapshot', UsageSnapshotPayload),
   'stats.snapshot': frame('stats.snapshot', TokenStatsSnapshot),
+  'stats.request': frame('stats.request', TokenStatsRequestPayload),
+  'stats.result': frame('stats.result', TokenStatsResultPayload),
   'settings.snapshot': frame('settings.snapshot', SettingsSnapshot),
   'switch.command': frame('switch.command', SwitchCommandPayload),
   'switch.result': frame('switch.result', SwitchResultPayload),
@@ -574,6 +613,8 @@ export const messageSchemas = {
 export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['usage.snapshot'],
   messageSchemas['stats.snapshot'],
+  messageSchemas['stats.request'],
+  messageSchemas['stats.result'],
   messageSchemas['settings.snapshot'],
   messageSchemas['switch.command'],
   messageSchemas['switch.result'],

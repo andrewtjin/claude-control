@@ -34,6 +34,7 @@ import {
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
+import { DEFAULT_STATS_DAYS } from '@claude-control/shared-protocol';
 import {
   computeOutlook,
   computePlan,
@@ -107,9 +108,10 @@ import {
   type SettingsSection,
 } from './settings.js';
 
-/** Default `cctl stats` window. A week is the span the weekly limits themselves run on, so it is
- *  the window a "did I overspend?" reading is actually asked in. */
-const DEFAULT_STATS_DAYS = 7;
+// The default `cctl stats` window is DEFAULT_STATS_DAYS from the wire contract rather than a copy
+// declared here. A week is the span the weekly limits themselves run on, so it is the window a
+// "did I overspend?" reading is actually asked in — and the terminal, the daemon's pushed snapshot
+// and Discord's `/stats` are only comparable for as long as all three mean the same week.
 
 /** Build the full `cctl` program. Exported so tests can introspect the command tree. */
 export function buildProgram(): Command {

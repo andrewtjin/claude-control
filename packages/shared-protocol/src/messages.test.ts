@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { decode, isType, stamp, encode } from './codec.js';
-import { Envelope, isMessageType, type PayloadOf } from './messages.js';
+import {
+  Envelope,
+  isMessageType,
+  MAX_STATS_DAYS,
+  MIN_STATS_DAYS,
+  type PayloadOf,
+} from './messages.js';
 import { PROTOCOL_VERSION } from './version.js';
 
 // Schema-level tests for the hook/managed-session protocol additions (permissionMode, the widened
@@ -551,6 +557,91 @@ describe('stats.snapshot', () => {
     expect(
       decode(rawFrame('stats.snapshot', { ...payload, overall: { ...totals, output: -1 } })).ok,
     ).toBe(false);
+  });
+
+  describe('stats.request / stats.result', () => {
+    it('are registered message types', () => {
+      expect(isMessageType('stats.request')).toBe(true);
+      expect(isMessageType('stats.result')).toBe(true);
+    });
+
+    it('round-trips a request for an explicit window', () => {
+      const result = decode(
+        encode(
+          stamp({
+            daemonId: 'daemon-1',
+            type: 'stats.request',
+            payload: { requestId: 'req-1', days: 30 },
+          }),
+        ),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok && isType(result.envelope, 'stats.request')) {
+        expect(result.envelope.payload).toEqual({ requestId: 'req-1', days: 30 });
+      }
+    });
+
+    it('accepts both ends of the allowed range', () => {
+      for (const days of [MIN_STATS_DAYS, MAX_STATS_DAYS]) {
+        expect(decode(rawFrame('stats.request', { requestId: 'req-1', days })).ok).toBe(true);
+      }
+    });
+
+    it('rejects a window outside the allowed range', () => {
+      // The bound that actually protects the host's disk from a hand-crafted frame: Discord's
+      // own min/max only constrains what a user can type into the client.
+      for (const days of [0, -1, MAX_STATS_DAYS + 1, 99_999]) {
+        expect(decode(rawFrame('stats.request', { requestId: 'req-1', days })).ok).toBe(false);
+      }
+    });
+
+    it('rejects a fractional or non-numeric window', () => {
+      expect(decode(rawFrame('stats.request', { requestId: 'req-1', days: 7.5 })).ok).toBe(false);
+      expect(decode(rawFrame('stats.request', { requestId: 'req-1', days: '7' })).ok).toBe(false);
+    });
+
+    it('round-trips a successful result carrying its snapshot', () => {
+      const result = decode(
+        encode(
+          stamp({
+            daemonId: 'daemon-1',
+            type: 'stats.result',
+            payload: { requestId: 'req-1', ok: true, snapshot: payload },
+          }),
+        ),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok && isType(result.envelope, 'stats.result')) {
+        expect(result.envelope.payload.snapshot).toEqual(payload);
+      }
+    });
+
+    it('accepts a failure result with no snapshot', () => {
+      // The failure path has to be representable, or a daemon that cannot scan has no way to
+      // answer at all — and silence is what leaves a deferred reply spinning.
+      const result = decode(
+        rawFrame('stats.result', { requestId: 'req-1', ok: false, error: 'scan failed' }),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok && isType(result.envelope, 'stats.result')) {
+        expect(result.envelope.payload.ok).toBe(false);
+        expect(result.envelope.payload.snapshot ?? null).toBeNull();
+      }
+    });
+
+    it('rejects a result whose snapshot is malformed rather than passing it through', () => {
+      const { coverage: _coverage, ...withoutCoverage } = payload;
+      expect(
+        decode(
+          rawFrame('stats.result', { requestId: 'req-1', ok: true, snapshot: withoutCoverage }),
+        ).ok,
+      ).toBe(false);
+    });
+
+    it('requires a requestId, since a result with no correlation can reach no one', () => {
+      expect(decode(rawFrame('stats.request', { days: 7 })).ok).toBe(false);
+      expect(decode(rawFrame('stats.result', { ok: true, snapshot: payload })).ok).toBe(false);
+    });
   });
 });
 
