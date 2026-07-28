@@ -41,21 +41,18 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
 
 ## What it does
 
-- **Burns the expiring budget first.** A weekly limit is the only quota that truly
-  evaporates — a 5-hour window resets and hands the same capacity straight back.
-  So the optimizer ranks accounts by which weekly budget dies soonest, spends that
-  one, and holds the others in reserve. One line tells you which account to use
-  now, and why.
-- **Switches before you hit the wall, not after.** When the active account's worst
-  limit runs low, the daemon moves to the best eligible account on its own — one
-  with real session headroom, not already low itself, and with a reset clock it can
-  actually see. No prompt, no dropped session. Or switch from your phone with one
+- **Burns the expiring budget first.** Maximize your usage by burning close resets
+  first. The optimizer tracks, ranks, and plans the optimal usage across your
+  accounts, holding other accounts in reserve. 
+- **Switches before you hit the wall.** When the active account's worst
+  limit runs low, the daemon moves to the best eligible account on its own.
+  No prompt, no dropped session. Or, manually switch from your phone with one
   tap.
 - **The remote link survives the switch.** Changing accounts doesn't cost you the
   session or the phone connection.
 - **Every limit in one view.** 5-hour, weekly, and per-model limits across all
   accounts at once, with the reset clocks that make them actionable.
-- **Approve from anywhere.** Permission prompts and "done / waiting" notices reach
+- **Approve from anywhere.** Permission prompts, questions, and "done / waiting" notices reach
   your phone; approve or deny from Discord. Send live prompts or start a fresh
   session and watch milestones stream back.
 
