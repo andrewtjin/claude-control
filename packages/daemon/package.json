@@ -20,7 +20,6 @@
     "@claude-control/switch-engine": "workspace:*",
     "@claude-control/session-runtime": "workspace:*",
     "@claude-control/usage-advisor": "workspace:*",
-    "pino": "^10.3.1",
     "ws": "^8.21.1"
   }
 }

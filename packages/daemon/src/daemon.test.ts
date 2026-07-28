@@ -41,6 +41,7 @@ import type {
 import { Store } from './store.js';
 import { UsagePoller } from './usagePoller.js';
 import { AttributionJournal } from './attributionJournal.js';
+import { LOOP_LAG_THRESHOLD_MS } from './loopLagMonitor.js';
 import { HookReceiver } from './hookReceiver.js';
 import {
   ControlPlaneClient,
@@ -1600,6 +1601,50 @@ describe('Daemon lifecycle', () => {
     await waitFor(() => entries.some((e) => e.msg === 'session.stop escalation finished'));
     const finished = entries.find((e) => e.msg === 'session.stop escalation finished');
     expect((finished?.obj as { rung?: string }).rung).toBe('hard_stopped');
+  });
+
+  it('attributes each poll-cycle phase in the log, and warns on one that runs long', async () => {
+    // The loop-lag monitor can say THAT the loop stalled but never WHERE — which is why the
+    // multi-second stall that motivated this instrumentation was never attributed to a phase.
+    // A phase slower than that monitor's own threshold has to name itself, at warn level.
+    const { logger, entries } = capturingLogger();
+    const slowJournal = {
+      sync: async () => {
+        await new Promise((r) => setTimeout(r, LOOP_LAG_THRESHOLD_MS + 40));
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal: slowJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000, // the startup cycle is the one under test
+      logger,
+    });
+    await daemon.start();
+
+    await waitFor(() => entries.some((e) => e.msg === 'poll cycle phase ran long'));
+    const slow = entries.find((e) => e.msg === 'poll cycle phase ran long');
+    expect((slow?.obj as { phase?: string }).phase).toBe('attributionJournal.sync');
+    expect((slow?.obj as { elapsedMs?: number }).elapsedMs).toBeGreaterThanOrEqual(
+      LOOP_LAG_THRESHOLD_MS,
+    );
+
+    // Every other phase still reports, at debug — a cycle that logged only its slow phase would
+    // leave the next anomaly with nothing to compare against.
+    await waitFor(() => entries.some((e) => e.msg === 'poll cycle phase'));
+    const timed = new Set(
+      entries
+        .filter((e) => e.msg === 'poll cycle phase')
+        .map((e) => (e.obj as { phase: string }).phase),
+    );
+    expect(timed).toContain('pollAll');
+    expect(timed).toContain('readFleetHistory');
   });
 
   it('session.stop for an unknown session emits an error envelope correlated via relatesTo', async () => {

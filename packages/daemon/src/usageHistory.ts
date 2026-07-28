@@ -100,49 +100,56 @@ export function measureBurnUnitsPerDay(
   return measurable ? units / spanDays : undefined;
 }
 
-/** Structural stand-in for a stored usage snapshot row, so this module needs no dependency on
- *  the daemon's store types. */
-export interface SnapshotRowLike {
-  fetchedAtMs: number;
-  json: string;
+/** The weekly reading pulled out of one serialized snapshot payload. `null` in both fields is
+ *  "this payload has no weekly reading", which is a normal shape, not a failure. */
+export interface ExtractedWeeklyReading {
+  weeklyPercent: number | null;
+  weeklyResetsAtMs: number | null;
 }
 
 /**
- * Parse stored snapshot rows into weekly observations, ascending by fetch time. A row whose
- * JSON is corrupt or carries no weekly limit is skipped: history is a best-effort record, and
- * one bad row must not blind the whole measurement.
+ * Read the weekly figures out of one serialized `AccountUsage` payload.
  *
- * Deliberately reads `weekly_all` only. That limit IS the account's overall budget, which is
- * what burn is measured against; `weekly_scoped` meters Fable alone, so differencing it would
- * report a fraction of the real burn as if it were all of it.
+ * This is the single definition of what a weekly reading IS, and it is called on the WRITE path
+ * (the store denormalizes its result into columns as each snapshot is appended) rather than once
+ * per row per read. That inversion is the whole point: the same parse that used to run ~13k times
+ * every sixty seconds now runs four times, and the read side never sees JSON at all.
+ *
+ * Deliberately reads `weekly_all` only. That limit IS the account's overall budget, which is what
+ * burn is measured against; `weekly_scoped` meters Fable alone, so differencing it would report a
+ * fraction of the real burn as if it were all of it.
+ *
+ * Total by construction: corrupt JSON, a missing `limits` array, a payload that is a poll-error
+ * record rather than a reading, and a non-finite percent all answer "no reading". History is a
+ * best-effort record, and one bad payload must never fail the write that carries it.
  */
-export function readWeeklyObservations(rows: SnapshotRowLike[]): WeeklyObservation[] {
-  const observations: WeeklyObservation[] = [];
-  for (const row of rows) {
-    type StoredLimit = { kind?: unknown; percent?: unknown; resetsAt?: unknown };
-    let weekly: StoredLimit | undefined;
-    try {
-      const parsed = JSON.parse(row.json) as { limits?: StoredLimit[] };
-      weekly = parsed.limits?.find((l) => l.kind === 'weekly_all');
-    } catch {
-      continue;
-    }
-    if (typeof weekly?.percent !== 'number' || !Number.isFinite(weekly.percent)) continue;
-    const resetsAtMs = typeof weekly.resetsAt === 'string' ? Date.parse(weekly.resetsAt) : NaN;
-    observations.push({
-      fetchedAtMs: row.fetchedAtMs,
-      percent: weekly.percent,
-      ...(Number.isFinite(resetsAtMs) ? { resetsAtMs } : {}),
-    });
+export function extractWeeklyReading(json: string): ExtractedWeeklyReading {
+  const none: ExtractedWeeklyReading = { weeklyPercent: null, weeklyResetsAtMs: null };
+  type StoredLimit = { kind?: unknown; percent?: unknown; resetsAt?: unknown };
+  let weekly: StoredLimit | undefined;
+  try {
+    const parsed = JSON.parse(json) as { limits?: StoredLimit[] };
+    weekly = parsed.limits?.find((l) => l.kind === 'weekly_all');
+  } catch {
+    return none;
   }
-  return observations.sort((a, b) => a.fetchedAtMs - b.fetchedAtMs);
+  if (typeof weekly?.percent !== 'number' || !Number.isFinite(weekly.percent)) return none;
+  const resetsAtMs = typeof weekly.resetsAt === 'string' ? Date.parse(weekly.resetsAt) : NaN;
+  return {
+    weeklyPercent: weekly.percent,
+    weeklyResetsAtMs: Number.isFinite(resetsAtMs) ? resetsAtMs : null,
+  };
 }
 
 /** The slice of the daemon's store these measurements read. Structural so the same code
  *  serves the daemon (which owns the store) and the CLI (which opens it to read the last
- *  poll), without either needing the other's wiring. */
+ *  poll), without either needing the other's wiring.
+ *
+ *  Reads observations, NOT snapshot rows: the blob a snapshot also carries is the expensive part
+ *  of that table and none of it is used here, so the narrow shape is what keeps a future caller
+ *  from quietly putting the parse back on this path. */
 export interface UsageHistoryReader {
-  listUsageSnapshotsSince(accountId: string, sinceMs: number): SnapshotRowLike[];
+  listWeeklyObservationsSince(accountId: string, sinceMs: number): WeeklyObservation[];
 }
 
 /** Everything history can say about the fleet at one moment. */
@@ -169,9 +176,9 @@ export function readFleetHistory(
   for (const { accountId, weight } of accounts) {
     // One read per account covers both measurements: the reset lookback is the longer of the
     // two windows, and the burn measurement filters the same observations down to its own.
-    const observations = readWeeklyObservations(
-      reader.listUsageSnapshotsSince(accountId, nowMs - RESET_LOOKBACK_MS),
-    );
+    // Already ascending by `fetchedAtMs` — the store's ORDER BY is served by the index, so the
+    // sort this used to do in JS is gone rather than moved.
+    const observations = reader.listWeeklyObservationsSince(accountId, nowMs - RESET_LOOKBACK_MS);
     // An unresolved plan tier weighs 1 Pro-equivalent unit — the same fallback pacing applies to
     // capacity, so burn and capacity stay denominated in the same units even for a fleet whose
     // tiers are half known. The pacing renderer states the fallback outright.
