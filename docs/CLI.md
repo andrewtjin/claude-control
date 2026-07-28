@@ -64,6 +64,12 @@ reads usually dominate, so one combined number would hide everything interesting
 No network call is made and no daemon needs to be running. The same numbers reach the
 phone as `/stats`, pushed by the daemon every 15 minutes.
 
+On the phone, `/stats` with no options renders that pushed snapshot — instant, and up to
+15 minutes old. `/stats days:30` (1–90) asks for a different window instead, which makes
+the daemon re-read the host's transcripts then and there: the reply is deferred while the
+scan runs, and only one scan happens at a time, so a request arriving while another is in
+flight is told to try again rather than queued behind it.
+
 **What these numbers are not.** They are the turns Claude Code recorded _on this machine_:
 
 - Work done from the web app, the mobile app, or another computer is not counted at all.

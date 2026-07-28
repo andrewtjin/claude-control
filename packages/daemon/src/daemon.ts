@@ -25,7 +25,17 @@ import {
 import type { AgentSdkClient } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
-import type { EnvelopeDraft, MessageOf, PayloadOf } from '@claude-control/shared-protocol';
+import type {
+  EnvelopeDraft,
+  MessageOf,
+  PayloadOf,
+  TokenStatsSnapshot,
+} from '@claude-control/shared-protocol';
+import {
+  DEFAULT_STATS_DAYS,
+  MAX_STATS_DAYS,
+  MIN_STATS_DAYS,
+} from '@claude-control/shared-protocol';
 import { planWeight, type AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
 import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
@@ -131,9 +141,11 @@ const DEFAULT_POLL_INTERVAL_MS = 60_000;
  *  the current view, so without a cutoff this table is the one thing the daemon grows without
  *  bound. 90 days keeps a full quarter of history for any future backfill while bounding the file. */
 const USAGE_SNAPSHOT_RETENTION_MS = 90 * 24 * 60 * 60_000;
-/** The window every pushed `stats.snapshot` covers. Matches `cctl stats`'s own default so the
- *  phone and the terminal answer the same question. */
-const STATS_WINDOW_MS = 7 * 24 * 60 * 60_000;
+/** One day, the unit every stats window is counted in. */
+const DAY_MS = 24 * 60 * 60_000;
+/** The window every pushed `stats.snapshot` covers. Reads the shared default rather than
+ *  restating 7 so the phone, the terminal (`cctl stats`) and `/stats` cannot drift apart. */
+const STATS_WINDOW_MS = DEFAULT_STATS_DAYS * DAY_MS;
 /** Default gap between transcript scans — see `DaemonOptions.statsIntervalMs`. */
 const DEFAULT_STATS_INTERVAL_MS = 15 * 60_000;
 /** How long {@link Daemon.stop} waits for live session handles to tear down before closing
@@ -288,6 +300,13 @@ export class Daemon {
   /** When the last transcript scan finished; `undefined` until the first one runs, so the very
    *  first poll cycle after startup always produces a snapshot. */
   private lastStatsAtMs: number | undefined;
+  /** Whether a transcript scan is running right now. Both scan paths (the throttled push and a
+   *  phone-requested window) read the same gigabytes off the same disk, so exactly one may run at
+   *  a time: without this, a spammed `/stats days:N` stacks full-history scans until the disk is
+   *  the bottleneck for every other subsystem. The push path skips its turn; a request is answered
+   *  with an explicit "already scanning" rather than being queued, because the phone is holding a
+   *  deferred reply open and a fast honest answer beats an unbounded wait. */
+  private statsScanInFlight = false;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   /** Tear-down for the event-loop lag watchdog started in {@link start}. */
   private stopLoopLagMonitor: (() => void) | undefined;
@@ -472,6 +491,11 @@ export class Daemon {
           this.logger.error({ err }, 'error handling session.prune');
         });
       },
+      onStatsRequest: (msg) => {
+        this.handleStatsRequest(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling stats.request');
+        });
+      },
     });
 
     await this.controlPlaneClient.connect();
@@ -651,28 +675,110 @@ export class Daemon {
    * that dies over an unreadable transcript directory.
    */
   private async maybePushTokenStats(accounts: StoredAccount[]): Promise<void> {
-    if (this.scanTranscripts === undefined) return;
+    const scanTranscripts = this.scanTranscripts;
+    if (scanTranscripts === undefined) return;
     const now = this.clock();
     if (this.lastStatsAtMs !== undefined && now - this.lastStatsAtMs < this.statsIntervalMs) return;
+    // A phone-requested window is already reading these same files — skip this turn rather than
+    // double the disk load. The next cycle picks it up; nothing is lost but freshness, and the
+    // requested scan is about to refresh the same numbers anyway.
+    if (this.statsScanInFlight) return;
     // Stamped BEFORE the await, so a scan slower than the interval cannot queue a second one
     // behind itself on the next cycle.
     this.lastStatsAtMs = now;
-    const windowStartMs = now - STATS_WINDOW_MS;
+    this.statsScanInFlight = true;
     try {
-      const scan = await this.scanTranscripts(windowStartMs);
       this.sendEnvelope({
         type: 'stats.snapshot',
-        payload: aggregateTokenStats({
-          scan,
-          intervals: this.store.listActivationIntervals(),
-          windowStartMs,
-          windowEndMs: this.clock(),
-          labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
-        }),
+        payload: await this.scanTokenStats(now - STATS_WINDOW_MS, accounts, scanTranscripts),
       });
     } catch (err) {
       this.logger.warn({ err }, 'transcript token scan failed; keeping the previous stats');
+    } finally {
+      this.statsScanInFlight = false;
     }
+  }
+
+  /**
+   * Phone-initiated token stats over an explicitly chosen window (`/stats days:N`).
+   *
+   * Unlike the pushed snapshot this is a REQUEST/REPLY: the asking surface is one Discord
+   * interaction holding a deferred reply open, so every path here must end in exactly one
+   * `stats.result` carrying the same requestId — including the failures. Silence is the one
+   * unacceptable outcome: it leaves a spinner on the phone until the interaction expires.
+   *
+   * The window is re-clamped here even though nothing can currently reach this handler with an
+   * out-of-range value: the Envelope schema bounds `days` at decode, so a hand-crafted frame is
+   * rejected before it arrives. That makes this clamp defence in depth rather than validation —
+   * it costs two comparisons, and it is the last thing standing between a future loosening of
+   * that schema and an unbounded scan of every transcript on the host. The daemon is the only
+   * one of the three enforcement points that actually pays the IO, so it is the one that keeps
+   * a redundant guard.
+   */
+  private async handleStatsRequest(msg: MessageOf<'stats.request'>): Promise<void> {
+    const { requestId } = msg.payload;
+    const scanTranscripts = this.scanTranscripts;
+    if (scanTranscripts === undefined) {
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: { requestId, ok: false, error: 'this daemon does not scan transcripts' },
+      });
+      return;
+    }
+    if (this.statsScanInFlight) {
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: {
+          requestId,
+          ok: false,
+          error: 'a transcript scan is already running — try again in a moment',
+        },
+      });
+      return;
+    }
+    const days = Math.min(Math.max(Math.round(msg.payload.days), MIN_STATS_DAYS), MAX_STATS_DAYS);
+    this.statsScanInFlight = true;
+    try {
+      // Accounts are fetched per request rather than captured from the poll cycle: a requested
+      // scan is not tied to one, and a label that changed since the last poll should show up.
+      const accounts = await this.switchEngine.listAccounts();
+      const snapshot = await this.scanTokenStats(
+        this.clock() - days * DAY_MS,
+        accounts,
+        scanTranscripts,
+      );
+      this.logger.info({ requestId, days }, 'answered a phone-requested token stats window');
+      this.sendEnvelope({ type: 'stats.result', payload: { requestId, ok: true, snapshot } });
+    } catch (err) {
+      this.logger.warn({ err, requestId, days }, 'requested transcript token scan failed');
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: { requestId, ok: false, error: 'the transcript scan failed on the host' },
+      });
+    } finally {
+      this.statsScanInFlight = false;
+    }
+  }
+
+  /** One transcript scan turned into a wire-ready snapshot — the single place a window becomes
+   *  numbers, shared by the pushed snapshot and the phone-requested one so the two can never
+   *  disagree about attribution, labeling, or what a window means. Takes the already-narrowed
+   *  scan function rather than re-checking `this.scanTranscripts`, so each caller keeps ownership
+   *  of what "this daemon cannot scan" means for its own surface. Throws whatever the scan throws;
+   *  a push swallows it, a request reports it. */
+  private async scanTokenStats(
+    windowStartMs: number,
+    accounts: StoredAccount[],
+    scanTranscripts: (sinceMs: number) => Promise<TranscriptScan>,
+  ): Promise<TokenStatsSnapshot> {
+    const scan = await scanTranscripts(windowStartMs);
+    return aggregateTokenStats({
+      scan,
+      intervals: this.store.listActivationIntervals(),
+      windowStartMs,
+      windowEndMs: this.clock(),
+      labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+    });
   }
 
   /** Emit a `hook.notification` (level 'warn') for each account that just entered quarantine,
