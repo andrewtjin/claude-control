@@ -1,0 +1,43 @@
+# Slack app manifest for the cctl control-plane bot (current manifest schema, YAML).
+#
+# To create the app: https://api.slack.com/apps -> Create New App -> From an app manifest ->
+# pick the target workspace -> paste this file's contents -> Create. Manifest changes to an
+# existing app are applied the same way, from the app's Settings -> App Manifest page.
+#
+# Two tokens the bot needs (see deploy/.env.example — SLACK_BOT_TOKEN / SLACK_APP_TOKEN):
+#   - SLACK_BOT_TOKEN (xoxb-...): shown on Settings -> Install App once you install this app to
+#     the workspace (or reinstall, after any scope change).
+#   - SLACK_APP_TOKEN (xapp-...): generated under Settings -> Basic Information ->
+#     App-Level Tokens -> Generate Token and Scopes, with the connections:write scope. This is
+#     the Socket Mode credential; there is no request URL to configure anywhere in this manifest.
+
+display_information:
+  name: cctl
+
+features:
+  bot_user:
+    display_name: cctl
+    always_online: true
+  slash_commands:
+    - command: /cctl
+      description: Control claude-control sessions from Slack
+      usage_hint: 'pair | status | usage | accounts | sessions | run | say | stop | stats'
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - commands
+      - chat:write
+      - im:write
+      - im:history
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
