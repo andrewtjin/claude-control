@@ -3,7 +3,8 @@
 #
 # Two services: `bot` (the daemon-facing relay + Discord gateway) and `caddy` (reverse proxy
 # in front of it, terminating automatic TLS for the hostname in .env). Copy .env.example to
-# .env alongside this file and fill in DISCORD_BOT_TOKEN + RELAY_HOSTNAME before starting.
+# .env alongside this file and fill in RELAY_HOSTNAME plus at least one chat surface —
+# DISCORD_BOT_TOKEN, or both SLACK_BOT_TOKEN and SLACK_APP_TOKEN — before starting.
 
 services:
   bot:
@@ -11,6 +12,9 @@ services:
       context: ..
       dockerfile: packages/control-plane-bot/Dockerfile
     restart: unless-stopped
+    # Discord and Slack tokens (DISCORD_BOT_TOKEN / SLACK_BOT_TOKEN / SLACK_APP_TOKEN) reach the
+    # container through this file, same as every other var here — Slack Socket Mode is an
+    # outbound-only WebSocket, so it needs no published port and no caddy route.
     env_file: .env
     environment:
       # bindings.json (the only state this bot persists) lives on the named volume below, not
