@@ -43,6 +43,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { isType, type Envelope, type PayloadOf } from '@claude-control/shared-protocol';
+import { PAIRING_PRIMER_MESSAGE } from '../primerMessage.js';
 import {
   DEFAULT_STATS_DAYS,
   MAX_STATS_DAYS,
@@ -138,37 +139,11 @@ const PROGRESS_ASSETS_DIR = join(
   '../../assets/progress-bar',
 );
 
-// Sent once, right after a daemon successfully claims a pairing code. Lists every command that
-// actually reaches the daemon, grouped so a brand-new user can find the one they want rather
-// than reading a flat wall of sixteen. {@link PRIMER_OMITTED_COMMANDS} records the ones
-// deliberately absent and why. A hand-written list beside a separately-declared command surface
-// drifts the moment someone adds a command and forgets this file, so a unit test holds the two to
-// each other rather than trusting the next author to remember.
-export const PAIRING_PRIMER_MESSAGE = [
-  "Paired. Here's what works right now:",
-  '',
-  '**Usage**',
-  '`/usage` — usage across accounts',
-  '`/timeline` — 5h-session budget and reset timeline',
-  '`/stats` — token counts per account, model and day (add `days:30` for a longer window)',
-  '`/accounts` — the accounts this daemon can switch between',
-  '',
-  '**Sessions**',
-  '`/run <prompt>` — start a Claude Code session',
-  '`/say <session> <text>` — send a message into a running session',
-  '`/stop <session>` — stop a running session',
-  '`/sessions` — every session this daemon has reported',
-  '`/prune` — clear out dormant session records (asks first)',
-  '`/thread-here` — send your session threads to this channel, or back to your DMs',
-  '',
-  '**Daemon**',
-  '`/switch <account>` — switch the active account',
-  '`/status` — daemon connection status',
-  '`/settings` — effective settings and where each came from',
-  '`/approve <request>` · `/deny <request>` — answer a pending permission request',
-  '',
-  'Permission prompts and questions arrive here as cards — tap the buttons, no command needed.',
-].join('\n');
+// Re-exported from here because this file is where the primer used to be DEFINED, and the tests
+// that hold it in step with the registered command list import it from this module. The text moved
+// to primerMessage.ts once a second surface needed it verbatim — see that file for why the copy is
+// shared rather than forked per surface.
+export { PAIRING_PRIMER_MESSAGE };
 
 /** Registered commands deliberately left out of {@link PAIRING_PRIMER_MESSAGE}, each for a reason
  *  that outlives the current command list. `pair` is the command the reader just finished using.
