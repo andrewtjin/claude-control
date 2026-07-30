@@ -319,6 +319,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     forwardNotificationCards: config.values.waitingCards,
     commandOutputCards: config.values.commandOutputCards,
     fullToolOutput: config.values.fullToolOutput,
+    // StopFailure warn cards ride the same umbrella switch as the managed sessions' retry
+    // loop: both are "survive transient API errors" behavior (CCTL_AUTO_CONTINUE).
+    apiErrorCards: config.values.autoContinue,
     // A managed session is recognized by either its record id or the SDK session id its hooks
     // report (persisted as the record's resume anchor on session_init).
     isManagedSession: (sessionId) =>
@@ -399,6 +402,17 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),
+    // Present only when the operator hasn't opted out — the Daemon stamps it onto every
+    // managed spawn/resume, and its absence IS the off switch (no policy, no retries).
+    ...(config.values.autoContinue
+      ? {
+          autoContinue: {
+            ...(config.values.autoContinueMaxAttempts !== undefined
+              ? { maxAttempts: config.values.autoContinueMaxAttempts }
+              : {}),
+          },
+        }
+      : {}),
     ...(autoSwitcher ? { autoSwitcher } : {}),
     settingsReport,
     logger,

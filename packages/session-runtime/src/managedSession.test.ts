@@ -440,3 +440,316 @@ describe('startManagedSession', () => {
     expect(seen).toEqual(['sdk-77']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Auto-continue: transient API failures retry instead of going terminal
+// ---------------------------------------------------------------------------
+
+/** Deterministic stand-in for the policy's timer seam: retries queue here and fire only
+ *  when the test says so, with the requested delay recorded for backoff assertions. */
+function manualSchedule(): {
+  schedule: (fn: () => void, delayMs: number) => () => void;
+  pending: Array<{ fn: () => void; delayMs: number; canceled: boolean; fired: boolean }>;
+  fire: () => Promise<void>;
+} {
+  const pending: Array<{ fn: () => void; delayMs: number; canceled: boolean; fired: boolean }> = [];
+  return {
+    pending,
+    schedule(fn, delayMs) {
+      const entry = { fn, delayMs, canceled: false, fired: false };
+      pending.push(entry);
+      return () => {
+        entry.canceled = true;
+      };
+    },
+    async fire() {
+      const next = pending.find((p) => !p.canceled && !p.fired);
+      if (!next) throw new Error('manualSchedule: nothing pending to fire');
+      next.fired = true;
+      next.fn();
+      await tick();
+    },
+  };
+}
+
+const SERVER_500 =
+  'API Error: 500 Internal server error. This is a server-side issue, usually temporary - try again in a moment.';
+
+describe('startManagedSession auto-continue', () => {
+  it('retries a transient mid-turn failure with `continue`, suppressing the failure card, then completes cleanly', async () => {
+    const { client, calls } = fakeClient([
+      [
+        { type: 'session_init', sessionId: 'sdk-1' },
+        { type: 'assistant_text', text: 'partial work' },
+        { type: 'turn_result', ok: false, summary: SERVER_500 },
+      ],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    const events = collectEvents(handle);
+    await tick();
+
+    // Non-terminal during the backoff wait; the milestone replaced the failure card.
+    expect(handle.getState()).toBe('running');
+    expect(events.some((e) => e.kind === 'summary' && e.text.startsWith('Session failed'))).toBe(
+      false,
+    );
+    const milestones = events.flatMap((e) =>
+      e.kind === 'milestone' && e.text.startsWith('Auto-continue') ? [e.text] : [],
+    );
+    expect(milestones).toHaveLength(1);
+    expect(milestones[0]).toContain('attempt 1/5');
+    expect(timers.pending[0]?.delayMs).toBe(15_000);
+
+    await timers.fire();
+    // The dead turn produced output, so the retry is the CLI's documented `continue`,
+    // resuming the SDK session captured at session_init.
+    expect(calls[1]?.prompt).toBe('continue');
+    expect(calls[1]?.opts.resumeSessionId).toBe('sdk-1');
+    expect(handle.getState()).toBe('waiting_input');
+  });
+
+  it('re-asks the prompt when output flowed but no session_init ever arrived (nothing to continue INTO)', async () => {
+    const { client, calls } = fakeClient([
+      [
+        // The CLI's synthetic "API Error: ..." text streams as assistant output, so a turn
+        // can look output-ful while having no resume anchor at all.
+        { type: 'assistant_text', text: 'API Error: 500 Internal server error.' },
+        { type: 'turn_result', ok: false, summary: SERVER_500 },
+      ],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+    await timers.fire();
+    expect(calls[1]?.prompt).toBe('go');
+    expect(calls[1]?.opts.resumeSessionId).toBeUndefined();
+  });
+
+  it('re-asks the turn prompt verbatim when the dead turn produced nothing', async () => {
+    const { client, calls } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: 'API Error: 529 Overloaded' }],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+    await timers.fire();
+    expect(calls[1]?.prompt).toBe('go');
+  });
+
+  it('retries a thrown stream whose message classifies transient (a mid-stream disconnect)', async () => {
+    const { client, calls } = fakeClient([
+      () => ({
+        // eslint-disable-next-line require-yield -- a stream that dies before its first event
+        async *[Symbol.asyncIterator](): AsyncGenerator<AgentSdkEvent> {
+          await Promise.resolve();
+          throw new Error('fetch failed');
+        },
+      }),
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(handle.getState()).toBe('starting'); // never produced output, never went terminal
+    expect(events.some((e) => e.kind === 'error')).toBe(false); // "Error:" text suppressed too
+    await timers.fire();
+    expect(calls[1]?.prompt).toBe('go');
+    expect(handle.getState()).toBe('waiting_input');
+  });
+
+  it('leaves non-transient failures exactly as terminal as before', async () => {
+    const { client } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: 'the tool exploded' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(handle.getState()).toBe('failed');
+    expect(events).toContainEqual({ kind: 'summary', text: 'Session failed: the tool exploded' });
+    expect(timers.pending).toHaveLength(0);
+  });
+
+  it('without a policy, a transient failure stays terminal (pre-existing behavior)', async () => {
+    const { client } = fakeClient([[{ type: 'turn_result', ok: false, summary: SERVER_500 }]]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    await tick();
+    expect(handle.getState()).toBe('failed');
+  });
+
+  it('doubles the backoff per consecutive failure, honors the cap, and gives up past the budget', async () => {
+    const failing: Turn = [{ type: 'turn_result', ok: false, summary: SERVER_500 }];
+    const { client, calls } = fakeClient([failing, failing, failing]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: {
+        schedule: timers.schedule,
+        maxAttempts: 2,
+        baseDelayMs: 100,
+        maxDelayMs: 150,
+      },
+    });
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(timers.pending[0]?.delayMs).toBe(100);
+    await timers.fire();
+    expect(timers.pending[1]?.delayMs).toBe(150); // 200 capped to 150
+    await timers.fire();
+
+    // Third consecutive failure exceeds maxAttempts=2: the failure card finally fires.
+    expect(handle.getState()).toBe('failed');
+    expect(calls).toHaveLength(3);
+    expect(events).toContainEqual({ kind: 'summary', text: `Session failed: ${SERVER_500}` });
+    expect(
+      events.filter((e) => e.kind === 'milestone' && e.text.startsWith('Auto-continue')),
+    ).toHaveLength(2);
+  });
+
+  it('counts an error event and the failed turn_result behind it as ONE failure', async () => {
+    const { client } = fakeClient([
+      [
+        { type: 'error', message: SERVER_500 },
+        { type: 'turn_result', ok: false, summary: SERVER_500 },
+      ],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(timers.pending).toHaveLength(1);
+    expect(
+      events.filter((e) => e.kind === 'milestone' && e.text.startsWith('Auto-continue')),
+    ).toHaveLength(1);
+    await timers.fire();
+    expect(handle.getState()).toBe('waiting_input');
+  });
+
+  it('a human send() during the backoff wait cancels the retry and wins', async () => {
+    const { client, calls } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: SERVER_500 }],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+
+    await handle.send('actually, do this instead');
+    await tick();
+    expect(timers.pending[0]?.canceled).toBe(true);
+    expect(calls[1]?.prompt).toBe('actually, do this instead');
+    expect(handle.getState()).toBe('waiting_input');
+  });
+
+  it('interrupt() during the backoff wait cancels the retry and settles waiting_input', async () => {
+    const { client, calls, counts } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: SERVER_500 }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+
+    await handle.interrupt();
+    expect(timers.pending[0]?.canceled).toBe(true);
+    expect(handle.getState()).toBe('waiting_input');
+    // No turn was in flight — the client's interrupt must not fire for a canceled wait.
+    expect(counts.interrupt).toBe(0);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('stop() during the backoff wait cancels the retry before tearing down', async () => {
+    const { client, calls, counts } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: SERVER_500 }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+
+    await handle.stop();
+    expect(timers.pending[0]?.canceled).toBe(true);
+    expect(handle.getState()).toBe('done');
+    expect(counts.end).toBe(1);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a clean turn completion resets the failure streak', async () => {
+    const failing: Turn = [{ type: 'turn_result', ok: false, summary: SERVER_500 }];
+    const succeeding: Turn = [{ type: 'turn_result', ok: true, summary: 'done' }];
+    const { client, calls } = fakeClient([failing, succeeding, failing, succeeding]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      // maxAttempts 1: WITHOUT the reset, the second failure would exhaust the budget.
+      autoContinue: { schedule: timers.schedule, maxAttempts: 1 },
+    });
+    await tick();
+    await timers.fire(); // retry -> clean completion resets the streak
+
+    await handle.send('next task');
+    await tick();
+    // The new failure retries again — proof the counter reset on the clean turn.
+    expect(handle.getState()).not.toBe('failed');
+    await timers.fire();
+    expect(calls).toHaveLength(4);
+    expect(handle.getState()).toBe('waiting_input');
+  });
+});
