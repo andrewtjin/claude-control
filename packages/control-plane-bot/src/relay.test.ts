@@ -712,7 +712,7 @@ describe('RelayServer outbound backpressure cap', () => {
     // socket buffer may absorb several MiB synchronously — so we accumulate instead, bounded so a
     // pathologically large buffer can't loop forever.
     const chunk = 'x'.repeat(4 * 1024 * 1024);
-    let result: SendResult = { ok: true };
+    let result: SendResult = { ok: true, id: 'seed' };
     for (let i = 0; i < 32 && result.ok; i++) {
       result = relay.sendToUser('user-a', (daemonId) => ({
         daemonId,
