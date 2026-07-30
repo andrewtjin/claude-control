@@ -9,8 +9,11 @@ import { join } from 'node:path';
 import {
   defaultLiveCredentialChannel,
   defaultProtector,
+  quoteSecurityArg,
+  type LiveCredentialChannel,
   type Paths,
 } from '@claude-control/switch-engine';
+import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 export interface DoctorCheck {
@@ -148,14 +151,18 @@ export function summarize(checks: DoctorCheck[]): { passed: number; failed: numb
 }
 
 /** Vault encryption availability, verified by a REAL protect/unprotect round-trip through
- *  this platform's protector (win32: DPAPI · darwin: Keychain+AES-GCM). On an unsupported
- *  platform the factory's error IS the report — the gap is stated, never silent. */
+ *  this platform's protector (win32: DPAPI · darwin: Keychain+AES-GCM · everywhere else:
+ *  file-key+AES-GCM). The key stores are get-or-create, so on a first run a green check is
+ *  also proof the key store is writable. `vaultKeyPath` is a test seam for the file-key
+ *  branch; production omits it and probes the real key file. */
 export async function checkVaultProtection(
   platform: NodeJS.Platform = process.platform,
+  vaultKeyPath?: string,
 ): Promise<DoctorCheck> {
-  const label = platform === 'win32' ? 'DPAPI' : platform === 'darwin' ? 'Keychain' : platform;
+  const label =
+    platform === 'win32' ? 'DPAPI' : platform === 'darwin' ? 'Keychain' : `file-key (${platform})`;
   try {
-    const p = defaultProtector(platform);
+    const p = defaultProtector(platform, vaultKeyPath);
     const probe = Buffer.from('cctl-doctor-probe');
     const ok = (await p.unprotect(await p.protect(probe))).equals(probe);
     return {
@@ -184,17 +191,40 @@ export function checkVault(paths: Paths): DoctorCheck {
 export async function checkLiveLogin(
   paths: Paths,
   platform: NodeJS.Platform = process.platform,
+  channel?: LiveCredentialChannel,
 ): Promise<DoctorCheck> {
-  const where = platform === 'darwin' ? "the CLI's Keychain item" : paths.credentialsPath;
+  // `where` starts as the file-channel fallback description and is refined once the channel is
+  // constructed. Keeping it defined before the try means a construction failure (e.g. the
+  // Keychain channel's constructor calling `userInfo()`, which throws when the effective UID has
+  // no passwd entry) still reports a target instead of skipping straight to a bare error.
+  let where: string = paths.credentialsPath;
   try {
-    const live = await defaultLiveCredentialChannel(paths, platform).readLiveCredentials();
+    // Constructed here, inside the try, not as a default parameter — a default parameter is
+    // evaluated before this function body runs, so a throwing constructor would propagate past
+    // this check entirely instead of surfacing as a normal `ok: false` doctor line.
+    channel ??= defaultLiveCredentialChannel(paths, platform);
+    // Name the EXACT target the CHANNEL itself resolved to (service/account, env overrides
+    // applied), read off the channel rather than recomputed here — recomputing independently is
+    // exactly how a reported target can drift from what readLiveCredentials/writeLiveCredentials
+    // actually hit. Only the Keychain channel has one; the file channel leaves this undefined and
+    // `paths.credentialsPath` (the fallback above) is the target. The suggested command is
+    // deliberately an ATTRIBUTE-ONLY dump: `-w`/`-g` would print the live OAuth token to the
+    // operator's terminal. `quoteSecurityArg` matches the quoting the real exec path uses, so an
+    // override containing a quote or `$(...)` doesn't produce mis-quoted copy-paste advice.
+    const target = channel.target;
+    if (target) {
+      where = `the CLI's Keychain item (service="${target.service}", account="${target.account}")`;
+    }
+    const missDetail = target
+      ? `no live credentials in ${where} - verify with ` +
+        `\`security find-generic-password -s ${quoteSecurityArg(target.service)}\` (attribute-only; never -w/-g), ` +
+        `or set CLAUDE_CLI_KEYCHAIN_SERVICE / CLAUDE_CLI_KEYCHAIN_ACCOUNT`
+      : `no live credentials in ${where} - run \`claude\` and log in first`;
+    const live = await channel.readLiveCredentials();
     return {
       name: 'login',
       ok: live !== undefined,
-      detail:
-        live !== undefined
-          ? `live credentials found in ${where}`
-          : `no live credentials in ${where} - run \`claude\` and log in first`,
+      detail: live !== undefined ? `live credentials found in ${where}` : missDetail,
     };
   } catch (err) {
     return {
@@ -215,6 +245,23 @@ export function checkClaudeJson(paths: Paths): DoctorCheck {
   };
 }
 
+/** Whether a remote session could actually start. Managed sessions (`/run` from Discord) are the
+ *  one feature that depends on the Agent SDK's native Claude Code binary, which the SDK looks up
+ *  lazily at the first session — so an install missing it passes every other check here and
+ *  fails only on the phone, hours later, with no local symptom. This check does that lookup up
+ *  front. It is diagnostic: nothing consults it before spawning. */
+export function checkSessionRuntime(deps: ClaudeCodeBinaryDeps = {}): DoctorCheck {
+  const lookup = findClaudeCodeBinary(deps);
+  return {
+    name: 'session-runtime',
+    ok: lookup.path !== undefined,
+    detail:
+      lookup.path !== undefined
+        ? `Claude Code binary for remote sessions: ${lookup.path}`
+        : `remote sessions (/run) cannot start — ${lookup.error}`,
+  };
+}
+
 /** Run every check for the given paths. */
 export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
   return [
@@ -223,6 +270,7 @@ export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
     checkVault(paths),
     await checkLiveLogin(paths),
     checkClaudeJson(paths),
+    checkSessionRuntime(),
     { name: 'lock', ok: true, detail: join(paths.vaultDir, '.lock') },
   ];
 }

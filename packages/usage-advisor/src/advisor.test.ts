@@ -12,7 +12,7 @@ function acct(
   accountId: string,
   label: string,
   limits: LimitInput[],
-  extra: { active?: boolean; quarantined?: boolean } = {},
+  extra: { active?: boolean; quarantined?: boolean; predictedResetAt?: number } = {},
 ): AccountUsageInput {
   return {
     accountId,
@@ -20,6 +20,7 @@ function acct(
     active: extra.active ?? false,
     quarantined: extra.quarantined ?? false,
     limits,
+    ...(extra.predictedResetAt !== undefined ? { predictedResetAt: extra.predictedResetAt } : {}),
   };
 }
 
@@ -189,6 +190,91 @@ describe('computePlan — burn-before-reset (the core behavior)', () => {
     const plan = computePlan([a], opts);
     expect(plan.reason).not.toMatch(/burn/i);
     expect(plan.advisories.some((x) => x.kind === 'burn_before_reset')).toBe(false);
+  });
+});
+
+describe('computePlan — the Fable sub-cap is not a second weekly budget', () => {
+  it('never reads the scoped cap as burnable budget when the weekly budget is nearly spent', () => {
+    // The endpoint reports both weekly limits on one clock: the overall budget (94% used) and
+    // the Fable sub-cap inside it (47% used). Only 6% of the week is actually left, which is
+    // under the significance floor — so there is nothing here to burn. Reading the sub-cap as
+    // budget of its own turns this into "53% weekly left" and recommends the fleet's most
+    // drained account.
+    const drained = acct('drained', 'drained', [
+      { kind: 'weekly_all', percent: 94, resetsAt: NOW + 14 * HOUR },
+      { kind: 'weekly_scoped', percent: 47, resetsAt: NOW + 14 * HOUR },
+    ]);
+    const reserve = acct('reserve', 'reserve', [
+      { kind: 'weekly_all', percent: 20, resetsAt: NOW + 6 * DAY },
+      { kind: 'weekly_scoped', percent: 3, resetsAt: NOW + 6 * DAY },
+    ]);
+    const plan = computePlan([drained, reserve], opts);
+
+    expect(plan.reason).not.toMatch(/burn/i);
+    expect(plan.reason).not.toMatch(/53%/);
+    expect(plan.recommendedAccountId).toBe('reserve');
+    // The ranking must not advertise the sub-cap's slack either.
+    expect(plan.ranking.find((r) => r.accountId === 'drained')?.note).not.toMatch(/burn/i);
+  });
+
+  it('quotes the weekly budget, not the sub-cap, for an account that IS worth burning', () => {
+    // Same two-limit shape, but the budget itself has real slack left: the advice must carry
+    // the budget's 45%, never the sub-cap's 90%.
+    const a = acct('a', 'A', [
+      { kind: 'weekly_all', percent: 55, resetsAt: NOW + 2 * HOUR },
+      { kind: 'weekly_scoped', percent: 10, resetsAt: NOW + 2 * HOUR },
+    ]);
+    const plan = computePlan([a], opts);
+    expect(plan.reason).toBe('Burn A (45% weekly left, resets in 2h).');
+    expect(plan.ranking[0]?.note).toBe('burn: 45% weekly resets soon');
+  });
+
+  it('ranks the burn queue by weekly budget, so a full sub-cap cannot jump the line', () => {
+    // Both budgets expire inside the window. B holds more budget and resets sooner, so it
+    // leads; A's untouched sub-cap must not promote it.
+    const a = acct('a', 'A', [
+      { kind: 'weekly_all', percent: 70, resetsAt: NOW + 9 * HOUR },
+      { kind: 'weekly_scoped', percent: 0, resetsAt: NOW + 9 * HOUR },
+    ]);
+    const b = acct('b', 'B', [
+      { kind: 'weekly_all', percent: 40, resetsAt: NOW + 3 * HOUR },
+      { kind: 'weekly_scoped', percent: 35, resetsAt: NOW + 3 * HOUR },
+    ]);
+    const plan = computePlan([a, b], opts);
+    expect(plan.recommendedAccountId).toBe('b');
+    expect(plan.reason).toBe(
+      'Burn B (60% weekly left, resets in 3h) → A (30% weekly left, in 9h).',
+    );
+  });
+
+  it('says "weekly (fable)" when the sub-cap is the only weekly reading the account has', () => {
+    // No `weekly_all` entry at all, so the sub-cap legitimately stands in as the budget —
+    // but the advice names it rather than passing a Fable-only figure off as the whole week.
+    const a = acct('a', 'A', [{ kind: 'weekly_scoped', percent: 40, resetsAt: NOW + 2 * HOUR }]);
+    const plan = computePlan([a], opts);
+    expect(plan.reason).toBe('Burn A (60% weekly (fable) left, resets in 2h).');
+    expect(plan.ranking[0]?.note).toBe('burn: 60% weekly (fable) resets soon');
+  });
+
+  it('takes the sub-cap reset as the clock while still quoting the budget percent', () => {
+    // The endpoint sometimes drops `resets_at` from one of the pair. They are two views of one
+    // weekly window, so the surviving reset is the honest clock — with the budget's percent.
+    const a = acct('a', 'A', [
+      { kind: 'weekly_all', percent: 55 },
+      { kind: 'weekly_scoped', percent: 10, resetsAt: NOW + 2 * HOUR },
+    ]);
+    const plan = computePlan([a], opts);
+    expect(plan.reason).toBe('Burn A (45% weekly left, resets in 2h).');
+  });
+
+  it('labels a burn deadline that came from a prediction rather than the endpoint', () => {
+    // Once a weekly window closes the endpoint stops publishing its reset; history predicts
+    // the next one. Burning is an action, so the inferred deadline is marked as inferred.
+    const a = acct('a', 'A', [{ kind: 'weekly_all', percent: 55 }], {
+      predictedResetAt: NOW + 2 * HOUR,
+    });
+    const plan = computePlan([a], opts);
+    expect(plan.reason).toBe('Burn A (45% weekly left, resets in 2h (predicted)).');
   });
 });
 

@@ -1,5 +1,19 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { buildProgram } from './program.js';
+
+// `buildEngine` is the CLI's single seam onto the switch engine, so stubbing it lets an action
+// body run for real — commander dispatch, the action, the render — with nothing near a real
+// vault. Hoisted because the mock factory is evaluated during the import above.
+const engine = vi.hoisted(() => ({
+  backfillAccountMetadata: vi.fn(() => Promise.resolve(0)),
+  listAccounts: vi.fn(() => Promise.resolve([])),
+  getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
+}));
+vi.mock('./context.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./context.js')>()),
+  buildEngine: () => engine,
+}));
 
 describe('buildProgram', () => {
   it('exposes the expected command surface', () => {
@@ -13,12 +27,20 @@ describe('buildProgram', () => {
     // Daemon-backed placeholders are present so the surface is discoverable.
     expect(names).toContain('usage');
     expect(names).toContain('timeline');
+    expect(names).toContain('stats');
     expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
     // First-run + at-a-glance status surfaces.
     expect(names).toContain('setup');
     expect(names).toContain('status');
+  });
+
+  it('offers a --days window on stats, defaulting to a week', () => {
+    const stats = buildProgram().commands.find((c) => c.name() === 'stats');
+    const days = stats?.options.find((o) => o.long === '--days');
+    expect(days).toBeDefined();
+    expect(days?.defaultValue).toBe('7');
   });
 
   it('offers --reconfigure and --relay on setup', () => {
@@ -101,7 +123,38 @@ describe('buildProgram', () => {
     expect(subs).toEqual(['install', 'run', 'status', 'supervise', 'uninstall']);
   });
 
-  it('reports its version', () => {
-    expect(buildProgram().version()).toBe('0.1.0');
+  // Asserting a version literal here only restated the constant one import away, so it stayed
+  // green while the publishable package sat on a different number — a 0.3.0 tarball packed a
+  // bundle that reported 0.2.2. The invariant worth holding is that the version a user is told
+  // they are running is the version npm published, so read the real manifest instead.
+  it('reports the version that gets published', () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL('../../cctl-publish/package.json', import.meta.url), 'utf8'),
+    ) as { version: string };
+    expect(buildProgram().version()).toBe(manifest.version);
+  });
+
+  // Asserting the command SURFACE (above) says nothing about what an action does, and the engine's
+  // own tests pass with the listing's call to it deleted — which is exactly the seam the original
+  // defect shipped through: the bundle -> row mapping was right all along and only the wiring that
+  // reaches non-live accounts was missing. So the wiring itself is the invariant to hold.
+  it('repairs stale account metadata before reading the rows it renders', async () => {
+    const order: string[] = [];
+    engine.backfillAccountMetadata.mockImplementation(() => {
+      order.push('repair');
+      return Promise.resolve(0);
+    });
+    engine.listAccounts.mockImplementation(() => {
+      order.push('read');
+      return Promise.resolve([]);
+    });
+    const write = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    try {
+      await buildProgram().parseAsync(['accounts', 'list'], { from: 'user' });
+    } finally {
+      write.mockRestore();
+    }
+    // Order, not just invocation: a repair that lands after the read still renders the stale rows.
+    expect(order).toEqual(['repair', 'read']);
   });
 });

@@ -4,8 +4,9 @@
 //
 //  1. VAULT protection (our storage): a random 256-bit key is kept as a generic password in
 //     the user's login Keychain, and vault blobs are AES-256-GCM encrypted with it in-process
-//     (node:crypto). Same threat model as DPAPI on Windows: a stolen vault directory is
-//     useless without the owner's login keychain.
+//     (aesgcm.ts — the sealing primitive shared with the POSIX file-key protector). Same
+//     threat model as DPAPI on Windows: a stolen vault directory is useless without the
+//     owner's login keychain.
 //
 //  2. LIVE credentials (Claude Code's storage): on macOS the CLI keeps its `claudeAiOauth`
 //     block in the login Keychain — NOT in `<claudeDir>/.credentials.json` — so an account
@@ -24,8 +25,9 @@
 // runs on an actual Mac. The logic below is unit-tested against a fake runner only.
 
 import { spawn } from 'node:child_process';
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { userInfo } from 'node:os';
+import { AesGcmProtector } from './aesgcm.js';
 import { VaultError } from './errors.js';
 import type { Protector } from './dpapi.js';
 import type { ClaudeOauth } from './types.js';
@@ -66,7 +68,7 @@ export const defaultExecRunner: ExecRunner = (file, args, input) =>
 /** `security -i` tokenizes stdin lines like a shell: to pass an arbitrary string as one
  *  argument it must be double-quoted with `\` and `"` escaped. (Assumed to match the real
  *  parser — exercise on a real Mac before the first real switch.) */
-function quoteSecurityArg(value: string): string {
+export function quoteSecurityArg(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
@@ -83,52 +85,6 @@ function isNotFound(err: unknown): boolean {
 /** Where the vault key lives in the login Keychain. Ours — free to name as we like. */
 export const VAULT_KEY_SERVICE = 'claude-control';
 export const VAULT_KEY_ACCOUNT = 'vault-key';
-
-/**
- * AES-256-GCM protector over an injected 32-byte key. Pure node:crypto — unit-testable on
- * every platform. Blob format: `aesgcm:` + base64( iv(12) ‖ authTag(16) ‖ ciphertext ), so
- * tampering with ANY byte fails authentication rather than yielding garbage plaintext.
- * The crypto itself is fast in-process CPU; the async signatures exist to satisfy the
- * Protector contract, whose other implementations genuinely shell out.
- */
-export class AesGcmProtector implements Protector {
-  constructor(private readonly key: Buffer) {
-    if (key.length !== 32) throw new VaultError('AES-256-GCM requires a 32-byte key');
-  }
-
-  protect(plaintext: Buffer): Promise<string> {
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', this.key, iv);
-    const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-    return Promise.resolve(
-      `aesgcm:${Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64')}`,
-    );
-  }
-
-  unprotect(blob: string): Promise<Buffer> {
-    try {
-      if (!blob.startsWith('aesgcm:')) {
-        throw new VaultError('blob was not produced by AesGcmProtector');
-      }
-      const raw = Buffer.from(blob.slice('aesgcm:'.length), 'base64');
-      if (raw.length < 12 + 16) throw new VaultError('AES-GCM blob too short');
-      const decipher = createDecipheriv('aes-256-gcm', this.key, raw.subarray(0, 12));
-      decipher.setAuthTag(raw.subarray(12, 28));
-      try {
-        return Promise.resolve(
-          Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]),
-        );
-      } catch (err) {
-        // Wrong key or tampered blob — GCM authentication failed either way.
-        throw new VaultError('AES-GCM authentication failed (wrong key or corrupted blob)', {
-          cause: err,
-        });
-      }
-    } catch (err) {
-      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
-    }
-  }
-}
 
 /**
  * Get-or-create the vault key in the login Keychain. Read path puts only service/account on
@@ -215,6 +171,31 @@ export class KeychainProtector implements Protector {
 /** The mac CLI's own Keychain item (assumed name — verify on a real Mac). */
 export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
+/** Effective service/account for the CLI's live Keychain item, applying operator env overrides
+ *  over the shipped defaults: if the CLI turns out to use a different item name than assumed
+ *  above, the operator corrects it with an env var instead of waiting on a code change. Used by
+ *  the live-channel factory (`defaultLiveCredentialChannel`) to construct the channel; callers
+ *  that need to REPORT the target (e.g. `cctl doctor`) read it off the constructed channel's
+ *  `.target` instead of calling this a second time, so the two can never drift apart. `env` is
+ *  injected for testability; unset keys fall back to the default service and the login user,
+ *  i.e. identical to constructing the channel with no options. */
+export function resolveClaudeCliKeychainTarget(env: NodeJS.ProcessEnv = process.env): {
+  service: string;
+  account: string;
+} {
+  // Trim first: a set-but-blank-or-whitespace override (`export CLAUDE_CLI_KEYCHAIN_SERVICE=`,
+  // or a stray space from a copy-pasted config line) is an operator slip, not an intentional
+  // empty item name — fall back to the default there too. `||` (not `??`) then treats the
+  // trimmed-empty result the same as unset. An empty/blank service or account is never a valid
+  // `security(1)` target, so this can only help.
+  const service = env.CLAUDE_CLI_KEYCHAIN_SERVICE?.trim();
+  const account = env.CLAUDE_CLI_KEYCHAIN_ACCOUNT?.trim();
+  return {
+    service: service || CLAUDE_CLI_KEYCHAIN_SERVICE,
+    account: account || userInfo().username,
+  };
+}
+
 /**
  * Live-credential channel backed by the Claude CLI's macOS Keychain item. Behavior mirrors
  * the file channel's SURGICAL rule: read the existing payload, replace exactly the
@@ -225,13 +206,18 @@ export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
  * A missing item reads as `undefined` ("nobody logged in"), exactly like a missing file.
  */
 export class KeychainCredentialChannel implements LiveCredentialChannel {
-  private readonly service: string;
-  private readonly account: string;
+  /** The exact service/account this instance reads and writes. Public (not just internal
+   *  state) so a caller — `cctl doctor` in particular — can report the EXACT target that will
+   *  actually be hit, instead of recomputing it via a second, independent call that could drift
+   *  out of sync with what this channel was actually constructed with. */
+  readonly target: { service: string; account: string };
   private readonly run: ExecRunner;
 
   constructor(options?: { service?: string; account?: string; run?: ExecRunner }) {
-    this.service = options?.service ?? CLAUDE_CLI_KEYCHAIN_SERVICE;
-    this.account = options?.account ?? userInfo().username;
+    this.target = {
+      service: options?.service ?? CLAUDE_CLI_KEYCHAIN_SERVICE,
+      account: options?.account ?? userInfo().username,
+    };
     this.run = options?.run ?? defaultExecRunner;
   }
 
@@ -256,7 +242,7 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
       await this.run(
         'security',
         ['-i'],
-        `add-generic-password -U -s ${quoteSecurityArg(this.service)} -a ${quoteSecurityArg(this.account)} -w ${quoteSecurityArg(json)}\n`,
+        `add-generic-password -U -s ${quoteSecurityArg(this.target.service)} -a ${quoteSecurityArg(this.target.account)} -w ${quoteSecurityArg(json)}\n`,
       );
     } catch (err) {
       throw new VaultError('failed to write live credentials to the login Keychain', {
@@ -272,9 +258,9 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
       out = await this.run('security', [
         'find-generic-password',
         '-s',
-        this.service,
+        this.target.service,
         '-a',
-        this.account,
+        this.target.account,
         '-w',
       ]);
     } catch (err) {

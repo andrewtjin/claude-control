@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { humanizeDuration, roundPct } from './format.js';
+import { formatTokens, humanizeDuration, roundPct } from './format.js';
 
 describe('humanizeDuration', () => {
   it('formats sub-minute and zero as expected', () => {
@@ -23,5 +23,41 @@ describe('roundPct', () => {
     expect(roundPct(42.6)).toBe(43);
     expect(roundPct(-5)).toBe(0);
     expect(roundPct(140)).toBe(100);
+  });
+});
+
+describe('formatTokens', () => {
+  it('keeps small counts exact and compacts large ones with a unit', () => {
+    expect(formatTokens(0)).toBe('0');
+    expect(formatTokens(847)).toBe('847');
+    expect(formatTokens(1234)).toBe('1.2k');
+    expect(formatTokens(847_000)).toBe('847k');
+    expect(formatTokens(1_200_000)).toBe('1.2M');
+    expect(formatTokens(1_900_000_000)).toBe('1.9B');
+  });
+
+  it('drops the decimal once it stops carrying information', () => {
+    // 9.9k still distinguishes two counts; 12k does not need the ".3".
+    expect(formatTokens(9900)).toBe('9.9k');
+    expect(formatTokens(12_300)).toBe('12k');
+  });
+
+  it('rounds sub-unit counts to a whole number rather than printing a fraction', () => {
+    expect(formatTokens(0.4)).toBe('0');
+    expect(formatTokens(999.6)).toBe('1000');
+  });
+
+  it('promotes to the next unit when rounding would otherwise print one that does not exist', () => {
+    // 999.6k and 999_999k both round to "1000k" pre-fix — a unit this function never
+    // otherwise emits, right next to rows reading "1.9B".
+    expect(formatTokens(999_600)).toBe('1.0M');
+    expect(formatTokens(999_999)).toBe('1.0M');
+    expect(formatTokens(999_999_999)).toBe('1.0B');
+  });
+
+  it('drops the decimal at the top unit once rounding reaches double digits', () => {
+    // 9.999999999B rounds to "10.0" at one decimal place, which must read "10B" (still the
+    // same unit, just no decimal), not the self-contradictory "10.0B".
+    expect(formatTokens(9_999_999_999)).toBe('10B');
   });
 });

@@ -46,6 +46,41 @@ cctl timeline   # 5h-session budget per account + when every limit resets, with 
 Both read the daemon's last-persisted snapshot, so they work whether or not the daemon
 is currently running.
 
+## Token stats
+
+```
+cctl stats             # absolute token counts per account, model and day (last 7 days)
+cctl stats --days 30   # a longer window
+```
+
+`usage` and `timeline` answer "how much of my limit is gone" — a percentage from
+Anthropic's usage endpoint. `stats` answers the different question, "how many tokens did I
+actually spend, and on which account". It reads the per-turn records Claude Code writes
+under your Claude config dir (`CLAUDE_CONFIG_DIR`, else `~/.claude`) and joins each turn's
+timestamp against the daemon's switch journal to decide which account was live at the
+time. Input, output, cache-write and cache-read tokens are reported separately — cache
+reads usually dominate, so one combined number would hide everything interesting.
+
+No network call is made and no daemon needs to be running. The same numbers reach the
+phone as `/stats`, pushed by the daemon every 15 minutes.
+
+On the phone, `/stats` with no options renders that pushed snapshot — instant, and up to
+15 minutes old. `/stats days:30` (1–90) asks for a different window instead, which makes
+the daemon re-read the host's transcripts then and there: the reply is deferred while the
+scan runs, and only one scan happens at a time, so a request arriving while another is in
+flight is told to try again rather than queued behind it.
+
+**What these numbers are not.** They are the turns Claude Code recorded _on this machine_:
+
+- Work done from the web app, the mobile app, or another computer is not counted at all.
+- Turns from before cctl recorded its first account switch cannot be attributed to an
+  account. They appear in an `unattributed` row rather than being dropped.
+- They are local records, not an authoritative billing figure from Anthropic.
+
+The command prints these caveats under every table, and reports how many transcript files
+it read, skipped, or could not read — a total over part of the corpus is a different claim
+from a total over all of it.
+
 ## Status and settings
 
 ```
@@ -179,3 +214,9 @@ pnpm run test
 The published `@andrewtjin/cctl` package (`packages/cctl-publish`) is a separate
 single-file esbuild bundle of the same CLI + daemon — see that package for the
 prepublish smoke test that guards it.
+
+One dependency is deliberately NOT bundled: `@anthropic-ai/claude-agent-sdk`, which
+spawns the Claude Code binary that backs every remote session. The SDK finds that binary
+by resolving a per-platform package from its own module location, so inlining it produces
+a bundle that builds and boots but cannot start a session. It stays external and declared,
+and the smoke test re-runs that lookup against a staged install so the gap cannot ship.

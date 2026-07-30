@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
@@ -7,12 +9,15 @@ import {
   summarize,
   checkVaultProtection,
   checkNodeVersion,
+  checkSessionRuntime,
   healthUrlFromRelay,
   probeRelay,
+  checkLiveLogin,
   MIN_NODE_VERSION,
   type DoctorCheck,
   type ProbeFetch,
 } from './doctor.js';
+import { sandboxPaths, type LiveCredentialChannel } from '@claude-control/switch-engine';
 
 // This file lives at packages/cli/src/, so two levels up is packages/, where the publishable
 // bundle lives at cctl-publish/package.json (see dependencyClosure.test.ts for the same idiom).
@@ -45,7 +50,9 @@ describe('checkVaultProtection', () => {
     { timeout: 30_000 },
     async () => {
       // Runs the REAL platform protector: DPAPI here on Windows, Keychain on a Mac. Either
-      // way the check must pass on any supported dev machine.
+      // way the check must pass on any supported dev machine. Gated off other platforms
+      // because the default file-key path would probe the REAL key file location — the
+      // file-key branch is covered below with a sandboxed path instead.
       if (process.platform !== 'win32' && process.platform !== 'darwin') return;
       const result = await checkVaultProtection();
       expect(result.ok).toBe(true);
@@ -53,11 +60,15 @@ describe('checkVaultProtection', () => {
     },
   );
 
-  it('names the gap on an unsupported platform instead of failing silently', async () => {
-    const result = await checkVaultProtection('freebsd');
-    expect(result.ok).toBe(false);
-    expect(result.detail).toMatch(/freebsd/);
-    expect(result.detail).toMatch(/win32 \(DPAPI\), darwin \(Keychain\)/);
+  it('round-trips through the file-key protector on OS-secret-store-less platforms', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-doctor-'));
+    try {
+      const result = await checkVaultProtection('linux', join(dir, 'vault.key'));
+      expect(result.ok).toBe(true);
+      expect(result.detail).toMatch(/file-key \(linux\) protect\/unprotect round-trip works/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -111,6 +122,38 @@ describe('checkNodeVersion', () => {
   });
 });
 
+describe('checkSessionRuntime', () => {
+  const MANIFEST = JSON.stringify({ platforms: { 'win32-x64': { binary: 'claude.exe' } } });
+
+  it('passes and names the binary a remote session would run', () => {
+    const check = checkSessionRuntime({
+      platform: 'win32',
+      arch: 'x64',
+      readManifest: () => MANIFEST,
+      resolveFromSdk: () => 'C:/n_m/claude.exe',
+    });
+    expect(check.name).toBe('session-runtime');
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('C:/n_m/claude.exe');
+  });
+
+  it('fails with the reason when the native binary is missing', () => {
+    // The `--omit=optional` install: every other doctor check passes and only /run is broken,
+    // which is exactly the state this check exists to make visible locally.
+    const check = checkSessionRuntime({
+      platform: 'win32',
+      arch: 'x64',
+      readManifest: () => MANIFEST,
+      resolveFromSdk: () => {
+        throw new Error('Cannot find module');
+      },
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('/run');
+    expect(check.detail).toContain('--omit=optional');
+  });
+});
+
 describe('healthUrlFromRelay', () => {
   it('maps ws→http and wss→https and appends /health', () => {
     expect(healthUrlFromRelay('ws://127.0.0.1:8765')).toBe('http://127.0.0.1:8765/health');
@@ -152,5 +195,55 @@ describe('probeRelay', () => {
     };
     await probeRelay('wss://relay.example.com', { fetchFn });
     expect(seen).toBe('https://relay.example.com/health');
+  });
+});
+
+describe('checkLiveLogin (darwin)', () => {
+  const paths = sandboxPaths('root');
+  // Inject a fake channel so the check never touches real `security(1)`, which on a Mac could
+  // raise the Keychain GUI prompt this check has no way to answer. `target` defaults to the
+  // shipped default so the existing assertions read naturally, but callers can override it to
+  // prove `checkLiveLogin` reports the CHANNEL's target, not a value it recomputed itself.
+  const fakeChannel = (
+    creds: unknown,
+    target: { service: string; account: string } = {
+      service: 'Claude Code-credentials',
+      account: 'login-user',
+    },
+  ): LiveCredentialChannel => ({
+    // `checkLiveLogin` only checks `!== undefined`, so test callers pass a partial credential
+    // shape; cast just this return value rather than the whole object, so `target`'s shape is
+    // still checked structurally against `LiveCredentialChannel`.
+    readLiveCredentials: () =>
+      Promise.resolve(creds) as ReturnType<LiveCredentialChannel['readLiveCredentials']>,
+    writeLiveCredentials: () => Promise.resolve(),
+    target,
+  });
+
+  it('names the effective Keychain service/account so a wrong item name self-diagnoses', async () => {
+    const res = await checkLiveLogin(paths, 'darwin', fakeChannel(undefined));
+    expect(res.ok).toBe(false);
+    expect(res.detail).toContain('service="Claude Code-credentials"');
+    // The hint stays attribute-only and points at the env override, never a token read.
+    expect(res.detail).toMatch(/attribute-only/);
+    expect(res.detail).toMatch(/CLAUDE_CLI_KEYCHAIN_SERVICE/);
+  });
+
+  it('reports found credentials against the same named target', async () => {
+    const res = await checkLiveLogin(paths, 'darwin', fakeChannel({ accessToken: 'x' }));
+    expect(res.ok).toBe(true);
+    expect(res.detail).toContain('service="Claude Code-credentials"');
+  });
+
+  it('reports the CHANNEL target, not a value recomputed independently of it', async () => {
+    // A channel configured with a non-default target (as an operator's env override would
+    // produce) must show up verbatim in `detail`. If `checkLiveLogin` ever went back to
+    // recomputing the target itself instead of reading `channel.target`, this target would
+    // never appear and the assertion below would fail.
+    const custom = { service: 'Custom-Item', account: 'alt-user' };
+    const res = await checkLiveLogin(paths, 'darwin', fakeChannel(undefined, custom));
+    expect(res.detail).toContain('service="Custom-Item"');
+    expect(res.detail).toContain('account="alt-user"');
+    expect(res.detail).not.toContain('Claude Code-credentials');
   });
 });

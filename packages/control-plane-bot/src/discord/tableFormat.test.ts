@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { formatTables, DEFAULT_TABLE_WIDTH } from './tableFormat.js';
+import { clampFieldValue } from './embeds.js';
+import { clampBalanced } from './messageChunks.js';
+import { formatTables, formatTablesClamped, DEFAULT_TABLE_WIDTH } from './tableFormat.js';
 
 // The real card that motivated this module: a terminal-sized comparison table (88 columns)
 // that a phone-width Discord surface shredded. Kept verbatim as the primary fixture.
@@ -73,6 +75,35 @@ describe('formatTables — box-drawing input', () => {
     expect(separators).toHaveLength(4); // 5 rows, a separator after each but the last
   });
 
+  it('keeps a separator between every body row for a fully-separated box source (3 rows)', () => {
+    // A box source states its own gaps and the render mirrors them exactly — unlike markdown,
+    // which states none. A source ruled at every gap therefore comes back ruled at every gap,
+    // and narrowing the columns to their natural width must not cost a single rule.
+    const threeRows = [
+      '┌─────┬─────┬─────┐',
+      '│  A  │  A  │  A  │',
+      '├─────┼─────┼─────┤',
+      '│ A   │ A   │ A   │',
+      '├─────┼─────┼─────┤',
+      '│ A   │ A   │ A   │',
+      '└─────┴─────┴─────┘',
+    ].join('\n');
+    const out = formatTables(threeRows);
+    expect(out).toBe(
+      [
+        '```',
+        '┌───┬───┬───┐',
+        '│ A │ A │ A │',
+        '├───┼───┼───┤',
+        '│ A │ A │ A │',
+        '├───┼───┼───┤',
+        '│ A │ A │ A │',
+        '└───┴───┴───┘',
+        '```',
+      ].join('\n'),
+    );
+  });
+
   it('renders a table that already fits at its natural width', () => {
     const narrow = ['┌────┬────┐', '│ ab │ cd │', '├────┼────┤', '│ ef │ gh │', '└────┴────┘'].join(
       '\n',
@@ -135,8 +166,35 @@ describe('formatTables — markdown pipe input', () => {
     expect(lines[1]?.startsWith('┌')).toBe(true);
     for (const line of lines) expect(line.length).toBeLessThanOrEqual(DEFAULT_TABLE_WIDTH);
     expect(columnText(out, 0)).toBe('Flag--auto-switch--greedy'.replace(/\s+/g, ''));
-    // Header separator only — markdown tables have exactly one.
-    expect(lines.filter((l) => l.startsWith('├'))).toHaveLength(1);
+    // Markdown has exactly one delimiter row (header/body), but that delimiter marks where the
+    // HEADER ends, not how many separators the grid gets: every row still sits on its own line
+    // in the source, so the render separates every gap — one after the header, one between the
+    // two body rows.
+    expect(lines.filter((l) => l.startsWith('├'))).toHaveLength(2);
+  });
+
+  it('separates every body row, not just the header — a markdown table has no way to mark a gap as unseparated', () => {
+    // With a rule only under the header, every body row past the first sits flush against the
+    // next and the three of them read as one three-line row. A single-character cell keeps the
+    // box narrow enough that nothing wraps, isolating the rule count from the width/wrap
+    // behavior covered elsewhere.
+    const threeBodyRows = [
+      '| Col | Val |',
+      '| --- | --- |',
+      '| A | A |',
+      '| A | A |',
+      '| A | A |',
+    ].join('\n');
+    const out = formatTables(threeBodyRows);
+    const lines = out.split('\n');
+    // 4 rows total (header + 3 body) means 3 gaps, every one of them separated.
+    expect(lines.filter((l) => l.startsWith('├'))).toHaveLength(3);
+    // And no two data rows are adjacent without a separator between them.
+    const dataOrSep = lines.filter((l) => l.startsWith('│') || l.startsWith('├'));
+    for (let i = 0; i + 1 < dataOrSep.length; i++) {
+      const both = [dataOrSep[i], dataOrSep[i + 1]];
+      expect(both.every((l) => l?.startsWith('│'))).toBe(false);
+    }
   });
 
   it('does not fire on a stray pipe in prose (no separator line follows)', () => {
@@ -145,7 +203,373 @@ describe('formatTables — markdown pipe input', () => {
   });
 
   it('honors a custom width', () => {
-    const out = formatTables(MD_TABLE, 60);
+    const out = formatTables(MD_TABLE, { maxWidth: 60 });
     for (const line of out.split('\n')) expect(line.length).toBeLessThanOrEqual(60);
+  });
+});
+
+describe('formatTables — the rules are kept or shed by what the surface DELIVERS', () => {
+  /** Discord's embed-field cap, and the real clamp that enforces it: whole trailing LINES dropped
+   *  and a "… +N more" marker appended. Every case here runs through that clamp rather than a
+   *  stand-in, because the trade being measured lives entirely in how the clamp cuts. */
+  const FIELD_MAX = 1024;
+  const deliverField = (rendered: string): string =>
+    clampBalanced(rendered, FIELD_MAX, clampFieldValue);
+
+  /** A markdown table whose cells stay short enough to keep the grid layout, so the only thing
+   *  `bodyRows` grows is the row count and the rules between them. `pad` widens every cell by a
+   *  fixed amount, which walks the ruled render's overrun past the clamp's line boundary — the
+   *  boundary is where every character-counting model of the clamp has gone wrong. */
+  const mdTable = (bodyRows: number, pad = 0): string =>
+    [
+      '| Account | Plan | Left |',
+      '| --- | --- | --- |',
+      ...Array.from(
+        { length: bodyRows },
+        (_, i) => `| acct-${i}. | max20x${'x'.repeat(pad)} | ${i}% |`,
+      ),
+    ].join('\n');
+
+  /** The pre-fix render: a rule under the header and nowhere else. Built by deleting the rules a
+   *  fully-ruled render draws past the first, which is exactly the line set the unruled policy
+   *  emits — the two policies differ in nothing else. Pinned by the equality assertion below. */
+  const bareBaseline = (text: string): string => {
+    let kept = 0;
+    return formatTables(text)
+      .split('\n')
+      .filter((line) => !line.startsWith('├') || kept++ === 0)
+      .join('\n');
+  };
+
+  /** How many of `tokens` a delivered value still shows. The reader's-eye measure of content:
+   *  observable in the output, and stated in the source's own words rather than in any notion of
+   *  a line the module might hold. */
+  const shown = (value: string, tokens: string[]): number =>
+    tokens.filter((t) => value.includes(t)).length;
+
+  const accountTokens = (rows: number): string[] =>
+    Array.from({ length: rows }, (_, i) => `acct-${i}.`);
+
+  it('rules every gap while the surface shows the whole render', () => {
+    const out = formatTablesClamped(mdTable(3), FIELD_MAX, clampFieldValue);
+    expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
+  });
+
+  it('sheds the rules — and only down to the header rule — once they cost rows', () => {
+    const source = mdTable(20);
+    const out = formatTablesClamped(source, FIELD_MAX, clampFieldValue);
+    // Down to the delimiter's own gap and not one rule further: the header must stay divided from
+    // the body even when there is no room for anything else.
+    expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(1);
+    expect(out).toBe(deliverField(bareBaseline(source)));
+    for (const token of accountTokens(20)) expect(out).toContain(token);
+    expect(out).not.toMatch(/… \+\d+ more/);
+    expect(out.length).toBeLessThanOrEqual(FIELD_MAX);
+  });
+
+  it('keeps every row of a table whose ruled render overruns by less than one line', () => {
+    // The boundary case. A sixteen-row table one character wider per cell overruns the cap by a
+    // few characters — less than the line the clamp then drops, plus the ten it spends on the
+    // marker. Any model that asks "how much of the ruled render fits?" reads that as a tie with
+    // the unruled one and keeps the rules; the clamp then charges the reader a whole row for it.
+    const source = mdTable(16, 1);
+    expect(formatTables(source).length).toBeGreaterThan(FIELD_MAX);
+    const out = formatTablesClamped(source, FIELD_MAX, clampFieldValue);
+    for (const token of accountTokens(16)) expect(out).toContain(token);
+    // The clamp's own marker, matched by its shape — a cell that happens to say "more" is content.
+    expect(out).not.toMatch(/… \+\d+ more/);
+  });
+
+  /** A three-row table followed by twelve paragraphs of `width` characters. The prose alone
+   *  overruns the field cap, so the cut lands well past the table and the only question is
+   *  whether the three rules above the prose cost the reader a paragraph. */
+  const tableThenProse = (width: number): string =>
+    [
+      mdTable(3),
+      '',
+      ...Array.from({ length: 12 }, (_, i) => `p${i}. ${'x'.repeat(width - 4)}`),
+    ].join('\n');
+
+  it('keeps the rules when what overruns is prose they stand in front of none of', () => {
+    // 73-character paragraphs: the ruled render overruns the cap by more than a hundred
+    // characters, and every line the clamp then drops is prose it would have dropped without the
+    // rules too. Shedding them buys the reader nothing and costs them the divisions, so the
+    // render must be the one this text gets on a surface with no cap at all.
+    const text = tableThenProse(73);
+    expect(formatTables(text).length).toBeGreaterThan(FIELD_MAX);
+    const out = formatTablesClamped(text, FIELD_MAX, clampFieldValue);
+    expect(out).toBe(deliverField(formatTables(text)));
+    expect(out.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
+  });
+
+  it('sheds them one character of prose either side, where they do cost a paragraph', () => {
+    // The two widths bracketing the case above, where the rules are exactly what pushes a
+    // paragraph past the cut. This is the half of the trade a rows-only measure cannot see at
+    // all: the rules sit ABOVE the prose, so what they push off the screen is paragraphs.
+    for (const width of [63, 72]) {
+      const text = tableThenProse(width);
+      const out = formatTablesClamped(text, FIELD_MAX, clampFieldValue);
+      expect({ width, rules: out.split('\n').filter((l) => l.startsWith('├')).length }).toEqual({
+        width,
+        rules: 1,
+      });
+      // The paragraph the rules would have cost, on the reader's screen.
+      const kept = Array.from({ length: 12 }, (_, i) => `p${i}.`).filter((t) => out.includes(t));
+      const ruledKept = Array.from({ length: 12 }, (_, i) => `p${i}.`).filter((t) =>
+        deliverField(formatTables(text)).includes(t),
+      );
+      expect({ width, kept: kept.length }).toEqual({ width, kept: ruledKept.length + 1 });
+    }
+  });
+
+  it('shows at least as much as the unruled baseline, sweeping cell width and row count', () => {
+    for (let pad = 0; pad <= 10; pad++) {
+      for (const rows of [4, 8, 12, 16, 20, 24]) {
+        const source = mdTable(rows, pad);
+        const tokens = accountTokens(rows);
+        const chosen = shown(formatTablesClamped(source, FIELD_MAX, clampFieldValue), tokens);
+        expect({ pad, rows, chosen }).toEqual({
+          pad,
+          rows,
+          chosen: Math.max(chosen, shown(deliverField(bareBaseline(source)), tokens)),
+        });
+      }
+    }
+  });
+
+  it('shows at least as much as the unruled baseline, sweeping prose width', () => {
+    // Every width from a short bullet to a wrapped paragraph: the widths where the two policies
+    // tie are the ones every previous rule got wrong, so none of them may be skipped.
+    const tokens = [...accountTokens(3), ...Array.from({ length: 12 }, (_, i) => `p${i}.`)];
+    for (let width = 40; width <= 300; width++) {
+      const source = tableThenProse(width);
+      const chosen = shown(formatTablesClamped(source, FIELD_MAX, clampFieldValue), tokens);
+      expect({ width, chosen }).toEqual({
+        width,
+        chosen: Math.max(chosen, shown(deliverField(bareBaseline(source)), tokens)),
+      });
+    }
+  });
+
+  it('leaves a box source ruled as it was drawn however hard the surface cuts', () => {
+    // A box source states its gaps, so shedding them would be dropping information the sender
+    // supplied — a clamp buys back what this module chose to add, never what it was given.
+    const box = [
+      '┌─────┬─────┐',
+      '│ a   │ b   │',
+      '├─────┼─────┤',
+      '│ c   │ d   │',
+      '├─────┼─────┤',
+      '│ e   │ f   │',
+      '└─────┴─────┘',
+    ].join('\n');
+    // The harshest surface there is — one that shows none of the render at all.
+    expect(
+      formatTables(box, { deliver: () => '' })
+        .split('\n')
+        .filter((l) => l.startsWith('├')),
+    ).toHaveLength(2);
+  });
+
+  it('is unchanged by a surface that shows the whole render', () => {
+    expect(formatTablesClamped(mdTable(2), 4096, clampFieldValue)).toBe(formatTables(mdTable(2)));
+  });
+
+  it('rules every gap when the caller states no delivery at all', () => {
+    expect(
+      formatTables(mdTable(20))
+        .split('\n')
+        .filter((l) => l.startsWith('├')),
+    ).toHaveLength(20);
+  });
+});
+
+// The shape that motivated the record layout: a 2-column markdown table whose second column is
+// whole sentences. Discord renders none of it, and a 40-column grid would give each sentence a
+// third of a line. Synthetic file names — the fixture is about the SHAPE (code spans in the first
+// cell, a paragraph in the second), not about any particular repository.
+const PROSE_MD_TABLE = [
+  '| Action | Detail |',
+  '|---|---|',
+  '| `widget.ts` -> `src/parts/` | Self-contained, no relative imports - moves unchanged. |',
+  "| `loader.ts` + `loader-old.ts` -> `src/parts/loader.ts` | Collapsed the duplicate; kept the streaming path, took the older file's bounded retry cap. |",
+  '| `legacy.config.json` -> deleted | Folded into the package config. A stray `legacy.config.json` would win over it and the merged settings would be ignored without a word. Added `roots = ["src"]` so `example_pkg` resolves before the local install. |',
+  '| `README.md`, `tasks/todo.md` | Updated the dangling paths the moves created. |',
+  '| `.cache/` | Deleted - two stale build caches of pure garbage. |',
+].join('\n');
+
+/** Every rendered character that is not a fence or layout whitespace — the roundtrip form for
+ *  asserting a record layout dropped nothing and reordered nothing. */
+function recordText(rendered: string): string {
+  return rendered
+    .split('\n')
+    .filter((l) => l !== '```')
+    .join('')
+    .replace(/\s+/g, '');
+}
+
+describe('formatTables — long-cell tables render as records, not a grid', () => {
+  it('renders the prose table as one record per row', () => {
+    expect(formatTables(PROSE_MD_TABLE)).toBe(
+      [
+        '```',
+        'Action',
+        '  Detail',
+        '',
+        '`widget.ts` -> `src/parts/`',
+        '  Self-contained, no relative imports -',
+        '  moves unchanged.',
+        '',
+        '`loader.ts` + `loader-old.ts` ->',
+        '`src/parts/loader.ts`',
+        '  Collapsed the duplicate; kept the',
+        "  streaming path, took the older file's",
+        '  bounded retry cap.',
+        '',
+        '`legacy.config.json` -> deleted',
+        '  Folded into the package config. A',
+        '  stray `legacy.config.json` would win',
+        '  over it and the merged settings would',
+        '  be ignored without a word. Added',
+        '  `roots = ["src"]` so `example_pkg`',
+        '  resolves before the local install.',
+        '',
+        '`README.md`, `tasks/todo.md`',
+        '  Updated the dangling paths the moves',
+        '  created.',
+        '',
+        '`.cache/`',
+        '  Deleted - two stale build caches of',
+        '  pure garbage.',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('keeps every record line inside the width budget', () => {
+    for (const line of formatTables(PROSE_MD_TABLE).split('\n')) {
+      expect(line.length).toBeLessThanOrEqual(DEFAULT_TABLE_WIDTH);
+    }
+  });
+
+  it('loses no cell content and keeps source order — full roundtrip', () => {
+    // Header row included: with two fields it renders as the first record rather than vanishing.
+    const cells = PROSE_MD_TABLE.split('\n')
+      .filter((l) => !/^\|?[\s:|-]+\|?$/.test(l))
+      .flatMap((l) => l.split('|').slice(1, -1));
+    expect(recordText(formatTables(PROSE_MD_TABLE))).toBe(cells.join('').replace(/\s+/g, ''));
+  });
+
+  it('labels each field past two columns, taking the labels from the header row', () => {
+    const three = [
+      '| Action | Detail | Owner |',
+      '|---|---|---|',
+      '| `widget.ts` -> `src/parts/` | Self-contained, no relative imports so it moves unchanged. | platform |',
+      '| `legacy.config.json` -> deleted | Folded into the package config; a stray file would silently win. | tooling |',
+    ].join('\n');
+    expect(formatTables(three)).toBe(
+      [
+        '```',
+        'ACTION: `widget.ts` -> `src/parts/`',
+        'DETAIL: Self-contained, no relative',
+        '        imports so it moves unchanged.',
+        'OWNER:  platform',
+        '',
+        'ACTION: `legacy.config.json` -> deleted',
+        'DETAIL: Folded into the package config;',
+        '        a stray file would silently win.',
+        'OWNER:  tooling',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('leaves a blank header cell unlabeled instead of printing a bare colon', () => {
+    // `| | Tradeoff | Recommendation |` is a common idiom: the corner names nothing, so it must
+    // pad to the label column rather than label every record with a lone `:`.
+    const blankCorner = [
+      '| | Tradeoff | Recommendation |',
+      '|---|---|---|',
+      '| Option A | Costs more up front, but it avoids a rewrite in the next quarter. | Take it |',
+      '| Option B | Cheaper today, and the rewrite lands squarely on the next team. | Skip it |',
+    ].join('\n');
+    const lines = formatTables(blankCorner).split('\n');
+    expect(lines[1]).toBe('                Option A');
+    expect(lines[2]).toBe('TRADEOFF:       Costs more up front, but');
+  });
+
+  it('drops the grid when the columns cannot be squeezed to the target width', () => {
+    // Twenty one-word cells: no cell wraps at all, so the height gate never fires, yet every
+    // column sits at its floor and the box still renders past 100 columns — the shredded grid
+    // this module exists to replace. Width has to gate the layout too.
+    const columns = 20;
+    const wide = [
+      `| ${Array.from({ length: columns }, (_, i) => `c${i}`).join(' | ')} |`,
+      `|${'---|'.repeat(columns)}`,
+      `| ${Array.from({ length: columns }, (_, i) => `v${i}`).join(' | ')} |`,
+    ].join('\n');
+    const out = formatTables(wide);
+    expect(out).not.toContain('┌');
+    for (const line of out.split('\n'))
+      expect(line.length).toBeLessThanOrEqual(DEFAULT_TABLE_WIDTH);
+    expect(out).toContain('C19: v19');
+  });
+
+  it('hard-splits an astral token on code points, never through a surrogate pair', () => {
+    // A record wraps at `maxWidth - lead.length`, which is odd whenever the padded label is — and
+    // a UTF-16 slice at an odd offset lands INSIDE an emoji, replacing it with two broken halves.
+    const glyph = '\u{1F600}';
+    const table = [
+      '| Label | Detail |',
+      '|---|---|',
+      `| ${glyph.repeat(40)} | ${'a sentence long enough to force the record layout '.repeat(3)}|`,
+    ].join('\n');
+    const out = formatTables(table);
+    expect([...out].filter((c) => c === glyph)).toHaveLength(40);
+    // Nothing but complete pairs: a lone surrogate is what renders as U+FFFD.
+    expect(out.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')).not.toMatch(/[\uD800-\uDFFF]/);
+  });
+
+  it('never eats a first DATA row as labels when the source declared no header', () => {
+    const long = (n: string): string =>
+      `${n} cell that runs on well past any column a phone-width grid could give it`;
+    const headerless = [
+      '┌──────┬──────┬──────┐',
+      `│ ${long('first')} │ ${long('second')} │ ${long('third')} │`,
+      `│ ${long('fourth')} │ ${long('fifth')} │ ${long('sixth')} │`,
+      '└──────┴──────┴──────┘',
+    ].join('\n');
+    const blocks = formatTables(headerless)
+      .split('\n')
+      .filter((l) => l !== '```')
+      .join('\n')
+      .split('\n\n');
+    // Two rows in, two records out — the first row is data, not a legend.
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]?.startsWith('first cell')).toBe(true);
+    expect(formatTables(headerless)).not.toContain('FIRST');
+  });
+
+  it('keeps the grid for a table whose cells stay short (the boundary the layout turns on)', () => {
+    // The 88-column fixture squeezes hard but its cells are still labels, not paragraphs.
+    expect(formatTables(WIDE_BOX_TABLE)).toContain('┌');
+    expect(formatTables(PROSE_MD_TABLE)).not.toContain('┌');
+  });
+
+  it('defuses a fence-closing backtick run of any length', () => {
+    // Three is the fence itself; four is the idiom for fencing a block that CONTAINS a fence, so
+    // a longer run is the case that matters — defusing only the leading three would leave the
+    // rest adjacent to the backticks just emitted and rebuild a ``` inside the body.
+    const zeroWidthSpace = String.fromCharCode(0x200b);
+    for (const run of ['```', '````', '`````', '``````']) {
+      const table = ['| Cmd | Note |', '| --- | --- |', `| ${run} | ends a fence |`].join('\n');
+      const out = formatTables(table);
+      // Exactly the opening and closing fences: nothing in the body can terminate ours.
+      expect(out.match(/```/g)).toHaveLength(2);
+      const body = out.split('\n').slice(1, -1).join('\n');
+      // Every backtick is still there — the defusal separates them, it never drops them.
+      expect(body.match(/`/g)).toHaveLength(run.length);
+      expect(body).toContain([...run].join(zeroWidthSpace));
+    }
   });
 });

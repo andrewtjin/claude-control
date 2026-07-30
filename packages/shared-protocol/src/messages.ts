@@ -41,7 +41,13 @@ export const UsageLimit = z.object({
 
 /** Per-account usage as the daemon reports it to the phone. `source` records whether the
  *  numbers are live (endpoint) or cached (tier-0 `~/.claude.json`), with a fetch timestamp
- *  so the UI can label staleness rather than pretend cached data is fresh. */
+ *  so the UI can label staleness rather than pretend cached data is fresh.
+ *
+ *  Deliberately carries NO monetary fields. The usage endpoint also returns an extra-usage
+ *  credit `spend` block, but this envelope is relayed in cleartext through a host that is not
+ *  the user's (see `docs/THREAT_MODEL.md`, "In-transit visibility"), so per-account dollar
+ *  amounts must not ride along until something actually renders them — the privacy cost is
+ *  paid the moment the field is populated, not the moment it is read. */
 export const AccountUsage = z.object({
   accountId: AccountId,
   label: z.string(),
@@ -50,6 +56,26 @@ export const AccountUsage = z.object({
   fetchedAtMs: z.number().int().nonnegative(),
   limits: z.array(UsageLimit),
   error: z.string().nullish(),
+  /** Epoch ms of this account's next weekly reset, DERIVED by the daemon from its stored
+   *  snapshot history. The endpoint stops publishing `resets_at` once an account's weekly
+   *  window closes, so the accounts holding a full untouched allowance are exactly the ones
+   *  that report no reset — and only the daemon holds the history to derive one. Additive and
+   *  tolerant like `epoch`/`permissionMode`: a daemon predating this field omits it and the
+   *  phone says the reset is unknown rather than inventing one. Consumers must always label
+   *  it as predicted; it is never an endpoint observation. */
+  predictedResetAt: z.number().int().nonnegative().nullish(),
+  /** The account's relative plan capacity (Pro = 1, Max 20x = 20), resolved by the daemon from
+   *  the registry's tier signals. The bot cannot derive it: the signals live in the local vault,
+   *  never on the wire. Absent means the tier could not be resolved, which every renderer shows
+   *  as "?" — an account of unknown tier is still weighted 1 in aggregate math, and saying "1x"
+   *  would present that fallback as a reading. Additive and tolerant like `predictedResetAt`. */
+  planWeight: z.number().positive().finite().nullish(),
+  /** The billing cell as the daemon rendered it, e.g. "~Aug 11 (est.)" / "trial->Aug 3" /
+   *  "unknown". Pre-rendered rather than sent as raw dates because the estimate is a derivation
+   *  with rules (anniversary roll-forward, short-month clamping, trials outranking
+   *  subscriptions) that must not be reimplemented on a second surface — the same reason
+   *  `SettingRow` ships display text. Display-only: nothing routes or authorizes on it. */
+  billing: z.string().nullish(),
 });
 
 // ---------------------------------------------------------------------------
@@ -94,6 +120,113 @@ export const UsagePlan = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Token stats (absolute counts read from local Claude Code transcripts)
+// ---------------------------------------------------------------------------
+//
+// Every `AccountUsage` number above is a PERCENT of an opaque limit. These are absolute token
+// counts the daemon reads out of Claude Code's own transcript files on the host and attributes to
+// accounts through its switch-audit journal. Only the AGGREGATE crosses the wire: the bot must
+// never read a transcript (they contain conversation text, and the bot holds nothing privileged),
+// so it receives sums and nothing else.
+
+/** One bucket's token counts. The four token kinds stay separate all the way to the wire: they
+ *  are separate fields upstream, they are billed differently, and cache reads outweigh plain
+ *  input by orders of magnitude — folding them into one number destroys the only useful signal. */
+export const TokenTotals = z.object({
+  input: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  cacheCreation: z.number().nonnegative(),
+  cacheRead: z.number().nonnegative(),
+  /** Assistant turns counted (after de-duplication), so a reader can sanity-check the sums. */
+  turns: z.number().int().nonnegative(),
+});
+
+/** Totals for one account. `accountId` is null for the UNATTRIBUTED bucket — turns that happened
+ *  before cctl recorded its first switch, which have no account they can honestly be assigned to.
+ *  That bucket is carried on the wire (rather than dropped) precisely so every surface can render
+ *  it: silently omitting it would make the per-account numbers look like the whole truth. */
+export const TokenAccountRow = z.object({
+  accountId: AccountId.nullish(),
+  label: z.string(),
+  totals: TokenTotals,
+});
+
+/** Totals for one model id, or one local calendar day (`YYYY-MM-DD`). */
+export const TokenBucketRow = z.object({
+  label: z.string(),
+  totals: TokenTotals,
+});
+
+/** What the scan could and could not read. Sent so the phone can say so out loud — a total over
+ *  40 of 442 transcript files is a different claim from the same total over all 442. */
+export const TokenStatsCoverage = z.object({
+  filesScanned: z.number().int().nonnegative(),
+  filesSkippedByMtime: z.number().int().nonnegative(),
+  filesUnreadable: z.number().int().nonnegative(),
+  /** Project directories that could not even be listed (permission denied, a stale mount) — a
+   *  distinct failure mode from an unreadable FILE: it can hide an entire project's transcripts. */
+  dirsUnreadable: z.number().int().nonnegative(),
+  malformedLines: z.number().int().nonnegative(),
+  duplicateTurns: z.number().int().nonnegative(),
+});
+
+/**
+ * Absolute token usage over a window, broken down by account, model and day.
+ *
+ * HONEST LIMITS, which every renderer of this payload must state: these are the turns Claude Code
+ * wrote to disk ON THIS MACHINE. Work done from the web app, the mobile app or another machine is
+ * invisible here, turns predating the first recorded switch land in the unattributed bucket, and
+ * none of it is an authoritative billing figure from Anthropic.
+ */
+export const TokenStatsSnapshot = z.object({
+  windowStartMs: z.number().int().nonnegative(),
+  /** End of the window, i.e. when the scan ran — the payload's "as of". */
+  windowEndMs: z.number().int().nonnegative(),
+  overall: TokenTotals,
+  byAccount: z.array(TokenAccountRow),
+  byModel: z.array(TokenBucketRow),
+  byDay: z.array(TokenBucketRow),
+  coverage: TokenStatsCoverage,
+});
+
+/** How many days back a stats window covers when nobody says otherwise — the daemon's pushed
+ *  snapshot, `cctl stats`, and `/stats` with no `days` all use this one number. Lives in the wire
+ *  contract rather than in each package because the three surfaces are only comparable if their
+ *  default window is literally the same; three local copies would drift silently. */
+export const DEFAULT_STATS_DAYS = 7;
+/** Bounds on an explicitly requested window. The floor is one day because a window is counted in
+ *  whole local days. The ceiling is a real cost guard, not a formality: a request makes the HOST
+ *  re-read every transcript touched inside the window, so an unbounded value turns one slash
+ *  command into a full-history disk scan. 90 days answers any "what did this quarter cost" question
+ *  while keeping the worst case bounded. Enforced in three places, deliberately: Discord rejects
+ *  out-of-range input client-side, this schema rejects a hand-crafted frame, and the daemon clamps
+ *  what it actually scans — the outer two are UX, the daemon's is the one that protects the disk. */
+export const MIN_STATS_DAYS = 1;
+export const MAX_STATS_DAYS = 90;
+
+/** Phone-initiated request for a token-stats window OTHER than the one the daemon pushes on its
+ *  own schedule. There is no idempotency key: a scan is read-only and changes nothing, so a
+ *  replayed frame costs a redundant scan at worst — and unlike a prune, silently ignoring a
+ *  duplicate would strand the phone's deferred reply waiting for a result that never comes. */
+const TokenStatsRequestPayload = z.object({
+  requestId: RequestId,
+  days: z.number().int().min(MIN_STATS_DAYS).max(MAX_STATS_DAYS),
+});
+
+/** The daemon's answer to stats.request. Correlated by `requestId` because the asking surface is
+ *  a single Discord interaction waiting on THIS scan — unlike the pushed `stats.snapshot`, which
+ *  is addressed to nobody in particular and answers whoever asks next. A failure is reported
+ *  explicitly (`ok: false` + reason) rather than by silence: the phone is holding a deferred reply
+ *  open, and "the scan failed" is a far better thing to show than a spinner that times out. */
+const TokenStatsResultPayload = z.object({
+  requestId: RequestId,
+  ok: z.boolean(),
+  /** The window that was actually scanned; absent when `ok` is false. */
+  snapshot: TokenStatsSnapshot.nullish(),
+  error: z.string().nullish(),
+});
+
+// ---------------------------------------------------------------------------
 // Settings (the daemon's effective configuration, for visibility only)
 // ---------------------------------------------------------------------------
 
@@ -121,6 +254,13 @@ const UsageSnapshotPayload = z.object({
   accounts: z.array(AccountUsage),
   /** The optimizer's recommendation, when the daemon has computed one. */
   plan: UsagePlan.nullish(),
+  /** Fleet-wide burn in Pro-equivalent units/day, MEASURED by the daemon from stored snapshot
+   *  history. The pacing model returns no sustainability verdict without it, and the bot can
+   *  never measure it itself: it holds no history and must not read the daemon's database.
+   *  Fractional by nature (a rate), and finite-bounded because a non-finite number serializes
+   *  to `null` and would fail the peer's own parse. Absent means "not measurable", which the
+   *  model reports as such — never as zero, which would read as "nothing is being used". */
+  burnUnitsPerDay: z.number().finite().nonnegative().nullish(),
 });
 
 /** The daemon's effective settings, resolved once at startup (flags and env are read only
@@ -408,7 +548,11 @@ const HelloResultPayload = z.object({
 
 const PairClaimPayload = z.object({
   pairingCode: z.string().min(1),
-  hostLabel: z.string(),
+  // A short display label (the daemon sends its host name). Bounded because the bot persists it
+  // verbatim into the shared bindings.json and rewrites that whole file on every pairing — an
+  // unbounded label would let one claimer bloat every other user's pairing write. 256 covers any
+  // real hostname (DNS caps a name at 253) with room to spare.
+  hostLabel: z.string().max(256),
 });
 
 const PairResultPayload = z.object({
@@ -453,6 +597,9 @@ function frame<T extends string, P extends z.ZodTypeAny>(type: T, payload: P) {
 
 export const messageSchemas = {
   'usage.snapshot': frame('usage.snapshot', UsageSnapshotPayload),
+  'stats.snapshot': frame('stats.snapshot', TokenStatsSnapshot),
+  'stats.request': frame('stats.request', TokenStatsRequestPayload),
+  'stats.result': frame('stats.result', TokenStatsResultPayload),
   'settings.snapshot': frame('settings.snapshot', SettingsSnapshot),
   'switch.command': frame('switch.command', SwitchCommandPayload),
   'switch.result': frame('switch.result', SwitchResultPayload),
@@ -482,6 +629,9 @@ export const messageSchemas = {
 /** The full frame schema. One `.parse` validates routing + type + payload together. */
 export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['usage.snapshot'],
+  messageSchemas['stats.snapshot'],
+  messageSchemas['stats.request'],
+  messageSchemas['stats.result'],
   messageSchemas['settings.snapshot'],
   messageSchemas['switch.command'],
   messageSchemas['switch.result'],
@@ -524,6 +674,11 @@ export type AccountUsage = z.infer<typeof AccountUsage>;
 export type SettingSource = z.infer<typeof SettingSource>;
 export type SettingRow = z.infer<typeof SettingRow>;
 export type SettingsSnapshot = z.infer<typeof SettingsSnapshot>;
+export type TokenTotals = z.infer<typeof TokenTotals>;
+export type TokenAccountRow = z.infer<typeof TokenAccountRow>;
+export type TokenBucketRow = z.infer<typeof TokenBucketRow>;
+export type TokenStatsCoverage = z.infer<typeof TokenStatsCoverage>;
+export type TokenStatsSnapshot = z.infer<typeof TokenStatsSnapshot>;
 export type UsageAdvisory = z.infer<typeof UsageAdvisory>;
 export type AccountScore = z.infer<typeof AccountScore>;
 export type UsagePlan = z.infer<typeof UsagePlan>;

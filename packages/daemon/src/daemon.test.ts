@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -41,6 +41,7 @@ import type {
 import { Store } from './store.js';
 import { UsagePoller } from './usagePoller.js';
 import { AttributionJournal } from './attributionJournal.js';
+import { LOOP_LAG_THRESHOLD_MS } from './loopLagMonitor.js';
 import { HookReceiver } from './hookReceiver.js';
 import {
   ControlPlaneClient,
@@ -53,6 +54,7 @@ import {
   type SwitchEngineLike,
   type QuarantineNoticeState,
 } from './daemon.js';
+import type { TranscriptScan } from './transcriptTokens.js';
 
 // ---------------------------------------------------------------------------
 // A minimal steady-state relay: accepts `hello` unconditionally, collects every envelope it
@@ -581,6 +583,362 @@ describe('Daemon lifecycle', () => {
     expect(relay.received.some((e) => e.type === 'settings.snapshot')).toBe(false);
   });
 
+  it('trims usage snapshots past the retention window on every poll cycle', async () => {
+    // One ancient row and one current row. Only the cycle's retention step can remove the
+    // ancient one — nothing else in the daemon ever deletes from this table.
+    const ancient = Date.now() - 200 * 24 * 60 * 60_000;
+    store.insertUsageSnapshot({
+      accountId: 'acct-x',
+      fetchedAtMs: ancient,
+      source: 'live',
+      json: '{}',
+    });
+    store.insertUsageSnapshot({
+      accountId: 'acct-x',
+      fetchedAtMs: Date.now(),
+      source: 'live',
+      json: '{}',
+    });
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+
+    const kept = store.listUsageSnapshots('acct-x');
+    expect(kept.some((r) => r.fetchedAtMs === ancient)).toBe(false);
+    expect(kept.length).toBeGreaterThan(0);
+  });
+
+  it('scans transcripts and pushes a stats.snapshot, attributing turns to live accounts', async () => {
+    const now = Date.now();
+    // Attribution flows from the REAL journal, not a hand-seeded table: the poll cycle re-derives
+    // every interval from this audit log before it scans, so anything written straight into the
+    // store would be wiped. Writing the log is what proves the two halves are actually joined.
+    await writeFile(
+      join(vaultDir, 'switch-audit.jsonl'),
+      JSON.stringify({
+        ts: now - 60_000,
+        event: 'activated',
+        fromAccountId: null,
+        toAccountId: 'acct-x',
+      }) + '\n',
+      'utf8',
+    );
+    const scanTranscripts = vi.fn((sinceMs: number) => {
+      void sinceMs;
+      return Promise.resolve({
+        turns: [
+          {
+            tsMs: now - 30_000,
+            model: 'claude-opus-5',
+            inputTokens: 10,
+            outputTokens: 20,
+            cacheCreationTokens: 30,
+            cacheReadTokens: 40,
+          },
+        ],
+        filesScanned: 1,
+        filesSkippedByMtime: 2,
+        filesUnreadable: 0,
+        dirsUnreadable: 0,
+        malformedLines: 0,
+        duplicateTurns: 3,
+      });
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.snapshot'));
+    const pushed = relay.received.find((e) => e.type === 'stats.snapshot');
+    expect(pushed?.type).toBe('stats.snapshot');
+    if (pushed?.type !== 'stats.snapshot') throw new Error('unreachable');
+    expect(pushed.payload.overall).toEqual({
+      input: 10,
+      output: 20,
+      cacheCreation: 30,
+      cacheRead: 40,
+      turns: 1,
+    });
+    // The registry label, not the raw id — the phone never sees account ids it cannot read.
+    expect(pushed.payload.byAccount).toEqual([
+      {
+        accountId: 'acct-x',
+        label: 'main',
+        totals: { input: 10, output: 20, cacheCreation: 30, cacheRead: 40, turns: 1 },
+      },
+    ]);
+    expect(pushed.payload.coverage.filesSkippedByMtime).toBe(2);
+    // The window the daemon asked for must be the window it advertises.
+    expect(scanTranscripts).toHaveBeenCalledWith(pushed.payload.windowStartMs);
+  });
+
+  it('pushes no stats.snapshot when no transcript scanner is wired', async () => {
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    expect(relay.received.some((e) => e.type === 'stats.snapshot')).toBe(false);
+  });
+
+  it('keeps polling when the transcript scan fails', async () => {
+    const scanTranscripts = vi.fn(() => Promise.reject(new Error('EPERM: projects dir locked')));
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 30,
+    });
+    await daemon.start();
+
+    // A dead scan must cost the phone its stats, never its usage: the cycle keeps running.
+    await waitFor(() => relay.received.filter((e) => e.type === 'usage.snapshot').length >= 2);
+    expect(relay.received.some((e) => e.type === 'stats.snapshot')).toBe(false);
+  });
+
+  it('throttles the transcript scan rather than re-running it every poll cycle', async () => {
+    const scanTranscripts = vi.fn(() =>
+      Promise.resolve({
+        turns: [],
+        filesScanned: 0,
+        filesSkippedByMtime: 0,
+        filesUnreadable: 0,
+        dirsUnreadable: 0,
+        malformedLines: 0,
+        duplicateTurns: 0,
+      }),
+    );
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      statsIntervalMs: 60_000,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 30,
+    });
+    await daemon.start();
+
+    await waitFor(() => relay.received.filter((e) => e.type === 'usage.snapshot').length >= 3);
+    expect(scanTranscripts).toHaveBeenCalledTimes(1);
+  });
+
+  /** An empty scan — these tests are about the request/reply contract and the window, never the
+   *  arithmetic (tokenStats.test.ts owns that). */
+  function emptyScan() {
+    return Promise.resolve({
+      turns: [],
+      filesScanned: 4,
+      filesSkippedByMtime: 0,
+      filesUnreadable: 0,
+      dirsUnreadable: 0,
+      malformedLines: 0,
+      duplicateTurns: 0,
+    });
+  }
+
+  /** A daemon whose transcript scan is exactly what the test wants, with the push cadence turned
+   *  down far enough that a scheduled push can never be mistaken for the requested one. */
+  function daemonWithScan(scanTranscripts: (sinceMs: number) => Promise<TranscriptScan>): Daemon {
+    return new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+      statsIntervalMs: 100_000,
+    });
+  }
+
+  it('stats.request answers with a snapshot over exactly the requested window', async () => {
+    const scanTranscripts = vi.fn(emptyScan);
+    daemon = daemonWithScan(scanTranscripts);
+    await daemon.start();
+    // The startup poll cycle pushes its own 7-day snapshot; wait it out so the assertions below
+    // cannot accidentally read it instead of the requested window.
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.snapshot'));
+
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-1', days: 30 },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.result'));
+
+    const result = relay.received.find((e) => e.type === 'stats.result');
+    if (result?.type !== 'stats.result') throw new Error('unreachable');
+    expect(result.payload.requestId).toBe('sr-1');
+    expect(result.payload.ok).toBe(true);
+    const snapshot = result.payload.snapshot;
+    if (snapshot === undefined || snapshot === null) throw new Error('expected a snapshot');
+    // 30 days, not the pushed default — and the window it advertises is the window it read.
+    expect(snapshot.windowEndMs - snapshot.windowStartMs).toBeCloseTo(30 * 86_400_000, -4);
+    expect(scanTranscripts).toHaveBeenLastCalledWith(snapshot.windowStartMs);
+    expect(snapshot.coverage.filesScanned).toBe(4);
+  });
+
+  it('answers a stats.request with ok:false when no transcript scanner is wired', async () => {
+    // The default daemon has no scanner — it can never answer this, and must say so rather than
+    // leave the phone holding a deferred reply open until it expires.
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-none', days: 7 },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.result'));
+
+    const result = relay.received.find((e) => e.type === 'stats.result');
+    if (result?.type !== 'stats.result') throw new Error('unreachable');
+    expect(result.payload.ok).toBe(false);
+    expect(result.payload.requestId).toBe('sr-none');
+    expect(result.payload.error).toMatch(/does not scan transcripts/);
+  });
+
+  it('answers a failing scan with ok:false rather than going silent', async () => {
+    daemon = daemonWithScan(() => Promise.reject(new Error('EPERM: projects dir locked')));
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-err', days: 7 },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.result'));
+
+    const result = relay.received.find((e) => e.type === 'stats.result');
+    if (result?.type !== 'stats.result') throw new Error('unreachable');
+    expect(result.payload.ok).toBe(false);
+    expect(result.payload.snapshot ?? null).toBeNull();
+    // The reason reaches the phone, but the host's raw errno does not.
+    expect(result.payload.error).toMatch(/scan failed/);
+    expect(result.payload.error).not.toMatch(/EPERM/);
+  });
+
+  it('refuses a second scan while one is already running, instead of stacking disk reads', async () => {
+    // A scan that never finishes on its own: the point is to hold the in-flight slot open while
+    // the second request arrives, which is exactly the shape a real long scan has.
+    let releaseScan: (() => void) | undefined;
+    const scanTranscripts = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        releaseScan = resolve;
+      });
+      return emptyScan();
+    });
+    daemon = daemonWithScan(scanTranscripts);
+    await daemon.start();
+
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-first', days: 7 },
+    });
+    await waitFor(() => scanTranscripts.mock.calls.length >= 1);
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'stats.request',
+      payload: { requestId: 'sr-second', days: 7 },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.result'));
+
+    // The second request is answered immediately and never became a second scan.
+    const refusal = relay.received.find((e) => e.type === 'stats.result');
+    if (refusal?.type !== 'stats.result') throw new Error('unreachable');
+    expect(refusal.payload.requestId).toBe('sr-second');
+    expect(refusal.payload.ok).toBe(false);
+    expect(refusal.payload.error).toMatch(/already running/);
+    expect(scanTranscripts).toHaveBeenCalledTimes(1);
+
+    // Releasing the first scan still produces its own answer — a refusal must not have consumed
+    // or cancelled the request that was legitimately in flight.
+    releaseScan?.();
+    await waitFor(() => relay.received.filter((e) => e.type === 'stats.result').length >= 2);
+    const answered = relay.received.filter(
+      (e) => e.type === 'stats.result' && e.payload.requestId === 'sr-first',
+    );
+    expect(answered).toHaveLength(1);
+    expect(answered[0]?.type === 'stats.result' && answered[0].payload.ok).toBe(true);
+  });
+
+  it('frees the in-flight slot after a scan, so a later request is served', async () => {
+    const scanTranscripts = vi.fn(emptyScan);
+    daemon = daemonWithScan(scanTranscripts);
+    await daemon.start();
+
+    for (const requestId of ['sr-a', 'sr-b']) {
+      relay.push({
+        daemonId: 'daemon-under-test',
+        type: 'stats.request',
+        payload: { requestId, days: 7 },
+      });
+      await waitFor(() =>
+        relay.received.some((e) => e.type === 'stats.result' && e.payload.requestId === requestId),
+      );
+    }
+    const results = relay.received.filter((e) => e.type === 'stats.result');
+    expect(results).toHaveLength(2);
+    // Both answered on their own merits — the guard is per-scan, not a one-shot latch.
+    expect(results.every((e) => e.type === 'stats.result' && e.payload.ok)).toBe(true);
+  });
+
+  it('stamps the history-derived pacing inputs onto the usage snapshot it pushes', async () => {
+    // A dormant account's history: an observed reset from before its weekly window closed,
+    // then readings the endpoint no longer publishes any reset alongside. Only the daemon can
+    // see this, which is why the phone has to be told rather than left to work it out.
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const anchorIso = new Date(now - 2 * DAY_MS).toISOString();
+    const weeklyJson = (percent: number, resetsAt?: string): string =>
+      JSON.stringify({
+        limits: [{ kind: 'weekly_all', percent, ...(resetsAt !== undefined ? { resetsAt } : {}) }],
+      });
+    for (const row of [
+      { fetchedAtMs: now - 4 * DAY_MS, json: weeklyJson(80, anchorIso) },
+      { fetchedAtMs: now - 2 * DAY_MS, json: weeklyJson(0) },
+      { fetchedAtMs: now - 60_000, json: weeklyJson(10) },
+    ]) {
+      store.insertUsageSnapshot({ accountId: 'acct-x', source: 'live', ...row });
+    }
+
+    await daemon.start();
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    const pushed = relay.received.find((e) => e.type === 'usage.snapshot');
+    if (pushed?.type !== 'usage.snapshot') throw new Error('no usage.snapshot pushed');
+
+    // The anchor advanced by one whole cadence — a strictly future reset the endpoint is not
+    // reporting for this account at all.
+    const predicted = pushed.payload.accounts.find(
+      (a) => a.accountId === 'acct-x',
+    )?.predictedResetAt;
+    expect(predicted).toBe(Date.parse(anchorIso) + 7 * DAY_MS);
+    // An account with no stored history stays absent rather than borrowing another's clock.
+    expect(
+      pushed.payload.accounts.find((a) => a.accountId === 'acct-y')?.predictedResetAt,
+    ).toBeUndefined();
+    // 10% of one Pro-equivalent unit over the trailing burn window.
+    expect(pushed.payload.burnUnitsPerDay).toBeGreaterThan(0);
+  });
+
   it("feeds each poll cycle's advisor inputs to the auto-switcher when one is wired", async () => {
     const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
       void accounts;
@@ -606,6 +964,55 @@ describe('Daemon lifecycle', () => {
     const inputs = evaluate.mock.calls[0]?.[0];
     // One advisor input per account the fake engine reports, in poll order.
     expect(inputs?.map((i) => i.accountId)).toEqual(['acct-x', 'acct-y']);
+  });
+
+  it("gives the auto-switcher each account's predicted reset, so a dormant one is reachable", async () => {
+    // Without this the policy cannot see a dormant account at all: the endpoint stops
+    // publishing a reset once its weekly window closes, and an unknown weekly clock
+    // disqualifies a candidate outright.
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const anchorIso = new Date(now - 3 * DAY_MS).toISOString();
+    for (const row of [
+      {
+        fetchedAtMs: now - 5 * DAY_MS,
+        json: JSON.stringify({
+          limits: [{ kind: 'weekly_all', percent: 70, resetsAt: anchorIso }],
+        }),
+      },
+      {
+        fetchedAtMs: now - 60_000,
+        json: JSON.stringify({ limits: [{ kind: 'weekly_all', percent: 0 }] }),
+      },
+    ]) {
+      store.insertUsageSnapshot({ accountId: 'acct-x', source: 'live', ...row });
+    }
+
+    const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
+      void accounts;
+      return Promise.resolve();
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      autoSwitcher: { evaluate },
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => evaluate.mock.calls.length > 0);
+    const inputs = evaluate.mock.calls[0]?.[0];
+    expect(inputs?.find((i) => i.accountId === 'acct-x')?.predictedResetAt).toBe(
+      Date.parse(anchorIso) + 7 * DAY_MS,
+    );
+    // An account with no stored history keeps NO prediction — never a borrowed clock.
+    expect(inputs?.find((i) => i.accountId === 'acct-y')?.predictedResetAt).toBeUndefined();
   });
 
   it('start() is idempotent — calling it twice does not double-connect or double-recover', async () => {
@@ -950,6 +1357,51 @@ describe('Daemon lifecycle', () => {
       expect(err.payload.message).toContain('a turn is already in flight');
       expect(err.payload.relatesTo).toBe(frame.id);
     }
+  });
+
+  it('answers spawn_failed with the cause when the session never starts', async () => {
+    // `/run`'s Discord reply is sent when the frame leaves the relay, so a spawn that dies before
+    // a handle exists would otherwise leave the phone on "Session spawn requested." forever with
+    // the reason only in the daemon's local log.
+    sessionManager.spawnManaged.mockImplementationOnce(() =>
+      Promise.reject(new Error('registry is locked')),
+    );
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-fail', prompt: 'do the thing', idempotencyKey: 'k' },
+    });
+
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const error = relay.received.find((e) => e.type === 'error');
+    if (error?.type === 'error') {
+      expect(error.payload.code).toBe('spawn_failed');
+      expect(error.payload.message).toContain('registry is locked');
+    }
+  });
+
+  it('does not double-report a failure the running session already owns', async () => {
+    // Once a handle exists the session's own event stream carries its failures (text + a `failed`
+    // status). A second envelope from the spawn path would report the same thing twice, so the
+    // catch above must stay narrow.
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-late', prompt: 'do the thing', idempotencyKey: 'k' },
+    });
+    await waitFor(() => sessionManager.spawnManaged.mock.calls.length > 0);
+
+    const handle = sessionManager.get('spawned-session') as
+      ReturnType<typeof makeFakeHandle> | undefined;
+    handle?.emit({ kind: 'output', text: 'Error: Not logged in · Please run /login' });
+    handle?.emit({ kind: 'status', state: 'failed' });
+
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'session.status' && e.payload.state === 'failed'),
+    );
+    expect(relay.received.some((e) => e.type === 'error')).toBe(false);
   });
 
   it('stamps a stable per-run epoch on every session.output envelope', async () => {
@@ -1323,6 +1775,50 @@ describe('Daemon lifecycle', () => {
     await waitFor(() => entries.some((e) => e.msg === 'session.stop escalation finished'));
     const finished = entries.find((e) => e.msg === 'session.stop escalation finished');
     expect((finished?.obj as { rung?: string }).rung).toBe('hard_stopped');
+  });
+
+  it('attributes each poll-cycle phase in the log, and warns on one that runs long', async () => {
+    // The loop-lag monitor can say THAT the loop stalled but never WHERE — which is why the
+    // multi-second stall that motivated this instrumentation was never attributed to a phase.
+    // A phase slower than that monitor's own threshold has to name itself, at warn level.
+    const { logger, entries } = capturingLogger();
+    const slowJournal = {
+      sync: async () => {
+        await new Promise((r) => setTimeout(r, LOOP_LAG_THRESHOLD_MS + 40));
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal: slowJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000, // the startup cycle is the one under test
+      logger,
+    });
+    await daemon.start();
+
+    await waitFor(() => entries.some((e) => e.msg === 'poll cycle phase ran long'));
+    const slow = entries.find((e) => e.msg === 'poll cycle phase ran long');
+    expect((slow?.obj as { phase?: string }).phase).toBe('attributionJournal.sync');
+    expect((slow?.obj as { elapsedMs?: number }).elapsedMs).toBeGreaterThanOrEqual(
+      LOOP_LAG_THRESHOLD_MS,
+    );
+
+    // Every other phase still reports, at debug — a cycle that logged only its slow phase would
+    // leave the next anomaly with nothing to compare against.
+    await waitFor(() => entries.some((e) => e.msg === 'poll cycle phase'));
+    const timed = new Set(
+      entries
+        .filter((e) => e.msg === 'poll cycle phase')
+        .map((e) => (e.obj as { phase: string }).phase),
+    );
+    expect(timed).toContain('pollAll');
+    expect(timed).toContain('readFleetHistory');
   });
 
   it('session.stop for an unknown session emits an error envelope correlated via relatesTo', async () => {

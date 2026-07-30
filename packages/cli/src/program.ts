@@ -8,7 +8,6 @@
 import { Command } from 'commander';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -26,21 +25,27 @@ import {
 import {
   ControlPlaneClient,
   Store,
+  aggregateTokenStats,
   buildDaemonHookSpecs,
+  readFleetHistory,
   readHeartbeat,
+  readTranscriptTurns,
   uninstallHooks,
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
+import { DEFAULT_STATS_DAYS } from '@claude-control/shared-protocol';
 import {
   computeOutlook,
   computePlan,
+  planWeight,
   renderOutlook,
   renderPlanSummary,
   timelineInputFromWire,
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail } from './context.js';
+import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
   appendCrashLine,
@@ -55,11 +60,12 @@ import {
   startDaemonTaskNow,
   uninstallDaemonTask,
 } from './daemonInstall.js';
-import { colorEnabled, detectPalette, outlookStyle } from './ansi.js';
+import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
   renderAccountsTable,
   renderDaemonStatus,
   renderPacingLine,
+  renderTokenStats,
   renderUsage,
   type UsageRow,
 } from './render.js';
@@ -98,10 +104,14 @@ import {
   reportSaysGreedyActive,
   resolveCliSettings,
   resolveDaemonConfig,
+  VERSION,
   type SettingsSection,
 } from './settings.js';
 
-const VERSION = '0.1.0';
+// The default `cctl stats` window is DEFAULT_STATS_DAYS from the wire contract rather than a copy
+// declared here. A week is the span the weekly limits themselves run on, so it is the window a
+// "did I overspend?" reading is actually asked in — and the terminal, the daemon's pushed snapshot
+// and Discord's `/stats` are only comparable for as long as all three mean the same week.
 
 /** Build the full `cctl` program. Exported so tests can introspect the command tree. */
 export function buildProgram(): Command {
@@ -155,19 +165,23 @@ export function buildProgram(): Command {
     .command('usage')
     .description("show usage across all accounts (from the daemon's latest poll)")
     .action(async () => {
-      const { accounts, activeId, usageFor } = await readUsageState();
       const nowMs = Date.now();
-      const rows: UsageRow[] = accounts.map((a) => ({
+      const state = await readUsageState(nowMs);
+      const rows: UsageRow[] = state.accounts.map((a) => ({
         label: a.label,
-        active: a.id === activeId,
-        usage: usageFor(a.id),
+        active: a.id === state.activeId,
+        usage: state.usageFor(a.id),
       }));
       let text = renderUsage(rows, nowMs, detectPalette());
       // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
       // state), which UsageRow doesn't carry — build it separately rather than widen UsageRow
       // for one trailing line.
-      const inputs = buildAdvisorInputs(accounts, activeId, usageFor);
-      if (inputs.length > 0) text += '\n\n' + renderPacingLine(inputs, nowMs);
+      const inputs = buildAdvisorInputs(state);
+      if (inputs.length > 0) {
+        text +=
+          '\n\n' +
+          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
+      }
       process.stdout.write(text + '\n');
     });
 
@@ -175,10 +189,10 @@ export function buildProgram(): Command {
     .command('timeline')
     .description('5h-session budget per account + when every limit resets, with a usage plan')
     .action(async () => {
-      const { accounts, activeId, usageFor } = await readUsageState();
       const nowMs = Date.now();
-      const inputs = buildAdvisorInputs(accounts, activeId, usageFor);
-      const outlook = computeOutlook(inputs);
+      const state = await readUsageState(nowMs);
+      const inputs = buildAdvisorInputs(state);
+      const outlook = computeOutlook(inputs, nowMs);
       let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to burn first and what to
       // hold. When the last-started daemon runs greedy auto-switch, the advice matches its
@@ -187,9 +201,58 @@ export function buildProgram(): Command {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
         text +=
           '\n\n' + renderPlanSummary(computePlan(inputs, greedy ? { greedyAutoSwitch: true } : {}));
-        text += '\n\n' + renderPacingLine(inputs, nowMs);
+        text +=
+          '\n\n' +
+          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       process.stdout.write(text + '\n');
+    });
+
+  // `usage`/`timeline` answer "how much of my LIMIT is gone" (a percent from Anthropic's
+  // endpoint). `stats` answers the different question "how many tokens did I actually spend, and
+  // on which account" — read from the turn records Claude Code writes on this machine and joined
+  // against the daemon's switch journal. Nothing here touches the network.
+  program
+    .command('stats')
+    .description('absolute token counts per account, model and day (from local transcripts)')
+    .option('--days <n>', 'how many days back to count', String(DEFAULT_STATS_DAYS))
+    .action(async (opts: { days?: string }) => {
+      const days = Number(opts.days);
+      if (!Number.isFinite(days) || days <= 0) fail('--days must be a positive number.');
+      const paths = defaultPaths();
+      const windowEndMs = Date.now();
+      const windowStartMs = windowEndMs - days * 86_400_000;
+
+      // The scan reads every transcript touched inside the window, which is seconds of disk IO on
+      // a machine with real history. Say so — but only to a terminal, so piping stdout still
+      // yields nothing but the table.
+      if (process.stderr.isTTY) {
+        process.stderr.write(`Reading transcripts under ${paths.claudeDir} ...\n`);
+      }
+      const [accounts, scan] = await Promise.all([
+        buildEngine(paths).listAccounts(),
+        readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs: windowStartMs }),
+      ]);
+
+      // Attribution comes from the daemon's journal, read offline like `usage`/`timeline` do:
+      // no running daemon is required, and an empty journal simply means every turn lands in the
+      // unattributed bucket (which the renderer shows rather than hides).
+      const store = new Store(daemonDbPath(paths));
+      let intervals;
+      try {
+        intervals = store.listActivationIntervals();
+      } finally {
+        store.close();
+      }
+
+      const stats = aggregateTokenStats({
+        scan,
+        intervals,
+        windowStartMs,
+        windowEndMs,
+        labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+      });
+      process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });
 
   program
@@ -691,20 +754,29 @@ async function readStatusSummary(): Promise<SetupSummary> {
   };
 }
 
-/** Accounts + active id joined with the daemon's latest persisted usage snapshot per
- *  account. Read-only view shared by `usage` and `timeline`: it works whether or not the
- *  daemon is currently running (it shows the last poll), and opening a not-yet-created db
- *  just yields an empty one. A corrupt snapshot row is skipped, never fatal. */
-async function readUsageState(): Promise<{
+/** What `usage` and `timeline` read before rendering: the registry, the daemon's latest
+ *  persisted snapshot per account, and the two history-derived measurements the pure advisor
+ *  cannot make for itself (each account's predicted weekly reset and the fleet's burn rate).
+ *  Works whether or not the daemon is currently running (it shows the last poll), and opening
+ *  a not-yet-created db just yields an empty one. A corrupt snapshot row is skipped, never
+ *  fatal. */
+interface UsageState {
   accounts: StoredAccount[];
   activeId: string | null;
   usageFor: (accountId: string) => AccountUsage | undefined;
-}> {
+  /** Next weekly reset predicted from stored history, for accounts the endpoint has stopped
+   *  publishing one for. Absent when the account has no observed reset in history at all. */
+  predictedResetFor: (accountId: string) => number | undefined;
+  /** Fleet burn in Pro-equivalent units/day, or undefined when history cannot measure one. */
+  burnUnitsPerDay: number | undefined;
+}
+
+async function readUsageState(nowMs: number): Promise<UsageState> {
   const engine = buildEngine();
   const [accounts, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
   const store = new Store(daemonDbPath());
-  const byId = new Map<string, AccountUsage>();
   try {
+    const byId = new Map<string, AccountUsage>();
     for (const a of accounts) {
       const row = store.latestUsageSnapshot(a.id);
       if (!row) continue;
@@ -714,30 +786,59 @@ async function readUsageState(): Promise<{
         // a corrupt row must not crash the whole view
       }
     }
+    // The same measurement the daemon makes each poll cycle, over the same store and the one
+    // implementation — so a number the CLI prints can never disagree with the one the phone got.
+    const history = readFleetHistory(
+      store,
+      accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) })),
+      nowMs,
+    );
+    return {
+      accounts,
+      activeId,
+      usageFor: (accountId) => byId.get(accountId),
+      predictedResetFor: (accountId) => history.predictedResetByAccount.get(accountId),
+      burnUnitsPerDay: history.burnUnitsPerDay,
+    };
   } finally {
     store.close();
   }
-  return { accounts, activeId, usageFor: (accountId) => byId.get(accountId) };
 }
 
 /** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both
  *  commands' pacing line. Registry data (label/active/quarantined) is authoritative and
  *  current; the persisted snapshot only contributes the limits, so a stale snapshot can't
  *  misreport which account is live. Accounts without a snapshot still appear (as "unknown"). */
-function buildAdvisorInputs(
-  accounts: StoredAccount[],
-  activeId: string | null,
-  usageFor: (accountId: string) => AccountUsage | undefined,
-): AccountUsageInput[] {
+function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
   return timelineInputFromWire(
-    accounts.map((a) => ({
+    state.accounts.map((a) => ({
       accountId: a.id,
       label: a.label,
-      active: a.id === activeId,
+      active: a.id === state.activeId,
       quarantined: a.quarantined,
-      limits: usageFor(a.id)?.limits ?? [],
+      limits: state.usageFor(a.id)?.limits ?? [],
+      predictedResetAt: state.predictedResetFor(a.id),
+      // The registry is right here, so resolve the tier from it rather than leaving the fleet
+      // math equal-weighting a Max 20x against a Pro. Only a KNOWN weight is passed: an
+      // unresolved one must stay absent so pacing reports the assumption instead of burying it.
+      ...resolvedWeight(a),
     })),
   );
+}
+
+/** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same
+ *  present-or-absent contract `timelineInputFromWire` relies on to tell a real 1x Pro account
+ *  from one whose tier nothing could read. */
+function resolvedWeight(account: StoredAccount): { weight?: number } {
+  const result = planWeight(account);
+  return result.known ? { weight: result.weight } : {};
+}
+
+/** Spread the measured burn into `PacingOptions` only when there IS one. `exactOptionalPropertyTypes`
+ *  forbids passing an explicit `undefined`, and the distinction is load-bearing: an absent burn
+ *  rate means "not measurable", which pacing reports rather than treating as zero. */
+function burnOption(state: UsageState): { burnUnitsPerDay?: number } {
+  return state.burnUnitsPerDay !== undefined ? { burnUnitsPerDay: state.burnUnitsPerDay } : {};
 }
 
 /**
@@ -748,9 +849,9 @@ function buildAdvisorInputs(
  */
 async function addFreshAccount(label: string): Promise<void> {
   const paths = defaultPaths();
-  const captureDir = join(dirname(paths.vaultDir), `capture-${randomUUID()}`);
-  mkdirSync(captureDir, { recursive: true });
-  try {
+  // Failures are RETURNED, not `fail()`ed, so the dir is deleted before the process exits —
+  // `fail()` is `process.exit`, which skips `finally`. See captureDir.ts.
+  const failure = await withCaptureDir(dirname(paths.vaultDir), 'capture', async (captureDir) => {
     process.stdout.write(
       'Opening a throwaway Claude window. In it:\n' +
         '  1. /login - pick the NEW account in the browser (it may preselect the current one).\n' +
@@ -760,21 +861,22 @@ async function addFreshAccount(label: string): Promise<void> {
     const run = spawnSync('claude', [], {
       stdio: 'inherit',
       env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
-      shell: true, // `claude` is a .cmd shim on Windows
+      shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
     });
-    if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
-    const account = await buildEngine().captureFromConfigDir(label, captureDir);
-    process.stdout.write(
-      `Added ${account.label} (${account.id}). Your current login was not touched - ` +
-        `\`cctl switch ${account.label}\` to use it.\n`,
-    );
-  } catch (err) {
-    if (err instanceof SwitchEngineError && err.code === 'no_capture_login') fail(err.message);
-    throw err;
-  } finally {
-    // Token-bearing — must not outlive the capture, success or failure.
-    rmSync(captureDir, { recursive: true, force: true });
-  }
+    if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
+    try {
+      const account = await buildEngine().captureFromConfigDir(label, captureDir);
+      process.stdout.write(
+        `Added ${account.label} (${account.id}). Your current login was not touched - ` +
+          `\`cctl switch ${account.label}\` to use it.\n`,
+      );
+    } catch (err) {
+      if (err instanceof SwitchEngineError && err.code === 'no_capture_login') return err.message;
+      throw err;
+    }
+    return undefined;
+  });
+  if (failure) fail(failure);
 }
 
 /**
@@ -791,9 +893,9 @@ async function reloginAccount(ref: string): Promise<void> {
   const account = resolved.account;
 
   const paths = defaultPaths();
-  const captureDir = join(dirname(paths.vaultDir), `relogin-${randomUUID()}`);
-  mkdirSync(captureDir, { recursive: true });
-  try {
+  // Same return-don't-fail contract as addFreshAccount: cleanup has to outlive every failure
+  // path, and `fail()` (process.exit) would skip it. See captureDir.ts.
+  const failure = await withCaptureDir(dirname(paths.vaultDir), 'relogin', async (captureDir) => {
     process.stdout.write(
       `Re-logging in "${account.label}" (${account.id}). A throwaway Claude window will open.\n` +
         '  1. /login - pick the SAME account this entry belongs to (attribution is preserved).\n' +
@@ -803,23 +905,24 @@ async function reloginAccount(ref: string): Promise<void> {
     const run = spawnSync('claude', [], {
       stdio: 'inherit',
       env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
-      shell: true, // `claude` is a .cmd shim on Windows
+      shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
     });
-    if (run.error) fail(`could not launch \`claude\`: ${run.error.message}`);
-    const updated = await engine.reloginFromConfigDir(account.id, captureDir);
-    process.stdout.write(
-      `Re-logged in ${updated.label} (${updated.id}). Quarantine cleared; usage history kept - ` +
-        `\`cctl switch ${updated.label}\` to use it.\n`,
-    );
-  } catch (err) {
-    // no_capture_login (login never completed) and relogin_identity_mismatch (wrong account) are
-    // expected, actionable failures — print the engine's message, don't stack-trace.
-    if (err instanceof SwitchEngineError) fail(err.message);
-    throw err;
-  } finally {
-    // Token-bearing — must not outlive the capture, success or failure.
-    rmSync(captureDir, { recursive: true, force: true });
-  }
+    if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
+    try {
+      const updated = await engine.reloginFromConfigDir(account.id, captureDir);
+      process.stdout.write(
+        `Re-logged in ${updated.label} (${updated.id}). Quarantine cleared; usage history kept - ` +
+          `\`cctl switch ${updated.label}\` to use it.\n`,
+      );
+    } catch (err) {
+      // no_capture_login (login never completed) and relogin_identity_mismatch (wrong account) are
+      // expected, actionable failures — print the engine's message, don't stack-trace.
+      if (err instanceof SwitchEngineError) return err.message;
+      throw err;
+    }
+    return undefined;
+  });
+  if (failure) fail(failure);
 }
 
 function buildAccountCommands(program: Command): void {
@@ -831,6 +934,17 @@ function buildAccountCommands(program: Command): void {
     .description('list stored accounts')
     .action(async () => {
       const engine = buildEngine();
+      // Self-heal before rendering. The PLAN/BILLING columns read fields that a row only gains
+      // when its bundle is rewritten, so an account stored by an earlier build shows "?" and
+      // "unknown" indefinitely even though its vaulted bundle has carried the answer all along.
+      // This call IS the repair mechanism for every account that is never switched to — nothing
+      // else reaches them. The sweep decrypts only rows that are actually behind, stamps each one
+      // whether or not it could be repaired, and yields the credential lock instead of waiting on
+      // it, so it costs nothing once healed and cannot stall a listing behind an in-flight switch.
+      // Unguarded on purpose: the engine's contract is that this never throws and logs whatever
+      // went wrong, so a listing the user asked for still renders whatever is already on record —
+      // without a `catch` here throwing the reason away on the way past.
+      await engine.backfillAccountMetadata();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
       process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
     });
@@ -945,7 +1059,7 @@ function buildSessionCommands(program: Command): void {
     .command('status')
     .description('show tracked sessions and the active account (reads the daemon db offline)')
     .action(async () => {
-      const { accounts, activeId, usageFor } = await readUsageState();
+      const { accounts, activeId, usageFor } = await readUsageState(Date.now());
       const labelById = new Map(accounts.map((a) => [a.id, a.label] as const));
 
       // Read the display-only sessions mirror. Opening a not-yet-created db yields an empty one;

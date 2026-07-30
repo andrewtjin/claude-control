@@ -16,12 +16,19 @@ unit tests over a mock never close a wet gate. Do not mark a wet gate done from 
   lock (contention + stale reclaim), the vault (encrypted round-trip, registry), the
   credential store (surgical key preservation in `~/.claude.json`). **DPAPI itself is
   proven for real** — a genuine PowerShell ProtectedData encrypt/decrypt round-trip
-  runs in the suite on Windows.
+  runs in the suite on Windows. The **darwin** Keychain protector and live-credential
+  channel are covered too, but only against a **fake `security(1)` runner** — that is
+  unit-proof of our argument construction and payload handling, and is not evidence
+  about a real Keychain (gate 13).
 - **usage-advisor** — burn-before-reset selection, near-cap risk avoidance, switch-now,
   quarantine handling, binding-limit headroom, determinism.
 - **control-plane-bot** — token mint/verify (constant-time), pairing (single-use,
   expiry, isolation), and WS relay routing/ACL over **real in-process sockets** (cross-
-  user isolation, bad-token/old-version rejection, invalid-frame drop).
+  user isolation, bad-token/old-version rejection, invalid-frame drop). Session-thread
+  routing is proven as far as it can be headlessly: the four-tier precedence, the
+  `/thread-here` decision tree and every reply string, the persisted pin store (concurrent
+  writes, a genuinely failed write, restart survival), and the command → store → resolver
+  path with no restart in between. Its three live Discord adapters are **not** — gate 14.
 - **session-runtime** — the summarizer, session state machine, and manager persistence,
   against injected fakes.
 
@@ -222,6 +229,107 @@ shared bot.
 returns 200; run `cctl setup --relay wss://<hostname>` (or `cctl pair --relay
 wss://<hostname>`) end-to-end from a separate machine; confirm `/usage` and `/switch`
 work over the VPS relay the same as gate 4 did over the shared one.
+**Result:** not yet run.
+
+### 12. Linux file-key vault ✅ CLOSED 2026-07-22
+
+**Claim to verify:** on real Linux (WSL2 counts — it is the primary target), the
+published bundle's `cctl doctor` passes `vault-crypto` via the file-key protector, the
+key file is created `0600` inside a `0700` dir at
+`~/.local/share/claude-control/vault.key`, and the key is stable across runs.
+**Result (WSL2 Ubuntu, Node v22.23.1, standalone `dist/bin.js`):** CONFIRMED —
+`[ok] vault-crypto: file-key (linux) protect/unprotect round-trip works`; `stat`
+reports `600` on `vault.key` and `700` on `~/.local/share/claude-control`; the file
+holds a single 64-hex line and is byte-identical across repeated doctor runs. The full
+`packages/switch-engine` suite also passes on the same Linux install (123 passed — the
+POSIX permission tests run for real there, not skipped as on Windows). Remaining open
+slice: a keyring-less **desktop** distro is expected to behave identically (same code
+path, no D-Bus involved), but has not been separately exercised.
+
+### 13. macOS support (Keychain vault + live-credential channel) ⏳ OPEN
+
+**State of the code:** the Keychain-backed vault protector and the `security(1)`
+live-credential channel are **implemented and shipping** (`packages/switch-engine/src/keychain.ts`,
+dispatched on `darwin` by `protector.ts`), and unit-tested — but every one of those tests
+drives a **fake `ExecRunner`**, never the real binary. Nothing below has run on Mac hardware,
+so macOS is **not a supported platform** no matter how green the suite is. Record the verdict
+as **arch-scoped** (arm64 ≠ Intel — do not generalize one to the other).
+
+**Run `claude-control-orchestrator/tasks/mac-wet-gate-runbook.md`** — the runbook holds the
+exact commands and per-step pass/fail criteria; results are stamped back **here**, the same
+cross-repo split gates 2, 4 and 6 use.
+
+**Verify (assumptions A1–A4, defined in `claude-control-orchestrator/tasks/mac-compatibility-plan.md`):**
+
+- **A1 — item name/account.** The CLI's live credentials are assumed to live in Keychain
+  service `Claude Code-credentials` under the login user; confirm the exact account name via an
+  **attribute-only** dump. Never `-w`/`-g` on the live item — those print the OAuth token, and
+  this file is public. A miss here is a config fix (`CLAUDE_CLI_KEYCHAIN_SERVICE` /
+  `CLAUDE_CLI_KEYCHAIN_ACCOUNT`), not a code change.
+- **A2 — payload shape.** The item decodes to the same `{claudeAiOauth:{…}}` shape as
+  `.credentials.json`, confirmed **keys-only**, never by echoing values.
+- **A3 — `CLAUDE_CONFIG_DIR` + `--fresh`.** A fresh login with `CLAUDE_CONFIG_DIR` set writes a
+  `.credentials.json` **into that dir** (the CLI respects it, as on Windows per WT-1) → `--fresh`
+  capture is safe. If instead the login mutates the global Keychain item (clobbering the live
+  account), `--fresh` needs a mac-specific path — stop and report, do not improvise one.
+- **A4 — recurring Keychain GUI prompt.** Reading the CLI's **cross-app** item via
+  `/usr/bin/security` may raise a GUI prompt, and the daemon reads it headlessly in steady
+  state. Probe with the three-observation differential (our own `vault-key` item stays silent /
+  the CLI item prompts / a post-token-refresh re-read isolates ACL-wipe-on-recreate). **A red
+  here has no `security(1)`-path code fix.** It routes to a documented terminal-fail caveat
+  ("the daemon needs an interactive login-session Always-Allow; fully headless operation is
+  unsupported on macOS"), never an ACL workaround.
+
+**Pass (each stamped with evidence):**
+
+- `cctl doctor` reports `vault-crypto` and `login` green on darwin.
+- Switch round-trip: `accounts add` → `switch spare` → `claude -p` runs under the spare →
+  `switch` back, with sibling Keychain keys preserved.
+- Daemon steady-state: usage polls **both** accounts with **no** Keychain GUI prompt and no
+  loopback-firewall dialog.
+- **Negative invariant:** the vault directory copied to a second user / temp-keychain context
+  **fails** to decrypt — a stolen vault dir is useless without the owner's login keychain.
+- **Relay-from-darwin:** the daemon's outbound WebSocket client connects from macOS.
+
+**Result:** not yet run — no Mac available. Nothing on this gate may be marked closed from
+the fake-runner unit tests or from the `macos-latest` CI leg (that leg exercises only our own
+`vault-key` item, which is the half that was never in doubt).
+
+### 14. `/thread-here` — the live Discord half ⏳ OPEN
+
+**State of the code:** the command, its precedence, its persistence and its whole decision tree
+are unit-proven. Its three live adapters are not: `gatherThreadHereFacts`, `probeThreadHere` and
+`inspectChannelHealth` are replaced by stand-ins in every test, so the guarantee that a channel
+the bot cannot use is refused at command time rests entirely on assumptions about Discord that
+no headless test can check.
+
+**Verify (each is an assumption the preflight is built on):**
+
+- **`interaction.appPermissions` reflects channel OVERWRITES**, not just the bot's guild-wide
+  role permissions. If it reports the role baseline, a channel that denies the bot by overwrite
+  passes stage one — the probe still catches it, but the reply names no permission and is
+  therefore unactionable.
+- **`interaction.guild === null` with a non-null `guildId` really is "the bot is not in this
+  server"** (user-installed app in a foreign guild). If it can also be null for a bot that IS a
+  member, that rejection tells a fixable case it cannot be fixed.
+- **The four required bits are exactly right.** Create a channel granting only View Channel,
+  Create Private Threads, Send Messages in Threads and Manage Threads — nothing else — and
+  confirm `/thread-here` pins and a real session thread is then created AND the user admitted.
+  Then revoke **Manage Threads alone** and confirm the pin is refused, which is the non-obvious
+  bit the whole preflight exists for (`invitable: false` + admitting a non-member).
+- **The probe cleans up.** After a successful pin, no `cctl channel check` thread remains. Then
+  force a cleanup failure and confirm a second `/thread-here` in the same channel reaps the
+  leftover rather than adding another.
+- **`action:show` names a user-side loss.** With the bot's permissions untouched, remove the
+  user's access to the pinned channel (leave the server, or deny View Channel for them) and
+  confirm `show` reports that they cannot see it — not `ok` — and that a new session lands in
+  their DMs.
+- **The three-second window.** A `pin` in a busy guild answers with a real reply, never "The
+  application did not respond". The path defers first, so this is a check that the deferral is
+  actually reached and edited, not that it is fast.
+
+**Pass:** every bullet above observed on a real Discord app, with a spare account.
+
 **Result:** not yet run.
 
 ## Reminder

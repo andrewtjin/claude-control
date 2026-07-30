@@ -18,6 +18,7 @@
 // not a recommendation heading plus a per-account advisory list.
 
 import { humanizeDuration, roundPct } from './format.js';
+import { selectWeeklyBudget } from './weekly.js';
 import type {
   AccountScore,
   AccountUsageInput,
@@ -55,9 +56,23 @@ interface Analysis {
   usable: boolean;
   weeklyResetAt?: number;
   sessionResetAt?: number;
-  /** The most at-risk WEEKLY limit: soonest reset with meaningful unused quota. Session
-   *  limits never appear here — a session reset wastes nothing (see module header). */
-  burn?: { unusedPct: number; resetsAt: number; kind: LimitInput['kind']; urgency: number };
+  /** This account's weekly BUDGET when it is at risk: meaningful unused quota against a reset
+   *  that lands inside the urgent window. Never a session limit (a session reset wastes
+   *  nothing — see the module header) and never the Fable sub-cap on its own (it is a ceiling
+   *  inside the budget, not spendable capacity beside it — see `analyze`). */
+  burn?: {
+    unusedPct: number;
+    resetsAt: number;
+    /** Which limit supplied the figures. `weekly_scoped` means the account reported no
+     *  `weekly_all` percent at all and the sub-cap is the only weekly reading there is — the
+     *  rendered advice says so rather than passing it off as the overall budget. */
+    kind: LimitInput['kind'];
+    urgency: number;
+    /** True when `resetsAt` is predicted from history rather than reported by the endpoint.
+     *  Carried so the advice can label it: burning is an ACTION, and an operator taking it
+     *  deserves to know the deadline driving it was inferred. */
+    predicted: boolean;
+  };
   score: number;
 }
 
@@ -117,42 +132,42 @@ function analyze(input: AccountUsageInput, now: number, cfg: Config): Analysis {
       ? 100
       : Math.min(...input.limits.map((l) => 100 - clampPct(l.percent)));
 
-  // "Weekly resets" means the SHARED weekly budget (weekly_all — the bar every surface
-  // renders), never the model-scoped cap; the scoped reset stands in only for an account
-  // that reports no weekly_all limit at all. Same convention as pacing's weeklyLimitFor.
-  const weeklyResetAt =
-    nearestResetOfKind(input.limits, ['weekly_all']) ??
-    nearestResetOfKind(input.limits, ['weekly_scoped']);
+  // The weekly budget — percent used AND the clock it resets on — comes from the one
+  // fleet-wide rule (see weekly.ts) so the Plan line and the Pacing line in the same view can
+  // never quote different limits for one account.
+  const weekly = selectWeeklyBudget(input.limits, now, input.predictedResetAt);
+  const weeklyResetAt = weekly?.resetsAt;
   const sessionResetAt = nearestResetOfKind(input.limits, ['session']);
 
-  // Find the most at-risk WEEKLY limit: the soonest-resetting one that still has meaningful
-  // unused capacity. That unused capacity is what we'd waste by letting it reset. Session
-  // limits are skipped on purpose: a session reset restores quota, it never destroys any,
-  // so "unused session capacity resetting soon" is not a loss worth chasing.
+  // The burn candidate: this account's weekly BUDGET, when it still holds meaningful unused
+  // capacity and resets soon. That unused capacity is what we'd waste by letting it reset.
   //
-  // The scoped (Fable-tier) cap only ever spends THROUGH the shared weekly budget, so its
-  // burnable amount is capped by weekly_all's remaining headroom: "fable left" with the
-  // shared budget empty is stranded quota, not a burn target — advertising it as burnable
-  // (let alone as "% weekly left") recommends an account that cannot actually deliver it.
-  const weeklyAll = input.limits.find((l) => l.kind === 'weekly_all');
-  const weeklyAllUnusedPct =
-    weeklyAll !== undefined ? 100 - clampPct(weeklyAll.percent) : undefined;
+  // It reads the budget through `selectWeeklyBudget` instead of scanning the limits itself,
+  // and that distinction is load-bearing. A scan sees `weekly_scoped` — the Fable-tier
+  // sub-cap — as a second weekly budget standing beside `weekly_all`, and since the sub-cap
+  // is the one that lags, it is the one a scan picks. An account 94% through its weekly
+  // budget while only 47% through its Fable sub-cap then reports "53% weekly left" and leads
+  // the burn queue, making the fleet's most-drained account the recommendation. The sub-cap
+  // is a ceiling INSIDE the budget, never budget beside it: with 6% of the week left there is
+  // 6% left for Fable too. Only `weekly_all` is spendable capacity, which is exactly the rule
+  // weekly.ts already encodes for everyone else.
+  //
+  // Session limits are out for a different reason: a session reset restores quota, it never
+  // destroys any, so "unused session capacity resetting soon" is not a loss worth chasing.
   let burn: Analysis['burn'];
-  for (const limit of input.limits) {
-    if (limit.kind === 'session') continue;
-    if (limit.resetsAt === undefined) continue;
-    let unusedPct = 100 - clampPct(limit.percent);
-    if (limit.kind === 'weekly_scoped' && weeklyAllUnusedPct !== undefined) {
-      unusedPct = Math.min(unusedPct, weeklyAllUnusedPct);
-    }
-    if (unusedPct < cfg.significantUnusedPct) continue;
-    const msUntil = limit.resetsAt - now;
-    if (msUntil <= 0 || msUntil > cfg.urgentWindowMs) continue;
-    // Sooner reset => higher fraction => more urgent. Scaled by how much would be wasted.
-    const fraction = 1 - msUntil / cfg.urgentWindowMs;
-    const urgency = unusedPct * fraction;
-    if (!burn || urgency > burn.urgency) {
-      burn = { unusedPct, resetsAt: limit.resetsAt, kind: limit.kind, urgency };
+  if (weekly?.percent !== undefined && weekly.resetsAt !== undefined) {
+    const unusedPct = 100 - clampPct(weekly.percent);
+    const msUntil = weekly.resetsAt - now;
+    if (unusedPct >= cfg.significantUnusedPct && msUntil > 0 && msUntil <= cfg.urgentWindowMs) {
+      // Sooner reset => higher fraction => more urgent. Scaled by how much would be wasted.
+      const fraction = 1 - msUntil / cfg.urgentWindowMs;
+      burn = {
+        unusedPct,
+        resetsAt: weekly.resetsAt,
+        kind: weekly.kind,
+        urgency: unusedPct * fraction,
+        predicted: weekly.predicted,
+      };
     }
   }
 
@@ -205,18 +220,11 @@ function toRanking(analyses: Analysis[]): AccountScore[] {
     });
 }
 
-/** Name a burnable budget for humans: the shared weekly budget is "weekly", the scoped cap
- *  is the Fable-tier limit — calling THAT "weekly" is how fable-left gets mistaken for
- *  budget-left when the shared bar is already empty. */
-function budgetName(kind: LimitInput['kind']): string {
-  return kind === 'weekly_scoped' ? 'fable' : 'weekly';
-}
-
 /** One-line status for an account in the ranking. */
 function noteFor(a: Analysis): string {
   if (a.input.quarantined) return 'quarantined — re-login required';
   if (!a.usable) return 'exhausted';
-  if (a.burn) return `burn: ${roundPct(a.burn.unusedPct)}% ${budgetName(a.burn.kind)} resets soon`;
+  if (a.burn) return `burn: ${roundPct(a.burn.unusedPct)}% ${budgetWord(a.burn.kind)} resets soon`;
   if (a.headroomPct < DEFAULTS.riskHeadroomPct) return 'near cap';
   return `${roundPct(a.headroomPct)}% headroom`;
 }
@@ -309,8 +317,8 @@ function buildReason(
     const queue = burns
       .map((a, i) => {
         const b = a.burn as NonNullable<Analysis['burn']>;
-        const left = `${roundPct(b.unusedPct)}% ${budgetName(b.kind)} left`;
-        const when = humanizeDuration(b.resetsAt - now);
+        const left = `${roundPct(b.unusedPct)}% ${budgetWord(b.kind)} left`;
+        const when = `${humanizeDuration(b.resetsAt - now)}${b.predicted ? ' (predicted)' : ''}`;
         // First entry spells everything out; later ones drop the repeated words.
         return i === 0
           ? `${a.input.label} (${left}, resets in ${when})`
@@ -333,6 +341,14 @@ function buildReason(
 }
 
 // ---- small helpers ----
+
+/** What to CALL the figures a burn entry carries. Normally "weekly", because they came from
+ *  the account's overall weekly budget. When the sub-cap had to stand in for a missing
+ *  `weekly_all` percent the word changes, matching how the timeline already names that limit —
+ *  a reader must never be handed a Fable-only number under the word for the whole budget. */
+function budgetWord(kind: LimitInput['kind']): string {
+  return kind === 'weekly_scoped' ? 'weekly (fable)' : 'weekly';
+}
 
 function clampPct(pct: number): number {
   return Math.max(0, Math.min(100, pct));

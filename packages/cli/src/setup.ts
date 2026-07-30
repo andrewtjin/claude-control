@@ -12,6 +12,7 @@
 import type { StoredAccount } from '@claude-control/switch-engine';
 import { renderDoctor, summarize, type DoctorCheck, type RelayProbe } from './doctor.js';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { BOT_INVITE_URL, BOT_USER_INSTALL_URL } from './settings.js';
 
 // ---------------------------------------------------------------------------
 // The wizard's IO surface
@@ -393,7 +394,13 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
       `${p.green('Already paired.')} Re-pair later with \`cctl daemon run --pair <code>\`.\n`,
     );
   } else {
-    io.write('In your Discord server, run `/pair` to get a one-time code.\n');
+    io.write(
+      'In your Discord server (or a DM with the bot), run `/pair` to get a one-time code.\n',
+    );
+    io.write(`No server with the bot yet? Add it first: ${BOT_INVITE_URL}\n`);
+    io.write(
+      `Or add it to just your account (no server needed) and DM it: ${BOT_USER_INSTALL_URL}\n`,
+    );
     io.write(`Enter it below, or type ${p.bold('s')} to skip and set up local-only.\n`);
     for (;;) {
       const raw = await io.ask('Pairing code (or `s` to skip): ');

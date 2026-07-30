@@ -14,7 +14,7 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
-import pino from 'pino';
+import { createLogger } from '@claude-control/shared-protocol';
 import {
   Vault,
   defaultPaths,
@@ -40,6 +40,7 @@ import {
   hookSecretPath,
   installHooks,
   readHookEndpoint,
+  readTranscriptTurns,
   writeHookForwarder,
   loadOrCreateHookSecret,
   writeHookEndpoint,
@@ -69,6 +70,15 @@ import {
 /** Token considered unusable for polling within this window before expiry — the poller then
  *  falls back to tier-0 rather than racing the expiry mid-request. */
 const POLL_TOKEN_MIN_TTL_MS = 60_000;
+
+/** The one stream every logger in this process renders to.
+ *
+ *  A foreground daemon writes nothing but log — it has no command output to keep a pipe clean
+ *  for — and `cctl daemon run > daemon.log` is a documented way to capture it, so ALL of it has
+ *  to be on the redirected stream. This process builds two loggers (its own, below, and the
+ *  switch engine's, through `buildEngine`); naming their destination once is what stops them
+ *  drifting onto different streams and splitting the log in half. */
+const DAEMON_LOG_SINK = process.stdout;
 
 export interface DaemonRunOptions {
   pair?: string;
@@ -190,15 +200,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       );
     }
   }
-  const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
-  const logger: Logger = {
-    debug: (obj, msg) => p.debug(obj, msg),
-    info: (obj, msg) => p.info(obj, msg),
-    warn: (obj, msg) => p.warn(obj, msg),
-    error: (obj, msg) => p.error(obj, msg),
-  };
+  const logger: Logger = createLogger({ defaultLevel: 'info', sink: DAEMON_LOG_SINK });
 
-  const engine = buildEngine(paths);
+  const engine = buildEngine(paths, DAEMON_LOG_SINK);
   const store = new Store(daemonDbPath(paths));
   const protector = defaultProtector();
 
@@ -315,6 +319,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     forwardNotificationCards: config.values.waitingCards,
     commandOutputCards: config.values.commandOutputCards,
     fullToolOutput: config.values.fullToolOutput,
+    // StopFailure warn cards ride the same umbrella switch as the managed sessions' retry
+    // loop: both are "survive transient API errors" behavior (CCTL_AUTO_CONTINUE).
+    apiErrorCards: config.values.autoContinue,
     // A managed session is recognized by either its record id or the SDK session id its hooks
     // report (persisted as the record's resume anchor on session_init).
     isManagedSession: (sessionId) =>
@@ -389,9 +396,23 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // Rewritten every start; the shutdown handler removes it so a stopped daemon leaves no
     // stale pointer. The secret file is the auth gate — this only answers "where".
     publishHookEndpoint: (port) => writeHookEndpoint(hookEndpointPath(dataDir), { port }),
+    // Absolute token counts for `/stats` on the phone, read from the transcripts Claude Code
+    // writes under this same config dir. Local file reads only; the bot receives only the sums.
+    scanTranscripts: (sinceMs) => readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs }),
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),
+    // Present only when the operator hasn't opted out — the Daemon stamps it onto every
+    // managed spawn/resume, and its absence IS the off switch (no policy, no retries).
+    ...(config.values.autoContinue
+      ? {
+          autoContinue: {
+            ...(config.values.autoContinueMaxAttempts !== undefined
+              ? { maxAttempts: config.values.autoContinueMaxAttempts }
+              : {}),
+          },
+        }
+      : {}),
     ...(autoSwitcher ? { autoSwitcher } : {}),
     settingsReport,
     logger,

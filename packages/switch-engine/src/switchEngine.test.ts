@@ -1,11 +1,11 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SwitchEngine, type RefreshFn } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore } from './credentialStore.js';
-import { Vault } from './vault.js';
+import { METADATA_BACKFILL_RETRY_MS, Vault } from './vault.js';
 import { IntentStore } from './intent.js';
 import { sandboxPaths, type Paths } from './paths.js';
 import {
@@ -17,11 +17,43 @@ import {
 } from './errors.js';
 import { acquireLock } from './lock.js';
 import type { ClaudeOauth, CredentialBundle } from './types.js';
+import type { Logger } from './logger.js';
+
+// A seam to make one atomic write's `rename` fail the way a Windows sharing violation does — the
+// registry is open in another process, so the replace is refused until that handle closes. Keyed
+// to the SOURCE path (unique per `atomicWriteFile` call), so arming it fails exactly one write and
+// all of its retries while every other write proceeds normally. Disarmed except in the test that
+// needs it, so every other test here sees the real `rename`.
+const renameFault = vi.hoisted(() => ({ armed: false, source: '' }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    rename: ((from: string, to: string): Promise<void> => {
+      if (renameFault.armed) {
+        if (renameFault.source === '') renameFault.source = String(from);
+        if (renameFault.source === String(from)) {
+          const err: NodeJS.ErrnoException = new Error('EPERM: operation not permitted, rename');
+          err.code = 'EPERM';
+          return Promise.reject(err);
+        }
+      }
+      return actual.rename(from, to);
+    }) as typeof actual.rename,
+  };
+});
 
 const NOW = 100_000_000;
 const HOUR = 3_600_000;
 
 let dirs: string[] = [];
+
+/** One line the engine logged, flattened enough to assert on. */
+interface LogLine {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  obj: unknown;
+  msg: string | undefined;
+}
 
 interface Harness {
   paths: Paths;
@@ -31,6 +63,9 @@ interface Harness {
   vault: Vault;
   intent: IntentStore;
   setNow: (n: number) => void;
+  /** Everything the engine logged, in order — the only place a best-effort repair can report
+   *  that it failed, since by contract it does not fail its caller. */
+  logs: LogLine[];
 }
 
 async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
@@ -52,6 +87,19 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
     });
   const refresh = vi.fn(refreshImpl ?? defaultRefresh);
 
+  const logs: LogLine[] = [];
+  const record =
+    (level: LogLine['level']) =>
+    (obj: unknown, msg?: string): void => {
+      logs.push({ level, obj, msg });
+    };
+  const logger: Logger = {
+    debug: record('debug'),
+    info: record('info'),
+    warn: record('warn'),
+    error: record('error'),
+  };
+
   const engine = new SwitchEngine({
     paths,
     protector,
@@ -59,6 +107,7 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
     clock,
     refreshSkewMs: 5 * 60 * 1000,
     lockOptions: { timeoutMs: 2000, pollMs: 10 },
+    logger,
   });
 
   return {
@@ -69,10 +118,13 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
     vault: new Vault(paths.vaultDir, protector, clock),
     intent: new IntentStore(paths.vaultDir),
     setNow: (n) => (now = n),
+    logs,
   };
 }
 
 afterEach(async () => {
+  renameFault.armed = false;
+  renameFault.source = '';
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
   dirs = [];
 });
@@ -280,6 +332,180 @@ describe('activate — happy path', () => {
   });
 });
 
+describe('derived account metadata is repaired from the stored bundle', () => {
+  // The registry is a cache of what a bundle says, and the only thing that used to refresh it was
+  // WRITING that bundle — an event tied to token rotation, not to metadata. So an account stored
+  // by a build that captured fewer fields rendered "?" / "unknown" indefinitely, even though its
+  // vaulted bundle had carried the answer since the day it was captured.
+  const PLAN_TIER = 'default_claude_max_20x';
+  const planBundle = (access: string, expiresAt: number): CredentialBundle => ({
+    claudeAiOauth: { ...oauth(access, expiresAt), subscriptionType: 'max' },
+    oauthAccount: {
+      accountUuid: 'uuid-' + access,
+      emailAddress: access + '@x.com',
+      organizationRateLimitTier: PLAN_TIER,
+      billingType: 'stripe_subscription',
+      subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+    },
+  });
+
+  /** Rewrite the registry the way a build predating these fields left it on disk: derived keys
+   *  absent, no revision stamp — while the encrypted bundles keep carrying the values. */
+  async function degradeRegistry(paths: Paths): Promise<void> {
+    const path = join(paths.vaultDir, 'accounts.json');
+    const reg = JSON.parse(await readFile(path, 'utf8')) as {
+      accounts: Record<string, unknown>[];
+    };
+    for (const account of reg.accounts) {
+      delete account.metadataRev;
+      delete account.organizationRateLimitTier;
+      delete account.billingType;
+      delete account.subscriptionCreatedAt;
+    }
+    await writeFile(path, JSON.stringify(reg, null, 2));
+  }
+
+  it('repairs the target during a switch that needs no token refresh', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+    expect(await h.vault.getAccount(accountB.id)).not.toHaveProperty('organizationRateLimitTier');
+
+    await h.engine.activate(accountB.id);
+
+    // B's token was nowhere near expiry, so nothing rewrote its bundle — the row is repaired
+    // from the copy the switch already had to decrypt.
+    expect(h.refresh).not.toHaveBeenCalled();
+    const b = await h.vault.getAccount(accountB.id);
+    expect(b?.organizationRateLimitTier).toBe(PLAN_TIER);
+    expect(b?.billingType).toBe('stripe_subscription');
+    // The account NOT being switched to is untouched by the switch — that is what the sweep is
+    // for, and asserting it keeps the two mechanisms from being confused for one another.
+    expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+  });
+
+  it('sweeps every stale account once, then costs nothing', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+
+    expect(await h.engine.backfillAccountMetadata()).toBe(2);
+    for (const id of [accountA.id, accountB.id]) {
+      expect((await h.vault.getAccount(id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+    }
+    // Stamped rows are skipped, so a listing does not pay for a decrypt on every run.
+    expect(await h.engine.backfillAccountMetadata()).toBe(0);
+  });
+
+  it('skips an account whose bundle cannot be read instead of failing the sweep', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+    // A missing blob is a real state (a half-removed account, a vault restored without it); one
+    // unreadable account must not deny every other account its metadata.
+    await rm(join(h.paths.vaultDir, accountA.id), { recursive: true, force: true });
+
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+    expect((await h.vault.getAccount(accountB.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+    expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+  });
+
+  it('backs a permanently unreadable row off, then retries it once the window passes', async () => {
+    // Skipping an unreadable row without recording the attempt leaves it selected forever, so the
+    // stale set never empties and every later listing takes the credential lock again. Recording
+    // it must not become a tombstone either: the blob can come back.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+    // Keep A's blob so it can be put back the way a restored vault or a re-paired machine would —
+    // out of band, without any write path running to heal the row as a side effect.
+    const blobPath = join(h.paths.vaultDir, accountA.id, 'cred.enc');
+    const blob = await readFile(blobPath, 'utf8');
+    await rm(join(h.paths.vaultDir, accountA.id), { recursive: true, force: true });
+
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+
+    // Even with the blob back, the row waits out its back-off rather than being retried per call.
+    await mkdir(join(h.paths.vaultDir, accountA.id), { recursive: true });
+    await writeFile(blobPath, blob);
+    expect(await h.engine.backfillAccountMetadata()).toBe(0);
+    expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+
+    h.setNow(NOW + METADATA_BACKFILL_RETRY_MS);
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+    expect((await h.vault.getAccount(accountA.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+  });
+
+  it('skips the sweep while another process holds the credential lock', async () => {
+    // The sweep runs inside `cctl accounts list`, a read command. Queueing behind an in-flight
+    // switch would make a listing sit out the whole acquire timeout for repair nobody asked for.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+
+    const held = await acquireLock(join(h.paths.vaultDir, '.lock'), () => NOW);
+    try {
+      expect(await h.engine.backfillAccountMetadata()).toBe(0);
+      expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+    } finally {
+      held.release();
+    }
+    // Skipping gives nothing up — the rows are untouched, so the next call still repairs them.
+    expect(await h.engine.backfillAccountMetadata()).toBe(2);
+  });
+
+  it('repairs the remaining rows after one of them cannot be written, and says which', async () => {
+    // Every row is repaired by its own registry write, so a write that loses a race with a
+    // concurrent reader says nothing about the next row. Stopping there would make which accounts
+    // get repaired depend on their position in the list — and leave every row after the failure
+    // waiting on a later sweep that hits the same wall in the same place.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await degradeRegistry(h.paths);
+
+    // The sweep's first registry write is A's; nothing between arming and it renames anything.
+    renameFault.armed = true;
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+    renameFault.armed = false;
+
+    expect(await h.vault.getAccount(accountA.id)).not.toHaveProperty('billingType');
+    expect((await h.vault.getAccount(accountB.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+    // A failed write must not leave its temp copy of the registry in the vault directory.
+    const left = (await readdir(h.paths.vaultDir)).filter((f) => f.startsWith('.tmp-'));
+    expect(left).toEqual([]);
+    // Best-effort does not mean unaccountable: the row that could not be repaired is named.
+    const warned = h.logs.filter((l) => l.level === 'warn');
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.obj).toMatchObject({ accountId: accountA.id });
+    // A is untouched, so the next sweep repairs it too — nothing is permanently skipped.
+    expect(await h.engine.backfillAccountMetadata()).toBe(1);
+    expect((await h.vault.getAccount(accountA.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+  });
+
+  it('logs rather than throws when the sweep cannot run at all', async () => {
+    // The sweep runs ahead of a read command the user DID ask for, so it must never fail that
+    // command. Reporting best-effort by throwing forces every call site into a bare `catch`, and a
+    // discarded reason makes a self-heal that has stopped healing look exactly like one with
+    // nothing left to do.
+    const h = await harness();
+    await seedAActiveWithB(h);
+    await writeFile(join(h.paths.vaultDir, 'accounts.json'), '{ not json');
+
+    await expect(h.engine.backfillAccountMetadata()).resolves.toBe(0);
+    expect(h.logs.filter((l) => l.level === 'warn')).toHaveLength(1);
+  });
+});
+
 describe('activate — refresh on near-expiry', () => {
   it('refreshes the target and persists the rotated token before use', async () => {
     const h = await harness();
@@ -349,6 +575,80 @@ describe('activate — reconcile-by-reading', () => {
     const result = await h.engine.activate(accountB.id);
     expect(result.adoptedPreviousRotation).toBe(false);
   });
+
+  it('adopts the rotated token without taking an unprovable live identity with it', async () => {
+    // The live identity block is unvalidated and can be partial — here it reports no uuid, so
+    // nothing proves it describes A. Adoption exists to save a rotated TOKEN; carrying that
+    // block into A's bundle would re-identify A off evidence that does not name it, and the
+    // identity in a bundle is what every attribution check downstream keys on.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    const liveA = (await h.credStore.readLiveCredentials())!;
+    await h.credStore.writeLiveCredentials({ ...liveA, refreshToken: 'cli-rotated' });
+    await h.credStore.writeOauthAccount({ emailAddress: 'stranger@x.com' });
+
+    const result = await h.engine.activate(accountB.id);
+
+    expect(result.adoptedPreviousRotation).toBe(true);
+    const adopted = await h.vault.readBundle(accountA.id);
+    expect(adopted.claudeAiOauth.refreshToken).toBe('cli-rotated');
+    expect(adopted.oauthAccount?.accountUuid).toBe('uuid-A');
+    expect(adopted.oauthAccount?.emailAddress).toBe('A@x.com');
+    expect((await h.vault.getAccount(accountA.id))?.emailAddress).toBe('A@x.com');
+  });
+});
+
+describe('activate — a target whose bundle carries no identity block', () => {
+  /** Seed A live+active, plus an account captured CREDENTIALS-ONLY: no `~/.claude.json` block
+   *  was readable when it was captured, so its bundle has no identity to make live. */
+  async function seedBlocklessTarget(h: Harness) {
+    const { accountA } = await seedAActiveWithB(h);
+    const blockless = await h.engine.addAccount('C', {
+      claudeAiOauth: oauth('C', NOW + 10 * HOUR),
+    });
+    return { accountA, blockless };
+  }
+
+  it('removes the live identity rather than leaving it naming the previous account', async () => {
+    const h = await harness();
+    const { blockless } = await seedBlocklessTarget(h);
+
+    await h.engine.activate(blockless.id);
+
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('C');
+    // Leaving uuid-A here would be a live statement that A is logged in while C's token is.
+    expect(await h.credStore.readOauthAccount()).toBeUndefined();
+  });
+
+  it('leaves nothing that reconciles the active account back to the previous one', async () => {
+    const h = await harness();
+    const { blockless } = await seedBlocklessTarget(h);
+    await h.engine.activate(blockless.id);
+    expect(await h.engine.getActiveId()).toBe(blockless.id);
+  });
+
+  it('adopts a later CLI rotation into the account that owns it, not the previous one', async () => {
+    // The full cascade this guards: a live identity left naming A makes A the "previous active"
+    // for the NEXT switch, and the adoption guard there compares that block against itself and
+    // agrees — so the rotated token of whoever is really live lands in A's bundle, and only a
+    // network ownership check much later can see it.
+    const h = await harness();
+    const { accountA, blockless } = await seedBlocklessTarget(h);
+    await h.engine.activate(blockless.id);
+
+    // The CLI rotates the live (C's) refresh token, then the operator switches back to A.
+    const live = (await h.credStore.readLiveCredentials())!;
+    await h.credStore.writeLiveCredentials({ ...live, refreshToken: 'cli-rotated-C' });
+    h.setNow(NOW + 61_000);
+
+    const result = await h.engine.activate(accountA.id);
+
+    expect(result.adoptedPreviousRotation).toBe(true);
+    expect((await h.vault.readBundle(blockless.id)).claudeAiOauth.refreshToken).toBe(
+      'cli-rotated-C',
+    );
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('r-A');
+  });
 });
 
 describe('active-id reconciliation (external /login inside the Claude CLI)', () => {
@@ -377,6 +677,24 @@ describe('active-id reconciliation (external /login inside the Claude CLI)', () 
     await externalLogin(h, bundleFor('STRANGER', NOW + 10 * HOUR));
 
     expect(await h.engine.getActiveId()).toBeNull();
+  });
+
+  it('getActiveId keeps the registry when a stale identity is contradicted by the live token', async () => {
+    // The disk state this bug left behind: the identity block still names A while B's
+    // credentials are live and the registry records B. The block is the only evidence pointing
+    // at A, and the token it sits beside contradicts it — believing the block would hand B's
+    // live token to A everywhere downstream.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.engine.activate(accountB.id);
+    await h.credStore.writeOauthAccount({ accountUuid: 'uuid-A', emailAddress: 'A@x.com' });
+
+    expect(await h.engine.getActiveId()).toBe(accountB.id);
+
+    // A genuine /login as A rewrites the token as well, and then the block is believed again —
+    // this must stay a reconcile-by-reading engine, not a registry-only one.
+    await h.credStore.writeLiveCredentials(oauth('A-fresh', NOW + 10 * HOUR));
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
   });
 
   it('getActiveId falls back to the registry when no live identity is readable', async () => {
@@ -576,6 +894,53 @@ describe('recover', () => {
     expect(result.action).toBe('rolled_forward');
     expect(await h.engine.getActiveId()).toBe(accountB.id);
     expect(await h.intent.read()).toBeUndefined();
+  });
+
+  it('rolls forward a target with no identity block by clearing the stale one', async () => {
+    // Roll-forward FINISHES the interrupted live write, and the write it finishes is now a
+    // removal when the target has no block — skipping it would commit the switch on top of the
+    // previous account's identity, which is the state this engine refuses to leave behind.
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+    const blockless = await h.engine.addAccount('C', {
+      claudeAiOauth: oauth('C', NOW + 10 * HOUR),
+    });
+    await h.credStore.writeLiveCredentials(oauth('C', NOW + 10 * HOUR));
+    await h.intent.write({
+      phase: 'written',
+      targetId: blockless.id,
+      prevActiveId: accountA.id,
+      hasRollback: false,
+      startedAtMs: NOW,
+    });
+
+    expect((await h.engine.recover()).action).toBe('rolled_forward');
+    expect(await h.engine.getActiveId()).toBe(blockless.id);
+    expect(await h.credStore.readOauthAccount()).toBeUndefined();
+  });
+
+  it('rolls back the live identity too, removing one the snapshot never carried', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    // The live files had no identity block when the switch began, so the snapshot has none
+    // either; the switch then wrote B's identity before its credential write went wrong.
+    const a = await h.vault.readBundle(accountA.id);
+    await h.vault.writeRollback({ claudeAiOauth: a.claudeAiOauth });
+    await h.credStore.writeLiveCredentials(oauth('CORRUPT', NOW + HOUR));
+    await h.credStore.writeOauthAccount({ accountUuid: 'uuid-B', emailAddress: 'B@x.com' });
+    await h.intent.write({
+      phase: 'written',
+      targetId: accountB.id,
+      prevActiveId: accountA.id,
+      hasRollback: true,
+      startedAtMs: NOW,
+    });
+
+    expect((await h.engine.recover()).action).toBe('rolled_back');
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    // Restoring A's credentials under B's identity would recreate the exact mismatch the
+    // forward path refuses to create.
+    expect(await h.credStore.readOauthAccount()).toBeUndefined();
   });
 
   it('rolls back to the snapshot when the live write is inconsistent', async () => {

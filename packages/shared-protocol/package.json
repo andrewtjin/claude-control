@@ -16,6 +16,7 @@
     "test": "vitest run --root ../.. packages/shared-protocol"
   },
   "dependencies": {
+    "pino": "^10.3.1",
     "zod": "^3.24.1"
   }
 }

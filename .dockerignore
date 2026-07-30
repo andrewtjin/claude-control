@@ -14,3 +14,10 @@ tasks
 scratch
 *.local
 *.log
+# Deploy secrets must never enter the build context: the build stage does `COPY . .`, so
+# without this an operator's real deploy/.env (Discord bot token) would be baked into a build
+# image layer even though the runtime stage never copies it. Secrets reach the container at
+# run time via docker-compose env_file/environment, never through the image.
+*.env
+**/.env
+deploy/.env
