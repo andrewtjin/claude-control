@@ -178,6 +178,16 @@ export interface SessionHandle {
   /** Tear the session down. Idempotent. */
   stop(): Promise<void>;
   /**
+   * Kick a session PARKED on a usage-limit failure back into work (managed only, and only
+   * meaningful when the session's auto-continue policy parked it — see managedSession's
+   * stall handling). Returns true when a stalled session actually started its resume turn;
+   * false for everything else (not stalled, mid-turn, terminal), so the daemon can call it
+   * across every live handle after an account switch and count what moved. Optional because
+   * an observed terminal has no input channel to resume through, and so minimal fakes stay
+   * valid.
+   */
+  resumeFromUsageLimitStall?(): boolean;
+  /**
    * Subscribe to STRUCTURED permission requests (managed sessions only). Optional because an
    * observed terminal has no structured permission seam — its permissions surface through the
    * CLI's own local prompt / hooks, not this handle. Separate from `onEvent` on purpose: the
