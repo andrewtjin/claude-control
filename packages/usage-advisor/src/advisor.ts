@@ -17,6 +17,7 @@
 // weekly budget first) and who to hold in reserve — so frontends render ONE compact line,
 // not a recommendation heading plus a per-account advisory list.
 
+import { MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
 import { humanizeDuration, roundPct } from './format.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type {
@@ -33,7 +34,7 @@ const DEFAULTS = {
   urgentWindowMs: 24 * 60 * 60 * 1000, // resets within a day are "imminent"
   significantUnusedPct: 15, // don't fuss over burning the last few percent
   riskHeadroomPct: 15, // below this, an account is near its cap
-  minUsableHeadroomPct: 2, // below this, treat as exhausted
+  minUsableHeadroomPct: MIN_USABLE_HEADROOM_PCT, // below this, treat as exhausted
 };
 
 // Weights turning the model's factors into one comparable score. Urgency dominates headroom
