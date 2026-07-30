@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cctl": {
+      "command": "cctl",
+      "args": ["channel", "serve"]
+    }
+  }
+}

@@ -74,9 +74,18 @@ export interface SetupDeps {
   /** The settings.json the daemon installs hooks into — reported to the user. */
   hooksProfilePath: string;
 
+  /** Whether prompts from the phone can already reach a session sitting idle at its prompt. */
+  channelEnabled(): Promise<{ effective: boolean; detail: string; path: string }>;
+  /** Approve cctl as a Claude Code channel. Needs administrator rights once, so the wizard asks
+   *  first and treats `'declined'` as a choice rather than a failure. */
+  enableChannel(): Promise<{
+    outcome: 'written' | 'unchanged' | 'declined' | 'unsupported';
+    detail: string;
+  }>;
+
   /** The relay URL in effect (default, env, or a value the caller resolved from a flag). */
   relayUrl: string;
-  /** Probe the relay's health endpoint (step 5). */
+  /** Probe the relay's health endpoint. */
   probeRelay(url: string): Promise<RelayProbe>;
 
   /** Whether a daemon identity is already persisted and decrypts (already paired). */
@@ -264,7 +273,7 @@ export function renderSetupSummary(
 // The wizard
 // ---------------------------------------------------------------------------
 
-const TOTAL_STEPS = 7;
+const TOTAL_STEPS = 8;
 
 /** Run the guided setup. Returns an outcome; all user-facing text goes through `deps.io`. */
 export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Promise<SetupOutcome> {
@@ -361,21 +370,60 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
     accounts = await deps.listAccounts();
   }
 
-  // ---- [4/7] hooks ----
+  // ---- [4/8] hooks ----
   step(4, 'Usage hooks');
   if (await deps.hooksInstalled()) {
     io.write(`${p.green('Already installed')} in ${deps.hooksProfilePath}.\n`);
   } else {
     // The hook command carries the daemon's loopback port, which is only known once the daemon
     // binds it — so the daemon installs (and self-heals) hooks on every start rather than the
-    // wizard writing a soon-stale entry here. Step 7 brings the daemon up; the summary confirms.
+    // wizard writing a soon-stale entry here. The last step brings the daemon up; the summary
+    // confirms.
     io.write(
-      `Hooks will be installed into ${deps.hooksProfilePath} when the daemon starts (step 7).\n`,
+      `Hooks will be installed into ${deps.hooksProfilePath} when the daemon starts (step ${TOTAL_STEPS}).\n`,
     );
   }
 
-  // ---- [5/7] relay ----
-  step(5, 'Relay');
+  // ---- [5/8] idle-session prompts ----
+  //
+  // Opt-in, and asked plainly, because this is the one step that needs administrator rights and
+  // the one whose absence is otherwise invisible: without it a prompt from the phone waits for a
+  // turn boundary that never comes while nobody is at the keyboard.
+  step(5, 'Prompts to idle sessions');
+  const channel = await deps.channelEnabled();
+  if (channel.effective) {
+    io.write(`${p.green('Already enabled')} — ${channel.detail}\n`);
+  } else {
+    io.write(
+      'Without this, a prompt you send from Discord waits until the session finishes a turn or\n' +
+        'you type in it — which never happens while you are away, the case phone control is for.\n' +
+        `Enabling it writes one file that Claude Code reads as administrator policy:\n  ${channel.path}\n` +
+        `${p.dim('You will see one Windows consent prompt now, and none afterwards.')}\n`,
+    );
+    if (isYes(await io.ask('Enable prompts to idle sessions? [y/N]: '))) {
+      const result = await deps.enableChannel();
+      switch (result.outcome) {
+        case 'written':
+        case 'unchanged':
+          io.write(`${p.green('[ok]')} ${result.detail}\n`);
+          break;
+        case 'declined':
+          io.write(
+            `${p.yellow('[--]')} Consent declined; nothing was written. ` +
+              'Run `cctl channel enable` whenever you want it.\n',
+          );
+          break;
+        case 'unsupported':
+          io.write(`${p.yellow('[--]')} ${result.detail}\n`);
+          break;
+      }
+    } else {
+      io.write(p.dim('Skipped. `cctl channel enable` turns it on later.\n'));
+    }
+  }
+
+  // ---- [6/8] relay ----
+  step(6, 'Relay');
   io.write(`Relay URL: ${p.bold(deps.relayUrl)}\n`);
   io.write(p.dim('Override with `cctl daemon run --relay <url>` or the CCTL_RELAY_URL env var.\n'));
   const probe = await deps.probeRelay(deps.relayUrl);
@@ -386,8 +434,8 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
       '\n',
   );
 
-  // ---- [6/7] pairing ----
-  step(6, 'Pair with Discord');
+  // ---- [7/8] pairing ----
+  step(7, 'Pair with Discord');
   let paired = await deps.isPaired();
   if (paired) {
     io.write(
@@ -442,8 +490,8 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
     }
   }
 
-  // ---- [7/7] autostart + daemon, then round-trip verify ----
-  step(7, 'Autostart and start the daemon');
+  // ---- [8/8] autostart + daemon, then round-trip verify ----
+  step(8, 'Autostart and start the daemon');
   // A failed registration must not kill the wizard at its final step — everything before it
   // (accounts, hooks, pairing) is already done, and the daemon runs fine without autostart.
   // Degrade to a warning with the retry path; the summary below reports the task honestly.

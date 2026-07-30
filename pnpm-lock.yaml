@@ -52,8 +52,23 @@ importers:
         specifier: ^0.28.1
         version: 0.28.1
 
+  packages/channel:
+    dependencies:
+      '@claude-control/daemon':
+        specifier: workspace:*
+        version: link:../daemon
+      '@claude-control/shared-protocol':
+        specifier: workspace:*
+        version: link:../shared-protocol
+      '@claude-control/switch-engine':
+        specifier: workspace:*
+        version: link:../switch-engine
+
   packages/cli:
     dependencies:
+      '@claude-control/channel':
+        specifier: workspace:*
+        version: link:../channel
       '@claude-control/daemon':
         specifier: workspace:*
         version: link:../daemon
