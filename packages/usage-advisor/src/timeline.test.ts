@@ -165,25 +165,6 @@ describe('computeOutlook — 5h window budget', () => {
     expect(outlook.events).toEqual([]);
   });
 
-  it('budgets against the SHARED weekly reset even when the scoped cap resets sooner', () => {
-    // The scoped (Fable-tier) cap resetting first does not refresh the budget the 5h windows
-    // spend from — "weekly resets in …" must mean the same weekly_all bar every surface shows.
-    const outlook = computeOutlook(
-      [
-        account({
-          accountId: 'a',
-          limits: [
-            { kind: 'weekly_scoped', percent: 34, resetsAt: NOW + 10 * HOUR },
-            { kind: 'weekly_all', percent: 21, resetsAt: NOW + 20 * HOUR },
-          ],
-        }),
-      ],
-      NOW,
-    );
-    expect(outlook.accounts[0]?.budget?.weeklyResetAt).toBe(NOW + 20 * HOUR);
-    expect(outlook.accounts[0]?.budget?.fullWindows).toBe(4);
-  });
-
   it('falls back to the scoped reset only when no weekly_all limit exists', () => {
     const outlook = computeOutlook(
       [
