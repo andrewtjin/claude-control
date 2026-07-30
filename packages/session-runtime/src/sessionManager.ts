@@ -11,7 +11,7 @@ import { mkdir, open, readFile, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { SessionHandle, SessionRecord, SessionState } from './types.js';
 import { startManagedSession } from './managedSession.js';
-import type { AgentSdkClient } from './managedSession.js';
+import type { AgentSdkClient, AutoContinuePolicy } from './managedSession.js';
 import { attachObservedSession } from './observedSession.js';
 import type { PtyFactory } from './observedSession.js';
 
@@ -96,6 +96,9 @@ export interface SpawnManagedOptions {
   /** Claude Code permission mode for the session (e.g. 'default' to enable remote
    *  approve/deny). Threaded into every turn's query. */
   permissionMode?: string;
+  /** Ride out transient API failures instead of going `failed` — passed through to
+   *  {@link startManagedSession}; omitted = failures stay terminal. */
+  autoContinue?: AutoContinuePolicy;
 }
 
 /** Re-attach ONE crashed/orphaned managed session by resuming its underlying SDK session.
@@ -111,6 +114,9 @@ export interface ResumeOrphanOptions {
   prompt: string;
   /** Optional permission mode for the resumed session (see SpawnManagedOptions). */
   permissionMode?: string;
+  /** Auto-continue policy for the resumed session (see SpawnManagedOptions) — a resumed
+   *  session deserves the same transient-failure cover as a fresh one. */
+  autoContinue?: AutoContinuePolicy;
 }
 
 export interface AttachObservedOptions {
@@ -279,6 +285,7 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
       ...(resumeOpts.permissionMode !== undefined
         ? { permissionMode: resumeOpts.permissionMode }
         : {}),
+      ...(resumeOpts.autoContinue !== undefined ? { autoContinue: resumeOpts.autoContinue } : {}),
       onSessionId: (sdkSessionId) => persistResumeId(record.id, sdkSessionId),
     });
 
@@ -315,6 +322,7 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
         ...(spawnOpts.permissionMode !== undefined
           ? { permissionMode: spawnOpts.permissionMode }
           : {}),
+        ...(spawnOpts.autoContinue !== undefined ? { autoContinue: spawnOpts.autoContinue } : {}),
         onSessionId: (sdkSessionId) => persistResumeId(id, sdkSessionId),
       });
       const record: SessionRecord = {

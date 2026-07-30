@@ -22,7 +22,7 @@ import {
   createAgentSdkClient as defaultCreateAgentSdkClient,
   escalateStop,
 } from '@claude-control/session-runtime';
-import type { AgentSdkClient } from '@claude-control/session-runtime';
+import type { AgentSdkClient, AutoContinuePolicy } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type {
@@ -88,6 +88,11 @@ export interface DaemonOptions {
   settingsReport?: PayloadOf<'settings.snapshot'>;
   /** Real Agent SDK adapter (live boundary), overridable so tests never touch a real SDK. */
   createAgentSdkClient?: () => AgentSdkClient;
+  /** Auto-continue policy stamped onto every managed session this daemon spawns or resumes
+   *  (see session-runtime's AutoContinuePolicy): transient API failures retry with backoff
+   *  instead of stamping the session `failed`. Omitted = the feature is off (the composition
+   *  root omits it when CCTL_AUTO_CONTINUE=0) and failures stay terminal, exactly as before. */
+  autoContinue?: AutoContinuePolicy;
   /** Self-heal the CLI's hook config on startup. Called AFTER the hook receiver binds, with
    *  its actual loopback port, so it can (re)install the curl hooks that POST to that port.
    *  Injected — the composition root owns WHERE settings.json lives and which profile is
@@ -300,6 +305,7 @@ export class Daemon {
   private readonly autoSwitcher: AutoSwitcherLike | undefined;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
   private readonly createAgentSdkClient: () => AgentSdkClient;
+  private readonly autoContinue: AutoContinuePolicy | undefined;
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
   private readonly publishHookEndpoint: ((port: number) => Promise<void>) | undefined;
   private readonly endpointRepublishMs: number;
@@ -383,6 +389,7 @@ export class Daemon {
     this.autoSwitcher = options.autoSwitcher;
     this.settingsReport = options.settingsReport;
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
+    this.autoContinue = options.autoContinue;
     this.installHooks = options.installHooks;
     this.publishHookEndpoint = options.publishHookEndpoint;
     this.endpointRepublishMs = options.endpointRepublishMs ?? DEFAULT_ENDPOINT_REPUBLISH_MS;
@@ -1086,6 +1093,7 @@ export class Daemon {
         client: this.createAgentSdkClient(),
         prompt: text,
         permissionMode: MANAGED_SESSION_PERMISSION_MODE,
+        ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
       });
       this.attachSessionPipes(resumed, record.accountId);
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
@@ -1258,6 +1266,7 @@ export class Daemon {
         ...(resumeSessionId !== undefined && resumeSessionId !== null ? { resumeSessionId } : {}),
         ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
         ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
+        ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
       });
     } catch (err) {
       this.logger.error({ err, requestId: msg.payload.requestId }, 'session.spawn failed to start');

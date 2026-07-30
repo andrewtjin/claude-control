@@ -30,6 +30,7 @@ import {
   type Paths,
 } from '@claude-control/switch-engine';
 import { DEFAULT_AUTOSWITCH_COOLDOWN_MS, DEFAULT_PERMISSION_HOLD_MS } from '@claude-control/daemon';
+import { DEFAULT_AUTO_CONTINUE_MAX_ATTEMPTS } from '@claude-control/session-runtime';
 import {
   DEFAULT_GREEDY_RESET_MARGIN_MS,
   DEFAULT_MIN_SESSION_HEADROOM_PCT,
@@ -195,6 +196,8 @@ export interface DaemonConfig {
     commandOutputCards: boolean;
     fullToolOutput: boolean;
     identityCheck: boolean;
+    autoContinue: boolean;
+    autoContinueMaxAttempts: number | undefined;
   };
   rows: SettingRow[];
 }
@@ -264,6 +267,12 @@ export function resolveDaemonConfig(
   // another account's credentials. The free local row-vs-bundle check runs regardless.
   const identityCheckEnv = envBool(env, 'CCTL_IDENTITY_CHECK');
   const identityCheck = identityCheckEnv ?? true;
+  // Default ON: a transient API failure (5xx/529/dropped connection) retries managed
+  // sessions with backoff instead of stamping them failed, and non-managed sessions get a
+  // cooldown-limited warn card. Purely event-driven — no polling cost rides this switch.
+  const autoContinueEnv = envBool(env, 'CCTL_AUTO_CONTINUE');
+  const autoContinue = autoContinueEnv ?? true;
+  const autoContinueMaxAttempts = envNumber(env, 'CCTL_AUTO_CONTINUE_MAX');
 
   const rows: SettingRow[] = [
     {
@@ -362,6 +371,19 @@ export function resolveDaemonConfig(
         'CCTL_IDENTITY_CHECK (verify each vault token really belongs to its account per poll; quarantine on mismatch)',
     },
     {
+      name: 'auto-continue',
+      value: autoContinue ? 'on' : 'off',
+      source: envSource(autoContinueEnv !== undefined),
+      detail:
+        'CCTL_AUTO_CONTINUE (retry managed sessions past transient API errors; warn card for terminal sessions)',
+    },
+    {
+      name: 'auto-continue attempts',
+      value: `${autoContinueMaxAttempts ?? DEFAULT_AUTO_CONTINUE_MAX_ATTEMPTS}`,
+      source: envSource(autoContinueMaxAttempts !== undefined),
+      detail: 'CCTL_AUTO_CONTINUE_MAX (consecutive transient failures tolerated before giving up)',
+    },
+    {
       name: 'full tool output',
       value: fullToolOutput ? 'on' : 'off',
       source: envSource(fullToolOutput),
@@ -412,6 +434,8 @@ export function resolveDaemonConfig(
       commandOutputCards,
       fullToolOutput,
       identityCheck,
+      autoContinue,
+      autoContinueMaxAttempts,
     },
     rows,
   };

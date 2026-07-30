@@ -72,6 +72,8 @@ describe('resolveDaemonConfig', () => {
       commandOutputCards: true,
       fullToolOutput: false,
       identityCheck: true,
+      autoContinue: true,
+      autoContinueMaxAttempts: undefined,
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('off');
@@ -173,6 +175,28 @@ describe('resolveDaemonConfig', () => {
     const { values, rows } = resolveDaemonConfig({ CCTL_TOOL_OUTPUT_FULL: '1' });
     expect(values.fullToolOutput).toBe(true);
     expect(row(rows, 'full tool output')).toMatchObject({ value: 'on', source: 'env' });
+  });
+
+  it('disables auto-continue via CCTL_AUTO_CONTINUE=0 (default stays on)', () => {
+    const off = resolveDaemonConfig({ CCTL_AUTO_CONTINUE: '0' });
+    expect(off.values.autoContinue).toBe(false);
+    expect(row(off.rows, 'auto-continue')).toMatchObject({ value: 'off', source: 'env' });
+    // A typo is not an override — the on default stands, attributed as default.
+    const typo = resolveDaemonConfig({ CCTL_AUTO_CONTINUE: 'nah' });
+    expect(typo.values.autoContinue).toBe(true);
+    expect(row(typo.rows, 'auto-continue')).toMatchObject({ value: 'on', source: 'default' });
+  });
+
+  it('caps auto-continue attempts via CCTL_AUTO_CONTINUE_MAX', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_AUTO_CONTINUE_MAX: '3' });
+    expect(values.autoContinueMaxAttempts).toBe(3);
+    expect(row(rows, 'auto-continue attempts')).toMatchObject({ value: '3', source: 'env' });
+    // Default view shows the runtime's own default, never a restated literal.
+    const plain = resolveDaemonConfig({});
+    expect(row(plain.rows, 'auto-continue attempts')).toMatchObject({
+      value: '5',
+      source: 'default',
+    });
   });
 
   it('reflects env overrides in both values and rows, with source "env"', () => {
