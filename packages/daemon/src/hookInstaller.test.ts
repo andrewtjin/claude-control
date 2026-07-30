@@ -277,7 +277,7 @@ describe('installHooks', () => {
     ]);
   });
 
-  it('installs all five default daemon hook events, including UserPromptSubmit', async () => {
+  it('installs all six default daemon hook events, including StopFailure', async () => {
     const specs = buildDaemonHookSpecs({
       secret: 's3cr3t',
       forwarderPath: 'C:\\data\\hook-forward.cjs',
@@ -289,6 +289,7 @@ describe('installHooks', () => {
       'PermissionRequest',
       'PostToolUse',
       'Stop',
+      'StopFailure',
       'UserPromptSubmit',
     ]);
   });
@@ -413,12 +414,13 @@ describe('buildDaemonHookSpecs', () => {
 
   it('builds one spec per default hook event, running the forwarder with the secret header', () => {
     const specs = buildDaemonHookSpecs(base);
-    expect(specs).toHaveLength(5);
+    expect(specs).toHaveLength(6);
     expect(specs.map((s) => s.event).sort()).toEqual([
       'Notification',
       'PermissionRequest',
       'PostToolUse',
       'Stop',
+      'StopFailure',
       'UserPromptSubmit',
     ]);
     for (const s of specs) {
@@ -476,6 +478,7 @@ describe('buildDaemonHookSpecs', () => {
         notification: 'CustomNotif',
         postToolUse: 'CustomPost',
         userPromptSubmit: 'CustomPrompt',
+        stopFailure: 'CustomStopFailure',
       },
     });
     expect(specs.map((s) => s.event).sort()).toEqual([
@@ -484,6 +487,7 @@ describe('buildDaemonHookSpecs', () => {
       'CustomPost',
       'CustomPrompt',
       'CustomStop',
+      'CustomStopFailure',
     ]);
   });
 });
