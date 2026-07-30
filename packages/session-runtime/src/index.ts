@@ -31,16 +31,28 @@ export {
   summarizeText,
 } from './summarizer.js';
 
-export { startManagedSession } from './managedSession.js';
+export {
+  startManagedSession,
+  DEFAULT_AUTO_CONTINUE_MAX_ATTEMPTS,
+  DEFAULT_AUTO_CONTINUE_BASE_DELAY_MS,
+  DEFAULT_AUTO_CONTINUE_MAX_DELAY_MS,
+} from './managedSession.js';
 export type {
   AgentSdkEvent,
   AgentSdkQueryOptions,
   AgentSdkClient,
   ManagedSessionOptions,
+  AutoContinuePolicy,
 } from './managedSession.js';
+
+export { classifyFailureText, classifyStopFailureType } from './apiFailure.js';
+export type { ApiFailureClassification, TransientFailureKind } from './apiFailure.js';
 
 export { createAgentSdkClient } from './agentSdkClient.js';
 export type { CreateAgentSdkClientDeps } from './agentSdkClient.js';
+
+export { findClaudeCodeBinary, AGENT_SDK_PACKAGE } from './claudeCodeBinary.js';
+export type { ClaudeCodeBinaryLookup, ClaudeCodeBinaryDeps } from './claudeCodeBinary.js';
 
 export { escalateStop } from './stopEscalation.js';
 export type { StopRung, StopEscalationResult, EscalateStopOptions } from './stopEscalation.js';

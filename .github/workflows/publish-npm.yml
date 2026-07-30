@@ -1,0 +1,223 @@
+name: Publish to npm
+
+# Setup this workflow depends on, recorded here because it lives outside the repository and is
+# invisible from the code: npm authenticates this workflow by identity rather than by a stored
+# token, via a trusted publisher configured on the package itself (npmjs.com -> @andrewtjin/cctl
+# -> Settings -> Trusted Publisher -> GitHub Actions), naming this repository and *this file by
+# name*. Two consequences worth knowing before editing:
+#   - The filename is load-bearing. Renaming this file silently breaks publishing until the
+#     trusted publisher is updated to match — the failure surfaces as an authentication error.
+#   - The trusted publisher's optional "environment" field must stay empty unless an
+#     `environment:` is also added to the job below; npm checks that the two agree.
+# Changes here can be rehearsed end to end from any branch with the workflow_dispatch dry run.
+#
+# A push to `main` *is* the release. `main` only moves when the owner merges the staging branch,
+# so the merge itself cuts the release rather than leaving a publish step to remember afterwards.
+# Whatever version sits in packages/cctl-publish/package.json at that moment is what ships.
+on:
+  push:
+    branches: [main]
+  # Lets the whole path be rehearsed from any branch before it ever runs against `main`. Defaults
+  # to a dry run so that triggering this by hand cannot publish by accident.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build, verify and pack, but stop before publishing
+        type: boolean
+        default: true
+
+# Deliberately *not* cancel-in-progress, unlike ci.yml. Superseding a lint run wastes nothing;
+# cancelling midway through a publish can leave a release half-announced — live on the registry
+# but untagged, with no notes. Queue instead so releases serialise.
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+env:
+  # Single source of truth for the publishable package; every step below reads the manifest here
+  # rather than restating the package name or version anywhere in this file.
+  PKG_DIR: packages/cctl-publish
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # Push the release tag and open the draft release.
+      contents: write
+      # Mint the OIDC token npm exchanges for publish rights. This is what replaces a stored
+      # NPM_TOKEN: npm verifies this workflow's identity against the trusted publisher configured
+      # on the package, so there is no long-lived credential in the repository to leak or rotate.
+      # It also makes npm attach a provenance attestation, letting users verify a tarball was
+      # built from this repo rather than uploaded from someone's laptop.
+      id-token: write
+      # Dispatch the bot-image build. See "Rebuild the bot image" below for why pushing the tag
+      # is not enough on its own.
+      actions: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags come along only with a full fetch, and the tagging step needs to see whether this
+          # release was already tagged by an earlier run.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite (built-in) needs a recent Node; keep this in step with engines and ci.yml.
+          node-version: 24
+          cache: pnpm
+
+      # Node 24 does not pin an npm new enough for trusted publishing on every patch release, and
+      # an older npm reacts by falling back to token auth — which surfaces as a confusing "need
+      # auth" error rather than "your npm is too old". Raise the floor explicitly instead.
+      - name: Ensure npm can use trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Install
+        # node-pty (observed sessions) is optional and native; never fail on it.
+        run: pnpm install --frozen-lockfile
+
+      # Every push to `main` lands here, but only some of them bump the version. Deciding up front
+      # whether this version is new keeps a routine push from failing on a republish it was never
+      # meant to attempt, and keeps re-running a red job idempotent: the second run sees the
+      # version already on npm and stops.
+      - name: Resolve the release
+        id: release
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./$PKG_DIR/package.json').name")
+          VERSION=$(node -p "require('./$PKG_DIR/package.json').version")
+          DRY_RUN="${{ inputs.dry_run || false }}"
+
+          # `npm view <pkg>@<version>` prints the version if it exists and errors if it does not;
+          # either way an empty result means this version has never been published.
+          PUBLISHED=$(npm view "$NAME@$VERSION" version 2>/dev/null || true)
+
+          {
+            echo "name=$NAME"
+            echo "version=$VERSION"
+            echo "tag=v$VERSION"
+            echo "dry_run=$DRY_RUN"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$PUBLISHED" ] && [ "$DRY_RUN" != "true" ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            # A skipped publish is a green job, which reads identically to a successful one at a
+            # glance. Say plainly which of the two happened.
+            {
+              echo "### Nothing to publish"
+              echo
+              echo "\`$NAME@$VERSION\` is already on npm, so this push published nothing."
+              echo
+              echo "To cut a release, bump \`version\` in \`$PKG_DIR/package.json\` — the bundle"
+              echo "build refuses to run until the CLI's \`VERSION\` constant matches it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The same gates ci.yml runs. Repeated rather than inherited on purpose: this job publishes
+      # to real users, so it must not depend on someone else's run having been green earlier, or on
+      # a required-check configuration that can be edited independently of this file.
+      - name: Lint
+        if: steps.release.outputs.proceed == 'true'
+        run: pnpm run lint
+
+      - name: Format check
+        if: steps.release.outputs.proceed == 'true'
+        run: pnpm run format:check
+
+      - name: Build
+        if: steps.release.outputs.proceed == 'true'
+        run: pnpm run build
+
+      - name: Test
+        if: steps.release.outputs.proceed == 'true'
+        run: pnpm run test
+
+      - name: Bundle publishable cctl package
+        if: steps.release.outputs.proceed == 'true'
+        run: pnpm --filter ${{ steps.release.outputs.name }} run build
+
+      - name: Smoke test the bundle
+        # Boots the bundle standalone (no workspace symlinks) with --version/--help. Not `doctor`:
+        # its checks are Windows-only and this runner is ubuntu.
+        if: steps.release.outputs.proceed == 'true'
+        run: pnpm --filter ${{ steps.release.outputs.name }} run smoke-test
+
+      # No NODE_AUTH_TOKEN and no registry-url: authentication is the OIDC token minted from the
+      # id-token permission above. The package's prepublishOnly hook rebuilds the workspace and
+      # re-bundles first, so a stale dist cannot ship even though the steps above already built.
+      # On a dry run npm does everything except upload, hooks included, so the rehearsal is real.
+      - name: Publish
+        if: steps.release.outputs.proceed == 'true'
+        working-directory: ${{ env.PKG_DIR }}
+        run: npm publish ${{ steps.release.outputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      # Lightweight rather than annotated: an annotated tag needs a tagger identity, and this
+      # release is the repository's, not a bot's.
+      - name: Tag the release
+        if: steps.release.outputs.proceed == 'true' && steps.release.outputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.release.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG already exists; leaving it as-is."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+      # Pushing the tag above cannot start publish-bot-image.yml: GitHub suppresses workflow runs
+      # from events made with the built-in GITHUB_TOKEN, to stop workflows triggering themselves.
+      # workflow_dispatch is the documented exception that always creates a run, so ask for the
+      # build explicitly — on the tag ref, which is what that workflow derives its image tags from.
+      # Without this the published npm package and the GHCR bot image drift apart silently.
+      - name: Rebuild the bot image for this tag
+        if: steps.release.outputs.proceed == 'true' && steps.release.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run publish-bot-image.yml --ref "${{ steps.release.outputs.tag }}"
+
+      # Opened as a draft, with the section headings the project's releases use and nothing filled
+      # in. Auto-generated notes would be a commit dump in place of the hand-written summary, and a
+      # draft is a prompt to write one rather than a wrong one published automatically.
+      - name: Draft the release notes
+        if: steps.release.outputs.proceed == 'true' && steps.release.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.release.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "A release for $TAG already exists; leaving it alone."
+          else
+            gh release create "$TAG" --draft --title "$TAG" --notes "$(printf 'Features:\n- \n\nBugs fixed:\n- \n')"
+          fi
+
+      - name: Summarise
+        if: steps.release.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.release.outputs.name }}"
+          VERSION="${{ steps.release.outputs.version }}"
+          TAG="${{ steps.release.outputs.tag }}"
+          if [ "${{ steps.release.outputs.dry_run }}" = "true" ]; then
+            {
+              echo "### Dry run only"
+              echo
+              echo "Built, verified and packed \`$NAME@$VERSION\`. Nothing was published, tagged or released."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### Published \`$NAME@$VERSION\`"
+              echo
+              echo "- npm: https://www.npmjs.com/package/$NAME/v/$VERSION"
+              echo "- Tagged \`$TAG\`, and asked publish-bot-image to build it"
+              echo "- Release notes are waiting as a **draft** — fill in and publish: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

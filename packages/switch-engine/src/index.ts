@@ -4,12 +4,14 @@ export * from './errors.js';
 export * from './paths.js';
 export * from './logger.js';
 export { type Protector, DpapiProtector, InsecurePassthroughProtector } from './dpapi.js';
+export { AesGcmProtector } from './aesgcm.js';
+export { FileKeyProtector, FileKeySource } from './fileKey.js';
 export {
-  AesGcmProtector,
   KeychainKeySource,
   KeychainProtector,
   KeychainCredentialChannel,
   defaultExecRunner,
+  quoteSecurityArg,
   VAULT_KEY_SERVICE,
   VAULT_KEY_ACCOUNT,
   CLAUDE_CLI_KEYCHAIN_SERVICE,
@@ -23,7 +25,12 @@ export {
   DEFAULT_REFRESH_SKEW_MS,
   type RefreshDeps,
 } from './oauth.js';
-export { Vault } from './vault.js';
+export {
+  Vault,
+  ACCOUNT_METADATA_REV,
+  METADATA_BACKFILL_RETRY_MS,
+  needsMetadataBackfill,
+} from './vault.js';
 export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
 export {
   CredentialStore,

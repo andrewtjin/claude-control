@@ -22,14 +22,27 @@ import {
   createAgentSdkClient as defaultCreateAgentSdkClient,
   escalateStop,
 } from '@claude-control/session-runtime';
-import type { AgentSdkClient } from '@claude-control/session-runtime';
+import type { AgentSdkClient, AutoContinuePolicy } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
-import type { EnvelopeDraft, MessageOf, PayloadOf } from '@claude-control/shared-protocol';
-import type { AccountUsageInput } from '@claude-control/usage-advisor';
+import type {
+  EnvelopeDraft,
+  MessageOf,
+  PayloadOf,
+  TokenStatsSnapshot,
+} from '@claude-control/shared-protocol';
+import {
+  DEFAULT_STATS_DAYS,
+  MAX_STATS_DAYS,
+  MIN_STATS_DAYS,
+} from '@claude-control/shared-protocol';
+import { planWeight, type AccountUsageInput } from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
-import { UsagePoller, type PollAccount } from './usagePoller.js';
+import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
+import { readFleetHistory, RESET_LOOKBACK_MS } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
+import type { TranscriptScan } from './transcriptTokens.js';
+import { aggregateTokenStats } from './tokenStats.js';
 import type {
   HookReceiver,
   HookReceiverCliHandlers,
@@ -41,7 +54,7 @@ import type {
   TrackedSessionView,
 } from './hookReceiver.js';
 import { ControlPlaneClient } from './controlPlaneClient.js';
-import { startLoopLagMonitor } from './loopLagMonitor.js';
+import { LOOP_LAG_THRESHOLD_MS, startLoopLagMonitor } from './loopLagMonitor.js';
 
 /** The subset of `SwitchEngine`'s public surface the daemon depends on — narrower than the
  *  concrete class so tests can fake it without building a whole real engine. The real
@@ -75,6 +88,11 @@ export interface DaemonOptions {
   settingsReport?: PayloadOf<'settings.snapshot'>;
   /** Real Agent SDK adapter (live boundary), overridable so tests never touch a real SDK. */
   createAgentSdkClient?: () => AgentSdkClient;
+  /** Auto-continue policy stamped onto every managed session this daemon spawns or resumes
+   *  (see session-runtime's AutoContinuePolicy): transient API failures retry with backoff
+   *  instead of stamping the session `failed`. Omitted = the feature is off (the composition
+   *  root omits it when CCTL_AUTO_CONTINUE=0) and failures stay terminal, exactly as before. */
+  autoContinue?: AutoContinuePolicy;
   /** Self-heal the CLI's hook config on startup. Called AFTER the hook receiver binds, with
    *  its actual loopback port, so it can (re)install the curl hooks that POST to that port.
    *  Injected — the composition root owns WHERE settings.json lives and which profile is
@@ -109,10 +127,48 @@ export interface DaemonOptions {
   sessionStopOnShutdownMs?: number;
   /** How often to poll usage and re-sync attribution. */
   pollIntervalMs?: number;
+  /** Scan local Claude Code transcripts for absolute token counts (see transcriptTokens.ts).
+   *  Injected rather than called directly because the scan reads gigabytes off the disk: tests
+   *  must be able to fake it, and a deployment that does not want the read can omit it, in which
+   *  case the daemon pushes no `stats.snapshot` at all (`cctl stats` is unaffected — it scans
+   *  in-process and needs no daemon). */
+  scanTranscripts?: (sinceMs: number) => Promise<TranscriptScan>;
+  /** How often that scan may re-run (default 15 min). Deliberately far slower than the poll
+   *  interval: the numbers move slowly, the scan is seconds of disk IO, and `/stats` renders the
+   *  last pushed snapshot rather than triggering a fresh one. */
+  statsIntervalMs?: number;
   logger?: Logger;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
+/** A poll-cycle phase slower than this is logged at warn rather than debug. Deliberately the
+ *  loop-lag monitor's own threshold: a phase that outlasts it is, by that monitor's definition,
+ *  long enough to be a stall worth naming, so the two never disagree about what counts as slow. */
+const POLL_PHASE_SLOW_MS = LOOP_LAG_THRESHOLD_MS;
+/** One day, the unit every window below is counted in. */
+const DAY_MS = 24 * 60 * 60_000;
+/** How long a usage snapshot is kept before the poll cycle trims it. The poller appends one row
+ *  per account per cycle (~1,900/day on a real machine) and nothing reads a snapshot older than
+ *  the current view, so without a cutoff this table is the one thing the daemon grows without
+ *  bound.
+ *
+ *  Sized against the longest window anything actually READS — `RESET_LOOKBACK_MS`, ten days —
+ *  plus four days of margin, rather than the quarter of history it used to keep for a backfill
+ *  nothing ever wrote. At the observed ~1,900 rows/day the old 90-day figure trends to ~170k rows
+ *  and tens of MB of payload that no code path can reach.
+ *
+ *  Expressed as the read window PLUS a margin, not as a bare number of days, so the two can never
+ *  drift apart in a later edit. The margin is not decoration and must not be tuned to zero:
+ *  {@link Daemon.runPollCycle} trims BEFORE it reads, both against the same `clock()`, so a cutoff
+ *  equal to the read window would race the read it feeds. It also absorbs clock skew and a daemon
+ *  that was off over a weekend. */
+const USAGE_SNAPSHOT_RETENTION_MARGIN_MS = 4 * DAY_MS;
+const USAGE_SNAPSHOT_RETENTION_MS = RESET_LOOKBACK_MS + USAGE_SNAPSHOT_RETENTION_MARGIN_MS;
+/** The window every pushed `stats.snapshot` covers. Reads the shared default rather than
+ *  restating 7 so the phone, the terminal (`cctl stats`) and `/stats` cannot drift apart. */
+const STATS_WINDOW_MS = DEFAULT_STATS_DAYS * DAY_MS;
+/** Default gap between transcript scans — see `DaemonOptions.statsIntervalMs`. */
+const DEFAULT_STATS_INTERVAL_MS = 15 * 60_000;
 /** How long {@link Daemon.stop} waits for live session handles to tear down before closing
  *  the rest anyway. Generous for a normal `client.end()` (subprocess exit is fast), tight
  *  enough that one wedged transport cannot hold Ctrl+C hostage; a handle that misses the
@@ -258,6 +314,7 @@ export class Daemon {
   private readonly autoSwitcher: AutoSwitcherLike | undefined;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
   private readonly createAgentSdkClient: () => AgentSdkClient;
+  private readonly autoContinue: AutoContinuePolicy | undefined;
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
   private readonly publishHookEndpoint: ((port: number) => Promise<void>) | undefined;
   private readonly endpointRepublishMs: number;
@@ -267,8 +324,20 @@ export class Daemon {
   private readonly stopGraceMs: number | undefined;
   private readonly sessionStopOnShutdownMs: number;
   private readonly pollIntervalMs: number;
+  private readonly scanTranscripts: ((sinceMs: number) => Promise<TranscriptScan>) | undefined;
+  private readonly statsIntervalMs: number;
   private readonly logger: Logger;
 
+  /** When the last transcript scan finished; `undefined` until the first one runs, so the very
+   *  first poll cycle after startup always produces a snapshot. */
+  private lastStatsAtMs: number | undefined;
+  /** Whether a transcript scan is running right now. Both scan paths (the throttled push and a
+   *  phone-requested window) read the same gigabytes off the same disk, so exactly one may run at
+   *  a time: without this, a spammed `/stats days:N` stacks full-history scans until the disk is
+   *  the bottleneck for every other subsystem. The push path skips its turn; a request is answered
+   *  with an explicit "already scanning" rather than being queued, because the phone is holding a
+   *  deferred reply open and a fast honest answer beats an unbounded wait. */
+  private statsScanInFlight = false;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   /** Tear-down for the event-loop lag watchdog started in {@link start}. */
   private stopLoopLagMonitor: (() => void) | undefined;
@@ -329,6 +398,7 @@ export class Daemon {
     this.autoSwitcher = options.autoSwitcher;
     this.settingsReport = options.settingsReport;
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
+    this.autoContinue = options.autoContinue;
     this.installHooks = options.installHooks;
     this.publishHookEndpoint = options.publishHookEndpoint;
     this.endpointRepublishMs = options.endpointRepublishMs ?? DEFAULT_ENDPOINT_REPUBLISH_MS;
@@ -339,6 +409,8 @@ export class Daemon {
     this.sessionStopOnShutdownMs =
       options.sessionStopOnShutdownMs ?? DEFAULT_SESSION_STOP_ON_SHUTDOWN_MS;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.scanTranscripts = options.scanTranscripts;
+    this.statsIntervalMs = options.statsIntervalMs ?? DEFAULT_STATS_INTERVAL_MS;
     this.logger = options.logger ?? noopLogger;
   }
 
@@ -451,6 +523,11 @@ export class Daemon {
           this.logger.error({ err }, 'error handling session.prune');
         });
       },
+      onStatsRequest: (msg) => {
+        this.handleStatsRequest(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling stats.request');
+        });
+      },
     });
 
     await this.controlPlaneClient.connect();
@@ -526,13 +603,39 @@ export class Daemon {
 
   // ---- poll cycle ----
 
-  private async runPollCycle(): Promise<void> {
-    await this.attributionJournal.sync();
+  /**
+   * Time one phase of the poll cycle and warn if it alone blocked past the lag threshold.
+   *
+   * The loop-lag monitor can only say THAT the loop stalled, never WHERE — which is why the
+   * regression it was built for still took a forensic hunt to attribute, and why one multi-second
+   * outlier in that same log remains unexplained. This closes that gap for the only periodic path
+   * long enough to matter: every phase reports its own duration, so the next anomaly names the
+   * phase in the log instead of being re-derived from cadence arithmetic after the fact.
+   *
+   * Costs two `clock()` reads per phase. Deliberately measures the phase's whole span — awaits
+   * included — rather than only its synchronous part: a phase that is slow for either reason is
+   * worth seeing, and the lag monitor beside it is what distinguishes the two.
+   */
+  private async timePhase<T>(phase: string, run: () => Promise<T> | T): Promise<T> {
+    const startedAt = this.clock();
+    try {
+      return await run();
+    } finally {
+      const elapsedMs = this.clock() - startedAt;
+      if (elapsedMs >= POLL_PHASE_SLOW_MS) {
+        this.logger.warn({ phase, elapsedMs }, 'poll cycle phase ran long');
+      } else {
+        this.logger.debug({ phase, elapsedMs }, 'poll cycle phase');
+      }
+    }
+  }
 
-    const [accounts, activeId] = await Promise.all([
-      this.switchEngine.listAccounts(),
-      this.switchEngine.getActiveId(),
-    ]);
+  private async runPollCycle(): Promise<void> {
+    await this.timePhase('attributionJournal.sync', () => this.attributionJournal.sync());
+
+    const [accounts, activeId] = await this.timePhase('listAccounts+getActiveId', () =>
+      Promise.all([this.switchEngine.listAccounts(), this.switchEngine.getActiveId()]),
+    );
     const pollAccounts: PollAccount[] = accounts.map((a) => ({
       accountId: a.id,
       label: a.label,
@@ -545,20 +648,49 @@ export class Daemon {
     // that account degrades. Ordered before pollAll so a poll failure can't skip the alert.
     this.emitQuarantineNotices(pollAccounts);
 
-    const snapshot = await this.poller.pollAll(pollAccounts);
-    for (const result of snapshot.results) {
-      if (result.outcome === 'skipped') continue; // nothing new to persist
-      this.store.insertUsageSnapshot({
-        accountId: result.accountId,
-        fetchedAtMs: result.usage.accountUsage.fetchedAtMs,
-        source: result.usage.accountUsage.source,
-        json: JSON.stringify(result.usage.accountUsage),
-      });
-    }
+    const snapshot = await this.timePhase('pollAll', () => this.poller.pollAll(pollAccounts));
+    await this.timePhase('persistSnapshots', () => {
+      for (const result of snapshot.results) {
+        if (result.outcome === 'skipped') continue; // nothing new to persist
+        this.store.insertUsageSnapshot({
+          accountId: result.accountId,
+          fetchedAtMs: result.usage.accountUsage.fetchedAtMs,
+          source: result.usage.accountUsage.source,
+          json: JSON.stringify(result.usage.accountUsage),
+        });
+      }
+      // Retention runs on the same cadence as the writes that make it necessary, right after
+      // them, so the table can never outgrow its cutoff by more than one cycle. A failure is
+      // logged and swallowed: an untrimmed table is a disk-space problem, never a reason to skip
+      // the push below (which is what the phone is actually waiting on).
+      try {
+        const dropped = this.store.trimUsageSnapshots(this.clock() - USAGE_SNAPSHOT_RETENTION_MS);
+        if (dropped > 0) this.logger.info({ dropped }, 'trimmed expired usage snapshots');
+      } catch (err) {
+        this.logger.warn({ err }, 'usage snapshot retention failed; retrying next cycle');
+      }
+    });
 
-    this.sendEnvelope({
-      type: 'usage.snapshot',
-      payload: { accounts: snapshot.accounts, plan: snapshot.plan },
+    // Measure AFTER persisting, so this cycle's own readings are part of the history. The
+    // daemon owns the store, so it is the only party that can make these measurements at all —
+    // it makes them once here and both the phone and its own advisor consume the same numbers.
+    // Weighted by plan tier, so a Max 20x account's one percent of weekly quota counts for
+    // twenty times a Pro account's. The burn rate and the fleet capacity it is judged against
+    // MUST use the same weights: measuring burn at 1x while pacing sizes the fleet at 20x
+    // understates consumption by the plan multiplier and reports every fleet as sustainable.
+    const history = await this.timePhase('readFleetHistory', () =>
+      readFleetHistory(
+        this.store,
+        accounts.map((a) => ({ accountId: a.id, ...planWeightOf(a) })),
+        this.clock(),
+      ),
+    );
+
+    await this.timePhase('sendUsageSnapshot', () => {
+      this.sendEnvelope({
+        type: 'usage.snapshot',
+        payload: toUsageSnapshotPayload(snapshot, history, accounts, this.clock()),
+      });
     });
 
     // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
@@ -573,11 +705,148 @@ export class Daemon {
     // engine failures itself; this catch only guards against bugs in the evaluator so a
     // broken policy can never take down the poll loop.
     if (this.autoSwitcher) {
-      const inputs = snapshot.results.map((r) => r.usage.advisorInput);
-      await this.autoSwitcher.evaluate(inputs).catch((err: unknown) => {
-        this.logger.error({ err }, 'auto-switch evaluation failed');
+      // The prediction rides along because without it a DORMANT account is invisible to the
+      // policy: the endpoint publishes no reset once a weekly window closes, and an unknown
+      // weekly clock disqualifies an account outright — so the accounts holding a full
+      // untouched allowance are exactly the ones auto-switch would never reach. The policy
+      // labels a predicted reset and holds it to a stricter bar (see autoswitch.ts); an
+      // account with no history at all stays absent here and is skipped as before.
+      const inputs = snapshot.results.map((r) => {
+        const predicted = history.predictedResetByAccount.get(r.accountId);
+        return predicted === undefined
+          ? r.usage.advisorInput
+          : { ...r.usage.advisorInput, predictedResetAt: predicted };
       });
+      await this.timePhase('autoSwitch', () =>
+        this.autoSwitcher?.evaluate(inputs).catch((err: unknown) => {
+          this.logger.error({ err }, 'auto-switch evaluation failed');
+        }),
+      );
     }
+
+    // LAST in the cycle, deliberately: the transcript scan is seconds of disk IO, and everything
+    // above it is either time-sensitive (auto-switch) or what the phone polls for (the usage
+    // push). Its own throttle means most cycles skip it entirely. Timed like the rest, so the one
+    // cycle in fifteen that carries the scan is identifiable in the log rather than looking like
+    // an unexplained spike on an otherwise ordinary cycle.
+    await this.timePhase('tokenStats', () => this.maybePushTokenStats(accounts));
+  }
+
+  /**
+   * Re-scan local transcripts and push a `stats.snapshot`, at most once per
+   * {@link statsIntervalMs}. Absolute token counts come from files Claude Code writes on this
+   * host; the bot receives only the aggregate — it never sees a transcript, which is what keeps
+   * "the bot holds zero credentials (and zero conversation text)" structural rather than polite.
+   *
+   * A scan failure is logged and swallowed: it means the phone keeps rendering the previous
+   * snapshot (already labeled with its own window), which is strictly better than a poll loop
+   * that dies over an unreadable transcript directory.
+   */
+  private async maybePushTokenStats(accounts: StoredAccount[]): Promise<void> {
+    const scanTranscripts = this.scanTranscripts;
+    if (scanTranscripts === undefined) return;
+    const now = this.clock();
+    if (this.lastStatsAtMs !== undefined && now - this.lastStatsAtMs < this.statsIntervalMs) return;
+    // A phone-requested window is already reading these same files — skip this turn rather than
+    // double the disk load. The next cycle picks it up; nothing is lost but freshness, and the
+    // requested scan is about to refresh the same numbers anyway.
+    if (this.statsScanInFlight) return;
+    // Stamped BEFORE the await, so a scan slower than the interval cannot queue a second one
+    // behind itself on the next cycle.
+    this.lastStatsAtMs = now;
+    this.statsScanInFlight = true;
+    try {
+      this.sendEnvelope({
+        type: 'stats.snapshot',
+        payload: await this.scanTokenStats(now - STATS_WINDOW_MS, accounts, scanTranscripts),
+      });
+    } catch (err) {
+      this.logger.warn({ err }, 'transcript token scan failed; keeping the previous stats');
+    } finally {
+      this.statsScanInFlight = false;
+    }
+  }
+
+  /**
+   * Phone-initiated token stats over an explicitly chosen window (`/stats days:N`).
+   *
+   * Unlike the pushed snapshot this is a REQUEST/REPLY: the asking surface is one Discord
+   * interaction holding a deferred reply open, so every path here must end in exactly one
+   * `stats.result` carrying the same requestId — including the failures. Silence is the one
+   * unacceptable outcome: it leaves a spinner on the phone until the interaction expires.
+   *
+   * The window is re-clamped here even though nothing can currently reach this handler with an
+   * out-of-range value: the Envelope schema bounds `days` at decode, so a hand-crafted frame is
+   * rejected before it arrives. That makes this clamp defence in depth rather than validation —
+   * it costs two comparisons, and it is the last thing standing between a future loosening of
+   * that schema and an unbounded scan of every transcript on the host. The daemon is the only
+   * one of the three enforcement points that actually pays the IO, so it is the one that keeps
+   * a redundant guard.
+   */
+  private async handleStatsRequest(msg: MessageOf<'stats.request'>): Promise<void> {
+    const { requestId } = msg.payload;
+    const scanTranscripts = this.scanTranscripts;
+    if (scanTranscripts === undefined) {
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: { requestId, ok: false, error: 'this daemon does not scan transcripts' },
+      });
+      return;
+    }
+    if (this.statsScanInFlight) {
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: {
+          requestId,
+          ok: false,
+          error: 'a transcript scan is already running — try again in a moment',
+        },
+      });
+      return;
+    }
+    const days = Math.min(Math.max(Math.round(msg.payload.days), MIN_STATS_DAYS), MAX_STATS_DAYS);
+    this.statsScanInFlight = true;
+    try {
+      // Accounts are fetched per request rather than captured from the poll cycle: a requested
+      // scan is not tied to one, and a label that changed since the last poll should show up.
+      const accounts = await this.switchEngine.listAccounts();
+      const snapshot = await this.scanTokenStats(
+        this.clock() - days * DAY_MS,
+        accounts,
+        scanTranscripts,
+      );
+      this.logger.info({ requestId, days }, 'answered a phone-requested token stats window');
+      this.sendEnvelope({ type: 'stats.result', payload: { requestId, ok: true, snapshot } });
+    } catch (err) {
+      this.logger.warn({ err, requestId, days }, 'requested transcript token scan failed');
+      this.sendEnvelope({
+        type: 'stats.result',
+        payload: { requestId, ok: false, error: 'the transcript scan failed on the host' },
+      });
+    } finally {
+      this.statsScanInFlight = false;
+    }
+  }
+
+  /** One transcript scan turned into a wire-ready snapshot — the single place a window becomes
+   *  numbers, shared by the pushed snapshot and the phone-requested one so the two can never
+   *  disagree about attribution, labeling, or what a window means. Takes the already-narrowed
+   *  scan function rather than re-checking `this.scanTranscripts`, so each caller keeps ownership
+   *  of what "this daemon cannot scan" means for its own surface. Throws whatever the scan throws;
+   *  a push swallows it, a request reports it. */
+  private async scanTokenStats(
+    windowStartMs: number,
+    accounts: StoredAccount[],
+    scanTranscripts: (sinceMs: number) => Promise<TranscriptScan>,
+  ): Promise<TokenStatsSnapshot> {
+    const scan = await scanTranscripts(windowStartMs);
+    return aggregateTokenStats({
+      scan,
+      intervals: this.store.listActivationIntervals(),
+      windowStartMs,
+      windowEndMs: this.clock(),
+      labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+    });
   }
 
   /** Emit a `hook.notification` (level 'warn') for each account that just entered quarantine,
@@ -851,6 +1120,7 @@ export class Daemon {
         client: this.createAgentSdkClient(),
         prompt: text,
         permissionMode: MANAGED_SESSION_PERMISSION_MODE,
+        ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
       });
       this.attachSessionPipes(resumed, record.accountId);
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
@@ -1001,12 +1271,27 @@ export class Daemon {
     return fresh.map((q) => q.text).join('\n\n');
   }
 
+  /**
+   * Phone-initiated spawn. The failure path matters as much as the success one: `/run`'s Discord
+   * reply is sent the moment the frame leaves the relay, so it says "Session spawn requested."
+   * whatever happens next. Everything that goes wrong AFTER a handle exists already reaches the
+   * phone — the session's own event stream carries it as text plus a `failed` status, which is
+   * how an unauthenticated spawn surfaces "Not logged in · Please run /login". Everything that
+   * goes wrong BEFORE one exists (the registry failing to load, its first persist failing, the
+   * SDK adapter refusing to construct) had no channel at all and died in the daemon's log,
+   * leaving the phone on that ack forever with nothing to retry and nothing to read.
+   *
+   * So this window gets an explicit envelope, exactly like the un-resumable orphan above. It
+   * stays a NARROW catch — once `attachSessionPipes` has run, the handle owns its own reporting
+   * and a second channel would double-report the same failure.
+   */
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
     const { requestId, prompt, resumeSessionId, cwd, accountId } = msg.payload;
+    let handle: SessionHandle;
     try {
       const resumeAnchor = this.resolveSpawnResumeAnchor(resumeSessionId ?? undefined);
       const client = this.createAgentSdkClient();
-      const handle = await this.sessionManager.spawnManaged({
+      handle = await this.sessionManager.spawnManaged({
         client,
         prompt,
         // Always 'default' so remote approve/deny actually works — see the constant's decision
@@ -1015,46 +1300,47 @@ export class Daemon {
         ...(resumeAnchor !== undefined ? { resumeSessionId: resumeAnchor } : {}),
         ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
         ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
+        ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
       });
-      // The spawn origin rides every status frame the new session emits (see
-      // forwardSessionEvent): a spawn mints a sessionId the requester has no other way to
-      // learn, and the bot needs the link to keep a resumed conversation in the thread the
-      // user typed into. `resumedFrom` echoes the CALLER'S ref (the wire id it knows), never
-      // the resolved SDK anchor.
-      const origin = {
-        requestId,
-        ...(resumeSessionId !== undefined && resumeSessionId !== null
-          ? { resumedFrom: resumeSessionId }
-          : {}),
-      };
-      this.attachSessionPipes(handle, accountId ?? undefined, origin);
-      // Announce the session NOW, before its first turn produces anything. The session
-      // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
-      // output BEFORE the starting→running transition — so without this frame the requester
-      // would meet the new sessionId through an anonymous output chunk it cannot yet route
-      // (the bot would mint a stray thread for it). The outbox preserves send order, so this
-      // status is guaranteed to arrive ahead of every event the pipes forward.
-      this.forwardSessionEvent(
-        handle.id,
-        accountId ?? undefined,
-        { kind: 'status', state: 'starting' },
-        origin,
-      );
     } catch (err) {
-      // A failed spawn previously died in the dispatcher's generic catch — logged locally,
-      // invisible to the phone, which sat waiting for session.status frames that would never
-      // come. Answer explicitly (`relatesTo` = this frame's id, the protocol's correlation
-      // anchor) so the requesting surface can say WHY nothing started.
-      this.logger.warn({ err, requestId }, 'session.spawn failed');
+      this.logger.error({ err, requestId }, 'session.spawn failed to start');
       this.sendEnvelope({
         type: 'error',
         payload: {
           code: 'spawn_failed',
-          message: `session.spawn: ${err instanceof Error ? err.message : String(err)}`,
+          message:
+            'session.spawn: the session could not be started ' +
+            `(${err instanceof Error ? err.message : String(err)})`,
           relatesTo: msg.id,
         },
       });
+      return;
     }
+
+    // The spawn origin rides every status frame the new session emits (see
+    // forwardSessionEvent): a spawn mints a sessionId the requester has no other way to
+    // learn, and the bot needs the link to keep a resumed conversation in the thread the
+    // user typed into. `resumedFrom` echoes the CALLER'S ref (the wire id it knows), never
+    // the resolved SDK anchor.
+    const origin = {
+      requestId,
+      ...(resumeSessionId !== undefined && resumeSessionId !== null
+        ? { resumedFrom: resumeSessionId }
+        : {}),
+    };
+    this.attachSessionPipes(handle, accountId ?? undefined, origin);
+    // Announce the session NOW, before its first turn produces anything. The session
+    // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
+    // output BEFORE the starting→running transition — so without this frame the requester
+    // would meet the new sessionId through an anonymous output chunk it cannot yet route
+    // (the bot would mint a stray thread for it). The outbox preserves send order, so this
+    // status is guaranteed to arrive ahead of every event the pipes forward.
+    this.forwardSessionEvent(
+      handle.id,
+      accountId ?? undefined,
+      { kind: 'status', state: 'starting' },
+      origin,
+    );
   }
 
   /**
@@ -1813,4 +2099,12 @@ export function reconcileQuarantineNotices(
   }
 
   return { notices, nextState };
+}
+
+/** `{ weight }` for an account whose plan tier resolves, `{}` otherwise — the present-or-absent
+ *  contract the burn measurement and the pacing model share, so an unreadable tier degrades to
+ *  the 1x fallback in ONE place and is reported rather than silently applied. */
+function planWeightOf(account: Parameters<typeof planWeight>[0]): { weight?: number } {
+  const result = planWeight(account);
+  return result.known ? { weight: result.weight } : {};
 }

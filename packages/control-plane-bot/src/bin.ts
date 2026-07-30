@@ -5,17 +5,40 @@
 // RelayServer — reading config exclusively from the environment:
 //   DISCORD_BOT_TOKEN        (required) the Discord application's bot token
 //   CCTL_RELAY_PORT          (default 8765) WebSocket port daemons connect to
-//   CCTL_BOT_STATE_DIR       (default ~/.claude-control-bot) where bindings.json and
-//                            session-threads.json live
-//   CCTL_SESSION_CHANNEL_ID  (optional) text channel that hosts per-session private
-//                            threads; unset → session output is delivered by DM
+//   CCTL_BOT_STATE_DIR       (default ~/.claude-control-bot) where bindings.json,
+//                            session-threads.json and session-channel-pins.json live
+//   CCTL_SESSION_CHANNEL_ID  (optional) text channel that hosts per-session private threads
+//                            for every paired user WITHOUT a CCTL_SESSION_CHANNELS entry;
+//                            unset → those users' session output is delivered by DM
+//   CCTL_SESSION_CHANNELS    (optional) per-user overrides, as a comma-separated
+//                            <discordUserId>:<channelId> list. Named users get threads in
+//                            their own channel; everyone else falls back to
+//                            CCTL_SESSION_CHANNEL_ID, or to DM when that is unset. Setting
+//                            only this one is the mixed deployment: threads for the operator,
+//                            DMs for every other paired user.
+//                            Both of these are DEFAULTS: a user's own `/thread-here` outranks
+//                            them in both directions (their own channel, or back to DMs), and
+//                            that choice lives in session-channel-pins.json. Neither env var
+//                            is an access control — they cannot stop someone reading their own
+//                            session output — so the operator's real lever over where the bot
+//                            may post is the channel's Discord permissions.
 //   CCTL_LOG_LEVEL           (default info)
+//   CCTL_LOG_FORMAT          (default: pretty on a TTY, json otherwise) 'pretty' or 'json'
+//                            overrides the auto-detection either way; see shared-protocol's
+//                            createLogger.
+//   CCTL_LOG_FILE            (optional) path to also append NDJSON logs to, regardless of
+//                            CCTL_LOG_FORMAT — useful since this process's stdout is not a TTY
+//                            when run under Docker/Compose and it defaults to json anyway.
+//   CCTL_MAX_PENDING_CONNECTIONS  (optional) cap on concurrent unauthenticated daemon sockets;
+//                            unset uses the relay's built-in default. Raise it for a self-host
+//                            serving many daemons that may reconnect at once.
 //
-// Discord application prerequisite WHEN CCTL_SESSION_CHANNEL_ID is set: the privileged
-// MESSAGE CONTENT intent must be enabled in the developer portal — replies typed in session
-// threads are read as messages, and requesting the intent without the portal toggle rejects
-// the gateway login outright. A DM-only deployment (no channel id) requests no privileged
-// intent and needs no portal change.
+// Discord application prerequisite WHEN CCTL_SESSION_CHANNEL_ID or CCTL_SESSION_CHANNELS is
+// set: the privileged MESSAGE CONTENT intent must be enabled in the developer portal — replies
+// typed in session threads are read as messages, and requesting the intent without the portal
+// toggle rejects the gateway login outright. A DM-only deployment (neither env set) requests
+// no privileged intent and needs no portal change; threads a user pins with `/thread-here` on
+// such a deployment still deliver output but cannot read replies (see gatewayIntents).
 //
 // This file preserves the package's structural zero-credential guarantee (see index.ts): it
 // imports only this package's own modules and declared deps — never switch-engine — so the
@@ -24,11 +47,12 @@
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import pino from 'pino';
+import { createLogger } from '@claude-control/shared-protocol';
 import { BindingStore } from './bindings.js';
 import { PairingService } from './pairing.js';
 import { RelayServer, type RelaySender } from './relay.js';
 import { DiscordJsGateway } from './discord/discordJsGateway.js';
+import { parseSessionChannelMap } from './discord/sessionChannels.js';
 import type { Logger } from './logger.js';
 
 /** Print an error and exit non-zero — the single failure path for startup problems. */
@@ -48,16 +72,21 @@ async function main(): Promise<void> {
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     fail(`CCTL_RELAY_PORT must be a port number, got "${process.env.CCTL_RELAY_PORT}"`);
   }
+  // Optional cap on concurrent unauthenticated daemon sockets (see relay.ts). Unset = the relay's
+  // built-in default; validated here like the port so a typo fails loudly at startup.
+  let maxPendingConnections: number | undefined;
+  const rawMaxPending = process.env.CCTL_MAX_PENDING_CONNECTIONS;
+  if (rawMaxPending !== undefined && rawMaxPending !== '') {
+    const parsed = Number(rawMaxPending);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      fail(`CCTL_MAX_PENDING_CONNECTIONS must be a positive integer, got "${rawMaxPending}"`);
+    }
+    maxPendingConnections = parsed;
+  }
   const stateDir = process.env.CCTL_BOT_STATE_DIR ?? join(homedir(), '.claude-control-bot');
   mkdirSync(stateDir, { recursive: true });
 
-  const p = pino({ level: process.env.CCTL_LOG_LEVEL ?? 'info' });
-  const logger: Logger = {
-    debug: (obj, msg) => p.debug(obj, msg),
-    info: (obj, msg) => p.info(obj, msg),
-    warn: (obj, msg) => p.warn(obj, msg),
-    error: (obj, msg) => p.error(obj, msg),
-  };
+  const logger: Logger = createLogger({ defaultLevel: 'info' });
 
   const bindings = new BindingStore(join(stateDir, 'bindings.json'));
   await bindings.load();
@@ -77,7 +106,20 @@ async function main(): Promise<void> {
   };
   // stateDir makes the session→thread registry durable; omitting it would silently park
   // session-threads.json under the OS temp dir and lose thread routing on reboot.
+  // Spread the optional values in only when set: exactOptionalPropertyTypes forbids passing an
+  // explicit `undefined` for an optional property, so an unset env must omit the key entirely
+  // and let each constructor apply its own default.
   const sessionChannelId = process.env.CCTL_SESSION_CHANNEL_ID;
+  // Every malformed pair is reported at once: an operator editing a multi-user map in a .env
+  // should not have to restart the bot per typo. Failing at all matters more than it looks —
+  // a mistyped id does not crash anything, it just never matches, and that user silently keeps
+  // getting DMs, which is precisely the symptom this map exists to fix.
+  const sessionChannels = parseSessionChannelMap(process.env.CCTL_SESSION_CHANNELS);
+  if (sessionChannels.errors.length > 0) {
+    fail(
+      `CCTL_SESSION_CHANNELS is malformed (expected "<userId>:<channelId>" pairs separated by commas): ${sessionChannels.errors.join('; ')}`,
+    );
+  }
   const gateway = new DiscordJsGateway({
     relay: relayRef,
     pairing,
@@ -85,8 +127,16 @@ async function main(): Promise<void> {
     token,
     stateDir,
     ...(sessionChannelId ? { sessionChannelId } : {}),
+    ...(sessionChannels.entries.size > 0 ? { sessionChannelsByUser: sessionChannels.entries } : {}),
   });
-  const relay = new RelayServer({ bindings, pairing, gateway, port, logger });
+  const relay = new RelayServer({
+    bindings,
+    pairing,
+    gateway,
+    port,
+    logger,
+    ...(maxPendingConnections !== undefined ? { maxPendingConnections } : {}),
+  });
   holder.relay = relay;
 
   const boundPort = await relay.listen();

@@ -15,6 +15,7 @@
 
 import { humanizeDuration, roundPct } from './format.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
+import { selectWeeklyBudget } from './weekly.js';
 
 /** Length of one Claude session window. */
 export const SESSION_WINDOW_MS = 5 * 60 * 60 * 1000;
@@ -27,18 +28,22 @@ export interface ResetEvent {
   kind: LimitInput['kind'];
   /** Percent of the limit consumed at snapshot time (what the reset will clear). */
   percentUsed: number;
+  /** True when this reset was PREDICTED from the account's history rather than reported by
+   *  the endpoint (which stops publishing a reset once the weekly window closes). Rendered
+   *  with its own mark and label — a prediction is never shown as an observation. */
+  predicted: boolean;
 }
 
 /** How many 5h windows an account can still open before its weekly reset. */
 export interface SessionWindowBudget {
-  /** The weekly reset that bounds the budget: the SHARED weekly budget's (weekly_all —
-   *  the bar every surface renders). The model-scoped cap only gates Fable-tier usage, so
-   *  its reset stands in only when the account reports no weekly_all limit at all. */
+  /** The weekly reset that bounds the budget (see `selectWeeklyBudget` for which one). */
   weeklyResetAt: number;
   /** Full-length 5h windows that fit, INCLUDING a currently-open one. */
   fullWindows: number;
   /** True when a final, truncated window (< 5h) also fits before the weekly reset. */
   hasPartialWindow: boolean;
+  /** True when `weeklyResetAt` is a prediction from history, not an endpoint reading. */
+  resetPredicted: boolean;
 }
 
 /** One account's place in the outlook. */
@@ -74,13 +79,11 @@ export function computeOutlook(accounts: AccountUsageInput[], now = Date.now()):
 
   for (const account of accounts) {
     const sessionLimit = soonestFutureLimit(account.limits, ['session'], now);
-    // The budget binds to the SHARED weekly reset ("weekly resets in …" must mean the bar),
-    // not to whichever weekly-flavored limit happens to reset soonest — the scoped Fable cap
-    // resetting first does not refresh the budget the 5h windows spend from. Scoped stands
-    // in only when no weekly_all limit exists. Same convention as pacing's weeklyLimitFor.
-    const weeklyLimit =
-      soonestFutureLimit(account.limits, ['weekly_all'], now) ??
-      soonestFutureLimit(account.limits, ['weekly_scoped'], now);
+    // The weekly budget follows the fleet-wide rule (see weekly.ts), so the budget line, the
+    // pacing line, and the burn plan never quote different limits for the same account. It
+    // falls back to the history-derived prediction, which is what stops a dormant account
+    // from reading "weekly reset time unknown" for the whole week it sits idle.
+    const weekly = selectWeeklyBudget(account.limits, now, account.predictedResetAt);
 
     const outlook: AccountOutlook = {
       accountId: account.accountId,
@@ -93,8 +96,13 @@ export function computeOutlook(accounts: AccountUsageInput[], now = Date.now()):
       outlook.openWindowEndsAt = sessionLimit.resetsAt as number;
       outlook.sessionPercent = roundPct(sessionLimit.percent);
     }
-    if (weeklyLimit) {
-      outlook.budget = computeBudget(now, weeklyLimit.resetsAt as number, outlook.openWindowEndsAt);
+    if (weekly?.resetsAt !== undefined) {
+      outlook.budget = computeBudget(
+        now,
+        weekly.resetsAt,
+        weekly.predicted,
+        outlook.openWindowEndsAt,
+      );
     }
     outlooks.push(outlook);
 
@@ -108,6 +116,20 @@ export function computeOutlook(accounts: AccountUsageInput[], now = Date.now()):
         label: account.label,
         kind: limit.kind,
         percentUsed: roundPct(limit.percent),
+        predicted: false,
+      });
+    }
+    // A predicted weekly reset is a timeline event too. Without it a dormant account's whole
+    // untouched allowance expires with nothing on screen to warn about it, which is the one
+    // thing the timeline exists to prevent.
+    if (weekly?.predicted === true && weekly.resetsAt !== undefined) {
+      events.push({
+        atMs: weekly.resetsAt,
+        accountId: account.accountId,
+        label: account.label,
+        kind: weekly.kind,
+        percentUsed: roundPct(weekly.percent ?? 0),
+        predicted: true,
       });
     }
   }
@@ -120,6 +142,7 @@ export function computeOutlook(accounts: AccountUsageInput[], now = Date.now()):
 function computeBudget(
   now: number,
   weeklyResetAt: number,
+  resetPredicted: boolean,
   openWindowEndsAt: number | undefined,
 ): SessionWindowBudget {
   // With a window open, counting starts when it closes; the open window itself counts as 1.
@@ -130,7 +153,7 @@ function computeBudget(
   const fullWindows =
     (openWindowEndsAt !== undefined ? 1 : 0) + Math.floor(remainingMs / SESSION_WINDOW_MS);
   const hasPartialWindow = remainingMs % SESSION_WINDOW_MS > 0;
-  return { weeklyResetAt, fullWindows, hasPartialWindow };
+  return { weeklyResetAt, fullWindows, hasPartialWindow, resetPredicted };
 }
 
 /** The limit of one of `kinds` with the soonest STILL-FUTURE reset, or undefined. */
@@ -161,6 +184,16 @@ export interface WireUsageLike {
   /** Callers that know quarantine state (e.g. the CLI reading the registry) pass it; the
    *  wire snapshot doesn't carry it, so it defaults to false. */
   quarantined?: boolean | undefined;
+  /** Plan weight and predicted reset, when the caller resolved them. Both now cross the wire —
+   *  the daemon resolves the tier from the registry (`planWeight`) and measures the reset from
+   *  stored history — which is why they tolerate `null` here: that is the shape a nullish wire
+   *  field arrives in. A caller reading the registry directly (the CLI) sets `weight` instead;
+   *  `planWeight` is preferred when both are present, since it is the wire's spelling of the
+   *  same fact. Absent from both leaves the account unweighted, and consumers say so rather
+   *  than silently counting it as 1x. */
+  weight?: number | undefined;
+  planWeight?: number | null | undefined;
+  predictedResetAt?: number | null | undefined;
   limits: Array<{
     kind: LimitInput['kind'];
     percent: number;
@@ -172,12 +205,23 @@ export interface WireUsageLike {
 
 /** Adapt wire usage snapshots to advisor inputs: ISO reset times become epoch ms, and an
  *  unparseable timestamp is dropped rather than poisoning the math with NaN. */
+/** The account's plan weight from whichever field carried it, or nothing. Spread rather than
+ *  assigned so an unresolved tier leaves the property ABSENT: `weight: undefined` and no
+ *  `weight` at all are the same to a reader but not to `exactOptionalPropertyTypes`, and the
+ *  absence is what makes pacing report the tier as unknown instead of quietly using 1. */
+function weightOf(a: WireUsageLike): { weight?: number } {
+  const resolved = a.planWeight ?? a.weight;
+  return resolved != null && resolved > 0 ? { weight: resolved } : {};
+}
+
 export function timelineInputFromWire(accounts: WireUsageLike[]): AccountUsageInput[] {
   return accounts.map((a) => ({
     accountId: a.accountId,
     label: a.label,
     active: a.active,
     quarantined: a.quarantined ?? false,
+    ...weightOf(a),
+    ...(a.predictedResetAt != null ? { predictedResetAt: a.predictedResetAt } : {}),
     limits: a.limits.map((l) => {
       const ms = l.resetsAt != null ? Date.parse(l.resetsAt) : NaN;
       return {
@@ -286,20 +330,25 @@ function budgetSection(
       a.openWindowEndsAt !== undefined
         ? `window open (${st.percent(`${pct}% used`, pct)}, resets in ${humanizeDuration(a.openWindowEndsAt - now)})`
         : 'no open window';
+    // A predicted reset is labelled inline: the budget it bounds is a projection, and the
+    // reader has to be able to tell that from an endpoint reading at a glance.
     const budget = a.budget
       ? `${a.budget.fullWindows} full 5h window${a.budget.fullWindows === 1 ? '' : 's'}` +
         `${a.budget.hasPartialWindow ? ' +1 partial' : ''}` +
-        ` before weekly reset in ${humanizeDuration(a.budget.weeklyResetAt - now)}`
-      : 'weekly reset time unknown';
+        ` before weekly reset in ${humanizeDuration(a.budget.weeklyResetAt - now)}` +
+        `${a.budget.resetPredicted ? ' (predicted)' : ''}`
+      : 'weekly reset time unknown - no history to predict one from';
     lines.push(`${marker} ${label}  ${window} · ${budget}`);
   }
   return lines.join('\n');
 }
 
-/** Style one track cell: dashes recede, marks pop in their own hue. */
+/** Style one track cell: dashes recede, marks pop in their own hue. A predicted weekly reset
+ *  ('?') shares the weekly hue — same kind of event, lower confidence, and the mark itself
+ *  already carries that distinction without adding a style hook every frontend must adopt. */
 function styleCell(cell: string, st: OutlookStyle): string {
   if (cell === 's') return st.session(cell);
-  if (cell === 'w') return st.weekly(cell);
+  if (cell === 'w' || cell === '?') return st.weekly(cell);
   if (cell === '*') return st.both(cell);
   return st.dim(cell);
 }
@@ -314,14 +363,16 @@ function timelineSection(
 ): string {
   const lastEvent = outlook.events[outlook.events.length - 1] as ResetEvent;
   const span = Math.max(lastEvent.atMs - now, 1); // avoid divide-by-zero on a same-ms event
-  const legend = `(${st.session('s')} = 5h window resets, ${st.weekly('w')} = weekly resets)`;
+  const legend =
+    `(${st.session('s')} = 5h window resets, ${st.weekly('w')} = weekly resets, ` +
+    `${st.weekly('?')} = predicted weekly reset)`;
   const lines = [`${st.heading(`Reset timeline  now -> ${humanizeDuration(span)}`)}  ${legend}`];
   for (const a of outlook.accounts) {
     const cells: string[] = new Array<string>(width).fill('-');
     for (const e of outlook.events) {
       if (e.accountId !== a.accountId) continue;
       const pos = Math.min(width - 1, Math.round(((e.atMs - now) / span) * (width - 1)));
-      const mark = e.kind === 'session' ? 's' : 'w';
+      const mark = e.predicted ? '?' : e.kind === 'session' ? 's' : 'w';
       // Two resets landing in the same cell collapse to '*' so neither silently vanishes.
       cells[pos] = cells[pos] === '-' || cells[pos] === mark ? mark : '*';
     }
@@ -356,10 +407,11 @@ function describeEvent(e: ResetEvent, st: OutlookStyle): string {
   // The scoped weekly cap is the Fable-tier limit, so name the model rather than the
   // opaque wire kind.
   const label = e.kind === 'weekly_scoped' ? 'weekly (fable)' : 'weekly';
+  const when = e.predicted ? ' (predicted)' : '';
   const unused = 100 - e.percentUsed;
   return unused > 0
-    ? `${label} quota resets - ${st.alert(`${unused}% unused expires with it`)}`
-    : `${label} quota resets`;
+    ? `${label} quota resets${when} - ${st.alert(`${unused}% unused expires with it`)}`
+    : `${label} quota resets${when}`;
 }
 
 /** Compact rendering of an advisor plan, appended under the timeline by both frontends.

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import type { AccountUsage, UsagePlan } from '@claude-control/shared-protocol';
+import type {
+  AccountUsage,
+  TokenStatsSnapshot,
+  TokenTotals,
+  UsagePlan,
+} from '@claude-control/shared-protocol';
 import {
   buildUsageEmbed,
   buildAccountsEmbed,
@@ -10,6 +15,7 @@ import {
   buildAnsweredQuestionEmbed,
   buildLapsedQuestionEmbed,
   buildSettingsEmbed,
+  buildStatsEmbed,
   buildSwitchResultEmbed,
   buildTimelineEmbed,
   buildDoneEmbed,
@@ -158,11 +164,9 @@ describe('buildUsageEmbed', () => {
         accounts: [
           account({
             limits: [
-              // 38% elapsed, 52% used — the same "ahead of pace" fixture as usage-advisor's
-              // pacing tests, so the expected headline is known exactly.
               {
                 kind: 'weekly_all',
-                percent: 52,
+                percent: 50,
                 isActive: true,
                 resetsAt: new Date(NOW + Math.round(0.62 * WEEK_MS)).toISOString(),
               },
@@ -173,10 +177,66 @@ describe('buildUsageEmbed', () => {
       NOW,
     ).toJSON();
     const pacing = embed.fields?.find((f) => f.name === 'Pacing');
-    expect(pacing?.value).toBe(
-      '38% of the combined week elapsed, 52% of budget burned - ahead of pace (~1.4x): ' +
-        'slow down or expect an early wall.',
+    expect(pacing?.value).toContain('0.5u of 1u available (50%)');
+  });
+
+  it('states what the wire cannot tell it rather than printing an unsupported verdict', () => {
+    // Plan tiers never cross the wire, and a daemon predating the burn field sends none — so
+    // the bot can neither weight accounts nor measure a rate. Both must be said outright.
+    const embed = buildUsageEmbed({
+      accounts: [account({ limits: [{ kind: 'weekly_all', percent: 20, isActive: true }] })],
+    }).toJSON();
+    const pacing = embed.fields?.find((f) => f.name === 'Pacing');
+    expect(pacing?.value).toContain('burn rate not measured yet');
+    expect(pacing?.value).toContain(
+      '• plan tiers unknown, so accounts are weighted equally (1 unit each).',
     );
+  });
+
+  it('reaches a real verdict once the daemon sends the pacing inputs', () => {
+    const NOW = Date.parse('2026-07-16T12:00:00.000Z');
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    // One account in use with a reported reset, one dormant holding its whole allowance — and
+    // the dormant one's reset exists ONLY as the daemon's prediction.
+    const embed = buildUsageEmbed(
+      {
+        accounts: [
+          account({
+            limits: [
+              {
+                kind: 'weekly_all',
+                percent: 80,
+                isActive: true,
+                resetsAt: new Date(NOW + 2 * DAY_MS).toISOString(),
+              },
+            ],
+          }),
+          account({
+            accountId: 'acct-2',
+            label: 'Spare',
+            active: false,
+            limits: [{ kind: 'weekly_all', percent: 0, isActive: true }],
+            predictedResetAt: NOW + DAY_MS,
+          }),
+        ],
+        burnUnitsPerDay: 0.1,
+      },
+      NOW,
+    ).toJSON();
+
+    const pacing = embed.fields?.find((f) => f.name === 'Pacing');
+    // The verdict and the waste figure that names the account to act on — neither is
+    // computable without the two inputs the daemon just supplied.
+    expect(pacing?.value).toContain('1.2u of 2u available (60%)');
+    expect(pacing?.value).toContain('sustainable for the next 14d.');
+    expect(pacing?.value).toContain('on Spare in 1d');
+    expect(pacing?.value).toContain('• next weekly reset predicted from history for Spare.');
+    expect(pacing?.value).not.toContain('burn rate not measured yet');
+    // The account's own field carries that reset too, labelled — a prediction is never
+    // rendered as though the endpoint had reported it.
+    const spare = embed.fields?.find((f) => f.name?.startsWith('Spare'));
+    expect(spare?.value).toContain('weekly resets <t:');
+    expect(spare?.value).toContain('(predicted)');
   });
 
   it('omits the Pacing field when there are no accounts', () => {
@@ -399,6 +459,42 @@ describe('emoji-width overflow fallback', () => {
   });
 });
 
+// The phone showed neither the plan tier nor the billing date the terminal had always shown,
+// on all three account views. Both facts live in the local registry and reach the bot only
+// because the daemon resolves them onto the snapshot — so each surface is asserted separately:
+// they render from one helper, but nothing structural stops one of them from dropping it.
+describe('plan tier and billing across the account views', () => {
+  const withPlan = account({ planWeight: 20, billing: '~Aug 11 (est.)' });
+
+  it('shows both on /accounts', () => {
+    const embed = buildAccountsEmbed([withPlan]).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('plan 20x · billing ~Aug 11 (est.)');
+  });
+
+  it('shows both on /usage', () => {
+    const embed = buildUsageEmbed({ accounts: [withPlan] }).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('plan 20x · billing ~Aug 11 (est.)');
+  });
+
+  it('shows both on /timeline', () => {
+    const embed = buildTimelineEmbed({ accounts: [withPlan] }).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('plan 20x · billing ~Aug 11 (est.)');
+  });
+
+  it('renders an unresolved tier as "?" rather than implying a 1x reading', () => {
+    const embed = buildAccountsEmbed([account({ billing: 'unknown' })]).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('plan ? · billing unknown');
+  });
+
+  it('stays silent when a daemon predating the fields reports neither', () => {
+    // Otherwise every account on an older daemon gains a "plan ? · billing unknown" caption
+    // for a question that was never asked.
+    const embed = buildAccountsEmbed([account()]).toJSON();
+    expect(embed.fields?.[0]?.value).not.toContain('plan ');
+    expect(embed.fields?.[0]?.value).not.toContain('billing');
+  });
+});
+
 describe('buildAccountsEmbed', () => {
   it('lists each account with its source', () => {
     const embed = buildAccountsEmbed([account({ source: 'cached' })]).toJSON();
@@ -565,6 +661,88 @@ describe('buildQuestionEmbed', () => {
     expect(embed.footer?.text).not.toContain('mode');
   });
 
+  it('re-renders a table inside a question, before the field clamp', () => {
+    const embed = buildQuestionEmbed([
+      {
+        question: ['Which?', '| Option | Cost |', '| --- | --- |', '| a | cheap |'].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    expect(embed.fields?.[0]?.value).not.toContain('| --- |');
+    expect(embed.fields?.[0]?.value).toContain('┌');
+  });
+
+  it('shows every row of a long table rather than rules on a clamped one', () => {
+    // A question that arrives as a twenty-account comparison is the whole reason this field goes
+    // through the formatter, and the field cap is hard: rendering a rule between every row costs
+    // more than the cap can hold, and the rows past the cap are the ones the reader loses. The
+    // rules are what must go.
+    const rows = Array.from({ length: 20 }, (_, i) => `| account-${i} | max20x | ${i}% |`);
+    const embed = buildQuestionEmbed([
+      {
+        question: ['| Account | Plan | Left |', '| --- | --- | --- |', ...rows].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    for (let i = 0; i < 20; i++) expect(value).toContain(`account-${i}`);
+    // The clamp's own marker, matched by its shape — a cell that happens to say "more" is
+    // content, not evidence that anything was dropped.
+    expect(value).not.toMatch(/… \+\d+ more/);
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
+  it('keeps a short table ruled when the prose beside it is what overruns the field', () => {
+    // The cap is overrun by the prose, not by the table, and this field's clamp drops whole
+    // LINES — so freeing the two rules (26 characters) can never buy back a 200-character line.
+    // The reader receives identical content either way, and should receive it with the rows
+    // still divided.
+    const table = [
+      '| Account | Status | Reset |',
+      '| --- | --- | --- |',
+      '| alpha | ok | 3h |',
+      '| beta | ok | 5h |',
+      '| gamma | busy | 9h |',
+    ];
+    const prose = Array.from({ length: 8 }, (_, i) => `${i}. ${'x'.repeat(197)}`);
+    const embed = buildQuestionEmbed([
+      {
+        question: [...table, '', ...prose].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    expect(value.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
+  it('keeps every paragraph beside a short table when the rules are what would cost one', () => {
+    // The same shape at the width where the rules DO cost something. They sit above the prose, so
+    // what they push past the cut is a paragraph rather than a row — invisible to anything that
+    // measures the trade in rows, and a whole paragraph of the reader's answer either way.
+    const table = [
+      '| Account | Status | Reset |',
+      '| --- | --- | --- |',
+      '| alpha | ok | 3h |',
+      '| beta | ok | 5h |',
+      '| gamma | busy | 9h |',
+    ];
+    const prose = Array.from({ length: 12 }, (_, i) => `p${i}. ${'x'.repeat(58)}`);
+    const embed = buildQuestionEmbed([
+      {
+        question: [...table, '', ...prose].join('\n'),
+        multiSelect: false,
+        options: [{ label: 'a' }],
+      },
+    ]).toJSON();
+    const value = embed.fields?.[0]?.value ?? '';
+    for (let i = 0; i < 12; i++) expect(value).toContain(`p${i}.`);
+    expect(value.length).toBeLessThanOrEqual(1024);
+  });
+
   it('renders at most four questions', () => {
     const many = Array.from({ length: 6 }, (_, i) => ({
       question: `q${i}`,
@@ -662,11 +840,38 @@ describe('lifecycle cards (done / waiting / quarantine)', () => {
     expect(embed.description).toContain('chars truncated');
   });
 
+  it('buildDoneEmbed re-renders a markdown table Discord would show as raw pipes', () => {
+    // A final assistant message routinely ends in a summary table, and Discord renders markdown
+    // tables not at all — so the card must never ship the source text.
+    const embed = buildDoneEmbed({
+      lastAssistantMessage: [
+        'Here is what moved.',
+        '',
+        '| Action | Detail |',
+        '|---|---|',
+        '| `widget.ts` -> `src/parts/` | Self-contained, no relative imports - moves unchanged. |',
+        '| `legacy.config.json` -> deleted | Folded into the package config. A stray `legacy.config.json` would win over it and the merged settings would be ignored without a word. |',
+      ].join('\n'),
+    }).toJSON();
+    expect(embed.description).toContain('Here is what moved.');
+    expect(embed.description).not.toContain('|---|');
+    // Long cells, so the record layout: a heading line with its detail indented under it.
+    expect(embed.description).toContain('`widget.ts` -> `src/parts/`\n  Self-contained,');
+  });
+
   it('buildWaitingEmbed is a blue 🔔 "your turn" card', () => {
     const embed = buildWaitingEmbed({ sessionId: 's1', body: 'Reply to continue.' }).toJSON();
     expect(embed.title).toContain('🔔');
     expect(embed.color).toBe(NOTIFICATION_COLOR.waiting);
     expect(embed.description).toBe('Reply to continue.');
+  });
+
+  it('buildWaitingEmbed re-renders tables in the prompt it is waiting on', () => {
+    const embed = buildWaitingEmbed({
+      body: ['| Flag | Meaning |', '| --- | --- |', '| --greedy | burn the soonest |'].join('\n'),
+    }).toJSON();
+    expect(embed.description).not.toContain('| --- |');
+    expect(embed.description?.startsWith('```\n┌')).toBe(true);
   });
 
   it('buildQuarantineEmbed prints the injected host re-login command verbatim', () => {
@@ -853,5 +1058,281 @@ describe('session card / summary embeds — table re-rendering', () => {
     const boxLines = description.split('\n').filter((l) => /^[┌│├└]/.test(l));
     expect(boxLines.length).toBeGreaterThan(0);
     for (const line of boxLines) expect(line.length).toBeLessThanOrEqual(40);
+  });
+});
+
+describe('clamping a re-rendered table leaves no fence open', () => {
+  // Every prose surface arrives fenced now (formatTables), and both clamps cut blind — so a cut
+  // landing inside a table leaves an unterminated ```, and Discord swallows the rest of the card
+  // into one code block. An eight-row comparison table already overruns a field.
+  const proseTable = (rows: number): string =>
+    [
+      '| Action | Detail |',
+      '|---|---|',
+      ...Array.from(
+        { length: rows },
+        (_, i) =>
+          `| \`module_${i}.ts\` | A sentence of explanation long enough to read as real prose and to push this row past any column a phone-width grid could give it, row ${i}. |`,
+      ),
+    ].join('\n');
+
+  const fenceCount = (text: string): number => (text.match(/```/g) ?? []).length;
+
+  const sessionModel = (summary: string): SessionCardModel => ({
+    sessionId: 's1',
+    state: 'running',
+    stopping: false,
+    summary,
+    outputTail: 'the last lines of stdout',
+    totalOutputChars: 24,
+    attached: false,
+    hasGap: false,
+    sourceTruncated: false,
+    hadError: false,
+  });
+
+  for (const rows of [8, 60]) {
+    it(`balances every clamped card at ${rows} rows`, () => {
+      const source = proseTable(rows);
+      const clamped: [string, string, number][] = [
+        ['done', buildDoneEmbed({ lastAssistantMessage: source }).toJSON().description ?? '', 4096],
+        ['waiting', buildWaitingEmbed({ body: source }).toJSON().description ?? '', 4096],
+        [
+          'question',
+          buildQuestionEmbed([
+            { question: source, multiSelect: false, options: [{ label: 'a' }] },
+          ]).toJSON().fields?.[0]?.value ?? '',
+          1024,
+        ],
+        ['card', buildSessionCardEmbed(sessionModel(source)).toJSON().description ?? '', 4096],
+        [
+          'summary',
+          buildSessionSummaryEmbed(sessionModel(source)).toJSON().description ?? '',
+          4096,
+        ],
+      ];
+      for (const [name, rendered, max] of clamped) {
+        expect(`${name}: ${fenceCount(rendered) % 2}`).toBe(`${name}: 0`);
+        expect(rendered.length).toBeLessThanOrEqual(max);
+      }
+      // The clamp really fired at both sizes — otherwise balance proves nothing.
+      const question = clamped[2]?.[1] ?? '';
+      expect(question).toMatch(/… \+\d+ more/);
+      expect(question.length).toBeGreaterThan(900);
+    });
+  }
+});
+
+describe('the slicing clamp (truncateLabeled) — the same rules-vs-content trade, on the clamp none of the above exercise', () => {
+  // Every decision test elsewhere in this file and in tableFormat.test.ts runs the rules-vs-content
+  // trade through `clampFieldValue`, which only ever drops whole trailing LINES. `truncateLabeled`
+  // is the OTHER clamp `formatTablesClamped` is measured through — it backs the description on
+  // every lifecycle card (buildDoneEmbed / buildWaitingEmbed / buildSessionSummaryEmbed) and the
+  // live session card's summary — and it clamps by raw CHARACTER SLICE instead. A suite that only
+  // ever drives the line-dropping clamp would go green on a regression confined to this one, so the
+  // ordinary shed/keep behavior is repeated here against a real slicing surface, not just measured
+  // through a stand-in.
+  const mdTable = (bodyRows: number): string =>
+    [
+      '| Account | Plan | Left |',
+      '| --- | --- | --- |',
+      ...Array.from({ length: bodyRows }, (_, i) => `| acct-${i}. | max20x | ${i}% |`),
+    ].join('\n');
+
+  function model(overrides: Partial<SessionCardModel> = {}): SessionCardModel {
+    return {
+      sessionId: 's1',
+      state: 'running',
+      stopping: false,
+      totalOutputChars: 0,
+      attached: false,
+      hasGap: false,
+      sourceTruncated: false,
+      hadError: false,
+      ...overrides,
+    };
+  }
+
+  it('rules every gap while the live card shows the whole render', () => {
+    const embed = buildSessionCardEmbed(model({ summary: mdTable(3) })).toJSON();
+    expect(embed.description).toBe(
+      [
+        '```',
+        '┌─────────┬────────┬──────┐',
+        '│ Account │ Plan   │ Left │',
+        '├─────────┼────────┼──────┤',
+        '│ acct-0. │ max20x │ 0%   │',
+        '├─────────┼────────┼──────┤',
+        '│ acct-1. │ max20x │ 1%   │',
+        '├─────────┼────────┼──────┤',
+        '│ acct-2. │ max20x │ 2%   │',
+        '└─────────┴────────┴──────┘',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('sheds the rules — down to the header rule only — once they cost rows', () => {
+    const embed = buildSessionCardEmbed(model({ summary: mdTable(8) })).toJSON();
+    expect(embed.description).toBe(
+      [
+        '```',
+        '┌─────────┬────────┬──────┐',
+        '│ Account │ Plan   │ Left │',
+        '├─────────┼────────┼──────┤',
+        '│ acct-0. │ max20x │ 0%   │',
+        '│ acct-1. │ max20x │ 1%   │',
+        '│ acct-2. │ max20x │ 2%   │',
+        '│ acct-3. │ max20x │ 3%   │',
+        '│ acct-4. │ max20x │ 4%   │',
+        '│ acct-5. │ max20x │ 5%   │',
+        '│ acct-6. │ max20x │ 6%   │',
+        '│ acct-7. │ max20x │ 7%   │',
+        '└─────────┴────────┴──────┘',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('ties on a mid-paragraph slice and keeps every rule — the accepted line-splitting tradeoff', () => {
+    // A character slice can cut mid-line, where a whole-line drop never does: the resulting final
+    // partial line matches no full line of EITHER candidate render, so `deliveredContent` credits
+    // it to neither, the two candidates tie, and `formatTables` resolves a tie in the rules' favor
+    // (see its final comparison: `bare` only wins on a STRICT excess, not a tie). What the reader
+    // loses is confined to the un-credited tail of the one paragraph already being cut in both
+    // renders — never a whole paragraph, and never a row. INVARIANT: this stays a tie kept in the
+    // rules' favor; a future change that turns it into a strict loss (fewer whole paragraphs than
+    // the unruled render would have delivered) is a regression in the trade, not a fixture to
+    // reshape around the new numbers.
+    const table = mdTable(3);
+    const paragraphs = Array.from({ length: 60 }, (_, i) => `p${i}. ${'x'.repeat(87)}`);
+    const message = [table, '', ...paragraphs].join('\n');
+    const embed = buildDoneEmbed({ lastAssistantMessage: message }).toJSON();
+    const value = embed.description ?? '';
+    expect(value.length).toBe(4092);
+    expect(value.split('\n')).toHaveLength(54);
+    expect(value.split('\n').filter((l) => l.startsWith('├'))).toHaveLength(3);
+    // Paragraph 40 is the last one delivered whole; 41 is the shared partial tail neither
+    // candidate is credited for.
+    expect(value).toContain('p40.');
+    expect(value).not.toContain('p41.');
+    expect(value).toContain('… [+1764 chars truncated]');
+  });
+});
+
+describe('buildStatsEmbed', () => {
+  const t = (over: Partial<TokenTotals> = {}): TokenTotals => ({
+    input: 0,
+    output: 0,
+    cacheCreation: 0,
+    cacheRead: 0,
+    turns: 0,
+    ...over,
+  });
+
+  const snapshot = (over: Partial<TokenStatsSnapshot> = {}): TokenStatsSnapshot => ({
+    windowStartMs: 1_000_000_000_000,
+    windowEndMs: 1_000_000_000_000 + 7 * 86_400_000,
+    overall: t({
+      input: 1000,
+      output: 2_000_000,
+      cacheCreation: 3000,
+      cacheRead: 1_900_000_000,
+      turns: 1234,
+    }),
+    byAccount: [
+      { accountId: 'acct-a', label: 'main', totals: t({ cacheRead: 1_900_000_000, turns: 1000 }) },
+      { accountId: null, label: 'unattributed', totals: t({ output: 2_000_000, turns: 234 }) },
+    ],
+    byModel: [{ label: 'claude-opus-5', totals: t({ output: 2_000_000, turns: 1234 }) }],
+    byDay: [
+      { label: '2026-07-18', totals: t({ output: 1, turns: 1 }) },
+      { label: '2026-07-25', totals: t({ output: 2, turns: 2 }) },
+    ],
+    coverage: {
+      filesScanned: 42,
+      filesSkippedByMtime: 400,
+      filesUnreadable: 0,
+      dirsUnreadable: 0,
+      malformedLines: 0,
+      duplicateTurns: 0,
+    },
+    ...over,
+  });
+
+  it('breaks the window down by account, model, day and token kind', () => {
+    const json = buildStatsEmbed(snapshot()).toJSON();
+    expect(json.title).toBe('Token usage');
+    expect(json.description).toMatch(/Last 7 days/);
+    expect(json.description).toMatch(/1\.9B/);
+    const names = (json.fields ?? []).map((f) => f.name);
+    expect(names).toEqual(['By account', 'By model', 'By day', 'Token kinds', 'Coverage']);
+    const byAccount = (json.fields ?? []).find((f) => f.name === 'By account');
+    expect(byAccount?.value).toMatch(/\*\*main\*\*/);
+    expect(byAccount?.value).toMatch(/unattributed/);
+    const kinds = (json.fields ?? []).find((f) => f.name === 'Token kinds');
+    expect(kinds?.value).toMatch(/cache read 1\.9B/);
+  });
+
+  it('renders the coverage block instead of silently dropping a partial scan', () => {
+    const json = buildStatsEmbed(
+      snapshot({
+        coverage: {
+          filesScanned: 142,
+          filesSkippedByMtime: 0,
+          filesUnreadable: 300,
+          dirsUnreadable: 2,
+          malformedLines: 5,
+          duplicateTurns: 7,
+        },
+      }),
+    ).toJSON();
+    const coverage = (json.fields ?? []).find((f) => f.name === 'Coverage');
+    expect(coverage?.value).toMatch(/142 transcript files read/);
+    expect(coverage?.value).toMatch(/300 could not be read/);
+    expect(coverage?.value).toMatch(/2 project folders could not be read/);
+    expect(coverage?.value).toMatch(/5 malformed lines skipped/);
+    expect(coverage?.value).toMatch(/7 duplicate turns skipped/);
+  });
+
+  it('puts the most recent day first, so the clamp drops the far tail', () => {
+    const byDay = (buildStatsEmbed(snapshot()).toJSON().fields ?? []).find(
+      (f) => f.name === 'By day',
+    );
+    expect(byDay?.value.indexOf('2026-07-25')).toBeLessThan(
+      byDay?.value.indexOf('2026-07-18') ?? 0,
+    );
+  });
+
+  it('states the measurement limits on every render', () => {
+    const json = buildStatsEmbed(snapshot()).toJSON();
+    expect(json.footer?.text).toMatch(/Local Claude Code turns on the host only/);
+    expect(json.footer?.text).toMatch(/cannot be attributed/);
+    expect(json.footer?.text).toMatch(/Not a billing figure/);
+  });
+
+  it('says nothing was recorded rather than rendering empty tables, but keeps coverage', () => {
+    const json = buildStatsEmbed(
+      snapshot({ overall: t(), byAccount: [], byModel: [], byDay: [] }),
+    ).toJSON();
+    expect(json.description).toMatch(/No Claude Code turns recorded on the host/);
+    // Coverage is the one field that still belongs here: zero turns can mean an empty window
+    // OR a scan that failed to read anything, and those are different claims.
+    const names = (json.fields ?? []).map((f) => f.name);
+    expect(names).toEqual(['Coverage']);
+    // The caveats survive the empty case — an absent number still needs its context.
+    expect(json.footer?.text).toMatch(/Not a billing figure/);
+  });
+
+  it('clamps a bucket list too long for a Discord field instead of throwing', () => {
+    const many = Array.from({ length: 400 }, (_, i) => ({
+      label: `account-with-a-long-label-${i}`,
+      accountId: `acct-${i}`,
+      totals: t({ output: 400 - i, turns: 1 }),
+    }));
+    const json = buildStatsEmbed(snapshot({ byAccount: many })).toJSON();
+    const byAccount = (json.fields ?? []).find((f) => f.name === 'By account');
+    expect(byAccount?.value.length).toBeLessThanOrEqual(1024);
+    expect(byAccount?.value).toMatch(/… \+\d+ more/);
   });
 });

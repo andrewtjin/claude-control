@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { decode, isType, stamp, encode } from './codec.js';
-import { Envelope, isMessageType, type PayloadOf } from './messages.js';
+import {
+  Envelope,
+  isMessageType,
+  MAX_STATS_DAYS,
+  MIN_STATS_DAYS,
+  type PayloadOf,
+} from './messages.js';
 import { PROTOCOL_VERSION } from './version.js';
 
 // Schema-level tests for the hook/managed-session protocol additions (permissionMode, the widened
@@ -462,6 +468,27 @@ describe('session.status spawnRequestId (additive, N/N-1 tolerant)', () => {
   });
 });
 
+describe('pair.claim hostLabel bound', () => {
+  const base = { pairingCode: 'ABCDEFGH' };
+
+  it('accepts a normal short hostLabel', () => {
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'my-laptop' }));
+    expect(result.ok).toBe(true);
+  });
+
+  it('accepts a hostLabel at the 256-char bound', () => {
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'h'.repeat(256) }));
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects a hostLabel past the bound — the bot persists it verbatim, so it must be capped', () => {
+    // The label is written into the shared bindings.json and that whole file is rewritten on
+    // every pairing; an unbounded label would let one claimer bloat every other user's write.
+    const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'h'.repeat(257) }));
+    expect(result.ok).toBe(false);
+  });
+});
+
 describe('session.status resumedFrom (additive, N/N-1 tolerant)', () => {
   const base: PayloadOf<'session.status'> = { sessionId: 'sess-2', state: 'starting' };
 
@@ -484,5 +511,251 @@ describe('session.status resumedFrom (additive, N/N-1 tolerant)', () => {
     if (result.ok && isType(result.envelope, 'session.status')) {
       expect(result.envelope.payload.resumedFrom).toBe('sess-1');
     }
+  });
+});
+
+describe('usage.snapshot carries no monetary data', () => {
+  const account = {
+    accountId: 'acct-1',
+    label: 'Work',
+    active: true,
+    source: 'live' as const,
+    fetchedAtMs: 1,
+    limits: [],
+  };
+
+  it('strips a spend block off an account rather than relaying it', () => {
+    // The usage endpoint returns per-account credit spend, and the daemon deliberately does not
+    // carry it: this envelope is relayed in cleartext through a host the user does not own (see
+    // docs/THREAT_MODEL.md, "In-transit visibility"), so dollar amounts must not cross it while
+    // nothing renders them. The schema is the enforcement point — a sender that starts emitting
+    // the field (a rolled-back daemon, a future edit) has it dropped here, not forwarded.
+    const result = decode(
+      rawFrame('usage.snapshot', {
+        accounts: [
+          {
+            ...account,
+            spend: {
+              used: { amountMinor: 1234, currency: 'USD', exponent: 2 },
+              percent: 12,
+              enabled: true,
+              canPurchaseCredits: true,
+            },
+          },
+        ],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      const decoded = result.envelope.payload.accounts[0];
+      expect(decoded && 'spend' in decoded).toBe(false);
+      expect(JSON.stringify(result.envelope)).not.toContain('1234');
+    }
+  });
+
+  it('accepts an account with no monetary fields at all', () => {
+    const payload: PayloadOf<'usage.snapshot'> = { accounts: [account] };
+    const env = stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe('stats.snapshot', () => {
+  const totals = { input: 1, output: 2, cacheCreation: 3, cacheRead: 4, turns: 5 };
+  const payload = {
+    windowStartMs: 0,
+    windowEndMs: 604_800_000,
+    overall: totals,
+    byAccount: [{ accountId: 'acct-a', label: 'main', totals }],
+    byModel: [{ label: 'claude-opus-5', totals }],
+    byDay: [{ label: '2026-07-25', totals }],
+    coverage: {
+      filesScanned: 42,
+      filesSkippedByMtime: 400,
+      filesUnreadable: 1,
+      dirsUnreadable: 1,
+      malformedLines: 2,
+      duplicateTurns: 3,
+    },
+  };
+
+  it('is a registered message type', () => {
+    expect(isMessageType('stats.snapshot')).toBe(true);
+  });
+
+  it('round-trips a full snapshot', () => {
+    const result = decode(encode(stamp({ daemonId: 'daemon-1', type: 'stats.snapshot', payload })));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'stats.snapshot')) {
+      expect(result.envelope.payload).toEqual(payload);
+    }
+  });
+
+  it('carries the unattributed bucket as a null accountId rather than dropping the row', () => {
+    const result = decode(
+      rawFrame('stats.snapshot', {
+        ...payload,
+        byAccount: [{ accountId: null, label: 'unattributed', totals }],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'stats.snapshot')) {
+      expect(result.envelope.payload.byAccount[0]?.accountId ?? null).toBeNull();
+      expect(result.envelope.payload.byAccount[0]?.label).toBe('unattributed');
+    }
+  });
+
+  it('rejects a frame missing its coverage, so a total can never arrive uncontextualized', () => {
+    const { coverage: _coverage, ...withoutCoverage } = payload;
+    expect(decode(rawFrame('stats.snapshot', withoutCoverage)).ok).toBe(false);
+  });
+
+  it('rejects negative token counts', () => {
+    expect(
+      decode(rawFrame('stats.snapshot', { ...payload, overall: { ...totals, output: -1 } })).ok,
+    ).toBe(false);
+  });
+
+  describe('stats.request / stats.result', () => {
+    it('are registered message types', () => {
+      expect(isMessageType('stats.request')).toBe(true);
+      expect(isMessageType('stats.result')).toBe(true);
+    });
+
+    it('round-trips a request for an explicit window', () => {
+      const result = decode(
+        encode(
+          stamp({
+            daemonId: 'daemon-1',
+            type: 'stats.request',
+            payload: { requestId: 'req-1', days: 30 },
+          }),
+        ),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok && isType(result.envelope, 'stats.request')) {
+        expect(result.envelope.payload).toEqual({ requestId: 'req-1', days: 30 });
+      }
+    });
+
+    it('accepts both ends of the allowed range', () => {
+      for (const days of [MIN_STATS_DAYS, MAX_STATS_DAYS]) {
+        expect(decode(rawFrame('stats.request', { requestId: 'req-1', days })).ok).toBe(true);
+      }
+    });
+
+    it('rejects a window outside the allowed range', () => {
+      // The bound that actually protects the host's disk from a hand-crafted frame: Discord's
+      // own min/max only constrains what a user can type into the client.
+      for (const days of [0, -1, MAX_STATS_DAYS + 1, 99_999]) {
+        expect(decode(rawFrame('stats.request', { requestId: 'req-1', days })).ok).toBe(false);
+      }
+    });
+
+    it('rejects a fractional or non-numeric window', () => {
+      expect(decode(rawFrame('stats.request', { requestId: 'req-1', days: 7.5 })).ok).toBe(false);
+      expect(decode(rawFrame('stats.request', { requestId: 'req-1', days: '7' })).ok).toBe(false);
+    });
+
+    it('round-trips a successful result carrying its snapshot', () => {
+      const result = decode(
+        encode(
+          stamp({
+            daemonId: 'daemon-1',
+            type: 'stats.result',
+            payload: { requestId: 'req-1', ok: true, snapshot: payload },
+          }),
+        ),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok && isType(result.envelope, 'stats.result')) {
+        expect(result.envelope.payload.snapshot).toEqual(payload);
+      }
+    });
+
+    it('accepts a failure result with no snapshot', () => {
+      // The failure path has to be representable, or a daemon that cannot scan has no way to
+      // answer at all — and silence is what leaves a deferred reply spinning.
+      const result = decode(
+        rawFrame('stats.result', { requestId: 'req-1', ok: false, error: 'scan failed' }),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok && isType(result.envelope, 'stats.result')) {
+        expect(result.envelope.payload.ok).toBe(false);
+        expect(result.envelope.payload.snapshot ?? null).toBeNull();
+      }
+    });
+
+    it('rejects a result whose snapshot is malformed rather than passing it through', () => {
+      const { coverage: _coverage, ...withoutCoverage } = payload;
+      expect(
+        decode(
+          rawFrame('stats.result', { requestId: 'req-1', ok: true, snapshot: withoutCoverage }),
+        ).ok,
+      ).toBe(false);
+    });
+
+    it('requires a requestId, since a result with no correlation can reach no one', () => {
+      expect(decode(rawFrame('stats.request', { days: 7 })).ok).toBe(false);
+      expect(decode(rawFrame('stats.result', { ok: true, snapshot: payload })).ok).toBe(false);
+    });
+  });
+});
+
+describe('usage.snapshot pacing inputs (additive, N/N-1 tolerant)', () => {
+  const account = {
+    accountId: 'acct-1',
+    label: 'Work',
+    active: true,
+    source: 'live',
+    fetchedAtMs: 1,
+    limits: [{ kind: 'weekly_all', percent: 40 }],
+  };
+
+  it('parses without them — frames from daemons predating the fields stay valid', () => {
+    const result = decode(rawFrame('usage.snapshot', { accounts: [account] }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.burnUnitsPerDay ?? undefined).toBeUndefined();
+      expect(result.envelope.payload.accounts[0]?.predictedResetAt ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries a predicted reset and a fractional burn rate through a round-trip', () => {
+    const result = decode(
+      rawFrame('usage.snapshot', {
+        accounts: [{ ...account, predictedResetAt: 1_800_000_000_000 }],
+        burnUnitsPerDay: 2.75,
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.accounts[0]?.predictedResetAt).toBe(1_800_000_000_000);
+      expect(result.envelope.payload.burnUnitsPerDay).toBe(2.75);
+    }
+  });
+
+  it('a measured zero survives — it is a verdict ("idle"), not a missing value', () => {
+    const result = decode(rawFrame('usage.snapshot', { accounts: [account], burnUnitsPerDay: 0 }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.burnUnitsPerDay).toBe(0);
+    }
+  });
+
+  it('refuses a fractional predicted reset and a non-finite burn rate at encode time', () => {
+    // encode() validates BEFORE serializing, so a sender whose value is looser than the schema
+    // throws here rather than shipping a frame the peer will drop. Both shapes are the ones a
+    // careless producer actually reaches: a rate is fractional by nature and a reset is not.
+    const frame = (payload: PayloadOf<'usage.snapshot'>) =>
+      stamp({ daemonId: 'daemon-1', type: 'usage.snapshot', payload });
+    expect(() =>
+      encode(frame({ accounts: [{ ...account, predictedResetAt: 1.5 }] } as never)),
+    ).toThrow();
+    expect(() =>
+      encode(frame({ accounts: [account], burnUnitsPerDay: Infinity } as never)),
+    ).toThrow();
+    expect(() => encode(frame({ accounts: [account], burnUnitsPerDay: -1 } as never))).toThrow();
   });
 });

@@ -5,9 +5,12 @@
 Each **user** runs a **daemon** on their own machine. The daemon owns that user's 3–5
 Claude accounts: their encrypted credentials, the switch engine, usage polling, live
 sessions, and a loopback hook receiver. A single **control-plane bot** (one shared
-Discord app) is the phone-facing surface. The bot holds **no credentials and no
-session content** — it stores only which Discord user is bound to which daemon, plus a
-hash of each daemon's token, and it routes messages strictly by Discord user id.
+Discord app) is the phone-facing surface. The bot holds **no credentials** and
+**persists no session content** — it stores only which Discord user is bound to which
+daemon, plus a hash of each daemon's token, and it routes messages strictly by Discord
+user id. It does, in transit, see the content it must render into your phone cards
+(commands, tool output, prompts, session text); only your Anthropic tokens are
+structurally kept from it. See the trust model below and `docs/SELF_HOST.md`.
 
 Daemons connect **outbound** to the bot over a WebSocket, so nothing listens on an
 inbound port and everything works behind NAT. Local Claude Code use never depends on
@@ -24,7 +27,7 @@ flowchart LR
   end
   subgraph User machine [User's PC · daemon]
     G[control-plane client]
-    SE[switch-engine · vault/DPAPI]
+    SE[switch-engine · encrypted vault]
     UP[usage poller]
     UA[usage-advisor]
     SM[session manager]
@@ -47,15 +50,15 @@ flowchart LR
 Dependencies point **one way**, and the bot sits at the top of that order so it
 _cannot_ reach credential code:
 
-| Package             | Depends on                                                     | Role                                                           |
-| ------------------- | -------------------------------------------------------------- | -------------------------------------------------------------- |
-| `shared-protocol`   | —                                                              | zod-validated wire envelope + message union + codec.           |
-| `switch-engine`     | —                                                              | account vault (DPAPI), OAuth refresh, atomic switch, recovery. |
-| `usage-advisor`     | —                                                              | pure burn-down optimizer: which account to use now.            |
-| `session-runtime`   | Agent SDK                                                      | managed + observed Claude sessions behind one interface.       |
-| `daemon`            | shared-protocol, switch-engine, usage-advisor, session-runtime | wires it all together; owns state.                             |
-| `control-plane-bot` | **shared-protocol only**                                       | Discord bot + WS relay; zero credentials.                      |
-| `cli` (`cctl`)      | shared-protocol, switch-engine, daemon                         | local command-line control.                                    |
+| Package             | Depends on                                                     | Role                                                             |
+| ------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `shared-protocol`   | —                                                              | zod-validated wire envelope + message union + codec.             |
+| `switch-engine`     | —                                                              | encrypted account vault, OAuth refresh, atomic switch, recovery. |
+| `usage-advisor`     | —                                                              | pure burn-down optimizer: which account to use now.              |
+| `session-runtime`   | Agent SDK                                                      | managed + observed Claude sessions behind one interface.         |
+| `daemon`            | shared-protocol, switch-engine, usage-advisor, session-runtime | wires it all together; owns state.                               |
+| `control-plane-bot` | **shared-protocol only**                                       | Discord bot + WS relay; zero credentials.                        |
+| `cli` (`cctl`)      | shared-protocol, switch-engine, daemon                         | local command-line control.                                      |
 
 The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 "the bot holds zero credentials" a structural fact rather than a promise.
@@ -63,11 +66,17 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 ## Trust model
 
 - **Credentials never leave the user's machine.** Access/refresh tokens live only in
-  the DPAPI-encrypted vault (`%LOCALAPPDATA%\claude-control\vault`) and, transiently,
-  in the live files the CLI reads. They never enter a protocol message, the bot, or
-  Discord.
-- **What may cross the wire:** usage percentages, the burn-down plan, session
-  summaries, permission prompts/decisions, and control commands — never a token.
+  the encrypted vault (Windows: DPAPI at `%LOCALAPPDATA%\claude-control\vault`;
+  Linux: file-key at `~/.local/share/claude-control/vault` — see `docs/PLATFORM.md`)
+  and, transiently, in the live files the CLI reads. They never enter a protocol
+  message, the bot, or Discord.
+- **What may cross the wire (and is visible to the bot operator):**
+  usage percentages, the burn-down plan, session output and summaries, the prompts you
+  send, control commands, and permission prompts/decisions — the last of which carry the
+  literal tool input, so a shell command's text, a file path, and the contents of a
+  Write/Edit all transit in cleartext. **Never an OAuth token.** On the shared default relay
+  that operator is us; self-host (`docs/SELF_HOST.md`) to keep that content on
+  infrastructure you control.
 - **ACL is enforced twice.** The bot routes every interaction by
   `interaction.user.id`; the daemon re-validates on ingress. A user literally cannot
   name another user's daemon, and the bot can only resolve request ids the daemon
@@ -94,6 +103,16 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 - **Attribution.** Transcripts carry no account identity, so the switch engine's
   append-only audit trail (`switch-audit.jsonl`) records when each account was live;
   the daemon joins it against transcript timestamps.
+- **Token stats.** Claude Code writes a per-turn `usage` block into its own transcripts.
+  `transcriptTokens` streams those files (de-duplicated by `message.id`, since one API
+  response spans several lines and a resumed session copies its history) and
+  `tokenStats` attributes each turn through the intervals above — the absolute counts
+  behind `cctl stats` and `/stats`. Local reads only; the bot receives sums, never text.
+  Everything the machine did outside Claude Code on this host is invisible, and every
+  surface says so. The daemon pushes a 7-day snapshot on a slow cadence, which is what a
+  bare `/stats` renders; `/stats days:N` is the one command that round-trips
+  (`stats.request` → `stats.result`) because a window nobody has scanned yet cannot be
+  answered from a cache. One scan runs at a time — the disk is the shared resource.
 - **Sessions.** Phone-started work runs as an Agent-SDK **managed** session (clean
   structured streaming to Discord); a user's own terminal is a **observed** ConPTY
   session (notify/approve/inject only). Switching mid-session interrupts, activates,
@@ -103,5 +122,7 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 
 The daemon persists to `node:sqlite` (`daemon.db`): the attribution journal, usage
 snapshots, pending permissions, the session registry, and a bounded outbox that buffers
-messages during a bot outage. The switch engine keeps its own file-based vault, intent,
-and audit trail so it works even when the daemon isn't running (e.g. from `cctl`).
+messages during a bot outage. Both growing tables are bounded — the outbox by row count,
+usage snapshots by a 90-day cutoff trimmed on each poll cycle. The switch engine keeps its
+own file-based vault, intent, and audit trail so it works even when the daemon isn't
+running (e.g. from `cctl`).

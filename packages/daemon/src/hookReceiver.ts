@@ -1,6 +1,6 @@
 // Loopback HTTP server that receives Claude Code CLI hook events (PermissionRequest, Stop,
-// Notification, PostToolUse, UserPromptSubmit) and turns them into protocol envelopes for the
-// control-plane client to send.
+// Notification, PostToolUse, UserPromptSubmit, StopFailure) and turns them into protocol
+// envelopes for the control-plane client to send.
 //
 // SECURITY CONTRACT: the bot deliberately does not
 // correlate `permission.response` messages against anything — it just relays what the phone
@@ -18,9 +18,10 @@
 // requestId's real job is correlating OUR pending-permission row with the phone's response,
 // not echoing anything the CLI knows about.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { EnvelopeDraft, PayloadOf } from '@claude-control/shared-protocol';
+import { classifyStopFailureType } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import type { Store } from './store.js';
 
@@ -42,6 +43,11 @@ export interface HookEventNames {
    *  channel for queued operator steering, alongside Stop. Unlike Stop it does not wait for a
    *  turn to finish: it is the session's next opportunity to hear queued guidance while idle. */
   userPromptSubmit: string;
+  /** Fires INSTEAD of Stop when a turn dies of an API error (after the CLI's own internal
+   *  retries gave up), carrying the CLI's `error_type`/`error_text` classification. Its
+   *  output is ignored by the CLI — detection-only, so the receiver's whole job here is the
+   *  operator card (see handleStopFailure). */
+  stopFailure: string;
 }
 
 export const DEFAULT_HOOK_EVENT_NAMES: HookEventNames = {
@@ -50,6 +56,7 @@ export const DEFAULT_HOOK_EVENT_NAMES: HookEventNames = {
   notification: 'Notification',
   postToolUse: 'PostToolUse',
   userPromptSubmit: 'UserPromptSubmit',
+  stopFailure: 'StopFailure',
 };
 
 export interface HookReceiverOptions {
@@ -88,6 +95,12 @@ export interface HookReceiverOptions {
    *  applies (OUTPUT_BODY_FULL_MAX) so a runaway command cannot push megabytes. Default OFF;
    *  CCTL_TOOL_OUTPUT_FULL enables. */
   fullToolOutput?: boolean;
+  /** Push a warn card when a NON-managed session's turn dies of an API error (StopFailure
+   *  hook). Default ON — the failure happens in a terminal nobody is watching (that's why
+   *  cctl is installed), and one cooldown-limited card is the only recovery channel a
+   *  hand-started session has. CCTL_AUTO_CONTINUE=0 turns it off along with the managed
+   *  sessions' retry loop (one umbrella switch: both are "survive API errors" behavior). */
+  apiErrorCards?: boolean;
   /** Answers "does this hook session_id belong to a session this daemon manages?" A managed
    *  session already reaches the phone through session.status/session.output (live card,
    *  milestone lines, summary card) and decides permissions through the SDK's canUseTool
@@ -221,6 +234,11 @@ export const DEFAULT_PERMISSION_HOLD_MS = 570_000;
  *  chosen answers are injected into the tool's `updatedInput` — see the AskUserQuestion branch in
  *  {@link HookReceiver.handlePermissionRequest} and {@link HookReceiver.resolveQuestion}. */
 const ASK_USER_QUESTION_TOOL = 'AskUserQuestion';
+
+/** One StopFailure card per session per this window: the CLI only fires StopFailure after
+ *  its OWN retries gave up, so repeats inside the window mean the same outage is still on —
+ *  the operator already has the card that matters. */
+const API_ERROR_CARD_COOLDOWN_MS = 5 * 60_000;
 
 /** How long after a remote allow the matching PostToolUse is still forwarded as an output
  *  card. PostToolUse fires only when the tool FINISHES, so the window must outlast a slow
@@ -407,6 +425,11 @@ export class HookReceiver {
   private readonly forwardNotificationCards: boolean;
   private readonly commandOutputCards: boolean;
   private readonly fullToolOutput: boolean;
+  private readonly apiErrorCards: boolean;
+  /** Last StopFailure card time per session — the cooldown that keeps a session flapping
+   *  against a hard outage from turning the phone into a pager. Pruned opportunistically on
+   *  insert, so it stays bounded by the number of RECENTLY-failing sessions. */
+  private readonly apiErrorCardLastAt = new Map<string, number>();
   private readonly isManagedSession: (sessionId: string) => boolean;
   private server: Server | undefined;
   /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
@@ -490,6 +513,7 @@ export class HookReceiver {
     this.forwardNotificationCards = options.forwardNotificationCards ?? false;
     this.commandOutputCards = options.commandOutputCards ?? true;
     this.fullToolOutput = options.fullToolOutput ?? false;
+    this.apiErrorCards = options.apiErrorCards ?? true;
     this.isManagedSession = options.isManagedSession ?? (() => false);
   }
 
@@ -821,7 +845,7 @@ export class HookReceiver {
 
     const presented = req.headers[this.secretHeader.toLowerCase()];
     const presentedSecret = Array.isArray(presented) ? presented[0] : presented;
-    if (presentedSecret !== this.secret) {
+    if (!secretsMatch(presentedSecret, this.secret)) {
       // A stale secret in settings.json (or a stranger on loopback) — never log the value.
       this.logger.warn({ path: req.url }, 'hook POST rejected: bad or missing secret header');
       this.respond(res, 401, { ok: false, error: 'invalid secret' });
@@ -1021,6 +1045,10 @@ export class HookReceiver {
     }
     if (event === this.eventNames.userPromptSubmit) {
       this.handleUserPromptSubmit(body, res, event);
+      return;
+    }
+    if (event === this.eventNames.stopFailure) {
+      this.handleStopFailure(body, res);
       return;
     }
     // Whatever event name the CLI fires that we don't handle shows up here by name, so a
@@ -1431,6 +1459,80 @@ export class HookReceiver {
   }
 
   /**
+   * StopFailure fires INSTEAD of Stop when a turn dies of an API error, and only after the
+   * CLI's own internal retries gave up. Its output is ignored by the CLI (detection-only,
+   * per the hook contract), so the receiver's whole job is the operator card — which is
+   * exactly what an interactive terminal session needs: the death happened in a window
+   * nobody was watching (that's why cctl is installed), and the recovery (typing
+   * `continue`) is a human act there. Managed sessions are suppressed: their failures
+   * surface through the session event stream, where auto-continue retries them for real —
+   * a card here would narrate a failure the daemon is already busy fixing.
+   */
+  private handleStopFailure(body: Record<string, unknown>, res: ServerResponse): void {
+    const sessionId = str(body.session_id) ?? str(body.sessionId);
+    if (sessionId !== undefined && this.isManagedSession(sessionId)) {
+      this.logger.info({ sessionId }, 'StopFailure from a managed session suppressed');
+      this.respond(res, 200, { ok: true });
+      return;
+    }
+    if (!this.apiErrorCards) {
+      this.logger.info(
+        { sessionId },
+        'StopFailure card suppressed (auto-continue off - CCTL_AUTO_CONTINUE enables)',
+      );
+      this.respond(res, 200, { ok: true });
+      return;
+    }
+    // One card per session per window — see API_ERROR_CARD_COOLDOWN_MS.
+    const cooldownKey = sessionId ?? '(unknown)';
+    const now = this.clock();
+    const lastAt = this.apiErrorCardLastAt.get(cooldownKey);
+    if (lastAt !== undefined && now - lastAt < API_ERROR_CARD_COOLDOWN_MS) {
+      this.logger.info({ sessionId }, 'StopFailure card suppressed by cooldown');
+      this.respond(res, 200, { ok: true });
+      return;
+    }
+    for (const [key, at] of this.apiErrorCardLastAt) {
+      if (now - at >= API_ERROR_CARD_COOLDOWN_MS) this.apiErrorCardLastAt.delete(key);
+    }
+    this.apiErrorCardLastAt.set(cooldownKey, now);
+
+    // Field names read tolerantly across BOTH observed shapes: the installed CLI sends
+    // `error` + `last_assistant_message` (live-observed), while the hook docs name them
+    // `error_type` + `error_text` — read the documented names first so a CLI that converges
+    // on its own docs keeps working, with the observed names as the operative fallbacks.
+    const errorType = str(body.error_type) ?? str(body.error) ?? str(body.errorType) ?? 'unknown';
+    const errorText =
+      str(body.error_text) ?? str(body.last_assistant_message) ?? str(body.errorText);
+    const cwd = str(body.cwd);
+    // The guidance mirrors the shared classifier's verdict: a transient death is recoverable
+    // by continuing; anything else (auth, billing, rate limit) needs the human to fix a cause.
+    const transient = classifyStopFailureType(errorType, errorText).transient;
+    const guidance = transient
+      ? 'Usually temporary - type "continue" in that terminal to pick up where it left off.'
+      : `Not retryable (${errorType}) - the session needs attention.`;
+    const detail = errorText !== undefined ? `${truncate(errorText, 300)}\n${guidance}` : guidance;
+    this.emit({
+      daemonId: this.daemonId(),
+      type: 'hook.notification',
+      payload: {
+        // Rides the tolerant `notification` variant with `notificationType` as the rich-card
+        // discriminator (the additive pattern `idle_prompt` set) — never a new `event` enum
+        // value, which an older bot's envelope parse would drop whole.
+        event: 'notification',
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(cwd !== undefined ? { cwd } : {}),
+        title: 'Session hit an API error',
+        body: detail,
+        level: 'warn',
+        notificationType: 'api_error',
+      },
+    });
+    this.logger.info({ sessionId, errorType, transient }, 'StopFailure card pushed');
+    this.respond(res, 200, { ok: true });
+  }
+
+  /**
    * The second delivery channel for queued operator steering (see {@link setSteeringSource}):
    * UserPromptSubmit fires the moment the user types locally, which can happen while the
    * session is sitting idle — Stop alone only delivers at the NEXT turn boundary, so a closed
@@ -1490,6 +1592,20 @@ export class HookReceiver {
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(JSON.stringify(body));
   }
+}
+
+/** Constant-time equality for the loopback auth secret. The receiver binds 127.0.0.1, but a
+ *  loopback socket is not scoped to the owning OS user, so any local principal can reach the
+ *  port; a plain `!==` short-circuits at the first differing byte and leaks a timing signal about
+ *  how many leading bytes matched. Both sides are hashed to a fixed 32-byte digest first so the
+ *  compare is length-independent (timingSafeEqual throws on unequal lengths) and reveals nothing
+ *  about the secret's length or content — matching the constant-time posture tokens.ts already
+ *  uses for daemon tokens. A missing header is a plain miss. */
+function secretsMatch(presented: string | undefined, expected: string): boolean {
+  if (presented === undefined) return false;
+  const a = createHash('sha256').update(presented).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
 }
 
 /** Read and JSON-parse a request body, bounded so a misbehaving/malicious sender can't exhaust
