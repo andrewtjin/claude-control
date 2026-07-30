@@ -131,7 +131,7 @@ describe('renderSetupSummary', () => {
     expect(out).toContain('[ok] accounts: work (active)');
     expect(out).toContain('[ok] hooks: installed in C:/home/.claude/settings.json');
     expect(out).toContain('[ok] daemon: running');
-    expect(out).toContain('[ok] discord: paired');
+    expect(out).toContain('[ok] pairing: paired');
     expect(out).toContain('relay: ws://127.0.0.1:8765');
   });
 
@@ -147,7 +147,7 @@ describe('renderSetupSummary', () => {
     expect(out).toContain('[--] accounts: none captured yet');
     expect(out).toContain('[--] hooks: not yet');
     expect(out).toContain('[--] daemon: no autostart registered');
-    expect(out).toContain('[--] discord: local-only');
+    expect(out).toContain('[--] pairing: local-only');
   });
 
   it('adds the first-poll note only on the success screen and only when paired', () => {
@@ -331,7 +331,7 @@ describe('runSetup', () => {
     expect(outcome).toBe('completed');
     expect(pairCalls).toBe(0);
     expect(text()).toContain('local-only');
-    expect(text()).toContain('[--] discord: local-only');
+    expect(text()).toContain('[--] pairing: local-only');
   });
 
   it('re-prompts with an actionable message on a pairing timeout, then succeeds', async () => {

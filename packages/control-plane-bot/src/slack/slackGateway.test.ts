@@ -717,7 +717,8 @@ describe('SlackGateway', () => {
       };
       expect(call.channel).toBe('D-U1');
       expect(call.text).toContain('Paired');
-      // Discord-flavored '**bold**' from the shared primer copy became Slack's single asterisk.
+      // The primer's source markdown ('**bold**', CommonMark-style) went through toMrkdwn and came
+      // out as Slack's single-asterisk bold.
       expect(call.text).not.toContain('**');
     });
 

@@ -1,20 +1,23 @@
-// The pairing primer text, owned here rather than by either chat surface.
+// The pairing primer text for both chat surfaces, owned here rather than by either one.
 //
-// WHY its own module: both surfaces send this same copy, and it must stay ONE copy — the moment
-// each surface owns its wording, the two drift and a user who moves between them is told two
-// different things about the same daemon. It sits outside discord/ and slack/ so that sharing it
-// never makes one surface import the other, which would drag a whole client library into a process
-// that may not use it. The command names are written the way Discord renders them; the Slack
-// surface passes the text through its mrkdwn converter and sends it unchanged, so its
-// `/cctl <subcommand>` grammar reads slightly differently there — an accepted cosmetic mismatch,
-// and the reason this text carries no surface-specific formatting of its own.
+// WHY its own module: sharing this location (not discord/ or slack/) means neither surface has to
+// import the other's client library just to reuse copy, and it keeps the two primers sitting side
+// by side where a reader immediately sees that one changed without the other.
 //
-// Sent once, right after a daemon successfully claims a pairing code. Lists every command that
-// actually reaches the daemon, grouped so a brand-new user can find the one they want rather
-// than reading a flat wall of sixteen. discord/discordJsGateway.ts's PRIMER_OMITTED_COMMANDS
-// records the ones deliberately absent and why. A hand-written list beside a separately-declared
-// command surface drifts the moment someone adds a command and forgets this file, so a unit test
-// holds the two to each other rather than trusting the next author to remember.
+// The two exports below are NOT the same string. Discord exposes each command as its own bare
+// slash command (`/usage`, `/run`, …); Slack funnels everything through one `/cctl <subcommand>`
+// dispatcher whose v1 set (see slack/slackCommands.ts's SUBCOMMANDS) is materially smaller —
+// there is no Slack `/timeline`, `/prune`, `/thread-here`, `/settings`, or `/approve`/`/deny` yet.
+// Printing Discord's command names on Slack would tell a new Slack user to run things that do not
+// exist there, which is worse than the two primers simply reading differently. Each is instead
+// hand-written for its own surface and pinned to ITS OWN real command list by a colocated drift
+// test — discordJsGateway.test.ts against commandDefinitions()/PRIMER_OMITTED_COMMANDS,
+// slackCommands.test.ts against SUBCOMMANDS/SLACK_PRIMER_OMITTED_SUBCOMMANDS — so neither can go
+// stale even though the two are no longer required to agree with each other.
+//
+// Sent once, right after a daemon successfully claims a pairing code. Each lists every command
+// that actually reaches the daemon on that surface, grouped so a brand-new user can find the one
+// they want rather than reading a flat wall of text.
 export const PAIRING_PRIMER_MESSAGE = [
   "Paired. Here's what works right now:",
   '',
@@ -37,6 +40,32 @@ export const PAIRING_PRIMER_MESSAGE = [
   '`/status` — daemon connection status',
   '`/settings` — effective settings and where each came from',
   '`/approve <request>` · `/deny <request>` — answer a pending permission request',
+  '',
+  'Permission prompts and questions arrive here as cards — tap the buttons, no command needed.',
+].join('\n');
+
+/** The Slack v1 primer. Every line names a real `/cctl <subcommand>` (see slack/slackCommands.ts's
+ *  SUBCOMMANDS) — no bare `/name` commands exist on this surface, so unlike the Discord primer
+ *  above every command reference here carries the `/cctl ` prefix. `pair` is omitted for the same
+ *  reason Discord omits it (see SLACK_PRIMER_OMITTED_SUBCOMMANDS); `run`'s optional `cwd:`/`resume:`
+ *  tokens are called out inline because Slack has no structured slash-command options to surface
+ *  them the way Discord's `/run` fields do. */
+export const SLACK_PAIRING_PRIMER_MESSAGE = [
+  "Paired. Here's what works right now:",
+  '',
+  '**Usage**',
+  '`/cctl usage` — usage across accounts',
+  '`/cctl stats` — token counts per account, model and day (add `days:30` for a longer window)',
+  '`/cctl accounts` — the accounts this daemon can switch between',
+  '',
+  '**Sessions**',
+  '`/cctl run <prompt>` — start a Claude Code session (`cwd:<path>` and `resume:<sessionId>` are optional, before the prompt)',
+  '`/cctl say <session> <text>` — send a message into a running session',
+  '`/cctl stop <session>` — stop a running session',
+  '`/cctl sessions` — every session this daemon has reported',
+  '',
+  '**Daemon**',
+  '`/cctl status` — daemon connection status',
   '',
   'Permission prompts and questions arrive here as cards — tap the buttons, no command needed.',
 ].join('\n');
