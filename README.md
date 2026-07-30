@@ -8,11 +8,12 @@ soonest, hops accounts the moment the active one runs low, and keeps your phone
 link alive across the hop.
 
 Each person runs a **local daemon** on their own machine that manages 3–5 of their
-own accounts. A single **shared Discord bot** acts as a credential-free control
-plane: it holds no tokens and routes every interaction strictly by Discord user. Your
-credentials never leave your machine. The bot does relay the session content your phone
-cards are built from — commands, tool output, and the prompts you send — so if you'd
-rather no shared operator see that, self-host it (see `docs/SELF_HOST.md`).
+own accounts. A single **shared control-plane bot** — reachable from Discord and Slack
+alike — acts as a credential-free control plane: it holds no tokens and routes every
+interaction strictly by your chat account. Your credentials never leave your machine. The
+bot does relay the session content your phone cards are built from — commands, tool output,
+and the prompts you send — so if you'd rather no shared operator see that, self-host it (see
+`docs/SELF_HOST.md`).
 
 ## Quick start
 
@@ -21,6 +22,9 @@ rather no shared operator see that, self-host it (see `docs/SELF_HOST.md`).
 First, [add the cctl bot to your Discord server](https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands) or [add it to just your account](https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands)
 and DM it. Either way is where `/pair` runs and where approvals, questions, and usage
 cards reach you.
+
+Prefer Slack? Create your own app from [`deploy/slack-app-manifest.yml`](./deploy/slack-app-manifest.yml)
+and see `docs/SETUP.md` for the pairing walkthrough.
 
 - For non-bot setups, see [Local-only](#local-only-no-discord) below.
 

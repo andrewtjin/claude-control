@@ -1,10 +1,10 @@
 # Self-hosting the control-plane bot
 
 The shared bot is one deploy of the same thing you can run yourself: `docker compose
-up` from `deploy/` is the whole story, on your own VPS with your own Discord app. The
-bot is credential-free by construction (it can only import `shared-protocol` — see
-`docs/ARCHITECTURE.md`), so self-hosting changes nothing about the trust model, only
-who operates the box.
+up` from `deploy/` is the whole story, on your own VPS with your own Discord app, Slack
+app, or both. The bot is credential-free by construction (it can only import
+`shared-protocol` — see `docs/ARCHITECTURE.md`), so self-hosting changes nothing about the
+trust model, only who operates the box.
 
 ## What you need
 
@@ -13,8 +13,16 @@ who operates the box.
 - A hostname that already resolves to that IP. Caddy requests a Let's Encrypt
   certificate for it automatically — a bare IP cannot get one, so a real hostname is
   required, not optional.
-- A Discord application + bot token (Discord Developer Portal → New Application →
-  Bot → Reset Token).
+- At least one chat surface, configured with its token(s):
+  - **Discord** — an application + bot token (Discord Developer Portal → New Application →
+    Bot → Reset Token).
+  - **Slack** — an app created from `deploy/slack-app-manifest.yml` (`api.slack.com/apps` →
+    **Create New App** → **From an app manifest**) and installed to a workspace, giving you
+    a bot token (`SLACK_BOT_TOKEN`, `xoxb-…`) and an app-level token (`SLACK_APP_TOKEN`,
+    `xapp-…`, generated with the `connections:write` scope). Both are required together —
+    one without the other fails the bot at startup, naming the half that's missing.
+  - Both surfaces may run at once on the same bot process, routed by which chat platform a
+    session's paired user came from.
 - Docker + the Compose plugin on the VPS.
 
 ## Deploy
@@ -22,16 +30,22 @@ who operates the box.
 ```bash
 git clone <this repo> && cd claude-control/deploy
 cp .env.example .env
-# edit .env: DISCORD_BOT_TOKEN=..., RELAY_HOSTNAME=relay.yourdomain.example
+# edit .env: DISCORD_BOT_TOKEN=... and/or SLACK_BOT_TOKEN=...+SLACK_APP_TOKEN=...,
+# RELAY_HOSTNAME=relay.yourdomain.example
 docker compose up -d
 ```
 
 Two services come up:
 
-- **`bot`** — the Discord gateway + WebSocket relay daemons connect to. Not
-  published directly; only reachable through `caddy`.
+- **`bot`** — the Discord gateway and/or Slack Socket Mode connection, plus the WebSocket
+  relay daemons connect to. Not published directly; only reachable through `caddy`.
 - **`caddy`** — reverse proxy on 80/443, terminating automatic TLS for
   `RELAY_HOSTNAME` and forwarding to `bot`.
+
+Slack's Socket Mode connection is outbound-only, the same direction as the daemon↔relay
+link itself: the bot opens it, Slack's edge answers, and nothing new needs to be published
+or routed through Caddy for it. Adding the Slack surface changes nothing about this
+deploy's topology — no new port, no new `caddy` route, no change to the Caddyfile.
 
 Optional: to get per-session **private threads** instead of DM delivery, set
 `CCTL_SESSION_CHANNEL_ID` in `.env` to the id of a text channel the bot can see (right-click
@@ -99,6 +113,15 @@ Routing is per **user**, not per server: session output arrives from your daemon
 relay socket and carries no guild, so the bot cannot infer "this belongs to server X". Adding
 the bot to a second server changes nothing on its own; name the channel you want.
 
+### Slack delivery
+
+None of the above applies to Slack: `CCTL_SESSION_CHANNEL_ID`, `CCTL_SESSION_CHANNELS`, and
+`/thread-here` are Discord-only, since they route to a channel and Slack's surface has no
+channel-routing concept. Every Slack session is delivered to the paired
+user's own DM, with its own thread inside that DM per session so concurrent sessions don't
+interleave — a reply typed into that thread reaches the session the same way a Discord thread
+reply does. There is no way to route Slack output to a channel instead.
+
 Point your own `cctl daemon run --relay wss://<RELAY_HOSTNAME>` at your hostname once
 it's up. For a self-host you want to keep, prefer `relayUrl` in `config.json` beside
 the vault — unlike a flag it survives autostart and reboots, and unlike a baked-in
@@ -112,13 +135,16 @@ See `docs/CLI.md`'s relay precedence for the full order.
 
 ## State and backup
 
-The bot persists three small JSON files, none of which holds a credential: `bindings.json`
-(which Discord user is bound to which daemon, plus a scrypt hash of each daemon's token),
-`session-threads.json` (which thread each session's output goes to, so a restart does not
-re-anchor a live session), and `session-channel-pins.json` (each user's own `/thread-here`
-choice). They live on the named Docker volume `bot-state`, not in the image, so a redeploy or
-`docker compose restart` never loses a pairing. Back it up by copying the volume; there
-is no database migration story to worry about.
+The bot persists a handful of small JSON files, none of which holds a credential:
+`bindings.json` (which user — Discord or Slack — is bound to which daemon, plus a scrypt hash
+of each daemon's token), `session-threads.json` (which Discord thread each session's output
+goes to, so a restart does not re-anchor a live session), `session-channel-pins.json` (each
+Discord user's own `/thread-here` choice), and, when the Slack surface is configured,
+`slack/session-threads.json` (the same per-session mapping for Slack's own DM threads, kept
+separately since a Slack thread is addressed differently than a Discord one). They live on the
+named Docker volume `bot-state`, not in the image, so a redeploy or `docker compose restart`
+never loses a pairing. Back it up by copying the volume; there is no database migration story
+to worry about.
 
 Caddy's own volumes (`caddy-data`, `caddy-config`) hold its ACME account and issued
 certificates — losing them just costs a re-issue on next start, not an outage.

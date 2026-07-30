@@ -13,9 +13,9 @@ cctl setup
 ```
 
 The guided wizard: environment doctor → capture your current account → optional
-add-more-accounts loop → usage hooks → relay → Discord pairing → autostart + start the
-daemon → round-trip verify. See `docs/SETUP.md` for the full step-by-step walkthrough,
-every prompt, and every unhappy path.
+add-more-accounts loop → usage hooks → relay → chat-surface pairing (Discord or Slack) →
+autostart + start the daemon → round-trip verify. See `docs/SETUP.md` for the full
+step-by-step walkthrough, every prompt, and every unhappy path.
 
 ## Accounts
 
@@ -99,7 +99,8 @@ attribution journal, and the control-plane connection to the bot.
 
 ```
 cctl daemon run                        # run in the foreground (Ctrl+C to stop)
-cctl daemon run --pair <code>          # adopt a new identity from a Discord /pair code
+cctl daemon run --pair <code>          # adopt a new identity from a one-time pairing code
+                                        # (Discord's /pair or Slack's /cctl pair)
 cctl daemon run --relay <url>          # override the control-plane WebSocket url
 cctl daemon run --auto-switch          # auto-switch when the active account runs low
 cctl daemon run --auto-switch --greedy # also hop toward whichever account's weekly
@@ -141,7 +142,8 @@ reads as "will restart at next logon", not just a bare timestamp.
 ```
 cctl session register       # opt the current session into daemon tracking + phone streaming
 cctl session label <name>   # name the current tracked session (shown in the phone list)
-cctl session watch [--off]  # stream the current session to Discord (--off to stop)
+cctl session watch [--off]  # stream the current session to your paired chat surface
+                             # (Discord or Slack) (--off to stop)
 cctl session unregister     # stop tracking (by the current session, --session <id>, or --label <name>)
 cctl session status         # show tracked sessions + active account (reads the daemon db offline)
 ```
@@ -155,7 +157,8 @@ self-contained Claude Code plugin that holds no secrets and only wraps the CLI.
 
 ```
 cctl pair              # prompts for the code interactively
-cctl pair <code>       # bind this machine to the Discord bot using a one-time /pair code
+cctl pair <code>       # bind this machine to the control-plane bot using a one-time
+                       # pairing code (Discord's /pair or Slack's /cctl pair)
 cctl pair <code> --relay <url>
 ```
 
@@ -163,6 +166,10 @@ Pairing codes are case-insensitive and tolerate stray whitespace/dashes (`AB-CD 
 `abcd12` pair identically). `cctl pair` only adopts and persists the daemon identity —
 start (or restart) the daemon afterward to actually connect (`cctl daemon install` or
 `cctl setup`).
+
+Setting up the bot side itself — Discord's `DISCORD_BOT_TOKEN`, Slack's `SLACK_BOT_TOKEN` +
+`SLACK_APP_TOKEN`, or self-hosting either — is `docs/SELF_HOST.md`'s job; this page covers
+only the CLI/daemon half of pairing.
 
 Failure is reason-specific, never a raw error:
 
