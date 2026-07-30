@@ -103,13 +103,16 @@ export class ChannelRegistry {
   ): { ok: true; attachment: ChannelAttachment } | { ok: false; reason: 'already_attached' } {
     const now = this.clock();
     const existingId = this.bySession.get(input.sessionId);
+    // Whatever the outgoing server never delivered is carried onto the newcomer's queue rather
+    // than dropped: the session is the same one, it is alive again, and the operator was told the
+    // text was sent. `take` re-applies the TTL, so anything genuinely stale still expires there.
+    let inherited: ChannelInjection[] = [];
     if (existingId !== undefined) {
       const existing = this.attachments.get(existingId);
       if (existing !== undefined && now - existing.lastPollAtMs < CHANNEL_ATTACH_STALE_MS) {
         return { ok: false, reason: 'already_attached' };
       }
-      // Reclaim: whatever the dead server never delivered moves to the newcomer's queue below.
-      this.detach(existingId);
+      inherited = this.detach(existingId);
     }
     const attachment: ChannelAttachment = {
       ...input,
@@ -119,7 +122,7 @@ export class ChannelRegistry {
     };
     this.attachments.set(attachment.attachId, attachment);
     this.bySession.set(input.sessionId, attachment.attachId);
-    this.queues.set(attachment.attachId, []);
+    this.queues.set(attachment.attachId, inherited);
     this.inFlight.set(attachment.attachId, new Map());
     return { ok: true, attachment };
   }
