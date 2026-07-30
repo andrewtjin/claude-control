@@ -2,12 +2,13 @@
 //
 // STRUCTURAL GUARANTEE ("the bot holds zero credentials"): this package imports only
 // '@claude-control/shared-protocol' plus its declared package.json dependencies (discord.js,
-// ws, pino, node:*). It never imports '@claude-control/switch-engine',
+// @slack/bolt, ws, pino, node:*). It never imports '@claude-control/switch-engine',
 // '@claude-control/session-runtime', or '@claude-control/daemon' — so it is physically
 // incapable of touching an OAuth token or a vault. Verify at any time with:
 //   grep -R "^import" packages/control-plane-bot/src | grep "@claude-control/"
-// and confirm the only workspace package named is shared-protocol. Do not add a workspace
-// dependency here without re-reading this comment first.
+// and confirm the only workspace package named is shared-protocol. This guarantee covers ANY
+// dependency this package declares, present or future — do not add one, workspace or external,
+// without re-reading this comment first.
 
 export { mintToken, hashToken, verifyToken } from './tokens.js';
 export { BindingStore, type Binding } from './bindings.js';

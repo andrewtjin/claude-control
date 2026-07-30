@@ -332,6 +332,45 @@ no headless test can check.
 
 **Result:** not yet run.
 
+### 15. Slack surface
+
+**Setup:** a dev Slack app created from `deploy/slack-app-manifest.yml` in a workspace you
+control — never the shared/production workspace — with `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN` set
+on a **local** bot process and a **local** daemon pointed at it, the same local-only posture
+gates 1–6 were run under rather than against the hosted relay.
+
+**Verify:**
+
+- **Pairing.** `/cctl pair` in the dev workspace mints a code; `cctl daemon run --pair <code>`
+  (or `cctl pair <code>`) claims it and the daemon shows as bound.
+- **Permission card round trip.** A permission prompt posts a Block Kit card in the paired
+  user's DM; both Approve and Deny round-trip — the tap resolves the request, and the card is
+  edited to drop its buttons rather than staying tappable after it's resolved.
+- **Question card round trip — single-select.** A single-select question's button or
+  `static_select` answer relays to the session immediately and the card updates to "Answered".
+- **Question card round trip — multi-select.** A `multi_static_select` question accumulates
+  selections across taps and relays only on the explicit Submit button, never on a bare
+  selection-change event.
+- **`/cctl run` streaming.** `/cctl run <prompt>` starts a session whose live status streams
+  into a DM thread, with milestone/summary/error lines following as their own messages in that
+  same thread.
+- **In-thread reply injection.** A reply typed directly into that DM thread reaches the running
+  session, the same effect as `/cctl say <sessionId> <text>`.
+- **`/cctl stop`/`status`/`usage`.** Each behaves the same as its Discord counterpart.
+- **Forced Socket Mode disconnect.** Kill the WebSocket (or drop network) under the bot process
+  and confirm the connection comes back on its own — capped exponential backoff with jitter,
+  not a bot-process restart — visible in the log lines this path emits (`slack: scheduling
+reconnect` → `slack: connecting` → `slack: connected`).
+- **Discord regression spot-check.** On the SAME dual-surface deploy (`DISCORD_BOT_TOKEN` set
+  alongside the Slack pair), re-run a couple of existing Discord gates (e.g. `/usage`, a
+  permission card) and confirm no regression from Slack being present.
+- **Existing Discord bindings survive.** A daemon already bound to Discord before Slack was
+  enabled on the same bot process reconnects and works with **zero re-pairing** once Slack is
+  added — Discord's bare ids and Slack's namespaced `slack:<teamId>:<userId>` principals share
+  `bindings.json` without collision or migration.
+
+**Result:** not yet run.
+
 ## Reminder
 
 The undocumented endpoints (2, 3) and hook names (5) can change without notice. Parsing
