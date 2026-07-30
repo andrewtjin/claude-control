@@ -66,6 +66,13 @@ export const BOT_INVITE_URL =
 export const BOT_USER_INSTALL_URL =
   'https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands';
 
+/** Invite link to the shared Slack workspace this bot lives in. The two Discord constants above
+ *  are self-service OAuth authorize URLs minted from a fixed client id; Slack has no equivalent —
+ *  the shared-workspace invite is operator-supplied, so this starts empty until one hands out a
+ *  real one. Copy that would print it (see setup.ts) must omit the line entirely while it is
+ *  empty, never show a blank or placeholder URL. */
+export const SLACK_WORKSPACE_INVITE_URL: string = '';
+
 // ---------------------------------------------------------------------------
 // Env parsing (shared with daemonRun.ts — the single source of truth)
 // ---------------------------------------------------------------------------

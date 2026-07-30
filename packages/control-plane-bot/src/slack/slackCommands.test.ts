@@ -8,7 +8,13 @@ import { DaemonStateCache } from '../discord/stateCache.js';
 import { PendingStatsScans } from '../discord/pendingStatsScans.js';
 import { noopLogger } from '../logger.js';
 import type { SlackContext } from './context.js';
-import { registerSlackCommands } from './slackCommands.js';
+import {
+  registerSlackCommands,
+  SUBCOMMANDS,
+  SLACK_PRIMER_OMITTED_SUBCOMMANDS,
+} from './slackCommands.js';
+import { toMrkdwn, SLACK_LIMITS } from './slackFormat.js';
+import { SLACK_PAIRING_PRIMER_MESSAGE } from '../primerMessage.js';
 
 // ---------------------------------------------------------------------------
 // Fakes. No real Bolt App, no real socket — `registerSlackCommands` only ever touches
@@ -408,17 +414,7 @@ describe('registerSlackCommands', () => {
     await getHandler()({ command: fakeSlashCommand('bogus'), ack: noopAck, respond });
     const text = at(0).text ?? '';
     expect(text).toContain('Unknown command');
-    for (const sub of [
-      'pair',
-      'status',
-      'usage',
-      'accounts',
-      'sessions',
-      'run',
-      'say',
-      'stop',
-      'stats',
-    ]) {
+    for (const sub of SUBCOMMANDS) {
       expect(text).toContain(sub);
     }
   });
@@ -556,5 +552,54 @@ describe('registerSlackCommands', () => {
       expect(settle).not.toThrow();
       expect(settle()).toBe(false);
     });
+  });
+});
+
+/** The post-pairing primer is the first thing a freshly paired Slack user reads, and — like its
+ *  Discord counterpart (see discordJsGateway.test.ts's own 'pairing primer' block) — it is a
+ *  hand-written list of a surface declared somewhere else: the shape that goes stale without
+ *  anyone noticing, because nothing fails when it does. These tests are what fails: they tie
+ *  SLACK_PAIRING_PRIMER_MESSAGE to SUBCOMMANDS in both directions, so neither adding nor removing
+ *  a `/cctl` subcommand can leave it wrong. Pure data throughout — no Bolt app or Slack connection
+ *  is involved. */
+describe('Slack pairing primer', () => {
+  /** Subcommand names the primer mentions. Every Slack command is `/cctl <subcommand>` (there are
+   *  no bare `/name` commands on this surface), so the match anchors on the literal `/cctl ` prefix
+   *  rather than a leading slash alone — which would also catch the unrelated `` `days:30` ``
+   *  example span in the stats line. */
+  const mentioned = new Set(
+    [...SLACK_PAIRING_PRIMER_MESSAGE.matchAll(/`\/cctl ([a-z-]+)/g)]
+      .map((m) => m[1])
+      .filter((name): name is string => name !== undefined),
+  );
+  const registered = new Set<string>(SUBCOMMANDS);
+
+  it('mentions no subcommand that is not registered', () => {
+    expect([...mentioned].filter((name) => !registered.has(name))).toEqual([]);
+  });
+
+  it('mentions every registered subcommand except the documented omissions', () => {
+    const unmentioned = [...registered].filter(
+      (name) => !mentioned.has(name) && !SLACK_PRIMER_OMITTED_SUBCOMMANDS.has(name),
+    );
+    expect(unmentioned).toEqual([]);
+  });
+
+  it('omits only subcommands that still exist', () => {
+    // The reverse drift: retiring a subcommand must retire its omission entry too, or the set
+    // quietly excuses a name nothing would have mentioned anyway.
+    expect([...SLACK_PRIMER_OMITTED_SUBCOMMANDS].filter((name) => !registered.has(name))).toEqual(
+      [],
+    );
+  });
+
+  it('fits in one Slack message chunk', () => {
+    // sendPrimer (slackGateway.ts) chunks via slackChunks(toMrkdwn(...)) at
+    // SLACK_LIMITS.SECTION_TEXT_MAX; staying under that budget means a brand-new user gets the
+    // primer as ONE message rather than a chunked sequence contending with their first session
+    // thread for the same paced channel.
+    expect(toMrkdwn(SLACK_PAIRING_PRIMER_MESSAGE).length).toBeLessThanOrEqual(
+      SLACK_LIMITS.SECTION_TEXT_MAX,
+    );
   });
 });

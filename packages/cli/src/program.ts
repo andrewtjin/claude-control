@@ -110,8 +110,9 @@ import {
 
 // The default `cctl stats` window is DEFAULT_STATS_DAYS from the wire contract rather than a copy
 // declared here. A week is the span the weekly limits themselves run on, so it is the window a
-// "did I overspend?" reading is actually asked in — and the terminal, the daemon's pushed snapshot
-// and Discord's `/stats` are only comparable for as long as all three mean the same week.
+// "did I overspend?" reading is actually asked in — and the terminal, the daemon's pushed snapshot,
+// and every chat surface's own `/stats` are only comparable for as long as all of them mean the
+// same week.
 
 /** Build the full `cctl` program. Exported so tests can introspect the command tree. */
 export function buildProgram(): Command {
@@ -293,7 +294,7 @@ export function buildProgram(): Command {
 
   program
     .command('setup')
-    .description('guided first-run setup: accounts, hooks, relay, Discord pairing, autostart')
+    .description('guided first-run setup: accounts, hooks, relay, chat-surface pairing, autostart')
     .option('--reconfigure', 're-run every step even when setup already looks complete')
     .option(
       '--relay <url>',
@@ -320,13 +321,16 @@ export function buildProgram(): Command {
     });
 
   // The daemon: the one long-running local process (usage poller, hook receiver, attribution
-  // journal, control-plane connection). `--pair` is the first-run on-ramp: run /pair in
-  // Discord for a code, then `cctl daemon run --pair <code>`.
+  // journal, control-plane connection). `--pair` is the first-run on-ramp: run /pair on Discord
+  // or /cctl pair on Slack for a code, then `cctl daemon run --pair <code>`.
   const daemon = program.command('daemon').description('the background daemon');
   daemon
     .command('run')
     .description('run the daemon in the foreground (Ctrl+C to stop)')
-    .option('--pair <code>', 'pairing code from Discord /pair (adopts a new identity)')
+    .option(
+      '--pair <code>',
+      'pairing code from /pair (Discord) or /cctl pair (Slack) (adopts a new identity)',
+    )
     .option(
       '--relay <url>',
       // Derived from the constant, never restated, so help text cannot drift from behavior.
@@ -359,7 +363,10 @@ export function buildProgram(): Command {
     .description(
       'run the daemon and restart it automatically if it crashes (a clean exit ends supervision)',
     )
-    .option('--pair <code>', 'pairing code from Discord /pair (adopts a new identity)')
+    .option(
+      '--pair <code>',
+      'pairing code from /pair (Discord) or /cctl pair (Slack) (adopts a new identity)',
+    )
     .option(
       '--relay <url>',
       'control-plane WebSocket url (default CCTL_RELAY_URL or ws://127.0.0.1:8765)',
@@ -508,13 +515,17 @@ export function buildProgram(): Command {
       );
     });
 
-  // Bind this machine to the bot with a one-time `/pair` code. Adopts (and persists) the
+  // Bind this machine to the bot with a one-time pairing code. Adopts (and persists) the
   // daemon identity now; the daemon reconnects with it on its next start. The wizard runs this
-  // same flow as step 6 — this standalone command is for re-pairing later.
+  // same flow as step 6 — this standalone command is for re-pairing later. The code itself is
+  // surface-agnostic: it means the same thing whether it came from Discord's /pair or Slack's
+  // /cctl pair.
   program
     .command('pair')
-    .description('bind this machine to the Discord bot using a /pair code')
-    .argument('[code]', 'the one-time code from Discord /pair (prompted if omitted)')
+    .description(
+      'bind this machine using a one-time code from /pair (Discord) or /cctl pair (Slack)',
+    )
+    .argument('[code]', 'the one-time pairing code (prompted if omitted)')
     .option('--relay <url>', 'relay WebSocket url to pair against')
     .action(async (codeArg: string | undefined, opts: { relay?: string }) => {
       const relayUrl = resolveRelayUrl(opts.relay);
@@ -525,7 +536,7 @@ export function buildProgram(): Command {
         }
         const { io, close } = createWizardIo();
         try {
-          raw = await io.ask('Pairing code from Discord /pair: ');
+          raw = await io.ask('Pairing code from /pair (Discord) or /cctl pair (Slack): ');
         } finally {
           close();
         }
@@ -556,7 +567,7 @@ export function buildProgram(): Command {
   program
     .command('run')
     .description(
-      '(needs the running daemon + hosted bot) start a remote session (drive it from Discord)',
+      '(needs the running daemon + hosted bot) start a remote session (drive it from Discord or Slack)',
     )
     .allowUnknownOption(true)
     .action(() =>
@@ -1032,7 +1043,7 @@ function buildSessionCommands(program: Command): void {
 
   session
     .command('watch')
-    .description('stream this session to Discord (use --off to stop streaming it)')
+    .description('stream this session to your paired chat surface (use --off to stop streaming it)')
     .option(sessionIdOption, sessionIdOrLabelHelp)
     .option('--off', 'turn per-session streaming OFF (default is on)')
     .action(async (opts: { session?: string; off?: boolean }) => {

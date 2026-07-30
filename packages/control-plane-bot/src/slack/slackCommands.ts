@@ -21,8 +21,11 @@ import { buildStatsEmbed } from '../discord/embeds.js';
 
 /** Every subcommand `/cctl` accepts. Kept as one list so the help text (unknown/empty subcommand)
  *  and the dispatch switch below can never silently drift apart — a subcommand added to one without
- *  the other is exactly the kind of mismatch this module exists to prevent. */
-const SUBCOMMANDS = [
+ *  the other is exactly the kind of mismatch this module exists to prevent. Exported so the
+ *  pairing-primer drift test (slackCommands.test.ts) can hold primerMessage.ts's
+ *  SLACK_PAIRING_PRIMER_MESSAGE to the SAME real dispatch set, the way discordJsGateway.ts's
+ *  commandDefinitions() does for the Discord primer. */
+export const SUBCOMMANDS = [
   'pair',
   'status',
   'usage',
@@ -33,6 +36,14 @@ const SUBCOMMANDS = [
   'stop',
   'stats',
 ] as const;
+
+/** Subcommands deliberately left out of SLACK_PAIRING_PRIMER_MESSAGE, each for a reason that
+ *  outlives the current subcommand list — mirrors discordJsGateway.ts's PRIMER_OMITTED_COMMANDS.
+ *  `pair` is the subcommand the reader just finished using: the primer is sent right after a
+ *  pairing code is claimed, so telling them how to pair again is not what a brand-new user needs
+ *  first. Read by the drift test that keeps the primer and SUBCOMMANDS in step, so dropping a
+ *  name from here is what makes that subcommand required in the primer text. */
+export const SLACK_PRIMER_OMITTED_SUBCOMMANDS = new Set(['pair']);
 
 /** How long a `/cctl stats days:N` reply waits for the host's scan before saying so. Mirrors the
  *  Discord surface's own bound (discordJsGateway.ts's `STATS_SCAN_TIMEOUT_MS`) — the daemon-side

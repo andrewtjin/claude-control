@@ -36,7 +36,7 @@ import { parseSlackPrincipal, slackPrincipal } from '../principal.js';
 import { renderPush } from '../discord/pushRender.js';
 import { DaemonStateCache } from '../discord/stateCache.js';
 import { PendingStatsScans } from '../discord/pendingStatsScans.js';
-import { PAIRING_PRIMER_MESSAGE } from '../primerMessage.js';
+import { SLACK_PAIRING_PRIMER_MESSAGE } from '../primerMessage.js';
 import type {
   PacedChannelSend,
   SlackContext,
@@ -355,10 +355,9 @@ export class SlackGateway {
     }
   }
 
-  /** DM the working-commands primer to a freshly paired Slack user. The primer's copy lists bare
-   *  slash commands (`/run`, `/say`, …) written for Discord's flat command namespace; on Slack
-   *  every one of those actually reads as a `/cctl` subcommand. Sent as-is rather than forked —
-   *  see the class doc / this module's caller-facing concerns for why. */
+  /** DM the working-commands primer to a freshly paired Slack user. Sends the Slack-native primer
+   *  (see primerMessage.ts) — every line names a real `/cctl <subcommand>`, not Discord's bare
+   *  command names, since Slack's v1 command set is both smaller and shaped differently. */
   async sendPrimer(principalId: string): Promise<void> {
     const parts = parseSlackPrincipal(principalId);
     if (!parts || !this.ctx || parts.teamId !== this.ctx.teamId) {
@@ -373,7 +372,7 @@ export class SlackGateway {
       // Paced like every other send into this channel: pairing typically lands right alongside the
       // user's first session thread, so the primer and that thread's first messages contend for
       // the same per-channel budget.
-      for (const chunk of slackChunks(toMrkdwn(PAIRING_PRIMER_MESSAGE))) {
+      for (const chunk of slackChunks(toMrkdwn(SLACK_PAIRING_PRIMER_MESSAGE))) {
         await this.sendPaced(channel, () => ctx.web.chat.postMessage({ channel, text: chunk }));
       }
     } catch (err) {

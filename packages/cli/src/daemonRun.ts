@@ -3,7 +3,9 @@
 // Every subsystem here is a tested library (see packages/daemon); this file only assembles
 // them over the real paths and real network config, mirroring daemon.test.ts's wiring with
 // production collaborators instead of fakes. Config comes from flags first, env second:
-//   --pair <code>    first-run pairing code from Discord's /pair (re-pairs if already paired)
+//   --pair <code>    first-run pairing code from /pair on Discord or /cctl pair on Slack
+//                    (re-pairs if already paired) — the daemon side of pairing doesn't care
+//                    which surface issued the code, only that it's valid
 //   --relay <url>    control-plane WebSocket url (or CCTL_RELAY_URL; default local bot)
 //
 // SECURITY: the daemon's control-plane identity (daemonId + daemonToken) is a bearer

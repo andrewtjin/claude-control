@@ -12,7 +12,7 @@
 import type { StoredAccount } from '@claude-control/switch-engine';
 import { renderDoctor, summarize, type DoctorCheck, type RelayProbe } from './doctor.js';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
-import { BOT_INVITE_URL, BOT_USER_INSTALL_URL } from './settings.js';
+import { BOT_INVITE_URL, BOT_USER_INSTALL_URL, SLACK_WORKSPACE_INVITE_URL } from './settings.js';
 
 // ---------------------------------------------------------------------------
 // The wizard's IO surface
@@ -238,9 +238,11 @@ export function renderSetupSummary(
       ? warn('daemon: not running yet — starts at logon (or: cctl daemon install)')
       : warn('daemon: no autostart registered — run: cctl daemon install');
 
+  // Surface-neutral label: the daemon pairs with a chat surface, and which one (Discord, Slack)
+  // is a choice made in step 6 below, not something this summary line should assume.
   const pairingLine = s.paired
-    ? ok('discord: paired')
-    : warn('discord: local-only (not paired) — pair later: cctl setup --reconfigure');
+    ? ok('pairing: paired')
+    : warn('pairing: local-only (not paired) — pair later: cctl setup --reconfigure');
 
   const lines = [
     accountsLine,
@@ -306,7 +308,7 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
     return 'already-set-up';
   }
 
-  io.write(`${p.bold('cctl setup')} — one-time setup for control from Discord.\n`);
+  io.write(`${p.bold('cctl setup')} — one-time setup for control from Discord or Slack.\n`);
   io.write('Every step is safe to re-run; you can stop with Ctrl+C and resume later.\n');
 
   // ---- [1/7] environment ----
@@ -387,7 +389,7 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
   );
 
   // ---- [6/7] pairing ----
-  step(6, 'Pair with Discord');
+  step(6, 'Pair with Discord or Slack');
   let paired = await deps.isPaired();
   if (paired) {
     io.write(
@@ -395,13 +397,19 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
     );
   } else {
     io.write(
-      'In your Discord server (or a DM with the bot), run `/pair` to get a one-time code.\n',
+      'Discord: in your server (or a DM with the bot), run `/pair` to get a one-time code.\n',
     );
-    io.write(`No server with the bot yet? Add it first: ${BOT_INVITE_URL}\n`);
+    io.write(`  No server with the bot yet? Add it first: ${BOT_INVITE_URL}\n`);
     io.write(
-      `Or add it to just your account (no server needed) and DM it: ${BOT_USER_INSTALL_URL}\n`,
+      `  Or add it to just your account (no server needed) and DM it: ${BOT_USER_INSTALL_URL}\n`,
     );
-    io.write(`Enter it below, or type ${p.bold('s')} to skip and set up local-only.\n`);
+    io.write('Slack: in the shared workspace, run `/cctl pair` to get a one-time code.\n');
+    // No placeholder URL when the operator hasn't set one — an unset invite means "ask however
+    // you already got into the workspace," not a broken link.
+    if (SLACK_WORKSPACE_INVITE_URL) {
+      io.write(`  Not in the workspace yet? Join: ${SLACK_WORKSPACE_INVITE_URL}\n`);
+    }
+    io.write(`Enter the code below, or type ${p.bold('s')} to skip and set up local-only.\n`);
     for (;;) {
       const raw = await io.ask('Pairing code (or `s` to skip): ');
       if (isSkip(raw)) {
