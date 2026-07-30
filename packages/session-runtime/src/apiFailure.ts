@@ -20,9 +20,24 @@ export interface ApiFailureClassification {
   transient: boolean;
   /** Present only when `transient` — which recognizer matched. */
   kind?: TransientFailureKind;
+  /** True when the failure is the account's own usage/rate limit — never transient (waiting
+   *  doesn't help within the window), but also not dead: a different account fixes it. This
+   *  is what lets a managed session PARK on an exhausted account instead of failing, to be
+   *  resumed by the daemon after an account switch (see managedSession's stall handling). */
+  usageLimit?: boolean;
 }
 
 const NOT_TRANSIENT: ApiFailureClassification = { transient: false };
+const USAGE_LIMIT: ApiFailureClassification = { transient: false, usageLimit: true };
+
+/** The usage/rate-limit vocabulary (HTTP 429, the API's `rate_limit_error`, the CLI's own
+ *  "Claude usage limit reached" copy). Split out of {@link PERMANENT_PATTERN} — which it is
+ *  still part of, composed below so the two can never drift — because this one permanent
+ *  cause has a distinct recovery: not retrying, not giving up, but switching accounts. */
+const USAGE_LIMIT_PATTERN: RegExp = new RegExp(
+  [/\b429\b/, /rate.?limit/, /usage limit/].map((r) => r.source).join('|'),
+  'i',
+);
 
 /**
  * Failures that retrying cannot fix, checked before any transient pattern. Rate limits
@@ -32,9 +47,7 @@ const NOT_TRANSIENT: ApiFailureClassification = { transient: false };
  */
 const PERMANENT_PATTERN: RegExp = new RegExp(
   [
-    /\b429\b/,
-    /rate.?limit/,
-    /usage limit/,
+    USAGE_LIMIT_PATTERN,
     /authentication|unauthori[sz]ed|forbidden|invalid.?api.?key|oauth/,
     /billing|credit balance/,
     /invalid.?request|model.?not.?found/,
@@ -73,6 +86,9 @@ const TIMEOUT_PATTERN = /\b408\b|request timed out|timed? ?out waiting|api.?time
  * say") is unbounded and a retry loop is the wrong default for the unknown.
  */
 export function classifyFailureText(text: string): ApiFailureClassification {
+  // Usage limits first: they are a subset of PERMANENT_PATTERN, and the generic permanent
+  // verdict would erase the one bit (usageLimit) that names their distinct recovery.
+  if (USAGE_LIMIT_PATTERN.test(text)) return USAGE_LIMIT;
   if (PERMANENT_PATTERN.test(text)) return NOT_TRANSIENT;
   if (OVERLOADED_PATTERN.test(text)) return { transient: true, kind: 'overloaded' };
   if (SERVER_ERROR_PATTERN.test(text)) return { transient: true, kind: 'server_error' };
@@ -96,10 +112,13 @@ export function classifyStopFailureType(
       return { transient: true, kind: 'server_error' };
     case 'overloaded':
       return { transient: true, kind: 'overloaded' };
+    case 'rate_limit':
+      // Same verdict the free-text side gives 429s: not retryable, but recoverable by an
+      // account switch — the two tiers must agree on the usageLimit bit like everything else.
+      return USAGE_LIMIT;
     default:
-      // rate_limit, authentication_failed, oauth_org_not_allowed, billing_error,
-      // invalid_request, model_not_found, max_output_tokens — retrying fixes none of them,
-      // and rate_limit belongs to the auto-switcher (see PERMANENT_PATTERN's rationale).
+      // authentication_failed, oauth_org_not_allowed, billing_error, invalid_request,
+      // model_not_found, max_output_tokens — retrying fixes none of them.
       if (errorType === 'unknown' && errorText !== undefined) {
         return classifyFailureText(errorText);
       }

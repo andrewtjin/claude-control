@@ -3,6 +3,8 @@ export * from './types.js';
 export { computePlan } from './advisor.js';
 export {
   decideAutoSwitch,
+  hasUsableHeadroom,
+  MIN_USABLE_HEADROOM_PCT,
   DEFAULT_TRIGGER_PERCENT,
   DEFAULT_STALE_TRIGGER_PERCENT,
   DEFAULT_STALE_AFTER_MS,
