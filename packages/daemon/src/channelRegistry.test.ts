@@ -50,6 +50,38 @@ describe('attach', () => {
     clock.advance(CHANNEL_ATTACH_STALE_MS + 1);
     expect(reg.attach(attachInput()).ok).toBe(true);
   });
+
+  it('carries the dead server’s undelivered work onto the replacement', () => {
+    const clock = fakeClock();
+    const reg = new ChannelRegistry({ clock: clock.now });
+    const first = reg.attach(attachInput());
+    if (!first.ok) throw new Error('attach failed');
+    reg.enqueue('sess-1', 'queued before the crash');
+    reg.enqueue('sess-1', 'also undelivered');
+    // One of them was handed out but never acknowledged before the server died.
+    reg.take(first.attachment.attachId);
+    reg.enqueue('sess-1', 'arrived after');
+
+    clock.advance(CHANNEL_ATTACH_STALE_MS + 1);
+    const second = reg.attach(attachInput());
+    if (!second.ok) throw new Error('re-attach failed');
+    expect(reg.take(second.attachment.attachId)?.map((i) => i.text)).toEqual([
+      'queued before the crash',
+      'also undelivered',
+      'arrived after',
+    ]);
+  });
+
+  it('still expires inherited work that aged past the TTL', () => {
+    const clock = fakeClock();
+    const reg = new ChannelRegistry({ clock: clock.now });
+    reg.attach(attachInput());
+    reg.enqueue('sess-1', 'ancient');
+    clock.advance(CHANNEL_TTL_MS + 1);
+    const second = reg.attach(attachInput());
+    if (!second.ok) throw new Error('re-attach failed');
+    expect(reg.take(second.attachment.attachId)).toEqual([]);
+  });
 });
 
 describe('enqueue', () => {

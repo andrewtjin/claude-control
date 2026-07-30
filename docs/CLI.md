@@ -13,9 +13,9 @@ cctl setup
 ```
 
 The guided wizard: environment doctor → capture your current account → optional
-add-more-accounts loop → usage hooks → relay → Discord pairing → autostart + start the
-daemon → round-trip verify. See `docs/SETUP.md` for the full step-by-step walkthrough,
-every prompt, and every unhappy path.
+add-more-accounts loop → usage hooks → prompts to idle sessions → relay → Discord
+pairing → autostart + start the daemon → round-trip verify. See `docs/SETUP.md` for the
+full step-by-step walkthrough, every prompt, and every unhappy path.
 
 ## Accounts
 
@@ -150,6 +150,41 @@ cctl session status         # show tracked sessions + active account (reads the 
 receiver; `status` reads the local database and works offline. The group is also
 exposed in-session as the `/cctl:*` slash commands shipped in `plugins/cctl/` — a
 self-contained Claude Code plugin that holds no secrets and only wraps the CLI.
+
+## Prompts to idle sessions
+
+```
+cctl channel status              # is idle-session delivery enabled on this machine?
+cctl channel enable              # approve cctl as a channel (one administrator consent prompt)
+cctl channel enable --print      # show exactly what would be written, and where; write nothing
+cctl channel enable --no-elevate # don't ask for rights; print the file to place by hand
+cctl channel disable             # withdraw the approval
+```
+
+Without this, a prompt sent from Discord to an interactive session waits for that session's next
+turn boundary — it lands when the session finishes what it is doing, or when you next type in it.
+That never happens while you are away, which is the case phone control exists for. Enabling it lets
+the prompt land immediately on a session sitting idle.
+
+The mechanism is a Claude Code **channel**: a small MCP server that Claude Code starts alongside
+each session. Claude Code only loads a channel whose plugin an administrator has approved, so
+`enable` writes one file — `managed-settings.d/claude-control-channels.json` inside Claude Code's
+managed-settings directory. cctl writes its own drop-in there and never edits
+`managed-settings.json`, so a file another administrator owns is left alone. The written content
+restates Anthropic's four official channel plugins alongside cctl's, because that list _replaces_
+the built-in one rather than extending it.
+
+Two things worth knowing:
+
+- **A session cannot be upgraded after it starts.** A channel is attached at launch. Sessions
+  already running keep turn-boundary delivery; `cctl session status` distinguishes them.
+- **"Sent" is not "delivered."** Channel notifications are fire-and-forget: if a session never
+  loaded the channel, the event is dropped with no error returned. cctl therefore reports `sent`
+  and watches for the session to actually start working, rather than claiming delivery it cannot
+  confirm. Anything undelivered falls back to the turn-boundary queue.
+
+`cctl doctor` reports the current state, and `cctl setup` offers to turn it on (you can decline; it
+stays available afterwards).
 
 ## Pairing
 
