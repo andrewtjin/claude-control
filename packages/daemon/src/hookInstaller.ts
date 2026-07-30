@@ -346,5 +346,8 @@ export function buildDaemonHookSpecs(options: BuildDaemonHookSpecsOptions): Hook
     { event: eventNames.notification, command },
     { event: eventNames.postToolUse, command },
     { event: eventNames.userPromptSubmit, command },
+    // Fires instead of Stop when a turn dies of an API error; response ignored by the CLI
+    // (detection-only), so the forwarder's fire-and-forget-or-await split doesn't matter here.
+    { event: eventNames.stopFailure, command },
   ];
 }
