@@ -36,7 +36,11 @@ import {
   MAX_STATS_DAYS,
   MIN_STATS_DAYS,
 } from '@claude-control/shared-protocol';
-import { planWeight, type AccountUsageInput } from '@claude-control/usage-advisor';
+import {
+  hasUsableHeadroom,
+  planWeight,
+  type AccountUsageInput,
+} from '@claude-control/usage-advisor';
 import type { Store } from './store.js';
 import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
 import { readFleetHistory, RESET_LOOKBACK_MS } from './usageHistory.js';
@@ -90,8 +94,10 @@ export interface DaemonOptions {
   createAgentSdkClient?: () => AgentSdkClient;
   /** Auto-continue policy stamped onto every managed session this daemon spawns or resumes
    *  (see session-runtime's AutoContinuePolicy): transient API failures retry with backoff
-   *  instead of stamping the session `failed`. Omitted = the feature is off (the composition
-   *  root omits it when CCTL_AUTO_CONTINUE=0) and failures stay terminal, exactly as before. */
+   *  instead of stamping the session `failed`, and usage-limit failures PARK the session for
+   *  {@link Daemon.resumeUsageStalledSessions} to kick after a phone /switch. Omitted = the
+   *  feature is off (the composition root omits it when CCTL_AUTO_CONTINUE=0) and failures
+   *  stay terminal, exactly as before. */
   autoContinue?: AutoContinuePolicy;
   /** Self-heal the CLI's hook config on startup. Called AFTER the hook receiver binds, with
    *  its actual loopback port, so it can (re)install the curl hooks that POST to that port.
@@ -376,6 +382,12 @@ export class Daemon {
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
    *  not re-pushed on every restart). */
   private quarantineState = new Map<string, QuarantineNoticeState>();
+  /** Each account's advisor input from the most recent poll cycle — what the post-switch
+   *  stalled-session kick consults to answer "does the switch target have usage left?"
+   *  without a blocking re-poll (see {@link resumeUsageStalledSessions}). In-memory only:
+   *  an account absent here (daemon just started, or never polled) is treated as usable,
+   *  the same unknown-is-not-exhausted posture `hasUsableHeadroom` takes. */
+  private readonly latestAdvisorInputs = new Map<string, AccountUsageInput>();
   private started = false;
 
   constructor(options: DaemonOptions) {
@@ -640,6 +652,12 @@ export class Daemon {
     this.emitQuarantineNotices(pollAccounts);
 
     const snapshot = await this.timePhase('pollAll', () => this.poller.pollAll(pollAccounts));
+    // Refresh the post-switch kick's per-account view first, before anything below can
+    // fail: even a 'skipped' result carries the poller's last real advisorInput, so this
+    // map always holds the freshest numbers the poller has (see resumeUsageStalledSessions).
+    for (const result of snapshot.results) {
+      this.latestAdvisorInputs.set(result.accountId, result.usage.advisorInput);
+    }
     await this.timePhase('persistSnapshots', () => {
       for (const result of snapshot.results) {
         if (result.outcome === 'skipped') continue; // nothing new to persist
@@ -900,6 +918,14 @@ export class Daemon {
           message: `switched to ${result.activeAccountId}`,
         },
       });
+      // AFTER the result ships, so the phone reads the switch confirmation before any
+      // resumed session's output starts flowing. Phone-initiated switches only: the
+      // operator asked for this account NOW, which is exactly the moment to un-park work
+      // that stalled on the previous account's usage limit (auto-switch deliberately does
+      // not kick — resuming paused work unattended is a bigger policy step than hopping).
+      if (result.ok) {
+        this.resumeUsageStalledSessions(resolved.account.id, resolved.account.label);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const activeAccountId =
@@ -916,6 +942,52 @@ export class Daemon {
         },
       });
     }
+  }
+
+  /**
+   * Kick every managed session PARKED on a usage-limit failure back into work, after a
+   * phone `/switch` landed on `accountId`. Managed sessions run their turns against the
+   * globally-active credentials (each turn spawns a fresh CLI subprocess — see
+   * agentSdkMapping's account-binding rationale), so the resumed turn runs on the account
+   * just switched to. Guarded by "does the target have usage left": kicking sessions into
+   * an account the latest poll already shows exhausted would burn a request per session
+   * just to re-park them all. Unknown accounts (never polled) pass the guard — unknown is
+   * not exhausted, and a wrong kick self-heals by re-parking. The kick itself is the
+   * handle's own `resumeFromUsageLimitStall` (blind-fired across the registry; only parked
+   * sessions react), so the daemon never has to know what prompt resumes a session.
+   */
+  private resumeUsageStalledSessions(accountId: string, accountLabel: string): void {
+    const input = this.latestAdvisorInputs.get(accountId);
+    if (input !== undefined && !hasUsableHeadroom(input, this.clock())) {
+      this.logger.info(
+        { accountId },
+        'switch target has no usage left; stalled sessions stay parked',
+      );
+      return;
+    }
+
+    let kicked = 0;
+    for (const record of this.sessionManager.list()) {
+      const handle = this.sessionManager.get(record.id);
+      if (handle?.resumeFromUsageLimitStall?.() === true) kicked++;
+    }
+    if (kicked === 0) return;
+
+    this.logger.info({ accountId, kicked }, 'resumed usage-stalled sessions after switch');
+    // One fleet-level card, not one per session: each resumed session's own event stream
+    // already carries its "resuming from usage-limit stall" milestone as session.output.
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        title: `Resumed ${kicked} stalled session${kicked === 1 ? '' : 's'}`,
+        body:
+          `${kicked === 1 ? 'A session' : `${kicked} sessions`} parked on a usage limit ` +
+          `resumed automatically on "${accountLabel}".`,
+        level: 'success',
+        notificationType: 'usage_stall_resumed',
+      },
+    });
   }
 
   /**

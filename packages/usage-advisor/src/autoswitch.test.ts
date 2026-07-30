@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { decideAutoSwitch } from './autoswitch.js';
+import { decideAutoSwitch, hasUsableHeadroom, MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 const NOW = Date.parse('2026-07-16T12:00:00.000Z');
@@ -541,5 +541,33 @@ describe('decideAutoSwitch — dormant accounts and predicted resets', () => {
       { kind: 'weekly_all', percent: 0 },
     ]);
     expect(decideAutoSwitch([lowActive(), jailed], NOW)).toBeNull();
+  });
+});
+
+describe('hasUsableHeadroom', () => {
+  it('a quarantined account never has usage left, whatever its numbers say', () => {
+    const jailed = acct('q', { quarantined: true }, [{ kind: 'weekly_all', percent: 0 }]);
+    expect(hasUsableHeadroom(jailed, NOW)).toBe(false);
+  });
+
+  it('no limit data at all counts as usable — unknown is not exhausted', () => {
+    expect(hasUsableHeadroom(acct('fresh'), NOW)).toBe(true);
+  });
+
+  it('judges by the WORST live limit, holding exactly at the exhausted bar', () => {
+    const at = (percent: number) =>
+      acct('a', {}, [
+        { kind: 'session', percent: 10, resetsAt: NOW + 2 * H },
+        { kind: 'weekly_all', percent, resetsAt: NOW + 48 * H },
+      ]);
+    expect(hasUsableHeadroom(at(100 - MIN_USABLE_HEADROOM_PCT), NOW)).toBe(true);
+    expect(hasUsableHeadroom(at(100 - MIN_USABLE_HEADROOM_PCT + 0.5), NOW)).toBe(false);
+    expect(hasUsableHeadroom(at(100), NOW)).toBe(false);
+  });
+
+  it('ignores an exhausted limit whose window already ended', () => {
+    // 100% used, but that window closed an hour ago — the account is rested, not exhausted.
+    const rested = acct('a', {}, [{ kind: 'session', percent: 100, resetsAt: NOW - H }]);
+    expect(hasUsableHeadroom(rested, NOW)).toBe(true);
   });
 });

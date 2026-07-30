@@ -753,3 +753,182 @@ describe('startManagedSession auto-continue', () => {
     expect(handle.getState()).toBe('waiting_input');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Usage-limit stall: park on an exhausted account, resume after a switch
+// ---------------------------------------------------------------------------
+
+const USAGE_LIMIT_529 = 'Claude usage limit reached. Your limit will reset at 3pm.';
+
+describe('startManagedSession usage-limit stall', () => {
+  it('parks on a usage-limit death: waiting_input, no failure card, no retry timer', async () => {
+    const { client } = fakeClient([
+      [
+        { type: 'session_init', sessionId: 'sdk-1' },
+        { type: 'assistant_text', text: 'partial work' },
+        { type: 'turn_result', ok: false, summary: USAGE_LIMIT_529 },
+      ],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(handle.getState()).toBe('waiting_input');
+    expect(events.some((e) => e.kind === 'summary' && e.text.startsWith('Session failed'))).toBe(
+      false,
+    );
+    // Parked means WAITING, not retrying: no backoff timer may be pending.
+    expect(timers.pending).toHaveLength(0);
+    const milestones = events.flatMap((e) =>
+      e.kind === 'milestone' && e.text.startsWith('Usage limit reached') ? [e.text] : [],
+    );
+    expect(milestones).toHaveLength(1);
+  });
+
+  it('resumeFromUsageLimitStall kicks `continue` into the resumed conversation, once', async () => {
+    const { client, calls } = fakeClient([
+      [
+        { type: 'session_init', sessionId: 'sdk-1' },
+        { type: 'assistant_text', text: 'partial work' },
+        { type: 'turn_result', ok: false, summary: USAGE_LIMIT_529 },
+      ],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+
+    expect(handle.resumeFromUsageLimitStall!()).toBe(true);
+    await tick();
+    // The dead turn produced output and captured a resume anchor, so the kick is the CLI's
+    // documented `continue` into the same conversation — on whatever account is now active.
+    expect(calls[1]?.prompt).toBe('continue');
+    expect(calls[1]?.opts.resumeSessionId).toBe('sdk-1');
+    expect(handle.getState()).toBe('waiting_input');
+    // The park is consumed: a second kick (a second /switch) has nothing to resume.
+    expect(handle.resumeFromUsageLimitStall!()).toBe(false);
+  });
+
+  it('the kick re-asks the turn prompt verbatim when the dead turn produced nothing', async () => {
+    const { client, calls } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: 'API Error: 429 Rate limit exceeded' }],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+
+    expect(handle.resumeFromUsageLimitStall!()).toBe(true);
+    await tick();
+    expect(calls[1]?.prompt).toBe('go');
+    expect(calls[1]?.opts.resumeSessionId).toBeUndefined();
+  });
+
+  it('a usage-limit death re-parks after a kick — self-limiting, one request per switch', async () => {
+    const dying: Turn = [{ type: 'turn_result', ok: false, summary: USAGE_LIMIT_529 }];
+    const { client, calls } = fakeClient([dying, dying]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+
+    expect(handle.resumeFromUsageLimitStall!()).toBe(true);
+    await tick();
+    // The kicked turn hit another exhausted account: parked again, no timer, not failed.
+    expect(handle.getState()).toBe('waiting_input');
+    expect(timers.pending).toHaveLength(0);
+    expect(calls).toHaveLength(2);
+    // ...and a later switch can kick it again.
+    expect(handle.resumeFromUsageLimitStall!()).toBe(true);
+  });
+
+  it('without an autoContinue policy, a usage-limit failure stays terminal (pre-existing behavior)', async () => {
+    const { client } = fakeClient([[{ type: 'turn_result', ok: false, summary: USAGE_LIMIT_529 }]]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    const events = collectEvents(handle);
+    await tick();
+
+    expect(handle.getState()).toBe('failed');
+    expect(events).toContainEqual({
+      kind: 'summary',
+      text: `Session failed: ${USAGE_LIMIT_529}`,
+    });
+    expect(handle.resumeFromUsageLimitStall!()).toBe(false);
+  });
+
+  it('a human send() while parked wins and consumes the park', async () => {
+    const { client, calls } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: USAGE_LIMIT_529 }],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+
+    await handle.send('actually, do this instead');
+    await tick();
+    expect(calls[1]?.prompt).toBe('actually, do this instead');
+    // The human's turn ended the park: a switch arriving later must not replay anything.
+    expect(handle.resumeFromUsageLimitStall!()).toBe(false);
+    expect(calls).toHaveLength(2);
+  });
+
+  it('is a no-op on a session that never stalled', async () => {
+    const { client, calls } = fakeClient([[{ type: 'turn_result', ok: true, summary: 'done' }]]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    await tick();
+
+    expect(handle.resumeFromUsageLimitStall!()).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a usage-limit park does not corrupt the transient-failure streak bookkeeping', async () => {
+    const { client, calls } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: USAGE_LIMIT_529 }],
+      [{ type: 'turn_result', ok: false, summary: SERVER_500 }],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+
+    // Park -> kick -> the kicked turn dies of a TRANSIENT failure: auto-continue's retry
+    // loop takes over exactly as if the park had never happened.
+    expect(handle.resumeFromUsageLimitStall!()).toBe(true);
+    await tick();
+    expect(timers.pending).toHaveLength(1);
+    await timers.fire();
+    expect(calls).toHaveLength(3);
+    expect(handle.getState()).toBe('waiting_input');
+  });
+});

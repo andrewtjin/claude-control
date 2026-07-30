@@ -24,7 +24,10 @@ import { classifyFailureText } from './apiFailure.js';
  * Policy for riding out TRANSIENT API failures (5xx/529/dropped connections — see
  * apiFailure.ts for exactly what qualifies) instead of stamping the session `failed`.
  * Presence of this object on {@link ManagedSessionOptions} is what enables the behavior;
- * the daemon simply omits it when the operator turned auto-continue off.
+ * the daemon simply omits it when the operator turned auto-continue off. Presence also
+ * enables the usage-limit STALL — the same survive-API-errors umbrella, different
+ * mechanism: a 429/usage-limit death parks the session idle instead of failing it, to be
+ * resumed via {@link SessionHandle.resumeFromUsageLimitStall} after an account switch.
  *
  * Retrying happens at the TURN level because that is the only retry primitive the Agent
  * SDK offers: the CLI has already retried the raw request internally (~10x with backoff)
@@ -229,6 +232,14 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
   // Per-turn latch: an `error` event, the failed `turn_result` behind it, and a stream
   // throw after either are the SAME death — exactly one failure decision per turn.
   let failureHandled = false;
+  // ---- usage-limit stall (rides the same autoContinue umbrella) ----
+  // True while the session is PARKED on a usage-limit death: not failed (a different
+  // account fixes it), not retrying on a timer (waiting doesn't help within the window) —
+  // idle in `waiting_input` until the daemon's post-switch kick (resumeFromUsageLimitStall)
+  // or a human send() starts a turn. `stallRetryPrompt` is what the kick replays, derived
+  // by the same rule as auto-continue's retry prompt (see handleTurnFailure).
+  let stalledOnUsageLimit = false;
+  let stallRetryPrompt = opts.prompt;
   const listeners = new Set<(e: SessionEvent) => void>();
   // Structured permission-request listeners, kept separate from the display `listeners` above
   // because a permission request carries the `requestId` needed to resolve it — see the
@@ -274,7 +285,31 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     if (failureHandled) return;
     failureHandled = true;
 
-    const transient = autoContinue !== undefined && classifyFailureText(text).transient;
+    const classification = autoContinue === undefined ? undefined : classifyFailureText(text);
+
+    // A usage-limit death parks the session instead of failing it: no backoff timer can fix
+    // an exhausted window, but an account switch can — so the session settles idle exactly
+    // where a clean turn end would have left it, holding the prompt to replay, and the
+    // daemon kicks it after a switch to an account with usage left. Deliberately outside
+    // the consecutive-failure budget: every kick is operator-triggered (a /switch), and a
+    // kick that hits another exhausted account just re-parks here — self-limiting, one
+    // request per switch.
+    if (classification?.usageLimit === true) {
+      stalledOnUsageLimit = true;
+      // Same rule as the retry prompt below: `continue` only means something when the dead
+      // turn advanced a resumable conversation; otherwise re-asking is exact.
+      stallRetryPrompt =
+        turnProducedOutput && resumeId !== undefined ? 'continue' : currentTurnPrompt;
+      const failureNote = text.length > 160 ? `${text.slice(0, 157)}...` : text;
+      emit({
+        kind: 'milestone',
+        text: `Usage limit reached — session parked; it resumes after a switch to an account with usage left (${failureNote})`,
+      });
+      setState('waiting_input');
+      return;
+    }
+
+    const transient = classification?.transient === true;
     if (!transient || consecutiveFailures >= acMaxAttempts) {
       displayGiveUp();
       setState('failed');
@@ -388,7 +423,10 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
 
   async function runTurn(prompt: string): Promise<void> {
     busy = true;
-    // Fresh turn, fresh failure bookkeeping (the failure streak itself spans turns).
+    // Fresh turn, fresh failure bookkeeping (the failure streak itself spans turns). Any
+    // turn starting also ends a usage-limit park — whether it's the kick replaying the
+    // stalled prompt or a human send() choosing their own continuation.
+    stalledOnUsageLimit = false;
     currentTurnPrompt = prompt;
     turnProducedOutput = false;
     failureHandled = false;
@@ -478,6 +516,16 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       }
       void runTurn(text);
       return Promise.resolve();
+    },
+    resumeFromUsageLimitStall(): boolean {
+      // Only a session actually parked on a usage limit reacts — everything else reports
+      // false so the daemon can blind-fire this across the whole registry after a switch.
+      // The busy/terminal guards are defensive: a parked session is idle by construction,
+      // but a human send() racing the kick must win (runTurn already cleared the flag).
+      if (!stalledOnUsageLimit || busy || state === 'done' || state === 'failed') return false;
+      emit({ kind: 'milestone', text: 'Account switched — resuming from usage-limit stall' });
+      void runTurn(stallRetryPrompt);
+      return true;
     },
     async interrupt(): Promise<void> {
       // During a backoff wait there is no in-flight turn — the interrupt's meaning is
