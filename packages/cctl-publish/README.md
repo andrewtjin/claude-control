@@ -46,7 +46,9 @@ automatically.
   free-text "Other…" included. Your answers land back in the running session.
 
 Your credentials never leave your machine: the daemon holds them locally, and the
-shared bot is a credential-free control plane that never sees session content.
+shared bot is a credential-free control plane that persists no session content. It
+does relay the commands, tool output, and prompts your phone cards are built from,
+so if you'd rather no shared operator see that, self-host it.
 
 ## Local-only (no Discord)
 
