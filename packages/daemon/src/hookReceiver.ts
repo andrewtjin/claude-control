@@ -97,6 +97,10 @@ export interface HookReceiverOptions {
    *  the CLI falls through to the SDK gate and the phone sees exactly ONE card). Default:
    *  nothing is managed (interactive CLI windows keep every card). */
   isManagedSession?: (sessionId: string) => boolean;
+  /** How long a channel long-poll is held before answering empty. See
+   *  {@link DEFAULT_CHANNEL_POLL_MS}; tests shorten it so a bound can be exercised in
+   *  milliseconds rather than half a minute. */
+  channelPollMs?: number;
   clock?: () => number;
   /** Called with a fully-formed envelope draft whenever a hook produces one — the daemon
    *  wires this to the control-plane client's send/outbox path. Kept synchronous-callback
@@ -199,6 +203,40 @@ export interface HookReceiverCliHandlers {
   unregisterSession(input: SessionCommandBase): Promise<SessionCommandResult>;
 }
 
+/** One injection as the channel server sees it on the wire. */
+export interface ChannelInjectionView {
+  injectId: string;
+  text: string;
+  meta?: Record<string, string>;
+}
+
+export interface ChannelAttachRequest {
+  sessionId: string;
+  pid: number;
+  cwd?: string;
+  name?: string;
+  /** How the channel server identified its session. `ancestry` is a weaker claim than `env` and
+   *  is worth recording: it is the branch that can, in principle, resolve to the wrong session. */
+  identitySource: 'env' | 'ancestry';
+}
+
+/** The live-channel logic the daemon installs via {@link HookReceiver.setChannelHandlers}.
+ *
+ *  Same split as {@link HookReceiverCliHandlers}: the receiver owns sockets and held responses,
+ *  these handlers own the queue and the routing. Synchronous throughout because every operation
+ *  is in-memory bookkeeping — a channel poll must not wait on I/O nobody is waiting for. */
+export interface HookReceiverChannelHandlers {
+  attach(
+    input: ChannelAttachRequest,
+  ): { ok: true; attachId: string } | { ok: false; error: string };
+  /** `undefined` means the attachment is unknown or expired and the client must re-attach. */
+  take(attachId: string): ChannelInjectionView[] | undefined;
+  ack(attachId: string, injectId: string, state: 'sent' | 'failed'): boolean;
+  /** A reply the model produced for whoever sent the injection. */
+  reply(attachId: string, text: string): boolean;
+  detach(attachId: string): void;
+}
+
 /** Exported because the header name doubles as the installer's ownership fingerprint: any
  *  settings.json hook command containing it is one of OURS (some generation of the hook
  *  forwarder command), which is what lets installHooks replace stale entries across
@@ -215,6 +253,13 @@ const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
  *  the hold is open the terminal cannot prompt — a shorter hold trades remote decision time
  *  for a faster local-prompt fallback when the operator is at the keyboard. */
 export const DEFAULT_PERMISSION_HOLD_MS = 570_000;
+
+/** How long a `/cli/channel/next` poll is held before answering empty and letting the client
+ *  re-poll. Bounded rather than infinite: Node imposes no response deadline, so an unbounded poll
+ *  would be legal but would make shutdown slow and a dead daemon invisible to the client until it
+ *  next had something to say. Work arriving mid-hold completes the poll immediately
+ *  ({@link HookReceiver.wakeChannelPoll}), so this bound costs latency only when nothing happens. */
+export const DEFAULT_CHANNEL_POLL_MS = 30_000;
 
 /** The tool whose "permission" is really a structured multiple-choice prompt. It does not take
  *  the yes/no permission path: instead the hook response is held while the phone answers, and the
@@ -408,6 +453,7 @@ export class HookReceiver {
   private readonly commandOutputCards: boolean;
   private readonly fullToolOutput: boolean;
   private readonly isManagedSession: (sessionId: string) => boolean;
+  private readonly channelPollMs: number;
   private server: Server | undefined;
   /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
    *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
@@ -417,6 +463,19 @@ export class HookReceiver {
    *  receivers without a steering owner, e.g. unit harnesses): every Stop is then answered
    *  neutrally, exactly the pre-steering behavior. */
   private takeSteering: ((sessionId: string) => string | undefined) | undefined;
+  /** Installed by the daemon — see {@link setChannelHandlers}. Undefined until then, so a channel
+   *  server that races daemon startup gets the same clean 503 a `cctl session` command would. */
+  private channelHandlers: HookReceiverChannelHandlers | undefined;
+  /** `/cli/channel/next` polls currently held open, keyed by attachId.
+   *
+   *  These are open connections exactly like {@link heldPermissions}, and they carry the same
+   *  shutdown hazard: `server.close()` waits for every open connection, so an undrained poll
+   *  would hang the daemon for the length of its bound — once per idle session, and there can
+   *  easily be ten. {@link close} drains them. */
+  private readonly heldChannelPolls = new Map<
+    string,
+    { res: ServerResponse; timer: NodeJS.Timeout }
+  >();
   /** Permission hook responses currently held open awaiting a phone decision, keyed by the
    *  requestId we minted. `event` echoes the exact hook event name the CLI fired — the
    *  decision output must name it back (`hookSpecificOutput.hookEventName`). `toolInput` is
@@ -491,6 +550,7 @@ export class HookReceiver {
     this.commandOutputCards = options.commandOutputCards ?? true;
     this.fullToolOutput = options.fullToolOutput ?? false;
     this.isManagedSession = options.isManagedSession ?? (() => false);
+    this.channelPollMs = options.channelPollMs ?? DEFAULT_CHANNEL_POLL_MS;
   }
 
   /** Install the CLI session-command logic. Called by the daemon before `listen` (symmetric
@@ -498,6 +558,28 @@ export class HookReceiver {
    *  is constructed in the composition root before the Daemon that owns the registry exists. */
   setCliHandlers(handlers: HookReceiverCliHandlers): void {
     this.cliHandlers = handlers;
+  }
+
+  /** Install the live-channel logic (same late-binding contract as {@link setCliHandlers}). */
+  setChannelHandlers(handlers: HookReceiverChannelHandlers): void {
+    this.channelHandlers = handlers;
+  }
+
+  /**
+   * Complete a held `/cli/channel/next` poll immediately because work arrived for it.
+   *
+   * Called by the daemon the moment something is queued, so an injection reaches an idle session
+   * at once rather than waiting out the poll bound. A poll that is not currently held is a no-op:
+   * the client is between polls and will pick the work up on its next one.
+   */
+  wakeChannelPoll(attachId: string): void {
+    const held = this.heldChannelPolls.get(attachId);
+    if (held === undefined) return;
+    const items = this.channelHandlers?.take(attachId);
+    if (items === undefined || items.length === 0) return;
+    clearTimeout(held.timer);
+    this.heldChannelPolls.delete(attachId);
+    this.respond(held.res, 200, { ok: true, items });
   }
 
   /** Install the operator-steering source (same late-binding contract as
@@ -546,6 +628,15 @@ export class HookReceiver {
       this.respond(held.res, 200, {});
     }
     this.heldPermissions.clear();
+    // Held channel polls are open connections for the same reason, and there is one per idle
+    // channel-attached session — the common case, not a corner case. Answer them empty: the
+    // client treats that as an ordinary poll bound and re-polls, which fails against the closing
+    // daemon and sends it into its normal re-attach loop.
+    for (const [, held] of this.heldChannelPolls) {
+      clearTimeout(held.timer);
+      this.respond(held.res, 200, { ok: true, items: [] });
+    }
+    this.heldChannelPolls.clear();
     // Held questions are open connections too — answer them all neutrally and emit
     // question.lapsed 'shutdown', mirroring the permission drain above. Unlike an expiry lapse
     // (which declines), a dying daemon hands the live picker back to the terminal: the
@@ -850,12 +941,163 @@ export class HookReceiver {
       this.handleResolveQuestion(body, res);
       return;
     }
+    // Checked before the generic `/cli/` branch: channel requests are keyed by attachId, not by
+    // the sessionId + idempotencyKey that `handleCliRequest` validates for every session command.
+    if (path.startsWith('/cli/channel/')) {
+      this.handleChannelRequest(path, body, res);
+      return;
+    }
     if (path.startsWith('/cli/')) {
       await this.handleCliRequest(path, body, res);
       return;
     }
 
     this.handleHookEvent(body, res);
+  }
+
+  /**
+   * Route a channel-server request.
+   *
+   * These five endpoints are the daemon's half of live injection. `next` is the only one that
+   * holds its response open, and it is registered in {@link heldChannelPolls} so both a timeout
+   * and a shutdown answer it — an unanswered poll would wedge `close()`.
+   */
+  private handleChannelRequest(
+    path: string,
+    body: Record<string, unknown>,
+    res: ServerResponse,
+  ): void {
+    const handlers = this.channelHandlers;
+    if (!handlers) {
+      this.respond(res, 503, { ok: false, error: 'daemon is starting; retry in a moment' });
+      return;
+    }
+
+    if (path === '/cli/channel/attach') {
+      const sessionId = str(body.sessionId);
+      const pid = typeof body.pid === 'number' ? body.pid : undefined;
+      const identitySource = str(body.identitySource);
+      if (!sessionId || pid === undefined) {
+        this.respond(res, 400, { ok: false, error: 'sessionId and pid are required' });
+        return;
+      }
+      if (identitySource !== 'env' && identitySource !== 'ancestry') {
+        this.respond(res, 400, { ok: false, error: 'identitySource must be env or ancestry' });
+        return;
+      }
+      const cwd = str(body.cwd);
+      const name = str(body.name);
+      const result = handlers.attach({
+        sessionId,
+        pid,
+        identitySource,
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(name !== undefined ? { name } : {}),
+      });
+      if (!result.ok) {
+        // 409, not 500: a second server for one session is a real state the client must handle
+        // by exiting, not a fault it should retry through.
+        this.respond(res, 409, { ok: false, error: result.error });
+        return;
+      }
+      this.logger.info(
+        { sessionId, pid, identitySource },
+        'channel: server attached to a live session',
+      );
+      this.respond(res, 200, {
+        ok: true,
+        attachId: result.attachId,
+        pollMs: this.channelPollMs,
+      });
+      return;
+    }
+
+    const attachId = str(body.attachId);
+    if (!attachId) {
+      this.respond(res, 400, { ok: false, error: 'attachId is required' });
+      return;
+    }
+
+    switch (path) {
+      case '/cli/channel/next': {
+        const items = handlers.take(attachId);
+        if (items === undefined) {
+          this.respond(res, 404, { ok: false, error: 'unknown attachment' });
+          return;
+        }
+        if (items.length > 0) {
+          this.respond(res, 200, { ok: true, items });
+          return;
+        }
+        // Nothing queued: hold the response so an injection arriving in the next few seconds
+        // reaches an idle session immediately rather than after another round trip. Only one
+        // poll per attachment can be held; a second replaces the first, which is answered empty
+        // so its socket is never abandoned.
+        const previous = this.heldChannelPolls.get(attachId);
+        if (previous !== undefined) {
+          clearTimeout(previous.timer);
+          this.respond(previous.res, 200, { ok: true, items: [] });
+        }
+        const timer = setTimeout(() => {
+          const held = this.heldChannelPolls.get(attachId);
+          if (held === undefined) return;
+          this.heldChannelPolls.delete(attachId);
+          this.respond(held.res, 200, { ok: true, items: [] });
+        }, this.channelPollMs);
+        timer.unref();
+        this.heldChannelPolls.set(attachId, { res, timer });
+        res.on('close', () => {
+          const held = this.heldChannelPolls.get(attachId);
+          if (held?.res === res) {
+            clearTimeout(held.timer);
+            this.heldChannelPolls.delete(attachId);
+          }
+        });
+        return;
+      }
+      case '/cli/channel/ack': {
+        const injectId = str(body.injectId);
+        const state = str(body.state);
+        if (!injectId || (state !== 'sent' && state !== 'failed')) {
+          this.respond(res, 400, {
+            ok: false,
+            error: 'injectId and state (sent|failed) are required',
+          });
+          return;
+        }
+        const ok = handlers.ack(attachId, injectId, state);
+        this.respond(res, ok ? 200 : 404, ok ? { ok: true } : { ok: false, error: 'unknown item' });
+        return;
+      }
+      case '/cli/channel/reply': {
+        const text = str(body.text);
+        if (text === undefined || text.length === 0) {
+          this.respond(res, 400, { ok: false, error: 'text is required and must be non-empty' });
+          return;
+        }
+        const ok = handlers.reply(attachId, text);
+        this.respond(
+          res,
+          ok ? 200 : 404,
+          ok ? { ok: true } : { ok: false, error: 'unknown attachment' },
+        );
+        return;
+      }
+      case '/cli/channel/detach': {
+        // Answer the held poll first: detaching leaves nobody to complete it.
+        const held = this.heldChannelPolls.get(attachId);
+        if (held !== undefined) {
+          clearTimeout(held.timer);
+          this.heldChannelPolls.delete(attachId);
+          this.respond(held.res, 200, { ok: true, items: [] });
+        }
+        handlers.detach(attachId);
+        this.respond(res, 200, { ok: true });
+        return;
+      }
+      default:
+        this.respond(res, 404, { ok: false, error: `unknown channel endpoint "${path}"` });
+    }
   }
 
   /** Route a `cctl session` command. Validates the common shape here (so a malformed request is

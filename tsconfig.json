@@ -6,6 +6,7 @@
     { "path": "packages/usage-advisor" },
     { "path": "packages/session-runtime" },
     { "path": "packages/daemon" },
+    { "path": "packages/channel" },
     { "path": "packages/control-plane-bot" },
     { "path": "packages/cli" }
   ]
