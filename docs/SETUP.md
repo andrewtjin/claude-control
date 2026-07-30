@@ -122,6 +122,30 @@ Pairing code (or `s` to skip):
     (...). Codes are one-time and expire — run `/pair` again for a fresh one."
   - **`error`** — anything else, printed as-is: "Pairing failed (...)."
 
+#### Pairing with Slack instead
+
+The prompt above is written for Discord's `/pair`, but the code it asks for is
+surface-agnostic — the wizard's "Pairing code" field claims whatever code you give it, wherever
+it came from. To pair against a Slack workspace instead:
+
+1. Create the Slack app from [`deploy/slack-app-manifest.yml`](../deploy/slack-app-manifest.yml)
+   (`api.slack.com/apps` → **Create New App** → **From an app manifest** → pick the workspace →
+   paste the file's contents) and install it to that workspace.
+2. Collect the two tokens the manifest's own comments point at: `SLACK_BOT_TOKEN` (`xoxb-…`,
+   shown on **Settings → Install App** once the app is installed) and `SLACK_APP_TOKEN`
+   (`xapp-…`, generated under **Settings → Basic Information → App-Level Tokens** with the
+   `connections:write` scope). Set both on whichever machine runs the bot — see
+   `docs/SELF_HOST.md`.
+3. With the bot running and both tokens set, run `/cctl pair` in that workspace to mint a
+   one-time code — the same 10-minute, single-use code described above.
+4. Enter it at the wizard's "Pairing code" prompt, or later with `cctl pair <code>` or
+   `cctl setup --reconfigure`.
+
+Slack has no invite-link equivalent to Discord's bot-invite URL — an app installs into one
+workspace at a time, not a "add to any server" flow — so pairing against Slack means either
+standing up your own app as above or being added to a workspace someone else already set up
+this way.
+
 ### [7/7] Autostart and start the daemon
 
 Registers (or updates, or confirms unchanged) the logon Scheduled Task, then tries to
@@ -167,3 +191,5 @@ setup` wraps.
 - `docs/PLATFORM.md` — which platforms are supported (Windows and Linux/WSL2 today)
   and what `cctl doctor` checks.
 - `docs/VERIFICATION.md` — the fresh-machine wet gate this wizard exists to pass.
+- `deploy/slack-app-manifest.yml` — create your own Slack app to pair against (see step 6
+  above).

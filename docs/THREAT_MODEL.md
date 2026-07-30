@@ -12,15 +12,16 @@ choice — most notably, whether to trust the shared relay or self-host their ow
 
 1. **OAuth access/refresh tokens** for the user's Claude accounts. Compromise = full account
    takeover. These live only in the per-machine encrypted vault and the live files the CLI reads;
-   they never enter a protocol message, the relay, or Discord.
+   they never enter a protocol message, the relay, or Discord/Slack.
 2. **The daemon's ability to run commands.** `session.spawn` starts Claude Code (and thus shell
    tools) on the user's machine. Anything that can command the daemon can run code as the user.
 3. **Daemon tokens.** 256-bit secrets that authenticate a daemon to the relay. Stored only as
    scrypt hashes on the bot; the plaintext exists only on the owning machine.
 4. **Session content in transit** — prompts, tool inputs/outputs, permission prompts. Sensitive
-   but ephemeral; see "In-transit visibility" below.
-5. **Discord ↔ daemon bindings.** Routing metadata on the bot. Not a credential, but integrity
-   matters (a corrupted binding could misroute a command).
+   but ephemeral; see "In-transit visibility" below, and, for the Slack surface, "Shared-workspace
+   visibility" below that.
+5. **Discord/Slack ↔ daemon bindings.** Routing metadata on the bot. Not a credential, but
+   integrity matters (a corrupted binding could misroute a command).
 6. **Session-thread routing** — each user's own `/thread-here` choice, persisted on the bot. Not a
    credential either, but it is the only bot state a _user_ can write, and it decides where their
    session output is delivered; a cross-user write would be a way to redirect someone else's
@@ -28,12 +29,13 @@ choice — most notably, whether to trust the shared relay or self-host their ow
 
 ## Trust boundaries
 
-| Actor                       | Trusted to                                                                                           | Explicitly NOT able to                                                                      |
-| --------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| **Daemon** (user's machine) | Hold vault tokens, run sessions, decrypt credentials                                                 | —                                                                                           |
-| **Relay/bot** (shared host) | Route by Discord user id, store bindings, token **hashes** and each user's own session-thread choice | Read any OAuth token; import credential code (structural — see `dependencyClosure.test.ts`) |
-| **Discord**                 | Authenticate the human, deliver messages                                                             | Reach a daemon it isn't bound to                                                            |
-| **Caddy** (edge)            | Terminate TLS for the relay hostname                                                                 | See the Discord bot token (least-privilege env)                                             |
+| Actor                       | Trusted to                                                                                                 | Explicitly NOT able to                                                                                                                                                                                                      |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Daemon** (user's machine) | Hold vault tokens, run sessions, decrypt credentials                                                       | —                                                                                                                                                                                                                           |
+| **Relay/bot** (shared host) | Route by Discord/Slack user id, store bindings, token **hashes** and each user's own session-thread choice | Read any OAuth token; import credential code (structural — see `dependencyClosure.test.ts`)                                                                                                                                 |
+| **Discord**                 | Authenticate the human, deliver messages                                                                   | Reach a daemon it isn't bound to                                                                                                                                                                                            |
+| **Slack**                   | Authenticate the human within its own workspace, deliver messages                                          | Reach a daemon it isn't bound to; receive a delivery meant for a principal from a different workspace (the gateway checks the delivering principal's team id against the one its own token belongs to and drops a mismatch) |
+| **Caddy** (edge)            | Terminate TLS for the relay hostname                                                                       | See the Discord bot token or the Slack tokens (least-privilege env)                                                                                                                                                         |
 
 ## What is defended (and how)
 
@@ -47,6 +49,12 @@ choice — most notably, whether to trust the shared relay or self-host their ow
   nothing new — a user could already read their own session output — and what the bot may do in a
   channel is still bounded by that channel's Discord permissions, which the command verifies (and
   really exercises, by creating and deleting a throwaway thread) before it pins anything.
+- **Cross-workspace Slack delivery** — a Slack principal's workspace (team) id is checked
+  against the workspace this bot instance's own token actually belongs to (`auth.test`'s team
+  id) before every delivery; a stray or mismatched binding naming a principal from another
+  workspace is dropped and logged rather than delivered. One bot process only ever legitimately
+  serves one Slack workspace's users, by construction — see "Residual risks by design" below for
+  what that single-workspace model does and does not protect against.
 - **Daemon-token theft from the bot** — tokens are stored only as scrypt hashes (N=16384);
   verification is constant-time with a dummy-hash path so a missing daemon id and a wrong token
   are indistinguishable by timing.
@@ -68,16 +76,18 @@ choice — most notably, whether to trust the shared relay or self-host their ow
 These are the boundaries a user is implicitly accepting. None is a defect; each is the direct cost
 of a feature.
 
-### 1. Whoever controls the bound Discord account controls the daemon
+### 1. Whoever controls the bound chat-surface account controls the daemon
 
-The bot authorizes actions by Discord user id. It cannot tell the real owner apart from someone who
-has taken over that Discord account (stolen session, SIM-swap, shoulder-surf). Such an attacker can
-send prompts, spawn sessions, and approve permission prompts — i.e. **run code on the user's
-machine**. This is equivalent in power to compromising the machine itself.
+The bot authorizes actions by the paired chat-surface user id — a Discord snowflake or a
+`slack:<teamId>:<userId>` principal. It cannot tell the real owner apart from someone who has
+taken over that account (stolen session, SIM-swap, shoulder-surf — on Slack, also a compromised
+or over-provisioned workspace member). Such an attacker can send prompts, spawn sessions, and
+approve permission prompts — i.e. **run code on the user's machine**. This is equivalent in power
+to compromising the machine itself.
 
-_Mitigation:_ protect the Discord account as you would the machine — enable 2FA, don't leave
-Discord logged in on untrusted devices. Phone control is additive; the daemon still runs locally
-without it.
+_Mitigation:_ protect that account as you would the machine — enable 2FA on Discord, or rely on
+your Slack workspace's own SSO/2FA policy; don't leave either logged in on untrusted devices.
+Phone control is additive; the daemon still runs locally without it.
 
 ### 2. Relay domain / DNS / TLS takeover → remote code execution on daemons
 
@@ -113,6 +123,29 @@ Write/Edit bodies). The one thing structurally withheld from the bot is OAuth to
 the package dependency closure, not by policy. Do not treat the relay as zero-knowledge; treat it as
 "holds no long-term credentials, but sees session traffic in flight." (This matches the disclosures
 in `README.md` and `docs/ARCHITECTURE.md`.)
+
+### 5. Shared-workspace visibility (Slack)
+
+Everything in risk 4 applies equally when the Slack surface is delivering: the bot process still
+sees session cleartext for a Slack DM the same way it does for a Discord DM. Slack adds a boundary
+Discord does not have. Session output there is delivered into a conversation inside a
+**workspace**, not just handled by a bot process — and on paid Slack plans, that workspace's own
+owners and admins can reach the same content independent of the bot entirely, through Slack's own
+data-export APIs and Enterprise Grid / DLP tooling, which can export or audit the contents of any
+DM in the workspace, including one between this bot and a paired user. Discord has no comparable
+operator-side export/audit surface over a bot's own DMs — a Discord DM's contents are visible to
+the bot process (the same risk-4 exposure) but not additionally exposed to some third party who
+merely operates the server the bot happens to be in.
+
+In practice: on a shared workspace, session output — permission-prompt detail, tool
+inputs/outputs, the prompts you send — is visible not only to whoever operates the bot process
+(risk 3) but potentially to that workspace's own administrators, through a channel this bot's
+zero-credential design has no say over.
+
+_Mitigation:_ self-host both the relay and your own Slack workspace (`docs/SELF_HOST.md`) so the
+operator who can see that traffic and the workspace admin who could export it are the same
+trusted party — you. There is no in-protocol mitigation for this on a workspace you do not
+control; it is inherent to Slack's workspace-admin model, not a defect in this bot.
 
 ## Out of scope
 
