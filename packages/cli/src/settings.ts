@@ -268,8 +268,9 @@ export function resolveDaemonConfig(
   const identityCheckEnv = envBool(env, 'CCTL_IDENTITY_CHECK');
   const identityCheck = identityCheckEnv ?? true;
   // Default ON: a transient API failure (5xx/529/dropped connection) retries managed
-  // sessions with backoff instead of stamping them failed, and non-managed sessions get a
-  // cooldown-limited warn card. Purely event-driven — no polling cost rides this switch.
+  // sessions with backoff instead of stamping them failed, a usage-limit failure parks them
+  // until a phone /switch lands on an account with usage left, and non-managed sessions get
+  // a cooldown-limited warn card. Purely event-driven — no polling cost rides this switch.
   const autoContinueEnv = envBool(env, 'CCTL_AUTO_CONTINUE');
   const autoContinue = autoContinueEnv ?? true;
   const autoContinueMaxAttempts = envNumber(env, 'CCTL_AUTO_CONTINUE_MAX');
@@ -375,7 +376,7 @@ export function resolveDaemonConfig(
       value: autoContinue ? 'on' : 'off',
       source: envSource(autoContinueEnv !== undefined),
       detail:
-        'CCTL_AUTO_CONTINUE (retry managed sessions past transient API errors; warn card for terminal sessions)',
+        'CCTL_AUTO_CONTINUE (retry managed sessions past transient API errors; park them on usage limits until /switch; warn card for terminal sessions)',
     },
     {
       name: 'auto-continue attempts',
