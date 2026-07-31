@@ -33,6 +33,13 @@
 //                            unset uses the relay's built-in default. Raise it for a self-host
 //                            serving many daemons that may reconnect at once.
 //
+// Discord application prerequisite WHEN CCTL_SESSION_CHANNEL_ID or CCTL_SESSION_CHANNELS is
+// set: the privileged MESSAGE CONTENT intent must be enabled in the developer portal — replies
+// typed in session threads are read as messages, and requesting the intent without the portal
+// toggle rejects the gateway login outright. A DM-only deployment (neither env set) requests
+// no privileged intent and needs no portal change; threads a user pins with `/thread-here` on
+// such a deployment still deliver output but cannot read replies (see gatewayIntents).
+//
 // This file preserves the package's structural zero-credential guarantee (see index.ts): it
 // imports only this package's own modules and declared deps — never switch-engine — so the
 // bot process remains physically incapable of touching an OAuth token.
