@@ -338,3 +338,19 @@ describe('computePlan — determinism', () => {
     expect(one.ranking.map((r) => r.accountId)).toEqual(two.ranking.map((r) => r.accountId));
   });
 });
+
+describe('computePlan — the scoped (Fable) weekly cap is not the weekly budget', () => {
+  it('does not advertise fable-left as burnable when the shared weekly budget is empty', () => {
+    // Andrew's live case: fable quota remains, weekly_all has none. The near-empty account
+    // must not be recommended as a burn target on the strength of stranded fable quota.
+    const stranded = acct('a', 'Stranded', [
+      { kind: 'weekly_all', percent: 97 },
+      { kind: 'weekly_scoped', percent: 20, resetsAt: NOW + 2 * HOUR },
+    ]);
+    const healthy = acct('b', 'Healthy', [{ kind: 'weekly_all', percent: 40 }]);
+    const plan = computePlan([stranded, healthy], opts);
+    expect(plan.recommendedAccountId).toBe('b');
+    expect(plan.reason).not.toContain('weekly left');
+    expect(plan.reason).not.toContain('fable left');
+  });
+});
