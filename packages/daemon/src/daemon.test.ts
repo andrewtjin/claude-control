@@ -178,6 +178,8 @@ function fakeSwitchEngine(): SwitchEngineLike & {
     ),
     getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
     // Succeeds by default with an identity-verified result; reauth tests override per case.
+    // Succeeds by default with an identity-verified, VAULT-ONLY result (the re-authed account
+    // was not the live one, so the engine performed no live heal); cases override as needed.
     reauthenticate: vi.fn((id: string): Promise<ReauthResult> =>
       Promise.resolve({
         account: {
@@ -187,6 +189,7 @@ function fakeSwitchEngine(): SwitchEngineLike & {
           createdAtMs: 0,
           updatedAtMs: 0,
         },
+        healedLiveLogin: false,
         identityVerified: true,
       }),
     ),
@@ -1156,38 +1159,29 @@ describe('Daemon lifecycle', () => {
       outcome: 'reauthenticated',
       identityVerified: true,
     });
-    // Not the active account, so no live-file heal was attempted.
+    // The live heal belongs to the engine; a re-login never activates anything.
     expect(switchEngine.activate).not.toHaveBeenCalled();
-  });
-
-  it('heals the live files when the reauthed account is the ACTIVE one', async () => {
-    switchEngine.getActiveId.mockResolvedValue('acct-y');
-    await daemon.start();
-    const state = await mintLink('spare');
-
-    pushCode(`the-code#${state}`);
-    const result = await waitForResult();
-
-    // vaultAuthoritative is what stops the heal from adopting the dead live token back over the
-    // fix (see ActivateOptions) — asserted here because losing it silently re-quarantines.
-    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y', { vaultAuthoritative: true });
-    expect(result.outcome).toBe('reauthenticated_and_reactivated');
-  });
-
-  it('still reports success when the live-file heal fails, naming the follow-up', async () => {
-    switchEngine.getActiveId.mockResolvedValue('acct-y');
-    switchEngine.activate.mockRejectedValue(new Error('another switch holds the lock'));
-    await daemon.start();
-    const state = await mintLink('spare');
-
-    pushCode(`the-code#${state}`);
-    const result = await waitForResult();
-
-    // The vault write is durable and real; only the hot-apply lagged. Reporting the whole
-    // request as failed would tell the user to redo a login that already succeeded.
-    expect(result.ok).toBe(true);
-    expect(result.outcome).toBe('reauthenticated');
+    // Not the live account, so the reply names the follow-up that puts it live.
     expect(result.message).toMatch(/switch spare/);
+  });
+
+  it('reports the engine’s live heal, and never activates to get it', async () => {
+    // The engine rewrites the live files itself when the re-authed account holds the live seat
+    // (same contract as `cctl accounts relogin`); the daemon only relays that fact.
+    switchEngine.reauthenticate.mockResolvedValue({
+      account: { id: 'acct-y', label: 'spare', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
+      healedLiveLogin: true,
+      identityVerified: true,
+    });
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    pushCode(`the-code#${state}`);
+    const result = await waitForResult();
+
+    expect(result.outcome).toBe('reauthenticated_and_healed');
+    expect(result.message).toMatch(/already in place/);
+    expect(switchEngine.activate).not.toHaveBeenCalled();
   });
 
   it('keeps the link usable after a garbled paste (the code was never spent)', async () => {

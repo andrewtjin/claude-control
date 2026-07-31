@@ -253,11 +253,61 @@ describe('reloginFromConfigDir', () => {
 
     // The id is preserved — every activation_intervals / usage_snapshots row keyed to it stays
     // valid, which is the whole reason this verb exists instead of add --fresh.
-    expect(result.id).toBe(existing.id);
-    expect(result.quarantined).toBe(false);
+    expect(result.account.id).toBe(existing.id);
+    expect(result.account.quarantined).toBe(false);
     expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('NEW');
     // Still exactly one account — no new id was minted.
     expect(await h.engine.listAccounts()).toHaveLength(1);
+    // The account was never the live one, so there were no live files to heal.
+    expect(result.healedLiveLogin).toBe(false);
+  });
+
+  it('also rewrites the live files when the re-logged account is the LIVE one', async () => {
+    // The state this exists for: the live account's grant dies (the CLI reports an expired
+    // login), so the user re-logs THAT account. Repairing only the vault leaves the dead token
+    // in the live files — the listing says healthy while every session keeps failing auth.
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+    // The daemon quarantines a dying active account (invalid_grant on refresh) — model that too
+    // so the test proves quarantine and live state heal together.
+    await h.vault.quarantine(accountA.id, 'refresh token died');
+
+    const captureDir = join(h.paths.claudeDir, '..', 'live-relogin');
+    await writeCapture(h, captureDir, {
+      claudeAiOauth: oauth('NEW-A', NOW + 10 * HOUR),
+      oauthAccount: { accountUuid: 'uuid-A', emailAddress: 'A@x.com' },
+    });
+
+    const result = await h.engine.reloginFromConfigDir(accountA.id, captureDir);
+
+    expect(result.healedLiveLogin).toBe(true);
+    expect(result.account.quarantined).toBe(false);
+    // Live credentials AND identity now carry the fresh grant — a running/new session
+    // authenticates without any switch.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('NEW-A');
+    expect((await h.credStore.readOauthAccount())?.accountUuid).toBe('uuid-A');
+    // Vault and live agree, so the next switch has no rotation to adopt.
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.accessToken).toBe('NEW-A');
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+  });
+
+  it('leaves the live files alone when a DIFFERENT account is live', async () => {
+    const h = await harness();
+    const { accountB } = await seedAActiveWithB(h);
+
+    const captureDir = join(h.paths.claudeDir, '..', 'idle-relogin');
+    await writeCapture(h, captureDir, {
+      claudeAiOauth: oauth('NEW-B', NOW + 10 * HOUR),
+      oauthAccount: { accountUuid: 'uuid-B', emailAddress: 'B@x.com' },
+    });
+
+    const result = await h.engine.reloginFromConfigDir(accountB.id, captureDir);
+
+    expect(result.healedLiveLogin).toBe(false);
+    // A's live login is untouched; only B's vault entry changed.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect((await h.credStore.readOauthAccount())?.accountUuid).toBe('uuid-A');
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.accessToken).toBe('NEW-B');
   });
 
   it('refuses (and changes nothing) when the captured login is a DIFFERENT account', async () => {
@@ -343,6 +393,40 @@ describe('reauthenticate (authorization-code re-login)', () => {
 
     expect(account.quarantined).toBe(false);
     expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('reauthed-A');
+  });
+
+  it('also rewrites the live files when the re-authed account is the LIVE one', async () => {
+    // The case that motivates the whole verb: the LIVE account's grant died. Repairing only the
+    // vault would leave every running CLI session failing auth while the registry calls the
+    // account healthy. Same heal (and same honest report) `reloginFromConfigDir` performs.
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+
+    const { healedLiveLogin } = await h.engine.reauthenticate(accountA.id, params);
+
+    expect(healedLiveLogin).toBe(true);
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('reauthed-A');
+    expect((await h.credStore.readOauthAccount())?.accountUuid).toBe('uuid-A');
+  });
+
+  it('leaves the live files alone when a DIFFERENT account is live', async () => {
+    // Re-authing a stored-but-not-live account must not disturb whoever holds the live seat.
+    // The exchange returns B's own identity, or the attribution guard would (correctly) refuse.
+    const bLogin: ExchangeFn = () =>
+      Promise.resolve({
+        claudeAiOauth: oauth('reauthed-B', NOW + HOUR, 'r-reauthed-B'),
+        oauthAccount: { accountUuid: 'uuid-B', emailAddress: 'B@x.com' },
+      });
+    const h = await harness(undefined, bLogin);
+    const { accountB } = await seedAActiveWithB(h);
+
+    const { healedLiveLogin } = await h.engine.reauthenticate(accountB.id, params);
+
+    expect(healedLiveLogin).toBe(false);
+    // A still holds the live seat, untouched.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    // B's vault entry did get the fresh grant — the heal is the only part that was skipped.
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.accessToken).toBe('reauthed-B');
   });
 
   it('refuses (and changes nothing) when the login was a DIFFERENT account', async () => {
@@ -694,9 +778,15 @@ describe('activate — reconcile-by-reading', () => {
     const { accountA, accountB } = await seedAActiveWithB(h);
 
     // Simulate the Claude CLI refreshing A's token while it was live: the live refresh token
-    // now differs from the vault's stored copy for A.
+    // now differs from the vault's stored copy for A. A real rotation issues a new access
+    // token with a LATER expiry — the adoption guard reads that recency as proof of direction,
+    // so every rotation simulated in this file extends `expiresAt` alongside the token swap.
     const liveA = (await h.credStore.readLiveCredentials())!;
-    await h.credStore.writeLiveCredentials({ ...liveA, refreshToken: 'cli-rotated' });
+    await h.credStore.writeLiveCredentials({
+      ...liveA,
+      refreshToken: 'cli-rotated',
+      expiresAt: liveA.expiresAt + HOUR,
+    });
 
     const result = await h.engine.activate(accountB.id);
 
@@ -712,54 +802,38 @@ describe('activate — reconcile-by-reading', () => {
     expect(result.adoptedPreviousRotation).toBe(false);
   });
 
-  // The composition a re-login verb performs: fix the vault, then heal the live files of the
-  // SAME (active) account. Without `vaultAuthoritative` the heal reads the live-vs-vault
-  // disagreement as a CLI rotation and copies the DEAD live token back over the fix — which the
-  // next refresh then rejects, re-quarantining the account this sequence just repaired.
-  it('does NOT adopt the stale live token when healing a just-re-logged-in active account', async () => {
+  it('does not adopt a live token OLDER than the vault copy (in-place re-login left the vault newer)', async () => {
+    // The inverse of rotation: the live account's grant died, the user re-logged it in place,
+    // and only the vault took the fresh grant (say the live heal could not complete). The live
+    // files still hold the dead token — different from the vault, but STALE. Adopting it would
+    // overwrite the fresh grant with the dead one, and the refresh that follows would
+    // quarantine the account the user just repaired.
     const h = await harness();
-    const { accountA } = await seedAActiveWithB(h);
-    // Stand in for reauthenticate()/reloginFromConfigDir(): the vault gains a fresh token while
-    // the live files still hold the old (now dead) one.
+    const { accountA, accountB } = await seedAActiveWithB(h);
+
+    // Live: A's original token, now expired. Vault: A freshly re-logged (newer grant).
+    const liveA = (await h.credStore.readLiveCredentials())!;
+    await h.credStore.writeLiveCredentials({ ...liveA, expiresAt: NOW - HOUR });
     await h.vault.writeBundle(accountA.id, {
-      claudeAiOauth: oauth('A-reauthed', NOW + 10 * HOUR, 'r-A-reauthed'),
+      claudeAiOauth: oauth('RELOGGED-A', NOW + 10 * HOUR, 'r-relogged-A'),
       oauthAccount: { accountUuid: 'uuid-A', emailAddress: 'A@x.com' },
     });
 
-    const result = await h.engine.activate(accountA.id, { vaultAuthoritative: true });
+    const away = await h.engine.activate(accountB.id);
+    expect(away.adoptedPreviousRotation).toBe(false);
+    // The fresh re-login survived the switch.
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.accessToken).toBe('RELOGGED-A');
 
-    expect(result.adoptedPreviousRotation).toBe(false);
-    // The fix survived in the vault AND reached the live files.
-    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('r-A-reauthed');
-    expect((await h.credStore.readLiveCredentials())?.refreshToken).toBe('r-A-reauthed');
-  });
-
-  it('still adopts a genuine CLI rotation on a same-account heal without the flag', async () => {
-    // The flag is opt-in precisely so this case — the ordinary heal, where the LIVE token is the
-    // newer one — keeps working exactly as before.
-    const h = await harness();
-    const { accountA } = await seedAActiveWithB(h);
-    const liveA = (await h.credStore.readLiveCredentials())!;
-    await h.credStore.writeLiveCredentials({ ...liveA, refreshToken: 'cli-rotated' });
-
-    const result = await h.engine.activate(accountA.id);
-
-    expect(result.adoptedPreviousRotation).toBe(true);
-    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('cli-rotated');
-  });
-
-  it('still adopts the PREVIOUS account rotation when the flag rides a hop to another account', async () => {
-    // The flag speaks only for the target's own bundle. A hop still has a previous account whose
-    // live rotation would otherwise be lost, so adoption must not be suppressed there.
-    const h = await harness();
-    const { accountA, accountB } = await seedAActiveWithB(h);
-    const liveA = (await h.credStore.readLiveCredentials())!;
-    await h.credStore.writeLiveCredentials({ ...liveA, refreshToken: 'cli-rotated' });
-
-    const result = await h.engine.activate(accountB.id, { vaultAuthoritative: true });
-
-    expect(result.adoptedPreviousRotation).toBe(true);
-    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.refreshToken).toBe('cli-rotated');
+    // Switching back to A lands the fresh grant live, with no refresh (it is nowhere near
+    // expiry) and no quarantine — the re-login actually recovered the account.
+    h.setNow(NOW + 61_000);
+    const back = await h.engine.activate(accountA.id);
+    expect(back).toMatchObject({ ok: true, refreshed: false });
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('RELOGGED-A');
+    expect((await h.engine.listAccounts()).find((a) => a.id === accountA.id)?.quarantined).toBe(
+      false,
+    );
+    expect(h.refresh).not.toHaveBeenCalled();
   });
 
   it('adopts the rotated token without taking an unprovable live identity with it', async () => {
@@ -770,7 +844,11 @@ describe('activate — reconcile-by-reading', () => {
     const h = await harness();
     const { accountA, accountB } = await seedAActiveWithB(h);
     const liveA = (await h.credStore.readLiveCredentials())!;
-    await h.credStore.writeLiveCredentials({ ...liveA, refreshToken: 'cli-rotated' });
+    await h.credStore.writeLiveCredentials({
+      ...liveA,
+      refreshToken: 'cli-rotated',
+      expiresAt: liveA.expiresAt + HOUR,
+    });
     await h.credStore.writeOauthAccount({ emailAddress: 'stranger@x.com' });
 
     const result = await h.engine.activate(accountB.id);
@@ -824,7 +902,11 @@ describe('activate — a target whose bundle carries no identity block', () => {
 
     // The CLI rotates the live (C's) refresh token, then the operator switches back to A.
     const live = (await h.credStore.readLiveCredentials())!;
-    await h.credStore.writeLiveCredentials({ ...live, refreshToken: 'cli-rotated-C' });
+    await h.credStore.writeLiveCredentials({
+      ...live,
+      refreshToken: 'cli-rotated-C',
+      expiresAt: live.expiresAt + HOUR,
+    });
     h.setNow(NOW + 61_000);
 
     const result = await h.engine.activate(accountA.id);
@@ -899,7 +981,9 @@ describe('active-id reconciliation (external /login inside the Claude CLI)', () 
     const h = await harness();
     const { accountB } = await seedAActiveWithB(h);
     // The user /login'd as B in the CLI, which then rotated B's token: the vault copy is stale.
-    const b = bundleFor('B', NOW + 10 * HOUR);
+    // The rotation minted a new access token, so the live expiry is later than the vault's —
+    // the recency the adoption guard requires before believing the live side is newer.
+    const b = bundleFor('B', NOW + 11 * HOUR);
     await externalLogin(h, {
       ...b,
       claudeAiOauth: { ...b.claudeAiOauth, refreshToken: 'cli-rotated-B' },
@@ -924,7 +1008,8 @@ describe('active-id reconciliation (external /login inside the Claude CLI)', () 
   it('activate after an external login adopts the live rotation into the account that owns it', async () => {
     const h = await harness();
     const { accountA, accountB } = await seedAActiveWithB(h);
-    const b = bundleFor('B', NOW + 10 * HOUR);
+    // As above: the rotation extends the live expiry past the vault copy's.
+    const b = bundleFor('B', NOW + 11 * HOUR);
     await externalLogin(h, {
       ...b,
       claudeAiOauth: { ...b.claudeAiOauth, refreshToken: 'cli-rotated-B' },
@@ -1194,7 +1279,11 @@ describe('refreshToken — background refresh for polling', () => {
     const { accountA } = await seedAActiveWithB(h);
     // The CLI rotated A's token while live; the vault copy is stale AND (say) expired.
     const liveA = (await h.credStore.readLiveCredentials())!;
-    await h.credStore.writeLiveCredentials({ ...liveA, refreshToken: 'cli-rotated' });
+    await h.credStore.writeLiveCredentials({
+      ...liveA,
+      refreshToken: 'cli-rotated',
+      expiresAt: liveA.expiresAt + HOUR,
+    });
 
     const result = await h.engine.refreshToken(accountA.id);
 

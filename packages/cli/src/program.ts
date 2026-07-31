@@ -913,10 +913,18 @@ async function reloginAccount(ref: string): Promise<void> {
     });
     if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
     try {
-      const updated = await engine.reloginFromConfigDir(account.id, captureDir);
+      const { account: updated, healedLiveLogin } = await engine.reloginFromConfigDir(
+        account.id,
+        captureDir,
+      );
+      // Two truthful endings: a re-login of the LIVE account also rewrote the live files, so
+      // sessions pick the fresh login up on their own and telling the user to switch would be
+      // noise; any other outcome still needs the switch to put these credentials live.
       process.stdout.write(
         `Re-logged in ${updated.label} (${updated.id}). Quarantine cleared; usage history kept - ` +
-          `\`cctl switch ${updated.label}\` to use it.\n`,
+          (healedLiveLogin
+            ? 'this is the live account, so the fresh login is already in place.\n'
+            : `\`cctl switch ${updated.label}\` to use it.\n`),
       );
     } catch (err) {
       // no_capture_login (login never completed) and relogin_identity_mismatch (wrong account) are
@@ -977,18 +985,28 @@ async function reauthAccount(ref: string): Promise<void> {
     fail('that code was issued for a different login - re-run this command for a fresh link.');
   }
   try {
-    const { account: updated, identityVerified } = await engine.reauthenticate(account.id, {
+    const {
+      account: updated,
+      healedLiveLogin,
+      identityVerified,
+    } = await engine.reauthenticate(account.id, {
       code: parsed.code,
       state: parsed.state,
       verifier,
     });
+    // Same two truthful endings `accounts relogin` prints: re-authing the LIVE account also
+    // rewrote the live files, so telling the user to switch would be noise; anything else still
+    // needs the switch to put these credentials live.
     process.stdout.write(
       `Re-authenticated ${updated.label} (${updated.id}). Quarantine cleared; usage history kept` +
         (identityVerified
           ? ''
           : ' (the login did not report which account was used, so the match is unverified -' +
             ' check `cctl accounts list` shows the email you expect)') +
-        ` - \`cctl switch ${updated.label}\` to use it.\n`,
+        ' - ' +
+        (healedLiveLogin
+          ? 'this is the live account, so the fresh login is already in place.\n'
+          : `\`cctl switch ${updated.label}\` to use it.\n`),
     );
   } catch (err) {
     // Expected, actionable failures (bad/expired code, identity mismatch) print their message

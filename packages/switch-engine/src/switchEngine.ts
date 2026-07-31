@@ -47,6 +47,7 @@ import type {
   OauthAccount,
   RecoverResult,
   RefreshTokenResult,
+  ReloginResult,
   StoredAccount,
 } from './types.js';
 import { needsMetadataBackfill, Vault } from './vault.js';
@@ -61,12 +62,12 @@ export type ExchangeFn = (
   deps?: ExchangeDeps,
 ) => Promise<{ claudeAiOauth: ClaudeOauth; oauthAccount?: OauthAccount }>;
 
-/** What {@link SwitchEngine.reauthenticate} did. `identityVerified` is true ONLY when both the
- *  stored account and the exchange response carried an accountUuid and they were actually
- *  compared — false means the check was structurally skipped (identity missing on a side), so
- *  callers must render "match unverified" rather than imply a passed check. */
-export interface ReauthResult {
-  account: StoredAccount;
+/** What {@link SwitchEngine.reauthenticate} did — {@link ReloginResult} plus the one fact only
+ *  this verb can report. `identityVerified` is true ONLY when both the stored account and the
+ *  exchange response carried an accountUuid and they were actually compared; false means the
+ *  check was structurally skipped (identity missing on a side), so callers must render "match
+ *  unverified" rather than imply a passed check. */
+export interface ReauthResult extends ReloginResult {
   identityVerified: boolean;
 }
 
@@ -97,21 +98,6 @@ export interface SwitchEngineOptions {
 export interface ActivateOptions {
   /** Bypass the switch-cadence guard for a deliberate operator override. */
   force?: boolean;
-  /**
-   * The caller has just written this account's vault bundle out of band and KNOWS the vault copy
-   * is newer than the live files (today: the re-login verbs — {@link SwitchEngine.reauthenticate}
-   * / `reloginFromConfigDir` — followed by a heal of the same account). Suppresses rotation
-   * adoption for that same-account heal only.
-   *
-   * WHY this must be told, not inferred: adoption reads a live-vs-vault token disagreement as
-   * "the CLI rotated the live token, save it" — correct for every ordinary heal, and exactly
-   * backwards right after a re-login, where the live files still hold the DEAD token the
-   * re-login just replaced. Adopting there would copy the dead token back over the fix and
-   * re-quarantine the account on its next refresh. Nothing in the credentials distinguishes the
-   * two cases (a rotation and a re-login both just change the token), so the only honest
-   * discriminator is the caller who performed the write.
-   */
-  vaultAuthoritative?: boolean;
 }
 
 /** Default minimum interval between switches — see `minSwitchIntervalMs`. */
@@ -398,10 +384,19 @@ export class SwitchEngine {
    * account in the transient window). A missing uuid on either side skips the check — an older
    * capture or a provider that doesn't report one shouldn't block recovery.
    *
+   * LIVE HEAL: when the account being re-logged is the one whose credentials are live RIGHT NOW,
+   * the fresh grant is also written to the live files. Without this the verb repairs only the
+   * vault: the live files keep the dead token, every running/new CLI session keeps failing
+   * auth, and `cctl accounts list` — which reads the registry — reports the account healthy,
+   * so the one account whose death the user can actually SEE is the one this verb couldn't fix.
+   * The heal is best-effort: the vault write is the verb's contract, and a live-file failure
+   * degrades to `healedLiveLogin: false` (the caller then points at `cctl switch`) rather than
+   * failing a re-login that already succeeded.
+   *
    * The caller owns the transient `configDir` and MUST delete it afterwards (token-bearing) —
    * same contract as {@link captureFromConfigDir}.
    */
-  async reloginFromConfigDir(accountId: string, configDir: string): Promise<StoredAccount> {
+  async reloginFromConfigDir(accountId: string, configDir: string): Promise<ReloginResult> {
     // Locked end-to-end so the existence check, the in-place bundle overwrite, and the quarantine
     // clear cannot interleave with a concurrent registry writer — which could remove the account
     // between the check and the write, orphaning its freshly written bundle.
@@ -412,9 +407,15 @@ export class SwitchEngine {
   private async reloginFromConfigDirLocked(
     accountId: string,
     configDir: string,
-  ): Promise<StoredAccount> {
+  ): Promise<ReloginResult> {
     const existing = await this.vault.getAccount(accountId);
     if (!existing) throw new UnknownAccountError(accountId);
+
+    // Who owns the live seat, decided BEFORE the bundle overwrite below: getActiveId()'s
+    // stale-identity corroboration compares the live token against the STORED bundle, and this
+    // method is about to replace that bundle — asked afterwards, the comparison would run
+    // against the fresh capture and could never corroborate.
+    const liveAccountId = await this.getActiveId();
 
     // File-based capture on every platform (the mac Keychain caveat above applies here too):
     // the transient dir is a plain CLAUDE_CONFIG_DIR the CLI populated with
@@ -433,14 +434,16 @@ export class SwitchEngine {
       );
     }
     const oauthAccount = await store.readOauthAccount();
-    return this.applyReloginBundle(existing, creds, oauthAccount);
+    return this.applyReloginBundle(existing, creds, oauthAccount, liveAccountId);
   }
 
   /**
-   * The shared re-login core: identity guard → in-place bundle overwrite → quarantine clear.
-   * Used by {@link reloginFromConfigDir} (host capture) and {@link reauthenticate} (code
-   * exchange) so the same-account attribution guarantee has exactly ONE implementation.
-   * Callers must hold the credential lock.
+   * The shared re-login core: identity guard → in-place bundle overwrite → quarantine clear →
+   * LIVE HEAL. Used by {@link reloginFromConfigDir} (host capture) and {@link reauthenticate}
+   * (code exchange) so the same-account attribution guarantee, and the heal that makes the fix
+   * visible to a running CLI, each have exactly ONE implementation. Callers must hold the
+   * credential lock and pass the `liveAccountId` they read BEFORE the overwrite (see
+   * reloginFromConfigDirLocked for why the ordering matters).
    *
    * The bundle is built from the FRESH login only — the account's previous `oauthAccount`
    * block is never read or merged in. A stale identity block is precisely the contamination
@@ -451,7 +454,8 @@ export class SwitchEngine {
     existing: StoredAccount,
     creds: ClaudeOauth,
     oauthAccount: OauthAccount | undefined,
-  ): Promise<StoredAccount> {
+    liveAccountId: string | null,
+  ): Promise<ReloginResult> {
     // Attribution guard — a mismatch is fatal, not a warning: writing a different account's
     // tokens under this id would corrupt the very history this verb exists to protect.
     if (
@@ -476,11 +480,43 @@ export class SwitchEngine {
     // so the registry reflects the re-login.
     await this.vault.writeBundle(existing.id, bundle);
     await this.vault.clearQuarantine(existing.id);
+
+    // Live heal (see the method comment). Writing credentials before identity mirrors
+    // activate(); a crash between the two leaves the live identity naming the SAME account —
+    // benign, unlike the cross-account torn write recover() exists for — so no intent record
+    // is needed. The read-back is the same verification activate() does, but a mismatch here
+    // degrades instead of rolling back: restoring the dead token it would roll back TO helps
+    // nobody, and the vault-side re-login has already succeeded.
+    let healedLiveLogin = false;
+    if (liveAccountId === existing.id) {
+      try {
+        await this.credStore.writeLiveCredentials(bundle.claudeAiOauth);
+        await this.writeLiveIdentity(bundle.oauthAccount);
+        const check = await this.credStore.readLiveCredentials();
+        healedLiveLogin = check?.accessToken === bundle.claudeAiOauth.accessToken;
+      } catch (err) {
+        this.log.warn(
+          { accountId: existing.id, reason: errorReason(err) },
+          'relogin could not rewrite the live credentials; vault entry is updated',
+        );
+      }
+      if (healedLiveLogin) {
+        this.audit.append({
+          ts: this.clock(),
+          event: 'relogin_live_heal',
+          fromAccountId: existing.id,
+          toAccountId: existing.id,
+          detail: 're-login of the live account; fresh credentials written live',
+        });
+        this.log.info({ accountId: existing.id }, 'relogin healed the live credentials in place');
+      }
+    }
+
     const refreshed = await this.vault.getAccount(existing.id);
     // Only undefined if the account was removed concurrently mid-call — surface that as the
     // unknown-account error rather than returning a stale record.
     if (!refreshed) throw new UnknownAccountError(existing.id);
-    return refreshed;
+    return { account: refreshed, healedLiveLogin };
   }
 
   /**
@@ -497,8 +533,11 @@ export class SwitchEngine {
    *
    * Failure taxonomy: a failed exchange is always a {@link RefreshError} (the caller's paste
    * or the provider's rejection), NEVER a {@link QuarantineError} — this path must be unable
-   * to (re)quarantine anything; only the refresh path may. Touches the vault only: live files
-   * and activeId are a separate, honestly-reported follow-up (`activate()`).
+   * to (re)quarantine anything; only the refresh path may.
+   *
+   * LIVE HEAL: identical to {@link reloginFromConfigDir}'s — re-authenticating the account that
+   * is live right now also rewrites the live files, reported as `healedLiveLogin`. Never touches
+   * `activeId`: a re-login changes which credentials an account HAS, never which account is live.
    */
   async reauthenticate(
     accountId: string,
@@ -509,10 +548,18 @@ export class SwitchEngine {
     return this.withCredentialLock(async () => {
       const existing = await this.vault.getAccount(accountId);
       if (!existing) throw new UnknownAccountError(accountId);
+      // Read BEFORE the overwrite, for the same reason reloginFromConfigDirLocked does.
+      const liveAccountId = await this.getActiveId();
       const { claudeAiOauth, oauthAccount } = await this.exchange(params, this.refreshDeps);
-      const account = await this.applyReloginBundle(existing, claudeAiOauth, oauthAccount);
+      const { account, healedLiveLogin } = await this.applyReloginBundle(
+        existing,
+        claudeAiOauth,
+        oauthAccount,
+        liveAccountId,
+      );
       return {
         account,
+        healedLiveLogin,
         // True only when both sides had a uuid and the guard actually compared them — a
         // provider response with no identity block must read as "unverified", never "passed".
         identityVerified:
@@ -576,15 +623,13 @@ export class SwitchEngine {
 
       // Reconcile-by-reading: if the CLI rotated the previous account's refresh token while
       // it was live, the vault's copy is now stale. Adopt the live token before overwriting.
-      // Skipped only for a caller-declared same-account heal after an out-of-band vault write —
-      // see ActivateOptions.vaultAuthoritative for why that case must be declared, not detected.
-      // A hop to a DIFFERENT account still adopts: the flag speaks for the target's bundle,
-      // while adoption there protects the previous account's rotation.
-      const healingAuthoritativeVault =
-        options.vaultAuthoritative === true && targetId === prevActiveId;
-      const adoptedPreviousRotation = healingAuthoritativeVault
-        ? false
-        : await this.adoptRotationIfNeeded(prevActiveId, liveNow, liveOauthAccount);
+      // A stale live token left by an in-place re-login is NOT adopted — see the direction
+      // guard inside adoptRotationIfNeeded.
+      const adoptedPreviousRotation = await this.adoptRotationIfNeeded(
+        prevActiveId,
+        liveNow,
+        liveOauthAccount,
+      );
 
       // Load the target and refresh it if the access token is near expiry. The rotated token
       // is persisted to the vault the instant we get it — single-use tokens die if dropped.
@@ -814,6 +859,16 @@ export class SwitchEngine {
     const liveUuid = liveOauthAccount?.accountUuid;
     if (prevUuid !== undefined && liveUuid !== undefined && prevUuid !== liveUuid) return false;
     if (liveNow.refreshToken === prevBundle.claudeAiOauth.refreshToken) return false;
+
+    // Direction guard: "differs" is not "newer". Adoption exists to save a token the CLI
+    // minted AFTER our stored copy, but an in-place re-login makes the VAULT the newer side —
+    // with the live files still holding the dead grant the re-login replaced. Adopting then
+    // writes that dead token back over the fresh bundle, and the very next refresh of it fails
+    // as invalid_grant and quarantines the account: the recovery verb's work is undone by the
+    // switch meant to complete it. `expiresAt` dates each grant's mint (access-token lifetimes
+    // are fixed per provider), so a live token that expires no later than the stored one
+    // cannot be a later rotation, and is left alone rather than adopted.
+    if (liveNow.expiresAt <= prevBundle.claudeAiOauth.expiresAt) return false;
 
     // Identity precedence: the live block goes into this account's bundle only when it PROVABLY
     // belongs to it — both sides report a uuid and they agree. Otherwise the bundle keeps its own

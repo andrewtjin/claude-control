@@ -322,7 +322,7 @@ describe('reauth.* (phone re-login)', () => {
   });
 
   it('round-trips every result outcome, and defaults identityVerified to false', () => {
-    for (const outcome of ['reauthenticated', 'reauthenticated_and_reactivated', 'failed']) {
+    for (const outcome of ['reauthenticated', 'reauthenticated_and_healed', 'failed']) {
       const result = decode(
         rawFrame('reauth.result', {
           requestId: 'req-1',

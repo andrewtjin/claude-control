@@ -127,6 +127,18 @@ export interface ActivateResult {
   wroteCredentials: boolean;
 }
 
+/** What `reloginFromConfigDir()` did. Same honesty contract as {@link ActivateResult}:
+ *  `healedLiveLogin` reports a mechanical live-file write (verified by read-back), never that a
+ *  running session applied it. */
+export interface ReloginResult {
+  /** The account's registry row after the in-place bundle overwrite. */
+  account: StoredAccount;
+  /** True when the re-logged account was the live one and the fresh credentials (and identity)
+   *  were written to the live files. False for a non-live account — its live files were
+   *  deliberately untouched — or when the live write failed/could not be verified. */
+  healedLiveLogin: boolean;
+}
+
 /** Outcome of a startup recovery sweep. */
 export interface RecoverResult {
   recovered: boolean;
