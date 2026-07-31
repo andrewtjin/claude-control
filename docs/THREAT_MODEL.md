@@ -13,6 +13,12 @@ choice — most notably, whether to trust the shared relay or self-host their ow
 1. **OAuth access/refresh tokens** for the user's Claude accounts. Compromise = full account
    takeover. These live only in the per-machine encrypted vault and the live files the CLI reads;
    they never enter a protocol message, the relay, or Discord.
+   1a. **The PKCE `code_verifier` of an in-flight re-authentication** (`/reauth`,
+   `cctl accounts reauth`). Short-lived and single-use, it exists only in the memory of the process
+   that minted it (the daemon, or the `cctl` process) — it never enters a protocol message, the
+   relay, or Discord. The authorization **code** the user pastes back does cross those boundaries,
+   which is safe by construction: it is single-use, short-lived, and unusable without the verifier
+   that never left the host.
 2. **The daemon's ability to run commands.** `session.spawn` starts Claude Code (and thus shell
    tools) on the user's machine. Anything that can command the daemon can run code as the user.
 3. **Daemon tokens.** 256-bit secrets that authenticate a daemon to the relay. Stored only as
@@ -51,6 +57,19 @@ choice — most notably, whether to trust the shared relay or self-host their ow
   verification is constant-time with a dummy-hash path so a missing daemon id and a wrong token
   are indistinguishable by timing.
 - **Hook-secret timing oracle** — the loopback hook receiver compares its secret in constant time.
+- **Re-authenticating the wrong account** — a completed login for a _different_ Claude account than
+  the one being re-authenticated is refused, not silently written: the same `accountUuid` identity
+  guard `cctl accounts relogin` already uses (one implementation, shared by both verbs). When the
+  login response reports no identity at all, the check is structurally impossible, and the result
+  says so (`identityVerified: false` on the wire, an explicit caveat in the card and CLI output)
+  rather than implying a match was verified. A pasted code is also bound to the flow that minted
+  it — the `state` is compared **before** any network call, so a code pasted against the wrong (or
+  a stale, or a replaced) login link is refused without spending the single-use code.
+- **A failed re-authentication cannot quarantine an account** — quarantine means "the stored
+  refresh token is permanently dead", which a rejected authorization code never establishes. The
+  code-exchange path throws only `RefreshError`, never `QuarantineError`, and is a separate
+  function from the refresh path precisely so the two taxonomies cannot be conflated by a later
+  edit (asserted directly in `oauthCode.test.ts` and `switchEngine.test.ts`).
 - **Pre-auth resource exhaustion** — a per-frame size cap (refuse oversized frames before parsing),
   a concurrent **unauthenticated-connection** cap (shed a handshake flood before allocating state),
   a first-frame handshake timeout, and a per-socket outbound backpressure cap (the relay keeps no
@@ -74,6 +93,12 @@ The bot authorizes actions by Discord user id. It cannot tell the real owner apa
 has taken over that Discord account (stolen session, SIM-swap, shoulder-surf). Such an attacker can
 send prompts, spawn sessions, and approve permission prompts — i.e. **run code on the user's
 machine**. This is equivalent in power to compromising the machine itself.
+
+With `/reauth` this also includes **re-authenticating** (or rotating) any stored account without
+physical access to the host — a recovery step that previously required being at the keyboard. It
+grants no new class of power (such an attacker already has the code-execution lever above), but it
+does remove one action's implicit physical-presence requirement, and completing it needs the
+attacker to also pass a real Claude login for the account in question.
 
 _Mitigation:_ protect the Discord account as you would the machine — enable 2FA, don't leave
 Discord logged in on untrusted devices. Phone control is additive; the daemon still runs locally
@@ -109,7 +134,11 @@ you own.
 TLS protects the daemon↔relay link on the wire, but the **bot process itself terminates that link**
 and therefore sees the cleartext it relays: commands, tool inputs/outputs, prompts, and the literal
 contents of permission prompts (which include tool input, shell commands, file paths, and
-Write/Edit bodies). The one thing structurally withheld from the bot is OAuth tokens — enforced by
+Write/Edit bodies). A re-authentication adds two items to that list, both deliberately harmless to
+observe: the authorize URL (`client_id`, `state`, and the one-way `code_challenge` — no secret) and
+the authorization code the user pastes back. An observer holding both still cannot complete the
+exchange, because the `code_verifier` never transits (asset 1a above). The one thing structurally
+withheld from the bot is OAuth tokens — enforced by
 the package dependency closure, not by policy. Do not treat the relay as zero-knowledge; treat it as
 "holds no long-term credentials, but sees session traffic in flight." (This matches the disclosures
 in `README.md` and `docs/ARCHITECTURE.md`.)

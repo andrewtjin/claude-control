@@ -50,6 +50,11 @@ export interface IdentityStore {
 
 export interface ControlPlaneHandlers {
   onSwitchCommand?: (msg: MessageOf<'switch.command'>) => void;
+  /** Phone-initiated re-login: mint a login link (reauth.start) / complete it with the pasted
+   *  code (reauth.code). Routing only — PKCE state, TTLs, and result replies live in the
+   *  daemon's handlers, like every other inbound command. */
+  onReauthStart?: (msg: MessageOf<'reauth.start'>) => void;
+  onReauthCode?: (msg: MessageOf<'reauth.code'>) => void;
   onPermissionResponse?: (msg: MessageOf<'permission.response'>) => void;
   /** The phone's answers to a `question.request`. Routing only, like every inbound command —
    *  the daemon's handler owns which leg (managed gate vs held hook) applies them and the
@@ -345,6 +350,8 @@ export class ControlPlaneClient {
     }
 
     if (isType(envelope, 'switch.command')) this.opts.handlers.onSwitchCommand?.(envelope);
+    else if (isType(envelope, 'reauth.start')) this.opts.handlers.onReauthStart?.(envelope);
+    else if (isType(envelope, 'reauth.code')) this.opts.handlers.onReauthCode?.(envelope);
     else if (isType(envelope, 'permission.response'))
       this.opts.handlers.onPermissionResponse?.(envelope);
     else if (isType(envelope, 'question.response'))

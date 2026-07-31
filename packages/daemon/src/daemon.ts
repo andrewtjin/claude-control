@@ -8,8 +8,19 @@
 // pre-built (dependency injection) so a lifecycle test can fake all of them.
 
 import { randomUUID } from 'node:crypto';
-import type { RecoverResult, ActivateResult, StoredAccount } from '@claude-control/switch-engine';
-import { resolveAccountRef } from '@claude-control/switch-engine';
+import type {
+  RecoverResult,
+  ActivateResult,
+  ReauthResult,
+  StoredAccount,
+} from '@claude-control/switch-engine';
+import {
+  buildAuthorizeUrl,
+  generatePkce,
+  generateState,
+  parsePastedCode,
+  resolveAccountRef,
+} from '@claude-control/switch-engine';
 import type {
   SessionManager,
   SessionHandle,
@@ -59,6 +70,7 @@ import type {
 } from './hookReceiver.js';
 import { ControlPlaneClient } from './controlPlaneClient.js';
 import { LOOP_LAG_THRESHOLD_MS, startLoopLagMonitor } from './loopLagMonitor.js';
+import { DEFAULT_REAUTH_TTL_MS, PendingReauths } from './reauthFlow.js';
 
 /** The subset of `SwitchEngine`'s public surface the daemon depends on — narrower than the
  *  concrete class so tests can fake it without building a whole real engine. The real
@@ -68,6 +80,11 @@ export interface SwitchEngineLike {
   activate(id: string): Promise<ActivateResult>;
   listAccounts(): Promise<StoredAccount[]>;
   getActiveId(): Promise<string | null>;
+  /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
+  reauthenticate(
+    id: string,
+    params: { code: string; state: string; verifier: string },
+  ): Promise<ReauthResult>;
 }
 
 /** The slice of `AutoSwitcher` the daemon calls each poll cycle — narrowed to an interface
@@ -209,6 +226,12 @@ interface SpawnOrigin {
  *  survive the double/triple-tap window (seconds), so a few hundred remembered keys is
  *  generous while keeping each set trivially bounded across a long-lived daemon. */
 const MAX_SEEN_STOP_KEYS = 256;
+
+/** A thrown value reduced to one user-facing line: the message only. A stack tells the phone's
+ *  reader nothing actionable, and a non-Error throw still has to render as something. */
+function errorReason(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 /** Remember an idempotency key with FIFO eviction past the bound — a JS Set iterates in
  *  insertion order, so the first value is always the oldest key. The one eviction mechanic
@@ -381,6 +404,13 @@ export class Daemon {
    *  answers "already handled" instead of re-applying. Bounded FIFO — see
    *  {@link rememberSessionCmdKey}. */
   private readonly seenSessionCmdKeys = new Set<string>();
+  /** Outstanding phone-reauth login links (see reauthFlow.ts). Holds the PKCE verifiers, so
+   *  in-memory only and never logged. */
+  private readonly pendingReauths = new PendingReauths();
+  /** Recently seen `reauth.code` idempotencyKeys. Deduped BEFORE the network because the
+   *  authorization code is single-use: a genuine double-submit that both reached the exchange
+   *  would make the second read a spurious "already used" as if the paste were bad. */
+  private readonly seenReauthKeys = new Set<string>();
   /** Operator /say texts queued per REGISTERED INTERACTIVE session, awaiting that session's
    *  next Stop hook (see {@link queueSteering}). In-memory only — a daemon restart drops the
    *  queue, which is tolerable because every queued text was confirmed to the phone as
@@ -507,6 +537,16 @@ export class Daemon {
       onSwitchCommand: (msg) => {
         this.handleSwitchCommand(msg).catch((err: unknown) => {
           this.logger.error({ err }, 'error handling switch.command');
+        });
+      },
+      onReauthStart: (msg) => {
+        this.handleReauthStart(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling reauth.start');
+        });
+      },
+      onReauthCode: (msg) => {
+        this.handleReauthCode(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling reauth.code');
         });
       },
       onPermissionResponse: (msg) => {
@@ -659,6 +699,10 @@ export class Daemon {
     // authoritative registry flag (not the poll result) so it fires even if the usage poll for
     // that account degrades. Ordered before pollAll so a poll failure can't skip the alert.
     this.emitQuarantineNotices(pollAccounts);
+
+    // Drop abandoned reauth links. Lazy expiry in take() already makes a stale link unusable;
+    // this only keeps their (secret) verifiers from idling in memory for the daemon's lifetime.
+    this.pendingReauths.sweep(this.clock());
 
     const snapshot = await this.timePhase('pollAll', () => this.poller.pollAll(pollAccounts));
     // Refresh the post-switch kick's per-account view first, before anything below can
@@ -893,8 +937,7 @@ export class Daemon {
           title: `Account quarantined: ${notice.label}`,
           body:
             `Account "${notice.label}" (${notice.accountId}) can no longer refresh its login ` +
-            `(its refresh token is dead) and needs re-authentication on this PC before it can be ` +
-            `used again.`,
+            `(its refresh token is dead) and needs re-authentication before it can be used again.`,
           level: 'warn',
           notificationType: 'quarantine',
         },
@@ -948,6 +991,182 @@ export class Daemon {
           activeAccountId,
           message: `switch to ${targetAccountId} failed`,
           error: message,
+        },
+      });
+    }
+  }
+
+  /**
+   * `reauth.start` — mint a PKCE login link for a stored account and send it to the phone.
+   *
+   * The verifier stays in {@link pendingReauths} (process memory) and never enters the
+   * envelope: that is what makes relaying the pasted code through a third-party relay safe.
+   * Nothing is logged but the account and the expiry — never the URL (it carries the
+   * challenge and state) and never the verifier.
+   */
+  private async handleReauthStart(msg: MessageOf<'reauth.start'>): Promise<void> {
+    const { requestId, accountRef } = msg.payload;
+    try {
+      // Same id-or-label resolution as `/switch`, so a ref that works there works here.
+      const resolved = resolveAccountRef(await this.switchEngine.listAccounts(), accountRef);
+      if (!resolved.ok) throw new Error(resolved.message);
+
+      const { verifier, challenge } = generatePkce();
+      const state = generateState();
+      const url = buildAuthorizeUrl({ challenge, state });
+      const expiresAtMs = this.clock() + DEFAULT_REAUTH_TTL_MS;
+      // Replaces any link already outstanding for this account (see PendingReauths.start).
+      this.pendingReauths.start(requestId, {
+        accountId: resolved.account.id,
+        label: resolved.account.label,
+        verifier,
+        state,
+        url,
+        expiresAtMs,
+      });
+      this.logger.info(
+        { accountId: resolved.account.id, requestId, expiresAtMs },
+        'reauth link minted',
+      );
+      this.sendEnvelope({
+        type: 'reauth.link',
+        payload: {
+          requestId,
+          ok: true,
+          accountId: resolved.account.id,
+          label: resolved.account.label,
+          url,
+          expiresAt: expiresAtMs,
+          message: `log in as ${resolved.account.label}, then paste the code it shows you`,
+        },
+      });
+    } catch (err) {
+      this.sendEnvelope({
+        type: 'reauth.link',
+        payload: {
+          requestId,
+          ok: false,
+          message: `could not start re-auth for "${accountRef}"`,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+    }
+  }
+
+  /**
+   * `reauth.code` — complete a pending re-login with the code the user pasted.
+   *
+   * Two asymmetries carry the correctness of this handler:
+   *
+   *  1. LOCAL failures (garbled paste, state mismatch) happen before the network, so the
+   *     single-use code is NOT spent — the pending flow is restored and the user can just
+   *     re-paste. Anything that reached the exchange consumes the flow: retrying a burned code
+   *     is futile, so the honest answer is "run /reauth again".
+   *  2. When the reauthed account is the ACTIVE one, the vault fix alone leaves the live
+   *     credential files holding the dead token, so a heal (`activate` on the same account —
+   *     cadence-exempt) follows. A heal failure NEVER demotes the result: the vault write is
+   *     durable and real, and the reply says so while naming the follow-up `/switch`.
+   */
+  private async handleReauthCode(msg: MessageOf<'reauth.code'>): Promise<void> {
+    const { requestId, code, idempotencyKey } = msg.payload;
+    // Synchronous check-then-remember, before any await — see seenReauthKeys.
+    if (this.seenReauthKeys.has(idempotencyKey)) {
+      this.logger.info({ requestId }, 'duplicate reauth.code ignored');
+      return;
+    }
+    rememberBounded(this.seenReauthKeys, idempotencyKey, MAX_SEEN_STOP_KEYS);
+
+    // One-shot take: deletes synchronously, so a racing submit can never exchange twice.
+    const lookup = this.pendingReauths.take(requestId, this.clock());
+    if (lookup.kind !== 'ok') {
+      this.sendEnvelope({
+        type: 'reauth.result',
+        payload: {
+          requestId,
+          ok: false,
+          outcome: 'failed',
+          identityVerified: false,
+          message:
+            lookup.kind === 'expired'
+              ? 'That login link expired. Run /reauth again for a fresh one.'
+              : 'No re-auth is in progress for that link (it may have completed, expired, or ' +
+                'been replaced by a newer /reauth). Run /reauth again.',
+          error: lookup.kind === 'expired' ? 'reauth_expired' : 'reauth_not_found',
+        },
+      });
+      return;
+    }
+    const pending = lookup.entry;
+
+    const parsed = parsePastedCode(code);
+    if (!parsed || parsed.state !== pending.state) {
+      // Pre-network, so the code is unspent: restore the flow (original expiry kept) and let
+      // the user re-paste against the SAME link rather than redo the browser login.
+      this.pendingReauths.restore(requestId, pending);
+      this.sendEnvelope({
+        type: 'reauth.result',
+        payload: {
+          requestId,
+          ok: false,
+          accountId: pending.accountId,
+          outcome: 'failed',
+          identityVerified: false,
+          message: parsed
+            ? 'That code belongs to a different re-auth. Copy the code from the page this ' +
+              "link opened, or run /reauth again — then paste it with the same link's button."
+            : 'That does not look like a complete code — paste the WHOLE string the page ' +
+              'showed, including the part after the "#".',
+          error: parsed ? 'reauth_state_mismatch' : 'reauth_malformed_code',
+        },
+      });
+      return;
+    }
+
+    try {
+      // The engine owns the live heal: re-authenticating the account that is live right now also
+      // rewrites the live files, reported honestly as `healedLiveLogin` (same contract as
+      // `cctl accounts relogin`). Nothing here activates anything — a re-login changes which
+      // credentials an account HAS, never which account is live.
+      const { account, healedLiveLogin, identityVerified } = await this.switchEngine.reauthenticate(
+        pending.accountId,
+        {
+          code: parsed.code,
+          state: parsed.state,
+          verifier: pending.verifier,
+        },
+      );
+      this.sendEnvelope({
+        type: 'reauth.result',
+        payload: {
+          requestId,
+          ok: true,
+          accountId: account.id,
+          outcome: healedLiveLogin ? 'reauthenticated_and_healed' : 'reauthenticated',
+          identityVerified,
+          message:
+            `Re-authenticated ${account.label}; quarantine cleared.` +
+            (healedLiveLogin
+              ? ' This is the live account, so the fresh login is already in place.'
+              : ` Use /switch ${account.label} to put it live.`) +
+            (identityVerified
+              ? ''
+              : ' The login did not report which account was used, so the match is unverified ' +
+                '— check the email on /accounts is the one you expect.'),
+        },
+      });
+    } catch (err) {
+      this.sendEnvelope({
+        type: 'reauth.result',
+        payload: {
+          requestId,
+          ok: false,
+          accountId: pending.accountId,
+          outcome: 'failed',
+          identityVerified: false,
+          // The engine's own message for an identity mismatch names the wrong account, which is
+          // exactly what the user needs; anything else is a spent code — say so plainly.
+          message: `Could not re-authenticate ${pending.label}: ${errorReason(err)}`,
+          error: err instanceof Error ? err.message : String(err),
         },
       });
     }

@@ -246,6 +246,114 @@ describe('permission.lapsed', () => {
   });
 });
 
+describe('reauth.* (phone re-login)', () => {
+  it('all four are registered message types', () => {
+    expect(isMessageType('reauth.start')).toBe(true);
+    expect(isMessageType('reauth.link')).toBe(true);
+    expect(isMessageType('reauth.code')).toBe(true);
+    expect(isMessageType('reauth.result')).toBe(true);
+  });
+
+  it('round-trips a start carrying the unresolved account ref', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      discordUserId: 'user-1',
+      type: 'reauth.start',
+      payload: { requestId: 'req-1', accountRef: 'spare', idempotencyKey: 'idem-1' },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'reauth.start')) {
+      expect(result.envelope.payload.accountRef).toBe('spare');
+    }
+  });
+
+  it('rejects a start without an idempotencyKey — every mutating command must dedupe', () => {
+    const result = decode(rawFrame('reauth.start', { requestId: 'req-1', accountRef: 'spare' }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/idempotencyKey/);
+  });
+
+  it('round-trips a link, and a REFUSAL that names no account', () => {
+    const ok = stamp({
+      daemonId: 'daemon-1',
+      type: 'reauth.link',
+      payload: {
+        requestId: 'req-1',
+        ok: true,
+        accountId: 'acct-1',
+        label: 'spare',
+        url: 'https://claude.ai/oauth/authorize?code=true',
+        expiresAt: 1_000_000,
+        message: 'log in',
+      },
+    });
+    const okResult = decode(encode(ok));
+    expect(okResult.ok).toBe(true);
+
+    // A refusal legitimately has no accountId/url/expiresAt — the ref never resolved, and
+    // inventing values would be dishonest.
+    const refused = decode(
+      rawFrame('reauth.link', { requestId: 'req-1', ok: false, message: 'no such account' }),
+    );
+    expect(refused.ok).toBe(true);
+    if (refused.ok && isType(refused.envelope, 'reauth.link')) {
+      expect(refused.envelope.payload.url ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('bounds the pasted code — untrusted modal input must not be unbounded', () => {
+    const tooLong = decode(
+      rawFrame('reauth.code', {
+        requestId: 'req-1',
+        code: 'x'.repeat(513),
+        idempotencyKey: 'idem-1',
+      }),
+    );
+    expect(tooLong.ok).toBe(false);
+    const atBound = decode(
+      rawFrame('reauth.code', {
+        requestId: 'req-1',
+        code: 'x'.repeat(512),
+        idempotencyKey: 'idem-1',
+      }),
+    );
+    expect(atBound.ok).toBe(true);
+  });
+
+  it('round-trips every result outcome, and defaults identityVerified to false', () => {
+    for (const outcome of ['reauthenticated', 'reauthenticated_and_healed', 'failed']) {
+      const result = decode(
+        rawFrame('reauth.result', {
+          requestId: 'req-1',
+          ok: outcome !== 'failed',
+          accountId: 'acct-1',
+          outcome,
+          message: 'done',
+        }),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok && isType(result.envelope, 'reauth.result')) {
+        expect(result.envelope.payload.outcome).toBe(outcome);
+        // Absent → false: an unverified identity must never read as a verified one.
+        expect(result.envelope.payload.identityVerified).toBe(false);
+      }
+    }
+  });
+
+  it('accepts a failed result with NO accountId (nothing resolvable to report)', () => {
+    const result = decode(
+      rawFrame('reauth.result', {
+        requestId: 'req-1',
+        ok: false,
+        outcome: 'failed',
+        message: 'no re-auth in progress',
+      }),
+    );
+    expect(result.ok).toBe(true);
+  });
+});
+
 describe('session.prune / session.prune.result', () => {
   it('both are registered message types', () => {
     expect(isMessageType('session.prune')).toBe(true);

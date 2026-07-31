@@ -292,6 +292,69 @@ const SwitchResultPayload = z.object({
   error: z.string().nullish(),
 });
 
+/** Phone-initiated re-login of a stored (usually quarantined) account. The daemon runs the
+ *  OAuth authorization-code+PKCE flow itself: it mints the login link (reauth.link), the user
+ *  completes it in a browser and pastes the displayed code back (reauth.code), and the daemon
+ *  exchanges the code for tokens written into the account's EXISTING vault entry — same id,
+ *  usage attribution intact. The PKCE verifier never rides in ANY of these frames: it lives
+ *  only in the daemon's memory, which is what makes relaying the code in cleartext safe (the
+ *  code is single-use, short-lived, and unusable without the verifier). */
+const ReauthStartPayload = z.object({
+  requestId: RequestId,
+  /** Whatever the user typed — an id or a label, resolved daemon-side exactly like
+   *  switch.command's targetAccountId. Named `accountRef` (not accountId) because unlike the
+   *  other account fields this one is HONESTLY unresolved at send time. */
+  accountRef: z.string().min(1),
+  idempotencyKey: IdempotencyKey,
+});
+
+/** The daemon's answer to reauth.start: a login link, or an honest refusal (unknown ref,
+ *  mint failure). One response type per request type — link answers start, result answers
+ *  code — so a card renderer never has to guess which stage a failure belongs to. */
+const ReauthLinkPayload = z.object({
+  requestId: RequestId,
+  ok: z.boolean(),
+  /** The RESOLVED account id/label, present only when ok — the paste button's customId
+   *  carries requestId, but the card must NAME the account so concurrent reauths for two
+   *  accounts stay legible. */
+  accountId: AccountId.nullish(),
+  label: z.string().nullish(),
+  url: z.string().nullish(),
+  /** Epoch ms the daemon's own pending flow dies (its in-memory TTL) — NOT a claim about the
+   *  provider's authorize-page or code lifetime, which is unverified. */
+  expiresAt: z.number().int().nonnegative().nullish(),
+  message: z.string(),
+  error: z.string().nullish(),
+});
+
+/** The pasted "code#state" text, verbatim. A dumb bounded string on purpose: the daemon owns
+ *  trimming/splitting (a stricter wire shape would reject a mobile copy-paste's stray
+ *  whitespace at the parse boundary, where the error message is worst). Bounded like
+ *  PairClaimPayload.hostLabel — untrusted modal input must not bloat daemon memory/logs. */
+const ReauthCodePayload = z.object({
+  requestId: RequestId,
+  code: z.string().min(1).max(512),
+  idempotencyKey: IdempotencyKey,
+});
+
+/** The daemon's answer to reauth.code. `outcome` distinguishes a vault-only fix from one that
+ *  also healed the live credential files (the reauthed account was the live one), because
+ *  the phone copy differs: the former needs a follow-up /switch, the latter does not.
+ *  `identityVerified` is the honest flag for whether the exchange response actually proved
+ *  which account was logged in — when the provider omits identity, the card must say the
+ *  match is unverified rather than imply a check that never ran. */
+const ReauthResultPayload = z.object({
+  requestId: RequestId,
+  ok: z.boolean(),
+  /** Nullish unlike switch.result's activeAccountId: a code pasted against an unknown or
+   *  expired requestId has no recoverable account identity, and inventing one would lie. */
+  accountId: AccountId.nullish(),
+  outcome: z.enum(['reauthenticated', 'reauthenticated_and_healed', 'failed']),
+  message: z.string(),
+  error: z.string().nullish(),
+  identityVerified: z.boolean().default(false),
+});
+
 const PermissionRequestPayload = z.object({
   requestId: RequestId,
   sessionId: SessionId,
@@ -603,6 +666,10 @@ export const messageSchemas = {
   'settings.snapshot': frame('settings.snapshot', SettingsSnapshot),
   'switch.command': frame('switch.command', SwitchCommandPayload),
   'switch.result': frame('switch.result', SwitchResultPayload),
+  'reauth.start': frame('reauth.start', ReauthStartPayload),
+  'reauth.link': frame('reauth.link', ReauthLinkPayload),
+  'reauth.code': frame('reauth.code', ReauthCodePayload),
+  'reauth.result': frame('reauth.result', ReauthResultPayload),
   'permission.request': frame('permission.request', PermissionRequestPayload),
   'permission.response': frame('permission.response', PermissionResponsePayload),
   'permission.lapsed': frame('permission.lapsed', PermissionLapsedPayload),
@@ -635,6 +702,10 @@ export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['settings.snapshot'],
   messageSchemas['switch.command'],
   messageSchemas['switch.result'],
+  messageSchemas['reauth.start'],
+  messageSchemas['reauth.link'],
+  messageSchemas['reauth.code'],
+  messageSchemas['reauth.result'],
   messageSchemas['permission.request'],
   messageSchemas['permission.response'],
   messageSchemas['permission.lapsed'],

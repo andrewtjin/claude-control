@@ -332,8 +332,55 @@ no headless test can check.
 
 **Result:** not yet run.
 
+### 15. Authorization-code re-login (`/reauth`, `cctl accounts reauth`) ⏳ OPEN
+
+**State of the code:** the PKCE mint, the authorize-URL shape, the paste parser, the code exchange,
+the identity guard, the in-place vault write and the whole daemon-side pending-flow state machine
+are unit-proven against injected fakes. What no headless test can check is whether the
+reverse-engineered endpoints and formats in `switch-engine/src/oauth.ts` are what the real service
+actually does — the same posture as gate 2, whose module this shares.
+
+**Verify (run the CLI verb first — same engine call as the phone, minus the daemon):**
+
+- **The authorize URL is accepted as built.** `DEFAULT_AUTHORIZE_ENDPOINT` plus the exact parameter
+  set (`code=true`, `client_id`, `response_type=code`, `redirect_uri` = `DEFAULT_REDIRECT_URI`,
+  `scope` = `OAUTH_AUTHORIZE_SCOPES`, `code_challenge`, `code_challenge_method=S256`, `state`)
+  reaches a real login page and, after approval, a code display — not an error page.
+- **The displayed code really is `<code>#<state>`**, with a single separator and no surrounding
+  markup or entity-encoding that `parsePastedCode` would mis-split. The parser splits on the LAST
+  `#`; confirm no real code makes that the wrong choice.
+- **The exchange request/response shape is right.** A JSON `authorization_code` body at
+  `DEFAULT_TOKEN_ENDPOINT` returns `access_token` + `refresh_token` (+ `expires_in`), and whatever
+  `account`/`organization` fields `mapExchangeResponse` reads are named as assumed — those field
+  names are guesses today, so log the token-redacted body once and correct the mapping if it
+  differs. If no identity block arrives at all, confirm the output says the match is unverified.
+- **A WRONG `code_verifier` is rejected by the real endpoint** (right code, tampered verifier).
+  This is the one live check that proves the whole "the verifier never transits, so relaying the
+  code is safe" posture (`THREAT_MODEL.md` asset 1a) enforces something server-side, rather than
+  PKCE being silently optional.
+- **The account is really usable afterwards.** `cctl accounts list` shows the SAME id with
+  quarantine cleared, then `cctl switch <label>` + a `claude -p "hi"` authenticates on the
+  re-authenticated login.
+- **A failed paste changes nothing.** Paste garbage, and a code with a doctored state segment;
+  confirm each prints one actionable line and leaves the account's bundle and quarantine flag
+  exactly as they were (in particular: a healthy account is never newly quarantined).
+- **Then the phone loop**, against a local bot + local daemon (never the shared relay): `/reauth
+<label>` → link card → log in on the phone → **Paste code** → success card. Confirm the daemon's
+  log records the account and expiry but **never** the URL, the pasted code, the verifier, or a
+  token. Re-submit the same modal and confirm the second attempt answers "no re-auth in progress"
+  rather than exchanging twice.
+- **The live heal.** Re-authenticate the account that is currently live and confirm the live files
+  end up holding the NEW token (result outcome `reauthenticated_and_healed`, and the CLI saying the
+  fresh login is already in place), that a running `claude` authenticates again without a switch,
+  and that the account is **not** quarantined moments later by the next refresh — the failure mode
+  `adoptRotationIfNeeded`'s direction guard exists to prevent.
+
+**Pass:** every bullet above observed against a real Claude account.
+
+**Result:** not yet run.
+
 ## Reminder
 
-The undocumented endpoints (2, 3) and hook names (5) can change without notice. Parsing
+The undocumented endpoints (2, 3, 15) and hook names (5) can change without notice. Parsing
 is deliberately tolerant so a schema drift degrades gracefully instead of crashing the
 poller — but a change still needs re-confirmation here.
