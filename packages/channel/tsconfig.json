@@ -8,10 +8,7 @@
   "references": [
     { "path": "../shared-protocol" },
     { "path": "../switch-engine" },
-    { "path": "../daemon" },
-    { "path": "../session-runtime" },
-    { "path": "../usage-advisor" },
-    { "path": "../channel" }
+    { "path": "../daemon" }
   ],
   "include": ["src/**/*.ts"]
 }

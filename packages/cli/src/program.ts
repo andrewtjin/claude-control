@@ -64,6 +64,17 @@ import {
   startDaemonTaskNow,
   uninstallDaemonTask,
 } from './daemonInstall.js';
+import {
+  canWriteManagedDir,
+  cctlDropInPath,
+  diffCctlDropIn,
+  managedDropInDir,
+  readCctlDropIn,
+  removeCctlDropIn,
+  verifyManagedSettingsEffective,
+  writeCctlDropIn,
+  writeCctlDropInElevated,
+} from './managedSettings.js';
 import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
   renderAccountsTable,
@@ -127,6 +138,7 @@ export function buildProgram(): Command {
 
   buildAccountCommands(program);
   buildSessionCommands(program);
+  buildChannelCommands(program);
 
   program
     .command('switch <ref>')
@@ -711,6 +723,26 @@ function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
     addFreshAccount: (label) => addFreshAccount(label),
     hooksInstalled: () => hooksInstalledAt(settingsPath),
     hooksProfilePath: settingsPath,
+    channelEnabled: async () => {
+      const status = await verifyManagedSettingsEffective({});
+      return { effective: status.effective, detail: status.detail, path: status.path };
+    },
+    enableChannel: async () => {
+      // Already writable (an elevated shell, or a non-Windows box under sudo) — no need to ask
+      // the OS for something the process already has.
+      if (await canWriteManagedDir(managedDropInDir())) {
+        const written = await writeCctlDropIn({});
+        return { outcome: written.outcome, detail: `${written.outcome}: ${written.path}` };
+      }
+      const result = await writeCctlDropInElevated({});
+      return {
+        outcome: result.outcome,
+        detail:
+          result.outcome === 'unsupported'
+            ? `cctl does not escalate privileges here. Run: ${result.manualCommand ?? ''}`
+            : `${result.outcome}: ${result.path}${result.error !== undefined ? ` (${result.error})` : ''}`,
+      };
+    },
     relayUrl,
     probeRelay: (url) => probeRelay(url),
     isPaired: async () =>
@@ -1095,6 +1127,160 @@ function buildAccountCommands(program: Command): void {
  *     sessionClient.ts) — they require the daemon to be up, and fail with an actionable message
  *     otherwise (never silently no-op).
  */
+/**
+ * `cctl channel <serve|enable|disable|status>` — the surface that lets a prompt from the phone
+ * reach a session sitting IDLE at its prompt.
+ *
+ * Without it, a `/say` waits for the session's next turn boundary, which never arrives if nobody
+ * is at the keyboard — the exact case phone control exists for. Claude Code only loads a channel
+ * whose plugin an administrator has approved, so `enable` writes one administrator-scoped file
+ * and asks for consent once.
+ */
+function buildChannelCommands(program: Command): void {
+  const channel = program
+    .command('channel')
+    .description('let prompts from your phone reach a session that is sitting idle');
+
+  channel
+    .command('serve')
+    .description('run the per-session channel server (Claude Code spawns this; not for humans)')
+    .action(async () => {
+      // Imported lazily: this is the only command that needs the channel package, and every
+      // other `cctl` invocation would otherwise pay for loading its module graph.
+      const { runChannelServer } = await import('@claude-control/channel');
+      const code = await runChannelServer();
+      if (code !== 0) process.exit(code);
+    });
+
+  channel
+    .command('status')
+    .description('show whether idle-session prompts are enabled on this machine')
+    .action(async () => {
+      const status = await verifyManagedSettingsEffective({});
+      const p = detectPalette();
+      if (status.effective) {
+        process.stdout.write(`${p.green('enabled')} — ${status.detail}\n`);
+        return;
+      }
+      process.stdout.write(
+        `${p.yellow('not enabled')} — ${status.detail}\n` +
+          `Prompts sent from Discord will wait for the session's next turn boundary.\n` +
+          `Run \`cctl channel enable\` to change that.\n`,
+      );
+    });
+
+  channel
+    .command('enable')
+    .description('approve cctl as a Claude Code channel (writes one administrator-scoped file)')
+    .option(
+      '--no-elevate',
+      'do not ask for administrator rights; print the file to place by hand instead',
+    )
+    .option('--print', 'only show what would be written, and where')
+    .action(async (opts: { elevate?: boolean; print?: boolean }) => {
+      const path = cctlDropInPath();
+      const current = await readCctlDropIn(path).catch(() => ({ present: false }));
+      const diff = diffCctlDropIn(current);
+
+      // A file the operator cannot override is never written without showing it first.
+      process.stdout.write(`${diff.action === 'create' ? 'Create' : 'Update'}: ${path}\n\n`);
+      process.stdout.write(`${diff.desiredText}\n`);
+      if (diff.parseError !== undefined) {
+        process.stdout.write(
+          `warning: the existing file is not valid JSON (${diff.parseError}); it will be replaced.\n`,
+        );
+      }
+      if (diff.removedPlugins.length > 0) {
+        process.stdout.write(
+          `warning: this removes ${diff.removedPlugins
+            .map((r) => `${r.plugin}@${r.marketplace}`)
+            .join(', ')} from the approved list.\n`,
+        );
+      }
+      if (opts.print === true) return;
+      if (!diff.changed) {
+        process.stdout.write('Already up to date; nothing to do.\n');
+        return;
+      }
+
+      // Already writable (an elevated shell, or a non-Windows box running under sudo): just write.
+      if (await canWriteManagedDir(managedDropInDir())) {
+        const result = await writeCctlDropIn({ path });
+        process.stdout.write(
+          `${result.outcome === 'written' ? 'Written' : 'Unchanged'}: ${path}\n`,
+        );
+        await reportChannelNextSteps();
+        return;
+      }
+
+      if (opts.elevate === false) {
+        process.stdout.write(
+          `\nThis file lives in an administrator-owned directory and cctl was told not to ask for\n` +
+            `elevation. Place the JSON above at:\n  ${path}\n`,
+        );
+        return;
+      }
+
+      process.stdout.write('\nRequesting administrator rights to write it...\n');
+      const result = await writeCctlDropInElevated({ path });
+      switch (result.outcome) {
+        case 'written':
+          process.stdout.write(`Written: ${path}\n`);
+          await reportChannelNextSteps();
+          return;
+        case 'unchanged':
+          fail(`could not write ${path}${result.error !== undefined ? `: ${result.error}` : ''}`);
+        // eslint-disable-next-line no-fallthrough -- fail() returns never
+        case 'declined':
+          fail(
+            'administrator rights were declined, so nothing was written. ' +
+              'Re-run and accept the prompt, or use `cctl channel enable --no-elevate` to place the file yourself.',
+          );
+        // eslint-disable-next-line no-fallthrough -- fail() returns never
+        case 'unsupported':
+          process.stdout.write(
+            `\ncctl does not escalate privileges on this platform. Run:\n  ${result.manualCommand}\n` +
+              `and paste the JSON above.\n`,
+          );
+          return;
+      }
+    });
+
+  channel
+    .command('disable')
+    .description('withdraw cctl from the approved channel list')
+    .action(async () => {
+      const path = cctlDropInPath();
+      if (!(await canWriteManagedDir(managedDropInDir()))) {
+        fail(
+          `${path} is in an administrator-owned directory. Delete it from an elevated shell to disable the channel.`,
+        );
+      }
+      const result = await removeCctlDropIn({ path });
+      process.stdout.write(
+        result.outcome === 'removed'
+          ? `Removed: ${path}\nSessions started from now on will not load the cctl channel.\n`
+          : `Nothing to remove; ${path} was not present.\n`,
+      );
+    });
+}
+
+/** What the operator has to do next, said once and plainly: the approval only takes effect for
+ *  sessions started AFTER it, because a channel cannot be attached to a session already running. */
+async function reportChannelNextSteps(): Promise<void> {
+  const status = await verifyManagedSettingsEffective({});
+  if (!status.effective) {
+    process.stdout.write(
+      'warning: the file was written but does not read back as effective. Run `cctl doctor`.\n',
+    );
+    return;
+  }
+  process.stdout.write(
+    'Sessions started from now on can receive prompts while idle. ' +
+      'Sessions already running cannot — a channel is attached at launch and cannot be added later.\n',
+  );
+}
+
 function buildSessionCommands(program: Command): void {
   const session = program
     .command('session')

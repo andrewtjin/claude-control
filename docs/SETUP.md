@@ -40,16 +40,16 @@ Pairing is intentionally excluded from "already set up" — skipping Discord pai
 a valid, complete local-only setup, and `--reconfigure` is how you go back and pair
 later without re-answering everything else.
 
-## The seven steps
+## The eight steps
 
-### [1/7] Checking your environment
+### [1/8] Checking your environment
 
 Runs `cctl doctor`'s checks inline (Node version floor, vault crypto round-trip, vault
 directory, live login, `~/.claude.json`) and prints them. A failed check does not stop
 setup — it's a warning to revisit if a later step fails, since most checks (e.g. "not
 logged in yet") are expected to still be red this early.
 
-### [2/7] Your current Claude account
+### [2/8] Your current Claude account
 
 If accounts are already captured, this step is a no-op ("Leaving them as-is").
 Otherwise:
@@ -66,27 +66,58 @@ Otherwise:
 [default]:` — bare Enter uses `default`), and the currently logged-in account is
   captured into the vault. Your live login is never touched by this step.
 
-### [3/7] Add more accounts (optional)
+### [3/8] Add more accounts (optional)
 
 A `[y/N]` loop (default No on bare Enter): each `y` prompts for a label and runs the
 `--fresh` capture flow — a throwaway `claude` window where you log into the _new_
 account without touching your existing live login. An empty label skips that one
 iteration rather than failing the whole step.
 
-### [4/7] Usage hooks
+### [4/8] Usage hooks
 
 If hooks are already present in your profile's `settings.json`, this is a no-op.
 Otherwise the wizard explains (and does not itself write anything yet):
 
 ```
-Hooks will be installed into <settings.json path> when the daemon starts (step 7).
+Hooks will be installed into <settings.json path> when the daemon starts (step 8).
 ```
 
 This is deliberate, not a bug: the hook command line carries the daemon's loopback
 port, which is only known once the daemon actually binds it. Writing a
-soon-to-be-stale entry here would just create work for step 7 to redo.
+soon-to-be-stale entry here would just create work for step 8 to redo.
 
-### [5/7] Relay
+### [5/8] Prompts to idle sessions
+
+The one step that asks for administrator rights, and the only one whose absence is
+otherwise invisible. Without it, a prompt you send from Discord to an interactive
+session waits until that session finishes a turn or you type in it — which never
+happens while you are away, the case phone control exists for.
+
+If it is already enabled the wizard says so and moves on. Otherwise it explains what
+the file does, names the exact path, and asks:
+
+```
+Enable prompts to idle sessions? [y/N]:
+```
+
+Answering yes writes one file into Claude Code's managed-settings drop-in directory and
+raises a single Windows consent prompt. There is no prompt on any later session. The
+default is No, and nothing is written without an explicit yes.
+
+Three outcomes, all reported plainly:
+
+- **Accepted** — the path it wrote, plus a reminder that only sessions started from now
+  on can receive prompts while idle. A channel is attached at launch, so a session
+  already running cannot be upgraded.
+- **Consent declined** — nothing was written, and setup continues. `cctl channel enable`
+  turns it on whenever you want.
+- **macOS/Linux** — cctl does not escalate privileges for you. It prints the `sudo`
+  command to run and the JSON to place.
+
+Skipping is free: everything else works, and a prompt from Discord still delivers at the
+next turn boundary. `cctl channel status` and `cctl doctor` both report the current state.
+
+### [6/8] Relay
 
 Prints the effective relay URL (flag → `CCTL_RELAY_URL` env → `relayUrl` in
 `config.json` → built-in default) and
@@ -94,7 +125,7 @@ probes its `/health` endpoint. An unreachable relay does not stop setup — it's
 warning that pairing below may fail, with the same actionable detail `cctl doctor`
 would show.
 
-### [6/7] Pair with Discord
+### [7/8] Pair with Discord
 
 If already paired: informational only, with the re-pair command for later.
 
@@ -122,7 +153,7 @@ Pairing code (or `s` to skip):
     (...). Codes are one-time and expire — run `/pair` again for a fresh one."
   - **`error`** — anything else, printed as-is: "Pairing failed (...)."
 
-### [7/7] Autostart and start the daemon
+### [8/8] Autostart and start the daemon
 
 Registers (or updates, or confirms unchanged) the logon Scheduled Task, then tries to
 start the daemon immediately rather than making you wait for the next logon — a

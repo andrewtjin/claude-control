@@ -2570,6 +2570,125 @@ describe('Daemon lifecycle', () => {
     expect(stopAnswer).toEqual({ ok: true });
   });
 
+  // ---- Live channels: the path that reaches a session sitting IDLE, where no hook is in flight
+  // for the steering queue to answer. These cover the daemon-side glue specifically — which
+  // delivery path a prompt takes, and what the operator is told about it afterwards.
+
+  /** Attach a channel server the way the real one does, over the loopback receiver. */
+  async function attachChannel(
+    hookPort: number,
+    sessionId: string,
+  ): Promise<{ status: number; attachId: string | undefined }> {
+    const res = await fetch(`http://127.0.0.1:${hookPort}/cli/channel/attach`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-claude-control-secret': 'shh' },
+      body: JSON.stringify({ sessionId, pid: process.pid, identitySource: 'env' }),
+    });
+    const parsed = (await res.json().catch(() => undefined)) as { attachId?: string } | undefined;
+    return { status: res.status, attachId: parsed?.attachId };
+  }
+
+  async function detachChannel(hookPort: number, attachId: string): Promise<void> {
+    await fetch(`http://127.0.0.1:${hookPort}/cli/channel/detach`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-claude-control-secret': 'shh' },
+      body: JSON.stringify({ attachId }),
+    });
+  }
+
+  function cardOfType(type: string) {
+    const found = relay.received.find(
+      (e) => e.type === 'hook.notification' && e.payload.notificationType === type,
+    );
+    return found?.type === 'hook.notification' ? found.payload : undefined;
+  }
+
+  it('a live channel takes the prompt instead of the turn-boundary queue', async () => {
+    seedTerminalSession('terminal-chan-1');
+    const hookPort = await startCapturingHookPort();
+    expect((await attachChannel(hookPort, 'terminal-chan-1')).status).toBe(200);
+
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-chan-1', text: 'go', idempotencyKey: 'ch-1' },
+    });
+    await waitFor(() => cardOfType('channel_sent') !== undefined);
+
+    // The whole point: it did NOT fall into the queue that waits for a turn boundary...
+    expect(cardOfType('steering_queued')).toBeUndefined();
+    // ...so a Stop hook finds nothing queued for it.
+    expect(
+      await postHook(hookPort, { hook_event_name: 'Stop', session_id: 'terminal-chan-1' }),
+    ).toEqual({ ok: true });
+  });
+
+  it('never tells the operator a channel message was delivered, only that it was sent', async () => {
+    seedTerminalSession('terminal-chan-2');
+    const hookPort = await startCapturingHookPort();
+    await attachChannel(hookPort, 'terminal-chan-2');
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-chan-2', text: 'go', idempotencyKey: 'ch-2' },
+    });
+    await waitFor(() => cardOfType('channel_sent') !== undefined);
+
+    // A channel notification is fire-and-forget: nothing on this side can observe the session
+    // receiving it, so wording that claims it did would be a promise the daemon cannot keep.
+    const body = cardOfType('channel_sent')?.body ?? '';
+    expect(body).not.toMatch(/\bdelivered\b/i);
+    expect(body).not.toMatch(/\bimmediately\b/i);
+  });
+
+  it('resolves a registered label to that session live channel', async () => {
+    seedTerminalSession('terminal-chan-3', 'api');
+    const hookPort = await startCapturingHookPort();
+    await attachChannel(hookPort, 'terminal-chan-3');
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'api', text: 'by label', idempotencyKey: 'ch-3' },
+    });
+    await waitFor(() => cardOfType('channel_sent') !== undefined);
+    expect(cardOfType('channel_sent')?.sessionId).toBe('terminal-chan-3');
+  });
+
+  it('falls back to turn-boundary steering when no channel is attached', async () => {
+    seedTerminalSession('terminal-chan-4');
+    // The receiver still has to be listening; this test just never talks to it directly.
+    await startCapturingHookPort();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-chan-4', text: 'no channel here', idempotencyKey: 'ch-4' },
+    });
+    await waitFor(() => cardOfType('steering_queued') !== undefined);
+    expect(cardOfType('channel_sent')).toBeUndefined();
+  });
+
+  it('a closing channel hands undelivered text back to steering, and says so', async () => {
+    seedTerminalSession('terminal-chan-5');
+    const hookPort = await startCapturingHookPort();
+    const { attachId } = await attachChannel(hookPort, 'terminal-chan-5');
+    if (attachId === undefined) throw new Error('attach failed');
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'terminal-chan-5', text: 'undelivered', idempotencyKey: 'ch-5' },
+    });
+    await waitFor(() => cardOfType('channel_sent') !== undefined);
+
+    // The server goes away before ever collecting it.
+    await detachChannel(hookPort, attachId);
+    await waitFor(() => cardOfType('channel_fell_back') !== undefined);
+
+    // It really is on the turn-boundary queue now, not merely announced as such.
+    expect(
+      await postHook(hookPort, { hook_event_name: 'Stop', session_id: 'terminal-chan-5' }),
+    ).toEqual({ decision: 'block', reason: 'undelivered' });
+  });
+
   it('queued steering delivers via Stop first; a later UserPromptSubmit finds nothing left', async () => {
     seedTerminalSession('terminal-upsub-2');
     const hookPort = await startCapturingHookPort();

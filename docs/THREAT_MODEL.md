@@ -104,6 +104,30 @@ _Mitigation:_ protect the Discord account as you would the machine — enable 2F
 Discord logged in on untrusted devices. Phone control is additive; the daemon still runs locally
 without it.
 
+#### The channel widens this, and it is worth stating plainly
+
+Before live channels, a taken-over Discord account could read usage and approve a tool call **that
+Claude had already decided to make** — it could say yes to a question the model asked. With a
+channel attached it can **originate arbitrary instructions** to a live agent holding the user's
+credentials and filesystem access, and do so against a session nobody is watching, which is the
+whole point of the feature. The gap between "approve what was proposed" and "propose anything" is
+the real escalation here.
+
+Two second-order risks specific to cctl, because channel `content` lands inside the model's context
+and is therefore a prompt-injection surface:
+
+- A message can ask Claude to run `cctl switch` or `cctl accounts` — i.e. to **move credentials
+  between accounts**. Those verbs deserve an explicit refusal in the channel's instructions.
+- A message can ask Claude to edit the channel allowlist or the access configuration that gates who
+  may send in the first place. Nothing reaching the model through a channel may be treated as
+  authority to widen its own access.
+
+_Mitigation:_ the channel is **off until an administrator writes the approval file**, and it is
+per-session — a session launched without it cannot be retrofitted, by design of the CLI. `cctl
+channel disable` withdraws it machine-wide. The identity path fails closed: a channel server that
+cannot verify which session it belongs to refuses to accept anything rather than guessing, because a
+wrong guess delivers one operator's instruction into a different repo.
+
 ### 2. Relay domain / DNS / TLS takeover → remote code execution on daemons
 
 Daemons trust the relay identified by DNS and the public web PKI (`wss://cctl.andrewtjin.com` by

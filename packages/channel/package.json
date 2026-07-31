@@ -1,30 +1,30 @@
 {
-  "name": "@claude-control/cli",
+  "name": "@claude-control/channel",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "cctl": "./dist/bin.js"
+    "cctl-channel": "./dist/bin.js"
   },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./run": {
+      "types": "./dist/run.d.ts",
+      "import": "./dist/run.js"
     }
   },
   "scripts": {
     "build": "tsc -b",
-    "test": "vitest run --root ../.. packages/cli"
+    "test": "vitest run --root ../.. packages/channel"
   },
   "dependencies": {
     "@claude-control/shared-protocol": "workspace:*",
     "@claude-control/switch-engine": "workspace:*",
-    "@claude-control/daemon": "workspace:*",
-    "@claude-control/session-runtime": "workspace:*",
-    "@claude-control/usage-advisor": "workspace:*",
-    "commander": "^15.0.0",
-    "@claude-control/channel": "workspace:*"
+    "@claude-control/daemon": "workspace:*"
   }
 }

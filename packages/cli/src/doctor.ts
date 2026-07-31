@@ -15,6 +15,7 @@ import {
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { verifyManagedSettingsEffective } from './managedSettings.js';
 
 export interface DoctorCheck {
   name: string;
@@ -262,6 +263,31 @@ export function checkSessionRuntime(deps: ClaudeCodeBinaryDeps = {}): DoctorChec
   };
 }
 
+/**
+ * Whether a prompt from the phone can reach a session sitting IDLE at its prompt.
+ *
+ * Reported as a pass-with-detail rather than a failure when unconfigured: everything else still
+ * works without it, and a `/say` still lands at the session's next turn boundary. What the
+ * operator needs is for "nothing happened when I messaged an idle session" to read as a
+ * configuration state with a named fix, rather than as a bug.
+ */
+export async function checkChannelAllowlist(
+  platform: NodeJS.Platform = process.platform,
+): Promise<DoctorCheck> {
+  const status = await verifyManagedSettingsEffective({ platform });
+  if (status.effective) {
+    return { name: 'channel', ok: true, detail: `idle-session prompts enabled (${status.path})` };
+  }
+  return {
+    name: 'channel',
+    ok: true,
+    detail: status.presentButStale
+      ? `${status.detail} — re-run \`cctl channel enable\` to restore it`
+      : 'idle-session prompts not enabled; /say delivers at the next turn boundary instead. ' +
+        '`cctl channel enable` changes that.',
+  };
+}
+
 /** Run every check for the given paths. */
 export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
   return [
@@ -271,6 +297,7 @@ export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
     await checkLiveLogin(paths),
     checkClaudeJson(paths),
     checkSessionRuntime(),
+    await checkChannelAllowlist(),
     { name: 'lock', ok: true, detail: join(paths.vaultDir, '.lock') },
   ];
 }

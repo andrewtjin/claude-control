@@ -213,6 +213,13 @@ function makeDeps(io: WizardIo, overrides: Partial<SetupDeps> = {}): SetupDeps {
     },
     hooksInstalled: () => Promise.resolve(false),
     hooksProfilePath: 'C:/home/.claude/settings.json',
+    channelEnabled: () =>
+      Promise.resolve({
+        effective: true,
+        detail: 'idle-session prompts enabled',
+        path: 'C:/Program Files/ClaudeCode/managed-settings.d/claude-control-channels.json',
+      }),
+    enableChannel: () => Promise.resolve({ outcome: 'written', detail: 'written' }),
     relayUrl: 'ws://127.0.0.1:8765',
     probeRelay: () => Promise.resolve({ reachable: true, detail: 'relay healthy' }),
     isPaired: () => Promise.resolve(false),
@@ -263,9 +270,85 @@ describe('runSetup', () => {
       { reconfigure: true },
     );
     expect(outcome).toBe('completed');
-    expect(text()).toContain('[1/7]');
-    expect(text()).toContain('[7/7]');
+    expect(text()).toContain('[1/8]');
+    expect(text()).toContain('[8/8]');
     expect(text()).toContain('Already paired');
+  });
+
+  // The idle-session channel step. It is the only step that asks for administrator rights, so
+  // it must never act without an explicit yes, and declining must read as a choice.
+  const channelOff = {
+    channelEnabled: () =>
+      Promise.resolve({
+        effective: false,
+        detail: 'not enabled',
+        path: 'C:/Program Files/ClaudeCode/managed-settings.d/claude-control-channels.json',
+      }),
+  };
+
+  it('does not ask about idle-session prompts when they are already enabled', async () => {
+    // Only two answers scripted: a third question would exhaust them and hang the wizard.
+    const { io, text } = makeIo(['', 'n', 'AB-CD 12']);
+    await runSetup(makeDeps(io));
+    expect(text()).toContain('Already enabled');
+    expect(text()).not.toContain('Enable prompts to idle sessions?');
+  });
+
+  it('enables idle-session prompts on an explicit yes', async () => {
+    let asked = 0;
+    const { io, text } = makeIo(['', 'n', 'y', 'AB-CD 12']);
+    await runSetup(
+      makeDeps(io, {
+        ...channelOff,
+        enableChannel: () => {
+          asked += 1;
+          return Promise.resolve({ outcome: 'written', detail: 'written: policy file' });
+        },
+      }),
+    );
+    expect(asked).toBe(1);
+    expect(text()).toContain('written: policy file');
+  });
+
+  it('never writes machine policy without an explicit yes', async () => {
+    let asked = 0;
+    const { io, text } = makeIo(['', 'n', '', 'AB-CD 12']);
+    await runSetup(
+      makeDeps(io, {
+        ...channelOff,
+        enableChannel: () => {
+          asked += 1;
+          return Promise.resolve({ outcome: 'written', detail: 'should not happen' });
+        },
+      }),
+    );
+    expect(asked).toBe(0);
+    expect(text()).toContain('cctl channel enable');
+  });
+
+  it('reports declined consent as a choice, and setup still completes', async () => {
+    const { io, text } = makeIo(['', 'n', 'y', 'AB-CD 12']);
+    const outcome = await runSetup(
+      makeDeps(io, {
+        ...channelOff,
+        enableChannel: () => Promise.resolve({ outcome: 'declined', detail: 'declined' }),
+      }),
+    );
+    expect(outcome).toBe('completed');
+    expect(text()).toContain('Consent declined');
+    expect(text()).toContain('Setup complete.');
+  });
+
+  it('tells the operator what to run by hand where cctl does not escalate', async () => {
+    const { io, text } = makeIo(['', 'n', 'y', 'AB-CD 12']);
+    await runSetup(
+      makeDeps(io, {
+        ...channelOff,
+        enableChannel: () =>
+          Promise.resolve({ outcome: 'unsupported', detail: 'Run: sudo tee /etc/claude-code/...' }),
+      }),
+    );
+    expect(text()).toContain('sudo tee');
   });
 
   it('runs the full happy path first-run and reports completed', async () => {
@@ -283,7 +366,7 @@ describe('runSetup', () => {
     expect(outcome).toBe('completed');
     const out = text();
     // Every step announced, in order.
-    for (const n of [1, 2, 3, 4, 5, 6, 7]) expect(out).toContain(`[${n}/7]`);
+    for (const n of [1, 2, 3, 4, 5, 6, 7, 8]) expect(out).toContain(`[${n}/8]`);
     expect(out).toContain('Captured default');
     // The pairing code reached the pair() dep already normalized.
     expect(paired).toEqual(['abcd12']);
