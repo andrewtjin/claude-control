@@ -60,8 +60,22 @@ function post(
 
 const SECRET = 'test-secret-abc';
 const auth = { 'x-claude-control-secret': SECRET };
-/** Short enough that a poll bound is a test, not a wait. */
-const POLL_MS = 250;
+/** Short enough that waiting one out is a test rather than a pause, but long enough that "this
+ *  response came back immediately" stays distinguishable from "this response waited out the
+ *  bound" on a loaded machine. A tighter value made the immediacy assertions measure CPU
+ *  contention instead of the behaviour under test. */
+const POLL_MS = 5_000;
+
+/** Wait for an observable condition instead of sleeping a fixed amount. A poll is "held" only
+ *  once the receiver has actually taken for it, and on a busy machine that can be far later than
+ *  any sleep a test would be willing to hard-code. */
+async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('waitFor timed out');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
 
 let store: Store;
 let receiver: HookReceiver;
@@ -69,17 +83,24 @@ let registry: ChannelRegistry;
 let port: number;
 let replies: { attachId: string; text: string }[];
 let recovered: string[];
+/** Every `take` the receiver made, in order, tagged with why — the liveness contract is exactly
+ *  that a daemon-side push is not a poll. */
+let takeSources: ('poll' | 'wake')[];
 
 /** The same binding daemon.ts installs, minus the envelope plumbing. */
 function handlersFor(reg: ChannelRegistry): HookReceiverChannelHandlers {
   return {
     attach: (input) => {
       const result = reg.attach(input);
-      return result.ok
-        ? { ok: true, attachId: result.attachment.attachId }
+      if (result.ok) return { ok: true, attachId: result.attachment.attachId };
+      return result.reason === 'closing'
+        ? { ok: false, error: 'daemon is shutting down', retryable: true }
         : { ok: false, error: 'already attached' };
     },
-    take: (attachId): ChannelInjectionView[] | undefined => reg.take(attachId),
+    take: (attachId, source): ChannelInjectionView[] | undefined => {
+      takeSources.push(source);
+      return reg.take(attachId, source);
+    },
     ack: (attachId, injectId, state) => reg.ack(attachId, injectId, state).ok,
     reply: (attachId, text) => {
       if (reg.get(attachId) === undefined) return false;
@@ -96,6 +117,7 @@ beforeEach(async () => {
   store = new Store(':memory:');
   replies = [];
   recovered = [];
+  takeSources = [];
   receiver = new HookReceiver({
     store,
     secret: SECRET,
@@ -205,7 +227,7 @@ describe('next', () => {
     const attachId = await attach();
     const pending = post(port, '/cli/channel/next', { attachId }, auth);
     // Give the poll time to be registered as held, then push work into it.
-    await new Promise((r) => setTimeout(r, 60));
+    await waitFor(() => takeSources.length >= 1);
     const started = Date.now();
     registry.enqueue('sess-1', 'woken');
     const res = await pending;
@@ -230,11 +252,115 @@ describe('next', () => {
   it('never abandons a socket when a second poll replaces the first', async () => {
     const attachId = await attach();
     const first = post(port, '/cli/channel/next', { attachId }, auth);
-    await new Promise((r) => setTimeout(r, 60));
+    await waitFor(() => takeSources.length >= 1);
     const second = post(port, '/cli/channel/next', { attachId }, auth);
     // The displaced poll is answered rather than left hanging.
     expect((await first).status).toBe(200);
     expect((await second).status).toBe(200);
+  });
+
+  it('delivers work into a held poll rather than making it wait for the next one', async () => {
+    // The registry cannot produce a "second poll finds work the first one missed" state: an
+    // enqueue wakes whatever poll is currently held, which is the entire point of the wake path.
+    // Assert that, so the next reader does not mistake it for a gap.
+    const attachId = await attach();
+    const first = post(port, '/cli/channel/next', { attachId }, auth);
+    await waitFor(() => takeSources.length >= 1);
+    registry.enqueue('sess-1', 'arrived with a poll already held');
+
+    const body = (await first).body as { items: ChannelInjectionView[] };
+    expect(body.items.map((i) => i.text)).toEqual(['arrived with a poll already held']);
+    expect(takeSources).toContain('wake');
+  });
+
+  it('answers a displaced poll even when the replacement finds work waiting', async () => {
+    // Unreachable through the registry (see above), so drive the receiver's own contract
+    // directly — the ordering is still the receiver's to guarantee. The displacement must not
+    // depend on the replacement going on to be held: a second poll that returns items
+    // immediately displaces the first just as surely, and the first's socket would otherwise be
+    // abandoned until its own bound expired.
+    const queued: ChannelInjectionView[][] = [[], [{ injectId: 'i1', text: 'waiting' }]];
+    const local = new HookReceiver({
+      store,
+      secret: SECRET,
+      emit: () => undefined,
+      daemonId: () => 'daemon-1',
+      channelPollMs: POLL_MS,
+    });
+    local.setChannelHandlers({
+      attach: () => ({ ok: true, attachId: 'a1' }),
+      take: () => queued.shift() ?? [],
+      ack: () => true,
+      reply: () => true,
+      detach: () => undefined,
+    });
+    const localPort = await local.listen(0);
+    try {
+      await post(
+        localPort,
+        '/cli/channel/attach',
+        { sessionId: 's', pid: 1, identitySource: 'env' },
+        auth,
+      );
+      const first = post(localPort, '/cli/channel/next', { attachId: 'a1' }, auth);
+      await waitFor(() => queued.length === 1);
+      const started = Date.now();
+      const second = post(localPort, '/cli/channel/next', { attachId: 'a1' }, auth);
+
+      expect((await second).body).toMatchObject({ ok: true, items: [{ text: 'waiting' }] });
+      expect((await first).body).toEqual({ ok: true, items: [] });
+      expect(Date.now() - started).toBeLessThan(POLL_MS);
+    } finally {
+      await local.close();
+    }
+  });
+
+  it('answers a displaced poll even when the replacement 404s on a dead attachment', async () => {
+    const attachId = await attach();
+    const first = post(port, '/cli/channel/next', { attachId }, auth);
+    await waitFor(() => takeSources.length >= 1);
+    // The attachment disappears (swept, or the daemon shut its registry) between the two polls.
+    registry.detach(attachId);
+    const started = Date.now();
+    const second = post(port, '/cli/channel/next', { attachId }, auth);
+
+    expect((await second).status).toBe(404);
+    expect((await first).body).toEqual({ ok: true, items: [] });
+    expect(Date.now() - started).toBeLessThan(POLL_MS);
+  });
+
+  it('tags a client poll as a poll and a daemon push as a wake', async () => {
+    const attachId = await attach();
+    const pending = post(port, '/cli/channel/next', { attachId }, auth);
+    await waitFor(() => takeSources.length >= 1);
+    registry.enqueue('sess-1', 'woken');
+    await pending;
+    expect(takeSources).toEqual(['poll', 'wake']);
+  });
+});
+
+describe('shutdown latch', () => {
+  it('refuses a re-attach once closing, with a status that says "come back" not "give up"', async () => {
+    await attach('sess-1');
+    receiver.beginClose();
+    const res = await post(
+      port,
+      '/cli/channel/attach',
+      { sessionId: 'sess-2', pid: 9, identitySource: 'env' },
+      auth,
+    );
+    // 503, not the 409 a duplicate server gets: this client should retry against the next daemon.
+    expect(res.status).toBe(503);
+  });
+
+  it('refuses a poll once closing rather than holding a socket the drain has already passed', async () => {
+    const attachId = await attach();
+    receiver.beginClose();
+    const started = Date.now();
+    const res = await post(port, '/cli/channel/next', { attachId }, auth);
+    expect(res.status).toBe(503);
+    // Answered outright — a held poll registered after the drain would wedge close().
+    expect(Date.now() - started).toBeLessThan(POLL_MS);
   });
 });
 
@@ -279,7 +405,7 @@ describe('ack, reply, detach', () => {
   it('answers a held poll before detaching, so nothing is left waiting on a dead attachment', async () => {
     const attachId = await attach();
     const pending = post(port, '/cli/channel/next', { attachId }, auth);
-    await new Promise((r) => setTimeout(r, 60));
+    await waitFor(() => takeSources.length >= 1);
     await post(port, '/cli/channel/detach', { attachId }, auth);
     expect((await pending).status).toBe(200);
   });
@@ -296,7 +422,7 @@ describe('shutdown', () => {
   it('drains held polls so close() does not wait on them', async () => {
     const attachId = await attach();
     const pending = post(port, '/cli/channel/next', { attachId }, auth);
-    await new Promise((r) => setTimeout(r, 60));
+    await waitFor(() => takeSources.length >= 1);
     const started = Date.now();
     await receiver.close();
     // close() must not have waited out the poll bound.

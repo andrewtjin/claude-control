@@ -30,9 +30,16 @@ export const CHANNEL_TTL_MS = 30 * 60_000;
  *  Node imposes no response deadline of its own. */
 export const CHANNEL_POLL_MS = 30_000;
 
-/** An attachment with no poll for this long is treated as dead and swept. Comfortably longer
- *  than the poll bound so a client that is merely between polls is never mistaken for gone. */
-export const CHANNEL_ATTACH_STALE_MS = 3 * CHANNEL_POLL_MS;
+/** Staleness is always a MULTIPLE of the poll bound actually in force, never an independent
+ *  number: a client that is merely between polls must never be mistaken for gone, and the only
+ *  way to guarantee that is to derive one from the other. Three polls leaves room for two
+ *  consecutive lost round trips before an attachment is written off. */
+const STALE_POLL_MULTIPLE = 3;
+
+/** The default staleness window — what {@link STALE_POLL_MULTIPLE} yields for the default poll
+ *  bound. A registry configured with a different `pollMs` scales its own window with it (see
+ *  {@link ChannelRegistry.staleAfterMs}); this constant is only the default. */
+export const CHANNEL_ATTACH_STALE_MS = STALE_POLL_MULTIPLE * CHANNEL_POLL_MS;
 
 /** How the channel server worked out which session it belongs to. Recorded because an
  *  `ancestry` resolution is a weaker claim than `env` and is worth surfacing when a message
@@ -63,20 +70,41 @@ export interface ChannelInjection {
 export type EnqueueResult =
   { ok: true; injectId: string } | { ok: false; reason: 'not_attached' | 'queue_full' };
 
+/** Why a `take` is happening. A client asking for work is evidence it is alive; the daemon
+ *  pushing into a socket it is already holding is evidence of nothing — see {@link
+ *  ChannelRegistry.take}. */
+export type TakeSource = 'poll' | 'wake';
+
 export interface ChannelRegistryOptions {
   clock?: () => number;
   /** Called when work arrives for an attachment, so the receiver can complete a held poll
    *  immediately instead of leaving the operator waiting for the next one. */
   onEnqueue?: (attachId: string) => void;
+  /** Called with whatever {@link ChannelRegistry.take} dropped for being older than the TTL.
+   *  The registry is transport-free, so it cannot card the operator itself — but the operator
+   *  was told the text was sent, and an expiry that reaches nobody is exactly the silent loss
+   *  this module exists to prevent. */
+  onExpire?: (sessionId: string, expired: ChannelInjection[]) => void;
   queueCap?: number;
   ttlMs?: number;
+  /** The poll bound actually in force on the transport. The staleness window is derived from
+   *  it, so raising the bound can never make the sweep detach a client mid-hold. */
+  pollMs?: number;
 }
 
 export class ChannelRegistry {
   private readonly clock: () => number;
   private readonly onEnqueue: ((attachId: string) => void) | undefined;
+  private readonly onExpire: ((sessionId: string, expired: ChannelInjection[]) => void) | undefined;
   private readonly queueCap: number;
   private readonly ttlMs: number;
+  /** How long an attachment may go without a poll before it is written off. Derived, never
+   *  configured directly — see {@link STALE_POLL_MULTIPLE}. */
+  readonly staleAfterMs: number;
+  /** Set by {@link close}. Shutdown is a one-way door: without this, a client that re-attaches
+   *  during the teardown window re-populates the registry AFTER its only drain, and its work is
+   *  then lost for real rather than merely undelivered. */
+  private closed = false;
 
   private readonly attachments = new Map<string, ChannelAttachment>();
   /** One attachment per session. A second server for the same session is a bug (two copies of
@@ -91,16 +119,22 @@ export class ChannelRegistry {
   constructor(options: ChannelRegistryOptions = {}) {
     this.clock = options.clock ?? Date.now;
     this.onEnqueue = options.onEnqueue;
+    this.onExpire = options.onExpire;
     this.queueCap = options.queueCap ?? CHANNEL_QUEUE_CAP;
     this.ttlMs = options.ttlMs ?? CHANNEL_TTL_MS;
+    this.staleAfterMs = STALE_POLL_MULTIPLE * (options.pollMs ?? CHANNEL_POLL_MS);
   }
 
   /** Attach a channel server to a session. Refuses a second attachment for a session that
    *  already has a live one, unless the existing attachment has gone stale (its process died
-   *  without detaching, which is the ordinary case after a crash). */
+   *  without detaching, which is the ordinary case after a crash), and refuses everything once
+   *  {@link close} has run. */
   attach(
     input: ChannelAttachInput,
-  ): { ok: true; attachment: ChannelAttachment } | { ok: false; reason: 'already_attached' } {
+  ):
+    | { ok: true; attachment: ChannelAttachment }
+    | { ok: false; reason: 'already_attached' | 'closing' } {
+    if (this.closed) return { ok: false, reason: 'closing' };
     const now = this.clock();
     const existingId = this.bySession.get(input.sessionId);
     // Whatever the outgoing server never delivered is carried onto the newcomer's queue rather
@@ -109,7 +143,7 @@ export class ChannelRegistry {
     let inherited: ChannelInjection[] = [];
     if (existingId !== undefined) {
       const existing = this.attachments.get(existingId);
-      if (existing !== undefined && now - existing.lastPollAtMs < CHANNEL_ATTACH_STALE_MS) {
+      if (existing !== undefined && now - existing.lastPollAtMs < this.staleAfterMs) {
         return { ok: false, reason: 'already_attached' };
       }
       inherited = this.detach(existingId);
@@ -183,18 +217,31 @@ export class ChannelRegistry {
     return { ok: true, injectId: injection.injectId };
   }
 
-  /** Hand a poller everything queued for it, moving those items in-flight. Expired items are
-   *  dropped here rather than delivered: see {@link CHANNEL_TTL_MS}. */
-  take(attachId: string): ChannelInjection[] | undefined {
+  /**
+   * Hand a poller everything queued for it, moving those items in-flight. Expired items are
+   * dropped here rather than delivered (see {@link CHANNEL_TTL_MS}) and reported through
+   * `onExpire`, never dropped silently.
+   *
+   * `source` decides whether this counts as proof of life. A `'poll'` is the client asking, which
+   * it can only do if it is running. A `'wake'` is the daemon pushing into a socket it is already
+   * holding — a half-open connection accepts that write without anyone being on the other end, so
+   * treating it as liveness would restart the staleness countdown for a client that is gone.
+   */
+  take(attachId: string, source: TakeSource = 'poll'): ChannelInjection[] | undefined {
     const attachment = this.attachments.get(attachId);
     if (attachment === undefined) return undefined;
     const now = this.clock();
-    attachment.lastPollAtMs = now;
+    if (source === 'poll') attachment.lastPollAtMs = now;
     const queue = this.queues.get(attachId) ?? [];
-    const fresh = queue.filter((item) => now - item.queuedAtMs <= this.ttlMs);
+    const fresh: ChannelInjection[] = [];
+    const expired: ChannelInjection[] = [];
+    for (const item of queue) {
+      (now - item.queuedAtMs <= this.ttlMs ? fresh : expired).push(item);
+    }
     this.queues.set(attachId, []);
     const flying = this.inFlight.get(attachId);
     if (flying !== undefined) for (const item of fresh) flying.set(item.injectId, item);
+    if (expired.length > 0) this.onExpire?.(attachment.sessionId, expired);
     return fresh;
   }
 
@@ -222,15 +269,17 @@ export class ChannelRegistry {
     const now = this.clock();
     const dead: { attachment: ChannelAttachment; recovered: ChannelInjection[] }[] = [];
     for (const attachment of [...this.attachments.values()]) {
-      if (now - attachment.lastPollAtMs < CHANNEL_ATTACH_STALE_MS) continue;
+      if (now - attachment.lastPollAtMs < this.staleAfterMs) continue;
       dead.push({ attachment, recovered: this.detach(attachment.attachId) });
     }
     return dead;
   }
 
-  /** Everything still undelivered, for a clean shutdown that wants to fall messages back rather
-   *  than drop them on the floor. */
-  drainAll(): ChannelInjection[] {
+  /** Shut the registry: refuse further attachments and hand back everything still undelivered.
+   *  The latch is the point — a drain alone leaves a window in which a client re-attaches and
+   *  re-populates a registry nobody will drain again. */
+  close(): ChannelInjection[] {
+    this.closed = true;
     return [...this.attachments.keys()].flatMap((attachId) => this.detach(attachId));
   }
 }

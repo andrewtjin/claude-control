@@ -14,8 +14,13 @@ import {
 } from '@claude-control/daemon';
 import { InsecurePassthroughProtector } from '@claude-control/switch-engine';
 import {
+  BACKOFF_BASE_MS,
   createDiscover,
   DaemonLink,
+  EMPTY_POLL_FLOOR_MS,
+  MAX_POLL_MS,
+  MIN_POLL_MS,
+  STALE_ATTACHMENT_MS,
   type AttachIdentity,
   type ChannelItem,
   type Deliver,
@@ -228,7 +233,7 @@ describe('attach + poll + ack against a real daemon', () => {
     });
   });
 
-  it('re-polls immediately, without backing off, when the long poll returns nothing', async () => {
+  it('floors, but does not back off, when the long poll returns nothing', async () => {
     const thirdPoll = deferred();
     const stub = await startStub((req, res) => {
       if (req.path === '/cli/channel/attach') return json(res, 200, { ok: true, attachId: 'a' });
@@ -256,21 +261,89 @@ describe('attach + poll + ack against a real daemon', () => {
     link.stop();
     await running;
 
-    expect(slept).toEqual([]);
+    // Every wait is the small floor, never a backoff step: an empty result is a SUCCESS, so the
+    // backoff stays reset — but the daemon does not always hold the socket, and a zero-delay
+    // re-poll would become an unthrottled request loop against its event loop.
+    expect(slept.length).toBeGreaterThan(0);
+    expect(new Set(slept)).toEqual(new Set([EMPTY_POLL_FLOOR_MS]));
+    expect(EMPTY_POLL_FLOOR_MS).toBeLessThan(BACKOFF_BASE_MS);
   });
 });
 
 describe('self-healing', () => {
-  it('exits on 409 rather than double-delivering alongside the server that owns the session', async () => {
+  it('retries a 409 once, because a dead predecessor still owns the attachment for 90s', async () => {
+    // Claude Code does not restart a failed MCP server, so exiting on the first 409 costs this
+    // session its channel for its entire life — and the likeliest cause is not a genuine second
+    // server but a predecessor that died without detaching.
+    const attached = deferred();
+    const stub = await startStub((req, res) => {
+      if (req.path === '/cli/channel/attach') {
+        const attaches = stub.requests.filter((r) => r.path === '/cli/channel/attach').length;
+        // The stale attachment is swept between the two attempts.
+        if (attaches === 1) return json(res, 409, { ok: false, error: 'already attached' });
+        return json(res, 200, { ok: true, attachId: 'second-chance' });
+      }
+      attached.resolve();
+      return; // hold the poll
+    });
+
+    const waits: number[] = [];
+    const link = track(
+      new DaemonLink({
+        identity: IDENTITY,
+        discover: fixedDiscover(stub.port).discover,
+        conflictRetryMs: 5,
+        sleep: (ms) => {
+          waits.push(ms);
+          return Promise.resolve();
+        },
+      }),
+    );
+    const running = link.run(okDeliver);
+    await attached.promise;
+    link.stop();
+    await running;
+
+    expect(link.currentAttachId).toBe('second-chance');
+    expect(waits).toContain(5);
+  });
+
+  it('gives up after the retry also comes back 409 - two live servers is real', async () => {
     const stub = await startStub((_req, res) =>
       json(res, 409, { ok: false, error: 'already attached' }),
     );
     const link = track(
-      new DaemonLink({ identity: IDENTITY, discover: fixedDiscover(stub.port).discover }),
+      new DaemonLink({
+        identity: IDENTITY,
+        discover: fixedDiscover(stub.port).discover,
+        conflictRetryMs: 5,
+        sleep: () => Promise.resolve(),
+      }),
     );
 
     expect(await link.run(okDeliver)).toEqual({ reason: 'conflict' });
-    expect(stub.requests).toHaveLength(1);
+    // Exactly two attempts: one retry, never a loop.
+    expect(stub.requests.filter((r) => r.path === '/cli/channel/attach')).toHaveLength(2);
+  });
+
+  it('defaults the conflict wait to just past the daemon stale window', async () => {
+    const stub = await startStub((_req, res) =>
+      json(res, 409, { ok: false, error: 'already attached' }),
+    );
+    const waits: number[] = [];
+    const link = track(
+      new DaemonLink({
+        identity: IDENTITY,
+        discover: fixedDiscover(stub.port).discover,
+        sleep: (ms) => {
+          waits.push(ms);
+          return Promise.resolve();
+        },
+      }),
+    );
+    await link.run(okDeliver);
+
+    expect(waits[0]).toBeGreaterThan(STALE_ATTACHMENT_MS);
   });
 
   it('re-discovers and re-attaches after the daemon forgets the attachment (404)', async () => {
@@ -436,8 +509,9 @@ describe('backoff', () => {
     link.stop();
     await running;
 
-    // 10, 20 while failing; then a good poll resets, so the next failure starts over at 10.
-    expect(slept).toEqual([10, 20, 10]);
+    // 10, 20 while failing; the empty poll succeeds (resetting the backoff) and costs only the
+    // floor; then the next failure starts over at 10.
+    expect(slept).toEqual([10, 20, EMPTY_POLL_FLOOR_MS, 10]);
   });
 });
 
@@ -580,5 +654,32 @@ describe('bridge, end to end', () => {
       attachId: 'e2e',
       text: 'green, deploying',
     });
+  });
+});
+
+describe('daemon-supplied pollMs', () => {
+  it('clamps an absurd value rather than sizing our own deadline from it', async () => {
+    const polled = deferred();
+    const stub = await startStub((req, res) => {
+      if (req.path === '/cli/channel/attach') {
+        // A buggy or future daemon. `pollMs` sizes this client's request deadline, so trusting
+        // it unbounded turns a remote field into a local hang (or an instant timeout).
+        return json(res, 200, { ok: true, attachId: 'clamped', pollMs: Number.MAX_SAFE_INTEGER });
+      }
+      polled.resolve();
+      return; // hold
+    });
+
+    const link = track(
+      new DaemonLink({ identity: IDENTITY, discover: fixedDiscover(stub.port).discover }),
+    );
+    const running = link.run(okDeliver);
+    await polled.promise;
+    link.stop();
+    await running;
+
+    // The poll went out at all, which it could not have with an unusable deadline.
+    expect(stub.requests.some((r) => r.path === '/cli/channel/next')).toBe(true);
+    expect(MIN_POLL_MS).toBeLessThan(MAX_POLL_MS);
   });
 });

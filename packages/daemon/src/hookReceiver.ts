@@ -22,6 +22,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { EnvelopeDraft, PayloadOf } from '@claude-control/shared-protocol';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
+import { CHANNEL_POLL_MS, type TakeSource } from './channelRegistry.js';
 import type { Store } from './store.js';
 
 /** The structured questions carried on a `question.request` envelope. Aliased from the wire
@@ -226,11 +227,16 @@ export interface ChannelAttachRequest {
  *  these handlers own the queue and the routing. Synchronous throughout because every operation
  *  is in-memory bookkeeping — a channel poll must not wait on I/O nobody is waiting for. */
 export interface HookReceiverChannelHandlers {
+  /** `retryable` separates "come back later" (the daemon is shutting down) from "give up" (some
+   *  other server already owns this session), which the client must handle differently: one is a
+   *  backoff, the other is an exit. */
   attach(
     input: ChannelAttachRequest,
-  ): { ok: true; attachId: string } | { ok: false; error: string };
-  /** `undefined` means the attachment is unknown or expired and the client must re-attach. */
-  take(attachId: string): ChannelInjectionView[] | undefined;
+  ): { ok: true; attachId: string } | { ok: false; error: string; retryable?: boolean };
+  /** `undefined` means the attachment is unknown or expired and the client must re-attach.
+   *  `source` distinguishes a client's own poll from a daemon-side push into a held socket —
+   *  only the former is evidence the client is still alive. */
+  take(attachId: string, source: TakeSource): ChannelInjectionView[] | undefined;
   ack(attachId: string, injectId: string, state: 'sent' | 'failed'): boolean;
   /** A reply the model produced for whoever sent the injection. */
   reply(attachId: string, text: string): boolean;
@@ -258,8 +264,12 @@ export const DEFAULT_PERMISSION_HOLD_MS = 570_000;
  *  re-poll. Bounded rather than infinite: Node imposes no response deadline, so an unbounded poll
  *  would be legal but would make shutdown slow and a dead daemon invisible to the client until it
  *  next had something to say. Work arriving mid-hold completes the poll immediately
- *  ({@link HookReceiver.wakeChannelPoll}), so this bound costs latency only when nothing happens. */
-export const DEFAULT_CHANNEL_POLL_MS = 30_000;
+ *  ({@link HookReceiver.wakeChannelPoll}), so this bound costs latency only when nothing happens.
+ *
+ *  Aliased from the registry's own constant rather than restated: the registry's staleness window
+ *  is a multiple of the poll bound, and two independently-written 30s literals would let a later
+ *  edit move one without the other. */
+export const DEFAULT_CHANNEL_POLL_MS = CHANNEL_POLL_MS;
 
 /** The tool whose "permission" is really a structured multiple-choice prompt. It does not take
  *  the yes/no permission path: instead the hook response is held while the phone answers, and the
@@ -476,6 +486,11 @@ export class HookReceiver {
     string,
     { res: ServerResponse; timer: NodeJS.Timeout }
   >();
+  /** Set by {@link beginClose} (and by {@link close} itself). Teardown drains the held polls and
+   *  the daemon drains its registry exactly once, so anything that could re-populate either after
+   *  that point must be refused rather than served — otherwise shutdown completing at all depends
+   *  on the client not happening to re-attach inside the window. */
+  private closingChannels = false;
   /** Permission hook responses currently held open awaiting a phone decision, keyed by the
    *  requestId we minted. `event` echoes the exact hook event name the CLI fired — the
    *  decision output must name it back (`hookSpecificOutput.hookEventName`). `toolInput` is
@@ -566,6 +581,24 @@ export class HookReceiver {
   }
 
   /**
+   * Stop serving the channel endpoints, ahead of the rest of {@link close}.
+   *
+   * The daemon's shutdown drains its channel registry and then spends seconds stopping live
+   * sessions before this receiver closes. That window is long enough for a client to re-attach
+   * and start polling again — against a registry nothing will drain a second time. Latching the
+   * endpoints first makes the refusal a decision instead of a race.
+   */
+  beginClose(): void {
+    this.closingChannels = true;
+  }
+
+  /** The poll bound this receiver actually enforces, so a collaborator sizing anything against it
+   *  (the registry's staleness window) reads the real value rather than assuming the default. */
+  getChannelPollMs(): number {
+    return this.channelPollMs;
+  }
+
+  /**
    * Complete a held `/cli/channel/next` poll immediately because work arrived for it.
    *
    * Called by the daemon the moment something is queued, so an injection reaches an idle session
@@ -575,7 +608,7 @@ export class HookReceiver {
   wakeChannelPoll(attachId: string): void {
     const held = this.heldChannelPolls.get(attachId);
     if (held === undefined) return;
-    const items = this.channelHandlers?.take(attachId);
+    const items = this.channelHandlers?.take(attachId, 'wake');
     if (items === undefined || items.length === 0) return;
     clearTimeout(held.timer);
     this.heldChannelPolls.delete(attachId);
@@ -618,6 +651,10 @@ export class HookReceiver {
   }
 
   async close(): Promise<void> {
+    // Latch first, so nothing served between here and the drain below can register a new held
+    // poll — an unanswered poll registered after the drain would hold `server.close()` open for
+    // the length of its bound.
+    this.closingChannels = true;
     if (!this.server) return;
     // Held permission responses are open connections — `server.close()` waits for them, so a
     // shutdown mid-hold would hang until the hold lapsed. Answer them all neutrally first
@@ -630,8 +667,9 @@ export class HookReceiver {
     this.heldPermissions.clear();
     // Held channel polls are open connections for the same reason, and there is one per idle
     // channel-attached session — the common case, not a corner case. Answer them empty: the
-    // client treats that as an ordinary poll bound and re-polls, which fails against the closing
-    // daemon and sends it into its normal re-attach loop.
+    // client treats that as an ordinary poll bound and re-polls at once. That re-poll is refused
+    // by the latch set above — NOT by the socket dying, which would be a race — and the client
+    // backs off into its normal re-attach loop.
     for (const [, held] of this.heldChannelPolls) {
       clearTimeout(held.timer);
       this.respond(held.res, 200, { ok: true, items: [] });
@@ -972,6 +1010,13 @@ export class HookReceiver {
       this.respond(res, 503, { ok: false, error: 'daemon is starting; retry in a moment' });
       return;
     }
+    // Shutting down: refuse the whole surface rather than serve a request whose state nothing
+    // will drain again. 503 (not 404/409) is what tells the client to back off and come back to
+    // the next daemon, instead of exiting or re-attaching into the teardown.
+    if (this.closingChannels) {
+      this.respond(res, 503, { ok: false, error: 'daemon is shutting down' });
+      return;
+    }
 
     if (path === '/cli/channel/attach') {
       const sessionId = str(body.sessionId);
@@ -996,8 +1041,12 @@ export class HookReceiver {
       });
       if (!result.ok) {
         // 409, not 500: a second server for one session is a real state the client must handle
-        // by exiting, not a fault it should retry through.
-        this.respond(res, 409, { ok: false, error: result.error });
+        // by exiting, not a fault it should retry through. A retryable refusal is a 503 for the
+        // opposite reason — the client SHOULD come back.
+        this.respond(res, result.retryable === true ? 503 : 409, {
+          ok: false,
+          error: result.error,
+        });
         return;
       }
       this.logger.info(
@@ -1020,7 +1069,18 @@ export class HookReceiver {
 
     switch (path) {
       case '/cli/channel/next': {
-        const items = handlers.take(attachId);
+        // Only one poll per attachment can be held; a second replaces the first, which is
+        // answered empty so its socket is never abandoned. Retired BEFORE this request is
+        // served, because every exit below — 404, items, or a fresh hold — displaces it just the
+        // same, and a cleanup that only ran on one of the three would abandon the socket on the
+        // other two.
+        const previous = this.heldChannelPolls.get(attachId);
+        if (previous !== undefined) {
+          clearTimeout(previous.timer);
+          this.heldChannelPolls.delete(attachId);
+          this.respond(previous.res, 200, { ok: true, items: [] });
+        }
+        const items = handlers.take(attachId, 'poll');
         if (items === undefined) {
           this.respond(res, 404, { ok: false, error: 'unknown attachment' });
           return;
@@ -1030,14 +1090,7 @@ export class HookReceiver {
           return;
         }
         // Nothing queued: hold the response so an injection arriving in the next few seconds
-        // reaches an idle session immediately rather than after another round trip. Only one
-        // poll per attachment can be held; a second replaces the first, which is answered empty
-        // so its socket is never abandoned.
-        const previous = this.heldChannelPolls.get(attachId);
-        if (previous !== undefined) {
-          clearTimeout(previous.timer);
-          this.respond(previous.res, 200, { ok: true, items: [] });
-        }
+        // reaches an idle session immediately rather than after another round trip.
         const timer = setTimeout(() => {
           const held = this.heldChannelPolls.get(attachId);
           if (held === undefined) return;
