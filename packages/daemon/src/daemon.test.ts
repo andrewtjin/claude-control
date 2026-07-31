@@ -1337,6 +1337,131 @@ describe('Daemon lifecycle', () => {
     }
   });
 
+  it('a successful switch.command kicks sessions parked on a usage limit and pushes ONE summary card', async () => {
+    // One parked session, one healthy one: the kick is blind-fired across the registry, so
+    // only the parked handle may react and the card must count exactly it.
+    const parked = makeFakeHandle('s-parked');
+    let stalled = true;
+    let kicks = 0;
+    parked.resumeFromUsageLimitStall = () => {
+      if (!stalled) return false;
+      stalled = false;
+      kicks += 1;
+      return true;
+    };
+    const healthy = makeFakeHandle('s-healthy');
+    healthy.resumeFromUsageLimitStall = () => false;
+    sessionManager.handles.set(parked.id, parked);
+    sessionManager.handles.set(healthy.id, healthy);
+    sessionManager.records.push(
+      { id: parked.id, kind: 'managed', state: 'waiting_input', startedAtMs: 0 },
+      { id: healthy.id, kind: 'managed', state: 'waiting_input', startedAtMs: 0 },
+    );
+
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'switch.command',
+      payload: {
+        requestId: 'r-kick',
+        targetAccountId: 'spare',
+        reason: 'manual',
+        idempotencyKey: 'k-kick',
+      },
+    });
+    await waitFor(() =>
+      relay.received.some(
+        (e) =>
+          e.type === 'hook.notification' && e.payload.notificationType === 'usage_stall_resumed',
+      ),
+    );
+
+    expect(kicks).toBe(1);
+    // The switch confirmation must reach the phone before any resumed-session card.
+    const resultIdx = relay.received.findIndex((e) => e.type === 'switch.result');
+    const cardIdx = relay.received.findIndex(
+      (e) => e.type === 'hook.notification' && e.payload.notificationType === 'usage_stall_resumed',
+    );
+    expect(resultIdx).toBeGreaterThanOrEqual(0);
+    expect(cardIdx).toBeGreaterThan(resultIdx);
+    const card = relay.received[cardIdx];
+    if (card?.type === 'hook.notification') {
+      expect(card.payload.title).toBe('Resumed 1 stalled session');
+      expect(card.payload.body).toContain('"spare"');
+    }
+  });
+
+  it('leaves parked sessions alone when the switch target has no usage left', async () => {
+    // The latest poll shows acct-y ('spare') fully exhausted on a still-live session window.
+    poller = new UsagePoller({
+      fetch: vi.fn(),
+      getToken: () => Promise.resolve(undefined),
+      getCachedUsage: (accountId) =>
+        Promise.resolve(
+          accountId === 'acct-y'
+            ? {
+                limits: [
+                  {
+                    kind: 'session',
+                    percent: 100,
+                    resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+                  },
+                ],
+              }
+            : { limits: [] },
+        ),
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+
+    const parked = makeFakeHandle('s-parked');
+    let kicks = 0;
+    parked.resumeFromUsageLimitStall = () => {
+      kicks += 1;
+      return true;
+    };
+    sessionManager.handles.set(parked.id, parked);
+    sessionManager.records.push({
+      id: parked.id,
+      kind: 'managed',
+      state: 'waiting_input',
+      startedAtMs: 0,
+    });
+
+    await daemon.start();
+    // The startup poll must land first — it is what records acct-y as exhausted.
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'switch.command',
+      payload: {
+        requestId: 'r-nokick',
+        targetAccountId: 'spare',
+        reason: 'manual',
+        idempotencyKey: 'k-nokick',
+      },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
+
+    // The switch itself succeeded, but the kick was withheld: no resumed turn, no card.
+    expect(kicks).toBe(0);
+    expect(
+      relay.received.some(
+        (e) =>
+          e.type === 'hook.notification' && e.payload.notificationType === 'usage_stall_resumed',
+      ),
+    ).toBe(false);
+  });
+
   it('wires permission.response -> hookReceiver.resolvePermission (security contract intact)', async () => {
     store.insertPendingPermission({
       requestId: 'perm-1',
