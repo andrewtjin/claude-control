@@ -181,6 +181,19 @@ describe('computeOutlook — 5h window budget', () => {
     expect(outlook.accounts[0]?.budget?.weeklyResetAt).toBe(NOW + 10 * HOUR);
     expect(outlook.accounts[0]?.budget?.fullWindows).toBe(2);
   });
+
+  it('falls back to the scoped reset only when no weekly_all limit exists', () => {
+    const outlook = computeOutlook(
+      [
+        account({
+          accountId: 'a',
+          limits: [{ kind: 'weekly_scoped', percent: 34, resetsAt: NOW + 10 * HOUR }],
+        }),
+      ],
+      NOW,
+    );
+    expect(outlook.accounts[0]?.budget?.weeklyResetAt).toBe(NOW + 10 * HOUR);
+  });
 });
 
 describe('computeOutlook — merged events', () => {

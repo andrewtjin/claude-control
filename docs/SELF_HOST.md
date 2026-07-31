@@ -37,7 +37,8 @@ Optional: to get per-session **private threads** instead of DM delivery, set
 `CCTL_SESSION_CHANNEL_ID` in `.env` to the id of a text channel the bot can see (right-click
 the channel → Copy Channel ID, with Developer Mode on) and enable the **Message Content
 intent** on your Discord application (Developer Portal → Bot → Message Content Intent) so
-replies typed into a thread reach the session. Left unset, everything arrives by DM.
+replies typed into a thread reach the session — typing into a finished session's thread
+resumes it and keeps the conversation there. Left unset, everything arrives by DM.
 
 `CCTL_SESSION_CHANNEL_ID` applies to **every** paired user, which is not always what you
 want on a relay that other people pair against. `CCTL_SESSION_CHANNELS` overrides it per
@@ -54,6 +55,11 @@ Copy your own user id the same way as a channel id (right-click yourself → Cop
 A malformed pair fails startup with the offending entries listed — deliberately, because a
 mistyped id would otherwise just never match and leave that user silently on DMs.
 
+The Message Content intent requirement follows the routing, not one specific variable: the
+bot requests the privileged intent whenever **either** variable configures session threads,
+and requesting it without the portal toggle rejects the gateway login at startup. A pure-DM
+deployment (neither set) requests no privileged intent and needs no portal change.
+
 ### `/thread-here` — users pick their own channel
 
 Both env vars above are **defaults**. Any paired user can run `/thread-here` in a channel to
@@ -61,6 +67,13 @@ send their own future session threads there, and `/thread-here action:clear` fro
 send them back to their DMs — no operator edit, no redeploy. `/thread-here action:show` reports
 where their output goes right now, which authority decided that, and whether the bot can still
 use the channel.
+
+One caveat on a deployment that sets **neither** env var: a `/thread-here` pin still routes
+output into threads, but those threads are one-way — reading replies needs the privileged
+Message Content intent, and the bot only requests it at startup when the operator configured
+session threads. A user's pin cannot make the next boot request it, because an unapproved
+privileged intent rejects the login and takes the whole bot down for everyone. Set either
+variable above (plus the portal toggle) and restart to make pinned threads two-way.
 
 Full precedence, highest first:
 
