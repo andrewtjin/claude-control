@@ -43,6 +43,10 @@ export interface SessionThreadParent {
       name: string;
       type: ChannelType.PrivateThread;
       invitable: boolean;
+      /** Optional because only SESSION threads pin an archive window (they linger so a user can
+       *  re-enter one by typing, which resumes the session); probe threads live for seconds and
+       *  take the channel default. */
+      autoArchiveDuration?: number;
     }): Promise<{ id: string; members: { add(userId: string): Promise<unknown> } }>;
   };
 }

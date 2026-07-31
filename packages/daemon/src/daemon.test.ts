@@ -1534,6 +1534,180 @@ describe('Daemon lifecycle', () => {
     }
   });
 
+  it("echoes the spawn requestId on the spawned session's status frames", async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-echo', prompt: 'go', idempotencyKey: 'k' },
+    });
+    await waitFor(() => sessionManager.spawnManaged.mock.calls.length > 0);
+    const handle = sessionManager.get('spawned-session') as
+      ReturnType<typeof makeFakeHandle> | undefined;
+    handle?.emit({ kind: 'status', state: 'running' });
+    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
+    const st = relay.received.find((e) => e.type === 'session.status');
+    if (st?.type === 'session.status') {
+      // The requester has no other way to learn the sessionId its spawn minted.
+      expect(st.payload.spawnRequestId).toBe('r-echo');
+      expect(st.payload.sessionId).toBe('spawned-session');
+    }
+  });
+
+  it("announces a spawned session with an immediate 'starting' status, ahead of any event", async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-first', prompt: 'go', idempotencyKey: 'k' },
+    });
+    // No handle.emit at all: the announcement must not depend on the session producing
+    // anything — the first turn's first SDK event emits OUTPUT before any status, so without
+    // this frame the requester meets the new sessionId through an unroutable output chunk.
+    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
+    const st = relay.received.find((e) => e.type === 'session.status');
+    if (st?.type === 'session.status') {
+      expect(st.payload.state).toBe('starting');
+      expect(st.payload.spawnRequestId).toBe('r-first');
+      expect(st.payload.sessionId).toBe('spawned-session');
+    }
+  });
+
+  it("echoes resumedFrom — the caller's WIRE ref, never the resolved SDK anchor", async () => {
+    sessionManager.records.push({
+      id: 'wire-9',
+      kind: 'managed',
+      state: 'done',
+      startedAtMs: 0,
+      resumeId: 'sdk-xyz',
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r-res',
+        prompt: 'go on',
+        resumeSessionId: 'wire-9',
+        idempotencyKey: 'k',
+      },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
+    const st = relay.received.find((e) => e.type === 'session.status');
+    if (st?.type === 'session.status') {
+      expect(st.payload.resumedFrom).toBe('wire-9');
+      expect(st.payload.spawnRequestId).toBe('r-res');
+    }
+  });
+
+  it('answers spawn_failed (relatesTo the spawn frame) when the spawn throws', async () => {
+    await daemon.start();
+    sessionManager.spawnManaged.mockRejectedValueOnce(new Error('no account available'));
+    const frame = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-fail', prompt: 'go', idempotencyKey: 'k' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const err = relay.received.find((e) => e.type === 'error');
+    if (err?.type === 'error') {
+      expect(err.payload.code).toBe('spawn_failed');
+      expect(err.payload.message).toContain('no account available');
+      expect(err.payload.relatesTo).toBe(frame.id);
+    }
+  });
+
+  it('resolves a spawn resumeSessionId naming a MANAGED record to its persisted SDK anchor', async () => {
+    // The bot only ever knows the daemon-minted wire id; the SDK resumes by its own id.
+    sessionManager.records.push({
+      id: 'wire-1',
+      kind: 'managed',
+      state: 'done',
+      startedAtMs: 0,
+      resumeId: 'sdk-abc',
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r2',
+        prompt: 'continue',
+        resumeSessionId: 'wire-1',
+        idempotencyKey: 'k',
+      },
+    });
+    await waitFor(() => sessionManager.spawnManaged.mock.calls.length > 0);
+    expect(sessionManager.spawnManaged.mock.calls[0]![0]).toMatchObject({
+      resumeSessionId: 'sdk-abc',
+    });
+  });
+
+  it('passes a resume ref matching no managed record through unchanged (a raw SDK id)', async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r3',
+        prompt: 'continue',
+        resumeSessionId: 'raw-sdk-id',
+        idempotencyKey: 'k',
+      },
+    });
+    await waitFor(() => sessionManager.spawnManaged.mock.calls.length > 0);
+    expect(sessionManager.spawnManaged.mock.calls[0]![0]).toMatchObject({
+      resumeSessionId: 'raw-sdk-id',
+    });
+  });
+
+  it('refuses to resume a record that never reached session_init — spawn_failed, never a silent fresh session', async () => {
+    sessionManager.records.push({
+      id: 'wire-2',
+      kind: 'managed',
+      state: 'done',
+      startedAtMs: 0,
+    });
+    await daemon.start();
+    const frame = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r4',
+        prompt: 'continue',
+        resumeSessionId: 'wire-2',
+        idempotencyKey: 'k',
+      },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const err = relay.received.find((e) => e.type === 'error');
+    if (err?.type === 'error') {
+      expect(err.payload.code).toBe('spawn_failed');
+      expect(err.payload.message).toContain('session_init');
+      expect(err.payload.relatesTo).toBe(frame.id);
+    }
+    expect(sessionManager.spawnManaged.mock.calls).toHaveLength(0);
+  });
+
+  it('answers inject_failed when a live handle refuses the message, never a silent drop', async () => {
+    const handle = makeFakeHandle('sess-busy');
+    handle.send = () => Promise.reject(new Error('a turn is already in flight'));
+    sessionManager.get = (id) => (id === 'sess-busy' ? handle : undefined);
+    await daemon.start();
+    const frame = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'sess-busy', text: 'hello?', idempotencyKey: 'k' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const err = relay.received.find((e) => e.type === 'error');
+    if (err?.type === 'error') {
+      expect(err.payload.code).toBe('inject_failed');
+      expect(err.payload.message).toContain('a turn is already in flight');
+      expect(err.payload.relatesTo).toBe(frame.id);
+    }
+  });
+
   it('answers spawn_failed with the cause when the session never starts', async () => {
     // `/run`'s Discord reply is sent when the frame leaves the relay, so a spawn that dies before
     // a handle exists would otherwise leave the phone on "Session spawn requested." forever with
@@ -2125,11 +2299,12 @@ describe('Daemon lifecycle', () => {
       payload: { sessionId: 'done-1', text: 'hello?', idempotencyKey: 'k' },
     });
     // The refusal must be VISIBLE (the bot acks /say optimistically): an error envelope
-    // correlated to the inject frame, and no resume.
+    // correlated to the inject frame, and no resume. The code is the ENDED-specific one — a
+    // programmatic caller resumes on it (session.spawn + resumeSessionId) without parsing prose.
     await waitFor(() => relay.received.some((e) => e.type === 'error'));
     const error = relay.received.find((e) => e.type === 'error');
     if (error?.type === 'error') {
-      expect(error.payload.code).toBe('unknown_session');
+      expect(error.payload.code).toBe('session_ended');
       expect(error.payload.message).toContain('already ended');
       expect(error.payload.relatesTo).toBe(frame.id);
     }

@@ -1,18 +1,23 @@
 // discordJsGateway is otherwise a live boundary (see its file header): start()/deliver() make real
-// Discord API calls, so it is not unit-tested. Three deliberate exceptions live here. The first
+// Discord API calls, so it is not unit-tested. Four deliberate exceptions live here. The first
 // proves the per-session-route SERIALIZATION of deliver(), which is gateway-local state (the
 // promise chain + the cardMessages map) that no pure module can hold; it exercises that
 // serialization through the single `protected sinkFor` seam by returning a controllable fake sink.
 // The second is pure data — it holds the pairing primer and the registered command list to each
 // other. The third reads back the session-channel resolver the CONSTRUCTOR wired, so the option
 // plumbing is covered without re-deriving the precedence rules already proven in
-// sessionChannels.test.ts. None touches a real Discord connection.
+// sessionChannels.test.ts. The fourth is the inbound direction — thread messages becoming session
+// input (inject, resume-by-typing, single-flight, error routing) — driven through the same
+// protected seams (sinkFor, reactInThread, sendInThread, onThreadMessage) with a recording relay,
+// since that loop's state (pending sends, resume guards, thread rebinds) is gateway-local too.
+// None touches a real Discord connection.
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  GatewayIntentBits,
   InteractionContextType,
   PermissionFlagsBits,
   PermissionsBitField,
@@ -21,12 +26,13 @@ import {
   type Message,
   type SendableChannels,
 } from 'discord.js';
-import type { Envelope } from '@claude-control/shared-protocol';
+import type { Envelope, EnvelopeDraft } from '@claude-control/shared-protocol';
 import {
   DiscordJsGateway,
   PAIRING_PRIMER_MESSAGE,
   PRIMER_OMITTED_COMMANDS,
   commandDefinitions,
+  gatewayIntents,
   missingThreadPermissionLabels,
 } from './discordJsGateway.js';
 import type {
@@ -35,6 +41,7 @@ import type {
   ThreadHereChannelFacts,
   ThreadHereChannelHealth,
 } from './commands.js';
+import type { SessionThreadParent } from './sessionChannels.js';
 import type { DeliveryTarget } from './threadRegistry.js';
 import type { SessionRoute } from './sessionPlanner.js';
 import type { CardRef } from './permissionCards.js';
@@ -319,6 +326,276 @@ describe('DiscordJsGateway — question.lapsed', () => {
     ).resolves.toBeUndefined();
 
     expect(gw.resolveCalls).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Thread messages -> session input (the reverse direction)
+// ---------------------------------------------------------------------------
+
+/** A relay fake that records every draft and lets a test flip the daemon offline. */
+function inboundFakeRelay() {
+  const sent: EnvelopeDraft[] = [];
+  const state = { online: true };
+  const relay: RelaySender = {
+    sendToUser(_userId, build) {
+      if (!state.online) return { ok: false, error: 'daemon is offline' };
+      const draft = build('daemon-1');
+      sent.push(draft);
+      return { ok: true, id: `env-${sent.length}` };
+    },
+    isOnline: () => state.online,
+  };
+  return { relay, sent, state };
+}
+
+/** Gateway with the inbound seams recording instead of calling Discord. */
+class InboundTestGateway extends DiscordJsGateway {
+  testSink = new FakeSink();
+  readonly reactions: Array<{ threadId: string; messageId: string; emoji: string }> = [];
+  readonly threadSends: Array<{ threadId: string; content: string }> = [];
+  protected override sinkFor(_route: SessionRoute): Promise<SendableChannels | undefined> {
+    return Promise.resolve(this.testSink as unknown as SendableChannels);
+  }
+  protected override reactInThread(
+    threadId: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
+    this.reactions.push({ threadId, messageId, emoji });
+    return Promise.resolve();
+  }
+  protected override sendInThread(threadId: string, content: string): Promise<void> {
+    this.threadSends.push({ threadId, content });
+    return Promise.resolve();
+  }
+  driveThreadMessage(message: {
+    author: { id: string; bot: boolean };
+    channelId: string;
+    channel: { isThread(): boolean };
+    content: string;
+    id: string;
+  }): Promise<void> {
+    return this.onThreadMessage(message);
+  }
+}
+
+/** A thread parent whose create() mints predictable thread ids. */
+function fakeThreadParent(): SessionThreadParent {
+  let n = 0;
+  return {
+    threads: {
+      create: () =>
+        Promise.resolve({
+          id: `t${++n}`,
+          members: { add: () => Promise.resolve(undefined as unknown) },
+        }),
+    },
+  };
+}
+
+function inboundSetup() {
+  const { relay, sent, state } = inboundFakeRelay();
+  const parent = fakeThreadParent();
+  const gw = new InboundTestGateway({
+    relay,
+    pairing: stubPairing,
+    sessionChannelResolver: () => Promise.resolve(parent),
+  });
+  return { gw, sent, state };
+}
+
+const THREAD_MSG = {
+  author: { id: 'u1', bot: false },
+  channelId: 't1',
+  channel: { isThread: () => true },
+  content: 'keep going',
+  id: 'm1',
+};
+
+describe('DiscordJsGateway — thread messages become session input', () => {
+  it("forwards the bound user's text to the owning session as prompt.inject", async () => {
+    const { gw, sent } = inboundSetup();
+    // First frame binds (u1, s1) -> thread t1 via the resolver.
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
+    await gw.driveThreadMessage(THREAD_MSG);
+    const inject = sent.find((d) => d.type === 'prompt.inject');
+    expect(inject?.payload).toEqual({
+      sessionId: 's1',
+      text: 'keep going',
+      idempotencyKey: 'thread:m1',
+    });
+    expect(gw.reactions).toContainEqual({ threadId: 't1', messageId: 'm1', emoji: '📨' });
+  });
+
+  it('ignores bots, non-threads, unbound threads, and any author but the bound user', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
+    const before = sent.length;
+    await gw.driveThreadMessage({ ...THREAD_MSG, author: { id: 'u1', bot: true } });
+    await gw.driveThreadMessage({ ...THREAD_MSG, channel: { isThread: () => false } });
+    await gw.driveThreadMessage({ ...THREAD_MSG, channelId: 't-not-ours' });
+    await gw.driveThreadMessage({ ...THREAD_MSG, author: { id: 'intruder', bot: false } });
+    expect(sent.length).toBe(before);
+    expect(gw.reactions).toHaveLength(0); // ignored silently — no confirmation leaks
+  });
+
+  it('shrugs visibly at a message with no forwardable text', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
+    const before = sent.length;
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: '   ' });
+    expect(sent.length).toBe(before);
+    expect(gw.reactions).toContainEqual({ threadId: 't1', messageId: 'm1', emoji: '⚠️' });
+  });
+
+  it('surfaces an offline daemon in the thread instead of dropping the message', async () => {
+    const { gw, state } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
+    state.online = false;
+    await gw.driveThreadMessage(THREAD_MSG);
+    expect(gw.reactions).toContainEqual({ threadId: 't1', messageId: 'm1', emoji: '⚠️' });
+    expect(gw.threadSends.some((t) => t.threadId === 't1' && t.content.includes('offline'))).toBe(
+      true,
+    );
+  });
+
+  it('resumes an ENDED session via session.spawn and rebinds the new sessionId to the SAME thread', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'done' }));
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'and another thing', id: 'm2' });
+
+    const spawn = sent.find((d) => d.type === 'session.spawn');
+    expect(spawn?.payload).toMatchObject({
+      prompt: 'and another thing',
+      resumeSessionId: 's1',
+      idempotencyKey: 'thread:m2',
+    });
+    expect(gw.reactions).toContainEqual({ threadId: 't1', messageId: 'm2', emoji: '🔄' });
+
+    // The daemon spawns a NEW sessionId and echoes the requestId; the first status frame must
+    // bind s2 to the same thread and announce the seam there.
+    const requestId = (spawn?.payload as { requestId: string }).requestId;
+    await gw.deliver(
+      'u1',
+      envelope('session.status', { sessionId: 's2', state: 'running', spawnRequestId: requestId }),
+    );
+    expect(gw.threadSends.some((t) => t.threadId === 't1' && t.content.includes('s2'))).toBe(true);
+
+    // And the thread now steers the NEW session.
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'louder', id: 'm3' });
+    const inject = sent.find((d) => d.type === 'prompt.inject');
+    expect(inject?.payload).toMatchObject({ sessionId: 's2', text: 'louder' });
+  });
+
+  it('escalates a session_ended inject refusal to a resume spawn with the SAME text', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
+    await gw.driveThreadMessage(THREAD_MSG); // inject sent as env-1
+    await gw.deliver(
+      'u1',
+      envelope('error', {
+        code: 'session_ended',
+        message: "prompt.inject: session 's1' already ended",
+        relatesTo: 'env-1',
+      }),
+    );
+    const spawn = sent.find((d) => d.type === 'session.spawn');
+    expect(spawn?.payload).toMatchObject({ prompt: 'keep going', resumeSessionId: 's1' });
+  });
+
+  it('lands any other correlated refusal in the thread, not the DMs', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
+    await gw.driveThreadMessage(THREAD_MSG); // inject sent as env-1
+    await gw.deliver(
+      'u1',
+      envelope('error', {
+        code: 'inject_failed',
+        message: "prompt.inject: session 's1' did not accept the message (busy)",
+        relatesTo: 'env-1',
+      }),
+    );
+    expect(sent.some((d) => d.type === 'session.spawn')).toBe(false);
+    expect(gw.reactions).toContainEqual({ threadId: 't1', messageId: 'm1', emoji: '❗' });
+    expect(
+      gw.threadSends.some((t) => t.threadId === 't1' && t.content.includes('did not accept')),
+    ).toBe(true);
+  });
+});
+
+describe('gatewayIntents — privileged intents only when threads are configured', () => {
+  it('keeps the pre-thread non-privileged set for a DM-only deployment', () => {
+    expect(gatewayIntents(false)).toEqual([GatewayIntentBits.Guilds]);
+  });
+  it('adds GuildMessages + MessageContent only for a threaded deployment', () => {
+    expect(gatewayIntents(true)).toEqual([
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+    ]);
+  });
+});
+
+describe('DiscordJsGateway — resume is single-flight per thread', () => {
+  it('queues a second message behind an in-flight resume instead of forking a second session', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'done' }));
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'continue', id: 'm1' });
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'and also X', id: 'm2' });
+
+    expect(sent.filter((d) => d.type === 'session.spawn')).toHaveLength(1);
+    expect(gw.reactions).toContainEqual({ threadId: 't1', messageId: 'm2', emoji: '📨' });
+
+    // The rebind delivers the queued text into the RESUMED session, in order.
+    const spawn = sent.find((d) => d.type === 'session.spawn');
+    const requestId = (spawn?.payload as { requestId: string }).requestId;
+    await gw.deliver(
+      'u1',
+      envelope('session.status', { sessionId: 's2', state: 'running', spawnRequestId: requestId }),
+    );
+    const inject = sent.find((d) => d.type === 'prompt.inject');
+    expect(inject?.payload).toMatchObject({ sessionId: 's2', text: 'and also X' });
+  });
+
+  it('releases the single-flight guard when the spawn fails, so the next message retries', async () => {
+    const { gw, sent } = inboundSetup();
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'done' }));
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'continue', id: 'm1' });
+    const firstSpawnEnvelope = `env-${sent.length}`; // the spawn was the latest send
+    await gw.deliver(
+      'u1',
+      envelope('error', {
+        code: 'spawn_failed',
+        message: 'session.spawn: no account available',
+        relatesTo: firstSpawnEnvelope,
+      }),
+    );
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'try again', id: 'm2' });
+    expect(sent.filter((d) => d.type === 'session.spawn')).toHaveLength(2);
+  });
+});
+
+describe('DiscordJsGateway — rebind survives lost in-memory state via resumedFrom', () => {
+  it('binds a resumed session to its origin thread with NO pending entry (restart / external resume)', async () => {
+    const { gw, sent } = inboundSetup();
+    // s1 lives in thread t1; the bot then "forgets" everything in-memory about a resume it
+    // never saw (e.g. it restarted after the spawn went out, or the user ran /run resume).
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'done' }));
+    await gw.deliver(
+      'u1',
+      envelope('session.status', {
+        sessionId: 's2',
+        state: 'starting',
+        spawnRequestId: 'r-unknown-to-this-bot',
+        resumedFrom: 's1',
+      }),
+    );
+    expect(gw.threadSends.some((t) => t.threadId === 't1' && t.content.includes('s2'))).toBe(true);
+    // The thread now steers the resumed session.
+    await gw.driveThreadMessage({ ...THREAD_MSG, content: 'go on', id: 'm9' });
+    const inject = sent.find((d) => d.type === 'prompt.inject');
+    expect(inject?.payload).toMatchObject({ sessionId: 's2', text: 'go on' });
   });
 });
 
