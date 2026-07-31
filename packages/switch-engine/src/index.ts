@@ -20,10 +20,20 @@ export {
 export { defaultProtector, defaultLiveCredentialChannel } from './protector.js';
 export {
   refreshCredentials,
+  exchangeAuthorizationCode,
+  generatePkce,
+  generateState,
+  buildAuthorizeUrl,
+  parsePastedCode,
   CLAUDE_CODE_CLIENT_ID,
   DEFAULT_TOKEN_ENDPOINT,
+  DEFAULT_AUTHORIZE_ENDPOINT,
+  DEFAULT_REDIRECT_URI,
+  OAUTH_AUTHORIZE_SCOPES,
   DEFAULT_REFRESH_SKEW_MS,
   type RefreshDeps,
+  type ExchangeDeps,
+  type PkcePair,
 } from './oauth.js';
 export {
   Vault,
@@ -46,6 +56,8 @@ export {
   type SwitchEngineOptions,
   type ActivateOptions,
   type RefreshFn,
+  type ExchangeFn,
+  type ReauthResult,
 } from './switchEngine.js';
 // Not switch-engine domain logic, but the workspace's only fsync'd atomic writer. Exposed so
 // other packages replace a state file the way this one already does, instead of hand-rolling a

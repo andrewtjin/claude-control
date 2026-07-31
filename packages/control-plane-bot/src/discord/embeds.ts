@@ -708,15 +708,16 @@ export function buildWaitingEmbed(p: {
   return embed;
 }
 
-/** A quarantine notice → the "account down" card. Re-authentication is an interactive OAuth flow
- *  that can only complete on the host (the bot holds zero credentials by design), so the card's
- *  whole job is to name the account and print the EXACT host command to run. `reloginCommand` is
- *  injected (from pushRender's single source of truth) so the card, `handleReauth`, and the real
- *  CLI verb can never drift apart. */
+/** A quarantine notice → the "account down" card. Two recovery paths now exist, so the card
+ *  names both: `reauthCommand` completes right here (the daemon mints an OAuth link and does
+ *  the exchange — the bot still holds zero credentials), `reloginCommand` is the host verb for
+ *  when you're at the keyboard. Both strings are injected from pushRender's single source of
+ *  truth so the card, `handleReauth`, and the real verbs can never drift apart. */
 export function buildQuarantineEmbed(p: {
   title?: string;
   body?: string;
   reloginCommand: string;
+  reauthCommand: string;
 }): EmbedBuilder {
   const embed = new EmbedBuilder()
     .setTitle(`${NOTIFICATION_ICON.quarantine} ${p.title ?? 'Account needs re-login'}`)
@@ -730,10 +731,47 @@ export function buildQuarantineEmbed(p: {
       ),
     )
     .addFields({
-      name: 'Fix it on the host',
-      value: `Run \`${p.reloginCommand}\` to restore the account, then \`cctl switch <label>\`.`,
+      name: 'Fix it',
+      value:
+        `From here: \`${p.reauthCommand}\` — open the link, log in, paste the code back.\n` +
+        `On the host: \`${p.reloginCommand}\`, then \`cctl switch <label>\`.`,
     });
   return embed;
+}
+
+/** The reauth login-link card. Its job is to make the ONE thing that can go wrong — logging
+ *  into the wrong account — impossible to miss, and to say exactly what to copy: the approval
+ *  page shows "<code>#<state>" and pasting only the part before the "#" is the most likely
+ *  mistake. `expiresAt` is rendered as a live relative timestamp so the window is honest
+ *  without this module quoting a duration the daemon owns. */
+export function buildReauthLinkEmbed(p: {
+  label: string;
+  accountId: string;
+  url: string;
+  expiresAt: number;
+}): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle('🔑 Re-authenticate account')
+    .setColor(COLOR_WARN)
+    .setDescription(
+      `Log back into **${p.label}** (${p.accountId}). You must sign in as the SAME account — ` +
+        `a different login is refused so its usage history stays intact.\n\n` +
+        `1. [Open the login page](${p.url}) and sign in.\n` +
+        `2. The page shows a code like \`AbCd1234#xYz\` — copy the WHOLE thing, including the ` +
+        `part after the \`#\`.\n` +
+        `3. Tap **Paste code** below.\n\n` +
+        `Link expires <t:${Math.floor(p.expiresAt / 1000)}:R>.`,
+    );
+}
+
+/** The reauth outcome card. The daemon's message is already the honest account of what happened
+ *  (vault-only vs live-files healed, identity verified or not), so this renders it verbatim
+ *  rather than re-deriving copy from the flags. */
+export function buildReauthResultEmbed(ok: boolean, message: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle(ok ? '✅ Re-authenticated' : 'Re-auth failed')
+    .setColor(ok ? COLOR_OK : COLOR_WARN)
+    .setDescription(truncateLabeled(message, EMBED_DESCRIPTION_LIMIT));
 }
 
 /** Rendered for an incoming switch.result push. */

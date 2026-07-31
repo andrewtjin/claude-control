@@ -17,10 +17,12 @@ import {
   negotiateVersion,
   type Envelope,
   type EnvelopeDraft,
+  type PayloadOf,
 } from '@claude-control/shared-protocol';
 import type {
   RecoverResult,
   ActivateResult,
+  ReauthResult,
   StoredAccount,
   Logger,
 } from '@claude-control/switch-engine';
@@ -151,6 +153,7 @@ function fakeSwitchEngine(): SwitchEngineLike & {
   recover: ReturnType<typeof vi.fn>;
   listAccounts: ReturnType<typeof vi.fn>;
   getActiveId: ReturnType<typeof vi.fn>;
+  reauthenticate: ReturnType<typeof vi.fn>;
 } {
   return {
     recover: vi.fn((): Promise<RecoverResult> =>
@@ -174,6 +177,19 @@ function fakeSwitchEngine(): SwitchEngineLike & {
       ]),
     ),
     getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
+    // Succeeds by default with an identity-verified result; reauth tests override per case.
+    reauthenticate: vi.fn((id: string): Promise<ReauthResult> =>
+      Promise.resolve({
+        account: {
+          id,
+          label: id === 'acct-y' ? 'spare' : 'main',
+          quarantined: false,
+          createdAtMs: 0,
+          updatedAtMs: 0,
+        },
+        identityVerified: true,
+      }),
+    ),
   };
 }
 
@@ -1043,6 +1059,220 @@ describe('Daemon lifecycle', () => {
         activeAccountId: 'acct-x',
       });
     }
+  });
+
+  // --- reauth.start / reauth.code ---
+  //
+  // A valid paste, matched to the link the daemon minted. `reauth.link` carries the state inside
+  // its url, so a test reads it from there rather than reaching into daemon internals — the same
+  // way the real user does (copy what the page, reached via that url, shows).
+  async function mintLink(accountRef: string, requestId = 'rq-1'): Promise<string> {
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'reauth.start',
+      payload: { requestId, accountRef, idempotencyKey: `ik-${requestId}` },
+    });
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'reauth.link' && e.payload.requestId === requestId),
+    );
+    const link = relay.received.find(
+      (e) => e.type === 'reauth.link' && e.payload.requestId === requestId,
+    );
+    if (link?.type !== 'reauth.link' || !link.payload.url) throw new Error('no link minted');
+    const state = new URL(link.payload.url).searchParams.get('state');
+    if (state === null) throw new Error('link carried no state');
+    return state;
+  }
+
+  function pushCode(code: string, requestId = 'rq-1', idempotencyKey = 'ck-1'): void {
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'reauth.code',
+      payload: { requestId, code, idempotencyKey },
+    });
+  }
+
+  async function waitForResult(requestId = 'rq-1'): Promise<PayloadOf<'reauth.result'>> {
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'reauth.result' && e.payload.requestId === requestId),
+    );
+    const result = relay.received.find(
+      (e) => e.type === 'reauth.result' && e.payload.requestId === requestId,
+    );
+    if (result?.type !== 'reauth.result') throw new Error('unreachable');
+    return result.payload;
+  }
+
+  it('mints a PKCE link for a label, and keeps the verifier OFF the wire', async () => {
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    const link = relay.received.find((e) => e.type === 'reauth.link');
+    if (link?.type !== 'reauth.link') throw new Error('unreachable');
+    expect(link.payload).toMatchObject({ ok: true, accountId: 'acct-y', label: 'spare' });
+    const url = new URL(link.payload.url ?? '');
+    // A challenge, never a verifier: everything the relay and Discord see is one-way.
+    expect(url.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(url.searchParams.get('code_challenge')).toBeTruthy();
+    expect(JSON.stringify(link.payload)).not.toContain('code_verifier');
+    expect(state).toBeTruthy();
+    expect(link.payload.expiresAt).toBeGreaterThan(0);
+  });
+
+  it('refuses an unknown ref with a failed link, minting nothing', async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'reauth.start',
+      payload: { requestId: 'rq-bad', accountRef: 'nope', idempotencyKey: 'ik-bad' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'reauth.link'));
+
+    const link = relay.received.find((e) => e.type === 'reauth.link');
+    if (link?.type !== 'reauth.link') throw new Error('unreachable');
+    expect(link.payload.ok).toBe(false);
+    expect(link.payload.url ?? undefined).toBeUndefined();
+  });
+
+  it('completes a valid paste through switchEngine.reauthenticate()', async () => {
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    pushCode(`the-code#${state}`);
+    const result = await waitForResult();
+
+    const [accountId, exchanged] = switchEngine.reauthenticate.mock.calls[0] as [
+      string,
+      { code: string; state: string; verifier: string },
+    ];
+    expect(accountId).toBe('acct-y');
+    expect(exchanged.code).toBe('the-code');
+    expect(exchanged.state).toBe(state);
+    // The verifier is the daemon's own secret — asserted present, never compared to the wire.
+    expect(exchanged.verifier.length).toBeGreaterThan(0);
+    expect(result).toMatchObject({
+      ok: true,
+      accountId: 'acct-y',
+      outcome: 'reauthenticated',
+      identityVerified: true,
+    });
+    // Not the active account, so no live-file heal was attempted.
+    expect(switchEngine.activate).not.toHaveBeenCalled();
+  });
+
+  it('heals the live files when the reauthed account is the ACTIVE one', async () => {
+    switchEngine.getActiveId.mockResolvedValue('acct-y');
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    pushCode(`the-code#${state}`);
+    const result = await waitForResult();
+
+    // vaultAuthoritative is what stops the heal from adopting the dead live token back over the
+    // fix (see ActivateOptions) — asserted here because losing it silently re-quarantines.
+    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y', { vaultAuthoritative: true });
+    expect(result.outcome).toBe('reauthenticated_and_reactivated');
+  });
+
+  it('still reports success when the live-file heal fails, naming the follow-up', async () => {
+    switchEngine.getActiveId.mockResolvedValue('acct-y');
+    switchEngine.activate.mockRejectedValue(new Error('another switch holds the lock'));
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    pushCode(`the-code#${state}`);
+    const result = await waitForResult();
+
+    // The vault write is durable and real; only the hot-apply lagged. Reporting the whole
+    // request as failed would tell the user to redo a login that already succeeded.
+    expect(result.ok).toBe(true);
+    expect(result.outcome).toBe('reauthenticated');
+    expect(result.message).toMatch(/switch spare/);
+  });
+
+  it('keeps the link usable after a garbled paste (the code was never spent)', async () => {
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    pushCode('missing-the-hash', 'rq-1', 'ck-garbled');
+    const failure = await waitForResult();
+    expect(failure.ok).toBe(false);
+    expect(failure.error).toBe('reauth_malformed_code');
+    expect(switchEngine.reauthenticate).not.toHaveBeenCalled();
+
+    // Same link, correct paste this time: no second /reauth needed.
+    pushCode(`the-code#${state}`, 'rq-1', 'ck-good');
+    await waitFor(() => switchEngine.reauthenticate.mock.calls.length === 1);
+  });
+
+  it('keeps the link usable after a state mismatch, and never exchanges the code', async () => {
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    pushCode('the-code#someone-elses-state', 'rq-1', 'ck-wrong');
+    const failure = await waitForResult();
+    expect(failure.error).toBe('reauth_state_mismatch');
+    expect(switchEngine.reauthenticate).not.toHaveBeenCalled();
+
+    pushCode(`the-code#${state}`, 'rq-1', 'ck-good');
+    await waitFor(() => switchEngine.reauthenticate.mock.calls.length === 1);
+  });
+
+  it('consumes the flow after an exchange failure — a spent code is not retryable', async () => {
+    switchEngine.reauthenticate.mockRejectedValue(
+      new Error('authorization code rejected: already used'),
+    );
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    pushCode(`the-code#${state}`, 'rq-1', 'ck-1');
+    const failure = await waitForResult();
+    expect(failure.ok).toBe(false);
+    expect(failure.message).toMatch(/already used/);
+
+    // A retry against the same link finds nothing: the code reached the network, so re-sending
+    // it could only fail again — the honest answer is "run /reauth again".
+    pushCode(`the-code#${state}`, 'rq-1', 'ck-2');
+    await waitFor(() => relay.received.filter((e) => e.type === 'reauth.result').length >= 2, 3000);
+    const second = relay.received.filter((e) => e.type === 'reauth.result').at(-1);
+    expect(second?.type === 'reauth.result' && second.payload.error).toBe('reauth_not_found');
+    expect(switchEngine.reauthenticate).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers an unknown requestId honestly, with no account to name', async () => {
+    await daemon.start();
+    pushCode('the-code#st', 'rq-never-minted', 'ck-1');
+    const result = await waitForResult('rq-never-minted');
+
+    expect(result).toMatchObject({ ok: false, outcome: 'failed', error: 'reauth_not_found' });
+    expect(result.accountId ?? undefined).toBeUndefined();
+    expect(switchEngine.reauthenticate).not.toHaveBeenCalled();
+  });
+
+  it('exchanges once for a duplicated reauth.code (the code is single-use)', async () => {
+    await daemon.start();
+    const state = await mintLink('spare');
+
+    pushCode(`the-code#${state}`, 'rq-1', 'same-key');
+    await waitForResult();
+    pushCode(`the-code#${state}`, 'rq-1', 'same-key');
+    // Give the duplicate a chance to be (wrongly) handled before asserting it wasn't.
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(switchEngine.reauthenticate).toHaveBeenCalledTimes(1);
+    expect(relay.received.filter((e) => e.type === 'reauth.result')).toHaveLength(1);
+  });
+
+  it('supersedes an earlier link for the same account', async () => {
+    await daemon.start();
+    const firstState = await mintLink('spare', 'rq-first');
+    await mintLink('spare', 'rq-second');
+
+    // The first card is still on screen, but its flow is gone — one live link per account.
+    pushCode(`the-code#${firstState}`, 'rq-first', 'ck-first');
+    const result = await waitForResult('rq-first');
+    expect(result.error).toBe('reauth_not_found');
+    expect(switchEngine.reauthenticate).not.toHaveBeenCalled();
   });
 
   it('resolves a LABEL in switch.command to the account id before activating', async () => {

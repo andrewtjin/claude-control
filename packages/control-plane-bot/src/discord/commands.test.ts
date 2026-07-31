@@ -24,6 +24,7 @@ import {
   handlePruneRequest,
   handlePruneConfirm,
   handleReauth,
+  handleReauthSubmit,
   rejectThreadHereChannel,
   buildThreadHereResult,
   type CommandDeps,
@@ -423,18 +424,56 @@ describe('handlePruneRequest / handlePruneConfirm — the two-step prune', () =>
   });
 });
 
-describe('handleReauth stays host-only and prints the REAL CLI verb', () => {
-  it('points the user at `cctl accounts relogin` and never sends an envelope', () => {
+// `/reauth` used to be host-only (it printed the CLI verb and sent nothing) because the bot
+// holds no credentials. It now asks the DAEMON to mint an OAuth link and does the exchange
+// there, so the bot's zero-credential guarantee is intact while the flow completes from the
+// phone — hence these assertions replace, rather than relax, the old "sends nothing" test.
+describe('handleReauth asks the daemon for a login link', () => {
+  it('sends reauth.start with the ref the user typed', () => {
     const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
-    const deps = makeDeps(relay);
-    const result = handleReauth(deps, 'user-a', 'acct-9');
+    const result = handleReauth(makeDeps(relay), 'user-a', 'spare', 'req-1', 'idem-1');
+
     expect(result.kind).toBe('text');
-    // The account it names, the in-place verb, and NOT the id-minting `add --fresh` (which
-    // would break usage attribution) or the nonexistent `cctl login`.
-    expect(result.kind === 'text' && result.text).toContain('acct-9');
-    expect(result.kind === 'text' && result.text).toContain('cctl accounts relogin <label>');
-    expect(result.kind === 'text' && result.text).not.toContain('--fresh');
-    expect(result.kind === 'text' && result.text).not.toContain('cctl login');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.draft).toMatchObject({
+      type: 'reauth.start',
+      payload: { requestId: 'req-1', accountRef: 'spare', idempotencyKey: 'idem-1' },
+    });
+  });
+
+  it('reports the relay error when the daemon is offline', () => {
+    const { relay, sent } = createFakeRelay({ online: {} });
+    const result = handleReauth(makeDeps(relay), 'user-a', 'spare', 'req-1', 'idem-1');
+
+    expect(result.kind).toBe('error');
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe('handleReauthSubmit', () => {
+  it('sends the pasted code verbatim to the daemon that minted the link', () => {
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const result = handleReauthSubmit(
+      makeDeps(relay),
+      'user-a',
+      'req-1',
+      'AbCd1234#xYzState',
+      'idem-1',
+    );
+
+    expect(result.kind).toBe('text');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.draft).toMatchObject({
+      type: 'reauth.code',
+      payload: { requestId: 'req-1', code: 'AbCd1234#xYzState', idempotencyKey: 'idem-1' },
+    });
+  });
+
+  it('reports the relay error when the daemon is offline', () => {
+    const { relay, sent } = createFakeRelay({ online: {} });
+    const result = handleReauthSubmit(makeDeps(relay), 'user-a', 'req-1', 'code#state', 'idem-1');
+
+    expect(result.kind).toBe('error');
     expect(sent).toHaveLength(0);
   });
 });

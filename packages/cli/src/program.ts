@@ -17,8 +17,12 @@ import {
   QuarantineError,
   SwitchEngineError,
   UnknownAccountError,
+  buildAuthorizeUrl,
   defaultPaths,
   defaultProtector,
+  generatePkce,
+  generateState,
+  parsePastedCode,
   resolveAccountRef,
   type StoredAccount,
 } from '@claude-control/switch-engine';
@@ -925,6 +929,75 @@ async function reloginAccount(ref: string): Promise<void> {
   if (failure) fail(failure);
 }
 
+/**
+ * `cctl accounts reauth <ref>` — re-login an EXISTING account through a browser login link,
+ * with no browser needed on THIS host. Prints the authorize URL, reads back the "<code>#<state>"
+ * the approval page displays, and exchanges it for tokens written into the account's existing
+ * vault entry (same id — usage history kept, quarantine cleared).
+ *
+ * The headless sibling of the phone's `/reauth`, running the SAME engine call
+ * (`reauthenticate`), which is what makes it the wet-test vehicle for the OAuth flow itself:
+ * any problem with the authorize URL, the paste format, or the exchange shows up here without
+ * the daemon's pending-flow machinery in the way.
+ *
+ * Unlike `relogin`, nothing is spawned and no transient config dir exists — so there is no
+ * token-bearing directory to clean up, and the verifier lives only in this function's scope.
+ */
+async function reauthAccount(ref: string): Promise<void> {
+  const engine = buildEngine();
+  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  if (!resolved.ok) fail(resolved.message);
+  const account = resolved.account;
+
+  const { verifier, challenge } = generatePkce();
+  const state = generateState();
+  const url = buildAuthorizeUrl({ challenge, state });
+
+  process.stdout.write(
+    `Re-authenticating "${account.label}" (${account.id}).\n` +
+      '  1. Open this URL and log in as the SAME account (attribution is preserved):\n' +
+      `     ${url}\n` +
+      '  2. The page shows a code like `abc123#xyz` - copy the WHOLE thing.\n\n',
+  );
+  // Read from stdin rather than an argv option on purpose: an argument would put the code into
+  // shell history and `ps`. Plain line read, so a piped (non-TTY) wet test works too.
+  const { io, close } = createWizardIo();
+  let pasted: string;
+  try {
+    pasted = (await io.ask('Paste the code here: ')).trim();
+  } finally {
+    close();
+  }
+
+  const parsed = parsePastedCode(pasted);
+  // Both checks are local (no network), so a mistake here costs nothing but a re-run — and the
+  // single-use code is not spent against the endpoint.
+  if (!parsed) fail('that does not look like a pasted code (expected "<code>#<state>").');
+  if (parsed.state !== state) {
+    fail('that code was issued for a different login - re-run this command for a fresh link.');
+  }
+  try {
+    const { account: updated, identityVerified } = await engine.reauthenticate(account.id, {
+      code: parsed.code,
+      state: parsed.state,
+      verifier,
+    });
+    process.stdout.write(
+      `Re-authenticated ${updated.label} (${updated.id}). Quarantine cleared; usage history kept` +
+        (identityVerified
+          ? ''
+          : ' (the login did not report which account was used, so the match is unverified -' +
+            ' check `cctl accounts list` shows the email you expect)') +
+        ` - \`cctl switch ${updated.label}\` to use it.\n`,
+    );
+  } catch (err) {
+    // Expected, actionable failures (bad/expired code, identity mismatch) print their message
+    // rather than a stack trace — same contract as reloginAccount.
+    if (err instanceof SwitchEngineError) fail(err.message);
+    throw err;
+  }
+}
+
 function buildAccountCommands(program: Command): void {
   const accounts = program.command('accounts').description('manage stored accounts');
 
@@ -974,6 +1047,13 @@ function buildAccountCommands(program: Command): void {
     .description('re-login an existing (usually quarantined) account in place, keeping its id')
     .action(async (ref: string) => {
       await reloginAccount(ref);
+    });
+
+  accounts
+    .command('reauth <ref>')
+    .description('re-login an existing account via a login link + pasted code, keeping its id')
+    .action(async (ref: string) => {
+      await reauthAccount(ref);
     });
 
   accounts
