@@ -338,7 +338,7 @@ const ReauthCodePayload = z.object({
 });
 
 /** The daemon's answer to reauth.code. `outcome` distinguishes a vault-only fix from one that
- *  also healed the live credential files (the reauthed account was the active one), because
+ *  also healed the live credential files (the reauthed account was the live one), because
  *  the phone copy differs: the former needs a follow-up /switch, the latter does not.
  *  `identityVerified` is the honest flag for whether the exchange response actually proved
  *  which account was logged in — when the provider omits identity, the card must say the
@@ -349,7 +349,7 @@ const ReauthResultPayload = z.object({
   /** Nullish unlike switch.result's activeAccountId: a code pasted against an unknown or
    *  expired requestId has no recoverable account identity, and inventing one would lie. */
   accountId: AccountId.nullish(),
-  outcome: z.enum(['reauthenticated', 'reauthenticated_and_reactivated', 'failed']),
+  outcome: z.enum(['reauthenticated', 'reauthenticated_and_healed', 'failed']),
   message: z.string(),
   error: z.string().nullish(),
   identityVerified: z.boolean().default(false),

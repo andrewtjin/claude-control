@@ -365,14 +365,15 @@ actually does — the same posture as gate 2, whose module this shares.
   confirm each prints one actionable line and leaves the account's bundle and quarantine flag
   exactly as they were (in particular: a healthy account is never newly quarantined).
 - **Then the phone loop**, against a local bot + local daemon (never the shared relay): `/reauth
-  <label>` → link card → log in on the phone → **Paste code** → success card. Confirm the daemon's
+<label>` → link card → log in on the phone → **Paste code** → success card. Confirm the daemon's
   log records the account and expiry but **never** the URL, the pasted code, the verifier, or a
   token. Re-submit the same modal and confirm the second attempt answers "no re-auth in progress"
   rather than exchanging twice.
-- **The active-account heal.** Re-authenticate the account that is currently live and confirm the
-  live files end up holding the NEW token (result outcome `reauthenticated_and_reactivated`), and
-  that the account is **not** quarantined moments later by the next refresh — the failure mode
-  `ActivateOptions.vaultAuthoritative` exists to prevent.
+- **The live heal.** Re-authenticate the account that is currently live and confirm the live files
+  end up holding the NEW token (result outcome `reauthenticated_and_healed`, and the CLI saying the
+  fresh login is already in place), that a running `claude` authenticates again without a switch,
+  and that the account is **not** quarantined moments later by the next refresh — the failure mode
+  `adoptRotationIfNeeded`'s direction guard exists to prevent.
 
 **Pass:** every bullet above observed against a real Claude account.
 

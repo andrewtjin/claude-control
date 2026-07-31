@@ -77,9 +77,7 @@ import { DEFAULT_REAUTH_TTL_MS, PendingReauths } from './reauthFlow.js';
  *  `SwitchEngine` satisfies this structurally; no adapter needed. */
 export interface SwitchEngineLike {
   recover(): Promise<RecoverResult>;
-  /** `options` carries the post-reauth heal's `vaultAuthoritative` flag (see ActivateOptions);
-   *  every other caller omits it and gets today's behavior. */
-  activate(id: string, options?: { vaultAuthoritative?: boolean }): Promise<ActivateResult>;
+  activate(id: string): Promise<ActivateResult>;
   listAccounts(): Promise<StoredAccount[]>;
   getActiveId(): Promise<string | null>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
@@ -1116,42 +1114,35 @@ export class Daemon {
     }
 
     try {
-      const { account, identityVerified } = await this.switchEngine.reauthenticate(
+      // The engine owns the live heal: re-authenticating the account that is live right now also
+      // rewrites the live files, reported honestly as `healedLiveLogin` (same contract as
+      // `cctl accounts relogin`). Nothing here activates anything — a re-login changes which
+      // credentials an account HAS, never which account is live.
+      const { account, healedLiveLogin, identityVerified } = await this.switchEngine.reauthenticate(
         pending.accountId,
-        { code: parsed.code, state: parsed.state, verifier: pending.verifier },
+        {
+          code: parsed.code,
+          state: parsed.state,
+          verifier: pending.verifier,
+        },
       );
-      // Heal the live files when this account is the live one (see the method comment).
-      let outcome: 'reauthenticated' | 'reauthenticated_and_reactivated' = 'reauthenticated';
-      let note = '';
-      const activeId = await this.switchEngine.getActiveId().catch(() => null);
-      if (activeId === account.id) {
-        try {
-          // vaultAuthoritative: the bundle we just wrote is newer than the live files, which
-          // still hold the dead token. Without this the heal would "adopt" that dead token back
-          // over the fix and re-quarantine the account (see ActivateOptions).
-          await this.switchEngine.activate(account.id, { vaultAuthoritative: true });
-          outcome = 'reauthenticated_and_reactivated';
-        } catch (err) {
-          note =
-            ` The live session still holds the old login (${errorReason(err)}) — ` +
-            `run /switch ${account.label} to finish.`;
-        }
-      }
       this.sendEnvelope({
         type: 'reauth.result',
         payload: {
           requestId,
           ok: true,
           accountId: account.id,
-          outcome,
+          outcome: healedLiveLogin ? 'reauthenticated_and_healed' : 'reauthenticated',
           identityVerified,
           message:
             `Re-authenticated ${account.label}; quarantine cleared.` +
+            (healedLiveLogin
+              ? ' This is the live account, so the fresh login is already in place.'
+              : ` Use /switch ${account.label} to put it live.`) +
             (identityVerified
               ? ''
               : ' The login did not report which account was used, so the match is unverified ' +
-                '— check the email on /accounts is the one you expect.') +
-            note,
+                '— check the email on /accounts is the one you expect.'),
         },
       });
     } catch (err) {
