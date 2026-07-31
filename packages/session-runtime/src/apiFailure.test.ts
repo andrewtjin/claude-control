@@ -39,12 +39,20 @@ describe('classifyFailureText', () => {
     expect(classifyFailureText(text)).toEqual({ transient: true, kind });
   });
 
-  // Failures a retry provably cannot fix — including rate limits, which are transient in
-  // HTTP terms but belong to the auto-switcher, never to a retry loop.
+  // Usage/rate limits: never transient (a retry loop must not fight an exhausted window),
+  // but flagged usageLimit — the one permanent cause an account switch recovers, which is
+  // what lets a managed session park instead of fail.
   it.each([
     'API Error: 429 Rate limit exceeded',
     'You have hit your usage limit.',
+    'Claude usage limit reached. Your limit will reset at 3pm.',
     'rate_limit_error: Number of requests has exceeded your per-minute rate limit',
+  ])('flags "%s" as a non-transient usage limit', (text) => {
+    expect(classifyFailureText(text)).toEqual({ transient: false, usageLimit: true });
+  });
+
+  // Failures neither a retry nor an account switch can fix.
+  it.each([
     'API Error: 401 Unauthorized',
     'authentication_error: invalid x-api-key',
     'OAuth token has expired',
@@ -62,6 +70,7 @@ describe('classifyFailureText', () => {
   it('prefers the permanent classification for mixed messages', () => {
     expect(classifyFailureText('429 rate limit while retrying after server error')).toEqual({
       transient: false,
+      usageLimit: true,
     });
   });
 
@@ -86,8 +95,11 @@ describe('classifyStopFailureType', () => {
     expect(classifyStopFailureType(errorType)).toEqual({ transient: true, kind });
   });
 
+  it('gives error_type rate_limit the same usage-limit verdict as the free-text side', () => {
+    expect(classifyStopFailureType('rate_limit')).toEqual({ transient: false, usageLimit: true });
+  });
+
   it.each([
-    'rate_limit',
     'authentication_failed',
     'oauth_org_not_allowed',
     'billing_error',

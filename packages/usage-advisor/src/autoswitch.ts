@@ -227,6 +227,25 @@ export function decideAutoSwitch(
   return null;
 }
 
+/** Headroom at/below this is "effectively exhausted" — the one definition shared by the
+ *  advisor's scoring (its `minUsableHeadroomPct` default) and the daemon's post-switch
+ *  stalled-session kick, so "has usage left" can never mean two different things. */
+export const MIN_USABLE_HEADROOM_PCT = 2;
+
+/**
+ * Does this account have usage left to run work on right now? Quarantined = no (dead
+ * refresh token, unusable regardless of quota). No live limit data = YES: unknown is not
+ * exhausted, and the account with no snapshot at all (dormant, never polled) is exactly the
+ * one holding a full untouched allowance. Otherwise the binding (worst) live limit must
+ * clear the exhausted bar. Same pure-function posture as `decideAutoSwitch`: the caller
+ * supplies the snapshot and the moment.
+ */
+export function hasUsableHeadroom(account: AccountUsageInput, now = Date.now()): boolean {
+  if (account.quarantined) return false;
+  const worst = worstPercent(account, now);
+  return worst === undefined || 100 - worst >= MIN_USABLE_HEADROOM_PCT;
+}
+
 /** Limits that still describe a live window: reset time unknown, or still in the future. */
 function effectiveLimits(account: AccountUsageInput, now: number): LimitInput[] {
   return account.limits.filter((l) => l.resetsAt === undefined || l.resetsAt > now);
