@@ -435,6 +435,39 @@ describe('question round-trip trio', () => {
   });
 });
 
+describe('session.status spawnRequestId (additive, N/N-1 tolerant)', () => {
+  const base: PayloadOf<'session.status'> = {
+    sessionId: 'sess-1',
+    state: 'running',
+  };
+
+  it('parses without spawnRequestId — frames from pre-echo daemons stay valid', () => {
+    const result = decode(rawFrame('session.status', base));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.spawnRequestId ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries the spawn requestId through a round-trip', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'session.status',
+      payload: { ...base, spawnRequestId: 'req-42' },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.spawnRequestId).toBe('req-42');
+    }
+  });
+
+  it('rejects an empty-string requestId — absent and empty must not be conflated', () => {
+    const result = decode(rawFrame('session.status', { ...base, spawnRequestId: '' }));
+    expect(result.ok).toBe(false);
+  });
+});
+
 describe('pair.claim hostLabel bound', () => {
   const base = { pairingCode: 'ABCDEFGH' };
 
@@ -453,6 +486,31 @@ describe('pair.claim hostLabel bound', () => {
     // every pairing; an unbounded label would let one claimer bloat every other user's write.
     const result = decode(rawFrame('pair.claim', { ...base, hostLabel: 'h'.repeat(257) }));
     expect(result.ok).toBe(false);
+  });
+});
+
+describe('session.status resumedFrom (additive, N/N-1 tolerant)', () => {
+  const base: PayloadOf<'session.status'> = { sessionId: 'sess-2', state: 'starting' };
+
+  it('parses without resumedFrom — frames from pre-echo daemons stay valid', () => {
+    const result = decode(rawFrame('session.status', base));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.resumedFrom ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries the resume origin through a round-trip', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'session.status',
+      payload: { ...base, spawnRequestId: 'req-7', resumedFrom: 'sess-1' },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.resumedFrom).toBe('sess-1');
+    }
   });
 });
 

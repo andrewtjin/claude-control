@@ -202,7 +202,7 @@ describe('RelayServer', () => {
         type: 'ping',
         payload: {},
       }));
-      expect(sent).toEqual({ ok: true });
+      expect(sent).toMatchObject({ ok: true });
       const received = await nextMessage(ws2);
       expect(received.type).toBe('ping');
       ws2.close();
@@ -342,8 +342,11 @@ describe('RelayServer', () => {
           idempotencyKey: 'k1',
         },
       }));
-      expect(result).toEqual({ ok: true });
+      expect(result).toMatchObject({ ok: true });
       const received = await bMessage;
+      // The stamped envelope id is HANDED BACK to the sender: a daemon error reply's
+      // `relatesTo` carries this exact value, so callers can correlate refusals.
+      if (result.ok) expect(received.id).toBe(result.id);
       expect(received.type).toBe('switch.command');
       expect(received.daemonId).toBe('daemon-2'); // never daemon-1, which user-b does not own
 
@@ -421,7 +424,7 @@ describe('RelayServer', () => {
           idempotencyKey: 'k',
         },
       }));
-      expect(sent).toEqual({ ok: true });
+      expect(sent).toMatchObject({ ok: true });
       const received = await forwarded;
       expect(received.type).toBe('permission.response');
       if (received.type !== 'permission.response') throw new Error('unreachable');
@@ -709,7 +712,7 @@ describe('RelayServer outbound backpressure cap', () => {
     // socket buffer may absorb several MiB synchronously — so we accumulate instead, bounded so a
     // pathologically large buffer can't loop forever.
     const chunk = 'x'.repeat(4 * 1024 * 1024);
-    let result: SendResult = { ok: true };
+    let result: SendResult = { ok: true, id: 'seed' };
     for (let i = 0; i < 32 && result.ok; i++) {
       result = relay.sendToUser('user-a', (daemonId) => ({
         daemonId,
