@@ -165,6 +165,23 @@ describe('computeOutlook — 5h window budget', () => {
     expect(outlook.events).toEqual([]);
   });
 
+  it('budgets against the SOONEST weekly reset when both weekly kinds report one', () => {
+    const outlook = computeOutlook(
+      [
+        account({
+          accountId: 'a',
+          limits: [
+            { kind: 'weekly_scoped', percent: 34, resetsAt: NOW + 10 * HOUR },
+            { kind: 'weekly_all', percent: 21, resetsAt: NOW + 20 * HOUR },
+          ],
+        }),
+      ],
+      NOW,
+    );
+    expect(outlook.accounts[0]?.budget?.weeklyResetAt).toBe(NOW + 10 * HOUR);
+    expect(outlook.accounts[0]?.budget?.fullWindows).toBe(2);
+  });
+
   it('falls back to the scoped reset only when no weekly_all limit exists', () => {
     const outlook = computeOutlook(
       [

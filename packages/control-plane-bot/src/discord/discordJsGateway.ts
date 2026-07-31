@@ -467,9 +467,11 @@ export class DiscordJsGateway implements DiscordGateway {
       // routes) — see gatewayIntents. The resolver alone can't be the signal anymore: it always
       // exists now (it also serves /thread-here pins), and a pin is a user action that must never
       // decide whether the next boot requests a privileged intent.
+      // Truthiness on purpose, matching how bin.ts spreads the option in: an empty-string
+      // channel id configures no threads and must not request a privileged intent.
       intents: gatewayIntents(
         options.sessionChannelResolver !== undefined ||
-          options.sessionChannelId !== undefined ||
+          Boolean(options.sessionChannelId) ||
           (options.sessionChannelsByUser !== undefined && options.sessionChannelsByUser.size > 0),
       ),
       allowedMentions: { parse: [] },

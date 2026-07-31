@@ -1,12 +1,16 @@
 // discordJsGateway is otherwise a live boundary (see its file header): start()/deliver() make real
-// Discord API calls, so it is not unit-tested. Three deliberate exceptions live here. The first
+// Discord API calls, so it is not unit-tested. Four deliberate exceptions live here. The first
 // proves the per-session-route SERIALIZATION of deliver(), which is gateway-local state (the
 // promise chain + the cardMessages map) that no pure module can hold; it exercises that
 // serialization through the single `protected sinkFor` seam by returning a controllable fake sink.
 // The second is pure data — it holds the pairing primer and the registered command list to each
 // other. The third reads back the session-channel resolver the CONSTRUCTOR wired, so the option
 // plumbing is covered without re-deriving the precedence rules already proven in
-// sessionChannels.test.ts. None touches a real Discord connection.
+// sessionChannels.test.ts. The fourth is the inbound direction — thread messages becoming session
+// input (inject, resume-by-typing, single-flight, error routing) — driven through the same
+// protected seams (sinkFor, reactInThread, sendInThread, onThreadMessage) with a recording relay,
+// since that loop's state (pending sends, resume guards, thread rebinds) is gateway-local too.
+// None touches a real Discord connection.
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
