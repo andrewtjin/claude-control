@@ -31,7 +31,9 @@ import { acquireLock, type Lock, type LockOptions } from './lock.js';
 import { noopLogger, type Logger } from './logger.js';
 import {
   DEFAULT_REFRESH_SKEW_MS,
+  exchangeAuthorizationCode as defaultExchange,
   refreshCredentials as defaultRefresh,
+  type ExchangeDeps,
   type RefreshDeps,
 } from './oauth.js';
 import type { Paths } from './paths.js';
@@ -52,6 +54,22 @@ import { needsMetadataBackfill, Vault } from './vault.js';
 /** Signature of the refresh function, so tests can inject a fake. */
 export type RefreshFn = (current: ClaudeOauth, deps?: RefreshDeps) => Promise<ClaudeOauth>;
 
+/** Signature of the authorization-code exchange, so tests can inject a fake (same seam
+ *  discipline as {@link RefreshFn} — reauthenticate() never hits the network in tests). */
+export type ExchangeFn = (
+  params: { code: string; state: string; verifier: string },
+  deps?: ExchangeDeps,
+) => Promise<{ claudeAiOauth: ClaudeOauth; oauthAccount?: OauthAccount }>;
+
+/** What {@link SwitchEngine.reauthenticate} did. `identityVerified` is true ONLY when both the
+ *  stored account and the exchange response carried an accountUuid and they were actually
+ *  compared — false means the check was structurally skipped (identity missing on a side), so
+ *  callers must render "match unverified" rather than imply a passed check. */
+export interface ReauthResult {
+  account: StoredAccount;
+  identityVerified: boolean;
+}
+
 export interface SwitchEngineOptions {
   paths: Paths;
   /** Defaults to this platform's real protector (win32 DPAPI / darwin Keychain).
@@ -62,6 +80,8 @@ export interface SwitchEngineOptions {
   liveCredentialChannel?: LiveCredentialChannel;
   /** Defaults to the real OAuth refresh. Tests pass a fake. */
   refresh?: RefreshFn;
+  /** Defaults to the real authorization-code exchange. Tests pass a fake. */
+  exchange?: ExchangeFn;
   refreshDeps?: RefreshDeps;
   clock?: () => number;
   /** Refresh the target's access token when its remaining lifetime is below this. */
@@ -77,6 +97,21 @@ export interface SwitchEngineOptions {
 export interface ActivateOptions {
   /** Bypass the switch-cadence guard for a deliberate operator override. */
   force?: boolean;
+  /**
+   * The caller has just written this account's vault bundle out of band and KNOWS the vault copy
+   * is newer than the live files (today: the re-login verbs — {@link SwitchEngine.reauthenticate}
+   * / `reloginFromConfigDir` — followed by a heal of the same account). Suppresses rotation
+   * adoption for that same-account heal only.
+   *
+   * WHY this must be told, not inferred: adoption reads a live-vs-vault token disagreement as
+   * "the CLI rotated the live token, save it" — correct for every ordinary heal, and exactly
+   * backwards right after a re-login, where the live files still hold the DEAD token the
+   * re-login just replaced. Adopting there would copy the dead token back over the fix and
+   * re-quarantine the account on its next refresh. Nothing in the credentials distinguishes the
+   * two cases (a rotation and a re-login both just change the token), so the only honest
+   * discriminator is the caller who performed the write.
+   */
+  vaultAuthoritative?: boolean;
 }
 
 /** Default minimum interval between switches — see `minSwitchIntervalMs`. */
@@ -96,6 +131,7 @@ export class SwitchEngine {
   private readonly intent: IntentStore;
   private readonly audit: AuditLog;
   private readonly refresh: RefreshFn;
+  private readonly exchange: ExchangeFn;
   private readonly refreshDeps: RefreshDeps;
   private readonly clock: () => number;
   private readonly refreshSkewMs: number;
@@ -116,6 +152,7 @@ export class SwitchEngine {
     this.intent = new IntentStore(this.paths.vaultDir);
     this.audit = new AuditLog(this.paths.vaultDir);
     this.refresh = options.refresh ?? defaultRefresh;
+    this.exchange = options.exchange ?? defaultExchange;
     this.refreshDeps = options.refreshDeps ?? {};
     this.refreshSkewMs = options.refreshSkewMs ?? DEFAULT_REFRESH_SKEW_MS;
     this.minSwitchIntervalMs = options.minSwitchIntervalMs ?? DEFAULT_MIN_SWITCH_INTERVAL_MS;
@@ -396,8 +433,27 @@ export class SwitchEngine {
       );
     }
     const oauthAccount = await store.readOauthAccount();
+    return this.applyReloginBundle(existing, creds, oauthAccount);
+  }
 
-    // Attribution guard — see the method comment for why a mismatch is fatal, not a warning.
+  /**
+   * The shared re-login core: identity guard → in-place bundle overwrite → quarantine clear.
+   * Used by {@link reloginFromConfigDir} (host capture) and {@link reauthenticate} (code
+   * exchange) so the same-account attribution guarantee has exactly ONE implementation.
+   * Callers must hold the credential lock.
+   *
+   * The bundle is built from the FRESH login only — the account's previous `oauthAccount`
+   * block is never read or merged in. A stale identity block is precisely the contamination
+   * class the identity anchor work exists to prevent: it can only survive by being carried
+   * forward, and a missing block self-heals on the next activation, while a stale one does not.
+   */
+  private async applyReloginBundle(
+    existing: StoredAccount,
+    creds: ClaudeOauth,
+    oauthAccount: OauthAccount | undefined,
+  ): Promise<StoredAccount> {
+    // Attribution guard — a mismatch is fatal, not a warning: writing a different account's
+    // tokens under this id would corrupt the very history this verb exists to protect.
     if (
       existing.accountUuid !== undefined &&
       oauthAccount?.accountUuid !== undefined &&
@@ -418,13 +474,51 @@ export class SwitchEngine {
     // authenticate again. `clearQuarantine` is a no-op flag-wise if it was never quarantined
     // (re-login is also a legitimate way to rotate a still-valid login) and bumps updatedAtMs,
     // so the registry reflects the re-login.
-    await this.vault.writeBundle(accountId, bundle);
-    await this.vault.clearQuarantine(accountId);
-    const refreshed = await this.vault.getAccount(accountId);
+    await this.vault.writeBundle(existing.id, bundle);
+    await this.vault.clearQuarantine(existing.id);
+    const refreshed = await this.vault.getAccount(existing.id);
     // Only undefined if the account was removed concurrently mid-call — surface that as the
     // unknown-account error rather than returning a stale record.
-    if (!refreshed) throw new UnknownAccountError(accountId);
+    if (!refreshed) throw new UnknownAccountError(existing.id);
     return refreshed;
+  }
+
+  /**
+   * Re-login an EXISTING account via a completed OAuth authorization-code+PKCE exchange — the
+   * headless counterpart to {@link reloginFromConfigDir} for callers with no browser on this
+   * host (phone `/reauth`, `cctl accounts reauth`). Shares its identity-guard +
+   * in-place-overwrite + quarantine-clear core, so the guarantees are identical: same account
+   * id, usage attribution intact, quarantine lifted on success.
+   *
+   * Deliberately NOT gated on `quarantined` — the most common real trigger is the ACTIVE
+   * account's refresh token dying, which this engine can never observe as quarantined
+   * (refreshToken() refuses to network-refresh the active account), and rotating a healthy
+   * login is as legitimate here as it is for relogin.
+   *
+   * Failure taxonomy: a failed exchange is always a {@link RefreshError} (the caller's paste
+   * or the provider's rejection), NEVER a {@link QuarantineError} — this path must be unable
+   * to (re)quarantine anything; only the refresh path may. Touches the vault only: live files
+   * and activeId are a separate, honestly-reported follow-up (`activate()`).
+   */
+  async reauthenticate(
+    accountId: string,
+    params: { code: string; state: string; verifier: string },
+  ): Promise<ReauthResult> {
+    // Locked end-to-end for the same reason as relogin: the existence check, the overwrite,
+    // and the quarantine clear must not interleave with a concurrent registry writer.
+    return this.withCredentialLock(async () => {
+      const existing = await this.vault.getAccount(accountId);
+      if (!existing) throw new UnknownAccountError(accountId);
+      const { claudeAiOauth, oauthAccount } = await this.exchange(params, this.refreshDeps);
+      const account = await this.applyReloginBundle(existing, claudeAiOauth, oauthAccount);
+      return {
+        account,
+        // True only when both sides had a uuid and the guard actually compared them — a
+        // provider response with no identity block must read as "unverified", never "passed".
+        identityVerified:
+          existing.accountUuid !== undefined && oauthAccount?.accountUuid !== undefined,
+      };
+    });
   }
 
   // ---- the state machine ----
@@ -482,11 +576,15 @@ export class SwitchEngine {
 
       // Reconcile-by-reading: if the CLI rotated the previous account's refresh token while
       // it was live, the vault's copy is now stale. Adopt the live token before overwriting.
-      const adoptedPreviousRotation = await this.adoptRotationIfNeeded(
-        prevActiveId,
-        liveNow,
-        liveOauthAccount,
-      );
+      // Skipped only for a caller-declared same-account heal after an out-of-band vault write —
+      // see ActivateOptions.vaultAuthoritative for why that case must be declared, not detected.
+      // A hop to a DIFFERENT account still adopts: the flag speaks for the target's bundle,
+      // while adoption there protects the previous account's rotation.
+      const healingAuthoritativeVault =
+        options.vaultAuthoritative === true && targetId === prevActiveId;
+      const adoptedPreviousRotation = healingAuthoritativeVault
+        ? false
+        : await this.adoptRotationIfNeeded(prevActiveId, liveNow, liveOauthAccount);
 
       // Load the target and refresh it if the access token is near expiry. The rotated token
       // is persisted to the vault the instant we get it — single-use tokens die if dropped.

@@ -3,7 +3,8 @@ import type { Envelope } from '@claude-control/shared-protocol';
 import { decodeButton } from './buttons.js';
 import { decodeQuestionSelect, OTHER_VALUE } from './questionCards.js';
 import { chunkMessage } from './messageChunks.js';
-import { renderPush, RELOGIN_COMMAND } from './pushRender.js';
+import { renderPush, REAUTH_COMMAND, RELOGIN_COMMAND } from './pushRender.js';
+import { decodeReauthPasteButton } from './reauthCards.js';
 import { formatTables } from './tableFormat.js';
 
 /** Minimal well-formed envelope wrapper so each test states only the payload that matters. */
@@ -143,7 +144,7 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(json?.color).toBe(0x3498db);
   });
 
-  it('a quarantine notification renders a card that prints the exact host re-login command', () => {
+  it('a quarantine notification prints BOTH exact recovery commands', () => {
     const push = renderPush(
       env('hook.notification', {
         event: 'notification',
@@ -155,7 +156,10 @@ describe('renderPush — lifecycle notification cards', () => {
     );
     const json = push?.embeds?.[0]?.toJSON();
     expect(json?.title).toContain('🚫');
-    const fix = json?.fields?.find((f) => f.name === 'Fix it on the host');
+    const fix = json?.fields?.find((f) => f.name === 'Fix it');
+    // Both constants verbatim: the card, `handleReauth`, and the real verbs share one source of
+    // truth precisely so a reader is never sent to a command that does not exist.
+    expect(fix?.value).toContain(REAUTH_COMMAND);
     expect(fix?.value).toContain(RELOGIN_COMMAND);
   });
 
@@ -371,6 +375,73 @@ describe('renderPush — routing of other envelopes', () => {
       }),
     );
     expect(push?.embeds?.[0]?.toJSON().title).toBe('Switched');
+  });
+
+  it('reauth.link renders the login card with a paste button', () => {
+    const push = renderPush(
+      env('reauth.link', {
+        requestId: 'rq-1',
+        ok: true,
+        accountId: 'acct-1',
+        label: 'spare',
+        url: 'https://claude.ai/oauth/authorize?code=true&state=st-1',
+        expiresAt: 1_700_000_000_000,
+        message: 'log in',
+      }),
+    );
+    const embed = push?.embeds?.[0]?.toJSON();
+    expect(embed?.title).toContain('Re-authenticate');
+    // The account it names, the SAME-account warning, and what to copy — the three things that
+    // decide whether the user's next two minutes succeed.
+    expect(embed?.description).toContain('spare');
+    expect(embed?.description).toContain('SAME account');
+    expect(embed?.description).toContain('#');
+    expect(embed?.description).toContain('https://claude.ai/oauth/authorize');
+    const button = push?.components?.[0]?.[0];
+    expect(button?.label).toBe('Paste code');
+    expect(decodeReauthPasteButton(button?.customId ?? '')).toBe('rq-1');
+  });
+
+  it('a REFUSED reauth.link renders a failure card with no button to tap', () => {
+    // Nothing to log into, so a paste button could only ever fail — the refusal reads as the
+    // failure it is.
+    const push = renderPush(
+      env('reauth.link', {
+        requestId: 'rq-1',
+        ok: false,
+        message: 'could not start re-auth for "nope"',
+        error: 'no account matches "nope"',
+      }),
+    );
+    expect(push?.embeds?.[0]?.toJSON().title).toContain('failed');
+    expect(push?.components ?? []).toHaveLength(0);
+  });
+
+  it('reauth.result renders success and failure differently', () => {
+    const ok = renderPush(
+      env('reauth.result', {
+        requestId: 'rq-1',
+        ok: true,
+        accountId: 'acct-1',
+        outcome: 'reauthenticated',
+        message: 'Re-authenticated spare; quarantine cleared.',
+        identityVerified: true,
+      }),
+    );
+    const failed = renderPush(
+      env('reauth.result', {
+        requestId: 'rq-1',
+        ok: false,
+        outcome: 'failed',
+        message: 'That login link expired.',
+        identityVerified: false,
+      }),
+    );
+    expect(ok?.embeds?.[0]?.toJSON().title).toContain('Re-authenticated');
+    // The daemon's message is the honest account of what happened — rendered verbatim.
+    expect(ok?.embeds?.[0]?.toJSON().description).toContain('quarantine cleared');
+    expect(failed?.embeds?.[0]?.toJSON().title).toContain('failed');
+    expect(failed?.embeds?.[0]?.toJSON().description).toContain('expired');
   });
 
   it('session.output stdout is cache-only, but milestones DM', () => {

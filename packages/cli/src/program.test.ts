@@ -57,10 +57,12 @@ describe('buildProgram', () => {
     expect(pair?.registeredArguments.map((a) => a.name())).toContain('code');
   });
 
-  it('nests account subcommands including in-place relogin', () => {
+  it('nests account subcommands including both in-place re-login verbs', () => {
     const accounts = buildProgram().commands.find((c) => c.name() === 'accounts');
     const subs = accounts?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['add', 'list', 'relogin', 'remove']);
+    // `relogin` spawns a browser login on this host; `reauth` takes a pasted code instead, so a
+    // headless/SSH host (and the wet test for the OAuth flow itself) has a path too.
+    expect(subs).toEqual(['add', 'list', 'reauth', 'relogin', 'remove']);
   });
 
   it('nests session subcommands', () => {

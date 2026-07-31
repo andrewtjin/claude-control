@@ -361,24 +361,46 @@ export function handlePruneConfirm(
     : { kind: 'error', message: result.error };
 }
 
-/** `/reauth <accountId>` — re-authenticating a quarantined account is an interactive OAuth
- *  flow that must run on the host (the bot holds zero credentials by design — see the
- *  package-level architecture rule); there is no protocol message for it because the bot
- *  structurally cannot perform it. Point the user at `cctl accounts relogin <label>`, which
- *  re-logs into the EXISTING vault entry in place (same account id — usage attribution survives,
- *  quarantine cleared). This copy is kept in lockstep with the quarantine card's `RELOGIN_COMMAND`. */
+/** `/reauth <accountRef>` — ask the daemon for an OAuth login link so a (usually quarantined)
+ *  account can be re-authenticated from the phone. The bot still holds ZERO credentials: the
+ *  daemon mints the PKCE pair, keeps the verifier in its own memory, and does the token
+ *  exchange — all this handler ever carries is a link and, later, the code the user pastes.
+ *  The link itself arrives as a `reauth.link` push (see pushRender), not as this reply. */
 export function handleReauth(
-  _deps: CommandDeps,
-  _discordUserId: string,
-  accountId: string,
+  deps: CommandDeps,
+  discordUserId: string,
+  accountRef: string,
+  requestId: string,
+  idempotencyKey: string,
 ): CommandResult {
-  return {
-    kind: 'text',
-    text:
-      `Re-auth must run on the host (the bot holds no credentials). Run ` +
-      `\`cctl accounts relogin <label>\` to re-login in place (usage history kept), then ` +
-      `\`cctl switch <label>\`. (quarantined account: ${accountId})`,
-  };
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'reauth.start',
+    payload: { requestId, accountRef, idempotencyKey },
+  }));
+  return result.ok
+    ? { kind: 'text', text: `Re-auth requested for "${accountRef}" — the login link is coming.` }
+    : { kind: 'error', message: result.error };
+}
+
+/** The reauth modal's submit — hand the pasted "<code>#<state>" text to the daemon that minted
+ *  the matching link. The code is single-use and worthless without the daemon-held verifier,
+ *  which is what makes carrying it over the relay acceptable (see docs/THREAT_MODEL.md). */
+export function handleReauthSubmit(
+  deps: CommandDeps,
+  discordUserId: string,
+  requestId: string,
+  code: string,
+  idempotencyKey: string,
+): CommandResult {
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'reauth.code',
+    payload: { requestId, code, idempotencyKey },
+  }));
+  return result.ok
+    ? { kind: 'text', text: 'Code submitted — the result is coming.' }
+    : { kind: 'error', message: result.error };
 }
 
 // ---------------------------------------------------------------------------

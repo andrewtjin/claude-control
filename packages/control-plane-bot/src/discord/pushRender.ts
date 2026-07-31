@@ -12,11 +12,14 @@ import {
   buildPermissionRequestEmbed,
   buildQuarantineEmbed,
   buildQuestionEmbed,
+  buildReauthLinkEmbed,
+  buildReauthResultEmbed,
   buildSwitchResultEmbed,
   buildToolOutputEmbed,
   buildWaitingEmbed,
 } from './embeds.js';
 import { permissionButtons, type ButtonSpec } from './buttons.js';
+import { encodeReauthPasteButton } from './reauthCards.js';
 import { questionSelectSpecs, type SelectSpec } from './questionCards.js';
 import { chunkMessage } from './messageChunks.js';
 import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
@@ -61,6 +64,12 @@ export interface RenderedPush {
  *  so usage attribution survives — unlike `accounts add --fresh`, which mints a new id. */
 export const RELOGIN_COMMAND = 'cctl accounts relogin <label>';
 
+/** The phone-side counterpart of {@link RELOGIN_COMMAND} — same single-source-of-truth contract,
+ *  so the quarantine card and the real slash command can never drift. `/reauth` reaches the same
+ *  in-place re-login (same account id, quarantine cleared) with the OAuth step done in a browser
+ *  instead of at the host's terminal. */
+export const REAUTH_COMMAND = '/reauth <label>';
+
 /** Map one daemon-originated envelope to what the bot should DM, or `undefined` for cache-only. */
 export function renderPush(envelope: Envelope): RenderedPush | undefined {
   if (isType(envelope, 'permission.request')) {
@@ -87,6 +96,38 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
   }
   if (isType(envelope, 'switch.result')) {
     return { embeds: [buildSwitchResultEmbed(envelope.payload.ok, envelope.payload.message)] };
+  }
+  if (isType(envelope, 'reauth.link')) {
+    const p = envelope.payload;
+    // A refusal (unknown ref, mint failure) has no link to render and must not ship a paste
+    // button that could only fail — it degrades to the same failure card a bad code produces.
+    if (!p.ok || !p.url || p.expiresAt === null || p.expiresAt === undefined) {
+      return {
+        embeds: [buildReauthResultEmbed(false, p.error ? `${p.message}: ${p.error}` : p.message)],
+      };
+    }
+    return {
+      embeds: [
+        buildReauthLinkEmbed({
+          label: p.label ?? 'account',
+          accountId: p.accountId ?? 'unknown',
+          url: p.url,
+          expiresAt: p.expiresAt,
+        }),
+      ],
+      components: [
+        [
+          {
+            customId: encodeReauthPasteButton(p.requestId),
+            label: 'Paste code',
+            style: 'primary',
+          },
+        ],
+      ],
+    };
+  }
+  if (isType(envelope, 'reauth.result')) {
+    return { embeds: [buildReauthResultEmbed(envelope.payload.ok, envelope.payload.message)] };
   }
   if (isType(envelope, 'session.prune.result')) {
     // The visible close of the /prune flow (the cache removal happened in DaemonStateCache).
@@ -193,7 +234,12 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
     case 'quarantine':
       return {
         embeds: [
-          buildQuarantineEmbed({ title: p.title, body: p.body, reloginCommand: RELOGIN_COMMAND }),
+          buildQuarantineEmbed({
+            title: p.title,
+            body: p.body,
+            reloginCommand: RELOGIN_COMMAND,
+            reauthCommand: REAUTH_COMMAND,
+          }),
         ],
       };
     default: {
