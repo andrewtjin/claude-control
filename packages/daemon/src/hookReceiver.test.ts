@@ -841,6 +841,141 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('StopFailure -> api_error card', () => {
+    // Dedicated receiver: cooldown assertions need a mutable clock, and the managed-session
+    // suppression needs its own predicate.
+    let sfReceiver: HookReceiver;
+    let sfPort: number;
+    let sfEmitted: EnvelopeDraft[];
+    let nowMs: number;
+
+    beforeEach(async () => {
+      sfEmitted = [];
+      nowMs = 1_000_000;
+      sfReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => sfEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => nowMs,
+        isManagedSession: (sessionId) => sessionId === 'managed-1',
+      });
+      sfPort = await sfReceiver.listen(0);
+    });
+
+    afterEach(async () => {
+      await sfReceiver.close();
+    });
+
+    function postStopFailure(body: Record<string, unknown>): Promise<RawResponse> {
+      return post(
+        sfPort,
+        '/',
+        { hook_event_name: 'StopFailure', ...body },
+        { 'x-claude-control-secret': SECRET },
+      );
+    }
+
+    it('emits a warn card with api_error discriminator and continue guidance for a transient death', async () => {
+      const res = await postStopFailure({
+        session_id: 'sess-1',
+        cwd: 'C:\\repos\\proj',
+        error_type: 'server_error',
+        error_text: 'API Error: 500 Internal server error.',
+      });
+      expect(res.status).toBe(200);
+      expect(sfEmitted).toHaveLength(1);
+      const note = sfEmitted[0];
+      expect(note?.type).toBe('hook.notification');
+      if (note?.type === 'hook.notification') {
+        // Rides the tolerant `notification` variant so an N-1 bot still renders a plain
+        // card; the rich-card discriminator is notificationType, same as idle_prompt.
+        expect(note.payload.event).toBe('notification');
+        expect(note.payload.notificationType).toBe('api_error');
+        expect(note.payload.level).toBe('warn');
+        expect(note.payload.sessionId).toBe('sess-1');
+        expect(note.payload.cwd).toBe('C:\\repos\\proj');
+        expect(note.payload.body).toContain('API Error: 500');
+        expect(note.payload.body).toContain('type "continue"');
+      }
+    });
+
+    it('parses the LIVE-OBSERVED payload shape (error + last_assistant_message)', async () => {
+      // The installed CLI names the fields differently from the hook docs — this is the
+      // exact shape a real StopFailure POST carried (live-observed), minus noise fields.
+      const res = await postStopFailure({
+        session_id: '2562e353-4c0a-431c-b718-281281d009fa',
+        cwd: 'C:\\somewhere',
+        error: 'server_error',
+        last_assistant_message: 'API Error: Unable to connect to API (ConnectionRefused)',
+      });
+      expect(res.status).toBe(200);
+      const note = sfEmitted[0];
+      expect(note?.type).toBe('hook.notification');
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.notificationType).toBe('api_error');
+        expect(note.payload.body).toContain('ConnectionRefused');
+        expect(note.payload.body).toContain('type "continue"');
+      }
+    });
+
+    it('switches the guidance for a death a retry cannot fix', async () => {
+      await postStopFailure({ session_id: 'sess-1', error_type: 'billing_error' });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.body).toContain('Not retryable (billing_error)');
+        expect(note.payload.body).not.toContain('type "continue"');
+      }
+    });
+
+    it('suppresses managed sessions — their failures ride the session event stream', async () => {
+      const res = await postStopFailure({ session_id: 'managed-1', error_type: 'server_error' });
+      expect(res.status).toBe(200);
+      expect(sfEmitted).toHaveLength(0);
+    });
+
+    it('rate-limits to one card per session per cooldown window', async () => {
+      await postStopFailure({ session_id: 'sess-1', error_type: 'server_error' });
+      nowMs += 60_000; // one minute later: same outage, same session — suppressed
+      await postStopFailure({ session_id: 'sess-1', error_type: 'server_error' });
+      expect(sfEmitted).toHaveLength(1);
+
+      // A DIFFERENT session inside the window still gets its own card...
+      await postStopFailure({ session_id: 'sess-2', error_type: 'server_error' });
+      expect(sfEmitted).toHaveLength(2);
+
+      // ...and the first session earns a new card once the window has passed.
+      nowMs += 5 * 60_000;
+      await postStopFailure({ session_id: 'sess-1', error_type: 'server_error' });
+      expect(sfEmitted).toHaveLength(3);
+    });
+
+    it('answers 200 with no card when api-error cards are off', async () => {
+      const offEmitted: EnvelopeDraft[] = [];
+      const offReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => offEmitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => nowMs,
+        apiErrorCards: false,
+      });
+      const offPort = await offReceiver.listen(0);
+      try {
+        const res = await post(
+          offPort,
+          '/',
+          { hook_event_name: 'StopFailure', session_id: 'sess-1', error_type: 'server_error' },
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(res.status).toBe(200);
+        expect(offEmitted).toHaveLength(0);
+      } finally {
+        await offReceiver.close();
+      }
+    });
+  });
+
   describe('Stop-hook steering delivery', () => {
     it('answers Stop with block+reason when the steering source has queued text', async () => {
       const taken: string[] = [];

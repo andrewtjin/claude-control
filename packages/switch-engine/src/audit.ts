@@ -11,7 +11,13 @@ import { ensureDir } from './fsutil.js';
 
 export interface AuditEntry {
   ts: number;
-  event: 'activated' | 'quarantined' | 'recovered' | 'refresh_adopted' | 'refreshed';
+  event:
+    | 'activated'
+    | 'quarantined'
+    | 'recovered'
+    | 'refresh_adopted'
+    | 'refreshed'
+    | 'relogin_live_heal';
   fromAccountId: string | null;
   toAccountId: string | null;
   detail?: string;
