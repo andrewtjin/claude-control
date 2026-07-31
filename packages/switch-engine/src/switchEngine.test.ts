@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtemp, readFile, readdir, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SwitchEngine, type RefreshFn } from './switchEngine.js';
+import { SwitchEngine, type ExchangeFn, type RefreshFn } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore } from './credentialStore.js';
 import { METADATA_BACKFILL_RETRY_MS, Vault } from './vault.js';
@@ -59,6 +59,8 @@ interface Harness {
   paths: Paths;
   engine: SwitchEngine;
   refresh: ReturnType<typeof vi.fn>;
+  /** The injected authorization-code exchange (reauth). Defaults to a login for account 'A'. */
+  exchange: ReturnType<typeof vi.fn>;
   credStore: CredentialStore;
   vault: Vault;
   intent: IntentStore;
@@ -68,7 +70,7 @@ interface Harness {
   logs: LogLine[];
 }
 
-async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
+async function harness(refreshImpl?: RefreshFn, exchangeImpl?: ExchangeFn): Promise<Harness> {
   const root = await mkdtemp(join(tmpdir(), 'ce-eng-'));
   dirs.push(root);
   const paths = sandboxPaths(root);
@@ -86,6 +88,14 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
       expiresAt: now + HOUR,
     });
   const refresh = vi.fn(refreshImpl ?? defaultRefresh);
+  // Default: a successful re-login as A, with a fresh token pair and A's own identity — the
+  // "user logged back into the right account" case every reauth test varies from.
+  const defaultExchange: ExchangeFn = () =>
+    Promise.resolve({
+      claudeAiOauth: oauth('reauthed-A', now + HOUR, 'reauthed-r-A'),
+      oauthAccount: { accountUuid: 'uuid-A', emailAddress: 'A@x.com' },
+    });
+  const exchange = vi.fn(exchangeImpl ?? defaultExchange);
 
   const logs: LogLine[] = [];
   const record =
@@ -104,6 +114,7 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
     paths,
     protector,
     refresh: refresh,
+    exchange: exchange,
     clock,
     refreshSkewMs: 5 * 60 * 1000,
     lockOptions: { timeoutMs: 2000, pollMs: 10 },
@@ -114,6 +125,7 @@ async function harness(refreshImpl?: RefreshFn): Promise<Harness> {
     paths,
     engine,
     refresh,
+    exchange,
     credStore: new CredentialStore(paths),
     vault: new Vault(paths.vaultDir, protector, clock),
     intent: new IntentStore(paths.vaultDir),
@@ -342,6 +354,164 @@ describe('reloginFromConfigDir', () => {
     await expect(h.engine.reloginFromConfigDir('no-such-id', someDir)).rejects.toBeInstanceOf(
       UnknownAccountError,
     );
+  });
+});
+
+describe('reauthenticate (authorization-code re-login)', () => {
+  function bundleWithUuid(access: string, uuid: string, expiresAt: number): CredentialBundle {
+    return {
+      claudeAiOauth: oauth(access, expiresAt),
+      oauthAccount: { accountUuid: uuid, emailAddress: `${access}@x.com` },
+    };
+  }
+
+  const params = { code: 'the-code', state: 'st-1', verifier: 'ver-1' };
+
+  it('rewrites the SAME account id in place and clears quarantine (attribution preserved)', async () => {
+    const h = await harness();
+    const existing = await h.engine.addAccount('A', bundleWithUuid('OLD', 'uuid-A', NOW + HOUR));
+    await h.vault.quarantine(existing.id, 'refresh token died');
+
+    const { account, identityVerified } = await h.engine.reauthenticate(existing.id, params);
+
+    expect(account.id).toBe(existing.id);
+    expect(account.quarantined).toBe(false);
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('reauthed-A');
+    expect(await h.engine.listAccounts()).toHaveLength(1);
+    // Both sides reported a uuid and they matched, so the guard genuinely ran.
+    expect(identityVerified).toBe(true);
+    // The exchange got exactly the code/state/verifier the caller held — the verifier is the
+    // caller's secret and the engine must not substitute or drop it.
+    expect(h.exchange).toHaveBeenCalledWith(params, expect.anything());
+  });
+
+  it('re-logs in a HEALTHY account too (rotation is a legitimate use, like relogin)', async () => {
+    const h = await harness();
+    const existing = await h.engine.addAccount('A', bundleWithUuid('OLD', 'uuid-A', NOW + HOUR));
+
+    const { account } = await h.engine.reauthenticate(existing.id, params);
+
+    expect(account.quarantined).toBe(false);
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('reauthed-A');
+  });
+
+  it('also rewrites the live files when the re-authed account is the LIVE one', async () => {
+    // The case that motivates the whole verb: the LIVE account's grant died. Repairing only the
+    // vault would leave every running CLI session failing auth while the registry calls the
+    // account healthy. Same heal (and same honest report) `reloginFromConfigDir` performs.
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+
+    const { healedLiveLogin } = await h.engine.reauthenticate(accountA.id, params);
+
+    expect(healedLiveLogin).toBe(true);
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('reauthed-A');
+    expect((await h.credStore.readOauthAccount())?.accountUuid).toBe('uuid-A');
+  });
+
+  it('leaves the live files alone when a DIFFERENT account is live', async () => {
+    // Re-authing a stored-but-not-live account must not disturb whoever holds the live seat.
+    // The exchange returns B's own identity, or the attribution guard would (correctly) refuse.
+    const bLogin: ExchangeFn = () =>
+      Promise.resolve({
+        claudeAiOauth: oauth('reauthed-B', NOW + HOUR, 'r-reauthed-B'),
+        oauthAccount: { accountUuid: 'uuid-B', emailAddress: 'B@x.com' },
+      });
+    const h = await harness(undefined, bLogin);
+    const { accountB } = await seedAActiveWithB(h);
+
+    const { healedLiveLogin } = await h.engine.reauthenticate(accountB.id, params);
+
+    expect(healedLiveLogin).toBe(false);
+    // A still holds the live seat, untouched.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    // B's vault entry did get the fresh grant — the heal is the only part that was skipped.
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.accessToken).toBe('reauthed-B');
+  });
+
+  it('refuses (and changes nothing) when the login was a DIFFERENT account', async () => {
+    const wrongAccount: ExchangeFn = () =>
+      Promise.resolve({
+        claudeAiOauth: oauth('WRONG', NOW + HOUR, 'r-WRONG'),
+        oauthAccount: { accountUuid: 'uuid-someone-else', emailAddress: 'other@x.com' },
+      });
+    const h = await harness(undefined, wrongAccount);
+    const existing = await h.engine.addAccount('A', bundleWithUuid('OLD', 'uuid-A', NOW + HOUR));
+    await h.vault.quarantine(existing.id, 'refresh token died');
+
+    const err = await h.engine.reauthenticate(existing.id, params).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RefreshError);
+    expect((err as RefreshError).code).toBe('relogin_identity_mismatch');
+    // Nothing written: a wrong-account login must never corrupt the entry it meant to heal, and
+    // must not lift the quarantine either.
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('OLD');
+    expect((await h.engine.listAccounts())[0]?.quarantined).toBe(true);
+  });
+
+  it('reports identityVerified:false when the login response names no account', async () => {
+    // The check is structurally skipped here (nothing to compare), and callers must be able to
+    // tell that apart from a check that passed — otherwise the phone claims a verification that
+    // never happened.
+    const anonymous: ExchangeFn = () =>
+      Promise.resolve({ claudeAiOauth: oauth('NEW', NOW + HOUR, 'r-NEW') });
+    const h = await harness(undefined, anonymous);
+    const existing = await h.engine.addAccount('A', bundleWithUuid('OLD', 'uuid-A', NOW + HOUR));
+
+    const { identityVerified } = await h.engine.reauthenticate(existing.id, params);
+
+    expect(identityVerified).toBe(false);
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('NEW');
+  });
+
+  it('never carries the OLD identity block forward when the login reports none', async () => {
+    // The stale-identity-block failure class: a block that survives a credential replacement can
+    // shadow the new login forever (a MISSING block self-heals; a stale one does not). The bundle
+    // must therefore describe only the fresh login.
+    const anonymous: ExchangeFn = () =>
+      Promise.resolve({ claudeAiOauth: oauth('NEW', NOW + HOUR, 'r-NEW') });
+    const h = await harness(undefined, anonymous);
+    const existing = await h.engine.addAccount('A', bundleWithUuid('OLD', 'uuid-A', NOW + HOUR));
+
+    await h.engine.reauthenticate(existing.id, params);
+
+    expect((await h.vault.readBundle(existing.id)).oauthAccount).toBeUndefined();
+  });
+
+  it('propagates an exchange failure WITHOUT quarantining a healthy account', async () => {
+    // The load-bearing negative: only the refresh path may quarantine. A bad paste says nothing
+    // about the stored refresh token, so it must not mark the account dead.
+    const rejected: ExchangeFn = () =>
+      Promise.reject(new RefreshError('authorization code rejected', 'invalid_code'));
+    const h = await harness(undefined, rejected);
+    const existing = await h.engine.addAccount('A', bundleWithUuid('OLD', 'uuid-A', NOW + HOUR));
+
+    await expect(h.engine.reauthenticate(existing.id, params)).rejects.toBeInstanceOf(RefreshError);
+
+    expect((await h.engine.listAccounts())[0]?.quarantined).toBe(false);
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('OLD');
+  });
+
+  it('propagates an exchange failure leaving an ALREADY quarantined account quarantined', async () => {
+    const rejected: ExchangeFn = () =>
+      Promise.reject(new RefreshError('authorization code rejected', 'invalid_code'));
+    const h = await harness(undefined, rejected);
+    const existing = await h.engine.addAccount('A', bundleWithUuid('OLD', 'uuid-A', NOW + HOUR));
+    await h.vault.quarantine(existing.id, 'refresh token died');
+
+    await expect(h.engine.reauthenticate(existing.id, params)).rejects.toBeInstanceOf(RefreshError);
+
+    // Still quarantined: a failed recovery attempt must not silently look like a success.
+    expect((await h.engine.listAccounts())[0]?.quarantined).toBe(true);
+  });
+
+  it('refuses for an unknown account id, before ever exchanging the code', async () => {
+    const h = await harness();
+    await expect(h.engine.reauthenticate('no-such-id', params)).rejects.toBeInstanceOf(
+      UnknownAccountError,
+    );
+    // The single-use code is not spent on a request that could never have been applied.
+    expect(h.exchange).not.toHaveBeenCalled();
   });
 });
 

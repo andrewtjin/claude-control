@@ -24,8 +24,18 @@ cctl accounts list                 # list stored accounts (active marked with *)
 cctl accounts add <label>          # capture the currently logged-in account
 cctl accounts add <label> --fresh  # log in as a NEW account in a throwaway window,
                                     # without touching the live login
+cctl accounts relogin <id|label>   # re-login an existing account in a throwaway window,
+                                    # keeping its id (and its usage history)
+cctl accounts reauth <id|label>    # same in-place re-login, but via a login LINK you open
+                                    # anywhere and a code you paste back — no browser needed
+                                    # on this host (the phone's /reauth runs the same path)
 cctl accounts remove <id|label>    # remove a stored account
 ```
+
+`relogin` and `reauth` differ only in how the login happens: `relogin` spawns a throwaway
+`claude` window here, `reauth` prints a URL and reads back the `code#state` the approval page
+shows. Both write into the EXISTING vault entry — same account id, usage attribution intact,
+quarantine cleared — and both refuse if you log into a different account.
 
 ## Switching and recovery
 

@@ -63,12 +63,26 @@ export {
   handleQuestionAnswer,
   handleStop,
   handleReauth,
+  handleReauthSubmit,
   type CommandDeps,
   type CommandResult,
   type QuestionAnswerResponse,
   type RunOptions,
 } from './discord/commands.js';
-export { renderPush, RELOGIN_COMMAND, type RenderedPush } from './discord/pushRender.js';
+export {
+  renderPush,
+  RELOGIN_COMMAND,
+  REAUTH_COMMAND,
+  type RenderedPush,
+} from './discord/pushRender.js';
+export {
+  encodeReauthPasteButton,
+  decodeReauthPasteButton,
+  encodeReauthModal,
+  decodeReauthModal,
+  REAUTH_MODAL_INPUT_ID,
+  REAUTH_CODE_MAX_LENGTH,
+} from './discord/reauthCards.js';
 export {
   QuestionCardRegistry,
   QuestionAnswerCollector,

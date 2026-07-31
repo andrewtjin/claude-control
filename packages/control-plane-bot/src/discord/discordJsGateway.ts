@@ -90,6 +90,13 @@ import {
   type ButtonStyle as ButtonSpecStyle,
   type TapOutcome,
 } from './buttons.js';
+import {
+  decodeReauthModal,
+  decodeReauthPasteButton,
+  encodeReauthModal,
+  REAUTH_CODE_MAX_LENGTH,
+  REAUTH_MODAL_INPUT_ID,
+} from './reauthCards.js';
 import { SeenKeys } from './idempotencyGuard.js';
 import {
   SessionPlanner,
@@ -220,17 +227,16 @@ export const PAIRING_PRIMER_MESSAGE = [
   '`/status` — daemon connection status',
   '`/settings` — effective settings and where each came from',
   '`/approve <request>` · `/deny <request>` — answer a pending permission request',
+  '`/reauth <account>` — re-authenticate an account that can no longer refresh its login',
   '',
   'Permission prompts and questions arrive here as cards — tap the buttons, no command needed.',
 ].join('\n');
 
 /** Registered commands deliberately left out of {@link PAIRING_PRIMER_MESSAGE}, each for a reason
  *  that outlives the current command list. `pair` is the command the reader just finished using.
- *  `reauth` cannot do what its name implies — the bot holds no credentials by design, so it only
- *  replies with the host-side CLI command to run (see commands.ts) — and the primer's entire job
- *  is telling a new user what to try first. Read by the test that keeps the primer and the
- *  registered list in step, so dropping a name from here is what makes that command required. */
-export const PRIMER_OMITTED_COMMANDS = new Set(['pair', 'reauth']);
+ *  Read by the test that keeps the primer and the registered list in step, so dropping a name
+ *  from here is what makes that command required. */
+export const PRIMER_OMITTED_COMMANDS = new Set(['pair']);
 
 export interface DiscordJsGatewayOptions {
   relay: RelaySender;
@@ -1376,7 +1382,11 @@ export class DiscordJsGateway implements DiscordGateway {
     } else if (interaction.isStringSelectMenu()) {
       await this.onQuestionSelect(interaction);
     } else if (interaction.isModalSubmit()) {
-      await this.onQuestionModal(interaction);
+      // The reauth modal has its own codec (see reauthCards.ts); anything it doesn't claim
+      // falls through to the question flow's, which owns the "unrecognized" reply.
+      const reauthRequestId = decodeReauthModal(interaction.customId);
+      if (reauthRequestId !== null) await this.onReauthModal(interaction, reauthRequestId);
+      else await this.onQuestionModal(interaction);
     }
   }
 
@@ -1497,6 +1507,8 @@ export class DiscordJsGateway implements DiscordGateway {
           this.deps,
           userId,
           interaction.options.getString('account', true),
+          requestId,
+          idempotencyKey,
         );
         break;
       case 'thread-here': {
@@ -1846,6 +1858,14 @@ export class DiscordJsGateway implements DiscordGateway {
    *  `resolveTap`; this method only performs the discord.js side effect each outcome names. */
   private async onButton(interaction: ButtonInteraction): Promise<void> {
     const userId = interaction.user.id;
+    // The reauth paste button is intercepted BEFORE resolveTap: showing a modal must be the
+    // interaction's first response, which none of resolveTap's outcomes can do (see
+    // reauthCards.ts for why this button stays out of the two-tap grammar entirely).
+    const pasteRequestId = decodeReauthPasteButton(interaction.customId);
+    if (pasteRequestId !== null) {
+      await interaction.showModal(this.buildReauthModal(pasteRequestId));
+      return;
+    }
     const outcome = resolveTap(interaction.customId, this.clock());
     switch (outcome.kind) {
       case 'ignore':
@@ -2041,6 +2061,58 @@ export class DiscordJsGateway implements DiscordGateway {
     } catch (err) {
       this.logger.warn({ err }, 'discord: failed to edit an answered question card');
     }
+  }
+
+  /**
+   * The reauth modal's submit: hand the pasted code to the daemon that minted the link.
+   *
+   * No card bookkeeping, unlike the question flow: the pending flow lives in the DAEMON's memory
+   * and is one-shot there, so a stale paste is answered honestly by a `reauth.result` ("no
+   * re-auth in progress") rather than needing a bot-side registry to police. The dedupe key is
+   * DETERMINISTIC per (user, requestId) so a double-submit collapses before a second frame goes
+   * out — the underlying authorization code is single-use, so this matters more here than for an
+   * ordinary button.
+   */
+  private async onReauthModal(
+    interaction: ModalSubmitInteraction,
+    requestId: string,
+  ): Promise<void> {
+    const userId = interaction.user.id;
+    const key = `reauth:${userId}:${requestId}`;
+    if (!this.seenKeys.markIfNew(key)) {
+      await interaction.reply({ content: 'Already submitted.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const code = interaction.fields.getTextInputValue(REAUTH_MODAL_INPUT_ID).trim();
+    const result = commands.handleReauthSubmit(this.deps, userId, requestId, code, key);
+    if (result.kind === 'error') {
+      // Never left the bot (offline daemon): let a retry through once it returns.
+      this.seenKeys.forget(key);
+      await interaction.reply({
+        content: `Error: ${result.message}`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await interaction.reply({
+      content: result.kind === 'text' ? result.text : 'Code submitted.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  /** The paste-code modal: one required short input, its customId carrying the requestId so the
+   *  submit routes back to the daemon's matching pending flow. */
+  private buildReauthModal(requestId: string): ModalBuilder {
+    const input = new TextInputBuilder()
+      .setCustomId(REAUTH_MODAL_INPUT_ID)
+      .setLabel('Code (the whole thing, including #)')
+      .setStyle(TextInputStyle.Short)
+      .setMaxLength(REAUTH_CODE_MAX_LENGTH)
+      .setRequired(true);
+    return new ModalBuilder()
+      .setCustomId(encodeReauthModal(requestId))
+      .setTitle('Paste the login code')
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
   }
 
   /** The Other free-text modal: one required paragraph input, its customId encoding which held

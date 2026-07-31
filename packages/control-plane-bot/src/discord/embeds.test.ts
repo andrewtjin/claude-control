@@ -22,6 +22,8 @@ import {
   buildToolOutputEmbed,
   buildWaitingEmbed,
   buildQuarantineEmbed,
+  buildReauthLinkEmbed,
+  buildReauthResultEmbed,
   buildSessionCardEmbed,
   buildSessionSummaryEmbed,
   clampFieldValue,
@@ -874,15 +876,50 @@ describe('lifecycle cards (done / waiting / quarantine)', () => {
     expect(embed.description?.startsWith('```\n┌')).toBe(true);
   });
 
-  it('buildQuarantineEmbed prints the injected host re-login command verbatim', () => {
+  it('buildQuarantineEmbed prints BOTH injected recovery commands verbatim', () => {
     const embed = buildQuarantineEmbed({
       body: 'Work is quarantined.',
       reloginCommand: 'cctl accounts relogin <label>',
+      reauthCommand: '/reauth <label>',
     }).toJSON();
     expect(embed.title).toContain('🚫');
     expect(embed.color).toBe(NOTIFICATION_COLOR.quarantine);
-    const fix = embed.fields?.find((f) => f.name === 'Fix it on the host');
+    const fix = embed.fields?.find((f) => f.name === 'Fix it');
+    // Both paths, so a user on their phone is not sent to a keyboard they may not be near, and
+    // a user at the host still sees the verb that needs no Discord round trip.
+    expect(fix?.value).toContain('/reauth <label>');
     expect(fix?.value).toContain('cctl accounts relogin <label>');
+  });
+});
+
+describe('reauth cards', () => {
+  it('buildReauthLinkEmbed names the account, warns about the SAME account, and links out', () => {
+    const embed = buildReauthLinkEmbed({
+      label: 'spare',
+      accountId: 'acct-9',
+      url: 'https://claude.ai/oauth/authorize?code=true&state=st-1',
+      expiresAt: 1_700_000_000_000,
+    }).toJSON();
+
+    expect(embed.title).toContain('Re-authenticate');
+    expect(embed.description).toContain('spare');
+    expect(embed.description).toContain('acct-9');
+    // The one mistake that costs the user their history, stated before they can make it.
+    expect(embed.description).toContain('SAME account');
+    // And the one mistake that wastes a link: copying only the half before the '#'.
+    expect(embed.description).toContain('#');
+    expect(embed.description).toContain('https://claude.ai/oauth/authorize');
+    // A live relative timestamp, so the window is honest without hardcoding a duration here.
+    expect(embed.description).toContain('<t:1700000000:R>');
+  });
+
+  it('buildReauthResultEmbed titles success and failure differently', () => {
+    const ok = buildReauthResultEmbed(true, 'Re-authenticated spare; quarantine cleared.').toJSON();
+    const failed = buildReauthResultEmbed(false, 'That login link expired.').toJSON();
+    expect(ok.title).toContain('Re-authenticated');
+    expect(failed.title).toContain('failed');
+    expect(ok.description).toBe('Re-authenticated spare; quarantine cleared.');
+    expect(failed.description).toBe('That login link expired.');
   });
 });
 
