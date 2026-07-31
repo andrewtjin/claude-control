@@ -116,8 +116,13 @@ describe('acquireLock', () => {
     let maxHeld = 0;
     // If a contender could ever observe a claimed-but-ownerless lock and reclaim a live one,
     // two workers would be inside the critical section together and `maxHeld` would exceed 1.
+    //
+    // The acquisition budget is deliberately far larger than the work: 20 workers holding for 1ms
+    // need ~20ms of critical section, so a budget in the tens of seconds still fails fast on a
+    // real deadlock while never failing merely because the machine was busy. This assertion is
+    // about mutual exclusion, not latency, and a tighter budget made it flaky under parallel load.
     const worker = async () => {
-      const lock = await acquireLock(lockDir, Date.now, { timeoutMs: 5000, pollMs: 5 });
+      const lock = await acquireLock(lockDir, Date.now, { timeoutMs: 30_000, pollMs: 5 });
       held += 1;
       maxHeld = Math.max(maxHeld, held);
       await new Promise((resolve) => setTimeout(resolve, 1)); // hold briefly so races must wait

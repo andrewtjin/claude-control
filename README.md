@@ -55,6 +55,10 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
 - **Approve from anywhere.** Permission prompts, questions, and "done / waiting" notices reach
   your phone; approve or deny from Discord. Send live prompts or start a fresh
   session and watch milestones stream back.
+- **Reach a session that's sitting idle.** A prompt from Discord normally waits for the
+  session to finish a turn — which never happens while you're away. Turn on
+  `cctl channel enable` and it lands immediately instead, on a session nobody is
+  watching. One consent prompt at setup, none afterwards.
 
 ## Local-only (no Discord)
 

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-control",
+  "description": "claude-control's own plugin: in-session commands plus the channel that lets a paired phone drive this session while it sits idle.",
+  "owner": {
+    "name": "andrewtjin"
+  },
+  "plugins": [
+    {
+      "name": "cctl",
+      "description": "Register, label, and stream the current Claude Code session to your phone, and receive prompts back into it. Thin wrappers over the local cctl CLI — this plugin holds no secrets.",
+      "author": {
+        "name": "andrewtjin"
+      },
+      "category": "productivity",
+      "source": "./plugins/cctl"
+    }
+  ]
+}

@@ -60,6 +60,7 @@ import type { TranscriptScan } from './transcriptTokens.js';
 import { aggregateTokenStats } from './tokenStats.js';
 import type {
   HookReceiver,
+  HookReceiverChannelHandlers,
   HookReceiverCliHandlers,
   SessionCommandBase,
   SessionCommandResult,
@@ -68,6 +69,12 @@ import type {
   SessionWatchInput,
   TrackedSessionView,
 } from './hookReceiver.js';
+import {
+  CHANNEL_QUEUE_CAP,
+  CHANNEL_TTL_MS,
+  ChannelRegistry,
+  type ChannelInjection,
+} from './channelRegistry.js';
 import { ControlPlaneClient } from './controlPlaneClient.js';
 import { LOOP_LAG_THRESHOLD_MS, startLoopLagMonitor } from './loopLagMonitor.js';
 import { DEFAULT_REAUTH_TTL_MS, PendingReauths } from './reauthFlow.js';
@@ -138,6 +145,13 @@ export interface DaemonOptions {
   /** Injectable clock (house convention: no fake timers). Only used for the quarantine-notice
    *  debounce; defaults to `Date.now`. */
   clock?: () => number;
+  /** Does this pid name a live process? The channel server records its pid on attach, and that
+   *  pid is the only SYNCHRONOUS evidence the daemon has that the server still exists — poll
+   *  silence takes up to two stale windows to notice, during which the operator is told their
+   *  message went to a live session. Injected so tests can drive a dead server without killing a
+   *  real process; defaults to the `process.kill(pid, 0)` probe used by the daemon and
+   *  credential locks. */
+  isProcessAlive?: (pid: number) => boolean;
   /** Minimum gap between repeat quarantine-notice pushes for the SAME account, so an account
    *  whose refresh flaps in and out of quarantine can't spam the phone. */
   quarantineNoticeDebounceMs?: number;
@@ -200,6 +214,21 @@ const DEFAULT_SESSION_STOP_ON_SHUTDOWN_MS = 5_000;
 /** 30 minutes: re-login is a minutes-long human action on the PC, so nagging more often than
  *  ~twice an hour for the same still-broken account is pure noise. */
 const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
+
+/** Whether `pid` names a live process. `process.kill(pid, 0)` sends no signal — it only asks the
+ *  OS whether the pid exists. ESRCH ("no such process") is the only code that means dead; every
+ *  other outcome, notably EPERM (Windows raises this for a pid that exists but this process lacks
+ *  rights to signal), means the process is there. Same probe as the daemon instance lock and the
+ *  credential lock; kept local because a shared helper across three packages would be a
+ *  dependency edge for four lines. */
+function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
 
 /**
  * DECISION — managed sessions always run in Claude Code's 'default' permission mode.
@@ -306,6 +335,23 @@ type InteractiveRefResolution =
   | { outcome: 'resolved'; tracked: TrackedInteractiveSession }
   | { outcome: 'ambiguous'; matches: TrackedInteractiveSession[] }
   | { outcome: 'none' };
+
+/**
+ * What the session should be told about where an injection came from, as `meta` on the channel
+ * notification.
+ *
+ * `prompt.inject` carries no origin field (protocol v1), so the ONLY checked evidence is the
+ * envelope's `discordUserId` — stamped server-side by the bot from `interaction.user.id`, and
+ * absent on a frame that did not come from Discord. A frame without it gets no `source` at all
+ * rather than an assumed one: `prompt.inject` also arrives from the Slack surface, and a
+ * hardcoded `source: 'discord'` would be a fabricated field on every one of those. If a later
+ * protocol rev carries the surface explicitly, read it here instead of inferring.
+ */
+function injectOrigin(msg: MessageOf<'prompt.inject'>): Record<string, string> | undefined {
+  return typeof msg.discordUserId === 'string' && msg.discordUserId.length > 0
+    ? { source: 'discord' }
+    : undefined;
+}
 
 /** Pure view mapper: the compact shape echoed back to the CLI on a command. */
 function interactiveView(t: TrackedInteractiveSession): TrackedSessionView {
@@ -416,6 +462,15 @@ export class Daemon {
    *  queue, which is tolerable because every queued text was confirmed to the phone as
    *  "queued", delivery is best-effort by design, and the TTL bounds staleness anyway. */
   private readonly pendingSteering = new Map<string, QueuedSteering[]>();
+  /** Channel servers currently attached to live sessions, and what is queued for each. This is
+   *  the daemon's ONLY evidence that a session can take an injection while idle — never what a
+   *  launch command intended, because Claude Code's startup notice has been observed reporting a
+   *  channel as unconfigured in a session where that same channel then delivered normally. */
+  private readonly channels: ChannelRegistry;
+  /** Sweeps attachments whose server is gone — its process first (immediate and certain), then
+   *  poll silence (the fallback for a process that is alive but wedged). */
+  private channelSweepTimer: ReturnType<typeof setInterval> | undefined;
+  private readonly isProcessAlive: (pid: number) => boolean;
   /** Per-account quarantine bookkeeping for edge-detection + debounce; see
    *  {@link reconcileQuarantineNotices}. In-memory only, so it resets on restart — which is
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
@@ -454,6 +509,17 @@ export class Daemon {
     this.scanTranscripts = options.scanTranscripts;
     this.statsIntervalMs = options.statsIntervalMs ?? DEFAULT_STATS_INTERVAL_MS;
     this.logger = options.logger ?? noopLogger;
+    this.isProcessAlive = options.isProcessAlive ?? pidIsAlive;
+    // Waking the receiver's held poll on enqueue is what makes injection feel immediate rather
+    // than arriving up to a poll-bound later. `pollMs` comes from the receiver rather than a
+    // second copy of the default, so a tuned poll bound carries into the staleness window
+    // instead of leaving the sweep detaching clients mid-hold.
+    this.channels = new ChannelRegistry({
+      clock: this.clock,
+      pollMs: this.hookReceiver.getChannelPollMs(),
+      onEnqueue: (attachId) => this.hookReceiver.wakeChannelPoll(attachId),
+      onExpire: (sessionId, expired) => this.cardChannelExpiry(sessionId, expired),
+    });
   }
 
   /**
@@ -490,8 +556,19 @@ export class Daemon {
     // Same late-binding seam for steering: the receiver answers Stop hooks, this class owns
     // WHAT is queued for them (the /say → queue → turn-boundary delivery path).
     this.hookReceiver.setSteeringSource((sessionId) => this.takePendingSteering(sessionId));
+    // …and for live channels: the receiver owns the sockets and the held polls, this class owns
+    // the queue and where a reply is routed.
+    this.hookReceiver.setChannelHandlers(this.channelHandlers());
 
     const hookPort = await this.hookReceiver.listen(0);
+
+    // A dead channel server cannot tell us it died. Swept on a timer rather than lazily, because
+    // the point is to fall undelivered text back to the steering queue promptly, not the next
+    // time someone happens to ask.
+    this.channelSweepTimer = setInterval(() => {
+      this.sweepDeadChannels();
+    }, this.channels.staleAfterMs);
+    this.channelSweepTimer.unref();
 
     // Publish the bound loopback port so `cctl session register|label|watch` can find us. Like
     // hook self-heal below, this is additive and fail-open: a publish failure only degrades the
@@ -619,6 +696,22 @@ export class Daemon {
     this.endpointRepublishTimer = undefined;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = undefined;
+    if (this.channelSweepTimer) clearInterval(this.channelSweepTimer);
+    this.channelSweepTimer = undefined;
+    // Latch the transport BEFORE draining. The teardown below spends up to
+    // `sessionStopOnShutdownMs` stopping live sessions with the receiver still listening, which
+    // is ample time for a client to re-attach into a registry that will never be drained again.
+    this.hookReceiver.beginClose();
+    // Undelivered channel work is dropped, not fallen back: the steering queue it would fall to
+    // is in-memory and dies with this process anyway, so queuing it would only manufacture a
+    // false "queued" record. Logged rather than silent, because the phone was told "sent".
+    const undelivered = this.channels.close();
+    if (undelivered.length > 0) {
+      this.logger.warn(
+        { count: undelivered.length },
+        'channel: shutting down with injections still undelivered',
+      );
+    }
     // Live sessions FIRST, while the store/receiver they report through still work: each
     // handle.stop() ends the spawned SDK subprocess and fail-closes any parked permission
     // prompt through the runtime's own turn teardown. Without this, shutdown leaks the
@@ -1369,6 +1462,18 @@ export class Daemon {
     // real id or a registered label — resolveInteractiveRef covers both, same as label/watch/
     // unregister.
     const resolution = this.resolveInteractiveRef(sessionId);
+
+    // …unless a channel server is attached, which is the whole point of the channel: it is the
+    // only path that reaches a session sitting IDLE at its prompt, where no hook is in flight
+    // for the steering queue to answer. An exact session id wins outright, mirroring
+    // resolveInteractiveRef's own precedence; otherwise a resolved label may name one.
+    const channelTarget =
+      this.liveChannelTarget(sessionId) ??
+      (resolution.outcome === 'resolved'
+        ? this.liveChannelTarget(resolution.tracked.id)
+        : undefined);
+    if (channelTarget !== undefined && this.injectViaChannel(msg, channelTarget)) return;
+
     if (resolution.outcome === 'resolved') {
       this.queueSteering(msg, resolution.tracked);
       return;
@@ -1510,6 +1615,215 @@ export class Daemon {
       },
     });
     this.logger.info({ sessionId, queued: queue.length }, 'steering queued for terminal session');
+  }
+
+  /**
+   * The session id to inject into, but only if the channel attached to it is provably still
+   * there. Returns undefined when nothing is attached OR when the attached server's process is
+   * gone, in which case the attachment is retired NOW and its work fallen back — the sweep would
+   * otherwise take up to two staleness windows to reach the same conclusion, and for all of that
+   * time `enqueue` would keep succeeding into a queue nobody will ever poll.
+   *
+   * A pid check cannot prove a channel is HEALTHY (a live process can still be wedged, which is
+   * what poll silence is for). It proves the negative, immediately, and that is the case where
+   * the operator is currently told something untrue.
+   */
+  private liveChannelTarget(sessionId: string): string | undefined {
+    const attachment = this.channels.attachmentFor(sessionId);
+    if (attachment === undefined) return undefined;
+    if (this.isProcessAlive(attachment.pid)) return sessionId;
+    const recovered = this.channels.detach(attachment.attachId);
+    this.logger.warn(
+      { sessionId, pid: attachment.pid, event: 'channel_dead_pid' },
+      'channel: server process is gone; detaching without waiting for the stale sweep',
+    );
+    this.recoverChannelInjections(sessionId, recovered);
+    return undefined;
+  }
+
+  /**
+   * Retire channel attachments whose server is gone, falling their undelivered work back. Two
+   * signals, deliberately in this order: a vanished PROCESS is certain and costs one syscall,
+   * while poll silence is the only thing that catches a process that is alive but wedged — and
+   * it cannot fire sooner than the staleness window.
+   */
+  private sweepDeadChannels(): void {
+    for (const attachment of this.channels.list()) {
+      if (this.isProcessAlive(attachment.pid)) continue;
+      const recovered = this.channels.detach(attachment.attachId);
+      this.logger.warn(
+        { sessionId: attachment.sessionId, pid: attachment.pid, count: recovered.length },
+        'channel: server process is gone',
+      );
+      this.recoverChannelInjections(attachment.sessionId, recovered);
+    }
+    for (const { attachment, recovered } of this.channels.sweepStale()) {
+      this.logger.warn(
+        { sessionId: attachment.sessionId, count: recovered.length },
+        'channel: server stopped polling; treating it as gone',
+      );
+      this.recoverChannelInjections(attachment.sessionId, recovered);
+    }
+  }
+
+  /**
+   * Hand text to a session's live channel server, which delivers it even while the session sits
+   * idle at its prompt. Returns false when the channel refuses, so the caller can fall back to
+   * the turn-boundary queue rather than losing the message.
+   *
+   * The card claims only what has actually happened: the text is on the daemon's queue for that
+   * session's channel. Nothing has taken it yet, and even once something does, a channel
+   * notification is fire-and-forget — if the session did not really load our channel, or policy
+   * blocks it, the event is dropped with no error returned to us. The one thing the daemon must
+   * never do is render an unverifiable write as a confirmed delivery.
+   */
+  private injectViaChannel(msg: MessageOf<'prompt.inject'>, sessionId: string): boolean {
+    const { text } = msg.payload;
+    const result = this.channels.enqueue(sessionId, text, injectOrigin(msg));
+    if (!result.ok) {
+      if (result.reason === 'queue_full') {
+        this.sendEnvelope({
+          type: 'error',
+          payload: {
+            code: 'channel_queue_full',
+            message:
+              `prompt.inject: ${CHANNEL_QUEUE_CAP} messages are already awaiting delivery on ` +
+              `'${sessionId}'s channel and none have been acknowledged — the session may be ` +
+              `stalled on a permission prompt.`,
+            relatesTo: msg.id,
+          },
+        });
+        return true;
+      }
+      return false;
+    }
+    const excerpt = text.length > 120 ? `${text.slice(0, 120)}…` : text;
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        sessionId,
+        title: 'Sent to live session',
+        body:
+          `"${excerpt}" — queued on the session's live channel. Its server collects it on the ` +
+          `next poll, normally at once; nothing has confirmed the session displayed it.`,
+        level: 'info',
+        notificationType: 'channel_sent',
+      },
+    });
+    this.logger.info(
+      { sessionId, event: 'channel_inject' },
+      'channel: injection queued for a live session',
+    );
+    return true;
+  }
+
+  /**
+   * Fall recovered injections back onto the turn-boundary queue.
+   *
+   * A channel server can die between being handed an injection and writing it. Those items come
+   * back here rather than disappearing: the session is still alive, so its next turn boundary is
+   * a worse but real delivery path. Only reachable for a session that is also registered — an
+   * unregistered one has no steering queue, and the operator is told so.
+   *
+   * Every outcome is reported, because the operator's last word on each of these messages was
+   * "sent": the fallback itself is a downgrade from "immediately" to "at the next turn boundary",
+   * and anything the steering cap cannot take is a real loss. Each item keeps its ORIGINAL queue
+   * time — re-stamping it here would hand a message that already spent 29 minutes on the channel
+   * a fresh 30-minute TTL, so it could land an hour after it was written, which is exactly what
+   * the TTL exists to prevent.
+   */
+  private recoverChannelInjections(sessionId: string, items: ChannelInjection[]): void {
+    if (items.length === 0) return;
+    const tracked = this.readInteractiveSession(sessionId);
+    if (tracked === undefined) {
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'channel_detached',
+          message:
+            `${items.length} message(s) for session '${sessionId}' were never delivered: its ` +
+            `channel closed and the session is not registered, so there is no turn-boundary ` +
+            `queue to fall back to. Re-send once it is running again.`,
+        },
+      });
+      this.logger.warn(
+        { sessionId, count: items.length },
+        'channel: undelivered injections dropped; session not registered',
+      );
+      return;
+    }
+    const queue = this.pendingSteering.get(sessionId) ?? [];
+    const accepted = items.slice(0, Math.max(0, STEERING_QUEUE_CAP - queue.length));
+    const dropped = items.length - accepted.length;
+    for (const item of accepted) {
+      queue.push({ text: item.text, queuedAtMs: item.queuedAtMs });
+    }
+    this.pendingSteering.set(sessionId, queue);
+    if (accepted.length > 0) {
+      this.sendEnvelope({
+        type: 'hook.notification',
+        payload: {
+          event: 'notification',
+          sessionId,
+          title: `Channel closed for ${tracked.label ?? 'terminal session'}`,
+          body:
+            `${accepted.length === 1 ? 'Your message is' : `${accepted.length} messages are`} ` +
+            `no longer arriving immediately — the session's channel went away, so ` +
+            `${accepted.length === 1 ? 'it now delivers' : 'they now deliver'} when the session ` +
+            `finishes its current turn or you next type in it.`,
+          level: 'warn',
+          notificationType: 'channel_fell_back',
+        },
+      });
+    }
+    // The steering queue refuses at its cap rather than shedding (see queueSteering), and that
+    // contract does not get to bend just because these messages arrived by another route. What
+    // it cannot take is genuinely lost, so it is named as lost rather than folded into a count
+    // of what "fell back".
+    if (dropped > 0) {
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'steer_queue_full',
+          message:
+            `${dropped} of ${items.length} message(s) recovered from session '${sessionId}'s ` +
+            `closed channel could NOT be queued: its turn-boundary queue is already full at ` +
+            `${STEERING_QUEUE_CAP} and nothing is delivering. Those ${dropped} (the most recent) ` +
+            `were dropped — re-send them once the session catches up.`,
+        },
+      });
+    }
+    this.logger.warn(
+      { sessionId, recovered: accepted.length, dropped },
+      'channel: undelivered injections fell back to turn-boundary steering',
+    );
+  }
+
+  /**
+   * Card the operator about injections the channel queue expired before any client took them.
+   *
+   * The registry drops them (30-minute-old guidance delivered into whatever the session is doing
+   * now is worse than nothing) but it is transport-free, so it cannot say so. `takePendingSteering`
+   * sends exactly this card for the identical situation on the steering path; the two must not
+   * disagree about whether an expiry is worth telling the operator.
+   */
+  private cardChannelExpiry(sessionId: string, expired: ChannelInjection[]): void {
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        sessionId,
+        title: 'Channel message expired',
+        body:
+          `${expired.length} message${expired.length === 1 ? '' : 's'} sent to this session's ` +
+          `live channel aged past ${CHANNEL_TTL_MS / 60_000} minutes before its channel server ` +
+          `collected ${expired.length === 1 ? 'it' : 'them'} — dropped, not delivered.`,
+        level: 'warn',
+        notificationType: 'channel_expired',
+      },
+    });
+    this.logger.warn({ sessionId, count: expired.length }, 'channel: queued injections expired');
   }
 
   /**
@@ -2044,6 +2358,62 @@ export class Daemon {
       labelSession: (input) => Promise.resolve(this.labelSession(input)),
       watchSession: (input) => Promise.resolve(this.watchSession(input)),
       unregisterSession: (input) => Promise.resolve(this.unregisterSession(input)),
+    };
+  }
+
+  /** Bind this daemon's channel bookkeeping as the receiver's channel handlers. */
+  private channelHandlers(): HookReceiverChannelHandlers {
+    return {
+      attach: (input) => {
+        const result = this.channels.attach(input);
+        if (result.ok) return { ok: true, attachId: result.attachment.attachId };
+        // A shutdown refusal is retryable and a duplicate server is not, so the client can back
+        // off in one case and exit in the other instead of guessing from prose.
+        return result.reason === 'closing'
+          ? { ok: false, error: 'daemon is shutting down', retryable: true }
+          : {
+              ok: false,
+              error: `a channel server is already attached to session '${input.sessionId}'`,
+            };
+      },
+      take: (attachId, source) => this.channels.take(attachId, source),
+      ack: (attachId, injectId, state) => {
+        const result = this.channels.ack(attachId, injectId, state);
+        if (result.requeued) {
+          this.logger.warn(
+            { attachId, injectId },
+            'channel: server could not write an injection; requeued',
+          );
+        }
+        return result.ok;
+      },
+      reply: (attachId, text) => {
+        const attachment = this.channels.get(attachId);
+        if (attachment === undefined) return false;
+        // The model's answer to whoever sent the prompt. It rides the same notification card
+        // path as every other session output, so it lands in that session's own Discord thread
+        // without the model ever needing to know a channel id.
+        this.sendEnvelope({
+          type: 'hook.notification',
+          payload: {
+            event: 'notification',
+            sessionId: attachment.sessionId,
+            title: attachment.name ?? 'Session reply',
+            body: text,
+            level: 'info',
+            notificationType: 'channel_reply',
+          },
+        });
+        return true;
+      },
+      detach: (attachId) => {
+        const attachment = this.channels.get(attachId);
+        const recovered = this.channels.detach(attachId);
+        if (attachment !== undefined) {
+          this.logger.info({ sessionId: attachment.sessionId }, 'channel: server detached');
+          this.recoverChannelInjections(attachment.sessionId, recovered);
+        }
+      },
     };
   }
 
