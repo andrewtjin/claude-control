@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CHANNEL_ATTACH_STALE_MS,
+  CHANNEL_POLL_MS,
   CHANNEL_QUEUE_CAP,
   CHANNEL_TTL_MS,
   ChannelRegistry,
+  type ChannelInjection,
 } from './channelRegistry.js';
 
 /** A clock the test drives by hand, so TTL and staleness are exercised without real waiting. */
@@ -82,6 +84,30 @@ describe('attach', () => {
     if (!second.ok) throw new Error('re-attach failed');
     expect(reg.take(second.attachment.attachId)).toEqual([]);
   });
+
+  it('inherited work keeps its ORIGINAL queue time, so re-attaching cannot renew a TTL', () => {
+    const clock = fakeClock();
+    const reg = new ChannelRegistry({ clock: clock.now });
+    reg.attach(attachInput());
+    reg.enqueue('sess-1', 'queued at the very start');
+    // Old enough to be inherited by a replacement, young enough to survive the TTL...
+    clock.advance(CHANNEL_ATTACH_STALE_MS + 1);
+    const second = reg.attach(attachInput());
+    if (!second.ok) throw new Error('re-attach failed');
+    // …and it must still expire on the ORIGINAL schedule, not one restarted by the re-attach.
+    clock.advance(CHANNEL_TTL_MS - CHANNEL_ATTACH_STALE_MS);
+    expect(reg.take(second.attachment.attachId)).toEqual([]);
+  });
+
+  it('refuses to attach once the registry is closed, so a drain cannot be undone', () => {
+    const reg = new ChannelRegistry();
+    reg.attach(attachInput());
+    reg.close();
+    const after = reg.attach(attachInput('sess-2'));
+    expect(after.ok).toBe(false);
+    if (!after.ok) expect(after.reason).toBe('closing');
+    expect(reg.list()).toEqual([]);
+  });
 });
 
 describe('enqueue', () => {
@@ -141,6 +167,67 @@ describe('take', () => {
     reg.enqueue('sess-1', 'stale');
     clock.advance(CHANNEL_TTL_MS + 1);
     expect(reg.take(attached.attachment.attachId)).toEqual([]);
+  });
+
+  it('reports what it expired, so an expiry can never be a silent drop', () => {
+    const clock = fakeClock();
+    const expiries: { sessionId: string; texts: string[] }[] = [];
+    const reg = new ChannelRegistry({
+      clock: clock.now,
+      onExpire: (sessionId, expired: ChannelInjection[]) =>
+        expiries.push({ sessionId, texts: expired.map((i) => i.text) }),
+    });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    reg.enqueue('sess-1', 'too old');
+    clock.advance(CHANNEL_TTL_MS + 1);
+    reg.enqueue('sess-1', 'still fresh');
+
+    expect(reg.take(attached.attachment.attachId)?.map((i) => i.text)).toEqual(['still fresh']);
+    expect(expiries).toEqual([{ sessionId: 'sess-1', texts: ['too old'] }]);
+  });
+
+  it('says nothing when nothing expired', () => {
+    let calls = 0;
+    const reg = new ChannelRegistry({
+      onExpire: () => {
+        calls += 1;
+      },
+    });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    reg.enqueue('sess-1', 'fresh');
+    reg.take(attached.attachment.attachId);
+    expect(calls).toBe(0);
+  });
+
+  it('a daemon-side wake does NOT count as the client being alive', () => {
+    const clock = fakeClock();
+    const reg = new ChannelRegistry({ clock: clock.now });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    const id = attached.attachment.attachId;
+
+    // The client stops polling and its socket half-opens; the daemon keeps pushing into it.
+    clock.advance(CHANNEL_ATTACH_STALE_MS - 1);
+    reg.enqueue('sess-1', 'pushed into a dead socket');
+    reg.take(id, 'wake');
+    clock.advance(2);
+
+    // A write the client never read must not have restarted the staleness countdown.
+    expect(reg.sweepStale()).toHaveLength(1);
+    expect(reg.isAttached('sess-1')).toBe(false);
+  });
+
+  it('a real poll DOES count as the client being alive', () => {
+    const clock = fakeClock();
+    const reg = new ChannelRegistry({ clock: clock.now });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    clock.advance(CHANNEL_ATTACH_STALE_MS - 1);
+    reg.take(attached.attachment.attachId, 'poll');
+    clock.advance(2);
+    expect(reg.sweepStale()).toEqual([]);
   });
 });
 
@@ -233,7 +320,20 @@ describe('detach and sweep', () => {
     reg.attach(attachInput('sess-2'));
     reg.enqueue('sess-1', 'a');
     reg.enqueue('sess-2', 'b');
-    expect(reg.drainAll()).toHaveLength(2);
+    expect(reg.close()).toHaveLength(2);
     expect(reg.list()).toEqual([]);
+  });
+
+  it('scales its staleness window with the poll bound in force', () => {
+    // A deployment (or a test) that holds polls for longer than the DEFAULT stale window must not
+    // have its clients detached mid-hold — the window is derived from the bound, never fixed.
+    const longPollMs = CHANNEL_ATTACH_STALE_MS * 2;
+    const clock = fakeClock();
+    const reg = new ChannelRegistry({ clock: clock.now, pollMs: longPollMs });
+    expect(reg.staleAfterMs).toBeGreaterThan(longPollMs);
+    reg.attach(attachInput());
+    clock.advance(longPollMs);
+    expect(reg.sweepStale()).toEqual([]);
+    expect(new ChannelRegistry().staleAfterMs).toBe(3 * CHANNEL_POLL_MS);
   });
 });

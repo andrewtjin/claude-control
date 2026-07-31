@@ -7,7 +7,11 @@ export {
   resolveIdentity,
   readSessionRegistry,
   createParentOf,
+  pidIsLive,
   MAX_ANCESTOR_HOPS,
+  MAX_ANCESTOR_WALK_MS,
+  REGISTRY_READ_ATTEMPTS,
+  REGISTRY_RETRY_DELAY_MS,
   type IdentityResult,
   type ResolvedIdentity,
   type UnresolvedIdentity,
@@ -22,6 +26,10 @@ export {
   BACKOFF_BASE_MS,
   BACKOFF_CAP_MS,
   DEFAULT_POLL_MS,
+  MIN_POLL_MS,
+  MAX_POLL_MS,
+  EMPTY_POLL_FLOOR_MS,
+  STALE_ATTACHMENT_MS,
   type AttachIdentity,
   type ChannelItem,
   type DaemonAddress,
@@ -42,6 +50,12 @@ export {
   type ChannelServerOptions,
 } from './server.js';
 
+export { noopLogger, type Logger } from './logger.js';
+
 // The whole server, composed. `cctl channel serve` calls this so the CLI-hosted channel and the
 // standalone `cctl-channel` binary are the same program rather than two that must be kept in step.
+//
+// Importing THIS barrel eagerly loads identity + daemonLink, which the composition itself is
+// careful to defer. A caller that only needs to run the server should import the `./run` subpath
+// instead and keep that saving.
 export { runChannelServer } from './run.js';

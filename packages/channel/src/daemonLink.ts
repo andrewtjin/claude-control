@@ -19,13 +19,11 @@
 
 import { dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-  defaultPaths,
-  defaultProtector,
-  noopLogger,
-  type Logger,
-  type Protector,
-} from '@claude-control/switch-engine';
+// switch-engine is reached ONLY through a dynamic import inside `createDiscover` — its barrel
+// carries the vault, OAuth refresh, Keychain and DPAPI, none of which may sit in front of the
+// MCP handshake. `Protector` is type-only here, so it is erased and costs nothing.
+import type { Protector } from '@claude-control/switch-engine';
+import { noopLogger, type Logger } from './logger.js';
 
 /** One injection the daemon wants delivered into this session. */
 export interface ChannelItem {
@@ -34,9 +32,12 @@ export interface ChannelItem {
   meta?: Record<string, unknown> | undefined;
 }
 
-/** What the transport reports back about one item, which becomes the ack state. `sent` means
- *  the notification reached the transport — NOT that the session acted on it. Channel delivery
- *  is fire-and-forget by design, so no code here may ever claim more than that. */
+/** What the transport reports back about one item, which becomes the ack state.
+ *
+ *  `sent` means the notification was accepted by the transport — NOT that the session acted on
+ *  it. Channel delivery is fire-and-forget by design, so no code here may ever claim more. The
+ *  distinction has teeth: the daemon drops an item from its in-flight map on a `sent` ack, so a
+ *  wrongly-optimistic `{ok:true}` destroys the message rather than merely mis-reporting it. */
 export type DeliverResult = { ok: true } | { ok: false; error: string };
 
 /** Hand one item to the MCP transport. Supplied by the composition root so this module never
@@ -91,6 +92,22 @@ export const BACKOFF_BASE_MS = 500;
 export const BACKOFF_CAP_MS = 30_000;
 /** Fallback long-poll bound, used until the daemon's `attach` response states its own. */
 export const DEFAULT_POLL_MS = 30_000;
+/** Clamp on the daemon-supplied `pollMs`. It is used to size this client's own request deadline,
+ *  so an absurd value from a buggy or future daemon would either make every poll time out
+ *  instantly or disable the deadline entirely. Trusting the peer's number unbounded is how a
+ *  remote field becomes a local hang. */
+export const MIN_POLL_MS = 1_000;
+export const MAX_POLL_MS = 120_000;
+/** Floor between polls when the daemon answered with nothing.
+ *
+ *  An empty `200` is a success and resets the backoff, but the daemon does NOT always hold the
+ *  socket for the full bound — it answers a displaced poll immediately, and releases every held
+ *  poll at shutdown. Without a floor those cases turn into an unthrottled request loop against
+ *  the daemon's event loop. Small enough to be invisible to an operator waiting on a message. */
+export const EMPTY_POLL_FLOOR_MS = 50;
+/** How long the daemon keeps an attachment alive after a server stops polling. A server that
+ *  died uncleanly still owns its session for this long. */
+export const STALE_ATTACHMENT_MS = 90_000;
 /** Timeout for the small request/response calls (attach, ack, reply, detach). The long poll is
  *  bounded separately and far more generously — see {@link DaemonLink.poll}. */
 const SHORT_CALL_TIMEOUT_MS = 10_000;
@@ -106,6 +123,9 @@ export interface DaemonLinkOptions {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   backoffBaseMs?: number;
   backoffCapMs?: number;
+  /** How long to wait before the single re-attach that follows a 409. Defaults to just past the
+   *  daemon's stale-attachment window; see {@link DaemonLink.run}. */
+  conflictRetryMs?: number;
 }
 
 /** Why {@link DaemonLink.run} returned. `conflict` is the one the operator must see: another
@@ -120,6 +140,7 @@ export class DaemonLink {
   private readonly sleepFn: (ms: number, signal: AbortSignal) => Promise<void>;
   private readonly backoffBaseMs: number;
   private readonly backoffCapMs: number;
+  private readonly conflictRetryMs: number;
 
   /** Cached only while it keeps working; dropped on any failure so recovery always re-reads the
    *  endpoint file rather than retrying a port the daemon no longer owns. */
@@ -127,6 +148,9 @@ export class DaemonLink {
   private attachId: string | undefined;
   private pollMs = DEFAULT_POLL_MS;
   private backoffMs = 0;
+  /** A 409 buys exactly one retry, tracked here so a daemon that answers 409 forever cannot keep
+   *  this server waiting in a loop. */
+  private conflictRetried = false;
   private readonly abort = new AbortController();
 
   constructor(options: DaemonLinkOptions) {
@@ -137,6 +161,9 @@ export class DaemonLink {
     this.sleepFn = options.sleep ?? defaultSleep;
     this.backoffBaseMs = options.backoffBaseMs ?? BACKOFF_BASE_MS;
     this.backoffCapMs = options.backoffCapMs ?? BACKOFF_CAP_MS;
+    // Just past the daemon's stale window, so the retry lands after a dead predecessor's
+    // attachment has been swept rather than while it is still held.
+    this.conflictRetryMs = options.conflictRetryMs ?? STALE_ATTACHMENT_MS + 5_000;
   }
 
   /** The attachment id the daemon minted, once attached. Exposed for logging and tests. */
@@ -148,19 +175,39 @@ export class DaemonLink {
    * Attach, then poll until stopped. Every failure mode funnels into the same two moves — forget
    * the address, back off — so there is exactly one recovery path to reason about, and it is the
    * one that also covers "the daemon restarted on a different port".
+   *
+   * A 409 gets ONE bounded retry rather than an immediate exit. Claude Code does not restart a
+   * failed MCP server, so exiting on the first 409 is terminal for the session's whole life — and
+   * the most likely cause of a 409 is not a genuine second server but a predecessor that died
+   * without detaching, whose attachment the daemon still holds for {@link STALE_ATTACHMENT_MS}.
+   * Waiting out that window converts "no channel, ever" into "no channel for ninety seconds".
    */
   async run(deliver: Deliver): Promise<RunOutcome> {
     while (!this.abort.signal.aborted) {
       if (this.attachId === undefined) {
         const attached = await this.attach();
-        if (attached === 'conflict') return { reason: 'conflict' };
+        if (attached === 'conflict') {
+          if (this.conflictRetried) return { reason: 'conflict' };
+          this.conflictRetried = true;
+          this.logger.warn(
+            { sessionId: this.identity.sessionId, retryInMs: this.conflictRetryMs },
+            'channel: session already attached; waiting out the stale-attachment window to retry',
+          );
+          if (!(await this.pause(this.conflictRetryMs))) break;
+          continue;
+        }
         if (attached === 'failed') {
           if (!(await this.backoff())) break;
           continue;
         }
       }
-      if (!(await this.poll(deliver))) {
+      const polled = await this.poll(deliver);
+      if (polled === 'failed') {
         if (!(await this.backoff())) break;
+      } else if (polled === 'empty') {
+        // Floor an empty result. It is a success (backoff stays reset) but must not become a
+        // zero-delay request loop when the daemon answers immediately instead of holding.
+        if (!(await this.pause(EMPTY_POLL_FLOOR_MS))) break;
       }
     }
     return { reason: 'stopped' };
@@ -200,7 +247,9 @@ export class DaemonLink {
       return 'failed';
     }
     this.attachId = attachId;
-    this.pollMs = readPositiveInt(result.body, 'pollMs') ?? DEFAULT_POLL_MS;
+    // Clamped, not trusted: this number sizes our own request deadline below.
+    const advertised = readPositiveInt(result.body, 'pollMs') ?? DEFAULT_POLL_MS;
+    this.pollMs = Math.min(Math.max(advertised, MIN_POLL_MS), MAX_POLL_MS);
     this.backoffMs = 0;
     this.logger.info(
       {
@@ -214,12 +263,14 @@ export class DaemonLink {
     return 'ok';
   }
 
-  /** One bounded long poll. Returns false when the caller should back off. An empty `items` is a
-   *  SUCCESS — the daemon's bound simply elapsed — so it re-polls immediately and resets the
-   *  backoff, which is what keeps an idle session responsive. */
-  private async poll(deliver: Deliver): Promise<boolean> {
+  /** One bounded long poll.
+   *
+   *  `failed` means back off. `empty` is a SUCCESS — the daemon's bound simply elapsed — so the
+   *  backoff resets and only a small floor separates it from the next poll. `delivered` re-polls
+   *  at once, which is what keeps a busy session responsive. */
+  private async poll(deliver: Deliver): Promise<'delivered' | 'empty' | 'failed'> {
     const attachId = this.attachId;
-    if (attachId === undefined) return false;
+    if (attachId === undefined) return 'failed';
     // Generously above the daemon's own bound: the server is supposed to answer within
     // `pollMs`, so anything past double that is a hang, not a slow answer.
     const result = await this.post(
@@ -230,7 +281,7 @@ export class DaemonLink {
     if (result.kind === 'unreachable') {
       // Our own shutdown aborts the in-flight poll, which arrives here looking exactly like a
       // dead daemon. It is not: the attachment is still valid and `detach` is about to need it.
-      if (this.abort.signal.aborted) return false;
+      if (this.abort.signal.aborted) return 'failed';
       // The daemon died mid-poll (or never came back). Forget both the port and the attachment:
       // the attachment cannot outlive the process that minted it.
       this.attachId = undefined;
@@ -238,7 +289,7 @@ export class DaemonLink {
         { sessionId: this.identity.sessionId, reason: result.reason },
         'channel: poll lost the daemon, re-attaching',
       );
-      return false;
+      return 'failed';
     }
     if (result.status === 404) {
       // The daemon is alive but has forgotten us (restart, or the attachment expired). Re-attach
@@ -249,22 +300,29 @@ export class DaemonLink {
         { sessionId: this.identity.sessionId },
         'channel: attachment unknown to daemon, re-attaching',
       );
-      return false;
+      return 'failed';
     }
     if (result.status !== 200) {
       this.logger.warn(
         { sessionId: this.identity.sessionId, status: result.status },
         'channel: unexpected poll status',
       );
-      return false;
+      return 'failed';
     }
     this.backoffMs = 0;
-    for (const item of readItems(result.body)) {
+    const items = readItems(result.body);
+    for (const item of items) {
       if (this.abort.signal.aborted) break;
       const delivered = await deliver(item);
+      if (!delivered.ok) {
+        this.logger.error(
+          { sessionId: this.identity.sessionId, injectId: item.injectId, error: delivered.error },
+          'channel: the session transport rejected an item; acking failed so the daemon can requeue it',
+        );
+      }
       await this.ack(item.injectId, delivered);
     }
-    return true;
+    return items.length > 0 ? 'delivered' : 'empty';
   }
 
   /** Report what became of one item. Best-effort by design: a lost ack costs the daemon a retry
@@ -327,15 +385,21 @@ export class DaemonLink {
   /** Exponential, capped, and reset on every successful poll. Returns false when the sleep was
    *  cut short by {@link stop}, which ends the loop. */
   private async backoff(): Promise<boolean> {
-    // A failure caused BY the shutdown (the in-flight poll being aborted) must not schedule a
-    // retry — that would both delay exit and misreport the backoff schedule.
-    if (this.abort.signal.aborted) return false;
     this.backoffMs =
       this.backoffMs === 0 ? this.backoffBaseMs : Math.min(this.backoffMs * 2, this.backoffCapMs);
+    return this.pause(this.backoffMs);
+  }
+
+  /** Sleep, unless we are shutting down. Returns false when the loop should stop — either because
+   *  stop() had already been called, or because it landed during the sleep. A failure caused BY
+   *  the shutdown (the in-flight poll being aborted) must not schedule a retry: that would both
+   *  delay exit and misreport the backoff schedule. */
+  private async pause(ms: number): Promise<boolean> {
+    if (this.abort.signal.aborted) return false;
     try {
-      await this.sleepFn(this.backoffMs, this.abort.signal);
+      await this.sleepFn(ms, this.abort.signal);
     } catch {
-      return false; // aborted
+      return false; // aborted mid-sleep
     }
     return !this.abort.signal.aborted;
   }
@@ -399,8 +463,12 @@ export function createDiscover(options: DiscoverOptions = {}): Discover {
   return async () => {
     const { hookEndpointPath, hookSecretPath, loadHookSecret, readHookEndpoint } =
       await import('@claude-control/daemon');
-    const dataDir = options.dataDir ?? dirname(defaultPaths().vaultDir);
-    const protector = options.protector ?? defaultProtector();
+    // switch-engine is dynamic for the same reason and pays the same way: discovery runs behind
+    // the handshake, so the vault/OAuth/Keychain/DPAPI graph loads where nothing is waiting.
+    const needsDefaults = options.dataDir === undefined || options.protector === undefined;
+    const engine = needsDefaults ? await import('@claude-control/switch-engine') : undefined;
+    const dataDir = options.dataDir ?? dirname(engine!.defaultPaths().vaultDir);
+    const protector = options.protector ?? engine!.defaultProtector();
 
     const secret = await loadHookSecret({ filePath: hookSecretPath(dataDir), protector });
     if (secret === undefined) {

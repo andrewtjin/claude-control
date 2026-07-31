@@ -15,7 +15,8 @@
 
 import { createInterface, type Interface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
-import { noopLogger, type Logger } from '@claude-control/switch-engine';
+import { noopLogger, type Logger } from './logger.js';
+// Type-only, so it is erased at compile time and costs this module nothing at startup.
 import type { DeliverResult } from './daemonLink.js';
 
 /** Name Claude Code shows for this server. */
@@ -59,6 +60,11 @@ export interface ChannelServerOptions {
   logger?: Logger;
   /** Reported in `serverInfo`; defaults to this package's version. */
   version?: string;
+  /** Called once when stdin or stdout fails — EPIPE, in practice, when Claude Code goes away.
+   *  Node treats an unhandled stream `error` as an uncaught exception, which would kill this
+   *  process instantly and skip the detach, leaving the daemon holding an attachment for a
+   *  session that no longer exists. The composition root wires this to its shutdown path. */
+  onTransportError?: (error: Error) => void;
 }
 
 /** JSON-RPC error codes this server emits. */
@@ -75,11 +81,15 @@ export class ChannelServer {
   private readonly onReply: (text: string) => Promise<DeliverResult>;
   private readonly logger: Logger;
   private readonly version: string;
+  private readonly onTransportError: ((error: Error) => void) | undefined;
 
   private lines: Interface | undefined;
   private initialized = false;
   private readonly readyPromise: Promise<void>;
   private markReady!: () => void;
+  /** Set once the transport has failed. Every later write short-circuits to a failure rather
+   *  than pretending, so a dead pipe can never be reported as a delivery. */
+  private transportError: string | undefined;
 
   constructor(options: ChannelServerOptions) {
     this.input = options.input;
@@ -87,6 +97,7 @@ export class ChannelServer {
     this.onReply = options.onReply;
     this.logger = options.logger ?? noopLogger;
     this.version = options.version ?? '0.1.0';
+    this.onTransportError = options.onTransportError;
     this.readyPromise = new Promise<void>((resolve) => {
       this.markReady = resolve;
     });
@@ -96,28 +107,55 @@ export class ChannelServer {
    *  the client's `initialize` is answered immediately. */
   start(): void {
     if (this.lines !== undefined) return;
+    // Stream errors MUST be handled here. Node escalates an unhandled `error` on a stream to an
+    // uncaught exception, so without these two lines an EPIPE (Claude Code exiting first) kills
+    // this process before the shutdown path can detach.
+    this.output.on('error', (err: Error) => this.failTransport(err, 'stdout'));
+    this.input.on('error', (err: Error) => this.failTransport(err, 'stdin'));
     // readline handles both LF and CRLF framing and never splits a frame across chunks, which a
     // hand-rolled buffer split is easy to get wrong under partial reads.
     this.lines = createInterface({ input: this.input, crlfDelay: Infinity });
+    // readline RE-EMITS a source error on the Interface as well as leaving it on the stream
+    // (measured). Handling only the stream is therefore not enough — the Interface's copy would
+    // still be unhandled, and that is the one that takes the process down.
+    this.lines.on('error', (err: Error) => this.failTransport(err, 'stdin'));
     this.lines.on('line', (line) => {
       void this.handleLine(line);
     });
   }
 
   /**
-   * Resolves once the client has sent `notifications/initialized`. Until then the session is not
-   * listening on the channel, so pushing a notification would drop it silently — and channel
-   * delivery has no delivered-state to discover that from afterwards.
+   * Wait for the client's `notifications/initialized`. Until it arrives the session is not
+   * listening on the channel, so pushing would be dropped silently — and channel delivery has no
+   * delivered-state to discover that from afterwards.
+   *
+   * Resolves `true` on handshake, or `false` if `timeoutMs` elapses first. Callers that pass a
+   * bound get an answer either way; an unbounded wait on a client that never finishes its
+   * handshake is an invisible park, which is worse than a logged failure.
    */
-  ready(): Promise<void> {
-    return this.readyPromise;
+  ready(timeoutMs?: number): Promise<boolean> {
+    if (timeoutMs === undefined) return this.readyPromise.then(() => true);
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeoutMs);
+      // Never hold the process open on account of this timer.
+      timer.unref();
+      void this.readyPromise.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
   }
 
-  /** Push one channel item into the session. Resolves when the frame has been flushed to the
-   *  transport, which is the strongest claim anyone here can honestly make: what the session
-   *  then does with it is unobservable from this side. */
-  async push(content: string, meta?: Record<string, unknown>): Promise<void> {
-    await this.write({
+  /**
+   * Push one channel item into the session.
+   *
+   * Reports whether the frame reached the transport — NOT whether the session acted on it, which
+   * is unobservable from here. The caller acks on this result, and the daemon drops the item from
+   * its in-flight map on a `sent` ack, so a false success here destroys a message: it can no
+   * longer be recovered by detach, by the stale sweep, or by the turn-boundary fallback.
+   */
+  push(content: string, meta?: Record<string, unknown>): Promise<DeliverResult> {
+    return this.write({
       jsonrpc: '2.0',
       method: 'notifications/claude/channel',
       params: { content, meta: sanitizeMetaKeys(meta, this.logger) },
@@ -127,6 +165,14 @@ export class ChannelServer {
   close(): void {
     this.lines?.close();
     this.lines = undefined;
+  }
+
+  /** Record the first transport failure and hand it to the composition root exactly once. */
+  private failTransport(error: Error, stream: 'stdin' | 'stdout'): void {
+    if (this.transportError !== undefined) return;
+    this.transportError = `${stream}: ${error.message}`;
+    this.logger.error({ stream, error: error.message }, 'channel: stdio transport failed');
+    this.onTransportError?.(error);
   }
 
   // -------------------------------------------------------------------------
@@ -141,19 +187,11 @@ export class ChannelServer {
     } catch {
       // Per JSON-RPC, an unparsable frame is answered with a null-id error rather than ignored:
       // if it was a request, silence would hang the client.
-      await this.write({
-        jsonrpc: '2.0',
-        id: null,
-        error: { code: PARSE_ERROR, message: 'parse error' },
-      });
+      await this.respondNullId(PARSE_ERROR, 'parse error');
       return;
     }
     if (message === null || typeof message !== 'object' || Array.isArray(message)) {
-      await this.write({
-        jsonrpc: '2.0',
-        id: null,
-        error: { code: INVALID_REQUEST, message: 'invalid request' },
-      });
+      await this.respondNullId(INVALID_REQUEST, 'invalid request');
       return;
     }
     const record = message as Record<string, unknown>;
@@ -253,35 +291,68 @@ export class ChannelServer {
     }
     const sent = await this.onReply(text);
     if (sent.ok) {
-      await this.toolResult(id, 'Delivered to the sender.', false);
+      // NOT "delivered". All that is known here is that cctl accepted it: the daemon enqueues to
+      // a durable outbox, and nothing on this side ever learns whether the sender saw it. This
+      // package refuses to overclaim delivery everywhere else and must not start here.
+      await this.toolResult(id, 'Handed to cctl for delivery.', false);
       return;
     }
-    // The model must know its reply did NOT land, or it will assume the sender has been answered
-    // and stop talking to a person who has heard nothing.
-    await this.toolResult(id, `The reply was not delivered: ${sent.error}`, true);
+    // The model must know its reply did NOT go out, or it will assume the sender has been
+    // answered and stop talking to a person who has heard nothing.
+    await this.toolResult(id, `The reply could not be sent: ${sent.error}`, true);
   }
 
   // -------------------------------------------------------------------------
   // Writing
   // -------------------------------------------------------------------------
 
+  /** The JSON-RPC answer to a frame so malformed we never recovered an id from it. */
+  private async respondNullId(code: number, message: string): Promise<void> {
+    const wrote = await this.write({ jsonrpc: '2.0', id: null, error: { code, message } });
+    if (!wrote.ok) {
+      this.logger.error({ error: wrote.error }, 'channel: could not write a response');
+    }
+  }
+
+  /** Send a response frame. A response that cannot be written is unrecoverable — the client is
+   *  gone — so it is logged rather than propagated; only `push` has a caller that can act. */
+  private async respond(message: unknown, id: JsonRpcId): Promise<void> {
+    const wrote = await this.write(message);
+    if (!wrote.ok) {
+      this.logger.error({ id, error: wrote.error }, 'channel: could not write a response');
+    }
+  }
+
   private result(id: JsonRpcId, result: unknown): Promise<void> {
-    return this.write({ jsonrpc: '2.0', id, result });
+    return this.respond({ jsonrpc: '2.0', id, result }, id);
   }
 
   private error(id: JsonRpcId, code: number, message: string): Promise<void> {
-    return this.write({ jsonrpc: '2.0', id, error: { code, message } });
+    return this.respond({ jsonrpc: '2.0', id, error: { code, message } }, id);
   }
 
   private toolResult(id: JsonRpcId, text: string, isError: boolean): Promise<void> {
     return this.result(id, { content: [{ type: 'text', text }], isError });
   }
 
-  /** One frame, one line. Resolves when the chunk has actually been handed to the OS, so callers
-   *  that ack on "written to the transport" are not acking on a buffer append. */
-  private write(message: unknown): Promise<void> {
-    return new Promise((resolve) => {
-      this.output.write(`${JSON.stringify(message)}\n`, () => resolve());
+  /**
+   * One frame, one line, with an honest answer about whether it left.
+   *
+   * The write callback's FIRST ARGUMENT IS THE ERROR. Discarding it — which reads perfectly
+   * naturally as `write(line, () => resolve())` — makes every failed write indistinguishable
+   * from a successful one, and everything downstream of `push` is built on trusting this result.
+   */
+  private write(message: unknown): Promise<DeliverResult> {
+    if (this.transportError !== undefined) {
+      return Promise.resolve({ ok: false, error: this.transportError });
+    }
+    if (this.output.destroyed || this.output.writableEnded) {
+      return Promise.resolve({ ok: false, error: 'the stdio transport is closed' });
+    }
+    return new Promise<DeliverResult>((resolve) => {
+      this.output.write(`${JSON.stringify(message)}\n`, (err) => {
+        resolve(err ? { ok: false, error: err.message } : { ok: true });
+      });
     });
   }
 
@@ -295,24 +366,41 @@ export class ChannelServer {
  * Make a `meta` object survive the trip.
  *
  * Claude Code drops any key outside `[A-Za-z0-9_]+` without complaining, so `message-id` simply
- * vanishes at the far end. Rather than lose data silently, keys are normalised (`-` and friends
- * become `_`) in a second pass, and a normalised key that would collide with a key that was
- * already valid is dropped instead of overwriting it — silently replacing a good value with a
- * different one is worse than losing the one that was malformed. Values are flattened to
- * strings; anything that is not a primitive has no meaningful string form and is dropped.
+ * vanishes at the far end. Keys are therefore normalised (`-` and friends become `_`) in a second
+ * pass, and a normalised key that would collide with a key that was already valid is dropped
+ * rather than overwriting it — silently replacing a good value with a different one is worse than
+ * losing the one that was malformed.
+ *
+ * Values are flattened to strings. Anything that is not a primitive (an object, an array, `null`)
+ * has no meaningful flat form and IS dropped — as is a key that normalises to nothing. Every one
+ * of those drops is logged, because the alternative is meta quietly arriving incomplete with no
+ * way to tell from either end.
  */
 export function sanitizeMetaKeys(
   meta: Record<string, unknown> | undefined,
   logger: Logger = noopLogger,
 ): Record<string, string> {
-  const out: Record<string, string> = {};
+  // Null-prototype: `meta` comes off the wire, so a key of `__proto__` is reachable, and on a
+  // normal object literal `out['__proto__'] = v` mutates the prototype instead of adding a key —
+  // the value would vanish and the object would be quietly corrupted.
+  const out = Object.create(null) as Record<string, string>;
   if (meta === undefined || meta === null) return out;
+
+  const put = (key: string, value: unknown): void => {
+    const flat = flattenMetaValue(value);
+    if (flat === undefined) {
+      logger.warn(
+        { key, kind: value === null ? 'null' : typeof value },
+        'channel: dropped a meta value with no flat form',
+      );
+      return;
+    }
+    out[key] = flat;
+  };
 
   // Pass 1: keys that are already legal claim their name.
   for (const [key, value] of Object.entries(meta)) {
-    if (!SAFE_META_KEY.test(key)) continue;
-    const flat = flattenMetaValue(value);
-    if (flat !== undefined) out[key] = flat;
+    if (SAFE_META_KEY.test(key)) put(key, value);
   }
   // Pass 2: everything else, normalised, first-come — and never over the top of pass 1.
   for (const [key, value] of Object.entries(meta)) {
@@ -322,8 +410,7 @@ export function sanitizeMetaKeys(
       logger.warn({ key }, 'channel: dropped an unrepresentable meta key');
       continue;
     }
-    const flat = flattenMetaValue(value);
-    if (flat !== undefined) out[normalized] = flat;
+    put(normalized, value);
   }
   return out;
 }

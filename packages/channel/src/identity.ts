@@ -22,14 +22,24 @@
 // on the chain. The nearest ancestor is the owning session — but the caller is told the
 // resolution was ambiguous so the daemon can record it rather than have it vanish.
 //
-// Anything that is not one of those two checked outcomes is a refusal with a reason, never a
-// guess. In particular an EMPTY ancestor chain resolves to nothing at all: "we could not see the
-// process tree" is not evidence for "it must be the only session running".
+// THE CONTRADICTION RULE: if `CLAUDE_CODE_SESSION_ID` is set but the registry does not confirm
+// it, the ancestor walk is NOT allowed to answer instead. The env var is always present and
+// always correct, so a miss means the registry was momentarily incomplete — a torn write we
+// skipped, or the file not yet created — which is precisely when the process tree is least
+// trustworthy. The concrete failure: session A spawns session B through a Bash tool; B's registry
+// file is torn for one read; B's walk climbs past its own missing entry to A and attaches as A,
+// and every message for A lands in B's terminal in the wrong repo. So the registry is re-read a
+// couple of times first, and an ancestry answer that disagrees with the env var is a refusal.
+// Two identity sources that contradict each other are not a resolution.
+//
+// Anything that is not a checked outcome is a refusal with a reason, never a guess. In particular
+// an EMPTY ancestor chain resolves to nothing at all: "we could not see the process tree" is not
+// evidence for "it must be the only session running".
 
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
-import { defaultPaths } from '@claude-control/switch-engine';
+import { setTimeout as delay } from 'node:timers/promises';
 
 /** One entry of Claude Code's own session registry, `<claudeDir>/sessions/<pid>.json`. Only the
  *  fields this server needs are modelled; the file carries more (status, version, timings) and
@@ -79,6 +89,19 @@ export type ParentOf = (pid: number) => Promise<number | undefined>;
  *  amount of work instead of an unbounded number of subprocess calls. */
 export const MAX_ANCESTOR_HOPS = 24;
 
+/** Wall-clock bound on the WHOLE walk, independent of the per-lookup timeout. The POSIX path
+ *  spends one `ps` per hop, so a hop bound alone permits 24 sequential lookups; this is what
+ *  stops a slow machine from turning the fallback into a multi-minute stall. */
+export const MAX_ANCESTOR_WALK_MS = 45_000;
+
+/** How many times the registry is read when `CLAUDE_CODE_SESSION_ID` is set but unconfirmed.
+ *  The misses this recovers are transient by nature — a torn write, or the file not yet created
+ *  during startup — so a couple of re-reads a moment apart is the whole fix. */
+export const REGISTRY_READ_ATTEMPTS = 3;
+/** Gap between those re-reads. Long enough for the owning session to finish rewriting its file,
+ *  short enough that the worst case stays far under the MCP handshake's patience. */
+export const REGISTRY_RETRY_DELAY_MS = 120;
+
 export interface IdentityDeps {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
@@ -93,6 +116,29 @@ export interface IdentityDeps {
   /** Hops above the first. Defaults to this platform's real implementation, which is built
    *  lazily so the verified-env path never constructs it. */
   parentOf?: ParentOf;
+  /** Is this pid still running? Defaults to a signal-0 probe. Injected by tests so the
+   *  liveness rule can be exercised without real processes. */
+  isLive?: (pid: number) => boolean;
+  /** Delay between registry re-reads; injectable so tests do not pay for them. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Clock for the walk deadline. */
+  now?: () => number;
+}
+
+/**
+ * Is a pid still running? `signal 0` performs the permission and existence checks without
+ * delivering anything — the same probe `daemonInstanceLock` and switch-engine's `lock` use.
+ *
+ * EPERM means the process EXISTS and belongs to another user, which is very much alive; only
+ * ESRCH means gone. Getting that backwards would reject live sessions on a shared machine.
+ */
+export function pidIsLive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 /**
@@ -128,6 +174,11 @@ export async function readSessionRegistry(sessionsDir: string): Promise<SessionR
         if (entry !== undefined) entries.push(entry);
       }),
   );
+  // Sorted because the reads above complete in arbitrary order, and callers pick with `find`.
+  // Two files can legitimately carry the same sessionId (a resumed session leaving its old pid
+  // file behind), and "whichever read finished first wins" is a coin flip between the live
+  // session and a dead one. Ascending pid is arbitrary but STABLE, which is the property needed.
+  entries.sort((a, b) => a.pid - b.pid);
   return entries;
 }
 
@@ -150,18 +201,50 @@ function toRegistryEntry(value: unknown): SessionRegistryEntry | undefined {
 /**
  * Establish this server's session identity, or refuse with a reason.
  *
- * The environment branch does one directory scan and no process work at all; the ancestor walk
- * is only constructed if that branch produces nothing, which is what keeps the MCP handshake off
- * the expensive path. A `CLAUDE_CODE_SESSION_ID` that no registry file confirms is treated as
- * absent (stale env inherited from a dead session is a real shape), so it falls through to
- * ancestry rather than being trusted.
+ * The environment branch does one directory scan and no process work at all; the ancestor walk is
+ * only constructed if that branch produces nothing, which is what keeps the MCP handshake off the
+ * expensive path.
+ *
+ * An unconfirmed `CLAUDE_CODE_SESSION_ID` is retried before anything else is tried, and if
+ * ancestry then names a DIFFERENT session the whole resolution is refused — see the contradiction
+ * rule in this module's header. The env var is not "one opinion among two"; it is the ground
+ * truth, and disagreement means the evidence is bad, not that the other source wins.
  */
 export async function resolveIdentity(deps: IdentityDeps = {}): Promise<IdentityResult> {
   const env = deps.env ?? process.env;
   const platform = deps.platform ?? process.platform;
-  const sessionsDir = deps.sessionsDir ?? join(defaultPaths(env, platform).claudeDir, 'sessions');
+  const sleep = deps.sleep ?? ((ms: number) => delay(ms));
+  const isLive = deps.isLive ?? pidIsLive;
+  const sessionsDir = deps.sessionsDir ?? (await defaultSessionsDir(env, platform));
+  const declared = env.CLAUDE_CODE_SESSION_ID?.trim();
+  const hasDeclared = declared !== undefined && declared.length > 0;
 
-  const entries = await readSessionRegistry(sessionsDir);
+  // Only the declared-but-unconfirmed case is worth re-reading for: with no env var there is
+  // nothing a second scan could confirm, so the fallback path pays nothing for this.
+  const attempts = hasDeclared ? REGISTRY_READ_ATTEMPTS : 1;
+  let entries: SessionRegistryEntry[] = [];
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    entries = await readSessionRegistry(sessionsDir);
+    if (hasDeclared) {
+      // Among duplicate sessionIds prefer the one whose process still exists; a resumed session
+      // can leave its previous pid's file behind, and that file's pid is the wrong attach target.
+      const candidates = entries.filter((entry) => entry.sessionId === declared);
+      const match = candidates.find((entry) => isLive(entry.pid)) ?? candidates[0];
+      if (match !== undefined) {
+        return {
+          ok: true,
+          sessionId: match.sessionId,
+          source: 'env',
+          pid: match.pid,
+          cwd: match.cwd,
+          name: match.name,
+          ambiguous: false,
+        };
+      }
+    }
+    if (attempt < attempts) await sleep(REGISTRY_RETRY_DELAY_MS);
+  }
+
   if (entries.length === 0) {
     return {
       ok: false,
@@ -169,34 +252,23 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
     };
   }
 
-  const declared = env.CLAUDE_CODE_SESSION_ID?.trim();
-  if (declared !== undefined && declared.length > 0) {
-    const match = entries.find((entry) => entry.sessionId === declared);
-    if (match !== undefined) {
-      return {
-        ok: true,
-        sessionId: match.sessionId,
-        source: 'env',
-        pid: match.pid,
-        cwd: match.cwd,
-        name: match.name,
-        ambiguous: false,
-      };
-    }
-  }
-
   const self = deps.pid ?? process.pid;
   // `in` rather than `??`: an explicitly-supplied `undefined` means "this process has no visible
   // parent", which is a case that must be representable — `??` would silently substitute the
   // real `process.ppid` and turn a test of the refusal path into a live process-table query.
   const parentPid = 'parentPid' in deps ? deps.parentPid : process.ppid;
-  const chain = await ancestorChain(self, parentPid, deps.parentOf ?? createParentOf(platform));
+  const chain = await ancestorChain(
+    self,
+    parentPid,
+    deps.parentOf ?? createParentOf(platform),
+    deps.now ?? Date.now,
+  );
   if (chain.length === 0) {
     // An unreadable process tree is an absence of evidence, not evidence that the only live
     // session is ours. Refuse.
     return {
       ok: false,
-      reason: declared
+      reason: hasDeclared
         ? `CLAUDE_CODE_SESSION_ID=${declared} matches no session in ${sessionsDir}, and this process has no visible ancestors`
         : 'no CLAUDE_CODE_SESSION_ID and this process has no visible ancestors',
     };
@@ -204,14 +276,28 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
 
   const byPid = new Map(entries.map((entry) => [entry.pid, entry]));
   // `chain` is ordered nearest-first, so the first hit is the nearest ancestor by construction.
+  // Entries whose process is gone are skipped: a registry file outlives its session, so without
+  // this the walk can resolve to a dead session and the refusal below would be a lie.
   const matches = chain
     .map((pid) => byPid.get(pid))
-    .filter((entry): entry is SessionRegistryEntry => entry !== undefined);
+    .filter((entry): entry is SessionRegistryEntry => entry !== undefined && isLive(entry.pid));
   const nearest = matches[0];
   if (nearest === undefined) {
     return {
       ok: false,
       reason: `no ancestor of pid ${self} is a live Claude Code session (walked ${chain.length} hop(s))`,
+    };
+  }
+  if (hasDeclared && nearest.sessionId !== declared) {
+    // The contradiction rule. Attaching as `nearest` here is how a nested session steals its
+    // parent's channel; refusing costs this session its channel and nothing else, and the daemon
+    // still reaches it through the turn-boundary fallback.
+    return {
+      ok: false,
+      reason:
+        `CLAUDE_CODE_SESSION_ID=${declared} is not in ${sessionsDir}, but the process tree points at ` +
+        `session ${nearest.sessionId} (pid ${nearest.pid}) - refusing rather than attaching to a ` +
+        'session the environment contradicts',
     };
   }
   return {
@@ -228,13 +314,18 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
 }
 
 /** Walk from `firstParent` upward, nearest-first, excluding `self`. Stops at the process tree's
- *  root (pid 0 / no parent), at {@link MAX_ANCESTOR_HOPS}, or on a repeat — pids are recycled by
- *  the OS, so a reported cycle is possible and must terminate rather than spin. */
+ *  root (pid 0 / no parent), at {@link MAX_ANCESTOR_HOPS}, on {@link MAX_ANCESTOR_WALK_MS}, or on
+ *  a repeat — pids are recycled by the OS, so a reported cycle is possible and must terminate
+ *  rather than spin. The wall-clock bound exists because the hop bound alone is not one: on
+ *  POSIX every hop is its own `ps`, so 24 slow hops multiply into a stall no single per-lookup
+ *  timeout would catch. A truncated chain is a shorter chain, never a wrong answer. */
 async function ancestorChain(
   self: number,
   firstParent: number | undefined,
   parentOf: ParentOf,
+  now: () => number,
 ): Promise<number[]> {
+  const deadline = now() + MAX_ANCESTOR_WALK_MS;
   const chain: number[] = [];
   const seen = new Set<number>([self]);
   let current = firstParent;
@@ -247,9 +338,25 @@ async function ancestorChain(
   ) {
     chain.push(current);
     seen.add(current);
+    if (now() >= deadline) break;
     current = await parentOf(current);
   }
   return chain;
+}
+
+/** `<claudeDir>/sessions`, honouring `CLAUDE_CONFIG_DIR`.
+ *
+ *  switch-engine's `defaultPaths` is the workspace's single authority on that precedence, so it
+ *  is reused rather than re-derived — but imported DYNAMICALLY. Its barrel pulls the vault, OAuth
+ *  refresh, Keychain and DPAPI along with it, and this process's module graph sits in front of
+ *  the MCP handshake. Identity resolution already runs after the transport is answering, so the
+ *  cost lands where nothing is waiting on it. */
+async function defaultSessionsDir(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): Promise<string> {
+  const { defaultPaths } = await import('@claude-control/switch-engine');
+  return join(defaultPaths(env, platform).claudeDir, 'sessions');
 }
 
 /**
@@ -307,15 +414,26 @@ async function windowsProcessTable(): Promise<Map<number, number>> {
     '-Command',
     'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress',
   ]);
+  return out === undefined ? new Map() : parseWindowsProcessTable(out);
+}
+
+/**
+ * Turn the CIM query's JSON into a pid→ppid map. Separated from the subprocess so the parsing —
+ * the part that can be wrong rather than merely slow — is testable without spawning PowerShell,
+ * which on a loaded machine takes tens of seconds and makes an otherwise sound test load-flaky.
+ *
+ * Tolerant by construction: anything unparsable yields an empty (or partial) table, which the
+ * walk reads as "unknown parent" and stops on. A wrong answer would be far worse than a short one.
+ */
+export function parseWindowsProcessTable(json: string): Map<number, number> {
   const table = new Map<number, number>();
-  if (out === undefined) return table;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(out);
+    parsed = JSON.parse(json);
   } catch {
     return table;
   }
-  // A single-process result serialises as an object rather than an array.
+  // `ConvertTo-Json` serialises a single row as a bare object rather than a one-element array.
   for (const row of Array.isArray(parsed) ? parsed : [parsed]) {
     if (row === null || typeof row !== 'object') continue;
     const { ProcessId, ParentProcessId } = row as Record<string, unknown>;

@@ -38,6 +38,9 @@ interface Harness {
   /** Complete the MCP handshake the way a real client does. */
   handshake(protocolVersion?: string): Promise<Record<string, unknown>>;
   replies: string[];
+  input: PassThrough;
+  output: PassThrough;
+  transportErrors: Error[];
 }
 
 const okReply = (): Promise<DeliverResult> => Promise.resolve({ ok: true });
@@ -48,10 +51,16 @@ function harness(onReply: (text: string) => Promise<DeliverResult> = okReply): H
   const frames = new Frames();
   const replies: string[] = [];
 
-  createInterface({ input: output, crlfDelay: Infinity }).on('line', (line) => {
+  const reader = createInterface({ input: output, crlfDelay: Infinity });
+  reader.on('line', (line) => {
     frames.push(JSON.parse(line) as Record<string, unknown>);
   });
+  // This test-side reader is a second consumer of the same stream, and readline re-emits source
+  // errors on the Interface; without this the destroy-based tests below would take the runner
+  // down instead of exercising the server.
+  reader.on('error', () => {});
 
+  const transportErrors: Error[] = [];
   const server = new ChannelServer({
     input,
     output,
@@ -59,6 +68,7 @@ function harness(onReply: (text: string) => Promise<DeliverResult> = okReply): H
       replies.push(text);
       return onReply(text);
     },
+    onTransportError: (err) => transportErrors.push(err),
   });
   server.start();
 
@@ -70,6 +80,9 @@ function harness(onReply: (text: string) => Promise<DeliverResult> = okReply): H
     server,
     frames,
     send,
+    input,
+    output,
+    transportErrors,
     raw: (line: string) => {
       input.write(`${line}\n`);
     },
@@ -153,9 +166,11 @@ describe('tools', () => {
     const response = await h.frames.next();
     expect(h.replies).toEqual(['on it']);
     expect(response.result).toMatchObject({ isError: false });
-    expect((response.result as { content: Array<{ text: string }> }).content[0]?.text).toContain(
-      'Delivered',
-    );
+    // Deliberately NOT "delivered": cctl only accepted it for delivery. Nothing on this side
+    // ever learns whether the sender saw it.
+    const text = (response.result as { content: Array<{ text: string }> }).content[0]?.text;
+    expect(text).toBe('Handed to cctl for delivery.');
+    expect(text).not.toMatch(/delivered to/i);
   });
 
   it('tells the model when the reply did NOT land', async () => {
@@ -316,5 +331,111 @@ describe('sanitizeMetaKeys', () => {
 
   it('returns an empty object rather than undefined for no meta', () => {
     expect(sanitizeMetaKeys(undefined)).toEqual({});
+  });
+
+  it('keeps __proto__ as a real key instead of mutating the prototype', () => {
+    // `__proto__` matches the safe-key regex, so it reaches the assignment. On a normal object
+    // literal `out.__proto__ = v` silently sets the prototype and the value disappears.
+    const meta = JSON.parse('{"__proto__":"discord","seq":"1"}') as Record<string, unknown>;
+    const out = sanitizeMetaKeys(meta);
+
+    expect(Object.hasOwn(out, '__proto__')).toBe(true);
+    expect(out['__proto__']).toBe('discord');
+    expect(out.seq).toBe('1');
+    // Assert on the serialized form, because an object LITERAL cannot express this expectation:
+    // `{ __proto__: 'discord' }` sets the prototype and evaluates to `{}` — the very hazard.
+    expect(JSON.stringify(out)).toBe('{"__proto__":"discord","seq":"1"}');
+  });
+
+  it('logs every drop rather than losing meta silently', () => {
+    const warned: unknown[] = [];
+    const logger = {
+      debug: () => {},
+      info: () => {},
+      warn: (obj: unknown) => warned.push(obj),
+      error: () => {},
+    };
+
+    sanitizeMetaKeys(
+      { nested: { a: 1 }, empty: null, '': 'nameless', a_b: 'x', 'a-b': 'y' },
+      logger,
+    );
+
+    // nested, empty, the unnameable key, and the colliding normalization: four drops, four warns.
+    expect(warned).toHaveLength(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transport failure. A write that did not happen must never be reported as one that did: the
+// daemon drops an item from its in-flight map on a `sent` ack, so an optimistic answer here
+// destroys the message rather than merely mis-reporting it.
+// ---------------------------------------------------------------------------
+
+describe('transport failure', () => {
+  it('reports failure when the frame cannot be written to a destroyed transport', async () => {
+    const h = harness();
+    await h.handshake();
+    h.output.destroy();
+
+    const pushed = await h.server.push('this cannot get through', { source: 'discord' });
+
+    expect(pushed.ok).toBe(false);
+    expect(pushed).toHaveProperty('error');
+  });
+
+  it('reports failure for every later push once the transport has errored', async () => {
+    const h = harness();
+    await h.handshake();
+    h.output.destroy(new Error('EPIPE: broken pipe'));
+    // Let the error event land on the stream.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(await h.server.push('one')).toMatchObject({ ok: false });
+    expect(await h.server.push('two')).toMatchObject({ ok: false });
+  });
+
+  it('surfaces a stdout error instead of letting Node escalate it to an uncaught exception', async () => {
+    const h = harness();
+    await h.handshake();
+
+    h.output.destroy(new Error('EPIPE: broken pipe'));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Without a listener this error would kill the process before it could detach.
+    expect(h.transportErrors).toHaveLength(1);
+    expect(h.transportErrors[0]?.message).toContain('EPIPE');
+  });
+
+  it('surfaces a stdin error the same way', async () => {
+    const h = harness();
+    await h.handshake();
+
+    h.input.destroy(new Error('EPIPE: read end gone'));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(h.transportErrors).toHaveLength(1);
+  });
+
+  it('reports success on a healthy transport, so the failure path is not vacuous', async () => {
+    const h = harness();
+    await h.handshake();
+    expect(await h.server.push('this one really does get through')).toEqual({ ok: true });
+  });
+});
+
+describe('ready', () => {
+  it('resolves false when the client never completes its handshake', async () => {
+    const h = harness();
+    h.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+    await h.frames.next();
+    // No notifications/initialized ever arrives. An unbounded wait here is an invisible park.
+    expect(await h.server.ready(25)).toBe(false);
+  });
+
+  it('resolves true when it does', async () => {
+    const h = harness();
+    await h.handshake();
+    expect(await h.server.ready(5_000)).toBe(true);
   });
 });

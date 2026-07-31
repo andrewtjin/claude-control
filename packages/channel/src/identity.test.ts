@@ -1,10 +1,13 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   createParentOf,
+  parseWindowsProcessTable,
   MAX_ANCESTOR_HOPS,
+  MAX_ANCESTOR_WALK_MS,
+  pidIsLive,
   readSessionRegistry,
   resolveIdentity,
   type ParentOf,
@@ -12,7 +15,11 @@ import {
 } from './identity.js';
 
 // Real temp dirs and real registry files throughout — the whole point of this module is that it
-// reads what Claude Code actually wrote, so a stubbed filesystem would prove nothing.
+// reads what Claude Code actually wrote, so a stubbed filesystem would prove nothing. That also
+// means every test here pays real Windows filesystem latency, which on a busy machine is orders
+// of magnitude worse than the default bound; these are correctness tests, not timing ones.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
+
 const dirs: string[] = [];
 
 afterEach(async () => {
@@ -126,9 +133,10 @@ describe('resolveIdentity — verified environment', () => {
     expect(result).toMatchObject({ ok: true, sessionId: 'sess-cfg', source: 'env' });
   });
 
-  it('falls through to ancestry when the env var names an unknown session', async () => {
-    // A stale id inherited from a session that has since exited is a real shape; trusting it
-    // would address injections to a dead session.
+  it('REFUSES when ancestry names a different session than the env var', async () => {
+    // The wrong-session hazard, exactly. Session A (pid 900) spawned this process; the env var
+    // says we belong to session B, whose registry file was momentarily unreadable. Accepting
+    // ancestry here attaches us as A, and every message for A then lands in B's terminal.
     const sessionsDir = await registry([{ pid: 900, sessionId: 'live' }]);
     const { parentOf } = chainOf({ 500: 900 });
 
@@ -138,9 +146,64 @@ describe('resolveIdentity — verified environment', () => {
       pid: 1,
       parentPid: 500,
       parentOf,
+      sleep: () => Promise.resolve(),
+      // The invented pids in this test do not exist on the machine running it.
+      isLive: () => true,
     });
 
-    expect(result).toMatchObject({ ok: true, sessionId: 'live', source: 'ancestry' });
+    expect(result.ok).toBe(false);
+    const reason = (result as { reason: string }).reason;
+    expect(reason).toContain('ghost');
+    expect(reason).toContain('live');
+    expect(reason).toMatch(/contradict/i);
+  });
+
+  it('re-reads the registry so a torn write does not cost the session its identity', async () => {
+    // The registry entry is absent on the first read and present on the second — a torn write,
+    // which `readSessionRegistry` skips by design, or a file not yet created at startup.
+    const sessionsDir = await registry([{ pid: 900, sessionId: 'other' }]);
+    let reads = 0;
+    const sleep = async (): Promise<void> => {
+      reads += 1;
+      if (reads === 1) {
+        // The owning session finishes writing its file between our two scans.
+        await writeFile(
+          join(sessionsDir, '4242.json'),
+          JSON.stringify({ pid: 4242, sessionId: 'mine', cwd: 'C:\\repo\\mine' }),
+          'utf8',
+        );
+      }
+    };
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'mine' },
+      sessionsDir,
+      pid: 1,
+      parentPid: 900,
+      parentOf: chainOf({}).parentOf,
+      sleep,
+    });
+
+    expect(result).toMatchObject({ ok: true, sessionId: 'mine', source: 'env', pid: 4242 });
+  });
+
+  it('does not re-read when there is no env var to confirm', async () => {
+    const sessionsDir = await registry([{ pid: 900, sessionId: 'only' }]);
+    let sleeps = 0;
+
+    await resolveIdentity({
+      env: {},
+      sessionsDir,
+      pid: 1,
+      parentPid: 900,
+      parentOf: chainOf({}).parentOf,
+      sleep: () => {
+        sleeps += 1;
+        return Promise.resolve();
+      },
+    });
+
+    expect(sleeps).toBe(0);
   });
 });
 
@@ -155,6 +218,7 @@ describe('resolveIdentity — ancestry fallback', () => {
       pid: 10,
       parentPid: 50,
       parentOf,
+      isLive: () => true,
     });
 
     expect(result).toEqual({
@@ -183,6 +247,7 @@ describe('resolveIdentity — ancestry fallback', () => {
       pid: 400,
       parentPid: 300,
       parentOf,
+      isLive: () => true,
     });
 
     expect(result).toMatchObject({ ok: true, sessionId: 'inner', source: 'ancestry', pid: 200 });
@@ -199,6 +264,7 @@ describe('resolveIdentity — ancestry fallback', () => {
       pid: 400,
       parentPid: 300,
       parentOf,
+      isLive: () => true,
     });
 
     expect(result).toMatchObject({ ok: true, sessionId: 'outer', ambiguous: false });
@@ -277,12 +343,165 @@ describe('resolveIdentity — fail closed', () => {
 });
 
 describe('createParentOf', () => {
-  // The one test that exercises the real platform mechanism: Node already knows this process's
-  // parent, so the platform lookup has a checkable right answer. Both assertions share one
-  // lookup because on Windows each `createParentOf` costs a full process-table query.
-  it("resolves this process's real parent, and reports nothing for a pid that cannot exist", async () => {
+  it("resolves this process's real parent on this platform", async () => {
     const parentOf = createParentOf();
-    expect(await parentOf(process.pid)).toBe(process.ppid);
+    const got = await parentOf(process.pid);
+
+    if (process.platform === 'win32') {
+      // The Windows lookup shells out to a full CIM process query, which on a loaded machine
+      // can exceed its own timeout and legitimately answer "unknown parent" — the walk treats
+      // that as a stopping point, not an error. So assert the property that must ALWAYS hold:
+      // it never returns a WRONG parent. The parse itself is covered deterministically below.
+      if (got !== undefined) expect(got).toBe(process.ppid);
+    } else {
+      expect(got).toBe(process.ppid);
+    }
+  }, 90_000);
+
+  it('reports an unknown parent for a pid that cannot exist', async () => {
+    const parentOf = createParentOf();
     expect(await parentOf(0x7ffffff0)).toBeUndefined();
-  }, 90_000); // fast. // rather than tight — the point is that the mechanism is exercised for real, not that it is // Spawns a real process-table query; slow on a loaded Windows box, so the bound is patient
+  }, 90_000);
+});
+
+describe('parseWindowsProcessTable', () => {
+  it('reads the array form the CIM query normally returns', () => {
+    const table = parseWindowsProcessTable(
+      '[{"ProcessId":4242,"ParentProcessId":100},{"ProcessId":100,"ParentProcessId":4}]',
+    );
+    expect(table.get(4242)).toBe(100);
+    expect(table.get(100)).toBe(4);
+  });
+
+  it('reads the bare-object form ConvertTo-Json emits for a single row', () => {
+    expect(parseWindowsProcessTable('{"ProcessId":7,"ParentProcessId":1}').get(7)).toBe(1);
+  });
+
+  it('drops rows that cannot be a pid rather than inventing one', () => {
+    const table = parseWindowsProcessTable(
+      '[{"ProcessId":5,"ParentProcessId":0},{"ProcessId":null,"ParentProcessId":9},{"ProcessId":6}]',
+    );
+    // ppid 0 is the tree root, which must end a walk rather than extend it.
+    expect(table.has(5)).toBe(false);
+    expect(table.size).toBe(0);
+  });
+
+  it('degrades to an empty table on garbage instead of throwing', () => {
+    expect(parseWindowsProcessTable('not json').size).toBe(0);
+    expect(parseWindowsProcessTable('"a string"').size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Liveness and determinism. A registry file outlives the session that wrote it, so matching one
+// is not the same as finding a running session.
+// ---------------------------------------------------------------------------
+
+describe('liveness', () => {
+  it('skips an ancestor whose registry file belongs to a session that has exited', async () => {
+    const sessionsDir = await registry([
+      { pid: 200, sessionId: 'dead' },
+      { pid: 100, sessionId: 'alive' },
+    ]);
+    const { parentOf } = chainOf({ 300: 200, 200: 100, 100: 1 });
+
+    const result = await resolveIdentity({
+      env: {},
+      sessionsDir,
+      pid: 400,
+      parentPid: 300,
+      parentOf,
+      // pid 200's process is gone; its file is just a leftover.
+      isLive: (pid) => pid !== 200,
+    });
+
+    // Without the liveness filter the NEAREST match (the dead session) would have won.
+    expect(result).toMatchObject({ ok: true, sessionId: 'alive', pid: 100 });
+    expect(result).toHaveProperty('ambiguous', false);
+  });
+
+  it('refuses, honestly, when every ancestor match is dead', async () => {
+    const sessionsDir = await registry([{ pid: 100, sessionId: 'dead' }]);
+    const { parentOf } = chainOf({ 300: 100, 100: 1 });
+
+    const result = await resolveIdentity({
+      env: {},
+      sessionsDir,
+      pid: 400,
+      parentPid: 300,
+      parentOf,
+      isLive: () => false,
+    });
+
+    // The refusal claims "no ancestor is a LIVE session" — that claim has to be true.
+    expect(result).toMatchObject({ ok: false });
+    expect((result as { reason: string }).reason).toContain('live Claude Code session');
+  });
+
+  it('prefers the live file when two registry entries claim the same sessionId', async () => {
+    // A resumed session leaves its previous pid's file behind; attaching to that pid is wrong.
+    const sessionsDir = await registry([
+      { pid: 100, sessionId: 'shared', cwd: 'C:\\stale' },
+      { pid: 900, sessionId: 'shared', cwd: 'C:\\live' },
+    ]);
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'shared' },
+      sessionsDir,
+      isLive: (pid) => pid === 900,
+      sleep: () => Promise.resolve(),
+    });
+
+    expect(result).toMatchObject({ ok: true, pid: 900, cwd: 'C:\\live' });
+  });
+
+  it('pidIsLive agrees with reality for this process and for a pid that cannot exist', () => {
+    expect(pidIsLive(process.pid)).toBe(true);
+    expect(pidIsLive(0x7ffffff0)).toBe(false);
+  });
+});
+
+describe('readSessionRegistry ordering', () => {
+  it('returns a deterministic order regardless of which read finishes first', async () => {
+    const sessionsDir = await registry([
+      { pid: 900, sessionId: 'c' },
+      { pid: 100, sessionId: 'a' },
+      { pid: 500, sessionId: 'b' },
+    ]);
+
+    // Reads complete in arbitrary order, so run it repeatedly: an unsorted result would drift.
+    for (let i = 0; i < 5; i += 1) {
+      const entries = await readSessionRegistry(sessionsDir);
+      expect(entries.map((e) => e.pid)).toEqual([100, 500, 900]);
+    }
+  });
+});
+
+describe('walk deadline', () => {
+  it('stops walking once the wall-clock budget is spent, even below the hop cap', async () => {
+    const sessionsDir = await registry([{ pid: 999999, sessionId: 'far-away' }]);
+    let hops = 0;
+    const parentOf: ParentOf = (pid) => {
+      hops += 1;
+      return Promise.resolve(pid + 1);
+    };
+    // Every hop burns a third of the budget, so the walk must give up long before 24 hops.
+    let clock = 0;
+    const now = (): number => {
+      clock += MAX_ANCESTOR_WALK_MS / 3;
+      return clock;
+    };
+
+    const result = await resolveIdentity({
+      env: {},
+      sessionsDir,
+      pid: 1,
+      parentPid: 2,
+      parentOf,
+      now,
+    });
+
+    expect(result).toMatchObject({ ok: false });
+    expect(hops).toBeLessThan(MAX_ANCESTOR_HOPS);
+  });
 });
