@@ -1162,6 +1162,7 @@ describe('missingThreadPermissionLabels', () => {
     PermissionFlagsBits.CreatePrivateThreads,
     PermissionFlagsBits.SendMessagesInThreads,
     PermissionFlagsBits.ManageThreads,
+    PermissionFlagsBits.AddReactions,
   ];
 
   it('reports nothing missing when every thread permission is granted', () => {
@@ -1178,18 +1179,28 @@ describe('missingThreadPermissionLabels', () => {
     ]);
   });
 
+  // A relayed message's receipt is a reaction, so without this grant the relay works and simply
+  // looks ignored — the quietest failure on the surface, and the one worth naming out loud.
+  it('names Add Reactions when only that one is missing', () => {
+    const granted = ALL.filter((flag) => flag !== PermissionFlagsBits.AddReactions);
+    expect(missingThreadPermissionLabels(new PermissionsBitField(granted))).toEqual([
+      'Add Reactions',
+    ]);
+  });
+
   it('reports them in fix order when several are missing', () => {
     expect(missingThreadPermissionLabels(new PermissionsBitField([]))).toEqual([
       'View Channel',
       'Create Private Threads',
       'Send Messages in Threads',
       'Manage Threads',
+      'Add Reactions',
     ]);
   });
 
   // No computed permission set at all is unknown, not granted — reporting "nothing missing" there
   // would pin a channel on the strength of an absence.
   it('treats an absent permission set as everything missing', () => {
-    expect(missingThreadPermissionLabels(null)).toHaveLength(4);
+    expect(missingThreadPermissionLabels(null)).toHaveLength(ALL.length);
   });
 });
