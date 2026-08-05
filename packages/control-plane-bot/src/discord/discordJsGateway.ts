@@ -294,6 +294,10 @@ const REQUIRED_THREAD_PERMISSIONS: readonly (readonly [bigint, string])[] = [
   [PermissionFlagsBits.CreatePrivateThreads, 'Create Private Threads'],
   [PermissionFlagsBits.SendMessagesInThreads, 'Send Messages in Threads'],
   [PermissionFlagsBits.ManageThreads, 'Manage Threads'],
+  // Receipts on relayed thread messages are reactions, and a reaction the bot cannot add is the
+  // quietest failure on this surface: the message relays perfectly and simply looks ignored, so
+  // the reader assumes the relay dropped it. Preflighting it turns that into a sentence.
+  [PermissionFlagsBits.AddReactions, 'Add Reactions'],
 ];
 
 /** Name of the throwaway thread `/thread-here` creates to prove a channel really works. Self-
@@ -1233,7 +1237,12 @@ export class DiscordJsGateway implements DiscordGateway {
   }
 
   /** Best-effort reaction on a thread message — feedback, never load-bearing; a failure is
-   *  logged and swallowed. `protected` seam so unit tests observe reactions without discord.js. */
+   *  logged and swallowed. `protected` seam so unit tests observe reactions without discord.js.
+   *
+   *  Warn, not debug. The reaction IS the delivered receipt, so losing it makes a message that
+   *  relayed perfectly look ignored — and at debug level the only evidence of that was invisible
+   *  by default. A missing Add Reactions grant fails every call here identically, which is
+   *  exactly the case the log has to be loud enough to name. */
   protected async reactInThread(threadId: string, messageId: string, emoji: string): Promise<void> {
     try {
       const channel = await this.client.channels.fetch(threadId);
@@ -1241,7 +1250,10 @@ export class DiscordJsGateway implements DiscordGateway {
       const message = await channel.messages.fetch(messageId);
       await message.react(emoji);
     } catch (err) {
-      this.logger.debug({ err, threadId, messageId }, 'discord: failed to react in thread');
+      this.logger.warn(
+        { err, threadId, messageId, emoji },
+        'discord: failed to react in thread (a receipt is missing; check the Add Reactions grant)',
+      );
     }
   }
 
