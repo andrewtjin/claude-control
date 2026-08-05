@@ -3,9 +3,9 @@ import { renderSessionStatus, type SessionStatusRow } from './sessionRender.js';
 
 describe('renderSessionStatus', () => {
   it('nudges with an empty state when nothing is tracked', () => {
-    const out = renderSessionStatus([], { activeLabel: 'work', fullWindowsLeft: 3 });
+    const out = renderSessionStatus([], { activeLabel: 'work', weeklyResetInMs: 3 * 86_400_000 });
     expect(out).toContain('Active account: work');
-    expect(out).toContain('3x5h left');
+    expect(out).toContain('3d left');
     expect(out).toContain('/cctl:register');
   });
 
@@ -28,7 +28,7 @@ describe('renderSessionStatus', () => {
       // A managed (phone-spawned) session: no label → short id; no watch concept → dash.
       { id: 'abcdef1234567890', kind: 'managed', state: 'running', accountLabel: 'spare' },
     ];
-    const out = renderSessionStatus(rows, { activeLabel: 'work', fullWindowsLeft: 2 });
+    const out = renderSessionStatus(rows, { activeLabel: 'work', weeklyResetInMs: 2 * 86_400_000 });
 
     expect(out).toContain('SESSION');
     expect(out).toContain('refactor'); // interactive label
