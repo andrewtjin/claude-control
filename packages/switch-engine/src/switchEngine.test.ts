@@ -203,6 +203,121 @@ describe('captureFromConfigDir', () => {
   });
 });
 
+describe('keychain-delta capture (darwin flows)', () => {
+  /**
+   * Simulate the throwaway window's leftovers on darwin: the NEW login lands in the SHARED
+   * live channel (the mac CLI writes its one Keychain item regardless of CLAUDE_CONFIG_DIR —
+   * the harness's file channel plays that role here; the engine methods are channel-blind),
+   * and the transient dir carries only `.claude.json` identity, never `.credentials.json`.
+   */
+  async function windowLogin(h: Harness, access: string, uuid = 'uuid-' + access) {
+    const dir = join(h.paths.claudeDir, '..', 'kc-window-' + access);
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, '.claude.json'),
+      JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: `${access}@x.com` } }),
+    );
+    await h.credStore.writeLiveCredentials(oauth(access, NOW + 10 * HOUR));
+    return dir;
+  }
+
+  it('captureFromKeychainDelta vaults the new login and restores the prior live one', async () => {
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+    const prior = await h.engine.readLiveOauth();
+    const dir = await windowLogin(h, 'FRESH');
+
+    const account = await h.engine.captureFromKeychainDelta('fresh', dir, prior);
+
+    expect(account.label).toBe('fresh');
+    expect(account.accountUuid).toBe('uuid-FRESH');
+    expect((await h.vault.readBundle(account.id)).claudeAiOauth.accessToken).toBe('FRESH');
+    // The pre-window login is live again, and the active id never moved.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+  });
+
+  it('captureFromKeychainDelta refuses when the live login never changed', async () => {
+    const h = await harness();
+    await seedAActiveWithB(h);
+    const prior = await h.engine.readLiveOauth();
+    const dir = join(h.paths.claudeDir, '..', 'kc-window-none');
+    await mkdir(dir, { recursive: true });
+    await expect(h.engine.captureFromKeychainDelta('x', dir, prior)).rejects.toMatchObject({
+      code: 'no_capture_login',
+    });
+  });
+
+  it('captureFromKeychainDelta records the captured account active when nothing was logged in before', async () => {
+    const h = await harness();
+    const dir = await windowLogin(h, 'FIRST');
+    const account = await h.engine.captureFromKeychainDelta('first', dir, undefined);
+    expect(await h.engine.getActiveId()).toBe(account.id);
+    // No prior to restore: the captured login IS the live one.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('FIRST');
+  });
+
+  it('captureFromKeychainDelta restores the prior login even when vaulting fails', async () => {
+    const h = await harness();
+    await seedAActiveWithB(h);
+    const prior = await h.engine.readLiveOauth();
+    const dir = await windowLogin(h, 'FRESH');
+    // A protector whose seal always fails makes vault.addAccount throw AFTER the window
+    // already overwrote the live login — the restore must still happen on that path.
+    const failing = new SwitchEngine({
+      paths: h.paths,
+      protector: {
+        protect: () => Promise.reject(new Error('keychain sealed')),
+        unprotect: () => Promise.reject(new Error('keychain sealed')),
+      },
+      lockOptions: { timeoutMs: 2000, pollMs: 10 },
+    });
+    await expect(failing.captureFromKeychainDelta('fresh', dir, prior)).rejects.toThrow(
+      'keychain sealed',
+    );
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+  });
+
+  it('reloginFromKeychainDelta overwrites in place and restores the prior live login', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    const prior = await h.engine.readLiveOauth();
+    const dir = await windowLogin(h, 'B2', 'uuid-B');
+
+    const updated = await h.engine.reloginFromKeychainDelta(accountB.id, dir, prior);
+
+    expect(updated.id).toBe(accountB.id);
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.accessToken).toBe('B2');
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+  });
+
+  it('reloginFromKeychainDelta restores the prior login when the identity guard trips', async () => {
+    const h = await harness();
+    const { accountB } = await seedAActiveWithB(h);
+    const prior = await h.engine.readLiveOauth();
+    const dir = await windowLogin(h, 'C', 'uuid-C');
+
+    await expect(h.engine.reloginFromKeychainDelta(accountB.id, dir, prior)).rejects.toMatchObject({
+      code: 'relogin_identity_mismatch',
+    });
+    // The wrong-account login is NOT left live, and B's vault entry is untouched.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.accessToken).toBe('B');
+  });
+
+  it('reloginFromKeychainDelta refuses when the live login never changed', async () => {
+    const h = await harness();
+    const { accountB } = await seedAActiveWithB(h);
+    const prior = await h.engine.readLiveOauth();
+    const dir = join(h.paths.claudeDir, '..', 'kc-window-samey');
+    await mkdir(dir, { recursive: true });
+    await expect(h.engine.reloginFromKeychainDelta(accountB.id, dir, prior)).rejects.toMatchObject({
+      code: 'no_capture_login',
+    });
+  });
+});
+
 describe('reloginFromConfigDir', () => {
   /** A bundle whose account uuid is set explicitly, so a test can make the existing account and
    *  the captured login share (or deliberately NOT share) an identity. */
