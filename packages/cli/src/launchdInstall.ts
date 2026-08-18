@@ -63,10 +63,7 @@ export function daemonAgentPlistPath(home: string = homedir()): string {
 }
 
 function xmlEscape(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /**
@@ -125,7 +122,10 @@ export interface InstallDaemonAgentOptions {
 /** True when launchctl failed only because the job was not loaded — the normal state before
  *  the first bootstrap (`bootout` of an absent job) or after a manual bootout. */
 function isNotLoaded(err: unknown): boolean {
-  const text = `${(err as Error)?.message ?? ''}${String((err as { stderr?: unknown })?.stderr ?? '')}`;
+  // execFileSync attaches the child's stderr under `stderr` (a string here — the runner sets
+  // `encoding: 'utf8'`); tolerate other shapes rather than stringifying an object to noise.
+  const stderr = (err as { stderr?: unknown })?.stderr;
+  const text = `${(err as Error)?.message ?? ''}${typeof stderr === 'string' ? stderr : ''}`;
   return /No such process|not find|5: input\/output error|113/i.test(text);
 }
 
