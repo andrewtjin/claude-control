@@ -390,15 +390,19 @@ export class SwitchEngine {
       ? { claudeAiOauth: creds, oauthAccount }
       : { claudeAiOauth: creds };
     return this.withCredentialLock(async () => {
-      const account = await this.vault.addAccount(label, bundle);
-      if (prior) {
-        // Put the pre-window login back so "your live login was not touched" stays true.
-        await this.credStore.writeLiveCredentials(prior);
-      } else {
-        // Nothing to restore: the captured login is now the live one — record that.
-        await this.vault.setActive(account.id);
+      try {
+        const account = await this.vault.addAccount(label, bundle);
+        if (!prior) {
+          // Nothing to restore: the captured login is now the live one — record that.
+          await this.vault.setActive(account.id);
+        }
+        return account;
+      } finally {
+        // Put the pre-window login back so "your live login was not touched" stays true — in
+        // a `finally` because at this point the window HAS overwritten the live login: bailing
+        // on a vault failure without restoring would silently leave the wrong account live.
+        if (prior) await this.credStore.writeLiveCredentials(prior);
       }
-      return account;
     });
   }
 
@@ -413,9 +417,6 @@ export class SwitchEngine {
     prior: ClaudeOauth | undefined,
   ): Promise<StoredAccount> {
     return this.withCredentialLock(async () => {
-      const existing = await this.vault.getAccount(accountId);
-      if (!existing) throw new UnknownAccountError(accountId);
-
       const creds = await this.credStore.readLiveCredentials();
       if (!creds || creds.refreshToken === prior?.refreshToken) {
         throw new RefreshError(
@@ -423,34 +424,40 @@ export class SwitchEngine {
           'no_capture_login',
         );
       }
-      const oauthAccount = await this.transientStore(configDir).readOauthAccount();
+      // Everything past the delta check restores `prior` on the way out, success or failure —
+      // the window HAS overwritten the live login by now, so bailing on the identity guard (or
+      // a vault failure) without restoring would silently leave the wrong account live.
+      try {
+        const existing = await this.vault.getAccount(accountId);
+        if (!existing) throw new UnknownAccountError(accountId);
 
-      // Attribution guard — see reloginFromConfigDir for why a mismatch is fatal, not a warning.
-      if (
-        existing.accountUuid !== undefined &&
-        oauthAccount?.accountUuid !== undefined &&
-        existing.accountUuid !== oauthAccount.accountUuid
-      ) {
-        throw new RefreshError(
-          `the captured login is a different account (${oauthAccount.emailAddress ?? oauthAccount.accountUuid}) ` +
-            `than "${existing.label}" - re-login must use the SAME account to keep its usage history intact`,
-          'relogin_identity_mismatch',
-        );
-      }
+        const oauthAccount = await this.transientStore(configDir).readOauthAccount();
 
-      const bundle: CredentialBundle = oauthAccount
-        ? { claudeAiOauth: creds, oauthAccount }
-        : { claudeAiOauth: creds };
-      await this.vault.writeBundle(accountId, bundle);
-      await this.vault.clearQuarantine(accountId);
-      if (prior) {
-        await this.credStore.writeLiveCredentials(prior);
-      } else {
-        await this.vault.setActive(accountId);
+        // Attribution guard — see reloginFromConfigDir for why a mismatch is fatal, not a warning.
+        if (
+          existing.accountUuid !== undefined &&
+          oauthAccount?.accountUuid !== undefined &&
+          existing.accountUuid !== oauthAccount.accountUuid
+        ) {
+          throw new RefreshError(
+            `the captured login is a different account (${oauthAccount.emailAddress ?? oauthAccount.accountUuid}) ` +
+              `than "${existing.label}" - re-login must use the SAME account to keep its usage history intact`,
+            'relogin_identity_mismatch',
+          );
+        }
+
+        const bundle: CredentialBundle = oauthAccount
+          ? { claudeAiOauth: creds, oauthAccount }
+          : { claudeAiOauth: creds };
+        await this.vault.writeBundle(accountId, bundle);
+        await this.vault.clearQuarantine(accountId);
+        if (!prior) await this.vault.setActive(accountId);
+        const refreshed = await this.vault.getAccount(accountId);
+        if (!refreshed) throw new UnknownAccountError(accountId);
+        return refreshed;
+      } finally {
+        if (prior) await this.credStore.writeLiveCredentials(prior);
       }
-      const refreshed = await this.vault.getAccount(accountId);
-      if (!refreshed) throw new UnknownAccountError(accountId);
-      return refreshed;
     });
   }
 

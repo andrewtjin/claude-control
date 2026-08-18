@@ -60,11 +60,7 @@ import {
   startDaemonTaskNow,
   uninstallDaemonTask,
 } from './daemonInstall.js';
-import {
-  installDaemonAgent,
-  queryDaemonAgent,
-  uninstallDaemonAgent,
-} from './launchdInstall.js';
+import { installDaemonAgent, queryDaemonAgent, uninstallDaemonAgent } from './launchdInstall.js';
 import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
   renderAccountsTable,
@@ -407,7 +403,9 @@ export function buildProgram(): Command {
 
   daemon
     .command('install')
-    .description('register a logon task (Scheduled Task / LaunchAgent) that starts the daemon automatically')
+    .description(
+      'register a logon task (Scheduled Task / LaunchAgent) that starts the daemon automatically',
+    )
     .action(() => {
       let shimPath: string;
       try {
