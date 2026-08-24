@@ -593,6 +593,93 @@ describe('reauthenticate (authorization-code re-login)', () => {
     expect((await h.vault.readBundle(existing.id)).oauthAccount).toBeUndefined();
   });
 
+  /** A fully-described account: the plan facts a host capture knows and a code exchange does
+   *  not, spread across both halves of the bundle exactly as the live files carry them. */
+  function richBundle(access: string, uuid: string): CredentialBundle {
+    return {
+      claudeAiOauth: {
+        ...oauth(access, NOW + HOUR),
+        subscriptionType: 'max',
+        rateLimitTier: 'default_claude_max_20x',
+      },
+      oauthAccount: {
+        accountUuid: uuid,
+        emailAddress: 'old@x.com',
+        organizationUuid: 'org-old',
+        organizationName: 'Old Org',
+        organizationRateLimitTier: 'default_claude_max_20x',
+        billingType: 'stripe_subscription',
+        subscriptionCreatedAt: '2024-01-05T00:00:00Z',
+        claudeCodeTrialEndsAt: '2024-02-05T00:00:00Z',
+      },
+    };
+  }
+
+  it('keeps the plan and billing metadata the exchange never reports', async () => {
+    // The exchange answers with tokens and four identity fields and nothing else. Writing that
+    // answer verbatim would blank every plan field on the registry row, demoting a Max account
+    // to an unknown plan for anything that weights capacity by it.
+    const h = await harness();
+    const existing = await h.engine.addAccount('A', richBundle('OLD', 'uuid-A'));
+
+    const { account } = await h.engine.reauthenticate(existing.id, params);
+
+    expect(account).toMatchObject({
+      subscriptionType: 'max',
+      rateLimitTier: 'default_claude_max_20x',
+      organizationRateLimitTier: 'default_claude_max_20x',
+      billingType: 'stripe_subscription',
+      subscriptionCreatedAt: '2024-01-05T00:00:00Z',
+      claudeCodeTrialEndsAt: '2024-02-05T00:00:00Z',
+    });
+    // The bundle itself keeps them too, so the next row recompute has something to read.
+    const bundle = await h.vault.readBundle(existing.id);
+    expect(bundle.claudeAiOauth.accessToken).toBe('reauthed-A');
+    expect(bundle.claudeAiOauth.subscriptionType).toBe('max');
+    expect(bundle.oauthAccount?.billingType).toBe('stripe_subscription');
+  });
+
+  it('still applies the identity fields the exchange DID report', async () => {
+    // The other half of the merge: preserving the stored block must not freeze it. A renamed
+    // address or a moved organization is a legitimately changed fact and has to land.
+    const moved: ExchangeFn = () =>
+      Promise.resolve({
+        claudeAiOauth: oauth('reauthed-A', NOW + HOUR, 'reauthed-r-A'),
+        oauthAccount: {
+          accountUuid: 'uuid-A',
+          emailAddress: 'new@x.com',
+          organizationUuid: 'org-new',
+          organizationName: 'New Org',
+        },
+      });
+    const h = await harness(undefined, moved);
+    const existing = await h.engine.addAccount('A', richBundle('OLD', 'uuid-A'));
+
+    const { account } = await h.engine.reauthenticate(existing.id, params);
+
+    expect(account.emailAddress).toBe('new@x.com');
+    expect(account.organizationUuid).toBe('org-new');
+    expect((await h.vault.readBundle(existing.id)).oauthAccount?.organizationName).toBe('New Org');
+    // ...while the fields it stayed silent about are still the stored ones.
+    expect(account.billingType).toBe('stripe_subscription');
+  });
+
+  it('completes on an UNREADABLE stored bundle, keeping the exchange data alone', async () => {
+    // Losing the metadata is cosmetic; refusing to persist a rotated single-use token is not.
+    // An unreadable blob therefore degrades the merge instead of failing the re-login.
+    const h = await harness();
+    const existing = await h.engine.addAccount('A', richBundle('OLD', 'uuid-A'));
+    await writeFile(join(h.paths.vaultDir, existing.id, 'cred.enc'), 'not-a-bundle', 'utf8');
+
+    const { account } = await h.engine.reauthenticate(existing.id, params);
+
+    const bundle = await h.vault.readBundle(existing.id);
+    expect(bundle.claudeAiOauth.accessToken).toBe('reauthed-A');
+    expect(bundle.claudeAiOauth.subscriptionType).toBeUndefined();
+    expect(account.emailAddress).toBe('A@x.com');
+    expect(h.logs.some((l) => l.level === 'warn' && l.msg?.includes('stored bundle'))).toBe(true);
+  });
+
   it('propagates an exchange failure WITHOUT quarantining a healthy account', async () => {
     // The load-bearing negative: only the refresh path may quarantine. A bad paste says nothing
     // about the stored refresh token, so it must not mark the account dead.
