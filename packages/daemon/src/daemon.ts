@@ -32,6 +32,7 @@ import type {
 import {
   createAgentSdkClient as defaultCreateAgentSdkClient,
   escalateStop,
+  SessionBusyError,
 } from '@claude-control/session-runtime';
 import type { AgentSdkClient, AutoContinuePolicy } from '@claude-control/session-runtime';
 import type { SessionEvent } from '@claude-control/session-runtime';
@@ -462,6 +463,11 @@ export class Daemon {
    *  queue, which is tolerable because every queued text was confirmed to the phone as
    *  "queued", delivery is best-effort by design, and the TTL bounds staleness anyway. */
   private readonly pendingSteering = new Map<string, QueuedSteering[]>();
+  /** The same, per MANAGED session, awaiting that session's next `waiting_input` (see
+   *  {@link queueManagedInject}). Separate from `pendingSteering` because the two drain on
+   *  different signals — a hook answer versus an in-process state change — and merging them
+   *  would let one backend's boundary deliver the other's text. */
+  private readonly pendingManagedInjects = new Map<string, QueuedSteering[]>();
   /** Channel servers currently attached to live sessions, and what is queued for each. This is
    *  the daemon's ONLY evidence that a session can take an injection while idle — never what a
    *  launch command intended, because Claude Code's startup notice has been observed reporting a
@@ -1440,10 +1446,18 @@ export class Daemon {
       try {
         await handle.send(text);
       } catch (err) {
-        // A live handle can still refuse: mid-turn, or already wound down under us. This
-        // rejection used to die in the dispatcher's generic catch — a silent drop the sender
-        // reads as "the session ignored me". Answer the phone instead, same contract as every
-        // other refusal in this handler.
+        // Busy is a "not yet", not a failure: the session is mid-turn and will take this text as
+        // soon as it finishes. Refusing here made the same action succeed or fail purely on
+        // timing — a reply typed while the session was thinking bounced, the identical reply a
+        // moment later landed — and made the two backends disagree, since a terminal session has
+        // always queued rather than refused. Queue it and deliver at the turn boundary.
+        if (err instanceof SessionBusyError) {
+          this.queueManagedInject(msg, sessionId);
+          return;
+        }
+        // Every other refusal is terminal for this text (the session wound down under us), and
+        // the sender has to hear it: this rejection used to die in the dispatcher's generic
+        // catch — a silent drop the sender reads as "the session ignored me".
         this.logger.warn({ sessionId, err }, 'prompt.inject rejected by live session handle');
         this.sendEnvelope({
           type: 'error',
@@ -1583,6 +1597,68 @@ export class Daemon {
    * (takePendingSteering) always carries the session's real id — queuing under the label would
    * make delivery unreachable.
    */
+  /** Hold text a managed session was too busy to take, for delivery at its next turn boundary.
+   *
+   *  The mirror of {@link queueSteering} for the other backend, sharing its cap and its refusal
+   *  behaviour: a full queue means nothing is draining, and an honest refusal beats silently
+   *  dropping the oldest. It needs no TTL sweep of its own — a managed session is in this
+   *  daemon's memory, so its queue dies with it (see {@link dropManagedInjects}), which is the
+   *  case the interactive TTL exists to cover. */
+  private queueManagedInject(msg: MessageOf<'prompt.inject'>, sessionId: string): void {
+    const queue = this.pendingManagedInjects.get(sessionId) ?? [];
+    if (queue.length >= STEERING_QUEUE_CAP) {
+      this.sendEnvelope({
+        type: 'error',
+        payload: {
+          code: 'steer_queue_full',
+          message:
+            `prompt.inject: ${queue.length} messages are already queued for '${sessionId}' and ` +
+            `none have delivered — the session has not finished a turn since. Queued text ` +
+            `delivers when it next goes idle.`,
+          relatesTo: msg.id,
+        },
+      });
+      return;
+    }
+    queue.push({ text: msg.payload.text, queuedAtMs: this.clock() });
+    this.pendingManagedInjects.set(sessionId, queue);
+    this.logger.info(
+      { sessionId, queued: queue.length },
+      'prompt.inject queued behind an in-flight turn',
+    );
+  }
+
+  /** Deliver whatever queued up while a managed session was mid-turn, now that it is idle.
+   *
+   *  One text per boundary, deliberately: sending the next starts a new turn, so the session is
+   *  busy again the instant this returns and a second send would hit the very guard this queue
+   *  exists to absorb. The rest ride the boundary after it. */
+  private drainManagedInjects(sessionId: string): void {
+    const queue = this.pendingManagedInjects.get(sessionId);
+    if (queue === undefined || queue.length === 0) return;
+    const next = queue.shift();
+    if (queue.length === 0) this.pendingManagedInjects.delete(sessionId);
+    if (next === undefined) return;
+    const handle = this.sessionManager.get(sessionId);
+    if (!handle) {
+      // The session went away between queueing and this boundary; the rest cannot deliver either.
+      this.dropManagedInjects(sessionId);
+      return;
+    }
+    handle.send(next.text).catch((err: unknown) => {
+      this.logger.warn({ sessionId, err }, 'queued prompt.inject rejected at the turn boundary');
+    });
+  }
+
+  /** Forget a dead session's queued text. Nothing can deliver it once the handle is gone, and a
+   *  queue that outlives its session is just a leak wearing a promise. */
+  private dropManagedInjects(sessionId: string): void {
+    const dropped = this.pendingManagedInjects.get(sessionId)?.length ?? 0;
+    if (dropped === 0) return;
+    this.pendingManagedInjects.delete(sessionId);
+    this.logger.warn({ sessionId, dropped }, 'dropped queued prompt.inject for an ended session');
+  }
+
   private queueSteering(msg: MessageOf<'prompt.inject'>, tracked: TrackedInteractiveSession): void {
     const { text } = msg.payload;
     const sessionId = tracked.id;
@@ -2298,6 +2374,11 @@ export class Daemon {
       // so `cctl session status` reflects the same state the phone just saw. Failure to mirror
       // must never block the live envelope — see mirrorManagedSession.
       this.mirrorManagedSession(sessionId, accountId, event.state);
+      // The turn boundary queued injects have been waiting for. Terminal states instead end the
+      // wait: nothing will deliver, so the queue is dropped rather than left to look pending.
+      if (event.state === 'waiting_input') this.drainManagedInjects(sessionId);
+      else if (event.state === 'done' || event.state === 'failed')
+        this.dropManagedInjects(sessionId);
       this.sendEnvelope({
         type: 'session.status',
         payload: {

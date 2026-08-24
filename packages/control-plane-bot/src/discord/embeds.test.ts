@@ -118,7 +118,7 @@ describe('buildUsageEmbed', () => {
     expect(embed.fields ?? []).toHaveLength(0);
   });
 
-  it('appends the 5h-window budget when a weekly reset time is known', () => {
+  it('states the weekly reset as a native timestamp, with no 5h-window count', () => {
     const NOW = Date.parse('2026-07-16T12:00:00.000Z');
     const embed = buildUsageEmbed(
       {
@@ -139,14 +139,15 @@ describe('buildUsageEmbed', () => {
       NOW,
     ).toJSON();
     const weeklyTs = Math.floor(Date.parse('2026-07-17T14:00:00.000Z') / 1000);
-    expect(embed.fields?.[0]?.value).toContain(
-      `5×5h windows left · weekly resets <t:${weeklyTs}:R>`,
-    );
+    // A native `<t:…:R>` renders the countdown in the reader's own units — at weekly range,
+    // days — so `/usage` needs no window count of its own. `/timeline` keeps that unit.
+    expect(embed.fields?.[0]?.value).toContain(`weekly resets <t:${weeklyTs}:R>`);
+    expect(embed.fields?.[0]?.value).not.toContain('5h window');
   });
 
-  it('omits the budget line when no weekly reset time is known', () => {
+  it('omits the reset line when no weekly reset time is known', () => {
     const embed = buildUsageEmbed({ accounts: [account()] }).toJSON();
-    expect(embed.fields?.[0]?.value).not.toContain('5h windows left');
+    expect(embed.fields?.[0]?.value).not.toContain('weekly resets');
   });
 
   it('renders bars through an injected renderer instead of the unicode default', () => {

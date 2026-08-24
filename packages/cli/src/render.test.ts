@@ -274,9 +274,10 @@ describe('renderUsage', () => {
     expect(out).toMatch(/week 30%/); // weekly limit
   });
 
-  it('appends the 5h-window budget when reset times are known', () => {
-    // Open window ends in 2h, weekly resets in 12h: the open window + two more = 3.
-    const rows: UsageRow[] = [
+  /** A usage row whose session limit resets in 2h and whose weekly limit resets `weeklyInMs`
+   *  out — the two clocks the countdown is derived from. */
+  function rowsResettingIn(weeklyInMs: number): UsageRow[] {
+    return [
       {
         label: 'Work',
         active: true,
@@ -292,18 +293,30 @@ describe('renderUsage', () => {
               kind: 'weekly_all',
               percent: 30,
               isActive: true,
-              resetsAt: new Date(NOW + 12 * 3_600_000).toISOString(),
+              resetsAt: new Date(NOW + weeklyInMs).toISOString(),
             },
           ],
         }),
       },
     ];
-    expect(renderUsage(rows, NOW)).toMatch(/· 3x5h left/);
+  }
+
+  it('counts down to the weekly reset in days, not 5h windows', () => {
+    // 3 days and change out: the count floors, so the label is a floor on the runway left.
+    const out = renderUsage(rowsResettingIn(3 * 86_400_000 + 7 * 3_600_000), NOW);
+    expect(out).toMatch(/· 3d left/);
+    // The window count is `cctl timeline`'s unit — usage must not make the reader convert.
+    expect(out).not.toMatch(/x5h left/);
   });
 
-  it('omits the window budget when no weekly reset time is known', () => {
+  it('shows "<1d" rather than "0d" when the weekly reset is hours away', () => {
+    // 12h floors to zero whole days, and "0d left" would read as an already-spent budget.
+    expect(renderUsage(rowsResettingIn(12 * 3_600_000), NOW)).toMatch(/· <1d left/);
+  });
+
+  it('omits the reset countdown when no weekly reset time is known', () => {
     const rows: UsageRow[] = [{ label: 'Work', active: true, usage: usage() }];
-    expect(renderUsage(rows, NOW)).not.toMatch(/x5h left/);
+    expect(renderUsage(rows, NOW)).not.toMatch(/left/);
   });
 
   it('labels a cached reading as cached so it is not mistaken for fresh', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatTokens, humanizeDuration, roundPct } from './format.js';
+import { formatTokens, humanizeDaysUntil, humanizeDuration, roundPct } from './format.js';
 
 describe('humanizeDuration', () => {
   it('formats sub-minute and zero as expected', () => {
@@ -14,6 +14,26 @@ describe('humanizeDuration', () => {
     expect(humanizeDuration(2 * 3_600_000 + 15 * 60_000)).toBe('2h 15m');
     expect(humanizeDuration(3 * 86_400_000 + 4 * 3_600_000)).toBe('3d 4h');
     expect(humanizeDuration(3 * 86_400_000)).toBe('3d');
+  });
+});
+
+describe('humanizeDaysUntil', () => {
+  it('reports whole days, flooring so the count is a floor on the runway left', () => {
+    expect(humanizeDaysUntil(3 * 86_400_000)).toBe('3d');
+    // 3d23h is not 4 days of runway — claiming so would overstate what is left.
+    expect(humanizeDaysUntil(3 * 86_400_000 + 23 * 3_600_000)).toBe('3d');
+    expect(humanizeDaysUntil(86_400_000)).toBe('1d');
+  });
+
+  it('says "<1d" rather than "0d" while time remains', () => {
+    // "0d left" beside a half-used bar reads as an exhausted budget; it is not one.
+    expect(humanizeDaysUntil(23 * 3_600_000)).toBe('<1d');
+    expect(humanizeDaysUntil(60_000)).toBe('<1d');
+  });
+
+  it('collapses a reset that has already passed to "now"', () => {
+    expect(humanizeDaysUntil(0)).toBe('now');
+    expect(humanizeDaysUntil(-5_000)).toBe('now');
   });
 });
 

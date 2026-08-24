@@ -188,7 +188,7 @@ export function buildUsageEmbed(
       name: `${account.label} — ${marker}${cachedSuffix(account)}`,
       value: fitFieldValue(
         (unicodeFallback) =>
-          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
+          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${resetLine(outlook, account.accountId)}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
       ),
     });
   }
@@ -229,16 +229,18 @@ function pacingField(
   return { name: 'Pacing', value: truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT) };
 }
 
-/** "12×5h windows left · weekly resets <t:...:R>" — the session budget line appended to
- *  an account's `/usage` field, or empty when no weekly reset time is known. Uses a native
- *  timestamp so the line stays truthful even in old messages in the chat scrollback. */
-function windowsLine(outlook: ResetOutlook, accountId: string): string {
+/** "weekly resets <t:...:R>" — the reset line appended to an account's `/usage` field, or empty
+ *  when no weekly reset time is known. Uses a native timestamp so the line stays truthful even in
+ *  old messages in the chat scrollback, and so the countdown renders in the reader's own locale —
+ *  at weekly range, that reads in days.
+ *
+ *  The 5h-window count that used to lead this line lives in `/timeline`, which is the view for
+ *  planning around windows. Here it only made the reader convert windows to days to answer the
+ *  question `/usage` is actually asked: how long until this account is whole again. */
+function resetLine(outlook: ResetOutlook, accountId: string): string {
   const budget = outlook.accounts.find((a) => a.accountId === accountId)?.budget;
   if (!budget) return '';
-  return (
-    `\n${budget.fullWindows}×5h window${budget.fullWindows === 1 ? '' : 's'} left` +
-    ` · weekly resets ${discordRelative(budget.weeklyResetAt)}${predictedMark(budget.resetPredicted)}`
-  );
+  return `\nweekly resets ${discordRelative(budget.weeklyResetAt)}${predictedMark(budget.resetPredicted)}`;
 }
 
 /** " (predicted)" for a reset derived from history rather than reported by the endpoint. The
