@@ -182,7 +182,10 @@ describe('computeOutlook — 5h window budget', () => {
     expect(outlook.accounts[0]?.budget?.fullWindows).toBe(2);
   });
 
-  it('falls back to the scoped reset only when no weekly_all limit exists', () => {
+  it('uses the scoped reset when it is the only weekly reset reported', () => {
+    // The rule is "soonest still-future reset across BOTH weekly kinds", so the scoped entry
+    // answers whenever weekly_all carries no future reset — including when there is no
+    // weekly_all entry at all, which is this case.
     const outlook = computeOutlook(
       [
         account({
