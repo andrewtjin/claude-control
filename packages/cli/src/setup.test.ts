@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { StoredAccount } from '@claude-control/switch-engine';
+import { diffCctlDropIn, renderCctlDropInPlan } from './managedSettings.js';
 import {
   connectWithTimeout,
   isSkip,
@@ -13,6 +14,13 @@ import {
   type SetWizardTimer,
   type WizardIo,
 } from './setup.js';
+
+/** The drop-in path and the plan text the real composition root hands the wizard. Rendered by
+ *  the production renderer rather than typed out here, so a test that asserts the wizard SHOWS
+ *  the file is asserting the actual file and not a stand-in that could quietly stop matching. */
+const CHANNEL_DROP_IN_PATH =
+  'C:/Program Files/ClaudeCode/managed-settings.d/claude-control-channels.json';
+const CHANNEL_PLAN = renderCctlDropInPlan(CHANNEL_DROP_IN_PATH, diffCctlDropIn({ present: false }));
 
 // The wizard's dependency methods are declared with a plain function type in the fakes below
 // (`() => Promise.resolve(...)`) rather than `async` bodies, because this repo's `require-await`
@@ -217,7 +225,8 @@ function makeDeps(io: WizardIo, overrides: Partial<SetupDeps> = {}): SetupDeps {
       Promise.resolve({
         effective: true,
         detail: 'idle-session prompts enabled',
-        path: 'C:/Program Files/ClaudeCode/managed-settings.d/claude-control-channels.json',
+        path: CHANNEL_DROP_IN_PATH,
+        plan: CHANNEL_PLAN,
       }),
     enableChannel: () => Promise.resolve({ outcome: 'written', detail: 'written' }),
     relayUrl: 'ws://127.0.0.1:8765',
@@ -282,7 +291,8 @@ describe('runSetup', () => {
       Promise.resolve({
         effective: false,
         detail: 'not enabled',
-        path: 'C:/Program Files/ClaudeCode/managed-settings.d/claude-control-channels.json',
+        path: CHANNEL_DROP_IN_PATH,
+        plan: CHANNEL_PLAN,
       }),
   };
 
@@ -324,6 +334,24 @@ describe('runSetup', () => {
     );
     expect(asked).toBe(0);
     expect(text()).toContain('cctl channel enable');
+  });
+
+  it('shows the whole policy file, not just its path, before asking for administrator rights', async () => {
+    const { io, text } = makeIo(['', 'n', '', 'AB-CD 12']);
+    await runSetup(makeDeps(io, channelOff));
+    const shown = text();
+    // The same text `cctl channel enable` prints: where the file goes, and the plugin refs it
+    // approves. Naming the path alone would be asking for consent to something unread.
+    expect(shown).toContain(CHANNEL_DROP_IN_PATH);
+    expect(shown).toContain('allowedChannelPlugins');
+    for (const ref of diffCctlDropIn({ present: false }).addedPlugins) {
+      expect(shown).toContain(ref.plugin);
+      expect(shown).toContain(ref.marketplace);
+    }
+    // ...and it comes BEFORE the question, not after the operator has already answered.
+    expect(shown.indexOf('allowedChannelPlugins')).toBeLessThan(
+      shown.indexOf('Enable prompts to idle sessions?'),
+    );
   });
 
   it('reports declined consent as a choice, and setup still completes', async () => {
