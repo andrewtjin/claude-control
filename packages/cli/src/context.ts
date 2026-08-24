@@ -46,7 +46,15 @@ export function buildEngine(
   const adapter: Logger = createLogger({ defaultLevel: 'warn', sink: logSink });
   // The switch-cadence guard defaults to 60s; operators can tune (or 0-disable) it via env.
   const intervalEnv = Number(process.env.CCTL_SWITCH_MIN_INTERVAL_MS);
-  const options: ConstructorParameters<typeof SwitchEngine>[0] = { paths, logger: adapter };
+  // The same adapter reaches the OAuth retry loop, which is otherwise the one part of a token
+  // refresh that can spend seconds without saying anything: a 529 storm against the token
+  // endpoint would surface only as the eventual failure message. At the default `warn` level
+  // these lines stay quiet; CCTL_LOG_LEVEL=info is what turns the incident on.
+  const options: ConstructorParameters<typeof SwitchEngine>[0] = {
+    paths,
+    logger: adapter,
+    refreshDeps: { overload: { logger: adapter } },
+  };
   if (Number.isFinite(intervalEnv) && intervalEnv >= 0) {
     options.minSwitchIntervalMs = intervalEnv;
   }
