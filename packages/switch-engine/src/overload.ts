@@ -15,9 +15,17 @@
 // BUDGET CEILING (the constraint that sizes everything below): the token refresh this wraps runs
 // inside the cross-process credential lock, which another process may reclaim once the holder is
 // 60s old, with no heartbeat to say otherwise. A refresh that retried past that would have its
-// lock pulled mid-flight. So the in-call budget is capped well under a minute, and true
-// persistence lives at the callers that already re-attempt on their own schedule (the usage
-// poller's next cycle, the token getter's next interval).
+// lock pulled mid-flight. So the budget is a real DEADLINE, not just a gate on when the next try
+// may start: it opens on the first 529 and every retry after it is handed a signal that aborts
+// when it expires. Without that, the last retry could be started just inside the budget and then
+// run for its own full per-request timeout on top of it — the loop's true cost would be
+// `budget + one request timeout`, which is how a 25s budget turns into ~55s under the lock.
+// The first attempt is deliberately NOT deadlined: it is the request the caller would have made
+// anyway, and shortening it would change the behavior of calls that never see a 529 at all.
+// A caller that holds the credential lock passes {@link LOCKED_OVERLOAD_BUDGET_CAP_MS} to keep
+// the extra hold small on top of that, and true persistence lives at the callers that already
+// re-attempt on their own schedule (the usage poller's next cycle, the token getter's next
+// interval).
 
 import { noopLogger, type Logger } from './logger.js';
 
@@ -40,8 +48,8 @@ export const STATUS_PROBE_TIMEOUT_MS = 5_000;
  *  without this, one upstream hiccup would turn into a burst of probes against the status page. */
 export const STATUS_CACHE_TTL_MS = 60_000;
 
-/** How many tries a budget allows and how long they may take in total. Both bind: whichever
- *  runs out first ends the loop. */
+/** How many tries a budget allows, and how long the RETRY phase — everything after the first
+ *  overloaded answer — may take in total. Both bind: whichever runs out first ends the loop. */
 export interface OverloadBudget {
   readonly maxAttempts: number;
   readonly totalBudgetMs: number;
@@ -51,10 +59,19 @@ export interface OverloadBudget {
  *  most likely a brief spike, so try a couple more times and hand the caller its answer fast. */
 export const SHORT_OVERLOAD_BUDGET: OverloadBudget = { maxAttempts: 3, totalBudgetMs: 10_000 };
 
-/** Budget when an incident is reported (or the probe failed). Deliberately still far short of
- *  the credential lock's 60s reclaim window — the refresh path is the tightest caller, and a
- *  budget that outlived its own lock would be worse than giving up. */
+/** Budget when an incident is reported (or the probe failed). Sized for the poller, which owns
+ *  no lock and whose next cycle is minutes away; the refresh path caps it far lower — see
+ *  {@link LOCKED_OVERLOAD_BUDGET_CAP_MS}. */
 export const PATIENT_OVERLOAD_BUDGET: OverloadBudget = { maxAttempts: 6, totalBudgetMs: 25_000 };
+
+/** Cap a caller passes as `budgetCapMs` when its retries happen INSIDE the credential lock.
+ *
+ *  Two separate limits sit above it and neither may be reached. The lock reclaims a holder that
+ *  is 60s old, and a contender gives up after 15s of waiting — so a hold this loop lengthens is
+ *  a hold that can time out somebody else's `cctl switch` or another account's refresh. Retries
+ *  therefore get seconds, not tens of seconds: the endpoint either recovers immediately or the
+ *  caller's own next interval takes over, which is the persistence that actually matters. */
+export const LOCKED_OVERLOAD_BUDGET_CAP_MS = 8_000;
 
 /** First backoff step; doubles per retry up to {@link OVERLOAD_BACKOFF_CAP_MS}. */
 export const OVERLOAD_BACKOFF_BASE_MS = 1_000;
@@ -78,17 +95,39 @@ export interface StatusVerdict {
 }
 
 /** Minimal response shape the retry loop needs. Callers keep their own richer response types;
- *  this only reads the status and, when the caller's fetch exposes them, the headers. */
+ *  this only reads the status and, when the caller's fetch exposes them, the headers and the
+ *  body stream (see {@link discardBody}). */
 export interface OverloadResponse {
   status: number;
   headers?: { get(name: string): string | null | undefined };
+  body?: { cancel?: () => unknown } | null;
+}
+
+/** What each attempt is told about the budget it is running under. The signal is the half that
+ *  matters: a caller composes it with its own per-request timeout so a retry can never outlive
+ *  the loop's deadline (module comment, BUDGET CEILING). */
+export interface OverloadAttemptContext {
+  /** 1-based attempt number; 1 is the original request, not a retry. */
+  attempt: number;
+  /** Aborts when the retry budget expires. On the first attempt this never aborts — that
+   *  request is the one the caller would have made regardless, so it keeps its own timeout. */
+  signal: AbortSignal;
+  /** Milliseconds left in the retry budget; `Infinity` before the first overloaded answer. */
+  remainingMs: number;
 }
 
 /** The status-page fetch, injectable so tests never touch the network. */
 export type StatusFetchLike = (
   url: string,
   init: { signal?: AbortSignal },
-) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+) => Promise<{
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+  /** Optional so a test double stays three fields wide; a real `Response` satisfies it, which
+   *  is what lets a non-2xx status page be released instead of stranding its socket. */
+  body?: { cancel?: () => unknown } | null;
+}>;
 
 /** A per-process holder for the cached verdict. Production shares one module-level cache;
  *  tests create their own so a cached verdict cannot leak between cases. */
@@ -123,6 +162,10 @@ export interface OverloadRetryDeps {
   random?: () => number;
   /** Cache override; defaults to the shared per-process one. */
   statusCache?: StatusProbeCache;
+  /** Upper bound on the chosen budget's `totalBudgetMs`, for a caller whose retries are more
+   *  expensive than the endpoint's — the credential lock holder passes
+   *  {@link LOCKED_OVERLOAD_BUDGET_CAP_MS}. */
+  budgetCapMs?: number;
   onRetry?: (event: OverloadRetryEvent) => void;
   logger?: Logger;
 }
@@ -163,30 +206,45 @@ export async function probeClaudeStatus(deps: OverloadRetryDeps = {}): Promise<S
  * exactly one network call, so the happy path never pays for the status page. Anything the
  * attempt THROWS (network error, abort) propagates untouched — those are the caller's existing
  * transient paths, and this module deliberately does not claim them.
+ *
+ * The budget's clock starts at that first 529 and bounds the retry phase as a deadline: each
+ * retry is handed a signal that aborts when it expires, so the loop cannot be outlived by the
+ * request it started last.
  */
 export async function withOverloadRetry<Res extends OverloadResponse>(
-  attempt: () => Promise<Res>,
+  attempt: (context: OverloadAttemptContext) => Promise<Res>,
   deps: OverloadRetryDeps = {},
 ): Promise<OverloadRetryOutcome<Res>> {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? defaultSleep;
   const random = deps.random ?? Math.random;
   const log = deps.logger ?? noopLogger;
-  const startedAtMs = now();
 
   let verdict: StatusVerdict | undefined;
   // Assume the cheap budget until the probe says otherwise; it is only ever consulted after a
   // 529, at which point the verdict's budget replaces this.
   let budget = SHORT_OVERLOAD_BUDGET;
   let retries = 0;
+  // Absent until the first overloaded answer opens the retry phase — before that there is no
+  // budget to spend and therefore nothing to deadline.
+  let deadlineAtMs: number | undefined;
 
   for (;;) {
-    const response = await attempt();
+    const remainingMs =
+      deadlineAtMs === undefined ? Number.POSITIVE_INFINITY : Math.max(0, deadlineAtMs - now());
+    const response = await attempt({
+      attempt: retries + 1,
+      remainingMs,
+      signal: deadlineSignal(remainingMs),
+    });
     if (!OVERLOAD_STATUSES.has(response.status)) return outcome(response, retries, verdict);
 
     if (verdict === undefined) {
       verdict = await probeClaudeStatus(deps);
       budget = verdict.incident ? PATIENT_OVERLOAD_BUDGET : SHORT_OVERLOAD_BUDGET;
+      // The probe's own wait is spent before the deadline opens, so a slow status page costs
+      // patience rather than eating the retries it was consulted to authorize.
+      deadlineAtMs = now() + Math.min(budget.totalBudgetMs, deps.budgetCapMs ?? Infinity);
       log.debug(
         { status: response.status, statusPage: describeStatus(verdict) },
         'upstream overloaded; retrying',
@@ -196,12 +254,16 @@ export async function withOverloadRetry<Res extends OverloadResponse>(
     // Attempts made so far is `retries + 1`. Both bounds are checked BEFORE sleeping, so an
     // exhausted budget answers immediately instead of waiting to discover it is done.
     if (retries + 1 >= budget.maxAttempts) return outcome(response, retries, verdict);
-    const remainingMs = budget.totalBudgetMs - (now() - startedAtMs);
-    if (remainingMs <= 0) return outcome(response, retries, verdict);
+    const leftMs = (deadlineAtMs ?? now()) - now();
+    if (leftMs <= 0) return outcome(response, retries, verdict);
 
-    const delayMs = Math.min(nextDelayMs(retries, response, random), remainingMs);
+    const delayMs = Math.min(nextDelayMs(retries, response, random), leftMs);
     deps.onRetry?.({ attempt: retries + 1, status: response.status, delayMs, verdict });
     retries += 1;
+    // The response is about to be dropped for good. An undrained body holds its socket out of
+    // the connection pool until GC gets to it, which during a fleet-wide 529 is a socket per
+    // discarded attempt per account.
+    discardBody(response);
     await sleep(delayMs);
   }
 }
@@ -268,7 +330,10 @@ async function runStatusProbe(deps: OverloadRetryDeps): Promise<StatusVerdict> {
     const res = await doFetch(CLAUDE_STATUS_URL, {
       signal: AbortSignal.timeout(STATUS_PROBE_TIMEOUT_MS),
     });
-    if (!res.ok) return probeFailedVerdict();
+    if (!res.ok) {
+      discardBody(res); // nothing here will be read; do not strand its socket
+      return probeFailedVerdict();
+    }
     const body: unknown = await res.json();
     const indicator = (body as { status?: { indicator?: unknown } } | null)?.status?.indicator;
     // A body without a string indicator is not an all-clear — it is a page we cannot read.
@@ -276,6 +341,24 @@ async function runStatusProbe(deps: OverloadRetryDeps): Promise<StatusVerdict> {
     return { incident: indicator !== STATUS_INDICATOR_OK, indicator, probeFailed: false };
   } catch {
     return probeFailedVerdict();
+  }
+}
+
+/** The signal an attempt runs under. A finite budget becomes a real timeout; the first attempt
+ *  (no budget open yet) gets a signal that never fires, so callers can compose unconditionally
+ *  instead of branching on whether a deadline exists. */
+function deadlineSignal(remainingMs: number): AbortSignal {
+  if (!Number.isFinite(remainingMs)) return new AbortController().signal;
+  return AbortSignal.timeout(Math.max(0, remainingMs));
+}
+
+/** Release a response the loop will never read. Best-effort by design: a test double has no
+ *  body, an already-consumed stream throws, and neither is worth failing a retry over. */
+function discardBody(response: { body?: { cancel?: () => unknown } | null }): void {
+  try {
+    void Promise.resolve(response.body?.cancel?.()).catch(() => undefined);
+  } catch {
+    // A body that refuses to be cancelled is a leaked socket at worst, never a failed refresh.
   }
 }
 

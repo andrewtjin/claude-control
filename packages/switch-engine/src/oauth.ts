@@ -4,7 +4,8 @@
 // NEW refresh token and invalidates the old one. The switch engine must therefore persist
 // the rotated token immediately (see SwitchEngine.activate) — a stale copy is already dead.
 // A hard `invalid_grant` means the token is permanently spent and the account must be
-// quarantined; anything else (network, 5xx) is transient and safe to retry later.
+// quarantined; anything else (network, 5xx) is transient and safe to retry later. That rotation
+// is also why a REPEATED refresh cannot be read the same way — see refreshCredentials.
 //
 // The authorization-code half powers headless re-login (`cctl accounts reauth`, phone
 // `/reauth`): mint a PKCE pair, hand the user an authorize URL, and exchange the code they
@@ -25,6 +26,7 @@ import { QuarantineError, RefreshError } from './errors.js';
 import {
   describeStatus,
   withOverloadRetry,
+  LOCKED_OVERLOAD_BUDGET_CAP_MS,
   OVERLOAD_STATUSES,
   type OverloadRetryDeps,
   type StatusVerdict,
@@ -56,6 +58,9 @@ type FetchLike = (
   /** Optional so a test double stays two fields wide; a real `Response` satisfies it, which is
    *  what lets the overload retry honor a `Retry-After` in production. */
   headers?: { get(name: string): string | null | undefined };
+  /** Same reasoning: a real `Response` satisfies it, which is what lets an answer the retry
+   *  loop discards release its socket instead of holding it until the collector notices. */
+  body?: { cancel?: () => unknown } | null;
 }>;
 
 export interface RefreshDeps {
@@ -79,7 +84,8 @@ export interface RefreshDeps {
  * {@link RefreshError} once the budget is spent. Its message names the status page's verdict,
  * because that message is what a stranded user ends up reading.
  *
- * @throws {QuarantineError} the token is permanently dead (`invalid_grant`).
+ * @throws {QuarantineError} the token is permanently dead (`invalid_grant`) — only on an
+ *   attempt that was not preceded by a retry of this same, non-idempotent request.
  * @throws {RefreshError} a transient failure (network, non-2xx, malformed response).
  */
 export async function refreshCredentials(
@@ -98,12 +104,13 @@ export async function refreshCredentials(
 
   let res: Awaited<ReturnType<FetchLike>>;
   let attempts = 1;
+  let retried = false;
   let statusVerdict: StatusVerdict | undefined;
   try {
     // Each attempt builds its own request (a fresh abort signal above all — a reused, already
     // fired one would abort the retry the instant it started).
     const outcome = await withOverloadRetry(
-      () =>
+      (ctx) =>
         doFetch(deps.tokenEndpoint ?? DEFAULT_TOKEN_ENDPOINT, {
           method: 'POST',
           headers: {
@@ -115,12 +122,18 @@ export async function refreshCredentials(
           // A timeout rejects into this catch as a transient RefreshError, never a
           // QuarantineError — and, because it is a throw rather than a status, it is never
           // retried here: a hung endpoint is a different failure from an overloaded one.
-          signal: AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS),
+          // The retry deadline rides along with it so the LAST attempt cannot outlive the
+          // budget: this whole call runs inside the credential lock, and a lock held past its
+          // stale window is reclaimed mid-refresh by the next process that wants it.
+          signal: AbortSignal.any([AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS), ctx.signal]),
         }),
-      deps.overload,
+      // Retries here lengthen a lock hold that everything else queues behind, so they get the
+      // locked caller's tighter cap rather than the poller-sized budget.
+      { budgetCapMs: LOCKED_OVERLOAD_BUDGET_CAP_MS, ...deps.overload },
     );
     res = outcome.response;
     attempts = outcome.retries + 1;
+    retried = outcome.retries > 0;
     statusVerdict = outcome.verdict;
   } catch (err) {
     throw new RefreshError('network error during token refresh', 'network', { cause: err });
@@ -129,7 +142,22 @@ export async function refreshCredentials(
   const raw = await res.text();
   if (!res.ok) {
     // A 400 mentioning invalid_grant is the permanent-death signal; everything else is transient.
+    //
+    // Unless we RETRIED to get here. The token exchange is not idempotent: the refresh token is
+    // single-use and rotates, so a 529 emitted after the service already accepted the request
+    // leaves the next identical attempt replaying a token that is legitimately spent. That
+    // invalid_grant describes our own retry, not a dead account, and quarantining on it would
+    // strand a healthy user behind a re-login card. Report it as transient instead and let the
+    // next refresh — a single attempt against a fresh read — establish the truth.
     if (res.status === 400 && /invalid_grant/i.test(raw)) {
+      if (retried) {
+        throw new RefreshError(
+          `refresh token rejected (invalid_grant) after ${attempts} attempts against an ` +
+            `overloaded endpoint; treating as transient because a retried refresh may have ` +
+            `replayed an already-rotated token`,
+          'invalid_grant_after_retry',
+        );
+      }
       throw new QuarantineError(`refresh token rejected (invalid_grant): ${truncate(raw)}`);
     }
     // Still overloaded after the whole budget. Keep the `http_<status>` code (callers branch on
