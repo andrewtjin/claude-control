@@ -322,10 +322,20 @@ const STEERING_TTL_MS = 30 * 60_000;
  *  idle or closed window) — refusing the next /say with an honest error beats silently
  *  dropping the oldest, and it bounds what a dead session can accumulate in memory. */
 const STEERING_QUEUE_CAP = 8;
-/** One queued/delivered steering text, held in arrival order. */
+/** Which of the two queues a persisted row belongs to. Tagged rather than inferred from the
+ *  session id, because only ONE of them can be restored after a restart: an interactive session
+ *  is another process that outlives this daemon, while a managed session's SDK subprocess does
+ *  not — see {@link Daemon.reloadPendingSteering}. */
+const INTERACTIVE_STEERING_KIND = 'interactive';
+const MANAGED_STEERING_KIND = 'managed';
+
+/** One queued/delivered steering text, held in arrival order. `rowId` is its row in the store's
+ *  mirror of this queue, carried so a delivery or a drop retires exactly the row it consumed
+ *  rather than re-deriving which one it was. */
 interface QueuedSteering {
   text: string;
   queuedAtMs: number;
+  rowId: number;
 }
 
 /** Outcome of resolving a label/watch/unregister ref (or a prompt.inject sessionId) against the
@@ -459,14 +469,19 @@ export class Daemon {
    *  would make the second read a spurious "already used" as if the paste were bad. */
   private readonly seenReauthKeys = new Set<string>();
   /** Operator /say texts queued per REGISTERED INTERACTIVE session, awaiting that session's
-   *  next Stop hook (see {@link queueSteering}). In-memory only — a daemon restart drops the
-   *  queue, which is tolerable because every queued text was confirmed to the phone as
-   *  "queued", delivery is best-effort by design, and the TTL bounds staleness anyway. */
+   *  next Stop hook (see {@link queueSteering}). Mirrored into the store on every enqueue,
+   *  delivery and drop, and rebuilt from it at startup: the phone is told each text "delivers
+   *  when the session finishes its current turn", and a terminal session outlives this daemon,
+   *  so a restart that quietly emptied this map would break that promise with no envelope to
+   *  say so. The map stays authoritative while the process lives; the rows exist for the next
+   *  process (see {@link reloadPendingSteering}). */
   private readonly pendingSteering = new Map<string, QueuedSteering[]>();
   /** The same, per MANAGED session, awaiting that session's next `waiting_input` (see
    *  {@link queueManagedInject}). Separate from `pendingSteering` because the two drain on
    *  different signals — a hook answer versus an in-process state change — and merging them
-   *  would let one backend's boundary deliver the other's text. */
+   *  would let one backend's boundary deliver the other's text. Mirrored to the store as well,
+   *  but only so a restart can REPORT what it lost: the SDK subprocess these wait on does not
+   *  survive the daemon, so there is no boundary left for them to ride. */
   private readonly pendingManagedInjects = new Map<string, QueuedSteering[]>();
   /** Channel servers currently attached to live sessions, and what is queued for each. This is
    *  the daemon's ONLY evidence that a session can take an injection while idle — never what a
@@ -667,6 +682,17 @@ export class Daemon {
 
     await this.controlPlaneClient.connect();
 
+    // Rebuild the prompt queues a previous run left behind, and account for every one it cannot
+    // rebuild. Deliberately after connect() rather than in the constructor: this SENDS — the
+    // phone has to hear what expired or was lost — and that needs a transport. A failure here
+    // must never kill startup, for the same reason reconciliation's must not: a queue that
+    // cannot be restored is a degraded feature, not a dead daemon.
+    try {
+      this.reloadPendingSteering();
+    } catch (err) {
+      this.logger.error({ err }, 'restoring queued prompts failed; continuing startup without it');
+    }
+
     // Reconcile session records a previous daemon run left behind: stamp them 'orphaned' so
     // their persisted state is honest. Deliberately NO re-attach here — resuming a session
     // always runs a real turn (the SDK has no attach-without-prompting), so an eager pass
@@ -708,15 +734,15 @@ export class Daemon {
     // `sessionStopOnShutdownMs` stopping live sessions with the receiver still listening, which
     // is ample time for a client to re-attach into a registry that will never be drained again.
     this.hookReceiver.beginClose();
-    // Undelivered channel work is dropped, not fallen back: the steering queue it would fall to
-    // is in-memory and dies with this process anyway, so queuing it would only manufacture a
-    // false "queued" record. Logged rather than silent, because the phone was told "sent".
-    const undelivered = this.channels.close();
-    if (undelivered.length > 0) {
-      this.logger.warn(
-        { count: undelivered.length },
-        'channel: shutting down with injections still undelivered',
-      );
+    // Undelivered channel work falls back to turn-boundary steering rather than being dropped.
+    // It used to be dropped because the queue it would fall to died with this process too, so
+    // queuing it would only have manufactured a false "queued" record — but that queue now
+    // survives the restart, which makes the fallback real: a registered terminal session is
+    // still sitting at its prompt and its next turn boundary will deliver. The recovery path
+    // also does the TELLING, which was the part missing outright — the phone was told "sent",
+    // and a log line on a machine nobody is looking at is not an answer to that.
+    for (const { attachment, recovered } of this.channels.close()) {
+      this.recoverChannelInjections(attachment.sessionId, recovered);
     }
     // Live sessions FIRST, while the store/receiver they report through still work: each
     // handle.stop() ends the spawned SDK subprocess and fail-closes any parked permission
@@ -1620,7 +1646,14 @@ export class Daemon {
       });
       return;
     }
-    queue.push({ text: msg.payload.text, queuedAtMs: this.clock() });
+    const queuedAtMs = this.clock();
+    const rowId = this.store.insertPendingSteering({
+      sessionId,
+      kind: MANAGED_STEERING_KIND,
+      text: msg.payload.text,
+      queuedAtMs,
+    });
+    queue.push({ text: msg.payload.text, queuedAtMs, rowId });
     this.pendingManagedInjects.set(sessionId, queue);
     this.logger.info(
       { sessionId, queued: queue.length },
@@ -1639,6 +1672,10 @@ export class Daemon {
     const next = queue.shift();
     if (queue.length === 0) this.pendingManagedInjects.delete(sessionId);
     if (next === undefined) return;
+    // Retired the moment it leaves the queue, not once the send resolves: the send below is
+    // fire-and-forget, and a row still sitting here at the next startup would read as text that
+    // never delivered and be reported as lost.
+    this.store.deletePendingSteering(next.rowId);
     const handle = this.sessionManager.get(sessionId);
     if (!handle) {
       // The session went away between queueing and this boundary; the rest cannot deliver either.
@@ -1656,6 +1693,7 @@ export class Daemon {
     const dropped = this.pendingManagedInjects.get(sessionId)?.length ?? 0;
     if (dropped === 0) return;
     this.pendingManagedInjects.delete(sessionId);
+    this.store.deletePendingSteeringForSession(sessionId, MANAGED_STEERING_KIND);
     this.logger.warn({ sessionId, dropped }, 'dropped queued prompt.inject for an ended session');
   }
 
@@ -1677,7 +1715,14 @@ export class Daemon {
       });
       return;
     }
-    queue.push({ text, queuedAtMs: this.clock() });
+    const queuedAtMs = this.clock();
+    const rowId = this.store.insertPendingSteering({
+      sessionId,
+      kind: INTERACTIVE_STEERING_KIND,
+      text,
+      queuedAtMs,
+    });
+    queue.push({ text, queuedAtMs, rowId });
     this.pendingSteering.set(sessionId, queue);
     const excerpt = text.length > 120 ? `${text.slice(0, 120)}…` : text;
     this.sendEnvelope({
@@ -1836,7 +1881,13 @@ export class Daemon {
     const accepted = items.slice(0, Math.max(0, STEERING_QUEUE_CAP - queue.length));
     const dropped = items.length - accepted.length;
     for (const item of accepted) {
-      queue.push({ text: item.text, queuedAtMs: item.queuedAtMs });
+      const rowId = this.store.insertPendingSteering({
+        sessionId,
+        kind: INTERACTIVE_STEERING_KIND,
+        text: item.text,
+        queuedAtMs: item.queuedAtMs,
+      });
+      queue.push({ text: item.text, queuedAtMs: item.queuedAtMs, rowId });
     }
     this.pendingSteering.set(sessionId, queue);
     if (accepted.length > 0) {
@@ -1918,6 +1969,10 @@ export class Daemon {
     const queue = this.pendingSteering.get(sessionId);
     if (queue === undefined) return undefined;
     this.pendingSteering.delete(sessionId);
+    // The store mirror empties with the map, in the same breath: consumption is exactly-once for
+    // the queue, and a row that outlived it would make the NEXT daemon start re-deliver text this
+    // hook has already answered with.
+    this.store.deletePendingSteeringForSession(sessionId, INTERACTIVE_STEERING_KIND);
     const now = this.clock();
     const fresh = queue.filter((q) => now - q.queuedAtMs <= STEERING_TTL_MS);
     const expired = queue.length - fresh.length;
@@ -1953,6 +2008,100 @@ export class Daemon {
     });
     this.logger.info({ sessionId, delivered: fresh.length, expired }, 'steering delivered');
     return fresh.map((q) => q.text).join('\n\n');
+  }
+
+  /**
+   * Rebuild the prompt queues a previous daemon run left behind, and account for every row that
+   * cannot be rebuilt.
+   *
+   * Queued text is the one thing here the operator was explicitly PROMISED: the phone is told it
+   * "delivers when the session finishes its current turn". A restart used to answer that promise
+   * with silence — the next Stop hook found an empty map, answered `{ ok: true }`, and no
+   * envelope ever mentioned the text again. So every row leaves this method one of three ways,
+   * and none of them is quietly.
+   *
+   * INTERACTIVE rows go back on the queue. A registered terminal session is a different process
+   * entirely: it outlived this daemon, it is still sitting at its prompt, and its next turn
+   * boundary is a real delivery point.
+   *
+   * MANAGED rows cannot go back. Their SDK subprocess did not survive the daemon that spawned it
+   * (a clean shutdown stops every handle; a crash leaves records that recovery deliberately does
+   * not re-attach), so the `waiting_input` they were queued behind will never arrive. Dropped
+   * with a card, rather than parked in a queue that has no drain.
+   *
+   * EXPIRED rows are dropped for the reason {@link takePendingSteering} drops them at delivery
+   * time: guidance written for a context that is now hours gone lands as a non sequitur. The TTL
+   * runs from the ORIGINAL queue time, so time spent with the daemon down counts against it —
+   * which is exactly the staleness it exists to catch.
+   */
+  private reloadPendingSteering(): void {
+    const rows = this.store.listPendingSteering();
+    if (rows.length === 0) return;
+    const now = this.clock();
+    // Counted per session, because that is how the operator reads them: one card per session
+    // naming a number, not one card per message.
+    const expired = new Map<string, number>();
+    const undeliverable = new Map<string, number>();
+    let restored = 0;
+    for (const row of rows) {
+      if (row.kind !== INTERACTIVE_STEERING_KIND) {
+        this.store.deletePendingSteering(row.id);
+        undeliverable.set(row.sessionId, (undeliverable.get(row.sessionId) ?? 0) + 1);
+        continue;
+      }
+      if (now - row.queuedAtMs > STEERING_TTL_MS) {
+        this.store.deletePendingSteering(row.id);
+        expired.set(row.sessionId, (expired.get(row.sessionId) ?? 0) + 1);
+        continue;
+      }
+      // Rows arrive id-ordered, and the id IS arrival order, so appending rebuilds each queue in
+      // the order the operator wrote it — the one property they will notice if it is wrong.
+      const queue = this.pendingSteering.get(row.sessionId) ?? [];
+      queue.push({ text: row.text, queuedAtMs: row.queuedAtMs, rowId: row.id });
+      this.pendingSteering.set(row.sessionId, queue);
+      restored += 1;
+    }
+    let expiredCount = 0;
+    for (const [sessionId, count] of expired) {
+      expiredCount += count;
+      this.sendEnvelope({
+        type: 'hook.notification',
+        payload: {
+          event: 'notification',
+          sessionId,
+          title: 'Steering expired',
+          body:
+            `${count} message${count === 1 ? '' : 's'} queued for this session aged past ` +
+            `${STEERING_TTL_MS / 60_000} minutes before it finished a turn — dropped, not ` +
+            `delivered.`,
+          level: 'warn',
+          notificationType: 'steering_expired',
+        },
+      });
+    }
+    let undeliverableCount = 0;
+    for (const [sessionId, count] of undeliverable) {
+      undeliverableCount += count;
+      this.sendEnvelope({
+        type: 'hook.notification',
+        payload: {
+          event: 'notification',
+          sessionId,
+          title: 'Queued messages not delivered',
+          body:
+            `${count} message${count === 1 ? '' : 's'} queued for this session never reached ` +
+            `it: the session ended when the daemon restarted, so the turn boundary ` +
+            `${count === 1 ? 'it was' : 'they were'} waiting for never came. Re-send once it is ` +
+            `running again.`,
+          level: 'warn',
+          notificationType: 'steering_dropped',
+        },
+      });
+    }
+    this.logger.info(
+      { restored, expired: expiredCount, undeliverable: undeliverableCount },
+      'restored queued prompts left by a previous run',
+    );
   }
 
   /**
@@ -2681,8 +2830,10 @@ export class Daemon {
     const existing = resolution.tracked;
     this.store.deleteSession(existing.id);
     // Queued steering dies with the registration: nothing would ever deliver it (delivery is
-    // gated on the registry), and a later re-register must not inherit stale guidance.
+    // gated on the registry), and a later re-register must not inherit stale guidance — neither
+    // from this run nor, now that the queue is persisted, from any earlier one.
     this.pendingSteering.delete(existing.id);
+    this.store.deletePendingSteeringForSession(existing.id, INTERACTIVE_STEERING_KIND);
     this.rememberSessionCmdKey(input.idempotencyKey);
     // Echo the view of what was removed so the CLI can confirm WHICH session it just forgot.
     return { ok: true, status: 'applied', session: interactiveView(existing) };
