@@ -11,6 +11,7 @@ const baseOpts: ParseUsageOptions = {
   label: 'Work',
   active: true,
   quarantined: false,
+  autoSwitchExcluded: false,
   fetchedAtMs: 1_700_000_000_000,
   source: 'live',
 };
@@ -150,6 +151,19 @@ describe('parseUsageEndpointResponse', () => {
     expect(advisorInput.accountId).toBe('acct-1');
     expect(advisorInput.active).toBe(true);
     expect(advisorInput.quarantined).toBe(false);
+  });
+
+  it('carries the auto-switch exclusion onto BOTH shapes it produces', () => {
+    // The registry owns this flag; the parser only passes it through. Both consumers need it:
+    // the advisor input drives the policy, the wire shape explains the hold on the phone.
+    const raw = { limits: [{ kind: 'session', percent: 10 }] };
+    const excluded = parseUsageEndpointResponse(raw, { ...baseOpts, autoSwitchExcluded: true });
+    expect(excluded.advisorInput.autoSwitchExcluded).toBe(true);
+    expect(excluded.accountUsage.autoSwitchExcluded).toBe(true);
+
+    const open = parseUsageEndpointResponse(raw, baseOpts);
+    expect(open.advisorInput.autoSwitchExcluded).toBe(false);
+    expect(open.accountUsage.autoSwitchExcluded).toBe(false);
   });
 
   it('accepts a fractional "utilization" field in place of "percent"', () => {

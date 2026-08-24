@@ -116,6 +116,10 @@ export interface ParseUsageOptions {
   label: string;
   active: boolean;
   quarantined: boolean;
+  /** Whether the operator has barred auto-switch from hopping TO this account. A registry fact
+   *  like `quarantined`, not something the usage endpoint reports, so it is passed through
+   *  rather than parsed — the auto-switch policy and both frontends read it downstream. */
+  autoSwitchExcluded: boolean;
   fetchedAtMs: number;
   source: 'live' | 'cached';
 }
@@ -213,12 +217,14 @@ function buildResult(
     fetchedAtMs: opts.fetchedAtMs,
     limits,
     ...(error !== undefined ? { error } : {}),
+    autoSwitchExcluded: opts.autoSwitchExcluded,
   };
   const advisorInput: AccountUsageInput = {
     accountId: opts.accountId,
     label: opts.label,
     active: opts.active,
     quarantined: opts.quarantined,
+    autoSwitchExcluded: opts.autoSwitchExcluded,
     limits: inputs,
     // Same stamp the wire shape carries (cache-honored, never re-stamped at poll time) —
     // the auto-switch policy tightens its trigger on data this field shows to be stale.
