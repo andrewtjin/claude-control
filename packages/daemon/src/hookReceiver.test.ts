@@ -900,9 +900,9 @@ describe('HookReceiver', () => {
       }
     });
 
-    it('parses the LIVE-OBSERVED payload shape (error + last_assistant_message)', async () => {
-      // The installed CLI names the fields differently from the hook docs — this is the
-      // exact shape a real StopFailure POST carried (live-observed), minus noise fields.
+    it('parses the installed CLI payload shape (error + last_assistant_message)', async () => {
+      // The installed CLI names the fields differently from the hook docs — this is the shape a
+      // real StopFailure POST carries, minus the noise fields nothing here reads.
       const res = await postStopFailure({
         session_id: '2562e353-4c0a-431c-b718-281281d009fa',
         cwd: 'C:\\somewhere',
@@ -916,6 +916,68 @@ describe('HookReceiver', () => {
         expect(note.payload.notificationType).toBe('api_error');
         expect(note.payload.body).toContain('ConnectionRefused');
         expect(note.payload.body).toContain('type "continue"');
+      }
+    });
+
+    it('reads a live FREE-TEXT error as the transient death it is', async () => {
+      // The installed CLI puts prose where the docs promise a taxonomy token. Filed as a token
+      // it read as unrecognized, so an outage the user only had to wait out was announced as
+      // something a retry cannot fix.
+      await postStopFailure({
+        session_id: 'sess-1',
+        error: 'API Error: 529 Overloaded. Please try again later.',
+        last_assistant_message: "Let me check the file's imports.",
+      });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.body).toContain('API Error: 529 Overloaded.');
+        expect(note.payload.body).toContain('type "continue"');
+        expect(note.payload.body).not.toContain('Not retryable');
+      }
+    });
+
+    it("keeps Claude's last message out of the error slot, on a line of its own", async () => {
+      // What the assistant last SAID is not why the turn died; standing in for the error text it
+      // put the parting words of a healthy answer where the provider's failure belongs.
+      await postStopFailure({
+        session_id: 'sess-1',
+        error: 'API Error: 529 Overloaded. Please try again later.',
+        last_assistant_message: "Let me check the file's imports.",
+      });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        const lines = note.payload.body.split('\n');
+        expect(lines[0]).toBe('API Error: 529 Overloaded. Please try again later.');
+        expect(lines[1]).toBe("last message: Let me check the file's imports.");
+      }
+    });
+
+    it('still leads with the error when the payload carries no last message', async () => {
+      await postStopFailure({
+        session_id: 'sess-1',
+        error: 'API Error: 529 Overloaded. Please try again later.',
+      });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        const lines = note.payload.body.split('\n');
+        expect(lines[0]).toBe('API Error: 529 Overloaded. Please try again later.');
+        expect(note.payload.body).not.toContain('last message:');
+      }
+    });
+
+    it('still refuses to retry a live free-text death a retry cannot fix', async () => {
+      // The other direction of the same fix: reading the text must not turn every unrecognized
+      // value transient. And the guidance names a cause only when the CLI named one — quoting a
+      // whole sentence back inside the parentheses invents a taxonomy value.
+      await postStopFailure({
+        session_id: 'sess-1',
+        error: 'API Error: 401 authentication_error: OAuth token has expired',
+      });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.body).toContain('API Error: 401');
+        expect(note.payload.body).toContain('Not retryable - the session needs attention.');
+        expect(note.payload.body).not.toContain('type "continue"');
       }
     });
 

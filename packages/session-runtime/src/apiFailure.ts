@@ -98,30 +98,52 @@ export function classifyFailureText(text: string): ApiFailureClassification {
 }
 
 /**
+ * The CLI's `error_type` taxonomy, spelled out token by token with the verdict each one carries.
+ *
+ * A table rather than a switch for two reasons. The non-transient tokens have to stay ENUMERATED
+ * — {@link classifyStopFailureType} no longer treats "not one of the transient ones" as permanent,
+ * so a token whose verdict is "retrying fixes nothing" now has to say so out loud. And the same
+ * vocabulary answers a second question a card renderer asks — "did the hook name a cause, or hand
+ * me prose?" — which a switch cannot be asked; two copies of the list would drift.
+ */
+const STOP_FAILURE_TYPE_VERDICTS: ReadonlyMap<string, ApiFailureClassification> = new Map([
+  ['server_error', { transient: true, kind: 'server_error' }],
+  ['overloaded', { transient: true, kind: 'overloaded' }],
+  // Same verdict the free-text side gives 429s: not retryable, but recoverable by an account
+  // switch — the two tiers must agree on the usageLimit bit like everything else.
+  ['rate_limit', USAGE_LIMIT],
+  // Retrying fixes none of these.
+  ['authentication_failed', NOT_TRANSIENT],
+  ['oauth_org_not_allowed', NOT_TRANSIENT],
+  ['billing_error', NOT_TRANSIENT],
+  ['invalid_request', NOT_TRANSIENT],
+  ['model_not_found', NOT_TRANSIENT],
+  ['max_output_tokens', NOT_TRANSIENT],
+]);
+
+/** Whether a value is one of the taxonomy's TOKENS rather than the free text an installed CLI
+ *  puts in the same slot. For display, not classification: a cause worth naming in a card's
+ *  "not retryable (…)" is a short token — a whole sentence there is the message the card has
+ *  already printed in full, quoted back at the reader. */
+export function isStopFailureType(value: string): boolean {
+  return STOP_FAILURE_TYPE_VERDICTS.has(value);
+}
+
+/**
  * Classify a StopFailure hook's `error_type` — the CLI's own taxonomy for why a turn died
- * (`server_error`, `overloaded`, `rate_limit`, `authentication_failed`, …). `unknown` falls
- * back to the free-text classifier over `error_text` (when given), for the same
- * positively-named-only reason as above.
+ * (`server_error`, `overloaded`, `rate_limit`, `authentication_failed`, …).
+ *
+ * Anything that ISN'T one of those tokens is read as free text, preferring `error_text` when the
+ * payload carried one. That covers the documented `unknown`, and it covers the installed CLI,
+ * which puts a whole sentence ("API Error: 529 Overloaded. Please try again later.") where the
+ * docs promise a token — text a token-only reading files under "no token I recognize" and so,
+ * before this, under "permanent", turning a retryable outage into a session the user was told to
+ * go fix by hand. Free text that names nothing recognizable still lands on NOT_TRANSIENT, so the
+ * positively-named-only posture is unchanged; only the reach of the reading grew.
  */
 export function classifyStopFailureType(
   errorType: string,
   errorText?: string,
 ): ApiFailureClassification {
-  switch (errorType) {
-    case 'server_error':
-      return { transient: true, kind: 'server_error' };
-    case 'overloaded':
-      return { transient: true, kind: 'overloaded' };
-    case 'rate_limit':
-      // Same verdict the free-text side gives 429s: not retryable, but recoverable by an
-      // account switch — the two tiers must agree on the usageLimit bit like everything else.
-      return USAGE_LIMIT;
-    default:
-      // authentication_failed, oauth_org_not_allowed, billing_error, invalid_request,
-      // model_not_found, max_output_tokens — retrying fixes none of them.
-      if (errorType === 'unknown' && errorText !== undefined) {
-        return classifyFailureText(errorText);
-      }
-      return NOT_TRANSIENT;
-  }
+  return STOP_FAILURE_TYPE_VERDICTS.get(errorType) ?? classifyFailureText(errorText ?? errorType);
 }

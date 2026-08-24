@@ -21,7 +21,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { EnvelopeDraft, PayloadOf } from '@claude-control/shared-protocol';
-import { classifyStopFailureType } from '@claude-control/session-runtime';
+import { classifyStopFailureType, isStopFailureType } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import { CHANNEL_POLL_MS, type TakeSource } from './channelRegistry.js';
 import type { Store } from './store.js';
@@ -1793,20 +1793,35 @@ export class HookReceiver {
     this.apiErrorCardLastAt.set(cooldownKey, now);
 
     // Field names read tolerantly across BOTH observed shapes: the installed CLI sends
-    // `error` + `last_assistant_message` (live-observed), while the hook docs name them
-    // `error_type` + `error_text` — read the documented names first so a CLI that converges
-    // on its own docs keeps working, with the observed names as the operative fallbacks.
+    // `error` + `last_assistant_message`, while the hook docs name them `error_type` +
+    // `error_text` — read the documented names first so a CLI that converges on its own docs
+    // keeps working, with the observed names as the operative fallbacks. `error` feeds BOTH
+    // slots because the installed CLI uses it for both a bare token and a whole sentence; the
+    // classifier reads whichever it turns out to be (see classifyStopFailureType).
     const errorType = str(body.error_type) ?? str(body.error) ?? str(body.errorType) ?? 'unknown';
-    const errorText =
-      str(body.error_text) ?? str(body.last_assistant_message) ?? str(body.errorText);
+    const errorText = str(body.error_text) ?? str(body.error) ?? str(body.errorText);
+    // What Claude last SAID, which is not why the turn died. It used to stand in for the error
+    // text, so the card printed the assistant's parting words in the slot reserved for the
+    // provider's failure — it gets its own line instead, and only when the payload carries one.
+    const lastMessage = str(body.last_assistant_message);
     const cwd = str(body.cwd);
     // The guidance mirrors the shared classifier's verdict: a transient death is recoverable
     // by continuing; anything else (auth, billing, rate limit) needs the human to fix a cause.
     const transient = classifyStopFailureType(errorType, errorText).transient;
+    // Name the cause in the guidance only when the CLI named one. When that slot holds prose
+    // instead, the card has already printed it above and quoting a sentence back inside the
+    // parentheses reads as a taxonomy value that does not exist.
+    const cause = isStopFailureType(errorType) ? ` (${errorType})` : '';
     const guidance = transient
       ? 'Usually temporary - type "continue" in that terminal to pick up where it left off.'
-      : `Not retryable (${errorType}) - the session needs attention.`;
-    const detail = errorText !== undefined ? `${truncate(errorText, 300)}\n${guidance}` : guidance;
+      : `Not retryable${cause} - the session needs attention.`;
+    const detail = [
+      errorText !== undefined ? truncate(errorText, 300) : undefined,
+      lastMessage !== undefined ? `last message: ${truncate(lastMessage, 300)}` : undefined,
+      guidance,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join('\n');
     this.emit({
       daemonId: this.daemonId(),
       type: 'hook.notification',
