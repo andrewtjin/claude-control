@@ -98,9 +98,11 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   switching, and the poller degrades to cached data (labelled stale) rather than
   crashing on an endpoint change.
 - **Overload retries.** An HTTP 529 from the token or usage endpoint is retried in place for
-  a few seconds — patience tuned by status.claude.com, never gated on it — with the budget kept
-  far under the credential lock's stale-reclaim window, so real persistence stays with the
-  callers that already re-attempt on their own schedule.
+  a few seconds — patience tuned by status.claude.com, never gated on it. The budget is a
+  deadline each retry runs under, not merely a gate on starting one, and the refresh path (whose
+  retries happen while holding the credential lock) caps it lower again, so the lock is never
+  held near its stale-reclaim window or long enough to time out a waiting switch. Real
+  persistence stays with the callers that already re-attempt on their own schedule.
 - **Burn-down advice.** `usage-advisor.computePlan` ranks accounts so soon-to-reset
   unused quota gets burned before it evaporates, near-cap accounts are avoided, and an
   exhausted live account triggers a "switch now" advisory — all deterministic.

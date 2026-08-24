@@ -4,6 +4,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import {
+  LockTimeoutError,
   RefreshError,
   type CredentialBundle,
   type RefreshTokenResult,
@@ -211,6 +212,31 @@ describe('createPollTokenGetter', () => {
     // outage that is not this account's fault; at the floor it keeps asking.
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       await expect(getToken('a1')).rejects.toThrow(/overloaded \(529\)/);
+      expect(refreshToken).toHaveBeenCalledTimes(attempt);
+      now += POLL_REFRESH_MIN_INTERVAL_MS + 1;
+    }
+  });
+
+  it('a credential-lock timeout never grows the backoff either', async () => {
+    let now = 0;
+    const bundles = new Map([['a1', bundle('tok-old', -HOUR)]]);
+    const { engine, refreshToken } = fakeEngine(() =>
+      Promise.reject(
+        new LockTimeoutError('could not acquire credential lock at C:/lock within 15000ms'),
+      ),
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine,
+      minTtlMs: MIN_TTL_MS,
+      clock: () => now,
+    });
+
+    // Accounts poll together but refresh one at a time, so during an overload the account that
+    // holds the lock and retries in there is what makes the rest time out. Doubling on that
+    // would silence most of the fleet for hours over a wait that indicts none of their tokens.
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      await expect(getToken('a1')).rejects.toThrow(/credential lock/);
       expect(refreshToken).toHaveBeenCalledTimes(attempt);
       now += POLL_REFRESH_MIN_INTERVAL_MS + 1;
     }

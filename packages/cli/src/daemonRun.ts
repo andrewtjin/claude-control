@@ -253,6 +253,10 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const pollVault = new Vault(paths.vaultDir, protector);
   const poller = new UsagePoller({
     fetch: (url, init) => globalThis.fetch(url, init),
+    // The status-page probe an overloaded (529) usage endpoint triggers, passed explicitly for
+    // the same reason `fetch` is: the poller's contract is that every outbound call it can make
+    // was handed to it, so a test that wires none can never reach the network by accident.
+    overload: { statusFetch: (url, init) => globalThis.fetch(url, init) },
     getToken: createPollTokenGetter({
       vault: pollVault,
       engine,
