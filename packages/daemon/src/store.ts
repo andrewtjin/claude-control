@@ -121,6 +121,29 @@ export interface OutboxRow {
   createdAtMs: number;
 }
 
+/**
+ * One prompt queued for a session that could not take it yet, mirrored out of the daemon's
+ * in-memory queues (see daemon.ts `queueSteering` / `queueManagedInject`).
+ *
+ * Unlike the sessions table above, this is NOT display-only: the phone was told each of these
+ * texts was queued and would deliver at the session's next turn boundary, and an in-memory queue
+ * met that promise with silence across a restart — the next boundary found nothing and nothing
+ * ever said so. The rows are the durable half of that promise, so a restart can either put the
+ * text back or account for it.
+ */
+export interface PendingSteeringRow {
+  id: number;
+  sessionId: string;
+  /** Which queue the row belongs to — 'interactive' (a registered terminal session, answered at
+   *  its next hook) or 'managed' (an SDK session, sent at its next idle turn). Recorded rather
+   *  than inferred from the session id, because the two drain on different signals and a restart
+   *  can only put ONE of them back: the terminal session is another process and outlives this
+   *  daemon; the managed session's subprocess does not. */
+  kind: string;
+  text: string;
+  queuedAtMs: number;
+}
+
 // ---------------------------------------------------------------------------
 // Row narrowing
 // ---------------------------------------------------------------------------
@@ -247,6 +270,18 @@ export class Store {
         envelopeJson TEXT NOT NULL,
         createdAtMs INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS pending_steering (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sessionId TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        queuedAtMs INTEGER NOT NULL
+      );
+      -- The autoincrement id doubles as arrival order, which is the order queued text must be
+      -- delivered in, so every read here is id-ordered and the index carries the id along.
+      CREATE INDEX IF NOT EXISTS idx_pending_steering_session
+        ON pending_steering (sessionId, kind, id);
     `);
     // `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a database created
     // before the `origin` column existed must be upgraded here. Legacy rows default to
@@ -751,5 +786,58 @@ export class Store {
          )`,
       )
       .run(maxRows);
+  }
+
+  // ---- pending steering ----
+  //
+  // Write-through mirror of the daemon's queues, not a second source of truth: the maps stay
+  // authoritative while the process lives, and these rows exist only so the NEXT process can
+  // rebuild them. Every enqueue inserts, every delivery or drop deletes, so a row outliving its
+  // queue entry would mean a restart re-delivers text that already landed.
+
+  private toPendingSteeringRow(row: Record<string, unknown>): PendingSteeringRow {
+    return {
+      id: requireNumber(row, 'id'),
+      sessionId: requireString(row, 'sessionId'),
+      kind: requireString(row, 'kind'),
+      text: requireString(row, 'text'),
+      queuedAtMs: requireNumber(row, 'queuedAtMs'),
+    };
+  }
+
+  /** Returns the new row's id, which the caller keeps on its in-memory queue entry so the
+   *  matching delete can name exactly the one that delivered. */
+  insertPendingSteering(row: Omit<PendingSteeringRow, 'id'>): number {
+    const result = this.db
+      .prepare(
+        `INSERT INTO pending_steering (sessionId, kind, text, queuedAtMs) VALUES (?, ?, ?, ?)`,
+      )
+      .run(row.sessionId, row.kind, row.text, row.queuedAtMs);
+    return Number(result.lastInsertRowid);
+  }
+
+  /** Oldest-first across every session — arrival order is the order queued text delivers in,
+   *  and a reload has to rebuild each session's queue in exactly that order. */
+  listPendingSteering(): PendingSteeringRow[] {
+    return this.db
+      .prepare(`SELECT * FROM pending_steering ORDER BY id ASC`)
+      .all()
+      .map((r) => this.toPendingSteeringRow(r));
+  }
+
+  /** Retire one row — the delivered-a-single-message case (a managed session takes one text per
+   *  turn boundary), where the rest of the queue must stay. */
+  deletePendingSteering(id: number): void {
+    this.db.prepare(`DELETE FROM pending_steering WHERE id = ?`).run(id);
+  }
+
+  /** Retire a whole queue at once: everything consumed in one hook answer, or discarded because
+   *  the session was unregistered or ended. Returns the number of rows removed so a caller can
+   *  report a count honestly rather than guess one. */
+  deletePendingSteeringForSession(sessionId: string, kind: string): number {
+    const result = this.db
+      .prepare(`DELETE FROM pending_steering WHERE sessionId = ? AND kind = ?`)
+      .run(sessionId, kind);
+    return Number(result.changes);
   }
 }

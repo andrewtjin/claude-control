@@ -145,6 +145,28 @@ export interface DropInDiff {
   parseError?: string;
 }
 
+/**
+ * The exact text an operator must see before consenting to this file: where it goes, the whole
+ * JSON verbatim, and every warning about what the write would take away.
+ *
+ * One renderer, shared by every caller that asks for the write — `cctl channel enable` and the
+ * setup wizard's channel step. Two renderings would eventually disagree about what "showing the
+ * file" means, and the one that showed less would be the one asking for administrator rights.
+ */
+export function renderCctlDropInPlan(path: string, diff: DropInDiff): string {
+  let out =
+    `${diff.action === 'create' ? 'Create' : 'Update'}: ${path}\n\n` + `${diff.desiredText}\n`;
+  if (diff.parseError !== undefined) {
+    out += `warning: the existing file is not valid JSON (${diff.parseError}); it will be replaced.\n`;
+  }
+  if (diff.removedPlugins.length > 0) {
+    out += `warning: this removes ${diff.removedPlugins
+      .map((r) => `${r.plugin}@${r.marketplace}`)
+      .join(', ')} from the approved list.\n`;
+  }
+  return out;
+}
+
 const pluginKey = (p: ChannelPluginRef): string => `${p.marketplace}/${p.plugin}`;
 
 function pluginsOf(parsed: unknown): ChannelPluginRef[] {
