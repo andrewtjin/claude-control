@@ -96,10 +96,18 @@ export function computePlan(
   const greedy = options.greedyAutoSwitch === true;
   const analyses = accounts.map((a) => analyze(a, now, cfg));
   const ranking = toRanking(analyses);
+  // May the plan name this account as somewhere to GO? Under greedy auto-switch the plan text
+  // stops being advice and starts describing what the daemon will actually do ("Greedy
+  // auto-switch burns A -> B"), so an account the operator excluded from auto-switch must not
+  // head the burn queue or be the recommendation — the executor will never hop there, and the
+  // line would promise a switch that cannot happen. With greedy off the same text is advice to
+  // a human, who may still switch there by hand, so exclusion only earns a label (see
+  // `buildReason`) and changes nothing about eligibility.
+  const targetable = (a: Analysis): boolean => !greedy || a.input.autoSwitchExcluded !== true;
   // The burn queue: every usable account whose weekly budget is expiring soon, soonest
   // expiry first (ties by label for determinism). This IS the plan — burn down the queue.
   const burns = analyses
-    .filter((a) => a.usable && a.burn)
+    .filter((a) => a.usable && a.burn && targetable(a))
     .sort(
       (a, b) =>
         (a.burn as NonNullable<Analysis['burn']>).resetsAt -
@@ -110,7 +118,11 @@ export function computePlan(
   // headroom elsewhere (headroom keeps; expiring budget doesn't). Even if its session window
   // is nearly shut, it is still the right TARGET: the window reopens within hours while the
   // weekly budget is still evaporating. No burns → most headroom wins, as before.
-  const recommended = burns[0] ?? pickRecommended(analyses);
+  // The second fallback covers the case where greedy is on and EVERY usable account is
+  // excluded: there is nowhere for the daemon to hop, the fleet keeps running on whatever is
+  // live, and reporting "no usable account" would be plainly false.
+  const recommended =
+    burns[0] ?? pickRecommended(analyses.filter(targetable)) ?? pickRecommended(analyses);
   const advisories = buildAdvisories(analyses, recommended, burns.length > 0, greedy);
 
   return {
@@ -322,17 +334,21 @@ function buildReason(
         const when = `${humanizeDuration(b.resetsAt - now)}${b.predicted ? ' (predicted)' : ''}`;
         // First entry spells everything out; later ones drop the repeated words.
         return i === 0
-          ? `${a.input.label} (${left}, resets in ${when})`
-          : `${a.input.label} (${left}, in ${when})`;
+          ? `${a.input.label} (${left}, resets in ${when})${exclusionSuffix(a)}`
+          : `${a.input.label} (${left}, in ${when})${exclusionSuffix(a)}`;
       })
       .join(' → ');
-    // Reserves: usable accounts with no expiring budget — say why they're being skipped.
+    // Reserves: usable accounts that are not in the burn queue — say why they're being skipped.
+    // Membership is judged against the QUEUE, not against `burn`, so an account greedy dropped
+    // for being excluded lands here (with the label saying why) instead of vanishing from the
+    // line entirely.
     const holds = analyses
-      .filter((a) => a.usable && !a.burn)
-      .map((a) =>
-        a.weeklyResetAt !== undefined
-          ? `${a.input.label} (weekly resets in ${humanizeDuration(a.weeklyResetAt - now)})`
-          : a.input.label,
+      .filter((a) => a.usable && !burns.includes(a))
+      .map(
+        (a) =>
+          (a.weeklyResetAt !== undefined
+            ? `${a.input.label} (weekly resets in ${humanizeDuration(a.weeklyResetAt - now)})`
+            : a.input.label) + exclusionSuffix(a),
       );
     const holdPart = holds.length > 0 ? `; hold ${holds.join(', ')}` : '';
     return `${greedy ? 'Greedy auto-switch burns' : 'Burn'} ${queue}${holdPart}.`;
@@ -342,6 +358,13 @@ function buildReason(
 }
 
 // ---- small helpers ----
+
+/** The label an excluded account carries wherever the plan line names it. Shown whether or not
+ *  greedy is on: with greedy on it explains why the account is being held rather than burned,
+ *  and with greedy off it warns the human that acting on this advice means switching by hand. */
+function exclusionSuffix(a: Analysis): string {
+  return a.input.autoSwitchExcluded === true ? ' (excluded from auto-switch)' : '';
+}
 
 /** What to CALL the figures a burn entry carries. Normally "weekly", because they came from
  *  the account's overall weekly budget. When the sub-cap had to stand in for a missing

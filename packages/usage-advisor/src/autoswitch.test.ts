@@ -121,6 +121,29 @@ describe('decideAutoSwitch — candidate eligibility', () => {
     ]);
     expect(decideAutoSwitch([lowActive(), spare], NOW)).toBeNull();
   });
+
+  it('excludes an account the operator took out of auto-switch, however good a target it is', () => {
+    // The excluded account wins on every ranking key — soonest weekly reset, untouched
+    // session window — so if the gate leaked it would be chosen here.
+    const excluded = acct('b', { autoSwitchExcluded: true }, [
+      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 6 * H },
+    ]);
+    expect(decideAutoSwitch([lowActive(), excluded], NOW)).toBeNull();
+  });
+
+  it('picks the next-best target instead of an excluded one with a sooner reset', () => {
+    const excluded = acct('b', { autoSwitchExcluded: true }, [
+      { kind: 'weekly_all', percent: 10, resetsAt: NOW + 6 * H },
+    ]);
+    const open = acct('c', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 30 * H }]);
+    expect(decideAutoSwitch([lowActive(), excluded, open], NOW)?.targetAccountId).toBe('c');
+  });
+
+  it('still hops AWAY from an excluded account that is live — exclusion gates targets only', () => {
+    const active = { ...lowActive(), autoSwitchExcluded: true };
+    const spare = acct('b', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
+    expect(decideAutoSwitch([active, spare], NOW)?.targetAccountId).toBe('b');
+  });
 });
 
 describe('decideAutoSwitch — choosing among candidates', () => {
@@ -323,6 +346,21 @@ describe('decideAutoSwitch — greedy mode', () => {
     const active = acct('blind', { active: true });
     const known = acct('known', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
     expect(decideAutoSwitch([active, known], NOW, GREEDY)).toBeNull();
+  });
+
+  it('never targets an excluded account, even when its budget expires far sooner', () => {
+    // Exactly the hop greedy exists to make — a much sooner-expiring weekly budget on an idle
+    // account — refused because the operator took that account out of the target pool.
+    const excluded = acct('excluded', { autoSwitchExcluded: true }, [
+      { kind: 'weekly_all', percent: 20, resetsAt: NOW + 2 * H },
+    ]);
+    expect(decideAutoSwitch([healthyActive(), excluded], NOW, GREEDY)).toBeNull();
+  });
+
+  it('greedily hops away FROM an excluded live account toward an open one', () => {
+    const active = { ...healthyActive(), autoSwitchExcluded: true };
+    const sooner = acct('sooner', {}, [{ kind: 'weekly_all', percent: 50, resetsAt: NOW + 7 * H }]);
+    expect(decideAutoSwitch([active, sooner], NOW, GREEDY)?.targetAccountId).toBe('sooner');
   });
 
   it('leaves the low-quota trigger and its reason untouched when greedy is on', () => {

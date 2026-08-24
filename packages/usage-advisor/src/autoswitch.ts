@@ -13,8 +13,12 @@
 //   the hard cutoff and kills the session mid-work.
 //   ELIGIBLE — a candidate must still have at least `minSessionHeadroomPct` of its 5h
 //   session window left, must not itself already be low (otherwise the switch would
-//   immediately re-trigger), and must have a KNOWN future weekly reset — the weekly
-//   clock is the budget, and we never hop toward an account whose budget we can't see.
+//   immediately re-trigger), must have a KNOWN future weekly reset — the weekly
+//   clock is the budget, and we never hop toward an account whose budget we can't see — and
+//   must not be one the operator EXCLUDED from auto-switch. That exclusion is a standing
+//   choice about unattended hops only: it bars an account from being a TARGET here, while a
+//   deliberate switch still reaches it and an excluded account that happens to be active is
+//   still hopped away from like any other (this gate never reads the active account).
 //   CHOICE — the eligible account whose WEEKLY quota resets soonest, full stop. WEEKLY is
 //   the budget; the 5h window is only a gate, never a ranking key. Quota expiring soonest gets burned first, so the least is wasted.
 //
@@ -146,6 +150,7 @@ export function decideAutoSwitch(
     (a) =>
       !a.active &&
       !a.quarantined &&
+      !a.autoSwitchExcluded &&
       100 - sessionUsedPct(a, now) >= minSessionHeadroomPct &&
       // Never hop to an account that would itself immediately count as low — judged by ITS
       // OWN snapshot's age, so a stale near-limit candidate (whose true usage may already
