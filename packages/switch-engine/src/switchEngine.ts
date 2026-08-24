@@ -371,6 +371,134 @@ export class SwitchEngine {
   }
 
   /**
+   * The live `claudeAiOauth` block, wherever this platform keeps it — a public snapshot
+   * accessor for the darwin capture flow, which must record the pre-window live credentials
+   * BEFORE spawning the throwaway `claude` (see {@link captureFromKeychainDelta}).
+   */
+  readLiveOauth(): Promise<ClaudeOauth | undefined> {
+    return this.credStore.readLiveCredentials();
+  }
+
+  /**
+   * Darwin counterpart of {@link captureFromConfigDir}. On macOS the CLI ignores
+   * `CLAUDE_CONFIG_DIR` for credentials and writes every login to its single login-Keychain
+   * item (verified on a real Mac, CLI 2.x) — so the transient dir never contains
+   * `.credentials.json`, and a login in the "throwaway" window OVERWRITES the live login.
+   * This flow embraces that instead of fighting it:
+   *
+   *   1. The caller snapshots the live oauth block BEFORE spawning the window (`prior`).
+   *   2. After the window exits, the Keychain item is read again. Unchanged (same refresh
+   *      token, or still absent) means the login never completed — the same
+   *      `no_capture_login` failure the file flow reports.
+   *   3. The NEW credentials are vaulted under `label`. Identity (`oauthAccount`) still comes
+   *      from the transient dir's `.claude.json`, which the CLI DOES write file-based.
+   *   4. The `prior` block is written back, restoring the pre-window live login — preserving
+   *      this flow's documented contract that the live account is untouched. When there was
+   *      no prior login, the new account simply IS the live one and is recorded active.
+   *
+   * The caller still owns the transient `configDir` and MUST delete it afterwards — its
+   * `.claude.json` carries account identity even though no tokens land there on darwin.
+   */
+  async captureFromKeychainDelta(
+    label: string,
+    configDir: string,
+    prior: ClaudeOauth | undefined,
+  ): Promise<StoredAccount> {
+    const creds = await this.credStore.readLiveCredentials();
+    if (!creds || creds.refreshToken === prior?.refreshToken) {
+      throw new RefreshError(
+        'the throwaway window did not produce a new login in the Keychain; did the login complete?',
+        'no_capture_login',
+      );
+    }
+    const oauthAccount = await this.transientStore(configDir).readOauthAccount();
+    const bundle: CredentialBundle = oauthAccount
+      ? { claudeAiOauth: creds, oauthAccount }
+      : { claudeAiOauth: creds };
+    return this.withCredentialLock(async () => {
+      try {
+        const account = await this.vault.addAccount(label, bundle);
+        if (!prior) {
+          // Nothing to restore: the captured login is now the live one — record that.
+          await this.vault.setActive(account.id);
+        }
+        return account;
+      } finally {
+        // Put the pre-window login back so "your live login was not touched" stays true — in
+        // a `finally` because at this point the window HAS overwritten the live login: bailing
+        // on a vault failure without restoring would silently leave the wrong account live.
+        if (prior) await this.credStore.writeLiveCredentials(prior);
+      }
+    });
+  }
+
+  /**
+   * Darwin counterpart of {@link reloginFromConfigDir} — same Keychain-delta read and live-login
+   * restore as {@link captureFromKeychainDelta}, same in-place bundle overwrite + identity guard
+   * as the file relogin (see that method for why the id must be preserved).
+   */
+  async reloginFromKeychainDelta(
+    accountId: string,
+    configDir: string,
+    prior: ClaudeOauth | undefined,
+  ): Promise<StoredAccount> {
+    return this.withCredentialLock(async () => {
+      const creds = await this.credStore.readLiveCredentials();
+      if (!creds || creds.refreshToken === prior?.refreshToken) {
+        throw new RefreshError(
+          'the throwaway window did not produce a new login in the Keychain; did the login complete?',
+          'no_capture_login',
+        );
+      }
+      // Everything past the delta check restores `prior` on the way out, success or failure —
+      // the window HAS overwritten the live login by now, so bailing on the identity guard (or
+      // a vault failure) without restoring would silently leave the wrong account live.
+      try {
+        const existing = await this.vault.getAccount(accountId);
+        if (!existing) throw new UnknownAccountError(accountId);
+
+        const oauthAccount = await this.transientStore(configDir).readOauthAccount();
+
+        // Attribution guard — see reloginFromConfigDir for why a mismatch is fatal, not a warning.
+        if (
+          existing.accountUuid !== undefined &&
+          oauthAccount?.accountUuid !== undefined &&
+          existing.accountUuid !== oauthAccount.accountUuid
+        ) {
+          throw new RefreshError(
+            `the captured login is a different account (${oauthAccount.emailAddress ?? oauthAccount.accountUuid}) ` +
+              `than "${existing.label}" - re-login must use the SAME account to keep its usage history intact`,
+            'relogin_identity_mismatch',
+          );
+        }
+
+        const bundle: CredentialBundle = oauthAccount
+          ? { claudeAiOauth: creds, oauthAccount }
+          : { claudeAiOauth: creds };
+        await this.vault.writeBundle(accountId, bundle);
+        await this.vault.clearQuarantine(accountId);
+        if (!prior) await this.vault.setActive(accountId);
+        const refreshed = await this.vault.getAccount(accountId);
+        if (!refreshed) throw new UnknownAccountError(accountId);
+        return refreshed;
+      } finally {
+        if (prior) await this.credStore.writeLiveCredentials(prior);
+      }
+    });
+  }
+
+  /** A file-based CredentialStore over a transient `CLAUDE_CONFIG_DIR` — the darwin flows read
+   *  only its `.claude.json` (identity); its `.credentials.json` never exists there. */
+  private transientStore(configDir: string): CredentialStore {
+    return new CredentialStore({
+      claudeDir: configDir,
+      credentialsPath: join(configDir, '.credentials.json'),
+      claudeJsonPath: join(configDir, '.claude.json'),
+      vaultDir: this.paths.vaultDir,
+    });
+  }
+
+  /**
    * Re-login an EXISTING account in place. Reuses the same transient-config-dir capture the
    * `accounts add --fresh` flow uses, but writes the freshly captured credentials into the
    * account's EXISTING vault entry — SAME id — and lifts its quarantine flag on success.

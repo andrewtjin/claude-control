@@ -75,6 +75,7 @@ import {
   writeCctlDropIn,
   writeCctlDropInElevated,
 } from './managedSettings.js';
+import { installDaemonAgent, queryDaemonAgent, uninstallDaemonAgent } from './launchdInstall.js';
 import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
   renderAccountsTable,
@@ -418,13 +419,32 @@ export function buildProgram(): Command {
 
   daemon
     .command('install')
-    .description('register a logon Scheduled Task that starts the daemon automatically')
+    .description(
+      'register a logon task (Scheduled Task / LaunchAgent) that starts the daemon automatically',
+    )
     .action(() => {
       let shimPath: string;
       try {
         shimPath = resolveCctlShimPath();
       } catch (err) {
         fail(`could not resolve the installed cctl location: ${(err as Error).message}`);
+      }
+      if (process.platform === 'darwin') {
+        // launchd path: bootstrapping a RunAtLoad agent registers AND starts in one step.
+        let outcome: ReturnType<typeof installDaemonAgent>;
+        try {
+          outcome = installDaemonAgent({ shimPath });
+        } catch (err) {
+          fail(`could not register the LaunchAgent: ${(err as Error).message}`);
+        }
+        const verb = { created: 'Registered', updated: 'Updated', unchanged: 'Already registered' }[
+          outcome
+        ];
+        process.stdout.write(
+          `${verb} the LaunchAgent to run "${shimPath} daemon run" at login.\n` +
+            (outcome === 'unchanged' ? '' : 'Daemon starting now.\n'),
+        );
+        return;
       }
       let outcome: ReturnType<typeof installDaemonTask>;
       try {
@@ -459,7 +479,7 @@ export function buildProgram(): Command {
     .action(async () => {
       let outcome: ReturnType<typeof uninstallDaemonTask>;
       try {
-        outcome = uninstallDaemonTask();
+        outcome = process.platform === 'darwin' ? uninstallDaemonAgent() : uninstallDaemonTask();
       } catch (err) {
         fail(`could not remove the logon task: ${(err as Error).message}`);
       }
@@ -501,7 +521,7 @@ export function buildProgram(): Command {
       // here must not hide the heartbeat/pairing lines, which are still meaningful without it.
       let task: ReturnType<typeof queryDaemonTask>;
       try {
-        task = queryDaemonTask();
+        task = process.platform === 'darwin' ? queryDaemonAgent() : queryDaemonTask();
       } catch {
         task = { registered: false };
       }
@@ -685,6 +705,11 @@ async function attemptPair(code: string, relayUrl: string): Promise<PairResult> 
 /** Register/update the logon task and kick it now. Starting is best-effort — a correctly
  *  registered task still comes up at the next logon. */
 function installAutostart(): Promise<AutostartResult> {
+  if (process.platform === 'darwin') {
+    // Bootstrapping a RunAtLoad LaunchAgent registers and starts in one step.
+    const task = installDaemonAgent({ shimPath: resolveCctlShimPath() });
+    return Promise.resolve({ task, started: true });
+  }
   const task = installDaemonTask({ shimPath: resolveCctlShimPath() });
   try {
     startDaemonTaskNow();
@@ -892,6 +917,12 @@ async function addFreshAccount(label: string): Promise<void> {
   // Failures are RETURNED, not `fail()`ed, so the dir is deleted before the process exits —
   // `fail()` is `process.exit`, which skips `finally`. See captureDir.ts.
   const failure = await withCaptureDir(dirname(paths.vaultDir), 'capture', async (captureDir) => {
+    // Darwin: the CLI writes every login to its single Keychain item regardless of
+    // CLAUDE_CONFIG_DIR, so the capture must diff the Keychain around the window instead of
+    // reading files from the transient dir — and restore the pre-window login afterwards.
+    // See SwitchEngine.captureFromKeychainDelta.
+    const engine = buildEngine();
+    const prior = process.platform === 'darwin' ? await engine.readLiveOauth() : undefined;
     process.stdout.write(
       'Opening a throwaway Claude window. In it:\n' +
         '  1. /login - pick the NEW account in the browser (it may preselect the current one).\n' +
@@ -905,7 +936,10 @@ async function addFreshAccount(label: string): Promise<void> {
     });
     if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
     try {
-      const account = await buildEngine().captureFromConfigDir(label, captureDir);
+      const account =
+        process.platform === 'darwin'
+          ? await engine.captureFromKeychainDelta(label, captureDir, prior)
+          : await engine.captureFromConfigDir(label, captureDir);
       process.stdout.write(
         `Added ${account.label} (${account.id}). Your current login was not touched - ` +
           `\`cctl switch ${account.label}\` to use it.\n`,
@@ -936,6 +970,8 @@ async function reloginAccount(ref: string): Promise<void> {
   // Same return-don't-fail contract as addFreshAccount: cleanup has to outlive every failure
   // path, and `fail()` (process.exit) would skip it. See captureDir.ts.
   const failure = await withCaptureDir(dirname(paths.vaultDir), 'relogin', async (captureDir) => {
+    // Same darwin Keychain-diff-and-restore as addFreshAccount — see that flow's comment.
+    const prior = process.platform === 'darwin' ? await engine.readLiveOauth() : undefined;
     process.stdout.write(
       `Re-logging in "${account.label}" (${account.id}). A throwaway Claude window will open.\n` +
         '  1. /login - pick the SAME account this entry belongs to (attribution is preserved).\n' +
@@ -949,10 +985,16 @@ async function reloginAccount(ref: string): Promise<void> {
     });
     if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
     try {
-      const { account: updated, healedLiveLogin } = await engine.reloginFromConfigDir(
-        account.id,
-        captureDir,
-      );
+      // The Keychain path puts the pre-window login BACK on the way out (see that method), so
+      // on darwin the live login is never healed by a re-login — the switch is always the honest
+      // next step there, which is what `healedLiveLogin: false` says.
+      const { account: updated, healedLiveLogin } =
+        process.platform === 'darwin'
+          ? {
+              account: await engine.reloginFromKeychainDelta(account.id, captureDir, prior),
+              healedLiveLogin: false,
+            }
+          : await engine.reloginFromConfigDir(account.id, captureDir);
       // Two truthful endings: a re-login of the LIVE account also rewrote the live files, so
       // sessions pick the fresh login up on their own and telling the user to switch would be
       // noise; any other outcome still needs the switch to put these credentials live.
@@ -980,7 +1022,7 @@ async function reloginAccount(ref: string): Promise<void> {
  * vault entry (same id — usage history kept, quarantine cleared).
  *
  * The headless sibling of the phone's `/reauth`, running the SAME engine call
- * (`reauthenticate`), which is what makes it the wet-test vehicle for the OAuth flow itself:
+ * (`reauthenticate`), which is what makes it the first place any OAuth-flow problem shows up:
  * any problem with the authorize URL, the paste format, or the exchange shows up here without
  * the daemon's pending-flow machinery in the way.
  *
