@@ -792,6 +792,9 @@ export class Daemon {
       label: a.label,
       active: a.id === activeId,
       quarantined: a.quarantined,
+      // `?? false` rather than the raw optional: absent in the registry means "not excluded",
+      // and PollAccount states the fact outright so nothing downstream has to re-decide it.
+      autoSwitchExcluded: a.autoSwitchExcluded ?? false,
     }));
 
     // Push a guided-re-login card the moment an account newly enters quarantine. Done off the

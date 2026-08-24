@@ -76,6 +76,12 @@ export const AccountUsage = z.object({
    *  subscriptions) that must not be reimplemented on a second surface — the same reason
    *  `SettingRow` ships display text. Display-only: nothing routes or authorizes on it. */
   billing: z.string().nullish(),
+  /** True when the operator has taken this account out of the daemon's auto-switch target pool.
+   *  Display-only here: the daemon owns the decision and the registry that holds the flag, so
+   *  nothing on the phone routes on it — it exists so `/accounts` and `/usage` can explain why
+   *  a healthy account is never hopped to. Additive and tolerant like `predictedResetAt`: a
+   *  daemon predating the field omits it, which reads the same as "not excluded". */
+  autoSwitchExcluded: z.boolean().nullish(),
 });
 
 // ---------------------------------------------------------------------------

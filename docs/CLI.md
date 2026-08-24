@@ -29,6 +29,9 @@ cctl accounts relogin <id|label>   # re-login an existing account in a throwaway
 cctl accounts reauth <id|label>    # same in-place re-login, but via a login LINK you open
                                     # anywhere and a code you paste back — no browser needed
                                     # on this host (the phone's /reauth runs the same path)
+cctl accounts exclude <id|label>   # stop auto-switch from ever hopping TO this account
+                                    # (manual `cctl switch` and the phone's /switch still work)
+cctl accounts include <id|label>   # let auto-switch consider this account again
 cctl accounts remove <id|label>    # remove a stored account
 ```
 

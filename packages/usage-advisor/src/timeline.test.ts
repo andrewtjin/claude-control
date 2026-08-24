@@ -247,6 +247,23 @@ describe('timelineInputFromWire', () => {
     }
   });
 
+  it('carries the auto-switch exclusion through, and leaves it absent when unsent', () => {
+    // `timeline` computes its own plan from these inputs, so a dropped flag would have the
+    // terminal naming an excluded account as a greedy burn target the daemon refuses to pick.
+    // A daemon predating the field sends nothing (or null), which must stay ABSENT rather than
+    // becoming an explicit `false` the plan would have to reason about.
+    const base = { accountId: 'a', label: 'main', active: true, limits: [] };
+    expect(
+      timelineInputFromWire([{ ...base, autoSwitchExcluded: true }])[0]?.autoSwitchExcluded,
+    ).toBe(true);
+    expect(
+      timelineInputFromWire([{ ...base, autoSwitchExcluded: false }])[0]?.autoSwitchExcluded,
+    ).toBe(false);
+    for (const wire of [{ ...base }, { ...base, autoSwitchExcluded: null }]) {
+      expect(timelineInputFromWire([wire])[0]).not.toHaveProperty('autoSwitchExcluded');
+    }
+  });
+
   it('parses ISO reset times to epoch ms and defaults quarantined to false', () => {
     const inputs = timelineInputFromWire([
       {

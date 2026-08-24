@@ -591,6 +591,31 @@ describe('Vault registry + bundles', () => {
     expect(stored?.quarantineReason).toBeUndefined();
   });
 
+  it('round-trips the auto-switch exclusion flag, and clearing it removes the key', async () => {
+    const { v, registryPath } = await vaultAt();
+    const acct = await v.addAccount('work', bundle('a'));
+    expect((await v.getAccount(acct.id))?.autoSwitchExcluded).toBeUndefined();
+
+    await v.setAutoSwitchExcluded(acct.id, true);
+    expect((await v.getAccount(acct.id))?.autoSwitchExcluded).toBe(true);
+
+    // Read the file, not just the parsed row: `false` must be stored as an ABSENT key so the
+    // registry only ever carries the accounts an operator actually excluded.
+    await v.setAutoSwitchExcluded(acct.id, false);
+    expect((await v.getAccount(acct.id))?.autoSwitchExcluded).toBeUndefined();
+    const reg = JSON.parse(await readFile(registryPath, 'utf8')) as {
+      accounts: Record<string, unknown>[];
+    };
+    expect(reg.accounts[0]).not.toHaveProperty('autoSwitchExcluded');
+  });
+
+  it('refuses to set the exclusion flag on an account that does not exist', async () => {
+    const v = await vault();
+    await expect(v.setAutoSwitchExcluded('does-not-exist', true)).rejects.toBeInstanceOf(
+      UnknownAccountError,
+    );
+  });
+
   it('removes an account and its bundle, clearing active if needed', async () => {
     const v = await vault();
     const acct = await v.addAccount('work', bundle('a'));
