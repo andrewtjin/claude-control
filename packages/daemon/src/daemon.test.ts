@@ -1290,6 +1290,30 @@ describe('Daemon lifecycle', () => {
     }
   });
 
+  it('names the account by label in the switch result, never by its id', async () => {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'switch.command',
+      payload: {
+        requestId: 'r-msg',
+        targetAccountId: 'acct-y', // addressed by id, and still reported by label
+        reason: 'manual',
+        idempotencyKey: 'k-msg',
+      },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
+    const result = relay.received.find((e) => e.type === 'switch.result');
+    if (result?.type === 'switch.result') {
+      // The phone renders this message verbatim. An account id is not a name the operator uses
+      // or can act on, and the auto-switch card in the same channel already says the label.
+      expect(result.payload.message).toBe('switched to spare');
+      expect(result.payload.message).not.toContain('acct-y');
+      // The machine-readable field keeps the id — the message is the human half, not both.
+      expect(result.payload.activeAccountId).toBe('acct-y');
+    }
+  });
+
   it('refuses an unknown account ref with ok:false and never calls activate()', async () => {
     await daemon.start();
     relay.push({

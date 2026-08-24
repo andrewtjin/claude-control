@@ -1084,6 +1084,13 @@ export class Daemon {
       const resolved = resolveAccountRef(await this.switchEngine.listAccounts(), targetAccountId);
       if (!resolved.ok) throw new Error(resolved.message);
       const result = await this.switchEngine.activate(resolved.account.id);
+      // Named by LABEL, which is how the operator addressed the account and how the auto-switch
+      // card already reports one. A `/switch spare` answered with "switched to 6f2a-…" tells the
+      // user something they did not ask about, in the one vocabulary they never use — and the
+      // account id is not even a value they can act on from the phone. The id remains the
+      // fallback for a record carrying no label, where it is the only name there is.
+      const switchedTo =
+        resolved.account.label !== '' ? resolved.account.label : result.activeAccountId;
       // The engine reports only what it mechanically did (see switch-engine's own docs):
       // whether a running interactive session picks up rewritten live credentials is a
       // separate, per-platform empirical fact this daemon does not currently verify — so a
@@ -1095,7 +1102,7 @@ export class Daemon {
           ok: result.ok,
           outcome: 'hot_applied',
           activeAccountId: result.activeAccountId,
-          message: `switched to ${result.activeAccountId}`,
+          message: `switched to ${switchedTo}`,
         },
       });
       // AFTER the result ships, so the phone reads the switch confirmation before any
