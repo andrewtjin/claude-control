@@ -319,6 +319,38 @@ describe('renderUsage', () => {
     expect(renderUsage(rows, NOW)).not.toMatch(/left/);
   });
 
+  it('counts down to a PREDICTED reset, marked as one, when the endpoint reports none', () => {
+    // An account whose weekly window has rolled stops carrying a reset in its snapshot, which
+    // is exactly when the history-derived prediction is the only clock there is. The timeline
+    // and the phone both count down to it; this view went silent instead.
+    const rows: UsageRow[] = [
+      { label: 'Work', active: true, usage: usage(), predictedResetAt: NOW + 6 * 86_400_000 },
+    ];
+    const out = renderUsage(rows, NOW);
+    expect(out).toMatch(/· 6d left \(predicted\)/);
+  });
+
+  it('lets a real future reset win over a prediction, and drops the mark with it', () => {
+    // The prediction is a fallback, never an override: an observed reset is the better clock
+    // AND the honest label, so a row carrying both must render the observation unmarked.
+    const rows: UsageRow[] = rowsResettingIn(3 * 86_400_000 + 7 * 3_600_000).map((r) => ({
+      ...r,
+      predictedResetAt: NOW + 6 * 86_400_000,
+    }));
+    const out = renderUsage(rows, NOW);
+    expect(out).toMatch(/· 3d left/);
+    expect(out).not.toMatch(/predicted/);
+  });
+
+  it('omits the countdown when neither a reported nor a predicted reset exists', () => {
+    // A prediction already in the past is not a clock; the shared weekly rule refuses it, and
+    // this view must then say nothing rather than count down to a moment that has gone.
+    const rows: UsageRow[] = [
+      { label: 'Work', active: true, usage: usage(), predictedResetAt: NOW - 86_400_000 },
+    ];
+    expect(renderUsage(rows, NOW)).not.toMatch(/left/);
+  });
+
   it('labels a cached reading as cached so it is not mistaken for fresh', () => {
     const rows: UsageRow[] = [
       { label: 'Reserve', active: false, usage: usage({ source: 'cached', label: 'Reserve' }) },

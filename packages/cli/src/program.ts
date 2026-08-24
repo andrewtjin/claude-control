@@ -184,11 +184,19 @@ export function buildProgram(): Command {
     .action(async () => {
       const nowMs = Date.now();
       const state = await readUsageState(nowMs);
-      const rows: UsageRow[] = state.accounts.map((a) => ({
-        label: a.label,
-        active: a.id === state.activeId,
-        usage: state.usageFor(a.id),
-      }));
+      const rows: UsageRow[] = state.accounts.map((a) => {
+        // The prediction is measured here, from the same history the pacing line below reads,
+        // and handed to the row: an account whose endpoint reset has already passed has no
+        // reset in its snapshot, so without this the runway would simply vanish from this one
+        // view while every other surface still counted down to it.
+        const predictedResetAt = state.predictedResetFor(a.id);
+        return {
+          label: a.label,
+          active: a.id === state.activeId,
+          usage: state.usageFor(a.id),
+          ...(predictedResetAt !== undefined ? { predictedResetAt } : {}),
+        };
+      });
       let text = renderUsage(rows, nowMs, detectPalette());
       // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
       // state), which UsageRow doesn't carry — build it separately rather than widen UsageRow
@@ -1046,7 +1054,7 @@ async function reauthAccount(ref: string): Promise<void> {
       '  2. The page shows a code like `abc123#xyz` - copy the WHOLE thing.\n\n',
   );
   // Read from stdin rather than an argv option on purpose: an argument would put the code into
-  // shell history and `ps`. Plain line read, so a piped (non-TTY) wet test works too.
+  // shell history and `ps`. Plain line read, so piped (non-TTY) input works too.
   const { io, close } = createWizardIo();
   let pasted: string;
   try {

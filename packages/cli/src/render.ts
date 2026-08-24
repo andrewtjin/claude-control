@@ -110,6 +110,12 @@ export interface UsageRow {
   label: string;
   active: boolean;
   usage: AccountUsage | undefined;
+  /** The history-derived next weekly reset, when the caller measured one. It does NOT ride the
+   *  usage snapshot — the endpoint stops publishing a reset once the weekly window closes,
+   *  which is precisely when the prediction is the only clock there is — so the row has to
+   *  carry it or this view alone goes silent about a reset the other surfaces are counting
+   *  down to. Absent, never `undefined`-valued, so "not measured" stays distinguishable. */
+  predictedResetAt?: number;
 }
 
 /** Render cross-account usage from the daemon's latest persisted poll. Shows each account's
@@ -139,7 +145,7 @@ export function renderUsage(
         : 'no limits reported';
       const err = r.usage.error ? `  ${palette.red(`[${r.usage.error}]`)}` : '';
       const source = palette.dim(`(${r.usage.source}, ${age})`);
-      return `${marker} ${label}  ${source}  ${limits}${resetLeft(r.usage, nowMs)}${err}`;
+      return `${marker} ${label}  ${source}  ${limits}${resetLeft(r, nowMs)}${err}`;
     })
     .join('\n');
 }
@@ -160,14 +166,31 @@ export function renderPacingLine(
   return renderPacingSummary(computePacing(inputs, options), options.nowMs, style);
 }
 
-/** "· 3d left" — whole days until this account's weekly reset. Empty when no weekly reset time
- *  is known. The 5h-window count this used to print belongs to `cctl timeline`, which is the
- *  view for planning around windows; the at-a-glance question here is how many days of runway
- *  remain, and a window count made the reader convert to answer it. */
-function resetLeft(usage: AccountUsage, nowMs: number): string {
-  const outlook = computeOutlook(timelineInputFromWire([usage]), nowMs);
+/** "· 3d left", or "· 3d left (predicted)" — whole days until this account's weekly reset.
+ *  Empty when no weekly reset time is known at all. The 5h-window count this used to print
+ *  belongs to `cctl timeline`, which is the view for planning around windows; the at-a-glance
+ *  question here is how many days of runway remain, and a window count made the reader convert
+ *  to answer it.
+ *
+ *  The reset itself comes from the shared weekly rule, prediction included, so this line cannot
+ *  disagree with the timeline or the phone about when the week turns over. A prediction is
+ *  always marked with the same " (predicted)" the other two surfaces use — the runway is real
+ *  either way, but a projection must never be read as an endpoint reading. */
+function resetLeft(row: UsageRow, nowMs: number): string {
+  if (!row.usage) return '';
+  const outlook = computeOutlook(
+    timelineInputFromWire([
+      {
+        ...row.usage,
+        ...(row.predictedResetAt !== undefined ? { predictedResetAt: row.predictedResetAt } : {}),
+      },
+    ]),
+    nowMs,
+  );
   const budget = outlook.accounts[0]?.budget;
-  return budget ? ` · ${humanizeDaysUntil(budget.weeklyResetAt - nowMs)} left` : '';
+  if (!budget) return '';
+  const mark = budget.resetPredicted ? ' (predicted)' : '';
+  return ` · ${humanizeDaysUntil(budget.weeklyResetAt - nowMs)} left${mark}`;
 }
 
 function limitShort(kind: AccountUsage['limits'][number]['kind']): string {
