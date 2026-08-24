@@ -14,12 +14,13 @@ unit tests over a mock never close a wet gate. Do not mark a wet gate done from 
   reconcile-by-reading adoption, all three crash-recovery branches), the OAuth refresh
   mapping (rotation, `invalid_grant` → quarantine, transient vs permanent), the file
   lock (contention + stale reclaim), the vault (encrypted round-trip, registry), the
-  credential store (surgical key preservation in `~/.claude.json`). **DPAPI itself is
-  proven for real** — a genuine PowerShell ProtectedData encrypt/decrypt round-trip
-  runs in the suite on Windows. The **darwin** Keychain protector and live-credential
-  channel are covered too, but only against a **fake `security(1)` runner** — that is
-  unit-proof of our argument construction and payload handling, and is not evidence
-  about a real Keychain (gate 13).
+  credential store (surgical key preservation in `~/.claude.json`), and the 529 retry
+  loop (which statuses retry, both budgets, `Retry-After`, jitter bounds, the cached
+  status probe). **DPAPI itself is proven for real** — a genuine PowerShell
+  ProtectedData encrypt/decrypt round-trip runs in the suite on Windows. The **darwin**
+  Keychain protector and live-credential channel are covered too, but only against a
+  **fake `security(1)` runner** — that is unit-proof of our argument construction and
+  payload handling, and is not evidence about a real Keychain (gate 13).
 - **usage-advisor** — burn-before-reset selection, near-cap risk avoidance, switch-now,
   quarantine handling, binding-limit headroom, determinism.
 - **control-plane-bot** — token mint/verify (constant-time), pairing (single-use,
@@ -378,6 +379,43 @@ actually does — the same posture as gate 2, whose module this shares.
 **Pass:** every bullet above observed against a real Claude account.
 
 **Result:** not yet run.
+
+### 16. status.claude.com probe ⏳ OPEN
+
+**Endpoint claim:** `GET https://status.claude.com/api/v2/status.json` (Atlassian Statuspage v2)
+answers `{"page": {...}, "status": {"indicator": "none"|"minor"|"major"|"critical",
+"description": "All Systems Operational"}}`, and `switch-engine/src/overload.ts` treats any
+`indicator` other than exactly `none` as an incident.
+
+**Live-confirmed:** the URL and that body shape, read from the real page in the all-clear state
+(`indicator: "none"`, `description: "All Systems Operational"`). The field path
+`status.indicator` is what the probe reads; nothing else in the body is used.
+
+**What no headless test can close:**
+
+- **The indicator during a REAL incident.** `minor`/`major`/`critical` are the documented
+  Statuspage vocabulary, not values observed here. If the page ever reports something outside
+  that set, the probe must still buy the patient budget — an unrecognized indicator is
+  deliberately treated as an incident, and that branch wants confirming against a live one.
+- **That a real 529 coincides with a reported incident at all.** The whole premise is that a
+  fleet-wide overload shows up on the status page. It may lag, or may never be posted for a
+  short spike, in which case the short budget is what a genuine 529 gets — acceptable by
+  design (the caller retries next cycle), but worth knowing rather than assuming.
+- **The probe under a real outage's network conditions.** A status page that is slow rather
+  than down must hit the 5s bound and degrade to `unreachable` (→ patient), not stall the
+  refresh inside the credential lock.
+
+**Verify:** during (or by simulating against a recorded body) a reported incident, confirm the
+refresh failure message reads `token endpoint overloaded (529) after 6 attempts;
+status.claude.com: <indicator>` and that the usage snapshot carries the matching
+`usage endpoint overloaded (529); status.claude.com: <indicator>`. Then block
+`status.claude.com` at the firewall and confirm the same paths say `unreachable` and still
+retry the patient number of times.
+
+**Pass:** an all-clear 529 retried the short budget, an incident (or an unreachable page) the
+patient one, and no path ever stopped retrying because the status page could not be read.
+
+**Result:** the endpoint and its all-clear body are confirmed; incident behavior is not yet run.
 
 ## Reminder
 

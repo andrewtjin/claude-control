@@ -3,7 +3,11 @@
 // without any network or real credential machinery.
 
 import { describe, it, expect, vi } from 'vitest';
-import type { CredentialBundle, RefreshTokenResult } from '@claude-control/switch-engine';
+import {
+  RefreshError,
+  type CredentialBundle,
+  type RefreshTokenResult,
+} from '@claude-control/switch-engine';
 import {
   createPollTokenGetter,
   POLL_REFRESH_MIN_INTERVAL_MS,
@@ -182,6 +186,58 @@ describe('createPollTokenGetter', () => {
     now += POLL_REFRESH_MIN_INTERVAL_MS;
     await expect(getToken('a1')).rejects.toThrow();
     expect(refreshToken).toHaveBeenCalledTimes(3);
+  });
+
+  it('an overloaded token endpoint (529) never grows the backoff', async () => {
+    let now = 0;
+    const bundles = new Map([['a1', bundle('tok-old', -HOUR)]]);
+    const { engine, refreshToken } = fakeEngine(() =>
+      Promise.reject(
+        new RefreshError(
+          'token endpoint overloaded (529) after 6 attempts; status.claude.com: major',
+          'http_529',
+        ),
+      ),
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine,
+      minTtlMs: MIN_TTL_MS,
+      clock: () => now,
+    });
+
+    // Four consecutive overloads, each an interval apart. The doubling backoff would have
+    // stopped re-attempting after the second and left the account blind for hours over an
+    // outage that is not this account's fault; at the floor it keeps asking.
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      await expect(getToken('a1')).rejects.toThrow(/overloaded \(529\)/);
+      expect(refreshToken).toHaveBeenCalledTimes(attempt);
+      now += POLL_REFRESH_MIN_INTERVAL_MS + 1;
+    }
+  });
+
+  it('a non-overload http error still backs off exponentially', async () => {
+    let now = 0;
+    const bundles = new Map([['a1', bundle('tok-old', -HOUR)]]);
+    const { engine, refreshToken } = fakeEngine(() =>
+      Promise.reject(new RefreshError('token endpoint returned 503: down', 'http_503')),
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine,
+      minTtlMs: MIN_TTL_MS,
+      clock: () => now,
+    });
+
+    await expect(getToken('a1')).rejects.toThrow(); // failure 1 → wait 1×interval
+    now += POLL_REFRESH_MIN_INTERVAL_MS + 1;
+    await expect(getToken('a1')).rejects.toThrow(); // failure 2 → wait 2×interval
+    expect(refreshToken).toHaveBeenCalledTimes(2);
+    // One interval on is still inside the doubled window: the 529 exemption must not have
+    // leaked into every `http_*` code.
+    now += POLL_REFRESH_MIN_INTERVAL_MS + 1;
+    await expect(getToken('a1')).rejects.toThrow();
+    expect(refreshToken).toHaveBeenCalledTimes(2);
   });
 
   it('a success after failures resets the backoff and clears the standing error', async () => {
