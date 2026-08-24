@@ -169,6 +169,9 @@ export class SwitchEngine {
   clearQuarantine(id: string): Promise<void> {
     return this.withCredentialLock(() => this.vault.clearQuarantine(id));
   }
+  setAutoSwitchExcluded(id: string, excluded: boolean): Promise<void> {
+    return this.withCredentialLock(() => this.vault.setAutoSwitchExcluded(id, excluded));
+  }
 
   /**
    * Recompute the derived (plan/billing/identity) row of every account whose metadata predates
