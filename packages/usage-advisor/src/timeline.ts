@@ -194,6 +194,11 @@ export interface WireUsageLike {
   weight?: number | undefined;
   planWeight?: number | null | undefined;
   predictedResetAt?: number | null | undefined;
+  /** Whether the operator barred auto-switch from hopping to this account. It reaches the CLI
+   *  from the registry and the phone from the wire (where a nullish field is the shape an
+   *  older daemon sends), and the plan needs it: without it a frontend computing its own plan
+   *  would name an excluded account as a burn target the daemon will never pick. */
+  autoSwitchExcluded?: boolean | null | undefined;
   limits: Array<{
     kind: LimitInput['kind'];
     percent: number;
@@ -222,6 +227,7 @@ export function timelineInputFromWire(accounts: WireUsageLike[]): AccountUsageIn
     quarantined: a.quarantined ?? false,
     ...weightOf(a),
     ...(a.predictedResetAt != null ? { predictedResetAt: a.predictedResetAt } : {}),
+    ...(a.autoSwitchExcluded != null ? { autoSwitchExcluded: a.autoSwitchExcluded } : {}),
     limits: a.limits.map((l) => {
       const ms = l.resetsAt != null ? Date.parse(l.resetsAt) : NaN;
       return {
