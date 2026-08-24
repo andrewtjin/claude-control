@@ -9,11 +9,13 @@ import {
   probeClaudeStatus,
   withOverloadRetry,
   CLAUDE_STATUS_URL,
+  LOCKED_OVERLOAD_BUDGET_CAP_MS,
   OVERLOAD_BACKOFF_CAP_MS,
   PATIENT_OVERLOAD_BUDGET,
   RETRY_AFTER_CAP_MS,
   SHORT_OVERLOAD_BUDGET,
   STATUS_CACHE_TTL_MS,
+  type OverloadAttemptContext,
   type OverloadRetryDeps,
 } from './overload.js';
 
@@ -261,7 +263,7 @@ describe('withOverloadRetry', () => {
   );
 
   it('stops on the total-time budget even with attempts left, clamping the last sleep', async () => {
-    // Slow attempts (7s each) burn the patient budget before its 6th try, and the third sleep
+    // Slow attempts (7s each) burn the patient budget before its 6th try, and the last sleep
     // has to shrink to whatever is left rather than overrunning the budget.
     const { deps, advance } = harness(statusPage('major'), () => 1);
     const attempt = vi.fn(() => {
@@ -276,10 +278,78 @@ describe('withOverloadRetry', () => {
     const sleeps = (deps.sleep as ReturnType<typeof vi.fn>).mock.calls.map(
       (call) => call[0] as number,
     );
-    expect(sleeps).toEqual([1_000, 2_000, 1_000]);
+    // The budget's clock starts at the first overloaded answer, so the 7s spent discovering it
+    // is not charged to the retries; the final sleep is clamped to what remains after them.
+    expect(sleeps).toEqual([1_000, 2_000, 4_000]);
     expect(sleeps.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
       PATIENT_OVERLOAD_BUDGET.totalBudgetMs,
     );
+  });
+
+  it('deadlines every retry, so the last one cannot outlive the budget', async () => {
+    // The failure this pins: bounding only when a retry may START lets the final attempt run
+    // for its caller's whole per-request timeout ON TOP of the budget — under the credential
+    // lock that is the difference between a bounded hold and one reclaimed mid-refresh.
+    const REQUEST_TIMEOUT_MS = 30_000; // a caller's own ceiling, far past the retry budget
+    const { deps, advance } = harness(statusPage('major'), () => 1);
+    const offered: number[] = [];
+    const attempt = vi.fn((ctx: OverloadAttemptContext) => {
+      offered.push(ctx.remainingMs);
+      // A request that ends at its own timeout or at the loop's deadline, whichever comes
+      // first — exactly what composing `ctx.signal` into the fetch produces in production.
+      advance(Math.min(REQUEST_TIMEOUT_MS, ctx.remainingMs));
+      return Promise.resolve(response(529));
+    });
+
+    const outcome = await withOverloadRetry(attempt, deps);
+
+    // The first attempt is the request the caller would have made anyway: no deadline of ours.
+    expect(offered[0]).toBe(Number.POSITIVE_INFINITY);
+    expect(offered.slice(1).every((ms) => ms <= PATIENT_OVERLOAD_BUDGET.totalBudgetMs)).toBe(true);
+    expect(outcome.response.status).toBe(529);
+    // Total elapsed, not summed sleeps: everything after the first answer fits in the budget.
+    expect(deps.now?.()).toBeLessThanOrEqual(
+      REQUEST_TIMEOUT_MS + PATIENT_OVERLOAD_BUDGET.totalBudgetMs,
+    );
+  });
+
+  it('honors a caller-supplied budget cap (the locked refresh path)', async () => {
+    const { deps, advance } = harness(statusPage('major'), () => 1);
+    const FIRST_ATTEMPT_MS = 30_000;
+    const attempt = vi.fn((ctx: OverloadAttemptContext) => {
+      advance(Math.min(FIRST_ATTEMPT_MS, ctx.remainingMs));
+      return Promise.resolve(response(529));
+    });
+
+    const outcome = await withOverloadRetry(attempt, {
+      ...deps,
+      budgetCapMs: LOCKED_OVERLOAD_BUDGET_CAP_MS,
+    });
+
+    // The incident bought the patient budget, but a caller holding the credential lock spends
+    // only its cap — everything after the first answer lands inside it.
+    expect(outcome.verdict?.incident).toBe(true);
+    expect(attempt.mock.calls.length).toBeGreaterThan(1);
+    expect((deps.now?.() ?? 0) - FIRST_ATTEMPT_MS).toBeLessThanOrEqual(
+      LOCKED_OVERLOAD_BUDGET_CAP_MS,
+    );
+  });
+
+  it('releases the body of every response it retries away', async () => {
+    // An undrained body holds its socket out of the pool until the collector gets to it, and a
+    // fleet-wide overload discards one of them per retry per account.
+    const { deps } = harness(statusPage('none'));
+    const cancel = vi.fn(() => Promise.resolve());
+    let index = 0;
+    const attempt = vi.fn(() => {
+      index += 1;
+      return Promise.resolve({ ...response(index === 1 ? 529 : 200), body: { cancel } });
+    });
+
+    await withOverloadRetry(attempt, deps);
+
+    // Once for the discarded 529; the response handed back is the caller's to read.
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it('reports each retry to onRetry with the verdict that priced it', async () => {

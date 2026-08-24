@@ -3,6 +3,7 @@ import { refreshCredentials, type RefreshDeps } from './oauth.js';
 import { QuarantineError, RefreshError } from './errors.js';
 import {
   createStatusProbeCache,
+  LOCKED_OVERLOAD_BUDGET_CAP_MS,
   PATIENT_OVERLOAD_BUDGET,
   SHORT_OVERLOAD_BUDGET,
   type OverloadRetryDeps,
@@ -220,6 +221,67 @@ describe('refreshCredentials', () => {
 
       expect(err).toBeInstanceOf(QuarantineError);
       expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT quarantine an invalid_grant that only appeared after a retry', async () => {
+      // The refresh token is single-use: a 529 emitted after the service already accepted the
+      // request leaves the retry replaying a token that is legitimately spent. That answer
+      // describes our own retry, not a dead account, and must not strand a healthy user behind
+      // a re-login card.
+      const fetch = scriptedFetch([
+        [529, 'overloaded'],
+        [400, JSON.stringify({ error: 'invalid_grant' })],
+      ]);
+
+      const err = await refreshCredentials(current, depsFor(fetch, 'major')).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).not.toBeInstanceOf(QuarantineError);
+      expect(err).toBeInstanceOf(RefreshError);
+      expect((err as RefreshError).code).toBe('invalid_grant_after_retry');
+      expect((err as RefreshError).message).toContain('already-rotated token');
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('spends less than the patient budget, because it retries inside the credential lock', async () => {
+      // The lock reclaims a holder at 60s and a contender gives up waiting at 15s, so this
+      // path buys fewer of the patient budget's seconds than the poller does.
+      let nowMs = 0;
+      const fetch = vi.fn(() => {
+        nowMs += 1_000; // a fast 529 from a load shedder
+        return Promise.resolve({
+          ok: false,
+          status: 529,
+          text: () => Promise.resolve('overloaded'),
+        });
+      });
+
+      const err = await refreshCredentials(current, {
+        fetch,
+        overload: {
+          now: () => nowMs,
+          sleep: (ms: number) => {
+            nowMs += ms;
+            return Promise.resolve();
+          },
+          random: () => 1, // top of the jitter range: the longest sleeps the budget allows
+          statusCache: createStatusProbeCache(),
+          statusFetch: () =>
+            Promise.resolve({
+              ok: true,
+              status: 200,
+              json: () => Promise.resolve<unknown>({ status: { indicator: 'major' } }),
+            }),
+        },
+      }).catch((e: unknown) => e);
+
+      expect(fetch.mock.calls.length).toBeGreaterThan(1);
+      expect(fetch.mock.calls.length).toBeLessThan(PATIENT_OVERLOAD_BUDGET.maxAttempts);
+      expect((err as RefreshError).code).toBe('http_529');
+      // Retries and sleeps together stay inside the locked cap, plus the request that
+      // discovered the overload and the one that ends the loop.
+      expect(nowMs).toBeLessThanOrEqual(LOCKED_OVERLOAD_BUDGET_CAP_MS + 2_000);
     });
 
     it('leaves a 503 on its old single-attempt path', async () => {
