@@ -321,6 +321,17 @@ export class Vault {
     });
   }
 
+  /** Take an account out of (or back into) the daemon's auto-switch target pool. Setting it
+   *  false DELETES the key rather than storing `false`: absent already means "not excluded"
+   *  everywhere that reads it, so the registry keeps only the accounts an operator actually
+   *  chose to exclude instead of accumulating a default on every row. */
+  async setAutoSwitchExcluded(id: string, excluded: boolean): Promise<void> {
+    await this.patchAccount(id, (a) => {
+      if (excluded) a.autoSwitchExcluded = true;
+      else delete a.autoSwitchExcluded;
+    });
+  }
+
   private async patchAccount(id: string, mutate: (a: StoredAccount) => void): Promise<void> {
     const reg = await this.loadRegistry();
     const account = reg.accounts.find((a) => a.id === id);

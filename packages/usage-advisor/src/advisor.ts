@@ -96,9 +96,22 @@ export function computePlan(
   const greedy = options.greedyAutoSwitch === true;
   const analyses = accounts.map((a) => analyze(a, now, cfg));
   const ranking = toRanking(analyses);
+  // May the plan name this account as somewhere to GO? Under greedy auto-switch the plan text
+  // stops being advice and starts describing what the daemon will actually do ("Greedy
+  // auto-switch burns A -> B"), so an account the operator excluded from auto-switch must not
+  // head the burn queue or be the recommendation — the executor will never hop there, and the
+  // line would promise a switch that cannot happen. The account already LIVE is exempt:
+  // exclusion bars hops TO an account, and staying where you are needs no hop at all — the
+  // same carve-out `decideAutoSwitch` makes by only ever filtering non-active candidates.
+  // With greedy off the whole text is advice to a human, who may still switch there by hand,
+  // so exclusion only earns a label (see `buildReason`) and changes nothing about eligibility.
+  const targetable = (a: Analysis): boolean =>
+    !greedy || a.input.active === true || a.input.autoSwitchExcluded !== true;
   // The burn queue: every usable account whose weekly budget is expiring soon, soonest
   // expiry first (ties by label for determinism). This IS the plan — burn down the queue.
-  const burns = analyses
+  // `dropped` keeps the entries greedy removed, so the advice can still account for them
+  // rather than letting an expiring budget disappear from the line (see `buildReason`).
+  const burnable = analyses
     .filter((a) => a.usable && a.burn)
     .sort(
       (a, b) =>
@@ -106,16 +119,21 @@ export function computePlan(
           (b.burn as NonNullable<Analysis['burn']>).resetsAt ||
         a.input.label.localeCompare(b.input.label),
     );
+  const burns = burnable.filter((a) => targetable(a));
+  const dropped = burnable.filter((a) => !targetable(a));
   // Head of the burn queue wins outright — an expiring weekly budget outranks any amount of
   // headroom elsewhere (headroom keeps; expiring budget doesn't). Even if its session window
   // is nearly shut, it is still the right TARGET: the window reopens within hours while the
   // weekly budget is still evaporating. No burns → most headroom wins, as before.
-  const recommended = burns[0] ?? pickRecommended(analyses);
+  // There is deliberately no unfiltered fallback: resurrecting an excluded account as the
+  // recommendation is exactly the false promise this gate exists to prevent — the advisories
+  // would then announce a hop the executor refuses to make.
+  const recommended = burns[0] ?? pickRecommended(analyses.filter(targetable));
   const advisories = buildAdvisories(analyses, recommended, burns.length > 0, greedy);
 
   return {
     recommendedAccountId: recommended?.input.accountId ?? null,
-    reason: buildReason(recommended, analyses, burns, greedy, now),
+    reason: buildReason(recommended, analyses, burns, dropped, greedy, now),
     ranking,
     advisories,
     generatedAtMs: now,
@@ -303,45 +321,78 @@ function buildReason(
   recommended: Analysis | undefined,
   analyses: Analysis[],
   burns: Analysis[],
+  dropped: Analysis[],
   greedy: boolean,
   now: number,
 ): string {
   if (!recommended) {
-    const anyQuarantined = analyses.some((a) => a.input.quarantined);
     if (analyses.length === 0) return 'No accounts configured.';
+    // Greedy can leave the plan without a target while the fleet is perfectly healthy: every
+    // usable account is excluded and none of them is the live one. Reporting an outage there
+    // would be a plain falsehood — the accounts have quota, auto-switch just may not take it.
+    if (analyses.some((a) => a.usable))
+      return 'No auto-switch target: every usable account is excluded from auto-switch.';
+    const anyQuarantined = analyses.some((a) => a.input.quarantined);
     return anyQuarantined
       ? 'No usable account: all are exhausted or quarantined.'
       : 'No usable account: all are out of quota.';
   }
 
-  if (burns.length > 0) {
-    const queue = burns
-      .map((a, i) => {
-        const b = a.burn as NonNullable<Analysis['burn']>;
-        const left = `${roundPct(b.unusedPct)}% ${budgetWord(b.kind)} left`;
-        const when = `${humanizeDuration(b.resetsAt - now)}${b.predicted ? ' (predicted)' : ''}`;
-        // First entry spells everything out; later ones drop the repeated words.
-        return i === 0
-          ? `${a.input.label} (${left}, resets in ${when})`
-          : `${a.input.label} (${left}, in ${when})`;
-      })
-      .join(' → ');
-    // Reserves: usable accounts with no expiring budget — say why they're being skipped.
+  // Greedy drops excluded accounts from the queue, and they normally land in the holds below
+  // with the label saying why. But when dropping them empties the queue there is no queue
+  // sentence left to hold them against, and a budget about to evaporate would vanish from the
+  // plan entirely — the one fact exclusion does NOT make irrelevant, since the operator can
+  // still burn it by hand. So it is named as manual work instead.
+  const manual = burns.length === 0 ? dropped : [];
+  const named = burns.length > 0 ? burns : manual;
+  if (named.length > 0) {
+    // Reserves: usable accounts that are not named in the queue — say why they're being
+    // skipped. Membership is judged against the RENDERED queue, not against `burn`, so an
+    // account greedy dropped for being excluded lands here (with the label saying why)
+    // instead of being listed twice or not at all.
     const holds = analyses
-      .filter((a) => a.usable && !a.burn)
-      .map((a) =>
-        a.weeklyResetAt !== undefined
-          ? `${a.input.label} (weekly resets in ${humanizeDuration(a.weeklyResetAt - now)})`
-          : a.input.label,
+      .filter((a) => a.usable && !named.includes(a))
+      .map(
+        (a) =>
+          (a.weeklyResetAt !== undefined
+            ? `${a.input.label} (weekly resets in ${humanizeDuration(a.weeklyResetAt - now)})`
+            : a.input.label) + exclusionSuffix(a),
       );
     const holdPart = holds.length > 0 ? `; hold ${holds.join(', ')}` : '';
-    return `${greedy ? 'Greedy auto-switch burns' : 'Burn'} ${queue}${holdPart}.`;
+    const lead =
+      burns.length > 0
+        ? `${greedy ? 'Greedy auto-switch burns' : 'Burn'} ${renderQueue(burns, now)}`
+        : `Burn by hand: ${renderQueue(manual, now)}`;
+    return `${lead}${holdPart}.`;
   }
 
-  return `${recommended.input.label} has the most available headroom (${roundPct(recommended.headroomPct)}%).`;
+  return `${recommended.input.label} has the most available headroom (${roundPct(recommended.headroomPct)}%)${exclusionSuffix(recommended)}.`;
+}
+
+/** Render a burn queue: soonest-expiring budget first, each entry labelled if it is excluded
+ *  from auto-switch. The first entry spells everything out; later ones drop the repeated
+ *  words, since the sentence has already established what the figures mean. */
+function renderQueue(entries: Analysis[], now: number): string {
+  return entries
+    .map((a, i) => {
+      const b = a.burn as NonNullable<Analysis['burn']>;
+      const left = `${roundPct(b.unusedPct)}% ${budgetWord(b.kind)} left`;
+      const when = `${humanizeDuration(b.resetsAt - now)}${b.predicted ? ' (predicted)' : ''}`;
+      return i === 0
+        ? `${a.input.label} (${left}, resets in ${when})${exclusionSuffix(a)}`
+        : `${a.input.label} (${left}, in ${when})${exclusionSuffix(a)}`;
+    })
+    .join(' → ');
 }
 
 // ---- small helpers ----
+
+/** The label an excluded account carries wherever the plan line names it. Shown whether or not
+ *  greedy is on: with greedy on it explains why the account is being held rather than burned,
+ *  and with greedy off it warns the human that acting on this advice means switching by hand. */
+function exclusionSuffix(a: Analysis): string {
+  return a.input.autoSwitchExcluded === true ? ' (excluded from auto-switch)' : '';
+}
 
 /** What to CALL the figures a burn entry carries. Normally "weekly", because they came from
  *  the account's overall weekly budget. When the sub-cap had to stand in for a missing

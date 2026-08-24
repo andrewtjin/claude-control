@@ -76,12 +76,14 @@ const account: PollAccount = {
   label: 'Work',
   active: true,
   quarantined: false,
+  autoSwitchExcluded: false,
 };
 const account2: PollAccount = {
   accountId: 'acct-2',
   label: 'Alt',
   active: false,
   quarantined: false,
+  autoSwitchExcluded: false,
 };
 
 describe('UsagePoller', () => {
@@ -465,6 +467,43 @@ describe('UsagePoller', () => {
     expect(skipped.results[0]?.usage.accountUsage.fetchedAtMs).toBe(1000); // data still aged
   });
 
+  it('a skipped cycle re-stamps the auto-switch exclusion, so a toggle takes effect at once', async () => {
+    // Excluding an account is a decision about the very NEXT auto-switch, not the one after the
+    // poll floor expires — so it cannot be allowed to ride along with the retained usage data.
+    let now = 1000;
+    const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(200, liveBody(42))));
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(undefined),
+      clock: () => now,
+    });
+
+    const live = await poller.pollAll([account]);
+    expect(live.results[0]?.usage.advisorInput.autoSwitchExcluded).toBe(false);
+
+    now = POLL_FLOOR_MS - 1;
+    const excluded: PollAccount = { ...account, autoSwitchExcluded: true };
+    const skipped = await poller.pollAll([excluded]);
+    expect(skipped.results[0]?.outcome).toBe('skipped');
+    expect(skipped.results[0]?.usage.advisorInput.autoSwitchExcluded).toBe(true);
+    expect(skipped.results[0]?.usage.accountUsage.autoSwitchExcluded).toBe(true);
+  });
+
+  it('parsed inputs carry the exclusion from a live poll straight to the advisor', async () => {
+    const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(200, liveBody(20))));
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(undefined),
+      clock: () => 1000,
+    });
+    const snapshot = await poller.pollAll([{ ...account, autoSwitchExcluded: true }, account2]);
+    expect(snapshot.results[0]?.usage.advisorInput.autoSwitchExcluded).toBe(true);
+    expect(snapshot.results[1]?.usage.advisorInput.autoSwitchExcluded).toBe(false);
+    expect(snapshot.accounts[0]?.autoSwitchExcluded).toBe(true);
+  });
+
   it('one account failing to read tier-0 cache degrades only that account, not the whole cycle', async () => {
     const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(200, liveBody(20))));
     const poller = new UsagePoller({
@@ -690,6 +729,7 @@ describe('toUsageSnapshotPayload — what actually goes on the wire', () => {
           label: accountId,
           active: false,
           quarantined: false,
+          autoSwitchExcluded: false,
           fetchedAtMs: r.atMs,
           source: 'live',
         }).accountUsage,

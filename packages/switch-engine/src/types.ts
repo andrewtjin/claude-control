@@ -90,6 +90,13 @@ export interface StoredAccount {
   metadataBackfillFailedAtMs?: number;
   /** A quarantined account has a dead refresh token and must be re-logged-in before use. */
   quarantined: boolean;
+  /** True when the operator has taken this account out of the daemon's auto-switch TARGET pool.
+   *  Deliberate switches still reach it (`cctl switch`, the phone's `/switch`), and it can still
+   *  be hopped AWAY from while it is live — only the unattended choice of WHERE to hop skips it.
+   *  A chosen setting, not an incident, so unlike quarantine it carries no reason or timestamp.
+   *  Absent means "not excluded", which is what every row written before this field says: old
+   *  registries need no migration. */
+  autoSwitchExcluded?: boolean;
   quarantineReason?: string;
   quarantinedAtMs?: number;
   createdAtMs: number;
