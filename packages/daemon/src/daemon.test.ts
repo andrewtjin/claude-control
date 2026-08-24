@@ -2796,6 +2796,127 @@ describe('Daemon lifecycle', () => {
     ).toEqual({ decision: 'block', reason: 'undelivered' });
   });
 
+  // ---- what a restart keeps ----
+  //
+  // Every /say the phone accepts is answered "delivers when the session finishes its current
+  // turn". A registered terminal session is a different process, so it is still there after the
+  // daemon restarts — which makes an in-memory queue a promise the daemon quietly broke, with
+  // the next Stop hook answering ok and nothing ever saying the text was gone. These run two
+  // real daemons over one sqlite file, because nothing short of that proves what survives.
+
+  it('queued steering survives a daemon restart and delivers at the next Stop hook', async () => {
+    const dbDir = await mkdtemp(join(tmpdir(), 'daemon-steering-restart-'));
+    try {
+      store.close(); // the beforeEach :memory: store; this test needs a file to reopen
+      const dbPath = join(dbDir, 'daemon.db');
+      await startDaemonOver(dbPath);
+      seedTerminalSession('terminal-restart');
+      relay.push({
+        daemonId: 'daemon-under-test',
+        type: 'prompt.inject',
+        payload: {
+          sessionId: 'terminal-restart',
+          text: 'survive the restart',
+          idempotencyKey: 'rs-1',
+        },
+      });
+      await waitFor(() => cardOfType('steering_queued') !== undefined);
+      await daemon.stop();
+
+      const port = await startDaemonOver(dbPath);
+      expect(
+        await postHook(port, { hook_event_name: 'Stop', session_id: 'terminal-restart' }),
+      ).toEqual({ decision: 'block', reason: 'survive the restart' });
+
+      // Consumed, not merely re-read: the row is retired with the queue entry, so no later
+      // restart can hand the session the same guidance a second time.
+      expect(store.listPendingSteering()).toEqual([]);
+      expect(
+        await postHook(port, { hook_event_name: 'Stop', session_id: 'terminal-restart' }),
+      ).toEqual({ ok: true });
+    } finally {
+      await daemon.stop().catch(() => {});
+      await rm(dbDir, { recursive: true, force: true });
+    }
+  });
+
+  it('steering that aged out while the daemon was down is dropped with a card naming the count', async () => {
+    const dbDir = await mkdtemp(join(tmpdir(), 'daemon-steering-ttl-restart-'));
+    let now = 1_000_000;
+    try {
+      store.close();
+      const dbPath = join(dbDir, 'daemon.db');
+      await startDaemonOver(dbPath, () => now);
+      seedTerminalSession('terminal-restart-ttl');
+      relay.push({
+        daemonId: 'daemon-under-test',
+        type: 'prompt.inject',
+        payload: {
+          sessionId: 'terminal-restart-ttl',
+          text: 'stale by the time it comes back',
+          idempotencyKey: 'rs-ttl-1',
+        },
+      });
+      await waitFor(() => cardOfType('steering_queued') !== undefined);
+      await daemon.stop();
+
+      // The whole TTL passes with the daemon down, which is exactly the staleness it exists to
+      // catch: the text was written for a context that is now half an hour gone.
+      now += 31 * 60_000;
+      const port = await startDaemonOver(dbPath, () => now);
+
+      await waitFor(() => cardOfType('steering_expired') !== undefined);
+      expect(cardOfType('steering_expired')?.body).toContain('1 message');
+      // Dropped, not delivered — and the row went with it.
+      expect(
+        await postHook(port, { hook_event_name: 'Stop', session_id: 'terminal-restart-ttl' }),
+      ).toEqual({ ok: true });
+      expect(store.listPendingSteering()).toEqual([]);
+    } finally {
+      await daemon.stop().catch(() => {});
+      await rm(dbDir, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdown falls undelivered channel text back to steering and tells the phone', async () => {
+    const dbDir = await mkdtemp(join(tmpdir(), 'daemon-channel-shutdown-'));
+    try {
+      store.close();
+      const dbPath = join(dbDir, 'daemon.db');
+      const hookPort = await startDaemonOver(dbPath);
+      seedTerminalSession('terminal-chan-shutdown');
+      const { attachId } = await attachChannel(hookPort, 'terminal-chan-shutdown');
+      if (attachId === undefined) throw new Error('attach failed');
+      relay.push({
+        daemonId: 'daemon-under-test',
+        type: 'prompt.inject',
+        payload: {
+          sessionId: 'terminal-chan-shutdown',
+          text: 'still in the channel',
+          idempotencyKey: 'ch-sd-1',
+        },
+      });
+      await waitFor(() => cardOfType('channel_sent') !== undefined);
+
+      // The channel server never collects it, and the daemon goes down under it.
+      await daemon.stop();
+      const port = await startDaemonOver(dbPath);
+
+      // The phone's last word on this message was "sent", so shutting down owes it an answer.
+      // (Sent as the daemon went down, or replayed from the durable outbox if the socket closed
+      // first — either way it arrives, which is the point.)
+      await waitFor(() => cardOfType('channel_fell_back') !== undefined);
+      // And the answer is true rather than consoling: the text really is on the turn-boundary
+      // queue, and the daemon that comes up next delivers it.
+      expect(
+        await postHook(port, { hook_event_name: 'Stop', session_id: 'terminal-chan-shutdown' }),
+      ).toEqual({ decision: 'block', reason: 'still in the channel' });
+    } finally {
+      await daemon.stop().catch(() => {});
+      await rm(dbDir, { recursive: true, force: true });
+    }
+  });
+
   it('queued steering delivers via Stop first; a later UserPromptSubmit finds nothing left', async () => {
     seedTerminalSession('terminal-upsub-2');
     const hookPort = await startCapturingHookPort();
@@ -3136,8 +3257,9 @@ describe('Daemon lifecycle', () => {
   // ---- cctl session registry (loopback CLI endpoints) + display mirror ----
 
   /** Rebuild + start the daemon with a port-capturing endpoint publisher, so the test knows the
-   *  loopback port to POST cctl-session commands at. Returns the bound port. */
-  async function startCapturingHookPort(): Promise<number> {
+   *  loopback port to POST cctl-session commands at. Returns the bound port. `clock` is for the
+   *  tests that have to move time across a restart. */
+  async function startCapturingHookPort(clock?: () => number): Promise<number> {
     let captured: number | undefined;
     daemon = new Daemon({
       store,
@@ -3153,11 +3275,36 @@ describe('Daemon lifecycle', () => {
         return Promise.resolve();
       },
       pollIntervalMs: 100_000,
+      ...(clock !== undefined ? { clock } : {}),
     });
     await daemon.start();
     await waitFor(() => captured !== undefined);
     if (captured === undefined) throw new Error('hook port was never published');
     return captured;
+  }
+
+  /** Start a whole daemon stack over `dbPath` — a real sqlite FILE, because `stop()` closes the
+   *  store and a `:memory:` database dies with it. This is what lets a test stop one daemon and
+   *  start another over the state the first one left behind, which is the only honest way to ask
+   *  what a restart keeps. Returns the new daemon's loopback port. */
+  async function startDaemonOver(dbPath: string, clock?: () => number): Promise<number> {
+    store = new Store(dbPath);
+    hookReceiver = new HookReceiver({
+      store,
+      secret: 'shh',
+      emit: () => {},
+      daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unknown',
+    });
+    controlPlaneClient = new ControlPlaneClient({
+      url: relay.url(relayPort),
+      identityStore: memoryIdentityStore({ daemonId: 'daemon-under-test', daemonToken: 'tok' }),
+      store,
+      hostLabel: 'test',
+      reconnectBaseMs: 10,
+      heartbeatMs: 100_000,
+    });
+    attributionJournal = new AttributionJournal({ store, vaultDir });
+    return startCapturingHookPort(clock);
   }
 
   /** POST a cctl-session command to the daemon's loopback CLI endpoint (real HTTP, house
