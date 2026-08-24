@@ -67,6 +67,7 @@ import {
 import {
   canWriteManagedDir,
   cctlDropInPath,
+  renderCctlDropInPlan,
   diffCctlDropIn,
   managedDropInDir,
   readCctlDropIn,
@@ -758,7 +759,16 @@ function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
     hooksProfilePath: settingsPath,
     channelEnabled: async () => {
       const status = await verifyManagedSettingsEffective({});
-      return { effective: status.effective, detail: status.detail, path: status.path };
+      // The wizard asks for the same administrator rights `cctl channel enable` does, so it must
+      // show the same thing first. Rendered here, from the real on-disk state, rather than
+      // described in the wizard's own words: the plan the operator reads is the plan that runs.
+      const current = await readCctlDropIn(status.path).catch(() => ({ present: false }));
+      return {
+        effective: status.effective,
+        detail: status.detail,
+        path: status.path,
+        plan: renderCctlDropInPlan(status.path, diffCctlDropIn(current)),
+      };
     },
     enableChannel: async () => {
       // Already writable (an elevated shell, or a non-Windows box under sudo) — no need to ask
@@ -1054,7 +1064,7 @@ async function reauthAccount(ref: string): Promise<void> {
       '  2. The page shows a code like `abc123#xyz` - copy the WHOLE thing.\n\n',
   );
   // Read from stdin rather than an argv option on purpose: an argument would put the code into
-  // shell history and `ps`. Plain line read, so piped (non-TTY) input works too.
+  // shell history and `ps`. Plain line read, so a piped (non-TTY) stdin works too.
   const { io, close } = createWizardIo();
   let pasted: string;
   try {
@@ -1280,20 +1290,7 @@ function buildChannelCommands(program: Command): void {
       const diff = diffCctlDropIn(current);
 
       // A file the operator cannot override is never written without showing it first.
-      process.stdout.write(`${diff.action === 'create' ? 'Create' : 'Update'}: ${path}\n\n`);
-      process.stdout.write(`${diff.desiredText}\n`);
-      if (diff.parseError !== undefined) {
-        process.stdout.write(
-          `warning: the existing file is not valid JSON (${diff.parseError}); it will be replaced.\n`,
-        );
-      }
-      if (diff.removedPlugins.length > 0) {
-        process.stdout.write(
-          `warning: this removes ${diff.removedPlugins
-            .map((r) => `${r.plugin}@${r.marketplace}`)
-            .join(', ')} from the approved list.\n`,
-        );
-      }
+      process.stdout.write(renderCctlDropInPlan(path, diff));
       if (opts.print === true) return;
       if (!diff.changed) {
         process.stdout.write('Already up to date; nothing to do.\n');

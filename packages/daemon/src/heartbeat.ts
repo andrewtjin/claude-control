@@ -54,7 +54,18 @@ export class HeartbeatWriter {
   start(): void {
     if (this.timer) return; // already running — start() is idempotent
     const tick = (): void => {
-      this.pending = this.writeOnce().catch((err: unknown) => this.onError?.(err));
+      // Stamped HERE, not inside the write: the beat records when the daemon's loop was alive,
+      // and a write that waits its turn behind a slow one must still report the moment its tick
+      // fired rather than the moment the disk got around to it.
+      const writtenAtMs = this.clock();
+      // Chained onto the previous write, never fired alongside it. Two atomic replaces of the
+      // same path can finish in either order, so an older beat landing last would publish a
+      // timestamp that moves BACKWARDS — a live daemon reading as staler than it is. Chaining
+      // also makes flush() a real barrier: it awaits every write started so far, not just the
+      // most recent one.
+      this.pending = this.pending
+        .then(() => this.writeOnce(writtenAtMs))
+        .catch((err: unknown) => this.onError?.(err));
     };
     tick();
     this.timer = setInterval(tick, this.intervalMs);
@@ -65,15 +76,16 @@ export class HeartbeatWriter {
     this.timer = undefined;
   }
 
-  /** Resolves once the most recently started write has settled (it never rejects — write
-   *  failures are routed to `onError`). The timer fires writes fire-and-forget, so this is
-   *  the only way a caller (a clean shutdown, a test) can line up behind the real fs work. */
+  /** Resolves once every write started so far has settled (it never rejects — write failures
+   *  are routed to `onError`). The timer fires writes fire-and-forget, so this is the only way
+   *  a caller (a clean shutdown, a test) can line up behind the real fs work; because the
+   *  writes are chained, awaiting the tail awaits all of them. */
   flush(): Promise<void> {
     return this.pending;
   }
 
-  private async writeOnce(): Promise<void> {
-    const payload: HeartbeatFile = { writtenAtMs: this.clock() };
+  private async writeOnce(writtenAtMs: number): Promise<void> {
+    const payload: HeartbeatFile = { writtenAtMs };
     // Atomic replace, not a plain write: `cctl daemon status` reads this file on its own
     // schedule, and a reader that catches a truncated write parses nothing and reports the
     // daemon as having NEVER run — the most alarming possible reading of a live daemon.

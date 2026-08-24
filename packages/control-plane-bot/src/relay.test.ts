@@ -125,6 +125,21 @@ function waitForClose(ws: WebSocket, timeoutMs = 2000): Promise<number> {
   });
 }
 
+/** The whole close frame, for the refusals whose REASON is the point — a code alone cannot say
+ *  which of the relay's ceilings a daemon hit. */
+function waitForCloseFrame(
+  ws: WebSocket,
+  timeoutMs = 2000,
+): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for close')), timeoutMs);
+    ws.once('close', (code, reason: Buffer) => {
+      clearTimeout(timer);
+      resolve({ code, reason: reason.toString('utf8') });
+    });
+  });
+}
+
 function sendEnvelope(ws: WebSocket, draft: EnvelopeDraft): void {
   ws.send(encode(stamp(draft)));
 }
@@ -694,7 +709,10 @@ describe('RelayServer outbound backpressure cap', () => {
     await relay.close();
   });
 
-  it('drops a daemon socket whose outbound buffer exceeds the cap and reports it offline', async () => {
+  /** Connect a bound daemon and push frames until the outbound guard trips, handing back the
+   *  wedged socket and the refusing result. Shared so each test asserts on a different half of
+   *  the same setup rather than rebuilding a stuck socket per assertion. */
+  async function wedgeOutboundBuffer(): Promise<{ ws: WebSocket; result: SendResult }> {
     const token = mintToken();
     await bindings.bind('user-a', 'daemon-1', await hashToken(token), 'host', Date.now());
     const ws = await connect(port);
@@ -720,9 +738,24 @@ describe('RelayServer outbound backpressure cap', () => {
         payload: { requestId: `r${i}`, prompt: chunk, idempotencyKey: `i${i}` },
       }));
     }
-    // The guard tripped: the stuck socket was terminated and evicted, so the daemon reads offline.
+    return { ws, result };
+  }
+
+  it('drops a daemon socket whose outbound buffer exceeds the cap and reports it offline', async () => {
+    const { ws, result } = await wedgeOutboundBuffer();
+    // The guard tripped: the stuck socket was dropped and evicted, so the daemon reads offline.
     expect(result.ok).toBe(false);
     expect(relay.isOnline('user-a')).toBe(false);
     ws.close();
+  });
+
+  it('names the cap in the close frame, so the drop is not just another 1006', async () => {
+    const { ws } = await wedgeOutboundBuffer();
+    // Generous bound: the client has to drain everything the loop above buffered before the
+    // close frame queued behind it can arrive.
+    const frame = await waitForCloseFrame(ws, 15_000);
+    // A terminate would surface as 1006 with an empty reason — indistinguishable from a dropped
+    // network. The refusal has to say which ceiling was hit, like every other one in the relay.
+    expect(frame).toEqual({ code: 4009, reason: 'outbound buffer cap exceeded' });
   });
 });

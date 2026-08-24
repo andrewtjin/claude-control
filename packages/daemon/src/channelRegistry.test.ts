@@ -314,13 +314,19 @@ describe('detach and sweep', () => {
     expect(reg.list()).toHaveLength(2);
   });
 
-  it('drains everything on shutdown', () => {
+  it('drains everything on shutdown, naming the session each message was for', () => {
     const reg = new ChannelRegistry();
     reg.attach(attachInput('sess-1'));
     reg.attach(attachInput('sess-2'));
     reg.enqueue('sess-1', 'a');
     reg.enqueue('sess-2', 'b');
-    expect(reg.close()).toHaveLength(2);
+    // Grouped by attachment, not flattened: the caller has to fall each message back to ITS
+    // session's turn-boundary queue, which a bare list of texts cannot tell it how to do.
+    const drained = reg.close();
+    expect(drained.map((d) => [d.attachment.sessionId, d.recovered.map((i) => i.text)])).toEqual([
+      ['sess-1', ['a']],
+      ['sess-2', ['b']],
+    ]);
     expect(reg.list()).toEqual([]);
   });
 

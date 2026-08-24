@@ -74,8 +74,10 @@ export interface SetupDeps {
   /** The settings.json the daemon installs hooks into — reported to the user. */
   hooksProfilePath: string;
 
-  /** Whether prompts from the phone can already reach a session sitting idle at its prompt. */
-  channelEnabled(): Promise<{ effective: boolean; detail: string; path: string }>;
+  /** Whether prompts from the phone can already reach a session sitting idle at its prompt.
+   *  `plan` is the rendered file the wizard shows before asking — the same text `cctl channel
+   *  enable` prints, so the two paths cannot drift into showing different things. */
+  channelEnabled(): Promise<{ effective: boolean; detail: string; path: string; plan: string }>;
   /** Approve cctl as a Claude Code channel. Needs administrator rights once, so the wizard asks
    *  first and treats `'declined'` as a choice rather than a failure. */
   enableChannel(): Promise<{
@@ -397,9 +399,13 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
     io.write(
       'Without this, a prompt you send from Discord waits until the session finishes a turn or\n' +
         'you type in it — which never happens while you are away, the case phone control is for.\n' +
-        `Enabling it writes one file that Claude Code reads as administrator policy:\n  ${channel.path}\n` +
-        `${p.dim('You will see one Windows consent prompt now, and none afterwards.')}\n`,
+        'Enabling it writes one file that Claude Code reads as administrator policy:\n\n',
     );
+    // Shown in full, not merely named. A file the operator cannot override is never written
+    // without showing it first, and this step asks for exactly the administrator rights
+    // `cctl channel enable` asks for — so it owes the reader exactly what that command shows.
+    io.write(channel.plan);
+    io.write(`${p.dim('You will see one Windows consent prompt now, and none afterwards.')}\n`);
     if (isYes(await io.ask('Enable prompts to idle sessions? [y/N]: '))) {
       const result = await deps.enableChannel();
       switch (result.outcome) {

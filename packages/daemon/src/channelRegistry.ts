@@ -275,11 +275,19 @@ export class ChannelRegistry {
     return dead;
   }
 
-  /** Shut the registry: refuse further attachments and hand back everything still undelivered.
-   *  The latch is the point — a drain alone leaves a window in which a client re-attaches and
-   *  re-populates a registry nobody will drain again. */
-  close(): ChannelInjection[] {
+  /** Shut the registry: refuse further attachments and hand back everything still undelivered,
+   *  grouped by the attachment it was queued for. The latch is the point — a drain alone leaves
+   *  a window in which a client re-attaches and re-populates a registry nobody will drain again.
+   *
+   *  Shaped like {@link sweepStale} rather than a flat list, because undelivered text is only
+   *  actionable if the caller knows WHICH session it was for: falling it back to that session's
+   *  turn-boundary queue, and telling the operator which session's messages did not arrive, are
+   *  both impossible from a bare array of texts. */
+  close(): { attachment: ChannelAttachment; recovered: ChannelInjection[] }[] {
     this.closed = true;
-    return [...this.attachments.keys()].flatMap((attachId) => this.detach(attachId));
+    return [...this.attachments.values()].map((attachment) => ({
+      attachment,
+      recovered: this.detach(attachment.attachId),
+    }));
   }
 }
