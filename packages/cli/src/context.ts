@@ -67,8 +67,39 @@ export function buildEngine(
   return new SwitchEngine(options);
 }
 
-/** Print an error line and exit non-zero — the single failure path for command actions. */
+/** The CLI's "stop here, with this message" signal. Its message is the whole error — already
+ *  phrased for a human — so the entry point prints that and never a stack. */
+export class CliFailure extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CliFailure';
+  }
+}
+
+/**
+ * End the current command with an error line and a non-zero exit — the single failure path for
+ * command actions.
+ *
+ * It THROWS rather than calling `process.exit`, and that is load-bearing. A command that failed
+ * mid-network still has sockets closing when it gives up; exiting on top of them asks libuv to
+ * finish closing a handle whose loop is already gone, which it refuses with an assertion — so a
+ * caller checking for exit code 1 intermittently gets a crash code instead. The entry point
+ * catches this, prints the line, and sets `process.exitCode`, letting the loop drain on its own.
+ *
+ * The `never` return that callers narrow on is preserved by the throw. One behavior does change:
+ * `finally` blocks on the way out now RUN, where `process.exit` skipped them — which is what the
+ * flows holding token-bearing temporary directories wanted in the first place.
+ */
 export function fail(message: string): never {
-  process.stderr.write(`error: ${message}\n`);
-  process.exit(1);
+  throw new CliFailure(message);
+}
+
+/** Report a fatal error and ask for a non-zero exit without tearing the loop down. Split out of
+ *  the entry point so the exit path is testable; the race it exists to avoid is not. */
+export function reportFatal(
+  err: unknown,
+  sink: { write(text: string): unknown } = process.stderr,
+): void {
+  sink.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+  process.exitCode = 1;
 }
