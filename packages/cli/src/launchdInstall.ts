@@ -14,7 +14,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 
 export const DAEMON_AGENT_LABEL = 'com.claude-control.daemon';
 
@@ -58,8 +58,11 @@ const defaultPlistFs: PlistFs = {
   },
 };
 
+/** Where launchd expects a per-user agent. Joined as a POSIX path on every platform: this is a
+ *  macOS location by definition, so the platform separator would only ever be wrong — it turns
+ *  `/Users/u/...` into backslashes when the code merely runs on Windows (as its tests do). */
 export function daemonAgentPlistPath(home: string = homedir()): string {
-  return join(home, 'Library', 'LaunchAgents', `${DAEMON_AGENT_LABEL}.plist`);
+  return posix.join(home, 'Library', 'LaunchAgents', `${DAEMON_AGENT_LABEL}.plist`);
 }
 
 function xmlEscape(value: string): string {
