@@ -75,6 +75,10 @@ export interface PollAccount {
   label: string;
   active: boolean;
   quarantined: boolean;
+  /** Whether the operator has barred auto-switch from hopping TO this account. Read from the
+   *  registry every cycle beside `active`/`quarantined`, never polled — see `restampIdentity`
+   *  for why that distinction decides how a skipped cycle treats it. */
+  autoSwitchExcluded: boolean;
 }
 
 /** The registry-only facts that ride out on the usage snapshot beside the polled numbers.
@@ -209,10 +213,10 @@ export class UsagePoller {
       // (original fetchedAtMs + source), tagged 'skipped' so callers can tell "we
       // deliberately didn't poll" apart from "we polled and got nothing new". Deliberately
       // does NOT re-read tier-0 — re-reading and stamping fetchedAtMs:now here would report
-      // stale, frozen cache as freshly-fetched. Identity flags (active/quarantined/label)
-      // are NOT polled data though — the caller knows them fresh every cycle — so they are
-      // re-stamped: a switch during the poll floor must not leave the advisor and the
-      // auto-switcher reasoning about who WAS active up to 3 minutes ago.
+      // stale, frozen cache as freshly-fetched. Identity flags (active/quarantined/label/
+      // auto-switch exclusion) are NOT polled data though — the caller knows them fresh every
+      // cycle — so they are re-stamped: a switch during the poll floor must not leave the
+      // advisor and the auto-switcher reasoning about who WAS active up to 3 minutes ago.
       return {
         accountId: account.accountId,
         usage: restampIdentity(state.lastResult, account),
@@ -324,6 +328,7 @@ export class UsagePoller {
         label: account.label,
         active: account.active,
         quarantined: account.quarantined,
+        autoSwitchExcluded: account.autoSwitchExcluded,
         fetchedAtMs: now,
         source: 'live',
       });
@@ -358,6 +363,7 @@ export class UsagePoller {
       label: account.label,
       active: account.active,
       quarantined: account.quarantined,
+      autoSwitchExcluded: account.autoSwitchExcluded,
       fetchedAtMs: now,
       source: 'cached',
     });
@@ -446,6 +452,7 @@ export class UsagePoller {
       label: account.label,
       active: account.active,
       quarantined: account.quarantined,
+      autoSwitchExcluded: account.autoSwitchExcluded,
       fetchedAtMs: now,
       source: 'cached',
     });
@@ -462,19 +469,23 @@ export class UsagePoller {
 
 /** Overwrite a retained result's identity flags with the caller's current ones. Usage
  *  numbers age with the poll floor; WHO is active does not — it changes the instant a
- *  switch commits, and both frontends and the auto-switcher must see that immediately. */
+ *  switch commits, and both frontends and the auto-switcher must see that immediately. The
+ *  auto-switch exclusion is the same kind of fact: an operator who excludes an account expects
+ *  the very next decision to honor it, not one taken up to a poll floor later. */
 function restampIdentity(usage: ParsedUsage, account: PollAccount): ParsedUsage {
   return {
     accountUsage: {
       ...usage.accountUsage,
       label: account.label,
       active: account.active,
+      autoSwitchExcluded: account.autoSwitchExcluded,
     },
     advisorInput: {
       ...usage.advisorInput,
       label: account.label,
       active: account.active,
       quarantined: account.quarantined,
+      autoSwitchExcluded: account.autoSwitchExcluded,
     },
   };
 }

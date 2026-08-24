@@ -1329,6 +1329,36 @@ describe('refreshToken — background refresh for polling', () => {
   });
 });
 
+describe('setAutoSwitchExcluded', () => {
+  it('round-trips the flag through the registry and clears it again', async () => {
+    const h = await harness();
+    const { accountB } = await seedAActiveWithB(h);
+    const flagOf = async () =>
+      (await h.engine.listAccounts()).find((a) => a.id === accountB.id)?.autoSwitchExcluded;
+
+    expect(await flagOf()).toBeUndefined();
+    await h.engine.setAutoSwitchExcluded(accountB.id, true);
+    expect(await flagOf()).toBe(true);
+    await h.engine.setAutoSwitchExcluded(accountB.id, false);
+    expect(await flagOf()).toBeUndefined();
+  });
+
+  it('never leaves the account unusable — an excluded account still activates', async () => {
+    // Exclusion governs where AUTO-switch may go; a deliberate switch must be unaffected.
+    const h = await harness();
+    const { accountB } = await seedAActiveWithB(h);
+    await h.engine.setAutoSwitchExcluded(accountB.id, true);
+    await expect(h.engine.activate(accountB.id)).resolves.toMatchObject({ ok: true });
+  });
+
+  it('rejects an unknown account id', async () => {
+    const h = await harness();
+    await expect(h.engine.setAutoSwitchExcluded('nope', true)).rejects.toBeInstanceOf(
+      UnknownAccountError,
+    );
+  });
+});
+
 describe('registry mutators serialize against the credential lock', () => {
   /** An engine on `paths` whose registry mutators give up quickly under contention, so the test
    *  observes the lock-contention error without waiting out a long timeout. */
@@ -1371,6 +1401,11 @@ describe('registry mutators serialize against the credential lock', () => {
   it('clearQuarantine waits on the lock', async () => {
     const h = await harness();
     await expectBlockedWhileLocked(h.paths, (e) => e.clearQuarantine('any-id'));
+  });
+
+  it('setAutoSwitchExcluded waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.setAutoSwitchExcluded('any-id', true));
   });
 
   it('captureCurrentLogin waits on the lock (the add + setActive path)', async () => {
