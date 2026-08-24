@@ -12,7 +12,12 @@ function acct(
   accountId: string,
   label: string,
   limits: LimitInput[],
-  extra: { active?: boolean; quarantined?: boolean; predictedResetAt?: number } = {},
+  extra: {
+    active?: boolean;
+    quarantined?: boolean;
+    predictedResetAt?: number;
+    autoSwitchExcluded?: boolean;
+  } = {},
 ): AccountUsageInput {
   return {
     accountId,
@@ -21,6 +26,9 @@ function acct(
     quarantined: extra.quarantined ?? false,
     limits,
     ...(extra.predictedResetAt !== undefined ? { predictedResetAt: extra.predictedResetAt } : {}),
+    ...(extra.autoSwitchExcluded !== undefined
+      ? { autoSwitchExcluded: extra.autoSwitchExcluded }
+      : {}),
   };
 }
 
@@ -174,6 +182,161 @@ describe('computePlan — burn-before-reset (the core behavior)', () => {
         'hold Reserve (weekly resets in 6d).',
     );
     // The queue itself is identical — only the wording changes.
+    expect(plan.recommendedAccountId).toBe('a');
+  });
+
+  it('never names an excluded account as a greedy burn target, and says why it is held', () => {
+    // Locked has the soonest-expiring budget and would head the queue, but the daemon is the
+    // one executing this plan and auto-switch will never hop there — so the line must not
+    // promise a burn that cannot happen.
+    const locked = acct(
+      'x',
+      'Locked',
+      [{ kind: 'weekly_all', percent: 50, resetsAt: NOW + HOUR }],
+      {
+        autoSwitchExcluded: true,
+      },
+    );
+    const burnme = acct('a', 'Burnme', [
+      { kind: 'weekly_all', percent: 60, resetsAt: NOW + 2 * HOUR },
+    ]);
+    const reserve = acct('b', 'Reserve', [
+      { kind: 'weekly_all', percent: 20, resetsAt: NOW + 6 * DAY },
+    ]);
+    const plan = computePlan([burnme, locked, reserve], { ...opts, greedyAutoSwitch: true });
+    expect(plan.reason).toBe(
+      'Greedy auto-switch burns Burnme (40% weekly left, resets in 2h); ' +
+        'hold Locked (weekly resets in 1h) (excluded from auto-switch), ' +
+        'Reserve (weekly resets in 6d).',
+    );
+    expect(plan.recommendedAccountId).toBe('a');
+  });
+
+  it('keeps an excluded account burnable when the advice is for a human, and labels it', () => {
+    // Greedy off: nothing executes this plan, so the operator may still switch by hand — the
+    // queue keeps its true order and only gains the label.
+    const locked = acct(
+      'x',
+      'Locked',
+      [{ kind: 'weekly_all', percent: 50, resetsAt: NOW + HOUR }],
+      {
+        autoSwitchExcluded: true,
+      },
+    );
+    const burnme = acct('a', 'Burnme', [
+      { kind: 'weekly_all', percent: 60, resetsAt: NOW + 2 * HOUR },
+    ]);
+    const plan = computePlan([burnme, locked], opts);
+    expect(plan.reason).toBe(
+      'Burn Locked (50% weekly left, resets in 1h) (excluded from auto-switch) → ' +
+        'Burnme (40% weekly left, in 2h).',
+    );
+    expect(plan.recommendedAccountId).toBe('x');
+  });
+
+  it('still recommends the only usable account when greedy and every account is excluded', () => {
+    // Nothing to hop to means the fleet keeps running on what is live — claiming "no usable
+    // account" would be false, and the phone would show an outage that is not happening.
+    const only = acct('a', 'Solo', [{ kind: 'weekly_all', percent: 20 }], {
+      active: true,
+      autoSwitchExcluded: true,
+    });
+    const plan = computePlan([only], { ...opts, greedyAutoSwitch: true });
+    expect(plan.recommendedAccountId).toBe('a');
+  });
+
+  it('still burns the LIVE account when it is the excluded one', () => {
+    // Exclusion bars hops TO an account; the fleet is already on this one, so burning its
+    // soonest-expiring budget needs no switch at all. Demoting it to a hold would have the
+    // plan advertise a hop away that auto-switch will never make — it only fires when someone
+    // ELSE expires sooner — while the fleet quietly burns the budget the line called held.
+    const live = acct('a', 'Live', [{ kind: 'weekly_all', percent: 50, resetsAt: NOW + HOUR }], {
+      active: true,
+      autoSwitchExcluded: true,
+    });
+    const other = acct('b', 'Other', [
+      { kind: 'weekly_all', percent: 60, resetsAt: NOW + 5 * HOUR },
+    ]);
+    const plan = computePlan([live, other], { ...opts, greedyAutoSwitch: true });
+    expect(plan.reason).toBe(
+      'Greedy auto-switch burns Live (50% weekly left, resets in 1h) (excluded from auto-switch) → ' +
+        'Other (40% weekly left, in 5h).',
+    );
+    expect(plan.recommendedAccountId).toBe('a');
+  });
+
+  it('keeps the excluded live account as the recommendation when there is nothing to burn', () => {
+    // Same rule on the no-burn path: filtering the live account out of the pool would print a
+    // superlative about a less healthy account while the ranking in the same payload shows the
+    // live one scoring far higher, and nothing forces a hop off a healthy account anyway.
+    const alpha = acct(
+      'a',
+      'Alpha',
+      [
+        { kind: 'session', percent: 5 },
+        { kind: 'weekly_all', percent: 5 },
+      ],
+      { active: true, autoSwitchExcluded: true },
+    );
+    const bravo = acct('b', 'Bravo', [
+      { kind: 'session', percent: 60 },
+      { kind: 'weekly_all', percent: 60 },
+    ]);
+    const plan = computePlan([alpha, bravo], { ...opts, greedyAutoSwitch: true });
+    expect(plan.recommendedAccountId).toBe('a');
+    expect(plan.reason).toBe(
+      'Alpha has the most available headroom (95%) (excluded from auto-switch).',
+    );
+  });
+
+  it('never promises a hop to an excluded account when the live one is out of quota', () => {
+    // The only spare is excluded, so auto-switch has nowhere to go. Naming it anyway would
+    // leave the operator waiting for a recovery that never arrives instead of switching by
+    // hand — the plan says there is no target rather than inventing one.
+    const live = acct(
+      'a',
+      'Live',
+      [
+        { kind: 'session', percent: 100 },
+        { kind: 'weekly_all', percent: 99 },
+      ],
+      { active: true },
+    );
+    const spare = acct('b', 'Spare', [{ kind: 'weekly_all', percent: 20 }], {
+      autoSwitchExcluded: true,
+    });
+    const plan = computePlan([live, spare], { ...opts, greedyAutoSwitch: true });
+    expect(plan.recommendedAccountId).toBeNull();
+    expect(plan.advisories.some((x) => x.kind === 'switch_now')).toBe(false);
+    expect(plan.reason).toBe(
+      'No auto-switch target: every usable account is excluded from auto-switch.',
+    );
+  });
+
+  it('names a sole excluded burn candidate as manual work instead of dropping it', () => {
+    // Greedy filtering empties the queue here. The expiring budget is still the most
+    // actionable fact on the fleet — nothing automatic will burn it, and the operator can —
+    // so it must not vanish from the line along with the queue.
+    const live = acct(
+      'a',
+      'Live',
+      [{ kind: 'weekly_all', percent: 30, resetsAt: NOW + 200 * HOUR }],
+      { active: true },
+    );
+    const locked = acct(
+      'x',
+      'Locked',
+      [{ kind: 'weekly_all', percent: 40, resetsAt: NOW + HOUR }],
+      {
+        autoSwitchExcluded: true,
+      },
+    );
+    const plan = computePlan([live, locked], { ...opts, greedyAutoSwitch: true });
+    expect(plan.reason).toBe(
+      'Burn by hand: Locked (60% weekly left, resets in 1h) (excluded from auto-switch); ' +
+        'hold Live (weekly resets in 8d 8h).',
+    );
+    // The recommendation is still somewhere auto-switch may actually go.
     expect(plan.recommendedAccountId).toBe('a');
   });
 

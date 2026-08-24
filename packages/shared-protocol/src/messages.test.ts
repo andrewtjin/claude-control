@@ -827,7 +827,24 @@ describe('usage.snapshot pacing inputs (additive, N/N-1 tolerant)', () => {
     if (result.ok && isType(result.envelope, 'usage.snapshot')) {
       expect(result.envelope.payload.burnUnitsPerDay ?? undefined).toBeUndefined();
       expect(result.envelope.payload.accounts[0]?.predictedResetAt ?? undefined).toBeUndefined();
+      expect(result.envelope.payload.accounts[0]?.autoSwitchExcluded ?? undefined).toBeUndefined();
     }
+  });
+
+  it('carries the auto-switch exclusion through, and refuses a non-boolean for it', () => {
+    const result = decode(
+      rawFrame('usage.snapshot', { accounts: [{ ...account, autoSwitchExcluded: true }] }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      expect(result.envelope.payload.accounts[0]?.autoSwitchExcluded).toBe(true);
+    }
+    // A flag is a verdict, not a hint: a producer sending "true" as a string must be caught on
+    // the sending side rather than shipping a frame the peer reads as excluded-by-truthiness.
+    expect(
+      decode(rawFrame('usage.snapshot', { accounts: [{ ...account, autoSwitchExcluded: 'yes' }] }))
+        .ok,
+    ).toBe(false);
   });
 
   it('carries a predicted reset and a fractional burn rate through a round-trip', () => {

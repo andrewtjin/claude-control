@@ -25,6 +25,12 @@ export interface AccountUsageInput {
   active: boolean;
   /** A quarantined account has a dead refresh token and cannot be used until re-login. */
   quarantined: boolean;
+  /** True when the operator has taken this account out of the auto-switch TARGET pool. Unlike
+   *  `quarantined` it says nothing about the account's health: it is perfectly usable, and a
+   *  deliberate switch (CLI or phone) still goes there. It only bars the UNATTENDED hop, so it
+   *  gates where auto-switch may go — never whether the account may be left. Absent = not
+   *  excluded, so callers predating the field behave exactly as before. */
+  autoSwitchExcluded?: boolean;
   limits: LimitInput[];
   /** Epoch ms when this snapshot's limits were actually READ (live poll time, or the cache's
    *  own stamp when serving fallback data). Usage only grows between reads, so an old stamp
