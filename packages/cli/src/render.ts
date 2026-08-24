@@ -19,6 +19,7 @@ import {
   computeOutlook,
   computePacing,
   formatTokens,
+  humanizeDaysUntil,
   PLAIN_PACING_STYLE,
   planLabel,
   renderPacingSummary,
@@ -138,7 +139,7 @@ export function renderUsage(
         : 'no limits reported';
       const err = r.usage.error ? `  ${palette.red(`[${r.usage.error}]`)}` : '';
       const source = palette.dim(`(${r.usage.source}, ${age})`);
-      return `${marker} ${label}  ${source}  ${limits}${windowsLeft(r.usage, nowMs)}${err}`;
+      return `${marker} ${label}  ${source}  ${limits}${resetLeft(r.usage, nowMs)}${err}`;
     })
     .join('\n');
 }
@@ -159,12 +160,14 @@ export function renderPacingLine(
   return renderPacingSummary(computePacing(inputs, options), options.nowMs, style);
 }
 
-/** "· 15x5h left" — how many 5h session windows still fit before this account's weekly
- *  reset. Empty when no weekly reset time is known (full detail lives in `cctl timeline`). */
-function windowsLeft(usage: AccountUsage, nowMs: number): string {
+/** "· 3d left" — whole days until this account's weekly reset. Empty when no weekly reset time
+ *  is known. The 5h-window count this used to print belongs to `cctl timeline`, which is the
+ *  view for planning around windows; the at-a-glance question here is how many days of runway
+ *  remain, and a window count made the reader convert to answer it. */
+function resetLeft(usage: AccountUsage, nowMs: number): string {
   const outlook = computeOutlook(timelineInputFromWire([usage]), nowMs);
   const budget = outlook.accounts[0]?.budget;
-  return budget ? ` · ${budget.fullWindows}x5h left` : '';
+  return budget ? ` · ${humanizeDaysUntil(budget.weeklyResetAt - nowMs)} left` : '';
 }
 
 function limitShort(kind: AccountUsage['limits'][number]['kind']): string {

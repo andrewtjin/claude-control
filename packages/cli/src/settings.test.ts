@@ -6,6 +6,7 @@ import type { Paths } from '@claude-control/switch-engine';
 import type { SettingRow } from '@claude-control/shared-protocol';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import {
+  BOT_INVITE_URL,
   DEFAULT_RELAY_URL,
   daemonConfigPath,
   daemonSettingsPath,
@@ -404,6 +405,38 @@ describe('the published default relay', () => {
   it('is a secure, non-loopback websocket url', () => {
     expect(DEFAULT_RELAY_URL.startsWith('wss://')).toBe(true);
     expect(DEFAULT_RELAY_URL).not.toMatch(/127\.0\.0\.1|localhost|\[::1\]/);
+  });
+});
+
+describe('the bot invite link', () => {
+  /** Discord permission bits this install link must request, by the name of the capability that
+   *  breaks without them. Asserted as bits rather than as the literal mask so a future addition
+   *  reads as one more entry here, not as an unexplained new number. */
+  const REQUIRED_BITS: readonly (readonly [bigint, string])[] = [
+    [1n << 10n, 'View Channel'],
+    [1n << 11n, 'Send Messages'],
+    [1n << 14n, 'Embed Links'],
+    [1n << 15n, 'Attach Files'],
+    [1n << 16n, 'Read Message History'],
+    [1n << 34n, 'Manage Threads'],
+    [1n << 36n, 'Create Private Threads'],
+    [1n << 38n, 'Send Messages in Threads'],
+    // The receipt on a relayed thread message is a reaction. Without this bit the relay works
+    // and the message merely looks ignored, which reads as a dropped relay rather than a
+    // missing grant — and it shipped that way once, undetected, because nothing asserted it.
+    [1n << 6n, 'Add Reactions'],
+  ];
+
+  it('requests every permission the bot actually uses', () => {
+    const mask = new URL(BOT_INVITE_URL).searchParams.get('permissions');
+    expect(mask).not.toBeNull();
+    const granted = BigInt(mask as string);
+    const missing = REQUIRED_BITS.filter(([bit]) => (granted & bit) === 0n).map(([, name]) => name);
+    expect(missing).toEqual([]);
+  });
+
+  it('asks for the command scope, without which the slash commands never appear', () => {
+    expect(new URL(BOT_INVITE_URL).searchParams.get('scope')).toContain('applications.commands');
   });
 });
 

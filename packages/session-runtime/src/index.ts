@@ -33,6 +33,7 @@ export {
 
 export {
   startManagedSession,
+  SessionBusyError,
   DEFAULT_AUTO_CONTINUE_MAX_ATTEMPTS,
   DEFAULT_AUTO_CONTINUE_BASE_DELAY_MS,
   DEFAULT_AUTO_CONTINUE_MAX_DELAY_MS,

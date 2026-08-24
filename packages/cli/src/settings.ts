@@ -56,9 +56,14 @@ export const DEFAULT_RELAY_URL = 'wss://cctl.andrewtjin.com';
 /** OAuth2 install link for the shared Discord bot. `applications.commands` is required or
  *  `/pair` never appears in the invited server; the permission bits cover message/embed/file
  *  delivery plus private-thread mode (View Channel and Read Message History included so the
- *  bot can see its host channel and re-fetch its own cards). */
+ *  bot can see its host channel and re-fetch its own cards), and Add Reactions, which is how a
+ *  relayed thread message gets its delivered receipt.
+ *
+ *  A grant is consent-based and is NOT pushed to servers that already installed the bot: adding
+ *  a bit here only changes what a NEW install asks for. An existing install must be re-invited
+ *  through this link before the added permission exists for it. */
 export const BOT_INVITE_URL =
-  'https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands';
+  'https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137109056&scope=bot+applications.commands';
 
 /** User-install variant of the invite: adds the app to a Discord ACCOUNT rather than a
  *  server, so `/pair` and DM delivery work with no server at all. No `bot` scope and no
