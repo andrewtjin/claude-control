@@ -8,7 +8,10 @@
 //
 // The real endpoint URL, header names, and response shape are reverse-engineered
 // from the CLI (see docs/VERIFICATION.md) — this module only ever calls the INJECTED `fetch`,
-// never `globalThis.fetch`, so tests can fully control what "the endpoint" returns.
+// never `globalThis.fetch`, so tests can fully control what "the endpoint" returns. The one
+// exception is advisory and lives a layer down: an overloaded (529) endpoint makes the retry
+// helper consult status.claude.com, which uses the process fetch unless a `statusFetch` is
+// injected through `overload`. The daemon wiring injects one so the rule holds end to end.
 
 import type { AccountUsage, PayloadOf, UsagePlan } from '@claude-control/shared-protocol';
 import {
@@ -20,6 +23,12 @@ import {
   type BillingSignals,
   type PlanTierSignals,
 } from '@claude-control/usage-advisor';
+import {
+  describeStatus,
+  withOverloadRetry,
+  OVERLOAD_STATUSES,
+  type OverloadRetryDeps,
+} from '@claude-control/switch-engine';
 import { parseUsageEndpointResponse, parseCachedUsage, type ParsedUsage } from './usageParse.js';
 import type { FleetHistory } from './usageHistory.js';
 
@@ -46,6 +55,12 @@ export interface FetchLikeResponse {
   ok: boolean;
   status: number;
   json(): Promise<unknown>;
+  /** Optional so a test double stays three fields wide; a real `Response` satisfies it, which
+   *  is what lets the overload retry honor a `Retry-After` in production. */
+  headers?: { get(name: string): string | null | undefined };
+  /** Same reasoning: what lets an answer the retry loop discards release its socket rather
+   *  than hold it out of the pool until the collector gets to it. */
+  body?: { cancel?: () => unknown } | null;
 }
 /** The injected fetch. `signal` rides through so the poller can bound each request with an
  *  `AbortSignal.timeout`; the production wiring forwards it straight to `globalThis.fetch`. */
@@ -108,6 +123,10 @@ export interface UsagePollerOptions {
   random?: () => number;
   userAgent?: string;
   advisorOptions?: AdvisorOptions;
+  /** Clock/sleep/jitter and the status-page probe used when the endpoint answers 529. The
+   *  poller's own clock and jitter source are passed through by default, so a test that already
+   *  controls those controls the retry too; production needs no wiring at all. */
+  overload?: OverloadRetryDeps;
 }
 
 /** Per-account poll/backoff bookkeeping the poller carries between calls. */
@@ -152,6 +171,7 @@ export class UsagePoller {
   private readonly random: () => number;
   private readonly userAgent: string;
   private readonly advisorOptions: AdvisorOptions | undefined;
+  private readonly overloadDeps: OverloadRetryDeps;
   private readonly state = new Map<string, AccountPollState>();
 
   constructor(options: UsagePollerOptions) {
@@ -162,6 +182,9 @@ export class UsagePoller {
     this.random = options.random ?? Math.random;
     this.userAgent = options.userAgent ?? 'claude-code/1.0.0';
     this.advisorOptions = options.advisorOptions;
+    // The poller's clock/jitter are the defaults, but an explicit override still wins — a test
+    // that wants a deterministic backoff should not have to fake the poller's whole clock.
+    this.overloadDeps = { now: this.clock, random: this.random, ...options.overload };
   }
 
   /** Poll every account (subject to each one's floor/backoff), then assemble the burn-down
@@ -243,16 +266,39 @@ export class UsagePoller {
     }
 
     try {
-      const res = await this.fetchFn(USAGE_ENDPOINT, {
-        headers: {
-          authorization: `Bearer ${token}`,
-          'anthropic-beta': ANTHROPIC_BETA_HEADER,
-          'user-agent': this.userAgent,
-        },
-        // A hung endpoint aborts here and lands in the catch below as a transient network
-        // failure (tier-0 fallback), never blocking the cycle past this bound.
-        signal: AbortSignal.timeout(POLL_FETCH_TIMEOUT_MS),
-      });
+      // An overloaded endpoint (529) is retried in place, bounded by the retry helper's own
+      // budget — a few seconds at worst, which one account cannot exceed and which accounts
+      // spend concurrently (pollOne runs per account). Beyond that bound the persistence is
+      // the poll cycle itself: falling back below costs no backoff, so the next cycle retries.
+      const { response: res, verdict } = await withOverloadRetry(
+        (ctx) =>
+          this.fetchFn(USAGE_ENDPOINT, {
+            headers: {
+              authorization: `Bearer ${token}`,
+              'anthropic-beta': ANTHROPIC_BETA_HEADER,
+              'user-agent': this.userAgent,
+            },
+            // A hung endpoint aborts here and lands in the catch below as a transient network
+            // failure (tier-0 fallback), never blocking the cycle past this bound. The retry
+            // deadline is composed in so a retry started near the end of the budget cannot
+            // then run for a further full timeout on top of it.
+            signal: AbortSignal.any([AbortSignal.timeout(POLL_FETCH_TIMEOUT_MS), ctx.signal]),
+          }),
+        this.overloadDeps,
+      );
+
+      if (OVERLOAD_STATUSES.has(res.status)) {
+        // Still overloaded after the retry budget. Treated like the transient 5xx below — no
+        // backoff penalty — because the endpoint is not rejecting THIS account, and silencing
+        // an account for half an hour over a fleet-wide overload is the outcome to avoid.
+        this.recordSuccess(account.accountId, now);
+        const usage = await this.fallbackStale(
+          account,
+          now,
+          `usage endpoint overloaded (${res.status}); status.claude.com: ${describeStatus(verdict)}`,
+        );
+        return { usage, outcome: 'cached' };
+      }
 
       if (res.status === 429) {
         this.recordRateLimited(account.accountId, now);

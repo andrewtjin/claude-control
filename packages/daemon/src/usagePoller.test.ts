@@ -11,11 +11,51 @@ import {
   type PollAccount,
   type SnapshotResult,
 } from './usagePoller.js';
+import {
+  createStatusProbeCache,
+  PATIENT_OVERLOAD_BUDGET,
+  type OverloadRetryDeps,
+} from '@claude-control/switch-engine';
 import { extractWeeklyReading, readFleetHistory } from './usageHistory.js';
 import { parseUsageEndpointResponse } from './usageParse.js';
 
 function jsonResponse(status: number, body: unknown): FetchLikeResponse {
   return { ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) };
+}
+
+/** A fetch that walks a list of statuses, repeating the last one forever after — what an
+ *  in-place retry needs to be observed at all. */
+function scriptedFetch(statuses: number[]) {
+  let index = 0;
+  return vi.fn(() => {
+    const status = statuses[Math.min(index, statuses.length - 1)] ?? 200;
+    index += 1;
+    return Promise.resolve(jsonResponse(status, status === 200 ? liveBody(20) : {}));
+  });
+}
+
+/** Overload wiring for the poller: no real sleeping, and a status page the test controls. */
+function fakeOverload(indicator: string): {
+  deps: OverloadRetryDeps;
+  statusFetch: ReturnType<typeof vi.fn>;
+} {
+  const statusFetch = vi.fn(() =>
+    Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve<unknown>({ status: { indicator } }),
+    }),
+  );
+  return {
+    statusFetch,
+    deps: {
+      statusFetch,
+      sleep: () => Promise.resolve(),
+      random: () => 0,
+      // A cache per case: a verdict from one test must never decide another.
+      statusCache: createStatusProbeCache(),
+    },
+  };
 }
 
 /** Poll a predicate on real timers (no fake timers) — used to observe that concurrent fetches
@@ -233,6 +273,97 @@ describe('UsagePoller', () => {
     const result = await poller.pollAll([account]);
     expect(result.results[0]?.outcome).toBe('cached');
     expect(result.accounts[0]?.error).toMatch(/500/);
+    // A 500 keeps its old single-attempt path: only 529 is retried in place.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('529 is retried in place and a success on the retry still counts as live', async () => {
+    const { deps, statusFetch } = fakeOverload('none');
+    const fetchFn = scriptedFetch([529, 200]);
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(1)),
+      clock: () => 0,
+      overload: deps,
+    });
+
+    const result = await poller.pollAll([account]);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(result.results[0]?.outcome).toBe('live');
+    expect(result.accounts[0]?.error).toBeUndefined();
+    expect(statusFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('an exhausted 529 falls back with the overload reason and no backoff penalty', async () => {
+    let now = 0;
+    const { deps } = fakeOverload('major');
+    const fetchFn = scriptedFetch([529]);
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(7)),
+      clock: () => now,
+      random: () => 0,
+      overload: deps,
+    });
+
+    const result = await poller.pollAll([account]);
+    expect(fetchFn).toHaveBeenCalledTimes(PATIENT_OVERLOAD_BUDGET.maxAttempts);
+    expect(result.results[0]?.outcome).toBe('cached');
+    expect(result.accounts[0]?.source).toBe('cached');
+    // The snapshot says WHY, including what the status page reported — a phone showing frozen
+    // numbers with no explanation is the failure mode this reason text exists to prevent.
+    expect(result.accounts[0]?.error).toMatch(
+      /usage endpoint overloaded \(529\); status\.claude\.com: major/,
+    );
+
+    // No 429-style backoff: the only gate on the next poll is the floor, cycle after cycle.
+    // Those cycles ARE the cross-cycle persistence — the in-call budget is deliberately too
+    // small to ride out an outage on its own, so a 529 must never buy silence the way a 429
+    // does (whose doubling would overtake the floor by the fourth consecutive failure).
+    for (let cycle = 2; cycle <= 5; cycle += 1) {
+      now += POLL_FLOOR_MS + 1;
+      await poller.pollAll([account]);
+      expect(fetchFn).toHaveBeenCalledTimes(cycle * PATIENT_OVERLOAD_BUDGET.maxAttempts);
+    }
+  });
+
+  it('an unreachable status page still reports the overload, named as unreachable', async () => {
+    const fetchFn = scriptedFetch([529]);
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(7)),
+      clock: () => 0,
+      overload: {
+        sleep: () => Promise.resolve(),
+        random: () => 0,
+        statusCache: createStatusProbeCache(),
+        statusFetch: () => Promise.reject(new Error('offline')),
+      },
+    });
+
+    const result = await poller.pollAll([account]);
+    // The probe failing must never shorten the retries or hide the reason.
+    expect(fetchFn).toHaveBeenCalledTimes(PATIENT_OVERLOAD_BUDGET.maxAttempts);
+    expect(result.accounts[0]?.error).toMatch(
+      /usage endpoint overloaded \(529\); status\.claude\.com: unreachable/,
+    );
+  });
+
+  it('a healthy poll never costs a status-page request', async () => {
+    const { deps, statusFetch } = fakeOverload('none');
+    const poller = new UsagePoller({
+      fetch: scriptedFetch([200]),
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(1)),
+      clock: () => 0,
+      overload: deps,
+    });
+
+    await poller.pollAll([account]);
+    expect(statusFetch).not.toHaveBeenCalled();
   });
 
   it('enforces the per-account poll floor (>=180s) between live fetches', async () => {
