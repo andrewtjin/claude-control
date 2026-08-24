@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { buildProgram } from './program.js';
 
@@ -7,8 +7,9 @@ import { buildProgram } from './program.js';
 // vault. Hoisted because the mock factory is evaluated during the import above.
 const engine = vi.hoisted(() => ({
   backfillAccountMetadata: vi.fn(() => Promise.resolve(0)),
-  listAccounts: vi.fn(() => Promise.resolve([])),
+  listAccounts: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
+  setAutoSwitchExcluded: vi.fn(() => Promise.resolve()),
 }));
 vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
@@ -62,7 +63,7 @@ describe('buildProgram', () => {
     const subs = accounts?.commands.map((c) => c.name()).sort();
     // `relogin` spawns a browser login on this host; `reauth` takes a pasted code instead, so a
     // headless/SSH host (and the wet test for the OAuth flow itself) has a path too.
-    expect(subs).toEqual(['add', 'list', 'reauth', 'relogin', 'remove']);
+    expect(subs).toEqual(['add', 'exclude', 'include', 'list', 'reauth', 'relogin', 'remove']);
   });
 
   it('nests session subcommands', () => {
@@ -158,5 +159,68 @@ describe('buildProgram', () => {
     }
     // Order, not just invocation: a repair that lands after the read still renders the stale rows.
     expect(order).toEqual(['repair', 'read']);
+  });
+});
+
+// Exclusion is a registry write behind a resolved ref, so the verbs are worth running for real:
+// a typo'd command name or a wrong-way-round boolean would sail past a surface-only assertion.
+describe('accounts exclude / include', () => {
+  const row = (extra: Record<string, unknown> = {}) => ({
+    id: 'id-1',
+    label: 'Work',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    ...extra,
+  });
+
+  /** Run one command with stdout captured, so the printed line can be asserted. */
+  async function run(argv: string[]): Promise<string> {
+    let out = '';
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      out += String(chunk);
+      return true;
+    });
+    try {
+      await buildProgram().parseAsync(argv, { from: 'user' });
+    } finally {
+      write.mockRestore();
+    }
+    return out;
+  }
+
+  beforeEach(() => {
+    engine.setAutoSwitchExcluded.mockClear();
+    engine.backfillAccountMetadata.mockImplementation(() => Promise.resolve(0));
+  });
+
+  it('excludes an account by label and says what changed', async () => {
+    engine.listAccounts.mockImplementation(() => Promise.resolve([row()]));
+    const out = await run(['accounts', 'exclude', 'Work']);
+    expect(engine.setAutoSwitchExcluded).toHaveBeenCalledWith('id-1', true);
+    expect(out).toMatch(/Excluded Work from auto-switch/);
+  });
+
+  it('includes an excluded account again', async () => {
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([row({ autoSwitchExcluded: true })]),
+    );
+    const out = await run(['accounts', 'include', 'Work']);
+    expect(engine.setAutoSwitchExcluded).toHaveBeenCalledWith('id-1', false);
+    expect(out).toMatch(/available to auto-switch again/);
+  });
+
+  it('reports a no-op honestly instead of claiming a change it did not make', async () => {
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([row({ autoSwitchExcluded: true })]),
+    );
+    const excluded = await run(['accounts', 'exclude', 'Work']);
+    expect(excluded).toMatch(/already excluded/);
+
+    engine.listAccounts.mockImplementation(() => Promise.resolve([row()]));
+    const included = await run(['accounts', 'include', 'Work']);
+    expect(included).toMatch(/already available/);
+
+    expect(engine.setAutoSwitchExcluded).not.toHaveBeenCalled();
   });
 });

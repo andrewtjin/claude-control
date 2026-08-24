@@ -465,6 +465,37 @@ describe('emoji-width overflow fallback', () => {
 // on all three account views. Both facts live in the local registry and reach the bot only
 // because the daemon resolves them onto the snapshot — so each surface is asserted separately:
 // they render from one helper, but nothing structural stops one of them from dropping it.
+describe('auto-switch exclusion across the account views', () => {
+  const excluded = account({ autoSwitchExcluded: true });
+
+  it('says so on /accounts', () => {
+    const embed = buildAccountsEmbed([excluded]).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('excluded from auto-switch');
+  });
+
+  it('says so on /usage', () => {
+    const embed = buildUsageEmbed({ accounts: [excluded] }).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('excluded from auto-switch');
+  });
+
+  it('stays silent for an account that is not excluded, and for a daemon predating the field', () => {
+    // Exclusion is the exception; captioning every healthy account with its absence is noise.
+    for (const a of [account({ autoSwitchExcluded: false }), account()]) {
+      expect(buildAccountsEmbed([a]).toJSON().fields?.[0]?.value).not.toContain('auto-switch');
+      expect(buildUsageEmbed({ accounts: [a] }).toJSON().fields?.[0]?.value).not.toContain(
+        'auto-switch',
+      );
+    }
+  });
+
+  it('leaves the health marker alone — an excluded account is not unhealthy', () => {
+    const embed = buildAccountsEmbed([excluded]).toJSON();
+    expect(embed.fields?.[0]?.name).toBe(
+      buildAccountsEmbed([account()]).toJSON().fields?.[0]?.name,
+    );
+  });
+});
+
 describe('plan tier and billing across the account views', () => {
   const withPlan = account({ planWeight: 20, billing: '~Aug 11 (est.)' });
 

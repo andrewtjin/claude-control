@@ -45,6 +45,30 @@ describe('renderAccountsTable', () => {
     expect(out).toMatch(/quarantined/);
   });
 
+  it('shows an auto-switch exclusion in the STATUS column, and quarantine outranks it', () => {
+    const out = renderAccountsTable(
+      [
+        acct('id-1', 'Work'),
+        acct('id-2', 'Paused', { autoSwitchExcluded: true }),
+        // Both flags set: quarantine is why the account cannot be used at all, so it wins.
+        acct('id-3', 'Dead', { quarantined: true, autoSwitchExcluded: true }),
+      ],
+      'id-1',
+    );
+    expect(out).toMatch(/Paused\s+.*\bexcluded\b/);
+    expect(out).toMatch(/Dead\s+.*\bquarantined\b/);
+    expect(out).not.toMatch(/Dead\s+.*\bexcluded\b/);
+  });
+
+  it('paints an exclusion dim, never red — it is a choice, not a fault', () => {
+    const accounts = [acct('id-1', 'Work'), acct('id-2', 'Paused', { autoSwitchExcluded: true })];
+    const plain = renderAccountsTable(accounts, 'id-1');
+    const colored = renderAccountsTable(accounts, 'id-1', ANSI_PALETTE);
+    expect(colored).toContain(ANSI_PALETTE.dim('excluded'));
+    expect(colored).not.toContain(ANSI_PALETTE.red('excluded'));
+    expect(stripAnsi(colored)).toBe(plain);
+  });
+
   it('colors quarantine red under a palette without disturbing column alignment', () => {
     const accounts = [
       acct('id-1', 'Work', { emailAddress: 'w@x.com' }),
