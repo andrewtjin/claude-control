@@ -9,6 +9,42 @@ import {
   HEARTBEAT_STALE_AFTER_MS,
 } from './heartbeat.js';
 
+/** Writes aimed at {@link gatedPath} park here instead of reaching the disk, newest last; every
+ *  other target goes through the real atomic writer, so the rest of this file still exercises
+ *  real files. Ordering between two beats in flight at once is set by disk timing, which no test
+ *  can steer — parking them is the only way to settle a pair in a chosen order and assert what
+ *  the writer guarantees regardless of it. */
+const parkedWrites: Array<{ data: string; land: () => void }> = [];
+/** The order payloads actually reached the file, newest last. */
+const landedWrites: string[] = [];
+/** The heartbeat file's on-disk shape, named so a parsed payload is compared as a real type
+ *  rather than as `any`. */
+interface HeartbeatFileShape {
+  writtenAtMs: number;
+}
+let gatedPath: string | undefined;
+
+vi.mock('@claude-control/switch-engine', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@claude-control/switch-engine')>();
+  return {
+    ...actual,
+    atomicWriteFile: (target: string, data: string | Buffer): Promise<void> => {
+      if (gatedPath === undefined || target !== gatedPath)
+        return actual.atomicWriteFile(target, data);
+      return new Promise<void>((resolve) => {
+        const payload = typeof data === 'string' ? data : data.toString('utf8');
+        parkedWrites.push({
+          data: payload,
+          land: () => {
+            landedWrites.push(payload);
+            resolve();
+          },
+        });
+      });
+    },
+  };
+});
+
 describe('HeartbeatWriter', () => {
   let dir: string;
   let filePath: string;
@@ -16,6 +52,11 @@ describe('HeartbeatWriter', () => {
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'cctl-heartbeat-'));
     filePath = join(dir, 'daemon-heartbeat.json');
+    // Nothing is gated unless a test opts in by naming its own path; the shared arrays are
+    // cleared here so one test's parked writes can never be read by the next.
+    gatedPath = undefined;
+    parkedWrites.length = 0;
+    landedWrites.length = 0;
     vi.useFakeTimers();
   });
 
@@ -47,6 +88,37 @@ describe('HeartbeatWriter', () => {
     await writer.flush();
     expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 2000 });
     writer.stop();
+  });
+
+  it('never starts a second beat while one is still in flight', async () => {
+    gatedPath = join(dir, 'gated-heartbeat.json');
+    let now = 1000;
+    const writer = new HeartbeatWriter(gatedPath, { intervalMs: 100, clock: () => now });
+    writer.start();
+    await vi.advanceTimersByTimeAsync(0); // let the immediate beat reach the writer
+    expect(parkedWrites).toHaveLength(1); // ...and sit there, still unwritten
+
+    now = 2000;
+    await vi.advanceTimersByTimeAsync(100);
+    // The tick's beat waits its turn rather than racing the one already in flight. Two writes
+    // outstanding at once is the whole defect: whichever rename lands last wins, so an older
+    // beat can overwrite a newer one and report the daemon as staler than it is.
+    expect(parkedWrites).toHaveLength(1);
+
+    // Settle the first; only then does the second start, and it carries its OWN tick's stamp
+    // rather than the time the disk freed up.
+    parkedWrites[0]?.land();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(parkedWrites).toHaveLength(2);
+    now = 9999; // a later clock must not reach the file — the beat was stamped at its tick
+    parkedWrites[1]?.land();
+
+    await writer.flush();
+    writer.stop();
+    expect(landedWrites.map((d) => JSON.parse(d) as HeartbeatFileShape)).toEqual([
+      { writtenAtMs: 1000 },
+      { writtenAtMs: 2000 },
+    ]);
   });
 
   it('stops writing after stop()', async () => {
