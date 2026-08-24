@@ -159,6 +159,31 @@ describe('refreshCredentials', () => {
       expect(fetch).toHaveBeenCalledTimes(2);
     });
 
+    it('reports the retry loop to an injected logger so an outage leaves a trace', async () => {
+      // The loop defaults to a discarding sink, so without a logger wired through refreshDeps a
+      // token endpoint shedding load spends seconds in silence and surfaces only as the failure
+      // message at the end. These lines are the incident's only record while it is happening.
+      const lines: { obj: unknown; msg: string | undefined }[] = [];
+      const record = (obj: unknown, msg?: string): void => void lines.push({ obj, msg });
+      const deps = depsFor(scriptedFetch([[529, 'overloaded']]), 'none');
+
+      await refreshCredentials(current, {
+        ...deps,
+        overload: {
+          ...deps.overload,
+          logger: { debug: record, info: record, warn: record, error: record },
+        },
+      }).catch(() => undefined);
+
+      const retries = lines.filter((l) => l.msg === 'upstream overloaded; retrying');
+      expect(retries).toHaveLength(SHORT_OVERLOAD_BUDGET.maxAttempts - 1);
+      expect(retries[0]?.obj).toMatchObject({ status: 529, attempt: 1, statusPage: 'none' });
+      // One closing line when the budget is spent: an incident needs an end as well as a start.
+      expect(
+        lines.filter((l) => l.msg === 'upstream still overloaded; retry budget spent'),
+      ).toHaveLength(1);
+    });
+
     it('gives up after the short budget when the status page is all-clear', async () => {
       const fetch = scriptedFetch([[529, 'overloaded']]);
 

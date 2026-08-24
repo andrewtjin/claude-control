@@ -173,6 +173,9 @@ export interface OverloadRetryDeps {
    *  {@link LOCKED_OVERLOAD_BUDGET_CAP_MS}. */
   budgetCapMs?: number;
   onRetry?: (event: OverloadRetryEvent) => void;
+  /** Where the retry loop reports an outage. Defaults to discarding it so tests and library
+   *  callers stay one-liners, but every composition root passes its own — the loop's lines are
+   *  the ONLY record a 529 storm leaves in a daemon log. */
   logger?: Logger;
 }
 
@@ -251,24 +254,48 @@ export async function withOverloadRetry<Res extends OverloadResponse>(
       // The probe's own wait is spent before the deadline opens, so a slow status page costs
       // patience rather than eating the retries it was consulted to authorize.
       deadlineAtMs = now() + Math.min(budget.totalBudgetMs, deps.budgetCapMs ?? Infinity);
-      log.debug(
-        { status: response.status, statusPage: describeStatus(verdict) },
-        'upstream overloaded; retrying',
-      );
     }
+
+    // Both ways out of the retry phase are the budget running out — attempts or time — so they
+    // share one line: what an operator needs is that the loop stopped and the upstream was still
+    // overloaded, not which of the two bounds happened to stop it first.
+    const giveUp = (): OverloadRetryOutcome<Res> => {
+      log.info(
+        {
+          status: response.status,
+          attempts: retries + 1,
+          statusPage: describeStatus(verdict),
+        },
+        'upstream still overloaded; retry budget spent',
+      );
+      return outcome(response, retries, verdict);
+    };
 
     // Attempts made so far is `retries + 1`. Both bounds are checked BEFORE sleeping, so an
     // exhausted budget answers immediately instead of waiting to discover it is done.
-    if (retries + 1 >= budget.maxAttempts) return outcome(response, retries, verdict);
+    if (retries + 1 >= budget.maxAttempts) return giveUp();
     // What is left must cover the sleep AND a retry worth making; the delay is clipped so the
     // attempt after it still gets {@link OVERLOAD_MIN_ATTEMPT_MS}, and when even that does not
     // fit the overloaded answer already in hand is the honest result.
     const leftMs = (deadlineAtMs ?? now()) - now();
-    if (leftMs <= OVERLOAD_MIN_ATTEMPT_MS) return outcome(response, retries, verdict);
+    if (leftMs <= OVERLOAD_MIN_ATTEMPT_MS) return giveUp();
 
     const delayMs = Math.min(
       nextDelayMs(retries, response, random),
       leftMs - OVERLOAD_MIN_ATTEMPT_MS,
+    );
+    // One line per retry, at INFO rather than debug: an upstream shedding load is an operator
+    // event, and this loop is otherwise entirely silent — an incident left nothing behind but
+    // whatever error text the caller eventually surfaced, minutes later and on another screen.
+    // Named fields rather than prose so the lines can be counted and grouped by status.
+    log.info(
+      {
+        status: response.status,
+        attempt: retries + 1,
+        delayMs,
+        statusPage: describeStatus(verdict),
+      },
+      'upstream overloaded; retrying',
     );
     deps.onRetry?.({ attempt: retries + 1, status: response.status, delayMs, verdict });
     retries += 1;
