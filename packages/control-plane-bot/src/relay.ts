@@ -108,6 +108,11 @@ const MAX_PENDING_CONNECTIONS = 64;
 // own send buffer when a daemon stops draining its socket. 8 MiB is far above the KB-scale command
 // frames this direction actually carries, so only a genuinely stuck peer trips it.
 const MAX_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024;
+// Application close code for a daemon dropped at that ceiling, in the same 4xxx space as this
+// file's other refusals (4001 unexpected frame, 4002 bad version, 4003 bad credentials, 4008
+// handshake timeout). RETRYABLE, unlike 4002/4003: the socket is dropped because it stopped
+// draining, which the daemon's own reconnect fixes — so nothing here should read as "stay away".
+const BACKPRESSURE_CLOSE_CODE = 4009;
 
 export class RelayServer implements RelaySender {
   private readonly httpServer: HttpServer;
@@ -205,7 +210,14 @@ export class RelayServer implements RelaySender {
         { daemonId: binding.daemonId, bufferedAmount: conn.socket.bufferedAmount },
         'relay: daemon socket exceeded outbound buffer cap; dropping as unreachable',
       );
-      conn.socket.terminate();
+      // Closed with a code and a reason, never terminated. A terminate is a 1006 on the wire —
+      // no code, no reason — which reads exactly like a yanked cable, so an operator staring at
+      // a daemon that keeps dropping has nothing to tell "the relay refused you" from "your
+      // network is bad". Every other refusal in this file names itself; this one now does too.
+      // The daemon treats a close as a close whatever the code (see controlPlaneClient's
+      // 'close' handler), so its ordinary backoff reconnect is unchanged — the frame only adds
+      // a diagnosis, it never asks the daemon to stay away.
+      conn.socket.close(BACKPRESSURE_CLOSE_CODE, 'outbound buffer cap exceeded');
       this.connectionsByDaemon.delete(binding.daemonId);
       return { ok: false, error: 'daemon is offline' };
     }
