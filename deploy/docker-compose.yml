@@ -13,8 +13,9 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # bindings.json (the only state this bot persists) lives on the named volume below, not
-      # in the image, so a redeploy/restart never loses a pairing.
+      # The three JSON files this bot persists (bindings.json, session-threads.json,
+      # session-channel-pins.json — see docs/SELF_HOST.md) live on the named volume below,
+      # not in the image, so a redeploy/restart never loses a pairing.
       CCTL_BOT_STATE_DIR: /data/bot-state
       CCTL_RELAY_PORT: '8765'
     volumes:

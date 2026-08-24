@@ -77,8 +77,12 @@ This package is a single-file bundle of the `cctl` CLI, built from the
 Installing it also pulls in `@anthropic-ai/claude-agent-sdk` and, through it, the
 Claude Code binary for your platform (~250MB). That binary is what a remote
 session actually runs. Installing with `--omit=optional` skips it, and `/run`
-will fail with "Native CLI binary not found" while every other command still
-works; `cctl doctor` reports this as the `session-runtime` check.
+will fail with "Native CLI binary for \<platform>-\<arch> not found. Reinstall
+@anthropic-ai/claude-agent-sdk without --omit=optional, or set
+options.pathToClaudeCodeExecutable." while every other command still works;
+`cctl doctor`'s `session-runtime` check reports the same gap in its own words:
+"no Claude Code binary found — install \<package> (a `--omit=optional` install
+skips it; reinstall cctl without that flag)".
 
 ## License
 

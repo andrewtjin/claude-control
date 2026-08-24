@@ -197,4 +197,5 @@ accounts list`.
 setup` wraps.
 - `docs/PLATFORM.md` — which platforms are supported (Windows and Linux/WSL2 today)
   and what `cctl doctor` checks.
-- `docs/VERIFICATION.md` — the fresh-machine wet gate this wizard exists to pass.
+- `docs/VERIFICATION.md` — what this wizard is held to on a fresh machine: a paired,
+  autostarted daemon in under ten minutes, without opening a doc to get unstuck.
