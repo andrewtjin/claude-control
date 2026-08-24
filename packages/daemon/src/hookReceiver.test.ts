@@ -1038,6 +1038,84 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('advertised deadlines', () => {
+    // A card counts down to the `expiresAt` it is handed, so that stamp has to be the moment the
+    // hold actually ends — not the pending row's longer TTL, which kept a card live and inviting
+    // an answer for minutes after the hold had already handed the prompt back to the terminal.
+    // The three windows are deliberately distinct so a stamp reading the wrong one cannot
+    // coincidentally look right, and the holds are tiny so each held hook answers promptly.
+    const NOW = 1_000_000;
+    const TTL = 900_000;
+    const PERMISSION_HOLD = 120;
+    const QUESTION_HOLD = 250;
+
+    /** A receiver with all three windows pinned, torn down however the test ends. */
+    async function withDeadlineReceiver(
+      run: (port: number, emitted: EnvelopeDraft[]) => Promise<void>,
+    ): Promise<void> {
+      const emitted: EnvelopeDraft[] = [];
+      const deadlineReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => emitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => NOW,
+        permissionTtlMs: TTL,
+        permissionHoldMs: PERMISSION_HOLD,
+        questionHoldMs: QUESTION_HOLD,
+      });
+      const deadlinePort = await deadlineReceiver.listen(0);
+      try {
+        await run(deadlinePort, emitted);
+      } finally {
+        await deadlineReceiver.close();
+      }
+    }
+
+    it('stamps permission.request with the hold that ends it', async () => {
+      await withDeadlineReceiver(async (deadlinePort, emitted) => {
+        await post(
+          deadlinePort,
+          '/',
+          {
+            hook_event_name: 'PermissionRequest',
+            session_id: 'sess-deadline',
+            tool_name: 'Bash',
+            tool_input: { command: 'echo x' },
+          },
+          { 'x-claude-control-secret': SECRET },
+        );
+        const req = emitted.find((e) => e.type === 'permission.request');
+        expect(req?.type).toBe('permission.request');
+        if (req?.type === 'permission.request') {
+          expect(req.payload.expiresAt).toBe(NOW + PERMISSION_HOLD);
+        }
+      });
+    });
+
+    it('stamps question.request with the question hold that ends it', async () => {
+      await withDeadlineReceiver(async (deadlinePort, emitted) => {
+        await post(
+          deadlinePort,
+          '/',
+          {
+            hook_event_name: 'PermissionRequest',
+            session_id: 'sess-deadline-q',
+            tool_name: 'AskUserQuestion',
+            tool_input: { questions: [{ question: 'Which color?', options: [{ label: 'teal' }] }] },
+          },
+          { 'x-claude-control-secret': SECRET },
+        );
+        const req = emitted.find((e) => e.type === 'question.request');
+        expect(req?.type).toBe('question.request');
+        if (req?.type === 'question.request') {
+          // Its own knob, not the permission hold it defaults to and not the row TTL.
+          expect(req.payload.expiresAt).toBe(NOW + QUESTION_HOLD);
+        }
+      });
+    });
+  });
+
   describe('Stop-hook steering delivery', () => {
     it('answers Stop with block+reason when the steering source has queued text', async () => {
       const taken: string[] = [];
