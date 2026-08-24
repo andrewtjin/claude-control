@@ -32,7 +32,13 @@
 // the message surfaced on the account's snapshot entry. Token material is never logged and
 // never appears in error messages.
 
-import type { RefreshTokenResult, Vault } from '@claude-control/switch-engine';
+import {
+  isOverloadCode,
+  LockTimeoutError,
+  RefreshError,
+  type RefreshTokenResult,
+  type Vault,
+} from '@claude-control/switch-engine';
 
 /** Floor between refresh attempts for one account — polling must not churn refresh tokens. */
 export const POLL_REFRESH_MIN_INTERVAL_MS = 60 * 60_000;
@@ -234,8 +240,27 @@ export function createPollTokenGetter(
       // Success (or a deliberate engine skip) — either way this attempt is spent.
       state.set(accountId, { nextAttemptAtMs: now + minIntervalMs, consecutiveFailures: 0 });
     } catch (err) {
-      const consecutiveFailures = (prior?.consecutiveFailures ?? 0) + 1;
-      const backoffMs = Math.min(minIntervalMs * 2 ** (consecutiveFailures - 1), backoffCapMs);
+      // An OVERLOADED token endpoint says nothing about this account, so it must not grow the
+      // backoff: the doubling reaches 6h within a few failures, which would keep an account
+      // blind for most of a day over an outage that cleared in minutes. The failure counter is
+      // left exactly as it was (neither raised nor reset — the endpoint told us nothing either
+      // way) and the next attempt is scheduled at the plain floor, so recovery tracks the
+      // outage instead of the number of times we happened to ask during it.
+      //
+      // A LOCK TIMEOUT is the same kind of non-evidence, and is exempted alongside it. Accounts
+      // poll concurrently but refresh one at a time behind the credential lock, so during an
+      // overload the one account that wins the lock and retries in there is precisely what makes
+      // the others time out waiting. Counting that against them would hand most of the fleet the
+      // hours of silence this exemption exists to prevent, over a wait that says nothing about
+      // any of their tokens.
+      const blameless =
+        (err instanceof RefreshError && isOverloadCode(err.code)) ||
+        err instanceof LockTimeoutError;
+      const priorFailures = prior?.consecutiveFailures ?? 0;
+      const consecutiveFailures = blameless ? priorFailures : priorFailures + 1;
+      const backoffMs = blameless
+        ? minIntervalMs
+        : Math.min(minIntervalMs * 2 ** (consecutiveFailures - 1), backoffCapMs);
       const message = err instanceof Error ? err.message : String(err);
       state.set(accountId, {
         nextAttemptAtMs: now + backoffMs,
