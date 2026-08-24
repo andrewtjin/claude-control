@@ -19,6 +19,25 @@ export function humanizeDuration(ms: number): string {
   return `${minutes}m`;
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Format a millisecond countdown as whole days: "3d", "1d", "<1d", "now".
+ *
+ * Rounds DOWN, so the label is a floor on the runway left and never claims a day that has not
+ * been earned — the same conservative convention the 5h-window budget counts with. `<1d` keeps
+ * a reset a few hours out from rendering as "0d", which would read as "already spent".
+ *
+ * Days are the unit the usage surfaces answer in: "how long until this account is whole again"
+ * is a question about days, and a window count made the reader do the conversion. The timeline
+ * keeps the window count — there, windows ARE the planning unit.
+ */
+export function humanizeDaysUntil(ms: number): string {
+  if (ms <= 0) return 'now';
+  const days = Math.floor(ms / DAY_MS);
+  return days < 1 ? '<1d' : `${days}d`;
+}
+
 /** Round a percentage to a whole number for display, clamped to 0–100. */
 export function roundPct(pct: number): number {
   return Math.max(0, Math.min(100, Math.round(pct)));
