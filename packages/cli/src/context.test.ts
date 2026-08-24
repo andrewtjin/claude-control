@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sandboxPaths, type Paths } from '@claude-control/switch-engine';
-import { buildEngine } from './context.js';
+import { buildEngine, CliFailure, fail, reportFatal } from './context.js';
 
 const tempDirs: string[] = [];
 function freshTempDir(): string {
@@ -85,5 +85,49 @@ describe('buildEngine: where the engine writes its diagnostics', () => {
 
     expect(stdout.join('')).toContain('account metadata sweep did not run');
     expect(stderr).toEqual([]);
+  });
+});
+
+describe('the CLI failure path', () => {
+  it('ends a command by throwing, never by tearing the process down', () => {
+    // A command that failed mid-request still has sockets closing behind it. Exiting on top of
+    // those asks libuv to finish a handle whose loop is gone, which it refuses with an assertion
+    // — so the caller reading the exit code gets a crash code instead of the 1 it expects.
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      expect(() => fail('no such account')).toThrow(CliFailure);
+      expect(() => fail('no such account')).toThrow('no such account');
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('reports a fatal error by asking for the exit code, not taking it', () => {
+    const previous = process.exitCode;
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const written: string[] = [];
+    try {
+      reportFatal(new CliFailure('token endpoint unreachable'), {
+        write: (text: string) => written.push(text),
+      });
+      expect(written.join('')).toBe('error: token endpoint unreachable\n');
+      expect(process.exitCode).toBe(1);
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      exitSpy.mockRestore();
+      process.exitCode = previous;
+    }
+  });
+
+  it('renders a non-Error throw without pretending it has a message', () => {
+    const written: string[] = [];
+    const previous = process.exitCode;
+    try {
+      reportFatal('something odd', { write: (text: string) => written.push(text) });
+      expect(written.join('')).toBe('error: something odd\n');
+    } finally {
+      process.exitCode = previous;
+    }
   });
 });
