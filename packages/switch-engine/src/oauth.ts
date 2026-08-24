@@ -22,6 +22,13 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { ClaudeOauth, OauthAccount } from './types.js';
 import { QuarantineError, RefreshError } from './errors.js';
+import {
+  describeStatus,
+  withOverloadRetry,
+  OVERLOAD_STATUSES,
+  type OverloadRetryDeps,
+  type StatusVerdict,
+} from './overload.js';
 
 /** The public OAuth client id the Claude Code CLI presents. Override if verification shows
  *  a different value. */
@@ -42,7 +49,14 @@ export const DEFAULT_REFRESH_TIMEOUT_MS = 30_000;
 type FetchLike = (
   input: string,
   init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
-) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+) => Promise<{
+  ok: boolean;
+  status: number;
+  text: () => Promise<string>;
+  /** Optional so a test double stays two fields wide; a real `Response` satisfies it, which is
+   *  what lets the overload retry honor a `Retry-After` in production. */
+  headers?: { get(name: string): string | null | undefined };
+}>;
 
 export interface RefreshDeps {
   fetch?: FetchLike;
@@ -51,11 +65,19 @@ export interface RefreshDeps {
   now?: () => number;
   /** Extra headers if verification shows the endpoint requires them (e.g. an anthropic-beta). */
   extraHeaders?: Record<string, string>;
+  /** Clock/sleep/jitter and the status-page probe used when the endpoint answers 529. Defaults
+   *  are the real ones, so production needs no wiring; tests inject to keep the suite instant. */
+  overload?: OverloadRetryDeps;
 }
 
 /**
  * Exchange the current refresh token for a fresh credential. Returns a new {@link ClaudeOauth}
  * carrying the rotated tokens; the caller MUST persist it before the old token is lost.
+ *
+ * An OVERLOADED token endpoint (529) is retried in place for a few seconds — see
+ * {@link withOverloadRetry} for why that budget is deliberately small — and only becomes a
+ * {@link RefreshError} once the budget is spent. Its message names the status page's verdict,
+ * because that message is what a stranded user ends up reading.
  *
  * @throws {QuarantineError} the token is permanently dead (`invalid_grant`).
  * @throws {RefreshError} a transient failure (network, non-2xx, malformed response).
@@ -75,18 +97,31 @@ export async function refreshCredentials(
   }).toString();
 
   let res: Awaited<ReturnType<FetchLike>>;
+  let attempts = 1;
+  let statusVerdict: StatusVerdict | undefined;
   try {
-    res = await doFetch(deps.tokenEndpoint ?? DEFAULT_TOKEN_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded',
-        accept: 'application/json',
-        ...deps.extraHeaders,
-      },
-      body,
-      // A timeout rejects into this catch as a transient RefreshError — never a QuarantineError.
-      signal: AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS),
-    });
+    // Each attempt builds its own request (a fresh abort signal above all — a reused, already
+    // fired one would abort the retry the instant it started).
+    const outcome = await withOverloadRetry(
+      () =>
+        doFetch(deps.tokenEndpoint ?? DEFAULT_TOKEN_ENDPOINT, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/x-www-form-urlencoded',
+            accept: 'application/json',
+            ...deps.extraHeaders,
+          },
+          body,
+          // A timeout rejects into this catch as a transient RefreshError, never a
+          // QuarantineError — and, because it is a throw rather than a status, it is never
+          // retried here: a hung endpoint is a different failure from an overloaded one.
+          signal: AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS),
+        }),
+      deps.overload,
+    );
+    res = outcome.response;
+    attempts = outcome.retries + 1;
+    statusVerdict = outcome.verdict;
   } catch (err) {
     throw new RefreshError('network error during token refresh', 'network', { cause: err });
   }
@@ -96,6 +131,16 @@ export async function refreshCredentials(
     // A 400 mentioning invalid_grant is the permanent-death signal; everything else is transient.
     if (res.status === 400 && /invalid_grant/i.test(raw)) {
       throw new QuarantineError(`refresh token rejected (invalid_grant): ${truncate(raw)}`);
+    }
+    // Still overloaded after the whole budget. Keep the `http_<status>` code (callers branch on
+    // it to avoid punishing an account for a fleet-wide outage) but say so in words, and skip
+    // the response body: the useful fact is the outage, not whatever the load shedder wrote.
+    if (OVERLOAD_STATUSES.has(res.status)) {
+      throw new RefreshError(
+        `token endpoint overloaded (${res.status}) after ${attempts} attempts; ` +
+          `status.claude.com: ${describeStatus(statusVerdict)}`,
+        `http_${res.status}`,
+      );
     }
     throw new RefreshError(
       `token endpoint returned ${res.status}: ${truncate(raw)}`,

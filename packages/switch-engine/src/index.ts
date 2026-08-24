@@ -35,6 +35,33 @@ export {
   type ExchangeDeps,
   type PkcePair,
 } from './oauth.js';
+// The overload retry lives here rather than in each caller: the daemon's poller and the CLI's
+// refresh path must agree on WHICH statuses are retried and on one shared status-page cache.
+export {
+  withOverloadRetry,
+  probeClaudeStatus,
+  describeStatus,
+  isOverloadCode,
+  createStatusProbeCache,
+  OVERLOAD_STATUSES,
+  CLAUDE_STATUS_URL,
+  STATUS_INDICATOR_OK,
+  STATUS_PROBE_TIMEOUT_MS,
+  STATUS_CACHE_TTL_MS,
+  SHORT_OVERLOAD_BUDGET,
+  PATIENT_OVERLOAD_BUDGET,
+  OVERLOAD_BACKOFF_BASE_MS,
+  OVERLOAD_BACKOFF_CAP_MS,
+  RETRY_AFTER_CAP_MS,
+  type OverloadBudget,
+  type OverloadResponse,
+  type OverloadRetryDeps,
+  type OverloadRetryEvent,
+  type OverloadRetryOutcome,
+  type StatusFetchLike,
+  type StatusProbeCache,
+  type StatusVerdict,
+} from './overload.js';
 export {
   Vault,
   ACCOUNT_METADATA_REV,
