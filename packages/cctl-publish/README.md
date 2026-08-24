@@ -10,7 +10,7 @@ keeps your phone link alive across the hop.
 
 ### Bot setup
 
-First, [add the cctl bot to a Discord server you're in](https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137108992&scope=bot+applications.commands).
+First, [add the cctl bot to a Discord server you're in](https://discord.com/oauth2/authorize?client_id=1527387188772208790&permissions=395137109056&scope=bot+applications.commands).
 With no server at all, [add it to just your account](https://discord.com/oauth2/authorize?client_id=1527387188772208790&integration_type=1&scope=applications.commands)
 and DM it. Either way is where `/pair` mints your pairing code and where
 notifications reach you.

@@ -1359,7 +1359,7 @@ function buildSessionCommands(program: Command): void {
       const activeAccount = accounts.find((a) => a.id === activeId);
       const header: SessionStatusHeader = {
         ...(activeAccount ? { activeLabel: activeAccount.label } : {}),
-        ...(activeId ? fullWindowsFor(usageFor(activeId)) : {}),
+        ...(activeId ? weeklyResetFor(usageFor(activeId)) : {}),
       };
       process.stdout.write(renderSessionStatus(rows, header, detectPalette()) + '\n');
     });
@@ -1383,13 +1383,16 @@ function sessionRowFromStore(row: SessionRow, labelById: Map<string, string>): S
   return out;
 }
 
-/** The active account's whole-5h-windows-left, for the status header — same computation `cctl
- *  usage` shows inline. Empty when there is no usage snapshot or no known weekly reset. */
-function fullWindowsFor(usage: AccountUsage | undefined): { fullWindowsLeft?: number } {
+/** How long until the active account's weekly reset, for the status header — the same runway
+ *  `cctl usage` shows inline. Empty when there is no usage snapshot or no known weekly reset.
+ *  Returns the remaining duration, not the reset instant: the renderer is clock-free, so the
+ *  subtraction has to happen here, where a real clock is already in hand. */
+function weeklyResetFor(usage: AccountUsage | undefined): { weeklyResetInMs?: number } {
   if (!usage) return {};
-  const outlook = computeOutlook(timelineInputFromWire([usage]), Date.now());
+  const nowMs = Date.now();
+  const outlook = computeOutlook(timelineInputFromWire([usage]), nowMs);
   const budget = outlook.accounts[0]?.budget;
-  return budget ? { fullWindowsLeft: budget.fullWindows } : {};
+  return budget ? { weeklyResetInMs: budget.weeklyResetAt - nowMs } : {};
 }
 
 /** Shared driver for register/label/watch: resolve the session id, POST to the daemon with a

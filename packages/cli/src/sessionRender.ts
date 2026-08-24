@@ -5,6 +5,7 @@
 // Kept IO-free so the exact output is unit-tested, and plain-by-default (color only via an
 // injected palette), matching render.ts's contract: pad on plain text, paint after.
 
+import { humanizeDaysUntil } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 /** One row of the session table. `watch` is `undefined` for kinds with no streaming concept
@@ -19,11 +20,14 @@ export interface SessionStatusRow {
   accountLabel?: string;
 }
 
-/** Optional header context shown above the table: which account is live and its 5h budget. */
+/** Optional header context shown above the table: which account is live and how much of its
+ *  weekly budget is left in time. */
 export interface SessionStatusHeader {
   activeLabel?: string;
-  /** Whole 5h session windows left before the active account's weekly reset, when known. */
-  fullWindowsLeft?: number;
+  /** Milliseconds until the active account's weekly reset, when known. Passed as a duration
+   *  rather than a formatted string so this renderer stays the single place that decides how a
+   *  countdown reads, and as a duration rather than a timestamp so it stays clock-free. */
+  weeklyResetInMs?: number;
 }
 
 /** Short display id for a session that has no label — the first 8 chars, enough to disambiguate
@@ -43,7 +47,9 @@ function renderHeader(header: SessionStatusHeader | undefined, palette: Palette)
     return palette.dim('Active account: (none - start the daemon: cctl daemon run)');
   }
   const budget =
-    header.fullWindowsLeft !== undefined ? `  ·  ${header.fullWindowsLeft}x5h left` : '';
+    header.weeklyResetInMs !== undefined
+      ? `  ·  ${humanizeDaysUntil(header.weeklyResetInMs)} left`
+      : '';
   return `Active account: ${palette.bold(header.activeLabel)}${palette.dim(budget)}`;
 }
 

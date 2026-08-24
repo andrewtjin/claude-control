@@ -40,6 +40,7 @@ import type {
   QuestionAnswer,
   ResumeOrphanOptions,
 } from '@claude-control/session-runtime';
+import { SessionBusyError } from '@claude-control/session-runtime';
 import { Store } from './store.js';
 import { UsagePoller } from './usagePoller.js';
 import { AttributionJournal } from './attributionJournal.js';
@@ -1706,6 +1707,112 @@ describe('Daemon lifecycle', () => {
       expect(err.payload.message).toContain('a turn is already in flight');
       expect(err.payload.relatesTo).toBe(frame.id);
     }
+  });
+
+  /** Spawn a managed session whose `send` refuses as busy the way a real in-flight turn does.
+   *  `refused` counts those refusals, which is the only way a test can tell that a queue actually
+   *  absorbed a message rather than racing ahead of the daemon and asserting on an empty one. */
+  async function spawnBusySession(): Promise<{
+    handle: ReturnType<typeof makeFakeHandle>;
+    refused: string[];
+    acceptFromNow: () => void;
+  }> {
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-busy', prompt: 'go', idempotencyKey: 'k0' },
+    });
+    await waitFor(() => sessionManager.spawnManaged.mock.calls.length > 0);
+    const handle = sessionManager.get('spawned-session') as ReturnType<typeof makeFakeHandle>;
+    const refused: string[] = [];
+    handle.send = (text: string) => {
+      refused.push(text);
+      return Promise.reject(new SessionBusyError('spawned-session'));
+    };
+    return {
+      handle,
+      refused,
+      acceptFromNow: () => {
+        handle.send = (text: string) => {
+          handle.sent.push(text);
+          return Promise.resolve();
+        };
+      },
+    };
+  }
+
+  function injectInto(sessionId: string, text: string, key: string): void {
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId, text, idempotencyKey: key },
+    });
+  }
+
+  // The defect this covers: the same reply succeeded or failed purely on whether the session
+  // happened to be mid-turn, and a terminal session queued where a managed one refused.
+  it('queues an inject a busy managed session refuses, instead of failing it', async () => {
+    const { handle, refused, acceptFromNow } = await spawnBusySession();
+    injectInto('spawned-session', 'while you work', 'k1');
+    await waitFor(() => refused.includes('while you work'));
+
+    // No error to the phone: the text is waiting, not lost.
+    expect(relay.received.filter((e) => e.type === 'error')).toEqual([]);
+
+    // The turn ends; the queued text goes in on that boundary.
+    acceptFromNow();
+    handle.emit({ kind: 'status', state: 'waiting_input' });
+    await waitFor(() => handle.sent.includes('while you work'));
+  });
+
+  // One per boundary: sending the next starts a new turn, so a second send in the same tick
+  // would hit the very guard the queue exists to absorb.
+  it('delivers one queued inject per turn boundary, in arrival order', async () => {
+    const { handle, refused, acceptFromNow } = await spawnBusySession();
+    injectInto('spawned-session', 'first', 'k1');
+    injectInto('spawned-session', 'second', 'k2');
+    // Both must be QUEUED before the session starts accepting, or they deliver straight through
+    // and the test proves nothing about ordering.
+    await waitFor(() => refused.length === 2);
+
+    acceptFromNow();
+    handle.emit({ kind: 'status', state: 'waiting_input' });
+    await waitFor(() => handle.sent.length === 1);
+    expect(handle.sent).toEqual(['first']);
+
+    handle.emit({ kind: 'status', state: 'waiting_input' });
+    await waitFor(() => handle.sent.length === 2);
+    expect(handle.sent).toEqual(['first', 'second']);
+  });
+
+  // A queue that outlives its session is a leak wearing a promise: nothing can ever deliver it.
+  it('drops queued injects when the session ends without taking them', async () => {
+    const { handle, refused, acceptFromNow } = await spawnBusySession();
+    injectInto('spawned-session', 'never lands', 'k1');
+    await waitFor(() => refused.length === 1);
+
+    handle.emit({ kind: 'status', state: 'done' });
+    acceptFromNow();
+    // A later idle transition must not resurrect text the ended session already forfeited.
+    handle.emit({ kind: 'status', state: 'waiting_input' });
+    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
+    expect(handle.sent).toEqual([]);
+  });
+
+  // Refusing an over-full queue beats silently dropping the oldest — a full queue means nothing
+  // is draining, and the sender needs to hear that rather than watch text vanish.
+  it('refuses a new inject once the queue is full, naming why', async () => {
+    await spawnBusySession();
+    for (let i = 0; i < 9; i += 1) injectInto('spawned-session', `msg ${i}`, `k${i}`);
+
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'error' && e.payload.code === 'steer_queue_full'),
+    );
+    const err = relay.received.find(
+      (e) => e.type === 'error' && e.payload.code === 'steer_queue_full',
+    );
+    if (err?.type === 'error') expect(err.payload.message).toContain('already queued');
   });
 
   it('answers spawn_failed with the cause when the session never starts', async () => {
