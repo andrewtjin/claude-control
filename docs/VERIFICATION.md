@@ -404,9 +404,16 @@ answers `{"page": {...}, "status": {"indicator": "none"|"minor"|"major"|"critica
 - **The probe under a real outage's network conditions.** A status page that is slow rather
   than down must hit the 5s bound and degrade to `unreachable` (→ patient), not stall the
   refresh inside the credential lock.
+- **What a 529 costs the credential lock in practice.** The refresh retries while holding that
+  lock, on a budget capped for exactly this reason. A `cctl switch` issued while an account is
+  retrying must still acquire the lock rather than time out waiting for it.
+- **Whether a real 529 can follow an accepted token exchange.** The refresh POST is not
+  idempotent, so an `invalid_grant` seen only after a retry is reported as transient instead of
+  quarantining. Whether that sequence happens at all is unknown; what must hold either way is
+  that a genuinely dead token still quarantines on the next single-attempt refresh.
 
 **Verify:** during (or by simulating against a recorded body) a reported incident, confirm the
-refresh failure message reads `token endpoint overloaded (529) after 6 attempts;
+refresh failure message reads `token endpoint overloaded (529) after <n> attempts;
 status.claude.com: <indicator>` and that the usage snapshot carries the matching
 `usage endpoint overloaded (529); status.claude.com: <indicator>`. Then block
 `status.claude.com` at the firewall and confirm the same paths say `unreachable` and still

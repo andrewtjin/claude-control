@@ -8,7 +8,10 @@
 //
 // The real endpoint URL, header names, and response shape are reverse-engineered
 // from the CLI (see docs/VERIFICATION.md) — this module only ever calls the INJECTED `fetch`,
-// never `globalThis.fetch`, so tests can fully control what "the endpoint" returns.
+// never `globalThis.fetch`, so tests can fully control what "the endpoint" returns. The one
+// exception is advisory and lives a layer down: an overloaded (529) endpoint makes the retry
+// helper consult status.claude.com, which uses the process fetch unless a `statusFetch` is
+// injected through `overload`. The daemon wiring injects one so the rule holds end to end.
 
 import type { AccountUsage, PayloadOf, UsagePlan } from '@claude-control/shared-protocol';
 import {
@@ -55,6 +58,9 @@ export interface FetchLikeResponse {
   /** Optional so a test double stays three fields wide; a real `Response` satisfies it, which
    *  is what lets the overload retry honor a `Retry-After` in production. */
   headers?: { get(name: string): string | null | undefined };
+  /** Same reasoning: what lets an answer the retry loop discards release its socket rather
+   *  than hold it out of the pool until the collector gets to it. */
+  body?: { cancel?: () => unknown } | null;
 }
 /** The injected fetch. `signal` rides through so the poller can bound each request with an
  *  `AbortSignal.timeout`; the production wiring forwards it straight to `globalThis.fetch`. */
@@ -261,7 +267,7 @@ export class UsagePoller {
       // spend concurrently (pollOne runs per account). Beyond that bound the persistence is
       // the poll cycle itself: falling back below costs no backoff, so the next cycle retries.
       const { response: res, verdict } = await withOverloadRetry(
-        () =>
+        (ctx) =>
           this.fetchFn(USAGE_ENDPOINT, {
             headers: {
               authorization: `Bearer ${token}`,
@@ -269,8 +275,10 @@ export class UsagePoller {
               'user-agent': this.userAgent,
             },
             // A hung endpoint aborts here and lands in the catch below as a transient network
-            // failure (tier-0 fallback), never blocking the cycle past this bound.
-            signal: AbortSignal.timeout(POLL_FETCH_TIMEOUT_MS),
+            // failure (tier-0 fallback), never blocking the cycle past this bound. The retry
+            // deadline is composed in so a retry started near the end of the budget cannot
+            // then run for a further full timeout on top of it.
+            signal: AbortSignal.any([AbortSignal.timeout(POLL_FETCH_TIMEOUT_MS), ctx.signal]),
           }),
         this.overloadDeps,
       );
