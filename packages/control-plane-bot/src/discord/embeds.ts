@@ -132,6 +132,14 @@ function planBillingSuffix(
   return `\nplan ${plan} · billing ${account.billing ?? 'unknown'}`;
 }
 
+/** A line saying auto-switch will never hop TO this account. Deliberately NOT part of
+ *  `accountMarker`: the marker reports HEALTH (active/idle/erroring), and an excluded account is
+ *  perfectly healthy — the operator simply chose to keep unattended hops away from it. Silent
+ *  otherwise, including for a daemon predating the field, so nothing captions the normal case. */
+function exclusionSuffix(account: Pick<AccountUsage, 'autoSwitchExcluded'> | undefined): string {
+  return account?.autoSwitchExcluded === true ? '\n⏸ excluded from auto-switch' : '';
+}
+
 /** Embed accent color for a usage snapshot: the worst severity across every limit of
  *  every account, or neutral blue when no limit data exists yet. */
 function usageColor(accounts: AccountUsage[]): number {
@@ -180,7 +188,7 @@ export function buildUsageEmbed(
       name: `${account.label} — ${marker}${cachedSuffix(account)}`,
       value: fitFieldValue(
         (unicodeFallback) =>
-          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${planBillingSuffix(account)}${errorSuffix(account)}`,
+          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${windowsLine(outlook, account.accountId)}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
       ),
     });
   }
@@ -469,7 +477,7 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
     addClampedField(
       embed,
       `${accountMarker(account)} ${account.label}`,
-      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${planBillingSuffix(account)}${errorSuffix(account)}`,
+      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
     );
   }
   return embed;

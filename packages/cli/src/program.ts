@@ -1048,6 +1048,32 @@ async function reauthAccount(ref: string): Promise<void> {
   }
 }
 
+/**
+ * The shared body of `accounts exclude` / `accounts include`. Reports what the registry now says
+ * rather than what the command asked for: running either verb on an account already in that
+ * state is a no-op, and printing "Excluded X" there would claim a change that did not happen.
+ */
+async function setExclusion(ref: string, excluded: boolean): Promise<void> {
+  const engine = buildEngine();
+  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  if (!resolved.ok) fail(resolved.message);
+  const already = resolved.account.autoSwitchExcluded === true;
+  if (already === excluded) {
+    process.stdout.write(
+      excluded
+        ? `${resolved.account.label} is already excluded from auto-switch.\n`
+        : `${resolved.account.label} is already available to auto-switch.\n`,
+    );
+    return;
+  }
+  await engine.setAutoSwitchExcluded(resolved.account.id, excluded);
+  process.stdout.write(
+    excluded
+      ? `Excluded ${resolved.account.label} from auto-switch (manual switches still work).\n`
+      : `${resolved.account.label} is available to auto-switch again.\n`,
+  );
+}
+
 function buildAccountCommands(program: Command): void {
   const accounts = program.command('accounts').description('manage stored accounts');
 
@@ -1104,6 +1130,23 @@ function buildAccountCommands(program: Command): void {
     .description('re-login an existing account via a login link + pasted code, keeping its id')
     .action(async (ref: string) => {
       await reauthAccount(ref);
+    });
+
+  // Exclusion is a standing choice about UNATTENDED hops only, so the two verbs deliberately
+  // change nothing else: `cctl switch` and the phone's /switch still activate an excluded
+  // account, and auto-switch still hops away from one that is live.
+  accounts
+    .command('exclude <ref>')
+    .description('stop auto-switch from ever hopping TO this account (manual switches still work)')
+    .action(async (ref: string) => {
+      await setExclusion(ref, true);
+    });
+
+  accounts
+    .command('include <ref>')
+    .description('let auto-switch consider this account again')
+    .action(async (ref: string) => {
+      await setExclusion(ref, false);
     });
 
   accounts

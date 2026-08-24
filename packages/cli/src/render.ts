@@ -45,7 +45,9 @@ export function renderAccountsTable(
     email: a.emailAddress ?? '-',
     plan: planLabel(a),
     billing: billingLabel(a, nowMs),
-    status: a.quarantined ? 'quarantined' : 'ok',
+    // Quarantine wins when both apply: it is the reason the account CANNOT be used, which
+    // outranks the operator's choice about where auto-switch may go.
+    status: a.quarantined ? 'quarantined' : a.autoSwitchExcluded ? 'excluded' : 'ok',
     id: a.id,
   }));
 
@@ -80,7 +82,14 @@ export function renderAccountsTable(
   ];
   const rowLine = (r: (typeof rows)[number]) => {
     const [active, label, email, plan, billing, status, id] = cells(r);
-    const paintStatus = r.status === 'quarantined' ? palette.red : (t: string) => t;
+    // Red is reserved for a fault. Exclusion is a deliberate setting, so it reads as quiet
+    // (dim) — visible without implying anything is wrong with the account.
+    const paintStatus =
+      r.status === 'quarantined'
+        ? palette.red
+        : r.status === 'excluded'
+          ? palette.dim
+          : (t: string) => t;
     return [
       palette.green(active ?? ''),
       palette.bold(label ?? ''),
