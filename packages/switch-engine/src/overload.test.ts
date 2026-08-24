@@ -10,6 +10,7 @@ import {
   withOverloadRetry,
   CLAUDE_STATUS_URL,
   LOCKED_OVERLOAD_BUDGET_CAP_MS,
+  OVERLOAD_MIN_ATTEMPT_MS,
   OVERLOAD_BACKOFF_CAP_MS,
   PATIENT_OVERLOAD_BUDGET,
   RETRY_AFTER_CAP_MS,
@@ -333,6 +334,29 @@ describe('withOverloadRetry', () => {
     expect((deps.now?.() ?? 0) - FIRST_ATTEMPT_MS).toBeLessThanOrEqual(
       LOCKED_OVERLOAD_BUDGET_CAP_MS,
     );
+  });
+
+  it('never starts a retry it cannot finish, so the last answer stays the honest one', async () => {
+    // The sleep is clipped to the budget, so without a floor the final retry would be handed a
+    // deadline of a few milliseconds and abort before reaching the network — surfacing to the
+    // caller as a transport error instead of the overloaded answer already in hand.
+    const { deps, advance } = harness(statusPage('none'), () => 1);
+    const offered: number[] = [];
+    const attempt = vi.fn((ctx: OverloadAttemptContext) => {
+      offered.push(ctx.remainingMs);
+      advance(200); // a quick 529 each time
+      return Promise.resolve(response(529));
+    });
+
+    const outcome = await withOverloadRetry(attempt, { ...deps, budgetCapMs: 1_500 });
+
+    expect(outcome.response.status).toBe(529);
+    // Every retry was offered at least the floor; the one that would not fit was never made.
+    expect(offered.slice(1).every((ms) => ms >= OVERLOAD_MIN_ATTEMPT_MS)).toBe(true);
+    const sleeps = (deps.sleep as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => call[0] as number,
+    );
+    expect(sleeps).toEqual([500]);
   });
 
   it('releases the body of every response it retries away', async () => {

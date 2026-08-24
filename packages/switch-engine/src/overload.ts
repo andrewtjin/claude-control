@@ -78,6 +78,12 @@ export const OVERLOAD_BACKOFF_BASE_MS = 1_000;
 /** Ceiling on one backoff step, so the patient budget spends itself across several tries
  *  instead of on a single long sleep. */
 export const OVERLOAD_BACKOFF_CAP_MS = 8_000;
+/** The least budget a retry is worth starting with. The backoff sleep is clipped to what is
+ *  left, so without this floor the last retry could be handed a deadline of a few milliseconds:
+ *  it would abort before reaching the network and come back to the caller as a TRANSPORT error,
+ *  hiding the honest answer — the endpoint was still overloaded, and the response that says so
+ *  is already in hand. Sized at roughly one round trip under load. */
+export const OVERLOAD_MIN_ATTEMPT_MS = 1_000;
 /** Ceiling on a server-supplied `Retry-After`. Honoring the header is right; letting an upstream
  *  park us for an arbitrary time inside a locked call is not. */
 export const RETRY_AFTER_CAP_MS = 15_000;
@@ -254,10 +260,16 @@ export async function withOverloadRetry<Res extends OverloadResponse>(
     // Attempts made so far is `retries + 1`. Both bounds are checked BEFORE sleeping, so an
     // exhausted budget answers immediately instead of waiting to discover it is done.
     if (retries + 1 >= budget.maxAttempts) return outcome(response, retries, verdict);
+    // What is left must cover the sleep AND a retry worth making; the delay is clipped so the
+    // attempt after it still gets {@link OVERLOAD_MIN_ATTEMPT_MS}, and when even that does not
+    // fit the overloaded answer already in hand is the honest result.
     const leftMs = (deadlineAtMs ?? now()) - now();
-    if (leftMs <= 0) return outcome(response, retries, verdict);
+    if (leftMs <= OVERLOAD_MIN_ATTEMPT_MS) return outcome(response, retries, verdict);
 
-    const delayMs = Math.min(nextDelayMs(retries, response, random), leftMs);
+    const delayMs = Math.min(
+      nextDelayMs(retries, response, random),
+      leftMs - OVERLOAD_MIN_ATTEMPT_MS,
+    );
     deps.onRetry?.({ attempt: retries + 1, status: response.status, delayMs, verdict });
     retries += 1;
     // The response is about to be dropped for good. An undrained body holds its socket out of
