@@ -34,6 +34,7 @@ import {
   commandDefinitions,
   gatewayIntents,
   missingThreadPermissionLabels,
+  promptThreadTarget,
 } from './discordJsGateway.js';
 import type {
   CommandResult,
@@ -1156,12 +1157,62 @@ describe('DiscordJsGateway — a running session keeps its thread', () => {
   });
 });
 
+describe('promptThreadTarget', () => {
+  const THREADED = (sessionId: string): DeliveryTarget | undefined =>
+    sessionId === 's1' ? { kind: 'thread', threadId: 't1' } : undefined;
+
+  const question = envelope('question.request', {
+    requestId: 'q1',
+    sessionId: 's1',
+    questions: [{ question: 'Which color?', header: 'Color', options: [], multiSelect: false }],
+  });
+
+  it('sends a question into the thread its session already lives in', () => {
+    expect(promptThreadTarget(question, THREADED)).toBe('t1');
+  });
+
+  // A permission prompt interrupts the same conversation for the same reason, and shares the
+  // whole code path — routing one and not the other would split the surface in half.
+  it('sends a permission prompt to the same place', () => {
+    const permission = envelope('permission.request', {
+      requestId: 'p1',
+      sessionId: 's1',
+      tool: 'Bash',
+      summary: 'run tests',
+    });
+    expect(promptThreadTarget(permission, THREADED)).toBe('t1');
+  });
+
+  it('falls back to the DM for a session with no thread of its own', () => {
+    // An interactive session never opens one, so this is the common case, not an edge.
+    expect(promptThreadTarget(question, () => undefined)).toBeUndefined();
+  });
+
+  it('honours a route that has already been pinned to the DM', () => {
+    expect(promptThreadTarget(question, () => ({ kind: 'dm' }))).toBeUndefined();
+  });
+
+  // The lookup must never be consulted for a frame that is not a prompt: session output has its
+  // own threaded path, and answering a thread id here would route it twice.
+  it('does not route a non-prompt envelope, and does not even look one up', () => {
+    let looked = 0;
+    const counted = (sessionId: string): DeliveryTarget | undefined => {
+      looked += 1;
+      return THREADED(sessionId);
+    };
+    const status = envelope('session.status', { sessionId: 's1', state: 'waiting_input' });
+    expect(promptThreadTarget(status, counted)).toBeUndefined();
+    expect(looked).toBe(0);
+  });
+});
+
 describe('missingThreadPermissionLabels', () => {
   const ALL = [
     PermissionFlagsBits.ViewChannel,
     PermissionFlagsBits.CreatePrivateThreads,
     PermissionFlagsBits.SendMessagesInThreads,
     PermissionFlagsBits.ManageThreads,
+    PermissionFlagsBits.AddReactions,
   ];
 
   it('reports nothing missing when every thread permission is granted', () => {
@@ -1178,18 +1229,28 @@ describe('missingThreadPermissionLabels', () => {
     ]);
   });
 
+  // A relayed message's receipt is a reaction, so without this grant the relay works and simply
+  // looks ignored — the quietest failure on the surface, and the one worth naming out loud.
+  it('names Add Reactions when only that one is missing', () => {
+    const granted = ALL.filter((flag) => flag !== PermissionFlagsBits.AddReactions);
+    expect(missingThreadPermissionLabels(new PermissionsBitField(granted))).toEqual([
+      'Add Reactions',
+    ]);
+  });
+
   it('reports them in fix order when several are missing', () => {
     expect(missingThreadPermissionLabels(new PermissionsBitField([]))).toEqual([
       'View Channel',
       'Create Private Threads',
       'Send Messages in Threads',
       'Manage Threads',
+      'Add Reactions',
     ]);
   });
 
   // No computed permission set at all is unknown, not granted — reporting "nothing missing" there
   // would pin a channel on the strength of an absence.
   it('treats an absent permission set as everything missing', () => {
-    expect(missingThreadPermissionLabels(null)).toHaveLength(4);
+    expect(missingThreadPermissionLabels(null)).toHaveLength(ALL.length);
   });
 });

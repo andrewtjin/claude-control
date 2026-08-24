@@ -194,6 +194,28 @@ function agentEventToDisplay(event: AgentSdkEvent): SessionEvent | undefined {
 }
 
 /**
+ * `send()` refused because a turn is already running.
+ *
+ * A distinct type, not a message, because the two ways `send()` can refuse call for opposite
+ * responses: a terminal session will never accept this text and the sender must be told, while a
+ * busy one will accept it a moment from now, so the right answer is to wait rather than to fail.
+ * Callers that cannot tell them apart have to either drop text that would have delivered or
+ * retry text that never will — and matching on the message string to avoid that is a contract
+ * nobody can see.
+ */
+export class SessionBusyError extends Error {
+  readonly sessionId: string;
+
+  constructor(sessionId: string) {
+    super(
+      `session '${sessionId}' is busy with an in-flight turn - wait for 'waiting_input' or call interrupt() first`,
+    );
+    this.name = 'SessionBusyError';
+    this.sessionId = sessionId;
+  }
+}
+
+/**
  * Start a managed session and immediately kick off its first turn. Callers must subscribe
  * via `onEvent` synchronously (before yielding to the event loop) to be guaranteed not to
  * miss the earliest events — the first turn starts on a microtask, not before this
@@ -496,11 +518,7 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     // implicit microtask hop, so the check-then-kick sequence stays a single atomic tick.
     send(text: string): Promise<void> {
       if (busy) {
-        return Promise.reject(
-          new Error(
-            `session '${opts.id}' is busy with an in-flight turn - wait for 'waiting_input' or call interrupt() first`,
-          ),
-        );
+        return Promise.reject(new SessionBusyError(opts.id));
       }
       if (state === 'done' || state === 'failed') {
         return Promise.reject(
