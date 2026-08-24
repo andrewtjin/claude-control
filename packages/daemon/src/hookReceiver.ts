@@ -1461,7 +1461,14 @@ export class HookReceiver {
         ...(detail !== undefined ? { detail } : {}),
         ...(cwd !== undefined ? { cwd } : {}),
         ...(permissionMode !== undefined ? { permissionMode } : {}),
-        expiresAt: now + this.permissionTtlMs,
+        // The HOLD, not the pending row's TTL: this is what the phone counts down on a live
+        // card, and the hold timer below is what actually ends the request. Stamped from the
+        // longer TTL it promised minutes that were never there, so the card stayed live and
+        // answerable past the moment the neutral answer had already handed the prompt back to
+        // the terminal. A row outliving its hold still matters — a request answered from a
+        // stale card is resolvable until the TTL — but that is the resolver's window, not the
+        // one a countdown should show.
+        expiresAt: now + this.permissionHoldMs,
       },
     });
     this.emit({
@@ -1541,7 +1548,11 @@ export class HookReceiver {
         questions,
         ...(cwd !== undefined ? { cwd } : {}),
         ...(permissionMode !== undefined ? { permissionMode } : {}),
-        expiresAt: now + this.permissionTtlMs,
+        // The question's OWN hold, for the same reason the permission path stamps its own (see
+        // there): the timer armed below is what ends this request, and a question's hold is a
+        // separately tunable knob — reading either from the pending-row TTL advertised a
+        // deadline nothing here fires on.
+        expiresAt: now + this.questionHoldMs,
       },
     });
     // Companion card, mirroring the permission path's own `hook.notification` companion — event
