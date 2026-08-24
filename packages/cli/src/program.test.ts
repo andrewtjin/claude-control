@@ -62,7 +62,7 @@ describe('buildProgram', () => {
     const accounts = buildProgram().commands.find((c) => c.name() === 'accounts');
     const subs = accounts?.commands.map((c) => c.name()).sort();
     // `relogin` spawns a browser login on this host; `reauth` takes a pasted code instead, so a
-    // headless/SSH host (and the wet test for the OAuth flow itself) has a path too.
+    // headless/SSH host has a path too.
     expect(subs).toEqual(['add', 'exclude', 'include', 'list', 'reauth', 'relogin', 'remove']);
   });
 
