@@ -461,10 +461,11 @@ describe('emoji-width overflow fallback', () => {
   });
 });
 
-// The phone showed neither the plan tier nor the billing date the terminal had always shown,
-// on all three account views. Both facts live in the local registry and reach the bot only
-// because the daemon resolves them onto the snapshot — so each surface is asserted separately:
-// they render from one helper, but nothing structural stops one of them from dropping it.
+// Exclusion is a standing operator choice, and the phone is where the fleet is read most
+// often, so both account views must say it. Each surface is asserted separately: they render
+// from one helper today, but nothing structural stops one of them from dropping the line. The
+// marker assertion pins the other half of the rule — exclusion is a choice, not ill health, so
+// it must not colour the per-account health marker.
 describe('auto-switch exclusion across the account views', () => {
   const excluded = account({ autoSwitchExcluded: true });
 

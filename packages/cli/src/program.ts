@@ -854,6 +854,10 @@ function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
       quarantined: a.quarantined,
       limits: state.usageFor(a.id)?.limits ?? [],
       predictedResetAt: state.predictedResetFor(a.id),
+      // The registry row carries the exclusion, so pass it: `timeline` computes its OWN plan
+      // with the daemon's greedy setting, and without this the terminal would promise a hop
+      // the daemon's policy refuses to make.
+      autoSwitchExcluded: a.autoSwitchExcluded,
       // The registry is right here, so resolve the tier from it rather than leaving the fleet
       // math equal-weighting a Max 20x against a Pro. Only a KNOWN weight is passed: an
       // unresolved one must stay absent so pacing reports the assumption instead of burying it.
