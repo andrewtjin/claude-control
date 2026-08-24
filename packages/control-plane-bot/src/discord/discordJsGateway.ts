@@ -294,6 +294,10 @@ const REQUIRED_THREAD_PERMISSIONS: readonly (readonly [bigint, string])[] = [
   [PermissionFlagsBits.CreatePrivateThreads, 'Create Private Threads'],
   [PermissionFlagsBits.SendMessagesInThreads, 'Send Messages in Threads'],
   [PermissionFlagsBits.ManageThreads, 'Manage Threads'],
+  // Receipts on relayed thread messages are reactions, and a reaction the bot cannot add is the
+  // quietest failure on this surface: the message relays perfectly and simply looks ignored, so
+  // the reader assumes the relay dropped it. Preflighting it turns that into a sentence.
+  [PermissionFlagsBits.AddReactions, 'Add Reactions'],
 ];
 
 /** Name of the throwaway thread `/thread-here` creates to prove a channel really works. Self-
@@ -316,6 +320,40 @@ export function missingThreadPermissionLabels(
   return REQUIRED_THREAD_PERMISSIONS.filter(([flag]) => !permissions.has(flag)).map(
     ([, label]) => label,
   );
+}
+
+/** The session a card is ABOUT, for the two envelope types that are part of a session's own
+ *  conversation: a question and a permission prompt each block one specific session's turn.
+ *  Everything else carries no session context worth routing on, and answers `undefined`. */
+function promptSessionId(envelope: Envelope): string | undefined {
+  if (isType(envelope, 'question.request')) return envelope.payload.sessionId;
+  if (isType(envelope, 'permission.request')) return envelope.payload.sessionId;
+  return undefined;
+}
+
+/**
+ * The thread a card should be posted into, or `undefined` for the DM.
+ *
+ * A prompt about a session that already has a thread belongs IN that thread — it is the session
+ * pausing mid-turn to ask something, and a DM splits the exchange so the reader answers in one
+ * place what they are reading in another. Anything that is not a prompt, and any session with no
+ * thread of its own, keeps the DM.
+ *
+ * `lookup` only ever REPORTS an existing route; it must not create one. A prompt must never be
+ * what opens a session's thread — that decision belongs to the session's own first frame, and
+ * making it from here would race it.
+ *
+ * Exported and pure because the decision is the part worth pinning down; the channel fetch around
+ * it is a live boundary that no test can meaningfully assert.
+ */
+export function promptThreadTarget(
+  envelope: Envelope,
+  lookup: (sessionId: string) => DeliveryTarget | undefined,
+): string | undefined {
+  const sessionId = promptSessionId(envelope);
+  if (sessionId === undefined) return undefined;
+  const target = lookup(sessionId);
+  return target?.kind === 'thread' ? target.threadId : undefined;
 }
 
 /** Flatten a thrown Discord error into one quotable line. Newlines collapse because the reply is a
@@ -350,6 +388,10 @@ export class DiscordJsGateway implements DiscordGateway {
   private readonly planner = new SessionPlanner();
   /** Persisted sessionId→thread map; loaded on start(), survives restart. */
   private readonly threadReg: PersistentThreadRegistry;
+  /** Users already told that session threads are failing. Deliberately per-process and not
+   *  persisted: the point is one explanation, not one forever — a restart is also when a
+   *  permission change would have taken effect, so re-earning the right to say it is correct. */
+  private readonly threadFallbackNotified = new Set<string>();
   /** Persisted per-user `/thread-here` choices; loaded on start(), survives restart. `protected`
    *  (not `private`), same seam rationale as {@link sinkFor}: the command tests assert what a
    *  `/thread-here` invocation actually WROTE, which is the only way to prove a rejected pin left
@@ -580,14 +622,14 @@ export class DiscordJsGateway implements DiscordGateway {
       return;
     }
     const push = renderPush(envelope);
-    if (!push) return; // cache-only: not worth a DM
+    if (!push) return; // cache-only: not worth a card
     try {
-      const user = await this.client.users.fetch(discordUserId);
+      const sink = await this.cardSink(discordUserId, envelope);
       const parts = push.content === undefined ? [undefined] : chunkMessage(push.content);
       for (const [index, content] of parts.entries()) {
         // Sent in sequence, not in parallel: Discord orders by arrival, and a summary that
         // lands out of order is worse than one that takes an extra moment.
-        const message = await user.send({
+        const message = await sink.send({
           ...(content === undefined ? {} : { content }),
           ...(index === 0 ? this.toSendExtras(push) : {}),
         });
@@ -612,7 +654,58 @@ export class DiscordJsGateway implements DiscordGateway {
         }
       }
     } catch (err) {
-      this.logger.warn({ err, discordUserId }, 'discord: failed to DM user');
+      this.logger.warn({ err, discordUserId }, 'discord: failed to deliver a card');
+    }
+  }
+
+  /** Where a card belongs.
+   *
+   *  A question or permission prompt about a session that already HAS a thread goes into that
+   *  thread. The prompt is part of that conversation — it is the session pausing mid-turn to ask
+   *  something — and a DM splits it in two, so the reader answers in one place what they are
+   *  reading in another. Everything else, and any session with no thread (an interactive session
+   *  never opens one), keeps the DM.
+   *
+   *  Deliberately {@link ThreadRegistry.get} and not {@link ensureTarget}: this REUSES a thread,
+   *  it never creates one. `ensureTarget` is the single place that decides where a session lives,
+   *  and creating from here would race the session's own first frame for that decision.
+   *
+   *  `protected` for the same reason as {@link sinkFor}: it is the seam a test overrides to prove
+   *  the routing without a live Discord connection. */
+  protected async cardSink(discordUserId: string, envelope: Envelope): Promise<SendableChannels> {
+    const threadId = promptThreadTarget(envelope, (sessionId) =>
+      this.threadReg.get(discordUserId, sessionId),
+    );
+    if (threadId !== undefined) {
+      const channel = await this.client.channels.fetch(threadId);
+      // A thread that has vanished is not an error worth failing the prompt over: the DM below is
+      // the same fallback the session's own frames take, so the question still gets asked.
+      if (channel?.isSendable()) return channel;
+    }
+    const user = await this.client.users.fetch(discordUserId);
+    return user.createDM();
+  }
+
+  /** Tell the user once, per process, that session threads are not working and what to do. The
+   *  DM is the fallback surface anyway, so the notice lands exactly where their session output
+   *  just did. Best-effort and never awaited by delivery: a failed notice must not also cost
+   *  them the frame that triggered it. */
+  private async notifyThreadFallback(discordUserId: string, err: unknown): Promise<void> {
+    if (this.threadFallbackNotified.has(discordUserId)) return;
+    this.threadFallbackNotified.add(discordUserId);
+    try {
+      const user = await this.client.users.fetch(discordUserId);
+      await user.send(
+        `⚠️ I could not open a session thread, so this session is coming to your DMs instead ` +
+          `(${describeProbeFailure(err)}).\n` +
+          `Run \`/thread-here\` in the channel you want sessions to live in — it names any ` +
+          `permission it is missing.`,
+      );
+    } catch (notifyErr) {
+      this.logger.warn(
+        { err: notifyErr, discordUserId },
+        'discord: failed to send the thread-fallback notice',
+      );
     }
   }
 
@@ -873,7 +966,11 @@ export class DiscordJsGateway implements DiscordGateway {
         target = { kind: 'thread', threadId: thread.id };
       }
     } catch (err) {
+      // Degrading silently is what made this invisible: the session kept working, in the wrong
+      // place, with only a log line to say so. Tell the user — they are the only one who can
+      // grant a permission, and they cannot grant what nobody told them was missing.
       this.logger.warn({ err, route }, 'discord: thread creation failed, falling back to DM');
+      void this.notifyThreadFallback(route.discordUserId, err);
       target = { kind: 'dm' };
     }
     // Write-behind: `record` updates the in-memory map synchronously (the authority for this
@@ -1233,7 +1330,12 @@ export class DiscordJsGateway implements DiscordGateway {
   }
 
   /** Best-effort reaction on a thread message — feedback, never load-bearing; a failure is
-   *  logged and swallowed. `protected` seam so unit tests observe reactions without discord.js. */
+   *  logged and swallowed. `protected` seam so unit tests observe reactions without discord.js.
+   *
+   *  Warn, not debug. The reaction IS the delivered receipt, so losing it makes a message that
+   *  relayed perfectly look ignored — and at debug level the only evidence of that was invisible
+   *  by default. A missing Add Reactions grant fails every call here identically, which is
+   *  exactly the case the log has to be loud enough to name. */
   protected async reactInThread(threadId: string, messageId: string, emoji: string): Promise<void> {
     try {
       const channel = await this.client.channels.fetch(threadId);
@@ -1241,7 +1343,10 @@ export class DiscordJsGateway implements DiscordGateway {
       const message = await channel.messages.fetch(messageId);
       await message.react(emoji);
     } catch (err) {
-      this.logger.debug({ err, threadId, messageId }, 'discord: failed to react in thread');
+      this.logger.warn(
+        { err, threadId, messageId, emoji },
+        'discord: failed to react in thread (a receipt is missing; check the Add Reactions grant)',
+      );
     }
   }
 
