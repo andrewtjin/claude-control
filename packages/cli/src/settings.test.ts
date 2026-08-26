@@ -108,6 +108,16 @@ describe('resolveDaemonConfig', () => {
     });
   });
 
+  it('describes what actually ends an unanswered question hold', () => {
+    // The help line is the only place an operator learns what the knob buys them. It promised a
+    // terminal picker after the window; the hold declines the question instead, so the session
+    // carries on without answers and no picker is ever shown.
+    const { rows } = resolveDaemonConfig({});
+    const detail = row(rows, 'question hold').detail;
+    expect(detail).toContain('declined');
+    expect(detail).not.toContain('picker');
+  });
+
   it('reads the permission hold window from CCTL_PERMISSION_HOLD_MS', () => {
     const { values, rows } = resolveDaemonConfig({ CCTL_PERMISSION_HOLD_MS: '60000' });
     expect(values.permissionHoldMs).toBe(60_000);

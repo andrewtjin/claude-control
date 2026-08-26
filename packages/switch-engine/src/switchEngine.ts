@@ -576,10 +576,13 @@ export class SwitchEngine {
    * credential lock and pass the `liveAccountId` they read BEFORE the overwrite (see
    * reloginFromConfigDirLocked for why the ordering matters).
    *
-   * The bundle is built from the FRESH login only — the account's previous `oauthAccount`
-   * block is never read or merged in. A stale identity block is precisely the contamination
-   * class the identity anchor work exists to prevent: it can only survive by being carried
-   * forward, and a missing block self-heals on the next activation, while a stale one does not.
+   * This core writes exactly the bundle it is handed and reads nothing of the account's own to
+   * build it; assembling that bundle is the caller's job, because only the caller knows how
+   * complete its source is (a host capture reads whole files, a code exchange gets a partial
+   * answer — see {@link mergeOverStoredBundle}). The one rule every caller owes it: the identity
+   * block must describe the login that just happened. A block carried forward past a login that
+   * named nobody is the cross-account contamination class — a missing block self-heals on the
+   * next activation, a wrong one never does.
    */
   private async applyReloginBundle(
     existing: StoredAccount,
@@ -651,6 +654,52 @@ export class SwitchEngine {
   }
 
   /**
+   * Fold an authorization-code exchange's answer onto the account's STORED bundle, so the write
+   * that follows describes the fresh grant without forgetting everything else.
+   *
+   * A host capture reads two whole files and therefore knows the account's plan, rate-limit
+   * tier, org tier, billing type, subscription start and trial end. An exchange knows none of
+   * that: it returns a token pair plus, at most, uuid / email / organization uuid / name. Writing
+   * that answer verbatim drops the rest from the bundle AND from the registry row derived from
+   * it, so a Max account silently renders — and is capacity-weighted — as an unknown plan until
+   * a full re-capture repairs it. The fresh values therefore win, and every field the response is
+   * silent about falls back to what is already stored.
+   *
+   * The identity block is merged ONLY when the exchange actually reported one. That block is what
+   * the live heal writes as "who is logged in", and carrying one forward for a response that
+   * named nobody is the stale-identity failure class: a MISSING block self-heals on the next
+   * capture, a wrong one never does. When a block IS reported, the guard downstream has proven
+   * it belongs to this account, so its fields overlay the stored ones and the untouched
+   * plan/billing keys ride along.
+   *
+   * An unreadable stored bundle (no blob yet, a protector that cannot decrypt it) degrades to the
+   * exchange's own data rather than failing a re-login that already succeeded — the metadata is
+   * cosmetic next to the rotated single-use token this call is about to persist, and the next
+   * capture recomputes it.
+   */
+  private async mergeOverStoredBundle(
+    accountId: string,
+    fresh: ClaudeOauth,
+    identity: OauthAccount | undefined,
+  ): Promise<CredentialBundle> {
+    let stored: CredentialBundle | undefined;
+    try {
+      stored = await this.vault.readBundle(accountId);
+    } catch (err) {
+      this.log.warn(
+        { accountId, reason: errorReason(err) },
+        'could not read the stored bundle; re-login keeps only the exchanged credentials',
+      );
+    }
+    // Spread order is the whole contract: the exchange only sets keys it actually reported (see
+    // oauth.ts's tolerant mapping), so an absent key leaves the stored value standing instead of
+    // blanking it — which is also why nothing here may assign an explicit undefined.
+    const claudeAiOauth: ClaudeOauth = { ...stored?.claudeAiOauth, ...fresh };
+    if (identity === undefined) return { claudeAiOauth };
+    return { claudeAiOauth, oauthAccount: { ...stored?.oauthAccount, ...identity } };
+  }
+
+  /**
    * Re-login an EXISTING account via a completed OAuth authorization-code+PKCE exchange — the
    * headless counterpart to {@link reloginFromConfigDir} for callers with no browser on this
    * host (phone `/reauth`, `cctl accounts reauth`). Shares its identity-guard +
@@ -665,6 +714,10 @@ export class SwitchEngine {
    * Failure taxonomy: a failed exchange is always a {@link RefreshError} (the caller's paste
    * or the provider's rejection), NEVER a {@link QuarantineError} — this path must be unable
    * to (re)quarantine anything; only the refresh path may.
+   *
+   * METADATA: the exchange reports far less about an account than a host capture does, so its
+   * answer is folded onto the stored bundle rather than replacing it ({@link
+   * mergeOverStoredBundle}) — a re-login must not cost the account its known plan.
    *
    * LIVE HEAL: identical to {@link reloginFromConfigDir}'s — re-authenticating the account that
    * is live right now also rewrites the live files, reported as `healedLiveLogin`. Never touches
@@ -682,10 +735,16 @@ export class SwitchEngine {
       // Read BEFORE the overwrite, for the same reason reloginFromConfigDirLocked does.
       const liveAccountId = await this.getActiveId();
       const { claudeAiOauth, oauthAccount } = await this.exchange(params, this.refreshDeps);
+      // A code exchange answers with tokens and, at most, a four-field identity block; it never
+      // echoes the plan facts the account already knows about itself. Fold it over the stored
+      // bundle so a re-login rotates credentials without erasing them (see the helper), and keep
+      // the RAW response for `identityVerified` below — the merged block can carry a uuid the
+      // exchange itself never reported.
+      const merged = await this.mergeOverStoredBundle(existing.id, claudeAiOauth, oauthAccount);
       const { account, healedLiveLogin } = await this.applyReloginBundle(
         existing,
-        claudeAiOauth,
-        oauthAccount,
+        merged.claudeAiOauth,
+        merged.oauthAccount,
         liveAccountId,
       );
       return {

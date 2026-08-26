@@ -60,6 +60,12 @@ bot requests the privileged intent whenever **either** variable configures sessi
 and requesting it without the portal toggle rejects the gateway login at startup. A pure-DM
 deployment (neither set) requests no privileged intent and needs no portal change.
 
+One more relay tunable, unrelated to routing: `CCTL_MAX_PENDING_CONNECTIONS` caps how many
+not-yet-authenticated daemon sockets the relay holds open at once (default 64) before it starts
+shedding new connections rather than let a flood exhaust the process. Raise it in `.env` only if
+you're self-hosting for enough daemons that many of them might reconnect at the same moment, say
+right after a host reboot.
+
 ### `/thread-here` — users pick their own channel
 
 Both env vars above are **defaults**. Any paired user can run `/thread-here` in a channel to
@@ -156,6 +162,7 @@ docker compose up -d
 ## Zero-credential guarantee
 
 `packages/control-plane-bot` may import only `@claude-control/shared-protocol` — a
-structural rule, not a promise, enforced by a dependency-closure build guard that fails
-if `@claude-control/switch-engine` (the package that touches vault/credential code)
-ever ends up in the bot's dependency graph, self-hosted or shared alike.
+structural rule, not a promise, enforced by a test that walks the real workspace
+`package.json` files and fails if `@claude-control/switch-engine` (the package that
+touches vault/credential code) ever ends up in the bot's dependency graph, self-hosted
+or shared alike.

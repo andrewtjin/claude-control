@@ -79,7 +79,8 @@ imply neither extreme:
   There is no `security(1)`-path workaround for that — if it reproduces, the honest
   outcome is a documented caveat, not an ACL hack.
 
-Until that gate closes (`docs/VERIFICATION.md` gate 13), macOS is unverified: the commands
+Until the _macOS support (Keychain vault + live-credential channel)_ section of
+`docs/VERIFICATION.md` is confirmed on real hardware, macOS is unverified: the commands
 may well work on your Mac, and nothing about them is claimed here.
 
 On an unsupported platform, `cctl doctor` reports the gap instead of failing

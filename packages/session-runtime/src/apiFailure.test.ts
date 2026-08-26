@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyFailureText, classifyStopFailureType } from './apiFailure.js';
+import { classifyFailureText, classifyStopFailureType, isStopFailureType } from './apiFailure.js';
 
 describe('classifyFailureText', () => {
   // The CLI's real synthetic give-up messages, verbatim from transcripts — the primary
@@ -110,7 +110,7 @@ describe('classifyStopFailureType', () => {
     expect(classifyStopFailureType(errorType)).toEqual({ transient: false });
   });
 
-  it('falls back to the text classifier only for error_type unknown', () => {
+  it('falls back to the text classifier for anything the taxonomy does not define', () => {
     expect(classifyStopFailureType('unknown', 'API Error: 500 Internal server error')).toEqual({
       transient: true,
       kind: 'server_error',
@@ -121,5 +121,48 @@ describe('classifyStopFailureType', () => {
     expect(classifyStopFailureType('billing_error', 'API Error: 500')).toEqual({
       transient: false,
     });
+  });
+
+  // The installed CLI puts a whole sentence in the slot the docs promise a token in, so these
+  // strings arrive as `errorType` with nothing else alongside. Read as a token they are all
+  // "unrecognized", which used to mean permanent — and told the user to go fix an outage.
+  it.each([
+    ['API Error: 529 Overloaded. Please try again later.', 'overloaded'],
+    ['API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}', 'overloaded'],
+    ['API Error: 500 Internal server error.', 'server_error'],
+  ])('reads the CLI free text %# as a transient death', (text, kind) => {
+    expect(classifyStopFailureType(text)).toEqual({ transient: true, kind });
+  });
+
+  it('keeps the usage-limit verdict when the free text is a rate limit', () => {
+    expect(classifyStopFailureType('API Error: 429 rate_limit_error')).toEqual({
+      transient: false,
+      usageLimit: true,
+    });
+  });
+
+  it('still refuses to retry free text naming a cause a retry cannot fix', () => {
+    expect(
+      classifyStopFailureType('API Error: 401 authentication_error: invalid bearer token'),
+    ).toEqual({ transient: false });
+  });
+
+  it('prefers the dedicated text field when the payload carries both', () => {
+    // `error_text` is the documented home for prose; a token slot holding prose is the fallback,
+    // never the winner.
+    expect(classifyStopFailureType('unknown', 'API Error: 529 Overloaded.')).toEqual({
+      transient: true,
+      kind: 'overloaded',
+    });
+  });
+});
+
+describe('isStopFailureType', () => {
+  it('separates the taxonomy tokens from the prose that arrives in the same slot', () => {
+    // What a card asks before quoting the value as a named cause.
+    expect(isStopFailureType('billing_error')).toBe(true);
+    expect(isStopFailureType('overloaded')).toBe(true);
+    expect(isStopFailureType('unknown')).toBe(false);
+    expect(isStopFailureType('API Error: 529 Overloaded. Please try again later.')).toBe(false);
   });
 });

@@ -511,10 +511,13 @@ export class DiscordJsGateway implements DiscordGateway {
     // trigger a ping. A future path that legitimately needs to mention someone sets the `users`/
     // `roles` array explicitly on that one message rather than relying on content parsing.
     this.client = new Client({
-      // Privileged intents only when the DEPLOYMENT configures channel threads (resolver or env
-      // routes) — see gatewayIntents. The resolver alone can't be the signal anymore: it always
-      // exists now (it also serves /thread-here pins), and a pin is a user action that must never
-      // decide whether the next boot requests a privileged intent.
+      // Privileged intents only when the DEPLOYMENT configures channel threads: a resolver it
+      // injected, or either env-derived route — see gatewayIntents. Read off `options`, never off
+      // the `sessionChannelResolver` FIELD: that field is always set, because the constructor
+      // above builds one even for a pure-DM deployment so `/thread-here` pins have somewhere to
+      // resolve. Testing the field would therefore request a privileged intent everywhere, and
+      // would let a pin — a user action — decide whether the next boot asks for an intent only
+      // the operator can enable in the developer portal.
       // Truthiness on purpose, matching how bin.ts spreads the option in: an empty-string
       // channel id configures no threads and must not request a privileged intent.
       intents: gatewayIntents(

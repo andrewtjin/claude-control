@@ -487,6 +487,19 @@ describe('computePlan — headroom is set by the binding limit', () => {
     expect(plan.ranking[0]?.sessionResetAt).toBe(NOW + 3 * HOUR);
     expect(plan.ranking[0]?.weeklyResetAt).toBe(NOW + 4 * DAY);
   });
+
+  it('ranks against the SOONEST weekly reset across both weekly kinds', () => {
+    // The reset the ranking quotes is the shared weekly rule's, not whichever kind supplied the
+    // percent: the two are views of one window, and reading only weekly_all would advertise a
+    // later turnover than the account actually has. Same clock the timeline and pacing use, so
+    // one view can never promise runway another has already ended.
+    const a = acct('a', 'A', [
+      { kind: 'weekly_all', percent: 50, resetsAt: NOW + 4 * DAY },
+      { kind: 'weekly_scoped', percent: 20, resetsAt: NOW + 2 * DAY },
+    ]);
+    const plan = computePlan([a], opts);
+    expect(plan.ranking[0]?.weeklyResetAt).toBe(NOW + 2 * DAY);
+  });
 });
 
 describe('computePlan — determinism', () => {

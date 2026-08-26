@@ -415,7 +415,10 @@ answers `{"page": {...}, "status": {"indicator": "none"|"minor"|"major"|"critica
 **Verify:** during (or by simulating against a recorded body) a reported incident, confirm the
 refresh failure message reads `token endpoint overloaded (529) after <n> attempts;
 status.claude.com: <indicator>` and that the usage snapshot carries the matching
-`usage endpoint overloaded (529); status.claude.com: <indicator>`. Then block
+`usage endpoint overloaded (529); status.claude.com: <indicator>` followed by the tier-0
+fallback's own reason — for an account with nothing cached, the whole line reads
+`usage endpoint overloaded (529); status.claude.com: <indicator>; no cached usage available`.
+Then block
 `status.claude.com` at the firewall and confirm the same paths say `unreachable` and still
 retry the patient number of times.
 
