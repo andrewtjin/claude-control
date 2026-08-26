@@ -204,6 +204,9 @@ export interface DaemonConfig {
     identityCheck: boolean;
     autoContinue: boolean;
     autoContinueMaxAttempts: number | undefined;
+    /** Where the daemon's NDJSON file sink writes, in addition to stdout — an explicit
+     *  CCTL_LOG_FILE, or `<dataDir>/daemon.log` when unset (see the `dataDir` parameter). */
+    logFilePath: string;
   };
   rows: SettingRow[];
 }
@@ -222,6 +225,11 @@ export function resolveDaemonConfig(
   env: NodeJS.ProcessEnv,
   flags: DaemonRunFlags = {},
   fileConfig: DaemonFileConfig = {},
+  // Same default the daemon itself uses for every other per-machine file (daemon.db,
+  // daemon-identity.enc, ...) — a caller previewing behavior (`cctl settings`) gets the same
+  // answer `cctl daemon run` would, and daemonRun.ts passes its own real dataDir explicitly so
+  // display and behavior are read from the exact same resolution (see the module comment).
+  dataDir: string = dirname(defaultPaths().vaultDir),
 ): DaemonConfig {
   // Both default ON (flag > env > default): a flag-less `daemon run` — which is exactly what
   // the installed logon task executes — hops when the active account runs low and burns
@@ -286,6 +294,10 @@ export function resolveDaemonConfig(
   const autoContinueEnv = envBool(env, 'CCTL_AUTO_CONTINUE');
   const autoContinue = autoContinueEnv ?? true;
   const autoContinueMaxAttempts = envNumber(env, 'CCTL_AUTO_CONTINUE_MAX');
+  // A blank override is an ABSENT one, same stance as the relay url above — an unset-but-defined
+  // CCTL_LOG_FILE must not win over the real default with an empty path nothing can write to.
+  const logFileEnv = blankAsUnset(env['CCTL_LOG_FILE']);
+  const logFilePath = logFileEnv ?? join(dataDir, 'daemon.log');
 
   const rows: SettingRow[] = [
     {
@@ -423,10 +435,11 @@ export function resolveDaemonConfig(
     },
     {
       name: 'daemon log file',
-      value: env['CCTL_LOG_FILE'] ?? 'off',
-      source: envSource(env['CCTL_LOG_FILE'] !== undefined),
+      value: logFilePath,
+      source: envSource(logFileEnv !== undefined),
       detail:
-        'CCTL_LOG_FILE (path NDJSON logs are also appended to; an installed daemon has no console)',
+        'CCTL_LOG_FILE (path NDJSON logs are also appended to; an installed daemon has no ' +
+        'console, so this defaults to <data dir>/daemon.log rather than off)',
     },
   ];
 
@@ -449,6 +462,7 @@ export function resolveDaemonConfig(
       identityCheck,
       autoContinue,
       autoContinueMaxAttempts,
+      logFilePath,
     },
     rows,
   };

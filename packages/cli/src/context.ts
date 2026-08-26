@@ -38,12 +38,17 @@ export function daemonDbPath(paths: Paths = defaultPaths()): string {
  *
  * Nothing is silenced either way: the level is unchanged, CCTL_LOG_FILE still receives the same
  * lines, and CCTL_LOG_LEVEL still turns more of them on.
+ *
+ * `env` defaults to the real `process.env`; `cctl daemon run` overrides just CCTL_LOG_FILE on
+ * it (its resolved default-or-explicit log path) so this engine's logger writes to the SAME
+ * file its own logger does, without disturbing every other env-driven knob this reads.
  */
 export function buildEngine(
   paths: Paths = defaultPaths(),
   logSink: LogSink = process.stderr,
+  env: NodeJS.ProcessEnv = process.env,
 ): SwitchEngine {
-  const adapter: Logger = createLogger({ defaultLevel: 'warn', sink: logSink });
+  const adapter: Logger = createLogger({ defaultLevel: 'warn', sink: logSink, env });
   // The switch-cadence guard defaults to 60s; operators can tune (or 0-disable) it via env.
   const intervalEnv = Number(process.env.CCTL_SWITCH_MIN_INTERVAL_MS);
   // The same adapter reaches the OAuth retry loop, which is otherwise the one part of a token

@@ -46,7 +46,8 @@ function isAuditEntry(value: unknown): value is AuditEntry {
     typeof v.ts === 'number' &&
     typeof v.event === 'string' &&
     (v.fromAccountId === null || typeof v.fromAccountId === 'string') &&
-    (v.toAccountId === null || typeof v.toAccountId === 'string')
+    (v.toAccountId === null || typeof v.toAccountId === 'string') &&
+    (v.origin === undefined || typeof v.origin === 'string')
   );
 }
 
@@ -56,13 +57,16 @@ function isAuditEntry(value: unknown): value is AuditEntry {
 interface ActivationEvent {
   ts: number;
   toAccountId: string;
+  /** `null` for an entry written before the audit trail carried `origin` — see
+   *  `ActivationIntervalRow.origin` (store.ts) for why that stays null rather than a guess. */
+  origin: string | null;
 }
 
 function toActivationEvents(entries: AuditEntry[]): ActivationEvent[] {
   const events: ActivationEvent[] = [];
   for (const e of entries) {
     if (e.event === 'activated' && e.toAccountId !== null) {
-      events.push({ ts: e.ts, toAccountId: e.toAccountId });
+      events.push({ ts: e.ts, toAccountId: e.toAccountId, origin: e.origin ?? null });
     }
   }
   // Oldest-first — the order intervals must be derived in.
@@ -75,6 +79,7 @@ interface DerivedInterval {
   accountId: string;
   startedAtMs: number;
   endedAtMs: number | null;
+  origin: string | null;
 }
 
 /** Turn the ts-sorted activation list into contiguous, non-overlapping intervals: each
@@ -91,6 +96,7 @@ function deriveIntervals(activations: ActivationEvent[]): DerivedInterval[] {
       accountId: activation.toAccountId,
       startedAtMs: activation.ts,
       endedAtMs: next ? next.ts : null,
+      origin: activation.origin,
     });
   }
   return intervals;
@@ -108,7 +114,8 @@ function intervalsEqual(existing: ActivationIntervalRow[], target: DerivedInterv
     if (
       e.accountId !== t.accountId ||
       e.startedAtMs !== t.startedAtMs ||
-      e.endedAtMs !== t.endedAtMs
+      e.endedAtMs !== t.endedAtMs ||
+      e.origin !== t.origin
     )
       return false;
   }

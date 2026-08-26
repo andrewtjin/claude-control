@@ -9,6 +9,12 @@ import { appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureDir } from './fsutil.js';
 
+/** Who/what initiated a switch — stamped on `activated` entries (see `SwitchEngine.activate`'s
+ *  `origin` option) and on the entries `recover()` writes for its own crash-recovery commits
+ *  ('recovery'). Absent on every entry written before this field existed, and on any entry type
+ *  that never carried a caller-supplied origin (quarantine, refresh-adopt, ...). */
+export type SwitchOrigin = 'auto' | 'manual' | 'phone' | 'recovery';
+
 export interface AuditEntry {
   ts: number;
   event:
@@ -21,6 +27,7 @@ export interface AuditEntry {
   fromAccountId: string | null;
   toAccountId: string | null;
   detail?: string;
+  origin?: SwitchOrigin;
 }
 
 /** Appends audit entries to `<vaultDir>/switch-audit.jsonl`. */

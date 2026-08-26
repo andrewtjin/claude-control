@@ -1127,7 +1127,7 @@ describe('Daemon lifecycle', () => {
       },
     });
     await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
-    expect(switchEngine.activate).toHaveBeenCalledWith('acct-x');
+    expect(switchEngine.activate).toHaveBeenCalledWith('acct-x', { origin: 'phone' });
     const result = relay.received.find((e) => e.type === 'switch.result');
     if (result?.type === 'switch.result') {
       expect(result.payload).toMatchObject({
@@ -1356,7 +1356,7 @@ describe('Daemon lifecycle', () => {
       },
     });
     await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
-    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y');
+    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y', { origin: 'phone' });
     const result = relay.received.find((e) => e.type === 'switch.result');
     if (result?.type === 'switch.result') {
       expect(result.payload).toMatchObject({ ok: true, activeAccountId: 'acct-y' });

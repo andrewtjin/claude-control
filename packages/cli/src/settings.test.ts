@@ -57,7 +57,8 @@ describe('envNumber / envFlag', () => {
 
 describe('resolveDaemonConfig', () => {
   it('is all defaults with no flags and no env', () => {
-    const { values, rows } = resolveDaemonConfig({});
+    const dataDir = join('fake', 'data-dir');
+    const { values, rows } = resolveDaemonConfig({}, {}, {}, dataDir);
     expect(values).toEqual({
       relayUrl: DEFAULT_RELAY_URL,
       autoSwitch: true,
@@ -75,6 +76,7 @@ describe('resolveDaemonConfig', () => {
       identityCheck: true,
       autoContinue: true,
       autoContinueMaxAttempts: undefined,
+      logFilePath: join(dataDir, 'daemon.log'),
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('on');
@@ -93,7 +95,12 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'relay url').value).toBe(DEFAULT_RELAY_URL);
     expect(row(rows, 'daemon log level').value).toBe('info');
     expect(row(rows, 'daemon log format').value).toBe('auto');
-    expect(row(rows, 'daemon log file').value).toBe('off');
+    // An installed daemon has no console, so — unlike the CLI's own log file row — this
+    // defaults to a real path rather than 'off'.
+    expect(row(rows, 'daemon log file')).toMatchObject({
+      value: join(dataDir, 'daemon.log'),
+      source: 'default',
+    });
   });
 
   it('reports the logging env overrides an operator has actually set', () => {

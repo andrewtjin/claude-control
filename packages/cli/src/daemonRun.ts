@@ -202,18 +202,15 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       );
     }
   }
-  const logger: Logger = createLogger({ defaultLevel: 'info', sink: DAEMON_LOG_SINK });
-
-  const engine = buildEngine(paths, DAEMON_LOG_SINK);
-  const store = new Store(daemonDbPath(paths));
-  const protector = defaultProtector();
-
   // The operator's persisted overrides, read here (the edge) so the resolution below stays
   // pure. A missing or malformed file degrades to no overrides, never to a failed start.
   const fileConfig = (await readDaemonConfigFile(daemonConfigPath(paths))) ?? {};
 
   // One resolution feeds BOTH behavior (the values wired below) and visibility (the rows
-  // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart.
+  // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart. Resolved
+  // BEFORE either logger below, because its `logFilePath` (an explicit CCTL_LOG_FILE, or the
+  // resolved `<dataDir>/daemon.log` default — see settings.ts) is the path both loggers must
+  // actually write to, not a second default independently guessed here.
   const config = resolveDaemonConfig(
     process.env,
     {
@@ -224,6 +221,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       ...(options.relay !== undefined ? { relay: options.relay } : {}),
     },
     fileConfig,
+    dataDir,
   );
   const {
     relayUrl,
@@ -235,7 +233,26 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     cooldownMs,
     autoSwitch,
     greedy,
+    logFilePath,
   } = config.values;
+
+  // Both loggers this process builds (this one, plus the switch-engine adapter inside
+  // buildEngine) must read the SAME CCTL_LOG_FILE, or `cctl daemon run > daemon.log` captures
+  // only half the log while the rest silently goes to a file nobody redirected (see
+  // buildEngine's own comment). Overriding just that one key on a copy of process.env is what
+  // lets the resolved default take effect without every OTHER env-driven knob in this process
+  // reading from a stale snapshot instead of the live environment.
+  const loggingEnv: NodeJS.ProcessEnv = { ...process.env, CCTL_LOG_FILE: logFilePath };
+  const logger: Logger = createLogger({
+    defaultLevel: 'info',
+    sink: DAEMON_LOG_SINK,
+    env: loggingEnv,
+  });
+
+  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv);
+  const store = new Store(daemonDbPath(paths));
+  const protector = defaultProtector();
+
   const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
   // Best-effort: the report is purely informational, so a write failure must not stop the
   // daemon from starting.
@@ -353,7 +370,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // and it reports every attempt to the phone through the same switch.result push as /switch.
   const autoSwitcher = autoSwitch
     ? new AutoSwitcher({
-        activate: (accountId) => engine.activate(accountId),
+        activate: (accountId, options) => engine.activate(accountId, options),
         notify: (payload) =>
           controlPlaneClient.send({
             type: 'switch.result',
