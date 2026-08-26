@@ -45,7 +45,7 @@ export type { SettingRow } from '@claude-control/shared-protocol';
  *  the phone. Lives here (not program.ts) so the daemon's settings report can carry it: after
  *  an `npm i -g` update the running daemon keeps its old build until restarted, and the two
  *  rows ('cli build' vs 'daemon build') are how an operator sees that skew. */
-export const VERSION = '0.4.0';
+export const VERSION = '0.4.1';
 
 /** The hosted control plane a published build dials with no configuration at all. This is the
  *  last fallback in the precedence ladder, not a lock-in: `--relay`, `CCTL_RELAY_URL`, and
