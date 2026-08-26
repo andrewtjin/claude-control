@@ -16,6 +16,7 @@ import {
   readDaemonConfigFile,
   readSettingsReport,
   renderSettings,
+  renderVersionInfo,
   reportSaysGreedyActive,
   resolveCliSettings,
   resolveDaemonConfig,
@@ -423,6 +424,36 @@ describe('reportSaysGreedyActive', () => {
     // Greedy set but inactive renders as a longer string — correctly not "on".
     expect(reportSaysGreedyActive(report('off', 'on (inactive: auto-switch is off)'))).toBe(false);
     expect(reportSaysGreedyActive(undefined)).toBe(false);
+  });
+});
+
+describe('renderVersionInfo', () => {
+  const reportWith = (daemonBuild: string) => ({
+    startedAtMs: 0,
+    settings: [{ name: 'daemon build', value: daemonBuild, source: 'default' as const }],
+  });
+
+  it('reports no daemon has run when there is no settings report', () => {
+    expect(renderVersionInfo('0.4.3', undefined)).toBe(
+      ['cli build: v0.4.3', 'daemon build: no daemon has run yet'].join('\n'),
+    );
+  });
+
+  it('shows both builds with no warning when they match', () => {
+    const text = renderVersionInfo('0.4.3', reportWith('v0.4.3'));
+    expect(text).toBe(['cli build: v0.4.3', 'daemon build: v0.4.3'].join('\n'));
+    expect(text).not.toContain('warning');
+  });
+
+  it('warns of skew when the daemon is on an older build than this CLI', () => {
+    const text = renderVersionInfo('0.4.3', reportWith('v0.4.2'));
+    expect(text).toBe(
+      [
+        'cli build: v0.4.3',
+        'daemon build: v0.4.2',
+        'warning: the daemon is on a different build than this CLI - restart it to pick up the update.',
+      ].join('\n'),
+    );
   });
 });
 

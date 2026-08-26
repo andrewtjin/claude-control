@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { buildProgram } from './program.js';
+import { VERSION, type SettingsReport } from './settings.js';
 
 // `buildEngine` is the CLI's single seam onto the switch engine, so stubbing it lets an action
 // body run for real — commander dispatch, the action, the render — with nothing near a real
@@ -15,6 +16,32 @@ vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
   buildEngine: () => engine,
 }));
+
+// `readSettingsReport` hits the real filesystem beside a real vault, which on a machine that has
+// ever run the daemon holds a real report — stubbing it is what keeps `version` deterministic
+// regardless of what daemon (if any) last ran on the box a test executes on.
+const settingsIo = vi.hoisted(() => ({
+  readSettingsReport: vi.fn((): Promise<SettingsReport | undefined> => Promise.resolve(undefined)),
+}));
+vi.mock('./settings.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./settings.js')>()),
+  readSettingsReport: settingsIo.readSettingsReport,
+}));
+
+/** Run one command with stdout captured, so the printed text can be asserted. */
+async function run(argv: string[]): Promise<string> {
+  let out = '';
+  const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+    out += String(chunk);
+    return true;
+  });
+  try {
+    await buildProgram().parseAsync(argv, { from: 'user' });
+  } finally {
+    write.mockRestore();
+  }
+  return out;
+}
 
 describe('buildProgram', () => {
   it('exposes the expected command surface', () => {
@@ -32,6 +59,7 @@ describe('buildProgram', () => {
     expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
+    expect(names).toContain('version');
     // First-run + at-a-glance status surfaces.
     expect(names).toContain('setup');
     expect(names).toContain('status');
@@ -169,6 +197,68 @@ describe('buildProgram', () => {
   });
 });
 
+describe('version command', () => {
+  beforeEach(() => {
+    settingsIo.readSettingsReport.mockReset().mockResolvedValue(undefined);
+  });
+
+  it('prints the cli build and says no daemon has run when there is no report', async () => {
+    const out = await run(['version']);
+    expect(out).toContain(`cli build: v${VERSION}`);
+    expect(out).toContain('no daemon has run');
+  });
+
+  it('prints both builds when the daemon has reported one', async () => {
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [{ name: 'daemon build', value: `v${VERSION}`, source: 'default' }],
+    });
+    const out = await run(['version']);
+    expect(out).toContain(`cli build: v${VERSION}`);
+    expect(out).toContain(`daemon build: v${VERSION}`);
+  });
+});
+
+describe('help', () => {
+  // Commander's own `help` dispatch always ends by calling `process.exit` (see `Command.help()`)
+  // — a bare-program `.action()` (the `cctl` summary above) is exactly the condition that makes
+  // Commander skip adding its implicit help command in the first place (see `_getHelpCommand`),
+  // so this exercises the real dispatch path rather than asserting our fix from the outside.
+  // `exitOverride()` can't substitute here: it only takes effect on subcommands created AFTER
+  // it is called, and every subcommand is already built by the time a test gets `buildProgram()`'s
+  // return value — so the exit itself is turned into a throw instead, unwinding the same way
+  // `exitOverride` would, without ever reaching a real `process.exit` in the test worker.
+  async function captureHelp(argv: string[]): Promise<string> {
+    let out = '';
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      out += String(chunk);
+      return true;
+    });
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('__test_process_exit__');
+    });
+    try {
+      await buildProgram().parseAsync(argv, { from: 'user' });
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== '__test_process_exit__') throw err;
+    } finally {
+      write.mockRestore();
+      exit.mockRestore();
+    }
+    return out;
+  }
+
+  it('prints top-level usage for `cctl help`', async () => {
+    const out = await captureHelp(['help']);
+    expect(out).toContain('Usage: cctl');
+  });
+
+  it("resolves `cctl help <command>` to that command's own usage", async () => {
+    const out = await captureHelp(['help', 'switch']);
+    expect(out).toContain('Usage: cctl switch');
+  });
+});
+
 // Exclusion is a registry write behind a resolved ref, so the verbs are worth running for real:
 // a typo'd command name or a wrong-way-round boolean would sail past a surface-only assertion.
 describe('accounts exclude / include', () => {
@@ -180,21 +270,6 @@ describe('accounts exclude / include', () => {
     updatedAtMs: 0,
     ...extra,
   });
-
-  /** Run one command with stdout captured, so the printed line can be asserted. */
-  async function run(argv: string[]): Promise<string> {
-    let out = '';
-    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
-      out += String(chunk);
-      return true;
-    });
-    try {
-      await buildProgram().parseAsync(argv, { from: 'user' });
-    } finally {
-      write.mockRestore();
-    }
-    return out;
-  }
 
   beforeEach(() => {
     engine.setAutoSwitchExcluded.mockClear();

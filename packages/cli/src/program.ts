@@ -118,6 +118,7 @@ import {
   readDaemonConfigFile,
   readSettingsReport,
   renderSettings,
+  renderVersionInfo,
   reportSaysGreedyActive,
   resolveCliSettings,
   resolveDaemonConfig,
@@ -137,6 +138,12 @@ export function buildProgram(): Command {
     .name('cctl')
     .description('claude-control - switch Claude accounts, see usage, control sessions')
     .version(VERSION);
+
+  // Commander only auto-adds a `help` subcommand when the program itself has no action handler
+  // of its own — ours does (the bare-`cctl` summary at the bottom of this function), which would
+  // otherwise silently disable `cctl help`/`cctl help <command>` rather than dispatching them.
+  // Force it on explicitly so both keep working regardless of that handler.
+  program.helpCommand(true);
 
   buildAccountCommands(program);
   buildSessionCommands(program);
@@ -308,6 +315,14 @@ export function buildProgram(): Command {
         });
       }
       process.stdout.write(renderSettings(sections, detectPalette()) + '\n');
+    });
+
+  program
+    .command('version')
+    .description("show this CLI's build and the running daemon's last-reported build")
+    .action(async () => {
+      const report = await readSettingsReport(daemonSettingsPath());
+      process.stdout.write(renderVersionInfo(VERSION, report) + '\n');
     });
 
   program
