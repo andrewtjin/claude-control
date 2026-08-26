@@ -44,11 +44,14 @@ export function decodePowerShellStderr(stderr: string): string {
     .map((m) =>
       (m[1] ?? '')
         .replace(/_x000D_|_x000A_/g, '')
-        .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&apos;/g, "'")
+        // `&amp;` must be undone last: doing it first turns e.g. `&amp;lt;` (a literal `&lt;`
+        // in the error text) into `&lt;` mid-chain, which the later replace then wrongly
+        // collapses to `<` — the classic double-unescape.
+        .replace(/&amp;/g, '&')
         .trim(),
     )
     .filter((line) => line.length > 0);

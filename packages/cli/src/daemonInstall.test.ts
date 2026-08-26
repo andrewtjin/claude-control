@@ -235,6 +235,13 @@ describe('decodePowerShellStderr', () => {
     expect(decoded).toBe("path 'C:\\a & b' <not found>");
   });
 
+  it('does not double-unescape entities whose escaped form contains &amp;', () => {
+    // `&amp;lt;` is a literal `&lt;` in the error text; unescaping `&amp;` first would
+    // collapse it all the way to `<`.
+    const decoded = decodePowerShellStderr('<S S="Error">literal &amp;lt; and &amp;amp;</S>');
+    expect(decoded).toBe('literal &lt; and &amp;');
+  });
+
   it('passes non-CLIXML stderr through untouched', () => {
     expect(decodePowerShellStderr('  plain error text\n')).toBe('plain error text');
   });
