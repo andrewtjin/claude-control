@@ -145,6 +145,44 @@ describe('UsagePoller', () => {
     expect(snapshot.accounts[0]?.error).toMatch(/token refresh failed: endpoint returned 503/);
   });
 
+  it('repollNow makes ONE account due again without disturbing the others', async () => {
+    let now = 0;
+    const polled: string[] = [];
+    const fetchFn: FetchLike = vi.fn((_url: string, init: { headers: Record<string, string> }) => {
+      polled.push(init.headers.authorization ?? '');
+      return Promise.resolve(jsonResponse(200, liveBody(5)));
+    });
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: (accountId) => Promise.resolve(`tok-${accountId}`),
+      getCachedUsage: () => Promise.resolve(cachedBody(0)),
+      clock: () => now,
+      random: () => 0,
+    });
+
+    await poller.pollAll([account, account2]);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+
+    // Well inside the floor: without the nudge neither account would be re-read.
+    now += 1;
+    poller.repollNow(account2.accountId);
+    await poller.pollAll([account, account2]);
+    expect(polled.slice(2)).toEqual([`Bearer tok-${account2.accountId}`]);
+  });
+
+  it('repollNow on an account that has never been polled is a no-op (it is due already)', async () => {
+    const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(200, liveBody(5))));
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(0)),
+      clock: () => 1000,
+    });
+    poller.repollNow('never-seen');
+    const snapshot = await poller.pollAll([account]);
+    expect(snapshot.results[0]?.outcome).toBe('live');
+  });
+
   it('429 triggers cached fallback; the floor is a hard minimum wait even under backoff', async () => {
     let now = 0;
     const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(429, {})));

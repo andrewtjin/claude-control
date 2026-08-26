@@ -102,6 +102,18 @@ describe('buildSdkQueryOptions', () => {
     expect(buildSdkQueryOptions({ permissionMode: 'made-up-mode' })).toEqual({});
   });
 
+  it('threads the turn-shaping knobs, preserving an EMPTY tool allowlist', () => {
+    // `allowedTools: []` is the "no tools" instruction; dropping it as falsy would silently
+    // hand the turn the CLI's full default toolset instead.
+    expect(
+      buildSdkQueryOptions({ model: 'claude-haiku-4-5', maxTurns: 1, allowedTools: [] }),
+    ).toEqual({ model: 'claude-haiku-4-5', maxTurns: 1, allowedTools: [] });
+  });
+
+  it('omits the turn-shaping knobs entirely when the caller sets none', () => {
+    expect(buildSdkQueryOptions({ cwd: '/w' })).toEqual({ cwd: '/w' });
+  });
+
   it('binds accountId to a config dir when a resolver is given (the legitimate mechanism)', () => {
     const onUnbound = vi.fn();
     const shape = buildSdkQueryOptions(

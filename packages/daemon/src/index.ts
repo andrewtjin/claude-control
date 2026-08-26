@@ -140,7 +140,21 @@ export {
 } from './autoSwitcher.js';
 
 export {
+  AccountProbe,
+  DEFAULT_PROBE_TIMEOUT_MS,
+  PROBE_BACKOFF_CAP_MS,
+  PROBE_COOLDOWN_MS,
+  PROBE_MODEL,
+  PROBE_PROMPT,
+  type AccountProbeOptions,
+  type ProbeCandidate,
+  type ProbeEngine,
+  type ProbeVault,
+} from './accountProbe.js';
+
+export {
   Daemon,
+  type AccountProbeLike,
   type AutoSwitcherLike,
   type DaemonOptions,
   type SwitchEngineLike,

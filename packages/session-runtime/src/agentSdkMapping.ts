@@ -126,6 +126,9 @@ export interface SdkQueryOptionsShape {
   resume?: string;
   cwd?: string;
   permissionMode?: PermissionMode;
+  model?: string;
+  maxTurns?: number;
+  allowedTools?: string[];
   env?: Record<string, string | undefined>;
 }
 
@@ -179,6 +182,11 @@ export function buildSdkQueryOptions(
     ...(opts.permissionMode !== undefined && KNOWN_PERMISSION_MODES.has(opts.permissionMode)
       ? { permissionMode: opts.permissionMode as PermissionMode }
       : {}),
+    ...(opts.model !== undefined ? { model: opts.model } : {}),
+    ...(opts.maxTurns !== undefined ? { maxTurns: opts.maxTurns } : {}),
+    // Presence, not truthiness: `[]` is the "no tools" instruction, and a length check here
+    // would silently drop it and hand the turn the CLI's full default toolset instead.
+    ...(opts.allowedTools !== undefined ? { allowedTools: opts.allowedTools } : {}),
   };
 
   if (opts.accountId !== undefined) {

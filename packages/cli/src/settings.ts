@@ -29,7 +29,11 @@ import {
   defaultPaths,
   type Paths,
 } from '@claude-control/switch-engine';
-import { DEFAULT_AUTOSWITCH_COOLDOWN_MS, DEFAULT_PERMISSION_HOLD_MS } from '@claude-control/daemon';
+import {
+  DEFAULT_AUTOSWITCH_COOLDOWN_MS,
+  DEFAULT_PERMISSION_HOLD_MS,
+  DEFAULT_PROBE_TIMEOUT_MS,
+} from '@claude-control/daemon';
 import { DEFAULT_AUTO_CONTINUE_MAX_ATTEMPTS } from '@claude-control/session-runtime';
 import {
   DEFAULT_GREEDY_RESET_MARGIN_MS,
@@ -196,6 +200,8 @@ export interface DaemonConfig {
     minSessionHeadroomPct: number | undefined;
     greedyResetMarginMs: number | undefined;
     cooldownMs: number | undefined;
+    probeUnknown: boolean;
+    probeTimeoutMs: number | undefined;
     waitingCards: boolean;
     permissionHoldMs: number | undefined;
     questionHoldMs: number | undefined;
@@ -238,6 +244,13 @@ export function resolveDaemonConfig(
   const minSessionHeadroomPct = envNumber(env, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
   const greedyResetMarginMs = envNumber(env, 'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS');
   const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
+  // Default ON, and — like greedy — only ever ACTIVE alongside auto-switch: it spends one cheap
+  // turn on an account that has never been used, so the endpoint starts publishing the weekly
+  // window that auto-switch needs before it may target that account at all. Off means those
+  // accounts stay unreachable rather than being activated unattended.
+  const probeUnknownEnv = envBool(env, 'CCTL_PROBE_UNKNOWN');
+  const probeUnknown = probeUnknownEnv ?? true;
+  const probeTimeoutMs = envNumber(env, 'CCTL_PROBE_TIMEOUT_MS');
   // A blank override is an ABSENT override, not an empty relay url. `CCTL_RELAY_URL=` left in a
   // shell profile, or `--relay "$SOMETHING_UNSET"` in a wrapper script, would otherwise win the
   // `??` chain with '' and send the daemon to dial nothing — while the settings view reported
@@ -352,6 +365,19 @@ export function resolveDaemonConfig(
       detail: 'CCTL_AUTOSWITCH_COOLDOWN_MS',
     },
     {
+      name: 'unknown-account probe',
+      value: probeUnknown ? (autoSwitch ? 'on' : 'on (inactive: auto-switch is off)') : 'off',
+      source: envSource(probeUnknownEnv !== undefined),
+      detail:
+        'CCTL_PROBE_UNKNOWN (spend one cheap turn on a never-used account so its weekly window opens and auto-switch can reach it)',
+    },
+    {
+      name: 'probe timeout',
+      value: humanizeMs(probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS),
+      source: envSource(probeTimeoutMs !== undefined),
+      detail: 'CCTL_PROBE_TIMEOUT_MS (hard ceiling on one probe turn)',
+    },
+    {
       name: 'waiting cards',
       value: waitingCards ? 'on' : 'off',
       source: envSource(waitingCards),
@@ -441,6 +467,8 @@ export function resolveDaemonConfig(
       minSessionHeadroomPct,
       greedyResetMarginMs,
       cooldownMs,
+      probeUnknown,
+      probeTimeoutMs,
       waitingCards,
       permissionHoldMs,
       questionHoldMs,

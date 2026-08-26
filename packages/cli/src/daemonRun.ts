@@ -24,6 +24,7 @@ import {
   type Protector,
 } from '@claude-control/switch-engine';
 import {
+  AccountProbe,
   AttributionJournal,
   AutoSwitcher,
   ControlPlaneClient,
@@ -235,6 +236,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     cooldownMs,
     autoSwitch,
     greedy,
+    probeUnknown,
+    probeTimeoutMs,
   } = config.values;
   const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
   // Best-effort: the report is purely informational, so a write failure must not stop the
@@ -373,6 +376,33 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       })
     : undefined;
 
+  // The eager activation probe. Only built alongside the auto-switcher: it spends a real turn
+  // purely to make an account TARGETABLE, which is worth nothing when nothing is choosing
+  // targets. This is the ONE path that binds an account to its own CLAUDE_CONFIG_DIR — the
+  // opposite of the activate-before-spawn model every managed session uses (see
+  // makeAgentSdkClientFactory) — and deliberately so: it must run a turn as an account WITHOUT
+  // making it live, which is exactly what the config-dir bind buys and what activation cannot.
+  // A fresh client per probe, for the same reason sessions get one.
+  //
+  // NOT ON DARWIN. The whole mechanism rests on the CLI reading credentials out of
+  // CLAUDE_CONFIG_DIR, and on macOS it does not — it reads its login Keychain item instead
+  // (the same platform fact the keychain-delta capture flows exist for). A probe there would
+  // seed files nothing reads and run its turn under whichever account is LIVE, spending that
+  // account's quota and attributing it to another. Off is the only honest posture until the
+  // per-account bind is verified on a real Mac.
+  const accountProbe =
+    autoSwitcher && probeUnknown && process.platform !== 'darwin'
+      ? new AccountProbe({
+          vault: pollVault,
+          engine,
+          configDirRoot: join(dataDir, 'probe'),
+          createClient: (configDir) =>
+            createAgentSdkClient({ configDirForAccount: () => configDir }),
+          ...(probeTimeoutMs !== undefined ? { timeoutMs: probeTimeoutMs } : {}),
+          logger,
+        })
+      : undefined;
+
   // Which profile gets hooks installed: the design uses a SINGLE shared ~/.claude for every
   // account (per-account config dirs don't isolate — the CLI reads some config outside them),
   // so there is exactly ONE user-level settings.json and it covers every account the daemon
@@ -427,6 +457,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         }
       : {}),
     ...(autoSwitcher ? { autoSwitcher } : {}),
+    ...(accountProbe ? { accountProbe } : {}),
     settingsReport,
     logger,
   });

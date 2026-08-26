@@ -51,10 +51,17 @@ import {
 import {
   hasUsableHeadroom,
   planWeight,
+  selectWeeklyBudget,
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
+import type { ProbeCandidate } from './accountProbe.js';
 import type { Store } from './store.js';
-import { UsagePoller, toUsageSnapshotPayload, type PollAccount } from './usagePoller.js';
+import {
+  UsagePoller,
+  toUsageSnapshotPayload,
+  type AccountPollResult,
+  type PollAccount,
+} from './usagePoller.js';
 import { readFleetHistory, RESET_LOOKBACK_MS } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
 import type { TranscriptScan } from './transcriptTokens.js';
@@ -101,6 +108,13 @@ export interface AutoSwitcherLike {
   evaluate(accounts: AccountUsageInput[]): Promise<void>;
 }
 
+/** The slice of `AccountProbe` the daemon calls each poll cycle — narrowed for the same reason
+ *  as `AutoSwitcherLike`. Resolves with the accounts whose probe succeeded, which is the only
+ *  thing the daemon acts on (it re-polls them at once). */
+export interface AccountProbeLike {
+  probeUnknown(candidates: ProbeCandidate[]): Promise<string[]>;
+}
+
 export interface DaemonOptions {
   store: Store;
   switchEngine: SwitchEngineLike;
@@ -111,6 +125,11 @@ export interface DaemonOptions {
   controlPlaneClient: ControlPlaneClient;
   /** Opt-in: evaluated after every poll cycle; absent = auto-switching disabled. */
   autoSwitcher?: AutoSwitcherLike;
+  /** Opt-in: given the accounts whose weekly clock this cycle could not resolve, so it can
+   *  eagerly activate one and make it reachable by auto-switch. Consulted ONLY when
+   *  `autoSwitcher` is also present — spending quota to widen a target pool nothing is going to
+   *  choose from would be a cost with no payoff. Absent = the feature is off. */
+  accountProbe?: AccountProbeLike;
   /** The effective-settings report resolved at startup (see cli/settings.ts). When present
    *  it is re-pushed with every poll cycle — settings never change mid-run, but the bot's
    *  cache is in-memory, so the repeat is what survives a bot restart. */
@@ -389,6 +408,39 @@ function minimalInteractiveView(sessionId: string): TrackedSessionView {
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 type EnvelopeDraftSansDaemonId = DistributiveOmit<EnvelopeDraft, 'daemonId'>;
 
+/**
+ * The accounts this cycle proved it cannot place on a weekly clock — the ones auto-switch is
+ * structurally unable to choose (`decideAutoSwitch` drops an unresolvable weekly reset outright).
+ *
+ * The weekly resolution is `selectWeeklyBudget`, the SAME function the policy itself calls, so
+ * "the probe thinks this account is unknown" and "the policy would refuse it" can never become
+ * two different judgements. It already folds in the history-derived prediction, which is what
+ * separates a DORMANT account (used once, window since closed, prediction stands in) from a
+ * never-used one — only the latter is worth a turn.
+ *
+ * Gated on a LIVE poll: a degraded cycle reports no limits either, and an account is not
+ * unproven just because our read of it failed. Active, quarantined and auto-switch-excluded
+ * accounts are all skipped — the live one must never be probed at all, and the other two are
+ * accounts nothing should be spending quota on.
+ */
+function unknownDescentCandidates(
+  results: AccountPollResult[],
+  inputs: AccountUsageInput[],
+  now: number,
+): ProbeCandidate[] {
+  const polled = new Map(results.map((r) => [r.accountId, r.outcome]));
+  return inputs
+    .filter(
+      (a) =>
+        !a.active &&
+        !a.quarantined &&
+        a.autoSwitchExcluded !== true &&
+        polled.get(a.accountId) === 'live' &&
+        selectWeeklyBudget(a.limits, now, a.predictedResetAt)?.resetsAt === undefined,
+    )
+    .map((a) => ({ accountId: a.accountId, label: a.label }));
+}
+
 export class Daemon {
   private readonly store: Store;
   private readonly switchEngine: SwitchEngineLike;
@@ -398,6 +450,7 @@ export class Daemon {
   private readonly hookReceiver: HookReceiver;
   private readonly controlPlaneClient: ControlPlaneClient;
   private readonly autoSwitcher: AutoSwitcherLike | undefined;
+  private readonly accountProbe: AccountProbeLike | undefined;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
   private readonly createAgentSdkClient: () => AgentSdkClient;
   private readonly autoContinue: AutoContinuePolicy | undefined;
@@ -514,6 +567,7 @@ export class Daemon {
     this.hookReceiver = options.hookReceiver;
     this.controlPlaneClient = options.controlPlaneClient;
     this.autoSwitcher = options.autoSwitcher;
+    this.accountProbe = options.accountProbe;
     this.settingsReport = options.settingsReport;
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
     this.autoContinue = options.autoContinue;
@@ -930,6 +984,13 @@ export class Daemon {
           this.logger.error({ err }, 'auto-switch evaluation failed');
         }),
       );
+
+      // Inside the auto-switch block on purpose: the probe exists to widen the pool the policy
+      // above chooses from, so with no policy running there is nothing to widen it for. Runs
+      // AFTER the evaluation, so a cycle that already had a hop to make makes it first.
+      await this.timePhase('probeUnknown', () =>
+        this.probeUnknownAccounts(snapshot.results, inputs),
+      );
     }
 
     // LAST in the cycle, deliberately: the transcript scan is seconds of disk IO, and everything
@@ -938,6 +999,33 @@ export class Daemon {
     // cycle in fifteen that carries the scan is identifiable in the log rather than looking like
     // an unexplained spike on an otherwise ordinary cycle.
     await this.timePhase('tokenStats', () => this.maybePushTokenStats(accounts));
+  }
+
+  /**
+   * Hand this cycle's unknown-descent accounts to the probe, and re-poll whatever it managed to
+   * activate. The re-poll is the point of the whole exercise: the endpoint only starts reporting
+   * an account's weekly window once it has been used, so without an immediate re-read the
+   * account this just activated would stay invisible to auto-switch until its poll floor
+   * elapsed — which is exactly the state the probe was spent to leave.
+   *
+   * A probe failure is already absorbed and backed off inside the probe; this catch only guards
+   * against a bug in it, so a broken probe can never take down the poll loop.
+   */
+  private async probeUnknownAccounts(
+    results: AccountPollResult[],
+    inputs: AccountUsageInput[],
+  ): Promise<void> {
+    const probe = this.accountProbe;
+    if (probe === undefined) return;
+    const candidates = unknownDescentCandidates(results, inputs, this.clock());
+    if (candidates.length === 0) return;
+    try {
+      for (const accountId of await probe.probeUnknown(candidates)) {
+        this.poller.repollNow(accountId);
+      }
+    } catch (err) {
+      this.logger.error({ err }, 'unknown-account probe failed');
+    }
   }
 
   /**
