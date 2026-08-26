@@ -106,7 +106,14 @@ describe('buildProgram', () => {
     const run = daemon?.commands.find((c) => c.name() === 'run');
     expect(run).toBeDefined();
     expect(run?.options.map((o) => o.long)).toEqual(
-      expect.arrayContaining(['--pair', '--relay', '--auto-switch', '--greedy']),
+      expect.arrayContaining([
+        '--pair',
+        '--relay',
+        '--auto-switch',
+        '--no-auto-switch',
+        '--greedy',
+        '--no-greedy',
+      ]),
     );
   });
 

@@ -60,8 +60,8 @@ describe('resolveDaemonConfig', () => {
     const { values, rows } = resolveDaemonConfig({});
     expect(values).toEqual({
       relayUrl: DEFAULT_RELAY_URL,
-      autoSwitch: false,
-      greedy: false,
+      autoSwitch: true,
+      greedy: true,
       triggerPercent: undefined,
       staleTriggerPercent: undefined,
       staleAfterMs: undefined,
@@ -77,8 +77,8 @@ describe('resolveDaemonConfig', () => {
       autoContinueMaxAttempts: undefined,
     });
     for (const r of rows) expect(r.source).toBe('default');
-    expect(row(rows, 'auto-switch').value).toBe('off');
-    expect(row(rows, 'greedy burn-back').value).toBe('off');
+    expect(row(rows, 'auto-switch').value).toBe('on');
+    expect(row(rows, 'greedy burn-back').value).toBe('on');
     expect(row(rows, 'switch trigger').value).toBe('94% used');
     expect(row(rows, 'stale switch trigger').value).toBe('85% used');
     expect(row(rows, 'stale snapshot age').value).toBe('15m');
@@ -250,13 +250,45 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'relay url')).toMatchObject({ value: 'ws://flag.example:2', source: 'flag' });
   });
 
-  it('labels env-enabled greedy as inactive when auto-switch is off', () => {
-    const { values, rows } = resolveDaemonConfig({ CCTL_AUTOSWITCH_GREEDY: '1' });
+  it('labels a still-on greedy as inactive when auto-switch is opted out', () => {
+    const { values, rows } = resolveDaemonConfig({}, { autoSwitch: false });
+    expect(values.autoSwitch).toBe(false);
     expect(values.greedy).toBe(true);
+    expect(row(rows, 'auto-switch')).toMatchObject({ value: 'off', source: 'flag' });
     expect(row(rows, 'greedy burn-back')).toMatchObject({
-      value: 'on (inactive: needs --auto-switch)',
-      source: 'env',
+      value: 'on (inactive: auto-switch is off)',
+      source: 'default',
     });
+  });
+
+  it('turns auto-switch and greedy off via env for a flag-less (installed) daemon', () => {
+    const { values, rows } = resolveDaemonConfig({
+      CCTL_AUTOSWITCH: '0',
+      CCTL_AUTOSWITCH_GREEDY: 'off',
+    });
+    expect(values.autoSwitch).toBe(false);
+    expect(values.greedy).toBe(false);
+    expect(row(rows, 'auto-switch')).toMatchObject({ value: 'off', source: 'env' });
+    expect(row(rows, 'greedy burn-back')).toMatchObject({ value: 'off', source: 'env' });
+  });
+
+  it('lets explicit flags outrank the env opt-out', () => {
+    const { values, rows } = resolveDaemonConfig(
+      { CCTL_AUTOSWITCH: '0', CCTL_AUTOSWITCH_GREEDY: '0' },
+      { autoSwitch: true, greedy: true },
+    );
+    expect(values.autoSwitch).toBe(true);
+    expect(values.greedy).toBe(true);
+    expect(row(rows, 'auto-switch')).toMatchObject({ value: 'on', source: 'flag' });
+    expect(row(rows, 'greedy burn-back')).toMatchObject({ value: 'on', source: 'flag' });
+  });
+
+  it('keeps low-water auto-switch on under --no-greedy alone', () => {
+    const { values, rows } = resolveDaemonConfig({}, { greedy: false });
+    expect(values.autoSwitch).toBe(true);
+    expect(values.greedy).toBe(false);
+    expect(row(rows, 'auto-switch')).toMatchObject({ value: 'on', source: 'default' });
+    expect(row(rows, 'greedy burn-back')).toMatchObject({ value: 'off', source: 'flag' });
   });
 });
 
@@ -356,7 +388,7 @@ describe('reportSaysGreedyActive', () => {
     expect(reportSaysGreedyActive(report('off', 'on'))).toBe(false);
     expect(reportSaysGreedyActive(report('on', 'off'))).toBe(false);
     // Greedy set but inactive renders as a longer string — correctly not "on".
-    expect(reportSaysGreedyActive(report('off', 'on (inactive: needs --auto-switch)'))).toBe(false);
+    expect(reportSaysGreedyActive(report('off', 'on (inactive: auto-switch is off)'))).toBe(false);
     expect(reportSaysGreedyActive(undefined)).toBe(false);
   });
 });

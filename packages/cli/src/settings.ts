@@ -46,7 +46,7 @@ export type { SettingRow } from '@claude-control/shared-protocol';
  *  the phone. Lives here (not program.ts) so the daemon's settings report can carry it: after
  *  an `npm i -g` update the running daemon keeps its old build until restarted, and the two
  *  rows ('cli build' vs 'daemon build') are how an operator sees that skew. */
-export const VERSION = '0.4.2';
+export const VERSION = '0.4.3';
 
 /** The hosted control plane a published build dials with no configuration at all. This is the
  *  last fallback in the precedence ladder, not a lock-in: `--relay`, `CCTL_RELAY_URL`, and
@@ -175,7 +175,8 @@ export async function readDaemonConfigFile(
 // Daemon configuration (flags + env + config file), resolved once
 // ---------------------------------------------------------------------------
 
-/** The daemon-run flags that shape settings. Absent flag = not passed. */
+/** The daemon-run flags that shape settings. Tri-state booleans: true = the positive flag,
+ *  false = its --no- negation, absent = neither passed (env or the default decides). */
 export interface DaemonRunFlags {
   autoSwitch?: boolean;
   greedy?: boolean;
@@ -222,10 +223,15 @@ export function resolveDaemonConfig(
   flags: DaemonRunFlags = {},
   fileConfig: DaemonFileConfig = {},
 ): DaemonConfig {
-  const autoSwitch = flags.autoSwitch === true;
-  const greedyFlag = flags.greedy === true;
-  const greedyEnv = envFlag(env, 'CCTL_AUTOSWITCH_GREEDY');
-  const greedy = greedyFlag || greedyEnv;
+  // Both default ON (flag > env > default): a flag-less `daemon run` — which is exactly what
+  // the installed logon task executes — hops when the active account runs low and burns
+  // expiring weekly budget first. Opt out per run with --no-auto-switch / --no-greedy, or
+  // persistently for an installed daemon (whose task carries no flags) with CCTL_AUTOSWITCH=0
+  // / CCTL_AUTOSWITCH_GREEDY=0.
+  const autoSwitchEnv = envBool(env, 'CCTL_AUTOSWITCH');
+  const autoSwitch = flags.autoSwitch ?? autoSwitchEnv ?? true;
+  const greedyEnv = envBool(env, 'CCTL_AUTOSWITCH_GREEDY');
+  const greedy = flags.greedy ?? greedyEnv ?? true;
   const triggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_TRIGGER_PCT');
   const staleTriggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT');
   const staleAfterMs = envNumber(env, 'CCTL_AUTOSWITCH_STALE_AFTER_MS');
@@ -293,15 +299,15 @@ export function resolveDaemonConfig(
     {
       name: 'auto-switch',
       value: autoSwitch ? 'on' : 'off',
-      source: autoSwitch ? 'flag' : 'default',
-      detail: '--auto-switch (per daemon run)',
+      source: flags.autoSwitch !== undefined ? 'flag' : envSource(autoSwitchEnv !== undefined),
+      detail: '--[no-]auto-switch or CCTL_AUTOSWITCH (on by default)',
     },
     {
       name: 'greedy burn-back',
       // Greedy without auto-switch does nothing — say so rather than show a lying "on".
-      value: greedy ? (autoSwitch ? 'on' : 'on (inactive: needs --auto-switch)') : 'off',
-      source: greedyFlag ? 'flag' : envSource(greedyEnv),
-      detail: '--greedy or CCTL_AUTOSWITCH_GREEDY',
+      value: greedy ? (autoSwitch ? 'on' : 'on (inactive: auto-switch is off)') : 'off',
+      source: flags.greedy !== undefined ? 'flag' : envSource(greedyEnv !== undefined),
+      detail: '--[no-]greedy or CCTL_AUTOSWITCH_GREEDY (on by default)',
     },
     {
       name: 'switch trigger',
