@@ -560,6 +560,30 @@ export function renderSettings(
 }
 
 // ---------------------------------------------------------------------------
+// `cctl version` (pure)
+// ---------------------------------------------------------------------------
+
+/** Render `cctl version`: the build running this CLI, plus the daemon's build as of its last
+ *  recorded start — reusing the exact report `cctl settings` already reads, rather than a
+ *  second path to the same file. An npm update replaces the CLI's files immediately but an
+ *  already-running daemon process keeps executing what it loaded at start, so the two can
+ *  legitimately disagree; that skew is exactly what the warning line exists to catch. */
+export function renderVersionInfo(cliVersion: string, report: SettingsReport | undefined): string {
+  const cli = `v${cliVersion}`;
+  const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
+  if (daemonBuild === undefined) {
+    return [`cli build: ${cli}`, 'daemon build: no daemon has run yet'].join('\n');
+  }
+  const lines = [`cli build: ${cli}`, `daemon build: ${daemonBuild}`];
+  if (daemonBuild !== cli) {
+    lines.push(
+      'warning: the daemon is on a different build than this CLI - restart it to pick up the update.',
+    );
+  }
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // The daemon's persisted effective-settings report
 // ---------------------------------------------------------------------------
 
