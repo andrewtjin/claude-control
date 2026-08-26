@@ -48,6 +48,7 @@ import { LOOP_LAG_THRESHOLD_MS } from './loopLagMonitor.js';
 import { HookReceiver } from './hookReceiver.js';
 import {
   ControlPlaneClient,
+  ControlPlaneRejectionError,
   type DaemonIdentity,
   type IdentityStore,
 } from './controlPlaneClient.js';
@@ -504,6 +505,71 @@ describe('Daemon lifecycle', () => {
     await waitFor(() => pollSpy.mock.calls.length > 0);
   });
 
+  it('polls even when the relay never answers — local auto-switching must not wait on connect()', async () => {
+    // A port that was listening a moment ago and is now released: connecting to it refuses,
+    // so the client reconnects internally forever and connect() never settles — the
+    // down/silent-relay case. Polling (and with it auto-switching) is local work; a daemon
+    // that cannot reach its relay must still be switching accounts on this machine.
+    const deadRelay = new SteadyRelay();
+    const deadPort = await deadRelay.listen();
+    await deadRelay.close();
+    controlPlaneClient = new ControlPlaneClient({
+      url: `ws://127.0.0.1:${deadPort}`,
+      identityStore: memoryIdentityStore({ daemonId: 'daemon-under-test', daemonToken: 'tok' }),
+      store,
+      hostLabel: 'test',
+      reconnectBaseMs: 10,
+      heartbeatMs: 100_000,
+    });
+    const pollSpy = vi.spyOn(poller, 'pollAll');
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+
+    // Mirrors the composition root: start() is backgrounded, never awaited — this promise
+    // (pending on connect()) will not settle for the life of the test.
+    void daemon.start().catch(() => {});
+
+    await waitFor(() => pollSpy.mock.calls.length > 0);
+  });
+
+  it('a terminal control-plane rejection still leaves the poll loop running (local-only daemon)', async () => {
+    // No adopted identity and no pairing code: connect() rejects terminally (not paired).
+    // The composition root logs that and keeps the process alive local-only — which is only
+    // honest if the poll loop actually came up before the rejection surfaced.
+    controlPlaneClient = new ControlPlaneClient({
+      url: relay.url(relayPort),
+      identityStore: { load: () => Promise.resolve(undefined), save: () => Promise.resolve() },
+      store,
+      hostLabel: 'test',
+      reconnectBaseMs: 10,
+      heartbeatMs: 100_000,
+    });
+    const pollSpy = vi.spyOn(poller, 'pollAll');
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+
+    await expect(daemon.start()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
+    await waitFor(() => pollSpy.mock.calls.length > 0);
+  });
+
   it('does NOT push a quarantine notice for an account already quarantined at first poll', async () => {
     // First sight of a quarantined account is recorded silently (restart-storm guard) — the
     // standing state rides on the usage snapshot, not a fresh push. NOTE: we key off the poll
@@ -868,12 +934,19 @@ describe('Daemon lifecycle', () => {
     daemon = daemonWithScan(scanTranscripts);
     await daemon.start();
 
+    // The startup poll cycle's own scan takes the in-flight slot first (polling deliberately
+    // does not wait for the control-plane handshake) — release it and wait for its snapshot,
+    // so the slot is free again before the two requests under test arrive.
+    await waitFor(() => scanTranscripts.mock.calls.length >= 1);
+    releaseScan?.();
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.snapshot'));
+
     relay.push({
       daemonId: 'daemon-under-test',
       type: 'stats.request',
       payload: { requestId: 'sr-first', days: 7 },
     });
-    await waitFor(() => scanTranscripts.mock.calls.length >= 1);
+    await waitFor(() => scanTranscripts.mock.calls.length >= 2);
     relay.push({
       daemonId: 'daemon-under-test',
       type: 'stats.request',
@@ -887,7 +960,7 @@ describe('Daemon lifecycle', () => {
     expect(refusal.payload.requestId).toBe('sr-second');
     expect(refusal.payload.ok).toBe(false);
     expect(refusal.payload.error).toMatch(/already running/);
-    expect(scanTranscripts).toHaveBeenCalledTimes(1);
+    expect(scanTranscripts).toHaveBeenCalledTimes(2);
 
     // Releasing the first scan still produces its own answer — a refusal must not have consumed
     // or cancelled the request that was legitimately in flight.
