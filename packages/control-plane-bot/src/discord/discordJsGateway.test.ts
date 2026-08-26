@@ -1111,14 +1111,18 @@ describe('DiscordJsGateway — a running session keeps its thread', () => {
     drive(route: SessionRoute): Promise<DeliveryTarget> {
       return this.ensureTarget(route);
     }
+    drain(): Promise<void> {
+      return this.settledDeliveryTargets();
+    }
   }
 
   it('leaves a session already bound to a thread on that thread after a pin change', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'thread-here-ensure-'));
+    let gw: EnsureTargetGateway | undefined;
     try {
       let channelId = 'channel-one';
       let resolverCalls = 0;
-      const gw = new EnsureTargetGateway({
+      gw = new EnsureTargetGateway({
         relay: stubRelay,
         pairing: stubPairing,
         token: 'not-used-without-start',
@@ -1152,6 +1156,9 @@ describe('DiscordJsGateway — a running session keeps its thread', () => {
       expect(next).toEqual({ kind: 'thread', threadId: 'thread-in-channel-two' });
       expect(resolverCalls).toBe(2);
     } finally {
+      // ensureTarget persists write-behind; removing the dir under an in-flight temp+rename
+      // fails with ENOTEMPTY, so the teardown drains first.
+      await gw?.drain();
       await rm(dir, { recursive: true, force: true });
     }
   });

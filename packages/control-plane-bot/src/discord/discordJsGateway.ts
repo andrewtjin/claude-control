@@ -985,6 +985,13 @@ export class DiscordJsGateway implements DiscordGateway {
     return target;
   }
 
+  /** Resolves once every write-behind persist queued by {@link ensureTarget} has settled. Delivery
+   *  never awaits those writes; anything that must see them on disk — or tear the state dir
+   *  down — awaits this instead. */
+  protected settledDeliveryTargets(): Promise<void> {
+    return this.threadReg.settled();
+  }
+
   /** (Re)schedule the single coalesced-flush timer for a route. Clearing any prior timer first is
    *  what enforces "≤1 edit per window": a burst of updates keeps moving one timer, never stacking. */
   private scheduleFlush(route: SessionRoute, atMs: number): void {
