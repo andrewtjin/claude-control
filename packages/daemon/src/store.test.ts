@@ -162,7 +162,11 @@ describe('Store', () => {
       expect(open).toBeUndefined();
 
       const all = store.listActivationIntervals('acct-1');
-      expect(all).toEqual([{ id, accountId: 'acct-1', startedAtMs: 1000, endedAtMs: 2000 }]);
+      // `openActivationInterval` never sets an origin — only `replaceActivationIntervals` (the
+      // attribution journal's write path) carries one in from the audit log.
+      expect(all).toEqual([
+        { id, accountId: 'acct-1', startedAtMs: 1000, endedAtMs: 2000, origin: null },
+      ]);
     });
 
     it('closeOpenActivationIntervals closes every open row', () => {
@@ -181,6 +185,15 @@ describe('Store', () => {
       expect(store.findActivationIntervalAt(1500)?.accountId).toBe('b');
       // Before any interval started.
       expect(store.findActivationIntervalAt(-1)).toBeUndefined();
+    });
+
+    it('replaceActivationIntervals round-trips a nullable origin per row', () => {
+      store.replaceActivationIntervals([
+        { accountId: 'a', startedAtMs: 1000, endedAtMs: 2000, origin: 'manual' },
+        { accountId: 'b', startedAtMs: 2000, endedAtMs: null, origin: null },
+      ]);
+      const rows = store.listActivationIntervals();
+      expect(rows.map((r) => r.origin)).toEqual(['manual', null]);
     });
   });
 
@@ -603,6 +616,43 @@ describe('Store migration', () => {
       expect(second.getPendingPermission('r1')?.origin).toBe('managed');
     } finally {
       second.close();
+    }
+  });
+
+  it('adds the origin column to a pre-origin activation_intervals table, defaulting legacy rows to null', () => {
+    const dbPath = join(dir, 'daemon.db');
+    // Recreate the table shape a pre-`origin` deploy left behind, with one already-closed row —
+    // `CREATE TABLE IF NOT EXISTS` alone would never add the column to this file.
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE activation_intervals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        accountId TEXT NOT NULL,
+        startedAtMs INTEGER NOT NULL,
+        endedAtMs INTEGER
+      );
+    `);
+    legacy
+      .prepare(
+        `INSERT INTO activation_intervals (accountId, startedAtMs, endedAtMs) VALUES ('a', 1000, 2000)`,
+      )
+      .run();
+    legacy.close();
+
+    const store = new Store(dbPath);
+    try {
+      // The legacy row's source audit line predates `origin` entirely — null is the honest
+      // answer, never a fabricated 'manual'.
+      expect(store.listActivationIntervals()).toEqual([
+        { id: 1, accountId: 'a', startedAtMs: 1000, endedAtMs: 2000, origin: null },
+      ]);
+      // Post-upgrade writes (the attribution journal's replace path) carry an origin end to end.
+      store.replaceActivationIntervals([
+        { accountId: 'b', startedAtMs: 3000, endedAtMs: null, origin: 'auto' },
+      ]);
+      expect(store.listActivationIntervals()[0]?.origin).toBe('auto');
+    } finally {
+      store.close();
     }
   });
 

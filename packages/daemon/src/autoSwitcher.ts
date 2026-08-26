@@ -25,8 +25,13 @@ export interface AutoSwitchActivateResult {
 }
 
 export interface AutoSwitcherOptions {
-  /** Perform the hop — production wires this to `SwitchEngine.activate` (never forced). */
-  activate: (accountId: string) => Promise<AutoSwitchActivateResult>;
+  /** Perform the hop — production wires this to `SwitchEngine.activate` (never forced). The
+   *  origin/reason this class always passes lets the audit trail (and, via the attribution
+   *  journal, `activation_intervals`) tell a policy hop apart from a human's `/switch`. */
+  activate: (
+    accountId: string,
+    options: { origin: 'auto'; reason: string },
+  ) => Promise<AutoSwitchActivateResult>;
   /** Ship a `switch.result` payload to the phone (the daemon stamps the envelope). */
   notify: (payload: PayloadOf<'switch.result'>) => void;
   policy?: AutoSwitchPolicy;
@@ -43,7 +48,10 @@ export interface AutoSwitcherOptions {
 export const DEFAULT_AUTOSWITCH_COOLDOWN_MS = 10 * 60_000;
 
 export class AutoSwitcher {
-  private readonly activate: (accountId: string) => Promise<AutoSwitchActivateResult>;
+  private readonly activate: (
+    accountId: string,
+    options: { origin: 'auto'; reason: string },
+  ) => Promise<AutoSwitchActivateResult>;
   private readonly notify: (payload: PayloadOf<'switch.result'>) => void;
   private readonly policy: AutoSwitchPolicy;
   private readonly cooldownMs: number;
@@ -79,7 +87,10 @@ export class AutoSwitcher {
 
     const requestId = `autoswitch-${this.newRequestId()}`;
     try {
-      const result = await this.activate(decision.targetAccountId);
+      const result = await this.activate(decision.targetAccountId, {
+        origin: 'auto',
+        reason: decision.reason,
+      });
       this.logger.info({ decision, result }, 'auto-switch executed');
       this.notify({
         requestId,

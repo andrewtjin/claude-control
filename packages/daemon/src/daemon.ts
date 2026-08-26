@@ -9,6 +9,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type {
+  ActivateOptions,
   RecoverResult,
   ActivateResult,
   ReauthResult,
@@ -92,7 +93,7 @@ import { DEFAULT_REAUTH_TTL_MS, PendingReauths } from './reauthFlow.js';
  *  `SwitchEngine` satisfies this structurally; no adapter needed. */
 export interface SwitchEngineLike {
   recover(): Promise<RecoverResult>;
-  activate(id: string): Promise<ActivateResult>;
+  activate(id: string, options?: ActivateOptions): Promise<ActivateResult>;
   listAccounts(): Promise<StoredAccount[]>;
   getActiveId(): Promise<string | null>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
@@ -1189,7 +1190,9 @@ export class Daemon {
       // ref works locally. Unknown/ambiguous refs are refused with the resolver's message.
       const resolved = resolveAccountRef(await this.switchEngine.listAccounts(), targetAccountId);
       if (!resolved.ok) throw new Error(resolved.message);
-      const result = await this.switchEngine.activate(resolved.account.id);
+      // Phone-initiated: stamped 'phone' so the audit trail (and activation_intervals) can tell
+      // this apart from the CLI's own 'manual' /switch and from a policy-driven 'auto' hop.
+      const result = await this.switchEngine.activate(resolved.account.id, { origin: 'phone' });
       // Named by LABEL, which is how the operator addressed the account and how the auto-switch
       // card already reports one. A `/switch spare` answered with "switched to 6f2a-…" tells the
       // user something they did not ask about, in the one vocabulary they never use — and the

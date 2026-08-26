@@ -14,7 +14,7 @@
 // new credentials. That is an empirical, per-platform fact (see docs/VERIFICATION.md); this
 // engine reports only what it mechanically did.
 
-import { AuditLog } from './audit.js';
+import { AuditLog, type SwitchOrigin } from './audit.js';
 import { CredentialStore, type LiveCredentialChannel } from './credentialStore.js';
 import { type Protector } from './dpapi.js';
 import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
@@ -98,6 +98,16 @@ export interface SwitchEngineOptions {
 export interface ActivateOptions {
   /** Bypass the switch-cadence guard for a deliberate operator override. */
   force?: boolean;
+  /** Who/what initiated this switch, stamped on the audit trail's `activated` entry (and, via
+   *  the daemon's attribution journal, onto the `activation_intervals` row it opens) — a fleet's
+   *  history can then tell a human's `/switch` apart from a policy hop. Defaults to 'manual':
+   *  every call site that predates this option (a script, a test) was always a human-initiated
+   *  switch and keeps reading as one. */
+  origin?: SwitchOrigin;
+  /** Human-readable context for `origin` (e.g. the auto-switch policy's decision reason).
+   *  Recorded as the audit entry's existing `detail` field — the origin needs no new column of
+   *  its own to carry a "why". */
+  reason?: string;
 }
 
 /** Default minimum interval between switches — see `minSwitchIntervalMs`. */
@@ -900,6 +910,8 @@ export class SwitchEngine {
         event: 'activated',
         fromAccountId: prevActiveId,
         toAccountId: targetId,
+        origin: options.origin ?? 'manual',
+        ...(options.reason !== undefined ? { detail: options.reason } : {}),
       });
       await this.finishIntent();
       this.log.info({ targetId, refreshed, adoptedPreviousRotation }, 'account activated');
@@ -1009,6 +1021,7 @@ export class SwitchEngine {
           fromAccountId: pending.prevActiveId,
           toAccountId: null,
           detail: `cleared at phase ${pending.phase}`,
+          origin: 'recovery',
         });
         return {
           recovered: true,
@@ -1033,6 +1046,7 @@ export class SwitchEngine {
           fromAccountId: pending.prevActiveId,
           toAccountId: pending.targetId,
           detail: 'rolled forward',
+          origin: 'recovery',
         });
         await this.finishIntent();
         return {
@@ -1049,6 +1063,7 @@ export class SwitchEngine {
         fromAccountId: pending.targetId,
         toAccountId: pending.prevActiveId,
         detail: restored ? 'rolled back' : 'no snapshot',
+        origin: 'recovery',
       });
       await this.finishIntent();
       return restored

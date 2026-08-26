@@ -76,6 +76,19 @@ describe('AttributionJournal', () => {
     expect(intervals[0]).toMatchObject({ accountId: 'a', endedAtMs: null });
   });
 
+  it('carries each activation entry origin into its interval, and null for one that never had one', async () => {
+    await writeAuditLog(vaultDir, [
+      { ts: 1000, event: 'activated', fromAccountId: null, toAccountId: 'a' }, // pre-origin line
+      { ts: 2000, event: 'activated', fromAccountId: 'a', toAccountId: 'b', origin: 'auto' },
+      { ts: 3000, event: 'activated', fromAccountId: 'b', toAccountId: 'a', origin: 'phone' },
+    ]);
+    const journal = new AttributionJournal({ store, vaultDir });
+    await journal.sync();
+
+    const intervals = store.listActivationIntervals();
+    expect(intervals.map((i) => i.origin)).toEqual([null, 'auto', 'phone']);
+  });
+
   it('a second sync() is idempotent when nothing new was appended', async () => {
     await writeAuditLog(vaultDir, [
       { ts: 1000, event: 'activated', fromAccountId: null, toAccountId: 'a' },

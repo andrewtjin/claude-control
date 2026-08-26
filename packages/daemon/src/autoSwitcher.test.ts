@@ -32,7 +32,9 @@ function healthySnapshot(): AccountUsageInput[] {
 }
 
 function makeSwitcher(overrides: Partial<ConstructorParameters<typeof AutoSwitcher>[0]> = {}) {
-  const activate = vi.fn((id: string) => Promise.resolve({ ok: true, activeAccountId: id }));
+  const activate = vi.fn((id: string, _options: { origin: 'auto'; reason: string }) =>
+    Promise.resolve({ ok: true, activeAccountId: id }),
+  );
   const notify = vi.fn((payload: PayloadOf<'switch.result'>) => {
     void payload;
   });
@@ -58,7 +60,13 @@ describe('AutoSwitcher', () => {
   it('activates the chosen account and notifies the phone like a manual switch', async () => {
     const { switcher, activate, notify } = makeSwitcher();
     await switcher.evaluate(lowSnapshot());
-    expect(activate).toHaveBeenCalledWith('spare');
+    // The origin/reason stamp is what lets the audit trail (and activation_intervals) tell this
+    // policy hop apart from a human's /switch — the same wording the phone card renders below.
+    expect(activate).toHaveBeenCalledTimes(1);
+    const [activatedId, activateOptions] = activate.mock.calls[0] ?? [];
+    expect(activatedId).toBe('spare');
+    expect(activateOptions).toMatchObject({ origin: 'auto' });
+    expect(activateOptions?.reason).toContain('hot is at 96% used');
     const payload = notify.mock.calls[0]?.[0];
     expect(payload).toMatchObject({
       requestId: 'autoswitch-fixed',
@@ -132,7 +140,7 @@ describe('AutoSwitcher', () => {
     const { switcher, activate, advance } = makeSwitcher();
 
     await switcher.evaluate(snapshot);
-    expect(activate).toHaveBeenCalledWith('dormant');
+    expect(activate).toHaveBeenCalledWith('dormant', expect.objectContaining({ origin: 'auto' }));
 
     // Reaching a new class of target buys no faster cadence: the cooldown is untouched.
     await switcher.evaluate(snapshot);

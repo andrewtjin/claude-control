@@ -65,6 +65,11 @@ export interface ActivationIntervalRow {
   startedAtMs: number;
   /** `null` while the interval is still open (this account is the currently-active one). */
   endedAtMs: number | null;
+  /** Who/what opened this interval — the `origin` the switch-audit's `activated` entry carried
+   *  (see `@claude-control/switch-engine`'s `SwitchOrigin`), or `null` for an interval derived
+   *  from an audit line written before the field existed. Denormalized from the audit log by
+   *  {@link AttributionJournal.sync}, same as every other column here. */
+  origin: string | null;
 }
 
 export interface PendingPermissionRow {
@@ -233,7 +238,8 @@ export class Store {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         accountId TEXT NOT NULL,
         startedAtMs INTEGER NOT NULL,
-        endedAtMs INTEGER
+        endedAtMs INTEGER,
+        origin TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_activation_intervals_account
         ON activation_intervals (accountId, startedAtMs);
@@ -295,6 +301,16 @@ export class Store {
       this.db.exec(
         `ALTER TABLE pending_permissions ADD COLUMN origin TEXT NOT NULL DEFAULT 'hook'`,
       );
+    }
+    // Same upgrade shape as pending_permissions.origin above, but nullable with no default: an
+    // activation_intervals row predates this column exactly when its source audit line predates
+    // the `origin` field on `activated` entries, and "unknown who initiated this" is honestly
+    // `NULL`, not a fabricated 'manual' — the row's actual initiator (or lack of one) is gone.
+    const activationIntervalColumns = this.db
+      .prepare(`PRAGMA table_info(activation_intervals)`)
+      .all();
+    if (!activationIntervalColumns.some((col) => col['name'] === 'origin')) {
+      this.db.exec(`ALTER TABLE activation_intervals ADD COLUMN origin TEXT`);
     }
     this.migrateWeeklyColumns();
   }
@@ -493,6 +509,7 @@ export class Store {
       accountId: requireString(row, 'accountId'),
       startedAtMs: requireNumber(row, 'startedAtMs'),
       endedAtMs: optionalNumber(row, 'endedAtMs'),
+      origin: optionalString(row, 'origin'),
     };
   }
 
@@ -525,14 +542,19 @@ export class Store {
    *  the daemon is single-threaded, so delete-then-insert with no `await` between is atomic
    *  with respect to any concurrent point-in-time lookup. */
   replaceActivationIntervals(
-    intervals: { accountId: string; startedAtMs: number; endedAtMs: number | null }[],
+    intervals: {
+      accountId: string;
+      startedAtMs: number;
+      endedAtMs: number | null;
+      origin: string | null;
+    }[],
   ): void {
     this.db.exec(`DELETE FROM activation_intervals`);
     const insert = this.db.prepare(
-      `INSERT INTO activation_intervals (accountId, startedAtMs, endedAtMs) VALUES (?, ?, ?)`,
+      `INSERT INTO activation_intervals (accountId, startedAtMs, endedAtMs, origin) VALUES (?, ?, ?, ?)`,
     );
     for (const interval of intervals) {
-      insert.run(interval.accountId, interval.startedAtMs, interval.endedAtMs);
+      insert.run(interval.accountId, interval.startedAtMs, interval.endedAtMs, interval.origin);
     }
   }
 

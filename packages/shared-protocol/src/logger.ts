@@ -13,7 +13,7 @@
 // package runs as a worker-thread transport, which is a bundling hazard for cctl-publish's
 // single-file CLI bundle — this destination is a plain synchronous object.
 
-import { closeSync, openSync, writeSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, renameSync, writeSync } from 'node:fs';
 import pino from 'pino';
 import { formatLogLine, type LogLineColors } from './logFormat.js';
 import { ansiLogColors, colorEnabled } from './ansiColor.js';
@@ -120,6 +120,12 @@ function resolveFormat(
  *  test — stay fully independent. */
 const fileSinks = new Map<string, FileSink>();
 
+/** One-shot rotation threshold: a file at or past this size gets rotated out to `.old` rather
+ *  than growing forever. The daemon is a long-running process nobody restarts to clear a log —
+ *  "one-shot" because there is exactly one backup generation, a crash-log-sized safety valve
+ *  rather than a real retention policy. */
+const LOG_FILE_ROTATE_BYTES = 10 * 1024 * 1024;
+
 function getFileSink(filePath: string, warn: (message: string) => void): FileSink {
   const existing = fileSinks.get(filePath);
   if (existing !== undefined) return existing;
@@ -144,6 +150,18 @@ function getFileSink(filePath: string, warn: (message: string) => void): FileSin
 class FileSink {
   private fd: number | undefined;
   private warned = false;
+  /** Earliest time (Date.now()) we'll try reopening a degraded fd. Set whenever we degrade;
+   *  read (and re-armed) from `maybeReopen`. Without this, a transient lock — Defender scanning
+   *  the file, a backup agent, an operator tailing it at the exact moment it rotates — would
+   *  disable this sink for the rest of the process's life, which defeats the point of a file
+   *  sink for a console-less installed daemon: nobody is watching stderr to notice, let alone
+   *  restart it. */
+  private nextReopenAt = 0;
+
+  /** How long to wait between reopen attempts once degraded. Long enough not to hammer a disk
+   *  that's genuinely full or a file a scanner holds for a while; short enough that a transient
+   *  lock heals itself well within one polling/log-flush cycle rather than needing a restart. */
+  private static readonly REOPEN_RETRY_MS = 30_000;
 
   constructor(
     private readonly filePath: string,
@@ -151,6 +169,35 @@ class FileSink {
   ) {
     try {
       this.fd = openSync(filePath, 'a');
+      // A daemon left running for weeks reopens the SAME fd's file across restarts, so a file
+      // already past the threshold at open time must rotate immediately — otherwise it would
+      // wait for the next write-check (below) to notice, i.e. potentially never, on a daemon
+      // that logs nothing more before its next restart.
+      this.rotateIfOversized();
+    } catch (err) {
+      this.degrade(err);
+    }
+  }
+
+  /** Rotate `filePath` -> `filePath.old` (silently replacing any earlier `.old`) when the file
+   *  behind our fd is at/over {@link LOG_FILE_ROTATE_BYTES}. Checked once at open (the
+   *  across-restarts case) and once after every write (so a single long-running process that
+   *  crosses the threshold mid-run rotates too, not only across restarts). Best-effort: a
+   *  rotation failure degrades exactly like an open failure, since it can leave us holding no
+   *  usable fd at all. */
+  private rotateIfOversized(): void {
+    if (this.fd === undefined) return;
+    let size: number;
+    try {
+      size = fstatSync(this.fd).size;
+    } catch {
+      return; // can't stat — keep appending rather than fail the logger over a diagnostic check
+    }
+    if (size < LOG_FILE_ROTATE_BYTES) return;
+    try {
+      closeSync(this.fd);
+      renameSync(this.filePath, `${this.filePath}.old`);
+      this.fd = openSync(this.filePath, 'a');
     } catch (err) {
       this.degrade(err);
     }
@@ -168,6 +215,7 @@ class FileSink {
       }
     }
     this.fd = undefined;
+    this.nextReopenAt = Date.now() + FileSink.REOPEN_RETRY_MS;
     if (this.warned) return;
     this.warned = true;
     const reason = err instanceof Error ? err.message : String(err);
@@ -176,7 +224,24 @@ class FileSink {
     );
   }
 
+  /** Called on every write while degraded: retries the open at most once per
+   *  {@link REOPEN_RETRY_MS} rather than on every single line, so a still-locked/still-full file
+   *  doesn't turn every log call into a syscall. A successful reopen re-arms `warned` so a LATER
+   *  failure (a second lock, disk full again) gets its own warning instead of going silent
+   *  forever because of one earlier report. */
+  private maybeReopen(): void {
+    if (this.fd !== undefined || Date.now() < this.nextReopenAt) return;
+    try {
+      this.fd = openSync(this.filePath, 'a');
+      this.warned = false;
+      this.rotateIfOversized();
+    } catch {
+      this.nextReopenAt = Date.now() + FileSink.REOPEN_RETRY_MS;
+    }
+  }
+
   write(chunk: string): void {
+    this.maybeReopen();
     if (this.fd === undefined) return;
     try {
       // `writeSync` is not guaranteed to write the whole buffer in one call (a pipe/FIFO can
@@ -190,7 +255,11 @@ class FileSink {
       }
     } catch (err) {
       this.degrade(err);
+      return;
     }
+    // Checked AFTER the write (not before) so the line that pushed the file over the threshold
+    // still lands in the file it was meant for, rather than being the first line of the next one.
+    this.rotateIfOversized();
   }
 }
 

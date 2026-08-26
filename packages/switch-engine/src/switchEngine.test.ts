@@ -151,6 +151,15 @@ function bundleFor(access: string, expiresAt: number): CredentialBundle {
   };
 }
 
+/** Every line of `switch-audit.jsonl`, parsed — the ground truth `origin` threading writes to. */
+async function readAuditLines(paths: Paths): Promise<Record<string, unknown>[]> {
+  const raw = await readFile(join(paths.vaultDir, 'switch-audit.jsonl'), 'utf8');
+  return raw
+    .split('\n')
+    .filter((line) => line.trim() !== '')
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 /** Seed account A as the live + active account, and add B (far from expiry). */
 async function seedAActiveWithB(h: Harness, bExpiresAt = NOW + 10 * HOUR) {
   const a = bundleFor('A', NOW + 10 * HOUR);
@@ -744,6 +753,21 @@ describe('activate — happy path', () => {
   it('rejects an unknown account id', async () => {
     const h = await harness();
     await expect(h.engine.activate('nope')).rejects.toBeInstanceOf(UnknownAccountError);
+  });
+
+  it('stamps the audit entry with the caller-supplied origin/reason, defaulting to manual', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+
+    await h.engine.activate(accountB.id); // no origin — every pre-existing call site
+    h.setNow(NOW + 61_000); // past the cadence guard — this is a second, distinct hop
+    await h.engine.activate(accountA.id, { origin: 'auto', reason: 'B is at 96% used' });
+
+    const activations = (await readAuditLines(h.paths)).filter((l) => l.event === 'activated');
+    expect(activations).toMatchObject([
+      { toAccountId: accountB.id, origin: 'manual' },
+      { toAccountId: accountA.id, origin: 'auto', detail: 'B is at 96% used' },
+    ]);
   });
 
   it('refuses to activate a quarantined account', async () => {
@@ -1346,6 +1370,10 @@ describe('recover', () => {
     expect(await h.intent.read()).toBeUndefined();
     // Live untouched — still A.
     expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    // recover()'s own audit entries are always origin 'recovery' — never the caller-supplied
+    // origins `activate()` threads, since nothing here was a deliberate switch request.
+    const recovered = (await readAuditLines(h.paths)).find((l) => l.event === 'recovered');
+    expect(recovered).toMatchObject({ origin: 'recovery' });
   });
 
   it('rolls forward when the target credentials are already live', async () => {
