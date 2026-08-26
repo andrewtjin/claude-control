@@ -413,11 +413,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   });
 
   // `daemon.start()` awaits the control-plane connect(), which on a down/silent relay never
-  // resolves nor rejects (it reconnects internally forever). Heartbeat, endpoint publish, and
-  // hook install are this process's own local work ("I'm alive"; "here's where to POST hook
-  // events") and must not wait behind the remote promise — start() runs all of them BEFORE
-  // its connect() await, so kicking it off in the background keeps a local-only daemon fully
-  // functional. A rejection is one of two very different things:
+  // resolves nor rejects (it reconnects internally forever). Heartbeat, endpoint publish, hook
+  // install, and the poll loop (which drives auto-switching) are this process's own local work
+  // and must not wait behind the remote promise — start() runs ALL of them before its connect()
+  // await, so kicking it off in the background keeps a local-only daemon fully functional:
+  // accounts keep being polled and auto-switched even while the relay is unreachable or has
+  // refused us. A rejection is one of two very different things:
   //   - A TERMINAL control-plane rejection (not paired, refused pairing code, revoked token /
   //     protocol mismatch — see ControlPlaneRejectionError): the daemon itself is healthy and
   //     all its local surfaces already came up, so it keeps running local-only with the

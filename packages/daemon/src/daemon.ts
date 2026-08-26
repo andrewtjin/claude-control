@@ -400,9 +400,13 @@ export class Daemon {
 
   /**
    * Bring the daemon up: recover any interrupted switch, start the hook receiver, wire
-   * inbound-message handlers, connect to the control plane, and kick off periodic polling.
+   * inbound-message handlers, kick off periodic polling, and connect to the control plane.
    * Order matters only where a real dependency exists (recover before anything else touches
    * credentials; handlers wired before connect so no early inbound message can be dropped).
+   * The control-plane connect is AWAITED last, after every local subsystem is running: on a
+   * down/silent relay that await never settles, and on a terminal rejection it throws — and
+   * polling (which drives auto-switching) is local work that must survive both. Anything the
+   * poll cycles push while disconnected lands in the outbox and flushes on reconnect.
    */
   async start(): Promise<void> {
     if (this.started) return;
@@ -514,7 +518,13 @@ export class Daemon {
       },
     });
 
-    await this.controlPlaneClient.connect();
+    // Kicked off NOW (so identity load and the socket come up concurrently with the local
+    // bring-up below) but awaited LAST — see the end of this method. The immediate no-op catch
+    // only parks a rejection that lands while the awaits below are still in flight, so it can
+    // never surface as an unhandled rejection; the final await still re-raises it for the
+    // composition root to classify.
+    const controlPlaneReady = this.controlPlaneClient.connect();
+    controlPlaneReady.catch(() => {});
 
     // Reconcile session records a previous daemon run left behind: stamp them 'orphaned' so
     // their persisted state is honest. Deliberately NO re-attach here — resuming a session
@@ -540,6 +550,13 @@ export class Daemon {
         this.logger.error({ err }, 'poll cycle failed');
       });
     }, this.pollIntervalMs);
+
+    // Awaited dead last, and ONLY as a report to the composition root: every local surface —
+    // hook receiver, session reconcile, the poll loop and with it auto-switching — is already
+    // running above this line. Gating any of them behind the relay would hand a cloud outage
+    // the power to silently disable local account switching, which is exactly the failure this
+    // ordering exists to rule out.
+    await controlPlaneReady;
   }
 
   async stop(): Promise<void> {
