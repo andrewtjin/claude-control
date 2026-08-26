@@ -295,6 +295,37 @@ describe('UsagePoller', () => {
     expect(statusFetch).toHaveBeenCalledTimes(1);
   });
 
+  it('reports the retry loop to an injected logger so an outage leaves a trace', async () => {
+    // Everything below the poller defaults its logger to a sink that discards, so an upstream
+    // shedding load is invisible unless a composition root hands one down. The lines are the
+    // only record a 529 storm leaves: the snapshot alone just shows frozen numbers.
+    const { deps } = fakeOverload('major');
+    const lines: { obj: unknown; msg: string | undefined }[] = [];
+    const record = (obj: unknown, msg?: string): void => void lines.push({ obj, msg });
+    const poller = new UsagePoller({
+      fetch: scriptedFetch([529]),
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(1)),
+      clock: () => 0,
+      random: () => 0,
+      overload: { ...deps, logger: { debug: record, info: record, warn: record, error: record } },
+    });
+
+    await poller.pollAll([account]);
+
+    const retries = lines.filter((l) => l.msg === 'upstream overloaded; retrying');
+    expect(retries).toHaveLength(PATIENT_OVERLOAD_BUDGET.maxAttempts - 1);
+    expect(retries[0]?.obj).toMatchObject({ status: 529, attempt: 1, statusPage: 'major' });
+    // And exactly one line when the budget is spent, so the incident has an end as well as a
+    // start — a log full of retries with no closing line reads as a loop that never stopped.
+    expect(lines.filter((l) => l.msg === 'upstream still overloaded; retry budget spent')).toEqual([
+      {
+        obj: { status: 529, attempts: PATIENT_OVERLOAD_BUDGET.maxAttempts, statusPage: 'major' },
+        msg: 'upstream still overloaded; retry budget spent',
+      },
+    ]);
+  });
+
   it('an exhausted 529 falls back with the overload reason and no backoff penalty', async () => {
     let now = 0;
     const { deps } = fakeOverload('major');

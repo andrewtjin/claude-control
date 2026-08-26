@@ -46,7 +46,7 @@ export type {
   AutoContinuePolicy,
 } from './managedSession.js';
 
-export { classifyFailureText, classifyStopFailureType } from './apiFailure.js';
+export { classifyFailureText, classifyStopFailureType, isStopFailureType } from './apiFailure.js';
 export type { ApiFailureClassification, TransientFailureKind } from './apiFailure.js';
 
 export { createAgentSdkClient } from './agentSdkClient.js';

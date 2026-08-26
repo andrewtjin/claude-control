@@ -347,6 +347,128 @@ describe('Store', () => {
       expect(store.countOutbox()).toBe(1);
     });
   });
+
+  describe('pending_steering', () => {
+    it('lists every queue oldest-first, so a reload rebuilds arrival order', () => {
+      store.insertPendingSteering({
+        sessionId: 's1',
+        kind: 'interactive',
+        text: 'first',
+        queuedAtMs: 100,
+      });
+      store.insertPendingSteering({
+        sessionId: 's2',
+        kind: 'managed',
+        text: 'other session',
+        queuedAtMs: 110,
+      });
+      store.insertPendingSteering({
+        sessionId: 's1',
+        kind: 'interactive',
+        text: 'second',
+        queuedAtMs: 120,
+      });
+
+      expect(store.listPendingSteering().map((r) => r.text)).toEqual([
+        'first',
+        'other session',
+        'second',
+      ]);
+    });
+
+    it('round-trips every field a reload needs', () => {
+      const id = store.insertPendingSteering({
+        sessionId: 's1',
+        kind: 'managed',
+        text: 'keep going',
+        queuedAtMs: 4242,
+      });
+      expect(store.listPendingSteering()).toEqual([
+        { id, sessionId: 's1', kind: 'managed', text: 'keep going', queuedAtMs: 4242 },
+      ]);
+    });
+
+    it('retires one row without touching the rest of its queue', () => {
+      const first = store.insertPendingSteering({
+        sessionId: 's1',
+        kind: 'managed',
+        text: 'one',
+        queuedAtMs: 1,
+      });
+      store.insertPendingSteering({
+        sessionId: 's1',
+        kind: 'managed',
+        text: 'two',
+        queuedAtMs: 2,
+      });
+      // A managed session takes one text per turn boundary, so exactly one row retires with it.
+      store.deletePendingSteering(first);
+      expect(store.listPendingSteering().map((r) => r.text)).toEqual(['two']);
+    });
+
+    it('retires a whole queue by session AND kind, leaving the other queue alone', () => {
+      store.insertPendingSteering({
+        sessionId: 's1',
+        kind: 'interactive',
+        text: 'a',
+        queuedAtMs: 1,
+      });
+      store.insertPendingSteering({
+        sessionId: 's1',
+        kind: 'interactive',
+        text: 'b',
+        queuedAtMs: 2,
+      });
+      // Same id in the other queue: the kind is what keeps one backend's delivery from clearing
+      // the other backend's queue.
+      store.insertPendingSteering({
+        sessionId: 's1',
+        kind: 'managed',
+        text: 'c',
+        queuedAtMs: 3,
+      });
+      store.insertPendingSteering({
+        sessionId: 's2',
+        kind: 'interactive',
+        text: 'd',
+        queuedAtMs: 4,
+      });
+
+      expect(store.deletePendingSteeringForSession('s1', 'interactive')).toBe(2);
+      expect(store.listPendingSteering().map((r) => r.text)).toEqual(['c', 'd']);
+    });
+
+    it('reports zero when there was nothing queued to retire', () => {
+      // The count is what the daemon reports to the phone, so it must never claim a drop that
+      // did not happen.
+      expect(store.deletePendingSteeringForSession('ghost', 'interactive')).toBe(0);
+    });
+
+    it('survives closing and reopening the same database file', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'cctl-store-steering-'));
+      try {
+        const dbPath = join(dir, 'daemon.db');
+        const first = new Store(dbPath);
+        first.insertPendingSteering({
+          sessionId: 's1',
+          kind: 'interactive',
+          text: 'across a restart',
+          queuedAtMs: 7,
+        });
+        first.close();
+
+        // The whole point of the table: a second process reads what the first one queued.
+        const second = new Store(dbPath);
+        try {
+          expect(second.listPendingSteering().map((r) => r.text)).toEqual(['across a restart']);
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 // Retention has to stay cheap on the table it exists to bound, so this checks the PLAN, not just

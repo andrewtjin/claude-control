@@ -900,9 +900,9 @@ describe('HookReceiver', () => {
       }
     });
 
-    it('parses the LIVE-OBSERVED payload shape (error + last_assistant_message)', async () => {
-      // The installed CLI names the fields differently from the hook docs — this is the
-      // exact shape a real StopFailure POST carried (live-observed), minus noise fields.
+    it('parses the installed CLI payload shape (error + last_assistant_message)', async () => {
+      // The installed CLI names the fields differently from the hook docs — this is the shape a
+      // real StopFailure POST carries, minus the noise fields nothing here reads.
       const res = await postStopFailure({
         session_id: '2562e353-4c0a-431c-b718-281281d009fa',
         cwd: 'C:\\somewhere',
@@ -916,6 +916,68 @@ describe('HookReceiver', () => {
         expect(note.payload.notificationType).toBe('api_error');
         expect(note.payload.body).toContain('ConnectionRefused');
         expect(note.payload.body).toContain('type "continue"');
+      }
+    });
+
+    it('reads a live FREE-TEXT error as the transient death it is', async () => {
+      // The installed CLI puts prose where the docs promise a taxonomy token. Filed as a token
+      // it read as unrecognized, so an outage the user only had to wait out was announced as
+      // something a retry cannot fix.
+      await postStopFailure({
+        session_id: 'sess-1',
+        error: 'API Error: 529 Overloaded. Please try again later.',
+        last_assistant_message: "Let me check the file's imports.",
+      });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.body).toContain('API Error: 529 Overloaded.');
+        expect(note.payload.body).toContain('type "continue"');
+        expect(note.payload.body).not.toContain('Not retryable');
+      }
+    });
+
+    it("keeps Claude's last message out of the error slot, on a line of its own", async () => {
+      // What the assistant last SAID is not why the turn died; standing in for the error text it
+      // put the parting words of a healthy answer where the provider's failure belongs.
+      await postStopFailure({
+        session_id: 'sess-1',
+        error: 'API Error: 529 Overloaded. Please try again later.',
+        last_assistant_message: "Let me check the file's imports.",
+      });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        const lines = note.payload.body.split('\n');
+        expect(lines[0]).toBe('API Error: 529 Overloaded. Please try again later.');
+        expect(lines[1]).toBe("last message: Let me check the file's imports.");
+      }
+    });
+
+    it('still leads with the error when the payload carries no last message', async () => {
+      await postStopFailure({
+        session_id: 'sess-1',
+        error: 'API Error: 529 Overloaded. Please try again later.',
+      });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        const lines = note.payload.body.split('\n');
+        expect(lines[0]).toBe('API Error: 529 Overloaded. Please try again later.');
+        expect(note.payload.body).not.toContain('last message:');
+      }
+    });
+
+    it('still refuses to retry a live free-text death a retry cannot fix', async () => {
+      // The other direction of the same fix: reading the text must not turn every unrecognized
+      // value transient. And the guidance names a cause only when the CLI named one — quoting a
+      // whole sentence back inside the parentheses invents a taxonomy value.
+      await postStopFailure({
+        session_id: 'sess-1',
+        error: 'API Error: 401 authentication_error: OAuth token has expired',
+      });
+      const note = sfEmitted[0];
+      if (note?.type === 'hook.notification') {
+        expect(note.payload.body).toContain('API Error: 401');
+        expect(note.payload.body).toContain('Not retryable - the session needs attention.');
+        expect(note.payload.body).not.toContain('type "continue"');
       }
     });
 
@@ -973,6 +1035,84 @@ describe('HookReceiver', () => {
       } finally {
         await offReceiver.close();
       }
+    });
+  });
+
+  describe('advertised deadlines', () => {
+    // A card counts down to the `expiresAt` it is handed, so that stamp has to be the moment the
+    // hold actually ends — not the pending row's longer TTL, which kept a card live and inviting
+    // an answer for minutes after the hold had already handed the prompt back to the terminal.
+    // The three windows are deliberately distinct so a stamp reading the wrong one cannot
+    // coincidentally look right, and the holds are tiny so each held hook answers promptly.
+    const NOW = 1_000_000;
+    const TTL = 900_000;
+    const PERMISSION_HOLD = 120;
+    const QUESTION_HOLD = 250;
+
+    /** A receiver with all three windows pinned, torn down however the test ends. */
+    async function withDeadlineReceiver(
+      run: (port: number, emitted: EnvelopeDraft[]) => Promise<void>,
+    ): Promise<void> {
+      const emitted: EnvelopeDraft[] = [];
+      const deadlineReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: (draft) => emitted.push(draft),
+        daemonId: () => 'daemon-1',
+        clock: () => NOW,
+        permissionTtlMs: TTL,
+        permissionHoldMs: PERMISSION_HOLD,
+        questionHoldMs: QUESTION_HOLD,
+      });
+      const deadlinePort = await deadlineReceiver.listen(0);
+      try {
+        await run(deadlinePort, emitted);
+      } finally {
+        await deadlineReceiver.close();
+      }
+    }
+
+    it('stamps permission.request with the hold that ends it', async () => {
+      await withDeadlineReceiver(async (deadlinePort, emitted) => {
+        await post(
+          deadlinePort,
+          '/',
+          {
+            hook_event_name: 'PermissionRequest',
+            session_id: 'sess-deadline',
+            tool_name: 'Bash',
+            tool_input: { command: 'echo x' },
+          },
+          { 'x-claude-control-secret': SECRET },
+        );
+        const req = emitted.find((e) => e.type === 'permission.request');
+        expect(req?.type).toBe('permission.request');
+        if (req?.type === 'permission.request') {
+          expect(req.payload.expiresAt).toBe(NOW + PERMISSION_HOLD);
+        }
+      });
+    });
+
+    it('stamps question.request with the question hold that ends it', async () => {
+      await withDeadlineReceiver(async (deadlinePort, emitted) => {
+        await post(
+          deadlinePort,
+          '/',
+          {
+            hook_event_name: 'PermissionRequest',
+            session_id: 'sess-deadline-q',
+            tool_name: 'AskUserQuestion',
+            tool_input: { questions: [{ question: 'Which color?', options: [{ label: 'teal' }] }] },
+          },
+          { 'x-claude-control-secret': SECRET },
+        );
+        const req = emitted.find((e) => e.type === 'question.request');
+        expect(req?.type).toBe('question.request');
+        if (req?.type === 'question.request') {
+          // Its own knob, not the permission hold it defaults to and not the row TTL.
+          expect(req.payload.expiresAt).toBe(NOW + QUESTION_HOLD);
+        }
+      });
     });
   });
 
