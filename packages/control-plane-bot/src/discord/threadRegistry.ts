@@ -133,4 +133,11 @@ export class PersistentThreadRegistry {
     this.writeQueue = next.catch(() => undefined);
     return next;
   }
+
+  /** Resolves once every write queued so far has settled — success or swallowed failure. The
+   *  gateway records write-behind so delivery never waits on disk; this is the matching drain
+   *  for whoever must observe, or remove, the state dir afterwards. */
+  settled(): Promise<void> {
+    return this.writeQueue;
+  }
 }

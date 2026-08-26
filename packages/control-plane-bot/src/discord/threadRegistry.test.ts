@@ -77,6 +77,27 @@ describe('PersistentThreadRegistry — survives a restart', () => {
   });
 });
 
+describe('PersistentThreadRegistry — settled() drains the write-behind', () => {
+  it('resolves only after every queued record has reached disk', async () => {
+    const dir = await tempDir();
+    const reg = new PersistentThreadRegistry(dir);
+    await reg.load();
+    // Neither record is awaited — exactly how the gateway's write-behind calls it.
+    void reg.record('u', 's1', { kind: 'thread', threadId: 't1' });
+    void reg.record('u', 's2', { kind: 'dm' });
+    await reg.settled();
+    const fresh = new PersistentThreadRegistry(dir);
+    await fresh.load();
+    expect(fresh.get('u', 's1')).toEqual({ kind: 'thread', threadId: 't1' });
+    expect(fresh.get('u', 's2')).toEqual({ kind: 'dm' });
+  });
+
+  it('resolves at once when nothing was ever recorded', async () => {
+    const reg = new PersistentThreadRegistry(await tempDir());
+    await expect(reg.settled()).resolves.toBeUndefined();
+  });
+});
+
 describe('ThreadRegistry — latestForThread (reverse lookup)', () => {
   it('answers undefined for a thread no session was ever bound to', () => {
     const reg = new ThreadRegistry();
