@@ -158,7 +158,10 @@ export function buildProgram(): Command {
       const resolved = resolveAccountRef(await engine.listAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
       try {
-        const result = await engine.activate(resolved.account.id, { force: Boolean(opts.force) });
+        const result = await engine.activate(resolved.account.id, {
+          force: Boolean(opts.force),
+          origin: 'manual',
+        });
         const bits = [
           result.wroteCredentials ? 'credentials written' : 'no change',
           result.refreshed ? 'token refreshed' : null,

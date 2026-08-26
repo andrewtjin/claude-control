@@ -58,7 +58,8 @@ describe('envNumber / envFlag', () => {
 
 describe('resolveDaemonConfig', () => {
   it('is all defaults with no flags and no env', () => {
-    const { values, rows } = resolveDaemonConfig({});
+    const dataDir = join('fake', 'data-dir');
+    const { values, rows } = resolveDaemonConfig({}, {}, {}, dataDir);
     expect(values).toEqual({
       relayUrl: DEFAULT_RELAY_URL,
       autoSwitch: true,
@@ -69,6 +70,8 @@ describe('resolveDaemonConfig', () => {
       minSessionHeadroomPct: undefined,
       greedyResetMarginMs: undefined,
       cooldownMs: undefined,
+      probeUnknown: true,
+      probeTimeoutMs: undefined,
       waitingCards: false,
       permissionHoldMs: undefined,
       commandOutputCards: true,
@@ -76,6 +79,7 @@ describe('resolveDaemonConfig', () => {
       identityCheck: true,
       autoContinue: true,
       autoContinueMaxAttempts: undefined,
+      logFilePath: join(dataDir, 'daemon.log'),
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('on');
@@ -86,6 +90,8 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'min session headroom').value).toBe('25% left');
     expect(row(rows, 'greedy reset margin').value).toBe('15m');
     expect(row(rows, 'auto-switch cooldown').value).toBe('10m');
+    expect(row(rows, 'unknown-account probe').value).toBe('on');
+    expect(row(rows, 'probe timeout').value).toBe('2m');
     expect(row(rows, 'waiting cards').value).toBe('off');
     expect(row(rows, 'permission hold').value).toBe('570s');
     expect(row(rows, 'command output cards').value).toBe('on');
@@ -94,7 +100,12 @@ describe('resolveDaemonConfig', () => {
     expect(row(rows, 'relay url').value).toBe(DEFAULT_RELAY_URL);
     expect(row(rows, 'daemon log level').value).toBe('info');
     expect(row(rows, 'daemon log format').value).toBe('auto');
-    expect(row(rows, 'daemon log file').value).toBe('off');
+    // An installed daemon has no console, so — unlike the CLI's own log file row — this
+    // defaults to a real path rather than 'off'.
+    expect(row(rows, 'daemon log file')).toMatchObject({
+      value: join(dataDir, 'daemon.log'),
+      source: 'default',
+    });
   });
 
   it('reports the logging env overrides an operator has actually set', () => {
@@ -282,6 +293,28 @@ describe('resolveDaemonConfig', () => {
     expect(values.greedy).toBe(true);
     expect(row(rows, 'auto-switch')).toMatchObject({ value: 'on', source: 'flag' });
     expect(row(rows, 'greedy burn-back')).toMatchObject({ value: 'on', source: 'flag' });
+  });
+
+  it('turns the unknown-account probe off via CCTL_PROBE_UNKNOWN=0 (default stays on)', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_PROBE_UNKNOWN: '0' });
+    expect(values.probeUnknown).toBe(false);
+    expect(row(rows, 'unknown-account probe')).toMatchObject({ value: 'off', source: 'env' });
+  });
+
+  it('labels a still-on probe as inactive when auto-switch is opted out', () => {
+    // Same shape as greedy: the knob keeps its own value, and the row says why nothing happens.
+    const { values, rows } = resolveDaemonConfig({}, { autoSwitch: false });
+    expect(values.probeUnknown).toBe(true);
+    expect(row(rows, 'unknown-account probe')).toMatchObject({
+      value: 'on (inactive: auto-switch is off)',
+      source: 'default',
+    });
+  });
+
+  it('reads the probe timeout from CCTL_PROBE_TIMEOUT_MS', () => {
+    const { values, rows } = resolveDaemonConfig({ CCTL_PROBE_TIMEOUT_MS: '45000' });
+    expect(values.probeTimeoutMs).toBe(45_000);
+    expect(row(rows, 'probe timeout')).toMatchObject({ value: '45s', source: 'env' });
   });
 
   it('keeps low-water auto-switch on under --no-greedy alone', () => {

@@ -24,6 +24,7 @@ import {
   type Protector,
 } from '@claude-control/switch-engine';
 import {
+  AccountProbe,
   AttributionJournal,
   AutoSwitcher,
   ControlPlaneClient,
@@ -202,18 +203,15 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       );
     }
   }
-  const logger: Logger = createLogger({ defaultLevel: 'info', sink: DAEMON_LOG_SINK });
-
-  const engine = buildEngine(paths, DAEMON_LOG_SINK);
-  const store = new Store(daemonDbPath(paths));
-  const protector = defaultProtector();
-
   // The operator's persisted overrides, read here (the edge) so the resolution below stays
   // pure. A missing or malformed file degrades to no overrides, never to a failed start.
   const fileConfig = (await readDaemonConfigFile(daemonConfigPath(paths))) ?? {};
 
   // One resolution feeds BOTH behavior (the values wired below) and visibility (the rows
-  // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart.
+  // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart. Resolved
+  // BEFORE either logger below, because its `logFilePath` (an explicit CCTL_LOG_FILE, or the
+  // resolved `<dataDir>/daemon.log` default — see settings.ts) is the path both loggers must
+  // actually write to, not a second default independently guessed here.
   const config = resolveDaemonConfig(
     process.env,
     {
@@ -224,6 +222,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       ...(options.relay !== undefined ? { relay: options.relay } : {}),
     },
     fileConfig,
+    dataDir,
   );
   const {
     relayUrl,
@@ -235,7 +234,28 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     cooldownMs,
     autoSwitch,
     greedy,
+    logFilePath,
+    probeUnknown,
+    probeTimeoutMs,
   } = config.values;
+
+  // Both loggers this process builds (this one, plus the switch-engine adapter inside
+  // buildEngine) must read the SAME CCTL_LOG_FILE, or `cctl daemon run > daemon.log` captures
+  // only half the log while the rest silently goes to a file nobody redirected (see
+  // buildEngine's own comment). Overriding just that one key on a copy of process.env is what
+  // lets the resolved default take effect without every OTHER env-driven knob in this process
+  // reading from a stale snapshot instead of the live environment.
+  const loggingEnv: NodeJS.ProcessEnv = { ...process.env, CCTL_LOG_FILE: logFilePath };
+  const logger: Logger = createLogger({
+    defaultLevel: 'info',
+    sink: DAEMON_LOG_SINK,
+    env: loggingEnv,
+  });
+
+  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv);
+  const store = new Store(daemonDbPath(paths));
+  const protector = defaultProtector();
+
   const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
   // Best-effort: the report is purely informational, so a write failure must not stop the
   // daemon from starting.
@@ -353,7 +373,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // and it reports every attempt to the phone through the same switch.result push as /switch.
   const autoSwitcher = autoSwitch
     ? new AutoSwitcher({
-        activate: (accountId) => engine.activate(accountId),
+        activate: (accountId, options) => engine.activate(accountId, options),
         notify: (payload) =>
           controlPlaneClient.send({
             type: 'switch.result',
@@ -372,6 +392,33 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         logger,
       })
     : undefined;
+
+  // The eager activation probe. Only built alongside the auto-switcher: it spends a real turn
+  // purely to make an account TARGETABLE, which is worth nothing when nothing is choosing
+  // targets. This is the ONE path that binds an account to its own CLAUDE_CONFIG_DIR — the
+  // opposite of the activate-before-spawn model every managed session uses (see
+  // makeAgentSdkClientFactory) — and deliberately so: it must run a turn as an account WITHOUT
+  // making it live, which is exactly what the config-dir bind buys and what activation cannot.
+  // A fresh client per probe, for the same reason sessions get one.
+  //
+  // NOT ON DARWIN. The whole mechanism rests on the CLI reading credentials out of
+  // CLAUDE_CONFIG_DIR, and on macOS it does not — it reads its login Keychain item instead
+  // (the same platform fact the keychain-delta capture flows exist for). A probe there would
+  // seed files nothing reads and run its turn under whichever account is LIVE, spending that
+  // account's quota and attributing it to another. Off is the only honest posture until the
+  // per-account bind is verified on a real Mac.
+  const accountProbe =
+    autoSwitcher && probeUnknown && process.platform !== 'darwin'
+      ? new AccountProbe({
+          vault: pollVault,
+          engine,
+          configDirRoot: join(dataDir, 'probe'),
+          createClient: (configDir) =>
+            createAgentSdkClient({ configDirForAccount: () => configDir }),
+          ...(probeTimeoutMs !== undefined ? { timeoutMs: probeTimeoutMs } : {}),
+          logger,
+        })
+      : undefined;
 
   // Which profile gets hooks installed: the design uses a SINGLE shared ~/.claude for every
   // account (per-account config dirs don't isolate — the CLI reads some config outside them),
@@ -427,6 +474,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         }
       : {}),
     ...(autoSwitcher ? { autoSwitcher } : {}),
+    ...(accountProbe ? { accountProbe } : {}),
     settingsReport,
     logger,
   });

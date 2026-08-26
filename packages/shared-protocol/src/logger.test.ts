@@ -1,5 +1,13 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLogger } from './logger.js';
@@ -444,5 +452,69 @@ describe('createLogger: file sink', () => {
     // produce exactly one warning for the whole process, not one apiece.
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(filePath);
+  });
+});
+
+describe('createLogger: file sink rotation', () => {
+  const ROTATE_BYTES = 10 * 1024 * 1024;
+
+  it('rotates a file already at/over the threshold before the first line of a new run lands', () => {
+    const dir = freshTempDir();
+    const filePath = join(dir, 'daemon.log');
+    writeFileSync(filePath, Buffer.alloc(ROTATE_BYTES, 'x'));
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FILE: filePath },
+      sink: new CapturingSink(true),
+    });
+    logger.info({}, 'first line of the new generation');
+
+    expect(existsSync(`${filePath}.old`)).toBe(true);
+    expect(statSync(`${filePath}.old`).size).toBeGreaterThanOrEqual(ROTATE_BYTES);
+    const current = readFileSync(filePath, 'utf8');
+    expect(current).toContain('first line of the new generation');
+    expect(current.length).toBeLessThan(ROTATE_BYTES);
+  });
+
+  it('rotates mid-run once a write crosses the threshold, replacing any earlier .old', () => {
+    const dir = freshTempDir();
+    const filePath = join(dir, 'daemon.log');
+    writeFileSync(`${filePath}.old`, 'stale generation from an earlier rotation\n');
+    // Seeded just under the threshold, so this one small log line is what tips it over.
+    writeFileSync(filePath, Buffer.alloc(ROTATE_BYTES - 10, 'x'));
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FILE: filePath },
+      sink: new CapturingSink(true),
+    });
+    logger.info({}, 'crossed the threshold');
+
+    // The line that tipped the scale still lands in the generation it was appended to, which
+    // is exactly the one that then gets rotated out — never dropped, never split mid-write.
+    const oldContents = readFileSync(`${filePath}.old`, 'utf8');
+    expect(oldContents).not.toContain('stale generation');
+    expect(oldContents).toContain('crossed the threshold');
+    // Rotation opens a fresh, empty file for whatever logs next.
+    expect(readFileSync(filePath, 'utf8')).toBe('');
+  });
+
+  it('keeps working (console-only) if a rotation rename fails, rather than losing the sink', () => {
+    const dir = freshTempDir();
+    const filePath = join(dir, 'daemon.log');
+    // A directory in the way of the rotated destination makes the rename fail — the same class
+    // of unrecoverable IO fault an open failure represents.
+    mkdirSync(`${filePath}.old`);
+    writeFileSync(filePath, Buffer.alloc(ROTATE_BYTES, 'x'));
+    const sink = new CapturingSink(true);
+    const warnings: string[] = [];
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FILE: filePath },
+      sink,
+      warn: (message) => warnings.push(message),
+    });
+    logger.info({}, 'still alive after a failed rotation');
+    expect(warnings).toHaveLength(1);
+    expect(sink.chunks.some((c) => c.includes('still alive after a failed rotation'))).toBe(true);
   });
 });

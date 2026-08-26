@@ -1108,6 +1108,163 @@ describe('Daemon lifecycle', () => {
     expect(inputs?.find((i) => i.accountId === 'acct-y')?.predictedResetAt).toBeUndefined();
   });
 
+  // -------------------------------------------------------------------------
+  // Unknown-account activation probe. What is composed HERE is the detection and the
+  // follow-through: which accounts the daemon considers unreachable by auto-switch, and what it
+  // does with the ones the probe managed to activate. The probe's own mechanics (config dir,
+  // credential harvest, backoff) live in accountProbe.test.ts.
+  // -------------------------------------------------------------------------
+
+  /** A poller whose LIVE answers are scripted per account, so a lifecycle test can put one
+   *  account in the never-used state (`weekly_all` with no reset anywhere) the probe exists
+   *  for. Keyed off the bearer token, which is how the account reaches the fetch at all. */
+  function scriptedPoller(bodies: Record<string, unknown>): UsagePoller {
+    return new UsagePoller({
+      getToken: (accountId) => Promise.resolve(`tok-${accountId}`),
+      getCachedUsage: () => Promise.resolve({ limits: [] }),
+      fetch: (_url, init) => {
+        const accountId = (init.headers.authorization ?? '').replace('Bearer tok-', '');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(bodies[accountId] ?? { limits: [] }),
+        });
+      },
+    });
+  }
+
+  /** A weekly limit the endpoint publishes no reset for — the shape of an account that has
+   *  never been used, and the one auto-switch cannot target. */
+  const NEVER_USED = { limits: [{ kind: 'weekly_all', percent: 0 }] };
+  const IN_USE = {
+    limits: [
+      {
+        kind: 'weekly_all',
+        percent: 20,
+        resets_at: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+      },
+    ],
+  };
+
+  function accountRow(id: string, extra: Partial<StoredAccount> = {}): StoredAccount {
+    return { id, label: id, quarantined: false, createdAtMs: 0, updatedAtMs: 0, ...extra };
+  }
+
+  it('probes exactly the accounts whose weekly clock is unresolvable, then re-polls them', async () => {
+    poller = scriptedPoller({ 'acct-x': IN_USE, 'acct-y': NEVER_USED });
+    const repollNow = vi.spyOn(poller, 'repollNow');
+    const probeUnknown = vi.fn((candidates: Array<{ accountId: string; label: string }>) =>
+      Promise.resolve(candidates.map((c) => c.accountId)),
+    );
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      autoSwitcher: { evaluate: () => Promise.resolve() },
+      accountProbe: { probeUnknown },
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => probeUnknown.mock.calls.length > 0);
+    // acct-x reports a real weekly reset, so it is already a legal auto-switch target.
+    expect(probeUnknown.mock.calls[0]?.[0]).toEqual([{ accountId: 'acct-y', label: 'spare' }]);
+    // The point of the probe: the account it just activated is re-read immediately instead of
+    // waiting out the poll floor that would keep it invisible.
+    await waitFor(() => repollNow.mock.calls.length > 0);
+    expect(repollNow).toHaveBeenCalledWith('acct-y');
+  });
+
+  it('never probes the active, quarantined, or auto-switch-excluded account', async () => {
+    switchEngine.listAccounts.mockResolvedValue([
+      accountRow('acct-live'),
+      accountRow('acct-quar', { quarantined: true }),
+      accountRow('acct-excl', { autoSwitchExcluded: true }),
+      accountRow('acct-ok'),
+    ]);
+    switchEngine.getActiveId.mockResolvedValue('acct-live');
+    // Every one of them is in the never-used state, so only the rails decide the outcome.
+    poller = scriptedPoller({
+      'acct-live': NEVER_USED,
+      'acct-quar': NEVER_USED,
+      'acct-excl': NEVER_USED,
+      'acct-ok': NEVER_USED,
+    });
+    const probeUnknown = vi.fn((candidates: Array<{ accountId: string; label: string }>) => {
+      void candidates;
+      return Promise.resolve<string[]>([]);
+    });
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      autoSwitcher: { evaluate: () => Promise.resolve() },
+      accountProbe: { probeUnknown },
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => probeUnknown.mock.calls.length > 0);
+    expect(probeUnknown.mock.calls[0]?.[0]).toEqual([{ accountId: 'acct-ok', label: 'acct-ok' }]);
+  });
+
+  it('leaves the probe unwired when auto-switch is off — nothing to widen a target pool for', async () => {
+    poller = scriptedPoller({ 'acct-x': NEVER_USED, 'acct-y': NEVER_USED });
+    const probeUnknown = vi.fn(() => Promise.resolve([]));
+    const pollSpy = vi.spyOn(poller, 'pollAll');
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      accountProbe: { probeUnknown },
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => pollSpy.mock.calls.length > 0);
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    expect(probeUnknown).not.toHaveBeenCalled();
+  });
+
+  it('absorbs a throwing probe — the cycle still ships its snapshot', async () => {
+    poller = scriptedPoller({ 'acct-x': NEVER_USED, 'acct-y': NEVER_USED });
+    const repollNow = vi.spyOn(poller, 'repollNow');
+    const probeUnknown = vi.fn(() => Promise.reject(new Error('probe exploded')));
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      autoSwitcher: { evaluate: () => Promise.resolve() },
+      accountProbe: { probeUnknown },
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => probeUnknown.mock.calls.length > 0);
+    await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));
+    expect(repollNow).not.toHaveBeenCalled();
+  });
+
   it('start() is idempotent — calling it twice does not double-connect or double-recover', async () => {
     await daemon.start();
     await daemon.start();
@@ -1127,7 +1284,7 @@ describe('Daemon lifecycle', () => {
       },
     });
     await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
-    expect(switchEngine.activate).toHaveBeenCalledWith('acct-x');
+    expect(switchEngine.activate).toHaveBeenCalledWith('acct-x', { origin: 'phone' });
     const result = relay.received.find((e) => e.type === 'switch.result');
     if (result?.type === 'switch.result') {
       expect(result.payload).toMatchObject({
@@ -1356,7 +1513,7 @@ describe('Daemon lifecycle', () => {
       },
     });
     await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
-    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y');
+    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y', { origin: 'phone' });
     const result = relay.received.find((e) => e.type === 'switch.result');
     if (result?.type === 'switch.result') {
       expect(result.payload).toMatchObject({ ok: true, activeAccountId: 'acct-y' });

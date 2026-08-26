@@ -204,6 +204,26 @@ export class UsagePoller {
     return { results, accounts: accountUsages, plan };
   }
 
+  /**
+   * Make ONE account due for a re-poll on the next `pollAll()`, leaving every other account's
+   * timing — and this one's retained result — untouched.
+   *
+   * The floor exists to stop a poll LOOP from churning the endpoint; it is the wrong instrument
+   * for a one-off event that just changed what the endpoint would say. The activation probe is
+   * exactly that: it spends a real turn to open an account's usage window, and until we ask
+   * again the snapshot still reports the window as unknown — so the account stays invisible to
+   * auto-switch for up to a full floor after the very work that made it visible. Deliberately
+   * clears any 429 backoff too: this is a single caller-initiated read, itself rate-limited by
+   * the probe's own cooldown, not a loop that could hammer anything.
+   *
+   * A no-op for an account with no timing state yet — one that has never been polled is due
+   * already.
+   */
+  repollNow(accountId: string): void {
+    const state = this.state.get(accountId);
+    if (state) state.nextDueAtMs = 0;
+  }
+
   private async pollOne(account: PollAccount): Promise<AccountPollResult> {
     const now = this.clock();
     const state = this.state.get(account.accountId);

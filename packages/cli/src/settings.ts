@@ -29,7 +29,11 @@ import {
   defaultPaths,
   type Paths,
 } from '@claude-control/switch-engine';
-import { DEFAULT_AUTOSWITCH_COOLDOWN_MS, DEFAULT_PERMISSION_HOLD_MS } from '@claude-control/daemon';
+import {
+  DEFAULT_AUTOSWITCH_COOLDOWN_MS,
+  DEFAULT_PERMISSION_HOLD_MS,
+  DEFAULT_PROBE_TIMEOUT_MS,
+} from '@claude-control/daemon';
 import { DEFAULT_AUTO_CONTINUE_MAX_ATTEMPTS } from '@claude-control/session-runtime';
 import {
   DEFAULT_GREEDY_RESET_MARGIN_MS,
@@ -196,6 +200,8 @@ export interface DaemonConfig {
     minSessionHeadroomPct: number | undefined;
     greedyResetMarginMs: number | undefined;
     cooldownMs: number | undefined;
+    probeUnknown: boolean;
+    probeTimeoutMs: number | undefined;
     waitingCards: boolean;
     permissionHoldMs: number | undefined;
     questionHoldMs: number | undefined;
@@ -204,6 +210,9 @@ export interface DaemonConfig {
     identityCheck: boolean;
     autoContinue: boolean;
     autoContinueMaxAttempts: number | undefined;
+    /** Where the daemon's NDJSON file sink writes, in addition to stdout — an explicit
+     *  CCTL_LOG_FILE, or `<dataDir>/daemon.log` when unset (see the `dataDir` parameter). */
+    logFilePath: string;
   };
   rows: SettingRow[];
 }
@@ -222,6 +231,11 @@ export function resolveDaemonConfig(
   env: NodeJS.ProcessEnv,
   flags: DaemonRunFlags = {},
   fileConfig: DaemonFileConfig = {},
+  // Same default the daemon itself uses for every other per-machine file (daemon.db,
+  // daemon-identity.enc, ...) — a caller previewing behavior (`cctl settings`) gets the same
+  // answer `cctl daemon run` would, and daemonRun.ts passes its own real dataDir explicitly so
+  // display and behavior are read from the exact same resolution (see the module comment).
+  dataDir: string = dirname(defaultPaths().vaultDir),
 ): DaemonConfig {
   // Both default ON (flag > env > default): a flag-less `daemon run` — which is exactly what
   // the installed logon task executes — hops when the active account runs low and burns
@@ -238,6 +252,13 @@ export function resolveDaemonConfig(
   const minSessionHeadroomPct = envNumber(env, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
   const greedyResetMarginMs = envNumber(env, 'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS');
   const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
+  // Default ON, and — like greedy — only ever ACTIVE alongside auto-switch: it spends one cheap
+  // turn on an account that has never been used, so the endpoint starts publishing the weekly
+  // window that auto-switch needs before it may target that account at all. Off means those
+  // accounts stay unreachable rather than being activated unattended.
+  const probeUnknownEnv = envBool(env, 'CCTL_PROBE_UNKNOWN');
+  const probeUnknown = probeUnknownEnv ?? true;
+  const probeTimeoutMs = envNumber(env, 'CCTL_PROBE_TIMEOUT_MS');
   // A blank override is an ABSENT override, not an empty relay url. `CCTL_RELAY_URL=` left in a
   // shell profile, or `--relay "$SOMETHING_UNSET"` in a wrapper script, would otherwise win the
   // `??` chain with '' and send the daemon to dial nothing — while the settings view reported
@@ -286,6 +307,10 @@ export function resolveDaemonConfig(
   const autoContinueEnv = envBool(env, 'CCTL_AUTO_CONTINUE');
   const autoContinue = autoContinueEnv ?? true;
   const autoContinueMaxAttempts = envNumber(env, 'CCTL_AUTO_CONTINUE_MAX');
+  // A blank override is an ABSENT one, same stance as the relay url above — an unset-but-defined
+  // CCTL_LOG_FILE must not win over the real default with an empty path nothing can write to.
+  const logFileEnv = blankAsUnset(env['CCTL_LOG_FILE']);
+  const logFilePath = logFileEnv ?? join(dataDir, 'daemon.log');
 
   const rows: SettingRow[] = [
     {
@@ -350,6 +375,19 @@ export function resolveDaemonConfig(
       value: humanizeMs(cooldownMs ?? DEFAULT_AUTOSWITCH_COOLDOWN_MS),
       source: envSource(cooldownMs !== undefined),
       detail: 'CCTL_AUTOSWITCH_COOLDOWN_MS',
+    },
+    {
+      name: 'unknown-account probe',
+      value: probeUnknown ? (autoSwitch ? 'on' : 'on (inactive: auto-switch is off)') : 'off',
+      source: envSource(probeUnknownEnv !== undefined),
+      detail:
+        'CCTL_PROBE_UNKNOWN (spend one cheap turn on a never-used account so its weekly window opens and auto-switch can reach it)',
+    },
+    {
+      name: 'probe timeout',
+      value: humanizeMs(probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS),
+      source: envSource(probeTimeoutMs !== undefined),
+      detail: 'CCTL_PROBE_TIMEOUT_MS (hard ceiling on one probe turn)',
     },
     {
       name: 'waiting cards',
@@ -423,10 +461,11 @@ export function resolveDaemonConfig(
     },
     {
       name: 'daemon log file',
-      value: env['CCTL_LOG_FILE'] ?? 'off',
-      source: envSource(env['CCTL_LOG_FILE'] !== undefined),
+      value: logFilePath,
+      source: envSource(logFileEnv !== undefined),
       detail:
-        'CCTL_LOG_FILE (path NDJSON logs are also appended to; an installed daemon has no console)',
+        'CCTL_LOG_FILE (path NDJSON logs are also appended to; an installed daemon has no ' +
+        'console, so this defaults to <data dir>/daemon.log rather than off)',
     },
   ];
 
@@ -441,6 +480,8 @@ export function resolveDaemonConfig(
       minSessionHeadroomPct,
       greedyResetMarginMs,
       cooldownMs,
+      probeUnknown,
+      probeTimeoutMs,
       waitingCards,
       permissionHoldMs,
       questionHoldMs,
@@ -449,6 +490,7 @@ export function resolveDaemonConfig(
       identityCheck,
       autoContinue,
       autoContinueMaxAttempts,
+      logFilePath,
     },
     rows,
   };

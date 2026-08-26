@@ -111,6 +111,17 @@ export interface AgentSdkQueryOptions {
    *  the SDK prompts (fires `canUseTool`) at all, and is echoed onto the emitted
    *  `permission_required` events so the bot can render mode-aware cards. */
   permissionMode?: string;
+  /** Model id for this turn. Absent — the case for every human-facing session — leaves the
+   *  CLI's own default in place, which is the only honest answer when a person is going to
+   *  read the output. Set it only when the turn's CONTENT is irrelevant and its cost is not. */
+  model?: string;
+  /** Hard ceiling on turns before the query stops. Absent = the SDK's default (unbounded for
+   *  our purposes); a caller that wants exactly one exchange must say so. */
+  maxTurns?: number;
+  /** Tool allowlist. An EMPTY array is meaningful and is preserved: it says "this turn may use
+   *  no tools at all", which only makes sense paired with a permission mode that denies rather
+   *  than prompts — a prompting mode would park the tool on `canUseTool` forever instead. */
+  allowedTools?: string[];
 }
 
 /** The seam managedSession depends on instead of the real SDK. */
