@@ -536,21 +536,50 @@ export class SwitchEngine {
    *
    * The caller owns the transient `configDir` and MUST delete it afterwards (token-bearing) —
    * same contract as {@link captureFromConfigDir}.
+   *
+   * `expectedRefreshToken`, when passed, guards against clobbering a write that landed on this
+   * account WHILE the caller's capture was in flight (the activation probe's turn can run for
+   * minutes between reading the vault and calling back in here). It must be the refresh token
+   * the caller saw in the vault at the START of that capture; if the vault's bundle has since
+   * moved on to a different token, someone else won the write and this capture is the stale one
+   * — refuse rather than overwrite. Omit it for a login the operator/user is driving live, where
+   * there is no earlier snapshot to compare against and last-writer-wins is the intended policy.
    */
-  async reloginFromConfigDir(accountId: string, configDir: string): Promise<ReloginResult> {
+  async reloginFromConfigDir(
+    accountId: string,
+    configDir: string,
+    expectedRefreshToken?: string,
+  ): Promise<ReloginResult> {
     // Locked end-to-end so the existence check, the in-place bundle overwrite, and the quarantine
     // clear cannot interleave with a concurrent registry writer — which could remove the account
     // between the check and the write, orphaning its freshly written bundle.
-    return this.withCredentialLock(() => this.reloginFromConfigDirLocked(accountId, configDir));
+    return this.withCredentialLock(() =>
+      this.reloginFromConfigDirLocked(accountId, configDir, expectedRefreshToken),
+    );
   }
 
   /** The unlocked core of {@link reloginFromConfigDir}; the public wrapper holds the lock. */
   private async reloginFromConfigDirLocked(
     accountId: string,
     configDir: string,
+    expectedRefreshToken?: string,
   ): Promise<ReloginResult> {
     const existing = await this.vault.getAccount(accountId);
     if (!existing) throw new UnknownAccountError(accountId);
+
+    // Staleness guard: read the CURRENT bundle (not just the metadata row above) and compare its
+    // token against the one the caller saw before its capture started. A mismatch means the
+    // vault moved on under us — some other writer's bundle is the live truth now, and this
+    // capture's credentials, however successfully obtained, are already behind it.
+    if (expectedRefreshToken !== undefined) {
+      const currentBundle = await this.vault.readBundle(accountId);
+      if (currentBundle.claudeAiOauth.refreshToken !== expectedRefreshToken) {
+        throw new RefreshError(
+          `vault bundle for "${existing.label}" changed since this capture started; refusing to overwrite a newer write with a stale one`,
+          'relogin_bundle_stale',
+        );
+      }
+    }
 
     // Who owns the live seat, decided BEFORE the bundle overwrite below: getActiveId()'s
     // stale-identity corroboration compares the live token against the STORED bundle, and this
