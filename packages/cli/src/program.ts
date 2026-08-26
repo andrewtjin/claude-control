@@ -335,17 +335,20 @@ export function buildProgram(): Command {
     )
     .option(
       '--auto-switch',
-      'when the active account runs low, auto-switch to the account with >=25% of a 5h window left whose weekly quota resets soonest',
+      'when the active account runs low, auto-switch to the account with >=25% of a 5h window left whose weekly quota resets soonest (the default; env: CCTL_AUTOSWITCH)',
     )
+    .option('--no-auto-switch', 'never hop accounts automatically this run')
     .option(
       '--greedy',
-      "with --auto-switch: also hop toward whichever account's weekly quota expires soonest, even while the active one is healthy (burns expiring budget first; env: CCTL_AUTOSWITCH_GREEDY)",
+      "with auto-switch: also hop toward whichever account's weekly quota expires soonest, even while the active one is healthy (burns expiring budget first; the default; env: CCTL_AUTOSWITCH_GREEDY)",
     )
+    .option('--no-greedy', 'hop only when the active account runs low')
     .action(
       async (opts: { pair?: string; relay?: string; autoSwitch?: boolean; greedy?: boolean }) => {
         // Greedy is a refinement of auto-switch, not a standalone mode — fail loudly rather
-        // than let the flag silently do nothing.
-        if (opts.greedy && !opts.autoSwitch) fail('--greedy requires --auto-switch.');
+        // than let the pair silently contradict each other.
+        if (opts.greedy === true && opts.autoSwitch === false)
+          fail('--greedy conflicts with --no-auto-switch.');
         try {
           await runDaemon(opts);
         } catch (err) {
@@ -366,10 +369,13 @@ export function buildProgram(): Command {
       'control-plane WebSocket url (default CCTL_RELAY_URL or ws://127.0.0.1:8765)',
     )
     .option('--auto-switch', 'forwarded to `daemon run` - see its help')
+    .option('--no-auto-switch', 'forwarded to `daemon run` - see its help')
     .option('--greedy', 'forwarded to `daemon run` - see its help')
+    .option('--no-greedy', 'forwarded to `daemon run` - see its help')
     .action(
       async (opts: { pair?: string; relay?: string; autoSwitch?: boolean; greedy?: boolean }) => {
-        if (opts.greedy && !opts.autoSwitch) fail('--greedy requires --auto-switch.');
+        if (opts.greedy === true && opts.autoSwitch === false)
+          fail('--greedy conflicts with --no-auto-switch.');
         // Reconstruct the child argv from the parsed flags: the supervisor and `daemon run`
         // deliberately share an option surface so nothing can be forwarded wrong.
         const childArgs = [
@@ -377,8 +383,10 @@ export function buildProgram(): Command {
           'run',
           ...(opts.pair !== undefined ? ['--pair', opts.pair] : []),
           ...(opts.relay !== undefined ? ['--relay', opts.relay] : []),
-          ...(opts.autoSwitch ? ['--auto-switch'] : []),
-          ...(opts.greedy ? ['--greedy'] : []),
+          ...(opts.autoSwitch === true ? ['--auto-switch'] : []),
+          ...(opts.autoSwitch === false ? ['--no-auto-switch'] : []),
+          ...(opts.greedy === true ? ['--greedy'] : []),
+          ...(opts.greedy === false ? ['--no-greedy'] : []),
         ];
         const dataDir = dirname(defaultPaths().vaultDir);
         const crashFile = crashLogPath(dataDir);

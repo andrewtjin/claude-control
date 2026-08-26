@@ -101,9 +101,11 @@ attribution journal, and the control-plane connection to the bot.
 cctl daemon run                        # run in the foreground (Ctrl+C to stop)
 cctl daemon run --pair <code>          # adopt a new identity from a Discord /pair code
 cctl daemon run --relay <url>          # override the control-plane WebSocket url
-cctl daemon run --auto-switch          # auto-switch when the active account runs low
-cctl daemon run --auto-switch --greedy # also hop toward whichever account's weekly
-                                        # quota expires soonest, even while healthy
+cctl daemon run --no-greedy            # hop only when the active account runs low
+                                        # (by default the daemon ALSO hops toward whichever
+                                        # account's weekly quota expires soonest)
+cctl daemon run --no-auto-switch       # never hop accounts automatically; for an installed
+                                        # daemon set CCTL_AUTOSWITCH=0 / CCTL_AUTOSWITCH_GREEDY=0
 
 cctl daemon supervise                  # run + auto-restart on crash or hang (same flags
                                         # as `daemon run`; a clean exit ends supervision)

@@ -61,8 +61,8 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
 Just want the daemon, with everything in your terminal? Skip the pairing step in
 `cctl setup` (type `s`) and nothing else changes: `cctl usage` and `cctl timeline`
 show every limit and which account to burn, `cctl switch` hops accounts manually,
-and `cctl daemon run --auto-switch` gives you the same before-the-wall automatic
-switching — no Discord anywhere. Pair later anytime with `cctl setup --reconfigure`.
+and `cctl daemon run` gives you the same before-the-wall automatic switching by
+default — no Discord anywhere. Pair later anytime with `cctl setup --reconfigure`.
 
 ## Platform
 

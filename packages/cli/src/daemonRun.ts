@@ -83,12 +83,14 @@ const DAEMON_LOG_SINK = process.stdout;
 export interface DaemonRunOptions {
   pair?: string;
   relay?: string;
-  /** Opt-in `--auto-switch`: hop accounts automatically when the active one runs low.
-   *  Tunables via env: CCTL_AUTOSWITCH_TRIGGER_PCT, CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT,
-   *  CCTL_AUTOSWITCH_COOLDOWN_MS, CCTL_AUTOSWITCH_GREEDY. */
+  /** Hop accounts automatically when the active one runs low. ON by default; false is the
+   *  explicit `--no-auto-switch` opt-out and undefined means no flag (CCTL_AUTOSWITCH or the
+   *  default decides). Tunables via env: CCTL_AUTOSWITCH_TRIGGER_PCT,
+   *  CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT, CCTL_AUTOSWITCH_COOLDOWN_MS. */
   autoSwitch?: boolean;
-  /** Opt-in `--greedy` (requires --auto-switch): also hop toward whichever account's
-   *  weekly quota expires soonest, even while the active one is healthy. */
+  /** With auto-switch: also hop toward whichever account's weekly quota expires soonest,
+   *  even while the active one is healthy. ON by default; false is `--no-greedy`, undefined
+   *  means no flag (CCTL_AUTOSWITCH_GREEDY or the default decides). */
   greedy?: boolean;
 }
 
@@ -215,8 +217,10 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const config = resolveDaemonConfig(
     process.env,
     {
-      autoSwitch: options.autoSwitch === true,
-      greedy: options.greedy === true,
+      // Tri-state: an absent flag stays absent so the resolver's env/default chain decides,
+      // while an explicit --no- opt-out passes through as false.
+      ...(options.autoSwitch !== undefined ? { autoSwitch: options.autoSwitch } : {}),
+      ...(options.greedy !== undefined ? { greedy: options.greedy } : {}),
       ...(options.relay !== undefined ? { relay: options.relay } : {}),
     },
     fileConfig,
@@ -229,6 +233,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     minSessionHeadroomPct,
     greedyResetMarginMs,
     cooldownMs,
+    autoSwitch,
     greedy,
   } = config.values;
   const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
@@ -280,7 +285,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     }),
     // Greedy-aware advice: when the daemon itself executes the burn plan, the plan's
     // wording turns descriptive instead of telling the user to do it by hand.
-    ...(options.autoSwitch && greedy ? { advisorOptions: { greedyAutoSwitch: true } } : {}),
+    ...(autoSwitch && greedy ? { advisorOptions: { greedyAutoSwitch: true } } : {}),
   });
 
   const attributionJournal = new AttributionJournal({ store, vaultDir: paths.vaultDir });
@@ -331,11 +336,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       : {}),
   });
 
-  // Auto-switch is strictly opt-in (`--auto-switch`): unattended account hops are a policy
-  // decision the owner makes explicitly, never a default. It calls the engine's normal
-  // activate() path, so the human-plausible cadence guard applies to auto-hops too, and it
-  // reports every attempt to the phone through the same switch.result push as /switch.
-  const autoSwitcher = options.autoSwitch
+  // Auto-switch (greedy) is the DEFAULT: a flag-less daemon — including the installed logon
+  // task, which carries no flags — hops before the wall without any setup. Opt out per run
+  // with --no-auto-switch, or persistently with CCTL_AUTOSWITCH=0. It calls the engine's
+  // normal activate() path, so the human-plausible cadence guard applies to auto-hops too,
+  // and it reports every attempt to the phone through the same switch.result push as /switch.
+  const autoSwitcher = autoSwitch
     ? new AutoSwitcher({
         activate: (accountId) => engine.activate(accountId),
         notify: (payload) =>
