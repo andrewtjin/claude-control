@@ -29,7 +29,8 @@ cctl setup
 `cctl setup` runs a guided first-run wizard: it checks your environment, captures
 your current Claude login, installs the usage-tracking hooks, pairs this machine
 with the shared Discord bot, and registers a logon task so the daemon starts
-automatically.
+automatically (Windows and macOS; on Linux you run the daemon yourself for now —
+see `docs/PLATFORM.md`).
 
 ## What it does
 

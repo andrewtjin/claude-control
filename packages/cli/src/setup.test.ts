@@ -129,7 +129,7 @@ describe('renderSetupSummary', () => {
     hooksInstalled: true,
     hooksProfilePath: 'C:/home/.claude/settings.json',
     relayUrl: 'ws://127.0.0.1:8765',
-    taskRegistered: true,
+    autostart: 'registered' as const,
     daemonAlive: true,
     paired: true,
   };
@@ -149,13 +149,23 @@ describe('renderSetupSummary', () => {
       accounts: [],
       hooksInstalled: false,
       daemonAlive: false,
-      taskRegistered: false,
+      autostart: 'unregistered',
       paired: false,
     });
     expect(out).toContain('[--] accounts: none captured yet');
     expect(out).toContain('[--] hooks: not yet');
     expect(out).toContain('[--] daemon: no autostart registered');
     expect(out).toContain('[--] discord: local-only');
+  });
+
+  it('never points at cctl daemon install on a platform without autostart', () => {
+    const stopped = renderSetupSummary({ ...base, autostart: 'unsupported', daemonAlive: false });
+    expect(stopped).toContain('[--] daemon: not running — start it: cctl daemon supervise');
+    expect(stopped).not.toContain('cctl daemon install');
+    // A hand-started daemon is running, but the reader should know it will not come back alone.
+    const running = renderSetupSummary({ ...base, autostart: 'unsupported' });
+    expect(running).toContain('[ok] daemon: running (started by hand — no autostart');
+    expect(running).not.toContain('cctl daemon install');
   });
 
   it('adds the first-poll note only on the success screen and only when paired', () => {
@@ -233,7 +243,7 @@ function makeDeps(io: WizardIo, overrides: Partial<SetupDeps> = {}): SetupDeps {
     probeRelay: () => Promise.resolve({ reachable: true, detail: 'relay healthy' }),
     isPaired: () => Promise.resolve(false),
     pair: () => Promise.resolve({ ok: true }),
-    taskRegistered: () => Promise.resolve(false),
+    autostartState: () => Promise.resolve('unregistered'),
     installAutostart: () => Promise.resolve({ task: 'created', started: true }),
     verifyDaemon: () => Promise.resolve(true),
   };
@@ -256,7 +266,7 @@ describe('runSetup', () => {
       makeDeps(io, {
         listAccounts: () => Promise.resolve([account('work')]),
         hooksInstalled: () => Promise.resolve(true),
-        taskRegistered: () => Promise.resolve(true),
+        autostartState: () => Promise.resolve('registered'),
         isPaired: () => Promise.resolve(true),
       }),
     );
@@ -273,7 +283,7 @@ describe('runSetup', () => {
       makeDeps(io, {
         listAccounts: () => Promise.resolve([account('work')]),
         hooksInstalled: () => Promise.resolve(true),
-        taskRegistered: () => Promise.resolve(true),
+        autostartState: () => Promise.resolve('registered'),
         isPaired: () => Promise.resolve(true),
       }),
       { reconfigure: true },
@@ -505,7 +515,7 @@ describe('runSetup', () => {
       makeDeps(io, {
         installAutostart: () =>
           Promise.reject(new Error('Register-ScheduledTask : Access is denied.')),
-        taskRegistered: () => Promise.resolve(false),
+        autostartState: () => Promise.resolve('unregistered'),
       }),
     );
     expect(outcome).toBe('completed');
@@ -514,5 +524,73 @@ describe('runSetup', () => {
     expect(text()).toContain('cctl daemon install');
     // The failure never claims success elsewhere: no "Registered the logon task" line.
     expect(text()).not.toContain('Registered the logon task');
+  });
+
+  // --- a platform with no autostart backend (Linux, WSL2 included) ---------------------------
+  // The wizard used to hand this platform to the Windows Scheduled Task path, which died with
+  // `spawnSync powershell.exe ENOENT` at step 7. Now the step is a statement of fact plus the
+  // manual start, and nothing autostart-related is ever attempted.
+
+  it('skips autostart with the manual-start note when the platform has no backend', async () => {
+    const { io, text } = makeIo(['', 'n', 's']);
+    let installs = 0;
+    const verifyCalls: ({ wait?: boolean } | undefined)[] = [];
+    const outcome = await runSetup(
+      makeDeps(io, {
+        autostartState: () => Promise.resolve('unsupported'),
+        installAutostart: () => {
+          installs += 1;
+          return Promise.resolve({ task: 'created', started: true });
+        },
+        verifyDaemon: (options) => {
+          verifyCalls.push(options);
+          return Promise.resolve(false);
+        },
+      }),
+    );
+    expect(outcome).toBe('completed');
+    expect(installs).toBe(0);
+    const out = text();
+    expect(out).toContain('[8/8]');
+    expect(out).toContain('Autostart is not available on this platform yet');
+    expect(out).toContain('cctl daemon supervise');
+    // Nothing was kicked, so the round-trip check reads once instead of waiting for it.
+    expect(verifyCalls).toEqual([{ wait: false }]);
+    expect(out).toContain('Daemon is not running — start it with `cctl daemon supervise`');
+    expect(out).not.toContain('has not reported in yet');
+    expect(out).not.toContain('Could not register');
+    expect(out).not.toContain('cctl daemon install');
+    // The summary carries the same fact rather than an install prompt.
+    expect(out).toContain('[--] daemon: not running — start it: cctl daemon supervise');
+  });
+
+  it('reports a hand-started daemon as up on a platform without autostart', async () => {
+    const { io, text } = makeIo(['', 'n', 's']);
+    const outcome = await runSetup(
+      makeDeps(io, {
+        autostartState: () => Promise.resolve('unsupported'),
+        verifyDaemon: () => Promise.resolve(true),
+      }),
+    );
+    expect(outcome).toBe('completed');
+    expect(text()).toContain('Daemon is up.');
+    expect(text()).toContain('[ok] daemon: running (started by hand');
+  });
+
+  it('counts an unsupported autostart as complete for the already-set-up gate', async () => {
+    // Nothing the user could do would change it, so it must not keep the wizard re-walking.
+    const { io, text } = makeIo();
+    const outcome = await runSetup(
+      makeDeps(io, {
+        listAccounts: () => Promise.resolve([account('work')]),
+        hooksInstalled: () => Promise.resolve(true),
+        autostartState: () => Promise.resolve('unsupported'),
+        isPaired: () => Promise.resolve(true),
+      }),
+    );
+    expect(outcome).toBe('already-set-up');
+    expect(text()).toContain('Already set up.');
+    expect(text()).toContain('no autostart on this platform');
+    expect(text()).not.toContain('autostart on,');
   });
 });

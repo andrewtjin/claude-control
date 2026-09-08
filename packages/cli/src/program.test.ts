@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { buildProgram } from './program.js';
+import { CliFailure } from './context.js';
 import { VERSION, type SettingsReport } from './settings.js';
 
 // `buildEngine` is the CLI's single seam onto the switch engine, so stubbing it lets an action
@@ -194,6 +195,24 @@ describe('buildProgram', () => {
     }
     // Order, not just invocation: a repair that lands after the read still renders the stale rows.
     expect(order).toEqual(['repair', 'read']);
+  });
+
+  // Every autostart call site used to decide darwin-vs-everything-else on its own, so Linux (WSL
+  // included) ran the Windows Scheduled Task backend and died on `spawnSync powershell.exe
+  // ENOENT`. The CLI must answer with the platform fact and fail before it resolves a shim or
+  // spawns anything — proven here by running the real action with the platform swapped. `fail`
+  // throws a CliFailure that the entry point turns into the non-zero exit.
+  it('daemon install on a platform without autostart explains itself and fails', async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    try {
+      const run = buildProgram().parseAsync(['daemon', 'install'], { from: 'user' });
+      await expect(run).rejects.toBeInstanceOf(CliFailure);
+      await expect(run).rejects.toThrow('autostart is not available on this platform');
+      await expect(run).rejects.toThrow('cctl daemon supervise');
+    } finally {
+      if (platform) Object.defineProperty(process, 'platform', platform);
+    }
   });
 });
 

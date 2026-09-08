@@ -49,9 +49,11 @@ it turns into a confusing runtime error.
 
 ## Linux caveats
 
-- **Autostart is not wired yet** (`cctl daemon install` is Scheduled-Task-based);
-  run the daemon manually or under your own systemd user unit / shell profile for
-  now.
+- **Autostart is not wired yet.** There is no Linux backend behind `cctl daemon
+install` (Windows registers a Scheduled Task, macOS a LaunchAgent): it says so and
+  exits 1, `cctl setup` skips the step with the same note, and `cctl daemon status`
+  reports it in place of a logon task. Run the daemon yourself — `cctl daemon
+supervise` in a terminal, under tmux/nohup, or as your own systemd user unit.
 - **Observed sessions** target ConPTY and stay Windows-only; everything else —
   daemon, CLI, usage polling, remote/managed sessions — runs as-is.
 

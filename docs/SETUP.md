@@ -177,6 +177,15 @@ or, if it hasn't reported in yet:
 Daemon has not reported in yet — give it a moment, then run `cctl status`.
 ```
 
+On a platform with no autostart backend (Linux, WSL2 included — see `docs/PLATFORM.md`)
+the wizard registers nothing and says so, then checks the heartbeat once instead of
+waiting for a daemon it did not start:
+
+```
+Autostart is not available on this platform yet — run the daemon yourself: cctl daemon supervise (...)
+Daemon is not running — start it with `cctl daemon supervise`.
+```
+
 ## Success summary
 
 The wizard ends with the same summary `cctl status` and bare `cctl` render: which
