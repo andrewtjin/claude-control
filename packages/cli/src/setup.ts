@@ -13,6 +13,7 @@ import type { StoredAccount } from '@claude-control/switch-engine';
 import { renderDoctor, summarize, type DoctorCheck, type RelayProbe } from './doctor.js';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import { BOT_INVITE_URL, BOT_USER_INSTALL_URL } from './settings.js';
+import { MANUAL_START_HINT, type AutostartResult, type AutostartState } from './autostart.js';
 
 // ---------------------------------------------------------------------------
 // The wizard's IO surface
@@ -38,15 +39,6 @@ export interface WizardIo {
  *  `'rejected'` (the relay actively refused the code) and `'error'` (anything else). */
 export type PairResult =
   { ok: true } | { ok: false; reason: 'timeout' | 'rejected' | 'error'; detail: string };
-
-/** Result of registering + kicking the autostart task. `task` mirrors the Scheduled Task
- *  register outcome; `started` is best-effort (a failure to start now still leaves the task
- *  correctly registered for the next logon). */
-export interface AutostartResult {
-  task: 'created' | 'updated' | 'unchanged';
-  started: boolean;
-  detail?: string;
-}
 
 /**
  * Everything the wizard needs from the outside world. Each member is either a pure-ish reader
@@ -84,12 +76,15 @@ export interface SetupDeps {
   /** Attempt pairing with an already-normalized code. MUST resolve within its own timeout. */
   pair(code: string): Promise<PairResult>;
 
-  /** Whether the logon Scheduled Task is registered. */
-  taskRegistered(): Promise<boolean>;
-  /** Register/update the logon task and start it now (best-effort). */
+  /** Whether autostart is registered — or 'unsupported' on a platform with no backend, which
+   *  the wizard treats as done (nothing to register) and never calls `installAutostart` for. */
+  autostartState(): Promise<AutostartState>;
+  /** Register/update autostart and start the daemon now (best-effort). */
   installAutostart(): Promise<AutostartResult>;
-  /** Whether the daemon is now actually up (heartbeat alive) — the round-trip check. */
-  verifyDaemon(): Promise<boolean>;
+  /** Whether the daemon is now actually up (heartbeat alive) — the round-trip check. `wait`
+   *  (default true) polls briefly so a just-kicked daemon has time to report in; false reads
+   *  once, for when nothing was kicked. */
+  verifyDaemon(options?: { wait?: boolean }): Promise<boolean>;
 }
 
 export interface SetupOptions {
@@ -204,7 +199,7 @@ export interface SetupSummary {
   hooksInstalled: boolean;
   hooksProfilePath: string;
   relayUrl: string;
-  taskRegistered: boolean;
+  autostart: AutostartState;
   daemonAlive: boolean;
   paired: boolean;
 }
@@ -232,11 +227,19 @@ export function renderSetupSummary(
     ? ok(`hooks: installed in ${s.hooksProfilePath}`)
     : warn(`hooks: not yet in ${s.hooksProfilePath} (installed when the daemon starts)`);
 
+  // On a platform with no autostart backend, `cctl daemon install` would only restate that and
+  // exit, so the line hands over the manual start instead.
   const daemonLine = s.daemonAlive
-    ? ok('daemon: running')
-    : s.taskRegistered
+    ? s.autostart === 'unsupported'
+      ? ok('daemon: running (started by hand — no autostart on this platform yet)')
+      : ok('daemon: running')
+    : s.autostart === 'registered'
       ? warn('daemon: not running yet — starts at logon (or: cctl daemon install)')
-      : warn('daemon: no autostart registered — run: cctl daemon install');
+      : s.autostart === 'unsupported'
+        ? warn(
+            'daemon: not running — start it: cctl daemon supervise (no autostart on this platform yet)',
+          )
+        : warn('daemon: no autostart registered — run: cctl daemon install');
 
   const pairingLine = s.paired
     ? ok('discord: paired')
@@ -287,18 +290,22 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
   // Idempotent re-entry: read the REAL on-disk state and, if setup is already complete, print a
   // one-line summary and stop — unless --reconfigure forces the full walk. "Complete" is
   // accounts + hooks + autostart; pairing is optional (skip = a valid local-only setup), so it
-  // never blocks this gate.
-  const [initialAccounts, initialHooks, initialTask] = await Promise.all([
+  // never blocks this gate. Autostart that this platform cannot have counts as complete too —
+  // nothing the user does would change it, so it must not keep the wizard re-walking.
+  const [initialAccounts, initialHooks, initialAutostart] = await Promise.all([
     deps.listAccounts(),
     deps.hooksInstalled(),
-    deps.taskRegistered(),
+    deps.autostartState(),
   ]);
-  const alreadyComplete = initialAccounts.length > 0 && initialHooks && initialTask;
+  const alreadyComplete =
+    initialAccounts.length > 0 && initialHooks && initialAutostart !== 'unregistered';
   if (alreadyComplete && !options.reconfigure) {
     const paired = await deps.isPaired();
+    const autostartNote =
+      initialAutostart === 'registered' ? 'autostart on' : 'no autostart on this platform';
     io.write(
       `${p.green('Already set up.')} ${initialAccounts.length} account(s), hooks in ` +
-        `${deps.hooksProfilePath}, autostart on, ${paired ? 'paired' : 'local-only'}.\n`,
+        `${deps.hooksProfilePath}, ${autostartNote}, ${paired ? 'paired' : 'local-only'}.\n`,
     );
     io.write(
       `Details: ${p.bold('cctl status')}   ·   reconfigure: ${p.bold('cctl setup --reconfigure')}\n`,
@@ -444,47 +451,61 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
 
   // ---- [7/7] autostart + daemon, then round-trip verify ----
   step(7, 'Autostart and start the daemon');
-  // A failed registration must not kill the wizard at its final step — everything before it
-  // (accounts, hooks, pairing) is already done, and the daemon runs fine without autostart.
-  // Degrade to a warning with the retry path; the summary below reports the task honestly.
-  let autostart: AutostartResult | undefined;
-  try {
-    autostart = await deps.installAutostart();
-  } catch (err) {
+  let daemonAlive: boolean;
+  if (initialAutostart === 'unsupported') {
+    // A platform fact, not a failure: nothing to register and nothing to retry, so say how the
+    // daemon runs here and check ONCE whether one is already up — no daemon was kicked, so
+    // waiting for one to report in would only stall on a heartbeat that cannot come.
+    io.write(p.yellow(`Autostart is not available on this platform yet — ${MANUAL_START_HINT}.\n`));
+    daemonAlive = await deps.verifyDaemon({ wait: false });
     io.write(
-      p.yellow(
-        `Could not register the logon task: ${(err as Error).message}\n` +
-          'The daemon still runs manually (`cctl daemon run` or `cctl daemon supervise`); ' +
-          'retry autostart later with `cctl daemon install`.\n',
-      ),
+      daemonAlive
+        ? `${p.green('Daemon is up.')}\n`
+        : p.yellow('Daemon is not running — start it with `cctl daemon supervise`.\n'),
     );
-  }
-  if (autostart) {
-    const taskVerb = {
-      created: 'Registered',
-      updated: 'Updated',
-      unchanged: 'Already registered',
-    }[autostart.task];
-    io.write(`${taskVerb} the logon task so the daemon starts automatically.\n`);
-    if (!autostart.started) {
+  } else {
+    // A failed registration must not kill the wizard at its final step — everything before it
+    // (accounts, hooks, pairing) is already done, and the daemon runs fine without autostart.
+    // Degrade to a warning with the retry path; the summary below reports the task honestly.
+    let autostart: AutostartResult | undefined;
+    try {
+      autostart = await deps.installAutostart();
+    } catch (err) {
       io.write(
         p.yellow(
-          `Could not start it right now${autostart.detail ? ` (${autostart.detail})` : ''}; ` +
-            'it will start at your next logon.\n',
+          `Could not register the logon task: ${(err as Error).message}\n` +
+            'The daemon still runs manually (`cctl daemon run` or `cctl daemon supervise`); ' +
+            'retry autostart later with `cctl daemon install`.\n',
         ),
       );
     }
+    if (autostart) {
+      const taskVerb = {
+        created: 'Registered',
+        updated: 'Updated',
+        unchanged: 'Already registered',
+      }[autostart.task];
+      io.write(`${taskVerb} the logon task so the daemon starts automatically.\n`);
+      if (!autostart.started) {
+        io.write(
+          p.yellow(
+            `Could not start it right now${autostart.detail ? ` (${autostart.detail})` : ''}; ` +
+              'it will start at your next logon.\n',
+          ),
+        );
+      }
+    }
+    daemonAlive = await deps.verifyDaemon();
+    io.write(
+      daemonAlive
+        ? `${p.green('Daemon is up.')}\n`
+        : p.yellow('Daemon has not reported in yet — give it a moment, then run `cctl status`.\n'),
+    );
   }
-  const daemonAlive = await deps.verifyDaemon();
-  io.write(
-    daemonAlive
-      ? `${p.green('Daemon is up.')}\n`
-      : p.yellow('Daemon has not reported in yet — give it a moment, then run `cctl status`.\n'),
-  );
 
   // ---- success summary ----
   const finalHooks = await deps.hooksInstalled();
-  const finalTask = await deps.taskRegistered();
+  const finalAutostart = await deps.autostartState();
   io.write('\n' + p.bold('Setup complete.') + '\n');
   io.write(
     renderSetupSummary(
@@ -493,7 +514,7 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
         hooksInstalled: finalHooks,
         hooksProfilePath: deps.hooksProfilePath,
         relayUrl: deps.relayUrl,
-        taskRegistered: finalTask,
+        autostart: finalAutostart,
         daemonAlive,
         paired,
       },

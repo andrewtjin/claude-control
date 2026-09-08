@@ -28,6 +28,7 @@ import {
   type PacingStyle,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
+import { MANUAL_START_HINT, type AutostartQuery } from './autostart.js';
 
 /** Render the accounts registry as an aligned table. `activeId` is marked with `*`. `nowMs`
  *  drives the PLAN/BILLING columns' estimates and defaults to the real clock; tests pin it. */
@@ -323,14 +324,20 @@ function colWidth<K extends string>(
 }
 
 /** What `cctl daemon status` has gathered before rendering — one snapshot from three
- *  independent sources (a live Scheduled Task query, the heartbeat file, the identity file)
- *  joined here only for display; each source degrades on its own (see daemonInstall.ts,
- *  heartbeat.ts, dpapiIdentityStore) so a missing piece never blocks the other lines. */
+ *  independent sources (a live autostart query, the heartbeat file, the identity file) joined
+ *  here only for display; each source degrades on its own (see autostart.ts, heartbeat.ts,
+ *  dpapiIdentityStore) so a missing piece never blocks the other lines. */
 export interface DaemonStatusView {
-  task: { registered: boolean; state?: string };
+  task: AutostartQuery;
   heartbeat: HeartbeatReading;
   paired: boolean;
   relayUrl: string;
+}
+
+/** The command a reader runs to get the daemon up: install autostart where a backend exists,
+ *  otherwise run it by hand — `cctl daemon install` would only print the same hint and exit. */
+function startCommand(task: AutostartQuery): string {
+  return task.supported ? 'run: cctl daemon install' : 'run: cctl daemon supervise';
 }
 
 /** Render an at-a-glance daemon health report: logon task, heartbeat, pairing, relay. Pure —
@@ -349,7 +356,11 @@ export function renderDaemonStatus(
   ].join('\n');
 }
 
-function taskLine(task: DaemonStatusView['task'], palette: Palette): string {
+function taskLine(task: AutostartQuery, palette: Palette): string {
+  if (!task.supported) {
+    // A platform fact, not something to fix — so no "run: cctl daemon install" here.
+    return `${palette.yellow('[--]')} autostart not available on this platform yet — ${MANUAL_START_HINT}`;
+  }
   if (!task.registered) {
     return `${palette.yellow('[--]')} logon task not registered — run: cctl daemon install`;
   }
@@ -357,21 +368,22 @@ function taskLine(task: DaemonStatusView['task'], palette: Palette): string {
   return `${palette.green('[ok]')} logon task registered${state}`;
 }
 
-/** The heartbeat line additionally reads `task.registered`: a stale heartbeat backed by a
+/** The heartbeat line additionally reads the autostart query: a stale heartbeat backed by a
  *  registered logon task will self-heal at the next logon, which is worth saying outright
  *  rather than leaving the reader to infer it from a bare timestamp. */
 function heartbeatLine(view: DaemonStatusView, palette: Palette): string {
   const { heartbeat, task } = view;
   if (heartbeat.state === 'never') {
     // Yellow, not dim: the line hands the reader a command, and the mark colors say so (ansi.ts).
-    return `${palette.yellow('[--]')} daemon has never run on this machine — run: cctl daemon install`;
+    return `${palette.yellow('[--]')} daemon has never run on this machine — ${startCommand(task)}`;
   }
   const age = ageLabel(heartbeat.ageMs);
   if (heartbeat.state === 'alive') {
     return `${palette.green('[ok]')} daemon alive (heartbeat ${age})`;
   }
-  const nextStep = task.registered
-    ? 'will restart at next logon (or run: cctl daemon install to start it now)'
-    : 'not scheduled to restart — run: cctl daemon install';
+  const nextStep =
+    task.supported && task.registered
+      ? 'will restart at next logon (or run: cctl daemon install to start it now)'
+      : `not scheduled to restart — ${startCommand(task)}`;
   return `${palette.red('[!!]')} daemon not responding (last heartbeat ${age}) — ${nextStep}`;
 }

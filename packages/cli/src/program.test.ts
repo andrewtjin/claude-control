@@ -164,4 +164,29 @@ describe('buildProgram', () => {
     // Order, not just invocation: a repair that lands after the read still renders the stale rows.
     expect(order).toEqual(['repair', 'read']);
   });
+
+  // Every autostart call site used to decide darwin-vs-everything-else on its own, so Linux (WSL
+  // included) ran the Windows Scheduled Task backend and died on `spawnSync powershell.exe
+  // ENOENT`. The CLI must answer with the platform fact and exit before it resolves a shim or
+  // spawns anything — proven here by running the real action with the platform swapped.
+  it('daemon install on a platform without autostart explains itself and exits 1', async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    const exit = vi.spyOn(process, 'exit').mockImplementation((code) => {
+      throw new Error(`exit ${String(code)}`);
+    });
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    try {
+      await expect(
+        buildProgram().parseAsync(['daemon', 'install'], { from: 'user' }),
+      ).rejects.toThrow('exit 1');
+      const written = stderr.mock.calls.map((call) => String(call[0])).join('');
+      expect(written).toContain('autostart is not available on this platform');
+      expect(written).toContain('cctl daemon supervise');
+    } finally {
+      stderr.mockRestore();
+      exit.mockRestore();
+      if (platform) Object.defineProperty(process, 'platform', platform);
+    }
+  });
 });

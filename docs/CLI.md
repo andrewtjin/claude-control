@@ -110,7 +110,8 @@ cctl daemon run --no-auto-switch       # never hop accounts automatically; for a
 cctl daemon supervise                  # run + auto-restart on crash or hang (same flags
                                         # as `daemon run`; a clean exit ends supervision)
 
-cctl daemon install     # register the logon Scheduled Task and start the daemon now
+cctl daemon install     # register the logon Scheduled Task (Windows) / LaunchAgent (macOS)
+                        # and start the daemon now; on Linux it says there is no autostart yet
 cctl daemon uninstall   # remove the logon task + the daemon's hook entries in settings.json
 cctl daemon status      # logon task, heartbeat, pairing, relay — at a glance
 ```

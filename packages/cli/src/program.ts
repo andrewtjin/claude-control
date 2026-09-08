@@ -53,14 +53,17 @@ import {
   crashLogPath,
   superviseDaemon,
 } from './daemonSupervise.js';
+import { resolveCctlShimPath } from './daemonInstall.js';
 import {
-  installDaemonTask,
-  queryDaemonTask,
-  resolveCctlShimPath,
-  startDaemonTaskNow,
-  uninstallDaemonTask,
-} from './daemonInstall.js';
-import { installDaemonAgent, queryDaemonAgent, uninstallDaemonAgent } from './launchdInstall.js';
+  AUTOSTART_UNSUPPORTED_NOTE,
+  autostartBackend,
+  autostartNoun,
+  installAutostart,
+  queryAutostart,
+  readAutostartState,
+  uninstallAutostart,
+  type AutostartResult,
+} from './autostart.js';
 import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
   renderAccountsTable,
@@ -89,7 +92,6 @@ import {
   renderSetupSummary,
   runSetup,
   PAIRING_TIMEOUT_MS,
-  type AutostartResult,
   type PairResult,
   type SetupDeps,
   type SetupSummary,
@@ -415,51 +417,35 @@ export function buildProgram(): Command {
       'register a logon task (Scheduled Task / LaunchAgent) that starts the daemon automatically',
     )
     .action(() => {
+      // Decide the platform before anything else runs: on a platform with no autostart backend
+      // there is no shim to resolve and no tooling to call, only the honest answer.
+      const backend = autostartBackend();
+      if (backend === 'none') fail(AUTOSTART_UNSUPPORTED_NOTE);
+      const noun = autostartNoun(backend);
       let shimPath: string;
       try {
         shimPath = resolveCctlShimPath();
       } catch (err) {
         fail(`could not resolve the installed cctl location: ${(err as Error).message}`);
       }
-      if (process.platform === 'darwin') {
-        // launchd path: bootstrapping a RunAtLoad agent registers AND starts in one step.
-        let outcome: ReturnType<typeof installDaemonAgent>;
-        try {
-          outcome = installDaemonAgent({ shimPath });
-        } catch (err) {
-          fail(`could not register the LaunchAgent: ${(err as Error).message}`);
-        }
-        const verb = { created: 'Registered', updated: 'Updated', unchanged: 'Already registered' }[
-          outcome
-        ];
-        process.stdout.write(
-          `${verb} the LaunchAgent to run "${shimPath} daemon run" at login.\n` +
-            (outcome === 'unchanged' ? '' : 'Daemon starting now.\n'),
-        );
-        return;
-      }
-      let outcome: ReturnType<typeof installDaemonTask>;
+      let result: AutostartResult;
       try {
-        outcome = installDaemonTask({ shimPath });
+        result = installAutostart(shimPath);
       } catch (err) {
-        fail(`could not register the logon task: ${(err as Error).message}`);
+        fail(`could not register the ${noun}: ${(err as Error).message}`);
       }
       const verb = { created: 'Registered', updated: 'Updated', unchanged: 'Already registered' }[
-        outcome
+        result.task
       ];
-      process.stdout.write(`${verb} the logon task to run "${shimPath} daemon run" at logon.\n`);
-      // Best-effort: get the daemon running now rather than making the user wait for the next
-      // logon. A failure here does not undo the (successful) registration above — Task
-      // Scheduler will still bring the daemon up next time.
-      try {
-        startDaemonTaskNow();
-        process.stdout.write('Daemon starting now.\n');
-      } catch (err) {
-        process.stdout.write(
-          `Could not start it immediately (${(err as Error).message}); ` +
-            'it will start at your next logon.\n',
-        );
-      }
+      process.stdout.write(`${verb} the ${noun} to run "${shimPath} daemon run" at logon.\n`);
+      // Starting now is best-effort: a failure here does not undo the (successful) registration
+      // above — the next logon still brings the daemon up.
+      process.stdout.write(
+        result.started
+          ? 'Daemon starting now.\n'
+          : `Could not start it immediately${result.detail ? ` (${result.detail})` : ''}; ` +
+              'it will start at your next logon.\n',
+      );
     });
 
   daemon
@@ -469,16 +455,20 @@ export function buildProgram(): Command {
         '(does not stop an already-running daemon)',
     )
     .action(async () => {
-      let outcome: ReturnType<typeof uninstallDaemonTask>;
+      let outcome: ReturnType<typeof uninstallAutostart>;
       try {
-        outcome = process.platform === 'darwin' ? uninstallDaemonAgent() : uninstallDaemonTask();
+        outcome = uninstallAutostart();
       } catch (err) {
         fail(`could not remove the logon task: ${(err as Error).message}`);
       }
       process.stdout.write(
-        outcome === 'removed'
-          ? 'Removed the logon task. A daemon already running keeps running until stopped.\n'
-          : 'No logon task was registered.\n',
+        {
+          removed:
+            'Removed the logon task. A daemon already running keeps running until stopped.\n',
+          not_installed: 'No logon task was registered.\n',
+          // A platform fact, not a failure — the hook removal below still applies.
+          unsupported: 'No autostart exists on this platform; nothing to remove.\n',
+        }[outcome],
       );
 
       // Same settings.json the daemon installs into (claudeDir honors CLAUDE_CONFIG_DIR).
@@ -509,14 +499,10 @@ export function buildProgram(): Command {
       const paths = defaultPaths();
       const dataDir = dirname(paths.vaultDir);
 
-      // Each source is queried independently and degrades on its own — a PowerShell failure
-      // here must not hide the heartbeat/pairing lines, which are still meaningful without it.
-      let task: ReturnType<typeof queryDaemonTask>;
-      try {
-        task = process.platform === 'darwin' ? queryDaemonAgent() : queryDaemonTask();
-      } catch {
-        task = { registered: false };
-      }
+      // Each source is queried independently and degrades on its own — an autostart backend
+      // failure (queryAutostart swallows it) must not hide the heartbeat/pairing lines, which
+      // are still meaningful without it.
+      const task = queryAutostart();
 
       const heartbeat = await readHeartbeat(join(dataDir, 'daemon-heartbeat.json'));
       const identity = await dpapiIdentityStore(
@@ -694,28 +680,12 @@ async function attemptPair(code: string, relayUrl: string): Promise<PairResult> 
   }
 }
 
-/** Register/update the logon task and kick it now. Starting is best-effort — a correctly
- *  registered task still comes up at the next logon. */
-function installAutostart(): Promise<AutostartResult> {
-  if (process.platform === 'darwin') {
-    // Bootstrapping a RunAtLoad LaunchAgent registers and starts in one step.
-    const task = installDaemonAgent({ shimPath: resolveCctlShimPath() });
-    return Promise.resolve({ task, started: true });
-  }
-  const task = installDaemonTask({ shimPath: resolveCctlShimPath() });
-  try {
-    startDaemonTaskNow();
-    return Promise.resolve({ task, started: true });
-  } catch (err) {
-    return Promise.resolve({ task, started: false, detail: (err as Error).message });
-  }
-}
-
-/** Poll the daemon heartbeat until it reports alive or a short deadline passes — the wizard's
- *  round-trip check that the just-started daemon actually came up. */
-async function verifyDaemonAlive(): Promise<boolean> {
+/** The wizard's round-trip check that the daemon is up. With `wait` (the default), polls the
+ *  heartbeat for up to 10s so a just-kicked daemon has time to report in; without it, reads
+ *  once — the right call when nothing was kicked, i.e. a platform with no autostart. */
+async function verifyDaemonAlive(options: { wait?: boolean } = {}): Promise<boolean> {
   const heartbeatPath = join(dirname(defaultPaths().vaultDir), 'daemon-heartbeat.json');
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + ((options.wait ?? true) ? 10_000 : 0);
   for (;;) {
     if ((await readHeartbeat(heartbeatPath)).state === 'alive') return true;
     if (Date.now() >= deadline) return false;
@@ -745,14 +715,8 @@ function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
     isPaired: async () =>
       (await dpapiIdentityStore(identityPath, defaultProtector()).load()) !== undefined,
     pair: (pairCode) => attemptPair(pairCode, relayUrl),
-    taskRegistered: () => {
-      try {
-        return Promise.resolve(queryDaemonTask().registered);
-      } catch {
-        return Promise.resolve(false);
-      }
-    },
-    installAutostart,
+    autostartState: () => Promise.resolve(readAutostartState()),
+    installAutostart: () => Promise.resolve(installAutostart(resolveCctlShimPath())),
     verifyDaemon: verifyDaemonAlive,
   };
 }
@@ -769,19 +733,13 @@ async function readStatusSummary(): Promise<SetupSummary> {
     hooksInstalledAt(settingsPath),
     dpapiIdentityStore(join(dataDir, 'daemon-identity.enc'), defaultProtector()).load(),
   ]);
-  let taskRegistered = false;
-  try {
-    taskRegistered = queryDaemonTask().registered;
-  } catch {
-    taskRegistered = false;
-  }
   const heartbeat = await readHeartbeat(join(dataDir, 'daemon-heartbeat.json'));
   return {
     accounts: accounts.map((a) => ({ label: a.label, active: a.id === activeId })),
     hooksInstalled,
     hooksProfilePath: settingsPath,
     relayUrl: resolveRelayUrl(),
-    taskRegistered,
+    autostart: readAutostartState(),
     daemonAlive: heartbeat.state === 'alive',
     paired: identity !== undefined,
   };

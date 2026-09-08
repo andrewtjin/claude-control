@@ -415,7 +415,7 @@ describe('renderPacingLine', () => {
 
 describe('renderDaemonStatus', () => {
   const healthy: DaemonStatusView = {
-    task: { registered: true, state: 'Ready' },
+    task: { supported: true, registered: true, state: 'Ready' },
     heartbeat: { state: 'alive', writtenAtMs: 0, ageMs: 5_000 },
     paired: true,
     relayUrl: 'wss://relay.example.com',
@@ -430,7 +430,7 @@ describe('renderDaemonStatus', () => {
   });
 
   it('prompts to install when no logon task is registered', () => {
-    const out = renderDaemonStatus({ ...healthy, task: { registered: false } });
+    const out = renderDaemonStatus({ ...healthy, task: { supported: true, registered: false } });
     expect(out).toMatch(/logon task not registered — run: cctl daemon install/);
   });
 
@@ -459,11 +459,45 @@ describe('renderDaemonStatus', () => {
   it('does NOT promise a next-logon restart for a stale heartbeat when no task is registered', () => {
     const out = renderDaemonStatus({
       ...healthy,
-      task: { registered: false },
+      task: { supported: true, registered: false },
       heartbeat: { state: 'stale', writtenAtMs: 0, ageMs: 5 * 60_000 },
     });
     expect(out).toMatch(/not scheduled to restart — run: cctl daemon install/);
     expect(out).not.toMatch(/will restart at next logon/);
+  });
+
+  // A platform with no autostart backend (Linux, WSL2 included) is a fact, not a fault: the
+  // report says how to run the daemon instead and never points at `cctl daemon install`, which
+  // would only print the same fact and exit.
+  it('states that autostart is unavailable instead of prompting to install it', () => {
+    const out = renderDaemonStatus({ ...healthy, task: { supported: false } });
+    expect(out).toMatch(/\[--\] autostart not available on this platform yet/);
+    expect(out).toMatch(/cctl daemon supervise/);
+    expect(out).not.toContain('cctl daemon install');
+    // The other lines still render on their own.
+    expect(out).toMatch(/daemon alive/);
+    expect(out).toMatch(/paired with the relay/);
+  });
+
+  it('hands the manual start command to a never-run daemon when autostart is unavailable', () => {
+    const out = renderDaemonStatus({
+      ...healthy,
+      task: { supported: false },
+      heartbeat: { state: 'never' },
+    });
+    expect(out).toMatch(/daemon has never run on this machine — run: cctl daemon supervise/);
+    expect(out).not.toContain('cctl daemon install');
+  });
+
+  it('hands the manual start command to a stale daemon when autostart is unavailable', () => {
+    const out = renderDaemonStatus({
+      ...healthy,
+      task: { supported: false },
+      heartbeat: { state: 'stale', writtenAtMs: 0, ageMs: 5 * 60_000 },
+    });
+    expect(out).toMatch(/not scheduled to restart — run: cctl daemon supervise/);
+    expect(out).not.toMatch(/will restart at next logon/);
+    expect(out).not.toContain('cctl daemon install');
   });
 
   it('prompts to pair when not paired', () => {
