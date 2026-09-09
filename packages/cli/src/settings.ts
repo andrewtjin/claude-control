@@ -374,14 +374,32 @@ export async function updateDaemonConfigFile(
   return true;
 }
 
+/** Drop every `env`-block entry that READS as `setting` — the canonical name and any
+ *  hand-written spelling the reader also accepts (an alias, another case). Removing only the
+ *  canonical key would leave such an entry in force while `unset` reported it gone, and a
+ *  `set` would sit beside it with the reader free to pick either. Returns whether anything
+ *  was removed; an emptied block is deleted so the file returns to what it was before the
+ *  first `set`, not to a leftover `"env": {}`. */
+function dropEnvEntries(config: Record<string, unknown>, setting: DaemonEnvSetting): boolean {
+  const env = config['env'];
+  if (!isRecord(env)) return false;
+  const matching = Object.keys(env).filter((k) => findDaemonEnvSetting(k)?.name === setting.name);
+  for (const k of matching) delete env[k];
+  if (Object.keys(env).length === 0) delete config['env'];
+  return matching.length > 0;
+}
+
 /** Persist one setting: the relay into its own `relayUrl` field, everything else into the
- *  `env` block under its env var name. `value` must already have passed `checkSettingValue`. */
+ *  `env` block under its env var name. Any other spelling of the same setting already in the
+ *  block goes, so the file holds one entry per setting. `value` must already have passed
+ *  `checkSettingValue`. */
 export async function persistDaemonSetting(
   filePath: string,
   setting: DaemonEnvSetting,
   value: string,
 ): Promise<void> {
   await updateDaemonConfigFile(filePath, (config) => {
+    dropEnvEntries(config, setting);
     if (setting.name === RELAY_ENV_NAME) {
       config['relayUrl'] = value;
       return true;
@@ -393,25 +411,22 @@ export async function persistDaemonSetting(
   });
 }
 
-/** Remove a persisted setting. Resolves to whether there was one to remove; a no-op never
- *  touches the disk, so asking about a setting that was never stored creates no file. */
+/** Remove a persisted setting wherever the reader would find it. Resolves to whether there was
+ *  one to remove; a no-op never touches the disk, so asking about a setting that was never
+ *  stored creates no file. */
 export async function forgetDaemonSetting(
   filePath: string,
   setting: DaemonEnvSetting,
 ): Promise<boolean> {
   return updateDaemonConfigFile(filePath, (config) => {
-    if (setting.name === RELAY_ENV_NAME) {
-      if (config['relayUrl'] === undefined) return false;
+    // Both homes, deliberately: the reader folds an env-block relay entry into `relayUrl`, so
+    // clearing the field alone would let a hand-written entry resurface as the live relay.
+    const droppedEnv = dropEnvEntries(config, setting);
+    if (setting.name === RELAY_ENV_NAME && config['relayUrl'] !== undefined) {
       delete config['relayUrl'];
       return true;
     }
-    const env = config['env'];
-    if (!isRecord(env) || !(setting.name in env)) return false;
-    delete env[setting.name];
-    // An emptied block is removed outright so the file returns to exactly what it was before
-    // the first `set`, not to a leftover `"env": {}`.
-    if (Object.keys(env).length === 0) delete config['env'];
-    return true;
+    return droppedEnv;
   });
 }
 
@@ -618,7 +633,10 @@ export function resolveDaemonConfig(
     {
       name: 'waiting cards',
       value: waitingCards ? 'on' : 'off',
-      source: sourceOf('CCTL_WAITING_CARDS', waitingCards),
+      // Attributed by PRESENCE of a parsed override, like every other row — an explicit "off"
+      // from the file or the environment is an override that happens to equal the default,
+      // and must say where it came from, not read as if nothing were set.
+      source: sourceOf('CCTL_WAITING_CARDS', envBool(layered, 'CCTL_WAITING_CARDS') !== undefined),
       detail: 'CCTL_WAITING_CARDS ("Claude is waiting..." terminal nags as phone cards)',
     },
     {
@@ -650,7 +668,10 @@ export function resolveDaemonConfig(
     {
       name: 'full tool output',
       value: fullToolOutput ? 'on' : 'off',
-      source: sourceOf('CCTL_TOOL_OUTPUT_FULL', fullToolOutput),
+      source: sourceOf(
+        'CCTL_TOOL_OUTPUT_FULL',
+        envBool(layered, 'CCTL_TOOL_OUTPUT_FULL') !== undefined,
+      ),
       detail:
         'CCTL_TOOL_OUTPUT_FULL (the attached output.txt carries the complete output instead of the phone-sized excerpt)',
     },

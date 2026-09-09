@@ -728,6 +728,17 @@ describe('config.json env block', () => {
     expect(row(flagged.rows, 'auto-switch').source).toBe('flag');
   });
 
+  // The two default-off knobs are attributed by presence like every other row: an explicit
+  // "off" is an override that happens to equal the default, and says where it came from.
+  it('attributes an explicit off on the default-off knobs to the layer that set it', () => {
+    const fromFile = resolveDaemonConfig({}, {}, { env: { CCTL_WAITING_CARDS: 'off' } });
+    expect(row(fromFile.rows, 'waiting cards')).toMatchObject({ value: 'off', source: 'config' });
+    const fromEnv = resolveDaemonConfig({ CCTL_TOOL_OUTPUT_FULL: 'off' });
+    expect(row(fromEnv.rows, 'full tool output')).toMatchObject({ value: 'off', source: 'env' });
+    const garbled = resolveDaemonConfig({ CCTL_WAITING_CARDS: 'nope' });
+    expect(row(garbled.rows, 'waiting cards')).toMatchObject({ value: 'off', source: 'default' });
+  });
+
   it('defaults the fable cap trigger to on, and honors the env opt-out', () => {
     const config = resolveDaemonConfig({});
     expect(config.values.autoSwitchOnFableCap).toBe(true);
@@ -777,6 +788,36 @@ describe('persisting daemon settings', () => {
       expect(await forgetDaemonSetting(file, setting('CCTL_AUTOSWITCH_TRIGGER_PCT'))).toBe(true);
       // The emptied block is gone: the file is back to exactly what it was before the first set.
       expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ future: { keep: true } });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The reader accepts an alias or another case as a key, so `unset` (and a `set` that would
+  // otherwise sit beside it) must find those spellings too, or a hand-written entry stays in
+  // force while the CLI reports it gone.
+  it('removes and replaces hand-written spellings the reader would also accept', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'config.json');
+      await writeFile(
+        file,
+        JSON.stringify({
+          relayUrl: 'wss://field.example',
+          env: { autoswitch: 'off', cctl_autoswitch: 'on', CCTL_RELAY_URL: 'wss://env.example' },
+        }),
+        'utf8',
+      );
+      await persistDaemonSetting(file, setting('CCTL_AUTOSWITCH'), 'off');
+      expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({
+        env: { CCTL_AUTOSWITCH: 'off', CCTL_RELAY_URL: 'wss://env.example' },
+      });
+      expect(await forgetDaemonSetting(file, setting('CCTL_AUTOSWITCH'))).toBe(true);
+      // The relay is forgotten from BOTH homes: the field and the env-block entry the reader
+      // would otherwise fold back into it.
+      expect(await forgetDaemonSetting(file, setting('CCTL_RELAY_URL'))).toBe(true);
+      expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({});
+      expect((await readDaemonConfigFile(file))?.relayUrl).toBeUndefined();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

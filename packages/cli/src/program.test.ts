@@ -23,10 +23,13 @@ vi.mock('./context.js', async (importOriginal) => ({
 }));
 // config.json is resolved through this one seam, so the settings tests below write to a
 // per-test temp file and never near the operator's real one.
-const settingsIo = vi.hoisted(() => ({ configPath: '' }));
+const settingsIo = vi.hoisted(() => ({ configPath: '', reportPath: '' }));
 vi.mock('./settings.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./settings.js')>()),
   daemonConfigPath: () => settingsIo.configPath,
+  // The bare `cctl settings` view reads the daemon's last report from here; an absent file is
+  // the "no daemon has run yet" preview, which is the branch these tests can exercise.
+  daemonSettingsPath: () => settingsIo.reportPath,
 }));
 
 /** Run one command through commander with stdout/stderr captured and `process.exit` turned
@@ -165,14 +168,38 @@ describe('buildProgram', () => {
     });
     afterEach(async () => {
       settingsIo.configPath = '';
+      settingsIo.reportPath = '';
       await rm(dir, { recursive: true, force: true });
     });
     const config = async () =>
       JSON.parse(await readFile(settingsIo.configPath, 'utf8')) as Record<string, unknown>;
 
-    it('nests set and unset under settings, keeping the bare view', () => {
+    it('nests set and unset under settings, keeping the bare view', async () => {
       const settings = buildProgram().commands.find((c) => c.name() === 'settings');
       expect(settings?.commands.map((c) => c.name()).sort()).toEqual(['set', 'unset']);
+      // The parent action must still run with no subcommand — commander would otherwise print
+      // help. With no daemon report on disk the daemon section is the preview, which reads the
+      // (temp) config.json, so a persisted value is visible here without a daemon.
+      settingsIo.reportPath = join(dir, 'daemon-settings.json');
+      await runCli(['settings', 'set', 'fable-cap', 'off']);
+      const r = await runCli(['settings']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain('cli (this shell)');
+      expect(r.out).toContain('no daemon has run yet');
+      expect(r.out).toMatch(/fable cap trigger\s+off\s+config/);
+    });
+
+    it('lists every settable name when the name is unknown, even with no value given', async () => {
+      const r = await runCli(['settings', 'set', 'x']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(
+        /"x" is not a daemon setting\. Settable: autoswitch \(CCTL_AUTOSWITCH\)/,
+      );
+      // A known name with no value gets the checker's own "takes …" line for that kind.
+      const known = await runCli(['settings', 'set', 'trigger']);
+      expect(known.exited).toBe(true);
+      expect(known.err).toMatch(/CCTL_AUTOSWITCH_TRIGGER_PCT takes a non-negative number/);
+      await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
     });
 
     it('persists a setting under its env var name, in any case, and says where it went', async () => {

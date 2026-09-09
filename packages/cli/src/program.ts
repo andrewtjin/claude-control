@@ -296,15 +296,20 @@ export function buildProgram(): Command {
   const unknownSetting = (name: string): string =>
     `"${name}" is not a daemon setting. Settable: ${settableSettingsSummary()}.`;
   settings
-    .command('set <name> <value>')
+    // `[value]` is optional only so a missing one reaches OUR message: with `<value>` commander
+    // answers `cctl settings set x` with "missing required argument" before the name is looked
+    // at, and the promise below (that an unknown name lists every settable one) would be false.
+    .command('set <name> [value]')
     .description(
       'persist a daemon setting in config.json, by alias or env var name (e.g. `fable-cap off`, ' +
         '`trigger 90`, `CCTL_AUTOSWITCH off`); `cctl settings set x` lists every name',
     )
-    .action(async (name: string, value: string) => {
+    .action(async (name: string, value: string | undefined) => {
       const setting = findDaemonEnvSetting(name);
       if (!setting) fail(unknownSetting(name));
-      const checked = checkSettingValue(setting, value);
+      // No value parses like a blank one, so the checker's own "takes …" line says what the
+      // setting expects without a second copy of that knowledge here.
+      const checked = checkSettingValue(setting, value ?? '');
       if (!checked.ok) fail(checked.message);
       const filePath = daemonConfigPath();
       try {

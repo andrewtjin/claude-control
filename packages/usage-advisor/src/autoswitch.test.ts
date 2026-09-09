@@ -607,4 +607,28 @@ describe('decideAutoSwitch — the Fable weekly cap (weekly_scoped)', () => {
     expect(decideAutoSwitch([onlyScoped, spare()], NOW)?.targetAccountId).toBe('spare');
     expect(decideAutoSwitch([onlyScoped, spare()], NOW, { fableCapTriggers: false })).toBeNull();
   });
+
+  // The opt-out must reach the ranking and the reason as well as the trigger: a candidate whose
+  // only weekly limit is the ignored cap has no visible weekly clock, so it is not a candidate —
+  // rather than being chosen and then described by the very cap the policy was told to ignore
+  // ("0% weekly budget left").
+  it('never ranks or describes a candidate by the ignored cap', () => {
+    const scopedOnly = acct('scoped', {}, [
+      { kind: 'session', percent: 0, resetsAt: NOW + 3 * H },
+      { kind: 'weekly_scoped', percent: 100, resetsAt: NOW + 6 * H },
+    ]);
+    expect(
+      decideAutoSwitch([lowActive(), scopedOnly], NOW, { fableCapTriggers: false }),
+    ).toBeNull();
+    // With a visible weekly budget beside it, the reason quotes THAT budget, never the cap.
+    const both = acct('both', {}, [
+      { kind: 'weekly_all', percent: 20, resetsAt: NOW + 24 * H },
+      { kind: 'weekly_scoped', percent: 100, resetsAt: NOW + 6 * H },
+    ]);
+    const decision = decideAutoSwitch([lowActive(), both], NOW, { fableCapTriggers: false });
+    expect(decision?.targetAccountId).toBe('both');
+    expect(decision?.reason).toContain('80% weekly budget left');
+    // The reset quoted is the shared weekly limit's (a day out), not the cap's six hours.
+    expect(decision?.reason).toContain('in 1d');
+  });
 });
