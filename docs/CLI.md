@@ -33,6 +33,8 @@ cctl accounts exclude <id|label>   # stop auto-switch from ever hopping TO this 
                                     # (manual `cctl switch` and the phone's /switch still work)
 cctl accounts include <id|label>   # let auto-switch consider this account again
 cctl accounts remove <id|label>    # remove a stored account
+cctl accounts rename <id|label> <new-label>
+                                    # give an account a new label; its id and usage history stay
 ```
 
 `relogin` and `reauth` differ only in how the login happens: `relogin` spawns a throwaway
@@ -101,6 +103,11 @@ cctl status     # at-a-glance: accounts, hooks, relay, daemon, pairing
 cctl settings   # every configurable setting: effective value and where it came from
                 # (flag / env / config / default), for both this shell and the
                 # last-started daemon
+cctl settings set <name> <value>    # persist a daemon setting by alias or env var name,
+                                    # e.g. `cctl settings set fable-cap off`,
+                                    # `cctl settings set trigger 90` (applies when the
+                                    # daemon next starts; aliases listed below)
+cctl settings unset <name>          # remove a persisted daemon setting
 cctl doctor     # environment checks: Node version, vault crypto round-trip, vault dir,
                 # live login, ~/.claude.json
 ```
@@ -118,7 +125,12 @@ cctl daemon run --no-greedy            # hop only when the active account runs l
                                         # (by default the daemon ALSO hops toward whichever
                                         # account's weekly quota expires soonest)
 cctl daemon run --no-auto-switch       # never hop accounts automatically; for an installed
-                                        # daemon set CCTL_AUTOSWITCH=0 / CCTL_AUTOSWITCH_GREEDY=0
+                                        # daemon: `cctl settings set autoswitch off`
+                                        # (likewise `greedy off`). A full Fable weekly
+                                        # cap counts as "out of quota" by default; to keep a
+                                        # Fable-capped account and hop only on the shared weekly
+                                        # budget or the 5h window:
+                                        # `cctl settings set fable-cap off`
 
 cctl daemon supervise                  # run + auto-restart on crash or hang (same flags
                                         # as `daemon run`; a clean exit ends supervision)
@@ -234,23 +246,68 @@ cctl run   # (needs the running daemon + hosted bot) start a remote session
 Until the daemon is connected to the bot, `cctl run` fails with a pointer to
 `docs/VERIFICATION.md` rather than doing nothing silently.
 
-## Relay override precedence
+## Persisted settings and override precedence
 
-Every command that talks to the relay resolves the url the same way, highest
-precedence first: `--relay <url>` flag → `CCTL_RELAY_URL` env var → `relayUrl` in
-`config.json` → the built-in default. `cctl settings` shows the effective value and
-which of the four produced it.
+Every daemon knob resolves the same way, highest precedence first: a `cctl daemon run`
+flag → the env var → `config.json` → the built-in default. `cctl settings` shows the
+effective value and which layer produced it. The relay is the same chain with
+`--relay <url>` as the flag and `relayUrl` as the file field.
 
 `config.json` lives beside the vault (the same directory as `daemon.db`; run
 `cctl settings` to see the resolved path) and is the option that survives a reboot
-without a wrapper script or a machine-wide env var:
+without a wrapper script or a machine-wide env var. `cctl settings set` writes it for
+you, keyed by the env var name the daemon already reads, and refuses a value the daemon
+would silently ignore (`CCTL_AUTOSWITCH maybe`, a negative percent, an unknown log
+level):
 
 ```json
-{ "relayUrl": "wss://relay.example.com" }
+{
+  "relayUrl": "wss://relay.example.com",
+  "env": {
+    "CCTL_AUTOSWITCH_ON_FABLE_CAP": "off",
+    "CCTL_AUTOSWITCH_TRIGGER_PCT": "90"
+  }
+}
 ```
 
+The daemon reads the file at start-up, so a change applies when it next starts. A
+value set in the real environment always wins over the file, even a misspelled one
+(which then falls to the default, exactly as it does without a file). Only the names
+`cctl settings` lists for the daemon are read from `env`; the CLI's own shell knobs
+(`CCTL_SWITCH_MIN_INTERVAL_MS`, `CCTL_REFRESH_SKEW_MS`) stay environment-only.
+
+Every setting has a short alias for the command line (case and `-`/`_` do not matter;
+`cctl settings set x` prints this list):
+
+| alias               | env var                                  | value                 |
+| ------------------- | ---------------------------------------- | --------------------- |
+| `autoswitch`        | `CCTL_AUTOSWITCH`                        | on / off              |
+| `greedy`            | `CCTL_AUTOSWITCH_GREEDY`                 | on / off              |
+| `fable-cap`         | `CCTL_AUTOSWITCH_ON_FABLE_CAP`           | on / off              |
+| `trigger`           | `CCTL_AUTOSWITCH_TRIGGER_PCT`            | percent used          |
+| `stale-trigger`     | `CCTL_AUTOSWITCH_STALE_TRIGGER_PCT`      | percent used          |
+| `stale-after`       | `CCTL_AUTOSWITCH_STALE_AFTER_MS`         | milliseconds          |
+| `min-session-left`  | `CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT`   | percent left          |
+| `greedy-margin`     | `CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS` | milliseconds          |
+| `cooldown`          | `CCTL_AUTOSWITCH_COOLDOWN_MS`            | milliseconds          |
+| `waiting-cards`     | `CCTL_WAITING_CARDS`                     | on / off              |
+| `permission-hold`   | `CCTL_PERMISSION_HOLD_MS`                | milliseconds          |
+| `question-hold`     | `CCTL_QUESTION_HOLD_MS`                  | milliseconds          |
+| `command-output`    | `CCTL_COMMAND_OUTPUT`                    | on / off              |
+| `identity-check`    | `CCTL_IDENTITY_CHECK`                    | on / off              |
+| `full-output`       | `CCTL_TOOL_OUTPUT_FULL`                  | on / off              |
+| `relay`             | `CCTL_RELAY_URL`                         | ws:// or wss:// url   |
+| `log-level`         | `CCTL_LOG_LEVEL`                         | trace … silent (pino) |
+| `log-format`        | `CCTL_LOG_FORMAT`                        | json / pretty         |
+| `log-file`          | `CCTL_LOG_FILE`                          | file path             |
+| `probe-unknown`     | `CCTL_PROBE_UNKNOWN`                     | on / off              |
+| `probe-timeout`     | `CCTL_PROBE_TIMEOUT_MS`                  | milliseconds          |
+| `auto-continue`     | `CCTL_AUTO_CONTINUE`                     | on / off              |
+| `auto-continue-max` | `CCTL_AUTO_CONTINUE_MAX`                 | count                 |
+
 A missing, corrupt, or wrong-shaped file is ignored rather than being a startup
-error, so a typo costs you the override, never the daemon. Do not confuse it with
+error, so a typo costs you the override, never the daemon (`cctl settings set` will
+refuse to overwrite a corrupt file rather than destroy it). Do not confuse it with
 `daemon-settings.json` in the same directory: that one is written _by_ the daemon to
 report what it resolved, and editing it changes nothing.
 

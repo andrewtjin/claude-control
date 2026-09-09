@@ -17,6 +17,7 @@ import {
   QuarantineError,
   SwitchEngineError,
   UnknownAccountError,
+  VaultError,
   buildAuthorizeUrl,
   defaultPaths,
   defaultProtector,
@@ -115,9 +116,13 @@ import {
   type WizardIo,
 } from './setup.js';
 import {
+  checkSettingValue,
   daemonSettingsPath,
   DEFAULT_RELAY_URL,
   daemonConfigPath,
+  findDaemonEnvSetting,
+  forgetDaemonSetting,
+  persistDaemonSetting,
   readDaemonConfigFile,
   readSettingsReport,
   renderSettings,
@@ -125,6 +130,7 @@ import {
   reportSaysGreedyActive,
   resolveCliSettings,
   resolveDaemonConfig,
+  settableSettingsSummary,
   VERSION,
   type SettingsSection,
 } from './settings.js';
@@ -294,7 +300,7 @@ export function buildProgram(): Command {
       process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });
 
-  program
+  const settings = program
     .command('settings')
     .description('show every configurable setting: effective value and where it came from')
     .action(async () => {
@@ -318,6 +324,61 @@ export function buildProgram(): Command {
         });
       }
       process.stdout.write(renderSettings(sections, detectPalette()) + '\n');
+    });
+
+  // Persisted daemon settings live in config.json under the env var names the daemon already
+  // reads, so an operator sets them by the name `cctl settings` shows and never has to find a
+  // machine-wide env var editor or wrap the logon task.
+  const unknownSetting = (name: string): string =>
+    `"${name}" is not a daemon setting. Settable: ${settableSettingsSummary()}.`;
+  settings
+    // `[value]` is optional only so a missing one reaches OUR message: with `<value>` commander
+    // answers `cctl settings set x` with "missing required argument" before the name is looked
+    // at, and the promise below (that an unknown name lists every settable one) would be false.
+    .command('set <name> [value]')
+    .description(
+      'persist a daemon setting in config.json, by alias or env var name (e.g. `fable-cap off`, ' +
+        '`trigger 90`, `CCTL_AUTOSWITCH off`); `cctl settings set x` lists every name',
+    )
+    .action(async (name: string, value: string | undefined) => {
+      const setting = findDaemonEnvSetting(name);
+      if (!setting) fail(unknownSetting(name));
+      // No value parses like a blank one, so the checker's own "takes …" line says what the
+      // setting expects without a second copy of that knowledge here.
+      const checked = checkSettingValue(setting, value ?? '');
+      if (!checked.ok) fail(checked.message);
+      const filePath = daemonConfigPath();
+      try {
+        await persistDaemonSetting(filePath, setting, checked.value);
+      } catch (err) {
+        fail(err instanceof Error ? err.message : String(err));
+      }
+      process.stdout.write(
+        `Saved ${setting.name}=${checked.value} to ${filePath}.\n` +
+          'Takes effect when the daemon next starts (restart it to apply now); a value set in ' +
+          'the environment still wins over the file.\n',
+      );
+    });
+
+  settings
+    .command('unset <name>')
+    .description('remove a persisted daemon setting from config.json')
+    .action(async (name: string) => {
+      const setting = findDaemonEnvSetting(name);
+      if (!setting) fail(unknownSetting(name));
+      const filePath = daemonConfigPath();
+      let removed: boolean;
+      try {
+        removed = await forgetDaemonSetting(filePath, setting);
+      } catch (err) {
+        fail(err instanceof Error ? err.message : String(err));
+      }
+      process.stdout.write(
+        removed
+          ? `Removed ${setting.name} from ${filePath}; the daemon falls back to the environment ` +
+              'or the default when it next starts.\n'
+          : `${setting.name} is not set in ${filePath}.\n`,
+      );
     });
 
   program
@@ -1219,6 +1280,33 @@ function buildAccountCommands(program: Command): void {
       if (!resolved.ok) fail(resolved.message);
       await engine.removeAccount(resolved.account.id);
       process.stdout.write(`Removed ${resolved.account.label}.\n`);
+    });
+
+  accounts
+    .command('rename <ref> <new-label>')
+    .alias('mv')
+    .description('give a stored account a new label (its id and usage history are unchanged)')
+    .action(async (ref: string, newLabel: string) => {
+      const engine = buildEngine();
+      const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+      if (!resolved.ok) fail(resolved.message);
+      // Answered here rather than written: nothing would change, so nothing should be saved or
+      // reported as a rename.
+      if (newLabel.trim() === resolved.account.label) {
+        process.stdout.write(`${resolved.account.label} already has that label.\n`);
+        return;
+      }
+      try {
+        const updated = await engine.renameAccount(resolved.account.id, newLabel);
+        process.stdout.write(
+          `Renamed ${resolved.account.label} to ${updated.label} (${updated.id}).\n`,
+        );
+      } catch (err) {
+        // A collision or an empty label is a user mistake carrying its own explanation; anything
+        // else is a real fault and propagates.
+        if (err instanceof VaultError) fail(err.message);
+        throw err;
+      }
     });
 }
 

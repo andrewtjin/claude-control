@@ -1,5 +1,9 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { VaultError, type StoredAccount } from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
 import { CliFailure } from './context.js';
 import { VERSION, type SettingsReport } from './settings.js';
@@ -12,22 +16,61 @@ const engine = vi.hoisted(() => ({
   listAccounts: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
   setAutoSwitchExcluded: vi.fn(() => Promise.resolve()),
+  renameAccount: vi.fn((id: string, label: string): Promise<StoredAccount> =>
+    Promise.reject(new Error(`renameAccount(${id}, ${label}) not stubbed`)),
+  ),
 }));
 vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
   buildEngine: () => engine,
 }));
-
-// `readSettingsReport` hits the real filesystem beside a real vault, which on a machine that has
-// ever run the daemon holds a real report — stubbing it is what keeps `version` deterministic
-// regardless of what daemon (if any) last ran on the box a test executes on.
+/// config.json and the daemon's settings report are resolved through these seams, so the settings
+// tests below write to per-test temp files and never near the operator's real ones, and `version`
+// stays deterministic regardless of what daemon (if any) last ran on the box a test executes on.
 const settingsIo = vi.hoisted(() => ({
+  configPath: '',
+  reportPath: '',
   readSettingsReport: vi.fn((): Promise<SettingsReport | undefined> => Promise.resolve(undefined)),
 }));
 vi.mock('./settings.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./settings.js')>()),
+  daemonConfigPath: () => settingsIo.configPath,
+  daemonSettingsPath: () => settingsIo.reportPath,
   readSettingsReport: settingsIo.readSettingsReport,
 }));
+
+/** Run one command through commander with stdout/stderr captured. `fail()` throws a CliFailure
+ *  that the entry point turns into an error line and exit 1, so a refusal comes back here as
+ *  `exited` with that line in `err`; a stray `process.exit` is turned into a throw as well. */
+async function runCli(args: string[]) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+    out.push(String(chunk));
+    return true;
+  });
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+    err.push(String(chunk));
+    return true;
+  });
+  const exit = vi.spyOn(process, 'exit').mockImplementation((code) => {
+    throw new Error(`exit ${String(code)}`);
+  });
+  try {
+    await buildProgram().parseAsync(args, { from: 'user' });
+    return { out: out.join(''), err: err.join(''), exited: false };
+  } catch (e) {
+    if (e instanceof CliFailure) {
+      return { out: out.join(''), err: err.join('') + `error: ${e.message}\n`, exited: true };
+    }
+    if (!(e instanceof Error) || !e.message.startsWith('exit ')) throw e;
+    return { out: out.join(''), err: err.join(''), exited: true };
+  } finally {
+    stdout.mockRestore();
+    stderr.mockRestore();
+    exit.mockRestore();
+  }
+}
 
 /** Run one command with stdout captured, so the printed text can be asserted. */
 async function run(argv: string[]): Promise<string> {
@@ -92,7 +135,170 @@ describe('buildProgram', () => {
     const subs = accounts?.commands.map((c) => c.name()).sort();
     // `relogin` spawns a browser login on this host; `reauth` takes a pasted code instead, so a
     // headless/SSH host has a path too.
-    expect(subs).toEqual(['add', 'exclude', 'include', 'list', 'reauth', 'relogin', 'remove']);
+    expect(subs).toEqual([
+      'add',
+      'exclude',
+      'include',
+      'list',
+      'reauth',
+      'relogin',
+      'remove',
+      'rename',
+    ]);
+  });
+
+  describe('accounts rename', () => {
+    const work: StoredAccount = {
+      id: 'id-1',
+      label: 'work',
+      quarantined: false,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
+
+    const rename = (args: string[]) => runCli(['accounts', 'rename', ...args]);
+
+    // The new-label half of the line must be what the VAULT stored, not an echo of the
+    // argument: the stub answers with a label differing from the raw arg in case and
+    // whitespace, so an implementation printing the input would fail here.
+    it('resolves the ref, renames by id and reports old name, stored name and id', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockResolvedValueOnce({ ...work, label: 'Personal' });
+      const r = await rename(['WORK', '  Personal  ']);
+      expect(r.exited).toBe(false);
+      // Trimming is the vault's job; the CLI hands the argument over untouched.
+      expect(engine.renameAccount).toHaveBeenCalledWith('id-1', '  Personal  ');
+      expect(r.out).toBe('Renamed work to Personal (id-1).\n');
+    });
+
+    it('answers a same-name rename without writing anything', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockClear();
+      const r = await rename(['work', ' work ']);
+      expect(r.exited).toBe(false);
+      expect(engine.renameAccount).not.toHaveBeenCalled();
+      expect(r.out).toBe('work already has that label.\n');
+    });
+
+    it('turns a vault refusal (collision, empty label) into an error line and exit 1', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockRejectedValueOnce(new VaultError('"home" already refers to x'));
+      const r = await rename(['work', 'home']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toBe('error: "home" already refers to x\n');
+    });
+
+    it('fails on an unknown ref before touching the engine', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockClear();
+      const r = await rename(['nope', 'x']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(/No account matches "nope"/);
+      expect(engine.renameAccount).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('settings set / unset', () => {
+    let dir = '';
+    beforeEach(async () => {
+      dir = await mkdtemp(join(tmpdir(), 'cctl-settings-cli-'));
+      settingsIo.configPath = join(dir, 'config.json');
+    });
+    afterEach(async () => {
+      settingsIo.configPath = '';
+      settingsIo.reportPath = '';
+      await rm(dir, { recursive: true, force: true });
+    });
+    const config = async () =>
+      JSON.parse(await readFile(settingsIo.configPath, 'utf8')) as Record<string, unknown>;
+
+    it('nests set and unset under settings, keeping the bare view', async () => {
+      const settings = buildProgram().commands.find((c) => c.name() === 'settings');
+      expect(settings?.commands.map((c) => c.name()).sort()).toEqual(['set', 'unset']);
+      // The parent action must still run with no subcommand — commander would otherwise print
+      // help. With no daemon report on disk the daemon section is the preview, which reads the
+      // (temp) config.json, so a persisted value is visible here without a daemon.
+      settingsIo.reportPath = join(dir, 'daemon-settings.json');
+      await runCli(['settings', 'set', 'fable-cap', 'off']);
+      const r = await runCli(['settings']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain('cli (this shell)');
+      expect(r.out).toContain('no daemon has run yet');
+      expect(r.out).toMatch(/fable cap trigger\s+off\s+config/);
+    });
+
+    it('lists every settable name when the name is unknown, even with no value given', async () => {
+      const r = await runCli(['settings', 'set', 'x']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(
+        /"x" is not a daemon setting\. Settable: autoswitch \(CCTL_AUTOSWITCH\)/,
+      );
+      // A known name with no value gets the checker's own "takes …" line for that kind.
+      const known = await runCli(['settings', 'set', 'trigger']);
+      expect(known.exited).toBe(true);
+      expect(known.err).toMatch(/CCTL_AUTOSWITCH_TRIGGER_PCT takes a non-negative number/);
+      await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('persists a setting under its env var name, in any case, and says where it went', async () => {
+      const r = await runCli(['settings', 'set', 'cctl_autoswitch', 'off']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain(`Saved CCTL_AUTOSWITCH=off to ${settingsIo.configPath}.`);
+      expect(r.out).toMatch(/next starts/);
+      expect(await config()).toEqual({ env: { CCTL_AUTOSWITCH: 'off' } });
+    });
+
+    it('accepts the short alias and stores the value under the env var name', async () => {
+      const r = await runCli(['settings', 'set', 'fable-cap', 'off']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain('Saved CCTL_AUTOSWITCH_ON_FABLE_CAP=off to');
+      expect(await config()).toEqual({ env: { CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' } });
+      const gone = await runCli(['settings', 'unset', 'FABLE_CAP']);
+      expect(gone.out).toContain('Removed CCTL_AUTOSWITCH_ON_FABLE_CAP from');
+      expect(await config()).toEqual({});
+    });
+
+    it('stores the relay in its own field', async () => {
+      const r = await runCli(['settings', 'set', 'relay', 'wss://relay.example.com']);
+      expect(r.exited).toBe(false);
+      expect(await config()).toEqual({ relayUrl: 'wss://relay.example.com' });
+    });
+
+    it('refuses a value the daemon would ignore, and writes nothing', async () => {
+      const r = await runCli(['settings', 'set', 'CCTL_AUTOSWITCH', 'maybe']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(/CCTL_AUTOSWITCH takes on or off/);
+      await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('refuses an unknown name and lists what can be set', async () => {
+      const r = await runCli(['settings', 'set', 'CCTL_NOPE', '1']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(/"CCTL_NOPE" is not a daemon setting/);
+      expect(r.err).toContain('fable-cap (CCTL_AUTOSWITCH_ON_FABLE_CAP)');
+    });
+
+    it('unset removes the entry, says when there was none, and never creates the file', async () => {
+      const none = await runCli(['settings', 'unset', 'CCTL_AUTOSWITCH']);
+      expect(none.exited).toBe(false);
+      expect(none.out).toContain('CCTL_AUTOSWITCH is not set in');
+      await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
+
+      await runCli(['settings', 'set', 'CCTL_AUTOSWITCH', 'off']);
+      const removed = await runCli(['settings', 'unset', 'CCTL_AUTOSWITCH']);
+      expect(removed.exited).toBe(false);
+      expect(removed.out).toContain('Removed CCTL_AUTOSWITCH from');
+      expect(await config()).toEqual({});
+    });
+
+    it('turns a corrupt config file into an error rather than overwriting it', async () => {
+      const { writeFile } = await import('node:fs/promises');
+      await writeFile(settingsIo.configPath, '{not json', 'utf8');
+      const r = await runCli(['settings', 'set', 'CCTL_AUTOSWITCH', 'off']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(/not valid JSON/);
+      expect(await readFile(settingsIo.configPath, 'utf8')).toBe('{not json');
+    });
   });
 
   it('nests session subcommands', () => {

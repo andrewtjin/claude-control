@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Paths } from '@claude-control/switch-engine';
@@ -7,12 +7,19 @@ import type { SettingRow } from '@claude-control/shared-protocol';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import {
   BOT_INVITE_URL,
+  DAEMON_ENV_SETTINGS,
   DEFAULT_RELAY_URL,
+  applyFileEnv,
+  checkSettingValue,
   daemonConfigPath,
   daemonSettingsPath,
   envBool,
   envFlag,
   envNumber,
+  findDaemonEnvSetting,
+  forgetDaemonSetting,
+  layerFileEnv,
+  persistDaemonSetting,
   readDaemonConfigFile,
   readSettingsReport,
   renderSettings,
@@ -21,6 +28,7 @@ import {
   resolveCliSettings,
   resolveDaemonConfig,
   writeSettingsReport,
+  type DaemonEnvSetting,
 } from './settings.js';
 
 /** Look up a row by name, failing loudly when the surface loses a knob. */
@@ -64,6 +72,7 @@ describe('resolveDaemonConfig', () => {
       relayUrl: DEFAULT_RELAY_URL,
       autoSwitch: true,
       greedy: true,
+      autoSwitchOnFableCap: true,
       triggerPercent: undefined,
       staleTriggerPercent: undefined,
       staleAfterMs: undefined,
@@ -628,6 +637,350 @@ describe('settings report file', () => {
 
       await writeFile(file, JSON.stringify({ settings: 'nope' }), 'utf8');
       expect(await readSettingsReport(file)).toBeUndefined(); // wrong shape
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/** Every CCTL_ name the daemon rows tell an operator about. */
+function namesInDaemonRows(): Set<string> {
+  const names = new Set<string>();
+  for (const r of resolveDaemonConfig({}).rows) {
+    for (const m of (r.detail ?? '').matchAll(/CCTL_[A-Z0-9_]+/g)) names.add(m[0]);
+  }
+  return names;
+}
+
+const setting = (name: string): DaemonEnvSetting => {
+  const found = findDaemonEnvSetting(name);
+  expect(found, `expected ${name} to be a settable daemon setting`).toBeDefined();
+  return found as DaemonEnvSetting;
+};
+
+describe('the settable daemon settings', () => {
+  // The list `cctl settings set` accepts and the list `cctl settings` shows must be the same
+  // list, or an operator is told about a knob they cannot set (or can set one nothing shows).
+  it('are exactly the names the daemon rows advertise', () => {
+    expect(new Set(DAEMON_ENV_SETTINGS.map((s) => s.name))).toEqual(namesInDaemonRows());
+  });
+
+  it('resolve by name regardless of case, and refuse unknown names', () => {
+    expect(findDaemonEnvSetting('cctl_autoswitch')?.name).toBe('CCTL_AUTOSWITCH');
+    expect(findDaemonEnvSetting('  CCTL_LOG_LEVEL ')?.name).toBe('CCTL_LOG_LEVEL');
+    expect(findDaemonEnvSetting('CCTL_NOPE')).toBeUndefined();
+    // Shell-side knobs are read by one-shot commands from their own environment.
+    expect(findDaemonEnvSetting('CCTL_SWITCH_MIN_INTERVAL_MS')).toBeUndefined();
+  });
+
+  it('resolve by their short alias, with dashes and underscores interchangeable', () => {
+    expect(findDaemonEnvSetting('fable-cap')?.name).toBe('CCTL_AUTOSWITCH_ON_FABLE_CAP');
+    expect(findDaemonEnvSetting('FABLE_CAP')?.name).toBe('CCTL_AUTOSWITCH_ON_FABLE_CAP');
+    expect(findDaemonEnvSetting('cctl-autoswitch-on-fable-cap')?.name).toBe(
+      'CCTL_AUTOSWITCH_ON_FABLE_CAP',
+    );
+    expect(findDaemonEnvSetting('trigger')?.name).toBe('CCTL_AUTOSWITCH_TRIGGER_PCT');
+    expect(findDaemonEnvSetting('relay')?.name).toBe('CCTL_RELAY_URL');
+    expect(findDaemonEnvSetting('Log-Level')?.name).toBe('CCTL_LOG_LEVEL');
+  });
+
+  // A ref must mean one setting: no alias may double as another's alias or as any env name,
+  // and every alias must be the lower-case kebab the lookup normalizes to.
+  it('give every setting one well-formed alias that collides with nothing', () => {
+    const aliases = DAEMON_ENV_SETTINGS.map((s) => s.alias);
+    expect(new Set(aliases).size).toBe(aliases.length);
+    for (const s of DAEMON_ENV_SETTINGS) {
+      expect(s.alias).toMatch(/^[a-z][a-z0-9-]*$/);
+      expect(DAEMON_ENV_SETTINGS.filter((o) => o.name === s.alias.toUpperCase())).toHaveLength(0);
+      expect(findDaemonEnvSetting(s.alias)).toBe(s);
+      expect(findDaemonEnvSetting(s.name)).toBe(s);
+    }
+  });
+
+  it('check values with the same parsers the daemon reads with', () => {
+    const bool = setting('CCTL_AUTOSWITCH');
+    for (const ok of ['off', '0', 'FALSE', 'no', 'on', '1', 'yes', ' true ']) {
+      expect(checkSettingValue(bool, ok)).toEqual({ ok: true, value: ok.trim() });
+    }
+    expect(checkSettingValue(bool, 'maybe')).toMatchObject({ ok: false });
+    expect(checkSettingValue(bool, '')).toMatchObject({ ok: false });
+
+    const num = setting('CCTL_AUTOSWITCH_TRIGGER_PCT');
+    expect(checkSettingValue(num, '90')).toEqual({ ok: true, value: '90' });
+    expect(checkSettingValue(num, '0')).toEqual({ ok: true, value: '0' });
+    expect(checkSettingValue(num, '-1')).toMatchObject({ ok: false });
+    expect(checkSettingValue(num, 'ninety')).toMatchObject({ ok: false });
+
+    const url = setting('CCTL_RELAY_URL');
+    expect(checkSettingValue(url, 'wss://relay.example.com')).toEqual({
+      ok: true,
+      value: 'wss://relay.example.com',
+    });
+    expect(checkSettingValue(url, 'https://relay.example.com')).toMatchObject({ ok: false });
+    expect(checkSettingValue(url, 'wss://')).toMatchObject({ ok: false });
+
+    const level = setting('CCTL_LOG_LEVEL');
+    expect(checkSettingValue(level, 'Debug')).toEqual({ ok: true, value: 'debug' });
+    expect(checkSettingValue(level, 'verbose')).toMatchObject({ ok: false });
+
+    const format = setting('CCTL_LOG_FORMAT');
+    expect(checkSettingValue(format, 'JSON')).toEqual({ ok: true, value: 'json' });
+    expect(checkSettingValue(format, 'yaml')).toMatchObject({ ok: false });
+
+    const path = setting('CCTL_LOG_FILE');
+    expect(checkSettingValue(path, ' /var/log/cctl.log ')).toEqual({
+      ok: true,
+      value: '/var/log/cctl.log',
+    });
+    expect(checkSettingValue(path, '   ')).toMatchObject({ ok: false });
+  });
+});
+
+describe('config.json env block', () => {
+  it('layers under the environment: a set (non-blank) env var wins, even a misspelled one', () => {
+    const file = { CCTL_AUTOSWITCH: 'off', CCTL_LOG_LEVEL: 'debug' };
+    expect(layerFileEnv({}, file)).toEqual(file);
+    expect(layerFileEnv({ CCTL_AUTOSWITCH: 'on' }, file).CCTL_AUTOSWITCH).toBe('on');
+    expect(layerFileEnv({ CCTL_AUTOSWITCH: 'maybe' }, file).CCTL_AUTOSWITCH).toBe('maybe');
+    expect(layerFileEnv({ CCTL_AUTOSWITCH: '  ' }, file).CCTL_AUTOSWITCH).toBe('off');
+    // The pure form leaves its input alone; the in-place form is what the daemon applies.
+    const env: NodeJS.ProcessEnv = { OTHER: 'x' };
+    layerFileEnv(env, file);
+    expect(env).toEqual({ OTHER: 'x' });
+    expect(applyFileEnv(env, file)).toBe(env);
+    expect(env).toEqual({ OTHER: 'x', ...file });
+  });
+
+  it('is read one known entry at a time, dropping blank, non-string and unknown ones', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'config.json');
+      await writeFile(
+        file,
+        JSON.stringify({
+          relayUrl: 'wss://relay.example.com',
+          env: {
+            cctl_autoswitch: ' off ',
+            CCTL_AUTOSWITCH_TRIGGER_PCT: 90,
+            CCTL_LOG_LEVEL: '',
+            CCTL_NOT_A_SETTING: 'x',
+            CCTL_SWITCH_MIN_INTERVAL_MS: '0',
+            'fable-cap': 'off',
+          },
+        }),
+        'utf8',
+      );
+      expect(await readDaemonConfigFile(file)).toEqual({
+        relayUrl: 'wss://relay.example.com',
+        env: { CCTL_AUTOSWITCH: 'off', CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' },
+      });
+
+      // A block with nothing usable in it reads as no block, not as an empty one.
+      await writeFile(file, JSON.stringify({ env: { CCTL_NOPE: '1' } }), 'utf8');
+      expect(await readDaemonConfigFile(file)).toEqual({});
+      await writeFile(file, JSON.stringify({ env: ['CCTL_AUTOSWITCH=0'] }), 'utf8');
+      expect(await readDaemonConfigFile(file)).toEqual({});
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('folds a hand-written CCTL_RELAY_URL entry into relayUrl instead of keeping two relays', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'config.json');
+      await writeFile(file, JSON.stringify({ env: { CCTL_RELAY_URL: 'wss://a.example' } }), 'utf8');
+      expect(await readDaemonConfigFile(file)).toEqual({ relayUrl: 'wss://a.example' });
+      // The field wins when both are present.
+      await writeFile(
+        file,
+        JSON.stringify({
+          relayUrl: 'wss://field.example',
+          env: { CCTL_RELAY_URL: 'wss://env.example' },
+        }),
+        'utf8',
+      );
+      expect(await readDaemonConfigFile(file)).toEqual({ relayUrl: 'wss://field.example' });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('feeds every daemon knob, attributed to "config", with the environment still on top', () => {
+    const fileConfig = {
+      env: {
+        CCTL_AUTOSWITCH: 'off',
+        CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off',
+        CCTL_AUTOSWITCH_TRIGGER_PCT: '80',
+        CCTL_WAITING_CARDS: 'on',
+        CCTL_LOG_LEVEL: 'debug',
+      },
+    };
+    const fromFile = resolveDaemonConfig({}, {}, fileConfig);
+    expect(fromFile.values.autoSwitch).toBe(false);
+    expect(row(fromFile.rows, 'auto-switch').source).toBe('config');
+    expect(fromFile.values.autoSwitchOnFableCap).toBe(false);
+    expect(row(fromFile.rows, 'fable cap trigger')).toMatchObject({
+      value: 'off',
+      source: 'config',
+    });
+    expect(fromFile.values.triggerPercent).toBe(80);
+    expect(row(fromFile.rows, 'switch trigger')).toMatchObject({
+      value: '80% used',
+      source: 'config',
+    });
+    expect(fromFile.values.waitingCards).toBe(true);
+    expect(row(fromFile.rows, 'waiting cards').source).toBe('config');
+    expect(row(fromFile.rows, 'daemon log level')).toMatchObject({
+      value: 'debug',
+      source: 'config',
+    });
+
+    // A real env var shadows the file and is reported as the winner...
+    const shadowed = resolveDaemonConfig({ CCTL_AUTOSWITCH: 'on' }, {}, fileConfig);
+    expect(shadowed.values.autoSwitch).toBe(true);
+    expect(row(shadowed.rows, 'auto-switch').source).toBe('env');
+    // ...even a misspelled one, which then falls to the DEFAULT rather than to the file: the
+    // environment always wins, with no exceptions to learn.
+    const garbled = resolveDaemonConfig({ CCTL_AUTOSWITCH: 'maybe' }, {}, fileConfig);
+    expect(garbled.values.autoSwitch).toBe(true);
+    expect(row(garbled.rows, 'auto-switch').source).toBe('default');
+    // A blank env var is an absent one, so the file applies.
+    const blank = resolveDaemonConfig({ CCTL_AUTOSWITCH: '' }, {}, fileConfig);
+    expect(blank.values.autoSwitch).toBe(false);
+    expect(row(blank.rows, 'auto-switch').source).toBe('config');
+    // A flag outranks both.
+    const flagged = resolveDaemonConfig(
+      { CCTL_AUTOSWITCH: 'off' },
+      { autoSwitch: true },
+      fileConfig,
+    );
+    expect(flagged.values.autoSwitch).toBe(true);
+    expect(row(flagged.rows, 'auto-switch').source).toBe('flag');
+  });
+
+  // The two default-off knobs are attributed by presence like every other row: an explicit
+  // "off" is an override that happens to equal the default, and says where it came from.
+  it('attributes an explicit off on the default-off knobs to the layer that set it', () => {
+    const fromFile = resolveDaemonConfig({}, {}, { env: { CCTL_WAITING_CARDS: 'off' } });
+    expect(row(fromFile.rows, 'waiting cards')).toMatchObject({ value: 'off', source: 'config' });
+    const fromEnv = resolveDaemonConfig({ CCTL_TOOL_OUTPUT_FULL: 'off' });
+    expect(row(fromEnv.rows, 'full tool output')).toMatchObject({ value: 'off', source: 'env' });
+    const garbled = resolveDaemonConfig({ CCTL_WAITING_CARDS: 'nope' });
+    expect(row(garbled.rows, 'waiting cards')).toMatchObject({ value: 'off', source: 'default' });
+  });
+
+  it('defaults the fable cap trigger to on, and honors the env opt-out', () => {
+    const config = resolveDaemonConfig({});
+    expect(config.values.autoSwitchOnFableCap).toBe(true);
+    expect(row(config.rows, 'fable cap trigger')).toMatchObject({ value: 'on', source: 'default' });
+    const off = resolveDaemonConfig({ CCTL_AUTOSWITCH_ON_FABLE_CAP: '0' });
+    expect(off.values.autoSwitchOnFableCap).toBe(false);
+    expect(row(off.rows, 'fable cap trigger')).toMatchObject({ value: 'off', source: 'env' });
+  });
+});
+
+describe('persisting daemon settings', () => {
+  const exists = (file: string) =>
+    access(file).then(
+      () => true,
+      () => false,
+    );
+
+  it('writes the env block, keeps unknown keys, and removes cleanly', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'config.json');
+      // A key this build does not know must survive every round trip untouched.
+      await writeFile(file, JSON.stringify({ future: { keep: true } }), 'utf8');
+
+      await persistDaemonSetting(file, setting('CCTL_AUTOSWITCH'), 'off');
+      await persistDaemonSetting(file, setting('CCTL_AUTOSWITCH_TRIGGER_PCT'), '90');
+      expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({
+        future: { keep: true },
+        env: { CCTL_AUTOSWITCH: 'off', CCTL_AUTOSWITCH_TRIGGER_PCT: '90' },
+      });
+      // What the daemon will read back is exactly what was stored.
+      expect((await readDaemonConfigFile(file))?.env).toEqual({
+        CCTL_AUTOSWITCH: 'off',
+        CCTL_AUTOSWITCH_TRIGGER_PCT: '90',
+      });
+
+      // The relay goes to its own field, and is forgotten from there.
+      await persistDaemonSetting(file, setting('CCTL_RELAY_URL'), 'wss://relay.example.com');
+      expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({
+        relayUrl: 'wss://relay.example.com',
+      });
+      expect(await forgetDaemonSetting(file, setting('CCTL_RELAY_URL'))).toBe(true);
+      expect(JSON.parse(await readFile(file, 'utf8'))).not.toHaveProperty('relayUrl');
+
+      expect(await forgetDaemonSetting(file, setting('CCTL_AUTOSWITCH'))).toBe(true);
+      expect(await forgetDaemonSetting(file, setting('CCTL_AUTOSWITCH'))).toBe(false);
+      expect(await forgetDaemonSetting(file, setting('CCTL_AUTOSWITCH_TRIGGER_PCT'))).toBe(true);
+      // The emptied block is gone: the file is back to exactly what it was before the first set.
+      expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ future: { keep: true } });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The reader accepts an alias or another case as a key, so `unset` (and a `set` that would
+  // otherwise sit beside it) must find those spellings too, or a hand-written entry stays in
+  // force while the CLI reports it gone.
+  it('removes and replaces hand-written spellings the reader would also accept', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'config.json');
+      await writeFile(
+        file,
+        JSON.stringify({
+          relayUrl: 'wss://field.example',
+          env: { autoswitch: 'off', cctl_autoswitch: 'on', CCTL_RELAY_URL: 'wss://env.example' },
+        }),
+        'utf8',
+      );
+      await persistDaemonSetting(file, setting('CCTL_AUTOSWITCH'), 'off');
+      expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({
+        env: { CCTL_AUTOSWITCH: 'off', CCTL_RELAY_URL: 'wss://env.example' },
+      });
+      expect(await forgetDaemonSetting(file, setting('CCTL_AUTOSWITCH'))).toBe(true);
+      // The relay is forgotten from BOTH homes: the field and the env-block entry the reader
+      // would otherwise fold back into it.
+      expect(await forgetDaemonSetting(file, setting('CCTL_RELAY_URL'))).toBe(true);
+      expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({});
+      expect((await readDaemonConfigFile(file))?.relayUrl).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('creates the file (and its directory) on the first set, never on a no-op unset', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'nested', 'config.json');
+      expect(await forgetDaemonSetting(file, setting('CCTL_AUTOSWITCH'))).toBe(false);
+      expect(await exists(file)).toBe(false);
+      await persistDaemonSetting(file, setting('CCTL_LOG_LEVEL'), 'debug');
+      expect(await readDaemonConfigFile(file)).toEqual({ env: { CCTL_LOG_LEVEL: 'debug' } });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to overwrite a file it cannot read as a JSON object', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-config-'));
+    try {
+      const file = join(dir, 'config.json');
+      await writeFile(file, '{not json', 'utf8');
+      await expect(persistDaemonSetting(file, setting('CCTL_AUTOSWITCH'), 'off')).rejects.toThrow(
+        /not valid JSON/,
+      );
+      expect(await readFile(file, 'utf8')).toBe('{not json');
+      await writeFile(file, '[1]', 'utf8');
+      await expect(persistDaemonSetting(file, setting('CCTL_AUTOSWITCH'), 'off')).rejects.toThrow(
+        /JSON object/,
+      );
+      expect(await readFile(file, 'utf8')).toBe('[1]');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

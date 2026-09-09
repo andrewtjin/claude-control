@@ -55,6 +55,7 @@ import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
   daemonConfigPath,
+  applyFileEnv,
   daemonSettingsPath,
   readDaemonConfigFile,
   resolveDaemonConfig,
@@ -205,7 +206,14 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   }
   // The operator's persisted overrides, read here (the edge) so the resolution below stays
   // pure. A missing or malformed file degrades to no overrides, never to a failed start.
+  // Its env block is laid UNDER the real environment before anything else starts, so every
+  // module that reads `process.env` on its own (the loggers, the engine's cadence guard)
+  // honors the same overrides `resolveDaemonConfig` reports. The resolver gets the shell's
+  // environment as it was BEFORE the overlay, so it can still say which layer each value
+  // came from.
   const fileConfig = (await readDaemonConfigFile(daemonConfigPath(paths))) ?? {};
+  const shellEnv: NodeJS.ProcessEnv = { ...process.env };
+  applyFileEnv(process.env, fileConfig.env);
 
   // One resolution feeds BOTH behavior (the values wired below) and visibility (the rows
   // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart. Resolved
@@ -213,7 +221,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // resolved `<dataDir>/daemon.log` default — see settings.ts) is the path both loggers must
   // actually write to, not a second default independently guessed here.
   const config = resolveDaemonConfig(
-    process.env,
+    shellEnv,
     {
       // Tri-state: an absent flag stays absent so the resolver's env/default chain decides,
       // while an explicit --no- opt-out passes through as false.
@@ -237,6 +245,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     logFilePath,
     probeUnknown,
     probeTimeoutMs,
+    autoSwitchOnFableCap,
   } = config.values;
 
   // Both loggers this process builds (this one, plus the switch-engine adapter inside
@@ -387,6 +396,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
           ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
           ...(greedyResetMarginMs !== undefined ? { greedyResetMarginMs } : {}),
           ...(greedy ? { greedy } : {}),
+          // Only the opt-out is passed: the policy's own default is on, and an absent key
+          // keeps the policy object identical to what earlier builds constructed.
+          ...(autoSwitchOnFableCap ? {} : { fableCapTriggers: false }),
         },
         ...(cooldownMs !== undefined ? { cooldownMs } : {}),
         logger,

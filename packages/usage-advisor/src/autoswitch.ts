@@ -7,7 +7,8 @@
 //
 // The policy, as specified by the owner:
 //   TRIGGER — the ACTIVE account's remaining quota is low (its worst limit is at/above
-//   `triggerPercent` used). When the account's snapshot is STALE (older than `staleAfterMs`)
+//   `triggerPercent` used; the Fable-only weekly cap counts unless `fableCapTriggers` is
+//   opted out). When the account's snapshot is STALE (older than `staleAfterMs`)
 //   the bar tightens to `staleTriggerPercent`: usage only grows while we're blind, so a
 //   stale near-limit reading is a floor, not a fact — hop before the unseen burn crosses
 //   the hard cutoff and kills the session mid-work.
@@ -79,6 +80,13 @@ export interface AutoSwitchPolicy {
    *  reported. Clamped to never fall below `greedyResetMarginMs` — a derived number can only
    *  raise the bar for an unprompted hop, never lower it. */
   greedyPredictedResetMarginMs?: number;
+  /** Whether the Fable weekly cap (`weekly_scoped`) exists for this policy at all. ON by
+   *  default: the sessions this daemon keeps alive mostly run Fable, so its wall is the wall.
+   *  Off for an operator who mostly runs other models — the cap is then invisible to the
+   *  trigger, to candidate eligibility, to the weekly ranking and to the reason text alike, so
+   *  only the shared weekly budget and the 5h window move the daemon, and a Fable-capped
+   *  account keeps serving everything else instead of being hopped away from. */
+  fableCapTriggers?: boolean;
 }
 
 // 94: hop only when the account is genuinely near the wall — fewer premature hops, still
@@ -142,8 +150,22 @@ export function decideAutoSwitch(
   const active = accounts.find((a) => a.active);
   if (!active) return null;
 
+  // Which limits the policy can see. With the Fable cap opted out, the scoped cap is invisible
+  // EVERYWHERE in this decision — the trigger, candidate eligibility, the weekly ranking and
+  // the reason text — never on one side only, or the daemon would hop away from a Fable-capped
+  // account and refuse to hop toward an identical one, or justify a hop by a budget it was
+  // told to ignore. An account that reports nothing but the cap then reports nothing at all.
+  const countFableCap = policy.fableCapTriggers ?? true;
+  const visibleLimits = (a: AccountUsageInput): LimitInput[] =>
+    countFableCap ? a.limits : a.limits.filter((l) => l.kind !== 'weekly_scoped');
+  const weeklyResetAt = (a: AccountUsageInput) => weeklyBudget(visibleLimits(a), a, now)?.resetsAt;
+  const weeklyUsedPct = (a: AccountUsageInput) =>
+    weeklyBudget(visibleLimits(a), a, now)?.percent ?? 0;
+  const weeklyPredicted = (a: AccountUsageInput) =>
+    weeklyBudget(visibleLimits(a), a, now)?.predicted ?? false;
+
   // No limit data at all means we know nothing — never act on ignorance.
-  const activeWorst = worstPercent(active, now);
+  const activeWorst = worstPercent(visibleLimits(active), now);
   if (activeWorst === undefined) return null;
 
   const candidates = accounts.filter(
@@ -155,10 +177,10 @@ export function decideAutoSwitch(
       // Never hop to an account that would itself immediately count as low — judged by ITS
       // OWN snapshot's age, so a stale near-limit candidate (whose true usage may already
       // be past the wall) is no safer a target than it would be to keep...
-      (worstPercent(a, now) ?? 0) < lowThreshold(a) &&
+      (worstPercent(visibleLimits(a), now) ?? 0) < lowThreshold(a) &&
       // ...or whose weekly budget clock we can't see — the choice is BY weekly reset,
       // so an unknown reset is not a lesser candidate, it's not a candidate at all.
-      weeklyResetAt(a, now) !== undefined,
+      weeklyResetAt(a) !== undefined,
   );
   if (candidates.length === 0) return null;
 
@@ -167,21 +189,21 @@ export function decideAutoSwitch(
   // see), then the account with MORE weekly budget remaining (the larger expiring asset), then
   // label so the decision is deterministic. The 5h window deliberately never ranks.
   candidates.sort((a, b) => {
-    const resetDelta = (weeklyResetAt(a, now) as number) - (weeklyResetAt(b, now) as number);
+    const resetDelta = (weeklyResetAt(a) as number) - (weeklyResetAt(b) as number);
     if (resetDelta !== 0) return resetDelta;
-    const confidenceDelta = Number(weeklyPredicted(a, now)) - Number(weeklyPredicted(b, now));
+    const confidenceDelta = Number(weeklyPredicted(a)) - Number(weeklyPredicted(b));
     if (confidenceDelta !== 0) return confidenceDelta;
-    const weeklyDelta = weeklyUsedPct(a, now) - weeklyUsedPct(b, now);
+    const weeklyDelta = weeklyUsedPct(a) - weeklyUsedPct(b);
     if (weeklyDelta !== 0) return weeklyDelta;
     return a.label.localeCompare(b.label);
   });
   const target = candidates[0] as AccountUsageInput;
-  const targetReset = weeklyResetAt(target, now) as number;
+  const targetReset = weeklyResetAt(target) as number;
   // The reason ships verbatim to the phone, so a derived reset is labelled there too — a
   // switch card must never present a prediction as something the endpoint reported.
   const targetBudget =
-    `in ${humanizeDuration(targetReset - now)}${weeklyPredicted(target, now) ? ' (predicted)' : ''}, ` +
-    `${roundPct(100 - weeklyUsedPct(target, now))}% weekly budget left`;
+    `in ${humanizeDuration(targetReset - now)}${weeklyPredicted(target) ? ' (predicted)' : ''}, ` +
+    `${roundPct(100 - weeklyUsedPct(target))}% weekly budget left`;
 
   // Primary trigger: the active account is nearly out of quota. On a stale snapshot the
   // tightened threshold applies; a hop that ONLY the derate explains says so in its reason
@@ -203,7 +225,7 @@ export function decideAutoSwitch(
   // so any observed expiry is "sooner").
   if (policy.greedy) {
     const baseMarginMs = policy.greedyResetMarginMs ?? DEFAULT_GREEDY_RESET_MARGIN_MS;
-    const targetPredicted = weeklyPredicted(target, now);
+    const targetPredicted = weeklyPredicted(target);
     // A predicted target has to clear the wider bar. Clamped upward, mirroring the stale-data
     // trigger: a derived number can only tighten what an unprompted hop must prove.
     const marginMs = targetPredicted
@@ -212,7 +234,7 @@ export function decideAutoSwitch(
           policy.greedyPredictedResetMarginMs ?? DEFAULT_GREEDY_PREDICTED_RESET_MARGIN_MS,
         )
       : baseMarginMs;
-    const activeReset = weeklyResetAt(active, now);
+    const activeReset = weeklyResetAt(active);
     // With no reset on the active account there is no margin to clear, so a prediction has
     // nothing to prove itself against — and greedy would be moving live work on a derived
     // number alone. Only a reported reset may hop into that blind spot; the low-quota trigger
@@ -247,44 +269,39 @@ export const MIN_USABLE_HEADROOM_PCT = 2;
  */
 export function hasUsableHeadroom(account: AccountUsageInput, now = Date.now()): boolean {
   if (account.quarantined) return false;
-  const worst = worstPercent(account, now);
+  const worst = worstPercent(account.limits, now);
   return worst === undefined || 100 - worst >= MIN_USABLE_HEADROOM_PCT;
 }
 
 /** Limits that still describe a live window: reset time unknown, or still in the future. */
-function effectiveLimits(account: AccountUsageInput, now: number): LimitInput[] {
-  return account.limits.filter((l) => l.resetsAt === undefined || l.resetsAt > now);
+function effectiveLimits(limits: LimitInput[], now: number): LimitInput[] {
+  return limits.filter((l) => l.resetsAt === undefined || l.resetsAt > now);
 }
 
-/** The account's binding constraint — max percent used across live limits. `undefined`
- *  when the account reported no usable limit data. */
-function worstPercent(account: AccountUsageInput, now: number): number | undefined {
-  const limits = effectiveLimits(account, now);
-  if (limits.length === 0) return undefined;
-  return Math.max(...limits.map((l) => l.percent));
+/** The binding constraint among `limits` — max percent used across the live ones. `undefined`
+ *  when nothing usable was reported: for the trigger that means "never act on ignorance", for
+ *  a candidate "nothing known to be low". The caller decides which limits the policy may see
+ *  (the Fable cap is dropped up front when opted out), so a snapshot carrying only an ignored
+ *  limit honestly reports no data. */
+function worstPercent(limits: LimitInput[], now: number): number | undefined {
+  const live = effectiveLimits(limits, now);
+  if (live.length === 0) return undefined;
+  return Math.max(...live.map((l) => l.percent));
 }
 
 /** Percent of the 5h session window used. No live session limit = no open window = 0. */
 function sessionUsedPct(account: AccountUsageInput, now: number): number {
-  const session = effectiveLimits(account, now).find((l) => l.kind === 'session');
+  const session = effectiveLimits(account.limits, now).find((l) => l.kind === 'session');
   return session?.percent ?? 0;
 }
 
-/** Percent of the weekly budget used, and when that budget next resets — both from the one
- *  fleet-wide rule (see weekly.ts), so the executor targets the same limit the Plan and Pacing
- *  lines describe. No weekly limit at all = 0% used (only reachable in reason text, since
- *  eligibility already requires a known weekly reset). */
-function weeklyUsedPct(account: AccountUsageInput, now: number): number {
-  return selectWeeklyBudget(account.limits, now, account.predictedResetAt)?.percent ?? 0;
-}
-
-function weeklyResetAt(account: AccountUsageInput, now: number): number | undefined {
-  return selectWeeklyBudget(account.limits, now, account.predictedResetAt)?.resetsAt;
-}
-
-/** True when the reset `weeklyResetAt` returned came from the caller's history-derived
- *  prediction rather than the endpoint. False for an account with no reset at all — there is
- *  nothing to be less confident about. */
-function weeklyPredicted(account: AccountUsageInput, now: number): boolean {
-  return selectWeeklyBudget(account.limits, now, account.predictedResetAt)?.predicted === true;
+/** The account's weekly budget — percent used, next reset, and whether that reset is the
+ *  caller's history-derived prediction — by the one fleet-wide rule (see weekly.ts), so the
+ *  executor targets the same limit the Plan and Pacing lines describe. Takes the limits the
+ *  policy may see rather than reading `account.limits` itself, for the same reason as
+ *  `worstPercent`: with the Fable cap opted out it must never rank by, or describe, that cap.
+ *  `undefined` when no visible weekly limit exists at all — such an account is never a
+ *  candidate (eligibility requires a known weekly reset). */
+function weeklyBudget(limits: LimitInput[], account: AccountUsageInput, now: number) {
+  return selectWeeklyBudget(limits, now, account.predictedResetAt);
 }

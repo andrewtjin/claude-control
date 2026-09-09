@@ -1628,6 +1628,22 @@ describe('registry mutators serialize against the credential lock', () => {
     await expectBlockedWhileLocked(h.paths, (e) => e.removeAccount('any-id'));
   });
 
+  it('renameAccount waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.renameAccount('any-id', 'new-label'));
+  });
+
+  // The lock test above never reaches the vault, so on its own it cannot tell a correct
+  // delegation from one with the two string arguments swapped. Drive the seam for real.
+  it('renameAccount relabels through the vault and returns the stored row', async () => {
+    const h = await harness();
+    const account = await h.engine.addAccount('X', bundleFor('X', NOW + HOUR));
+    const renamed = await h.engine.renameAccount(account.id, 'Y');
+    expect(renamed.id).toBe(account.id);
+    expect(renamed.label).toBe('Y');
+    expect((await h.engine.listAccounts()).find((a) => a.id === account.id)?.label).toBe('Y');
+  });
+
   it('clearQuarantine waits on the lock', async () => {
     const h = await harness();
     await expectBlockedWhileLocked(h.paths, (e) => e.clearQuarantine('any-id'));
