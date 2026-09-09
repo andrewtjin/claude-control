@@ -25,11 +25,29 @@
   `cctl doctor` runs a real protect/unprotect round-trip through this platform's
   protector and reports the result outright, instead of failing silently later.
 
-- **Autostart** registers a logon **Scheduled Task** (`cctl daemon install`), because
-  the DPAPI vault is `CurrentUser`-scoped: the daemon must run as the logged-in user,
-  which makes a Windows service structurally wrong regardless of convenience — a
-  service runs as SYSTEM/a service account by default and could never decrypt the
-  vault.
+- **Autostart** (`cctl daemon install`; the wizard's last step does the same) is
+  per-host, always as the logged-in user because every vault is scoped to that user:
+  - **Windows** registers a logon **Scheduled Task**. A Windows service would be
+    structurally wrong regardless of convenience — it runs as SYSTEM/a service account
+    by default and could never decrypt the `CurrentUser`-scoped DPAPI vault.
+  - **WSL2** registers a **Windows** logon task from inside the distro, through
+    `/mnt/c/.../powershell.exe` (so a PATH without the Windows entries still works),
+    named `ClaudeControlDaemon-WSL-<distro>`, whose action is
+    `wsl.exe -d <distro> --exec /bin/bash -lc '<shim> daemon run'`. Nothing inside the
+    distro can do this job: WSL stops a distro seconds after its last `wsl.exe` session
+    ends, so a systemd unit or shell-profile job dies with it, while the task's own
+    session keeps the distro alive for as long as the daemon runs. The login shell is
+    what puts nvm-installed `node` on PATH. Needs Windows interop (the default).
+  - **Linux** outside WSL writes a **systemd user unit**
+    (`~/.config/systemd/user/claude-control-daemon.service`, honoring
+    `XDG_CONFIG_HOME`), enables it, and asks for `loginctl enable-linger` so it starts
+    at boot rather than at first login — best-effort, since some polkit setups refuse
+    it; the unit still starts at login.
+  - `CCTL_AUTOSTART_BACKEND=wsl-task|systemd-user|none` pins the Linux choice; `none`
+    is for anyone who would rather cctl never touched their Task Scheduler or user
+    manager. A Linux host with neither interop nor a user manager has no backend:
+    `cctl daemon install` says so with the reason and exits 1, `cctl setup` skips the
+    step, and `cctl daemon status` reports it in place of a logon task.
 - **Observed sessions** (watching a live terminal you started yourself) target ConPTY,
   the Windows pseudo-console. This is an optional dependency (`node-pty`) — its
   absence degrades gracefully with a clear message rather than crashing `cctl run`.
@@ -49,11 +67,10 @@ it turns into a confusing runtime error.
 
 ## Linux caveats
 
-- **Autostart is not wired yet.** There is no Linux backend behind `cctl daemon
-install` (Windows registers a Scheduled Task, macOS a LaunchAgent): it says so and
-  exits 1, `cctl setup` skips the step with the same note, and `cctl daemon status`
-  reports it in place of a logon task. Run the daemon yourself — `cctl daemon
-supervise` in a terminal, under tmux/nohup, or as your own systemd user unit.
+- **Autostart** is the WSL Windows task or the systemd user unit described above; the
+  daemon process itself is identical. Without either (interop disabled, no
+  `systemctl --user`), run it yourself — `cctl daemon supervise` in a terminal, under
+  tmux/nohup, or as your own service.
 - **Observed sessions** target ConPTY and stay Windows-only; everything else —
   daemon, CLI, usage polling, remote/managed sessions — runs as-is.
 

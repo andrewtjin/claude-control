@@ -540,7 +540,7 @@ describe('renderDaemonStatus', () => {
   // would only print the same fact and exit.
   it('states that autostart is unavailable instead of prompting to install it', () => {
     const out = renderDaemonStatus({ ...healthy, task: { supported: false } });
-    expect(out).toMatch(/\[--\] autostart not available on this platform yet/);
+    expect(out).toMatch(/\[--\] autostart not available on this platform/);
     expect(out).toMatch(/cctl daemon supervise/);
     expect(out).not.toContain('cctl daemon install');
     // The other lines still render on their own.

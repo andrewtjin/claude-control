@@ -71,9 +71,10 @@ import {
   writeCctlDropInElevated,
 } from './managedSettings.js';
 import {
-  AUTOSTART_UNSUPPORTED_NOTE,
   autostartBackend,
   autostartNoun,
+  autostartUnsupportedNote,
+  detectAutostartHost,
   installAutostart,
   queryAutostart,
   readAutostartState,
@@ -457,13 +458,15 @@ export function buildProgram(): Command {
   daemon
     .command('install')
     .description(
-      'register a logon task (Scheduled Task / LaunchAgent) that starts the daemon automatically',
+      'register autostart for the daemon (Windows: logon Scheduled Task; macOS: LaunchAgent; ' +
+        'WSL: a Windows logon task into the distro; Linux: systemd user unit)',
     )
     .action(() => {
-      // Decide the platform before anything else runs: on a platform with no autostart backend
-      // there is no shim to resolve and no tooling to call, only the honest answer.
-      const backend = autostartBackend();
-      if (backend === 'none') fail(AUTOSTART_UNSUPPORTED_NOTE);
+      // Decide the host before anything else runs: on a host with no autostart backend there
+      // is no shim to resolve and no tooling to call, only the honest answer — with the reason.
+      const host = detectAutostartHost();
+      const backend = autostartBackend(host);
+      if (backend === 'none') fail(autostartUnsupportedNote(host));
       const noun = autostartNoun(backend);
       let shimPath: string;
       try {
@@ -473,7 +476,7 @@ export function buildProgram(): Command {
       }
       let result: AutostartResult;
       try {
-        result = installAutostart(shimPath);
+        result = installAutostart(shimPath, { host });
       } catch (err) {
         fail(`could not register the ${noun}: ${(err as Error).message}`);
       }

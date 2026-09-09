@@ -552,7 +552,7 @@ describe('runSetup', () => {
     expect(installs).toBe(0);
     const out = text();
     expect(out).toContain('[8/8]');
-    expect(out).toContain('Autostart is not available on this platform yet');
+    expect(out).toContain('Autostart is not available on this platform');
     expect(out).toContain('cctl daemon supervise');
     // Nothing was kicked, so the round-trip check reads once instead of waiting for it.
     expect(verifyCalls).toEqual([{ wait: false }]);

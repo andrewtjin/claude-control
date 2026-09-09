@@ -202,15 +202,22 @@ describe('buildProgram', () => {
   // ENOENT`. The CLI must answer with the platform fact and fail before it resolves a shim or
   // spawns anything — proven here by running the real action with the platform swapped. `fail`
   // throws a CliFailure that the entry point turns into the non-zero exit.
-  it('daemon install on a platform without autostart explains itself and fails', async () => {
+  it('daemon install on a host without autostart explains itself and fails', async () => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform');
     Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    // Pin the Linux backend off: the real probes would otherwise answer for whatever box runs
+    // the tests (a CI runner with a systemd user manager gets a real backend and a real unit).
+    const previousOverride = process.env.CCTL_AUTOSTART_BACKEND;
+    process.env.CCTL_AUTOSTART_BACKEND = 'none';
     try {
       const run = buildProgram().parseAsync(['daemon', 'install'], { from: 'user' });
       await expect(run).rejects.toBeInstanceOf(CliFailure);
       await expect(run).rejects.toThrow('autostart is not available on this platform');
       await expect(run).rejects.toThrow('cctl daemon supervise');
+      await expect(run).rejects.toThrow('CCTL_AUTOSTART_BACKEND=none');
     } finally {
+      if (previousOverride === undefined) delete process.env.CCTL_AUTOSTART_BACKEND;
+      else process.env.CCTL_AUTOSTART_BACKEND = previousOverride;
       if (platform) Object.defineProperty(process, 'platform', platform);
     }
   });

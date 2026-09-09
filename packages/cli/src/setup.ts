@@ -242,13 +242,13 @@ export function renderSetupSummary(
   // exit, so the line hands over the manual start instead.
   const daemonLine = s.daemonAlive
     ? s.autostart === 'unsupported'
-      ? ok('daemon: running (started by hand — no autostart on this platform yet)')
+      ? ok('daemon: running (started by hand — no autostart on this platform)')
       : ok('daemon: running')
     : s.autostart === 'registered'
       ? warn('daemon: not running yet — starts at logon (or: cctl daemon install)')
       : s.autostart === 'unsupported'
         ? warn(
-            'daemon: not running — start it: cctl daemon supervise (no autostart on this platform yet)',
+            'daemon: not running — start it: cctl daemon supervise (no autostart on this platform)',
           )
         : warn('daemon: no autostart registered — run: cctl daemon install');
 
@@ -510,7 +510,7 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
     // A platform fact, not a failure: nothing to register and nothing to retry, so say how the
     // daemon runs here and check ONCE whether one is already up — no daemon was kicked, so
     // waiting for one to report in would only stall on a heartbeat that cannot come.
-    io.write(p.yellow(`Autostart is not available on this platform yet — ${MANUAL_START_HINT}.\n`));
+    io.write(p.yellow(`Autostart is not available on this platform — ${MANUAL_START_HINT}.\n`));
     daemonAlive = await deps.verifyDaemon({ wait: false });
     io.write(
       daemonAlive

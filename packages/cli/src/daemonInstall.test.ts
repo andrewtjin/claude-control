@@ -4,63 +4,16 @@ import {
   resolveCctlShimPath,
   queryDaemonTask,
   installDaemonTask,
+  registerLogonTask,
   uninstallDaemonTask,
   startDaemonTaskNow,
   decodePowerShellStderr,
+  DAEMON_TASK_DESCRIPTION,
   DAEMON_TASK_NAME,
   DAEMON_TASK_ARGUMENTS,
   type PowerShellRunner,
 } from './daemonInstall.js';
-
-// --- fake Task Scheduler ---------------------------------------------------------------------
-// Interprets the exact PowerShell verbs this module emits (Get/Register/Unregister/Start-
-// ScheduledTask) against in-memory state, so installDaemonTask's check-then-update decisions
-// and the exact invocation shape are provable without a real Task Scheduler.
-
-interface FakeRegistration {
-  execute: string;
-  arguments: string;
-  state: string;
-}
-
-function fakeTaskScheduler(initial?: FakeRegistration) {
-  let registered: FakeRegistration | undefined = initial;
-  const scripts: string[] = [];
-  let startCalls = 0;
-
-  const extractQuoted = (script: string, flag: string): string => {
-    const match = new RegExp(`-${flag} '((?:[^']|'')*)'`).exec(script);
-    return (match?.[1] ?? '').replace(/''/g, "'");
-  };
-
-  const run: PowerShellRunner = (script) => {
-    scripts.push(script);
-    if (script.includes('Register-ScheduledTask')) {
-      registered = {
-        execute: extractQuoted(script, 'Execute'),
-        arguments: extractQuoted(script, 'Argument'),
-        state: 'Ready',
-      };
-      return '';
-    }
-    if (script.includes('Unregister-ScheduledTask')) {
-      registered = undefined;
-      return '';
-    }
-    if (script.includes('Start-ScheduledTask')) {
-      startCalls++;
-      return '';
-    }
-    if (script.includes('Get-ScheduledTask')) {
-      return registered
-        ? JSON.stringify({ registered: true, ...registered })
-        : '{"registered":false}';
-    }
-    throw new Error(`fake task scheduler: unrecognized script: ${script}`);
-  };
-
-  return { run, scripts, startCalls: () => startCalls, current: () => registered };
-}
+import { fakeTaskScheduler } from './testing/fakeTaskScheduler.js';
 
 // --- resolveCctlShimPath ----------------------------------------------------------------------
 
@@ -113,6 +66,58 @@ describe('queryDaemonTask', () => {
   });
 });
 
+// --- registerLogonTask --------------------------------------------------------------------------
+
+describe('registerLogonTask', () => {
+  it('registers an arbitrary action under the given name and description', () => {
+    const { run, current, scripts } = fakeTaskScheduler(undefined);
+    const outcome = registerLogonTask({
+      action: { execute: 'wsl.exe', arguments: '-d Ubuntu --exec /bin/bash -lc "x"' },
+      taskName: 'CustomTask',
+      description: "it's ours",
+      run,
+    });
+    expect(outcome).toBe('created');
+    expect(current()).toEqual({
+      execute: 'wsl.exe',
+      arguments: '-d Ubuntu --exec /bin/bash -lc "x"',
+      description: "it's ours",
+      state: 'Ready',
+    });
+    const register = scripts.find((s) => s.includes('Register-ScheduledTask'));
+    // Every interpolated value goes through PowerShell single-quote escaping.
+    expect(register).toContain("-Description 'it''s ours'");
+    expect(register).toContain("-TaskName 'CustomTask'");
+  });
+
+  it('compares the whole action, so a same-program different-arguments task is updated', () => {
+    const { run } = fakeTaskScheduler({
+      execute: 'wsl.exe',
+      arguments: '-d Ubuntu --exec /bin/bash -lc "old"',
+      state: 'Ready',
+    });
+    expect(
+      registerLogonTask({
+        action: { execute: 'wsl.exe', arguments: '-d Ubuntu --exec /bin/bash -lc "new"' },
+        taskName: 'CustomTask',
+        description: 'd',
+        run,
+      }),
+    ).toBe('updated');
+  });
+
+  it('is the mechanism behind installDaemonTask, which supplies the shim action and defaults', () => {
+    const { run, current } = fakeTaskScheduler(undefined);
+    installDaemonTask({ shimPath: 'C:\\npm\\cctl.cmd', run });
+    expect(current()).toEqual({
+      execute: 'C:\\npm\\cctl.cmd',
+      arguments: DAEMON_TASK_ARGUMENTS,
+      description: DAEMON_TASK_DESCRIPTION,
+      state: 'Ready',
+    });
+  });
+});
+
 // --- installDaemonTask --------------------------------------------------------------------------
 
 describe('installDaemonTask', () => {
@@ -122,7 +127,7 @@ describe('installDaemonTask', () => {
     const { run, current } = fakeTaskScheduler(undefined);
     const outcome = installDaemonTask({ shimPath, run });
     expect(outcome).toBe('created');
-    expect(current()).toEqual({
+    expect(current()).toMatchObject({
       execute: shimPath,
       arguments: DAEMON_TASK_ARGUMENTS,
       state: 'Ready',
