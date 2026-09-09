@@ -332,13 +332,49 @@ export class Vault {
     });
   }
 
-  private async patchAccount(id: string, mutate: (a: StoredAccount) => void): Promise<void> {
+  /**
+   * Give an account a new label. The label is a human alias and nothing more — the id, the
+   * encrypted bundle and every daemon record keyed on the id are untouched, so a rename never
+   * costs usage history or a re-login.
+   *
+   * Refuses a label another account already carries under case-insensitive comparison, and one
+   * that spells any account's id: `resolveAccountRef` matches id first, then exact label, then
+   * case-insensitive label, so either collision would leave one of the two accounts unreachable
+   * by name (reported as ambiguous, or shadowed by the id match). Only OTHER rows count, so
+   * re-casing an account's own label ("Work" -> "work") is an ordinary rename.
+   */
+  async renameAccount(id: string, label: string): Promise<StoredAccount> {
+    const next = label.trim();
+    if (next === '') throw new VaultError('a label cannot be empty');
+    const lower = next.toLowerCase();
+    return this.patchAccount(id, (account, reg) => {
+      const taken = reg.accounts.find(
+        (a) => a.id === next || (a.id !== id && a.label.toLowerCase() === lower),
+      );
+      if (taken) {
+        throw new VaultError(
+          `"${next}" already refers to account ${taken.id} ("${taken.label}"); ` +
+            'two accounts answering to one name could not be told apart on switch',
+        );
+      }
+      account.label = next;
+    });
+  }
+
+  /** Apply `mutate` to one registry row and persist it. The whole registry rides along so a
+   *  mutation can be validated against the OTHER rows under the same load — a rename checks for
+   *  a label collision this way — instead of a second read that could see a different file. */
+  private async patchAccount(
+    id: string,
+    mutate: (a: StoredAccount, reg: Registry) => void,
+  ): Promise<StoredAccount> {
     const reg = await this.loadRegistry();
     const account = reg.accounts.find((a) => a.id === id);
     if (!account) throw new UnknownAccountError(id);
-    mutate(account);
+    mutate(account, reg);
     account.updatedAtMs = this.clock();
     await this.saveRegistry(reg);
+    return account;
   }
 
   // ---- secret bundles (DPAPI) ----

@@ -33,6 +33,8 @@ cctl accounts exclude <id|label>   # stop auto-switch from ever hopping TO this 
                                     # (manual `cctl switch` and the phone's /switch still work)
 cctl accounts include <id|label>   # let auto-switch consider this account again
 cctl accounts remove <id|label>    # remove a stored account
+cctl accounts rename <id|label> <new-label>
+                                    # give an account a new label; its id and usage history stay
 ```
 
 `relogin` and `reauth` differ only in how the login happens: `relogin` spawns a throwaway

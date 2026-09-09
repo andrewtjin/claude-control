@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { VaultError, type StoredAccount } from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
 import { CliFailure } from './context.js';
 import { VERSION, type SettingsReport } from './settings.js';
@@ -12,6 +13,9 @@ const engine = vi.hoisted(() => ({
   listAccounts: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
   setAutoSwitchExcluded: vi.fn(() => Promise.resolve()),
+  renameAccount: vi.fn((id: string, label: string): Promise<StoredAccount> =>
+    Promise.reject(new Error(`renameAccount(${id}, ${label}) not stubbed`)),
+  ),
 }));
 vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
@@ -92,7 +96,79 @@ describe('buildProgram', () => {
     const subs = accounts?.commands.map((c) => c.name()).sort();
     // `relogin` spawns a browser login on this host; `reauth` takes a pasted code instead, so a
     // headless/SSH host has a path too.
-    expect(subs).toEqual(['add', 'exclude', 'include', 'list', 'reauth', 'relogin', 'remove']);
+    expect(subs).toEqual([
+      'add',
+      'exclude',
+      'include',
+      'list',
+      'reauth',
+      'relogin',
+      'remove',
+      'rename',
+    ]);
+  });
+
+  describe('accounts rename', () => {
+    const work: StoredAccount = {
+      id: 'id-1',
+      label: 'work',
+      quarantined: false,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
+
+    /** Run one rename through commander with stdout captured. `fail()` throws a CliFailure that
+     *  the entry point turns into the error line and exit 1, so a refusal comes back here as its
+     *  message rather than as a process exit. */
+    async function rename(args: string[]) {
+      const out: string[] = [];
+      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+        out.push(String(chunk));
+        return true;
+      });
+      try {
+        await buildProgram().parseAsync(['accounts', 'rename', ...args], { from: 'user' });
+        return { out, failure: undefined };
+      } catch (e) {
+        if (!(e instanceof CliFailure)) throw e;
+        return { out, failure: e.message };
+      } finally {
+        stdout.mockRestore();
+      }
+    }
+
+    it('resolves the ref, renames by id and reports old name, new name and id', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockResolvedValueOnce({ ...work, label: 'personal' });
+      const r = await rename(['WORK', 'personal']);
+      expect(r.failure).toBeUndefined();
+      expect(engine.renameAccount).toHaveBeenCalledWith('id-1', 'personal');
+      expect(r.out.join('')).toBe('Renamed work to personal (id-1).\n');
+    });
+
+    it('answers a same-name rename without writing anything', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockClear();
+      const r = await rename(['work', ' work ']);
+      expect(r.failure).toBeUndefined();
+      expect(engine.renameAccount).not.toHaveBeenCalled();
+      expect(r.out.join('')).toBe('work already has that label.\n');
+    });
+
+    it('turns a vault refusal (collision, empty label) into a CLI failure', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockRejectedValueOnce(new VaultError('"home" already refers to x'));
+      const r = await rename(['work', 'home']);
+      expect(r.failure).toBe('"home" already refers to x');
+    });
+
+    it('fails on an unknown ref before touching the engine', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockClear();
+      const r = await rename(['nope', 'x']);
+      expect(r.failure).toMatch(/No account matches "nope"/);
+      expect(engine.renameAccount).not.toHaveBeenCalled();
+    });
   });
 
   it('nests session subcommands', () => {

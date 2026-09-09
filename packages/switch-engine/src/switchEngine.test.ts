@@ -1628,6 +1628,11 @@ describe('registry mutators serialize against the credential lock', () => {
     await expectBlockedWhileLocked(h.paths, (e) => e.removeAccount('any-id'));
   });
 
+  it('renameAccount waits on the lock', async () => {
+    const h = await harness();
+    await expectBlockedWhileLocked(h.paths, (e) => e.renameAccount('any-id', 'new-label'));
+  });
+
   it('clearQuarantine waits on the lock', async () => {
     const h = await harness();
     await expectBlockedWhileLocked(h.paths, (e) => e.clearQuarantine('any-id'));
