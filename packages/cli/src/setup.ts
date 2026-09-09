@@ -90,6 +90,9 @@ export interface SetupDeps {
   /** Whether autostart is registered — or 'unsupported' on a platform with no backend, which
    *  the wizard treats as done (nothing to register) and never calls `installAutostart` for. */
   autostartState(): Promise<AutostartState>;
+  /** What this host calls its autostart mechanism ("logon task", "LaunchAgent", "systemd user
+   *  service") — the word the step's lines use. Any value when the state is 'unsupported'. */
+  autostartNoun: string;
   /** Register/update autostart and start the daemon now (best-effort). */
   installAutostart(): Promise<AutostartResult>;
   /** Whether the daemon is now actually up (heartbeat alive) — the round-trip check. `wait`
@@ -242,13 +245,13 @@ export function renderSetupSummary(
   // exit, so the line hands over the manual start instead.
   const daemonLine = s.daemonAlive
     ? s.autostart === 'unsupported'
-      ? ok('daemon: running (started by hand — no autostart on this platform yet)')
+      ? ok('daemon: running (started by hand — no autostart on this platform)')
       : ok('daemon: running')
     : s.autostart === 'registered'
       ? warn('daemon: not running yet — starts at logon (or: cctl daemon install)')
       : s.autostart === 'unsupported'
         ? warn(
-            'daemon: not running — start it: cctl daemon supervise (no autostart on this platform yet)',
+            'daemon: not running — start it: cctl daemon supervise (no autostart on this platform)',
           )
         : warn('daemon: no autostart registered — run: cctl daemon install');
 
@@ -510,7 +513,7 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
     // A platform fact, not a failure: nothing to register and nothing to retry, so say how the
     // daemon runs here and check ONCE whether one is already up — no daemon was kicked, so
     // waiting for one to report in would only stall on a heartbeat that cannot come.
-    io.write(p.yellow(`Autostart is not available on this platform yet — ${MANUAL_START_HINT}.\n`));
+    io.write(p.yellow(`Autostart is not available on this platform — ${MANUAL_START_HINT}.\n`));
     daemonAlive = await deps.verifyDaemon({ wait: false });
     io.write(
       daemonAlive
@@ -527,7 +530,7 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
     } catch (err) {
       io.write(
         p.yellow(
-          `Could not register the logon task: ${(err as Error).message}\n` +
+          `Could not register the ${deps.autostartNoun}: ${(err as Error).message}\n` +
             'The daemon still runs manually (`cctl daemon run` or `cctl daemon supervise`); ' +
             'retry autostart later with `cctl daemon install`.\n',
         ),
@@ -539,7 +542,9 @@ export async function runSetup(deps: SetupDeps, options: SetupOptions = {}): Pro
         updated: 'Updated',
         unchanged: 'Already registered',
       }[autostart.task];
-      io.write(`${taskVerb} the logon task so the daemon starts automatically.\n`);
+      io.write(`${taskVerb} the ${deps.autostartNoun} so the daemon starts automatically.\n`);
+      // A backend's non-fatal remarks (a refused linger, say) are the user's to weigh.
+      for (const note of autostart.notes ?? []) io.write(p.yellow(`Note: ${note}\n`));
       if (!autostart.started) {
         io.write(
           p.yellow(

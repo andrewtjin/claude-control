@@ -12,9 +12,9 @@
 // runs no launchctl at all; changed content is rewritten and re-bootstrapped.
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join, posix } from 'node:path';
+import { defaultTextFileStore, type TextFileStore } from './textFileStore.js';
 
 export const DAEMON_AGENT_LABEL = 'com.claude-control.daemon';
 
@@ -29,34 +29,11 @@ export const defaultLaunchctlRunner: LaunchctlRunner = (args) =>
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 
-/** Filesystem seam, so the plist read/compare/write logic unit-tests in memory. */
-export interface PlistFs {
-  read(path: string): string | undefined;
-  write(path: string, content: string): void;
-  remove(path: string): void;
-}
+/** Filesystem seam, so the plist read/compare/write logic unit-tests in memory — the store
+ *  shared with the systemd backend (textFileStore.ts). */
+export type PlistFs = TextFileStore;
 
-const defaultPlistFs: PlistFs = {
-  read(path) {
-    try {
-      return readFileSync(path, 'utf8');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-      throw err;
-    }
-  },
-  write(path, content) {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, content, 'utf8');
-  },
-  remove(path) {
-    try {
-      unlinkSync(path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    }
-  },
-};
+const defaultPlistFs: PlistFs = defaultTextFileStore;
 
 /** Where launchd expects a per-user agent. Joined as a POSIX path on every platform: this is a
  *  macOS location by definition, so the platform separator would only ever be wrong — it turns

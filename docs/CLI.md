@@ -135,15 +135,17 @@ cctl daemon run --no-auto-switch       # never hop accounts automatically; for a
 cctl daemon supervise                  # run + auto-restart on crash or hang (same flags
                                         # as `daemon run`; a clean exit ends supervision)
 
-cctl daemon install     # register the logon Scheduled Task (Windows) / LaunchAgent (macOS)
-                        # and start the daemon now; on Linux it says there is no autostart yet
+cctl daemon install     # register autostart and start the daemon now: a Windows logon
+                        # Scheduled Task (from inside WSL too), a macOS LaunchAgent, or a
+                        # Linux systemd user unit — see docs/PLATFORM.md
 cctl daemon uninstall   # remove the logon task + the daemon's hook entries in settings.json
 cctl daemon status      # logon task, heartbeat, pairing, relay — at a glance
 ```
 
 `cctl daemon install`/`uninstall` are idempotent: install checks the current
-registration first and only calls `Register-ScheduledTask` when the resolved action
-actually differs, so re-running it (e.g. re-entering `cctl setup`) is a fast no-op. A
+registration first and only re-registers (`Register-ScheduledTask`, a rewritten plist
+or unit) when the resolved action actually differs, so re-running it (e.g. re-entering
+`cctl setup`) is a fast no-op. A
 second daemon instance is refused up front with an actionable message naming the
 running daemon's pid, not a raw exception.
 

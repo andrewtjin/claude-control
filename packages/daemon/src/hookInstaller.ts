@@ -268,11 +268,13 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<'r
   const hooksSection: JsonObject = settings.hooks;
 
   // `HookEventNames` has no index signature, so `Object.values` can't infer a typed array from
-  // it (TypeScript silently falls back to `any[]`) — list the five fields explicitly instead.
+  // it (TypeScript silently falls back to `any[]`) — list the six fields explicitly instead.
+  // Every event `installHooks` writes must appear here, or its entry survives an uninstall.
   const activeEventNames = options.eventNames ?? DEFAULT_HOOK_EVENT_NAMES;
   const events: string[] = [
     activeEventNames.permissionRequest,
     activeEventNames.stop,
+    activeEventNames.stopFailure,
     activeEventNames.notification,
     activeEventNames.postToolUse,
     activeEventNames.userPromptSubmit,

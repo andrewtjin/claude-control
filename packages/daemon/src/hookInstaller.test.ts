@@ -361,7 +361,7 @@ describe('uninstallHooks', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('removes every installed daemon hook (all five events) and leaves foreign entries + other keys intact', async () => {
+  it('removes every installed daemon hook (all six events) and leaves foreign entries + other keys intact', async () => {
     await writeFile(
       settingsPath,
       JSON.stringify(
@@ -393,6 +393,8 @@ describe('uninstallHooks', () => {
     expect(settings.hooks.Notification ?? []).toEqual([]);
     expect(settings.hooks.PostToolUse ?? []).toEqual([]);
     expect(settings.hooks.UserPromptSubmit ?? []).toEqual([]);
+    // StopFailure joined the default set later than the others and once outlived an uninstall.
+    expect(settings.hooks.StopFailure ?? []).toEqual([]);
     const stopCommands = (settings.hooks.Stop ?? []).flatMap((g) => g.hooks.map((h) => h.command));
     expect(stopCommands).toEqual(['some-other-tool --notify']);
   });

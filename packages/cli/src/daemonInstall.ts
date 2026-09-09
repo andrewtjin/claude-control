@@ -7,12 +7,16 @@
 // logic — what gets asked for, in what order, only when something actually needs to change —
 // is unit-tested without ever touching a real Task Scheduler.
 //
-// Idempotent by construction: `installDaemonTask` always queries the current registration
+// Idempotent by construction: `registerLogonTask` always queries the current registration
 // first and only calls `Register-ScheduledTask` when the resolved action differs from what's
 // already there, so a repeated `cctl daemon install` (e.g. re-entering the setup wizard) is a
 // fast no-op instead of an unconditional overwrite.
+//
+// Two backends share this file: the native Windows one (`installDaemonTask`, action = the npm
+// shim) and the WSL one (wslInstall.ts, action = `wsl.exe` into the distro). The task-level
+// mechanics are identical; only the action, the task name and the PowerShell binary differ.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { join } from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -58,30 +62,42 @@ export function decodePowerShellStderr(stderr: string): string {
   return lines.length > 0 ? lines.join('\n') : stderr.trim();
 }
 
-/** Production runner. stderr is piped so PowerShell's error text lands in the thrown error
- *  rather than on the parent console (same rationale as dpapi.ts's runner), decoded from
- *  CLIXML into the human-readable error lines. */
-export const defaultPowerShellRunner: PowerShellRunner = (script) => {
-  try {
-    return execFileSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(script)],
-      {
-        encoding: 'utf8',
-        windowsHide: true,
-        maxBuffer: 16 * 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    ).trim();
-  } catch (err) {
-    const stderr = (err as { stderr?: unknown }).stderr;
-    const raw =
-      typeof stderr === 'string' ? stderr : Buffer.isBuffer(stderr) ? stderr.toString('utf8') : '';
-    const decoded = decodePowerShellStderr(raw);
-    if (decoded.length === 0) throw err;
-    throw new Error(decoded, { cause: err });
-  }
-};
+/**
+ * Build a production runner for one PowerShell binary. The native Windows backend runs the
+ * bare `powershell.exe` from PATH; the WSL backend names the Windows binary by its `/mnt`
+ * path, because a distro's PATH need not carry the Windows interop entries at all. stderr is
+ * piped so PowerShell's error text lands in the thrown error rather than on the parent console
+ * (same rationale as dpapi.ts's runner), decoded from CLIXML into the human-readable lines.
+ */
+export function powerShellRunner(executable = 'powershell.exe'): PowerShellRunner {
+  return (script) => {
+    try {
+      return execFileSync(
+        executable,
+        ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(script)],
+        {
+          encoding: 'utf8',
+          windowsHide: true,
+          maxBuffer: 16 * 1024 * 1024,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      ).trim();
+    } catch (err) {
+      const stderr = (err as { stderr?: unknown }).stderr;
+      const raw =
+        typeof stderr === 'string'
+          ? stderr
+          : Buffer.isBuffer(stderr)
+            ? stderr.toString('utf8')
+            : '';
+      const decoded = decodePowerShellStderr(raw);
+      if (decoded.length === 0) throw err;
+      throw new Error(decoded, { cause: err });
+    }
+  };
+}
+
+export const defaultPowerShellRunner: PowerShellRunner = powerShellRunner();
 
 /** Escape a value for interpolation into a PowerShell single-quoted string literal. */
 function psSingleQuote(value: string): string {
@@ -99,24 +115,26 @@ export interface ResolveCctlShimPathOptions {
   platform?: NodeJS.Platform;
 }
 
+// One fixed command string through the shell: npm is a .cmd shim on Windows, which only a
+// shell can run, and a string (rather than an args array with `shell: true`) keeps Node from
+// warning about unescaped arguments — there are none to escape.
 const defaultNpmPrefix = (): string =>
-  execFileSync('npm', ['prefix', '-g'], {
+  execSync('npm prefix -g', {
     encoding: 'utf8',
-    shell: true, // npm is a .cmd shim on Windows; the daemon install flow that calls this is Windows-only
     windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 
 /**
  * Absolute path to the `cctl` command shim npm generated for this machine's global install.
- * A Scheduled Task action does not inherit an interactive shell's PATH, so the task must name
- * this file outright rather than the bare `cctl` command — resolved once, at install time.
+ * No autostart mechanism inherits an interactive shell's PATH, so each names this file
+ * outright rather than the bare `cctl` command — resolved once, at install time.
  */
 export function resolveCctlShimPath(options: ResolveCctlShimPathOptions = {}): string {
   const platform = options.platform ?? process.platform;
   const prefix = (options.npmPrefix ?? defaultNpmPrefix)();
   // Windows: npm places command shims (`<name>.cmd`) directly in the global prefix directory.
-  // Unix: they live under `<prefix>/bin/<name>` — kept here for completeness even though the
-  // daemon itself is Windows-only this round (macOS stays on its own gated port).
+  // Unix (nvm prefixes included): they live under `<prefix>/bin/<name>`.
   return platform === 'win32' ? join(prefix, 'cctl.cmd') : join(prefix, 'bin', 'cctl');
 }
 
@@ -129,6 +147,9 @@ export const DAEMON_TASK_NAME = 'ClaudeControlDaemon';
 /** The arguments the task always runs the shim with — a plain, un-flagged `cctl daemon run`.
  *  Exported so install/uninstall and their tests share one literal instead of two. */
 export const DAEMON_TASK_ARGUMENTS = 'daemon run';
+
+export const DAEMON_TASK_DESCRIPTION =
+  'claude-control daemon (managed by cctl; see: cctl daemon uninstall)';
 
 export interface DaemonTaskQuery {
   registered: boolean;
@@ -196,15 +217,23 @@ const RESTART_INTERVAL_MINUTES = 1;
 
 export type DaemonTaskOutcome = 'created' | 'updated' | 'unchanged';
 
-export interface InstallDaemonTaskOptions {
-  /** Absolute path to the cctl shim the task should invoke (see `resolveCctlShimPath`). */
-  shimPath: string;
+/** What a logon task runs: `execute` is the program, `arguments` its single argument string —
+ *  exactly Task Scheduler's own two action fields, so a query compares like-for-like. */
+export interface LogonTaskAction {
+  execute: string;
+  arguments: string;
+}
+
+export interface RegisterLogonTaskOptions {
+  action: LogonTaskAction;
+  taskName: string;
+  /** Task Scheduler's Description column — says who owns the task and how to remove it. */
+  description: string;
   run?: PowerShellRunner;
-  taskName?: string;
 }
 
 /**
- * Register (or update) the logon Scheduled Task that runs `<shimPath> daemon run`. Checks the
+ * Register (or update) a logon-triggered Scheduled Task with the given action. Checks the
  * current registration first and calls `Register-ScheduledTask` only when the resolved action
  * actually differs — an unregistered task is 'created', a registered one whose command line
  * changed (e.g. npm reinstalled to a new location) is 'updated', and an already-correct one is
@@ -215,15 +244,15 @@ export interface InstallDaemonTaskOptions {
  * stray `Start-ScheduledTask` call never even reaches the point where the lock would have to
  * reject it.
  */
-export function installDaemonTask(options: InstallDaemonTaskOptions): DaemonTaskOutcome {
+export function registerLogonTask(options: RegisterLogonTaskOptions): DaemonTaskOutcome {
   const run = options.run ?? defaultPowerShellRunner;
-  const taskName = options.taskName ?? DAEMON_TASK_NAME;
+  const { taskName, action } = options;
 
   const existing = queryDaemonTask(run, taskName);
   if (
     existing.registered &&
-    existing.execute === options.shimPath &&
-    existing.arguments === DAEMON_TASK_ARGUMENTS
+    existing.execute === action.execute &&
+    existing.arguments === action.arguments
   ) {
     return 'unchanged';
   }
@@ -234,13 +263,30 @@ export function installDaemonTask(options: InstallDaemonTaskOptions): DaemonTask
   // daemon needs anyway — it can only run under this user's DPAPI scope.
   const script = `
 $ErrorActionPreference = 'Stop'
-$Action = New-ScheduledTaskAction -Execute '${psSingleQuote(options.shimPath)}' -Argument '${psSingleQuote(DAEMON_TASK_ARGUMENTS)}'
+$Action = New-ScheduledTaskAction -Execute '${psSingleQuote(action.execute)}' -Argument '${psSingleQuote(action.arguments)}'
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 $Settings = New-ScheduledTaskSettingsSet -RestartCount ${RESTART_COUNT} -RestartInterval (New-TimeSpan -Minutes ${RESTART_INTERVAL_MINUTES}) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName '${psSingleQuote(taskName)}' -Action $Action -Trigger $Trigger -Settings $Settings -Description 'claude-control daemon (managed by cctl; see: cctl daemon uninstall)' -Force | Out-Null
+Register-ScheduledTask -TaskName '${psSingleQuote(taskName)}' -Action $Action -Trigger $Trigger -Settings $Settings -Description '${psSingleQuote(options.description)}' -Force | Out-Null
 `;
   run(script);
   return existing.registered ? 'updated' : 'created';
+}
+
+export interface InstallDaemonTaskOptions {
+  /** Absolute path to the cctl shim the task should invoke (see `resolveCctlShimPath`). */
+  shimPath: string;
+  run?: PowerShellRunner;
+  taskName?: string;
+}
+
+/** The native Windows backend: the logon task runs `<shimPath> daemon run` directly. */
+export function installDaemonTask(options: InstallDaemonTaskOptions): DaemonTaskOutcome {
+  return registerLogonTask({
+    action: { execute: options.shimPath, arguments: DAEMON_TASK_ARGUMENTS },
+    taskName: options.taskName ?? DAEMON_TASK_NAME,
+    description: DAEMON_TASK_DESCRIPTION,
+    ...(options.run ? { run: options.run } : {}),
+  });
 }
 
 // ---------------------------------------------------------------------------

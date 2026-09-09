@@ -244,6 +244,7 @@ function makeDeps(io: WizardIo, overrides: Partial<SetupDeps> = {}): SetupDeps {
     isPaired: () => Promise.resolve(false),
     pair: () => Promise.resolve({ ok: true }),
     autostartState: () => Promise.resolve('unregistered'),
+    autostartNoun: 'logon task',
     installAutostart: () => Promise.resolve({ task: 'created', started: true }),
     verifyDaemon: () => Promise.resolve(true),
   };
@@ -526,6 +527,26 @@ describe('runSetup', () => {
     expect(text()).not.toContain('Registered the logon task');
   });
 
+  it("prints a backend's notes under the registration line, in the host's own noun", async () => {
+    const { io, text } = makeIo(['', 'n', 's']);
+    const outcome = await runSetup(
+      makeDeps(io, {
+        autostartNoun: 'systemd user service',
+        installAutostart: () =>
+          Promise.resolve({
+            task: 'created',
+            started: true,
+            notes: ['could not enable linger (refused); the service starts at your next login'],
+          }),
+      }),
+    );
+    expect(outcome).toBe('completed');
+    expect(text()).toContain(
+      'Registered the systemd user service so the daemon starts automatically.',
+    );
+    expect(text()).toContain('Note: could not enable linger (refused)');
+  });
+
   // --- a platform with no autostart backend (Linux, WSL2 included) ---------------------------
   // The wizard used to hand this platform to the Windows Scheduled Task path, which died with
   // `spawnSync powershell.exe ENOENT` at step 7. Now the step is a statement of fact plus the
@@ -552,7 +573,7 @@ describe('runSetup', () => {
     expect(installs).toBe(0);
     const out = text();
     expect(out).toContain('[8/8]');
-    expect(out).toContain('Autostart is not available on this platform yet');
+    expect(out).toContain('Autostart is not available on this platform');
     expect(out).toContain('cctl daemon supervise');
     // Nothing was kicked, so the round-trip check reads once instead of waiting for it.
     expect(verifyCalls).toEqual([{ wait: false }]);

@@ -1,234 +1,359 @@
 import { describe, it, expect } from 'vitest';
 import {
+  AUTOSTART_BACKEND_ENV,
   AUTOSTART_UNSUPPORTED_NOTE,
   AutostartUnsupportedError,
   autostartBackend,
   autostartNoun,
+  autostartUnsupportedNote,
+  detectAutostartHost,
   installAutostart,
   queryAutostart,
   readAutostartState,
   uninstallAutostart,
+  type AutostartBackend,
   type AutostartBackends,
+  type AutostartHost,
 } from './autostart.js';
 
-// --- fake backends ----------------------------------------------------------------------------
-// Every call is recorded so each test proves not only what the dispatch returned but which
-// backend it reached — the defect this module exists to prevent is a call reaching the WRONG
-// one (Linux in the Windows backend), and "no call at all" on a platform without a backend is
-// as much the contract as the return value.
+// --- fixtures --------------------------------------------------------------------------------------
 
-type Overrides = {
-  scheduledTask?: Partial<AutostartBackends['scheduledTask']>;
-  launchAgent?: Partial<AutostartBackends['launchAgent']>;
+const host = (facts: Partial<AutostartHost> & { platform: NodeJS.Platform }): AutostartHost => ({
+  systemdUser: false,
+  ...facts,
+});
+
+const WSL_OK = {
+  distro: 'Ubuntu',
+  powerShell: '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
 };
+const WSL_NO_INTEROP = { distro: 'Ubuntu' };
 
-function fakeBackends(overrides: Overrides = {}) {
+/** Fake backends that record every call as `<backend>.<verb>`, so each test proves not only
+ *  what the dispatch returned but which backend it reached — the defect this module exists to
+ *  prevent is a call reaching the WRONG one, and "no call at all" on a host without a backend
+ *  is as much the contract as the return value. */
+function fakeBackends() {
   const calls: string[] = [];
+  const impl = (name: Exclude<AutostartBackend, 'none'>, withStart: boolean) => ({
+    install: (shimPath: string) => {
+      calls.push(`${name}.install ${shimPath}`);
+      return { outcome: 'created' as const };
+    },
+    ...(withStart
+      ? {
+          startNow: () => {
+            calls.push(`${name}.startNow`);
+          },
+        }
+      : {}),
+    query: () => {
+      calls.push(`${name}.query`);
+      return { registered: true, state: 'Ready' };
+    },
+    uninstall: () => {
+      calls.push(`${name}.uninstall`);
+      return 'removed' as const;
+    },
+  });
   const backends: AutostartBackends = {
-    scheduledTask: {
-      install: (shimPath) => {
-        calls.push(`task.install ${shimPath}`);
-        return 'created';
-      },
-      startNow: () => {
-        calls.push('task.startNow');
-      },
-      query: () => {
-        calls.push('task.query');
-        return { registered: true, state: 'Ready' };
-      },
-      uninstall: () => {
-        calls.push('task.uninstall');
-        return 'removed';
-      },
-      ...overrides.scheduledTask,
-    },
-    launchAgent: {
-      install: (shimPath) => {
-        calls.push(`agent.install ${shimPath}`);
-        return 'updated';
-      },
-      query: () => {
-        calls.push('agent.query');
-        return { registered: true, state: 'Loaded' };
-      },
-      uninstall: () => {
-        calls.push('agent.uninstall');
-        return 'not_installed';
-      },
-      ...overrides.launchAgent,
-    },
+    'scheduled-task': impl('scheduled-task', true),
+    'launch-agent': impl('launch-agent', false),
+    'wsl-task': impl('wsl-task', true),
+    'systemd-user': impl('systemd-user', true),
   };
   return { backends, calls };
 }
 
-// --- platform → backend -----------------------------------------------------------------------
+// --- detectAutostartHost ---------------------------------------------------------------------------
 
-describe('autostartBackend', () => {
-  it('maps Windows and macOS to their backends and everything else to none', () => {
-    expect(autostartBackend('win32')).toBe('scheduled-task');
-    expect(autostartBackend('darwin')).toBe('launch-agent');
-    // Linux covers WSL2 too: `process.platform` is 'linux' there even with Windows interop on
-    // PATH, and the Windows backend would register a task pointing at a Linux path.
-    for (const platform of ['linux', 'freebsd', 'openbsd', 'sunos', 'aix', 'android'] as const) {
-      expect(autostartBackend(platform)).toBe('none');
-    }
+describe('detectAutostartHost', () => {
+  const never = () => {
+    throw new Error('probed off Linux');
+  };
+
+  it('probes nothing off Linux', () => {
+    expect(
+      detectAutostartHost({ platform: 'win32', env: {}, wsl: never, systemdUser: never }),
+    ).toEqual({ platform: 'win32', systemdUser: false });
+  });
+
+  it('gathers the WSL and systemd facts on Linux', () => {
+    expect(
+      detectAutostartHost({
+        platform: 'linux',
+        env: {},
+        wsl: () => WSL_OK,
+        systemdUser: () => true,
+      }),
+    ).toEqual({ platform: 'linux', wsl: WSL_OK, systemdUser: true });
+  });
+
+  it('keeps a recognized override and drops an unrecognized one', () => {
+    const probes = { wsl: () => undefined, systemdUser: () => false };
+    expect(
+      detectAutostartHost({
+        platform: 'linux',
+        env: { [AUTOSTART_BACKEND_ENV]: 'none' },
+        ...probes,
+      }).override,
+    ).toBe('none');
+    expect(
+      detectAutostartHost({
+        platform: 'linux',
+        env: { [AUTOSTART_BACKEND_ENV]: 'cron' },
+        ...probes,
+      }).override,
+    ).toBeUndefined();
   });
 
   it('defaults to the running platform', () => {
-    expect(autostartBackend()).toBe(autostartBackend(process.platform));
+    expect(detectAutostartHost().platform).toBe(process.platform);
+  });
+});
+
+// --- autostartBackend ------------------------------------------------------------------------------
+
+describe('autostartBackend', () => {
+  it('maps Windows and macOS by platform alone', () => {
+    expect(autostartBackend(host({ platform: 'win32' }))).toBe('scheduled-task');
+    expect(autostartBackend(host({ platform: 'darwin', systemdUser: true }))).toBe('launch-agent');
+  });
+
+  it('gives a plain Linux box the systemd user unit, and nothing without a user manager', () => {
+    expect(autostartBackend(host({ platform: 'linux', systemdUser: true }))).toBe('systemd-user');
+    expect(autostartBackend(host({ platform: 'linux' }))).toBe('none');
+  });
+
+  it('prefers the Windows task inside WSL even when systemd is also running there', () => {
+    // A unit inside the distro dies with WSL's idle shutdown; the Windows task keeps it alive.
+    expect(autostartBackend(host({ platform: 'linux', wsl: WSL_OK, systemdUser: true }))).toBe(
+      'wsl-task',
+    );
+  });
+
+  it('falls back to systemd inside WSL only when the Windows side is unreachable', () => {
+    expect(
+      autostartBackend(host({ platform: 'linux', wsl: WSL_NO_INTEROP, systemdUser: true })),
+    ).toBe('systemd-user');
+    expect(autostartBackend(host({ platform: 'linux', wsl: WSL_NO_INTEROP }))).toBe('none');
+  });
+
+  it('honors the override, and an ask the host cannot meet becomes none, not the other backend', () => {
+    expect(autostartBackend(host({ platform: 'linux', wsl: WSL_OK, override: 'none' }))).toBe(
+      'none',
+    );
+    expect(
+      autostartBackend(host({ platform: 'linux', wsl: WSL_OK, override: 'systemd-user' })),
+    ).toBe('systemd-user');
+    expect(
+      autostartBackend(host({ platform: 'linux', systemdUser: true, override: 'wsl-task' })),
+    ).toBe('none');
+    expect(autostartBackend(host({ platform: 'linux', wsl: WSL_OK, override: 'wsl-task' }))).toBe(
+      'wsl-task',
+    );
+  });
+
+  it('ignores the override off Linux', () => {
+    expect(autostartBackend(host({ platform: 'win32', override: 'none' }))).toBe('scheduled-task');
+  });
+
+  it('has no backend for the other platforms', () => {
+    for (const platform of ['freebsd', 'openbsd', 'sunos', 'aix', 'android'] as const) {
+      expect(autostartBackend(host({ platform, systemdUser: true }))).toBe('none');
+    }
+  });
+
+  it('defaults to the detected host', () => {
+    expect(autostartBackend()).toBe(autostartBackend(detectAutostartHost()));
   });
 
   it('names the mechanism the way the surfaces print it', () => {
     expect(autostartNoun('scheduled-task')).toBe('logon task');
+    expect(autostartNoun('wsl-task')).toBe('logon task');
     expect(autostartNoun('launch-agent')).toBe('LaunchAgent');
+    expect(autostartNoun('systemd-user')).toBe('systemd user service');
   });
 });
 
-// --- a platform without a backend --------------------------------------------------------------
+// --- autostartUnsupportedNote ------------------------------------------------------------------------
 
-describe('dispatch on a platform without a backend', () => {
-  it('install throws the unsupported error without touching either backend', () => {
-    const { backends, calls } = fakeBackends();
-    expect(() => installAutostart('/usr/local/bin/cctl', { platform: 'linux', backends })).toThrow(
-      AutostartUnsupportedError,
-    );
-    expect(() => installAutostart('/usr/local/bin/cctl', { platform: 'linux', backends })).toThrow(
+describe('autostartUnsupportedNote', () => {
+  it('always carries the manual start, and no platform name in the generic form', () => {
+    expect(AUTOSTART_UNSUPPORTED_NOTE).toContain('cctl daemon supervise');
+    expect(AUTOSTART_UNSUPPORTED_NOTE).toContain('this platform');
+    expect(autostartUnsupportedNote(host({ platform: 'freebsd' }))).toBe(
       AUTOSTART_UNSUPPORTED_NOTE,
     );
+  });
+
+  it('names the WSL distro and interop when the Windows side is unreachable', () => {
+    const note = autostartUnsupportedNote(host({ platform: 'linux', wsl: WSL_NO_INTEROP }));
+    expect(note).toContain('Ubuntu');
+    expect(note).toContain('interop');
+  });
+
+  it('names the missing user manager on a plain Linux box', () => {
+    expect(autostartUnsupportedNote(host({ platform: 'linux' }))).toContain('systemctl --user');
+  });
+
+  it('names the opt-out, and a wsl-task ask outside WSL', () => {
+    expect(autostartUnsupportedNote(host({ platform: 'linux', override: 'none' }))).toContain(
+      `${AUTOSTART_BACKEND_ENV}=none`,
+    );
+    expect(
+      autostartUnsupportedNote(
+        host({ platform: 'linux', systemdUser: true, override: 'wsl-task' }),
+      ),
+    ).toContain('not a WSL distro');
+  });
+});
+
+// --- dispatch on a host without a backend -------------------------------------------------------------
+
+describe('dispatch on a host without a backend', () => {
+  const none = host({ platform: 'linux' });
+
+  it('install throws the unsupported error with the reason, touching no backend', () => {
+    const { backends, calls } = fakeBackends();
+    expect(() => installAutostart('/usr/local/bin/cctl', { host: none, backends })).toThrow(
+      AutostartUnsupportedError,
+    );
+    expect(() => installAutostart('/usr/local/bin/cctl', { host: none, backends })).toThrow(
+      'systemctl --user',
+    );
     expect(calls).toEqual([]);
   });
 
-  it('the unsupported note tells the reader how to run the daemon instead', () => {
-    expect(AUTOSTART_UNSUPPORTED_NOTE).toContain('cctl daemon supervise');
-    // Never names a platform: the wizard and renderers print it from injected state, so their
-    // tests must not depend on the host they run on.
-    expect(AUTOSTART_UNSUPPORTED_NOTE).toContain('this platform');
-  });
-
-  it('uninstall reports unsupported as an outcome, not an error, and calls nothing', () => {
+  it('uninstall and query report the fact rather than an error, and call nothing', () => {
     const { backends, calls } = fakeBackends();
-    expect(uninstallAutostart({ platform: 'linux', backends })).toBe('unsupported');
-    expect(calls).toEqual([]);
-  });
-
-  it('query and the folded state say unsupported and call nothing', () => {
-    const { backends, calls } = fakeBackends();
-    expect(queryAutostart({ platform: 'linux', backends })).toEqual({ supported: false });
-    expect(readAutostartState({ platform: 'linux', backends })).toBe('unsupported');
+    expect(uninstallAutostart({ host: none, backends })).toBe('unsupported');
+    expect(queryAutostart({ host: none, backends })).toEqual({ supported: false });
+    expect(readAutostartState({ host: none, backends })).toBe('unsupported');
     expect(calls).toEqual([]);
   });
 });
 
-// --- Windows: Scheduled Task ------------------------------------------------------------------
+// --- dispatch per backend -------------------------------------------------------------------------------
 
-describe('dispatch on win32', () => {
-  it('installs through the Scheduled Task backend and then starts the task', () => {
-    const { backends, calls } = fakeBackends();
-    const result = installAutostart('C:\\npm\\cctl.cmd', { platform: 'win32', backends });
-    expect(result).toEqual({ task: 'created', started: true });
-    expect(calls).toEqual(['task.install C:\\npm\\cctl.cmd', 'task.startNow']);
+describe('dispatch per backend', () => {
+  const cases: {
+    title: string;
+    host: AutostartHost;
+    backend: Exclude<AutostartBackend, 'none'>;
+  }[] = [
+    {
+      title: 'Windows → Scheduled Task',
+      host: host({ platform: 'win32' }),
+      backend: 'scheduled-task',
+    },
+    { title: 'macOS → LaunchAgent', host: host({ platform: 'darwin' }), backend: 'launch-agent' },
+    {
+      title: 'WSL → Windows task',
+      host: host({ platform: 'linux', wsl: WSL_OK }),
+      backend: 'wsl-task',
+    },
+    {
+      title: 'Linux → systemd user unit',
+      host: host({ platform: 'linux', systemdUser: true }),
+      backend: 'systemd-user',
+    },
+  ];
+
+  for (const { title, host: h, backend } of cases) {
+    it(`${title}: install, query, and uninstall reach exactly that backend`, () => {
+      const { backends, calls } = fakeBackends();
+      const result = installAutostart('/p/cctl', { host: h, backends });
+      expect(result).toEqual({ task: 'created', started: true });
+      expect(queryAutostart({ host: h, backends })).toEqual({
+        supported: true,
+        noun: autostartNoun(backend),
+        registered: true,
+        state: 'Ready',
+      });
+      expect(readAutostartState({ host: h, backends })).toBe('registered');
+      expect(uninstallAutostart({ host: h, backends })).toBe('removed');
+      const expected = [`${backend}.install /p/cctl`];
+      if (backends[backend].startNow !== undefined) expected.push(`${backend}.startNow`);
+      expected.push(`${backend}.query`, `${backend}.query`, `${backend}.uninstall`);
+      expect(calls).toEqual(expected);
+    });
+  }
+
+  it("passes a backend's notes through, and omits the field when there are none", () => {
+    const { backends } = fakeBackends();
+    const linux = host({ platform: 'linux', systemdUser: true });
+    backends['systemd-user'].install = () => ({
+      outcome: 'created',
+      notes: ['could not enable linger (refused)'],
+    });
+    expect(installAutostart('/p/cctl', { host: linux, backends })).toEqual({
+      task: 'created',
+      started: true,
+      notes: ['could not enable linger (refused)'],
+    });
+    backends['systemd-user'].install = () => ({ outcome: 'created', notes: [] });
+    expect(installAutostart('/p/cctl', { host: linux, backends })).toEqual({
+      task: 'created',
+      started: true,
+    });
   });
 
   it('reports a failed start as started:false with the detail, keeping the registration', () => {
-    const { backends } = fakeBackends({
-      scheduledTask: {
-        startNow: () => {
-          throw new Error('already running');
-        },
-      },
-    });
-    expect(installAutostart('C:\\npm\\cctl.cmd', { platform: 'win32', backends })).toEqual({
-      task: 'created',
-      started: false,
-      detail: 'already running',
-    });
+    const { backends } = fakeBackends();
+    backends['systemd-user'].startNow = () => {
+      throw new Error('Failed to start: unit masked');
+    };
+    expect(
+      installAutostart('/p/cctl', {
+        host: host({ platform: 'linux', systemdUser: true }),
+        backends,
+      }),
+    ).toEqual({ task: 'created', started: false, detail: 'Failed to start: unit masked' });
   });
 
-  it('lets a registration failure propagate (nothing to start)', () => {
-    const { backends, calls } = fakeBackends({
-      scheduledTask: {
-        install: () => {
-          throw new Error('Register-ScheduledTask : Access is denied.');
-        },
-      },
-    });
-    expect(() => installAutostart('C:\\npm\\cctl.cmd', { platform: 'win32', backends })).toThrow(
-      'Access is denied',
-    );
-    expect(calls).not.toContain('task.startNow');
-  });
-
-  it('queries, uninstalls, and folds state through the Scheduled Task backend', () => {
+  it('lets a registration failure propagate, starting nothing', () => {
     const { backends, calls } = fakeBackends();
-    expect(queryAutostart({ platform: 'win32', backends })).toEqual({
-      supported: true,
-      registered: true,
-      state: 'Ready',
-    });
-    expect(readAutostartState({ platform: 'win32', backends })).toBe('registered');
-    expect(uninstallAutostart({ platform: 'win32', backends })).toBe('removed');
-    expect(calls).toEqual(['task.query', 'task.query', 'task.uninstall']);
+    backends['wsl-task'].install = () => {
+      throw new Error('Register-ScheduledTask : Access is denied.');
+    };
+    expect(() =>
+      installAutostart('/p/cctl', { host: host({ platform: 'linux', wsl: WSL_OK }), backends }),
+    ).toThrow('Access is denied');
+    expect(calls).not.toContain('wsl-task.startNow');
   });
 
-  it('reads a backend that cannot even be asked as not registered rather than throwing', () => {
-    // `cctl daemon status` and the summaries must keep rendering their other lines.
-    const { backends } = fakeBackends({
-      scheduledTask: {
-        query: () => {
-          throw new Error('spawnSync powershell.exe ENOENT');
-        },
-      },
-    });
-    expect(queryAutostart({ platform: 'win32', backends })).toEqual({
-      supported: true,
-      registered: false,
-    });
-    expect(readAutostartState({ platform: 'win32', backends })).toBe('unregistered');
-  });
-
-  it('omits state when the backend reports none', () => {
-    const { backends } = fakeBackends({
-      scheduledTask: { query: () => ({ registered: false }) },
-    });
-    expect(queryAutostart({ platform: 'win32', backends })).toEqual({
-      supported: true,
-      registered: false,
-    });
-  });
-});
-
-// --- macOS: LaunchAgent -----------------------------------------------------------------------
-
-describe('dispatch on darwin', () => {
-  it('installs through the LaunchAgent backend, which starts as part of registering', () => {
-    const { backends, calls } = fakeBackends();
-    const result = installAutostart('/usr/local/bin/cctl', { platform: 'darwin', backends });
-    expect(result).toEqual({ task: 'updated', started: true });
-    // No separate start call exists on this backend — and no Scheduled Task call ever happens.
-    expect(calls).toEqual(['agent.install /usr/local/bin/cctl']);
-  });
-
-  it('treats an unchanged (already loaded) agent as started', () => {
-    const { backends } = fakeBackends({ launchAgent: { install: () => 'unchanged' } });
-    expect(installAutostart('/usr/local/bin/cctl', { platform: 'darwin', backends })).toEqual({
+  it('treats an unchanged LaunchAgent as started — registering is what starts it', () => {
+    const { backends } = fakeBackends();
+    backends['launch-agent'].install = () => ({ outcome: 'unchanged' });
+    expect(installAutostart('/p/cctl', { host: host({ platform: 'darwin' }), backends })).toEqual({
       task: 'unchanged',
       started: true,
     });
   });
 
-  it('queries, uninstalls, and folds state through the LaunchAgent backend', () => {
-    const { backends, calls } = fakeBackends();
-    backends.launchAgent.query = () => {
-      calls.push('agent.query');
-      return { registered: false };
+  it('reads a backend that cannot even be asked as not registered rather than throwing', () => {
+    const { backends } = fakeBackends();
+    backends['scheduled-task'].query = () => {
+      throw new Error('spawnSync powershell.exe ENOENT');
     };
-    expect(queryAutostart({ platform: 'darwin', backends })).toEqual({
+    expect(queryAutostart({ host: host({ platform: 'win32' }), backends })).toEqual({
       supported: true,
+      noun: 'logon task',
       registered: false,
     });
-    expect(readAutostartState({ platform: 'darwin', backends })).toBe('unregistered');
-    expect(uninstallAutostart({ platform: 'darwin', backends })).toBe('not_installed');
-    expect(calls).toEqual(['agent.query', 'agent.query', 'agent.uninstall']);
+    expect(readAutostartState({ host: host({ platform: 'win32' }), backends })).toBe(
+      'unregistered',
+    );
+  });
+
+  it('omits state when the backend reports none', () => {
+    const { backends } = fakeBackends();
+    backends['scheduled-task'].query = () => ({ registered: false });
+    expect(queryAutostart({ host: host({ platform: 'win32' }), backends })).toEqual({
+      supported: true,
+      noun: 'logon task',
+      registered: false,
+    });
   });
 });
