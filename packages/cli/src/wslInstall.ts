@@ -9,8 +9,9 @@
 //
 // It fires at Windows logon like the native task, its `wsl.exe` session keeps the distro alive
 // for as long as the daemon runs, and Task Scheduler restarts it with the same settings. The
-// login shell (`-l`) matters: it loads the user's profile, which is where nvm and friends put
-// `node` on PATH — the npm shim re-execs `node` by name and the daemon spawns `claude`.
+// login shell (`-l`) loads the user's profile so the daemon can spawn `claude` by name; the
+// shim's own bin directory is pinned onto PATH as well, because the profile alone does not
+// reliably reach an nvm-installed `node` (see `wslTaskAction`).
 //
 // Registration goes through Windows interop: the Windows PowerShell binary named by its
 // `/mnt` path (a distro's PATH need not carry the Windows entries at all) running the very
@@ -86,15 +87,27 @@ export function wslTaskName(distro: string): string {
   return `${WSL_TASK_NAME_PREFIX}${distro.replace(/[\\/:*?"<>|]/g, '_')}`;
 }
 
+/** Quote one word for bash inside single quotes; an apostrophe uses the `'\''` idiom. */
+function bashQuote(word: string): string {
+  return `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
 /**
  * The task action. Task Scheduler hands `arguments` to `wsl.exe` as one Windows command line,
  * split by the usual Windows rules (double quotes group, single quotes do not), and everything
  * after `--exec` reaches the distro verbatim as argv — so the whole `bash -lc` script must be
- * ONE double-quoted Windows token. Inside it the shim is single-quoted for bash, so a path with
- * spaces survives the second split; an apostrophe in the path uses bash's `'\''` idiom (the
- * backslash is literal to the Windows splitter, which only treats one before a double quote
- * specially). A double quote anywhere would end the Windows token early, so it is refused
- * outright rather than mis-quoted into a task that silently runs the wrong thing.
+ * ONE double-quoted Windows token. Inside it every path is single-quoted for bash, so spaces
+ * survive the second split and an apostrophe rides bash's `'\''` idiom (the backslash is
+ * literal to the Windows splitter, which only treats one before a double quote specially). A
+ * double quote anywhere would end the Windows token early, so it is refused outright rather
+ * than mis-quoted into a task that silently runs the wrong thing.
+ *
+ * The script pins the shim's own bin directory ahead of PATH before exec'ing the shim. The
+ * login shell alone is not enough: on Linux the npm shim is a symlink to a `#!/usr/bin/env
+ * node` script, and an nvm-installed `node` lives beside the shim but only reaches PATH from
+ * `~/.bashrc` — which Ubuntu's stock profile exits early for non-interactive shells, before
+ * nvm's lines at its end ever run. (`$PATH` is safe unquoted inside an `export` assignment:
+ * bash gives it assignment semantics, no word splitting.)
  */
 export function wslTaskAction(distro: string, shimPath: string): LogonTaskAction {
   if (shimPath.includes('"') || distro.includes('"')) {
@@ -102,7 +115,10 @@ export function wslTaskAction(distro: string, shimPath: string): LogonTaskAction
       `cannot build a wsl.exe command line for a path or distro name containing a double quote: ${shimPath.includes('"') ? shimPath : distro}`,
     );
   }
-  const bashScript = `'${shimPath.replace(/'/g, `'\\''`)}' ${DAEMON_TASK_ARGUMENTS}`;
+  const binDir = posix.dirname(shimPath);
+  const bashScript =
+    `export PATH=${bashQuote(binDir)}:$PATH; ` +
+    `exec ${bashQuote(shimPath)} ${DAEMON_TASK_ARGUMENTS}`;
   const distroArg = /\s/.test(distro) ? `"${distro}"` : distro;
   return {
     execute: 'wsl.exe',

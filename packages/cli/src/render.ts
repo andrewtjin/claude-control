@@ -397,10 +397,10 @@ function taskLine(task: AutostartQuery, palette: Palette): string {
     return `${palette.yellow('[--]')} autostart not available on this platform — ${MANUAL_START_HINT}`;
   }
   if (!task.registered) {
-    return `${palette.yellow('[--]')} logon task not registered — run: cctl daemon install`;
+    return `${palette.yellow('[--]')} ${task.noun} not registered — run: cctl daemon install`;
   }
   const state = task.state ? ` (${task.state})` : '';
-  return `${palette.green('[ok]')} logon task registered${state}`;
+  return `${palette.green('[ok]')} ${task.noun} registered${state}`;
 }
 
 /** The heartbeat line additionally reads the autostart query: a stale heartbeat backed by a

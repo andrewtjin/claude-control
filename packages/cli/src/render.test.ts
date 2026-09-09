@@ -484,7 +484,7 @@ describe('renderPacingLine', () => {
 
 describe('renderDaemonStatus', () => {
   const healthy: DaemonStatusView = {
-    task: { supported: true, registered: true, state: 'Ready' },
+    task: { supported: true, noun: 'logon task', registered: true, state: 'Ready' },
     heartbeat: { state: 'alive', writtenAtMs: 0, ageMs: 5_000 },
     paired: true,
     relayUrl: 'wss://relay.example.com',
@@ -499,8 +499,26 @@ describe('renderDaemonStatus', () => {
   });
 
   it('prompts to install when no logon task is registered', () => {
-    const out = renderDaemonStatus({ ...healthy, task: { supported: true, registered: false } });
+    const out = renderDaemonStatus({
+      ...healthy,
+      task: { supported: true, noun: 'logon task', registered: false },
+    });
     expect(out).toMatch(/logon task not registered — run: cctl daemon install/);
+  });
+
+  it("calls the mechanism by the host's own name", () => {
+    const unit = {
+      supported: true,
+      noun: 'systemd user service',
+      registered: true,
+      state: 'active',
+    };
+    expect(renderDaemonStatus({ ...healthy, task: unit })).toMatch(
+      /systemd user service registered \(active\)/,
+    );
+    expect(renderDaemonStatus({ ...healthy, task: { ...unit, registered: false } })).toMatch(
+      /systemd user service not registered — run: cctl daemon install/,
+    );
   });
 
   it("says the daemon has never run when the heartbeat state is 'never'", () => {
@@ -528,7 +546,7 @@ describe('renderDaemonStatus', () => {
   it('does NOT promise a next-logon restart for a stale heartbeat when no task is registered', () => {
     const out = renderDaemonStatus({
       ...healthy,
-      task: { supported: true, registered: false },
+      task: { supported: true, noun: 'logon task', registered: false },
       heartbeat: { state: 'stale', writtenAtMs: 0, ageMs: 5 * 60_000 },
     });
     expect(out).toMatch(/not scheduled to restart — run: cctl daemon install/);

@@ -116,16 +116,23 @@ export interface DaemonUnitOptions {
   unitPath?: string;
 }
 
+export interface DaemonUnitInstall {
+  outcome: DaemonUnitOutcome;
+  /** Non-fatal remarks for the operator — today, a refused `enable-linger`. */
+  notes: string[];
+}
+
 /**
  * Write (or rewrite) the unit and enable it. A changed unit is reloaded so the manager sees
  * the new definition; an identical one is 'unchanged' and runs nothing. Linger is requested
  * whenever the unit is written: without it the user manager — and this unit — exists only
  * while the user is logged in. It is best-effort because some polkit setups refuse it for the
- * user's own account; the unit is enabled either way and the caller reports the detail.
+ * user's own account (and WSL has no logind to grant it); the unit is enabled either way and
+ * the refusal comes back as a note, since "starts at login, not at boot" is worth knowing.
  */
 export function installDaemonUnit(
   options: DaemonUnitOptions & { shimPath: string },
-): DaemonUnitOutcome {
+): DaemonUnitInstall {
   const run = options.run ?? defaultSystemctlRunner;
   const loginctl = options.loginctl ?? defaultLoginctlRunner;
   const fs = options.fs ?? defaultTextFileStore;
@@ -133,18 +140,24 @@ export function installDaemonUnit(
 
   const desired = renderDaemonUnit(options.shimPath);
   const existing = fs.read(unitPath);
-  if (existing === desired) return 'unchanged';
+  if (existing === desired) return { outcome: 'unchanged', notes: [] };
 
   fs.write(unitPath, desired);
   run(['daemon-reload']);
   run(['enable', DAEMON_UNIT_NAME]);
+  const notes: string[] = [];
   try {
     loginctl(['enable-linger']);
-  } catch {
-    // Reported through `queryDaemonUnit`'s state rather than failing the install: the unit is
-    // registered and starts at the next login even without linger.
+  } catch (err) {
+    // execFileSync's message carries the command line and the tool's stderr on separate lines;
+    // fold it onto one so the note reads as a sentence.
+    const reason = (err as Error).message.replace(/\s+/g, ' ').trim();
+    notes.push(
+      `could not enable linger (${reason}); the service starts at your next login rather ` +
+        'than at boot — run `loginctl enable-linger` yourself to change that',
+    );
   }
-  return existing === undefined ? 'created' : 'updated';
+  return { outcome: existing === undefined ? 'created' : 'updated', notes };
 }
 
 /** Start the service now — the separate step that leaves the daemon running after an install,

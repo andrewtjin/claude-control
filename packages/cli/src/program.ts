@@ -484,6 +484,7 @@ export function buildProgram(): Command {
         result.task
       ];
       process.stdout.write(`${verb} the ${noun} to run "${shimPath} daemon run" at logon.\n`);
+      for (const note of result.notes ?? []) process.stdout.write(`Note: ${note}\n`);
       // Starting now is best-effort: a failure here does not undo the (successful) registration
       // above — the next logon still brings the daemon up.
       process.stdout.write(
@@ -497,21 +498,23 @@ export function buildProgram(): Command {
   daemon
     .command('uninstall')
     .description(
-      'remove the logon Scheduled Task and the daemon hook entries ' +
+      'remove the autostart registration and the daemon hook entries ' +
         '(does not stop an already-running daemon)',
     )
     .action(async () => {
+      const host = detectAutostartHost();
+      const backend = autostartBackend(host);
+      const noun = backend === 'none' ? 'autostart' : autostartNoun(backend);
       let outcome: ReturnType<typeof uninstallAutostart>;
       try {
-        outcome = uninstallAutostart();
+        outcome = uninstallAutostart({ host });
       } catch (err) {
-        fail(`could not remove the logon task: ${(err as Error).message}`);
+        fail(`could not remove the ${noun}: ${(err as Error).message}`);
       }
       process.stdout.write(
         {
-          removed:
-            'Removed the logon task. A daemon already running keeps running until stopped.\n',
-          not_installed: 'No logon task was registered.\n',
+          removed: `Removed the ${noun}. A daemon already running keeps running until stopped.\n`,
+          not_installed: `No ${noun} was registered.\n`,
           // A platform fact, not a failure — the hook removal below still applies.
           unsupported: 'No autostart exists on this platform; nothing to remove.\n',
         }[outcome],
@@ -747,6 +750,10 @@ function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
   const identityPath = join(dataDir, 'daemon-identity.enc');
   const relayUrl = resolveRelayUrl(relayFlag);
   const engine = buildEngine(paths);
+  // One host snapshot for the whole wizard run: the re-entry check, the final step, and its
+  // wording all reason from the same facts.
+  const autostartHost = detectAutostartHost();
+  const backend = autostartBackend(autostartHost);
   return {
     io,
     runDoctor: () => runDoctor(paths),
@@ -790,8 +797,10 @@ function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
     isPaired: async () =>
       (await dpapiIdentityStore(identityPath, defaultProtector()).load()) !== undefined,
     pair: (pairCode) => attemptPair(pairCode, relayUrl),
-    autostartState: () => Promise.resolve(readAutostartState()),
-    installAutostart: () => Promise.resolve(installAutostart(resolveCctlShimPath())),
+    autostartState: () => Promise.resolve(readAutostartState({ host: autostartHost })),
+    autostartNoun: backend === 'none' ? 'autostart' : autostartNoun(backend),
+    installAutostart: () =>
+      Promise.resolve(installAutostart(resolveCctlShimPath(), { host: autostartHost })),
     verifyDaemon: verifyDaemonAlive,
   };
 }

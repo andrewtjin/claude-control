@@ -91,7 +91,10 @@ describe('installDaemonUnit', () => {
   it('writes the unit, reloads, enables, and requests linger on a first install', () => {
     const { fs, files } = memFs();
     const { run, loginctl, calls, lingerCalls } = fakeSystemd();
-    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toBe('created');
+    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toEqual({
+      outcome: 'created',
+      notes: [],
+    });
     expect(files.get(UNIT)).toBe(renderDaemonUnit(shimPath));
     expect(calls).toEqual([['daemon-reload'], ['enable', DAEMON_UNIT_NAME]]);
     expect(lingerCalls).toEqual([['enable-linger']]);
@@ -100,7 +103,10 @@ describe('installDaemonUnit', () => {
   it('is unchanged for identical content and runs nothing at all', () => {
     const { fs } = memFs({ [UNIT]: renderDaemonUnit(shimPath) });
     const { run, loginctl, calls, lingerCalls } = fakeSystemd();
-    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toBe('unchanged');
+    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toEqual({
+      outcome: 'unchanged',
+      notes: [],
+    });
     expect(calls).toEqual([]);
     expect(lingerCalls).toEqual([]);
   });
@@ -108,18 +114,26 @@ describe('installDaemonUnit', () => {
   it('rewrites and reloads when the shim moves', () => {
     const { fs, files } = memFs({ [UNIT]: renderDaemonUnit('/old/bin/cctl') });
     const { run, loginctl, calls } = fakeSystemd();
-    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toBe('updated');
+    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT }).outcome).toBe(
+      'updated',
+    );
     expect(files.get(UNIT)).toContain(shimPath);
     expect(calls[0]).toEqual(['daemon-reload']);
   });
 
-  it('keeps the install when linger is refused — the unit still starts at login', () => {
+  it('keeps the install when linger is refused and says so in a note — the unit still starts at login', () => {
+    // WSL has no logind to grant linger, and some polkit setups refuse it for the user's own
+    // account; either way the operator should hear "at login, not at boot" rather than nothing.
     const { fs } = memFs();
     const { run, calls } = fakeSystemd();
     const loginctl: LoginctlRunner = () => {
-      throw new Error('Could not enable linger: Access denied');
+      throw new Error('Could not enable linger: No such device or address');
     };
-    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toBe('created');
+    const result = installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT });
+    expect(result.outcome).toBe('created');
+    expect(result.notes).toHaveLength(1);
+    expect(result.notes[0]).toContain('No such device or address');
+    expect(result.notes[0]).toContain('loginctl enable-linger');
     expect(calls).toContainEqual(['enable', DAEMON_UNIT_NAME]);
   });
 

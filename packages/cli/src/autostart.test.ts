@@ -38,7 +38,7 @@ function fakeBackends() {
   const impl = (name: Exclude<AutostartBackend, 'none'>, withStart: boolean) => ({
     install: (shimPath: string) => {
       calls.push(`${name}.install ${shimPath}`);
-      return 'created' as const;
+      return { outcome: 'created' as const };
     },
     ...(withStart
       ? {
@@ -267,6 +267,7 @@ describe('dispatch per backend', () => {
       expect(result).toEqual({ task: 'created', started: true });
       expect(queryAutostart({ host: h, backends })).toEqual({
         supported: true,
+        noun: autostartNoun(backend),
         registered: true,
         state: 'Ready',
       });
@@ -278,6 +279,25 @@ describe('dispatch per backend', () => {
       expect(calls).toEqual(expected);
     });
   }
+
+  it("passes a backend's notes through, and omits the field when there are none", () => {
+    const { backends } = fakeBackends();
+    const linux = host({ platform: 'linux', systemdUser: true });
+    backends['systemd-user'].install = () => ({
+      outcome: 'created',
+      notes: ['could not enable linger (refused)'],
+    });
+    expect(installAutostart('/p/cctl', { host: linux, backends })).toEqual({
+      task: 'created',
+      started: true,
+      notes: ['could not enable linger (refused)'],
+    });
+    backends['systemd-user'].install = () => ({ outcome: 'created', notes: [] });
+    expect(installAutostart('/p/cctl', { host: linux, backends })).toEqual({
+      task: 'created',
+      started: true,
+    });
+  });
 
   it('reports a failed start as started:false with the detail, keeping the registration', () => {
     const { backends } = fakeBackends();
@@ -305,7 +325,7 @@ describe('dispatch per backend', () => {
 
   it('treats an unchanged LaunchAgent as started — registering is what starts it', () => {
     const { backends } = fakeBackends();
-    backends['launch-agent'].install = () => 'unchanged';
+    backends['launch-agent'].install = () => ({ outcome: 'unchanged' });
     expect(installAutostart('/p/cctl', { host: host({ platform: 'darwin' }), backends })).toEqual({
       task: 'unchanged',
       started: true,
@@ -319,6 +339,7 @@ describe('dispatch per backend', () => {
     };
     expect(queryAutostart({ host: host({ platform: 'win32' }), backends })).toEqual({
       supported: true,
+      noun: 'logon task',
       registered: false,
     });
     expect(readAutostartState({ host: host({ platform: 'win32' }), backends })).toBe(
@@ -331,6 +352,7 @@ describe('dispatch per backend', () => {
     backends['scheduled-task'].query = () => ({ registered: false });
     expect(queryAutostart({ host: host({ platform: 'win32' }), backends })).toEqual({
       supported: true,
+      noun: 'logon task',
       registered: false,
     });
   });

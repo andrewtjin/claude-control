@@ -16,7 +16,7 @@
 // shim) and the WSL one (wslInstall.ts, action = `wsl.exe` into the distro). The task-level
 // mechanics are identical; only the action, the task name and the PowerShell binary differ.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { join } from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -115,11 +115,14 @@ export interface ResolveCctlShimPathOptions {
   platform?: NodeJS.Platform;
 }
 
+// One fixed command string through the shell: npm is a .cmd shim on Windows, which only a
+// shell can run, and a string (rather than an args array with `shell: true`) keeps Node from
+// warning about unescaped arguments — there are none to escape.
 const defaultNpmPrefix = (): string =>
-  execFileSync('npm', ['prefix', '-g'], {
+  execSync('npm prefix -g', {
     encoding: 'utf8',
-    shell: true, // npm is a .cmd shim on Windows; harmless on the POSIX platforms
     windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 
 /**

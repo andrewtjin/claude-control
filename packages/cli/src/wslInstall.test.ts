@@ -80,23 +80,28 @@ describe('wslTaskName', () => {
 // --- wslTaskAction -------------------------------------------------------------------------------
 
 describe('wslTaskAction', () => {
-  it('runs the shim through a login shell in the named distro, as one double-quoted Windows token', () => {
+  it('pins the shim bin dir onto PATH and execs the shim through a login shell in the named distro, as one double-quoted Windows token', () => {
+    // The pinned PATH is what reaches an nvm-installed node from a non-interactive login shell:
+    // a real run without it died with `env: 'node': No such file or directory`.
     expect(wslTaskAction('Ubuntu', '/home/u/.nvm/versions/node/v24.20.0/bin/cctl')).toEqual({
       execute: 'wsl.exe',
-      arguments: `-d Ubuntu --exec /bin/bash -lc "'/home/u/.nvm/versions/node/v24.20.0/bin/cctl' daemon run"`,
+      arguments:
+        `-d Ubuntu --exec /bin/bash -lc "export PATH='/home/u/.nvm/versions/node/v24.20.0/bin':$PATH; ` +
+        `exec '/home/u/.nvm/versions/node/v24.20.0/bin/cctl' daemon run"`,
     });
   });
 
-  it('single-quotes a path with spaces for bash and double-quotes a distro with spaces for Windows', () => {
+  it('single-quotes paths with spaces for bash and double-quotes a distro with spaces for Windows', () => {
     expect(wslTaskAction('Ubuntu 24', '/home/some user/bin/cctl').arguments).toBe(
-      `-d "Ubuntu 24" --exec /bin/bash -lc "'/home/some user/bin/cctl' daemon run"`,
+      `-d "Ubuntu 24" --exec /bin/bash -lc "export PATH='/home/some user/bin':$PATH; ` +
+        `exec '/home/some user/bin/cctl' daemon run"`,
     );
   });
 
-  it("escapes an apostrophe in the path with bash's '\\'' idiom", () => {
-    expect(wslTaskAction('Ubuntu', "/home/o'neil/bin/cctl").arguments).toContain(
-      `'/home/o'\\''neil/bin/cctl' daemon run`,
-    );
+  it("escapes an apostrophe in the path with bash's '\\'' idiom, in both places it appears", () => {
+    const { arguments: args } = wslTaskAction('Ubuntu', "/home/o'neil/bin/cctl");
+    expect(args).toContain(`export PATH='/home/o'\\''neil/bin':$PATH`);
+    expect(args).toContain(`exec '/home/o'\\''neil/bin/cctl' daemon run`);
   });
 
   it('refuses a double quote in the path or the distro instead of mis-quoting it', () => {

@@ -172,19 +172,27 @@ export class AutostartUnsupportedError extends Error {
 
 export type AutostartOutcome = 'created' | 'updated' | 'unchanged';
 
+/** What a backend's register step hands back: the outcome, plus anything the operator should
+ *  hear that did not fail the registration (a refused `enable-linger`, say). */
+export interface AutostartInstall {
+  outcome: AutostartOutcome;
+  notes?: string[];
+}
+
 /** Result of registering + kicking autostart. `task` mirrors the backend's register outcome;
  *  `started` is best-effort (a failure to start now still leaves the registration in place for
- *  the next logon). */
+ *  the next logon); `notes` are the backend's non-fatal remarks, printed as-is. */
 export interface AutostartResult {
   task: AutostartOutcome;
   started: boolean;
   detail?: string;
+  notes?: string[];
 }
 
 /** What `cctl daemon status` shows about autostart. `supported: false` is a host fact, not a
- *  failure — nothing to register, nothing to fix. */
+ *  failure — nothing to register, nothing to fix. `noun` is what to call the mechanism. */
 export type AutostartQuery =
-  { supported: false } | { supported: true; registered: boolean; state?: string };
+  { supported: false } | { supported: true; noun: string; registered: boolean; state?: string };
 
 /** The tri-state every summary surface needs. 'unsupported' satisfies "setup complete" —
  *  there is nothing for the user to do about it. */
@@ -198,7 +206,7 @@ export type AutostartUninstallOutcome = 'removed' | 'not_installed' | 'unsupport
 
 /** The uniform shape every mechanism presents to the dispatch. */
 export interface AutostartBackendImpl {
-  install(shimPath: string): AutostartOutcome;
+  install(shimPath: string): AutostartInstall;
   /** The separate "run it now" step. Absent when registering already starts the daemon (a
    *  RunAtLoad LaunchAgent). */
   startNow?(): void;
@@ -218,18 +226,18 @@ export function defaultBackends(host: AutostartHost): AutostartBackends {
   };
   return {
     'scheduled-task': {
-      install: (shimPath) => installDaemonTask({ shimPath }),
+      install: (shimPath) => ({ outcome: installDaemonTask({ shimPath }) }),
       startNow: () => startDaemonTaskNow(),
       query: () => queryDaemonTask(),
       uninstall: () => uninstallDaemonTask(),
     },
     'launch-agent': {
-      install: (shimPath) => installDaemonAgent({ shimPath }),
+      install: (shimPath) => ({ outcome: installDaemonAgent({ shimPath }) }),
       query: () => queryDaemonAgent(),
       uninstall: () => uninstallDaemonAgent(),
     },
     'wsl-task': {
-      install: (shimPath) => installWslDaemonTask({ host: wslHost(), shimPath }),
+      install: (shimPath) => ({ outcome: installWslDaemonTask({ host: wslHost(), shimPath }) }),
       startNow: () => startWslDaemonTaskNow({ host: wslHost() }),
       query: () => queryWslDaemonTask({ host: wslHost() }),
       uninstall: () => uninstallWslDaemonTask({ host: wslHost() }),
@@ -281,15 +289,16 @@ export function installAutostart(
 ): AutostartResult {
   const { host, impl } = resolve(options);
   if (impl === undefined) throw new AutostartUnsupportedError(autostartUnsupportedNote(host));
-  const task = impl.install(shimPath);
+  const { outcome: task, notes } = impl.install(shimPath);
+  const withNotes = notes !== undefined && notes.length > 0 ? { notes } : {};
   // No separate start step means registering started it: for a LaunchAgent, 'unchanged' is an
   // agent already loaded — i.e. already running — so "started" holds in every outcome.
-  if (impl.startNow === undefined) return { task, started: true };
+  if (impl.startNow === undefined) return { task, started: true, ...withNotes };
   try {
     impl.startNow();
-    return { task, started: true };
+    return { task, started: true, ...withNotes };
   } catch (err) {
-    return { task, started: false, detail: (err as Error).message };
+    return { task, started: false, detail: (err as Error).message, ...withNotes };
   }
 }
 
@@ -307,17 +316,19 @@ export function uninstallAutostart(options: AutostartOptions = {}): AutostartUni
  * rendering its other lines when this one source is broken.
  */
 export function queryAutostart(options: AutostartOptions = {}): AutostartQuery {
-  const { impl } = resolve(options);
-  if (impl === undefined) return { supported: false };
+  const { backend, impl } = resolve(options);
+  if (impl === undefined || backend === 'none') return { supported: false };
+  const noun = autostartNoun(backend);
   try {
     const q = impl.query();
     return {
       supported: true,
+      noun,
       registered: q.registered,
       ...(q.state !== undefined ? { state: q.state } : {}),
     };
   } catch {
-    return { supported: true, registered: false };
+    return { supported: true, noun, registered: false };
   }
 }
 

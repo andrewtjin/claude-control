@@ -244,6 +244,7 @@ function makeDeps(io: WizardIo, overrides: Partial<SetupDeps> = {}): SetupDeps {
     isPaired: () => Promise.resolve(false),
     pair: () => Promise.resolve({ ok: true }),
     autostartState: () => Promise.resolve('unregistered'),
+    autostartNoun: 'logon task',
     installAutostart: () => Promise.resolve({ task: 'created', started: true }),
     verifyDaemon: () => Promise.resolve(true),
   };
@@ -524,6 +525,26 @@ describe('runSetup', () => {
     expect(text()).toContain('cctl daemon install');
     // The failure never claims success elsewhere: no "Registered the logon task" line.
     expect(text()).not.toContain('Registered the logon task');
+  });
+
+  it("prints a backend's notes under the registration line, in the host's own noun", async () => {
+    const { io, text } = makeIo(['', 'n', 's']);
+    const outcome = await runSetup(
+      makeDeps(io, {
+        autostartNoun: 'systemd user service',
+        installAutostart: () =>
+          Promise.resolve({
+            task: 'created',
+            started: true,
+            notes: ['could not enable linger (refused); the service starts at your next login'],
+          }),
+      }),
+    );
+    expect(outcome).toBe('completed');
+    expect(text()).toContain(
+      'Registered the systemd user service so the daemon starts automatically.',
+    );
+    expect(text()).toContain('Note: could not enable linger (refused)');
   });
 
   // --- a platform with no autostart backend (Linux, WSL2 included) ---------------------------

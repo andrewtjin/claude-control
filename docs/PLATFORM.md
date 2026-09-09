@@ -32,12 +32,14 @@
     by default and could never decrypt the `CurrentUser`-scoped DPAPI vault.
   - **WSL2** registers a **Windows** logon task from inside the distro, through
     `/mnt/c/.../powershell.exe` (so a PATH without the Windows entries still works),
-    named `ClaudeControlDaemon-WSL-<distro>`, whose action is
-    `wsl.exe -d <distro> --exec /bin/bash -lc '<shim> daemon run'`. Nothing inside the
-    distro can do this job: WSL stops a distro seconds after its last `wsl.exe` session
-    ends, so a systemd unit or shell-profile job dies with it, while the task's own
-    session keeps the distro alive for as long as the daemon runs. The login shell is
-    what puts nvm-installed `node` on PATH. Needs Windows interop (the default).
+    named `ClaudeControlDaemon-WSL-<distro>`, whose action is `wsl.exe -d <distro>
+--exec /bin/bash -lc "<pin the shim's bin dir onto PATH>; exec '<shim>' daemon run"`.
+    Nothing inside the distro can do this job: WSL stops a distro seconds after its
+    last `wsl.exe` session ends, so a systemd unit or shell-profile job dies with it,
+    while the task's own session keeps the distro alive for as long as the daemon runs.
+    The login shell loads your profile (so the daemon finds `claude`); the pinned bin
+    dir is what reaches an nvm-installed `node`, which the profile alone does not from
+    a non-interactive shell. Needs Windows interop (the default).
   - **Linux** outside WSL writes a **systemd user unit**
     (`~/.config/systemd/user/claude-control-daemon.service`, honoring
     `XDG_CONFIG_HOME`), enables it, and asks for `loginctl enable-linger` so it starts
