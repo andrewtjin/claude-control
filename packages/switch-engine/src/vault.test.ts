@@ -9,7 +9,7 @@ import {
   Vault,
 } from './vault.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
-import { UnknownAccountError } from './errors.js';
+import { UnknownAccountError, VaultError } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
 import type { CredentialBundle } from './types.js';
 
@@ -589,6 +589,66 @@ describe('Vault registry + bundles', () => {
     stored = await v.getAccount(acct.id);
     expect(stored?.quarantined).toBe(false);
     expect(stored?.quarantineReason).toBeUndefined();
+  });
+
+  it('renames an account in place: same id, same bundle, label trimmed, updatedAt bumped', async () => {
+    const v = await vault();
+    const acct = await v.addAccount('work', bundle('a'));
+    await v.setActive(acct.id);
+    const renamed = await v.renameAccount(acct.id, '  personal ');
+    expect(renamed.id).toBe(acct.id);
+    expect(renamed.label).toBe('personal');
+    expect(renamed.updatedAtMs).toBeGreaterThan(acct.updatedAtMs);
+    const stored = await v.getAccount(acct.id);
+    expect(stored?.label).toBe('personal');
+    // The alias is all that moved: the account is still the active one and its secrets are intact.
+    expect(await v.getActiveId()).toBe(acct.id);
+    expect((await v.readBundle(acct.id)).claudeAiOauth.accessToken).toBe('a');
+  });
+
+  // resolveAccountRef falls back to a case-insensitive label match, so two rows differing only
+  // in case would both resolve as "ambiguous" and neither could be switched to by name.
+  it("refuses a rename onto another account's label, ignoring case", async () => {
+    const v = await vault();
+    const a = await v.addAccount('work', bundle('a'));
+    await v.addAccount('Personal', bundle('b'));
+    await expect(v.renameAccount(a.id, 'personal')).rejects.toBeInstanceOf(VaultError);
+    await expect(v.renameAccount(a.id, 'PERSONAL')).rejects.toThrow(/already refers to/);
+    expect((await v.getAccount(a.id))?.label).toBe('work');
+  });
+
+  // Only OTHER rows count as collisions: changing the case of an account's own label is a
+  // legitimate rename, not a clash with itself.
+  it('lets an account change only the case of its own label', async () => {
+    const v = await vault();
+    const a = await v.addAccount('Work', bundle('a'));
+    expect((await v.renameAccount(a.id, 'work')).label).toBe('work');
+  });
+
+  // Refs resolve by id BEFORE label, so a label spelling another account's id would never be
+  // reached by name - the id match would win every time.
+  it('refuses a label that spells an existing account id', async () => {
+    const v = await vault();
+    const a = await v.addAccount('work', bundle('a'));
+    const b = await v.addAccount('home', bundle('b'));
+    await expect(v.renameAccount(a.id, b.id)).rejects.toBeInstanceOf(VaultError);
+  });
+
+  it('refuses an empty or whitespace-only label without touching the registry', async () => {
+    const v = await vault();
+    const a = await v.addAccount('work', bundle('a'));
+    await expect(v.renameAccount(a.id, '')).rejects.toThrow(/cannot be empty/);
+    await expect(v.renameAccount(a.id, '   ')).rejects.toThrow(/cannot be empty/);
+    const stored = await v.getAccount(a.id);
+    expect(stored?.label).toBe('work');
+    expect(stored?.updatedAtMs).toBe(a.updatedAtMs);
+  });
+
+  it('rejects a rename of an unknown account', async () => {
+    const v = await vault();
+    await expect(v.renameAccount('does-not-exist', 'x')).rejects.toBeInstanceOf(
+      UnknownAccountError,
+    );
   });
 
   it('removes an account and its bundle, clearing active if needed', async () => {

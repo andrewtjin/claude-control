@@ -17,6 +17,7 @@ import {
   QuarantineError,
   SwitchEngineError,
   UnknownAccountError,
+  VaultError,
   defaultPaths,
   defaultProtector,
   resolveAccountRef,
@@ -991,6 +992,33 @@ function buildAccountCommands(program: Command): void {
       if (!resolved.ok) fail(resolved.message);
       await engine.removeAccount(resolved.account.id);
       process.stdout.write(`Removed ${resolved.account.label}.\n`);
+    });
+
+  accounts
+    .command('rename <ref> <new-label>')
+    .alias('mv')
+    .description('give a stored account a new label (its id and usage history are unchanged)')
+    .action(async (ref: string, newLabel: string) => {
+      const engine = buildEngine();
+      const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+      if (!resolved.ok) fail(resolved.message);
+      // Answered here rather than written: nothing would change, so nothing should be saved or
+      // reported as a rename.
+      if (newLabel.trim() === resolved.account.label) {
+        process.stdout.write(`${resolved.account.label} already has that label.\n`);
+        return;
+      }
+      try {
+        const updated = await engine.renameAccount(resolved.account.id, newLabel);
+        process.stdout.write(
+          `Renamed ${resolved.account.label} to ${updated.label} (${updated.id}).\n`,
+        );
+      } catch (err) {
+        // A collision or an empty label is a user mistake carrying its own explanation; anything
+        // else is a real fault and propagates.
+        if (err instanceof VaultError) fail(err.message);
+        throw err;
+      }
     });
 }
 

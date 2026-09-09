@@ -143,6 +143,9 @@ export class SwitchEngine {
   removeAccount(id: string): Promise<void> {
     return this.withCredentialLock(() => this.vault.removeAccount(id));
   }
+  renameAccount(id: string, label: string): Promise<StoredAccount> {
+    return this.withCredentialLock(() => this.vault.renameAccount(id, label));
+  }
   clearQuarantine(id: string): Promise<void> {
     return this.withCredentialLock(() => this.vault.clearQuarantine(id));
   }

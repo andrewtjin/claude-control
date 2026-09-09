@@ -25,6 +25,8 @@ cctl accounts add <label>          # capture the currently logged-in account
 cctl accounts add <label> --fresh  # log in as a NEW account in a throwaway window,
                                     # without touching the live login
 cctl accounts remove <id|label>    # remove a stored account
+cctl accounts rename <id|label> <new-label>
+                                    # give an account a new label; its id and usage history stay
 ```
 
 ## Switching and recovery
