@@ -54,6 +54,7 @@ import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
   daemonConfigPath,
+  applyFileEnv,
   daemonSettingsPath,
   readDaemonConfigFile,
   resolveDaemonConfig,
@@ -202,20 +203,27 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       );
     }
   }
+  // The operator's persisted overrides, read here (the edge) so the resolution below stays
+  // pure. A missing or malformed file degrades to no overrides, never to a failed start.
+  // Its env block is laid UNDER the real environment before anything else starts, so every
+  // module that reads `process.env` on its own (the logger, the engine's cadence guard)
+  // honors the same overrides `resolveDaemonConfig` reports. The resolver gets the shell's
+  // environment as it was BEFORE the overlay, so it can still say which layer each value
+  // came from.
+  const fileConfig = (await readDaemonConfigFile(daemonConfigPath(paths))) ?? {};
+  const shellEnv: NodeJS.ProcessEnv = { ...process.env };
+  applyFileEnv(process.env, fileConfig.env);
+
   const logger: Logger = createLogger({ defaultLevel: 'info', sink: DAEMON_LOG_SINK });
 
   const engine = buildEngine(paths, DAEMON_LOG_SINK);
   const store = new Store(daemonDbPath(paths));
   const protector = defaultProtector();
 
-  // The operator's persisted overrides, read here (the edge) so the resolution below stays
-  // pure. A missing or malformed file degrades to no overrides, never to a failed start.
-  const fileConfig = (await readDaemonConfigFile(daemonConfigPath(paths))) ?? {};
-
   // One resolution feeds BOTH behavior (the values wired below) and visibility (the rows
   // shipped to the phone and persisted for `cctl settings`) — they cannot drift apart.
   const config = resolveDaemonConfig(
-    process.env,
+    shellEnv,
     {
       // Tri-state: an absent flag stays absent so the resolver's env/default chain decides,
       // while an explicit --no- opt-out passes through as false.
@@ -235,6 +243,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     cooldownMs,
     autoSwitch,
     greedy,
+    autoSwitchOnFableCap,
   } = config.values;
   const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
   // Best-effort: the report is purely informational, so a write failure must not stop the
@@ -357,6 +366,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
           ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
           ...(greedyResetMarginMs !== undefined ? { greedyResetMarginMs } : {}),
           ...(greedy ? { greedy } : {}),
+          // Only the opt-out is passed: the policy's own default is on, and an absent key
+          // keeps the policy object identical to what earlier builds constructed.
+          ...(autoSwitchOnFableCap ? {} : { fableCapTriggers: false }),
         },
         ...(cooldownMs !== undefined ? { cooldownMs } : {}),
         logger,

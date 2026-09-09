@@ -16,7 +16,7 @@
 // `config.json` is INPUT an operator writes (`readDaemonConfigFile`), and only it can change
 // behavior; `daemon-settings.json` is OUTPUT the daemon writes (`writeSettingsReport`).
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   SettingsSnapshot,
@@ -26,6 +26,7 @@ import {
 import {
   DEFAULT_MIN_SWITCH_INTERVAL_MS,
   DEFAULT_REFRESH_SKEW_MS,
+  atomicWriteFile,
   defaultPaths,
   type Paths,
 } from '@claude-control/switch-engine';
@@ -119,17 +120,161 @@ function blankAsUnset(value: string | undefined): string | undefined {
   return trimmed === undefined || trimmed === '' ? undefined : trimmed;
 }
 
+/** A JSON object (not null, not an array): the only shape the config file and its `env` block
+ *  are read from. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// ---------------------------------------------------------------------------
+// What `cctl settings set` may persist, and how each value is checked
+// ---------------------------------------------------------------------------
+
+/** The relay's env var. Singled out because the relay has a field of its own in config.json
+ *  (`relayUrl`, older than the `env` block) — `settings set` writes it there, and the reader
+ *  folds an `env` entry by this name into the same field, so the relay is never persisted two
+ *  ways that could disagree. */
+const RELAY_ENV_NAME = 'CCTL_RELAY_URL';
+
+/** How a value is checked before it is persisted. Each kind uses the SAME parser the daemon
+ *  reads with, so `cctl settings set` can only store what the daemon will honor — a value the
+ *  daemon would silently treat as unset is the one typo the file exists to protect from. */
+export type SettingKind = 'bool' | 'number' | 'url' | 'log-level' | 'log-format' | 'path';
+
+export interface DaemonEnvSetting {
+  /** The env var name — also the key inside config.json's `env` block. */
+  name: string;
+  /** The short name typed on the command line (`fable-cap` for
+   *  `CCTL_AUTOSWITCH_ON_FABLE_CAP`). Lower-case kebab; unique across the table and never
+   *  equal to any env var name, so a ref can only ever mean one setting. */
+  alias: string;
+  kind: SettingKind;
+}
+
+/** Every daemon knob `cctl settings set` may persist. Names match the `detail` column of the
+ *  daemon rows one for one (a test holds the two lists together), so `cctl settings` doubles
+ *  as the list of what can be set. Engine and CLI-shell knobs (`CCTL_SWITCH_MIN_INTERVAL_MS`,
+ *  `CCTL_REFRESH_SKEW_MS`, `NO_COLOR`) are deliberately absent: one-shot commands read them
+ *  from the shell that runs them, where an env var is the natural home. */
+export const DAEMON_ENV_SETTINGS: readonly DaemonEnvSetting[] = [
+  { name: 'CCTL_AUTOSWITCH', alias: 'autoswitch', kind: 'bool' },
+  { name: 'CCTL_AUTOSWITCH_GREEDY', alias: 'greedy', kind: 'bool' },
+  { name: 'CCTL_AUTOSWITCH_ON_FABLE_CAP', alias: 'fable-cap', kind: 'bool' },
+  { name: 'CCTL_AUTOSWITCH_TRIGGER_PCT', alias: 'trigger', kind: 'number' },
+  { name: 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT', alias: 'stale-trigger', kind: 'number' },
+  { name: 'CCTL_AUTOSWITCH_STALE_AFTER_MS', alias: 'stale-after', kind: 'number' },
+  { name: 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT', alias: 'min-session-left', kind: 'number' },
+  { name: 'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS', alias: 'greedy-margin', kind: 'number' },
+  { name: 'CCTL_AUTOSWITCH_COOLDOWN_MS', alias: 'cooldown', kind: 'number' },
+  { name: 'CCTL_WAITING_CARDS', alias: 'waiting-cards', kind: 'bool' },
+  { name: 'CCTL_PERMISSION_HOLD_MS', alias: 'permission-hold', kind: 'number' },
+  { name: 'CCTL_QUESTION_HOLD_MS', alias: 'question-hold', kind: 'number' },
+  { name: 'CCTL_COMMAND_OUTPUT', alias: 'command-output', kind: 'bool' },
+  { name: 'CCTL_IDENTITY_CHECK', alias: 'identity-check', kind: 'bool' },
+  { name: 'CCTL_TOOL_OUTPUT_FULL', alias: 'full-output', kind: 'bool' },
+  { name: RELAY_ENV_NAME, alias: 'relay', kind: 'url' },
+  { name: 'CCTL_LOG_LEVEL', alias: 'log-level', kind: 'log-level' },
+  { name: 'CCTL_LOG_FORMAT', alias: 'log-format', kind: 'log-format' },
+  { name: 'CCTL_LOG_FILE', alias: 'log-file', kind: 'path' },
+];
+
+/** Look a setting up by alias or env var name, case-insensitively and with `_`/`-` read as
+ *  the same character: `fable-cap`, `FABLE_CAP` and `cctl_autoswitch_on_fable_cap` are all too
+ *  easy to type to refuse over spelling. */
+export function findDaemonEnvSetting(ref: string): DaemonEnvSetting | undefined {
+  const trimmed = ref.trim();
+  const name = trimmed.toUpperCase().replace(/-/g, '_');
+  const alias = trimmed.toLowerCase().replace(/_/g, '-');
+  return DAEMON_ENV_SETTINGS.find((s) => s.name === name || s.alias === alias);
+}
+
+/** One line naming every settable knob as `alias (ENV_NAME)`, for help and error text. */
+export function settableSettingsSummary(): string {
+  return DAEMON_ENV_SETTINGS.map((s) => `${s.alias} (${s.name})`).join(', ');
+}
+
+/** pino's level names, which `CCTL_LOG_LEVEL` is handed to verbatim — an unknown one would
+ *  throw at logger construction, which for a persisted value means at every daemon start. */
+const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'];
+
+export type SettingValueCheck = { ok: true; value: string } | { ok: false; message: string };
+
+/** Check a value the way the daemon will read it. Returns the text to persist (trimmed, and
+ *  lower-cased where the reader is case-sensitive), or the reason it would be ignored. */
+export function checkSettingValue(setting: DaemonEnvSetting, raw: string): SettingValueCheck {
+  const value = raw.trim();
+  const probe: NodeJS.ProcessEnv = { [setting.name]: value };
+  switch (setting.kind) {
+    case 'bool':
+      return envBool(probe, setting.name) === undefined
+        ? {
+            ok: false,
+            message: `${setting.name} takes on or off (also 1/0, true/false, yes/no), not "${raw}"`,
+          }
+        : { ok: true, value };
+    case 'number':
+      return envNumber(probe, setting.name) === undefined
+        ? { ok: false, message: `${setting.name} takes a non-negative number, not "${raw}"` }
+        : { ok: true, value };
+    case 'url':
+      return /^wss?:\/\/\S+$/i.test(value)
+        ? { ok: true, value }
+        : { ok: false, message: `${setting.name} takes a ws:// or wss:// url, not "${raw}"` };
+    case 'log-level':
+      return LOG_LEVELS.includes(value.toLowerCase())
+        ? { ok: true, value: value.toLowerCase() }
+        : {
+            ok: false,
+            message: `${setting.name} takes one of ${LOG_LEVELS.join(', ')}, not "${raw}"`,
+          };
+    case 'log-format':
+      return value.toLowerCase() === 'json' || value.toLowerCase() === 'pretty'
+        ? { ok: true, value: value.toLowerCase() }
+        : { ok: false, message: `${setting.name} takes json or pretty, not "${raw}"` };
+    case 'path':
+      return value === ''
+        ? { ok: false, message: `${setting.name} takes a file path` }
+        : { ok: true, value };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The operator's config file (persisted overrides)
 // ---------------------------------------------------------------------------
 
+/** Persisted env-style overrides, keyed by the env var each one stands in for. */
+export type FileEnv = Record<string, string>;
+
+/** Lay `fileEnv` UNDER `env`: a name set (non-blank) in the real environment shadows the file
+ *  entirely — even an unparseable value, which then falls to the default exactly as it does
+ *  without a file — so "the environment always wins" holds with no exceptions to learn.
+ *  Returns a fresh object; `env` is left alone. */
+export function layerFileEnv(env: NodeJS.ProcessEnv, fileEnv: FileEnv = {}): NodeJS.ProcessEnv {
+  return applyFileEnv({ ...env }, fileEnv);
+}
+
+/** The in-place form of `layerFileEnv`, for the daemon's own `process.env`: every module that
+ *  reads the environment directly (the logger, the engine's cadence guard) then sees the
+ *  persisted overrides too, not only the knobs `resolveDaemonConfig` wires by hand. */
+export function applyFileEnv(env: NodeJS.ProcessEnv, fileEnv: FileEnv = {}): NodeJS.ProcessEnv {
+  for (const [name, value] of Object.entries(fileEnv)) {
+    if (blankAsUnset(env[name]) === undefined) env[name] = value;
+  }
+  return env;
+}
+
 /** Settings an operator persists on this machine. Every field is optional: the file exists to
- *  override selected defaults, never to restate them. Kept deliberately small — a knob only
- *  belongs here when it must survive a reboot without an env var or a wrapper script. */
+ *  override selected defaults, never to restate them. */
 export interface DaemonFileConfig {
   /** The relay to dial. The reason this file exists: a published build bakes one default
    *  relay URL, and a self-hoster must be able to point at their own without a rebuild. */
   relayUrl?: string;
+  /** Overrides written by `cctl settings set`, keyed by the env var each stands in for
+   *  (`"CCTL_AUTOSWITCH": "off"`). Read UNDER the real environment (`layerFileEnv`), so a
+   *  shell or task-level env var still wins. Values are stored exactly as an env var would
+   *  carry them and parsed by the same code, so the file can never mean something the env
+   *  could not. Only the names in `DAEMON_ENV_SETTINGS` are read; anything else is ignored. */
+  env?: FileEnv;
 }
 
 /** Where the operator's config lives: beside the vault, like daemon.db. Distinct from
@@ -141,7 +286,8 @@ export function daemonConfigPath(paths: Paths = defaultPaths()): string {
 /** Reads the operator's config file. Missing, unreadable, corrupt, or wrong-shaped content
  *  degrades to `undefined` — the same typo-tolerance stance as `envNumber`: a malformed
  *  config falling back to the default beats a daemon that refuses to start. A blank or
- *  whitespace-only `relayUrl` counts as unset rather than as an empty URL. */
+ *  whitespace-only `relayUrl` counts as unset rather than as an empty URL, and the `env`
+ *  block is taken one entry at a time (`readFileEnv`), so one odd entry costs only itself. */
 export async function readDaemonConfigFile(
   filePath: string,
 ): Promise<DaemonFileConfig | undefined> {
@@ -158,11 +304,115 @@ export async function readDaemonConfigFile(
   } catch {
     return undefined;
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+  if (!isRecord(parsed)) return undefined;
 
-  const relayUrl = (parsed as Record<string, unknown>)['relayUrl'];
-  if (typeof relayUrl !== 'string' || relayUrl.trim() === '') return {};
-  return { relayUrl: relayUrl.trim() };
+  const config: DaemonFileConfig = {};
+  const env = readFileEnv(parsed['env']);
+  // The relay's own field wins; an `env` entry by its name (only a hand edit puts one there)
+  // is folded into the same field rather than dropped, then removed from the block so the
+  // relay resolves through exactly one path.
+  const relayRaw = parsed['relayUrl'];
+  const relayUrl =
+    blankAsUnset(typeof relayRaw === 'string' ? relayRaw : undefined) ?? env?.[RELAY_ENV_NAME];
+  if (relayUrl !== undefined) config.relayUrl = relayUrl;
+  if (env !== undefined) {
+    delete env[RELAY_ENV_NAME];
+    if (Object.keys(env).length > 0) config.env = env;
+  }
+  return config;
+}
+
+/** The `env` block: known names with string values only, blank ones dropped (an absent
+ *  override, as in the environment itself), everything else ignored. Names are normalized to
+ *  the upper case the daemon reads. */
+function readFileEnv(raw: unknown): FileEnv | undefined {
+  if (!isRecord(raw)) return undefined;
+  const env: FileEnv = {};
+  for (const [name, value] of Object.entries(raw)) {
+    const setting = findDaemonEnvSetting(name);
+    if (setting === undefined || typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed !== '') env[setting.name] = trimmed;
+  }
+  return Object.keys(env).length === 0 ? undefined : env;
+}
+
+/**
+ * Read-modify-write config.json under an atomic replace, keeping every other key exactly as
+ * it was — including ones this build does not know, so a newer build's settings survive an
+ * older CLI touching the file. `mutate` returns whether anything changed; nothing is written
+ * (and no file is created) when it did not. Refuses, rather than overwrites, a file that
+ * exists but is not a JSON object: the daemon ignores such a file, but a `set` that quietly
+ * replaced it would destroy whatever the operator had been editing.
+ */
+export async function updateDaemonConfigFile(
+  filePath: string,
+  mutate: (config: Record<string, unknown>) => boolean,
+): Promise<boolean> {
+  let raw: string | undefined;
+  try {
+    raw = await readFile(filePath, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  let config: Record<string, unknown> = {};
+  if (raw !== undefined && raw.trim() !== '') {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`${filePath} is not valid JSON; fix or delete it, then retry`);
+    }
+    if (!isRecord(parsed)) {
+      throw new Error(`${filePath} does not hold a JSON object; fix or delete it, then retry`);
+    }
+    config = parsed;
+  }
+  if (!mutate(config)) return false;
+  await mkdir(dirname(filePath), { recursive: true });
+  await atomicWriteFile(filePath, JSON.stringify(config, null, 2) + '\n');
+  return true;
+}
+
+/** Persist one setting: the relay into its own `relayUrl` field, everything else into the
+ *  `env` block under its env var name. `value` must already have passed `checkSettingValue`. */
+export async function persistDaemonSetting(
+  filePath: string,
+  setting: DaemonEnvSetting,
+  value: string,
+): Promise<void> {
+  await updateDaemonConfigFile(filePath, (config) => {
+    if (setting.name === RELAY_ENV_NAME) {
+      config['relayUrl'] = value;
+      return true;
+    }
+    const env = isRecord(config['env']) ? config['env'] : {};
+    env[setting.name] = value;
+    config['env'] = env;
+    return true;
+  });
+}
+
+/** Remove a persisted setting. Resolves to whether there was one to remove; a no-op never
+ *  touches the disk, so asking about a setting that was never stored creates no file. */
+export async function forgetDaemonSetting(
+  filePath: string,
+  setting: DaemonEnvSetting,
+): Promise<boolean> {
+  return updateDaemonConfigFile(filePath, (config) => {
+    if (setting.name === RELAY_ENV_NAME) {
+      if (config['relayUrl'] === undefined) return false;
+      delete config['relayUrl'];
+      return true;
+    }
+    const env = config['env'];
+    if (!isRecord(env) || !(setting.name in env)) return false;
+    delete env[setting.name];
+    // An emptied block is removed outright so the file returns to exactly what it was before
+    // the first `set`, not to a leftover `"env": {}`.
+    if (Object.keys(env).length === 0) delete config['env'];
+    return true;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +434,7 @@ export interface DaemonConfig {
     relayUrl: string;
     autoSwitch: boolean;
     greedy: boolean;
+    autoSwitchOnFableCap: boolean;
     triggerPercent: number | undefined;
     staleTriggerPercent: number | undefined;
     staleAfterMs: number | undefined;
@@ -215,21 +466,37 @@ export function resolveDaemonConfig(
   flags: DaemonRunFlags = {},
   fileConfig: DaemonFileConfig = {},
 ): DaemonConfig {
-  // Both default ON (flag > env > default): a flag-less `daemon run` — which is exactly what
-  // the installed logon task executes — hops when the active account runs low and burns
+  // The file's env block sits UNDER the real environment (`layerFileEnv`): every knob below
+  // reads the layered view, and `sourceOf` names the layer that actually supplied it.
+  const fileEnv = fileConfig.env ?? {};
+  const layered = layerFileEnv(env, fileEnv);
+  /** Attribution for a knob read from `layered`: the environment when it set the name
+   *  (non-blank), else the file, else — an unparseable override included — the default. */
+  const sourceOf = (name: string, parsed: boolean): SettingSource => {
+    if (!parsed) return 'default';
+    if (blankAsUnset(env[name]) !== undefined) return 'env';
+    return name in fileEnv ? 'config' : 'default';
+  };
+  // Both default ON (flag > env > file > default): a flag-less `daemon run` — which is exactly
+  // what the installed logon task executes — hops when the active account runs low and burns
   // expiring weekly budget first. Opt out per run with --no-auto-switch / --no-greedy, or
-  // persistently for an installed daemon (whose task carries no flags) with CCTL_AUTOSWITCH=0
-  // / CCTL_AUTOSWITCH_GREEDY=0.
-  const autoSwitchEnv = envBool(env, 'CCTL_AUTOSWITCH');
+  // persistently for an installed daemon (whose task carries no flags) with
+  // `cctl settings set CCTL_AUTOSWITCH off` / `CCTL_AUTOSWITCH_GREEDY off`.
+  const autoSwitchEnv = envBool(layered, 'CCTL_AUTOSWITCH');
   const autoSwitch = flags.autoSwitch ?? autoSwitchEnv ?? true;
-  const greedyEnv = envBool(env, 'CCTL_AUTOSWITCH_GREEDY');
+  const greedyEnv = envBool(layered, 'CCTL_AUTOSWITCH_GREEDY');
   const greedy = flags.greedy ?? greedyEnv ?? true;
-  const triggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_TRIGGER_PCT');
-  const staleTriggerPercent = envNumber(env, 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT');
-  const staleAfterMs = envNumber(env, 'CCTL_AUTOSWITCH_STALE_AFTER_MS');
-  const minSessionHeadroomPct = envNumber(env, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
-  const greedyResetMarginMs = envNumber(env, 'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS');
-  const cooldownMs = envNumber(env, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
+  // Default ON: a full Fable weekly cap counts as the wall, because the sessions the daemon
+  // keeps alive mostly run Fable. Off for an operator on other models, whose account still
+  // has every other budget left when that cap fills.
+  const fableCapEnv = envBool(layered, 'CCTL_AUTOSWITCH_ON_FABLE_CAP');
+  const autoSwitchOnFableCap = fableCapEnv ?? true;
+  const triggerPercent = envNumber(layered, 'CCTL_AUTOSWITCH_TRIGGER_PCT');
+  const staleTriggerPercent = envNumber(layered, 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT');
+  const staleAfterMs = envNumber(layered, 'CCTL_AUTOSWITCH_STALE_AFTER_MS');
+  const minSessionHeadroomPct = envNumber(layered, 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT');
+  const greedyResetMarginMs = envNumber(layered, 'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS');
+  const cooldownMs = envNumber(layered, 'CCTL_AUTOSWITCH_COOLDOWN_MS');
   // A blank override is an ABSENT override, not an empty relay url. `CCTL_RELAY_URL=` left in a
   // shell profile, or `--relay "$SOMETHING_UNSET"` in a wrapper script, would otherwise win the
   // `??` chain with '' and send the daemon to dial nothing — while the settings view reported
@@ -251,24 +518,24 @@ export function resolveDaemonConfig(
           : 'default';
   // Default OFF: the CLI's Notification hook nags ("Claude is waiting for your input…")
   // duplicate the real permission/done cards on the phone.
-  const waitingCards = envFlag(env, 'CCTL_WAITING_CARDS');
+  const waitingCards = envFlag(layered, 'CCTL_WAITING_CARDS');
   // The hook contract offers ONE decision channel: while a permission is held for a remote
   // decision the terminal cannot prompt. A shorter hold favors keyboard-first use.
-  const permissionHoldMs = envNumber(env, 'CCTL_PERMISSION_HOLD_MS');
+  const permissionHoldMs = envNumber(layered, 'CCTL_PERMISSION_HOLD_MS');
   // Questions (AskUserQuestion) share the permission hold's tradeoff but not necessarily its
   // tuning: a question is usually mid-flow, so an operator may want the terminal picker back
   // sooner than they want permission prompts back. Falls back to the permission hold.
-  const questionHoldMs = envNumber(env, 'CCTL_QUESTION_HOLD_MS');
+  const questionHoldMs = envNumber(layered, 'CCTL_QUESTION_HOLD_MS');
   // Default ON: a remote operator can't see the terminal, so every shell command's output is
   // pushed as a card in every permission mode; `off` silences chatty sessions.
-  const commandOutputEnv = envBool(env, 'CCTL_COMMAND_OUTPUT');
+  const commandOutputEnv = envBool(layered, 'CCTL_COMMAND_OUTPUT');
   const commandOutputCards = commandOutputEnv ?? true;
   // Default OFF: cards ship a phone-sized excerpt; full output arrives as a file attachment.
-  const fullToolOutput = envFlag(env, 'CCTL_TOOL_OUTPUT_FULL');
+  const fullToolOutput = envFlag(layered, 'CCTL_TOOL_OUTPUT_FULL');
   // Default ON: each poll verifies the vault token's OWNER against the OAuth profile
   // endpoint and quarantines on mismatch — the guard against a bundle silently holding
   // another account's credentials. The free local row-vs-bundle check runs regardless.
-  const identityCheckEnv = envBool(env, 'CCTL_IDENTITY_CHECK');
+  const identityCheckEnv = envBool(layered, 'CCTL_IDENTITY_CHECK');
   const identityCheck = identityCheckEnv ?? true;
 
   const rows: SettingRow[] = [
@@ -283,20 +550,33 @@ export function resolveDaemonConfig(
     {
       name: 'auto-switch',
       value: autoSwitch ? 'on' : 'off',
-      source: flags.autoSwitch !== undefined ? 'flag' : envSource(autoSwitchEnv !== undefined),
+      source:
+        flags.autoSwitch !== undefined
+          ? 'flag'
+          : sourceOf('CCTL_AUTOSWITCH', autoSwitchEnv !== undefined),
       detail: '--[no-]auto-switch or CCTL_AUTOSWITCH (on by default)',
     },
     {
       name: 'greedy burn-back',
       // Greedy without auto-switch does nothing — say so rather than show a lying "on".
       value: greedy ? (autoSwitch ? 'on' : 'on (inactive: auto-switch is off)') : 'off',
-      source: flags.greedy !== undefined ? 'flag' : envSource(greedyEnv !== undefined),
+      source:
+        flags.greedy !== undefined
+          ? 'flag'
+          : sourceOf('CCTL_AUTOSWITCH_GREEDY', greedyEnv !== undefined),
       detail: '--[no-]greedy or CCTL_AUTOSWITCH_GREEDY (on by default)',
+    },
+    {
+      name: 'fable cap trigger',
+      value: autoSwitchOnFableCap ? 'on' : 'off',
+      source: sourceOf('CCTL_AUTOSWITCH_ON_FABLE_CAP', fableCapEnv !== undefined),
+      detail:
+        'CCTL_AUTOSWITCH_ON_FABLE_CAP (off: a full Fable weekly cap alone never triggers a hop; the shared weekly budget and the 5h window still do)',
     },
     {
       name: 'switch trigger',
       value: `${triggerPercent ?? DEFAULT_TRIGGER_PERCENT}% used`,
-      source: envSource(triggerPercent !== undefined),
+      source: sourceOf('CCTL_AUTOSWITCH_TRIGGER_PCT', triggerPercent !== undefined),
       detail: 'CCTL_AUTOSWITCH_TRIGGER_PCT',
     },
     {
@@ -307,70 +587,70 @@ export function resolveDaemonConfig(
         staleTriggerPercent ?? DEFAULT_STALE_TRIGGER_PERCENT,
         triggerPercent ?? DEFAULT_TRIGGER_PERCENT,
       )}% used`,
-      source: envSource(staleTriggerPercent !== undefined),
+      source: sourceOf('CCTL_AUTOSWITCH_STALE_TRIGGER_PCT', staleTriggerPercent !== undefined),
       detail: 'CCTL_AUTOSWITCH_STALE_TRIGGER_PCT (tightened trigger while usage data is stale)',
     },
     {
       name: 'stale snapshot age',
       value: humanizeMs(staleAfterMs ?? DEFAULT_STALE_AFTER_MS),
-      source: envSource(staleAfterMs !== undefined),
+      source: sourceOf('CCTL_AUTOSWITCH_STALE_AFTER_MS', staleAfterMs !== undefined),
       detail: 'CCTL_AUTOSWITCH_STALE_AFTER_MS (usage data older than this counts as stale)',
     },
     {
       name: 'min session headroom',
       value: `${minSessionHeadroomPct ?? DEFAULT_MIN_SESSION_HEADROOM_PCT}% left`,
-      source: envSource(minSessionHeadroomPct !== undefined),
+      source: sourceOf('CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT', minSessionHeadroomPct !== undefined),
       detail: 'CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT',
     },
     {
       name: 'greedy reset margin',
       value: humanizeMs(greedyResetMarginMs ?? DEFAULT_GREEDY_RESET_MARGIN_MS),
-      source: envSource(greedyResetMarginMs !== undefined),
+      source: sourceOf('CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS', greedyResetMarginMs !== undefined),
       detail:
         'CCTL_AUTOSWITCH_GREEDY_RESET_MARGIN_MS (weekly resets closer than this count as the same deadline - no greedy hop)',
     },
     {
       name: 'auto-switch cooldown',
       value: humanizeMs(cooldownMs ?? DEFAULT_AUTOSWITCH_COOLDOWN_MS),
-      source: envSource(cooldownMs !== undefined),
+      source: sourceOf('CCTL_AUTOSWITCH_COOLDOWN_MS', cooldownMs !== undefined),
       detail: 'CCTL_AUTOSWITCH_COOLDOWN_MS',
     },
     {
       name: 'waiting cards',
       value: waitingCards ? 'on' : 'off',
-      source: envSource(waitingCards),
+      source: sourceOf('CCTL_WAITING_CARDS', waitingCards),
       detail: 'CCTL_WAITING_CARDS ("Claude is waiting..." terminal nags as phone cards)',
     },
     {
       name: 'permission hold',
       value: `${Math.round((permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS) / 1000)}s`,
-      source: envSource(permissionHoldMs !== undefined),
+      source: sourceOf('CCTL_PERMISSION_HOLD_MS', permissionHoldMs !== undefined),
       detail: 'CCTL_PERMISSION_HOLD_MS (remote-decision window; local prompt appears after)',
     },
     {
       name: 'question hold',
       value: `${Math.round((questionHoldMs ?? permissionHoldMs ?? DEFAULT_PERMISSION_HOLD_MS) / 1000)}s`,
-      source: envSource(questionHoldMs !== undefined),
+      source: sourceOf('CCTL_QUESTION_HOLD_MS', questionHoldMs !== undefined),
       detail:
         'CCTL_QUESTION_HOLD_MS (remote-answer window for questions; terminal picker appears after)',
     },
     {
       name: 'command output cards',
       value: commandOutputCards ? 'on' : 'off',
-      source: envSource(commandOutputEnv !== undefined),
+      source: sourceOf('CCTL_COMMAND_OUTPUT', commandOutputEnv !== undefined),
       detail: "CCTL_COMMAND_OUTPUT (every shell command's output as a phone card; off silences)",
     },
     {
       name: 'identity check',
       value: identityCheck ? 'on' : 'off',
-      source: envSource(identityCheckEnv !== undefined),
+      source: sourceOf('CCTL_IDENTITY_CHECK', identityCheckEnv !== undefined),
       detail:
         'CCTL_IDENTITY_CHECK (verify each vault token really belongs to its account per poll; quarantine on mismatch)',
     },
     {
       name: 'full tool output',
       value: fullToolOutput ? 'on' : 'off',
-      source: envSource(fullToolOutput),
+      source: sourceOf('CCTL_TOOL_OUTPUT_FULL', fullToolOutput),
       detail:
         'CCTL_TOOL_OUTPUT_FULL (the attached output.txt carries the complete output instead of the phone-sized excerpt)',
     },
@@ -382,20 +662,20 @@ export function resolveDaemonConfig(
     },
     {
       name: 'daemon log level',
-      value: env['CCTL_LOG_LEVEL'] ?? 'info',
-      source: envSource(env['CCTL_LOG_LEVEL'] !== undefined),
+      value: layered['CCTL_LOG_LEVEL'] ?? 'info',
+      source: sourceOf('CCTL_LOG_LEVEL', layered['CCTL_LOG_LEVEL'] !== undefined),
       detail: 'CCTL_LOG_LEVEL (debug also prints the stack under every error line)',
     },
     {
       name: 'daemon log format',
-      value: env['CCTL_LOG_FORMAT'] ?? 'auto',
-      source: envSource(env['CCTL_LOG_FORMAT'] !== undefined),
+      value: layered['CCTL_LOG_FORMAT'] ?? 'auto',
+      source: sourceOf('CCTL_LOG_FORMAT', layered['CCTL_LOG_FORMAT'] !== undefined),
       detail: "CCTL_LOG_FORMAT ('pretty' or 'json'; auto is pretty on a terminal, json otherwise)",
     },
     {
       name: 'daemon log file',
-      value: env['CCTL_LOG_FILE'] ?? 'off',
-      source: envSource(env['CCTL_LOG_FILE'] !== undefined),
+      value: layered['CCTL_LOG_FILE'] ?? 'off',
+      source: sourceOf('CCTL_LOG_FILE', layered['CCTL_LOG_FILE'] !== undefined),
       detail:
         'CCTL_LOG_FILE (path NDJSON logs are also appended to; an installed daemon has no console)',
     },
@@ -406,6 +686,7 @@ export function resolveDaemonConfig(
       relayUrl,
       autoSwitch,
       greedy,
+      autoSwitchOnFableCap,
       triggerPercent,
       staleTriggerPercent,
       staleAfterMs,

@@ -99,15 +99,20 @@ import {
   type WizardIo,
 } from './setup.js';
 import {
+  checkSettingValue,
   daemonSettingsPath,
   DEFAULT_RELAY_URL,
   daemonConfigPath,
+  findDaemonEnvSetting,
+  forgetDaemonSetting,
+  persistDaemonSetting,
   readDaemonConfigFile,
   readSettingsReport,
   renderSettings,
   reportSaysGreedyActive,
   resolveCliSettings,
   resolveDaemonConfig,
+  settableSettingsSummary,
   VERSION,
   type SettingsSection,
 } from './settings.js';
@@ -259,7 +264,7 @@ export function buildProgram(): Command {
       process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });
 
-  program
+  const settings = program
     .command('settings')
     .description('show every configurable setting: effective value and where it came from')
     .action(async () => {
@@ -283,6 +288,56 @@ export function buildProgram(): Command {
         });
       }
       process.stdout.write(renderSettings(sections, detectPalette()) + '\n');
+    });
+
+  // Persisted daemon settings live in config.json under the env var names the daemon already
+  // reads, so an operator sets them by the name `cctl settings` shows and never has to find a
+  // machine-wide env var editor or wrap the logon task.
+  const unknownSetting = (name: string): string =>
+    `"${name}" is not a daemon setting. Settable: ${settableSettingsSummary()}.`;
+  settings
+    .command('set <name> <value>')
+    .description(
+      'persist a daemon setting in config.json, by alias or env var name (e.g. `fable-cap off`, ' +
+        '`trigger 90`, `CCTL_AUTOSWITCH off`); `cctl settings set x` lists every name',
+    )
+    .action(async (name: string, value: string) => {
+      const setting = findDaemonEnvSetting(name);
+      if (!setting) fail(unknownSetting(name));
+      const checked = checkSettingValue(setting, value);
+      if (!checked.ok) fail(checked.message);
+      const filePath = daemonConfigPath();
+      try {
+        await persistDaemonSetting(filePath, setting, checked.value);
+      } catch (err) {
+        fail(err instanceof Error ? err.message : String(err));
+      }
+      process.stdout.write(
+        `Saved ${setting.name}=${checked.value} to ${filePath}.\n` +
+          'Takes effect when the daemon next starts (restart it to apply now); a value set in ' +
+          'the environment still wins over the file.\n',
+      );
+    });
+
+  settings
+    .command('unset <name>')
+    .description('remove a persisted daemon setting from config.json')
+    .action(async (name: string) => {
+      const setting = findDaemonEnvSetting(name);
+      if (!setting) fail(unknownSetting(name));
+      const filePath = daemonConfigPath();
+      let removed: boolean;
+      try {
+        removed = await forgetDaemonSetting(filePath, setting);
+      } catch (err) {
+        fail(err instanceof Error ? err.message : String(err));
+      }
+      process.stdout.write(
+        removed
+          ? `Removed ${setting.name} from ${filePath}; the daemon falls back to the environment ` +
+              'or the default when it next starts.\n'
+          : `${setting.name} is not set in ${filePath}.\n`,
+      );
     });
 
   program

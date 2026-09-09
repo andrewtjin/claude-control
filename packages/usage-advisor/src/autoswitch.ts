@@ -7,7 +7,8 @@
 //
 // The policy, as specified by the owner:
 //   TRIGGER — the ACTIVE account's remaining quota is low (its worst limit is at/above
-//   `triggerPercent` used). When the account's snapshot is STALE (older than `staleAfterMs`)
+//   `triggerPercent` used; the Fable-only weekly cap counts unless `fableCapTriggers` is
+//   opted out). When the account's snapshot is STALE (older than `staleAfterMs`)
 //   the bar tightens to `staleTriggerPercent`: usage only grows while we're blind, so a
 //   stale near-limit reading is a floor, not a fact — hop before the unseen burn crosses
 //   the hard cutoff and kills the session mid-work.
@@ -75,6 +76,12 @@ export interface AutoSwitchPolicy {
    *  reported. Clamped to never fall below `greedyResetMarginMs` — a derived number can only
    *  raise the bar for an unprompted hop, never lower it. */
   greedyPredictedResetMarginMs?: number;
+  /** Whether a full Fable weekly cap (`weekly_scoped`) counts toward "low". ON by default:
+   *  the sessions this daemon keeps alive mostly run Fable, so its wall is the wall. Off for
+   *  an operator who mostly runs other models — then only the shared weekly budget and the
+   *  5h window can trigger a hop or disqualify a candidate, and a Fable-capped account keeps
+   *  serving everything else instead of being hopped away from. */
+  fableCapTriggers?: boolean;
 }
 
 // 94: hop only when the account is genuinely near the wall — fewer premature hops, still
@@ -138,8 +145,13 @@ export function decideAutoSwitch(
   const active = accounts.find((a) => a.active);
   if (!active) return null;
 
+  // Which limits count as the wall. With the Fable cap opted out, the scoped cap is invisible
+  // to BOTH the trigger and candidate eligibility — the same rule on both sides, or the daemon
+  // would hop away from a Fable-capped account and refuse to hop toward an identical one.
+  const countFableCap = policy.fableCapTriggers ?? true;
+
   // No limit data at all means we know nothing — never act on ignorance.
-  const activeWorst = worstPercent(active, now);
+  const activeWorst = worstPercent(active, now, countFableCap);
   if (activeWorst === undefined) return null;
 
   const candidates = accounts.filter(
@@ -150,7 +162,7 @@ export function decideAutoSwitch(
       // Never hop to an account that would itself immediately count as low — judged by ITS
       // OWN snapshot's age, so a stale near-limit candidate (whose true usage may already
       // be past the wall) is no safer a target than it would be to keep...
-      (worstPercent(a, now) ?? 0) < lowThreshold(a) &&
+      (worstPercent(a, now, countFableCap) ?? 0) < lowThreshold(a) &&
       // ...or whose weekly budget clock we can't see — the choice is BY weekly reset,
       // so an unknown reset is not a lesser candidate, it's not a candidate at all.
       weeklyResetAt(a, now) !== undefined,
@@ -233,9 +245,19 @@ function effectiveLimits(account: AccountUsageInput, now: number): LimitInput[] 
 }
 
 /** The account's binding constraint — max percent used across live limits. `undefined`
- *  when the account reported no usable limit data. */
-function worstPercent(account: AccountUsageInput, now: number): number | undefined {
-  const limits = effectiveLimits(account, now);
+ *  when the account reported no usable limit data. With `countFableCap` off the Fable-only
+ *  `weekly_scoped` cap is left out, so an account whose ONLY live limit is that cap reports
+ *  no data at all: for the trigger that means "never act on ignorance", for a candidate it
+ *  means "nothing known to be low" — both the honest reading of a snapshot that says nothing
+ *  about the budget the operator cares about. */
+function worstPercent(
+  account: AccountUsageInput,
+  now: number,
+  countFableCap = true,
+): number | undefined {
+  const limits = effectiveLimits(account, now).filter(
+    (l) => countFableCap || l.kind !== 'weekly_scoped',
+  );
   if (limits.length === 0) return undefined;
   return Math.max(...limits.map((l) => l.percent));
 }

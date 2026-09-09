@@ -1,5 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { VaultError, type StoredAccount } from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
 
@@ -18,6 +21,42 @@ vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
   buildEngine: () => engine,
 }));
+// config.json is resolved through this one seam, so the settings tests below write to a
+// per-test temp file and never near the operator's real one.
+const settingsIo = vi.hoisted(() => ({ configPath: '' }));
+vi.mock('./settings.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./settings.js')>()),
+  daemonConfigPath: () => settingsIo.configPath,
+}));
+
+/** Run one command through commander with stdout/stderr captured and `process.exit` turned
+ *  into a throw, so `fail()` surfaces as `exited` instead of ending the test runner. */
+async function runCli(args: string[]) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+    out.push(String(chunk));
+    return true;
+  });
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+    err.push(String(chunk));
+    return true;
+  });
+  const exit = vi.spyOn(process, 'exit').mockImplementation((code) => {
+    throw new Error(`exit ${String(code)}`);
+  });
+  try {
+    await buildProgram().parseAsync(args, { from: 'user' });
+    return { out: out.join(''), err: err.join(''), exited: false };
+  } catch (e) {
+    if (!(e instanceof Error) || !e.message.startsWith('exit ')) throw e;
+    return { out: out.join(''), err: err.join(''), exited: true };
+  } finally {
+    stdout.mockRestore();
+    stderr.mockRestore();
+    exit.mockRestore();
+  }
+}
 
 describe('buildProgram', () => {
   it('exposes the expected command surface', () => {
@@ -76,42 +115,19 @@ describe('buildProgram', () => {
       updatedAtMs: 1,
     };
 
-    /** Run one rename through commander with stdout/stderr captured and `process.exit` turned
-     *  into a throw, so `fail()` surfaces as a rejection instead of ending the test runner. */
-    async function rename(args: string[]) {
-      const out: string[] = [];
-      const err: string[] = [];
-      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
-        out.push(String(chunk));
-        return true;
-      });
-      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
-        err.push(String(chunk));
-        return true;
-      });
-      const exit = vi.spyOn(process, 'exit').mockImplementation((code) => {
-        throw new Error(`exit ${String(code)}`);
-      });
-      try {
-        await buildProgram().parseAsync(['accounts', 'rename', ...args], { from: 'user' });
-        return { out, err, exited: false };
-      } catch (e) {
-        if (!(e instanceof Error) || !e.message.startsWith('exit ')) throw e;
-        return { out, err, exited: true };
-      } finally {
-        stdout.mockRestore();
-        stderr.mockRestore();
-        exit.mockRestore();
-      }
-    }
+    const rename = (args: string[]) => runCli(['accounts', 'rename', ...args]);
 
-    it('resolves the ref, renames by id and reports old name, new name and id', async () => {
+    // The new-label half of the line must be what the VAULT stored, not an echo of the
+    // argument: the stub answers with a label differing from the raw arg in case and
+    // whitespace, so an implementation printing the input would fail here.
+    it('resolves the ref, renames by id and reports old name, stored name and id', async () => {
       engine.listAccounts.mockResolvedValueOnce([work]);
-      engine.renameAccount.mockResolvedValueOnce({ ...work, label: 'personal' });
-      const r = await rename(['WORK', 'personal']);
+      engine.renameAccount.mockResolvedValueOnce({ ...work, label: 'Personal' });
+      const r = await rename(['WORK', '  Personal  ']);
       expect(r.exited).toBe(false);
-      expect(engine.renameAccount).toHaveBeenCalledWith('id-1', 'personal');
-      expect(r.out.join('')).toBe('Renamed work to personal (id-1).\n');
+      // Trimming is the vault's job; the CLI hands the argument over untouched.
+      expect(engine.renameAccount).toHaveBeenCalledWith('id-1', '  Personal  ');
+      expect(r.out).toBe('Renamed work to Personal (id-1).\n');
     });
 
     it('answers a same-name rename without writing anything', async () => {
@@ -120,7 +136,7 @@ describe('buildProgram', () => {
       const r = await rename(['work', ' work ']);
       expect(r.exited).toBe(false);
       expect(engine.renameAccount).not.toHaveBeenCalled();
-      expect(r.out.join('')).toBe('work already has that label.\n');
+      expect(r.out).toBe('work already has that label.\n');
     });
 
     it('turns a vault refusal (collision, empty label) into an error line and exit 1', async () => {
@@ -128,7 +144,7 @@ describe('buildProgram', () => {
       engine.renameAccount.mockRejectedValueOnce(new VaultError('"home" already refers to x'));
       const r = await rename(['work', 'home']);
       expect(r.exited).toBe(true);
-      expect(r.err.join('')).toBe('error: "home" already refers to x\n');
+      expect(r.err).toBe('error: "home" already refers to x\n');
     });
 
     it('fails on an unknown ref before touching the engine', async () => {
@@ -136,8 +152,87 @@ describe('buildProgram', () => {
       engine.renameAccount.mockClear();
       const r = await rename(['nope', 'x']);
       expect(r.exited).toBe(true);
-      expect(r.err.join('')).toMatch(/No account matches "nope"/);
+      expect(r.err).toMatch(/No account matches "nope"/);
       expect(engine.renameAccount).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('settings set / unset', () => {
+    let dir = '';
+    beforeEach(async () => {
+      dir = await mkdtemp(join(tmpdir(), 'cctl-settings-cli-'));
+      settingsIo.configPath = join(dir, 'config.json');
+    });
+    afterEach(async () => {
+      settingsIo.configPath = '';
+      await rm(dir, { recursive: true, force: true });
+    });
+    const config = async () =>
+      JSON.parse(await readFile(settingsIo.configPath, 'utf8')) as Record<string, unknown>;
+
+    it('nests set and unset under settings, keeping the bare view', () => {
+      const settings = buildProgram().commands.find((c) => c.name() === 'settings');
+      expect(settings?.commands.map((c) => c.name()).sort()).toEqual(['set', 'unset']);
+    });
+
+    it('persists a setting under its env var name, in any case, and says where it went', async () => {
+      const r = await runCli(['settings', 'set', 'cctl_autoswitch', 'off']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain(`Saved CCTL_AUTOSWITCH=off to ${settingsIo.configPath}.`);
+      expect(r.out).toMatch(/next starts/);
+      expect(await config()).toEqual({ env: { CCTL_AUTOSWITCH: 'off' } });
+    });
+
+    it('accepts the short alias and stores the value under the env var name', async () => {
+      const r = await runCli(['settings', 'set', 'fable-cap', 'off']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain('Saved CCTL_AUTOSWITCH_ON_FABLE_CAP=off to');
+      expect(await config()).toEqual({ env: { CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' } });
+      const gone = await runCli(['settings', 'unset', 'FABLE_CAP']);
+      expect(gone.out).toContain('Removed CCTL_AUTOSWITCH_ON_FABLE_CAP from');
+      expect(await config()).toEqual({});
+    });
+
+    it('stores the relay in its own field', async () => {
+      const r = await runCli(['settings', 'set', 'relay', 'wss://relay.example.com']);
+      expect(r.exited).toBe(false);
+      expect(await config()).toEqual({ relayUrl: 'wss://relay.example.com' });
+    });
+
+    it('refuses a value the daemon would ignore, and writes nothing', async () => {
+      const r = await runCli(['settings', 'set', 'CCTL_AUTOSWITCH', 'maybe']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(/CCTL_AUTOSWITCH takes on or off/);
+      await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('refuses an unknown name and lists what can be set', async () => {
+      const r = await runCli(['settings', 'set', 'CCTL_NOPE', '1']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(/"CCTL_NOPE" is not a daemon setting/);
+      expect(r.err).toContain('fable-cap (CCTL_AUTOSWITCH_ON_FABLE_CAP)');
+    });
+
+    it('unset removes the entry, says when there was none, and never creates the file', async () => {
+      const none = await runCli(['settings', 'unset', 'CCTL_AUTOSWITCH']);
+      expect(none.exited).toBe(false);
+      expect(none.out).toContain('CCTL_AUTOSWITCH is not set in');
+      await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
+
+      await runCli(['settings', 'set', 'CCTL_AUTOSWITCH', 'off']);
+      const removed = await runCli(['settings', 'unset', 'CCTL_AUTOSWITCH']);
+      expect(removed.exited).toBe(false);
+      expect(removed.out).toContain('Removed CCTL_AUTOSWITCH from');
+      expect(await config()).toEqual({});
+    });
+
+    it('turns a corrupt config file into an error rather than overwriting it', async () => {
+      const { writeFile } = await import('node:fs/promises');
+      await writeFile(settingsIo.configPath, '{not json', 'utf8');
+      const r = await runCli(['settings', 'set', 'CCTL_AUTOSWITCH', 'off']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toMatch(/not valid JSON/);
+      expect(await readFile(settingsIo.configPath, 'utf8')).toBe('{not json');
     });
   });
 
