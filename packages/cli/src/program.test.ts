@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VaultError, type StoredAccount } from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
+import { VERSION, type SettingsReport } from './settings.js';
 
 // `buildEngine` is the CLI's single seam onto the switch engine, so stubbing it lets an action
 // body run for real — commander dispatch, the action, the render — with nothing near a real
@@ -23,13 +24,19 @@ vi.mock('./context.js', async (importOriginal) => ({
 }));
 // config.json is resolved through this one seam, so the settings tests below write to a
 // per-test temp file and never near the operator's real one.
-const settingsIo = vi.hoisted(() => ({ configPath: '', reportPath: '' }));
+// config.json and the daemon's settings report are resolved through these seams, so the settings
+// tests below write to per-test temp files and never near the operator's real ones, and `version`
+// stays deterministic regardless of what daemon (if any) last ran on the box a test executes on.
+const settingsIo = vi.hoisted(() => ({
+  configPath: '',
+  reportPath: '',
+  readSettingsReport: vi.fn((): Promise<SettingsReport | undefined> => Promise.resolve(undefined)),
+}));
 vi.mock('./settings.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./settings.js')>()),
   daemonConfigPath: () => settingsIo.configPath,
-  // The bare `cctl settings` view reads the daemon's last report from here; an absent file is
-  // the "no daemon has run yet" preview, which is the branch these tests can exercise.
   daemonSettingsPath: () => settingsIo.reportPath,
+  readSettingsReport: settingsIo.readSettingsReport,
 }));
 
 /** Run one command through commander with stdout/stderr captured and `process.exit` turned
@@ -61,6 +68,21 @@ async function runCli(args: string[]) {
   }
 }
 
+/** Run one command with stdout captured, so the printed text can be asserted. */
+async function run(argv: string[]): Promise<string> {
+  let out = '';
+  const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+    out += String(chunk);
+    return true;
+  });
+  try {
+    await buildProgram().parseAsync(argv, { from: 'user' });
+  } finally {
+    write.mockRestore();
+  }
+  return out;
+}
+
 describe('buildProgram', () => {
   it('exposes the expected command surface', () => {
     const names = buildProgram()
@@ -77,6 +99,7 @@ describe('buildProgram', () => {
     expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
+    expect(names).toContain('version');
     // First-run + at-a-glance status surfaces.
     expect(names).toContain('setup');
     expect(names).toContain('status');
@@ -388,5 +411,67 @@ describe('buildProgram', () => {
       exit.mockRestore();
       if (platform) Object.defineProperty(process, 'platform', platform);
     }
+  });
+});
+
+describe('version command', () => {
+  beforeEach(() => {
+    settingsIo.readSettingsReport.mockReset().mockResolvedValue(undefined);
+  });
+
+  it('prints the cli build and says no daemon has run when there is no report', async () => {
+    const out = await run(['version']);
+    expect(out).toContain(`cli build: v${VERSION}`);
+    expect(out).toContain('no daemon has run');
+  });
+
+  it('prints both builds when the daemon has reported one', async () => {
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [{ name: 'daemon build', value: `v${VERSION}`, source: 'default' }],
+    });
+    const out = await run(['version']);
+    expect(out).toContain(`cli build: v${VERSION}`);
+    expect(out).toContain(`daemon build: v${VERSION}`);
+  });
+});
+
+describe('help', () => {
+  // Commander's own `help` dispatch always ends by calling `process.exit` (see `Command.help()`)
+  // — a bare-program `.action()` (the `cctl` summary above) is exactly the condition that makes
+  // Commander skip adding its implicit help command in the first place (see `_getHelpCommand`),
+  // so this exercises the real dispatch path rather than asserting our fix from the outside.
+  // `exitOverride()` can't substitute here: it only takes effect on subcommands created AFTER
+  // it is called, and every subcommand is already built by the time a test gets `buildProgram()`'s
+  // return value — so the exit itself is turned into a throw instead, unwinding the same way
+  // `exitOverride` would, without ever reaching a real `process.exit` in the test worker.
+  async function captureHelp(argv: string[]): Promise<string> {
+    let out = '';
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      out += String(chunk);
+      return true;
+    });
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('__test_process_exit__');
+    });
+    try {
+      await buildProgram().parseAsync(argv, { from: 'user' });
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== '__test_process_exit__') throw err;
+    } finally {
+      write.mockRestore();
+      exit.mockRestore();
+    }
+    return out;
+  }
+
+  it('prints top-level usage for `cctl help`', async () => {
+    const out = await captureHelp(['help']);
+    expect(out).toContain('Usage: cctl');
+  });
+
+  it("resolves `cctl help <command>` to that command's own usage", async () => {
+    const out = await captureHelp(['help', 'switch']);
+    expect(out).toContain('Usage: cctl switch');
   });
 });
