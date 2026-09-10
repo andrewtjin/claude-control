@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sandboxPaths, type Paths } from '@claude-control/switch-engine';
-import { buildEngine } from './context.js';
+import { ANSI_PALETTE, PLAIN_PALETTE } from './ansi.js';
+import { buildEngine, fail, paintErrorLine } from './context.js';
 
 const tempDirs: string[] = [];
 function freshTempDir(): string {
@@ -85,5 +86,55 @@ describe('buildEngine: where the engine writes its diagnostics', () => {
 
     expect(stdout.join('')).toContain('account metadata sweep did not run');
     expect(stderr).toEqual([]);
+  });
+});
+
+describe('paintErrorLine', () => {
+  const ESC = '\u001b';
+
+  it('paints the whole line red and keeps the newline outside the color', () => {
+    expect(paintErrorLine('error: nope\n', ANSI_PALETTE)).toBe(`${ESC}[31merror: nope${ESC}[0m\n`);
+    expect(paintErrorLine('error: nope', ANSI_PALETTE)).toBe(`${ESC}[31merror: nope${ESC}[0m`);
+  });
+
+  it('is the identity under the plain palette', () => {
+    expect(paintErrorLine('error: nope\n', PLAIN_PALETTE)).toBe('error: nope\n');
+  });
+});
+
+describe('fail: the one error line every command prints', () => {
+  /** Run `body` with stderr pretending to be (or not be) a terminal and NO_COLOR unset, and
+   *  `process.exit` turned into a throw so `fail` hands control back to the test. */
+  async function failing(isTTY: boolean, body: () => void): Promise<string> {
+    const had = Object.getOwnPropertyDescriptor(process.stderr, 'isTTY');
+    Object.defineProperty(process.stderr, 'isTTY', {
+      value: isTTY,
+      configurable: true,
+      writable: true,
+    });
+    vi.stubEnv('NO_COLOR', undefined);
+    const exit = vi.spyOn(process, 'exit').mockImplementation((code) => {
+      throw new Error(`exit ${String(code)}`);
+    });
+    try {
+      const { stderr } = await captureConsole(() => {
+        expect(body).toThrow('exit 1');
+        return Promise.resolve();
+      });
+      return stderr.join('');
+    } finally {
+      exit.mockRestore();
+      vi.unstubAllEnvs();
+      if (had) Object.defineProperty(process.stderr, 'isTTY', had);
+      else delete (process.stderr as { isTTY?: boolean }).isTTY;
+    }
+  }
+
+  it('is red on a terminal', async () => {
+    expect(await failing(true, () => fail('nope'))).toBe('\u001b[31merror: nope\u001b[0m\n');
+  });
+
+  it('is plain when stderr is redirected', async () => {
+    expect(await failing(false, () => fail('nope'))).toBe('error: nope\n');
   });
 });

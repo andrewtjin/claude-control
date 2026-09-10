@@ -45,7 +45,7 @@ import {
   timelineInputFromWire,
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
-import { buildEngine, daemonDbPath, fail } from './context.js';
+import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
@@ -108,6 +108,8 @@ import {
   persistDaemonSetting,
   readDaemonConfigFile,
   readSettingsReport,
+  renderSettingForgotten,
+  renderSettingSaved,
   renderSettings,
   renderVersionInfo,
   reportSaysGreedyActive,
@@ -136,6 +138,13 @@ export function buildProgram(): Command {
   // otherwise silently disable `cctl help`/`cctl help <command>` rather than dispatching them.
   // Force it on explicitly so both keep working regardless of that handler.
   program.helpCommand(true);
+
+  // Commander's own refusals (an unknown command, a missing argument) reach stderr through this
+  // hook. They take the same red as `fail()`'s line so every `error:` the CLI prints looks
+  // alike, and the same stderr-is-a-terminal test so a redirected stderr stays plain.
+  program.configureOutput({
+    outputError: (str, write) => write(paintErrorLine(str, detectPalette(process.stderr))),
+  });
 
   buildAccountCommands(program);
   buildSessionCommands(program);
@@ -324,11 +333,7 @@ export function buildProgram(): Command {
       } catch (err) {
         fail(err instanceof Error ? err.message : String(err));
       }
-      process.stdout.write(
-        `Saved ${setting.name}=${checked.value} to ${filePath}.\n` +
-          'Takes effect when the daemon next starts (restart it to apply now); a value set in ' +
-          'the environment still wins over the file.\n',
-      );
+      process.stdout.write(renderSettingSaved(setting, checked.value, filePath, detectPalette()));
     });
 
   settings
@@ -344,12 +349,7 @@ export function buildProgram(): Command {
       } catch (err) {
         fail(err instanceof Error ? err.message : String(err));
       }
-      process.stdout.write(
-        removed
-          ? `Removed ${setting.name} from ${filePath}; the daemon falls back to the environment ` +
-              'or the default when it next starts.\n'
-          : `${setting.name} is not set in ${filePath}.\n`,
-      );
+      process.stdout.write(renderSettingForgotten(setting, filePath, removed, detectPalette()));
     });
 
   program

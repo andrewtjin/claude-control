@@ -22,8 +22,6 @@ vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
   buildEngine: () => engine,
 }));
-// config.json is resolved through this one seam, so the settings tests below write to a
-// per-test temp file and never near the operator's real one.
 // config.json and the daemon's settings report are resolved through these seams, so the settings
 // tests below write to per-test temp files and never near the operator's real ones, and `version`
 // stays deterministic regardless of what daemon (if any) last ran on the box a test executes on.
@@ -473,5 +471,69 @@ describe('help', () => {
   it("resolves `cctl help <command>` to that command's own usage", async () => {
     const out = await captureHelp(['help', 'switch']);
     expect(out).toContain('Usage: cctl switch');
+  });
+});
+
+/** Run `body` with the named stream pretending to be a terminal and NO_COLOR unset — the one
+ *  condition under which the CLI paints — restoring both afterwards. */
+async function onTerminal<T>(stream: NodeJS.WriteStream, body: () => Promise<T>): Promise<T> {
+  const had = Object.getOwnPropertyDescriptor(stream, 'isTTY');
+  Object.defineProperty(stream, 'isTTY', { value: true, configurable: true, writable: true });
+  vi.stubEnv('NO_COLOR', undefined);
+  try {
+    return await body();
+  } finally {
+    vi.unstubAllEnvs();
+    if (had) Object.defineProperty(stream, 'isTTY', had);
+    else delete (stream as { isTTY?: boolean }).isTTY;
+  }
+}
+
+describe('color on a terminal', () => {
+  const ESC = String.fromCharCode(27);
+  let dir = '';
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-color-cli-'));
+    settingsIo.configPath = join(dir, 'config.json');
+  });
+  afterEach(async () => {
+    settingsIo.configPath = '';
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('paints the saved assignment and the removal green, and nothing when piped', async () => {
+    const saved = await onTerminal(process.stdout, () =>
+      runCli(['settings', 'set', 'fable-cap', 'off']),
+    );
+    expect(saved.out).toContain(`${ESC}[32mSaved CCTL_AUTOSWITCH_ON_FABLE_CAP=off${ESC}[0m to `);
+    const removed = await onTerminal(process.stdout, () =>
+      runCli(['settings', 'unset', 'fable-cap']),
+    );
+    expect(removed.out).toContain(`${ESC}[32mRemoved CCTL_AUTOSWITCH_ON_FABLE_CAP${ESC}[0m from `);
+    // Piped — the default in this worker — the same lines carry no code at all.
+    const piped = await runCli(['settings', 'set', 'fable-cap', 'off']);
+    expect(piped.out).toContain('Saved CCTL_AUTOSWITCH_ON_FABLE_CAP=off to ');
+    expect(piped.out).not.toContain(ESC);
+  });
+
+  it("paints fail()'s line red when stderr is a terminal, judged by stderr alone", async () => {
+    const r = await onTerminal(process.stderr, () =>
+      runCli(['settings', 'set', 'fable-cap', 'maybe']),
+    );
+    expect(r.exited).toBe(true);
+    expect(r.err.startsWith(`${ESC}[31merror: CCTL_AUTOSWITCH_ON_FABLE_CAP takes `)).toBe(true);
+    expect(r.err.endsWith(`${ESC}[0m\n`)).toBe(true);
+    // A terminal on stdout does not color stderr: `cctl x 2>err.log` stays plain.
+    const redirected = await onTerminal(process.stdout, () =>
+      runCli(['settings', 'set', 'fable-cap', 'maybe']),
+    );
+    expect(redirected.exited).toBe(true);
+    expect(redirected.err).not.toContain(ESC);
+  });
+
+  it("paints commander's own refusals the same red", async () => {
+    const r = await onTerminal(process.stderr, () => runCli(['settings', 'unset']));
+    expect(r.exited).toBe(true);
+    expect(r.err).toBe(`${ESC}[31merror: missing required argument 'name'${ESC}[0m\n`);
   });
 });

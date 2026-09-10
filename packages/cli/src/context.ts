@@ -9,6 +9,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createLogger, type LogSink } from '@claude-control/shared-protocol';
 import { SwitchEngine, defaultPaths, type Logger, type Paths } from '@claude-control/switch-engine';
+import { detectPalette, type Palette } from './ansi.js';
 
 /** The daemon's sqlite database — a sibling of the vault under the claude-control data dir.
  *  The CLI reads it (e.g. `cctl usage`) without needing the daemon process to be running.
@@ -59,8 +60,18 @@ export function buildEngine(
   return new SwitchEngine(options);
 }
 
-/** Print an error line and exit non-zero — the single failure path for command actions. */
+/** Paint one error line for a terminal: the whole line red, with the trailing newline kept
+ *  outside the color so the reset lands before the cursor moves. The identity palette leaves
+ *  it untouched, which is what a piped or redirected stderr gets. */
+export function paintErrorLine(line: string, palette: Palette): string {
+  const newline = line.endsWith('\n') ? '\n' : '';
+  return palette.red(line.slice(0, line.length - newline.length)) + newline;
+}
+
+/** Print an error line and exit non-zero — the single failure path for command actions. Red on
+ *  a terminal, judged by stderr's own TTY-ness rather than stdout's: `cctl x 2>err.log` must
+ *  stay plain while `cctl x | less` still shows its error in color. */
 export function fail(message: string): never {
-  process.stderr.write(`error: ${message}\n`);
+  process.stderr.write(paintErrorLine(`error: ${message}\n`, detectPalette(process.stderr)));
   process.exit(1);
 }

@@ -193,6 +193,37 @@ export function settableSettingsSummary(): string {
   return DAEMON_ENV_SETTINGS.map((s) => `${s.alias} (${s.name})`).join(', ');
 }
 
+/** The lines `cctl settings set` prints once the value is on disk. The assignment is the
+ *  outcome, so it alone is painted (green: done, nothing further owed); the path says where to
+ *  look and the caveat what to do next, and both stay plain so the eye lands on the result.
+ *  Plain by default — piped output and the tests see exact strings. */
+export function renderSettingSaved(
+  setting: DaemonEnvSetting,
+  value: string,
+  filePath: string,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  return (
+    `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}.\n` +
+    'Takes effect when the daemon next starts (restart it to apply now); a value set in ' +
+    'the environment still wins over the file.\n'
+  );
+}
+
+/** The line `cctl settings unset` prints. A removal is painted like a save — the file changed
+ *  as asked — while "not set" stays plain: nothing changed and nothing needs doing. */
+export function renderSettingForgotten(
+  setting: DaemonEnvSetting,
+  filePath: string,
+  removed: boolean,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  return removed
+    ? `${palette.green(`Removed ${setting.name}`)} from ${filePath}; the daemon falls back to ` +
+        'the environment or the default when it next starts.\n'
+    : `${setting.name} is not set in ${filePath}.\n`;
+}
+
 /** pino's level names, which `CCTL_LOG_LEVEL` is handed to verbatim — an unknown one would
  *  throw at logger construction, which for a persisted value means at every daemon start. */
 const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'];
@@ -747,9 +778,11 @@ export function resolveCliSettings(env: NodeJS.ProcessEnv, colorOn: boolean): Se
       name: 'color',
       value: colorOn ? 'on' : 'off',
       // Color is off either because NO_COLOR asked for it (env) or because stdout is not a
-      // TTY (the default TTY-detection behavior).
+      // TTY (the default TTY-detection behavior). This row is about stdout — the output a
+      // command prints; error lines make the same decision for stderr on their own, so
+      // `cctl x | less` can show a red error while this row says off.
       source: envSource(noColorSet),
-      detail: 'NO_COLOR (on only for a terminal)',
+      detail: 'NO_COLOR (on only when stdout is a terminal; error lines follow stderr)',
     },
     {
       name: 'switch cadence',

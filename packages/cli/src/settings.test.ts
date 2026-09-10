@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Paths } from '@claude-control/switch-engine';
 import type { SettingRow } from '@claude-control/shared-protocol';
-import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { ANSI_PALETTE, PLAIN_PALETTE, type Palette } from './ansi.js';
 import {
   DAEMON_ENV_SETTINGS,
   DEFAULT_RELAY_URL,
@@ -21,6 +21,8 @@ import {
   persistDaemonSetting,
   readDaemonConfigFile,
   readSettingsReport,
+  renderSettingForgotten,
+  renderSettingSaved,
   renderSettings,
   renderVersionInfo,
   reportSaysGreedyActive,
@@ -884,5 +886,42 @@ describe('persisting daemon settings', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('renderSettingSaved / renderSettingForgotten', () => {
+  const ESC = '\u001b';
+  const fableCap = findDaemonEnvSetting('fable-cap') as DaemonEnvSetting;
+  const file = 'C:/cfg/config.json';
+
+  it('says what was saved and where, then the restart caveat, plain by default', () => {
+    expect(renderSettingSaved(fableCap, 'off', file)).toBe(
+      `Saved CCTL_AUTOSWITCH_ON_FABLE_CAP=off to ${file}.\n` +
+        'Takes effect when the daemon next starts (restart it to apply now); a value set in ' +
+        'the environment still wins over the file.\n',
+    );
+  });
+
+  it('paints only the assignment on a terminal; the path and the caveat stay plain', () => {
+    const text = renderSettingSaved(fableCap, 'off', file, ANSI_PALETTE);
+    expect(
+      text.startsWith(`${ESC}[32mSaved CCTL_AUTOSWITCH_ON_FABLE_CAP=off${ESC}[0m to ${file}.\n`),
+    ).toBe(true);
+    // Exactly one painted span — nothing else on the two lines carries a code.
+    expect(text.split(ESC).length).toBe(3);
+  });
+
+  it('paints a removal like a save and leaves "not set" plain', () => {
+    expect(renderSettingForgotten(fableCap, file, true, ANSI_PALETTE)).toBe(
+      `${ESC}[32mRemoved CCTL_AUTOSWITCH_ON_FABLE_CAP${ESC}[0m from ${file}; the daemon falls back to ` +
+        'the environment or the default when it next starts.\n',
+    );
+    expect(renderSettingForgotten(fableCap, file, false, ANSI_PALETTE)).toBe(
+      `CCTL_AUTOSWITCH_ON_FABLE_CAP is not set in ${file}.\n`,
+    );
+    expect(renderSettingForgotten(fableCap, file, true)).toBe(
+      `Removed CCTL_AUTOSWITCH_ON_FABLE_CAP from ${file}; the daemon falls back to ` +
+        'the environment or the default when it next starts.\n',
+    );
   });
 });
