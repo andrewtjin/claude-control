@@ -24,7 +24,7 @@ vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
   buildEngine: () => engine,
 }));
-/// config.json and the daemon's settings report are resolved through these seams, so the settings
+// config.json and the daemon's settings report are resolved through these seams, so the settings
 // tests below write to per-test temp files and never near the operator's real ones, and `version`
 // stays deterministic regardless of what daemon (if any) last ran on the box a test executes on.
 const settingsIo = vi.hoisted(() => ({
