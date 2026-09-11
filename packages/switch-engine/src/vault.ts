@@ -17,6 +17,31 @@ import { atomicWriteFile, ensureDir, readJsonIfExists, removeIfExists } from './
 import { UnknownAccountError, VaultError } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
 
+/** What {@link Vault.dedupeAccounts} did, for the CLI to say out loud. */
+export interface DedupeReport {
+  /** Rows removed because another row already stored the same login. */
+  merged: Array<{ label: string; keptId: string; removedId: string }>;
+  /** Rows relabelled because they shared a label with a different login. */
+  relabelled: Array<{ id: string; from: string; to: string }>;
+}
+
+/** Refuse a label another row already answers to (any case) or that spells an account id:
+ *  `resolveAccountRef` matches id first, then exact label, then case-insensitive label, so
+ *  either collision would leave one of the two accounts unreachable by name. `exceptId` is
+ *  the row being renamed, whose own label is not a collision with itself. */
+function assertLabelFree(reg: Registry, label: string, exceptId: string | undefined): void {
+  const lower = label.toLowerCase();
+  const taken = reg.accounts.find(
+    (a) => a.id === label || (a.id !== exceptId && a.label.toLowerCase() === lower),
+  );
+  if (taken) {
+    throw new VaultError(
+      `"${label}" already refers to account ${taken.id} ("${taken.label}"); ` +
+        'two accounts answering to one name could not be told apart on switch',
+    );
+  }
+}
+
 /** A fresh empty registry. MUST be a factory, not a shared constant — callers mutate the
  *  `accounts` array in place, and a shared array would leak accounts between vaults. */
 function emptyRegistry(): Registry {
@@ -265,10 +290,25 @@ export class Vault {
    */
   async addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
     const reg = await this.loadRegistry();
+    const next = label.trim();
+    if (next === '') throw new VaultError('a label cannot be empty');
+    assertLabelFree(reg, next, undefined);
+    // The same login stored twice is the other way two rows come to answer to one name (and
+    // to poll one quota twice). The identity block names the login; when it names a row that
+    // is already here, that row is the one to refresh, never a second copy.
+    const uuid = bundle.oauthAccount?.accountUuid;
+    const stored =
+      uuid !== undefined ? reg.accounts.find((a) => a.accountUuid === uuid) : undefined;
+    if (stored) {
+      throw new VaultError(
+        `this login is account ${stored.id} ("${stored.label}"), which is already stored; run ` +
+          `\`cctl accounts relogin ${stored.label}\` to refresh it instead of adding a duplicate`,
+      );
+    }
     const now = this.clock();
     const account: StoredAccount = {
       id: randomUUID(),
-      label,
+      label: next,
       quarantined: false,
       createdAtMs: now,
       updatedAtMs: now,
@@ -335,19 +375,72 @@ export class Vault {
   async renameAccount(id: string, label: string): Promise<StoredAccount> {
     const next = label.trim();
     if (next === '') throw new VaultError('a label cannot be empty');
-    const lower = next.toLowerCase();
     return this.patchAccount(id, (account, reg) => {
-      const taken = reg.accounts.find(
-        (a) => a.id === next || (a.id !== id && a.label.toLowerCase() === lower),
-      );
-      if (taken) {
-        throw new VaultError(
-          `"${next}" already refers to account ${taken.id} ("${taken.label}"); ` +
-            'two accounts answering to one name could not be told apart on switch',
-        );
-      }
+      assertLabelFree(reg, next, id);
       account.label = next;
     });
+  }
+
+  /**
+   * Resolve duplicates that predate the refusals in {@link addAccount}: the same login stored
+   * twice is merged onto one row (the active one, else the most recently captured: a capture
+   * always writes fresh tokens, whereas the registry's updated clock also moves on metadata
+   * touches and says nothing about which tokens are newer), and two logins under one label keep the earlier row's
+   * label while the later ones get a numbered suffix. Both leave every account reachable by
+   * exactly one name. Rewrites the registry only when something changed; the merged rows'
+   * bundles are removed with them.
+   */
+  async dedupeAccounts(): Promise<DedupeReport> {
+    const reg = await this.loadRegistry();
+    const report: DedupeReport = { merged: [], relabelled: [] };
+
+    const byLogin = new Map<string, StoredAccount[]>();
+    for (const a of reg.accounts) {
+      if (a.accountUuid === undefined) continue;
+      byLogin.set(a.accountUuid, [...(byLogin.get(a.accountUuid) ?? []), a]);
+    }
+    const removed = new Set<string>();
+    for (const rows of byLogin.values()) {
+      if (rows.length < 2) continue;
+      const keep =
+        rows.find((r) => r.id === reg.activeId) ??
+        rows.reduce((best, r) => (r.createdAtMs > best.createdAtMs ? r : best));
+      for (const r of rows) {
+        if (r === keep) continue;
+        removed.add(r.id);
+        report.merged.push({ label: r.label, keptId: keep.id, removedId: r.id });
+      }
+    }
+    reg.accounts = reg.accounts.filter((a) => !removed.has(a.id));
+
+    // Earlier rows keep their label; every label already on record (any case) and every id is
+    // off limits for the suffix, so the result is unique under the same rules a rename obeys.
+    const taken = new Set(reg.accounts.map((a) => a.label.toLowerCase()));
+    const seen = new Set<string>();
+    for (const a of [...reg.accounts].sort((x, y) => x.createdAtMs - y.createdAtMs)) {
+      const lower = a.label.toLowerCase();
+      if (!seen.has(lower)) {
+        seen.add(lower);
+        continue;
+      }
+      let n = 2;
+      let next = `${a.label} (${n})`;
+      while (taken.has(next.toLowerCase()) || reg.accounts.some((o) => o.id === next)) {
+        n += 1;
+        next = `${a.label} (${n})`;
+      }
+      report.relabelled.push({ id: a.id, from: a.label, to: next });
+      a.label = next;
+      a.updatedAtMs = this.clock();
+      taken.add(next.toLowerCase());
+      seen.add(next.toLowerCase());
+    }
+
+    if (report.merged.length > 0 || report.relabelled.length > 0) {
+      await this.saveRegistry(reg);
+      for (const id of removed) await removeIfExists(this.bundlePath(id));
+    }
+    return report;
   }
 
   /** Apply `mutate` to one registry row and persist it. The whole registry rides along so a

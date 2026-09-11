@@ -78,6 +78,7 @@ import {
 } from './autostart.js';
 import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
+  renderAccountHeal,
   renderAccountsTable,
   renderDaemonStatus,
   renderPacingLine,
@@ -141,6 +142,13 @@ import {
 // and Discord's `/stats` are only comparable for as long as all three mean the same week.
 
 /** Build the full `cctl` program. Exported so tests can introspect the command tree. */
+/** Resolve duplicate accounts before an account-reading command renders, and say what was
+ *  done. The vault refuses to create duplicates now; rows from before it did are merged or
+ *  relabelled here, so no listing can show two accounts answering to one name. */
+async function healAccounts(engine: ReturnType<typeof buildEngine>): Promise<void> {
+  process.stdout.write(renderAccountHeal(await engine.dedupeAccounts(), detectPalette()));
+}
+
 export function buildProgram(): Command {
   const program = new Command();
   program
@@ -205,6 +213,7 @@ export function buildProgram(): Command {
     .command('usage')
     .description("show usage across all accounts (from the daemon's latest poll)")
     .action(async () => {
+      await healAccounts(buildEngine());
       const nowMs = Date.now();
       const state = await readUsageState(nowMs);
       const rows: UsageRow[] = state.accounts.map((a) => ({
@@ -229,6 +238,7 @@ export function buildProgram(): Command {
     .command('timeline')
     .description('5h-session budget per account + when every limit resets, with a usage plan')
     .action(async () => {
+      await healAccounts(buildEngine());
       const nowMs = Date.now();
       const state = await readUsageState(nowMs);
       const inputs = buildAdvisorInputs(state);
@@ -1121,6 +1131,7 @@ function buildAccountCommands(program: Command): void {
       // Unguarded on purpose: the engine's contract is that this never throws and logs whatever
       // went wrong, so a listing the user asked for still renders whatever is already on record —
       // without a `catch` here throwing the reason away on the way past.
+      await healAccounts(engine);
       await engine.backfillAccountMetadata();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
       process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
@@ -1141,7 +1152,10 @@ function buildAccountCommands(program: Command): void {
       try {
         const account = await buildEngine().captureCurrentLogin(label);
         process.stdout.write(`Added ${account.label} (${account.id}) and set it active.\n`);
-      } catch {
+      } catch (err) {
+        // A refused duplicate (label or login already stored) is the vault's own message;
+        // anything else is the capture finding no login to store.
+        if (err instanceof VaultError) fail(err.message);
         fail('no live login to capture. Run `claude` and log in first, then retry.');
       }
     });

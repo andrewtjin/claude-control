@@ -12,6 +12,10 @@ import { VERSION, type SettingsReport } from './settings.js';
 // vault. Hoisted because the mock factory is evaluated during the import above.
 const engine = vi.hoisted(() => ({
   backfillAccountMetadata: vi.fn(() => Promise.resolve(0)),
+  dedupeAccounts: vi.fn(() => Promise.resolve({ merged: [], relabelled: [] })),
+  captureCurrentLogin: vi.fn((label: string): Promise<StoredAccount> =>
+    Promise.reject(new Error(`captureCurrentLogin(${label}) not stubbed`)),
+  ),
   listAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
   renameAccount: vi.fn((id: string, label: string): Promise<StoredAccount> =>
@@ -322,6 +326,39 @@ describe('buildProgram', () => {
     // distinct alternative-ref flag, not a naming collision to worry about across commands.
     const register = session?.commands.find((c) => c.name() === 'register');
     expect(register?.options.map((o) => o.long)).toContain('--label');
+  });
+
+  it('prints what the duplicate-account heal did above the accounts listing', async () => {
+    engine.dedupeAccounts.mockResolvedValueOnce({
+      merged: [{ label: 'jina25', keptId: 'keep-1', removedId: 'dup-2' }],
+      relabelled: [{ id: 'x-3', from: 'jina25', to: 'jina25 (2)' }],
+    });
+    const out = await run(['accounts', 'list']);
+    expect(
+      out.startsWith(
+        'merged duplicate account jina25: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
+          'renamed account jina25 (x-3) to "jina25 (2)": another account already had that label\n',
+      ),
+    ).toBe(true);
+    // Nothing to heal prints nothing extra.
+    const quiet = await run(['accounts', 'list']);
+    expect(quiet).not.toContain('duplicate');
+  });
+
+  it("surfaces the vault's refusal of a duplicate on accounts add, not the no-login hint", async () => {
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new VaultError(
+        '"jina25" already refers to account abc ("jina25"); two accounts answering to one name could not be told apart on switch',
+      ),
+    );
+    const r = await runCli(['accounts', 'add', 'jina25']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('error: "jina25" already refers to account abc ("jina25")');
+    expect(r.err).not.toContain('no live login');
+    // Any other failure still reads as the capture finding nothing to store.
+    engine.captureCurrentLogin.mockRejectedValueOnce(new Error('boom'));
+    const other = await runCli(['accounts', 'add', 'new']);
+    expect(other.err).toContain('no live login to capture');
   });
 
   it('offers the --fresh capture flag on accounts add', () => {

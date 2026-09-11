@@ -5,7 +5,7 @@
 // TTY; see ansi.ts), and layout is always computed on plain text before painting, so
 // styled and plain output align identically.
 
-import type { StoredAccount } from '@claude-control/switch-engine';
+import type { DedupeReport, StoredAccount } from '@claude-control/switch-engine';
 import type {
   AccountUsage,
   TokenBucketRow,
@@ -386,4 +386,27 @@ function heartbeatLine(view: DaemonStatusView, palette: Palette): string {
       ? 'will restart at next logon (or run: cctl daemon install to start it now)'
       : `not scheduled to restart — ${startCommand(task)}`;
   return `${palette.red('[!!]')} daemon not responding (last heartbeat ${age}) — ${nextStep}`;
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate-account resolution notice
+// ---------------------------------------------------------------------------
+
+/** One line per repair the vault made before an account listing, so a row that vanished or
+ *  changed its name is explained on the spot; empty when nothing happened. Plain by default;
+ *  the palette marks the lines as notices, never as errors — nothing failed. */
+export function renderAccountHeal(report: DedupeReport, palette: Palette = PLAIN_PALETTE): string {
+  const lines = [
+    ...report.merged.map(
+      (m) =>
+        `${palette.yellow('merged')} duplicate account ${m.label}: kept ${m.keptId}, removed ` +
+        `${m.removedId} (the same login was stored twice)`,
+    ),
+    ...report.relabelled.map(
+      (r) =>
+        `${palette.yellow('renamed')} account ${r.from} (${r.id}) to "${r.to}": another account ` +
+        'already had that label',
+    ),
+  ];
+  return lines.length === 0 ? '' : lines.join('\n') + '\n';
 }
