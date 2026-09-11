@@ -5,6 +5,7 @@ import {
   renderDaemonAgentPlist,
   installDaemonAgent,
   queryDaemonAgent,
+  startDaemonAgentNow,
   uninstallDaemonAgent,
   type LaunchctlRunner,
   type PlistFs,
@@ -175,5 +176,24 @@ describe('uninstallDaemonAgent', () => {
 describe('daemonAgentPlistPath', () => {
   it('lives in the per-user LaunchAgents dir', () => {
     expect(daemonAgentPlistPath('/Users/u')).toBe(PLIST);
+  });
+});
+
+describe('startDaemonAgentNow', () => {
+  it('kickstarts the loaded job in the user GUI domain', () => {
+    const calls: string[][] = [];
+    startDaemonAgentNow((args) => {
+      calls.push(args);
+      return '';
+    }, 501);
+    expect(calls).toEqual([['kickstart', `gui/501/${DAEMON_AGENT_LABEL}`]]);
+  });
+
+  it('lets launchctl’s refusal propagate when the job is not loaded', () => {
+    expect(() =>
+      startDaemonAgentNow(() => {
+        throw new Error(`Could not find service "${DAEMON_AGENT_LABEL}" in domain for user`);
+      }, 501),
+    ).toThrow(/Could not find service/);
   });
 });

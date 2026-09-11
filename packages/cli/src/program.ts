@@ -56,6 +56,16 @@ import {
 } from './daemonSupervise.js';
 import { resolveCctlShimPath } from './daemonInstall.js';
 import {
+  DaemonControlError,
+  defaultDaemonControlDeps,
+  renderRestartOutcome,
+  renderStartOutcome,
+  renderStopOutcome,
+  restartDaemon,
+  startDaemon,
+  stopDaemon,
+} from './daemonControl.js';
+import {
   AUTOSTART_UNSUPPORTED_NOTE,
   autostartBackend,
   autostartNoun,
@@ -106,6 +116,8 @@ import {
   findDaemonEnvSetting,
   forgetDaemonSetting,
   persistDaemonSetting,
+  daemonSectionTitle,
+  markPendingRestart,
   readDaemonConfigFile,
   readSettingsReport,
   renderSettingForgotten,
@@ -291,13 +303,20 @@ export function buildProgram(): Command {
       // is ACTUALLY running with. Without one, preview what a daemon started from this
       // shell would resolve (flags absent, env + defaults only).
       const report = await readSettingsReport(daemonSettingsPath());
+      // config.json is read either way: beside a report it says what the next start changes;
+      // without one it is the preview's input (a relay taken from the file must not read as
+      // 'default').
+      const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
       if (report) {
         const since = new Date(report.startedAtMs).toLocaleString();
-        sections.push({ title: `daemon (effective since ${since})`, rows: report.settings });
+        // Resolved with NO environment on purpose: the file is the only layer this shell can
+        // vouch for on the daemon's behalf (see markPendingRestart).
+        const marked = markPendingRestart(
+          report.settings,
+          resolveDaemonConfig({}, {}, fileConfig).rows,
+        );
+        sections.push({ title: daemonSectionTitle(since, marked.pending), rows: marked.rows });
       } else {
-        // The preview must honor config.json too — otherwise it would report 'default' for a
-        // relay the daemon will actually take from the file.
-        const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
         sections.push({
           title: 'daemon (no daemon has run yet — what `cctl daemon run` would use)',
           rows: resolveDaemonConfig(process.env, {}, fileConfig).rows,
@@ -487,6 +506,60 @@ export function buildProgram(): Command {
       },
     );
 
+  // Lifecycle from the command line. `start` goes through the logon registration when there is
+  // one, so the daemon comes up exactly as it does at logon; `stop` asks the running daemon
+  // over its own endpoint and terminates only one that cannot be asked. Every refusal is a
+  // DaemonControlError with the operator's next step in it, printed as the one error line.
+  const startedVia = (): string => {
+    const backend = autostartBackend();
+    return backend === 'none' ? 'logon registration' : autostartNoun(backend);
+  };
+  const control = async (body: () => Promise<string>): Promise<void> => {
+    try {
+      process.stdout.write(await body());
+    } catch (err) {
+      if (err instanceof DaemonControlError) fail(err.message);
+      throw err;
+    }
+  };
+  daemon
+    .command('stop')
+    .description(
+      'stop the running daemon: asks it over its endpoint, ends the process only if it cannot be asked',
+    )
+    .action(() =>
+      control(async () =>
+        renderStopOutcome(await stopDaemon(defaultDaemonControlDeps()), detectPalette()),
+      ),
+    );
+  daemon
+    .command('start')
+    .description(
+      'start the daemon in the background: through the logon task / LaunchAgent when one is registered, else as a detached `daemon run`',
+    )
+    .action(() =>
+      control(async () =>
+        renderStartOutcome(
+          await startDaemon(defaultDaemonControlDeps()),
+          startedVia(),
+          detectPalette(),
+        ),
+      ),
+    );
+  daemon
+    .command('restart')
+    .description(
+      'stop the daemon and start it again: applies persisted settings and an updated build',
+    )
+    .action(() =>
+      control(async () =>
+        renderRestartOutcome(
+          await restartDaemon(defaultDaemonControlDeps()),
+          startedVia(),
+          detectPalette(),
+        ),
+      ),
+    );
   daemon
     .command('install')
     .description(

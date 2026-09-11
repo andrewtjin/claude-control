@@ -36,6 +36,20 @@ vi.mock('./settings.js', async (importOriginal) => ({
   daemonSettingsPath: () => settingsIo.reportPath,
   readSettingsReport: settingsIo.readSettingsReport,
 }));
+// The lifecycle commands' policy has its own unit tests against fake deps; here only the
+// wiring is exercised (outcome → rendered lines, control error → the one error line), so the
+// three operations are stubbed and nothing near a real daemon, task, or process is touched.
+const controlIo = vi.hoisted(() => ({
+  stopDaemon: vi.fn(),
+  startDaemon: vi.fn(),
+  restartDaemon: vi.fn(),
+}));
+vi.mock('./daemonControl.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./daemonControl.js')>()),
+  stopDaemon: controlIo.stopDaemon,
+  startDaemon: controlIo.startDaemon,
+  restartDaemon: controlIo.restartDaemon,
+}));
 
 /** Run one command through commander with stdout/stderr captured and `process.exit` turned
  *  into a throw, so `fail()` surfaces as `exited` instead of ending the test runner. */
@@ -345,10 +359,19 @@ describe('buildProgram', () => {
     );
   });
 
-  it('nests install, uninstall, status, and supervise alongside run under daemon', () => {
+  it('nests the lifecycle, install, uninstall, status, and supervise alongside run under daemon', () => {
     const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
     const subs = daemon?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['install', 'run', 'status', 'supervise', 'uninstall']);
+    expect(subs).toEqual([
+      'install',
+      'restart',
+      'run',
+      'start',
+      'status',
+      'stop',
+      'supervise',
+      'uninstall',
+    ]);
   });
 
   // Asserting a version literal here only restated the constant one import away, so it stayed
@@ -409,6 +432,100 @@ describe('buildProgram', () => {
       exit.mockRestore();
       if (platform) Object.defineProperty(process, 'platform', platform);
     }
+  });
+});
+
+describe('settings view beside a running daemon', () => {
+  let dir = '';
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-settings-view-'));
+    settingsIo.configPath = join(dir, 'config.json');
+  });
+  afterEach(async () => {
+    settingsIo.configPath = '';
+    settingsIo.readSettingsReport.mockReset().mockResolvedValue(undefined);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('shows a saved value beside the running one and names the restart in the title', async () => {
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [
+        { name: 'daemon build', value: `v${VERSION}`, source: 'default' },
+        {
+          name: 'fable cap trigger',
+          value: 'on',
+          source: 'default',
+          detail: 'CCTL_AUTOSWITCH_ON_FABLE_CAP',
+        },
+      ],
+    });
+    await runCli(['settings', 'set', 'fable-cap', 'off']);
+    const r = await runCli(['settings']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toMatch(
+      /daemon \(effective since .*; 1 setting changes at its next start: cctl daemon restart\)/,
+    );
+    expect(r.out).toMatch(/fable cap trigger\s+on \(off after restart\)\s+default/);
+    // Once the daemon runs with it, nothing is pending and the title is bare again.
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [
+        {
+          name: 'fable cap trigger',
+          value: 'off',
+          source: 'config',
+          detail: 'CCTL_AUTOSWITCH_ON_FABLE_CAP',
+        },
+      ],
+    });
+    const applied = await runCli(['settings']);
+    expect(applied.out).toMatch(/daemon \(effective since [^;)]*\)\n/);
+    expect(applied.out).not.toContain('after restart');
+  });
+});
+
+describe('daemon stop / start / restart', () => {
+  afterEach(() => {
+    controlIo.stopDaemon.mockReset();
+    controlIo.startDaemon.mockReset();
+    controlIo.restartDaemon.mockReset();
+  });
+  const started = {
+    outcome: 'started',
+    how: 'background',
+    report: {
+      startedAtMs: 1,
+      settings: [
+        { name: 'daemon build', value: `v${VERSION}`, source: 'default' },
+        { name: 'fable cap trigger', value: 'off', source: 'config' },
+      ],
+    },
+  };
+
+  it('prints each outcome as its lines', async () => {
+    controlIo.stopDaemon.mockResolvedValue({ outcome: 'stopped', how: 'graceful', pid: 41 });
+    expect((await runCli(['daemon', 'stop'])).out).toBe('Stopped the daemon (pid 41).\n');
+    controlIo.startDaemon.mockResolvedValue(started);
+    expect((await runCli(['daemon', 'start'])).out).toBe(
+      `Started the daemon in the background (build v${VERSION}).\nSettings from config.json: fable cap trigger off.\n`,
+    );
+    controlIo.restartDaemon.mockResolvedValue({ stop: { outcome: 'not_running' }, start: started });
+    const r = await runCli(['daemon', 'restart']);
+    expect(r.out.startsWith('No daemon is running.\nStarted the daemon in the background')).toBe(
+      true,
+    );
+  });
+
+  it('turns a control refusal into the one error line and a non-zero exit', async () => {
+    const { DaemonControlError } = await import('./daemonControl.js');
+    controlIo.stopDaemon.mockRejectedValue(
+      new DaemonControlError('the daemon (pid 41) acknowledged the stop but is still running'),
+    );
+    const r = await runCli(['daemon', 'stop']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toBe('error: the daemon (pid 41) acknowledged the stop but is still running\n');
+    expect(r.out).toBe('');
   });
 });
 

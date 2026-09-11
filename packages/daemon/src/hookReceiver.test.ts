@@ -1790,6 +1790,59 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('daemon stop endpoint (/cli/daemon/stop)', () => {
+    it('is behind the secret like every other route', async () => {
+      const res = await post(port, '/cli/daemon/stop', {});
+      expect(res.status).toBe(401);
+    });
+
+    it('answers 501 from a receiver built without a stop hook', async () => {
+      const res = await post(port, '/cli/daemon/stop', {}, { 'x-claude-control-secret': SECRET });
+      expect(res.status).toBe(501);
+      expect(res.body).toEqual({
+        ok: false,
+        error: 'this daemon cannot be stopped over its endpoint',
+      });
+    });
+
+    it('answers 200 with its pid even though the stop hook closes this very server', async () => {
+      // The real hook runs the daemon's shutdown sequence, which closes the receiver: the
+      // answer must already be on the wire by then, or the CLI would read a dead socket and
+      // fall back to killing a daemon that was already stopping.
+      let stopped = false;
+      const stopping: HookReceiver = new HookReceiver({
+        store,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'daemon-1',
+        requestStop: () => {
+          stopped = true;
+          void stopping.close();
+        },
+      });
+      const stoppingPort = await stopping.listen(0);
+      try {
+        // No session fields at all: the route must not demand sessionId/idempotencyKey, and it
+        // must work before any session handlers are installed (none are here).
+        const res = await post(
+          stoppingPort,
+          '/cli/daemon/stop',
+          {},
+          { 'x-claude-control-secret': SECRET },
+        );
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ ok: true, pid: process.pid });
+        await waitFor(() => (stopped ? true : undefined));
+        // And the server really is gone: the next request is refused, not answered.
+        await expect(
+          post(stoppingPort, '/cli/daemon/stop', {}, { 'x-claude-control-secret': SECRET }),
+        ).rejects.toThrow();
+      } finally {
+        await stopping.close();
+      }
+    });
+  });
+
   describe('CLI session endpoints (/cli/session/*)', () => {
     // A configurable, call-recording set of CLI handlers — the receiver owns transport; the
     // daemon (faked here) owns the registry logic, so these tests assert only the boundary.

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   acquireInstanceLock,
   probePredecessorEndpoint,
+  readLiveInstanceLock,
   releaseInstanceLock,
   instanceLockPath,
   DaemonAlreadyRunningError,
@@ -169,5 +170,35 @@ describe('probePredecessorEndpoint — the fail-open backstop behind the lock', 
     // daemon mid event-loop stall, which must refuse rather than invite a duel.
     const port = await listen(createServer(() => undefined));
     expect(await probePredecessorEndpoint(port, 200)).toBe('serving');
+  });
+});
+
+describe('readLiveInstanceLock — what `cctl daemon stop|start` treat as the running daemon', () => {
+  it('returns the record while its pid is alive', async () => {
+    const dir = await sandbox();
+    const record = { pid: process.pid, startedAt: '2020-01-01T00:00:00.000Z' };
+    await writeFile(instanceLockPath(dir), JSON.stringify(record), 'utf8');
+    await expect(readLiveInstanceLock(dir)).resolves.toEqual(record);
+  });
+
+  it('reads a dead pid, a corrupt file, and no file at all as no daemon', async () => {
+    const dir = await sandbox();
+    await expect(readLiveInstanceLock(dir)).resolves.toBeUndefined();
+    await writeFile(
+      instanceLockPath(dir),
+      JSON.stringify({ pid: DEAD_PID, startedAt: '2020-01-01T00:00:00.000Z' }),
+      'utf8',
+    );
+    await expect(readLiveInstanceLock(dir)).resolves.toBeUndefined();
+    await writeFile(instanceLockPath(dir), '{not json', 'utf8');
+    await expect(readLiveInstanceLock(dir)).resolves.toBeUndefined();
+  });
+
+  it('never touches the file, even when it is stale', async () => {
+    const dir = await sandbox();
+    const stale = JSON.stringify({ pid: DEAD_PID, startedAt: '2020-01-01T00:00:00.000Z' });
+    await writeFile(instanceLockPath(dir), stale, 'utf8');
+    await readLiveInstanceLock(dir);
+    expect(await readFile(instanceLockPath(dir), 'utf8')).toBe(stale);
   });
 });

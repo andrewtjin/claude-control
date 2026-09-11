@@ -5,6 +5,7 @@ import {
   autostartBackend,
   autostartNoun,
   installAutostart,
+  startAutostart,
   queryAutostart,
   readAutostartState,
   uninstallAutostart,
@@ -47,6 +48,9 @@ function fakeBackends(overrides: Overrides = {}) {
       install: (shimPath) => {
         calls.push(`agent.install ${shimPath}`);
         return 'updated';
+      },
+      startNow: () => {
+        calls.push('agent.startNow');
       },
       query: () => {
         calls.push('agent.query');
@@ -199,6 +203,42 @@ describe('dispatch on win32', () => {
 });
 
 // --- macOS: LaunchAgent -----------------------------------------------------------------------
+
+describe('startAutostart', () => {
+  it('starts through the platform backend, and only that one', () => {
+    const win = fakeBackends();
+    startAutostart({ platform: 'win32', backends: win.backends });
+    expect(win.calls).toEqual(['task.startNow']);
+    const mac = fakeBackends({
+      launchAgent: {
+        startNow: () => {
+          mac.calls.push('agent.startNow');
+        },
+      },
+    });
+    startAutostart({ platform: 'darwin', backends: mac.backends });
+    expect(mac.calls).toEqual(['agent.startNow']);
+  });
+
+  it('lets a backend failure propagate for the caller to phrase', () => {
+    const { backends } = fakeBackends({
+      scheduledTask: {
+        startNow: () => {
+          throw new Error('Start-ScheduledTask : No such task');
+        },
+      },
+    });
+    expect(() => startAutostart({ platform: 'win32', backends })).toThrow('No such task');
+  });
+
+  it('throws the unsupported error on a platform without a backend, touching nothing', () => {
+    const { backends, calls } = fakeBackends();
+    expect(() => startAutostart({ platform: 'linux', backends })).toThrow(
+      AutostartUnsupportedError,
+    );
+    expect(calls).toEqual([]);
+  });
+});
 
 describe('dispatch on darwin', () => {
   it('installs through the LaunchAgent backend, which starts as part of registering', () => {

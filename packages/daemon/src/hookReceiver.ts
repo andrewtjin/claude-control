@@ -97,6 +97,11 @@ export interface HookReceiverOptions {
    *  the CLI falls through to the SDK gate and the phone sees exactly ONE card). Default:
    *  nothing is managed (interactive CLI windows keep every card). */
   isManagedSession?: (sessionId: string) => boolean;
+  /** Runs the daemon's shutdown sequence when `cctl daemon stop|restart` asks for it over the
+   *  loopback route. The receiver answers the request BEFORE calling this (the sequence closes
+   *  this very server), and a receiver without it answers the route with 501 so an older
+   *  daemon tells the CLI honestly that it has to be stopped another way. */
+  requestStop?: () => void;
   clock?: () => number;
   /** Called with a fully-formed envelope draft whenever a hook produces one — the daemon
    *  wires this to the control-plane client's send/outbox path. Kept synchronous-callback
@@ -408,6 +413,7 @@ export class HookReceiver {
   private readonly commandOutputCards: boolean;
   private readonly fullToolOutput: boolean;
   private readonly isManagedSession: (sessionId: string) => boolean;
+  private readonly requestStop: (() => void) | undefined;
   private server: Server | undefined;
   /** Installed by the daemon (post-construction, before `listen`) — see {@link setCliHandlers}.
    *  Undefined until then: a `cctl session` command that races daemon startup gets a clean 503
@@ -491,6 +497,7 @@ export class HookReceiver {
     this.commandOutputCards = options.commandOutputCards ?? true;
     this.fullToolOutput = options.fullToolOutput ?? false;
     this.isManagedSession = options.isManagedSession ?? (() => false);
+    this.requestStop = options.requestStop;
   }
 
   /** Install the CLI session-command logic. Called by the daemon before `listen` (symmetric
@@ -868,6 +875,12 @@ export class HookReceiver {
     body: Record<string, unknown>,
     res: ServerResponse,
   ): Promise<void> {
+    // The daemon-level stop verb carries no session, so it is routed before the session-shape
+    // validation below — and before the session handlers exist, since it needs none of them.
+    if (path === '/cli/daemon/stop') {
+      this.handleStopRequest(res);
+      return;
+    }
     if (!this.cliHandlers) {
       // Raced daemon startup (handlers installed just before listen); tell the CLI to retry.
       this.respond(res, 503, { ok: false, error: 'daemon is starting; retry in a moment' });
@@ -923,6 +936,25 @@ export class HookReceiver {
       default:
         this.respond(res, 404, { ok: false, error: `unknown CLI endpoint "${path}"` });
     }
+  }
+
+  /** `POST /cli/daemon/stop`: the graceful half of `cctl daemon stop`. The 200 carries this
+   *  process's pid so the CLI can watch that exact process go away, and it is written before
+   *  the shutdown sequence starts — the sequence closes this server, and a response queued
+   *  behind close() would never reach the CLI, which would then fall back to killing a daemon
+   *  that was already stopping. A receiver built without a stop hook answers 501 rather than
+   *  pretending: the CLI reads that as "stop it another way". */
+  private handleStopRequest(res: ServerResponse): void {
+    if (!this.requestStop) {
+      this.respond(res, 501, {
+        ok: false,
+        error: 'this daemon cannot be stopped over its endpoint',
+      });
+      return;
+    }
+    this.respond(res, 200, { ok: true, pid: process.pid });
+    const stop = this.requestStop;
+    setImmediate(() => stop());
   }
 
   /** Map a {@link SessionCommandResult} onto an HTTP response: success → 200 (with the echoed

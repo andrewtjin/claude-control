@@ -18,7 +18,12 @@ import {
   startDaemonTaskNow,
   uninstallDaemonTask,
 } from './daemonInstall.js';
-import { installDaemonAgent, queryDaemonAgent, uninstallDaemonAgent } from './launchdInstall.js';
+import {
+  installDaemonAgent,
+  queryDaemonAgent,
+  startDaemonAgentNow,
+  uninstallDaemonAgent,
+} from './launchdInstall.js';
 
 // ---------------------------------------------------------------------------
 // Which backend a platform uses
@@ -99,6 +104,8 @@ export interface AutostartBackends {
   launchAgent: {
     /** A RunAtLoad LaunchAgent registers AND starts in one bootstrap — no separate start. */
     install(shimPath: string): AutostartOutcome;
+    /** Kick a loaded-but-stopped agent (after `cctl daemon stop`); throws when not loaded. */
+    startNow(): void;
     query(): { registered: boolean; state?: string };
     uninstall(): 'removed' | 'not_installed';
   };
@@ -113,6 +120,7 @@ const defaultBackends: AutostartBackends = {
   },
   launchAgent: {
     install: (shimPath) => installDaemonAgent({ shimPath }),
+    startNow: () => startDaemonAgentNow(),
     query: () => queryDaemonAgent(),
     uninstall: () => uninstallDaemonAgent(),
   },
@@ -153,6 +161,27 @@ export function installAutostart(
       // 'unchanged' means the agent was already loaded — i.e. already running — so "started"
       // holds in every outcome: the daemon is up, or coming up, once this returns.
       return { task: backends.launchAgent.install(shimPath), started: true };
+    case 'none':
+      throw new AutostartUnsupportedError();
+  }
+}
+
+/**
+ * Start the daemon through its registered autostart mechanism — what `cctl daemon start` and
+ * `restart` do when a registration exists, so the daemon comes up exactly as it does at logon
+ * (same shim, same environment, same flag-less `daemon run`) rather than as a child of this
+ * shell. Throws on a platform without a backend; backend failures (task not registered, agent
+ * not loaded, PowerShell/launchctl missing) propagate for the caller to phrase.
+ */
+export function startAutostart(options: AutostartOptions = {}): void {
+  const backends = options.backends ?? defaultBackends;
+  switch (autostartBackend(options.platform)) {
+    case 'scheduled-task':
+      backends.scheduledTask.startNow();
+      return;
+    case 'launch-agent':
+      backends.launchAgent.startNow();
+      return;
     case 'none':
       throw new AutostartUnsupportedError();
   }

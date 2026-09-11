@@ -89,11 +89,13 @@ from a total over all of it.
 cctl status     # at-a-glance: accounts, hooks, relay, daemon, pairing
 cctl settings   # every configurable setting: effective value and where it came from
                 # (flag / env / config / default), for both this shell and the
-                # last-started daemon
+                # running daemon; a saved value the daemon is not yet running with
+                # shows beside the live one as `on (off after restart)`
 cctl settings set <name> <value>    # persist a daemon setting by alias or env var name,
                                     # e.g. `cctl settings set fable-cap off`,
                                     # `cctl settings set trigger 90` (applies when the
-                                    # daemon next starts; aliases listed below)
+                                    # daemon next starts: `cctl daemon restart`;
+                                    # aliases listed below)
 cctl settings unset <name>          # remove a persisted daemon setting
 cctl doctor     # environment checks: Node version, vault crypto round-trip, vault dir,
                 # live login, ~/.claude.json
@@ -122,6 +124,13 @@ cctl daemon run --no-auto-switch       # never hop accounts automatically; for a
 cctl daemon supervise                  # run + auto-restart on crash or hang (same flags
                                         # as `daemon run`; a clean exit ends supervision)
 
+cctl daemon start       # start the daemon in the background: through the logon task /
+                        # LaunchAgent when one is registered, else as a detached `daemon run`
+cctl daemon stop        # ask the running daemon to stop; ends the process only if it cannot
+                        # be asked (an older build, or one that stopped answering)
+cctl daemon restart     # stop + start: applies persisted settings and an updated build, then
+                        # prints the build and the settings that came from config.json
+
 cctl daemon install     # register the logon Scheduled Task (Windows) / LaunchAgent (macOS)
                         # and start the daemon now; on Linux it says there is no autostart yet
 cctl daemon uninstall   # remove the logon task + the daemon's hook entries in settings.json
@@ -139,7 +148,8 @@ running daemon's pid, not a raw exception.
 of the file are untouched. Hook removal is best-effort: if settings.json can't be
 touched (e.g. it isn't valid JSON), the command prints a warning but the task removal
 still counts as a success. Neither step stops an already-running daemon, and a running
-daemon reinstalls its hooks on its next start — stop it for the removal to stick.
+daemon reinstalls its hooks on its next start — `cctl daemon stop` first for the removal
+to stick.
 
 `cctl daemon supervise` respawns the daemon a couple of seconds after a crash (with a
 cooldown if it crash-loops), probes its local health endpoint, and kills + respawns a
@@ -220,8 +230,10 @@ level):
 }
 ```
 
-The daemon reads the file at start-up, so a change applies when it next starts. A
-value set in the real environment always wins over the file, even a misspelled one
+The daemon reads the file at start-up, so a change applies when it next starts —
+`cctl daemon restart` does that now, and until then `cctl settings` shows the saved
+value beside the running one (`on (off after restart)`) with the restart command in the
+section title. A value set in the real environment always wins over the file, even a misspelled one
 (which then falls to the default, exactly as it does without a file). Only the names
 `cctl settings` lists for the daemon are read from `env`; the CLI's own shell knobs
 (`CCTL_SWITCH_MIN_INTERVAL_MS`, `CCTL_REFRESH_SKEW_MS`) stay environment-only.
