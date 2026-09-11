@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +12,7 @@ import {
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { UnknownAccountError, VaultError } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
-import type { CredentialBundle } from './types.js';
+import type { CredentialBundle, Registry, StoredAccount } from './types.js';
 
 let dirs: string[] = [];
 /** A vault plus the directory its registry lives in, so a test can rewrite `accounts.json` the
@@ -668,5 +669,164 @@ describe('Vault registry + bundles', () => {
     expect((await v.readRollback())?.claudeAiOauth.accessToken).toBe('prev');
     await v.clearRollback();
     expect(await v.readRollback()).toBeUndefined();
+  });
+});
+
+describe('one name, one login: addAccount refusals', () => {
+  it('refuses a label another account already has, in any case, without writing anything', async () => {
+    const v = await vault();
+    const first = await v.addAccount('jina25', bundle('a'));
+    await expect(v.addAccount('jina25', bundle('b'))).rejects.toThrow(VaultError);
+    await expect(v.addAccount('JINA25', bundle('b'))).rejects.toThrow(
+      `"JINA25" already refers to account ${first.id} ("jina25")`,
+    );
+    expect(await v.listAccounts()).toHaveLength(1);
+    await expect(v.readBundle(first.id)).resolves.toMatchObject({
+      claudeAiOauth: { accessToken: 'a' },
+    });
+  });
+
+  it('refuses a label that spells an existing account id', async () => {
+    const v = await vault();
+    const first = await v.addAccount('work', bundle('a'));
+    await expect(v.addAccount(first.id, bundle('b'))).rejects.toThrow(VaultError);
+    expect(await v.listAccounts()).toHaveLength(1);
+  });
+
+  it('refuses the same login under a new label, naming the row to relogin instead', async () => {
+    const v = await vault();
+    const first = await v.addAccount('jina25', bundle('a'));
+    // Same accountUuid ('uuid-a'), different tokens: a second capture of the same login.
+    const again: CredentialBundle = {
+      claudeAiOauth: { accessToken: 'a2', refreshToken: 'r-a2', expiresAt: 999 },
+      oauthAccount: { accountUuid: 'uuid-a', emailAddress: 'a@x.com' },
+    };
+    await expect(v.addAccount('jina25-again', again)).rejects.toThrow(
+      `this login is account ${first.id} ("jina25"), which is already stored; run \`cctl accounts relogin jina25\``,
+    );
+    expect(await v.listAccounts()).toHaveLength(1);
+  });
+
+  it('still adds a new login under a new label, and trims the label', async () => {
+    const v = await vault();
+    await v.addAccount('jina25', bundle('a'));
+    const second = await v.addAccount('  debate ', bundle('b'));
+    expect(second.label).toBe('debate');
+    expect(await v.listAccounts()).toHaveLength(2);
+  });
+
+  it('refuses an empty label', async () => {
+    const v = await vault();
+    await expect(v.addAccount('   ', bundle('a'))).rejects.toThrow('a label cannot be empty');
+  });
+});
+
+describe('dedupeAccounts: rows an older build let through', () => {
+  /** Append a registry row that bypasses addAccount's refusals — what an older build wrote. */
+  async function smuggle(
+    v: Vault,
+    row: Partial<StoredAccount> & { label: string; accountUuid: string },
+  ): Promise<string> {
+    const dir = (v as unknown as { vaultDir: string }).vaultDir;
+    const file = join(dir, 'accounts.json');
+    const reg = JSON.parse(await readFile(file, 'utf8')) as Registry;
+    const id = row.id ?? randomUUID();
+    reg.accounts.push({
+      id,
+      quarantined: false,
+      createdAtMs: row.createdAtMs ?? 1,
+      updatedAtMs: row.updatedAtMs ?? 1,
+      ...row,
+    });
+    await writeFile(file, JSON.stringify(reg, null, 2), 'utf8');
+    return id;
+  }
+
+  it('merges the same login stored twice onto the active row and drops the other bundle', async () => {
+    const v = await vault();
+    const kept = await v.addAccount('jina25', bundle('a'));
+    await v.setActive(kept.id);
+    const dup = await smuggle(v, { label: 'jina25', accountUuid: 'uuid-a', updatedAtMs: 9_999 });
+    const report = await v.dedupeAccounts();
+    expect(report).toEqual({
+      merged: [{ label: 'jina25', keptId: kept.id, removedId: dup }],
+      relabelled: [],
+    });
+    expect((await v.listAccounts()).map((a) => a.id)).toEqual([kept.id]);
+    expect(await v.getActiveId()).toBe(kept.id);
+    await expect(v.readBundle(dup)).rejects.toThrow();
+  });
+
+  it('with no active row among them, keeps the later capture even if the older row was touched since', async () => {
+    const v = await vault();
+    const older = await v.addAccount('jina25', bundle('a'));
+    // Captured later (createdAtMs past the vault clock), but the OLDER row's registry entry
+    // was rewritten more recently — a metadata sync, not a login — and must not win.
+    const newer = await smuggle(v, {
+      label: 'jina25',
+      accountUuid: 'uuid-a',
+      createdAtMs: 5_000,
+      updatedAtMs: 10,
+    });
+    const report = await v.dedupeAccounts();
+    expect(report.merged).toEqual([{ label: 'jina25', keptId: newer, removedId: older.id }]);
+    expect((await v.listAccounts()).map((a) => a.id)).toEqual([newer]);
+  });
+
+  it('gives a later row that shares a label with a different login a numbered suffix', async () => {
+    const v = await vault();
+    const first = await v.addAccount('jina25', bundle('a'));
+    // The vault clock has moved past the added row's createdAtMs; these are later still.
+    const second = await smuggle(v, { label: 'jina25', accountUuid: 'uuid-z', createdAtMs: 5_000 });
+    await smuggle(v, { label: 'Jina25 (2)', accountUuid: 'uuid-y', createdAtMs: 6_000 });
+    const report = await v.dedupeAccounts();
+    // The earlier row keeps its name; "(2)" is taken (any case), so the next free number is used.
+    expect(report.merged).toEqual([]);
+    expect(report.relabelled).toEqual([{ id: second, from: 'jina25', to: 'jina25 (3)' }]);
+    const labels = (await v.listAccounts()).map((a) => a.label);
+    expect(labels).toEqual(['jina25', 'jina25 (3)', 'Jina25 (2)']);
+    expect((await v.listAccounts()).find((a) => a.id === first.id)?.label).toBe('jina25');
+  });
+
+  it('never merges a row that carries no login id; a shared label still gets the suffix', async () => {
+    const v = await vault();
+    const first = await v.addAccount('jina25', bundle('a'));
+    // An identity-less row (a bundle that came without its oauthAccount block) under the label.
+    const dir = (v as unknown as { vaultDir: string }).vaultDir;
+    const file = join(dir, 'accounts.json');
+    const reg = JSON.parse(await readFile(file, 'utf8')) as Registry;
+    reg.accounts.push({
+      id: 'no-uuid-row',
+      label: 'jina25',
+      quarantined: false,
+      createdAtMs: 5_000,
+      updatedAtMs: 5_000,
+    });
+    await writeFile(file, JSON.stringify(reg, null, 2), 'utf8');
+    const report = await v.dedupeAccounts();
+    expect(report.merged).toEqual([]);
+    expect(report.relabelled).toEqual([{ id: 'no-uuid-row', from: 'jina25', to: 'jina25 (2)' }]);
+    expect((await v.listAccounts()).map((a) => a.id)).toEqual([first.id, 'no-uuid-row']);
+  });
+
+  it('leaves a clean vault untouched: empty report, registry byte-identical', async () => {
+    const v = await vault();
+    await v.addAccount('jina25', bundle('a'));
+    await v.addAccount('debate', bundle('b'));
+    const file = join((v as unknown as { vaultDir: string }).vaultDir, 'accounts.json');
+    const before = await readFile(file, 'utf8');
+    expect(await v.dedupeAccounts()).toEqual({ merged: [], relabelled: [] });
+    expect(await readFile(file, 'utf8')).toBe(before);
+  });
+
+  it('is idempotent: a second pass finds nothing', async () => {
+    const v = await vault();
+    await v.addAccount('jina25', bundle('a'));
+    await smuggle(v, { label: 'jina25', accountUuid: 'uuid-a' });
+    await smuggle(v, { label: 'jina25', accountUuid: 'uuid-q', createdAtMs: 7_000 });
+    const first = await v.dedupeAccounts();
+    expect(first.merged).toHaveLength(1);
+    expect(first.relabelled).toHaveLength(1);
+    expect(await v.dedupeAccounts()).toEqual({ merged: [], relabelled: [] });
   });
 });

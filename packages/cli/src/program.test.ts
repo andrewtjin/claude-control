@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { VaultError, type StoredAccount } from '@claude-control/switch-engine';
+import { VaultError, type DedupeReport, type StoredAccount } from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
 import { VERSION, type SettingsReport } from './settings.js';
 
@@ -12,6 +12,12 @@ import { VERSION, type SettingsReport } from './settings.js';
 // vault. Hoisted because the mock factory is evaluated during the import above.
 const engine = vi.hoisted(() => ({
   backfillAccountMetadata: vi.fn(() => Promise.resolve(0)),
+  dedupeAccounts: vi.fn((): Promise<DedupeReport> =>
+    Promise.resolve({ merged: [], relabelled: [] }),
+  ),
+  captureCurrentLogin: vi.fn((label: string): Promise<StoredAccount> =>
+    Promise.reject(new Error(`captureCurrentLogin(${label}) not stubbed`)),
+  ),
   listAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
   renameAccount: vi.fn((id: string, label: string): Promise<StoredAccount> =>
@@ -22,21 +28,35 @@ vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
   buildEngine: () => engine,
 }));
-// config.json is resolved through this one seam, so the settings tests below write to a
-// per-test temp file and never near the operator's real one.
 // config.json and the daemon's settings report are resolved through these seams, so the settings
 // tests below write to per-test temp files and never near the operator's real ones, and `version`
 // stays deterministic regardless of what daemon (if any) last ran on the box a test executes on.
 const settingsIo = vi.hoisted(() => ({
   configPath: '',
   reportPath: '',
+  heartbeatPath: '',
   readSettingsReport: vi.fn((): Promise<SettingsReport | undefined> => Promise.resolve(undefined)),
 }));
 vi.mock('./settings.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./settings.js')>()),
   daemonConfigPath: () => settingsIo.configPath,
   daemonSettingsPath: () => settingsIo.reportPath,
+  daemonHeartbeatPath: () => settingsIo.heartbeatPath,
   readSettingsReport: settingsIo.readSettingsReport,
+}));
+// The lifecycle commands' policy has its own unit tests against fake deps; here only the
+// wiring is exercised (outcome → rendered lines, control error → the one error line), so the
+// three operations are stubbed and nothing near a real daemon, task, or process is touched.
+const controlIo = vi.hoisted(() => ({
+  stopDaemon: vi.fn(),
+  startDaemon: vi.fn(),
+  restartDaemon: vi.fn(),
+}));
+vi.mock('./daemonControl.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./daemonControl.js')>()),
+  stopDaemon: controlIo.stopDaemon,
+  startDaemon: controlIo.startDaemon,
+  restartDaemon: controlIo.restartDaemon,
 }));
 
 /** Run one command through commander with stdout/stderr captured and `process.exit` turned
@@ -310,6 +330,39 @@ describe('buildProgram', () => {
     expect(register?.options.map((o) => o.long)).toContain('--label');
   });
 
+  it('prints what the duplicate-account heal did above the accounts listing', async () => {
+    engine.dedupeAccounts.mockResolvedValueOnce({
+      merged: [{ label: 'jina25', keptId: 'keep-1', removedId: 'dup-2' }],
+      relabelled: [{ id: 'x-3', from: 'jina25', to: 'jina25 (2)' }],
+    });
+    const out = await run(['accounts', 'list']);
+    expect(
+      out.startsWith(
+        'merged duplicate account jina25: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
+          'renamed account jina25 (x-3) to "jina25 (2)": another account already had that label\n',
+      ),
+    ).toBe(true);
+    // Nothing to heal prints nothing extra.
+    const quiet = await run(['accounts', 'list']);
+    expect(quiet).not.toContain('duplicate');
+  });
+
+  it("surfaces the vault's refusal of a duplicate on accounts add, not the no-login hint", async () => {
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new VaultError(
+        '"jina25" already refers to account abc ("jina25"); two accounts answering to one name could not be told apart on switch',
+      ),
+    );
+    const r = await runCli(['accounts', 'add', 'jina25']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('error: "jina25" already refers to account abc ("jina25")');
+    expect(r.err).not.toContain('no live login');
+    // Any other failure still reads as the capture finding nothing to store.
+    engine.captureCurrentLogin.mockRejectedValueOnce(new Error('boom'));
+    const other = await runCli(['accounts', 'add', 'new']);
+    expect(other.err).toContain('no live login to capture');
+  });
+
   it('offers the --fresh capture flag on accounts add', () => {
     const accounts = buildProgram().commands.find((c) => c.name() === 'accounts');
     const add = accounts?.commands.find((c) => c.name() === 'add');
@@ -347,10 +400,19 @@ describe('buildProgram', () => {
     );
   });
 
-  it('nests install, uninstall, status, and supervise alongside run under daemon', () => {
+  it('nests the lifecycle, install, uninstall, status, and supervise alongside run under daemon', () => {
     const daemon = buildProgram().commands.find((c) => c.name() === 'daemon');
     const subs = daemon?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['install', 'run', 'status', 'supervise', 'uninstall']);
+    expect(subs).toEqual([
+      'install',
+      'restart',
+      'run',
+      'start',
+      'status',
+      'stop',
+      'supervise',
+      'uninstall',
+    ]);
   });
 
   // Asserting a version literal here only restated the constant one import away, so it stayed
@@ -414,6 +476,128 @@ describe('buildProgram', () => {
   });
 });
 
+describe('settings view beside a running daemon', () => {
+  let dir = '';
+  const fableRow = (value: string, source: 'default' | 'config') => ({
+    name: 'fable cap trigger',
+    value,
+    source,
+    detail: 'CCTL_AUTOSWITCH_ON_FABLE_CAP',
+  });
+  const buildRow = (build: string) => ({
+    name: 'daemon build',
+    value: build,
+    source: 'default' as const,
+  });
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-settings-view-'));
+    settingsIo.configPath = join(dir, 'config.json');
+    settingsIo.heartbeatPath = join(dir, 'daemon-heartbeat.json');
+    // A daemon that is still writing its heartbeat.
+    await writeFile(settingsIo.heartbeatPath, JSON.stringify({ writtenAtMs: Date.now() }), 'utf8');
+  });
+  afterEach(async () => {
+    settingsIo.configPath = '';
+    settingsIo.heartbeatPath = '';
+    settingsIo.readSettingsReport.mockReset().mockResolvedValue(undefined);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('shows a saved value beside the running one and names the restart in the title', async () => {
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [buildRow(`v${VERSION}`), fableRow('on', 'default')],
+    });
+    await runCli(['settings', 'set', 'fable-cap', 'off']);
+    const r = await runCli(['settings']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toMatch(
+      /daemon \(effective since .*; 1 setting changes after cctl daemon restart\)/,
+    );
+    expect(r.out).toMatch(/fable cap trigger\s+on \(off after cctl daemon restart\)\s+default/);
+    // Once the daemon runs with it, nothing is pending and the title is bare again.
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [buildRow(`v${VERSION}`), fableRow('off', 'config')],
+    });
+    const applied = await runCli(['settings']);
+    expect(applied.out).toMatch(/daemon \(effective since [^;)]*\)\n/);
+    expect(applied.out).not.toContain('after cctl daemon restart');
+  });
+
+  it('says the daemon is not running when its heartbeat is stale or missing', async () => {
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [buildRow(`v${VERSION}`), fableRow('on', 'default')],
+    });
+    await rm(settingsIo.heartbeatPath, { force: true });
+    const r = await runCli(['settings']);
+    expect(r.out).toMatch(/daemon \(not running; last report from [^;)]*\)\n/);
+  });
+
+  it('keeps a saved setting the running build has no row for, and names the install to update', async () => {
+    // A report from a build that predates the knob: no fable-cap row at all.
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [
+        buildRow('v0.4.2'),
+        { name: 'auto-switch', value: 'on', source: 'flag', detail: 'CCTL_AUTOSWITCH' },
+      ],
+    });
+    await runCli(['settings', 'set', 'fable-cap', 'off']);
+    const r = await runCli(['settings']);
+    expect(r.out).toMatch(/fable cap trigger\s+off \(not read by build v0\.4\.2\)\s+config/);
+    expect(r.out).toContain(
+      '; 1 config.json setting not read by build v0.4.2: update it (npm i -g @andrewtjin/cctl), then cctl daemon restart)',
+    );
+    expect(r.out).not.toContain('after cctl daemon restart');
+  });
+});
+
+describe('daemon stop / start / restart', () => {
+  afterEach(() => {
+    controlIo.stopDaemon.mockReset();
+    controlIo.startDaemon.mockReset();
+    controlIo.restartDaemon.mockReset();
+  });
+  const started = {
+    outcome: 'started',
+    how: 'background',
+    report: {
+      startedAtMs: 1,
+      settings: [
+        { name: 'daemon build', value: `v${VERSION}`, source: 'default' },
+        { name: 'fable cap trigger', value: 'off', source: 'config' },
+      ],
+    },
+  };
+
+  it('prints each outcome as its lines', async () => {
+    controlIo.stopDaemon.mockResolvedValue({ outcome: 'stopped', how: 'graceful', pid: 41 });
+    expect((await runCli(['daemon', 'stop'])).out).toBe('Stopped the daemon (pid 41).\n');
+    controlIo.startDaemon.mockResolvedValue(started);
+    expect((await runCli(['daemon', 'start'])).out).toBe(
+      `Started the daemon in the background (build v${VERSION}).\nSettings from config.json: fable cap trigger off.\n`,
+    );
+    controlIo.restartDaemon.mockResolvedValue({ stop: { outcome: 'not_running' }, start: started });
+    const r = await runCli(['daemon', 'restart']);
+    expect(r.out.startsWith('No daemon is running.\nStarted the daemon in the background')).toBe(
+      true,
+    );
+  });
+
+  it('turns a control refusal into the one error line and a non-zero exit', async () => {
+    const { DaemonControlError } = await import('./daemonControl.js');
+    controlIo.stopDaemon.mockRejectedValue(
+      new DaemonControlError('the daemon (pid 41) acknowledged the stop but is still running'),
+    );
+    const r = await runCli(['daemon', 'stop']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toBe('error: the daemon (pid 41) acknowledged the stop but is still running\n');
+    expect(r.out).toBe('');
+  });
+});
+
 describe('version command', () => {
   beforeEach(() => {
     settingsIo.readSettingsReport.mockReset().mockResolvedValue(undefined);
@@ -473,5 +657,69 @@ describe('help', () => {
   it("resolves `cctl help <command>` to that command's own usage", async () => {
     const out = await captureHelp(['help', 'switch']);
     expect(out).toContain('Usage: cctl switch');
+  });
+});
+
+/** Run `body` with the named stream pretending to be a terminal and NO_COLOR unset — the one
+ *  condition under which the CLI paints — restoring both afterwards. */
+async function onTerminal<T>(stream: NodeJS.WriteStream, body: () => Promise<T>): Promise<T> {
+  const had = Object.getOwnPropertyDescriptor(stream, 'isTTY');
+  Object.defineProperty(stream, 'isTTY', { value: true, configurable: true, writable: true });
+  vi.stubEnv('NO_COLOR', undefined);
+  try {
+    return await body();
+  } finally {
+    vi.unstubAllEnvs();
+    if (had) Object.defineProperty(stream, 'isTTY', had);
+    else delete (stream as { isTTY?: boolean }).isTTY;
+  }
+}
+
+describe('color on a terminal', () => {
+  const ESC = String.fromCharCode(27);
+  let dir = '';
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-color-cli-'));
+    settingsIo.configPath = join(dir, 'config.json');
+  });
+  afterEach(async () => {
+    settingsIo.configPath = '';
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('paints the saved assignment and the removal green, and nothing when piped', async () => {
+    const saved = await onTerminal(process.stdout, () =>
+      runCli(['settings', 'set', 'fable-cap', 'off']),
+    );
+    expect(saved.out).toContain(`${ESC}[32mSaved CCTL_AUTOSWITCH_ON_FABLE_CAP=off${ESC}[0m to `);
+    const removed = await onTerminal(process.stdout, () =>
+      runCli(['settings', 'unset', 'fable-cap']),
+    );
+    expect(removed.out).toContain(`${ESC}[32mRemoved CCTL_AUTOSWITCH_ON_FABLE_CAP${ESC}[0m from `);
+    // Piped — the default in this worker — the same lines carry no code at all.
+    const piped = await runCli(['settings', 'set', 'fable-cap', 'off']);
+    expect(piped.out).toContain('Saved CCTL_AUTOSWITCH_ON_FABLE_CAP=off to ');
+    expect(piped.out).not.toContain(ESC);
+  });
+
+  it("paints fail()'s line red when stderr is a terminal, judged by stderr alone", async () => {
+    const r = await onTerminal(process.stderr, () =>
+      runCli(['settings', 'set', 'fable-cap', 'maybe']),
+    );
+    expect(r.exited).toBe(true);
+    expect(r.err.startsWith(`${ESC}[31merror: CCTL_AUTOSWITCH_ON_FABLE_CAP takes `)).toBe(true);
+    expect(r.err.endsWith(`${ESC}[0m\n`)).toBe(true);
+    // A terminal on stdout does not color stderr: `cctl x 2>err.log` stays plain.
+    const redirected = await onTerminal(process.stdout, () =>
+      runCli(['settings', 'set', 'fable-cap', 'maybe']),
+    );
+    expect(redirected.exited).toBe(true);
+    expect(redirected.err).not.toContain(ESC);
+  });
+
+  it("paints commander's own refusals the same red", async () => {
+    const r = await onTerminal(process.stderr, () => runCli(['settings', 'unset']));
+    expect(r.exited).toBe(true);
+    expect(r.err).toBe(`${ESC}[31merror: missing required argument 'name'${ESC}[0m\n`);
   });
 });

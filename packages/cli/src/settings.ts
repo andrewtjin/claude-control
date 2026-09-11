@@ -46,7 +46,7 @@ export type { SettingRow } from '@claude-control/shared-protocol';
  *  the phone. Lives here (not program.ts) so the daemon's settings report can carry it: after
  *  an `npm i -g` update the running daemon keeps its old build until restarted, and the two
  *  rows ('cli build' vs 'daemon build') are how an operator sees that skew. */
-export const VERSION = '0.4.5';
+export const VERSION = '0.4.6';
 
 /** The hosted control plane a published build dials with no configuration at all. This is the
  *  last fallback in the precedence ladder, not a lock-in: `--relay`, `CCTL_RELAY_URL`, and
@@ -191,6 +191,37 @@ export function findDaemonEnvSetting(ref: string): DaemonEnvSetting | undefined 
 /** One line naming every settable knob as `alias (ENV_NAME)`, for help and error text. */
 export function settableSettingsSummary(): string {
   return DAEMON_ENV_SETTINGS.map((s) => `${s.alias} (${s.name})`).join(', ');
+}
+
+/** The lines `cctl settings set` prints once the value is on disk. The assignment is the
+ *  outcome, so it alone is painted (green: done, nothing further owed); the path says where to
+ *  look and the caveat what to do next, and both stay plain so the eye lands on the result.
+ *  Plain by default — piped output and the tests see exact strings. */
+export function renderSettingSaved(
+  setting: DaemonEnvSetting,
+  value: string,
+  filePath: string,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  return (
+    `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}.\n` +
+    'Applies when the daemon next starts: cctl daemon restart. A value set in the ' +
+    'environment still wins over the file.\n'
+  );
+}
+
+/** The line `cctl settings unset` prints. A removal is painted like a save — the file changed
+ *  as asked — while "not set" stays plain: nothing changed and nothing needs doing. */
+export function renderSettingForgotten(
+  setting: DaemonEnvSetting,
+  filePath: string,
+  removed: boolean,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  return removed
+    ? `${palette.green(`Removed ${setting.name}`)} from ${filePath}; the daemon falls back to ` +
+        'the environment or the default when it next starts: cctl daemon restart.\n'
+    : `${setting.name} is not set in ${filePath}.\n`;
 }
 
 /** pino's level names, which `CCTL_LOG_LEVEL` is handed to verbatim — an unknown one would
@@ -560,7 +591,7 @@ export function resolveDaemonConfig(
       name: 'daemon build',
       value: `v${VERSION}`,
       source: 'default',
-      detail: 'update: npm i -g @andrewtjin/cctl, then restart the daemon',
+      detail: 'update: npm i -g @andrewtjin/cctl, then cctl daemon restart',
     },
     {
       name: 'auto-switch',
@@ -747,9 +778,11 @@ export function resolveCliSettings(env: NodeJS.ProcessEnv, colorOn: boolean): Se
       name: 'color',
       value: colorOn ? 'on' : 'off',
       // Color is off either because NO_COLOR asked for it (env) or because stdout is not a
-      // TTY (the default TTY-detection behavior).
+      // TTY (the default TTY-detection behavior). This row is about stdout — the output a
+      // command prints; error lines make the same decision for stderr on their own, so
+      // `cctl x | less` can show a red error while this row says off.
       source: envSource(noColorSet),
-      detail: 'NO_COLOR (on only for a terminal)',
+      detail: 'NO_COLOR (on only when stdout is a terminal; error lines follow stderr)',
     },
     {
       name: 'switch cadence',
@@ -788,9 +821,126 @@ export function resolveCliSettings(env: NodeJS.ProcessEnv, colorOn: boolean): Se
 // Rendering (pure)
 // ---------------------------------------------------------------------------
 
+/** A wire row plus what the CLI alone knows. `pending`: the value config.json gives this knob
+ *  after `cctl daemon restart`, when that differs from what the running daemon reports.
+ *  `unread`: the running daemon's build, on a file setting that build has no row for — it
+ *  predates the knob and takes nothing from the file for it, so the row shows the file's
+ *  value beside that fact instead of vanishing. Display-only and never on the wire — the
+ *  phone sees the daemon's own report. */
+export type DisplayRow = SettingRow & { pending?: string; unread?: string };
+
+/** The env var names config.json sets, the way the daemon rows name them (`relayUrl` is the
+ *  file's spelling of CCTL_RELAY_URL). What `cctl daemon start` checks the new daemon's
+ *  report against, so a file the daemon took nothing from is called out. */
+export function fileSettingNames(fileConfig: DaemonFileConfig): string[] {
+  return [
+    ...Object.keys(fileConfig.env ?? {}),
+    ...(fileConfig.relayUrl !== undefined ? [RELAY_ENV_NAME] : []),
+  ];
+}
+
+/** Where the daemon writes its liveness file (see heartbeat.ts): beside the vault, like the
+ *  settings report. Resolved here so `cctl settings` can say whether the report it renders
+ *  belongs to a daemon that is still running. */
+export function daemonHeartbeatPath(paths: Paths = defaultPaths()): string {
+  return join(dirname(paths.vaultDir), 'daemon-heartbeat.json');
+}
+
 export interface SettingsSection {
   title: string;
-  rows: SettingRow[];
+  rows: DisplayRow[];
+}
+
+/** Rows whose rendered value also depends on ANOTHER knob: the stale trigger is clamped to the
+ *  switch trigger, and greedy renders as inactive while auto-switch is off. Named here so
+ *  markPendingRestart can follow the dependency instead of guessing from the row alone. */
+const ROW_DEPENDS_ON: Readonly<Record<string, readonly string[]>> = {
+  'stale switch trigger': ['switch trigger'],
+  'greedy burn-back': ['auto-switch'],
+};
+
+/**
+ * Mark the daemon's reported rows with what config.json would change at its next start, so a
+ * `cctl settings set` is visible the moment it is saved rather than only after a restart. The
+ * comparison uses the file alone (`afterRestart` = the resolution with NO environment): a row
+ * the running daemon took from the environment or a flag is never marked — nor a row whose
+ * value depends on such a knob (see ROW_DEPENDS_ON): a restart through the logon task
+ * inherits that environment again, so greedy stays inactive while auto-switch is off there.
+ * A row is marked only when the file is involved on one side — it set the reported value
+ * (`config`), or would set the next one, for the row or a knob it depends on — so a value
+ * that merely renders differently across builds (the build row) never reads as pending,
+ * while the stale trigger does when the file moves the switch trigger it is clamped to.
+ * The daemon's own environment is unknowable from here; a value it reported as `default`
+ * because an unparseable env override fell through would be marked as if the file applied,
+ * which the restart then corrects — the honest limit of a view that cannot see that shell.
+ */
+export function markPendingRestart(
+  reported: readonly SettingRow[],
+  afterRestart: readonly SettingRow[],
+): { rows: DisplayRow[]; pending: number; unread: number } {
+  const fileCanDecide = (row: SettingRow): boolean =>
+    row.source === 'default' || row.source === 'config';
+  const nextOf = (name: string): SettingRow | undefined =>
+    afterRestart.find((r) => r.name === name);
+  let pending = 0;
+  const rows = reported.map((row): DisplayRow => {
+    const inputs = [
+      row,
+      ...(ROW_DEPENDS_ON[row.name] ?? []).map((n) => reported.find((r) => r.name === n)),
+    ];
+    if (inputs.some((r) => r === undefined || !fileCanDecide(r))) return row;
+    const next = nextOf(row.name);
+    if (!next || next.value === row.value) return row;
+    const fileInvolved = inputs.some(
+      (r) => r?.source === 'config' || nextOf(r?.name ?? '')?.source === 'config',
+    );
+    if (!fileInvolved) return row;
+    pending += 1;
+    return { ...row, pending: next.value };
+  });
+  // A file setting the running build does not even report is not pending: restarting the same
+  // build reads it no better. It stays visible — the file's value, and the build that ignores
+  // it — because a saved setting that silently disappears from the view reads as lost.
+  const build = reported.find((r) => r.name === 'daemon build')?.value ?? 'unknown';
+  const unreadRows = afterRestart
+    .filter((r) => r.source === 'config' && !reported.some((x) => x.name === r.name))
+    .map((r): DisplayRow => ({ ...r, unread: build }));
+  return { rows: [...rows, ...unreadRows], pending, unread: unreadRows.length };
+}
+
+/** The daemon section's title: when it started, and — if the file has changes it is not yet
+ *  running with — how many and the one command that applies them. */
+export interface DaemonSectionState {
+  /** The report's start time, rendered. */
+  since: string;
+  /** Whether a daemon is still writing its heartbeat — a report outlives its daemon. */
+  running: boolean;
+  pending: number;
+  unread: number;
+  /** The reported build, named when it ignores file settings. */
+  build: string;
+}
+
+/** Compose the title from the state: the running clause first, then each count with the one
+ *  command that resolves it, so a reader never has to guess what to do next. */
+export function daemonSectionTitle(s: DaemonSectionState): string {
+  const parts = [
+    s.running ? `effective since ${s.since}` : `not running; last report from ${s.since}`,
+  ];
+  if (s.pending > 0) {
+    parts.push(
+      s.pending === 1
+        ? '1 setting changes after cctl daemon restart'
+        : `${s.pending} settings change after cctl daemon restart`,
+    );
+  }
+  if (s.unread > 0) {
+    parts.push(
+      `${s.unread} config.json setting${s.unread === 1 ? '' : 's'} not read by build ${s.build}: ` +
+        'update it (npm i -g @andrewtjin/cctl), then cctl daemon restart',
+    );
+  }
+  return `daemon (${parts.join('; ')})`;
 }
 
 /** Render sections as aligned `name  value  source  detail` tables. Pure and plain by
@@ -802,14 +952,29 @@ export function renderSettings(
   palette: Palette = PLAIN_PALETTE,
 ): string {
   const allRows = sections.flatMap((s) => s.rows);
+  // A pending value rides in the value column as a plain-text suffix, so it is part of the
+  // column's width; the suffix is painted separately below.
+  const pendingSuffix = (row: DisplayRow): string =>
+    row.pending !== undefined
+      ? ` (${row.pending} after cctl daemon restart)`
+      : row.unread !== undefined
+        ? ` (not read by build ${row.unread})`
+        : '';
   const nameWidth = Math.max(0, ...allRows.map((r) => r.name.length));
-  const valueWidth = Math.max(0, ...allRows.map((r) => r.value.length));
+  const valueWidth = Math.max(0, ...allRows.map((r) => r.value.length + pendingSuffix(r).length));
   const sourceWidth = Math.max(0, ...allRows.map((r) => r.source.length));
 
   const paintValue = (row: SettingRow): ((text: string) => string) => {
     if (row.value === 'on') return palette.green;
     if (row.value === 'off') return palette.dim;
     return (t) => t;
+  };
+  // The value cell: the effective value painted as usual, the pending note in the warning
+  // color (something is saved that is not yet in force), the padding plain.
+  const valueCell = (row: DisplayRow): string => {
+    const suffix = pendingSuffix(row);
+    const padding = ' '.repeat(valueWidth - row.value.length - suffix.length);
+    return paintValue(row)(row.value) + (suffix ? palette.yellow(suffix) : '') + padding;
   };
 
   return sections
@@ -821,7 +986,7 @@ export function renderSettings(
           row.detail != null && row.detail !== '' ? `  ${palette.dim(row.detail)}` : '';
         return (
           `  ${row.name.padEnd(nameWidth)}  ` +
-          `${paintValue(row)(row.value.padEnd(valueWidth))}  ` +
+          `${valueCell(row)}  ` +
           `${paintSource(row.source.padEnd(sourceWidth))}${detail}`
         );
       });
@@ -848,7 +1013,7 @@ export function renderVersionInfo(cliVersion: string, report: SettingsReport | u
   const lines = [`cli build: ${cli}`, `daemon build: ${daemonBuild}`];
   if (daemonBuild !== cli) {
     lines.push(
-      'warning: the daemon is on a different build than this CLI - restart it to pick up the update.',
+      'warning: the daemon is on a different build than this CLI - cctl daemon restart picks up the update.',
     );
   }
   return lines.join('\n');

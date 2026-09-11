@@ -1272,3 +1272,31 @@ describe('registry mutators serialize against the credential lock', () => {
     expect((await engine.listAccounts()).map((a) => a.id)).toContain(account.id);
   });
 });
+
+describe('dedupeAccounts through the engine', () => {
+  it('merges a duplicate login under the lock and reports it; a clean vault reports nothing', async () => {
+    const h = await harness();
+    const kept = await h.engine.addAccount('jina25', bundleFor('a', NOW + HOUR));
+    // A second row for the same login, as an older build would have written it.
+    const file = join(h.paths.vaultDir, 'accounts.json');
+    const reg = JSON.parse(await readFile(file, 'utf8')) as {
+      accounts: Array<Record<string, unknown>>;
+    };
+    reg.accounts.push({
+      id: 'dup-row',
+      label: 'jina25',
+      accountUuid: 'uuid-a',
+      quarantined: false,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    });
+    await writeFile(file, JSON.stringify(reg, null, 2), 'utf8');
+    const report = await h.engine.dedupeAccounts();
+    expect(report).toEqual({
+      merged: [{ label: 'jina25', keptId: kept.id, removedId: 'dup-row' }],
+      relabelled: [],
+    });
+    expect((await h.engine.listAccounts()).map((a) => a.id)).toEqual([kept.id]);
+    expect(await h.engine.dedupeAccounts()).toEqual({ merged: [], relabelled: [] });
+  });
+});

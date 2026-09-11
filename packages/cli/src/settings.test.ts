@@ -4,23 +4,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Paths } from '@claude-control/switch-engine';
 import type { SettingRow } from '@claude-control/shared-protocol';
-import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { ANSI_PALETTE, PLAIN_PALETTE, type Palette } from './ansi.js';
 import {
   DAEMON_ENV_SETTINGS,
   DEFAULT_RELAY_URL,
   applyFileEnv,
   checkSettingValue,
   daemonConfigPath,
+  daemonSectionTitle,
   daemonSettingsPath,
   envBool,
   envFlag,
   envNumber,
+  fileSettingNames,
   findDaemonEnvSetting,
   forgetDaemonSetting,
   layerFileEnv,
+  markPendingRestart,
   persistDaemonSetting,
   readDaemonConfigFile,
   readSettingsReport,
+  renderSettingForgotten,
+  renderSettingSaved,
   renderSettings,
   renderVersionInfo,
   reportSaysGreedyActive,
@@ -341,7 +346,7 @@ describe('renderSettings', () => {
     };
     const text = renderSettings([{ title: 'daemon', rows }], palette);
     expect(text).toContain('<b>daemon</b>');
-    expect(text).toContain('<g>on </g>'); // padded first, painted after
+    expect(text).toContain('<g>on</g> '); // the value is painted, its column padding is not
     expect(text).toContain('<d>off</d>');
     expect(text).toContain('<c>env    </c>');
     expect(text).toContain('<d>default</d>');
@@ -392,7 +397,7 @@ describe('renderVersionInfo', () => {
       [
         'cli build: v0.4.3',
         'daemon build: v0.4.2',
-        'warning: the daemon is on a different build than this CLI - restart it to pick up the update.',
+        'warning: the daemon is on a different build than this CLI - cctl daemon restart picks up the update.',
       ].join('\n'),
     );
   });
@@ -884,5 +889,276 @@ describe('persisting daemon settings', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('renderSettingSaved / renderSettingForgotten', () => {
+  const ESC = '\u001b';
+  const fableCap = findDaemonEnvSetting('fable-cap') as DaemonEnvSetting;
+  const file = 'C:/cfg/config.json';
+
+  it('says what was saved and where, then the restart caveat, plain by default', () => {
+    expect(renderSettingSaved(fableCap, 'off', file)).toBe(
+      `Saved CCTL_AUTOSWITCH_ON_FABLE_CAP=off to ${file}.\n` +
+        'Applies when the daemon next starts: cctl daemon restart. A value set in the ' +
+        'environment still wins over the file.\n',
+    );
+  });
+
+  it('paints only the assignment on a terminal; the path and the caveat stay plain', () => {
+    const text = renderSettingSaved(fableCap, 'off', file, ANSI_PALETTE);
+    expect(
+      text.startsWith(`${ESC}[32mSaved CCTL_AUTOSWITCH_ON_FABLE_CAP=off${ESC}[0m to ${file}.\n`),
+    ).toBe(true);
+    // Exactly one painted span — nothing else on the two lines carries a code.
+    expect(text.split(ESC).length).toBe(3);
+  });
+
+  it('paints a removal like a save and leaves "not set" plain', () => {
+    expect(renderSettingForgotten(fableCap, file, true, ANSI_PALETTE)).toBe(
+      `${ESC}[32mRemoved CCTL_AUTOSWITCH_ON_FABLE_CAP${ESC}[0m from ${file}; the daemon falls back to ` +
+        'the environment or the default when it next starts: cctl daemon restart.\n',
+    );
+    expect(renderSettingForgotten(fableCap, file, false, ANSI_PALETTE)).toBe(
+      `CCTL_AUTOSWITCH_ON_FABLE_CAP is not set in ${file}.\n`,
+    );
+    expect(renderSettingForgotten(fableCap, file, true)).toBe(
+      `Removed CCTL_AUTOSWITCH_ON_FABLE_CAP from ${file}; the daemon falls back to ` +
+        'the environment or the default when it next starts: cctl daemon restart.\n',
+    );
+  });
+});
+
+describe('markPendingRestart / daemonSectionTitle', () => {
+  // The daemon's report: started with no file, everything default except one env override.
+  const reported = resolveDaemonConfig({ CCTL_AUTOSWITCH_GREEDY: '0' }).rows;
+  const after = (fileEnv: Record<string, string>, relayUrl?: string) =>
+    resolveDaemonConfig({}, {}, { env: fileEnv, ...(relayUrl ? { relayUrl } : {}) }).rows;
+  const marked = (rows: ReturnType<typeof markPendingRestart>['rows'], name: string) =>
+    rows.find((r) => r.name === name);
+
+  it('marks a default the file now sets, keeping the reported value and source', () => {
+    const { rows, pending } = markPendingRestart(
+      reported,
+      after({ CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' }),
+    );
+    expect(pending).toBe(1);
+    const row = marked(rows, 'fable cap trigger');
+    expect(row).toMatchObject({
+      name: 'fable cap trigger',
+      value: 'on',
+      source: 'default',
+      pending: 'off',
+    });
+    expect(row?.detail).toContain('CCTL_AUTOSWITCH_ON_FABLE_CAP');
+    expect(rows.filter((r) => r.pending !== undefined)).toHaveLength(1);
+  });
+
+  it('marks a config value the file no longer holds (after unset) with the value it reverts to', () => {
+    const runningWithFile = resolveDaemonConfig(
+      {},
+      {},
+      { env: { CCTL_AUTOSWITCH_TRIGGER_PCT: '90' } },
+    ).rows;
+    const { rows, pending } = markPendingRestart(runningWithFile, after({}));
+    expect(pending).toBe(1);
+    expect(marked(rows, 'switch trigger')).toMatchObject({
+      value: '90% used',
+      source: 'config',
+      pending: '94% used',
+    });
+  });
+
+  it('marks the relay the file sets (an env-block spelling is folded into relayUrl by the reader)', () => {
+    const { rows, pending } = markPendingRestart(reported, after({}, 'wss://a.example'));
+    expect(pending).toBe(1);
+    expect(marked(rows, 'relay url')?.pending).toBe('wss://a.example');
+  });
+
+  it('never marks a row the environment or a flag decided: the file cannot change it', () => {
+    // greedy came from the env (0 → off); the file saying on changes nothing at a restart.
+    const { rows, pending } = markPendingRestart(reported, after({ CCTL_AUTOSWITCH_GREEDY: '1' }));
+    expect(pending).toBe(0);
+    expect(marked(rows, 'greedy burn-back')).toMatchObject({ value: 'off', source: 'env' });
+    const flagged = resolveDaemonConfig({}, { autoSwitch: false }).rows;
+    expect(markPendingRestart(flagged, after({ CCTL_AUTOSWITCH: 'on' })).pending).toBe(0);
+  });
+
+  it('ignores differences the file has no part in: an older build, an inactive-greedy note', () => {
+    const older = reported.map((r) => (r.name === 'daemon build' ? { ...r, value: 'v0.0.1' } : r));
+    expect(markPendingRestart(older, after({})).pending).toBe(0);
+    // Auto-switch off by flag renders greedy as inactive; a flag-less restart renders it plain.
+    const flagged = resolveDaemonConfig({}, { autoSwitch: false }).rows;
+    expect(marked(flagged, 'greedy burn-back')?.value).toBe('on (inactive: auto-switch is off)');
+    expect(markPendingRestart(flagged, after({})).pending).toBe(0);
+  });
+
+  it('leaves an unchanged report untouched, row for row', () => {
+    const { rows, pending } = markPendingRestart(reported, after({}));
+    expect(pending).toBe(0);
+    expect(rows).toEqual(reported);
+  });
+
+  it('titles the section with the running state, the pending count, and the unread count', () => {
+    const base = {
+      since: '9/9/2026, 8:20:53 PM',
+      running: true,
+      pending: 0,
+      unread: 0,
+      build: 'v0.4.6',
+    };
+    expect(daemonSectionTitle(base)).toBe('daemon (effective since 9/9/2026, 8:20:53 PM)');
+    expect(daemonSectionTitle({ ...base, pending: 1 })).toBe(
+      'daemon (effective since 9/9/2026, 8:20:53 PM; 1 setting changes after cctl daemon restart)',
+    );
+    expect(daemonSectionTitle({ ...base, since: 'x', pending: 3 })).toBe(
+      'daemon (effective since x; 3 settings change after cctl daemon restart)',
+    );
+    // A report outlives its daemon: say so instead of "effective since" for a dead one.
+    expect(daemonSectionTitle({ ...base, running: false })).toBe(
+      'daemon (not running; last report from 9/9/2026, 8:20:53 PM)',
+    );
+    expect(
+      daemonSectionTitle({ ...base, running: false, pending: 1, unread: 2, build: 'v0.4.2' }),
+    ).toBe(
+      'daemon (not running; last report from 9/9/2026, 8:20:53 PM; 1 setting changes after cctl daemon restart; ' +
+        '2 config.json settings not read by build v0.4.2: update it (npm i -g @andrewtjin/cctl), then cctl daemon restart)',
+    );
+    expect(daemonSectionTitle({ ...base, unread: 1, build: 'v0.4.2' })).toBe(
+      'daemon (effective since 9/9/2026, 8:20:53 PM; 1 config.json setting not read by build v0.4.2: ' +
+        'update it (npm i -g @andrewtjin/cctl), then cctl daemon restart)',
+    );
+  });
+
+  it('renders a pending row as `value (next after cctl daemon restart)`, aligned, with only the note painted', () => {
+    const rows = [
+      { name: 'fable cap trigger', value: 'on', source: 'default', detail: 'D', pending: 'off' },
+      { name: 'auto-switch', value: 'on', source: 'default', detail: 'E' },
+    ] as const;
+    // The pending note is part of the value column, so the plain row pads to its width.
+    expect(renderSettings([{ title: 't', rows: [...rows] }])).toBe(
+      [
+        't',
+        '  fable cap trigger  on (off after cctl daemon restart)  default  D',
+        `  ${'auto-switch'.padEnd(17)}  ${'on'.padEnd('on (off after cctl daemon restart)'.length)}  default  E`,
+      ].join('\n'),
+    );
+    const ESC = String.fromCharCode(27);
+    const painted = renderSettings([{ title: 't', rows: [...rows] }], ANSI_PALETTE);
+    expect(painted).toContain(
+      `${ESC}[32mon${ESC}[0m${ESC}[33m (off after cctl daemon restart)${ESC}[0m  `,
+    );
+  });
+});
+
+describe('markPendingRestart follows a row to the knob it depends on', () => {
+  const after = (fileEnv: Record<string, string>) =>
+    resolveDaemonConfig({}, {}, { env: fileEnv }).rows;
+  const row = <R extends SettingRow>(rows: readonly R[], name: string): R | undefined =>
+    rows.find((r) => r.name === name);
+
+  it('marks the stale trigger when the file moves the switch trigger it is clamped to', () => {
+    const reported = resolveDaemonConfig({}).rows; // 94% / 85%, both default
+    const { rows, pending } = markPendingRestart(
+      reported,
+      after({ CCTL_AUTOSWITCH_TRIGGER_PCT: '80' }),
+    );
+    expect(pending).toBe(2);
+    expect(row(rows, 'switch trigger')).toMatchObject({ value: '94% used', pending: '80% used' });
+    expect(row(rows, 'stale switch trigger')).toMatchObject({
+      value: '85% used',
+      pending: '80% used',
+    });
+    // A trigger above the stale bar leaves the clamp alone: one change, not two.
+    expect(markPendingRestart(reported, after({ CCTL_AUTOSWITCH_TRIGGER_PCT: '90' })).pending).toBe(
+      1,
+    );
+  });
+
+  it('never marks greedy while auto-switch is off from the daemon environment, whatever the file says', () => {
+    // A restart through the logon task inherits that environment again, so greedy stays inactive.
+    const reported = resolveDaemonConfig(
+      { CCTL_AUTOSWITCH: '0' },
+      {},
+      { env: { CCTL_AUTOSWITCH_GREEDY: 'on' } },
+    ).rows;
+    expect(row(reported, 'greedy burn-back')).toMatchObject({
+      value: 'on (inactive: auto-switch is off)',
+      source: 'config',
+    });
+    const { rows, pending } = markPendingRestart(reported, after({ CCTL_AUTOSWITCH_GREEDY: 'on' }));
+    expect(pending).toBe(0);
+    expect(row(rows, 'greedy burn-back')?.pending).toBeUndefined();
+  });
+
+  it('marks greedy becoming active when the file itself stops switching auto-switch off', () => {
+    const reported = resolveDaemonConfig({}, {}, { env: { CCTL_AUTOSWITCH: 'off' } }).rows;
+    const { rows, pending } = markPendingRestart(reported, after({}));
+    expect(pending).toBe(2);
+    expect(row(rows, 'auto-switch')).toMatchObject({
+      value: 'off',
+      source: 'config',
+      pending: 'on',
+    });
+    expect(row(rows, 'greedy burn-back')).toMatchObject({
+      value: 'on (inactive: auto-switch is off)',
+      pending: 'on',
+    });
+  });
+});
+
+describe('markPendingRestart keeps a file setting the running build does not know', () => {
+  // A report from a build that predates the fable-cap knob: no such row at all.
+  const oldReport = resolveDaemonConfig({})
+    .rows.filter((r) => r.name !== 'fable cap trigger')
+    .map((r) => (r.name === 'daemon build' ? { ...r, value: 'v0.4.2' } : r));
+  const after = (fileEnv: Record<string, string>) =>
+    resolveDaemonConfig({}, {}, { env: fileEnv }).rows;
+
+  it('appends the row with the file value and the build that ignores it, counted as unread', () => {
+    const { rows, pending, unread } = markPendingRestart(
+      oldReport,
+      after({ CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' }),
+    );
+    expect(pending).toBe(0);
+    expect(unread).toBe(1);
+    const row = rows.find((r) => r.name === 'fable cap trigger');
+    expect(row).toMatchObject({ value: 'off', source: 'config', unread: 'v0.4.2' });
+    expect(row?.pending).toBeUndefined();
+    expect(rows.indexOf(row as (typeof rows)[number])).toBe(rows.length - 1);
+  });
+
+  it('adds nothing for a knob the file does not set, and nothing when the build knows every row', () => {
+    expect(markPendingRestart(oldReport, after({})).unread).toBe(0);
+    expect(markPendingRestart(oldReport, after({})).rows).toEqual(oldReport);
+    const current = resolveDaemonConfig({}).rows;
+    const { unread, pending } = markPendingRestart(
+      current,
+      after({ CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' }),
+    );
+    expect(unread).toBe(0);
+    expect(pending).toBe(1);
+  });
+
+  it('renders the unread note in the value column, painted like a pending one', () => {
+    const rows = markPendingRestart(oldReport, after({ CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' })).rows;
+    const text = renderSettings([{ title: 't', rows }]);
+    expect(text).toMatch(/fable cap trigger\s+off \(not read by build v0\.4\.2\)\s+config/);
+    const ESC = String.fromCharCode(27);
+    expect(renderSettings([{ title: 't', rows }], ANSI_PALETTE)).toContain(
+      `${ESC}[2moff${ESC}[0m${ESC}[33m (not read by build v0.4.2)${ESC}[0m`,
+    );
+  });
+});
+
+describe('fileSettingNames', () => {
+  it('lists the env block keys and spells relayUrl as its env var', () => {
+    expect(fileSettingNames({})).toEqual([]);
+    expect(
+      fileSettingNames({
+        env: { CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off', CCTL_AUTOSWITCH_TRIGGER_PCT: '90' },
+      }),
+    ).toEqual(['CCTL_AUTOSWITCH_ON_FABLE_CAP', 'CCTL_AUTOSWITCH_TRIGGER_PCT']);
+    expect(fileSettingNames({ relayUrl: 'wss://a.example' })).toEqual(['CCTL_RELAY_URL']);
   });
 });

@@ -217,6 +217,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const logger: Logger = createLogger({ defaultLevel: 'info', sink: DAEMON_LOG_SINK });
 
   const engine = buildEngine(paths, DAEMON_LOG_SINK);
+  // Two rows for one login would be polled as two accounts and shown twice on the phone;
+  // resolve any left by an older build before the first poll (logged, never fatal).
+  await engine.dedupeAccounts();
   const store = new Store(daemonDbPath(paths));
   const protector = defaultProtector();
 
@@ -324,9 +327,15 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // The receiver forwards hook envelopes out through the client (which buffers to its outbox
   // while disconnected). The secret is the stable one loaded above, not minted per run — see
   // hookSecret.ts for why that matters.
+  // `cctl daemon stop|restart` reaches this process through the receiver's loopback route. The
+  // shutdown sequence (bottom of this function) needs the daemon and the heartbeat, which are
+  // built after the receiver, so the route gets a slot the sequence is dropped into once it
+  // exists — which happens in this same synchronous pass, before the receiver ever listens.
+  let requestStop: () => void = () => {};
   const hookReceiver = new HookReceiver({
     store,
     secret: hookSecret,
+    requestStop: () => requestStop(),
     emit: (draft) => controlPlaneClient.send(draft),
     daemonId: () => controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
     logger,
@@ -480,4 +489,5 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  requestStop = shutdown;
 }

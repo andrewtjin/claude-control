@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  renderAccountHeal,
   renderAccountsTable,
   renderDaemonStatus,
   renderPacingLine,
@@ -633,5 +634,26 @@ describe('renderTokenStats', () => {
   it('marks the unattributed row as a caveat under a palette', () => {
     const colored = renderTokenStats(stats(), ANSI_PALETTE);
     expect(colored).toContain(ANSI_PALETTE.yellow('unattributed'));
+  });
+});
+
+describe('renderAccountHeal', () => {
+  it('is empty when nothing was repaired', () => {
+    expect(renderAccountHeal({ merged: [], relabelled: [] })).toBe('');
+  });
+
+  it('explains each merge and each relabel on its own line, painting only the verb', () => {
+    const report = {
+      merged: [{ label: 'jina25', keptId: 'keep-1', removedId: 'dup-2' }],
+      relabelled: [{ id: 'x-3', from: 'jina25', to: 'jina25 (2)' }],
+    };
+    expect(renderAccountHeal(report)).toBe(
+      'merged duplicate account jina25: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
+        'renamed account jina25 (x-3) to "jina25 (2)": another account already had that label\n',
+    );
+    const ESC = String.fromCharCode(27);
+    const painted = renderAccountHeal(report, ANSI_PALETTE);
+    expect(painted.startsWith(`${ESC}[33mmerged${ESC}[0m duplicate account jina25`)).toBe(true);
+    expect(painted).toContain(`\n${ESC}[33mrenamed${ESC}[0m account jina25 (x-3)`);
   });
 });

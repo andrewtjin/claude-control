@@ -18,7 +18,12 @@ import {
   startDaemonTaskNow,
   uninstallDaemonTask,
 } from './daemonInstall.js';
-import { installDaemonAgent, queryDaemonAgent, uninstallDaemonAgent } from './launchdInstall.js';
+import {
+  installDaemonAgent,
+  queryDaemonAgent,
+  startDaemonAgentNow,
+  uninstallDaemonAgent,
+} from './launchdInstall.js';
 
 // ---------------------------------------------------------------------------
 // Which backend a platform uses
@@ -76,7 +81,14 @@ export interface AutostartResult {
 /** What `cctl daemon status` shows about autostart. `supported: false` is a platform fact, not
  *  a failure — nothing to register, nothing to fix. */
 export type AutostartQuery =
-  { supported: false } | { supported: true; registered: boolean; state?: string };
+  | { supported: false }
+  | {
+      supported: true;
+      registered: boolean;
+      state?: string;
+      /** The executable the registration runs (the cctl shim it was installed with). */
+      execute?: string;
+    };
 
 /** The tri-state every summary surface needs. 'unsupported' satisfies "setup complete" —
  *  there is nothing for the user to do about it. */
@@ -93,13 +105,15 @@ export interface AutostartBackends {
     install(shimPath: string): AutostartOutcome;
     /** Separate from install: a Scheduled Task registration does not start the task. */
     startNow(): void;
-    query(): { registered: boolean; state?: string };
+    query(): { registered: boolean; state?: string; execute?: string };
     uninstall(): 'removed' | 'not_installed';
   };
   launchAgent: {
     /** A RunAtLoad LaunchAgent registers AND starts in one bootstrap — no separate start. */
     install(shimPath: string): AutostartOutcome;
-    query(): { registered: boolean; state?: string };
+    /** Kick a loaded-but-stopped agent (after `cctl daemon stop`); throws when not loaded. */
+    startNow(): void;
+    query(): { registered: boolean; state?: string; execute?: string };
     uninstall(): 'removed' | 'not_installed';
   };
 }
@@ -113,6 +127,7 @@ const defaultBackends: AutostartBackends = {
   },
   launchAgent: {
     install: (shimPath) => installDaemonAgent({ shimPath }),
+    startNow: () => startDaemonAgentNow(),
     query: () => queryDaemonAgent(),
     uninstall: () => uninstallDaemonAgent(),
   },
@@ -158,6 +173,27 @@ export function installAutostart(
   }
 }
 
+/**
+ * Start the daemon through its registered autostart mechanism — what `cctl daemon start` and
+ * `restart` do when a registration exists, so the daemon comes up exactly as it does at logon
+ * (same shim, same environment, same flag-less `daemon run`) rather than as a child of this
+ * shell. Throws on a platform without a backend; backend failures (task not registered, agent
+ * not loaded, PowerShell/launchctl missing) propagate for the caller to phrase.
+ */
+export function startAutostart(options: AutostartOptions = {}): void {
+  const backends = options.backends ?? defaultBackends;
+  switch (autostartBackend(options.platform)) {
+    case 'scheduled-task':
+      backends.scheduledTask.startNow();
+      return;
+    case 'launch-agent':
+      backends.launchAgent.startNow();
+      return;
+    case 'none':
+      throw new AutostartUnsupportedError();
+  }
+}
+
 /** Remove the autostart registration. Never stops an already-running daemon. On a platform
  *  with no backend there is nothing to remove, which is an outcome, not an error. */
 export function uninstallAutostart(options: AutostartOptions = {}): AutostartUninstallOutcome {
@@ -189,6 +225,7 @@ export function queryAutostart(options: AutostartOptions = {}): AutostartQuery {
       supported: true,
       registered: q.registered,
       ...(q.state !== undefined ? { state: q.state } : {}),
+      ...(q.execute !== undefined ? { execute: q.execute } : {}),
     };
   } catch {
     return { supported: true, registered: false };

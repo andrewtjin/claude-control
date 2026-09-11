@@ -193,6 +193,17 @@ export function queryDaemonAgent(
   };
 }
 
+/** Start the loaded agent's process now (`launchctl kickstart`), for `cctl daemon start` after a
+ *  `cctl daemon stop`: with `KeepAlive` off launchd leaves a stopped job stopped until the next
+ *  login, so a start needs an explicit kick. Throws when the job is not loaded — the caller
+ *  says "run cctl daemon install" rather than guessing. */
+export function startDaemonAgentNow(
+  run: LaunchctlRunner = defaultLaunchctlRunner,
+  uid: number = userInfo().uid,
+): void {
+  run(['kickstart', `gui/${uid}/${DAEMON_AGENT_LABEL}`]);
+}
+
 export type DaemonAgentUninstallOutcome = 'removed' | 'not_installed';
 
 /** Bootout and delete the LaunchAgent. Mirrors uninstallDaemonTask's contract: removing the

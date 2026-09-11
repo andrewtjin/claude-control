@@ -45,7 +45,7 @@ import {
   timelineInputFromWire,
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
-import { buildEngine, daemonDbPath, fail } from './context.js';
+import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
@@ -55,6 +55,17 @@ import {
   superviseDaemon,
 } from './daemonSupervise.js';
 import { resolveCctlShimPath } from './daemonInstall.js';
+import {
+  DaemonControlError,
+  defaultDaemonControlDeps,
+  renderRestartOutcome,
+  renderStartOutcome,
+  renderStopOutcome,
+  restartDaemon,
+  startDaemon,
+  stopDaemon,
+  type StartRenderContext,
+} from './daemonControl.js';
 import {
   AUTOSTART_UNSUPPORTED_NOTE,
   autostartBackend,
@@ -67,6 +78,7 @@ import {
 } from './autostart.js';
 import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
+  renderAccountHeal,
   renderAccountsTable,
   renderDaemonStatus,
   renderPacingLine,
@@ -106,8 +118,14 @@ import {
   findDaemonEnvSetting,
   forgetDaemonSetting,
   persistDaemonSetting,
+  daemonHeartbeatPath,
+  daemonSectionTitle,
+  fileSettingNames,
+  markPendingRestart,
   readDaemonConfigFile,
   readSettingsReport,
+  renderSettingForgotten,
+  renderSettingSaved,
   renderSettings,
   renderVersionInfo,
   reportSaysGreedyActive,
@@ -124,6 +142,13 @@ import {
 // and Discord's `/stats` are only comparable for as long as all three mean the same week.
 
 /** Build the full `cctl` program. Exported so tests can introspect the command tree. */
+/** Resolve duplicate accounts before an account-reading command renders, and say what was
+ *  done. The vault refuses to create duplicates now; rows from before it did are merged or
+ *  relabelled here, so no listing can show two accounts answering to one name. */
+async function healAccounts(engine: ReturnType<typeof buildEngine>): Promise<void> {
+  process.stdout.write(renderAccountHeal(await engine.dedupeAccounts(), detectPalette()));
+}
+
 export function buildProgram(): Command {
   const program = new Command();
   program
@@ -136,6 +161,13 @@ export function buildProgram(): Command {
   // otherwise silently disable `cctl help`/`cctl help <command>` rather than dispatching them.
   // Force it on explicitly so both keep working regardless of that handler.
   program.helpCommand(true);
+
+  // Commander's own refusals (an unknown command, a missing argument) reach stderr through this
+  // hook. They take the same red as `fail()`'s line so every `error:` the CLI prints looks
+  // alike, and the same stderr-is-a-terminal test so a redirected stderr stays plain.
+  program.configureOutput({
+    outputError: (str, write) => write(paintErrorLine(str, detectPalette(process.stderr))),
+  });
 
   buildAccountCommands(program);
   buildSessionCommands(program);
@@ -181,6 +213,7 @@ export function buildProgram(): Command {
     .command('usage')
     .description("show usage across all accounts (from the daemon's latest poll)")
     .action(async () => {
+      await healAccounts(buildEngine());
       const nowMs = Date.now();
       const state = await readUsageState(nowMs);
       const rows: UsageRow[] = state.accounts.map((a) => ({
@@ -205,6 +238,7 @@ export function buildProgram(): Command {
     .command('timeline')
     .description('5h-session budget per account + when every limit resets, with a usage plan')
     .action(async () => {
+      await healAccounts(buildEngine());
       const nowMs = Date.now();
       const state = await readUsageState(nowMs);
       const inputs = buildAdvisorInputs(state);
@@ -282,13 +316,31 @@ export function buildProgram(): Command {
       // is ACTUALLY running with. Without one, preview what a daemon started from this
       // shell would resolve (flags absent, env + defaults only).
       const report = await readSettingsReport(daemonSettingsPath());
+      // config.json is read either way: beside a report it says what the next start changes;
+      // without one it is the preview's input (a relay taken from the file must not read as
+      // 'default').
+      const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
       if (report) {
         const since = new Date(report.startedAtMs).toLocaleString();
-        sections.push({ title: `daemon (effective since ${since})`, rows: report.settings });
+        // Resolved with NO environment on purpose: the file is the only layer this shell can
+        // vouch for on the daemon's behalf (see markPendingRestart).
+        const marked = markPendingRestart(
+          report.settings,
+          resolveDaemonConfig({}, {}, fileConfig).rows,
+        );
+        // A report outlives its daemon; the heartbeat says whether one is still writing.
+        const heartbeat = await readHeartbeat(daemonHeartbeatPath());
+        sections.push({
+          title: daemonSectionTitle({
+            since,
+            running: heartbeat.state === 'alive',
+            pending: marked.pending,
+            unread: marked.unread,
+            build: report.settings.find((r) => r.name === 'daemon build')?.value ?? 'unknown',
+          }),
+          rows: marked.rows,
+        });
       } else {
-        // The preview must honor config.json too — otherwise it would report 'default' for a
-        // relay the daemon will actually take from the file.
-        const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
         sections.push({
           title: 'daemon (no daemon has run yet — what `cctl daemon run` would use)',
           rows: resolveDaemonConfig(process.env, {}, fileConfig).rows,
@@ -324,11 +376,7 @@ export function buildProgram(): Command {
       } catch (err) {
         fail(err instanceof Error ? err.message : String(err));
       }
-      process.stdout.write(
-        `Saved ${setting.name}=${checked.value} to ${filePath}.\n` +
-          'Takes effect when the daemon next starts (restart it to apply now); a value set in ' +
-          'the environment still wins over the file.\n',
-      );
+      process.stdout.write(renderSettingSaved(setting, checked.value, filePath, detectPalette()));
     });
 
   settings
@@ -344,12 +392,7 @@ export function buildProgram(): Command {
       } catch (err) {
         fail(err instanceof Error ? err.message : String(err));
       }
-      process.stdout.write(
-        removed
-          ? `Removed ${setting.name} from ${filePath}; the daemon falls back to the environment ` +
-              'or the default when it next starts.\n'
-          : `${setting.name} is not set in ${filePath}.\n`,
-      );
+      process.stdout.write(renderSettingForgotten(setting, filePath, removed, detectPalette()));
     });
 
   program
@@ -487,6 +530,69 @@ export function buildProgram(): Command {
       },
     );
 
+  // Lifecycle from the command line. `start` goes through the logon registration when there is
+  // one, so the daemon comes up exactly as it does at logon; `stop` asks the running daemon
+  // over its own endpoint and terminates only one that cannot be asked. Every refusal is a
+  // DaemonControlError with the operator's next step in it, printed as the one error line.
+  const startedVia = (): string => {
+    const backend = autostartBackend();
+    return backend === 'none' ? 'logon registration' : autostartNoun(backend);
+  };
+  // What the started daemon is measured against: this CLI's build, and the settings the file
+  // holds — so a registration that runs an older install, or a daemon that took nothing from
+  // the file, is said out loud rather than discovered in the next `cctl settings`.
+  const startContext = async (): Promise<StartRenderContext> => ({
+    cliBuild: `v${VERSION}`,
+    fileSettings: fileSettingNames((await readDaemonConfigFile(daemonConfigPath())) ?? {}),
+  });
+  const control = async (body: () => Promise<string>): Promise<void> => {
+    try {
+      process.stdout.write(await body());
+    } catch (err) {
+      if (err instanceof DaemonControlError) fail(err.message);
+      throw err;
+    }
+  };
+  daemon
+    .command('stop')
+    .description(
+      'stop the running daemon: asks it over its endpoint, ends the process only if it cannot be asked',
+    )
+    .action(() =>
+      control(async () =>
+        renderStopOutcome(await stopDaemon(defaultDaemonControlDeps()), detectPalette()),
+      ),
+    );
+  daemon
+    .command('start')
+    .description(
+      'start the daemon in the background: through the logon task / LaunchAgent when one is registered, else as a detached `daemon run`',
+    )
+    .action(() =>
+      control(async () =>
+        renderStartOutcome(
+          await startDaemon(defaultDaemonControlDeps()),
+          startedVia(),
+          await startContext(),
+          detectPalette(),
+        ),
+      ),
+    );
+  daemon
+    .command('restart')
+    .description(
+      'stop the daemon and start it again: applies persisted settings and an updated build',
+    )
+    .action(() =>
+      control(async () =>
+        renderRestartOutcome(
+          await restartDaemon(defaultDaemonControlDeps()),
+          startedVia(),
+          await startContext(),
+          detectPalette(),
+        ),
+      ),
+    );
   daemon
     .command('install')
     .description(
@@ -1025,6 +1131,7 @@ function buildAccountCommands(program: Command): void {
       // Unguarded on purpose: the engine's contract is that this never throws and logs whatever
       // went wrong, so a listing the user asked for still renders whatever is already on record —
       // without a `catch` here throwing the reason away on the way past.
+      await healAccounts(engine);
       await engine.backfillAccountMetadata();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
       process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
@@ -1045,7 +1152,10 @@ function buildAccountCommands(program: Command): void {
       try {
         const account = await buildEngine().captureCurrentLogin(label);
         process.stdout.write(`Added ${account.label} (${account.id}) and set it active.\n`);
-      } catch {
+      } catch (err) {
+        // A refused duplicate (label or login already stored) is the vault's own message;
+        // anything else is the capture finding no login to store.
+        if (err instanceof VaultError) fail(err.message);
         fail('no live login to capture. Run `claude` and log in first, then retry.');
       }
     });
