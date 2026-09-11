@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { VaultError, type StoredAccount } from '@claude-control/switch-engine';
+import { VaultError, type DedupeReport, type StoredAccount } from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
 import { VERSION, type SettingsReport } from './settings.js';
 
@@ -12,7 +12,9 @@ import { VERSION, type SettingsReport } from './settings.js';
 // vault. Hoisted because the mock factory is evaluated during the import above.
 const engine = vi.hoisted(() => ({
   backfillAccountMetadata: vi.fn(() => Promise.resolve(0)),
-  dedupeAccounts: vi.fn(() => Promise.resolve({ merged: [], relabelled: [] })),
+  dedupeAccounts: vi.fn((): Promise<DedupeReport> =>
+    Promise.resolve({ merged: [], relabelled: [] }),
+  ),
   captureCurrentLogin: vi.fn((label: string): Promise<StoredAccount> =>
     Promise.reject(new Error(`captureCurrentLogin(${label}) not stubbed`)),
   ),
