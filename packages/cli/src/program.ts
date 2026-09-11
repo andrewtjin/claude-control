@@ -64,6 +64,7 @@ import {
   restartDaemon,
   startDaemon,
   stopDaemon,
+  type StartRenderContext,
 } from './daemonControl.js';
 import {
   AUTOSTART_UNSUPPORTED_NOTE,
@@ -116,7 +117,9 @@ import {
   findDaemonEnvSetting,
   forgetDaemonSetting,
   persistDaemonSetting,
+  daemonHeartbeatPath,
   daemonSectionTitle,
+  fileSettingNames,
   markPendingRestart,
   readDaemonConfigFile,
   readSettingsReport,
@@ -315,7 +318,18 @@ export function buildProgram(): Command {
           report.settings,
           resolveDaemonConfig({}, {}, fileConfig).rows,
         );
-        sections.push({ title: daemonSectionTitle(since, marked.pending), rows: marked.rows });
+        // A report outlives its daemon; the heartbeat says whether one is still writing.
+        const heartbeat = await readHeartbeat(daemonHeartbeatPath());
+        sections.push({
+          title: daemonSectionTitle({
+            since,
+            running: heartbeat.state === 'alive',
+            pending: marked.pending,
+            unread: marked.unread,
+            build: report.settings.find((r) => r.name === 'daemon build')?.value ?? 'unknown',
+          }),
+          rows: marked.rows,
+        });
       } else {
         sections.push({
           title: 'daemon (no daemon has run yet — what `cctl daemon run` would use)',
@@ -514,6 +528,13 @@ export function buildProgram(): Command {
     const backend = autostartBackend();
     return backend === 'none' ? 'logon registration' : autostartNoun(backend);
   };
+  // What the started daemon is measured against: this CLI's build, and the settings the file
+  // holds — so a registration that runs an older install, or a daemon that took nothing from
+  // the file, is said out loud rather than discovered in the next `cctl settings`.
+  const startContext = async (): Promise<StartRenderContext> => ({
+    cliBuild: `v${VERSION}`,
+    fileSettings: fileSettingNames((await readDaemonConfigFile(daemonConfigPath())) ?? {}),
+  });
   const control = async (body: () => Promise<string>): Promise<void> => {
     try {
       process.stdout.write(await body());
@@ -542,6 +563,7 @@ export function buildProgram(): Command {
         renderStartOutcome(
           await startDaemon(defaultDaemonControlDeps()),
           startedVia(),
+          await startContext(),
           detectPalette(),
         ),
       ),
@@ -556,6 +578,7 @@ export function buildProgram(): Command {
         renderRestartOutcome(
           await restartDaemon(defaultDaemonControlDeps()),
           startedVia(),
+          await startContext(),
           detectPalette(),
         ),
       ),

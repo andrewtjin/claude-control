@@ -90,7 +90,7 @@ cctl status     # at-a-glance: accounts, hooks, relay, daemon, pairing
 cctl settings   # every configurable setting: effective value and where it came from
                 # (flag / env / config / default), for both this shell and the
                 # running daemon; a saved value the daemon is not yet running with
-                # shows beside the live one as `on (off after restart)`
+                # shows beside the live one as `on (off after cctl daemon restart)`
 cctl settings set <name> <value>    # persist a daemon setting by alias or env var name,
                                     # e.g. `cctl settings set fable-cap off`,
                                     # `cctl settings set trigger 90` (applies when the
@@ -232,8 +232,12 @@ level):
 
 The daemon reads the file at start-up, so a change applies when it next starts —
 `cctl daemon restart` does that now, and until then `cctl settings` shows the saved
-value beside the running one (`on (off after restart)`) with the restart command in the
-section title. A value set in the real environment always wins over the file, even a misspelled one
+value beside the running one (`on (off after cctl daemon restart)`) with the restart command in the
+section title, and says whether the report belongs to a daemon that is still running. A file
+setting the running build has no row for — a build from before that knob — stays visible as
+`off (not read by build v0.4.2)`, and the title says which install to update; `cctl daemon start`
+and `restart` print the same warning when the daemon they brought up is not this CLI's build
+or took nothing from the file. A value set in the real environment always wins over the file, even a misspelled one
 (which then falls to the default, exactly as it does without a file). Only the names
 `cctl settings` lists for the daemon are read from `env`; the CLI's own shell knobs
 (`CCTL_SWITCH_MIN_INTERVAL_MS`, `CCTL_REFRESH_SKEW_MS`) stay environment-only.

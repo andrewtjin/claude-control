@@ -821,10 +821,30 @@ export function resolveCliSettings(env: NodeJS.ProcessEnv, colorOn: boolean): Se
 // Rendering (pure)
 // ---------------------------------------------------------------------------
 
-/** A wire row plus what the CLI alone knows: `pending` is the value config.json will give this
- *  knob at the daemon's next start when that differs from what the running daemon reports.
- *  Display-only and never on the wire — the phone sees the daemon's own report. */
-export type DisplayRow = SettingRow & { pending?: string };
+/** A wire row plus what the CLI alone knows. `pending`: the value config.json gives this knob
+ *  after `cctl daemon restart`, when that differs from what the running daemon reports.
+ *  `unread`: the running daemon's build, on a file setting that build has no row for — it
+ *  predates the knob and takes nothing from the file for it, so the row shows the file's
+ *  value beside that fact instead of vanishing. Display-only and never on the wire — the
+ *  phone sees the daemon's own report. */
+export type DisplayRow = SettingRow & { pending?: string; unread?: string };
+
+/** The env var names config.json sets, the way the daemon rows name them (`relayUrl` is the
+ *  file's spelling of CCTL_RELAY_URL). What `cctl daemon start` checks the new daemon's
+ *  report against, so a file the daemon took nothing from is called out. */
+export function fileSettingNames(fileConfig: DaemonFileConfig): string[] {
+  return [
+    ...Object.keys(fileConfig.env ?? {}),
+    ...(fileConfig.relayUrl !== undefined ? [RELAY_ENV_NAME] : []),
+  ];
+}
+
+/** Where the daemon writes its liveness file (see heartbeat.ts): beside the vault, like the
+ *  settings report. Resolved here so `cctl settings` can say whether the report it renders
+ *  belongs to a daemon that is still running. */
+export function daemonHeartbeatPath(paths: Paths = defaultPaths()): string {
+  return join(dirname(paths.vaultDir), 'daemon-heartbeat.json');
+}
 
 export interface SettingsSection {
   title: string;
@@ -857,7 +877,7 @@ const ROW_DEPENDS_ON: Readonly<Record<string, readonly string[]>> = {
 export function markPendingRestart(
   reported: readonly SettingRow[],
   afterRestart: readonly SettingRow[],
-): { rows: DisplayRow[]; pending: number } {
+): { rows: DisplayRow[]; pending: number; unread: number } {
   const fileCanDecide = (row: SettingRow): boolean =>
     row.source === 'default' || row.source === 'config';
   const nextOf = (name: string): SettingRow | undefined =>
@@ -878,15 +898,49 @@ export function markPendingRestart(
     pending += 1;
     return { ...row, pending: next.value };
   });
-  return { rows, pending };
+  // A file setting the running build does not even report is not pending: restarting the same
+  // build reads it no better. It stays visible — the file's value, and the build that ignores
+  // it — because a saved setting that silently disappears from the view reads as lost.
+  const build = reported.find((r) => r.name === 'daemon build')?.value ?? 'unknown';
+  const unreadRows = afterRestart
+    .filter((r) => r.source === 'config' && !reported.some((x) => x.name === r.name))
+    .map((r): DisplayRow => ({ ...r, unread: build }));
+  return { rows: [...rows, ...unreadRows], pending, unread: unreadRows.length };
 }
 
 /** The daemon section's title: when it started, and — if the file has changes it is not yet
  *  running with — how many and the one command that applies them. */
-export function daemonSectionTitle(since: string, pending: number): string {
-  if (pending === 0) return `daemon (effective since ${since})`;
-  const noun = pending === 1 ? '1 setting changes' : `${pending} settings change`;
-  return `daemon (effective since ${since}; ${noun} at its next start: cctl daemon restart)`;
+export interface DaemonSectionState {
+  /** The report's start time, rendered. */
+  since: string;
+  /** Whether a daemon is still writing its heartbeat — a report outlives its daemon. */
+  running: boolean;
+  pending: number;
+  unread: number;
+  /** The reported build, named when it ignores file settings. */
+  build: string;
+}
+
+/** Compose the title from the state: the running clause first, then each count with the one
+ *  command that resolves it, so a reader never has to guess what to do next. */
+export function daemonSectionTitle(s: DaemonSectionState): string {
+  const parts = [
+    s.running ? `effective since ${s.since}` : `not running; last report from ${s.since}`,
+  ];
+  if (s.pending > 0) {
+    parts.push(
+      s.pending === 1
+        ? '1 setting changes after cctl daemon restart'
+        : `${s.pending} settings change after cctl daemon restart`,
+    );
+  }
+  if (s.unread > 0) {
+    parts.push(
+      `${s.unread} config.json setting${s.unread === 1 ? '' : 's'} not read by build ${s.build}: ` +
+        'update it (npm i -g @andrewtjin/cctl), then cctl daemon restart',
+    );
+  }
+  return `daemon (${parts.join('; ')})`;
 }
 
 /** Render sections as aligned `name  value  source  detail` tables. Pure and plain by
@@ -901,7 +955,11 @@ export function renderSettings(
   // A pending value rides in the value column as a plain-text suffix, so it is part of the
   // column's width; the suffix is painted separately below.
   const pendingSuffix = (row: DisplayRow): string =>
-    row.pending !== undefined ? ` (${row.pending} after restart)` : '';
+    row.pending !== undefined
+      ? ` (${row.pending} after cctl daemon restart)`
+      : row.unread !== undefined
+        ? ` (not read by build ${row.unread})`
+        : '';
   const nameWidth = Math.max(0, ...allRows.map((r) => r.name.length));
   const valueWidth = Math.max(0, ...allRows.map((r) => r.value.length + pendingSuffix(r).length));
   const sourceWidth = Math.max(0, ...allRows.map((r) => r.source.length));

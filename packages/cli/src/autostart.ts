@@ -81,7 +81,14 @@ export interface AutostartResult {
 /** What `cctl daemon status` shows about autostart. `supported: false` is a platform fact, not
  *  a failure — nothing to register, nothing to fix. */
 export type AutostartQuery =
-  { supported: false } | { supported: true; registered: boolean; state?: string };
+  | { supported: false }
+  | {
+      supported: true;
+      registered: boolean;
+      state?: string;
+      /** The executable the registration runs (the cctl shim it was installed with). */
+      execute?: string;
+    };
 
 /** The tri-state every summary surface needs. 'unsupported' satisfies "setup complete" —
  *  there is nothing for the user to do about it. */
@@ -98,7 +105,7 @@ export interface AutostartBackends {
     install(shimPath: string): AutostartOutcome;
     /** Separate from install: a Scheduled Task registration does not start the task. */
     startNow(): void;
-    query(): { registered: boolean; state?: string };
+    query(): { registered: boolean; state?: string; execute?: string };
     uninstall(): 'removed' | 'not_installed';
   };
   launchAgent: {
@@ -106,7 +113,7 @@ export interface AutostartBackends {
     install(shimPath: string): AutostartOutcome;
     /** Kick a loaded-but-stopped agent (after `cctl daemon stop`); throws when not loaded. */
     startNow(): void;
-    query(): { registered: boolean; state?: string };
+    query(): { registered: boolean; state?: string; execute?: string };
     uninstall(): 'removed' | 'not_installed';
   };
 }
@@ -218,6 +225,7 @@ export function queryAutostart(options: AutostartOptions = {}): AutostartQuery {
       supported: true,
       registered: q.registered,
       ...(q.state !== undefined ? { state: q.state } : {}),
+      ...(q.execute !== undefined ? { execute: q.execute } : {}),
     };
   } catch {
     return { supported: true, registered: false };

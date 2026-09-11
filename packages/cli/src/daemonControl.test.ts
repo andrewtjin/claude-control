@@ -362,6 +362,8 @@ describe('restartDaemon', () => {
 });
 
 describe('rendering', () => {
+  /** This CLI's build matches the fixture report and the file sets nothing: no warnings. */
+  const ctx = { cliBuild: 'v0.4.6', fileSettings: [] as string[] };
   const started: StartOutcome = {
     outcome: 'started',
     how: 'autostart',
@@ -379,22 +381,23 @@ describe('rendering', () => {
       'Terminated the daemon (pid 41): it was running but could not be asked to stop (an older ' +
         'build, or it had stopped answering).\n',
     );
-    expect(renderStartOutcome(started, 'logon task')).toBe(
+    expect(renderStartOutcome(started, 'logon task', ctx)).toBe(
       'Started the daemon via the logon task (build v0.4.6).\n' +
         'Settings from config.json: fable cap trigger off.\n',
     );
     expect(
-      renderStartOutcome({ ...started, how: 'background', report: report(1) }, 'logon task'),
+      renderStartOutcome({ ...started, how: 'background', report: report(1) }, 'logon task', ctx),
     ).toBe(
       'Started the daemon in the background (build v0.4.6).\nSettings from config.json: none.\n',
     );
-    expect(renderStartOutcome({ outcome: 'already_running', pid: 9 }, 'LaunchAgent')).toBe(
+    expect(renderStartOutcome({ outcome: 'already_running', pid: 9 }, 'LaunchAgent', ctx)).toBe(
       'The daemon is already running (pid 9).\n',
     );
     expect(
       renderRestartOutcome(
         { stop: { outcome: 'stopped', how: 'graceful', pid: 41 }, start: started },
         'logon task',
+        ctx,
       ),
     ).toBe(
       'Stopped the daemon (pid 41).\nStarted the daemon via the logon task (build v0.4.6).\n' +
@@ -409,8 +412,133 @@ describe('rendering', () => {
     expect(
       renderStopOutcome({ outcome: 'stopped', how: 'terminated', pid: 41 }, ANSI_PALETTE),
     ).toContain(`${ESC}[33mTerminated the daemon${ESC}[0m (pid 41)`);
-    expect(renderStartOutcome(started, 'logon task', ANSI_PALETTE)).toContain(
+    expect(renderStartOutcome(started, 'logon task', ctx, ANSI_PALETTE)).toContain(
       `${ESC}[32mStarted the daemon${ESC}[0m via the logon task`,
     );
+  });
+});
+
+describe('start warnings', () => {
+  const oldBuild: StartOutcome = {
+    outcome: 'started',
+    how: 'autostart',
+    report: {
+      startedAtMs: 1,
+      settings: [
+        { name: 'daemon build', value: 'v0.4.2', source: 'default', detail: null },
+        { name: 'auto-switch', value: 'on', source: 'flag', detail: 'CCTL_AUTOSWITCH' },
+      ],
+    },
+    command: 'C:/Users/u/AppData/Roaming/npm/cctl.cmd',
+  };
+
+  it('names a build that is not this CLI’s, and the install the registration runs', () => {
+    const text = renderStartOutcome(oldBuild, 'logon task', {
+      cliBuild: 'v0.4.6',
+      fileSettings: [],
+    });
+    expect(text).toBe(
+      'Started the daemon via the logon task (build v0.4.2).\n' +
+        'Settings from config.json: none.\n' +
+        "warning: build v0.4.2 is not this CLI's build (v0.4.6); the logon task runs " +
+        'C:/Users/u/AppData/Roaming/npm/cctl.cmd - update that install (npm i -g @andrewtjin/cctl), ' +
+        'then cctl daemon restart.\n',
+    );
+    // Without a registration command (a background start) the advice has no path to name.
+    const { command: _dropped, ...noCommand } = oldBuild;
+    expect(
+      renderStartOutcome({ ...noCommand, how: 'background' }, 'logon task', {
+        cliBuild: 'v0.4.6',
+        fileSettings: [],
+      }),
+    ).toContain(
+      "warning: build v0.4.2 is not this CLI's build (v0.4.6) - update it (npm i -g @andrewtjin/cctl), then cctl daemon restart.",
+    );
+  });
+
+  it('names file settings no row of the report knows, and leaves ones a row explains alone', () => {
+    const text = renderStartOutcome(oldBuild, 'logon task', {
+      cliBuild: 'v0.4.6',
+      // auto-switch has a row (the flag won — the row says so); fable-cap has none in this build.
+      fileSettings: ['CCTL_AUTOSWITCH', 'CCTL_AUTOSWITCH_ON_FABLE_CAP'],
+    });
+    expect(text).toContain(
+      'warning: config.json sets CCTL_AUTOSWITCH_ON_FABLE_CAP, which build v0.4.2 does not read.\n',
+    );
+    expect(text).not.toContain('sets CCTL_AUTOSWITCH,');
+  });
+
+  it('stays quiet when the build matches and every file setting has a row', () => {
+    const current: StartOutcome = {
+      outcome: 'started',
+      how: 'autostart',
+      report: report(1, [
+        {
+          name: 'fable cap trigger',
+          value: 'off',
+          source: 'config',
+          detail: 'CCTL_AUTOSWITCH_ON_FABLE_CAP',
+        },
+      ]),
+    };
+    const text = renderStartOutcome(current, 'logon task', {
+      cliBuild: 'v0.4.6',
+      fileSettings: ['CCTL_AUTOSWITCH_ON_FABLE_CAP'],
+    });
+    expect(text).not.toContain('warning');
+    expect(text).toContain('Settings from config.json: fable cap trigger off.');
+  });
+
+  it('paints only the warning label on a terminal', () => {
+    const ESC = String.fromCharCode(27);
+    expect(
+      renderStartOutcome(
+        oldBuild,
+        'logon task',
+        { cliBuild: 'v0.4.6', fileSettings: [] },
+        ANSI_PALETTE,
+      ),
+    ).toContain(`${ESC}[33mwarning:${ESC}[0m build v0.4.2 is not this CLI's build`);
+  });
+
+  it('carries the registration command through a start that went through it', async () => {
+    const w = world({ reportOnStart: report(1_000) });
+    w.deps.queryAutostart = () => ({
+      supported: true,
+      registered: true,
+      state: 'Ready',
+      execute: 'C:/x/cctl.cmd',
+    });
+    const out = await startDaemon(w.deps);
+    expect(out).toMatchObject({ outcome: 'started', how: 'autostart', command: 'C:/x/cctl.cmd' });
+  });
+});
+
+describe('start warnings: unread matching is by whole token', () => {
+  it('does not take CCTL_AUTOSWITCH_GREEDY in a row detail as a mention of CCTL_AUTOSWITCH', () => {
+    const outcome: StartOutcome = {
+      outcome: 'started',
+      how: 'background',
+      report: {
+        startedAtMs: 1,
+        settings: [
+          { name: 'daemon build', value: 'v0.4.6', source: 'default', detail: null },
+          {
+            name: 'greedy burn-back',
+            value: 'on',
+            source: 'default',
+            detail: 'CCTL_AUTOSWITCH_GREEDY (on by default)',
+          },
+        ],
+      },
+    };
+    const text = renderStartOutcome(outcome, 'logon task', {
+      cliBuild: 'v0.4.6',
+      fileSettings: ['CCTL_AUTOSWITCH', 'CCTL_AUTOSWITCH_GREEDY'],
+    });
+    expect(text).toContain(
+      'warning: config.json sets CCTL_AUTOSWITCH, which build v0.4.6 does not read.',
+    );
+    expect(text).not.toContain('CCTL_AUTOSWITCH_GREEDY, which');
   });
 });

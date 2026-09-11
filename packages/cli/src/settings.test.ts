@@ -16,6 +16,7 @@ import {
   envBool,
   envFlag,
   envNumber,
+  fileSettingNames,
   findDaemonEnvSetting,
   forgetDaemonSetting,
   layerFileEnv,
@@ -998,19 +999,38 @@ describe('markPendingRestart / daemonSectionTitle', () => {
     expect(rows).toEqual(reported);
   });
 
-  it('titles the section with the count and the command only when something is pending', () => {
-    expect(daemonSectionTitle('9/9/2026, 8:20:53 PM', 0)).toBe(
-      'daemon (effective since 9/9/2026, 8:20:53 PM)',
+  it('titles the section with the running state, the pending count, and the unread count', () => {
+    const base = {
+      since: '9/9/2026, 8:20:53 PM',
+      running: true,
+      pending: 0,
+      unread: 0,
+      build: 'v0.4.6',
+    };
+    expect(daemonSectionTitle(base)).toBe('daemon (effective since 9/9/2026, 8:20:53 PM)');
+    expect(daemonSectionTitle({ ...base, pending: 1 })).toBe(
+      'daemon (effective since 9/9/2026, 8:20:53 PM; 1 setting changes after cctl daemon restart)',
     );
-    expect(daemonSectionTitle('9/9/2026, 8:20:53 PM', 1)).toBe(
-      'daemon (effective since 9/9/2026, 8:20:53 PM; 1 setting changes at its next start: cctl daemon restart)',
+    expect(daemonSectionTitle({ ...base, since: 'x', pending: 3 })).toBe(
+      'daemon (effective since x; 3 settings change after cctl daemon restart)',
     );
-    expect(daemonSectionTitle('x', 3)).toBe(
-      'daemon (effective since x; 3 settings change at its next start: cctl daemon restart)',
+    // A report outlives its daemon: say so instead of "effective since" for a dead one.
+    expect(daemonSectionTitle({ ...base, running: false })).toBe(
+      'daemon (not running; last report from 9/9/2026, 8:20:53 PM)',
+    );
+    expect(
+      daemonSectionTitle({ ...base, running: false, pending: 1, unread: 2, build: 'v0.4.2' }),
+    ).toBe(
+      'daemon (not running; last report from 9/9/2026, 8:20:53 PM; 1 setting changes after cctl daemon restart; ' +
+        '2 config.json settings not read by build v0.4.2: update it (npm i -g @andrewtjin/cctl), then cctl daemon restart)',
+    );
+    expect(daemonSectionTitle({ ...base, unread: 1, build: 'v0.4.2' })).toBe(
+      'daemon (effective since 9/9/2026, 8:20:53 PM; 1 config.json setting not read by build v0.4.2: ' +
+        'update it (npm i -g @andrewtjin/cctl), then cctl daemon restart)',
     );
   });
 
-  it('renders a pending row as `value (next after restart)`, aligned, with only the note painted', () => {
+  it('renders a pending row as `value (next after cctl daemon restart)`, aligned, with only the note painted', () => {
     const rows = [
       { name: 'fable cap trigger', value: 'on', source: 'default', detail: 'D', pending: 'off' },
       { name: 'auto-switch', value: 'on', source: 'default', detail: 'E' },
@@ -1019,13 +1039,15 @@ describe('markPendingRestart / daemonSectionTitle', () => {
     expect(renderSettings([{ title: 't', rows: [...rows] }])).toBe(
       [
         't',
-        '  fable cap trigger  on (off after restart)  default  D',
-        `  ${'auto-switch'.padEnd(17)}  ${'on'.padEnd('on (off after restart)'.length)}  default  E`,
+        '  fable cap trigger  on (off after cctl daemon restart)  default  D',
+        `  ${'auto-switch'.padEnd(17)}  ${'on'.padEnd('on (off after cctl daemon restart)'.length)}  default  E`,
       ].join('\n'),
     );
     const ESC = String.fromCharCode(27);
     const painted = renderSettings([{ title: 't', rows: [...rows] }], ANSI_PALETTE);
-    expect(painted).toContain(`${ESC}[32mon${ESC}[0m${ESC}[33m (off after restart)${ESC}[0m  `);
+    expect(painted).toContain(
+      `${ESC}[32mon${ESC}[0m${ESC}[33m (off after cctl daemon restart)${ESC}[0m  `,
+    );
   });
 });
 
@@ -1082,5 +1104,61 @@ describe('markPendingRestart follows a row to the knob it depends on', () => {
       value: 'on (inactive: auto-switch is off)',
       pending: 'on',
     });
+  });
+});
+
+describe('markPendingRestart keeps a file setting the running build does not know', () => {
+  // A report from a build that predates the fable-cap knob: no such row at all.
+  const oldReport = resolveDaemonConfig({})
+    .rows.filter((r) => r.name !== 'fable cap trigger')
+    .map((r) => (r.name === 'daemon build' ? { ...r, value: 'v0.4.2' } : r));
+  const after = (fileEnv: Record<string, string>) =>
+    resolveDaemonConfig({}, {}, { env: fileEnv }).rows;
+
+  it('appends the row with the file value and the build that ignores it, counted as unread', () => {
+    const { rows, pending, unread } = markPendingRestart(
+      oldReport,
+      after({ CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' }),
+    );
+    expect(pending).toBe(0);
+    expect(unread).toBe(1);
+    const row = rows.find((r) => r.name === 'fable cap trigger');
+    expect(row).toMatchObject({ value: 'off', source: 'config', unread: 'v0.4.2' });
+    expect(row?.pending).toBeUndefined();
+    expect(rows.indexOf(row as (typeof rows)[number])).toBe(rows.length - 1);
+  });
+
+  it('adds nothing for a knob the file does not set, and nothing when the build knows every row', () => {
+    expect(markPendingRestart(oldReport, after({})).unread).toBe(0);
+    expect(markPendingRestart(oldReport, after({})).rows).toEqual(oldReport);
+    const current = resolveDaemonConfig({}).rows;
+    const { unread, pending } = markPendingRestart(
+      current,
+      after({ CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' }),
+    );
+    expect(unread).toBe(0);
+    expect(pending).toBe(1);
+  });
+
+  it('renders the unread note in the value column, painted like a pending one', () => {
+    const rows = markPendingRestart(oldReport, after({ CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' })).rows;
+    const text = renderSettings([{ title: 't', rows }]);
+    expect(text).toMatch(/fable cap trigger\s+off \(not read by build v0\.4\.2\)\s+config/);
+    const ESC = String.fromCharCode(27);
+    expect(renderSettings([{ title: 't', rows }], ANSI_PALETTE)).toContain(
+      `${ESC}[2moff${ESC}[0m${ESC}[33m (not read by build v0.4.2)${ESC}[0m`,
+    );
+  });
+});
+
+describe('fileSettingNames', () => {
+  it('lists the env block keys and spells relayUrl as its env var', () => {
+    expect(fileSettingNames({})).toEqual([]);
+    expect(
+      fileSettingNames({
+        env: { CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off', CCTL_AUTOSWITCH_TRIGGER_PCT: '90' },
+      }),
+    ).toEqual(['CCTL_AUTOSWITCH_ON_FABLE_CAP', 'CCTL_AUTOSWITCH_TRIGGER_PCT']);
+    expect(fileSettingNames({ relayUrl: 'wss://a.example' })).toEqual(['CCTL_RELAY_URL']);
   });
 });

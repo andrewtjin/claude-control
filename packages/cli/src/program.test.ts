@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VaultError, type StoredAccount } from '@claude-control/switch-engine';
@@ -28,12 +28,14 @@ vi.mock('./context.js', async (importOriginal) => ({
 const settingsIo = vi.hoisted(() => ({
   configPath: '',
   reportPath: '',
+  heartbeatPath: '',
   readSettingsReport: vi.fn((): Promise<SettingsReport | undefined> => Promise.resolve(undefined)),
 }));
 vi.mock('./settings.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./settings.js')>()),
   daemonConfigPath: () => settingsIo.configPath,
   daemonSettingsPath: () => settingsIo.reportPath,
+  daemonHeartbeatPath: () => settingsIo.heartbeatPath,
   readSettingsReport: settingsIo.readSettingsReport,
 }));
 // The lifecycle commands' policy has its own unit tests against fake deps; here only the
@@ -437,12 +439,27 @@ describe('buildProgram', () => {
 
 describe('settings view beside a running daemon', () => {
   let dir = '';
+  const fableRow = (value: string, source: 'default' | 'config') => ({
+    name: 'fable cap trigger',
+    value,
+    source,
+    detail: 'CCTL_AUTOSWITCH_ON_FABLE_CAP',
+  });
+  const buildRow = (build: string) => ({
+    name: 'daemon build',
+    value: build,
+    source: 'default' as const,
+  });
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'cctl-settings-view-'));
     settingsIo.configPath = join(dir, 'config.json');
+    settingsIo.heartbeatPath = join(dir, 'daemon-heartbeat.json');
+    // A daemon that is still writing its heartbeat.
+    await writeFile(settingsIo.heartbeatPath, JSON.stringify({ writtenAtMs: Date.now() }), 'utf8');
   });
   afterEach(async () => {
     settingsIo.configPath = '';
+    settingsIo.heartbeatPath = '';
     settingsIo.readSettingsReport.mockReset().mockResolvedValue(undefined);
     await rm(dir, { recursive: true, force: true });
   });
@@ -450,38 +467,51 @@ describe('settings view beside a running daemon', () => {
   it('shows a saved value beside the running one and names the restart in the title', async () => {
     settingsIo.readSettingsReport.mockResolvedValue({
       startedAtMs: 0,
-      settings: [
-        { name: 'daemon build', value: `v${VERSION}`, source: 'default' },
-        {
-          name: 'fable cap trigger',
-          value: 'on',
-          source: 'default',
-          detail: 'CCTL_AUTOSWITCH_ON_FABLE_CAP',
-        },
-      ],
+      settings: [buildRow(`v${VERSION}`), fableRow('on', 'default')],
     });
     await runCli(['settings', 'set', 'fable-cap', 'off']);
     const r = await runCli(['settings']);
     expect(r.exited).toBe(false);
     expect(r.out).toMatch(
-      /daemon \(effective since .*; 1 setting changes at its next start: cctl daemon restart\)/,
+      /daemon \(effective since .*; 1 setting changes after cctl daemon restart\)/,
     );
-    expect(r.out).toMatch(/fable cap trigger\s+on \(off after restart\)\s+default/);
+    expect(r.out).toMatch(/fable cap trigger\s+on \(off after cctl daemon restart\)\s+default/);
     // Once the daemon runs with it, nothing is pending and the title is bare again.
     settingsIo.readSettingsReport.mockResolvedValue({
       startedAtMs: 0,
-      settings: [
-        {
-          name: 'fable cap trigger',
-          value: 'off',
-          source: 'config',
-          detail: 'CCTL_AUTOSWITCH_ON_FABLE_CAP',
-        },
-      ],
+      settings: [buildRow(`v${VERSION}`), fableRow('off', 'config')],
     });
     const applied = await runCli(['settings']);
     expect(applied.out).toMatch(/daemon \(effective since [^;)]*\)\n/);
-    expect(applied.out).not.toContain('after restart');
+    expect(applied.out).not.toContain('after cctl daemon restart');
+  });
+
+  it('says the daemon is not running when its heartbeat is stale or missing', async () => {
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [buildRow(`v${VERSION}`), fableRow('on', 'default')],
+    });
+    await rm(settingsIo.heartbeatPath, { force: true });
+    const r = await runCli(['settings']);
+    expect(r.out).toMatch(/daemon \(not running; last report from [^;)]*\)\n/);
+  });
+
+  it('keeps a saved setting the running build has no row for, and names the install to update', async () => {
+    // A report from a build that predates the knob: no fable-cap row at all.
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [
+        buildRow('v0.4.2'),
+        { name: 'auto-switch', value: 'on', source: 'flag', detail: 'CCTL_AUTOSWITCH' },
+      ],
+    });
+    await runCli(['settings', 'set', 'fable-cap', 'off']);
+    const r = await runCli(['settings']);
+    expect(r.out).toMatch(/fable cap trigger\s+off \(not read by build v0\.4\.2\)\s+config/);
+    expect(r.out).toContain(
+      '; 1 config.json setting not read by build v0.4.2: update it (npm i -g @andrewtjin/cctl), then cctl daemon restart)',
+    );
+    expect(r.out).not.toContain('after cctl daemon restart');
   });
 });
 

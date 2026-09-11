@@ -97,7 +97,19 @@ export type StartOutcome =
       how: 'autostart' | 'background';
       /** The new daemon's report, once it published one within the timeout. */
       report: SettingsReport;
+      /** What the logon registration executes, when the start went through it — named when
+       *  the daemon it brought up is not this CLI's build, so the operator knows which
+       *  install to update. */
+      command?: string;
     };
+
+/** What the outcome lines compare the started daemon against. */
+export interface StartRenderContext {
+  /** This CLI's build, `v`-prefixed like the report's build row. */
+  cliBuild: string;
+  /** The env var names config.json sets (see fileSettingNames). */
+  fileSettings: readonly string[];
+}
 
 export interface RestartOutcome {
   stop: StopOutcome;
@@ -335,7 +347,8 @@ export async function startDaemon(deps: DaemonControlDeps): Promise<StartOutcome
             '`cctl daemon status` and daemon-crash.log beside the vault',
     );
   }
-  return { outcome: 'started', how, report };
+  const command = how === 'autostart' && autostart.supported ? autostart.execute : undefined;
+  return { outcome: 'started', how, report, ...(command !== undefined ? { command } : {}) };
 }
 
 export async function restartDaemon(deps: DaemonControlDeps): Promise<RestartOutcome> {
@@ -362,6 +375,7 @@ export function renderStopOutcome(outcome: StopOutcome, palette: Palette = PLAIN
 export function renderStartOutcome(
   outcome: StartOutcome,
   via: string,
+  context: StartRenderContext,
   palette: Palette = PLAIN_PALETTE,
 ): string {
   if (outcome.outcome === 'already_running') {
@@ -370,18 +384,49 @@ export function renderStartOutcome(
   const build = outcome.report.settings.find((r) => r.name === 'daemon build')?.value;
   const where = outcome.how === 'autostart' ? `via the ${via}` : 'in the background';
   const fromFile = outcome.report.settings.filter((r) => r.source === 'config');
-  return (
-    `${palette.green('Started the daemon')} ${where}${build ? ` (build ${build})` : ''}.\n` +
-    (fromFile.length === 0
-      ? 'Settings from config.json: none.\n'
-      : `Settings from config.json: ${fromFile.map((r) => `${r.name} ${r.value}`).join(', ')}.\n`)
+  const lines = [
+    `${palette.green('Started the daemon')} ${where}${build ? ` (build ${build})` : ''}.`,
+    fromFile.length === 0
+      ? 'Settings from config.json: none.'
+      : `Settings from config.json: ${fromFile.map((r) => `${r.name} ${r.value}`).join(', ')}.`,
+  ];
+  // A registration can point at an older install than the one running this command; a
+  // restart then quietly brings that build back. Say so, and say which install to update.
+  if (build !== undefined && build !== context.cliBuild) {
+    lines.push(
+      `${palette.yellow('warning:')} build ${build} is not this CLI's build (${context.cliBuild})` +
+        (outcome.command !== undefined
+          ? `; the ${via} runs ${outcome.command} - update that install ` +
+            '(npm i -g @andrewtjin/cctl), then cctl daemon restart.'
+          : ' - update it (npm i -g @andrewtjin/cctl), then cctl daemon restart.'),
+    );
+  }
+  // A file setting no row of the report even names is one that build does not read at all —
+  // distinct from a row the environment or a flag won, which the row itself explains.
+  // Whole-token match: CCTL_AUTOSWITCH is a prefix of CCTL_AUTOSWITCH_GREEDY, and the names are
+  // [A-Z0-9_]+, so the token ends wherever a character outside that set (or the text) does.
+  const mentions = (text: string, name: string): boolean =>
+    new RegExp('(^|[^A-Z0-9_])' + name + '($|[^A-Z0-9_])').test(text);
+  const unread = context.fileSettings.filter(
+    (name) => !outcome.report.settings.some((r) => mentions(r.detail ?? '', name)),
   );
+  if (unread.length > 0) {
+    lines.push(
+      `${palette.yellow('warning:')} config.json sets ${unread.join(', ')}, which ` +
+        `${build !== undefined ? `build ${build}` : 'that build'} does not read.`,
+    );
+  }
+  return lines.join('\n') + '\n';
 }
 
 export function renderRestartOutcome(
   outcome: RestartOutcome,
   via: string,
+  context: StartRenderContext,
   palette: Palette = PLAIN_PALETTE,
 ): string {
-  return renderStopOutcome(outcome.stop, palette) + renderStartOutcome(outcome.start, via, palette);
+  return (
+    renderStopOutcome(outcome.stop, palette) +
+    renderStartOutcome(outcome.start, via, context, palette)
+  );
 }

@@ -272,3 +272,27 @@ describe('dispatch on darwin', () => {
     expect(calls).toEqual(['agent.query', 'agent.query', 'agent.uninstall']);
   });
 });
+
+describe('queryAutostart carries the registration executable', () => {
+  it('folds execute through on both backends when the backend reports it', () => {
+    const win = fakeBackends({
+      scheduledTask: {
+        query: () => ({ registered: true, state: 'Ready', execute: 'C:/npm/cctl.cmd' }),
+      },
+    });
+    expect(queryAutostart({ platform: 'win32', backends: win.backends })).toEqual({
+      supported: true,
+      registered: true,
+      state: 'Ready',
+      execute: 'C:/npm/cctl.cmd',
+    });
+    const mac = fakeBackends({
+      launchAgent: {
+        query: () => ({ registered: true, state: 'Loaded', execute: '/usr/local/bin/cctl' }),
+      },
+    });
+    expect(queryAutostart({ platform: 'darwin', backends: mac.backends })).toMatchObject({
+      execute: '/usr/local/bin/cctl',
+    });
+  });
+});
