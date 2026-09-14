@@ -9,6 +9,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createLogger, type LogSink } from '@claude-control/shared-protocol';
 import { SwitchEngine, defaultPaths, type Logger, type Paths } from '@claude-control/switch-engine';
+import { detectPalette, type Palette } from './ansi.js';
 
 /** The daemon's sqlite database — a sibling of the vault under the claude-control data dir.
  *  The CLI reads it (e.g. `cctl usage`) without needing the daemon process to be running.
@@ -81,6 +82,14 @@ export class CliFailure extends Error {
   }
 }
 
+/** Paint one error line for a terminal: the whole line red, with the trailing newline kept
+ *  outside the color so the reset lands before the cursor moves. The identity palette leaves
+ *  it untouched, which is what a piped or redirected stderr gets. */
+export function paintErrorLine(line: string, palette: Palette): string {
+  const newline = line.endsWith('\n') ? '\n' : '';
+  return palette.red(line.slice(0, line.length - newline.length)) + newline;
+}
+
 /**
  * End the current command with an error line and a non-zero exit — the single failure path for
  * command actions.
@@ -100,11 +109,14 @@ export function fail(message: string): never {
 }
 
 /** Report a fatal error and ask for a non-zero exit without tearing the loop down. Split out of
- *  the entry point so the exit path is testable; the race it exists to avoid is not. */
+ *  the entry point so the exit path is testable; the race it exists to avoid is not. Red on a
+ *  terminal, judged by stderr's own TTY-ness rather than stdout's: `cctl x 2>err.log` must
+ *  stay plain while `cctl x | less` still shows its error in color. */
 export function reportFatal(
   err: unknown,
   sink: { write(text: string): unknown } = process.stderr,
 ): void {
-  sink.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+  const line = `error: ${err instanceof Error ? err.message : String(err)}\n`;
+  sink.write(paintErrorLine(line, detectPalette(process.stderr)));
   process.exitCode = 1;
 }

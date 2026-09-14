@@ -19,7 +19,12 @@ import {
   startDaemonTaskNow,
   uninstallDaemonTask,
 } from './daemonInstall.js';
-import { installDaemonAgent, queryDaemonAgent, uninstallDaemonAgent } from './launchdInstall.js';
+import {
+  installDaemonAgent,
+  queryDaemonAgent,
+  startDaemonAgentNow,
+  uninstallDaemonAgent,
+} from './launchdInstall.js';
 import {
   detectWsl,
   installWslDaemonTask,
@@ -192,7 +197,16 @@ export interface AutostartResult {
 /** What `cctl daemon status` shows about autostart. `supported: false` is a host fact, not a
  *  failure — nothing to register, nothing to fix. `noun` is what to call the mechanism. */
 export type AutostartQuery =
-  { supported: false } | { supported: true; noun: string; registered: boolean; state?: string };
+  | { supported: false }
+  | {
+      supported: true;
+      noun: string;
+      registered: boolean;
+      state?: string;
+      /** The executable the registration runs (the shim it was installed with), when the
+       *  backend can say — what a build-mismatch warning names. */
+      execute?: string;
+    };
 
 /** The tri-state every summary surface needs. 'unsupported' satisfies "setup complete" —
  *  there is nothing for the user to do about it. */
@@ -207,10 +221,11 @@ export type AutostartUninstallOutcome = 'removed' | 'not_installed' | 'unsupport
 /** The uniform shape every mechanism presents to the dispatch. */
 export interface AutostartBackendImpl {
   install(shimPath: string): AutostartInstall;
-  /** The separate "run it now" step. Absent when registering already starts the daemon (a
-   *  RunAtLoad LaunchAgent). */
+  /** The separate "run it now" step: a Scheduled Task registration does not start the task, a
+   *  loaded LaunchAgent that was stopped is kicked, a systemd unit is started. Absent only for
+   *  a mechanism where registering is the start. */
   startNow?(): void;
-  query(): { registered: boolean; state?: string };
+  query(): { registered: boolean; state?: string; execute?: string };
   uninstall(): 'removed' | 'not_installed';
 }
 
@@ -233,6 +248,9 @@ export function defaultBackends(host: AutostartHost): AutostartBackends {
     },
     'launch-agent': {
       install: (shimPath) => ({ outcome: installDaemonAgent({ shimPath }) }),
+      // A RunAtLoad agent starts as part of registering; the kick is for a loaded agent that
+      // `cctl daemon stop` brought down.
+      startNow: () => startDaemonAgentNow(),
       query: () => queryDaemonAgent(),
       uninstall: () => uninstallDaemonAgent(),
     },
@@ -302,6 +320,25 @@ export function installAutostart(
   }
 }
 
+/**
+ * Start the daemon through its registered autostart mechanism — what `cctl daemon start` and
+ * `restart` do when a registration exists, so the daemon comes up exactly as it does at logon
+ * (same shim, same environment, same flag-less `daemon run`) rather than as a child of this
+ * shell. Throws `AutostartUnsupportedError` on a host without a backend, or with one that has
+ * no separate start step; backend failures (task not registered, agent not loaded,
+ * PowerShell/launchctl/systemctl missing) propagate for the caller to phrase.
+ */
+export function startAutostart(options: AutostartOptions = {}): void {
+  const { host, backend, impl } = resolve(options);
+  if (impl === undefined || backend === 'none') {
+    throw new AutostartUnsupportedError(autostartUnsupportedNote(host));
+  }
+  if (impl.startNow === undefined) {
+    throw new AutostartUnsupportedError(`the ${autostartNoun(backend)} has no separate start step`);
+  }
+  impl.startNow();
+}
+
 /** Remove the autostart registration. Never stops an already-running daemon. On a host with no
  *  backend there is nothing to remove, which is an outcome, not an error. */
 export function uninstallAutostart(options: AutostartOptions = {}): AutostartUninstallOutcome {
@@ -326,6 +363,7 @@ export function queryAutostart(options: AutostartOptions = {}): AutostartQuery {
       noun,
       registered: q.registered,
       ...(q.state !== undefined ? { state: q.state } : {}),
+      ...(q.execute !== undefined ? { execute: q.execute } : {}),
     };
   } catch {
     return { supported: true, noun, registered: false };

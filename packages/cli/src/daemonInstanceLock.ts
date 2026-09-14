@@ -25,7 +25,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 /** On-disk record of the daemon holding the instance lock. */
-interface InstanceLockRecord {
+export interface InstanceLockRecord {
   pid: number;
   startedAt: string;
 }
@@ -74,13 +74,24 @@ async function readLockRecord(filePath: string): Promise<InstanceLockRecord | un
  *  OS whether the pid exists. ESRCH ("no such process") is the only code that means dead; every
  *  other outcome, notably EPERM (Windows raises this for a pid that exists but this process
  *  lacks rights to signal), means the process is there. */
-function isPidAlive(pid: number): boolean {
+export function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
     return (err as NodeJS.ErrnoException).code !== 'ESRCH';
   }
+}
+
+/** The daemon currently holding the lock, for `cctl daemon stop|start`: the record when its pid
+ *  is alive, `undefined` for no lock, a corrupt one, or a stale one left by a crash — the same
+ *  classification {@link acquireInstanceLock} reclaims on. Read-only; never touches the file. */
+export async function readLiveInstanceLock(
+  dataDir: string,
+  alive: (pid: number) => boolean = isPidAlive,
+): Promise<InstanceLockRecord | undefined> {
+  const existing = await readLockRecord(instanceLockPath(dataDir));
+  return existing !== undefined && alive(existing.pid) ? existing : undefined;
 }
 
 /** Bounded retries for the acquire loop: one attempt can lose a genuine race to a concurrent

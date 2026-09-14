@@ -69,6 +69,7 @@ export {
   ACCOUNT_METADATA_REV,
   METADATA_BACKFILL_RETRY_MS,
   needsMetadataBackfill,
+  type DedupeReport,
 } from './vault.js';
 export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
 export {

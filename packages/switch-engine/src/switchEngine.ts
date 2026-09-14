@@ -50,7 +50,7 @@ import type {
   ReloginResult,
   StoredAccount,
 } from './types.js';
-import { needsMetadataBackfill, Vault } from './vault.js';
+import { needsMetadataBackfill, Vault, type DedupeReport } from './vault.js';
 
 /** Signature of the refresh function, so tests can inject a fake. */
 export type RefreshFn = (current: ClaudeOauth, deps?: RefreshDeps) => Promise<ClaudeOauth>;
@@ -228,6 +228,30 @@ export class SwitchEngine {
     } catch (err) {
       this.log.warn({ reason: errorReason(err) }, 'account metadata sweep did not run');
       return 0;
+    }
+  }
+
+  /**
+   * Resolve duplicate accounts (see {@link Vault.dedupeAccounts}) ahead of any account-reading
+   * command, under the same take-it-or-leave-it lock as the metadata sweep: a listing must not
+   * stall behind an in-flight switch for a repair it did not ask for, and the next call
+   * retries. Never throws — an empty report is "nothing to do or could not run", and the
+   * reason for the latter is logged rather than handed to a caller that would drop it.
+   */
+  async dedupeAccounts(): Promise<DedupeReport> {
+    const nothing: DedupeReport = { merged: [], relabelled: [] };
+    try {
+      const report = await this.withCredentialLockIfFree(() => this.vault.dedupeAccounts());
+      if (report && (report.merged.length > 0 || report.relabelled.length > 0)) {
+        this.log.info(
+          { merged: report.merged, relabelled: report.relabelled },
+          'resolved duplicate accounts',
+        );
+      }
+      return report ?? nothing;
+    } catch (err) {
+      this.log.warn({ reason: errorReason(err) }, 'duplicate-account check did not run');
+      return nothing;
     }
   }
 

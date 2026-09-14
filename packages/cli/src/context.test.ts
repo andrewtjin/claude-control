@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sandboxPaths, type Paths } from '@claude-control/switch-engine';
-import { buildEngine, CliFailure, fail, reportFatal } from './context.js';
+import { ANSI_PALETTE, PLAIN_PALETTE } from './ansi.js';
+import { buildEngine, CliFailure, fail, paintErrorLine, reportFatal } from './context.js';
 
 const tempDirs: string[] = [];
 function freshTempDir(): string {
@@ -129,5 +130,53 @@ describe('the CLI failure path', () => {
     } finally {
       process.exitCode = previous;
     }
+  });
+});
+
+describe('paintErrorLine', () => {
+  const ESC = '\u001b';
+
+  it('paints the whole line red and keeps the newline outside the color', () => {
+    expect(paintErrorLine('error: nope\n', ANSI_PALETTE)).toBe(`${ESC}[31merror: nope${ESC}[0m\n`);
+    expect(paintErrorLine('error: nope', ANSI_PALETTE)).toBe(`${ESC}[31merror: nope${ESC}[0m`);
+  });
+
+  it('is the identity under the plain palette', () => {
+    expect(paintErrorLine('error: nope\n', PLAIN_PALETTE)).toBe('error: nope\n');
+  });
+});
+
+describe('reportFatal: the one error line every command prints', () => {
+  /** Run `reportFatal` with stderr pretending to be (or not be) a terminal and NO_COLOR unset,
+   *  and hand back what it wrote; the exit code it asks for is restored afterwards. */
+  async function reported(isTTY: boolean, err: unknown): Promise<string> {
+    const had = Object.getOwnPropertyDescriptor(process.stderr, 'isTTY');
+    Object.defineProperty(process.stderr, 'isTTY', {
+      value: isTTY,
+      configurable: true,
+      writable: true,
+    });
+    vi.stubEnv('NO_COLOR', undefined);
+    const previous = process.exitCode;
+    try {
+      const { stderr } = await captureConsole(() => {
+        reportFatal(err);
+        return Promise.resolve();
+      });
+      return stderr.join('');
+    } finally {
+      process.exitCode = previous;
+      vi.unstubAllEnvs();
+      if (had) Object.defineProperty(process.stderr, 'isTTY', had);
+      else delete (process.stderr as { isTTY?: boolean }).isTTY;
+    }
+  }
+
+  it('is red on a terminal', async () => {
+    expect(await reported(true, new CliFailure('nope'))).toBe('\u001b[31merror: nope\u001b[0m\n');
+  });
+
+  it('is plain when stderr is redirected', async () => {
+    expect(await reported(false, new CliFailure('nope'))).toBe('error: nope\n');
   });
 });

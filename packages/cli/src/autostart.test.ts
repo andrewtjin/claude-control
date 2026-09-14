@@ -8,6 +8,7 @@ import {
   autostartUnsupportedNote,
   detectAutostartHost,
   installAutostart,
+  startAutostart,
   queryAutostart,
   readAutostartState,
   uninstallAutostart,
@@ -355,5 +356,73 @@ describe('dispatch per backend', () => {
       noun: 'logon task',
       registered: false,
     });
+  });
+});
+
+describe('queryAutostart carries the registration executable', () => {
+  it('folds execute through when the backend reports it', () => {
+    const win = fakeBackends();
+    win.backends['scheduled-task'].query = () => ({
+      registered: true,
+      state: 'Ready',
+      execute: 'C:/npm/cctl.cmd',
+    });
+    expect(queryAutostart({ host: host({ platform: 'win32' }), backends: win.backends })).toEqual({
+      supported: true,
+      noun: 'logon task',
+      registered: true,
+      state: 'Ready',
+      execute: 'C:/npm/cctl.cmd',
+    });
+    const mac = fakeBackends();
+    mac.backends['launch-agent'].query = () => ({
+      registered: true,
+      state: 'Loaded',
+      execute: '/usr/local/bin/cctl',
+    });
+    expect(
+      queryAutostart({ host: host({ platform: 'darwin' }), backends: mac.backends }),
+    ).toMatchObject({ execute: '/usr/local/bin/cctl' });
+  });
+});
+
+describe('startAutostart', () => {
+  it('starts through the host backend, and only that one', () => {
+    const win = fakeBackends();
+    startAutostart({ host: host({ platform: 'win32' }), backends: win.backends });
+    expect(win.calls).toEqual(['scheduled-task.startNow']);
+    const mac = fakeBackends();
+    mac.backends['launch-agent'].startNow = () => {
+      mac.calls.push('launch-agent.startNow');
+    };
+    startAutostart({ host: host({ platform: 'darwin' }), backends: mac.backends });
+    expect(mac.calls).toEqual(['launch-agent.startNow']);
+  });
+
+  it('lets a backend failure propagate for the caller to phrase', () => {
+    const { backends } = fakeBackends();
+    backends['scheduled-task'].startNow = () => {
+      throw new Error('Start-ScheduledTask : No such task');
+    };
+    expect(() => startAutostart({ host: host({ platform: 'win32' }), backends })).toThrow(
+      'No such task',
+    );
+  });
+
+  it('throws the unsupported error on a host without a backend, touching nothing', () => {
+    const { backends, calls } = fakeBackends();
+    expect(() => startAutostart({ host: host({ platform: 'linux' }), backends })).toThrow(
+      AutostartUnsupportedError,
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it('throws the unsupported error for a backend with no start step', () => {
+    const { backends, calls } = fakeBackends();
+    delete backends['launch-agent'].startNow;
+    expect(() => startAutostart({ host: host({ platform: 'darwin' }), backends })).toThrow(
+      AutostartUnsupportedError,
+    );
+    expect(calls).toEqual([]);
   });
 });
