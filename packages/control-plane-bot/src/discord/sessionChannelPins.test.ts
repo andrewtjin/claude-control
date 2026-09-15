@@ -30,6 +30,22 @@ afterEach(async () => {
   while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
 });
 
+describe('PersistentSessionChannelPinStore — a damaged file on disk', () => {
+  it('loads an empty store from invalid JSON or a 0-byte file and keeps working', async () => {
+    for (const content of ['{not json', '']) {
+      const dir = await tempDir();
+      await writeFile(join(dir, PIN_FILE), content, 'utf8');
+      const store = new PersistentSessionChannelPinStore(dir);
+      await expect(store.load()).resolves.toBeUndefined();
+      expect(store.get(USER_A)).toBeUndefined();
+      await store.record(USER_A, { kind: 'channel', channelId: CHANNEL_A });
+      const reloaded = new PersistentSessionChannelPinStore(dir);
+      await reloaded.load();
+      expect(reloaded.get(USER_A)).toEqual({ kind: 'channel', channelId: CHANNEL_A });
+    }
+  });
+});
+
 describe('SessionChannelPinStore — pure map', () => {
   it('returns undefined for a user who has never pinned anything', () => {
     const store = new SessionChannelPinStore();

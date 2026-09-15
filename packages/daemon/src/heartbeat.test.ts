@@ -174,6 +174,53 @@ describe('HeartbeatWriter', () => {
   it('defaults to the real 30s interval', () => {
     expect(HEARTBEAT_INTERVAL_MS).toBe(30_000);
   });
+
+  it('leaves a stop marker on stop(), which a reader tells from a crash at any age', async () => {
+    let now = 1_000_000;
+    const writer = new HeartbeatWriter(filePath, { intervalMs: 60_000, clock: () => now });
+    writer.start();
+    await writer.flush();
+    now = 1_005_000;
+    writer.stop();
+    await writer.flush();
+    const onDisk = JSON.parse(await readFile(filePath, 'utf8')) as HeartbeatFileShape & {
+      stoppedAtMs?: number;
+    };
+    expect(onDisk).toEqual({ writtenAtMs: 1_005_000, stoppedAtMs: 1_005_000 });
+    // Long past the stale threshold the marker still reads as a clean stop, never as a fault.
+    expect(await readHeartbeat(filePath, 1_005_000 + 10 * HEARTBEAT_STALE_AFTER_MS)).toEqual({
+      state: 'stopped',
+      writtenAtMs: 1_005_000,
+      stoppedAtMs: 1_005_000,
+      ageMs: 10 * HEARTBEAT_STALE_AFTER_MS,
+    });
+  });
+
+  it('writes no marker when stopped without ever starting', async () => {
+    const writer = new HeartbeatWriter(filePath);
+    writer.stop();
+    await writer.flush();
+    expect(await readHeartbeat(filePath)).toEqual({ state: 'never' });
+  });
+
+  it('clears the stop marker with the first beat of the next start', async () => {
+    let now = 1_000_000;
+    const writer = new HeartbeatWriter(filePath, { intervalMs: 60_000, clock: () => now });
+    writer.start();
+    writer.stop();
+    await writer.flush();
+    expect((await readHeartbeat(filePath, now)).state).toBe('stopped');
+    now = 1_010_000;
+    writer.start();
+    await writer.flush();
+    expect(await readHeartbeat(filePath, now)).toEqual({
+      state: 'alive',
+      writtenAtMs: 1_010_000,
+      ageMs: 0,
+    });
+    writer.stop();
+    await writer.flush();
+  });
 });
 
 describe('readHeartbeat', () => {

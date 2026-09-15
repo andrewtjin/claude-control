@@ -8,6 +8,8 @@
 // Convention: `percent` everywhere means percent USED (0–100). Headroom is `100 - percent`.
 // This matches the OAuth usage endpoint, which reports utilization, not remaining.
 
+import type { AutoSwitchPolicy } from './autoswitch.js';
+
 /** One usage limit for an account, as normalized from the usage endpoint. */
 export interface LimitInput {
   kind: 'session' | 'weekly_all' | 'weekly_scoped';
@@ -70,6 +72,10 @@ export interface AdvisorOptions {
   riskHeadroomPct?: number;
   /** Headroom below this means the account is effectively exhausted (not usable now). */
   minUsableHeadroomPct?: number;
+  /** The executor's own policy, when greedy auto-switch is on: the plan then names only
+   *  accounts `decideAutoSwitch` would hop to under it (session headroom, not itself low, a
+   *  known weekly reset). Absent = the executor's defaults. */
+  autoSwitchPolicy?: AutoSwitchPolicy;
 }
 
 /** One account's place in the ranking. Higher `score` = better to use right now. */

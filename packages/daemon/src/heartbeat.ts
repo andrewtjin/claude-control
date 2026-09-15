@@ -22,6 +22,8 @@ export const HEARTBEAT_STALE_AFTER_MS = HEARTBEAT_INTERVAL_MS * 3;
 
 interface HeartbeatFile {
   writtenAtMs: number;
+  /** Present only in the marker a clean shutdown leaves behind (see `HeartbeatWriter.stop`). */
+  stoppedAtMs?: number;
 }
 
 export interface HeartbeatWriterOptions {
@@ -71,9 +73,21 @@ export class HeartbeatWriter {
     this.timer = setInterval(tick, this.intervalMs);
   }
 
+  /**
+   * Stop beating and leave a stop marker in place of the last beat. Without the marker a reader
+   * keeps classifying the final beat as 'alive' until it ages past the stale threshold — up to
+   * a minute and a half of a cleanly stopped daemon reported as running by `cctl daemon status`.
+   * A crash or a kill never gets here, so a stale beat still means what it always meant. Chained
+   * behind the beats in flight like any other write; `flush()` waits for it.
+   */
   stop(): void {
-    if (this.timer) clearInterval(this.timer);
+    if (!this.timer) return; // never started, or already stopped: no beat to contradict
+    clearInterval(this.timer);
     this.timer = undefined;
+    const stoppedAtMs = this.clock();
+    this.pending = this.pending
+      .then(() => this.writeOnce(stoppedAtMs, stoppedAtMs))
+      .catch((err: unknown) => this.onError?.(err));
   }
 
   /** Resolves once every write started so far has settled (it never rejects — write failures
@@ -84,8 +98,9 @@ export class HeartbeatWriter {
     return this.pending;
   }
 
-  private async writeOnce(writtenAtMs: number): Promise<void> {
-    const payload: HeartbeatFile = { writtenAtMs };
+  private async writeOnce(writtenAtMs: number, stoppedAtMs?: number): Promise<void> {
+    const payload: HeartbeatFile =
+      stoppedAtMs === undefined ? { writtenAtMs } : { writtenAtMs, stoppedAtMs };
     // Atomic replace, not a plain write: `cctl daemon status` reads this file on its own
     // schedule, and a reader that catches a truncated write parses nothing and reports the
     // daemon as having NEVER run — the most alarming possible reading of a live daemon.
@@ -95,13 +110,17 @@ export class HeartbeatWriter {
 
 /** 'never' = no heartbeat file has ever been written here (fresh install, or the daemon has
  *  never started on this machine) — distinct from 'stale' (it ran before, but the most recent
- *  write is too old to trust). */
-export type HeartbeatState = 'alive' | 'stale' | 'never';
+ *  write is too old to trust) and from 'stopped' (it ran before and shut down cleanly, leaving
+ *  the marker `HeartbeatWriter.stop` writes; however old that marker is, it is not a fault). */
+export type HeartbeatState = 'alive' | 'stale' | 'never' | 'stopped';
 
 /** A discriminated union rather than optional fields on one shape: 'never' genuinely has no
- *  age to report, and callers should not need an `?? 0` fallback to read the other two. */
+ *  age to report, and callers should not need an `?? 0` fallback to read the others. For
+ *  'stopped', `ageMs` is the age of the stop, not of the last beat. */
 export type HeartbeatReading =
-  { state: 'never' } | { state: 'alive' | 'stale'; writtenAtMs: number; ageMs: number };
+  | { state: 'never' }
+  | { state: 'alive' | 'stale'; writtenAtMs: number; ageMs: number }
+  | { state: 'stopped'; writtenAtMs: number; stoppedAtMs: number; ageMs: number };
 
 /**
  * Read and classify the heartbeat file against `nowMs`. Missing or unparseable content reads
@@ -126,8 +145,11 @@ export async function readHeartbeat(
   } catch {
     return { state: 'never' };
   }
-  const writtenAtMs = (parsed as Partial<HeartbeatFile>).writtenAtMs;
+  const { writtenAtMs, stoppedAtMs } = parsed as Partial<HeartbeatFile>;
   if (typeof writtenAtMs !== 'number') return { state: 'never' };
+  if (typeof stoppedAtMs === 'number') {
+    return { state: 'stopped', writtenAtMs, stoppedAtMs, ageMs: nowMs - stoppedAtMs };
+  }
   const ageMs = nowMs - writtenAtMs;
   return { state: ageMs > staleAfterMs ? 'stale' : 'alive', writtenAtMs, ageMs };
 }

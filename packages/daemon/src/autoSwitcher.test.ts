@@ -66,7 +66,7 @@ describe('AutoSwitcher', () => {
     const [activatedId, activateOptions] = activate.mock.calls[0] ?? [];
     expect(activatedId).toBe('spare');
     expect(activateOptions).toMatchObject({ origin: 'auto' });
-    expect(activateOptions?.reason).toContain('hot is at 96% used');
+    expect(activateOptions?.reason).toContain('hot is at 96% of its 5-hour window');
     const payload = notify.mock.calls[0]?.[0];
     expect(payload).toMatchObject({
       requestId: 'autoswitch-fixed',
@@ -74,7 +74,7 @@ describe('AutoSwitcher', () => {
       outcome: 'hot_applied',
       activeAccountId: 'spare',
     });
-    expect(payload?.message).toContain('auto-switch: hot is at 96% used');
+    expect(payload?.message).toContain('auto-switch: hot is at 96% of its 5-hour window');
   });
 
   it('enforces the cooldown between attempts, then allows the next one', async () => {

@@ -993,6 +993,18 @@ export class HookReceiver {
       body = await readJsonBody(req);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // An over-cap body gets the 400 the sender can read: the rest of the upload is drained
+      // and discarded (the reader stopped keeping chunks at the cap) and the connection closes
+      // after the response. Destroying the socket up front — the old behaviour — reset the
+      // connection before any response reached the sender, so the size limit read as a
+      // network failure rather than a refusal.
+      if (message === 'body too large') {
+        res.setHeader('connection', 'close');
+        // Without listeners a resumed stream discards what arrives; with the reader's own
+        // 'data' listener still attached, the next chunk would only pause it again.
+        req.removeAllListeners('data');
+        req.resume();
+      }
       this.respond(res, 400, { ok: false, error: `malformed body: ${message}` });
       return;
     }
@@ -1970,8 +1982,10 @@ function readJsonBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<unkno
     req.on('data', (chunk: Buffer) => {
       total += chunk.length;
       if (total > maxBytes) {
+        // Stop reading rather than tearing the socket down: the caller answers with a 400
+        // and closes the connection once that response has gone out.
+        req.pause();
         reject(new Error('body too large'));
-        req.destroy();
         return;
       }
       chunks.push(chunk);

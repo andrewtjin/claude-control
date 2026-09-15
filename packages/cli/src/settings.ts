@@ -42,6 +42,7 @@ import {
   DEFAULT_STALE_AFTER_MS,
   DEFAULT_STALE_TRIGGER_PERCENT,
   DEFAULT_TRIGGER_PERCENT,
+  type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
@@ -516,6 +517,32 @@ export interface DaemonConfig {
     logFilePath: string;
   };
   rows: SettingRow[];
+}
+
+/**
+ * The auto-switch policy a resolution implies — the ONE place it is built, so the executor
+ * (`cctl daemon run`) and every plan that describes what the executor will do (`cctl
+ * timeline`, the daemon's own advisor) judge targets by the same thresholds. Only the knobs
+ * that were set appear: the policy's own defaults stay the policy's, and an absent key keeps
+ * the object identical to what earlier builds constructed.
+ */
+export function autoSwitchPolicyOf(values: DaemonConfig['values']): AutoSwitchPolicy {
+  return {
+    ...(values.triggerPercent !== undefined ? { triggerPercent: values.triggerPercent } : {}),
+    ...(values.staleTriggerPercent !== undefined
+      ? { staleTriggerPercent: values.staleTriggerPercent }
+      : {}),
+    ...(values.staleAfterMs !== undefined ? { staleAfterMs: values.staleAfterMs } : {}),
+    ...(values.minSessionHeadroomPct !== undefined
+      ? { minSessionHeadroomPct: values.minSessionHeadroomPct }
+      : {}),
+    ...(values.greedyResetMarginMs !== undefined
+      ? { greedyResetMarginMs: values.greedyResetMarginMs }
+      : {}),
+    ...(values.greedy ? { greedy: true } : {}),
+    // Only the opt-out is passed: the policy's own default is on.
+    ...(values.autoSwitchOnFableCap ? {} : { fableCapTriggers: false }),
+  };
 }
 
 /**

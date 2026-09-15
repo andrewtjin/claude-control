@@ -419,7 +419,7 @@ describe('renderPacingLine', () => {
       [
         'Pacing  [ok] sustainable past 14d (2u/2.9u burned per day)',
         '  left     10u of 20u (50%)',
-        '  expires  a 10u in 3d - nothing else expires within 14d',
+        '  expires  a 4u in 3d, then 1 more - 10u total over 14d',
         '  1u = one Pro account-week (a Max 20x counts 20)',
       ].join('\n'),
     );
@@ -471,7 +471,7 @@ describe('renderPacingLine', () => {
     const colored = renderPacingLine([input('a', 50, 3)], opts, pacingStyle(ANSI_PALETTE));
     expect(colored).not.toBe(plain);
     expect(colored).toContain(ANSI_PALETTE.green('[ok]'));
-    expect(colored).toContain(ANSI_PALETTE.yellow('a 10u in 3d - nothing else expires within 14d'));
+    expect(colored).toContain(ANSI_PALETTE.yellow('a 4u in 3d, then 1 more - 10u total over 14d'));
     // The row labels are bold, and the legend dim — the block's two furniture tiers.
     expect(colored).toContain(ANSI_PALETTE.bold('expires'));
     expect(colored).toContain(ANSI_PALETTE.dim('1u = one Pro account-week (a Max 20x counts 20)'));
@@ -525,6 +525,31 @@ describe('renderDaemonStatus', () => {
   it("says the daemon has never run when the heartbeat state is 'never'", () => {
     const out = renderDaemonStatus({ ...healthy, heartbeat: { state: 'never' } });
     expect(out).toMatch(/daemon has never run on this machine — run: cctl daemon install/);
+  });
+
+  it('reports a clean stop as stopped, never as not responding, and names the way back', () => {
+    const stopped = { state: 'stopped', writtenAtMs: 0, stoppedAtMs: 0, ageMs: 5_000 } as const;
+    const registered = renderDaemonStatus({ ...healthy, heartbeat: stopped });
+    expect(registered).toMatch(
+      /\[--\] daemon stopped cleanly \(just now\) — run: cctl daemon start/,
+    );
+    expect(registered).not.toMatch(/not responding|daemon alive/);
+    const unregistered = renderDaemonStatus({
+      ...healthy,
+      task: { supported: true, noun: 'logon task', registered: false },
+      heartbeat: stopped,
+    });
+    expect(unregistered).toMatch(/daemon stopped cleanly \(just now\) — run: cctl daemon install/);
+    const unsupported = renderDaemonStatus({
+      ...healthy,
+      task: { supported: false },
+      heartbeat: { ...stopped, ageMs: 5 * 60_000 },
+    });
+    expect(unsupported).toMatch(/daemon stopped cleanly \(5m ago\) — run: cctl daemon supervise/);
+    // Yellow like the never-run line: it hands the reader a command.
+    expect(renderDaemonStatus({ ...healthy, heartbeat: stopped }, ANSI_PALETTE)).toContain(
+      ANSI_PALETTE.yellow('[--]'),
+    );
   });
 
   it('yellows the never-run mark, since the line hands the reader a command', () => {

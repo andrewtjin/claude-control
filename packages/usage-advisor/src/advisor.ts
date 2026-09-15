@@ -17,7 +17,7 @@
 // weekly budget first) and who to hold in reserve — so frontends render ONE compact line,
 // not a recommendation heading plus a per-account advisory list.
 
-import { MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
+import { isAutoSwitchCandidate, MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
 import { humanizeDuration, roundPct } from './format.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type {
@@ -105,8 +105,13 @@ export function computePlan(
   // same carve-out `decideAutoSwitch` makes by only ever filtering non-active candidates.
   // With greedy off the whole text is advice to a human, who may still switch there by hand,
   // so exclusion only earns a label (see `buildReason`) and changes nothing about eligibility.
+  // The same goes for every other gate the executor applies to a target — a session window
+  // with too little headroom, an account already near its own wall, an unknown weekly clock:
+  // under greedy, an account the executor would refuse must not be announced as the target.
   const targetable = (a: Analysis): boolean =>
-    !greedy || a.input.active === true || a.input.autoSwitchExcluded !== true;
+    !greedy ||
+    a.input.active === true ||
+    isAutoSwitchCandidate(a.input, now, options.autoSwitchPolicy ?? {});
   // The burn queue: every usable account whose weekly budget is expiring soon, soonest
   // expiry first (ties by label for determinism). This IS the plan — burn down the queue.
   // `dropped` keeps the entries greedy removed, so the advice can still account for them
@@ -328,10 +333,18 @@ function buildReason(
   if (!recommended) {
     if (analyses.length === 0) return 'No accounts configured.';
     // Greedy can leave the plan without a target while the fleet is perfectly healthy: every
-    // usable account is excluded and none of them is the live one. Reporting an outage there
-    // would be a plain falsehood — the accounts have quota, auto-switch just may not take it.
-    if (analyses.some((a) => a.usable))
-      return 'No auto-switch target: every usable account is excluded from auto-switch.';
+    // usable account fails the executor's gate — excluded, too little 5-hour headroom, near its
+    // own wall, or no known weekly reset — and none of them is the live one. Reporting an
+    // outage there would be a plain falsehood (the accounts have quota; auto-switch just may
+    // not take it), and so would blaming exclusion when something else disqualified them.
+    const usable = analyses.filter((a) => a.usable);
+    if (usable.length > 0) {
+      return usable.every((a) => a.input.autoSwitchExcluded === true)
+        ? 'No auto-switch target: every usable account is excluded from auto-switch.'
+        : 'No auto-switch target: no usable account qualifies right now (a target needs 5-hour ' +
+            'headroom, room under its own limits and a known weekly reset; an excluded account ' +
+            'never qualifies).';
+    }
     const anyQuarantined = analyses.some((a) => a.input.quarantined);
     return anyQuarantined
       ? 'No usable account: all are exhausted or quarantined.'

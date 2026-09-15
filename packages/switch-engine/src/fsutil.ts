@@ -144,17 +144,32 @@ export async function atomicWriteFile(
   }
 }
 
-/** Read and JSON-parse a file, or return `undefined` if it does not exist. Other IO errors
- *  propagate — a permissions failure should be loud, not silently treated as "absent". */
+/** Read and JSON-parse a file, or return `undefined` if it does not exist. Every other failure
+ *  is loud and names the file — a permissions problem, a directory where a file should be, or
+ *  content that is not JSON must never be treated as "absent": the callers persist state, and
+ *  an absent registry is one they would happily overwrite. A UTF-8 byte-order mark is stripped
+ *  first (an editor on Windows adds one without asking; it is not JSON). */
 export async function readJsonIfExists<T>(path: string): Promise<T | undefined> {
   let raw: string;
   try {
     raw = await readFile(path, 'utf8');
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw err;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return undefined;
+    throw new Error(
+      `${path} could not be read (${code ?? (err instanceof Error ? err.message : String(err))})`,
+      { cause: err },
+    );
   }
-  return JSON.parse(raw) as T;
+  try {
+    return JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw) as T;
+  } catch (err) {
+    throw new Error(
+      `${path} is not valid JSON (${err instanceof Error ? err.message : String(err)}); ` +
+        'fix the file or move it aside - it was left untouched',
+      { cause: err },
+    );
+  }
 }
 
 /** Best-effort delete; a missing file is success. */

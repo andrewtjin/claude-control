@@ -116,6 +116,16 @@ describe('HookReceiver', () => {
       const res = await post(port, '/', { event: 'Stop' }, { 'x-claude-control-secret': SECRET });
       expect(res.status).toBe(200);
     });
+
+    it('answers an over-cap body with a 400 the sender can read, not a reset socket', async () => {
+      const huge = JSON.stringify({ event: 'Stop', pad: 'x'.repeat(1_000_100) });
+      const res = await post(port, '/', huge, { 'x-claude-control-secret': SECRET });
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ ok: false, error: 'malformed body: body too large' });
+      // The receiver is still serving afterwards.
+      const ok = await post(port, '/', { event: 'Stop' }, { 'x-claude-control-secret': SECRET });
+      expect(ok.status).toBe(200);
+    });
   });
 
   describe('malformed body', () => {

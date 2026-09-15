@@ -410,9 +410,16 @@ function unknownHeadline(
  *  it wastes budget at. */
 interface WasteByAccount {
   label: string;
+  /** Everything the account loses inside the horizon, across all of its wasting resets. */
   units: number;
   /** The account's FIRST wasting reset — the deadline to act by. */
   firstAtMs: number;
+  /** What that first reset alone destroys — the only figure a single deadline may be paired
+   *  with: quoting the horizon total beside it would claim a loss the account does not even
+   *  hold yet. */
+  firstUnits: number;
+  /** How many wasting resets the total spans. */
+  resets: number;
 }
 
 /** Aggregate waste events PER ACCOUNT rather than per reset: an account that wastes at two
@@ -423,11 +430,21 @@ function wasteByAccount(waste: PacingWaste[]): WasteByAccount[] {
   for (const w of waste) {
     const entry = byAccount.get(w.accountId);
     if (entry === undefined) {
-      byAccount.set(w.accountId, { label: w.label, units: w.units, firstAtMs: w.atMs });
+      byAccount.set(w.accountId, {
+        label: w.label,
+        units: w.units,
+        firstAtMs: w.atMs,
+        firstUnits: w.units,
+        resets: 1,
+      });
       continue;
     }
     entry.units += w.units;
-    entry.firstAtMs = Math.min(entry.firstAtMs, w.atMs);
+    entry.resets += 1;
+    if (w.atMs < entry.firstAtMs) {
+      entry.firstAtMs = w.atMs;
+      entry.firstUnits = w.units;
+    }
   }
   return [...byAccount.values()];
 }
@@ -459,9 +476,17 @@ function wasteNote(
   nowMs: number,
 ): string {
   const ranked = rankWasteByUnits(waste);
+  // An account that wastes at more than one reset gets its total AND the part that goes first:
+  // "40u in 6d" would say the whole 40u is lost at the 6d reset, when 20u of it survives until
+  // the next one.
   const named = ranked
     .slice(0, MAX_NAMED_ACCOUNTS)
-    .map((w) => `${units(w.units)} on ${w.label} in ${humanizeDuration(w.firstAtMs - nowMs)}`)
+    .map((w) =>
+      w.resets > 1
+        ? `${units(w.units)} on ${w.label} across ${w.resets} resets, the first ` +
+          `${units(w.firstUnits)} in ${humanizeDuration(w.firstAtMs - nowMs)}`
+        : `${units(w.units)} on ${w.label} in ${humanizeDuration(w.firstAtMs - nowMs)}`,
+    )
     .join(', ');
   const rest = Math.max(0, ranked.length - MAX_NAMED_ACCOUNTS);
   const tail = rest > 0 ? `, and ${rest} more account${rest === 1 ? '' : 's'}` : '';
@@ -709,10 +734,13 @@ function renderExpiring(
 ): string | undefined {
   const first = rankWasteByDeadline(waste)[0];
   if (first === undefined) return undefined;
-  const others = wasteByAccount(waste).length - 1;
-  const head = `${first.label} ${units(first.units)} in ${humanizeDuration(first.firstAtMs - nowMs)}`;
-  // With a single waster the fleet total IS the named figure, so repeating it would just invite
-  // the reader to look for the difference between two identical numbers.
+  // The deadline is paired with what THAT reset destroys, and "more" counts the remaining
+  // resets (an account's own later reset included): a second loss on the same account is
+  // still something else that expires within the horizon.
+  const others = waste.length - 1;
+  const head = `${first.label} ${units(first.firstUnits)} in ${humanizeDuration(first.firstAtMs - nowMs)}`;
+  // With a single wasting reset the fleet total IS the named figure, so repeating it would just
+  // invite the reader to look for the difference between two identical numbers.
   return others > 0
     ? `${head}, then ${others} more - ${units(wastedUnits)} total over ${horizonDays}d`
     : `${head} - nothing else expires within ${horizonDays}d`;

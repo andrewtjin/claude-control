@@ -194,10 +194,12 @@ describe('computePacing — waste', () => {
     expect(first?.atMs).toBe(NOW + 4 * DAY_MS);
     // Both accounts reset twice inside the 14d horizon; nothing is burned, so all of it goes.
     expect(pacing.wastedUnits).toBeCloseTo(8 + 20 + 20 + 20, 6);
-    // Named once per ACCOUNT, biggest loss first, stamped with the deadline to act by: the two
-    // tjin.29 resets are one decision, not two entries crowding debate off the line.
+    // Named once per ACCOUNT, biggest loss first: the two tjin.29 resets are one decision, not
+    // two entries crowding debate off the line — but the deadline is paired only with what that
+    // first reset destroys, never with the account's whole-horizon total.
     expect(pacing.notes[0]).toBe(
-      '68u expires unused within 14d: 40u on tjin.29 in 6d, 28u on debate in 4d.',
+      '68u expires unused within 14d: 40u on tjin.29 across 2 resets, the first 20u in 6d, ' +
+        '28u on debate across 2 resets, the first 8u in 4d.',
     );
   });
 
@@ -553,7 +555,9 @@ describe('renderPacingSummary', () => {
 
   it('adds a waste line naming the account and deadline, without narrating the rest', () => {
     // A weekly reset every 7d inside a 14d horizon fires twice (day 5, day 12); with nothing
-    // burned, the account's full 1u allowance is lost at each — 2u total, one account named.
+    // burned, the account's full 1u allowance is lost at each — 2u total. The row names the
+    // first reset with ITS loss (1u), and the second reset is the "1 more": the account holds
+    // only 1u at any moment, so "2u in 5d" would describe a loss it cannot take.
     const pacing = computePacing([account({ accountId: 'a', weight: 1, limits: [weekly(0, 5)] })], {
       nowMs: NOW,
       burnUnitsPerDay: 0,
@@ -562,10 +566,37 @@ describe('renderPacingSummary', () => {
       [
         'Pacing  [ok] sustainable past 14d (0u/0.1u burned per day)',
         '  left     1u of 1u (100%)',
-        '  expires  a 2u in 5d - nothing else expires within 14d',
+        '  expires  a 1u in 5d, then 1 more - 2u total over 14d',
         '  1u = one Pro account-week (a Max 20x counts 20)',
       ].join('\n'),
     );
+  });
+
+  it("pairs the deadline with that reset's own loss, never the account's horizon total", () => {
+    // A large, lightly used reserve resets twice inside the horizon beside a busy account; the
+    // reserve's two losses used to be summed and glued to the first deadline — a figure larger
+    // than the reserve even holds — and the second loss read as "nothing else expires".
+    const pacing = computePacing(
+      [
+        // busy holds 1u and burns it before its reset, so it wastes nothing.
+        account({ accountId: 'busy', weight: 20, active: true, limits: [weekly(95, 1)] }),
+        account({ accountId: 'idlebig', weight: 20, limits: [weekly(10, 2)] }),
+      ],
+      { nowMs: NOW, burnUnitsPerDay: 1 },
+    );
+    const first = pacing.waste[0];
+    expect(first?.label).toBe('idlebig');
+    expect(pacing.waste.filter((w) => w.label === 'idlebig').length).toBeGreaterThan(1);
+    const line = renderPacingSummary(pacing, NOW)
+      .split('\n')
+      .find((l) => l.includes('expires'));
+    // The head figure is the first reset's own loss, and it never exceeds what the fleet holds.
+    const head = /expires\s+idlebig (\d+(?:\.\d+)?)u in 2d, then (\d+) more/.exec(line ?? '');
+    expect(head).not.toBeNull();
+    expect(Number(head?.[1])).toBeCloseTo(first?.units ?? -1, 1);
+    expect(Number(head?.[1])).toBeLessThanOrEqual(pacing.availableUnits + 1e-6);
+    expect(Number(head?.[2])).toBe(pacing.waste.length - 1);
+    expect(line).not.toContain('nothing else expires');
   });
 
   it('pairs the named account with ITS OWN loss and ITS OWN deadline, not the fleet total', () => {
@@ -622,7 +653,8 @@ describe('renderPacingSummary', () => {
 
   it('counts the accounts it does not name, and keeps the fleet total labelled as a total', () => {
     // Each account's weekly reset fires twice inside the 14d horizon: a loses 2u twice (4u),
-    // b loses 1u twice (2u). 'a' expires first, so 'a' is named with its own 4u.
+    // b loses 1u twice (2u). 'a' expires first, so 'a' is named with the 2u that first reset
+    // destroys, and the other three resets (a's second, b's two) are the "3 more".
     const pacing = computePacing(
       [
         account({ accountId: 'a', label: 'a', weight: 2, limits: [weekly(0, 3)] }),
@@ -635,7 +667,7 @@ describe('renderPacingSummary', () => {
       [
         'Pacing  [ok] sustainable past 14d (0u/0.4u burned per day)',
         '  left     3u of 3u (100%)',
-        '  expires  a 4u in 3d, then 1 more - 6u total over 14d',
+        '  expires  a 2u in 3d, then 3 more - 6u total over 14d',
         '  1u = one Pro account-week; plan tiers unknown, so every account counts 1u',
       ].join('\n'),
     );
@@ -721,7 +753,7 @@ describe('renderPacingSummary', () => {
     ]);
     expect(spy).toContain('<[ok]>');
     expect(spy).toContain('_expires_');
-    expect(spy).toContain('{a 2u in 5d - nothing else expires within 14d}');
+    expect(spy).toContain('{a 1u in 5d, then 1 more - 2u total over 14d}');
   });
 
   it('routes the locked-out marker through `warn`, not the verdict marker', () => {

@@ -10,6 +10,7 @@ import {
   DAEMON_ENV_SETTINGS,
   DEFAULT_RELAY_URL,
   applyFileEnv,
+  autoSwitchPolicyOf,
   checkSettingValue,
   daemonConfigPath,
   daemonSectionTitle,
@@ -66,6 +67,30 @@ describe('envNumber / envFlag', () => {
     expect(envBool({}, 'X')).toBeUndefined();
     expect(envBool({ X: 'nope' }, 'X')).toBeUndefined();
     expect(envBool({ X: '  ' }, 'X')).toBeUndefined();
+  });
+});
+
+describe('autoSwitchPolicyOf', () => {
+  it('carries only the knobs that were set, so the policy keeps its own defaults', () => {
+    const dataDir = join('fake', 'data-dir');
+    expect(autoSwitchPolicyOf(resolveDaemonConfig({}, {}, {}, dataDir).values)).toEqual({
+      greedy: true,
+    });
+    const tuned = resolveDaemonConfig(
+      {
+        CCTL_AUTOSWITCH_TRIGGER_PCT: '90',
+        CCTL_AUTOSWITCH_MIN_SESSION_LEFT_PCT: '60',
+        CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off',
+      },
+      { greedy: false },
+      {},
+      dataDir,
+    ).values;
+    expect(autoSwitchPolicyOf(tuned)).toEqual({
+      triggerPercent: 90,
+      minSessionHeadroomPct: 60,
+      fableCapTriggers: false,
+    });
   });
 });
 

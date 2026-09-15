@@ -212,6 +212,56 @@ describe('computePlan — burn-before-reset (the core behavior)', () => {
     expect(plan.recommendedAccountId).toBe('a');
   });
 
+  it('never names a greedy target the executor would refuse for its session headroom', () => {
+    // Soonest weekly reset, so it heads the queue — but its 5h window is 80% used, under the
+    // executor's 25% headroom floor, so decideAutoSwitch would not hop there. The greedy line
+    // describes what the daemon does, so it must not promise that hop either.
+    const tight = acct('x', 'Tight', [
+      { kind: 'session', percent: 80, resetsAt: NOW + 3 * HOUR },
+      { kind: 'weekly_all', percent: 40, resetsAt: NOW + 20 * HOUR },
+    ]);
+    const live = acct('a', 'Live', [{ kind: 'weekly_all', percent: 30, resetsAt: NOW + 5 * DAY }], {
+      active: true,
+    });
+    const greedyPlan = computePlan([live, tight], { ...opts, greedyAutoSwitch: true });
+    expect(greedyPlan.recommendedAccountId).not.toBe('x');
+    expect(greedyPlan.reason).not.toMatch(/burns Tight/);
+    // The same fleet as advice to a human may still name it: the operator can switch by hand.
+    const humanPlan = computePlan([live, tight], opts);
+    expect(humanPlan.recommendedAccountId).toBe('x');
+    // A custom executor policy travels with the plan: a 10% floor lets the hop through.
+    const relaxed = computePlan([live, tight], {
+      ...opts,
+      greedyAutoSwitch: true,
+      autoSwitchPolicy: { minSessionHeadroomPct: 10 },
+    });
+    expect(relaxed.recommendedAccountId).toBe('x');
+  });
+
+  it('says why no greedy target qualifies without blaming an exclusion that is not set', () => {
+    // The live account is out; the two reserves fail the executor's gate for other reasons —
+    // one has no known weekly reset, the other has spent its 5-hour window.
+    const out = acct('a', 'Out', [{ kind: 'weekly_all', percent: 100, resetsAt: NOW + 3 * DAY }], {
+      active: true,
+    });
+    const noClock = acct('b', 'NoClock', [{ kind: 'weekly_all', percent: 5 }]);
+    const spentWindow = acct('c', 'Spent', [
+      { kind: 'session', percent: 95, resetsAt: NOW + 2 * HOUR },
+      { kind: 'weekly_all', percent: 5, resetsAt: NOW + 3 * DAY },
+    ]);
+    const plan = computePlan([out, noClock, spentWindow], { ...opts, greedyAutoSwitch: true });
+    expect(plan.recommendedAccountId).toBeNull();
+    expect(plan.reason).toContain('no usable account qualifies right now');
+    expect(plan.reason).not.toContain('is excluded from auto-switch');
+    // When exclusion really is the whole story, it is still named.
+    const locked = acct('d', 'Locked', [{ kind: 'weekly_all', percent: 5, resetsAt: NOW + DAY }], {
+      autoSwitchExcluded: true,
+    });
+    expect(computePlan([out, locked], { ...opts, greedyAutoSwitch: true }).reason).toBe(
+      'No auto-switch target: every usable account is excluded from auto-switch.',
+    );
+  });
+
   it('keeps an excluded account burnable when the advice is for a human, and labels it', () => {
     // Greedy off: nothing executes this plan, so the operator may still switch by hand — the
     // queue keeps its true order and only gains the label.

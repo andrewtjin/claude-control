@@ -205,13 +205,32 @@ describe('decideAutoSwitch — choosing among candidates', () => {
     ).toBe('moreWeeklyLeft');
   });
 
-  it('explains the hop weekly-first in one sentence', () => {
+  it('explains the hop weekly-first in one sentence, naming the limit that fired', () => {
     const spare = acct('spare', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 13 * H }]);
     const decision = decideAutoSwitch([lowActive(), spare], NOW);
-    expect(decision?.reason).toContain('hot is at 96% used');
+    expect(decision?.reason).toContain('hot is at 96% of its 5-hour window');
     expect(decision?.reason).toContain('spare has the soonest weekly reset');
     expect(decision?.reason).toContain('in 13h');
     expect(decision?.reason).toContain('90% weekly budget left');
+  });
+
+  it('names the weekly budget or the Fable cap when that is the limit at the wall', () => {
+    const spare = acct('spare', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 13 * H }]);
+    const weeklyOut = acct('hot', { active: true }, [
+      { kind: 'session', percent: 20, resetsAt: NOW + 2 * H },
+      { kind: 'weekly_all', percent: 97, resetsAt: NOW + 48 * H },
+    ]);
+    expect(decideAutoSwitch([weeklyOut, spare], NOW)?.reason).toContain(
+      'hot is at 97% of its weekly budget',
+    );
+    const fableOut = acct('hot', { active: true }, [
+      { kind: 'session', percent: 20, resetsAt: NOW + 2 * H },
+      { kind: 'weekly_all', percent: 40, resetsAt: NOW + 48 * H },
+      { kind: 'weekly_scoped', percent: 100, resetsAt: NOW + 48 * H },
+    ]);
+    expect(decideAutoSwitch([fableOut, spare], NOW)?.reason).toContain(
+      'hot is at 100% of its Fable weekly cap',
+    );
   });
 
   it('returns null when every other account is ineligible', () => {
@@ -368,7 +387,7 @@ describe('decideAutoSwitch — greedy mode', () => {
     const plain = decideAutoSwitch([lowActive(), spare], NOW);
     const greedy = decideAutoSwitch([lowActive(), spare], NOW, GREEDY);
     expect(greedy).toEqual(plain);
-    expect(greedy?.reason).toContain('hot is at 96% used');
+    expect(greedy?.reason).toContain('hot is at 96% of its 5-hour window');
     expect(greedy?.reason).not.toContain('greedy:');
   });
 });
@@ -392,7 +411,9 @@ describe('decideAutoSwitch — stale snapshots', () => {
     // but that snapshot was 2h old; real usage crossed 100% unseen and the session died.
     const decision = decideAutoSwitch([activeAt(93, NOW - 2 * H), freshSpare()], NOW);
     expect(decision?.targetAccountId).toBe('spare');
-    expect(decision?.reason).toContain('debate is at 93% used on usage data 2h old');
+    expect(decision?.reason).toContain(
+      'debate is at 93% of its weekly budget on usage data 2h old',
+    );
     expect(decision?.reason).toContain('hopping preemptively');
     expect(decision?.reason).toContain('spare has the soonest weekly reset');
   });
@@ -427,7 +448,9 @@ describe('decideAutoSwitch — stale snapshots', () => {
     // must not imply the hop hinged on data age.
     const decision = decideAutoSwitch([activeAt(96, NOW - 2 * H), freshSpare()], NOW);
     expect(decision?.targetAccountId).toBe('spare');
-    expect(decision?.reason).toContain('debate is at 96% used — spare has the soonest');
+    expect(decision?.reason).toContain(
+      'debate is at 96% of its weekly budget — spare has the soonest',
+    );
     expect(decision?.reason).not.toContain('preemptively');
   });
 

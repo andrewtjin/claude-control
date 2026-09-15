@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ThreadRegistry, PersistentThreadRegistry } from './threadRegistry.js';
@@ -130,6 +130,54 @@ describe('ThreadRegistry — latestForThread (reverse lookup)', () => {
     reg.set('u1', 's-new', { kind: 'thread', threadId: 't1' });
     const restored = ThreadRegistry.fromSnapshot(reg.snapshot());
     expect(restored.latestForThread('t1')).toEqual({ discordUserId: 'u1', sessionId: 's-new' });
+  });
+});
+
+describe('PersistentThreadRegistry — a damaged file on disk', () => {
+  it('loads an empty registry from invalid JSON, a 0-byte file, and a BOM-prefixed file', async () => {
+    for (const content of ['{not json', '', '﻿{"version":1,"entries":[]}']) {
+      const dir = await tempDir();
+      await writeFile(join(dir, 'session-threads.json'), content, 'utf8');
+      const reg = new PersistentThreadRegistry(dir);
+      await expect(reg.load()).resolves.toBeUndefined();
+      expect(reg.get('u1', 's1')).toBeUndefined();
+      // The registry keeps working: the next record replaces the damaged file.
+      await reg.record('u1', 's1', { kind: 'dm' });
+      const reloaded = new PersistentThreadRegistry(dir);
+      await reloaded.load();
+      expect(reloaded.get('u1', 's1')).toEqual({ kind: 'dm' });
+    }
+  });
+
+  it('loads an empty registry when a directory sits where the file should be', async () => {
+    const dir = await tempDir();
+    await mkdir(join(dir, 'session-threads.json'));
+    const reg = new PersistentThreadRegistry(dir);
+    await expect(reg.load()).resolves.toBeUndefined();
+    expect(reg.get('u1', 's1')).toBeUndefined();
+    // The write that cannot land is reported to the caller that asked for it, not swallowed.
+    await expect(reg.record('u1', 's1', { kind: 'dm' })).rejects.toThrow();
+  });
+
+  it('drops damaged entries one by one and keeps the well-formed ones', async () => {
+    const dir = await tempDir();
+    const snapshot = {
+      version: 1,
+      entries: [
+        null,
+        42,
+        { discordUserId: 'u1' },
+        { discordUserId: 'u1', sessionId: 's-bad', target: { kind: 'thread' } },
+        { discordUserId: 'u1', sessionId: 's-ok', target: { kind: 'thread', threadId: 't1' } },
+        { discordUserId: 'u2', sessionId: 's-dm', target: { kind: 'dm' } },
+      ],
+    };
+    await writeFile(join(dir, 'session-threads.json'), JSON.stringify(snapshot), 'utf8');
+    const reg = new PersistentThreadRegistry(dir);
+    await reg.load();
+    expect(reg.get('u1', 's-ok')).toEqual({ kind: 'thread', threadId: 't1' });
+    expect(reg.get('u2', 's-dm')).toEqual({ kind: 'dm' });
+    expect(reg.get('u1', 's-bad')).toBeUndefined();
   });
 });
 
