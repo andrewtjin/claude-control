@@ -1000,6 +1000,9 @@ export class HookReceiver {
       // network failure rather than a refusal.
       if (message === 'body too large') {
         res.setHeader('connection', 'close');
+        // Without listeners a resumed stream discards what arrives; with the reader's own
+        // 'data' listener still attached, the next chunk would only pause it again.
+        req.removeAllListeners('data');
         req.resume();
       }
       this.respond(res, 400, { ok: false, error: `malformed body: ${message}` });

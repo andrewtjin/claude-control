@@ -128,6 +128,7 @@ import {
   type WizardIo,
 } from './setup.js';
 import {
+  autoSwitchPolicyOf,
   checkSettingValue,
   daemonSettingsPath,
   DEFAULT_RELAY_URL,
@@ -275,11 +276,22 @@ export function buildProgram(): Command {
       let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to burn first and what to
       // hold. When the last-started daemon runs greedy auto-switch, the advice matches its
-      // descriptive phrasing (the daemon executes the plan; the user doesn't have to).
+      // descriptive phrasing (the daemon executes the plan; the user doesn't have to) and its
+      // targets are judged by the executor's thresholds — resolved here the way `cctl settings`
+      // previews them (this shell's environment over config.json), which is what a daemon
+      // started from here, or from the logon task, reads too. Only a daemon whose thresholds
+      // live solely in some other shell's environment could judge differently.
       if (inputs.length > 0) {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
+        const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
+        const autoSwitchPolicy = autoSwitchPolicyOf(
+          resolveDaemonConfig(process.env, {}, fileConfig).values,
+        );
         text +=
-          '\n\n' + renderPlanSummary(computePlan(inputs, greedy ? { greedyAutoSwitch: true } : {}));
+          '\n\n' +
+          renderPlanSummary(
+            computePlan(inputs, greedy ? { greedyAutoSwitch: true, autoSwitchPolicy } : {}),
+          );
         text +=
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));

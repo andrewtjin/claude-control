@@ -56,6 +56,7 @@ import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
   daemonConfigPath,
   applyFileEnv,
+  autoSwitchPolicyOf,
   daemonSettingsPath,
   readDaemonConfigFile,
   resolveDaemonConfig,
@@ -232,21 +233,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     fileConfig,
     dataDir,
   );
-  const {
-    relayUrl,
-    triggerPercent,
-    staleTriggerPercent,
-    staleAfterMs,
-    minSessionHeadroomPct,
-    greedyResetMarginMs,
-    cooldownMs,
-    autoSwitch,
-    greedy,
-    logFilePath,
-    probeUnknown,
-    probeTimeoutMs,
-    autoSwitchOnFableCap,
-  } = config.values;
+  const { relayUrl, cooldownMs, autoSwitch, greedy, logFilePath, probeUnknown, probeTimeoutMs } =
+    config.values;
 
   // Both loggers this process builds (this one, plus the switch-engine adapter inside
   // buildEngine) must read the SAME CCTL_LOG_FILE, or `cctl daemon run > daemon.log` captures
@@ -288,19 +276,10 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // account (1h floor, backoff on failure); a failure still falls back to tier-0, with the
   // reason surfaced on that account's snapshot entry.
   const pollVault = new Vault(paths.vaultDir, protector);
-  // One policy object for the executor AND the advisor's greedy plan, so the plan can only
-  // name targets the executor would accept under exactly these thresholds.
-  const autoSwitchPolicy = {
-    ...(triggerPercent !== undefined ? { triggerPercent } : {}),
-    ...(staleTriggerPercent !== undefined ? { staleTriggerPercent } : {}),
-    ...(staleAfterMs !== undefined ? { staleAfterMs } : {}),
-    ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
-    ...(greedyResetMarginMs !== undefined ? { greedyResetMarginMs } : {}),
-    ...(greedy ? { greedy } : {}),
-    // Only the opt-out is passed: the policy's own default is on, and an absent key
-    // keeps the policy object identical to what earlier builds constructed.
-    ...(autoSwitchOnFableCap ? {} : { fableCapTriggers: false }),
-  };
+  // One policy object for the executor AND the advisor's greedy plan (and `cctl timeline`,
+  // which builds its own from the same resolver), so a plan can only name targets the
+  // executor would accept under exactly these thresholds.
+  const autoSwitchPolicy = autoSwitchPolicyOf(config.values);
   const poller = new UsagePoller({
     fetch: (url, init) => globalThis.fetch(url, init),
     // The status-page probe an overloaded (529) usage endpoint triggers, passed explicitly for

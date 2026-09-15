@@ -67,13 +67,14 @@ export async function readJsonIfExists<T>(path: string): Promise<T | undefined> 
 }
 
 /** `readJsonIfExists` for state the bot can rebuild (thread targets, channel pins): content that
- *  does not parse — a truncated write, a hand edit gone wrong, a 0-byte file — reads as ABSENT,
- *  so a damaged cache file can never keep the bot from logging in. Real IO errors still propagate. */
+ *  does not parse — a truncated write, a hand edit gone wrong, a 0-byte file — or a file that
+ *  cannot be read at all (a directory in its place, a permissions problem) reads as ABSENT, so a
+ *  damaged cache file can never keep the bot from logging in. The next write of that cache
+ *  surfaces a path that still cannot be written, to the caller that asked for the write. */
 export async function readJsonOrAbsent<T>(path: string): Promise<T | undefined> {
   try {
     return await readJsonIfExists<T>(path);
-  } catch (err) {
-    if (err instanceof SyntaxError) return undefined;
-    throw err;
+  } catch {
+    return undefined;
   }
 }

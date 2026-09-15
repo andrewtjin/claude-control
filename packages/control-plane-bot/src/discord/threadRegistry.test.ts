@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ThreadRegistry, PersistentThreadRegistry } from './threadRegistry.js';
@@ -147,6 +147,16 @@ describe('PersistentThreadRegistry — a damaged file on disk', () => {
       await reloaded.load();
       expect(reloaded.get('u1', 's1')).toEqual({ kind: 'dm' });
     }
+  });
+
+  it('loads an empty registry when a directory sits where the file should be', async () => {
+    const dir = await tempDir();
+    await mkdir(join(dir, 'session-threads.json'));
+    const reg = new PersistentThreadRegistry(dir);
+    await expect(reg.load()).resolves.toBeUndefined();
+    expect(reg.get('u1', 's1')).toBeUndefined();
+    // The write that cannot land is reported to the caller that asked for it, not swallowed.
+    await expect(reg.record('u1', 's1', { kind: 'dm' })).rejects.toThrow();
   });
 
   it('drops damaged entries one by one and keeps the well-formed ones', async () => {

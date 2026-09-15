@@ -333,10 +333,18 @@ function buildReason(
   if (!recommended) {
     if (analyses.length === 0) return 'No accounts configured.';
     // Greedy can leave the plan without a target while the fleet is perfectly healthy: every
-    // usable account is excluded and none of them is the live one. Reporting an outage there
-    // would be a plain falsehood — the accounts have quota, auto-switch just may not take it.
-    if (analyses.some((a) => a.usable))
-      return 'No auto-switch target: every usable account is excluded from auto-switch.';
+    // usable account fails the executor's gate — excluded, too little 5-hour headroom, near its
+    // own wall, or no known weekly reset — and none of them is the live one. Reporting an
+    // outage there would be a plain falsehood (the accounts have quota; auto-switch just may
+    // not take it), and so would blaming exclusion when something else disqualified them.
+    const usable = analyses.filter((a) => a.usable);
+    if (usable.length > 0) {
+      return usable.every((a) => a.input.autoSwitchExcluded === true)
+        ? 'No auto-switch target: every usable account is excluded from auto-switch.'
+        : 'No auto-switch target: no usable account qualifies right now (a target needs 5-hour ' +
+            'headroom, room under its own limits and a known weekly reset; an excluded account ' +
+            'never qualifies).';
+    }
     const anyQuarantined = analyses.some((a) => a.input.quarantined);
     return anyQuarantined
       ? 'No usable account: all are exhausted or quarantined.'
