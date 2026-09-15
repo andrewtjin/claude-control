@@ -72,6 +72,9 @@ describe('HeartbeatWriter', () => {
       expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 1000 });
     });
     writer.stop();
+    // stop() still owes one write, the stop marker; settle it so afterEach never removes the
+    // directory mid-rename.
+    await writer.flush();
   });
 
   it('writes again every intervalMs while running', async () => {
@@ -88,6 +91,9 @@ describe('HeartbeatWriter', () => {
     await writer.flush();
     expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 2000 });
     writer.stop();
+    // stop() still owes one write, the stop marker; settle it so afterEach never removes the
+    // directory mid-rename.
+    await writer.flush();
   });
 
   it('never starts a second beat while one is still in flight', async () => {
@@ -129,9 +135,16 @@ describe('HeartbeatWriter', () => {
       expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 1000 });
     });
     writer.stop();
+    // stop() owes exactly one more write, the marker stamped with the clock at the stop, and
+    // nothing after it: with the clock moved on and old intervals elapsed, no later beat may land.
+    await writer.flush();
     now = 9999;
     await vi.advanceTimersByTimeAsync(500);
-    expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({ writtenAtMs: 1000 });
+    await writer.flush();
+    expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual({
+      writtenAtMs: 1000,
+      stoppedAtMs: 1000,
+    });
   });
 
   it('start() is idempotent — calling it twice does not double the timer', async () => {
@@ -169,6 +182,8 @@ describe('HeartbeatWriter', () => {
     writer.start();
     await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
     writer.stop();
+    // The marker write fails the same way; settle it so its error lands here, not in afterEach.
+    await writer.flush();
   });
 
   it('defaults to the real 30s interval', () => {
