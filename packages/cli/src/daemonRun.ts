@@ -288,6 +288,19 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // account (1h floor, backoff on failure); a failure still falls back to tier-0, with the
   // reason surfaced on that account's snapshot entry.
   const pollVault = new Vault(paths.vaultDir, protector);
+  // One policy object for the executor AND the advisor's greedy plan, so the plan can only
+  // name targets the executor would accept under exactly these thresholds.
+  const autoSwitchPolicy = {
+    ...(triggerPercent !== undefined ? { triggerPercent } : {}),
+    ...(staleTriggerPercent !== undefined ? { staleTriggerPercent } : {}),
+    ...(staleAfterMs !== undefined ? { staleAfterMs } : {}),
+    ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
+    ...(greedyResetMarginMs !== undefined ? { greedyResetMarginMs } : {}),
+    ...(greedy ? { greedy } : {}),
+    // Only the opt-out is passed: the policy's own default is on, and an absent key
+    // keeps the policy object identical to what earlier builds constructed.
+    ...(autoSwitchOnFableCap ? {} : { fableCapTriggers: false }),
+  };
   const poller = new UsagePoller({
     fetch: (url, init) => globalThis.fetch(url, init),
     // The status-page probe an overloaded (529) usage endpoint triggers, passed explicitly for
@@ -323,8 +336,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       claudeJsonPath: paths.claudeJsonPath,
     }),
     // Greedy-aware advice: when the daemon itself executes the burn plan, the plan's
-    // wording turns descriptive instead of telling the user to do it by hand.
-    ...(autoSwitch && greedy ? { advisorOptions: { greedyAutoSwitch: true } } : {}),
+    // wording turns descriptive instead of telling the user to do it by hand — and its
+    // targets are gated by the executor's own policy, so it never announces a hop the
+    // executor would refuse.
+    ...(autoSwitch && greedy
+      ? { advisorOptions: { greedyAutoSwitch: true, autoSwitchPolicy } }
+      : {}),
   });
 
   const attributionJournal = new AttributionJournal({ store, vaultDir: paths.vaultDir });
@@ -398,17 +415,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
             payload,
             daemonId: controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
           }),
-        policy: {
-          ...(triggerPercent !== undefined ? { triggerPercent } : {}),
-          ...(staleTriggerPercent !== undefined ? { staleTriggerPercent } : {}),
-          ...(staleAfterMs !== undefined ? { staleAfterMs } : {}),
-          ...(minSessionHeadroomPct !== undefined ? { minSessionHeadroomPct } : {}),
-          ...(greedyResetMarginMs !== undefined ? { greedyResetMarginMs } : {}),
-          ...(greedy ? { greedy } : {}),
-          // Only the opt-out is passed: the policy's own default is on, and an absent key
-          // keeps the policy object identical to what earlier builds constructed.
-          ...(autoSwitchOnFableCap ? {} : { fableCapTriggers: false }),
-        },
+        policy: autoSwitchPolicy,
         ...(cooldownMs !== undefined ? { cooldownMs } : {}),
         logger,
       })

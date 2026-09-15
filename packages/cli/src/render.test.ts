@@ -419,7 +419,7 @@ describe('renderPacingLine', () => {
       [
         'Pacing  [ok] sustainable past 14d (2u/2.9u burned per day)',
         '  left     10u of 20u (50%)',
-        '  expires  a 10u in 3d - nothing else expires within 14d',
+        '  expires  a 4u in 3d, then 1 more - 10u total over 14d',
         '  1u = one Pro account-week (a Max 20x counts 20)',
       ].join('\n'),
     );
@@ -471,7 +471,7 @@ describe('renderPacingLine', () => {
     const colored = renderPacingLine([input('a', 50, 3)], opts, pacingStyle(ANSI_PALETTE));
     expect(colored).not.toBe(plain);
     expect(colored).toContain(ANSI_PALETTE.green('[ok]'));
-    expect(colored).toContain(ANSI_PALETTE.yellow('a 10u in 3d - nothing else expires within 14d'));
+    expect(colored).toContain(ANSI_PALETTE.yellow('a 4u in 3d, then 1 more - 10u total over 14d'));
     // The row labels are bold, and the legend dim — the block's two furniture tiers.
     expect(colored).toContain(ANSI_PALETTE.bold('expires'));
     expect(colored).toContain(ANSI_PALETTE.dim('1u = one Pro account-week (a Max 20x counts 20)'));

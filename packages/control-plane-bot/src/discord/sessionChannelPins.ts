@@ -20,7 +20,7 @@
 // race the queue plus the atomic writer's EPERM retry exist to close on Windows.
 
 import { join } from 'node:path';
-import { atomicWriteFile, readJsonIfExists } from '../fsutil.js';
+import { atomicWriteFile, readJsonOrAbsent } from '../fsutil.js';
 import type { SessionChannelPin } from './sessionChannels.js';
 
 /** On-disk shape. Versioned so a future field addition can migrate rather than mis-parse, and a
@@ -115,7 +115,9 @@ export class PersistentSessionChannelPinStore {
   async load(): Promise<void> {
     if (this.loaded) return;
     this.loaded = true;
-    const snap = await readJsonIfExists<PinSnapshot>(this.path);
+    // Unparseable content reads as absent, as for the thread registry: a damaged pins file
+    // costs the pins, never the bot's login.
+    const snap = await readJsonOrAbsent<PinSnapshot>(this.path);
     this.store = SessionChannelPinStore.fromSnapshot(snap);
   }
 

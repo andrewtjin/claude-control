@@ -232,7 +232,7 @@ describe('buildUsageEmbed', () => {
     // computable without the two inputs the daemon just supplied.
     expect(pacing?.value).toContain('1.2u of 2u available (60%)');
     expect(pacing?.value).toContain('sustainable for the next 14d.');
-    expect(pacing?.value).toContain('on Spare in 1d');
+    expect(pacing?.value).toContain('on Spare across 2 resets, the first 0.9u in 1d');
     expect(pacing?.value).toContain('• next weekly reset predicted from history for Spare.');
     expect(pacing?.value).not.toContain('burn rate not measured yet');
     // The account's own field carries that reset too, labelled — a prediction is never

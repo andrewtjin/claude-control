@@ -1789,6 +1789,26 @@ describe('Daemon lifecycle', () => {
     }
   });
 
+  it('refuses a spawn whose working directory does not exist, with an error the phone can show', async () => {
+    await daemon.start();
+    const missing = `${process.cwd()}/definitely-missing-${Date.now()}`;
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-cwd', prompt: 'go', idempotencyKey: 'k', cwd: missing },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const err = relay.received.find((e) => e.type === 'error');
+    if (err?.type === 'error') {
+      expect(err.payload.code).toBe('spawn_failed');
+      expect(err.payload.message).toContain('working directory does not exist');
+      expect(err.payload.message).toContain(missing);
+    }
+    // Nothing was launched and nothing was announced as starting.
+    expect(sessionManager.spawnManaged).not.toHaveBeenCalled();
+    expect(relay.received.some((e) => e.type === 'session.status')).toBe(false);
+  });
+
   it("echoes the spawn requestId on the spawned session's status frames", async () => {
     await daemon.start();
     relay.push({

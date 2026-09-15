@@ -8,6 +8,7 @@
 // pre-built (dependency injection) so a lifecycle test can fake all of them.
 
 import { randomUUID } from 'node:crypto';
+import { stat } from 'node:fs/promises';
 import type {
   ActivateOptions,
   RecoverResult,
@@ -2236,6 +2237,24 @@ export class Daemon {
    */
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
     const { requestId, prompt, resumeSessionId, cwd, accountId } = msg.payload;
+    // A working directory that does not exist reaches the SDK child as a launch that never
+    // produces a first event, so the requester would watch 'starting' forever. Refuse it here,
+    // while the answer can still be an error envelope the phone shows against the request.
+    if (cwd !== undefined && cwd !== null) {
+      const problem = await describeBadDirectory(cwd);
+      if (problem !== undefined) {
+        this.logger.warn({ requestId, cwd }, 'session.spawn refused: bad working directory');
+        this.sendEnvelope({
+          type: 'error',
+          payload: {
+            code: 'spawn_failed',
+            message: `session.spawn: the working directory ${problem} (${cwd})`,
+            relatesTo: msg.id,
+          },
+        });
+        return;
+      }
+    }
     let handle: SessionHandle;
     try {
       const resumeAnchor = this.resolveSpawnResumeAnchor(resumeSessionId ?? undefined);
@@ -3119,4 +3138,15 @@ export function reconcileQuarantineNotices(
 function planWeightOf(account: Parameters<typeof planWeight>[0]): { weight?: number } {
   const result = planWeight(account);
   return result.known ? { weight: result.weight } : {};
+}
+
+/** Why `path` cannot be a session's working directory, or undefined when it can: a spawn
+ *  refuses a directory the SDK child could not start in, rather than announcing a session
+ *  that never produces its first event. */
+async function describeBadDirectory(path: string): Promise<string | undefined> {
+  try {
+    return (await stat(path)).isDirectory() ? undefined : 'is not a directory';
+  } catch {
+    return 'does not exist';
+  }
 }

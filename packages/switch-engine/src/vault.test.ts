@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -853,5 +853,47 @@ describe('dedupeAccounts: rows an older build let through', () => {
     expect(first.merged).toHaveLength(1);
     expect(first.relabelled).toHaveLength(1);
     expect(await v.dedupeAccounts()).toEqual({ merged: [], relabelled: [] });
+  });
+});
+
+describe('Vault — a damaged accounts.json is refused by name and left untouched', () => {
+  it('refuses a registry whose accounts field is not an array', async () => {
+    const { v, registryPath } = await vaultAt();
+    await v.addAccount('Keep', bundle('keep'));
+    await writeFile(registryPath, JSON.stringify({ activeId: null, accounts: {} }), 'utf8');
+    const before = await readFile(registryPath, 'utf8');
+    await expect(v.loadRegistry()).rejects.toThrow(VaultError);
+    await expect(v.loadRegistry()).rejects.toThrow(/malformed/);
+    await expect(v.listAccounts()).rejects.toThrow(/accounts\.json/);
+    expect(await readFile(registryPath, 'utf8')).toBe(before);
+  });
+
+  it('refuses a registry that is not JSON, naming the file, and leaves it as it was', async () => {
+    const { v, registryPath } = await vaultAt();
+    await v.addAccount('Keep', bundle('keep'));
+    await writeFile(registryPath, '{"activeId": null, "accounts": [', 'utf8');
+    await expect(v.loadRegistry()).rejects.toThrow(/accounts\.json is not valid JSON/);
+    expect(await readFile(registryPath, 'utf8')).toBe('{"activeId": null, "accounts": [');
+  });
+
+  it('refuses a row without a string id rather than crashing on it later', async () => {
+    const { v, registryPath } = await vaultAt();
+    await mkdir(join(registryPath, '..'), { recursive: true });
+    await writeFile(registryPath, JSON.stringify({ activeId: null, accounts: [null] }), 'utf8');
+    await expect(v.loadRegistry()).rejects.toThrow(/malformed/);
+  });
+
+  it('reads a registry an editor saved with a byte-order mark', async () => {
+    const { v, registryPath } = await vaultAt();
+    const { id } = await v.addAccount('Keep', bundle('keep'));
+    await writeFile(registryPath, '﻿' + (await readFile(registryPath, 'utf8')), 'utf8');
+    expect((await v.loadRegistry()).accounts.map((a) => a.id)).toEqual([id]);
+  });
+
+  it('defaults the fields an older file lacks', async () => {
+    const { v, registryPath } = await vaultAt();
+    await mkdir(join(registryPath, '..'), { recursive: true });
+    await writeFile(registryPath, '{}', 'utf8');
+    expect(await v.loadRegistry()).toEqual({ activeId: null, accounts: [] });
   });
 });

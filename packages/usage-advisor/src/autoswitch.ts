@@ -119,18 +119,12 @@ export interface AutoSwitchDecision {
 }
 
 /**
- * Decide whether to auto-switch, and to which account. Returns `null` unless ALL of:
- * an active account exists, a trigger fires (its remaining quota is low, or greedy mode
- * spots a sooner-expiring weekly budget elsewhere), and at least one eligible candidate
- * exists. Limits whose reset time is already past are ignored everywhere — their
- * percents describe a window that no longer exists (stale cached snapshots routinely
- * carry them).
+ * Everything the candidate gate depends on, resolved once per decision from the policy: the
+ * thresholds, the stale-data tightening, which limits are visible, and the predicate itself.
+ * Shared with the advisor through `isAutoSwitchCandidate`, so a greedy plan can only name an
+ * account this executor would actually hop to.
  */
-export function decideAutoSwitch(
-  accounts: AccountUsageInput[],
-  now = Date.now(),
-  policy: AutoSwitchPolicy = {},
-): AutoSwitchDecision | null {
+function candidateGate(now: number, policy: AutoSwitchPolicy) {
   const triggerPercent = policy.triggerPercent ?? DEFAULT_TRIGGER_PERCENT;
   const minSessionHeadroomPct = policy.minSessionHeadroomPct ?? DEFAULT_MIN_SESSION_HEADROOM_PCT;
   const staleAfterMs = policy.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
@@ -146,10 +140,6 @@ export function decideAutoSwitch(
   /** The "low" threshold this account is judged against, given its snapshot's age. */
   const lowThreshold = (a: AccountUsageInput): number =>
     snapshotAge(a) >= staleAfterMs ? staleTriggerPercent : triggerPercent;
-
-  const active = accounts.find((a) => a.active);
-  if (!active) return null;
-
   // Which limits the policy can see. With the Fable cap opted out, the scoped cap is invisible
   // EVERYWHERE in this decision — the trigger, candidate eligibility, the weekly ranking and
   // the reason text — never on one side only, or the daemon would hop away from a Fable-capped
@@ -159,6 +149,51 @@ export function decideAutoSwitch(
   const visibleLimits = (a: AccountUsageInput): LimitInput[] =>
     countFableCap ? a.limits : a.limits.filter((l) => l.kind !== 'weekly_scoped');
   const weeklyResetAt = (a: AccountUsageInput) => weeklyBudget(visibleLimits(a), a, now)?.resetsAt;
+  const isCandidate = (a: AccountUsageInput): boolean =>
+    !a.active &&
+    !a.quarantined &&
+    !a.autoSwitchExcluded &&
+    100 - sessionUsedPct(a, now) >= minSessionHeadroomPct &&
+    // Never hop to an account that would itself immediately count as low — judged by ITS
+    // OWN snapshot's age, so a stale near-limit candidate (whose true usage may already
+    // be past the wall) is no safer a target than it would be to keep...
+    (worstPercent(visibleLimits(a), now) ?? 0) < lowThreshold(a) &&
+    // ...or whose weekly budget clock we can't see — the choice is BY weekly reset,
+    // so an unknown reset is not a lesser candidate, it's not a candidate at all.
+    weeklyResetAt(a) !== undefined;
+  return { triggerPercent, snapshotAge, lowThreshold, visibleLimits, weeklyResetAt, isCandidate };
+}
+
+/** Whether `decideAutoSwitch` could pick this account as a hop target right now, under the
+ *  same policy — for surfaces that describe what the executor will do (the greedy plan), so
+ *  they never announce a hop the executor refuses. */
+export function isAutoSwitchCandidate(
+  account: AccountUsageInput,
+  now = Date.now(),
+  policy: AutoSwitchPolicy = {},
+): boolean {
+  return candidateGate(now, policy).isCandidate(account);
+}
+
+/**
+ * Decide whether to auto-switch, and to which account. Returns `null` unless ALL of:
+ * an active account exists, a trigger fires (its remaining quota is low, or greedy mode
+ * spots a sooner-expiring weekly budget elsewhere), and at least one eligible candidate
+ * exists. Limits whose reset time is already past are ignored everywhere — their
+ * percents describe a window that no longer exists (stale cached snapshots routinely
+ * carry them).
+ */
+export function decideAutoSwitch(
+  accounts: AccountUsageInput[],
+  now = Date.now(),
+  policy: AutoSwitchPolicy = {},
+): AutoSwitchDecision | null {
+  const gate = candidateGate(now, policy);
+  const { triggerPercent, snapshotAge, lowThreshold, visibleLimits, weeklyResetAt } = gate;
+
+  const active = accounts.find((a) => a.active);
+  if (!active) return null;
+
   const weeklyUsedPct = (a: AccountUsageInput) =>
     weeklyBudget(visibleLimits(a), a, now)?.percent ?? 0;
   const weeklyPredicted = (a: AccountUsageInput) =>
@@ -172,20 +207,7 @@ export function decideAutoSwitch(
   // since "97% used" alone cannot tell a full Fable cap from a spent weekly budget.
   const activeWall = `${roundPct(activeWorst)}% of its ${LIMIT_NOUN[activeLimit.kind]}`;
 
-  const candidates = accounts.filter(
-    (a) =>
-      !a.active &&
-      !a.quarantined &&
-      !a.autoSwitchExcluded &&
-      100 - sessionUsedPct(a, now) >= minSessionHeadroomPct &&
-      // Never hop to an account that would itself immediately count as low — judged by ITS
-      // OWN snapshot's age, so a stale near-limit candidate (whose true usage may already
-      // be past the wall) is no safer a target than it would be to keep...
-      (worstPercent(visibleLimits(a), now) ?? 0) < lowThreshold(a) &&
-      // ...or whose weekly budget clock we can't see — the choice is BY weekly reset,
-      // so an unknown reset is not a lesser candidate, it's not a candidate at all.
-      weeklyResetAt(a) !== undefined,
-  );
+  const candidates = accounts.filter(gate.isCandidate);
   if (candidates.length === 0) return null;
 
   // Soonest weekly reset wins — weekly is the budget. On the same reset moment a REPORTED

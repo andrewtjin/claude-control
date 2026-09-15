@@ -16,7 +16,7 @@
 // Windows EPERM retry) with writes serialized so bursts of new sessions can't race the final rename.
 
 import { join } from 'node:path';
-import { atomicWriteFile, readJsonIfExists } from '../fsutil.js';
+import { atomicWriteFile, readJsonOrAbsent } from '../fsutil.js';
 
 /** Where a session's frames are delivered. `thread` once a Discord thread exists for it; `dm` when
  *  thread creation was not possible and we fell back to (and pinned) the user's direct messages. */
@@ -85,10 +85,29 @@ export class ThreadRegistry {
   static fromSnapshot(snap: RegistrySnapshot | undefined): ThreadRegistry {
     const reg = new ThreadRegistry();
     if (snap && Array.isArray(snap.entries)) {
-      for (const e of snap.entries) reg.set(e.discordUserId, e.sessionId, e.target);
+      // Entry by entry: one damaged row (a hand edit, a null) costs that row, never the load.
+      for (const e of snap.entries as unknown[]) {
+        if (isRegistryEntry(e)) reg.set(e.discordUserId, e.sessionId, e.target);
+      }
     }
     return reg;
   }
+}
+
+function isDeliveryTarget(value: unknown): value is DeliveryTarget {
+  if (typeof value !== 'object' || value === null) return false;
+  const t = value as { kind?: unknown; threadId?: unknown };
+  return t.kind === 'dm' || (t.kind === 'thread' && typeof t.threadId === 'string');
+}
+
+function isRegistryEntry(value: unknown): value is RegistrySnapshot['entries'][number] {
+  if (typeof value !== 'object' || value === null) return false;
+  const e = value as { discordUserId?: unknown; sessionId?: unknown; target?: unknown };
+  return (
+    typeof e.discordUserId === 'string' &&
+    typeof e.sessionId === 'string' &&
+    isDeliveryTarget(e.target)
+  );
 }
 
 /** A ThreadRegistry backed by an atomically-persisted JSON file. Loaded once at startup; every
@@ -112,7 +131,9 @@ export class PersistentThreadRegistry {
   async load(): Promise<void> {
     if (this.loaded) return;
     this.loaded = true;
-    const snap = await readJsonIfExists<RegistrySnapshot>(this.path);
+    // Unparseable content reads as absent: the map is a cache of where sessions deliver, and a
+    // damaged file must cost fresh threads at worst, never the bot's login.
+    const snap = await readJsonOrAbsent<RegistrySnapshot>(this.path);
     this.registry = ThreadRegistry.fromSnapshot(snap);
   }
 

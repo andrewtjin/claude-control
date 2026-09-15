@@ -269,8 +269,9 @@ Until the daemon is connected to the bot, `cctl run` fails with a pointer to
 
 Every daemon knob resolves the same way, highest precedence first: a `cctl daemon run`
 flag → the env var → `config.json` → the built-in default. `cctl settings` shows the
-effective value and which layer produced it. The relay is the same chain with
-`--relay <url>` as the flag and `relayUrl` as the file field.
+effective value and which layer produced it. The relay is the same chain:
+`--relay <url>` flag → `CCTL_RELAY_URL` env var → `relayUrl` in `config.json` → the
+built-in default.
 
 `config.json` lives beside the vault (the same directory as `daemon.db`; run
 `cctl settings` to see the resolved path) and is the option that survives a reboot

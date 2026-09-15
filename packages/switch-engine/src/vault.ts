@@ -42,6 +42,21 @@ function assertLabelFree(reg: Registry, label: string, exceptId: string | undefi
   }
 }
 
+/** The registry file's shape: an object whose `accounts`, when present, is an array of rows
+ *  that each carry a string id — the one field every reader indexes by. */
+function isRegistryShape(value: unknown): value is { activeId?: unknown; accounts?: unknown[] } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const accounts = (value as { accounts?: unknown }).accounts;
+  return (
+    accounts === undefined ||
+    (Array.isArray(accounts) &&
+      accounts.every(
+        (a) =>
+          typeof a === 'object' && a !== null && typeof (a as { id?: unknown }).id === 'string',
+      ))
+  );
+}
+
 /** A fresh empty registry. MUST be a factory, not a shared constant — callers mutate the
  *  `accounts` array in place, and a shared array would leak accounts between vaults. */
 function emptyRegistry(): Registry {
@@ -256,10 +271,21 @@ export class Vault {
   // ---- registry (non-secret) ----
 
   async loadRegistry(): Promise<Registry> {
-    const reg = await readJsonIfExists<Registry>(this.registryPath());
-    if (!reg) return emptyRegistry();
-    // Defensive: an older/corrupt file still yields a well-formed registry.
-    return { activeId: reg.activeId ?? null, accounts: reg.accounts ?? [] };
+    const reg = await readJsonIfExists<unknown>(this.registryPath());
+    if (reg === undefined) return emptyRegistry();
+    // An older file may lack fields (they default), but a file whose shape is wrong is refused
+    // by name and left exactly as it is: reading it as empty would have the next write replace
+    // the operator's account index with nothing.
+    if (!isRegistryShape(reg)) {
+      throw new VaultError(
+        `the account registry at ${this.registryPath()} is malformed (expected ` +
+          '{"activeId": ..., "accounts": [...]}); fix the file or move it aside - it was left untouched',
+      );
+    }
+    return {
+      activeId: typeof reg.activeId === 'string' ? reg.activeId : null,
+      accounts: (reg.accounts ?? []) as StoredAccount[],
+    };
   }
 
   private async saveRegistry(reg: Registry): Promise<void> {

@@ -17,7 +17,7 @@
 // weekly budget first) and who to hold in reserve — so frontends render ONE compact line,
 // not a recommendation heading plus a per-account advisory list.
 
-import { MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
+import { isAutoSwitchCandidate, MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
 import { humanizeDuration, roundPct } from './format.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type {
@@ -105,8 +105,13 @@ export function computePlan(
   // same carve-out `decideAutoSwitch` makes by only ever filtering non-active candidates.
   // With greedy off the whole text is advice to a human, who may still switch there by hand,
   // so exclusion only earns a label (see `buildReason`) and changes nothing about eligibility.
+  // The same goes for every other gate the executor applies to a target — a session window
+  // with too little headroom, an account already near its own wall, an unknown weekly clock:
+  // under greedy, an account the executor would refuse must not be announced as the target.
   const targetable = (a: Analysis): boolean =>
-    !greedy || a.input.active === true || a.input.autoSwitchExcluded !== true;
+    !greedy ||
+    a.input.active === true ||
+    isAutoSwitchCandidate(a.input, now, options.autoSwitchPolicy ?? {});
   // The burn queue: every usable account whose weekly budget is expiring soon, soonest
   // expiry first (ties by label for determinism). This IS the plan — burn down the queue.
   // `dropped` keeps the entries greedy removed, so the advice can still account for them

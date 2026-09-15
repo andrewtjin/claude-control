@@ -62,5 +62,18 @@ export async function readJsonIfExists<T>(path: string): Promise<T | undefined> 
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw err;
   }
-  return JSON.parse(raw) as T;
+  // A UTF-8 byte-order mark (an editor on Windows adds one without asking) is not JSON.
+  return JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw) as T;
+}
+
+/** `readJsonIfExists` for state the bot can rebuild (thread targets, channel pins): content that
+ *  does not parse — a truncated write, a hand edit gone wrong, a 0-byte file — reads as ABSENT,
+ *  so a damaged cache file can never keep the bot from logging in. Real IO errors still propagate. */
+export async function readJsonOrAbsent<T>(path: string): Promise<T | undefined> {
+  try {
+    return await readJsonIfExists<T>(path);
+  } catch (err) {
+    if (err instanceof SyntaxError) return undefined;
+    throw err;
+  }
 }
