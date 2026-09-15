@@ -527,6 +527,31 @@ describe('renderDaemonStatus', () => {
     expect(out).toMatch(/daemon has never run on this machine — run: cctl daemon install/);
   });
 
+  it('reports a clean stop as stopped, never as not responding, and names the way back', () => {
+    const stopped = { state: 'stopped', writtenAtMs: 0, stoppedAtMs: 0, ageMs: 5_000 } as const;
+    const registered = renderDaemonStatus({ ...healthy, heartbeat: stopped });
+    expect(registered).toMatch(
+      /\[--\] daemon stopped cleanly \(just now\) — run: cctl daemon start/,
+    );
+    expect(registered).not.toMatch(/not responding|daemon alive/);
+    const unregistered = renderDaemonStatus({
+      ...healthy,
+      task: { supported: true, noun: 'logon task', registered: false },
+      heartbeat: stopped,
+    });
+    expect(unregistered).toMatch(/daemon stopped cleanly \(just now\) — run: cctl daemon install/);
+    const unsupported = renderDaemonStatus({
+      ...healthy,
+      task: { supported: false },
+      heartbeat: { ...stopped, ageMs: 5 * 60_000 },
+    });
+    expect(unsupported).toMatch(/daemon stopped cleanly \(5m ago\) — run: cctl daemon supervise/);
+    // Yellow like the never-run line: it hands the reader a command.
+    expect(renderDaemonStatus({ ...healthy, heartbeat: stopped }, ANSI_PALETTE)).toContain(
+      ANSI_PALETTE.yellow('[--]'),
+    );
+  });
+
   it('yellows the never-run mark, since the line hands the reader a command', () => {
     // The `[--]` glyph splits on whether there is something to run, not on which surface prints
     // it — a dim mark here would read as "wait and it will sort itself out".

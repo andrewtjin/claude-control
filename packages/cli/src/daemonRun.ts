@@ -554,6 +554,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       // deletes if it still records OUR pid) — a crash instead of a clean Ctrl+C skips this,
       // which is fine: the next start's liveness check treats the leftover file as stale.
       .then(() => releaseInstanceLock(dataDir).catch(() => {}))
+      // The stop marker `heartbeat.stop()` queued must reach the disk before this process ends,
+      // or `cctl daemon status` keeps reading the last beat as a live daemon.
+      .then(() => heartbeat.flush())
       .then(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);

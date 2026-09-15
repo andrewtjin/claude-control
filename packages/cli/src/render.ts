@@ -416,6 +416,13 @@ function heartbeatLine(view: DaemonStatusView, palette: Palette): string {
   if (heartbeat.state === 'alive') {
     return `${palette.green('[ok]')} daemon alive (heartbeat ${age})`;
   }
+  // A clean stop is a state the operator chose, not a fault: no red mark, and the command that
+  // brings the daemon back is the one its registration answers to.
+  if (heartbeat.state === 'stopped') {
+    const command =
+      task.supported && task.registered ? 'run: cctl daemon start' : startCommand(task);
+    return `${palette.yellow('[--]')} daemon stopped cleanly (${age}) — ${command}`;
+  }
   const nextStep =
     task.supported && task.registered
       ? 'will restart at next logon (or run: cctl daemon install to start it now)'

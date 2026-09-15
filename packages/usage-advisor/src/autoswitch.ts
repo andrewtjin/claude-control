@@ -165,8 +165,12 @@ export function decideAutoSwitch(
     weeklyBudget(visibleLimits(a), a, now)?.predicted ?? false;
 
   // No limit data at all means we know nothing — never act on ignorance.
-  const activeWorst = worstPercent(visibleLimits(active), now);
-  if (activeWorst === undefined) return null;
+  const activeLimit = worstLimit(visibleLimits(active), now);
+  if (activeLimit === undefined) return null;
+  const activeWorst = activeLimit.percent;
+  // The reason ships to the phone and the audit trail verbatim: it names WHICH limit fired,
+  // since "97% used" alone cannot tell a full Fable cap from a spent weekly budget.
+  const activeWall = `${roundPct(activeWorst)}% of its ${LIMIT_NOUN[activeLimit.kind]}`;
 
   const candidates = accounts.filter(
     (a) =>
@@ -211,10 +215,10 @@ export function decideAutoSwitch(
   if (activeWorst >= lowThreshold(active)) {
     const reason =
       activeWorst < triggerPercent
-        ? `${active.label} is at ${roundPct(activeWorst)}% used on usage data ` +
+        ? `${active.label} is at ${activeWall} on usage data ` +
           `${humanizeDuration(snapshotAge(active))} old — hopping preemptively — ` +
           `${target.label} has the soonest weekly reset (${targetBudget})`
-        : `${active.label} is at ${roundPct(activeWorst)}% used — ${target.label} has the ` +
+        : `${active.label} is at ${activeWall} — ${target.label} has the ` +
           `soonest weekly reset (${targetBudget})`;
     return { targetAccountId: target.accountId, targetLabel: target.label, reason };
   }
@@ -284,10 +288,23 @@ function effectiveLimits(limits: LimitInput[], now: number): LimitInput[] {
  *  (the Fable cap is dropped up front when opted out), so a snapshot carrying only an ignored
  *  limit honestly reports no data. */
 function worstPercent(limits: LimitInput[], now: number): number | undefined {
+  return worstLimit(limits, now)?.percent;
+}
+
+/** The limit behind `worstPercent`, so a reason can name it. On a tie the first reported one
+ *  wins — deterministic, and the endpoint lists the 5h window before the weekly limits. */
+function worstLimit(limits: LimitInput[], now: number): LimitInput | undefined {
   const live = effectiveLimits(limits, now);
   if (live.length === 0) return undefined;
-  return Math.max(...live.map((l) => l.percent));
+  return live.reduce((worst, l) => (l.percent > worst.percent ? l : worst));
 }
+
+/** How a reason names each limit kind — the words the usage table already uses for them. */
+const LIMIT_NOUN: Record<LimitInput['kind'], string> = {
+  session: '5-hour window',
+  weekly_all: 'weekly budget',
+  weekly_scoped: 'Fable weekly cap',
+};
 
 /** Percent of the 5h session window used. No live session limit = no open window = 0. */
 function sessionUsedPct(account: AccountUsageInput, now: number): number {
