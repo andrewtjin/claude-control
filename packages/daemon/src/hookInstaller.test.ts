@@ -389,14 +389,30 @@ describe('uninstallHooks', () => {
       hooks: Record<string, { hooks: { command: string }[] }[]>;
     };
     expect(settings.theme).toBe('dark');
-    expect(settings.hooks.PermissionRequest ?? []).toEqual([]);
-    expect(settings.hooks.Notification ?? []).toEqual([]);
-    expect(settings.hooks.PostToolUse ?? []).toEqual([]);
-    expect(settings.hooks.UserPromptSubmit ?? []).toEqual([]);
+    // The events we introduced are GONE, not left as empty arrays: an uninstall has to leave
+    // settings.json looking as though the install never happened, and `"PermissionRequest": []`
+    // is still our shape in someone else's file.
     // StopFailure joined the default set later than the others and once outlived an uninstall.
-    expect(settings.hooks.StopFailure ?? []).toEqual([]);
+    expect(Object.keys(settings.hooks)).toEqual(['Stop']);
     const stopCommands = (settings.hooks.Stop ?? []).flatMap((g) => g.hooks.map((h) => h.command));
     expect(stopCommands).toEqual(['some-other-tool --notify']);
+  });
+
+  it('drops only the events it filled, never an empty one belonging to somebody else', async () => {
+    // An empty array under an event we never touch is not ours to tidy up — the tidying is
+    // limited to the keys this installer created.
+    await writeFile(settingsPath, JSON.stringify({ hooks: { SessionStart: [] } }, null, 2), 'utf8');
+    await installHooks({
+      settingsPath,
+      hooks: buildDaemonHookSpecs({
+        forwarderPath: 'C:\\data\\hook-forward.cjs',
+        secret: 's3cr3t',
+      }),
+    });
+    await expect(uninstallHooks({ settingsPath })).resolves.toBe('removed');
+
+    const settings = (await readJson(settingsPath)) as { hooks: Record<string, unknown[]> };
+    expect(settings.hooks).toEqual({ SessionStart: [] });
   });
 
   it('is a no-op (no rewrite) when nothing of ours is installed', async () => {
