@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { sandboxPaths, type Paths } from '@claude-control/switch-engine';
+import { sandboxPaths, type Paths, type RefreshDeps } from '@claude-control/switch-engine';
 import { ANSI_PALETTE, PLAIN_PALETTE } from './ansi.js';
 import { buildEngine, CliFailure, fail, paintErrorLine, reportFatal } from './context.js';
 
@@ -55,6 +55,19 @@ function pathsWithUnreadableRegistry(): Paths {
   writeFileSync(join(paths.vaultDir, 'accounts.json'), '{ this is not json');
   return paths;
 }
+
+describe('buildEngine: what the refresh path is allowed to reach', () => {
+  it('injects the status-page fetch the 529 retry consults, instead of leaving it to a global', () => {
+    // The retry loop falls back to `globalThis.fetch` when no probe is wired, which is a call
+    // no composition root chose and no test can intercept. The daemon injects one; a CLI
+    // refresh runs the same loop against the same endpoint and gets the same treatment.
+    const engine = buildEngine(sandboxPaths(freshTempDir()));
+    const wired = (engine as unknown as { refreshDeps: RefreshDeps }).refreshDeps;
+    expect(typeof wired.overload?.statusFetch).toBe('function');
+    // The logger it already had is still there — this adds a dependency, it does not replace one.
+    expect(wired.overload?.logger).toBeDefined();
+  });
+});
 
 describe('buildEngine: where the engine writes its diagnostics', () => {
   it('keeps an engine warning off stdout, so a command can be piped', async () => {
