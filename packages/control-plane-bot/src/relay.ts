@@ -31,8 +31,19 @@ import type { PairingService } from './pairing.js';
 import type { Logger } from './logger.js';
 import { noopLogger } from './logger.js';
 import type { DiscordGateway } from './discord/gateway.js';
+import type { StatusPage } from './statusPage.js';
+import type { StatusReport } from './uptime.js';
 
 export type { DiscordGateway } from './discord/gateway.js';
+
+/** What the relay needs to answer `GET /` (the status page) and `GET /api/status` (its data).
+ *  Optional on purpose: a bare relay (tests, an embedder without a page) keeps answering 404 for
+ *  both, and the relay itself never learns how availability is measured. The live daemon count is
+ *  the one thing only the relay knows, so it is handed to `report` rather than read back out. */
+export interface StatusProvider {
+  page: StatusPage;
+  report(live: { connectedDaemons: number }): StatusReport;
+}
 
 /** The narrow surface command handlers get: address a bound user's daemon without ever
  *  learning or choosing a daemon id themselves (see `sendToUser`), and check reachability
@@ -71,6 +82,8 @@ export interface RelayServerOptions {
    *  dropped as unreachable. Defaults to {@link MAX_SOCKET_BUFFER_BYTES}; lowered in tests. */
   maxSocketBufferBytes?: number;
   clock?: () => number;
+  /** Serves the status page and its JSON; absent, `/` and `/api/status` are 404 like any path. */
+  status?: StatusProvider;
 }
 
 /** One live, authenticated daemon connection. */
@@ -127,6 +140,7 @@ export class RelayServer implements RelaySender {
   private readonly pendingConnections = new Set<WebSocket>();
   private readonly maxPendingConnections: number;
   private readonly maxSocketBufferBytes: number;
+  private readonly status: StatusProvider | undefined;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: RelayServerOptions) {
@@ -134,6 +148,7 @@ export class RelayServer implements RelaySender {
     this.pairing = options.pairing;
     this.gateway = options.gateway;
     this.logger = options.logger ?? noopLogger;
+    this.status = options.status;
     this.maxPendingConnections = options.maxPendingConnections ?? MAX_PENDING_CONNECTIONS;
     this.maxSocketBufferBytes = options.maxSocketBufferBytes ?? MAX_SOCKET_BUFFER_BYTES;
     // An explicit http.Server (rather than letting WebSocketServer's `port` option create one
@@ -241,18 +256,65 @@ export class RelayServer implements RelaySender {
     return addr.port;
   }
 
-  /** Unauthenticated GET /health on the same port daemons connect to — lets a setup wizard
-   *  distinguish "the relay is unreachable" from "your network/firewall is broken" without
-   *  needing any daemon credentials. Deliberately minimal: no auth, no request body, no
-   *  binding/pairing state — a plain liveness probe, nothing that could leak user data. */
+  /** The plain-HTTP surface on the same port daemons connect to. All of it is unauthenticated and
+   *  none of it touches binding or pairing state, so nothing here can leak user data:
+   *  - GET /health: a liveness probe that lets a setup wizard distinguish "the relay is
+   *    unreachable" from "your network/firewall is broken" without any daemon credentials.
+   *  - GET / and GET /api/status: the status page and its report, when a provider is configured.
+   *    The report carries availability totals and a daemon COUNT, never identities.
+   *  Anything else is a 404. A query string is ignored for routing, so a cache-busting `/?t=…`
+   *  still finds the page. HEAD is answered like GET (node omits the body on its own), since
+   *  external uptime monitors default to it. */
   private onHttpRequest(req: IncomingMessage, res: ServerResponse): void {
-    if (req.method === 'GET' && req.url === '/health') {
+    const path = (req.url ?? '').split('?')[0];
+    const read = req.method === 'GET' || req.method === 'HEAD';
+    if (read && path === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
       return;
     }
+    if (this.status && read && (path === '/' || path === '/api/status')) {
+      this.serveStatus(this.status, path, res);
+      return;
+    }
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'not found' }));
+  }
+
+  /** Answer the two status routes. Guarded because this runs inside http.Server's request
+   *  callback, where a thrown error is an uncaught exception that would take the relay down with
+   *  it: a defect in the report must cost one 500, never the daemons' sockets. */
+  private serveStatus(
+    status: StatusProvider,
+    path: '/' | '/api/status',
+    res: ServerResponse,
+  ): void {
+    try {
+      if (path === '/') {
+        res.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'content-security-policy': status.page.csp,
+          'x-content-type-options': 'nosniff',
+          // The shell is static per build but small; let a browser revalidate rather than pin it.
+          'cache-control': 'no-cache',
+        });
+        res.end(status.page.html);
+        return;
+      }
+      const report = status.report({ connectedDaemons: this.connectionsByDaemon.size });
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        // The report only moves once per sample, so a short shared cache costs nothing in
+        // freshness and lets any intermediary absorb a burst against this unauthenticated route.
+        'cache-control': 'public, max-age=15',
+        'x-content-type-options': 'nosniff',
+      });
+      res.end(JSON.stringify(report));
+    } catch (err) {
+      this.logger.error({ err, path }, 'relay: status route failed');
+      if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'status unavailable' }));
+    }
   }
 
   private onConnection(socket: WebSocket): void {

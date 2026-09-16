@@ -6,7 +6,8 @@
 //   DISCORD_BOT_TOKEN        (required) the Discord application's bot token
 //   CCTL_RELAY_PORT          (default 8765) WebSocket port daemons connect to
 //   CCTL_BOT_STATE_DIR       (default ~/.claude-control-bot) where bindings.json,
-//                            session-threads.json and session-channel-pins.json live
+//                            session-threads.json, session-channel-pins.json and uptime.json
+//                            (the availability history behind the status page at `/`) live
 //   CCTL_SESSION_CHANNEL_ID  (optional) text channel that hosts per-session private threads
 //                            for every paired user WITHOUT a CCTL_SESSION_CHANNELS entry;
 //                            unset → those users' session output is delivered by DM
@@ -53,6 +54,8 @@ import { PairingService } from './pairing.js';
 import { RelayServer, type RelaySender } from './relay.js';
 import { DiscordJsGateway } from './discord/discordJsGateway.js';
 import { parseSessionChannelMap } from './discord/sessionChannels.js';
+import { loadStatusPage } from './statusPage.js';
+import { UptimeRecorder } from './uptime.js';
 import type { Logger } from './logger.js';
 
 /** Print an error and exit non-zero — the single failure path for startup problems. */
@@ -129,26 +132,53 @@ async function main(): Promise<void> {
     ...(sessionChannelId ? { sessionChannelId } : {}),
     ...(sessionChannels.entries.size > 0 ? { sessionChannelsByUser: sessionChannels.entries } : {}),
   });
+  // Loaded before anything listens: a bot whose status page is missing from the image is
+  // mis-packaged, and that should fail the start, not surface as a 404 later.
+  const statusPage = loadStatusPage();
+  // The relay's own availability, served at `/`. It reads the gateway's readiness on every tick,
+  // so the Discord component reflects the live connection, not whether login ever succeeded.
+  const uptime = new UptimeRecorder({
+    path: join(stateDir, 'uptime.json'),
+    isDiscordReady: () => gateway.isReady(),
+    logger,
+  });
   const relay = new RelayServer({
     bindings,
     pairing,
     gateway,
     port,
     logger,
+    status: { page: statusPage, report: (live) => uptime.report(live) },
     ...(maxPendingConnections !== undefined ? { maxPendingConnections } : {}),
   });
   holder.relay = relay;
 
   const boundPort = await relay.listen();
-  await gateway.start();
-  logger.info({ port: boundPort, stateDir }, 'control-plane bot is up');
+  // Availability counts from here: the relay is accepting daemon sockets. The Discord component
+  // is sampled only on the recorder's ticks, so the login below has one sample interval of grace
+  // before a slow login would open a Discord incident; an ordinary deploy books none.
+  await uptime.start();
 
   const shutdown = (): void => {
     logger.info({}, 'shutting down');
-    void Promise.allSettled([gateway.stop(), relay.close()]).then(() => process.exit(0));
+    // The recorder's final tick samples the gateway, so it runs BEFORE the gateway is torn down:
+    // client.destroy() flips readiness to false synchronously, and a final tick after that would
+    // book a phantom Discord drop against every planned restart. The tick also leaves the
+    // clean-shutdown marker, so the next start dates this gap exactly and shows it as planned.
+    void uptime
+      .stop()
+      .catch((err: unknown) => {
+        logger.warn({ err }, 'uptime: final tick failed');
+      })
+      .then(() => Promise.allSettled([gateway.stop(), relay.close()]))
+      .then(() => process.exit(0));
   };
+  // Registered before the login so a stop signal during it still ends the run cleanly.
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  await gateway.start();
+  logger.info({ port: boundPort, stateDir }, 'control-plane bot is up');
 }
 
 main().catch((err: unknown) => fail(err instanceof Error ? err.message : String(err)));

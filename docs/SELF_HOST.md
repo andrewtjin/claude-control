@@ -131,11 +131,12 @@ See `docs/CLI.md`'s relay precedence for the full order.
 
 ## State and backup
 
-The bot persists three small JSON files, none of which holds a credential: `bindings.json`
+The bot persists four small JSON files, none of which holds a credential: `bindings.json`
 (which Discord user is bound to which daemon, plus a scrypt hash of each daemon's token),
 `session-threads.json` (which thread each session's output goes to, so a restart does not
-re-anchor a live session), and `session-channel-pins.json` (each user's own `/thread-here`
-choice). They live on the named Docker volume `bot-state`, not in the image, so a redeploy or
+re-anchor a live session), `session-channel-pins.json` (each user's own `/thread-here`
+choice), and `uptime.json` (the availability history behind the status page, see below).
+They live on the named Docker volume `bot-state`, not in the image, so a redeploy or
 `docker compose restart` never loses a pairing. Back it up by copying the volume; there
 is no database migration story to worry about.
 
@@ -149,6 +150,30 @@ proxied by Caddy at `https://<RELAY_HOSTNAME>/health`. `cctl setup` and `cctl do
 probe it to tell "the relay is down" apart from "your network is broken" — useful for
 confirming your own deploy came up before pairing a first machine against it.
 
+## Status page
+
+`https://<RELAY_HOSTNAME>/` is a public status page in the style of a hosted status site:
+one row per component (the relay itself, and the bot's Discord gateway connection), a bar
+per UTC day for the last 90 days, the window's uptime percentage, and the incidents of the
+last two weeks. `GET /api/status` returns the same data as JSON. Neither route is
+authenticated and neither exposes anything but availability totals and a count of connected
+daemons.
+
+The relay records its own availability: every 30 seconds the process vouches for the time
+since its previous tick and writes the running totals to `uptime.json` on the state volume.
+Anything it could not vouch for is downtime: the gap between a shutdown and the next start
+(a clean stop is dated exactly and shown as a planned restart; a crash is dated from the last
+tick it persisted, so it costs up to one extra sample), and any gap between ticks long enough
+to mean the process was not running. The Discord gateway's readiness is sampled on the same
+tick, so a dropped gateway shows as a Discord-only incident while the relay keeps serving.
+
+Because the page is served by the process it describes, the one thing it cannot show is its
+own total outage. `deploy/Caddyfile` covers that: while the bot container is down, Caddy
+answers a browser's request for `/` with a static "relay unreachable" page instead of a bare
+502, and leaves everything else untouched: `/health`, every other path, and the daemons'
+WebSocket upgrade (which uses the same path but is told apart by its headers). Deleting `uptime.json`
+starts the history over; a file the bot cannot read is set aside as `uptime.json.invalid`.
+
 ## Updating
 
 ```bash
@@ -157,7 +182,12 @@ docker compose build bot
 docker compose up -d
 ```
 
-`caddy` only needs a rebuild if `deploy/Caddyfile` changed.
+`deploy/Caddyfile` is bind-mounted into the `caddy` container, so when it changes Caddy only
+needs to reload its config, with no restart and no dropped connections:
+
+```bash
+docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
 
 ## Zero-credential guarantee
 
