@@ -253,12 +253,14 @@ describe('computePlan — burn-before-reset (the core behavior)', () => {
     expect(plan.recommendedAccountId).toBeNull();
     expect(plan.reason).toContain('no usable account qualifies right now');
     expect(plan.reason).not.toContain('is excluded from auto-switch');
-    // When exclusion really is the whole story, it is still named.
+    // When exclusion really is the whole story, it is still named — here on the burn-by-hand
+    // line, because this excluded account also has a budget expiring inside the urgent window
+    // and that outranks a bare statement about auto-switch having nowhere to go.
     const locked = acct('d', 'Locked', [{ kind: 'weekly_all', percent: 5, resetsAt: NOW + DAY }], {
       autoSwitchExcluded: true,
     });
     expect(computePlan([out, locked], { ...opts, greedyAutoSwitch: true }).reason).toBe(
-      'No auto-switch target: every usable account is excluded from auto-switch.',
+      'Burn by hand: Locked (95% weekly left, resets in 1d) (excluded from auto-switch).',
     );
   });
 
@@ -388,6 +390,32 @@ describe('computePlan — burn-before-reset (the core behavior)', () => {
     );
     // The recommendation is still somewhere auto-switch may actually go.
     expect(plan.recommendedAccountId).toBe('a');
+  });
+
+  it('still names the burn by hand when greedy leaves no target at all', () => {
+    // Every usable account is excluded, so greedy has nowhere to hop and the plan has no
+    // recommendation. Answering only "no auto-switch target" would let the expiring budget
+    // disappear from the line — the operator can still burn it, and nothing else will.
+    const soon = acct(
+      'x',
+      'Soon',
+      [{ kind: 'weekly_all', percent: 40, resetsAt: NOW + 2 * HOUR }],
+      {
+        autoSwitchExcluded: true,
+      },
+    );
+    const later = acct(
+      'y',
+      'Later',
+      [{ kind: 'weekly_all', percent: 30, resetsAt: NOW + 6 * DAY }],
+      { autoSwitchExcluded: true },
+    );
+    const plan = computePlan([soon, later], { ...opts, greedyAutoSwitch: true });
+    expect(plan.recommendedAccountId).toBeNull();
+    expect(plan.reason).toBe(
+      'Burn by hand: Soon (60% weekly left, resets in 2h) (excluded from auto-switch); ' +
+        'hold Later (weekly resets in 6d) (excluded from auto-switch).',
+    );
   });
 
   it('falls back to headroom advice for a weekly reset outside the urgent window', () => {
