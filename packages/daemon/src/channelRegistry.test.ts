@@ -187,6 +187,39 @@ describe('take', () => {
     expect(expiries).toEqual([{ sessionId: 'sess-1', texts: ['too old'] }]);
   });
 
+  it('says which expiries were handed out and which were never collected', () => {
+    // Two different events for the operator: one prompt nothing ever took, and one the channel
+    // server WAS given and never confirmed — which the session may well have received. The
+    // caller cannot tell them apart from a bare list, so the difference is reported here rather
+    // than guessed there.
+    const clock = fakeClock();
+    const expiries: { text: string; handedOut: boolean }[] = [];
+    const reg = new ChannelRegistry({
+      clock: clock.now,
+      onExpire: (_sessionId, expired) =>
+        expiries.push(...expired.map((i) => ({ text: i.text, handedOut: i.handedOut }))),
+    });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    const id = attached.attachment.attachId;
+
+    reg.enqueue('sess-1', 'handed over');
+    reg.take(id); // the server takes it and never acknowledges it
+    // A tick apart, because the report is sorted by queue time: two prompts written in the same
+    // millisecond is not a shape a person can produce, and pinning an order on it would be
+    // asserting the sort's tie-breaking rather than what the operator wrote.
+    clock.advance(1);
+    reg.enqueue('sess-1', 'never collected');
+    clock.advance(CHANNEL_TTL_MS + 1);
+    reg.enqueue('sess-1', 'still fresh');
+    expect(reg.take(id)?.map((i) => i.text)).toEqual(['still fresh']);
+
+    expect(expiries).toEqual([
+      { text: 'handed over', handedOut: true },
+      { text: 'never collected', handedOut: false },
+    ]);
+  });
+
   it('expires IN-FLIGHT items too, so a client that never acks cannot pin the cap', () => {
     const clock = fakeClock();
     const expiries: string[] = [];
@@ -468,5 +501,31 @@ describe('restore', () => {
     if (!attached.ok) throw new Error('attach failed');
     reg.restore('sess-1', [injection('a', 'deliver me now', 1)]);
     expect(woken).toEqual([attached.attachment.attachId]);
+  });
+});
+
+describe('discard', () => {
+  it('drops queued and in-flight work but keeps the server attached', () => {
+    // For the case where the work stops being owed while the connection stays legitimate: the
+    // operator unregistering a session says nothing about the Claude Code process behind it, so
+    // forcing its channel server to re-attach would be churn for no reason.
+    const reg = new ChannelRegistry();
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    const id = attached.attachment.attachId;
+    reg.enqueue('sess-1', 'handed out');
+    reg.take(id);
+    reg.enqueue('sess-1', 'still queued');
+
+    expect(reg.discard('sess-1').map((i) => i.text)).toEqual(['handed out', 'still queued']);
+    expect(reg.isAttached('sess-1')).toBe(true);
+    // Nothing is left to deliver, and the cap it was holding is free again.
+    expect(reg.enqueue('sess-1', 'a later prompt').ok).toBe(true);
+    expect(reg.take(id)?.map((i) => i.text)).toEqual(['a later prompt']);
+  });
+
+  it('is a no-op for a session with no channel', () => {
+    const reg = new ChannelRegistry();
+    expect(reg.discard('nobody')).toEqual([]);
   });
 });

@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { PassThrough } from 'node:stream';
 import { createInterface } from 'node:readline';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ChannelServer, SERVER_NAME, SERVER_VERSION, sanitizeMetaKeys } from './server.js';
 import type { DeliverResult } from './daemonLink.js';
 
@@ -123,6 +126,27 @@ describe('handshake', () => {
     // constant, so no caller can end up publishing a stale literal in `serverInfo`.
     expect(result.serverInfo).toEqual({ name: SERVER_NAME, version: SERVER_VERSION });
     expect(SERVER_VERSION).not.toBe('0.1.0');
+  });
+
+  it('reports the SAME version the published package and the CLI do', async () => {
+    // This server ships inside the `cctl` bundle and has no release of its own, so its version is
+    // hand-maintained against the two files that already carry the shipped one. Three hand-kept
+    // copies drift on the first release bump that misses one, and the drift is silent: the
+    // operator is told a version that is not the one they installed, and files against it. Read
+    // out of the real files rather than restated here, or this assertion would be a fourth copy.
+    const packages = fileURLToPath(new URL('../../', import.meta.url));
+    const published = JSON.parse(
+      await readFile(join(packages, 'cctl-publish', 'package.json'), 'utf8'),
+    ) as { version?: string };
+    const settings = await readFile(join(packages, 'cli', 'src', 'settings.ts'), 'utf8');
+    const cliVersion = /export const VERSION = '([^']+)'/.exec(settings)?.[1];
+
+    // Both are asserted to LOOK like versions first: a moved file or a renamed constant would
+    // otherwise leave two `undefined`s comparing equal and the test passing on nothing.
+    expect(published.version).toMatch(/^\d+\.\d+\.\d+/);
+    expect(cliVersion).toMatch(/^\d+\.\d+\.\d+/);
+    expect(SERVER_VERSION).toBe(published.version);
+    expect(SERVER_VERSION).toBe(cliVersion);
   });
 
   it('frames channel content as an operator request, naming the verbs it cannot authorise', async () => {
