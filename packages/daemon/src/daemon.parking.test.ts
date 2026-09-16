@@ -204,12 +204,14 @@ describe('Daemon: what may kick a parked session', () => {
       sessionManager,
       pollIntervalMs: 30,
       autoSwitcher: {
-        // One policy hop, exactly what the real AutoSwitcher does to the active account.
+        // One policy hop, exactly what the real AutoSwitcher does to the active account — and
+        // REPORTED back the way the real one reports it, which is the daemon's only evidence
+        // that this particular hop was its own.
         evaluate: async () => {
-          if (!hopped) {
-            hopped = true;
-            await switchEngine.activate('acct-y', { origin: 'auto' });
-          }
+          if (hopped) return undefined;
+          hopped = true;
+          const result = await switchEngine.activate('acct-y', { origin: 'auto' });
+          return result.activeAccountId;
         },
       },
     });
@@ -223,6 +225,54 @@ describe('Daemon: what may kick a parked session', () => {
     await waitFor(() => h.sent.filter((e) => e.type === 'usage.snapshot').length > snapshots + 2);
     expect(switchEngine.activeId).toBe('acct-y');
     expect(parked.kicks).toBe(0);
+  });
+
+  it('kicks on the next cycle for an operator switch that landed mid-cycle', async () => {
+    const switchEngine = fakeSwitchEngine('acct-x');
+    const sessionManager = fakeSessionManager();
+    const parked = fakeManagedHandle('s-parked', true);
+    sessionManager.handles.set(parked.id, parked);
+    sessionManager.records.push({
+      id: parked.id,
+      kind: 'managed',
+      state: 'waiting_input',
+      startedAtMs: 1,
+    });
+    let landed = false;
+    harness = await createHarness({
+      switchEngine,
+      sessionManager,
+      pollIntervalMs: 30,
+      autoSwitcher: {
+        // The policy hops nothing (so it reports nothing), and while it is deciding, an
+        // operator's `cctl switch spare` lands: the vault is rewritten under a cycle that has
+        // already read the active account and has not finished. That window is not a sliver —
+        // the probe that runs beside this phase can hold it open for minutes — and it is the
+        // only window a switch made outside the daemon has to fall into.
+        evaluate: () => {
+          if (!landed) {
+            landed = true;
+            switchEngine.activeId = 'acct-y';
+          }
+          return Promise.resolve(undefined);
+        },
+      },
+    });
+    const h = harness;
+    await h.daemon.start();
+    await waitFor(() => landed);
+
+    // The operator who typed it is as present as the one who taps /switch on the phone, so the
+    // session parked on the exhausted account is waiting for exactly this — being swallowed as
+    // "something the daemon did" is what leaves it parked forever.
+    await waitFor(() => parked.kicks === 1);
+    // And it really was nobody's hop but the operator's: the daemon activated nothing.
+    expect(switchEngine.activations).toEqual([]);
+
+    // Consumed once, like every other noticed change: later cycles kick nothing again.
+    const snapshots = h.sent.filter((e) => e.type === 'usage.snapshot').length;
+    await waitFor(() => h.sent.filter((e) => e.type === 'usage.snapshot').length > snapshots + 2);
+    expect(parked.kicks).toBe(1);
   });
 });
 

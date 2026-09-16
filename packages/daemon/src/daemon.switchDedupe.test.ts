@@ -37,7 +37,7 @@ import {
   type DaemonIdentity,
   type IdentityStore,
 } from './controlPlaneClient.js';
-import { Daemon, type SwitchEngineLike } from './daemon.js';
+import { Daemon, SEEN_SWITCH_KEY_TTL_MS, type SwitchEngineLike } from './daemon.js';
 
 const DAEMON_ID = 'daemon-under-test';
 
@@ -137,6 +137,10 @@ interface Rig {
    *  writes the audit line per activation, so this list IS the audit trail's length. */
   activated: string[];
   switchResults: () => Array<PayloadOf<'switch.result'>>;
+  /** Move the daemon's own clock forward. The daemon reads every age it measures through the
+   *  injected clock (house convention: no fake timers), so ageing a remembered key out takes no
+   *  waiting and no timer control. */
+  advance: (ms: number) => void;
 }
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -150,6 +154,9 @@ async function startRig(): Promise<Rig> {
   const store = new Store(':memory:');
   const vaultDir = await mkdtemp(join(tmpdir(), 'daemon-switchdedupe-'));
   const activated: string[] = [];
+  // A plain number the test moves by hand: the daemon's clock is injectable precisely so an age
+  // can be crossed without waiting for one.
+  let nowMs = 1_700_000_000_000;
 
   const switchEngine: SwitchEngineLike = {
     recover: (): Promise<RecoverResult> => Promise.resolve({ recovered: false, action: 'none' }),
@@ -202,6 +209,7 @@ async function startRig(): Promise<Rig> {
     hookReceiver,
     controlPlaneClient,
     pollIntervalMs: 100_000,
+    clock: () => nowMs,
   });
 
   cleanups.push(async () => {
@@ -216,6 +224,9 @@ async function startRig(): Promise<Rig> {
     activated,
     switchResults: () =>
       relay.received.filter((e) => e.type === 'switch.result').map((e) => e.payload),
+    advance: (ms: number) => {
+      nowMs += ms;
+    },
   };
 }
 
@@ -274,5 +285,60 @@ describe('switch.command idempotency', () => {
     // Resolved by label, and named by the label the operator used.
     expect(rig.activated).toEqual(['acct-y']);
     expect(result.message).toBe('switched to spare');
+  });
+
+  // A tapped card derives its key from the LOGICAL action — who, what, which account — so that
+  // two phones tapping the same button collapse to one command. The price of that is a key that
+  // recurs: tapping "switch to spare" again next week produces the identical string. The sender
+  // forgets its own copy after fifteen minutes and lets the second one through, so a daemon that
+  // remembers forever drops a command the operator just issued and answers it with nothing at
+  // all — a request on the phone that never resolves.
+  const CARD_KEY = 'btn:user-1:switch:account:acct-y';
+
+  it('still drops a redelivery of the same key inside the window, right up to its edge', async () => {
+    const rig = await startRig();
+    const frame = switchFrame({
+      requestId: 'r1',
+      targetAccountId: 'acct-y',
+      idempotencyKey: CARD_KEY,
+    });
+    rig.relay.push(frame);
+    await waitFor(() => rig.switchResults().length === 1);
+
+    // Exactly AT the boundary is still the same command: the two ends must not disagree by a
+    // millisecond over which frames are replays.
+    rig.advance(SEEN_SWITCH_KEY_TTL_MS);
+    rig.relay.push(frame);
+    // Sequenced behind a different command rather than a sleep, as above.
+    rig.relay.push(
+      switchFrame({ requestId: 'r2', targetAccountId: 'acct-x', idempotencyKey: 'k-other' }),
+    );
+    await waitFor(() => rig.switchResults().length === 2);
+
+    expect(rig.activated).toEqual(['acct-y', 'acct-x']);
+    expect(rig.switchResults().map((p) => p.requestId)).toEqual(['r1', 'r2']);
+  });
+
+  it('treats the same key past the TTL as the new command it is', async () => {
+    const rig = await startRig();
+    rig.relay.push(
+      switchFrame({ requestId: 'r1', targetAccountId: 'acct-y', idempotencyKey: CARD_KEY }),
+    );
+    await waitFor(() => rig.switchResults().length === 1);
+
+    // The operator switches away, then taps the same card's button again later.
+    rig.relay.push(
+      switchFrame({ requestId: 'r2', targetAccountId: 'acct-x', idempotencyKey: 'k-other' }),
+    );
+    await waitFor(() => rig.switchResults().length === 2);
+    rig.advance(SEEN_SWITCH_KEY_TTL_MS + 1);
+    rig.relay.push(
+      switchFrame({ requestId: 'r3', targetAccountId: 'acct-y', idempotencyKey: CARD_KEY }),
+    );
+    await waitFor(() => rig.switchResults().length === 3);
+
+    // It switched, and it said so — silence here is the failure, not a second activation.
+    expect(rig.activated).toEqual(['acct-y', 'acct-x', 'acct-y']);
+    expect(rig.switchResults().map((p) => p.requestId)).toEqual(['r1', 'r2', 'r3']);
   });
 });
