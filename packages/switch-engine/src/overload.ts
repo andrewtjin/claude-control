@@ -14,19 +14,26 @@
 //
 // BUDGET CEILING (the constraint that sizes everything below): the token refresh this wraps runs
 // inside the cross-process credential lock, which another process may reclaim once the holder is
-// 60s old, with no heartbeat to say otherwise. A refresh that retried past that would have its
-// lock pulled mid-flight. So the budget is a real DEADLINE, not just a gate on when the next try
-// may start: it opens on the first 529 and every retry after it is handed a signal that aborts
-// when it expires. Without that, the last retry could be started just inside the budget and then
-// run for its own full per-request timeout on top of it — the loop's true cost would be
-// `budget + one request timeout`, which is how a 25s budget turns into ~55s under the lock.
-// The first attempt is deliberately NOT deadlined: it is the request the caller would have made
-// anyway, and shortening it would change the behavior of calls that never see a 529 at all.
-// A caller that holds the credential lock passes {@link LOCKED_OVERLOAD_BUDGET_CAP_MS} to keep
-// the extra hold small on top of that, and true persistence lives at the callers that already
-// re-attempt on their own schedule (the usage poller's next cycle, the token getter's next
-// interval).
+// {@link LOCK_STALE_MS} old, with no heartbeat to say otherwise. A refresh that retried past that
+// would have its lock pulled mid-flight. So the budget is a real DEADLINE, not just a gate on
+// when the next try may start: it opens on the first 529 and every retry after it is handed a
+// signal that aborts when it expires. Without that, the last retry could be started just inside
+// the budget and then run for its own full per-request timeout on top of it — the loop's true
+// cost would be `budget + one request timeout`, which is how a 25s budget turns into ~55s under
+// the lock. A caller that holds the credential lock passes
+// {@link LOCKED_OVERLOAD_BUDGET_CAP_MS} to keep the extra hold small on top of that, and true
+// persistence lives at the callers that already re-attempt on their own schedule (the usage
+// poller's next cycle, the token getter's next interval).
+//
+// The retry phase is not the whole cost, though, and a lock does not care which phase spent its
+// window: the FIRST attempt's own timeout and the status probe sit outside that budget, and on
+// the refresh path they add up to tens of seconds before a single retry has run. A caller whose
+// total time is what matters therefore passes {@link LOCKED_CALL_BUDGET_MS} as `callBudgetMs`,
+// which deadlines every attempt including the first. Callers that own no lock (the usage poller)
+// pass none and keep the old behavior: the first attempt is the request they would have made
+// anyway, and shortening it would change calls that never see a 529 at all.
 
+import { LOCK_STALE_MS } from './lock.js';
 import { noopLogger, type Logger } from './logger.js';
 
 /** Statuses this module retries. 529 ("overloaded") only — see the module comment for why
@@ -73,6 +80,17 @@ export const PATIENT_OVERLOAD_BUDGET: OverloadBudget = { maxAttempts: 6, totalBu
  *  caller's own next interval takes over, which is the persistence that actually matters. */
 export const LOCKED_OVERLOAD_BUDGET_CAP_MS = 8_000;
 
+/** Ceiling on the WHOLE call for a caller running inside the credential lock — first attempt,
+ *  status probe and every retry — as opposed to {@link LOCKED_OVERLOAD_BUDGET_CAP_MS}, which
+ *  bounds the retry phase alone.
+ *
+ *  Sized so the worst case is provably half the reclaim window: the attempts are deadlined by
+ *  this budget, and the one step outside it is the advisory status probe, which can add at most
+ *  {@link STATUS_PROBE_TIMEOUT_MS} of its own. The other half is what the locked caller spends
+ *  off the network — the DPAPI shell-outs and the credential writes the refresh exists to
+ *  make — which is the part that must not be racing a reclaim. */
+export const LOCKED_CALL_BUDGET_MS = LOCK_STALE_MS / 2 - STATUS_PROBE_TIMEOUT_MS;
+
 /** First backoff step; doubles per retry up to {@link OVERLOAD_BACKOFF_CAP_MS}. */
 export const OVERLOAD_BACKOFF_BASE_MS = 1_000;
 /** Ceiling on one backoff step, so the patient budget spends itself across several tries
@@ -115,10 +133,14 @@ export interface OverloadResponse {
 export interface OverloadAttemptContext {
   /** 1-based attempt number; 1 is the original request, not a retry. */
   attempt: number;
-  /** Aborts when the retry budget expires. On the first attempt this never aborts — that
-   *  request is the one the caller would have made regardless, so it keeps its own timeout. */
+  /** Aborts when the loop's binding deadline expires. Without a `callBudgetMs` that is the
+   *  retry budget, which does not exist yet on the first attempt — that request is the one the
+   *  caller would have made regardless, so it keeps its own timeout. With one, the whole call
+   *  is deadlined and the first attempt aborts with it. */
   signal: AbortSignal;
-  /** Milliseconds left in the retry budget; `Infinity` before the first overloaded answer. */
+  /** Milliseconds left under whichever deadline binds — the retry budget, the whole-call one,
+   *  or the earlier of the two. `Infinity` when neither is open yet, which without a
+   *  `callBudgetMs` is every attempt before the first overloaded answer. */
   remainingMs: number;
 }
 
@@ -172,6 +194,10 @@ export interface OverloadRetryDeps {
    *  expensive than the endpoint's — the credential lock holder passes
    *  {@link LOCKED_OVERLOAD_BUDGET_CAP_MS}. */
   budgetCapMs?: number;
+  /** Deadline over the WHOLE call rather than the retry phase: every attempt, the first one
+   *  included, aborts when it expires. For a caller whose total time inside something else is
+   *  the real constraint — the credential lock holder passes {@link LOCKED_CALL_BUDGET_MS}. */
+  callBudgetMs?: number;
   onRetry?: (event: OverloadRetryEvent) => void;
   /** Where the retry loop reports an outage. Defaults to discarding it so tests and library
    *  callers stay one-liners, but every composition root passes its own — the loop's lines are
@@ -237,14 +263,28 @@ export async function withOverloadRetry<Res extends OverloadResponse>(
   // Absent until the first overloaded answer opens the retry phase — before that there is no
   // budget to spend and therefore nothing to deadline.
   let deadlineAtMs: number | undefined;
+  // The whole-call deadline, when the caller asked for one. Opens NOW, before the first attempt,
+  // which is the entire difference between it and the retry budget above.
+  const callDeadlineAtMs = deps.callBudgetMs === undefined ? undefined : now() + deps.callBudgetMs;
+  /** Whatever is left under the binding deadline — the earlier of the two, or no bound at all.
+   *  One reading for both the attempt signal and the give-up arithmetic, so a loop can never
+   *  deadline an attempt by one clock and decide to keep going by another. */
+  const remainingMs = (): number => {
+    const deadline =
+      deadlineAtMs === undefined
+        ? callDeadlineAtMs
+        : callDeadlineAtMs === undefined
+          ? deadlineAtMs
+          : Math.min(deadlineAtMs, callDeadlineAtMs);
+    return deadline === undefined ? Number.POSITIVE_INFINITY : Math.max(0, deadline - now());
+  };
 
   for (;;) {
-    const remainingMs =
-      deadlineAtMs === undefined ? Number.POSITIVE_INFINITY : Math.max(0, deadlineAtMs - now());
+    const remaining = remainingMs();
     const response = await attempt({
       attempt: retries + 1,
-      remainingMs,
-      signal: deadlineSignal(remainingMs),
+      remainingMs: remaining,
+      signal: deadlineSignal(remaining),
     });
     if (!OVERLOAD_STATUSES.has(response.status)) return outcome(response, retries, verdict);
 
@@ -276,8 +316,10 @@ export async function withOverloadRetry<Res extends OverloadResponse>(
     if (retries + 1 >= budget.maxAttempts) return giveUp();
     // What is left must cover the sleep AND a retry worth making; the delay is clipped so the
     // attempt after it still gets {@link OVERLOAD_MIN_ATTEMPT_MS}, and when even that does not
-    // fit the overloaded answer already in hand is the honest result.
-    const leftMs = (deadlineAtMs ?? now()) - now();
+    // fit the overloaded answer already in hand is the honest result. A whole-call budget the
+    // first attempt already spent lands here with nothing left, which is exactly right: the
+    // caller's time is gone, and the 529 in hand is the answer.
+    const leftMs = remainingMs();
     if (leftMs <= OVERLOAD_MIN_ATTEMPT_MS) return giveUp();
 
     const delayMs = Math.min(

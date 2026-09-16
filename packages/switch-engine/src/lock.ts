@@ -35,10 +35,22 @@ interface LockRecord {
   host: string;
 }
 
+/**
+ * How old a holder may be before a contender presumes it dead and reclaims the lock.
+ *
+ * Exported because it is not a lock-internal default: it is the ceiling on everything a holder
+ * does while holding. Reclaim goes by AGE for a live holder — the owner record's `startedAtMs`
+ * is stamped once at the claim and never renewed — so a holder that spends longer than this
+ * inside the lock has it pulled out from under it mid-write, and the network budgets of the
+ * calls that run under it are sized from this number (see overload.ts's
+ * {@link LOCKED_CALL_BUDGET_MS}).
+ */
+export const LOCK_STALE_MS = 60_000;
+
 const DEFAULTS: Required<LockOptions> = {
   timeoutMs: 15_000,
   pollMs: 100,
-  staleMs: 60_000,
+  staleMs: LOCK_STALE_MS,
 };
 
 /** A held lock. Call {@link release} exactly once (a `try/finally` in the caller). */
