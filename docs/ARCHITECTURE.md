@@ -127,8 +127,21 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
 ## State
 
 The daemon persists to `node:sqlite` (`daemon.db`): the attribution journal, usage
-snapshots, pending permissions, the session registry, and a bounded outbox that buffers
-messages during a bot outage. Both growing tables are bounded — the outbox by row count,
-usage snapshots by a 90-day cutoff trimmed on each poll cycle. The switch engine keeps its
-own file-based vault, intent, and audit trail so it works even when the daemon isn't
-running (e.g. from `cctl`).
+snapshots, pending permissions, the session registry, `pending_steering`, and a bounded
+outbox that buffers messages during a bot outage. Both growing tables are bounded — the
+outbox by row count, usage snapshots by a 90-day cutoff trimmed on each poll cycle. The
+switch engine keeps its own file-based vault, intent, and audit trail so it works even when
+the daemon isn't running (e.g. from `cctl`).
+
+**`pending_steering` holds prompt bodies in plaintext**, and it is the one table here whose
+contents are the operator's own words rather than metadata about them. A prompt gets a row
+the moment cctl accepts it and keeps it until the session receives it or cctl gives up —
+across restarts, reboots and crashes — because the phone was told the text would be
+delivered and an in-memory queue answered that promise with silence. One row per prompt for
+its whole life: the `kind` column says which path currently owns it (`interactive` for a
+registered terminal session's next turn boundary, `managed` for an SDK session's next idle
+turn, `channel` for a live MCP channel server about to collect it), and moving between paths
+is an update of that column, never a delete and a re-insert. A prompt that falls off a
+closing channel becomes an `interactive` row; a channel attaching for that session takes its
+rows back, which is what stops a prompt waiting on a turn boundary an idle session never
+reaches. `daemon.db` therefore deserves the same handling as the vault — it is not a cache.

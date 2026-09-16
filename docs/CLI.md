@@ -228,9 +228,12 @@ Two things worth knowing:
 - **A session cannot be upgraded after it starts.** A channel is attached at launch. Sessions
   already running keep turn-boundary delivery; `cctl session status` distinguishes them.
 - **"Sent" is not "delivered."** Channel notifications are fire-and-forget: if a session never
-  loaded the channel, the event is dropped with no error returned. cctl therefore reports `sent`
-  and watches for the session to actually start working, rather than claiming delivery it cannot
-  confirm. Anything undelivered falls back to the turn-boundary queue.
+  loaded the channel, the event is dropped with no error returned. cctl reports `sent` and stops
+  there — nothing on this side can observe whether the session displayed the message or acted on
+  it, and cctl does not claim otherwise. What it _does_ track is whether its own channel server
+  took the message: anything still undelivered when that server goes away falls back to the
+  turn-boundary queue, with a card saying so, and if a channel attaches for that session again,
+  whatever is still queued goes back onto it. Queued prompts also survive a daemon restart.
 
 `cctl doctor` reports the current state, and `cctl setup` offers to turn it on (you can decline; it
 stays available afterwards).

@@ -427,6 +427,50 @@ patient one, and no path ever stopped retrying because the status page could not
 
 **Result:** the endpoint and its all-clear body are confirmed; incident behavior is not yet run.
 
+### 17. Live channels — idle-session prompt delivery ⏳ PENDING
+
+**Claim to verify:** a prompt sent from the phone reaches a Claude Code session sitting IDLE at
+its prompt — immediately, with no local keystroke — and the model's `reply` comes back to the same
+Discord thread.
+
+**Unit-proven already:** identity resolution (registry confirmation, the ancestor cross-check, and
+every refusal), the MCP server's framing and refusals, the daemon link's attach/poll/ack/backoff
+and its self-healing across a daemon that moves or restarts, the registry's queue/TTL/cap/staleness
+rules, the receiver's channel endpoints, the promote/fall-back handoff between the channel and the
+turn-boundary queue, and the two packages composed against each other over real loopback HTTP and a
+real stdio pipe (`packages/channel/src/e2e.test.ts`). None of that involves Claude Code.
+
+**What no headless test can close:**
+
+- **That Claude Code loads the channel at all.** It only loads a channel whose plugin an
+  administrator has approved, through the `managed-settings.d` drop-in `cctl channel enable`
+  writes. That file's content _replaces_ Anthropic's built-in plugin list rather than extending
+  it, so the restated list has to be right or the official channels disappear with it.
+- **That `notifications/claude/channel` really interrupts an idle session.** The notification is
+  fire-and-forget: nothing on our side learns whether the session displayed it. Claude Code's own
+  startup notice is not evidence either way — it has been observed reporting the channel as
+  unconfigured in a session where that channel then delivered normally.
+- **That `CLAUDE_CODE_SESSION_ID` and `<claudeDir>/sessions/<pid>.json` mean what this code reads
+  them as** on the installed CLI version — including the inherited-env case (a `claude` started
+  from inside another session's Bash tool must be REFUSED, not attached as its parent), and the
+  cross-check finding the owning session at `process.ppid` without a process-table query.
+- **The `reply` round trip**, which needs a real Discord thread on the other end.
+- **Survival of a real kill.** Queued prompts are mirrored into `pending_steering`; a `taskkill /F`
+  on the daemon — not a `cctl daemon stop` — must leave them deliverable to the same session
+  afterwards, on whichever path it reaches first.
+
+**Verify:** with the channel enabled, start a terminal session, register it, leave it idle at its
+prompt, and `/say` to it from the phone. Confirm the card reads `Sent to live session`, the session
+starts working with no keystroke, and a `reply` lands in the thread. Then `taskkill /F` the daemon,
+restart it, and confirm a prompt sent just before the kill still arrives. Then, from inside that
+session's Bash tool, launch a second `claude` and confirm its channel server REFUSES — the reason
+is written to `~/.claude/debug/<session-id>.txt` — instead of attaching as the outer session.
+
+**Pass:** an idle session took the prompt with no local input, the reply reached the phone, a
+killed daemon lost nothing, and the nested session refused with a printed reason.
+
+**Result:** not yet run.
+
 ## Reminder
 
 The undocumented endpoints (2, 3, 15) and hook names (5) can change without notice. Parsing
