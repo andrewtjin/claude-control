@@ -552,6 +552,19 @@ export class Daemon {
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
    *  not re-pushed on every restart). */
   private quarantineState = new Map<string, QuarantineNoticeState>();
+  /** The account each LIVE managed session is currently running its turns against — the value
+   *  stamped on its `session.status`/`session.output` frames. Mutable because a session outlives
+   *  the account it was spawned on: a usage-limit park resumed after a switch runs everything
+   *  from there on against the newly-active credentials, and a frame still naming the spawn-time
+   *  account tells the phone the wrong one (and mis-attributes the work in the session table).
+   *  Seeded when the pipes are attached, re-stamped by the post-switch kick, dropped when the
+   *  session goes terminal — so it is bounded by live sessions, like the route maps above. */
+  private readonly sessionAccounts = new Map<string, string>();
+  /** The active account as of the last poll cycle, so a switch made OUTSIDE this daemon (a local
+   *  `cctl switch`, which writes the vault directly and never reaches handleSwitchCommand) is
+   *  detectable at all. `undefined` until the first observation: whatever account the daemon
+   *  starts on is nobody's switch. */
+  private lastObservedActiveId: string | null | undefined;
   /** Each account's advisor input from the most recent poll cycle — what the post-switch
    *  stalled-session kick consults to answer "does the switch target have usage left?"
    *  without a blocking re-poll (see {@link resumeUsageStalledSessions}). In-memory only:
@@ -913,6 +926,9 @@ export class Daemon {
     for (const result of snapshot.results) {
       this.latestAdvisorInputs.set(result.accountId, result.usage.advisorInput);
     }
+    // Ordered after that refresh so the headroom guard inside the kick reads this cycle's
+    // numbers, not the previous one's.
+    this.noticeActiveAccountChange(activeId, accounts);
     await this.timePhase('persistSnapshots', () => {
       for (const result of snapshot.results) {
         if (result.outcome === 'skipped') continue; // nothing new to persist
@@ -993,6 +1009,12 @@ export class Daemon {
       await this.timePhase('probeUnknown', () =>
         this.probeUnknownAccounts(snapshot.results, inputs),
       );
+
+      // Absorb whatever THIS daemon just did. Both the policy hop above and the probe activate
+      // accounts, and the next cycle would otherwise read their work as an operator's switch and
+      // resume parked sessions off the back of it — which auto-switch deliberately does not do
+      // (resuming paused work unattended is a bigger policy step than hopping).
+      this.lastObservedActiveId = await this.switchEngine.getActiveId();
     }
 
     // LAST in the cycle, deliberately: the transcript scan is seconds of disk IO, and everything
@@ -1221,6 +1243,10 @@ export class Daemon {
       // that stalled on the previous account's usage limit (auto-switch deliberately does
       // not kick — resuming paused work unattended is a bigger policy step than hopping).
       if (result.ok) {
+        // Recorded as seen BEFORE the kick, so the poll cycle's own change detection (which
+        // exists for switches that never come through here — see noticeActiveAccountChange)
+        // reads this hop as already handled rather than kicking the same sessions twice.
+        this.lastObservedActiveId = resolved.account.id;
         this.resumeUsageStalledSessions(resolved.account.id, resolved.account.label);
       }
     } catch (err) {
@@ -1429,6 +1455,30 @@ export class Daemon {
    * handle's own `resumeFromUsageLimitStall` (blind-fired across the registry; only parked
    * sessions react), so the daemon never has to know what prompt resumes a session.
    */
+  /**
+   * Notice that the ACTIVE account changed since the last poll cycle and treat it like the
+   * `/switch` it is.
+   *
+   * A `cctl switch spare` typed on this host writes the vault directly — it never reaches
+   * {@link handleSwitchCommand} — so the poll cycle is the only place the daemon can observe it
+   * at all. The operator who typed it is exactly as present as the one who typed `/switch` on
+   * the phone, and sessions parked on a usage limit are waiting for precisely this event; before
+   * this, they waited through it. Hops this daemon made itself are absorbed at the end of the
+   * cycle that made them (see runPollCycle), so auto-switch still never resumes parked work.
+   */
+  private noticeActiveAccountChange(activeId: string | null, accounts: StoredAccount[]): void {
+    const previous = this.lastObservedActiveId;
+    this.lastObservedActiveId = activeId;
+    // First observation of this run, no account at all, or nothing changed: nothing to resume.
+    if (previous === undefined || activeId === null || previous === activeId) return;
+    const label = accounts.find((a) => a.id === activeId)?.label;
+    this.logger.info({ accountId: activeId }, 'active account changed outside this daemon');
+    this.resumeUsageStalledSessions(
+      activeId,
+      label !== undefined && label !== '' ? label : activeId,
+    );
+  }
+
   private resumeUsageStalledSessions(accountId: string, accountLabel: string): void {
     const input = this.latestAdvisorInputs.get(accountId);
     if (input !== undefined && !hasUsableHeadroom(input, this.clock())) {
@@ -1442,7 +1492,12 @@ export class Daemon {
     let kicked = 0;
     for (const record of this.sessionManager.list()) {
       const handle = this.sessionManager.get(record.id);
-      if (handle?.resumeFromUsageLimitStall?.() === true) kicked++;
+      if (handle?.resumeFromUsageLimitStall?.() !== true) continue;
+      kicked++;
+      // The resumed turn runs against the credentials just switched to, so from this frame on
+      // the session IS this account's work — the spawn-time one it was stamped with would
+      // mis-name every status and output line that follows (see {@link sessionAccounts}).
+      this.sessionAccounts.set(record.id, accountId);
     }
     if (kicked === 0) return;
 
@@ -1671,6 +1726,28 @@ export class Daemon {
       this.answerPromptInjectRefusal(msg, record);
       return;
     }
+    // A re-attach inherits the record's working directory, and directories do not outlive
+    // everything that made them (a worktree gets removed, a branch folder is cleaned up). The
+    // SDK child then never produces its first event and the session sits at `starting` forever,
+    // so the same refusal a spawn gives a bad `cwd` has to apply here — while there is still a
+    // request to answer it against.
+    if (record.cwd !== undefined) {
+      const problem = await describeBadDirectory(record.cwd);
+      if (problem !== undefined) {
+        this.logger.warn({ sessionId, cwd: record.cwd }, 'resume refused: bad working directory');
+        this.sendEnvelope({
+          type: 'error',
+          payload: {
+            code: 'resume_failed',
+            message:
+              `prompt.inject: session '${sessionId}' cannot be re-attached because its working ` +
+              `directory ${problem} (${record.cwd})`,
+            relatesTo: msg.id,
+          },
+        });
+        return;
+      }
+    }
     try {
       const resumed = await this.sessionManager.resumeOrphan(sessionId, {
         client: this.createAgentSdkClient(),
@@ -1786,6 +1863,24 @@ export class Daemon {
   private drainManagedInjects(sessionId: string): void {
     const queue = this.pendingManagedInjects.get(sessionId);
     if (queue === undefined || queue.length === 0) return;
+    const handle = this.sessionManager.get(sessionId);
+    if (!handle) {
+      // The session went away between queueing and this boundary; nothing can deliver.
+      this.dropManagedInjects(sessionId);
+      return;
+    }
+    // Idle is not the same as READY. A session parked on a usage limit reports exactly the
+    // `waiting_input` a finished turn does, but sending into it spends a request on the account
+    // that just ran out, ends the park, and re-forms it around this text — so the prompt the
+    // post-switch kick was holding is lost and the operator's /switch resumes the wrong thing.
+    // The queue keeps waiting: the kick's own turn boundary is the one that drains it.
+    if (handle.isParkedOnUsageLimit?.() === true) {
+      this.logger.info(
+        { sessionId, queued: queue.length },
+        'holding queued prompt.inject: the session is parked on a usage limit',
+      );
+      return;
+    }
     const next = queue.shift();
     if (queue.length === 0) this.pendingManagedInjects.delete(sessionId);
     if (next === undefined) return;
@@ -1793,12 +1888,6 @@ export class Daemon {
     // fire-and-forget, and a row still sitting here at the next startup would read as text that
     // never delivered and be reported as lost.
     this.store.deletePendingSteering(next.rowId);
-    const handle = this.sessionManager.get(sessionId);
-    if (!handle) {
-      // The session went away between queueing and this boundary; the rest cannot deliver either.
-      this.dropManagedInjects(sessionId);
-      return;
-    }
     handle.send(next.text).catch((err: unknown) => {
       this.logger.warn({ sessionId, err }, 'queued prompt.inject rejected at the turn boundary');
     });
@@ -2497,6 +2586,27 @@ export class Daemon {
         'found orphaned sessions from a previous run; each re-attaches on its next operator prompt',
       );
     }
+    // A session that was PARKED on a usage limit was promised something the others were not:
+    // "it resumes after a switch to an account with usage left". The process holding it is gone,
+    // so no switch can resume it any more and nothing else would ever say so — the phone would
+    // just stop hearing from a session it was told was waiting. Recovery makes it re-attachable
+    // (an orphan), and this is the card that tells the operator it is on them now.
+    for (const record of orphaned.filter((r) => r.parkedOnUsageLimit === true)) {
+      this.sendEnvelope({
+        type: 'hook.notification',
+        payload: {
+          event: 'notification',
+          sessionId: record.id,
+          title: 'A parked session did not survive the restart',
+          body:
+            `Session ${record.id} was parked on a usage limit when the daemon stopped, so the ` +
+            `switch that would have resumed it never reached it. Send it a message to pick it ` +
+            `up where it stopped.`,
+          level: 'warn',
+          notificationType: 'usage_stall_lost',
+        },
+      });
+    }
   }
 
   /**
@@ -2511,12 +2621,20 @@ export class Daemon {
     accountId: string | undefined,
     spawnOrigin?: SpawnOrigin,
   ): void {
+    // The account is looked up per event rather than closed over, because it can change under a
+    // live session (see {@link sessionAccounts}). This is where it is seeded: a spawn's payload
+    // or a re-attached record's account is the truth until a switch says otherwise.
+    if (accountId !== undefined) this.sessionAccounts.set(handle.id, accountId);
     handle.onEvent((event) => {
+      const runningAs = this.sessionAccounts.get(handle.id) ?? accountId;
       if (event.kind === 'status' && (event.state === 'done' || event.state === 'failed')) {
         this.sweepManagedPermissionRoutes(handle.id);
         this.sweepManagedQuestionRoutes(handle.id);
+        // Read above, dropped here: the terminal frame still names the account the session was
+        // actually running under when it ended.
+        this.sessionAccounts.delete(handle.id);
       }
-      this.forwardSessionEvent(handle.id, accountId, event, spawnOrigin);
+      this.forwardSessionEvent(handle.id, runningAs, event, spawnOrigin);
     });
     // Optional on SessionHandle (observed terminals have no structured permission seam);
     // managed handles always implement it.
