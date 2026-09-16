@@ -123,12 +123,40 @@ export interface DaemonUnitInstall {
 }
 
 /**
+ * Read the unit's `UnitFileState` — systemd's own word for whether it is enabled (`enabled`,
+ * `disabled`, `masked`, `static`, …). `show` exits 0 even for a unit the manager has never
+ * heard of (it answers with an empty value), unlike `is-enabled`, whose non-zero exit for a
+ * disabled unit would reach callers as a thrown error. A manager that cannot be asked at all
+ * answers `undefined` — "unknown", which is never treated as a negative.
+ */
+function unitFileState(run: SystemctlRunner): string | undefined {
+  try {
+    return run(['show', '-p', 'UnitFileState', '--value', DAEMON_UNIT_NAME]) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a `UnitFileState` means the unit starts at login. `enabled-runtime` counts as a
+ *  definite no for our purposes — it is dropped on reboot, which is the opposite of autostart. */
+function saysEnabled(state: string | undefined): boolean {
+  return state === 'enabled';
+}
+
+/**
  * Write (or rewrite) the unit and enable it. A changed unit is reloaded so the manager sees
- * the new definition; an identical one is 'unchanged' and runs nothing. Linger is requested
- * whenever the unit is written: without it the user manager — and this unit — exists only
- * while the user is logged in. It is best-effort because some polkit setups refuse it for the
- * user's own account (and WSL has no logind to grant it); the unit is enabled either way and
+ * the new definition; a unit that is already both current and enabled is 'unchanged'. Linger is
+ * requested whenever the unit is written: without it the user manager — and this unit — exists
+ * only while the user is logged in. It is best-effort because some polkit setups refuse it for
+ * the user's own account (and WSL has no logind to grant it); the unit is enabled either way and
  * the refusal comes back as a note, since "starts at login, not at boot" is worth knowing.
+ *
+ * Idempotence is content AND enablement, and a failed registration takes the file back out,
+ * because the file alone is not the registration: `enable` is what links it into
+ * `default.target`. Judged on content alone, a unit whose `enable` failed (no bus, a polkit
+ * refusal) would answer 'unchanged' on every later install and never be enabled — while the
+ * caller starts the daemon now and nothing brings it back at the next login. Either half of
+ * this alone closes that hole; both are cheap, and they fail independently.
  */
 export function installDaemonUnit(
   options: DaemonUnitOptions & { shimPath: string },
@@ -140,11 +168,21 @@ export function installDaemonUnit(
 
   const desired = renderDaemonUnit(options.shimPath);
   const existing = fs.read(unitPath);
-  if (existing === desired) return { outcome: 'unchanged', notes: [] };
+  if (existing === desired && saysEnabled(unitFileState(run))) {
+    return { outcome: 'unchanged', notes: [] };
+  }
 
   fs.write(unitPath, desired);
-  run(['daemon-reload']);
-  run(['enable', DAEMON_UNIT_NAME]);
+  try {
+    run(['daemon-reload']);
+    run(['enable', DAEMON_UNIT_NAME]);
+  } catch (err) {
+    // Put the filesystem back exactly as it was, so the next install is a fresh attempt rather
+    // than a no-op over a file that never became a registration.
+    if (existing === undefined) fs.remove(unitPath);
+    else fs.write(unitPath, existing);
+    throw err;
+  }
   const notes: string[] = [];
   try {
     loginctl(['enable-linger']);
@@ -157,6 +195,9 @@ export function installDaemonUnit(
         'than at boot — run `loginctl enable-linger` yourself to change that',
     );
   }
+  // A unit whose content was already current but whose enablement had to be redone reads as
+  // 'updated': work was done, and claiming 'unchanged' is exactly the lie this function had to
+  // stop telling.
   return { outcome: existing === undefined ? 'created' : 'updated', notes };
 }
 
@@ -170,10 +211,23 @@ export interface DaemonUnitQuery {
   registered: boolean;
   /** systemd's ActiveState (`active`, `inactive`, `failed`, …) when the manager answered. */
   state?: string;
+  /** systemd's UnitFileState (`enabled`, `disabled`, …) when the manager answered — whether
+   *  the unit is linked into `default.target` and will therefore start at the next login. */
+  enabled?: string;
 }
 
-/** Registered means the unit file is on disk; the state comes from the manager when it can be
- *  asked (a missing manager still leaves the registration standing). */
+/**
+ * What the autostart registration looks like right now.
+ *
+ * Registered means the unit will actually start at login, which takes BOTH the unit file and an
+ * `enable` — a present-but-disabled unit is a file the manager ignores, and reporting it as a
+ * healthy registration hides the one thing wrong with it behind a green line in
+ * `cctl daemon status`. `registered: false` is also the honest answer for the reader, because
+ * the remedy it prints (`cctl daemon install`) is exactly what re-enables it.
+ *
+ * Only a definite negative demotes it: a manager that cannot be asked (no bus, no systemctl)
+ * answers nothing about either state, and a registration already on disk stands.
+ */
 export function queryDaemonUnit(options: DaemonUnitOptions = {}): DaemonUnitQuery {
   const run = options.run ?? defaultSystemctlRunner;
   const fs = options.fs ?? defaultTextFileStore;
@@ -185,7 +239,12 @@ export function queryDaemonUnit(options: DaemonUnitOptions = {}): DaemonUnitQuer
   } catch {
     state = undefined;
   }
-  return { registered: true, ...(state !== undefined ? { state } : {}) };
+  const enabled = unitFileState(run);
+  return {
+    registered: enabled === undefined || saysEnabled(enabled),
+    ...(state !== undefined ? { state } : {}),
+    ...(enabled !== undefined ? { enabled } : {}),
+  };
 }
 
 export type DaemonUnitUninstallOutcome = 'removed' | 'not_installed';
