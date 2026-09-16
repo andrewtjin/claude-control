@@ -182,7 +182,12 @@ docker compose build bot
 docker compose up -d
 ```
 
-`caddy` only needs a rebuild if `deploy/Caddyfile` changed.
+`deploy/Caddyfile` is bind-mounted into the `caddy` container, so when it changes Caddy only
+needs to reload its config, with no restart and no dropped connections:
+
+```bash
+docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
 
 ## Zero-credential guarantee
 
