@@ -588,22 +588,33 @@ export class RelayServer implements RelaySender {
 /**
  * Who a connection is charged against for the per-peer pending cap.
  *
- * The first `x-forwarded-for` entry when there is one (this relay runs behind a proxy in every
- * real deployment, where the socket's remote address is the proxy and would make every client one
+ * The LAST `x-forwarded-for` entry when there is one (this relay runs behind a proxy in every real
+ * deployment, where the socket's remote address is the proxy and would make every client one
  * peer), else the socket's own remote address.
  *
- * Trusting a header the client can set looks wrong, and would be if this were an authorization
- * decision. It is not: the key only decides which bucket a connection is counted in, and the
- * GLOBAL cap is what actually bounds memory. A client that forges varying XFF values spreads
- * itself across buckets and is left facing exactly the pre-existing global cap, so the header
- * cannot buy more capacity than it already had; honouring it is what keeps one real proxied client
- * from starving every other daemon behind the same proxy. An address that cannot be read at all
- * shares one bucket — unknown peers are not assumed to be distinct.
+ * Last, not first, and that is the whole property. A proxy APPENDS the address it saw to whatever
+ * the client already sent, so the trailing entry is the one the proxy wrote and every earlier one
+ * is the client's own text. Keyed on the first entry, a peer that varies the header lands in an
+ * unlimited number of buckets and the per-peer cap confines it not at all — it would be a cap in
+ * name only, leaving just the global pool, which is exactly the starvation this defends against.
+ * Keyed on the last, forged entries change nothing: every connection from one source still charges
+ * one bucket. An address that cannot be read at all shares one bucket — unknown peers are not
+ * assumed to be distinct.
+ *
+ * This assumes EXACTLY ONE trusted proxy in front of the relay, which is what ships: a second
+ * untrusted hop would append after the trusted one and the trailing entry would be attacker text
+ * again. Add a hop and this has to count back by however many are trusted.
  */
 function peerKey(request: IncomingMessage): string {
   const forwarded = request.headers['x-forwarded-for'];
-  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(',')[0]?.trim();
-  if (first !== undefined && first.length > 0) return first;
+  // Node joins repeated headers with ', ' for this one, but the typings still allow an array, and
+  // the hop the proxy appended is the last entry of the last value either way.
+  const hops = (Array.isArray(forwarded) ? forwarded.join(',') : (forwarded ?? ''))
+    .split(',')
+    .map((hop) => hop.trim())
+    .filter((hop) => hop.length > 0);
+  const nearest = hops[hops.length - 1];
+  if (nearest !== undefined) return nearest;
   return request.socket.remoteAddress ?? 'unknown';
 }
 

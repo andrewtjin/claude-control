@@ -972,6 +972,42 @@ describe('RelayServer handshake reaper and per-peer pending cap', () => {
       await flood.close();
     }
   });
+
+  it('charges a peer that forges leading x-forwarded-for entries to ONE bucket', async () => {
+    const flood = new RelayServer({
+      bindings,
+      pairing,
+      gateway: fake.gateway,
+      heartbeatMs: 0,
+      port: 0,
+      maxPendingConnections: 16,
+      maxPendingPerPeer: 2,
+      handshakeTimeoutMs: 5_000,
+    });
+    const floodPort = await flood.listen();
+    try {
+      // The proxy APPENDS what it saw, so everything before the last entry is the client's own
+      // text. Keyed on the first entry, these three are three different peers and the per-peer cap
+      // never bites; keyed on the hop the proxy wrote, they are one.
+      const forged = (claim: string): Promise<WebSocket> =>
+        connectAsPeer(floodPort, `${claim}, 198.51.100.9`);
+      const a1 = await forged('10.0.0.1');
+      const a2 = await forged('10.0.0.2');
+      const a3 = await forged('10.0.0.3');
+      expect(await waitForClose(a3)).toBe(1013);
+
+      // …and a real second source behind the same proxy is still untouched by the noise.
+      const b1 = await connectAsPeer(floodPort, '10.0.0.1, 203.0.113.4');
+      expect(await expectSilenceFor(b1, 60)).toBe('silence');
+      expect(b1.readyState).toBe(WebSocket.OPEN);
+
+      a1.close();
+      a2.close();
+      b1.close();
+    } finally {
+      await flood.close();
+    }
+  });
 });
 
 describe('RelayServer duplicate hello on one socket', () => {

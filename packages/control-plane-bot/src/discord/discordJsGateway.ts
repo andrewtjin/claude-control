@@ -90,6 +90,7 @@ import {
   resolveTap,
   type ButtonSpec,
   type ButtonStyle as ButtonSpecStyle,
+  type ParsedButton,
   type TapOutcome,
 } from './buttons.js';
 import {
@@ -297,6 +298,13 @@ export interface DiscordJsGatewayOptions {
  *  past any late trailing frame; the persisted thread mapping outlives it regardless. */
 const SESSION_FORGET_MS = 5 * 60_000;
 
+/** How long a thread that just failed the sendable check is taken at its word before being probed
+ *  again. Re-probing is what lets a session return to its thread when the cause clears (a revoked
+ *  permission restored, a Discord hiccup passing), but probing on EVERY op costs one REST fetch
+ *  per frame for as long as the cause lasts — and a DELETED thread never comes back, so that cost
+ *  has no end. One probe per window keeps the re-attach and drops the per-frame fetch. */
+const THREAD_PROBE_BACKOFF_MS = 60_000;
+
 /** discord.js styles keyed by our plain ButtonSpec style — the gateway is the one place that
  *  translates the render structs into real components. */
 const BUTTON_STYLE: Record<ButtonSpecStyle, ButtonStyle> = {
@@ -374,6 +382,14 @@ function promptRequestId(envelope: Envelope): string | undefined {
  * place what they are reading in another. Anything that is not a prompt, and any session with no
  * thread of its own, keeps the DM.
  *
+ * The BOUND thread, not only a live `thread` target: a session demoted to the DM keeps the id of
+ * the thread it belongs to, and delivery re-attaches to that thread the moment it is sendable
+ * again. Reading only `kind === 'thread'` here made cards disagree with session frames for the
+ * whole window before the next `session.status` re-recorded the promotion — the thread's own
+ * state line said the prompt was on the card here while the card went to the DM. Whether the
+ * thread can be posted in RIGHT NOW is the caller's question, and it is the same check delivery
+ * makes; this function answers only WHICH thread.
+ *
  * `lookup` only ever REPORTS an existing route; it must not create one. A prompt must never be
  * what opens a session's thread — that decision belongs to the session's own first frame, and
  * making it from here would race it.
@@ -388,7 +404,7 @@ export function promptThreadTarget(
   const sessionId = promptSessionId(envelope);
   if (sessionId === undefined) return undefined;
   const target = lookup(sessionId);
-  return target?.kind === 'thread' ? target.threadId : undefined;
+  return target === undefined ? undefined : boundThreadId(target);
 }
 
 /** Flatten a thrown Discord error into one quotable line. Newlines collapse because the reply is a
@@ -427,8 +443,12 @@ export class DiscordJsGateway implements DiscordGateway {
    *  privileged intents are chosen by, kept so the planner's copy and `/thread-here`'s reply can
    *  say what this deployment can actually do. */
   private readonly repliesReadable: boolean;
-  /** Persisted sessionId→thread map; loaded on start(), survives restart. */
-  private readonly threadReg: PersistentThreadRegistry;
+  /** Persisted sessionId→thread map; loaded on start(), survives restart. `protected` (not
+   *  `private`), same seam rationale as {@link sessionChannelPins}: surviving a restart is the
+   *  whole point of persisting it, and the only way to prove what still holds afterwards — a
+   *  thread that can still name its owner when the in-memory card registries cannot — is to load
+   *  it into a fresh gateway the way `start()` does, without a Discord connection. */
+  protected readonly threadReg: PersistentThreadRegistry;
   /** Users already told that session threads are failing. Deliberately per-process and not
    *  persisted: the point is one explanation, not one forever — a restart is also when a
    *  permission change would have taken effect, so re-earning the right to say it is correct. */
@@ -451,6 +471,10 @@ export class DiscordJsGateway implements DiscordGateway {
    *  per-user/fallback/DM config is verified through the real construction path rather than by
    *  re-deriving it. */
   protected readonly sessionChannelResolver: SessionChannelResolver | undefined;
+  /** threadId -> the earliest time it is worth probing again, for threads that just failed the
+   *  sendable check (see {@link sendableThread}). Entries are deleted as soon as a thread answers
+   *  yes, so this holds only currently-unreachable threads rather than every thread ever seen. */
+  private readonly threadProbeBackoff = new Map<string, number>();
   /** Live-card message per session route, so `editMessage ref:'card'` targets the right message.
    *  In-memory only: after a restart the card id is gone and the first edit posts a fresh card
    *  (a benign visual re-anchor, not a lost update). */
@@ -767,6 +791,10 @@ export class DiscordJsGateway implements DiscordGateway {
    *  it never creates one. `ensureTarget` is the single place that decides where a session lives,
    *  and creating from here would race the session's own first frame for that decision.
    *
+   *  The bound-thread-and-sendable decision is {@link sendableThread}, the SAME one the session's
+   *  own frames take. Anything else lets a card and the session it belongs to disagree about where
+   *  the conversation is happening.
+   *
    *  `protected` for the same reason as {@link sinkFor}: it is the seam a test overrides to prove
    *  the routing without a live Discord connection. */
   protected async cardSink(discordUserId: string, envelope: Envelope): Promise<SendableChannels> {
@@ -776,7 +804,7 @@ export class DiscordJsGateway implements DiscordGateway {
     if (threadId !== undefined) {
       // A thread that has vanished is not an error worth failing the prompt over: the DM below is
       // the same fallback the session's own frames take, so the question still gets asked.
-      const channel = await this.fetchThreadChannel(threadId);
+      const channel = await this.sendableThread(threadId);
       if (channel) return channel;
     }
     return this.fetchDmChannel(discordUserId);
@@ -1013,8 +1041,10 @@ export class DiscordJsGateway implements DiscordGateway {
   }
 
   /** Resolve a session route to a sendable channel: its recorded thread, or the user's DM as the
-   *  remembered fallback. Creates the thread on first use (persisting the mapping), and if a
-   *  previously-created thread has since vanished, pins the DM fallback so we stop re-fetching it.
+   *  remembered fallback. Creates the thread on first use (persisting the mapping), demotes to the
+   *  DM when the thread is not sendable, and re-attaches once it is again — at most one probe per
+   *  {@link THREAD_PROBE_BACKOFF_MS}, so a demoted session costs the DM path and not a REST fetch
+   *  on every op.
    *  `protected` (not `private`) is the ONE seam the otherwise live-boundary per-session op execution
    *  exposes: it lets a test subclass return a controllable fake sink so the pure serialization of
    *  {@link deliver} can be exercised without a real Discord connection. */
@@ -1022,7 +1052,7 @@ export class DiscordJsGateway implements DiscordGateway {
     const target = await this.ensureTarget(route);
     const threadId = boundThreadId(target);
     if (threadId !== undefined) {
-      const channel = await this.fetchThreadChannel(threadId);
+      const channel = await this.sendableThread(threadId);
       if (channel) {
         // Sendable again after a demotion (the permission came back, the outage ended): re-attach,
         // so the conversation returns to the thread it belongs to instead of finishing in the DM.
@@ -1045,14 +1075,44 @@ export class DiscordJsGateway implements DiscordGateway {
     return this.fetchDmChannel(route.discordUserId);
   }
 
+  /** "Can this thread be posted in right now?" — the one decision every delivery path makes, with
+   *  the cost of asking it bounded.
+   *
+   *  A thread that just failed is not asked about again until the backoff window passes. Without
+   *  that, a demoted session re-fetched its thread on every op for as long as the cause lasted,
+   *  and a DELETED thread made that forever. The entry is dropped the moment the answer is yes, so
+   *  the map only ever holds threads that are currently unreachable. */
+  private async sendableThread(threadId: string): Promise<SendableChannels | undefined> {
+    const retryAt = this.threadProbeBackoff.get(threadId);
+    if (retryAt !== undefined && this.clock() < retryAt) return undefined;
+    const channel = await this.fetchThreadChannel(threadId);
+    if (channel) {
+      this.threadProbeBackoff.delete(threadId);
+      return channel;
+    }
+    this.threadProbeBackoff.set(threadId, this.clock() + THREAD_PROBE_BACKOFF_MS);
+    return undefined;
+  }
+
   /** Live boundary: a thread channel this bot can post in RIGHT NOW, or `undefined` if it is gone,
-   *  invisible, or otherwise not sendable. The two callers ({@link sinkFor} and {@link cardSink})
-   *  both need exactly this question answered, and both must treat every failure shade the same
-   *  way — there is one fallback, and it is the DM. `protected` so the demote/re-attach decision
-   *  around it is testable without a Discord connection. */
+   *  invisible, or otherwise not sendable. The callers (through {@link sendableThread}) all need
+   *  exactly this question answered, and all must treat every failure shade the same way — there
+   *  is one fallback, and it is the DM. `protected` so the demote/re-attach decision around it is
+   *  testable without a Discord connection. */
   protected async fetchThreadChannel(threadId: string): Promise<SendableChannels | undefined> {
-    const channel = await this.client.channels.fetch(threadId);
+    // `ChannelManager.fetch` REJECTS on a channel that no longer exists — there is no null path
+    // for a deleted thread. Unhandled, that throw propagated out of the delivery sink and the
+    // frame was dropped with a log line, when the DM was sitting right there: "gone" is the
+    // plainest possible answer to "not sendable", not an error worth losing a frame over.
+    const channel = await this.fetchChannelById(threadId).catch(() => null);
     return channel?.isSendable() ? channel : undefined;
+  }
+
+  /** Live boundary: the raw channel fetch. Split out from {@link fetchThreadChannel} as its own
+   *  seam because the case that matters here is the one where it FAILS, and a fake channel object
+   *  cannot express a rejection. */
+  protected fetchChannelById(channelId: string): Promise<Channel | null> {
+    return this.client.channels.fetch(channelId);
   }
 
   /** Live boundary: the user's DM channel — the fallback every delivery path ends at. */
@@ -2125,12 +2185,16 @@ export class DiscordJsGateway implements DiscordGateway {
     // Ownership BEFORE the tap is resolved, because every phase of the two-tap grammar mutates the
     // card: an `arm` tap swaps in Confirm/Cancel and a `cancel` tap restores the row, both via
     // `interaction.update` on the OWNER's message. Decoding here (rather than reading the execute
-    // outcome) is what lets the first tap of a session-scope Deny be refused too.
+    // outcome) is what lets the first tap of a two-tap action be refused too.
+    //
+    // EVERY action, not just approve/deny. Stop is the one that matters most: it ships on the
+    // session card, which lives in the session's own thread, so a thread member could arm it,
+    // confirm it, strip the owner's controls with the `update` each phase performs, and send the
+    // stop to their OWN daemon — the same shape as a foreign Approve, on a louder button.
     const parsed = decodeButton(interaction.customId);
-    if (parsed !== null && (parsed.action === 'approve' || parsed.action === 'deny')) {
-      if (await this.refuseForeignCard(interaction, this.permissionCards.ownerOf(parsed.id))) {
-        return;
-      }
+    if (parsed !== null) {
+      const owner = this.cardOwner(interaction, this.registryOwnerOf(parsed));
+      if (await this.refuseForeignCard(interaction, owner)) return;
     }
     const outcome = resolveTap(interaction.customId, this.clock());
     switch (outcome.kind) {
@@ -2224,7 +2288,7 @@ export class DiscordJsGateway implements DiscordGateway {
     // Before ANY state is touched: the collector is shared per requestId, so a stranger's pick
     // would otherwise overwrite the owner's accumulated answers even if the submit itself were
     // refused later.
-    if (await this.refuseForeignCard(interaction, this.questionCards.ownerOf(requestId))) return;
+    if (await this.refuseForeignQuestion(interaction, requestId)) return;
     if (this.questionAnswers.expectedCount(requestId) === undefined) {
       await this.replyQuestionGone(interaction);
       return;
@@ -2253,7 +2317,7 @@ export class DiscordJsGateway implements DiscordGateway {
     const { requestId, qIndex } = decoded;
     // Same guard as the select path, for the same reason: the modal's customId is guessable from
     // the card, so the submit is its own entry point into another user's card state.
-    if (await this.refuseForeignCard(interaction, this.questionCards.ownerOf(requestId))) return;
+    if (await this.refuseForeignQuestion(interaction, requestId)) return;
     if (this.questionAnswers.expectedCount(requestId) === undefined) {
       await this.replyQuestionGone(interaction);
       return;
@@ -2280,7 +2344,7 @@ export class DiscordJsGateway implements DiscordGateway {
     // Both callers already refused a foreign interaction; re-checked here because this is the step
     // that RELAYS an answer (to the tapper's own daemon) and edits the card, so it must not depend
     // on a caller remembering to guard it.
-    if (await this.refuseForeignCard(interaction, this.questionCards.ownerOf(requestId))) return;
+    if (await this.refuseForeignQuestion(interaction, requestId)) return;
     const count = this.questionAnswers.expectedCount(requestId);
     if (count === undefined) {
       await this.replyQuestionGone(interaction);
@@ -2409,6 +2473,56 @@ export class DiscordJsGateway implements DiscordGateway {
       .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
   }
 
+  /** The card registry's record of who a decoded button's card was delivered to, or `undefined`
+   *  for an action that has no such registry.
+   *
+   *  Only the permission actions are registered by requestId. `stop` carries a sessionId, and
+   *  `switch`/`prune` carry an accountId / an invocation id — none of which any registry here maps
+   *  to a person. That is what {@link cardOwner} exists to answer for them. */
+  private registryOwnerOf(parsed: ParsedButton): string | undefined {
+    return parsed.action === 'approve' || parsed.action === 'deny'
+      ? this.permissionCards.ownerOf(parsed.id)
+      : undefined;
+  }
+
+  /** {@link refuseForeignCard} for a question card, whose three entry points (select, Other modal,
+   *  submit) ask the same question of the same registry and must not drift apart. */
+  private refuseForeignQuestion(
+    interaction: StringSelectMenuInteraction | ModalSubmitInteraction,
+    requestId: string,
+  ): Promise<boolean> {
+    return this.refuseForeignCard(
+      interaction,
+      this.cardOwner(interaction, this.questionCards.ownerOf(requestId)),
+    );
+  }
+
+  /** Who the card an interaction fired on belongs to, or `undefined` when nothing can say.
+   *
+   *  The card registries are the precise answer, and they are in memory: a restart, or an eviction
+   *  at the FIFO bound, forgets an owner while the card stays on screen and stays tappable. Falling
+   *  open there re-opened the hole for EVERY outstanding card in a shared thread after any restart,
+   *  so WHERE the tap happened is consulted second:
+   *   - a session thread belongs to exactly one user, and the thread registry is PERSISTED — it
+   *     survives the restart that lost the card registry, so it can still name them;
+   *   - a DM channel is between the bot and one user, so whoever tapped in one is its owner by
+   *     construction.
+   *  Only a tap that is neither — an unknown channel — stays unattributable, and that keeps the
+   *  allow-and-log: refusing an owner is the failure this whole guard defends against. */
+  private cardOwner(
+    interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+    registryOwner: string | undefined,
+  ): string | undefined {
+    if (registryOwner !== undefined) return registryOwner;
+    // `guildId === null` is how discord.js reports "this happened outside a guild", which for a
+    // card means the bot's DM with the person who tapped it.
+    if (interaction.guildId === null) return interaction.user.id;
+    const channelId = interaction.channelId;
+    return channelId === null
+      ? undefined
+      : this.threadReg.latestForThread(channelId)?.discordUserId;
+  }
+
   /** Refuse an interaction on a card that was delivered to someone ELSE, and report whether it was
    *  refused so the caller can stop.
    *
@@ -2420,10 +2534,10 @@ export class DiscordJsGateway implements DiscordGateway {
    *  blocked on a hold that nothing will ever release. So the tap is answered ephemerally and
    *  NOTHING is touched: no state, no card edit, no frame.
    *
-   *  An `undefined` owner is not a mismatch — it means this process has no record of the card
-   *  (evicted at the FIFO bound, or sent before a restart), and refusing there would make a live
-   *  card permanently unanswerable by its real owner, which is the failure this is defending
-   *  against in the first place. */
+   *  An `undefined` owner is not a mismatch — it means NOTHING could name the card's owner, not
+   *  even where the tap happened (see {@link cardOwner}), and refusing there would make a live card
+   *  permanently unanswerable by its real owner, which is the failure this is defending against in
+   *  the first place. */
   private async refuseForeignCard(
     interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
     ownerId: string | undefined,

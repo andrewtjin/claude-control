@@ -22,6 +22,7 @@ import {
   PermissionFlagsBits,
   PermissionsBitField,
   type ButtonInteraction,
+  type Channel,
   type ChatInputCommandInteraction,
   type EmbedBuilder,
   type Message,
@@ -40,7 +41,7 @@ import {
   promptThreadTarget,
   threadingConfigured,
 } from './discordJsGateway.js';
-import { permissionButtons } from './buttons.js';
+import { encodeButton, permissionButtons, sessionCardButtons } from './buttons.js';
 import { encodeQuestionModal, encodeQuestionSelect } from './questionCards.js';
 import type {
   CommandResult,
@@ -49,7 +50,7 @@ import type {
   ThreadHereChannelHealth,
 } from './commands.js';
 import type { SessionThreadParent } from './sessionChannels.js';
-import type { DeliveryTarget } from './threadRegistry.js';
+import { PersistentThreadRegistry, type DeliveryTarget } from './threadRegistry.js';
 import { SessionPlanner, type SessionRoute } from './sessionPlanner.js';
 import type { CardRef } from './permissionCards.js';
 import type { RelaySender } from '../relay.js';
@@ -1305,6 +1306,15 @@ class FakeCardSink {
   }
 }
 
+/** Where a tap happened, which is the second thing the ownership guard consults: a guild channel
+ *  the thread registry can name, or a DM (`guildId: null`). The default is a guild channel nothing
+ *  knows about — the one case that has to stay allow-and-log. */
+interface FakeLocation {
+  guildId: string | null;
+  channelId: string | null;
+}
+const UNKNOWN_CHANNEL: FakeLocation = { guildId: 'g1', channelId: 'c-unknown' };
+
 /** Everything one component interaction does, recorded. Covers the three shapes the handlers take
  *  (button, select, modal submit) because the ownership guard is identical across them. */
 class FakeInteraction {
@@ -1312,6 +1322,8 @@ class FakeInteraction {
   readonly updates: unknown[] = [];
   readonly followUps: unknown[] = [];
   readonly fields: { getTextInputValue: () => string };
+  readonly guildId: string | null;
+  readonly channelId: string | null;
   deferrals = 0;
   modals = 0;
   constructor(
@@ -1319,8 +1331,11 @@ class FakeInteraction {
     readonly customId: string,
     readonly values: string[] = [],
     text = '',
+    location: FakeLocation = UNKNOWN_CHANNEL,
   ) {
     this.fields = { getTextInputValue: () => text };
+    this.guildId = location.guildId;
+    this.channelId = location.channelId;
   }
   reply(payload: { content?: string }): Promise<void> {
     this.replies.push(payload);
@@ -1350,6 +1365,16 @@ class CardAuthGateway extends DiscordJsGateway {
   readonly sink = new FakeCardSink();
   protected override cardSink(): Promise<SendableChannels> {
     return Promise.resolve(this.sink as unknown as SendableChannels);
+  }
+  /** An executed Stop nudges the session card through the delivery path; keep that off a real
+   *  Discord connection without letting it change what the tap itself did. */
+  protected override sinkFor(): Promise<SendableChannels | undefined> {
+    return Promise.resolve(this.sink as unknown as SendableChannels);
+  }
+  /** What `start()` does with the persisted thread map, without logging in — the half of a
+   *  restart that SURVIVES while the in-memory card registries do not. */
+  loadThreads(): Promise<void> {
+    return this.threadReg.load();
   }
   driveButton(interaction: FakeInteraction): Promise<void> {
     return this.onButton(interaction as unknown as ButtonInteraction);
@@ -1399,6 +1424,12 @@ describe('DiscordJsGateway — only the card owner can answer it', () => {
   /** The first tap of the destructive session-scope Deny: it only SWAPS the row, but that swap is
    *  still an edit of the owner's message. */
   const denySessionId = row[2]?.customId ?? '';
+
+  /** State dirs for the restart cases below, which need a thread map that outlives one gateway. */
+  const dirs: string[] = [];
+  afterEach(async () => {
+    while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
+  });
 
   async function delivered(kind: 'permission' | 'question') {
     const { relay, sent } = addressedFakeRelay();
@@ -1481,9 +1512,10 @@ describe('DiscordJsGateway — only the card owner can answer it', () => {
     expect(gw.questionOwner('q1')).toBe(OWNER);
   });
 
-  // A card this process has no record of (evicted at the FIFO bound, or sent before a restart) has
-  // no owner to compare a tap against. Refusing there would make live cards unanswerable by the
-  // person they were sent to — the failure the guard exists to prevent — so unknown stays allowed.
+  // A card this process has no record of (evicted at the FIFO bound, or sent before a restart),
+  // tapped somewhere nothing can attribute either, has no owner to compare against. Refusing there
+  // would make live cards unanswerable by the person they were sent to — the failure the guard
+  // exists to prevent — so an unattributable tap stays allowed.
   it('does not refuse a tap on a card it has no record of', async () => {
     const { relay, sent } = addressedFakeRelay();
     const gw = new CardAuthGateway({ relay, pairing: stubPairing });
@@ -1493,6 +1525,140 @@ describe('DiscordJsGateway — only the card owner can answer it', () => {
 
     expect(tap.replies.map((r) => r.content)).not.toContain("This card isn't yours.");
     expect(sent).toHaveLength(1);
+  });
+
+  // The in-memory card registries do not survive a restart, and the cards in the thread do. Before
+  // the thread registry was consulted, that meant every outstanding card in a shared thread went
+  // back to being answerable by any member of it the moment the bot came back.
+  describe('after a restart has forgotten who each card belongs to', () => {
+    /** The persisted state a restart finds: the session thread t1 is the OWNER's. Written through
+     *  the real registry, which is what `ensureTarget` writes to before the restart. */
+    async function restartedWithOwnersThread() {
+      const dir = await mkdtemp(join(tmpdir(), 'card-auth-'));
+      dirs.push(dir);
+      const persisted = new PersistentThreadRegistry(dir);
+      await persisted.load();
+      await persisted.record(OWNER, 's1', { kind: 'thread', threadId: 't1' });
+
+      const { relay, sent } = addressedFakeRelay();
+      const gw = new CardAuthGateway({ relay, pairing: stubPairing, stateDir: dir });
+      await gw.loadThreads();
+      // The card itself is gone from memory — that is what "restart" means here.
+      expect(gw.permissionOwner('p1')).toBeUndefined();
+      return { gw, sent };
+    }
+
+    const IN_THREAD = { guildId: 'g1', channelId: 't1' };
+
+    it('still refuses a stranger in the session thread', async () => {
+      const { gw, sent } = await restartedWithOwnersThread();
+      const tap = new FakeInteraction({ id: STRANGER }, approveId, [], '', IN_THREAD);
+
+      await gw.driveButton(tap);
+
+      expect(tap.replies[0]?.content).toBe("This card isn't yours.");
+      expect(tap.updates).toEqual([]);
+      expect(sent).toEqual([]);
+    });
+
+    it('still lets the thread owner answer', async () => {
+      const { gw, sent } = await restartedWithOwnersThread();
+      const tap = new FakeInteraction({ id: OWNER }, approveId, [], '', IN_THREAD);
+
+      await gw.driveButton(tap);
+
+      expect(tap.replies.map((r) => r.content)).not.toContain("This card isn't yours.");
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.userId).toBe(OWNER);
+    });
+
+    it('lets whoever tapped in a DM answer — a DM card is theirs by construction', async () => {
+      const { gw, sent } = await restartedWithOwnersThread();
+      const tap = new FakeInteraction({ id: STRANGER }, approveId, [], '', {
+        guildId: null,
+        channelId: 'dm-2',
+      });
+
+      await gw.driveButton(tap);
+
+      expect(tap.replies.map((r) => r.content)).not.toContain("This card isn't yours.");
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.userId).toBe(STRANGER);
+    });
+  });
+
+  // Stop is the loudest control on the shared surface: it ships on the session card, which lives
+  // in the session's own thread. Guarded only on approve/deny, a thread member could arm it,
+  // confirm it, strip the owner's controls with the `update` each phase performs, and send the
+  // stop to their own daemon.
+  describe('the session card is as guarded as the permission card', () => {
+    const stopArmed = sessionCardButtons({ sessionId: 's1', stoppable: true })[0]?.[0]?.customId;
+    const stopConfirm = encodeButton({
+      action: 'stop',
+      phase: 'confirm',
+      scope: 'na',
+      ts: 0,
+      id: 's1',
+    });
+    const IN_THREAD = { guildId: 'g1', channelId: 't1' };
+
+    async function ownersSessionThread() {
+      const dir = await mkdtemp(join(tmpdir(), 'card-auth-stop-'));
+      dirs.push(dir);
+      const persisted = new PersistentThreadRegistry(dir);
+      await persisted.load();
+      await persisted.record(OWNER, 's1', { kind: 'thread', threadId: 't1' });
+
+      const { relay, sent } = addressedFakeRelay();
+      const gw = new CardAuthGateway({
+        relay,
+        pairing: stubPairing,
+        stateDir: dir,
+        // `resolveTap` ages a Confirm against its arm timestamp; a fixed clock keeps the second
+        // tap inside the window without the test depending on wall time.
+        clock: () => 0,
+      });
+      await gw.loadThreads();
+      return { gw, sent };
+    }
+
+    it("refuses a stranger's FIRST Stop tap, leaving the owner's controls on the card", async () => {
+      const { gw, sent } = await ownersSessionThread();
+      const tap = new FakeInteraction({ id: STRANGER }, stopArmed ?? '', [], '', IN_THREAD);
+
+      await gw.driveButton(tap);
+
+      expect(tap.replies[0]?.content).toBe("This card isn't yours.");
+      // No Confirm/Cancel swapped in: the owner's card still reads "Stop session".
+      expect(tap.updates).toEqual([]);
+      expect(sent).toEqual([]);
+    });
+
+    it("refuses a stranger's CONFIRMED Stop: no frame, no card edit", async () => {
+      const { gw, sent } = await ownersSessionThread();
+      const tap = new FakeInteraction({ id: STRANGER }, stopConfirm, [], '', IN_THREAD);
+
+      await gw.driveButton(tap);
+
+      expect(tap.replies[0]?.content).toBe("This card isn't yours.");
+      expect(tap.updates).toEqual([]);
+      expect(sent).toEqual([]);
+    });
+
+    it('lets the session thread owner arm and confirm their own Stop', async () => {
+      const { gw, sent } = await ownersSessionThread();
+
+      const arm = new FakeInteraction({ id: OWNER }, stopArmed ?? '', [], '', IN_THREAD);
+      await gw.driveButton(arm);
+      expect(arm.updates).toHaveLength(1); // the Confirm/Cancel pair swapped in
+
+      const confirm = new FakeInteraction({ id: OWNER }, stopConfirm, [], '', IN_THREAD);
+      await gw.driveButton(confirm);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.userId).toBe(OWNER);
+      expect(sent[0]?.draft.type).toBe('session.stop');
+    });
   });
 });
 
@@ -1552,17 +1718,30 @@ describe('DiscordJsGateway — a prompt card always reaches the user somehow', (
 // ---------------------------------------------------------------------------
 
 describe('DiscordJsGateway — a demoted session keeps its thread', () => {
+  /** The clock every gateway in this suite reads, so a test can step past the probe backoff
+   *  instead of waiting it out. */
+  let now = 1_000_000;
+
   /** A gateway whose thread channel can be made unsendable mid-session — what a transient
    *  permission loss looks like to `sinkFor`, exercised through the real demotion path rather than
-   *  a seeded registry entry. */
+   *  a seeded registry entry. `fetchChannelById` (not `fetchThreadChannel`) is the seam, so the
+   *  real "is this sendable?" step — including what it does with a REJECTED fetch — is under test
+   *  rather than stubbed out. */
   class DemotableGateway extends DiscordJsGateway {
     sendable = true;
+    /** Make the fetch REJECT rather than answer "not sendable" — a deleted thread, which
+     *  discord.js reports by throwing and not by returning null. */
+    rejectFetch = false;
+    fetches = 0;
     readonly thread = new FakeSink();
     readonly dm = new FakeSink();
-    protected override fetchThreadChannel(): Promise<SendableChannels | undefined> {
-      return Promise.resolve(
-        this.sendable ? (this.thread as unknown as SendableChannels) : undefined,
-      );
+    protected override fetchChannelById(): Promise<Channel | null> {
+      this.fetches += 1;
+      if (this.rejectFetch) return Promise.reject(new Error('Unknown Channel'));
+      return Promise.resolve({
+        isSendable: () => this.sendable,
+        send: (payload: unknown) => this.thread.send(payload),
+      } as unknown as Channel);
     }
     protected override fetchDmChannel(): Promise<SendableChannels> {
       return Promise.resolve(this.dm as unknown as SendableChannels);
@@ -1587,11 +1766,13 @@ describe('DiscordJsGateway — a demoted session keeps its thread', () => {
   /** s1 runs and ends in thread t1; s2 is its resume, bound to the SAME thread — the ordinary
    *  shape of a thread that has outlived one session. */
   async function twoSessionsInOneThread() {
+    now = 1_000_000;
     const { relay, sent } = addressedFakeRelay();
     const parent = fakeThreadParent();
     const gw = new DemotableGateway({
       relay,
       pairing: stubPairing,
+      clock: () => now,
       sessionChannelResolver: () => Promise.resolve(parent),
     });
     await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
@@ -1640,10 +1821,66 @@ describe('DiscordJsGateway — a demoted session keeps its thread', () => {
     const threadSends = gw.thread.sends.length;
 
     gw.sendable = true;
+    // Past the probe backoff: a thread that just failed is taken at its word for a window, so the
+    // re-attach happens on the first frame that is allowed to ask again.
+    now += 60_001;
     await gw.deliver('u1', envelope('session.status', { sessionId: 's2', state: 'orphaned' }));
 
     expect(gw.thread.sends.length).toBeGreaterThan(threadSends); // back in the thread
     expect(gw.dm.sends.length).toBe(dmSends); // and not also in the DM
+  });
+
+  it('delivers to the DM when the thread fetch REJECTS, instead of dropping the frame', async () => {
+    const { gw } = await twoSessionsInOneThread();
+    const threadSends = gw.thread.sends.length;
+
+    // A deleted thread: discord.js has no null path for it, `channels.fetch` simply throws. That
+    // throw used to escape the delivery sink and the frame was logged and lost.
+    gw.rejectFetch = true;
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's2', state: 'waiting_input' }));
+
+    expect(gw.dm.sends.length).toBeGreaterThan(0);
+    expect(gw.thread.sends.length).toBe(threadSends);
+  });
+
+  it('does not re-fetch a failing thread on every frame', async () => {
+    const { gw } = await twoSessionsInOneThread();
+    gw.rejectFetch = true;
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's2', state: 'waiting_input' }));
+    const afterDemotion = gw.fetches;
+
+    // Three more frames inside the backoff window: each still lands in the DM, none costs a fetch.
+    const dmSends = gw.dm.sends.length;
+    for (const state of ['running', 'waiting_input', 'running'] as const) {
+      await gw.deliver('u1', envelope('session.status', { sessionId: 's2', state }));
+    }
+    expect(gw.fetches).toBe(afterDemotion);
+    expect(gw.dm.sends.length).toBeGreaterThan(dmSends);
+  });
+
+  it('routes a prompt card the same way the session frames go', async () => {
+    const { gw } = await twoSessionsInOneThread();
+    // Demote s2, then let the thread recover WITHOUT another session.status to re-record it: the
+    // registry still says `dm`, and the thread's own state line still says the card is here.
+    gw.sendable = false;
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's2', state: 'waiting_input' }));
+    gw.sendable = true;
+    now += 60_001;
+
+    const threadSends = gw.thread.sends.length;
+    const dmSends = gw.dm.sends.length;
+    await gw.deliver(
+      'u1',
+      envelope('permission.request', {
+        requestId: 'p9',
+        sessionId: 's2',
+        tool: 'Bash',
+        summary: 'run the tests',
+      }),
+    );
+
+    expect(gw.thread.sends.length).toBeGreaterThan(threadSends);
+    expect(gw.dm.sends.length).toBe(dmSends);
   });
 });
 
