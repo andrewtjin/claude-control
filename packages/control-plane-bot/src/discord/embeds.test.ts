@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type { EmbedBuilder } from 'discord.js';
+import type { APIEmbed, EmbedBuilder } from 'discord.js';
 import type {
   AccountUsage,
   TokenStatsSnapshot,
@@ -1465,6 +1465,20 @@ describe('embed builders survive an over-long untrusted field', () => {
   const FIELD_NAME_MAX = 256;
   const FIELD_VALUE_MAX = 1024;
   const FOOTER_MAX = 2048;
+  const FIELD_COUNT_MAX = 25;
+  const EMBED_TOTAL_MAX = 6000;
+
+  /** What Discord charges against {@link EMBED_TOTAL_MAX}. Re-derived here rather than imported,
+   *  so the assertion is the API's rule and not the module's reading of it. */
+  function embedTextLength(json: APIEmbed): number {
+    return (
+      (json.title?.length ?? 0) +
+      (json.description?.length ?? 0) +
+      (json.footer?.text.length ?? 0) +
+      (json.author?.name.length ?? 0) +
+      (json.fields ?? []).reduce((sum, f) => sum + f.name.length + f.value.length, 0)
+    );
+  }
 
   const hostileAccount = account({
     accountId: HOSTILE,
@@ -1641,5 +1655,133 @@ describe('embed builders survive an over-long untrusted field', () => {
       expect(field.value.length).toBeLessThanOrEqual(FIELD_VALUE_MAX);
     }
     expect((json.footer?.text ?? '').length).toBeLessThanOrEqual(FOOTER_MAX);
+    expect((json.fields ?? []).length).toBeLessThanOrEqual(FIELD_COUNT_MAX);
+    expect(embedTextLength(json)).toBeLessThanOrEqual(EMBED_TOTAL_MAX);
+  });
+
+  // The other half of the same question. Above, ONE slot is hostile and the rest of the snapshot
+  // is ordinary; here every slot is ordinary and the SNAPSHOT is the hostile part — more accounts,
+  // more sessions, more rows than one embed can hold. Clamping each field's LENGTH answers the
+  // first and nothing about the second: the field COUNT and the embed's TOTAL size are ceilings of
+  // their own, and the total is not validated locally at all — an embed that breaks it builds
+  // cleanly here and is refused by the API at send, so the card simply never appears.
+  const many = <T>(make: (i: number) => T): T[] => Array.from({ length: 30 }, (_, i) => make(i));
+  const fatAccounts = many((i) =>
+    account({
+      accountId: `acct-${i}`,
+      label: `account-number-${i}`,
+      error: 'usage endpoint rate-limited (429)',
+      limits: [
+        { kind: 'session', percent: 42, isActive: true },
+        { kind: 'weekly_all', percent: 61, isActive: false },
+        { kind: 'weekly_scoped', percent: 12, isActive: false },
+      ],
+    }),
+  );
+  /** 24 sessions whose summaries alone are 24,000 characters: under the FIELD cap, far over the
+   *  total — the shape that used to build without complaint and die at the API. */
+  const fatSessions: SessionStatus[] = Array.from({ length: 24 }, (_, i) => ({
+    sessionId: `session-${i}`,
+    state: 'running',
+    summary: 'x'.repeat(1000),
+  }));
+
+  const fatCases: [string, () => EmbedBuilder][] = [
+    ['buildUsageEmbed', () => buildUsageEmbed({ accounts: fatAccounts, plan: hostilePlan })],
+    ['buildTimelineEmbed', () => buildTimelineEmbed({ accounts: fatAccounts, plan: hostilePlan })],
+    ['buildAccountsEmbed', () => buildAccountsEmbed(fatAccounts)],
+    [
+      'buildSessionListEmbed',
+      () =>
+        buildSessionListEmbed(
+          many((i) => ({ sessionId: `session-${i}`, state: 'running', summary: 'x'.repeat(200) })),
+        ),
+    ],
+    ['buildSessionListEmbed (long summaries)', () => buildSessionListEmbed(fatSessions)],
+    [
+      'buildAnsweredQuestionEmbed',
+      () =>
+        buildAnsweredQuestionEmbed(
+          many((i) => ({ question: `Question ${i}?`, selected: ['x'.repeat(500)] })),
+        ),
+    ],
+  ];
+
+  it.each(fatCases)('%s stays within every ceiling on a fleet-sized snapshot', (_name, build) => {
+    const json = build().toJSON();
+    expect((json.fields ?? []).length).toBeLessThanOrEqual(FIELD_COUNT_MAX);
+    expect(embedTextLength(json)).toBeLessThanOrEqual(EMBED_TOTAL_MAX);
+    for (const field of json.fields ?? []) {
+      expect(field.value.length).toBeLessThanOrEqual(FIELD_VALUE_MAX);
+      // An empty value is rejected exactly as hard as an over-long one.
+      expect(field.value.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('says how many entries the field cap cost instead of dropping them silently', () => {
+    const json = buildSessionListEmbed(
+      many((i) => ({ sessionId: `session-${i}`, state: 'running' })),
+    ).toJSON();
+    // 24 sessions, then one field accounting for the 6 that did not fit.
+    expect(json.fields).toHaveLength(FIELD_COUNT_MAX);
+    expect(json.fields?.[FIELD_COUNT_MAX - 1]?.value).toBe('… and 6 more');
+    expect(json.fields?.[0]?.name).toBe('session-0');
+  });
+
+  it('shrinks oversized fields evenly rather than dropping the tail of the list', () => {
+    const json = buildSessionListEmbed(fatSessions).toJSON();
+    // Every session the reader asked about is still listed; each one is shorter.
+    expect(json.fields).toHaveLength(fatSessions.length);
+    const lengths = (json.fields ?? []).map((f) => f.value.length);
+    expect(Math.max(...lengths) - Math.min(...lengths)).toBeLessThanOrEqual(1);
+    expect(embedTextLength(json)).toBeLessThanOrEqual(EMBED_TOTAL_MAX);
+  });
+});
+
+describe('the reauth login link is measured as it will be RENDERED', () => {
+  const linkCard = (url: string): string =>
+    buildReauthLinkEmbed({
+      label: 'spare',
+      accountId: 'acct-9',
+      url,
+      expiresAt: 1_700_000_000_000,
+    }).toJSON().description ?? '';
+
+  it('refuses a URL whose escaped form is too long, keeping the paste step readable', () => {
+    // Under 2048 raw, ~6000 once every `(` becomes `%28` — and the description clamp then cut the
+    // link mid-target, so the card carried an unclosed link and no steps beneath it.
+    const description = linkCard(`https://claude.ai/oauth/authorize?state=${'('.repeat(2000)}`);
+
+    expect(description).not.toContain('[Open the login page]');
+    expect(description).toContain('malformed');
+    // What the card exists for survives: the reader is told what to copy and where to paste it.
+    expect(description).toContain('Paste code');
+    expect(description).toContain('Link expires');
+    expect(description.length).toBeLessThanOrEqual(4096);
+  });
+
+  it('still renders a long-but-escapable URL, whole, with every step under it', () => {
+    const url = `https://claude.ai/oauth/authorize?state=${'x'.repeat(1990)}`;
+    const description = linkCard(url);
+
+    // The link is all-or-nothing: a truncated URL is a link to somewhere else.
+    expect(description).toContain(`[Open the login page](<${url}>)`);
+    expect(description).toContain('Paste code');
+    expect(description.length).toBeLessThanOrEqual(4096);
+  });
+
+  it('gives the steps the budget and lets an absurd account label give way', () => {
+    const description =
+      buildReauthLinkEmbed({
+        label: 'y'.repeat(10_000),
+        accountId: 'acct-9',
+        url: 'https://claude.ai/oauth/authorize?code=true',
+        expiresAt: 1_700_000_000_000,
+      }).toJSON().description ?? '';
+
+    expect(description).toContain('[Open the login page]');
+    expect(description).toContain('Paste code');
+    expect(description).toContain('Link expires');
+    expect(description.length).toBeLessThanOrEqual(4096);
   });
 });

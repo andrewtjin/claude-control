@@ -3,7 +3,7 @@
 // No network calls, no Interaction objects — every function here is a straight data
 // transform, which is what makes it unit-testable via `.toJSON()` without a real bot.
 
-import { EmbedBuilder, type APIEmbed } from 'discord.js';
+import { EmbedBuilder, type APIEmbed, type APIEmbedField } from 'discord.js';
 import type {
   AccountUsage,
   PayloadOf,
@@ -59,6 +59,27 @@ const TITLE_MAX = 256;
 
 /** Discord's cap on an embed footer's `text`, validated like the rest. */
 const FOOTER_MAX = 2048;
+
+/** Discord's cap on the NUMBER of fields in one embed. discord.js validates it exactly like the
+ *  per-part lengths — offering a 26th field throws and costs the whole command — so it has to be
+ *  enforced AT the add, not in a pass over a finished embed. */
+const FIELD_COUNT_MAX = 25;
+
+/** Discord's cap on the SUM of an embed's text parts (title + description + every field name and
+ *  value + footer + author). The one limit discord.js does NOT validate: an embed whose parts are
+ *  each legal still builds cleanly, and the API refuses it at send — so the failure surfaces as a
+ *  card that simply never appears, with a swallowed send error as its only trace. */
+const EMBED_TOTAL_MAX = 6000;
+
+/** Name of the field that takes the tail's place once there are more fields than Discord accepts.
+ *  A visible marker, not a silent drop: the reader has to be able to tell the list was cut. */
+const OVERFLOW_FIELD_NAME = '…';
+
+/** How many fields an embed has lost at {@link FIELD_COUNT_MAX}, so its marker can say how many.
+ *  Weak and keyed by the builder because the count belongs to the embed being built and must not
+ *  outlive it; threading a counter through every builder would put the bookkeeping back in the
+ *  call sites this module exists to keep free of it. */
+const droppedFieldCounts = new WeakMap<EmbedBuilder, number>();
 
 /** Longest URL this module will render as a markdown link. A login link is a bounded thing (an
  *  authorize endpoint plus query parameters); past this it is malformed, and a link that cannot
@@ -121,13 +142,102 @@ export function clampFieldValue(value: string, max = FIELD_VALUE_MAX): string {
   return `${(kept[0] ?? '').slice(0, max - 1)}…`;
 }
 
+/** The one place a field is added to an embed in this module, so the COUNT cap cannot be bypassed
+ *  by a builder that clamps its strings and then loops over an unbounded snapshot. Past the cap
+ *  the LAST slot is given up to a running counter: a 26th field makes discord.js throw and costs
+ *  the whole card, where a counter costs the tail and says so. Both halves of `field` are already
+ *  clamped by the caller — this is only the count half of the job. */
+function addFieldWithinCount(embed: EmbedBuilder, field: APIEmbedField): void {
+  const fields = embed.data.fields ?? [];
+  if (fields.length >= FIELD_COUNT_MAX) {
+    const already = droppedFieldCounts.get(embed);
+    // The first overflow also costs the field the marker REPLACES, which is why it starts at 2.
+    const dropped = already === undefined ? 2 : already + 1;
+    droppedFieldCounts.set(embed, dropped);
+    embed.spliceFields(FIELD_COUNT_MAX - 1, 1, {
+      name: OVERFLOW_FIELD_NAME,
+      value: `… and ${dropped} more`,
+    });
+    return;
+  }
+  embed.addFields(field);
+}
+
 /** `addFields` with BOTH halves clamped — every data-driven field in this module goes through
  *  here so no snapshot shape (more accounts, more limits, longer labels, a pathological session
  *  id) can ever make a command throw at the validation layer again. The name is clamped as well
  *  as the value because a field name is just as often wire-supplied (an account label, a session
  *  id, a question) and discord.js rejects an over-long one exactly as hard. */
 function addClampedField(embed: EmbedBuilder, name: string, value: string): void {
-  embed.addFields({ name: clampTitle(name), value: clampFieldValue(value) });
+  addFieldWithinCount(embed, { name: clampTitle(name), value: clampFieldValue(value) });
+}
+
+/** The characters Discord counts against {@link EMBED_TOTAL_MAX}. Read off `embed.data` rather
+ *  than `toJSON()` because this runs on every build and the JSON copy is pure waste here. */
+function embedTextLength(embed: EmbedBuilder): number {
+  const data = embed.data;
+  return (
+    (data.title?.length ?? 0) +
+    (data.description?.length ?? 0) +
+    (data.footer?.text.length ?? 0) +
+    (data.author?.name.length ?? 0) +
+    (data.fields ?? []).reduce((sum, f) => sum + f.name.length + f.value.length, 0)
+  );
+}
+
+/** Split `budget` characters across field values, SHORTEST first so a field already under its
+ *  fair share hands its surplus to the longer ones instead of every field being cut to the same
+ *  length. Clamping is by whole lines (see {@link clampFieldValue}), for the same reason it is
+ *  there: a mid-line cut can leave half an emoji-sprite token on screen. */
+function shareValueBudget(fields: readonly APIEmbedField[], budget: number): APIEmbedField[] {
+  const values = fields.map((f) => f.value);
+  const shortestFirst = values
+    .map((_, index) => index)
+    .sort((a, b) => (values[a]?.length ?? 0) - (values[b]?.length ?? 0));
+  let remaining = budget;
+  let slots = shortestFirst.length;
+  for (const index of shortestFirst) {
+    // At least one character per field: a value of '' is rejected by discord.js, and an empty
+    // slot would read as a rendering bug rather than as a field that had to give way.
+    const share = Math.max(1, Math.floor(remaining / slots));
+    const value = values[index] ?? '';
+    values[index] = value.length > share ? clampFieldValue(value, share) : value;
+    remaining -= values[index]?.length ?? 0;
+    slots -= 1;
+  }
+  return fields.map((f, index) => ({ ...f, value: values[index] ?? f.value }));
+}
+
+/**
+ * The last step of every builder here: bring a finished embed under Discord's TOTAL ceiling.
+ *
+ * Field VALUES give way first, and evenly, because they are the bulk and every multi-field embed
+ * in this module is a list of PEERS — shrinking all of them keeps the shape of the answer, where
+ * cutting the tail would silently drop whole accounts or sessions the reader asked about. Only
+ * when the parts this cannot shrink are themselves over budget (a long description; 25 long field
+ * NAMES, which alone can reach 6400 characters) does it fall back to trimming the description and
+ * then dropping trailing fields.
+ */
+function fitEmbed(embed: EmbedBuilder): EmbedBuilder {
+  if (embedTextLength(embed) <= EMBED_TOTAL_MAX) return embed;
+  const fields = embed.data.fields ?? [];
+  if (fields.length > 0) {
+    // Everything that is not a field value is fixed cost by now; what is left is what the values
+    // share between them.
+    const fixed = embedTextLength(embed) - fields.reduce((sum, f) => sum + f.value.length, 0);
+    embed.setFields(shareValueBudget(fields, Math.max(0, EMBED_TOTAL_MAX - fixed)));
+  }
+  const description = embed.data.description;
+  if (description !== undefined && embedTextLength(embed) > EMBED_TOTAL_MAX) {
+    const over = embedTextLength(embed) - EMBED_TOTAL_MAX;
+    embed.setDescription(clampFieldValue(description, Math.max(1, description.length - over)));
+  }
+  // Last resort, and only reachable when the field NAMES alone overrun the budget: drop from the
+  // end, which is the least-relevant entry on every list this module renders.
+  while (embedTextLength(embed) > EMBED_TOTAL_MAX && (embed.data.fields?.length ?? 0) > 0) {
+    embed.spliceFields((embed.data.fields?.length ?? 1) - 1, 1);
+  }
+  return embed;
 }
 
 // The default bar renderer is the credential-free unicode `layeredBar`. It is injected as an
@@ -251,9 +361,9 @@ export function buildUsageEmbed(
     addClampedField(embed, 'Plan', lines.join('\n'));
   }
   if (usage.accounts.length > 0) {
-    embed.addFields(pacingField(usage.accounts, nowMs, usage.burnUnitsPerDay));
+    addPacingField(embed, usage.accounts, nowMs, usage.burnUnitsPerDay);
   }
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** The "Pacing" field shared by `/usage` and `/timeline`: the fleet verdict layered on top of
@@ -266,11 +376,12 @@ export function buildUsageEmbed(
  *  they ride in on the snapshot. When a daemon predates them they are simply absent, and the
  *  model says so in `notes` rather than substituting a guess — this field never prints a
  *  verdict it cannot support. */
-function pacingField(
+function addPacingField(
+  embed: EmbedBuilder,
   accounts: AccountUsage[],
   nowMs: number,
   burnUnitsPerDay: number | undefined,
-): { name: string; value: string } {
+): void {
   const pacing = computePacing(timelineInputFromWire(accounts), {
     nowMs,
     // exactOptionalPropertyTypes forbids an explicit `undefined`, and the distinction is
@@ -278,7 +389,10 @@ function pacingField(
     ...(burnUnitsPerDay !== undefined ? { burnUnitsPerDay } : {}),
   });
   const lines = [pacing.headline, ...pacing.notes.map((n) => `• ${n}`)];
-  return { name: 'Pacing', value: truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT) };
+  // Added rather than returned, so the verdict goes through the same counted helper as every
+  // other field: a fleet large enough to fill the embed must not be able to push this one past
+  // the field cap and take the whole command down with it.
+  addClampedField(embed, 'Pacing', truncateLabeled(lines.join('\n'), EMBED_FIELD_VALUE_LIMIT));
 }
 
 /** "weekly resets <t:...:R>" — the reset line appended to an account's `/usage` field, or empty
@@ -321,7 +435,7 @@ export function buildTimelineEmbed(
   const outlook = computeOutlook(timelineInputFromWire(usage.accounts), nowMs);
   const embed = new EmbedBuilder().setTitle('Reset timeline').setColor(usageColor(usage.accounts));
   if (outlook.accounts.length === 0) {
-    return embed.setDescription('No accounts reported yet.');
+    return fitEmbed(embed.setDescription('No accounts reported yet.'));
   }
 
   // One shared span (now → last known reset) so every account's track uses the same
@@ -413,8 +527,8 @@ export function buildTimelineEmbed(
     for (const adv of usage.plan.advisories) planLines.push(`• ${adv.message}`);
     addClampedField(embed, 'Plan', planLines.join('\n'));
   }
-  embed.addFields(pacingField(usage.accounts, nowMs, usage.burnUnitsPerDay));
-  return embed;
+  addPacingField(embed, usage.accounts, nowMs, usage.burnUnitsPerDay);
+  return fitEmbed(embed);
 }
 
 /** What a reset means for planning: a session reset frees the window; a weekly reset
@@ -494,8 +608,10 @@ export function buildStatsEmbed(stats: TokenStatsSnapshot): EmbedBuilder {
 
   if (stats.overall.turns === 0) {
     addClampedField(embed, 'Coverage', coverageLine(stats.coverage));
-    return embed.setDescription(
-      `No Claude Code turns recorded on the host in the last ${days} day${days === 1 ? '' : 's'}.`,
+    return fitEmbed(
+      embed.setDescription(
+        `No Claude Code turns recorded on the host in the last ${days} day${days === 1 ? '' : 's'}.`,
+      ),
     );
   }
 
@@ -516,7 +632,7 @@ export function buildStatsEmbed(stats: TokenStatsSnapshot): EmbedBuilder {
       `cache read ${formatTokens(stats.overall.cacheRead)}`,
   );
   addClampedField(embed, 'Coverage', coverageLine(stats.coverage));
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** `/accounts` — a lighter listing than `/usage`: which accounts exist and whether each is
@@ -525,7 +641,7 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
   const embed = new EmbedBuilder().setTitle('Accounts').setColor(COLOR_INFO);
   if (accounts.length === 0) {
     embed.setDescription('No accounts reported yet.');
-    return embed;
+    return fitEmbed(embed);
   }
   for (const account of accounts) {
     // "source: cached" alone hides HOW stale — show the true fetch age and any failure
@@ -537,7 +653,7 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
       `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
     );
   }
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** `/sessions` — every session the daemon has reported a status for, most-recent value per
@@ -550,7 +666,7 @@ export function buildSettingsEmbed(snapshot: SettingsSnapshot): EmbedBuilder {
     const source = s.source === 'default' ? '' : ` _(via ${s.source})_`;
     return `**${s.name}** — ${s.value}${source}`;
   });
-  return (
+  return fitEmbed(
     new EmbedBuilder()
       .setTitle('Daemon settings')
       .setColor(COLOR_INFO)
@@ -558,7 +674,7 @@ export function buildSettingsEmbed(snapshot: SettingsSnapshot): EmbedBuilder {
       // long settings list degrades to its head rather than making `/settings` throw.
       .setDescription(clampDescription(lines.join('\n')))
       .setFooter({ text: 'as of daemon start' })
-      .setTimestamp(snapshot.startedAtMs)
+      .setTimestamp(snapshot.startedAtMs),
   );
 }
 
@@ -566,14 +682,14 @@ export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
   const embed = new EmbedBuilder().setTitle('Sessions').setColor(COLOR_INFO);
   if (sessions.length === 0) {
     embed.setDescription('No sessions reported yet.');
-    return embed;
+    return fitEmbed(embed);
   }
   for (const session of sessions) {
     // Summaries are daemon-relayed model text — unbounded, so clamp like everything else.
     const summaryLine = session.summary ? ` — ${session.summary}` : '';
     addClampedField(embed, session.sessionId, `${session.state}${summaryLine}`);
   }
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** Rendered for an incoming permission.request push — actionable in EVERY permission mode.
@@ -602,7 +718,7 @@ export function buildPermissionRequestEmbed(
     .setFooter({ text: `Approve or Deny below · or /approve /deny${modeNote}` });
   // Detail is hook-supplied tool input — unbounded (a long Bash command, a big diff).
   if (detail) addClampedField(embed, 'Detail', detail);
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** Human title per lapse reason — the phone reader's only cue for WHY the buttons died, since
@@ -643,12 +759,12 @@ export function buildQuestionEmbed(
     // own clamp goes to the formatter (rather than the plain `addClampedField`) so it can measure
     // its row-rule choice through the real cut, and so what it cut is closed behind it: the
     // output is fenced, and an eight-row table already overruns a field.
-    embed.addFields({
+    addFieldWithinCount(embed, {
       name: clampTitle(name),
       value: formatTablesClamped(q.question, FIELD_VALUE_MAX, clampFieldValue),
     });
   });
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** Rendered onto the ORIGINAL card once every question is answered: a success-accent record of
@@ -667,7 +783,7 @@ export function buildAnsweredQuestionEmbed(
     // addClampedField clamps the name (the question text) as well as the value.
     addClampedField(embed, answer.question, lines.length > 0 ? lines.join('\n') : '(no selection)');
   }
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** Human title per question-lapse reason. Parity with LAPSE_TITLE (the permission version): the
@@ -691,7 +807,7 @@ export function buildLapsedQuestionEmbed(
   original?: APIEmbed,
 ): EmbedBuilder {
   const embed = original ? EmbedBuilder.from(original) : new EmbedBuilder();
-  return embed.setTitle(QUESTION_LAPSE_TITLE[reason]).setColor(COLOR_MUTED);
+  return fitEmbed(embed.setTitle(QUESTION_LAPSE_TITLE[reason]).setColor(COLOR_MUTED));
 }
 
 /** Rendered for a permission.lapsed push: the hold ended without a phone decision, so the card
@@ -707,7 +823,7 @@ export function buildLapsedPermissionEmbed(
   original?: APIEmbed,
 ): EmbedBuilder {
   const embed = original ? EmbedBuilder.from(original) : new EmbedBuilder();
-  return embed.setTitle(LAPSE_TITLE[reason]).setColor(COLOR_MUTED);
+  return fitEmbed(embed.setTitle(LAPSE_TITLE[reason]).setColor(COLOR_MUTED));
 }
 
 /** A completed tool run's output as a COMPACT card: a glanceable few-line preview fenced in
@@ -742,7 +858,7 @@ export function buildToolOutputEmbed(p: {
     // session id, neither of which this side bounds.
     embed.setFooter({ text: truncateLabeled(p.footer, FOOTER_MAX) });
   }
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** `hook.notification` Stop event → the "done" card: WHAT Claude finished saying, not a bare
@@ -765,7 +881,7 @@ export function buildDoneEmbed(p: {
     .setColor(NOTIFICATION_COLOR.done)
     .setDescription(formatTablesClamped(message, EMBED_DESCRIPTION_LIMIT, truncateLabeled));
   if (p.sessionId) addClampedField(embed, 'Session', p.sessionId);
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** `hook.notification` with `notification_type: 'idle_prompt'` → the "waiting on you" card: the
@@ -788,7 +904,7 @@ export function buildWaitingEmbed(p: {
         : 'A session is waiting for your reply.',
     );
   if (p.sessionId) addClampedField(embed, 'Session', p.sessionId);
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** A quarantine notice → the "account down" card. Two recovery paths now exist, so the card
@@ -818,7 +934,7 @@ export function buildQuarantineEmbed(p: {
     `From here: \`${p.reauthCommand}\` — open the link, log in, paste the code back.\n` +
       `On the host: \`${p.reloginCommand}\`, then \`cctl switch <label>\`.`,
   );
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** The reauth login-link card. Its job is to make the ONE thing that can go wrong — logging
@@ -832,30 +948,38 @@ export function buildReauthLinkEmbed(p: {
   url: string;
   expiresAt: number;
 }): EmbedBuilder {
-  // A URL longer than this cannot be a working login link on any surface, and rendering one would
-  // only mean a link that silently goes nowhere — so it is named as broken rather than shown.
+  // Measured on the RENDERED target, not the raw URL: `markdownLinkTarget` percent-escapes, and a
+  // parenthesis-heavy URL roughly triples in length there. Against the raw length an over-long
+  // link passed for renderable, blew the description budget, and was cut mid-target — leaving an
+  // unclosed link and no steps under it, on the one card an account is recovered through. A URL
+  // this long cannot be a working login link on any surface, so it is named as broken instead.
+  const target = markdownLinkTarget(p.url);
   const step1 =
-    p.url.length <= LINK_TARGET_MAX
-      ? `1. [Open the login page](${markdownLinkTarget(p.url)}) and sign in.\n`
+    target.length <= LINK_TARGET_MAX
+      ? `1. [Open the login page](${target}) and sign in.\n`
       : `1. ⚠️ The login link came through malformed (${p.url.length} characters) — re-run the ` +
         `re-auth, or log in at the host.\n`;
-  return (
+  // The steps are what the card exists for — a reader who cannot see "Tap Paste code" cannot
+  // finish the login — so they are assembled first and the budget is measured against them.
+  const steps =
+    step1 +
+    `2. The page shows a code like \`AbCd1234#xYz\` — copy the WHOLE thing, including the ` +
+    `part after the \`#\`.\n` +
+    `3. Tap **Paste code** below.\n\n` +
+    `Link expires <t:${Math.floor(p.expiresAt / 1000)}:R>.`;
+  // Label and account id arrive from the daemon and are unbounded, so the INTRO is what gives way
+  // to keep the steps whole. Clamping the finished description instead would cut the tail, which
+  // is exactly the part that has to survive.
+  const intro = clampFieldValue(
+    `Log back into **${p.label}** (${p.accountId}). You must sign in as the SAME account — ` +
+      `a different login is refused so its usage history stays intact.\n\n`,
+    Math.max(1, EMBED_DESCRIPTION_LIMIT - steps.length),
+  );
+  return fitEmbed(
     new EmbedBuilder()
       .setTitle('🔑 Re-authenticate account')
       .setColor(COLOR_WARN)
-      // Label, account id and URL all arrive from the daemon; the clamp keeps a pathological one
-      // from taking down the card that is the user's only way back into the account.
-      .setDescription(
-        clampDescription(
-          `Log back into **${p.label}** (${p.accountId}). You must sign in as the SAME account — ` +
-            `a different login is refused so its usage history stays intact.\n\n` +
-            step1 +
-            `2. The page shows a code like \`AbCd1234#xYz\` — copy the WHOLE thing, including the ` +
-            `part after the \`#\`.\n` +
-            `3. Tap **Paste code** below.\n\n` +
-            `Link expires <t:${Math.floor(p.expiresAt / 1000)}:R>.`,
-        ),
-      )
+      .setDescription(clampDescription(intro + steps)),
   );
 }
 
@@ -863,20 +987,24 @@ export function buildReauthLinkEmbed(p: {
  *  (vault-only vs live-files healed, identity verified or not), so this renders it verbatim
  *  rather than re-deriving copy from the flags. */
 export function buildReauthResultEmbed(ok: boolean, message: string): EmbedBuilder {
-  return new EmbedBuilder()
-    .setTitle(ok ? '✅ Re-authenticated' : 'Re-auth failed')
-    .setColor(ok ? COLOR_OK : COLOR_WARN)
-    .setDescription(truncateLabeled(message, EMBED_DESCRIPTION_LIMIT));
+  return fitEmbed(
+    new EmbedBuilder()
+      .setTitle(ok ? '✅ Re-authenticated' : 'Re-auth failed')
+      .setColor(ok ? COLOR_OK : COLOR_WARN)
+      .setDescription(truncateLabeled(message, EMBED_DESCRIPTION_LIMIT)),
+  );
 }
 
 /** Rendered for an incoming switch.result push. The daemon's message is unbounded on the wire
  *  (it can carry a vault error verbatim), so it is clamped for the same reason the permission
  *  summary is: an over-long one would take the whole card down instead of its tail. */
 export function buildSwitchResultEmbed(ok: boolean, message: string): EmbedBuilder {
-  return new EmbedBuilder()
-    .setTitle(ok ? 'Switched' : 'Switch failed')
-    .setColor(ok ? COLOR_OK : COLOR_WARN)
-    .setDescription(clampDescription(message));
+  return fitEmbed(
+    new EmbedBuilder()
+      .setTitle(ok ? 'Switched' : 'Switch failed')
+      .setColor(ok ? COLOR_OK : COLOR_WARN)
+      .setDescription(clampDescription(message)),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +1119,7 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
   if (model.accountId) addClampedField(embed, 'Account', model.accountId);
   const notes = sessionNotes(model);
   if (notes) addClampedField(embed, 'Notes', notes);
-  return embed;
+  return fitEmbed(embed);
 }
 
 /** The final summary card, posted as its OWN message when a session reaches a terminal state — a
@@ -1009,8 +1137,8 @@ export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder 
     );
   addClampedField(embed, 'Session', model.sessionId);
   if (model.accountId) addClampedField(embed, 'Account', model.accountId);
-  embed.addFields({ name: 'Output', value: `${model.totalOutputChars} chars streamed` });
+  addClampedField(embed, 'Output', `${model.totalOutputChars} chars streamed`);
   const notes = sessionNotes(model);
   if (notes) addClampedField(embed, 'Notes', notes);
-  return embed;
+  return fitEmbed(embed);
 }
