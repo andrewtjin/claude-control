@@ -480,6 +480,10 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     switchEngine: engine,
     sessionManager,
     poller,
+    // The same policy object the executor and the plan read, handed over explicitly so the
+    // probe's view of which limits count never depends on whether greedy mode set it on the
+    // poller: a non-greedy run would otherwise fall back to the policy's defaults.
+    autoSwitchPolicy,
     attributionJournal,
     hookReceiver,
     controlPlaneClient,

@@ -34,6 +34,7 @@ export {
   type PollAccount,
   type UsagePollerOptions,
   type AccountPollResult,
+  type PollCycleResult,
   type SnapshotResult,
 } from './usagePoller.js';
 
