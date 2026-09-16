@@ -68,7 +68,23 @@ export interface ChannelInjection {
 }
 
 export type EnqueueResult =
-  { ok: true; injectId: string } | { ok: false; reason: 'not_attached' | 'queue_full' };
+  | {
+      ok: true;
+      injectId: string;
+      /** When this registry stamped the item. Returned rather than re-derived by the caller,
+       *  which mirrors the item to durable storage: a second clock read there would give one
+       *  prompt two queue times, and that value is what both the TTL and the delivery order are
+       *  computed from. */
+      queuedAtMs: number;
+    }
+  | { ok: false; reason: 'not_attached' | 'queue_full' };
+
+/** What {@link ChannelRegistry.restore} could and could not take back. */
+export interface RestoreResult {
+  accepted: ChannelInjection[];
+  /** Refused for want of room. The caller still owns these and must leave them where they were. */
+  rejected: ChannelInjection[];
+}
 
 /** Why a `take` is happening. A client asking for work is evidence it is alive; the daemon
  *  pushing into a socket it is already holding is evidence of nothing — see {@link
@@ -214,7 +230,52 @@ export class ChannelRegistry {
     };
     queue.push(injection);
     this.onEnqueue?.(attachment.attachId);
-    return { ok: true, injectId: injection.injectId };
+    return { ok: true, injectId: injection.injectId, queuedAtMs: injection.queuedAtMs };
+  }
+
+  /**
+   * Put prompts this session had ALREADY accepted back on its channel, keeping their identity and
+   * their original queue time.
+   *
+   * The counterpart of the fallback the daemon does on detach. That fallback is one-way on its
+   * own: a prompt handed back to the turn-boundary queue waits for a boundary that an idle
+   * session may never reach, so when a replacement channel server attaches for the same session
+   * — which is the exact moment that prompt could be delivered at once — it has to be able to
+   * come back. Without this, a cleanly-detached predecessor's queued prompt is stranded for the
+   * rest of the session's life while the operator has been told it was sent.
+   *
+   * Restored items are merged with whatever is already queued and the whole queue is re-sorted by
+   * `queuedAtMs`, so "ahead of anything newer" is a consequence of the timestamps rather than a
+   * second ordering rule. Identity is preserved: the same `injectId`, so a delivery confirmation
+   * still matches the prompt it confirms; and the same `queuedAtMs`, so the TTL keeps running
+   * from when the operator actually wrote the text — re-stamping it here would hand a prompt that
+   * already spent 29 minutes waiting a fresh half hour.
+   */
+  restore(sessionId: string, items: ChannelInjection[]): RestoreResult {
+    // Every early exit hands EVERYTHING back rather than swallowing it: these prompts are already
+    // owed to an operator, and a restore that quietly dropped what it could not place would lose
+    // them between the two queues, which is the failure this method exists to prevent.
+    const refuseAll: RestoreResult = { accepted: [], rejected: items };
+    if (this.closed) return refuseAll;
+    const attachment = this.attachmentFor(sessionId);
+    if (attachment === undefined) return refuseAll;
+    const queue = this.queues.get(attachment.attachId);
+    if (queue === undefined) return refuseAll;
+    // The same cap the live path refuses at, counted the same way: a restore that overflowed it
+    // would let the fallback queue smuggle past a limit `enqueue` enforces.
+    const room =
+      this.queueCap - (queue.length + (this.inFlight.get(attachment.attachId)?.size ?? 0));
+    if (room <= 0) return refuseAll;
+    const accepted = items.slice(0, room);
+    const rejected = items.slice(room);
+    // Restored first, so a tie on `queuedAtMs` resolves in favour of the older path (sort is
+    // stable), which is the prompt that has already been waiting.
+    this.queues.set(
+      attachment.attachId,
+      [...accepted, ...queue].sort((a, b) => a.queuedAtMs - b.queuedAtMs),
+    );
+    this.onEnqueue?.(attachment.attachId);
+    return { accepted, rejected };
   }
 
   /**
@@ -240,14 +301,36 @@ export class ChannelRegistry {
     }
     this.queues.set(attachId, []);
     const flying = this.inFlight.get(attachId);
-    if (flying !== undefined) for (const item of fresh) flying.set(item.injectId, item);
-    if (expired.length > 0) this.onExpire?.(attachment.sessionId, expired);
+    if (flying !== undefined) {
+      // In-flight items age out on the SAME card as queued ones. A client that polls but never
+      // acks is a real shape (it is what a wedged session looks like from here), and an in-flight
+      // set that nothing ever expires both keeps thirty-minute-old guidance deliverable and
+      // counts against the cap forever — so after a handful of them the session's channel refuses
+      // every new prompt permanently, while the operator is told the queue is full.
+      for (const [injectId, item] of flying) {
+        if (now - item.queuedAtMs <= this.ttlMs) continue;
+        flying.delete(injectId);
+        expired.push(item);
+      }
+      for (const item of fresh) flying.set(item.injectId, item);
+    }
+    if (expired.length > 0) {
+      // Sorted so the caller reports them in the order the operator wrote them; the in-flight
+      // sweep above appends after the queue scan, and those items are the OLDER ones.
+      expired.sort((a, b) => a.queuedAtMs - b.queuedAtMs);
+      this.onExpire?.(attachment.sessionId, expired);
+    }
     return fresh;
   }
 
   /** Record the client's report for one injection. A failure puts the item back at the FRONT of
    *  the queue — it was queued before anything that arrived while it was in flight, and delivery
-   *  order is the one property an operator will notice. */
+   *  order is the one property an operator will notice.
+   *
+   *  `{ok:false}` covers both "no such attachment" and "no such item", and the second of those is
+   *  now also how a LATE ack lands: an item that aged out of the in-flight set while the client
+   *  was reporting on it is already gone and already carded, so the report is a no-op rather than
+   *  a resurrection — requeuing it would re-deliver text the operator has been told expired. */
   ack(
     attachId: string,
     injectId: string,
