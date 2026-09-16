@@ -115,6 +115,42 @@ describe('classifyFailureText', () => {
         : { transient: true, kind: expected },
     );
   });
+
+  // The shapes that do NOT lead with one of the canonical introducer words: the reason phrase
+  // standing on its own, a status behind "returned"/"failed:", a camelCase field name, and the
+  // parenthesised code an abort message trails. Each one is a real failure the anchor has to
+  // reach, and each one is a way for an over-tight anchor to strand a session that a park or a
+  // retry would have saved.
+  it.each([
+    ['429 Too Many Requests', 'usage'],
+    ['Error: Request failed: 429', 'usage'],
+    ['status: 429', 'usage'],
+    ['statusCode: 429', 'usage'],
+    ['status_code: 429', 'usage'],
+    ['upstream returned 529', 'overloaded'],
+    ['AbortError: The operation timed out (408)', 'timeout'],
+    ['gateway returned 503', 'server_error'],
+  ])('recognizes the introducer-less real shape "%s"', (text, expected) => {
+    expect(classifyFailureText(text)).toEqual(
+      expected === 'usage'
+        ? { transient: false, usageLimit: true }
+        : { transient: true, kind: expected },
+    );
+  });
+
+  // …and the same prose the widened anchor must still read as nothing. "assertion failed:
+  // expected 408" is the trap the new `failed:` introducer opens if the status is allowed to
+  // sit anywhere after the word rather than immediately behind it.
+  it.each([
+    'ENOENT: no such file or directory, open /repo/build/429/out.json',
+    'Type error at src/router.ts:529:12 - property does not exist',
+    'Wrote 408 rows to the cache',
+    'assertion failed: expected 408, got 200',
+    'the job failed after 429 retries',
+    'renamed statuses/429 to statuses/older',
+  ])('keeps reading the widened-anchor near-miss as nothing: "%s"', (text) => {
+    expect(classifyFailureText(text)).toEqual({ transient: false });
+  });
 });
 
 describe('classifyStopFailureType', () => {

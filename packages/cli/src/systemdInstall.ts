@@ -137,10 +137,20 @@ function unitFileState(run: SystemctlRunner): string | undefined {
   }
 }
 
-/** Whether a `UnitFileState` means the unit starts at login. `enabled-runtime` counts as a
- *  definite no for our purposes — it is dropped on reboot, which is the opposite of autostart. */
-function saysEnabled(state: string | undefined): boolean {
-  return state === 'enabled';
+/**
+ * Whether a `UnitFileState` is a DEFINITE "does not start at login" — the only answer allowed to
+ * drive work. `enabled-runtime` is one: it is dropped on reboot, which is the opposite of
+ * autostart. An ABSENT state is not: that is the manager saying nothing at all (no bus, no
+ * systemctl, a manager that has never been told about this unit), and "could not ask" is evidence
+ * of neither side.
+ *
+ * Phrased as the negative rather than as its opposite because that is what both callers actually
+ * need, and because the opposite reads an unknown as "not enabled" — which rewrites and re-enables
+ * a perfectly current unit on every install, on hosts that can never answer, and reports each
+ * no-op as work done.
+ */
+function saysNotEnabled(state: string | undefined): boolean {
+  return state !== undefined && state !== 'enabled';
 }
 
 /**
@@ -157,6 +167,11 @@ function saysEnabled(state: string | undefined): boolean {
  * refusal) would answer 'unchanged' on every later install and never be enabled — while the
  * caller starts the daemon now and nothing brings it back at the next login. Either half of
  * this alone closes that hole; both are cheap, and they fail independently.
+ *
+ * Only a manager that DEFINITELY says "not enabled" forces that rewrite, though. A manager that
+ * cannot answer at all leaves the content-only verdict standing, because the alternative is an
+ * install that is never idempotent on such a host: identical content rewritten, re-enabled and
+ * reported 'updated' every single time, which is the same lie in the other direction.
  */
 export function installDaemonUnit(
   options: DaemonUnitOptions & { shimPath: string },
@@ -168,7 +183,7 @@ export function installDaemonUnit(
 
   const desired = renderDaemonUnit(options.shimPath);
   const existing = fs.read(unitPath);
-  if (existing === desired && saysEnabled(unitFileState(run))) {
+  if (existing === desired && !saysNotEnabled(unitFileState(run))) {
     return { outcome: 'unchanged', notes: [] };
   }
 
@@ -181,6 +196,15 @@ export function installDaemonUnit(
     // than a no-op over a file that never became a registration.
     if (existing === undefined) fs.remove(unitPath);
     else fs.write(unitPath, existing);
+    // …and tell the manager, because the reload above already happened: it is holding a parsed
+    // definition for content that no longer exists on disk, and nothing else would correct that
+    // until the next successful install. Best-effort — this runs while an error is on its way
+    // out, and a reload that also fails must not replace the failure the caller has to see.
+    try {
+      run(['daemon-reload']);
+    } catch {
+      // Nothing to add: the throw below already says the registration did not happen.
+    }
     throw err;
   }
   const notes: string[] = [];
@@ -241,7 +265,7 @@ export function queryDaemonUnit(options: DaemonUnitOptions = {}): DaemonUnitQuer
   }
   const enabled = unitFileState(run);
   return {
-    registered: enabled === undefined || saysEnabled(enabled),
+    registered: !saysNotEnabled(enabled),
     ...(state !== undefined ? { state } : {}),
     ...(enabled !== undefined ? { enabled } : {}),
   };

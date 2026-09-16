@@ -244,7 +244,8 @@ async function createRig(options: {
   const autoSwitcher: AutoSwitcherLike = {
     evaluate: (accounts) => {
       autoSwitchInputs.push(accounts);
-      return Promise.resolve();
+      // No hop, so nothing for the cycle to absorb as its own.
+      return Promise.resolve(undefined);
     },
   };
   const probed: ProbeCandidate[][] = [];

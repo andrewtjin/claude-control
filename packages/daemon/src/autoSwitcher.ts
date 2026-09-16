@@ -71,16 +71,26 @@ export class AutoSwitcher {
     this.logger = options.logger ?? noopLogger;
   }
 
-  /** Evaluate one usage snapshot and hop if the policy says so. Never throws: an engine
-   *  failure is reported (log + phone) and absorbed so the poll cycle stays healthy. */
-  async evaluate(accounts: AccountUsageInput[]): Promise<void> {
+  /**
+   * Evaluate one usage snapshot and hop if the policy says so. Never throws: an engine failure
+   * is reported (log + phone) and absorbed so the poll cycle stays healthy.
+   *
+   * Resolves with the account id this call ACTIVATED, or `undefined` when it activated nothing
+   * (no decision, still in cooldown, or the engine refused). That id is the caller's only honest
+   * way to tell its own hop apart from a switch somebody else made while the cycle was running:
+   * re-reading the live account afterwards cannot distinguish the two, and reading a human's
+   * switch as the daemon's own is what silently swallows it. Reported only for a successful
+   * activation — a refused hop left the live account wherever it already was, and claiming it as
+   * ours would swallow that account's real owner just the same.
+   */
+  async evaluate(accounts: AccountUsageInput[]): Promise<string | undefined> {
     const now = this.clock();
     const decision = decideAutoSwitch(accounts, now, this.policy);
-    if (!decision) return;
+    if (!decision) return undefined;
 
     if (now - this.lastAttemptAtMs < this.cooldownMs) {
       this.logger.debug({ decision }, 'auto-switch wanted but still in cooldown');
-      return;
+      return undefined;
     }
     // Stamp BEFORE attempting so a throwing engine still gets its cooldown.
     this.lastAttemptAtMs = now;
@@ -99,6 +109,9 @@ export class AutoSwitcher {
         activeAccountId: result.activeAccountId,
         message: `auto-switch: ${decision.reason}`,
       });
+      // The engine's own word for what is live now, not the target we asked for: the two agree
+      // today, and a caller that absorbs this id must absorb what actually happened.
+      return result.ok ? result.activeAccountId : undefined;
     } catch (err) {
       // Typically the engine's cadence guard or a refresh failure — absorbed, reported.
       const message = err instanceof Error ? err.message : String(err);
@@ -112,6 +125,7 @@ export class AutoSwitcher {
         message: `auto-switch to ${decision.targetLabel} failed`,
         error: message,
       });
+      return undefined;
     }
   }
 }

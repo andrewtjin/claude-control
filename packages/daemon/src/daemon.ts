@@ -106,9 +106,12 @@ export interface SwitchEngineLike {
 }
 
 /** The slice of `AutoSwitcher` the daemon calls each poll cycle — narrowed to an interface
- *  so lifecycle tests can fake it (mirroring `SwitchEngineLike`). */
+ *  so lifecycle tests can fake it (mirroring `SwitchEngineLike`). Resolves with the account id
+ *  the evaluation ACTIVATED, or `undefined` when it activated nothing; the daemon needs that
+ *  distinction to tell its own hop apart from a switch somebody else made mid-cycle (see the
+ *  absorb in {@link Daemon.pollCycle}). */
 export interface AutoSwitcherLike {
-  evaluate(accounts: AccountUsageInput[]): Promise<void>;
+  evaluate(accounts: AccountUsageInput[]): Promise<string | undefined>;
 }
 
 /** The slice of `AccountProbe` the daemon calls each poll cycle — narrowed for the same reason
@@ -172,8 +175,9 @@ export interface DaemonOptions {
    *  missing file makes every hook take the silent no-daemon fast path; the heartbeat bounds
    *  that outage to one interval. Injectable so tests can prove the re-publish quickly. */
   endpointRepublishMs?: number;
-  /** Injectable clock (house convention: no fake timers). Only used for the quarantine-notice
-   *  debounce; defaults to `Date.now`. */
+  /** Injectable clock (house convention: no fake timers) — what every age the daemon measures
+   *  is read from, including the quarantine-notice debounce and the switch-key TTL. Defaults to
+   *  `Date.now`. */
   clock?: () => number;
   /** Does this pid name a live process? The channel server records its pid on attach, and that
    *  pid is the only SYNCHRONOUS evidence the daemon has that the server still exists — poll
@@ -302,6 +306,52 @@ function rememberBounded(keys: Set<string>, key: string, bound: number): void {
     const oldest = keys.values().next().value;
     if (oldest !== undefined) keys.delete(oldest);
   }
+}
+
+/**
+ * How long a `switch.command` idempotency key stays "already handled".
+ *
+ * The sibling dedupes key off a fresh random value per command, so remembering one until it is
+ * evicted costs nothing: the same key twice can only ever be the same frame twice. A switch tapped
+ * from a card is different — its key is derived from the LOGICAL action (who, what, which account)
+ * so that a double-tap from two phones collapses to one command, which means tapping "switch to
+ * main" again tomorrow produces the exact same key. Remembering that key forever turns the second,
+ * genuinely new command into silence: dropped here, and answered by no `switch.result`, so the
+ * phone shows a request that never resolves. The sender ages its own copy of the key out after
+ * fifteen minutes; matching that is what keeps the two ends agreeing on which frames are replays.
+ */
+export const SEEN_SWITCH_KEY_TTL_MS = 15 * 60_000;
+
+/** Remember a key WITH the moment it was seen — the same FIFO bound as {@link rememberBounded}
+ *  (a Map iterates in insertion order too), for the sets that also have to forget. Re-inserted
+ *  rather than updated in place so a refreshed key becomes the youngest for eviction, matching
+ *  what its timestamp now claims. */
+function rememberBoundedAt(
+  keys: Map<string, number>,
+  key: string,
+  bound: number,
+  nowMs: number,
+): void {
+  keys.delete(key);
+  keys.set(key, nowMs);
+  if (keys.size > bound) {
+    const oldest = keys.keys().next().value;
+    if (oldest !== undefined) keys.delete(oldest);
+  }
+}
+
+/** Whether `key` was seen within `ttlMs` — exactly AT the boundary still counts as seen, so the
+ *  two ends of a deterministic key never disagree by one millisecond. An expired entry is dropped
+ *  on the way past, which is all the sweeping these maps need: a key nobody asks about again is
+ *  evicted by the bound instead. */
+function seenWithin(keys: Map<string, number>, key: string, nowMs: number, ttlMs: number): boolean {
+  const seenAtMs = keys.get(key);
+  if (seenAtMs === undefined) return false;
+  if (nowMs - seenAtMs > ttlMs) {
+    keys.delete(key);
+    return false;
+  }
+  return true;
 }
 
 /** Bound on the `cctl session register|label|watch` idempotency set. Same FIFO discipline as
@@ -559,11 +609,14 @@ export class Daemon {
   /** Recently seen `session.prune` idempotencyKeys, so a re-sent/replayed prune answers once
    *  instead of posting a second (empty) result. Bounded FIFO like the stop keys. */
   private readonly seenPruneKeys = new Set<string>();
-  /** Recently seen `switch.command` idempotencyKeys. A switch is the least replay-safe command
-   *  the phone can send: a frame re-delivered after the operator has moved on silently drags the
-   *  live account back to the earlier target and files a second activation in the audit trail,
-   *  where it reads as a hop nobody asked for. Bounded FIFO like the stop keys. */
-  private readonly seenSwitchKeys = new Set<string>();
+  /** Recently seen `switch.command` idempotencyKeys, each with the moment it was seen. A switch
+   *  is the least replay-safe command the phone can send: a frame re-delivered after the operator
+   *  has moved on silently drags the live account back to the earlier target and files a second
+   *  activation in the audit trail, where it reads as a hop nobody asked for. Bounded FIFO like
+   *  the stop keys, and ALSO aged out — alone among the daemon's dedupes, because a switch key can
+   *  be derived rather than random and so recur legitimately (see
+   *  {@link SEEN_SWITCH_KEY_TTL_MS}). */
+  private readonly seenSwitchKeys = new Map<string, number>();
   /** Recently seen `cctl session register|label|watch` idempotencyKeys, so a re-sent command
    *  answers "already handled" instead of re-applying. Bounded FIFO — see
    *  {@link rememberSessionCmdKey}. */
@@ -1097,28 +1150,41 @@ export class Daemon {
     // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
     // engine failures itself; this catch only guards against bugs in the evaluator so a
     // broken policy can never take down the poll loop.
-    if (this.autoSwitcher) {
+    // Read into a local so the narrowing survives into the callback below (a property's does
+    // not), which is also what lets the evaluation report its hop back without an `?.` swallowing
+    // the value.
+    const autoSwitcher = this.autoSwitcher;
+    if (autoSwitcher !== undefined) {
       // `snapshot.inputs` — the same array the plan above was computed from, predictions and
       // all. An executor deciding on anything else is the divergence the merge above exists
       // to rule out.
-      await this.timePhase('autoSwitch', () =>
-        this.autoSwitcher?.evaluate(snapshot.inputs).catch((err: unknown) => {
+      const hopped = await this.timePhase('autoSwitch', () =>
+        autoSwitcher.evaluate(snapshot.inputs).catch((err: unknown) => {
           this.logger.error({ err }, 'auto-switch evaluation failed');
+          return undefined;
         }),
       );
 
+      // Absorb the hop this daemon just made — BY ITS ID, never by re-reading the live account.
+      // The next cycle compares what it reads against this value and resumes parked sessions on a
+      // difference, which is right for a human's switch and wrong for the policy's own hop
+      // (resuming paused work unattended is a bigger policy step than hopping). A re-read cannot
+      // tell those two apart: a `cctl switch` typed on this host writes the vault directly, so one
+      // landing anywhere between this cycle's own read and here — a window the probe below can
+      // stretch to minutes — would come back as "the active account is X" with nothing to say who
+      // made it X, and be swallowed. An id the evaluator reports is the one thing that names the
+      // author, so nothing else is absorbed and every switch this daemon did not make survives to
+      // the comparison it exists for.
+      if (hopped !== undefined) this.lastObservedActiveId = hopped;
+
       // Inside the auto-switch block on purpose: the probe exists to widen the pool the policy
       // above chooses from, so with no policy running there is nothing to widen it for. Runs
-      // AFTER the evaluation, so a cycle that already had a hop to make makes it first.
+      // AFTER the evaluation, so a cycle that already had a hop to make makes it first. It needs
+      // no absorb of its own: a probe runs its turn in a throwaway config dir precisely so it
+      // never activates anything (see accountProbe.ts), so it moves nothing to absorb.
       await this.timePhase('probeUnknown', () =>
         this.probeUnknownAccounts(snapshot.results, snapshot.inputs),
       );
-
-      // Absorb whatever THIS daemon just did. Both the policy hop above and the probe activate
-      // accounts, and the next cycle would otherwise read their work as an operator's switch and
-      // resume parked sessions off the back of it — which auto-switch deliberately does not do
-      // (resuming paused work unattended is a bigger policy step than hopping).
-      this.lastObservedActiveId = await this.switchEngine.getActiveId();
     }
 
     // LAST in the cycle, deliberately: the transcript scan is seconds of disk IO, and everything
@@ -1321,14 +1387,15 @@ export class Daemon {
     // activate(). Silent (log only) like session.stop — the phone already had its
     // switch.result from the frame that was applied, and a second one for the same key would
     // report a switch that did not happen this time.
-    if (this.seenSwitchKeys.has(idempotencyKey)) {
+    const nowMs = this.clock();
+    if (seenWithin(this.seenSwitchKeys, idempotencyKey, nowMs, SEEN_SWITCH_KEY_TTL_MS)) {
       this.logger.info({ requestId, idempotencyKey }, 'duplicate switch.command ignored');
       return;
     }
     // Burned up front, on the attempt rather than on success: a failed switch already answers
     // the phone with an explicit ok:false it can act on, and a replayed frame silently
     // retrying an activation is the outcome this guard exists to prevent.
-    rememberBounded(this.seenSwitchKeys, idempotencyKey, MAX_SEEN_STOP_KEYS);
+    rememberBoundedAt(this.seenSwitchKeys, idempotencyKey, MAX_SEEN_STOP_KEYS, nowMs);
     try {
       // Phone-side commands carry whatever the user typed — an id or a label. Resolve it the
       // same way `cctl switch` does, or `/switch account:spare` fails while the identical
@@ -1589,8 +1656,10 @@ export class Daemon {
    * {@link handleSwitchCommand} — so the poll cycle is the only place the daemon can observe it
    * at all. The operator who typed it is exactly as present as the one who typed `/switch` on
    * the phone, and sessions parked on a usage limit are waiting for precisely this event; before
-   * this, they waited through it. Hops this daemon made itself are absorbed at the end of the
-   * cycle that made them (see runPollCycle), so auto-switch still never resumes parked work.
+   * this, they waited through it. Hops this daemon made itself are absorbed BY ID in the cycle
+   * that made them (see the absorb in {@link pollCycle}), so auto-switch still never resumes
+   * parked work — while a switch it did not make survives to this comparison however late in the
+   * cycle it landed.
    */
   private noticeActiveAccountChange(activeId: string | null, accounts: StoredAccount[]): void {
     const previous = this.lastObservedActiveId;
