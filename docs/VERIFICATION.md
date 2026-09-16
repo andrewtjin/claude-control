@@ -427,7 +427,7 @@ patient one, and no path ever stopped retrying because the status page could not
 
 **Result:** the endpoint and its all-clear body are confirmed; incident behavior is not yet run.
 
-### 17. Live channels — idle-session prompt delivery ⏳ PENDING
+### 17. Live channels — idle-session prompt delivery ⏳ OPEN
 
 **Claim to verify:** a prompt sent from the phone reaches a Claude Code session sitting IDLE at
 its prompt — immediately, with no local keystroke — and the model's `reply` comes back to the same
