@@ -59,12 +59,18 @@ export interface CreateLoggerOptions {
 
 type LogFormat = 'pretty' | 'json';
 
-/** pino serializes its own `level`/`time`/`msg` first and appends the call site's payload
- *  after, so a payload field with one of those names emits a DUPLICATE JSON key — and every
- *  parser (including this file's pretty renderer) keeps the last one. Left alone, such a field
- *  would silently overwrite the line's own level/timestamp/message and then vanish from the
- *  output entirely. Renaming the collision keeps both. */
-const RESERVED_KEYS = ['level', 'time', 'msg'];
+/** pino serializes its own fields first and appends the call site's payload after, so a payload
+ *  field with one of those names emits a DUPLICATE JSON key — and every parser (including this
+ *  file's pretty renderer) keeps the last one. Left alone, such a field would silently overwrite
+ *  the line's own identity and then vanish from the output entirely. Renaming the collision
+ *  keeps both.
+ *
+ *  Two groups, both reserved for the same reason. `level`/`time`/`msg` are pino's per-line
+ *  fields. `pid`/`hostname` are its BASE fields, stamped once per line from the running
+ *  process — and call sites legitimately log some OTHER process's pid (a spawned session, a
+ *  reaped child), which unreserved would make the line claim that pid as the logger's own while
+ *  the pretty renderer, which drops both base fields as constant noise, showed nothing at all. */
+const RESERVED_KEYS = ['level', 'time', 'msg', 'pid', 'hostname'];
 
 /** True only for a plain `{}`-literal-shaped object (including `Object.create(null)`), never for
  *  an `Error`, `Map`, or other class instance. The rename below rebuilds its input via
@@ -194,8 +200,15 @@ class FileSink {
       return; // can't stat — keep appending rather than fail the logger over a diagnostic check
     }
     if (size < LOG_FILE_ROTATE_BYTES) return;
+    // Handed off to a local and cleared BEFORE the close, so the field never names a descriptor
+    // this method has already closed. `degrade` (the catch below, reached whenever the rename or
+    // the reopen throws) closes `this.fd` when it is set — with the field still pointing at the
+    // closed number that would be a double close, and by then the OS may have recycled the
+    // number for some other file this process opened, which the second close would then shut.
+    const fd = this.fd;
+    this.fd = undefined;
     try {
-      closeSync(this.fd);
+      closeSync(fd);
       renameSync(this.filePath, `${this.filePath}.old`);
       this.fd = openSync(this.filePath, 'a');
     } catch (err) {
@@ -294,7 +307,9 @@ class LogDestination {
    *  default `level` is numeric (30, 40, ...); `pino.levels.labels` is the same lookup pino
    *  itself uses to turn that back into 'info'/'warn'/etc. `pid`/`hostname` are dropped here
    *  (constant for the process's whole lifetime, pure noise on every pretty line) but stay in
-   *  the file/JSON-mode output untouched, above. */
+   *  the file/JSON-mode output untouched, above. Only pino's OWN base fields are lost that way:
+   *  a payload that carries either name reaches this point already renamed (see
+   *  {@link RESERVED_KEYS}), so a call site logging a child's pid still prints it. */
   private renderPretty(chunk: string): string {
     let parsed: Record<string, unknown>;
     try {
