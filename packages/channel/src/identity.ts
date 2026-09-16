@@ -43,6 +43,13 @@
 // nearest live registered ancestor is a different session is refused too. Two identity sources
 // that contradict each other are not a resolution, whichever of them happens to be checkable.
 //
+// A confirmation is not the end of that transient window, only of half of it. A RESUMED session
+// leaves its previous pid's file behind carrying the same session id, so the id confirms on the
+// first read against a file describing a process we are not descended from, while the file for
+// the pid that IS our ancestor has not been written yet. A confirmed id with no registered
+// ancestor therefore spends the rest of the same read budget before it refuses — a contradiction
+// is a refusal, but an incomplete registry is not a contradiction.
+//
 // Anything that is not a checked outcome is a refusal with a reason, never a guess. In particular
 // an EMPTY ancestor chain resolves to nothing at all: "we could not see the process tree" is not
 // evidence for "it must be the only session running", and it is not evidence that an inherited
@@ -119,9 +126,12 @@ export const MAX_ANCESTOR_HOPS = 24;
  *  stops a slow machine from turning the fallback into a multi-minute stall. */
 export const MAX_ANCESTOR_WALK_MS = 45_000;
 
-/** How many times the registry is read when `CLAUDE_CODE_SESSION_ID` is set but unconfirmed.
- *  The misses this recovers are transient by nature — a torn write, or the file not yet created
- *  during startup — so a couple of re-reads a moment apart is the whole fix. */
+/** How many times the registry may be read while `CLAUDE_CODE_SESSION_ID` is set, across BOTH
+ *  things that read it: confirming the declared id, and finding the ancestor that proves the id
+ *  is ours. One budget rather than one each, because what it bounds is the total time a session
+ *  waits to be identified. The misses it recovers are transient by nature — a torn write, a file
+ *  not yet created at startup, a resumed session whose new pid file lands a moment after its old
+ *  one — so a couple of re-reads a moment apart is the whole fix. */
 export const REGISTRY_READ_ATTEMPTS = 3;
 /** Gap between those re-reads. Long enough for the owning session to finish rewriting its file,
  *  short enough that the worst case stays far under the MCP handshake's patience. */
@@ -138,8 +148,9 @@ export interface IdentityDeps {
   /** This process's immediate parent. Node hands it over for free, so hop 1 never costs a
    *  process-table query; only hop 2 and beyond reach for {@link ParentOf}. */
   parentPid?: number | undefined;
-  /** Hops above the first. Defaults to this platform's real implementation, which is built
-   *  lazily so the verified-env path never constructs it. */
+  /** Hops above the first. Defaults to this platform's real implementation, whose expensive part
+   *  is deferred until a hop actually asks for it — the verified-env path skips it entirely only
+   *  when the session's own process is this one's direct parent (see {@link createParentOf}). */
   parentOf?: ParentOf;
   /** Is this pid still running? Defaults to a signal-0 probe. Injected by tests so the
    *  liveness rule can be exercised without real processes. */
@@ -320,7 +331,12 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
   const attempts = hasDeclared ? REGISTRY_READ_ATTEMPTS : 1;
   let entries: SessionRegistryEntry[] = [];
   let confirmed = false;
+  // How many of `attempts` this loop spent. The cross-check below can need re-reads of its own
+  // for the same transient reason, and they come out of the same budget rather than a second one:
+  // the point of the bound is the total time a session may wait to be identified.
+  let reads = 0;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    reads = attempt;
     entries = await readSessionRegistry(sessionsDir);
     // A single registry file carrying the declared id is all this loop is waiting for; WHICH of
     // several duplicates to attach to is decided by the ancestor walk below, which knows which
@@ -346,7 +362,9 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
   const parentPid = 'parentPid' in deps ? deps.parentPid : process.ppid;
   const parentOf = deps.parentOf ?? createParentOf(platform);
   const now = deps.now ?? Date.now;
-  const byPid = new Map(entries.map((entry) => [entry.pid, entry]));
+  // `let`, because the cross-check below re-reads the registry when it comes up empty and
+  // `sessionAt` has to see the new entries. Rebuilding the map is the whole of that update.
+  let byPid = new Map(entries.map((entry) => [entry.pid, entry]));
   /** The live registered session owning `pid`, if that pid is one. */
   const sessionAt = (pid: number): SessionRegistryEntry | undefined => {
     const entry = byPid.get(pid);
@@ -365,7 +383,23 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
       now,
       (pid) => sessionAt(pid) !== undefined,
     );
-    const owner = chain.map(sessionAt).find((entry) => entry !== undefined);
+    let owner = chain.map(sessionAt).find((entry) => entry !== undefined);
+    // A confirmation is not the end of the transient window, only the end of one half of it. A
+    // RESUMED session leaves its previous pid's file behind carrying the same session id, so the
+    // loop above stops on the first read — satisfied by a file that describes a process we are
+    // not descended from — while the file for the pid that IS our ancestor has not been written
+    // yet. Refusing here would make a resume cost the session its channel for good, every time.
+    //
+    // Only the registry is re-read, never the tree: `stopAt` cannot have fired if nothing on the
+    // chain was a registered session, so `chain` is already the COMPLETE ancestor list and
+    // re-walking it would repeat the expensive half (see {@link createParentOf}) to obtain the
+    // identical pids. What can still change is which of them the registry knows about.
+    for (let attempt = reads; owner === undefined && attempt < attempts; attempt += 1) {
+      await sleep(REGISTRY_RETRY_DELAY_MS);
+      entries = await readSessionRegistry(sessionsDir);
+      byPid = new Map(entries.map((entry) => [entry.pid, entry]));
+      owner = chain.map(sessionAt).find((entry) => entry !== undefined);
+    }
     if (owner === undefined) {
       // The env var names a real session, but nothing above this process is one, so there is no
       // evidence it is OUR session rather than one we inherited the variable from. Refusing costs
@@ -375,7 +409,8 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
         reason:
           `CLAUDE_CODE_SESSION_ID=${declared} names a session in ${sessionsDir}, but no ancestor of ` +
           `pid ${self} is a live Claude Code session (walked ${chain.length} hop(s)) - refusing ` +
-          'rather than attaching to a session this process cannot be shown to belong to',
+          `rather than attaching to a session this process cannot be shown to belong to (` +
+          `${unreadableTreeHint(platform)})`,
       };
     }
     if (owner.sessionId !== declared) {
@@ -408,11 +443,12 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
   if (chain.length === 0) {
     // An unreadable process tree is an absence of evidence, not evidence that the only live
     // session is ours. Refuse.
+    const hint = ` (${unreadableTreeHint(platform)})`;
     return {
       ok: false,
       reason: hasDeclared
-        ? `CLAUDE_CODE_SESSION_ID=${declared} matches no session in ${sessionsDir}, and this process has no visible ancestors`
-        : 'no CLAUDE_CODE_SESSION_ID and this process has no visible ancestors',
+        ? `CLAUDE_CODE_SESSION_ID=${declared} matches no session in ${sessionsDir}, and this process has no visible ancestors${hint}`
+        : `no CLAUDE_CODE_SESSION_ID and this process has no visible ancestors${hint}`,
     };
   }
 
@@ -509,17 +545,45 @@ async function defaultSessionsDir(
 /**
  * This platform's parent lookup.
  *
- * NONE of this is reachable from the verified-`CLAUDE_CODE_SESSION_ID` path — see this module's
- * header. That matters most on Windows, where the only general answer is a CIM process query
- * costing on the order of a second; running it in front of the MCP handshake would stall the
- * session, so it runs once, lazily, and only when the environment failed to identify us. The
- * whole pid→ppid table is fetched in that single query and memoised, so a deep chain costs the
- * same as a shallow one.
+ * Reachable from BOTH resolution paths, which is not what the fast path's shape suggests. The
+ * verified-`CLAUDE_CODE_SESSION_ID` path stops at the first registered ancestor, and when that is
+ * `process.ppid` Node has already handed it over — no lookup at all. But that only holds while
+ * the session's `claude` process is this server's DIRECT parent. Put any wrapper in between and
+ * hop 2 lands here: on Windows the plugin's `cctl` is a `.cmd` shim, so the real tree is
+ * `claude -> cmd.exe -> node` and the cross-check reaches for a lookup every time.
+ *
+ * The cost of that hop on Windows is one `Get-CimInstance Win32_Process` query over the whole
+ * process table — around 0.8s on an idle box, and several seconds on a loaded one (see
+ * {@link PARENT_LOOKUP_TIMEOUT_MS}, whose bound has to cover that whole spread). It is why the
+ * query is memoised for the life of the walk — a deep chain costs the same as a shallow one, and
+ * a registry retry re-uses the table rather than paying again — and why nothing constructs it
+ * during startup: identity resolution runs after the MCP handshake has been answered, so the
+ * seconds land where no client is waiting on them.
  */
 export function createParentOf(platform: NodeJS.Platform = process.platform): ParentOf {
   if (platform === 'linux') return linuxParentOf;
   if (platform === 'win32') return createWindowsParentOf();
   return posixParentOf;
+}
+
+/**
+ * What to check when a refusal may have been caused by an unreadable process tree.
+ *
+ * {@link ParentOf} collapses "this is the top of the tree", "the process is gone" and "the lookup
+ * failed" into the same `undefined`, and the walk cannot tell them apart — so a refusal that
+ * blames the tree cannot honestly say WHY it could not read it. What it can do is name the helper
+ * this platform depends on, which turns a dead end into something the operator can check: the
+ * refusal is printed to stderr and captured into Claude Code's own debug log, where it is the
+ * only thing they will have to go on.
+ */
+function unreadableTreeHint(platform: NodeJS.Platform): string {
+  if (platform === 'win32') {
+    return 'if the process tree could not be read, check that powershell.exe is on PATH and can run Get-CimInstance Win32_Process';
+  }
+  if (platform === 'linux') {
+    return 'if the process tree could not be read, check that /proc is mounted and readable';
+  }
+  return "if the process tree could not be read, check that 'ps' is on PATH";
 }
 
 /** Linux (and WSL2): procfs, no subprocess at all. `stat` field 4 is the ppid, but field 2 is
@@ -596,9 +660,10 @@ export function parseWindowsProcessTable(json: string): Map<number, number> {
  *
  *  Deliberately generous. Nothing is blocked on this — the MCP handshake is long since answered
  *  and the daemon attach is a background loop that backs off anyway — whereas timing out early
- *  means the session is never identified and the channel never attaches at all. Measured at ~4s
- *  for the Windows CIM query on an idle box and >10s on a loaded one, so a tighter bound buys
- *  nothing and loses the identity. */
+ *  means the session is never identified and the channel never attaches at all. The Windows CIM
+ *  query is the expensive one, and its spread is what the bound has to cover rather than its
+ *  typical cost: under a second on an idle box, several seconds and more on a loaded one. A
+ *  tighter bound buys nothing and loses the identity. */
 const PARENT_LOOKUP_TIMEOUT_MS = 30_000;
 
 /** Run a helper and return its stdout, or `undefined` for any failure. Async on purpose: the

@@ -8,6 +8,7 @@ import {
   MAX_ANCESTOR_HOPS,
   MAX_ANCESTOR_WALK_MS,
   pidIsLive,
+  REGISTRY_READ_ATTEMPTS,
   readSessionRegistry,
   resolveIdentity,
   type ParentOf,
@@ -274,6 +275,97 @@ describe('resolveIdentity — verified environment', () => {
     expect(result).toMatchObject({ ok: true, sessionId: 'mine', source: 'env', pid: 4242 });
   });
 
+  it('re-reads for a RESUMED session whose stale file confirms before the live one exists', async () => {
+    // A resume leaves the previous pid's file behind carrying the same session id. The
+    // confirmation is therefore satisfied on the FIRST read — by a file describing a process this
+    // one is not descended from — while the file for the pid that really is our ancestor has not
+    // been written yet. Refusing there would cost every resumed session its channel, every time.
+    const sessionsDir = await registry([{ pid: 500, sessionId: 'resumed', cwd: 'C:\\old' }]);
+    let sleeps = 0;
+    const sleep = async (): Promise<void> => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        await writeFile(
+          join(sessionsDir, '900.json'),
+          JSON.stringify({ pid: 900, sessionId: 'resumed', cwd: 'C:\\new' }),
+          'utf8',
+        );
+      }
+    };
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'resumed' },
+      sessionsDir,
+      pid: 1,
+      // The process that is really ours, and which the registry does not know about yet.
+      parentPid: 900,
+      parentOf: chainOf({}).parentOf,
+      isLive: () => true,
+      sleep,
+    });
+
+    // Resolved to the ANCESTOR's entry — the live one — not to whichever file carried the id.
+    expect(result).toMatchObject({
+      ok: true,
+      sessionId: 'resumed',
+      source: 'env',
+      pid: 900,
+      cwd: 'C:\\new',
+    });
+  });
+
+  it('refuses once the read budget is spent, rather than retrying forever', async () => {
+    // The same shape with the file that never arrives: the retry is a wait for a transient, not
+    // a licence to attach to something unproven, and it is ONE budget shared with the
+    // confirmation loop rather than a second one bolted on.
+    const sessionsDir = await registry([{ pid: 500, sessionId: 'resumed', cwd: 'C:\\old' }]);
+    let sleeps = 0;
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'resumed' },
+      sessionsDir,
+      pid: 1,
+      parentPid: 900,
+      parentOf: chainOf({}).parentOf,
+      isLive: () => true,
+      sleep: () => {
+        sleeps += 1;
+        return Promise.resolve();
+      },
+    });
+
+    expect(result).toMatchObject({ ok: false });
+    expect((result as { reason: string }).reason).toContain('live Claude Code session');
+    expect(sleeps).toBe(REGISTRY_READ_ATTEMPTS - 1);
+  });
+
+  it('does not spend re-reads on a tree that actually answers', async () => {
+    // The contradicted shape, which must NOT be retried: the tree named a session, and it is not
+    // the declared one. Re-reading cannot change that — the registry is not what disagrees — and
+    // the refusal is owed to the operator immediately.
+    const sessionsDir = await registry([
+      { pid: 900, sessionId: 'outer' },
+      { pid: 4242, sessionId: 'inner' },
+    ]);
+    let sleeps = 0;
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'outer' },
+      sessionsDir,
+      pid: 1,
+      parentPid: 4242,
+      parentOf: chainOf({}).parentOf,
+      isLive: () => true,
+      sleep: () => {
+        sleeps += 1;
+        return Promise.resolve();
+      },
+    });
+
+    expect(result).toMatchObject({ ok: false });
+    expect(sleeps).toBe(0);
+  });
+
   it('does not re-read when there is no env var to confirm', async () => {
     const sessionsDir = await registry([{ pid: 900, sessionId: 'only' }]);
     let sleeps = 0;
@@ -394,12 +486,43 @@ describe('resolveIdentity — fail closed', () => {
     // what this module is not allowed to do.
     const sessionsDir = await registry([{ pid: 900, sessionId: 'tempting' }]);
 
-    const result = await resolveIdentity({ env: {}, sessionsDir, pid: 1, parentPid: undefined });
+    // The platform is pinned because the refusal names the helper THIS platform reads the tree
+    // with; without it the expected string would depend on the machine running the suite.
+    const result = await resolveIdentity({
+      env: {},
+      sessionsDir,
+      pid: 1,
+      parentPid: undefined,
+      platform: 'win32',
+    });
 
     expect(result).toEqual({
       ok: false,
-      reason: 'no CLAUDE_CODE_SESSION_ID and this process has no visible ancestors',
+      reason:
+        'no CLAUDE_CODE_SESSION_ID and this process has no visible ancestors (if the process ' +
+        'tree could not be read, check that powershell.exe is on PATH and can run ' +
+        'Get-CimInstance Win32_Process)',
     });
+  });
+
+  it('names the helper each platform reads the process tree with', async () => {
+    // An operator reading this in Claude Code's debug log has nothing else to go on: the walk
+    // cannot tell "this is the top of the tree" from "the lookup failed", so the one useful
+    // thing the refusal can do is say what to check.
+    const sessionsDir = await registry([{ pid: 900, sessionId: 'tempting' }]);
+    const refusalOn = async (platform: NodeJS.Platform): Promise<string> => {
+      const result = await resolveIdentity({
+        env: {},
+        sessionsDir,
+        pid: 1,
+        parentPid: undefined,
+        platform,
+      });
+      return (result as { reason: string }).reason;
+    };
+
+    expect(await refusalOn('darwin')).toContain("check that 'ps' is on PATH");
+    expect(await refusalOn('linux')).toContain('check that /proc is mounted and readable');
   });
 
   it('mentions the unverifiable env var when there is also no visible ancestry', async () => {
