@@ -473,19 +473,19 @@ describe('renderVersionInfo', () => {
   });
 
   it('reports no daemon has run when there is no settings report', () => {
-    expect(renderVersionInfo('0.4.3', undefined)).toBe(
+    expect(renderVersionInfo('0.4.3', undefined, false)).toBe(
       ['cli build: v0.4.3', 'daemon build: no daemon has run yet'].join('\n'),
     );
   });
 
   it('shows both builds with no warning when they match', () => {
-    const text = renderVersionInfo('0.4.3', reportWith('v0.4.3'));
+    const text = renderVersionInfo('0.4.3', reportWith('v0.4.3'), true);
     expect(text).toBe(['cli build: v0.4.3', 'daemon build: v0.4.3'].join('\n'));
     expect(text).not.toContain('warning');
   });
 
   it('warns of skew when the daemon is on an older build than this CLI', () => {
-    const text = renderVersionInfo('0.4.3', reportWith('v0.4.2'));
+    const text = renderVersionInfo('0.4.3', reportWith('v0.4.2'), true);
     expect(text).toBe(
       [
         'cli build: v0.4.3',
@@ -493,6 +493,17 @@ describe('renderVersionInfo', () => {
         'warning: the daemon is on a different build than this CLI - cctl daemon restart picks up the update.',
       ].join('\n'),
     );
+  });
+
+  it('claims no skew against a daemon that is not running, and names the build as the last one', () => {
+    // The report is written at daemon start and never cleared, so a stopped daemon's build sits
+    // in it indefinitely. Warning on that reports a mismatch with a process that does not exist
+    // and prescribes restarting a daemon that is already down.
+    const text = renderVersionInfo('0.4.3', reportWith('v0.4.2'), false);
+    expect(text).toBe(
+      ['cli build: v0.4.3', 'last started daemon build: v0.4.2 (no daemon is running)'].join('\n'),
+    );
+    expect(text).not.toContain('warning');
   });
 });
 

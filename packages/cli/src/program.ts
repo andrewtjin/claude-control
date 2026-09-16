@@ -23,6 +23,7 @@ import {
   defaultProtector,
   generatePkce,
   generateState,
+  isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
   type StoredAccount,
@@ -175,11 +176,35 @@ export function buildProgram(): Command {
     .description('claude-control - switch Claude accounts, see usage, control sessions')
     .version(VERSION);
 
-  // Commander only auto-adds a `help` subcommand when the program itself has no action handler
-  // of its own — ours does (the bare-`cctl` summary at the bottom of this function), which would
-  // otherwise silently disable `cctl help`/`cctl help <command>` rather than dispatching them.
-  // Force it on explicitly so both keep working regardless of that handler.
-  program.helpCommand(true);
+  // `help` is a command of ours rather than Commander's implicit one. Two reasons, and the
+  // second is why it is not just `helpCommand(true)`: Commander only auto-adds its help command
+  // when the program has no action handler of its own (ours does — the bare-`cctl` summary at
+  // the bottom of this function), and its dispatch takes exactly ONE command name, so
+  // `cctl help accounts reauth` would print the GROUP's help and silently drop the rest.
+  // A variadic path walks the tree instead, which is what a grouped command surface needs.
+  program
+    .command('help [command...]')
+    .description('display help for a command (e.g. cctl help accounts reauth)')
+    .action((names: string[]) => {
+      let target: Command = program;
+      const walked: string[] = [];
+      for (const name of names) {
+        const next = target.commands.find((c) => c.name() === name || c.aliases().includes(name));
+        // Named as far as it resolved, so a typo in a nested path says WHERE it stopped rather
+        // than repeating the whole line back.
+        if (!next) {
+          fail(
+            `unknown command "${name}"${walked.length > 0 ? ` under "${walked.join(' ')}"` : ''}` +
+              ' - run cctl help for the command list',
+          );
+        }
+        walked.push(name);
+        target = next;
+      }
+      // `helpInformation()` rather than `help()`: the latter ends in `process.exit`, which skips
+      // the `finally` blocks the rest of this CLI relies on (see context.ts's `fail`).
+      process.stdout.write(target.helpInformation());
+    });
 
   // Commander's own refusals (an unknown command, a missing argument) reach stderr through this
   // hook. They take the same red as `fail()`'s line so every `error:` the CLI prints looks
@@ -216,6 +241,14 @@ export function buildProgram(): Command {
           fail(`${resolved.account.label} is quarantined; re-login required.`);
         if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
         if (err instanceof UnknownAccountError) fail(err.message);
+        // The token endpoint shedding load is an outage, not a broken account: the engine has
+        // already spent its retry budget and checked the status page, so its message is the
+        // whole story and this switch simply did not happen. Printed as the CLI's own refusal
+        // (one error line, exit 1) so it reads like every other refusal here instead of
+        // escaping as an unhandled failure.
+        if (err instanceof SwitchEngineError && isOverloadCode(err.code)) {
+          fail(`${err.message}. Nothing was changed - try again shortly.`);
+        }
         throw err;
       }
     });
@@ -442,7 +475,11 @@ export function buildProgram(): Command {
     .description("show this CLI's build and the running daemon's last-reported build")
     .action(async () => {
       const report = await readSettingsReport(daemonSettingsPath());
-      process.stdout.write(renderVersionInfo(VERSION, report) + '\n');
+      // The report is written at daemon start and never cleared, so the build it names is only
+      // a live fact while a heartbeat says one is still running — the same source `cctl daemon
+      // status` and `cctl settings` read.
+      const heartbeat = await readHeartbeat(daemonHeartbeatPath());
+      process.stdout.write(renderVersionInfo(VERSION, report, heartbeat.state === 'alive') + '\n');
     });
 
   program

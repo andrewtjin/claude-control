@@ -46,13 +46,18 @@ async function captureConsole(
   return { stdout, stderr };
 }
 
-/** A sandbox whose registry cannot be parsed — the cheapest deterministic way to make the engine
- *  log through the adapter `buildEngine` gave it: the metadata sweep's read throws, and the
- *  no-throw wrapper turns that into exactly one warn line. */
-function pathsWithUnreadableRegistry(): Paths {
+/** A sandbox whose registry PARSES but holds a row with no label — the cheapest deterministic way
+ *  to make the engine log through the adapter `buildEngine` gave it: the duplicate check indexes
+ *  rows by label, throws on that row, and the no-throw wrapper turns it into exactly one warn
+ *  line. (A registry that cannot be parsed at all is deliberately quieter — the command doing the
+ *  reading reports that one itself — so it cannot be the fixture here.) */
+function pathsWithUnrepairableRegistry(): Paths {
   const paths = sandboxPaths(freshTempDir());
   mkdirSync(paths.vaultDir, { recursive: true });
-  writeFileSync(join(paths.vaultDir, 'accounts.json'), '{ this is not json');
+  writeFileSync(
+    join(paths.vaultDir, 'accounts.json'),
+    JSON.stringify({ activeId: null, accounts: [{ id: 'no-label-row' }] }),
+  );
   return paths;
 }
 
@@ -63,14 +68,14 @@ describe('buildEngine: where the engine writes its diagnostics', () => {
     // breaks every non-human consumer of it, while being no more visible to the operator than it
     // is on stderr.
     //
-    const engine = buildEngine(pathsWithUnreadableRegistry());
+    const engine = buildEngine(pathsWithUnrepairableRegistry());
 
     const { stdout, stderr } = await captureConsole(async () => {
-      await engine.backfillAccountMetadata();
+      await engine.dedupeAccounts();
     });
 
     expect(stdout).toEqual([]);
-    expect(stderr.join('')).toContain('account metadata sweep did not run');
+    expect(stderr.join('')).toContain('duplicate-account check did not run');
   });
 
   it('renders to the stream the caller names, so a daemon keeps its whole log on one', async () => {
@@ -78,13 +83,13 @@ describe('buildEngine: where the engine writes its diagnostics', () => {
     // documented way to capture it. Its engine diagnostics therefore have to reach the SAME
     // stream its own logger uses (stdout) — on stderr they would escape the redirect and land
     // on the terminal, splitting the daemon's log across two places with nothing to say so.
-    const engine = buildEngine(pathsWithUnreadableRegistry(), process.stdout);
+    const engine = buildEngine(pathsWithUnrepairableRegistry(), process.stdout);
 
     const { stdout, stderr } = await captureConsole(async () => {
-      await engine.backfillAccountMetadata();
+      await engine.dedupeAccounts();
     });
 
-    expect(stdout.join('')).toContain('account metadata sweep did not run');
+    expect(stdout.join('')).toContain('duplicate-account check did not run');
     expect(stderr).toEqual([]);
   });
 });

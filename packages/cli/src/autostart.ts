@@ -106,7 +106,11 @@ export function autostartBackend(host: AutostartHost = detectAutostartHost()): A
   if (host.platform === 'darwin') return 'launch-agent';
   if (host.platform !== 'linux') return 'none';
   if (host.override === 'none') return 'none';
-  if (host.override === 'systemd-user') return 'systemd-user';
+  // Both overrides are held to the same rule: asking for a mechanism this host does not have
+  // resolves to 'none' (with the reason in `autostartUnsupportedNote`), never to the other
+  // backend. The systemd ask is answered BEFORE the WSL preference so that inside a distro that
+  // DOES run a user manager the override still wins.
+  if (host.override === 'systemd-user') return host.systemdUser ? 'systemd-user' : 'none';
   if (host.wsl?.powerShell !== undefined) return 'wsl-task';
   if (host.override === 'wsl-task') return 'none';
   return host.systemdUser ? 'systemd-user' : 'none';
