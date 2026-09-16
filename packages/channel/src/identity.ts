@@ -393,8 +393,13 @@ export async function resolveIdentity(deps: IdentityDeps = {}): Promise<Identity
     // Only the registry is re-read, never the tree: `stopAt` cannot have fired if nothing on the
     // chain was a registered session, so `chain` is already the COMPLETE ancestor list and
     // re-walking it would repeat the expensive half (see {@link createParentOf}) to obtain the
-    // identical pids. What can still change is which of them the registry knows about.
-    for (let attempt = reads; owner === undefined && attempt < attempts; attempt += 1) {
+    // identical pids. What can still change is which of them the registry knows about — so an
+    // EMPTY chain, which no re-read can populate, is refused at once instead of after the budget.
+    for (
+      let attempt = reads;
+      owner === undefined && chain.length > 0 && attempt < attempts;
+      attempt += 1
+    ) {
       await sleep(REGISTRY_RETRY_DELAY_MS);
       entries = await readSessionRegistry(sessionsDir);
       byPid = new Map(entries.map((entry) => [entry.pid, entry]));

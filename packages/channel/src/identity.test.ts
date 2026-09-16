@@ -220,6 +220,29 @@ describe('resolveIdentity — verified environment', () => {
     expect((result as { reason: string }).reason).toContain('live Claude Code session');
   });
 
+  it('refuses at once, without spending the read budget, when no parent is visible at all', async () => {
+    // A re-read can only add registry rows for pids already ON the chain; with no visible parent
+    // there is nothing a later read could confirm, so the budget is not spent on it.
+    const sessionsDir = await registry([{ pid: 900, sessionId: 'somewhere' }]);
+    let sleeps = 0;
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'somewhere' },
+      sessionsDir,
+      pid: 1,
+      parentPid: undefined,
+      parentOf: chainOf({}).parentOf,
+      isLive: () => true,
+      sleep: () => {
+        sleeps += 1;
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(sleeps).toBe(0);
+  });
+
   it('stops the cross-check walk at the first registered ancestor', async () => {
     // The walk is bounded by what it is looking FOR, not by the depth of the tree: once a
     // registered session is found there is nothing further up that could change the answer, and
