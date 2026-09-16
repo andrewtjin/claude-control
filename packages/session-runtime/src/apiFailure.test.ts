@@ -128,7 +128,11 @@ describe('classifyFailureText', () => {
     ['statusCode: 429', 'usage'],
     ['status_code: 429', 'usage'],
     ['upstream returned 529', 'overloaded'],
+    ['upstream returned 529 Overloaded', 'overloaded'],
+    ['Request failed: 429 {"type":"error","error":{"type":"rate_limit_error"}}', 'usage'],
+    ['HTTP 429 Too Many Requests', 'usage'],
     ['AbortError: The operation timed out (408)', 'timeout'],
+    ['AbortError: The operation timed out (408).', 'timeout'],
     ['gateway returned 503', 'server_error'],
   ])('recognizes the introducer-less real shape "%s"', (text, expected) => {
     expect(classifyFailureText(text)).toEqual(
@@ -148,6 +152,14 @@ describe('classifyFailureText', () => {
     'assertion failed: expected 408, got 200',
     'the job failed after 429 retries',
     'renamed statuses/429 to statuses/older',
+    // The weak introducers and the parenthetical only count when the number ends the clause.
+    'returned 429 rows from the cache',
+    'the query returned 500 rows',
+    'failed: 500 unit tests',
+    'batch (429) complete',
+    'deleted (500) stale files',
+    // The reason phrase counts only beside its own number.
+    'there were too many requests queued in the local test harness',
   ])('keeps reading the widened-anchor near-miss as nothing: "%s"', (text) => {
     expect(classifyFailureText(text)).toEqual({ transient: false });
   });

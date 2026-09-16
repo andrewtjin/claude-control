@@ -49,9 +49,18 @@ const USAGE_LIMIT: ApiFailureClassification = { transient: false, usageLimit: tr
 function httpStatusSource(status: string): string {
   // `status(?:[ _-]?code)?` so the separator between the two words is optional: an SDK error
   // carries the field name `statusCode`, and a mandatory separator silently excludes it.
+  //
+  // `returned` and `failed` name a status only when the number ENDS the clause: "upstream
+  // returned 529" and "Request failed: 429" do, while "returned 429 rows" and "failed: 500 unit
+  // tests" are counts in passing. The parenthesised form is held to the same rule ("timed out
+  // (408)" trails a message; "batch (429) complete" does not), so only a code that nothing but
+  // punctuation or a line end follows is a code being quoted. A reason phrase after the number
+  // ("529 Overloaded") is caught by that phrase's own pattern, never by this one.
+  const clauseEnd = '(?!\\s*[\\w$])';
   return (
-    `(?:(?:api error|http|status(?:[ _-]?code)?|returned|failed)[:\\s]+${status}\\b` +
-    `|\\(\\s*${status}\\s*\\))`
+    `(?:(?:api error|http|status(?:[ _-]?code)?)[:\\s]+${status}\\b` +
+    `|(?:returned|failed)[:\\s]+${status}${clauseEnd}` +
+    `|\\(\\s*${status}\\s*\\)${clauseEnd})`
   );
 }
 
@@ -65,8 +74,9 @@ const USAGE_LIMIT_PATTERN: RegExp = new RegExp(
     /rate.?limit/.source,
     /usage limit/.source,
     // 429's own reason phrase. It arrives as the WHOLE message ("429 Too Many Requests"), where
-    // the number leads and no word introduces it — so the phrase, not the status, is the anchor.
-    /too many requests/.source,
+    // the number leads and no word introduces it — so the phrase is the anchor, tied to its own
+    // number on either side: "too many requests queued" in a tool's log is not a rate limit.
+    /\b429\b[^\n]{0,40}too many requests|too many requests[^\n]{0,40}\b429\b/.source,
   ].join('|'),
   'i',
 );
