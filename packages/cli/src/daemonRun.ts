@@ -55,6 +55,7 @@ import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
   daemonConfigPath,
+  daemonHeartbeatPath,
   applyFileEnv,
   autoSwitchPolicyOf,
   daemonSettingsPath,
@@ -158,6 +159,45 @@ export function makeAgentSdkClientFactory(logger: Logger): () => AgentSdkClient 
             'active account - confirm the switch engine activated it before spawn',
         ),
     });
+}
+
+/** The steps a clean stop performs, injected so their ORDER is testable without a live daemon.
+ *  Each one is best-effort inside {@link runShutdownSequence}. */
+export interface ShutdownSequence {
+  /** Stop the daemon itself: live sessions, poll loop, relay socket, hook receiver, store. */
+  stopDaemon: () => Promise<void>;
+  /** Drop the published loopback endpoint pointer. */
+  removeEndpoint: () => Promise<void>;
+  /** Drop the single-instance lock this process holds. */
+  releaseLock: () => Promise<void>;
+  /** Write the clean-stop marker (`HeartbeatWriter.stop`) — the claim `cctl daemon status`
+   *  renders as "stopped cleanly". */
+  markStopped: () => void;
+  /** Wait for every queued heartbeat write, marker included, to reach the disk. */
+  flushHeartbeat: () => Promise<void>;
+}
+
+/**
+ * Run a clean stop, in the one order that keeps the heartbeat honest.
+ *
+ * The stop marker is written LAST, after the teardown work and immediately before the flush
+ * that puts it on disk. Written first — the obvious place, since the heartbeat is the first
+ * thing you want to stop beating — it is a claim about a process that is still very much alive:
+ * `daemon.stop()` can take as long as its session-stop bound, and if it hangs outright (a wedged
+ * handle, a stuck close) the marker sits there telling `cctl daemon status` the daemon stopped
+ * cleanly while this process still holds the instance lock and the receiver's port. Beating a
+ * few seconds longer costs nothing; claiming a stop that has not happened sends the next start
+ * into a lock fight it was told nothing about.
+ *
+ * Every step is best-effort: a failure in any one of them must not strand the process before the
+ * marker is written, which is precisely the state that would be misreported afterwards.
+ */
+export async function runShutdownSequence(steps: ShutdownSequence): Promise<void> {
+  await steps.stopDaemon().catch(() => undefined);
+  await steps.removeEndpoint().catch(() => undefined);
+  await steps.releaseLock().catch(() => undefined);
+  steps.markStopped();
+  await steps.flushHeartbeat().catch(() => undefined);
 }
 
 /** Assemble and start the daemon; resolves once the process-level guards (crash log, instance
@@ -490,7 +530,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // reading this long after the daemon that wrote it has exited, so a file is the only channel
   // that survives a hard crash. Started as soon as this process is up (not gated on the
   // control-plane connection — see the comment below), stopped on shutdown.
-  const heartbeat = new HeartbeatWriter(join(dataDir, 'daemon-heartbeat.json'), {
+  const heartbeat = new HeartbeatWriter(daemonHeartbeatPath(paths), {
     onError: (err) => logger.warn({ err }, 'could not write the daemon heartbeat'),
   });
 
@@ -528,22 +568,19 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
 
   const shutdown = (): void => {
     process.stdout.write('Stopping daemon...\n');
-    heartbeat.stop();
-    void daemon
-      .stop()
-      .catch(() => {})
+    void runShutdownSequence({
+      stopDaemon: () => daemon.stop(),
       // Remove the published endpoint so a `cctl session` command run against a stopped daemon
-      // fails fast with "start the daemon" rather than racing a dead port. Best-effort.
-      .then(() => rm(hookEndpointPath(dataDir), { force: true }).catch(() => {}))
+      // fails fast with "start the daemon" rather than racing a dead port.
+      removeEndpoint: () => rm(hookEndpointPath(dataDir), { force: true }),
       // Free the instance lock so a subsequent `daemon run` doesn't have to wait for the
-      // liveness check to notice this pid is gone. Best-effort, and guarded internally (only
-      // deletes if it still records OUR pid) — a crash instead of a clean Ctrl+C skips this,
-      // which is fine: the next start's liveness check treats the leftover file as stale.
-      .then(() => releaseInstanceLock(dataDir).catch(() => {}))
-      // The stop marker `heartbeat.stop()` queued must reach the disk before this process ends,
-      // or `cctl daemon status` keeps reading the last beat as a live daemon.
-      .then(() => heartbeat.flush())
-      .then(() => process.exit(0));
+      // liveness check to notice this pid is gone. Guarded internally (only deletes if the file
+      // still records OUR pid) — a crash instead of a clean Ctrl+C skips this, which is fine:
+      // the next start's liveness check treats the leftover file as stale.
+      releaseLock: () => releaseInstanceLock(dataDir),
+      markStopped: () => heartbeat.stop(),
+      flushHeartbeat: () => heartbeat.flush(),
+    }).then(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

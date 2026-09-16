@@ -732,7 +732,7 @@ export function buildProgram(): Command {
       // are still meaningful without it.
       const task = queryAutostart();
 
-      const heartbeat = await readHeartbeat(join(dataDir, 'daemon-heartbeat.json'));
+      const heartbeat = await readHeartbeat(daemonHeartbeatPath(paths));
       const identity = await dpapiIdentityStore(
         join(dataDir, 'daemon-identity.enc'),
         defaultProtector(),
@@ -912,7 +912,7 @@ async function attemptPair(code: string, relayUrl: string): Promise<PairResult> 
  *  heartbeat for up to 10s so a just-kicked daemon has time to report in; without it, reads
  *  once — the right call when nothing was kicked, i.e. a platform with no autostart. */
 async function verifyDaemonAlive(options: { wait?: boolean } = {}): Promise<boolean> {
-  const heartbeatPath = join(dirname(defaultPaths().vaultDir), 'daemon-heartbeat.json');
+  const heartbeatPath = daemonHeartbeatPath();
   const deadline = Date.now() + ((options.wait ?? true) ? 10_000 : 0);
   for (;;) {
     if ((await readHeartbeat(heartbeatPath)).state === 'alive') return true;
@@ -996,7 +996,7 @@ async function readStatusSummary(): Promise<SetupSummary> {
     hooksInstalledAt(settingsPath),
     dpapiIdentityStore(join(dataDir, 'daemon-identity.enc'), defaultProtector()).load(),
   ]);
-  const heartbeat = await readHeartbeat(join(dataDir, 'daemon-heartbeat.json'));
+  const heartbeat = await readHeartbeat(daemonHeartbeatPath(paths));
   return {
     accounts: accounts.map((a) => ({ label: a.label, active: a.id === activeId })),
     hooksInstalled,
