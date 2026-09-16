@@ -120,6 +120,81 @@ function errorReason(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** The identity fields a registry row and a login's identity block BOTH carry — the only ones a
+ *  re-login's attribution can be checked on. `organizationName` and the plan facts live in the
+ *  bundle alone, so they can neither confirm a row nor contradict it. */
+const IDENTITY_ANCHORS = ['accountUuid', 'emailAddress', 'organizationUuid'] as const;
+type IdentityAnchor = (typeof IDENTITY_ANCHORS)[number];
+
+/** An anchor read out of an identity block. The block is unvalidated upstream JSON (see
+ *  vault.ts's `asString`), so a value that is not a string is not an anchor at all. */
+function anchorValue(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Why the identity a login REPORTED may not be written under `existing` — as a clause for the
+ * refusal message — or `undefined` when it may.
+ *
+ * The rule is "this login has to be provably, or at least consistently, the same account", and
+ * it is deliberately not just a uuid comparison:
+ *
+ *   - Both sides name a uuid: the uuid alone decides. Past that proof a changed address or
+ *     organization is a legitimately changed FACT (a rename, a moved org) that the re-login is
+ *     meant to apply, so refusing on it would freeze the account's own metadata.
+ *   - Only a partial identity was reported (no uuid — an exchange answers with whatever the
+ *     provider felt like returning): it may not contradict any anchor the row already holds.
+ *     Without this, another person's grant that happens to report no uuid passes unexamined.
+ *   - The ROW has no uuid: there is nothing to prove sameness against, so a login must echo
+ *     every anchor the row does have. A silent login would otherwise be adopted by any account
+ *     whose identity was never captured. A row with no identity at all has nothing to
+ *     contradict and nothing to lose, so it accepts and gains one.
+ *
+ * A login that named NOBODY is not checked: the bundle built from it carries no identity block
+ * (see {@link mergeOverStoredBundle}), so it cannot mis-attribute anything, and the next capture
+ * re-establishes the block.
+ */
+function reloginIdentityRefusal(
+  existing: StoredAccount,
+  reported: OauthAccount | undefined,
+): string | undefined {
+  if (reported === undefined) return undefined;
+  const claimed = (key: IdentityAnchor): string | undefined => anchorValue(reported[key]);
+
+  const storedUuid = existing.accountUuid;
+  const claimedUuid = claimed('accountUuid');
+  if (storedUuid !== undefined && claimedUuid !== undefined) {
+    if (storedUuid === claimedUuid) return undefined;
+    return `is a different account (${claimed('emailAddress') ?? claimedUuid}) than "${existing.label}"`;
+  }
+
+  // Unproven from here: one side or the other has no uuid, so the remaining anchors carry the
+  // whole check.
+  const contradicted = IDENTITY_ANCHORS.filter((key) => {
+    const stored = existing[key];
+    const value = claimed(key);
+    return stored !== undefined && value !== undefined && stored !== value;
+  });
+  if (contradicted.length > 0) {
+    const detail = contradicted
+      .map((key) => `${key} is ${String(claimed(key))}, not ${String(existing[key])}`)
+      .join('; ');
+    return `is not "${existing.label}" (${detail})`;
+  }
+  // A row WITH a uuid has been checked as far as a partial identity allows: it contradicts
+  // nothing this account knows about itself, so it is written.
+  if (storedUuid !== undefined) return undefined;
+
+  const unanswered = IDENTITY_ANCHORS.filter(
+    (key) => existing[key] !== undefined && claimed(key) === undefined,
+  );
+  if (unanswered.length === 0) return undefined;
+  return (
+    `cannot be shown to be "${existing.label}": it reports no ${unanswered.join('/')} to match ` +
+    'the stored one, and the account has no accountUuid to check against'
+  );
+}
+
 export class SwitchEngine {
   private readonly paths: Paths;
   private readonly vault: Vault;
@@ -226,9 +301,33 @@ export class SwitchEngine {
     try {
       return await this.sweepAccountMetadata();
     } catch (err) {
-      this.log.warn({ reason: errorReason(err) }, 'account metadata sweep did not run');
+      await this.reportRepairFailure(err, 'account metadata sweep did not run');
       return 0;
     }
+  }
+
+  /**
+   * Report an opportunistic repair that could not run (see {@link backfillAccountMetadata} and
+   * {@link dedupeAccounts} for why those never throw).
+   *
+   * A repair that failed on its own terms is a warning: it is the only evidence that a self-heal
+   * has stopped healing. An unreadable REGISTRY is not that — it is the calling command's own
+   * input being broken, and the read that command is about to do throws it as one clean,
+   * phrased error. Warning about it first only puts raw log lines in front of that error for a
+   * condition the operator is already being told about, once per repair. So it drops to debug,
+   * where `CCTL_LOG_LEVEL=debug` still has it.
+   *
+   * The registry is re-read to classify, which costs nothing in the steady state: this runs only
+   * after a repair has already failed.
+   */
+  private async reportRepairFailure(err: unknown, message: string): Promise<void> {
+    const reason = errorReason(err);
+    const registryBroken = await this.vault.listAccounts().then(
+      () => false,
+      () => true,
+    );
+    if (registryBroken) this.log.debug({ reason }, message);
+    else this.log.warn({ reason }, message);
   }
 
   /**
@@ -250,7 +349,7 @@ export class SwitchEngine {
       }
       return report ?? nothing;
     } catch (err) {
-      this.log.warn({ reason: errorReason(err) }, 'duplicate-account check did not run');
+      await this.reportRepairFailure(err, 'duplicate-account check did not run');
       return nothing;
     }
   }
@@ -631,7 +730,9 @@ export class SwitchEngine {
       );
     }
     const oauthAccount = await store.readOauthAccount();
-    return this.applyReloginBundle(existing, creds, oauthAccount, liveAccountId);
+    // A host capture reads the login's own files, so what gets stored and what the login
+    // reported are the same block — the guard has nothing merged to see through.
+    return this.applyReloginBundle(existing, creds, oauthAccount, liveAccountId, oauthAccount);
   }
 
   /**
@@ -649,23 +750,28 @@ export class SwitchEngine {
    * block must describe the login that just happened. A block carried forward past a login that
    * named nobody is the cross-account contamination class — a missing block self-heals on the
    * next activation, a wrong one never does.
+   *
+   * `reportedIdentity` is that same rule made checkable: what the login ITSELF said about who
+   * logged in, before any merge with what was already stored. The guard runs on that and never
+   * on `oauthAccount`, because a merged block inherits the stored row's own anchors and would
+   * only ever be compared against itself (see {@link reloginIdentityRefusal}).
    */
   private async applyReloginBundle(
     existing: StoredAccount,
     creds: ClaudeOauth,
     oauthAccount: OauthAccount | undefined,
     liveAccountId: string | null,
+    reportedIdentity: OauthAccount | undefined,
   ): Promise<ReloginResult> {
-    // Attribution guard — a mismatch is fatal, not a warning: writing a different account's
-    // tokens under this id would corrupt the very history this verb exists to protect.
-    if (
-      existing.accountUuid !== undefined &&
-      oauthAccount?.accountUuid !== undefined &&
-      existing.accountUuid !== oauthAccount.accountUuid
-    ) {
+    // Attribution guard — a refusal is fatal, not a warning: writing a different account's
+    // tokens under this id would corrupt the very history this verb exists to protect. It runs
+    // before ANY write, so a refused login leaves the vault bundle, the quarantine flag and the
+    // live files exactly as they were.
+    const refusal = reloginIdentityRefusal(existing, reportedIdentity);
+    if (refusal !== undefined) {
       throw new RefreshError(
-        `the captured login is a different account (${oauthAccount.emailAddress ?? oauthAccount.accountUuid}) ` +
-          `than "${existing.label}" - re-login must use the SAME account to keep its usage history intact`,
+        `the captured login ${refusal} - re-login must use the SAME account to keep its ` +
+          'usage history intact',
         'relogin_identity_mismatch',
       );
     }
@@ -807,11 +913,16 @@ export class SwitchEngine {
       // the RAW response for `identityVerified` below — the merged block can carry a uuid the
       // exchange itself never reported.
       const merged = await this.mergeOverStoredBundle(existing.id, claudeAiOauth, oauthAccount);
+      // The merged block is what gets STORED; the raw response is what gets CHECKED. They are
+      // not interchangeable: the merge folds the stored identity underneath the reported one, so
+      // a guard given the merged block would compare this account's anchors against themselves
+      // and pass any login that simply failed to mention who it belongs to.
       const { account, healedLiveLogin } = await this.applyReloginBundle(
         existing,
         merged.claudeAiOauth,
         merged.oauthAccount,
         liveAccountId,
+        oauthAccount,
       );
       return {
         account,
