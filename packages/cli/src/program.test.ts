@@ -3,7 +3,12 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { VaultError, type DedupeReport, type StoredAccount } from '@claude-control/switch-engine';
+import {
+  RefreshError,
+  VaultError,
+  type DedupeReport,
+  type StoredAccount,
+} from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
 import { CliFailure, reportFatal } from './context.js';
 import { VERSION, type SettingsReport } from './settings.js';
@@ -21,6 +26,9 @@ const engine = vi.hoisted(() => ({
   ),
   listAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
+  activate: vi.fn((id: string): Promise<never> =>
+    Promise.reject(new Error(`activate(${id}) not stubbed`)),
+  ),
   setAutoSwitchExcluded: vi.fn(() => Promise.resolve()),
   renameAccount: vi.fn((id: string, label: string): Promise<StoredAccount> =>
     Promise.reject(new Error(`renameAccount(${id}, ${label}) not stubbed`)),
@@ -619,10 +627,56 @@ describe('daemon stop / start / restart', () => {
   });
 });
 
-describe('version command', () => {
-  beforeEach(() => {
-    settingsIo.readSettingsReport.mockReset().mockResolvedValue(undefined);
+describe('switch', () => {
+  const account: StoredAccount = {
+    id: 'id-1',
+    label: 'Work',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  };
+
+  it('prints an overloaded token endpoint as its own refusal, with no stack', async () => {
+    // The engine has already spent its retry budget and read the status page by the time this
+    // surfaces, so there is nothing left for the CLI to do but say so. Reaching the entry
+    // point's catch-all instead would report a fleet-wide outage as an unhandled failure of
+    // this one command.
+    engine.listAccounts.mockResolvedValueOnce([account]);
+    engine.activate.mockRejectedValueOnce(
+      new RefreshError(
+        'token endpoint overloaded (529) after 6 attempts; status.claude.com: major',
+        'http_529',
+      ),
+    );
+
+    const r = await runCli(['switch', 'Work']);
+
+    expect(r.exited).toBe(true);
+    expect(r.err).toBe(
+      'error: token endpoint overloaded (529) after 6 attempts; status.claude.com: major. ' +
+        'Nothing was changed - try again shortly.\n',
+    );
+    expect(r.out).toBe('');
   });
+});
+
+describe('version command', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    settingsIo.readSettingsReport.mockReset().mockResolvedValue(undefined);
+    dir = await mkdtemp(join(tmpdir(), 'cctl-version-'));
+    settingsIo.heartbeatPath = join(dir, 'daemon-heartbeat.json');
+  });
+
+  afterEach(async () => {
+    settingsIo.heartbeatPath = '';
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** A daemon that is still writing its heartbeat right now. */
+  const running = (): Promise<void> =>
+    writeFile(settingsIo.heartbeatPath, JSON.stringify({ writtenAtMs: Date.now() }), 'utf8');
 
   it('prints the cli build and says no daemon has run when there is no report', async () => {
     const out = await run(['version']);
@@ -630,14 +684,28 @@ describe('version command', () => {
     expect(out).toContain('no daemon has run');
   });
 
-  it('prints both builds when the daemon has reported one', async () => {
+  it('prints both builds when a daemon is running and has reported one', async () => {
     settingsIo.readSettingsReport.mockResolvedValue({
       startedAtMs: 0,
       settings: [{ name: 'daemon build', value: `v${VERSION}`, source: 'default' }],
     });
+    await running();
     const out = await run(['version']);
     expect(out).toContain(`cli build: v${VERSION}`);
     expect(out).toContain(`daemon build: v${VERSION}`);
+  });
+
+  it('does not warn about skew with a daemon that is not running', async () => {
+    // The report outlives the daemon that wrote it, so an old build in it says nothing about a
+    // process that no longer exists — and "cctl daemon restart picks up the update" is advice
+    // only a running daemon can act on.
+    settingsIo.readSettingsReport.mockResolvedValue({
+      startedAtMs: 0,
+      settings: [{ name: 'daemon build', value: 'v0.0.1', source: 'default' }],
+    });
+    const out = await run(['version']);
+    expect(out).toContain('last started daemon build: v0.0.1 (no daemon is running)');
+    expect(out).not.toContain('warning');
   });
 });
 
@@ -678,6 +746,20 @@ describe('help', () => {
   it("resolves `cctl help <command>` to that command's own usage", async () => {
     const out = await captureHelp(['help', 'switch']);
     expect(out).toContain('Usage: cctl switch');
+  });
+
+  it('resolves a NESTED command, not the group it lives in', async () => {
+    // Most of this CLI's verbs live one level down, so a help that stops at the group answers a
+    // question nobody asked — and answers it silently, which reads as "that is all there is".
+    const out = await captureHelp(['help', 'accounts', 'reauth']);
+    expect(out).toContain('Usage: cctl accounts reauth');
+    expect(out).not.toContain('Usage: cctl accounts [options] [command]');
+  });
+
+  it('says which name it could not resolve, and where', async () => {
+    const r = await runCli(['help', 'accounts', 'nope']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('unknown command "nope" under "accounts"');
   });
 });
 
