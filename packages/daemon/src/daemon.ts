@@ -85,6 +85,7 @@ import {
   CHANNEL_TTL_MS,
   ChannelRegistry,
   type ChannelInjection,
+  type ExpiredInjection,
 } from './channelRegistry.js';
 import { ControlPlaneClient } from './controlPlaneClient.js';
 import { LOOP_LAG_THRESHOLD_MS, startLoopLagMonitor } from './loopLagMonitor.js';
@@ -2330,33 +2331,61 @@ export class Daemon {
   }
 
   /**
-   * Card the operator about injections the channel queue expired before any client took them.
+   * Card the operator about injections the channel queue expired.
    *
    * The registry drops them (30-minute-old guidance delivered into whatever the session is doing
    * now is worse than nothing) but it is transport-free, so it cannot say so. `takePendingSteering`
    * sends exactly this card for the identical situation on the steering path; the two must not
    * disagree about whether an expiry is worth telling the operator.
+   *
+   * The body separates the two expiries the registry reports, because only one of them is a
+   * statement about what the session did NOT receive. A prompt that aged out in the queue was
+   * never collected by anything. A prompt that aged out IN FLIGHT was handed to a channel server
+   * that never confirmed writing it: the session may have received it, and the only honest thing
+   * this card can say about it is that cctl has stopped waiting. Folding the second into the
+   * first would tell the operator a message did not arrive when it may well have — the same
+   * overstatement in the other direction as rendering an unverifiable write as a delivery.
    */
-  private cardChannelExpiry(sessionId: string, expired: ChannelInjection[]): void {
+  private cardChannelExpiry(sessionId: string, expired: ExpiredInjection[]): void {
     // Expired means gone, so the durable rows go with them. A row that outlived its expiry would
     // be restored by the next daemon start as text still waiting to deliver — text this daemon
     // has just told the operator was dropped.
     for (const item of expired) this.retireChannelRow(item.injectId);
+    const handedOut = expired.filter((item) => item.handedOut).length;
+    const uncollected = expired.length - handedOut;
+    const minutes = CHANNEL_TTL_MS / 60_000;
+    const clauses: string[] = [];
+    if (uncollected > 0) {
+      clauses.push(
+        `${uncollected} message${uncollected === 1 ? '' : 's'} sent to this session's live ` +
+          `channel aged past ${minutes} minutes before its channel server collected ` +
+          `${uncollected === 1 ? 'it' : 'them'} — dropped, not delivered.`,
+      );
+    }
+    if (handedOut > 0) {
+      clauses.push(
+        `${handedOut}${uncollected > 0 ? ' other' : ''} message${handedOut === 1 ? ' was' : 's were'} ` +
+          `handed to the channel server but never confirmed, and aged past the same ${minutes} ` +
+          `minutes — the session may have received ` +
+          `${handedOut === 1 ? 'it' : 'them'}; nothing is waiting to deliver ` +
+          `${handedOut === 1 ? 'it' : 'them'} now.`,
+      );
+    }
     this.sendEnvelope({
       type: 'hook.notification',
       payload: {
         event: 'notification',
         sessionId,
         title: 'Channel message expired',
-        body:
-          `${expired.length} message${expired.length === 1 ? '' : 's'} sent to this session's ` +
-          `live channel aged past ${CHANNEL_TTL_MS / 60_000} minutes before its channel server ` +
-          `collected ${expired.length === 1 ? 'it' : 'them'} — dropped, not delivered.`,
+        body: clauses.join(' '),
         level: 'warn',
         notificationType: 'channel_expired',
       },
     });
-    this.logger.warn({ sessionId, count: expired.length }, 'channel: queued injections expired');
+    this.logger.warn(
+      { sessionId, count: expired.length, handedOut },
+      'channel: queued injections expired',
+    );
   }
 
   /**

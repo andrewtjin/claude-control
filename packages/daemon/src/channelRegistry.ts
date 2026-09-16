@@ -67,6 +67,19 @@ export interface ChannelInjection {
   queuedAtMs: number;
 }
 
+/** An injection the TTL dropped, carrying the one thing the caller cannot work out for itself:
+ *  whether a channel server had already been handed it.
+ *
+ *  The two cases are not the same event and must not be reported as one. An item that expired in
+ *  the QUEUE was never collected by anything, so "the session never received it" is a fact. An
+ *  item that expired IN FLIGHT was handed to a live client that never acknowledged it — the write
+ *  may well have reached the session, and nothing here can tell. Reporting both as never
+ *  collected would tell the operator a prompt did not arrive when it may have. */
+export interface ExpiredInjection extends ChannelInjection {
+  /** True when this item had been taken by a channel server and never acknowledged. */
+  handedOut: boolean;
+}
+
 export type EnqueueResult =
   | {
       ok: true;
@@ -100,7 +113,7 @@ export interface ChannelRegistryOptions {
    *  The registry is transport-free, so it cannot card the operator itself — but the operator
    *  was told the text was sent, and an expiry that reaches nobody is exactly the silent loss
    *  this module exists to prevent. */
-  onExpire?: (sessionId: string, expired: ChannelInjection[]) => void;
+  onExpire?: (sessionId: string, expired: ExpiredInjection[]) => void;
   queueCap?: number;
   ttlMs?: number;
   /** The poll bound actually in force on the transport. The staleness window is derived from
@@ -111,7 +124,7 @@ export interface ChannelRegistryOptions {
 export class ChannelRegistry {
   private readonly clock: () => number;
   private readonly onEnqueue: ((attachId: string) => void) | undefined;
-  private readonly onExpire: ((sessionId: string, expired: ChannelInjection[]) => void) | undefined;
+  private readonly onExpire: ((sessionId: string, expired: ExpiredInjection[]) => void) | undefined;
   private readonly queueCap: number;
   private readonly ttlMs: number;
   /** How long an attachment may go without a poll before it is written off. Derived, never
@@ -318,9 +331,11 @@ export class ChannelRegistry {
     if (source === 'poll') attachment.lastPollAtMs = now;
     const queue = this.queues.get(attachId) ?? [];
     const fresh: ChannelInjection[] = [];
-    const expired: ChannelInjection[] = [];
+    const expired: ExpiredInjection[] = [];
     for (const item of queue) {
-      (now - item.queuedAtMs <= this.ttlMs ? fresh : expired).push(item);
+      // Still in the queue, so nothing has ever been handed it — the caller may say so flatly.
+      if (now - item.queuedAtMs <= this.ttlMs) fresh.push(item);
+      else expired.push({ ...item, handedOut: false });
     }
     this.queues.set(attachId, []);
     const flying = this.inFlight.get(attachId);
@@ -333,7 +348,9 @@ export class ChannelRegistry {
       for (const [injectId, item] of flying) {
         if (now - item.queuedAtMs <= this.ttlMs) continue;
         flying.delete(injectId);
-        expired.push(item);
+        // Flagged, because this one was written to a client: whether the session saw it is
+        // genuinely unknown here, and the report must not claim otherwise.
+        expired.push({ ...item, handedOut: true });
       }
       for (const item of fresh) flying.set(item.injectId, item);
     }

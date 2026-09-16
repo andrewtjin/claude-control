@@ -42,6 +42,7 @@ import { UsagePoller } from './usagePoller.js';
 import { AttributionJournal } from './attributionJournal.js';
 import { HookReceiver } from './hookReceiver.js';
 import { ControlPlaneClient, type DaemonIdentity } from './controlPlaneClient.js';
+import { CHANNEL_TTL_MS } from './channelRegistry.js';
 import { Daemon, DELIVERED_INJECT_SESSIONS, type SwitchEngineLike } from './daemon.js';
 
 const SECRET = 'shh';
@@ -174,9 +175,23 @@ afterEach(async () => {
   await rm(stateDir, { recursive: true, force: true });
 });
 
+/** A clock the test drives by hand, for the cases that turn on the half-hour TTL. Real time is
+ *  the default everywhere else (house convention: no fake timers) — this is the daemon's own
+ *  injected clock, which is also the one the channel registry stamps and expires items with, so
+ *  advancing it ages a prompt without making the test wait or the daemon's timers lie. */
+function fakeClock(): { now: () => number; advance: (ms: number) => void } {
+  let current = Date.now();
+  return {
+    now: () => current,
+    advance: (ms: number) => {
+      current += ms;
+    },
+  };
+}
+
 /** Build and start a daemon over `dbPath` (a real file, so a restart can read what the previous
  *  one left), returning its loopback port. */
-async function startDaemon(dbPath: string): Promise<number> {
+async function startDaemon(dbPath: string, clock?: () => number): Promise<number> {
   store = new Store(dbPath);
   hookReceiver = new HookReceiver({
     store,
@@ -215,6 +230,7 @@ async function startDaemon(dbPath: string): Promise<number> {
       return Promise.resolve();
     },
     pollIntervalMs: 100_000,
+    ...(clock !== undefined ? { clock } : {}),
   });
   await daemon.start();
   await waitFor(() => captured !== undefined);
@@ -611,3 +627,63 @@ describe('unregistering a session', () => {
   });
 });
 
+describe('the channel expiry card', () => {
+  it('separates what nothing collected from what the session may have received', async () => {
+    const clock = fakeClock();
+    await startDaemon(join(stateDir, 'daemon.db'), clock.now);
+    seedTerminalSession('sess-expiry');
+    const attachId = await attachChannel('sess-expiry');
+
+    // One prompt handed to the channel server, which never acknowledges it…
+    inject('sess-expiry', 'handed over, never confirmed', 'x1');
+    await waitFor(() => countOf('channel_sent') === 1);
+    await channelPost('next', { attachId });
+    // …and one that is never collected by anything at all.
+    inject('sess-expiry', 'nothing ever took this', 'x2');
+    await waitFor(() => countOf('channel_sent') === 2);
+
+    clock.advance(CHANNEL_TTL_MS + 1);
+    // A fresh prompt, so the poll that expires the other two answers at once instead of being
+    // held open for want of anything to return.
+    inject('sess-expiry', 'still fresh', 'x3');
+    await waitFor(() => countOf('channel_sent') === 3);
+    expect(await pollChannel(attachId)).toEqual(['still fresh']);
+    await waitFor(() => countOf('channel_expired') === 1);
+
+    const [card] = cardsOfType('channel_expired');
+    expect(card?.body).toContain(
+      "1 message sent to this session's live channel aged past 30 minutes before its channel " +
+        'server collected it — dropped, not delivered.',
+    );
+    expect(card?.body).toContain(
+      '1 other message was handed to the channel server but never confirmed',
+    );
+    expect(card?.body).toContain('the session may have received it');
+  });
+
+  it('never claims a handed-over prompt was uncollected', async () => {
+    // The dishonest shape on its own: everything that expired had been written to a live channel
+    // server. "Before its channel server collected it" would be flatly false, and it is the
+    // sentence an operator would read as "this did not reach the session".
+    const clock = fakeClock();
+    await startDaemon(join(stateDir, 'daemon.db'), clock.now);
+    seedTerminalSession('sess-expiry-flight');
+    const attachId = await attachChannel('sess-expiry-flight');
+    inject('sess-expiry-flight', 'the session may well have this', 'f1');
+    await waitFor(() => countOf('channel_sent') === 1);
+    await channelPost('next', { attachId });
+
+    clock.advance(CHANNEL_TTL_MS + 1);
+    inject('sess-expiry-flight', 'still fresh', 'f2');
+    await waitFor(() => countOf('channel_sent') === 2);
+    expect(await pollChannel(attachId)).toEqual(['still fresh']);
+    await waitFor(() => countOf('channel_expired') === 1);
+
+    const [card] = cardsOfType('channel_expired');
+    expect(card?.body).not.toContain('collected');
+    expect(card?.body).toContain(
+      '1 message was handed to the channel server but never confirmed, and aged past the same ' +
+        '30 minutes — the session may have received it; nothing is waiting to deliver it now.',
+    );
+  });
+});
