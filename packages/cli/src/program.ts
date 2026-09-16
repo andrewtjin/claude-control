@@ -105,6 +105,7 @@ import {
 } from './render.js';
 import {
   renderSessionStatus,
+  weeklyResetHeader,
   type SessionStatusHeader,
   type SessionStatusRow,
 } from './sessionRender.js';
@@ -1643,7 +1644,10 @@ function buildSessionCommands(program: Command): void {
     .command('status')
     .description('show tracked sessions and the active account (reads the daemon db offline)')
     .action(async () => {
-      const { accounts, activeId, usageFor } = await readUsageState(Date.now());
+      // One moment for the whole view: the snapshot read and the countdown derived from it must
+      // not straddle two clock reads.
+      const nowMs = Date.now();
+      const { accounts, activeId, usageFor, predictedResetFor } = await readUsageState(nowMs);
       const labelById = new Map(accounts.map((a) => [a.id, a.label] as const));
 
       // Read the display-only sessions mirror. Opening a not-yet-created db yields an empty one;
@@ -1659,7 +1663,12 @@ function buildSessionCommands(program: Command): void {
       const activeAccount = accounts.find((a) => a.id === activeId);
       const header: SessionStatusHeader = {
         ...(activeAccount ? { activeLabel: activeAccount.label } : {}),
-        ...(activeId ? weeklyResetFor(usageFor(activeId)) : {}),
+        // The PREDICTED reset travels with the snapshot: the endpoint stops publishing a weekly
+        // reset once that window closes, so without it this header goes silent about a runway
+        // `cctl usage` is still counting down.
+        ...(activeId
+          ? weeklyResetHeader(usageFor(activeId), predictedResetFor(activeId), nowMs)
+          : {}),
       };
       process.stdout.write(renderSessionStatus(rows, header, detectPalette()) + '\n');
     });
@@ -1681,18 +1690,6 @@ function sessionRowFromStore(row: SessionRow, labelById: Map<string, string>): S
   if (typeof parsed.watch === 'boolean') out.watch = parsed.watch;
   if (accountId !== undefined) out.accountLabel = labelById.get(accountId) ?? accountId;
   return out;
-}
-
-/** How long until the active account's weekly reset, for the status header — the same runway
- *  `cctl usage` shows inline. Empty when there is no usage snapshot or no known weekly reset.
- *  Returns the remaining duration, not the reset instant: the renderer is clock-free, so the
- *  subtraction has to happen here, where a real clock is already in hand. */
-function weeklyResetFor(usage: AccountUsage | undefined): { weeklyResetInMs?: number } {
-  if (!usage) return {};
-  const nowMs = Date.now();
-  const outlook = computeOutlook(timelineInputFromWire([usage]), nowMs);
-  const budget = outlook.accounts[0]?.budget;
-  return budget ? { weeklyResetInMs: budget.weeklyResetAt - nowMs } : {};
 }
 
 /** Shared driver for register/label/watch: resolve the session id, POST to the daemon with a
