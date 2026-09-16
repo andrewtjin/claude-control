@@ -140,6 +140,12 @@ export interface SessionRecord {
   startedAtMs: number;
   /** Last summary line surfaced by the session, if any — cheap "what's it doing" preview. */
   summary?: string;
+  /** True while the session is PARKED on a usage limit (managed only): idle, holding a prompt
+   *  to replay after an account switch. Persisted because `state` cannot carry it across a
+   *  restart — a park looks like any other idle session, and shutdown stamps it terminal like
+   *  any other — so without this marker the next run reads a session the operator was told
+   *  would resume as one that simply finished. Consumed by `recover()`. */
+  parkedOnUsageLimit?: boolean;
 }
 
 /**
@@ -187,6 +193,15 @@ export interface SessionHandle {
    * valid.
    */
   resumeFromUsageLimitStall?(): boolean;
+  /**
+   * Whether the session is PARKED on a usage limit right now (managed only; optional for the
+   * same reason as {@link resumeFromUsageLimitStall}). A parked session sits in
+   * `waiting_input` — indistinguishable by state from one that finished a turn and is ready
+   * for more — so anything that treats idle as "ready to take work" has to ask this first:
+   * sending into a park spends a request on the exhausted account and replaces the prompt the
+   * post-switch kick was holding.
+   */
+  isParkedOnUsageLimit?(): boolean;
   /**
    * Subscribe to STRUCTURED permission requests (managed sessions only). Optional because an
    * observed terminal has no structured permission seam — its permissions surface through the

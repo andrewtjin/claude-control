@@ -579,4 +579,179 @@ describe('createSessionManager', () => {
       ).rejects.toThrow(/already live/);
     });
   });
+
+  // The policy is threaded through two pass-throughs (spawn and re-attach) and nothing else
+  // here proves either one arrives: a dropped spread would leave every managed session failing
+  // on the first transient API error with every other test still green.
+  describe('autoContinue pass-through', () => {
+    /** A client whose first turn dies of a transient API failure and whose second completes —
+     *  a session that reaches the second turn can only have got there through the policy. */
+    function flakyThenCleanClient(): { client: AgentSdkClient; prompts: string[] } {
+      const prompts: string[] = [];
+      const script: AgentSdkEvent[][] = [
+        [{ type: 'turn_result', ok: false, summary: 'API Error: 500 Internal server error.' }],
+        [{ type: 'turn_result', ok: true, summary: 'done' }],
+      ];
+      let turn = 0;
+      return {
+        prompts,
+        client: {
+          query(prompt) {
+            prompts.push(prompt);
+            const events = script[turn] ?? [];
+            turn++;
+            return {
+              async *[Symbol.asyncIterator]() {
+                await Promise.resolve();
+                for (const e of events) yield e;
+              },
+            };
+          },
+          interrupt: () => Promise.resolve(),
+          end: () => Promise.resolve(),
+        },
+      };
+    }
+
+    /** Collects the retry callbacks instead of waiting out a real backoff. */
+    function manualSchedule(): {
+      schedule: (fn: () => void) => () => void;
+      due: Array<() => void>;
+    } {
+      const due: Array<() => void> = [];
+      return {
+        due,
+        schedule: (fn) => {
+          due.push(fn);
+          return () => undefined;
+        },
+      };
+    }
+
+    it('reaches a spawned session (a transient failure retries instead of going terminal)', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      const { client, prompts } = flakyThenCleanClient();
+      const timers = manualSchedule();
+      const handle = await manager.spawnManaged({
+        id: 'm1',
+        client,
+        prompt: 'go',
+        autoContinue: { schedule: timers.schedule },
+      });
+      await tick();
+
+      expect(handle.getState()).not.toBe('failed');
+      expect(timers.due).toHaveLength(1);
+      timers.due[0]?.();
+      await tick();
+      expect(prompts).toEqual(['go', 'go']);
+      expect(handle.getState()).toBe('waiting_input');
+    });
+
+    it('reaches a re-attached session too', async () => {
+      const dir = await sandbox();
+      const rec: SessionRecord = {
+        id: 'm2',
+        kind: 'managed',
+        state: 'orphaned',
+        startedAtMs: 1,
+        resumeId: 'sdk-7',
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([rec]));
+      const manager = createSessionManager({ stateDir: dir });
+      const { client, prompts } = flakyThenCleanClient();
+      const timers = manualSchedule();
+      const handle = await manager.resumeOrphan!('m2', {
+        client,
+        prompt: 'pick it up',
+        autoContinue: { schedule: timers.schedule },
+      });
+      await tick();
+
+      expect(handle.getState()).not.toBe('failed');
+      expect(timers.due).toHaveLength(1);
+      timers.due[0]?.();
+      await tick();
+      expect(prompts).toEqual(['pick it up', 'pick it up']);
+      expect(handle.getState()).toBe('waiting_input');
+    });
+  });
+
+  describe('usage-limit park', () => {
+    const USAGE_LIMIT = 'Claude usage limit reached. Your limit will reset at 3pm.';
+
+    /** Turn N of the session gets script[N]'s events — a park followed by a clean resume needs
+     *  two DIFFERENT turns, which the shared single-script fake cannot express. */
+    function scriptedClient(script: AgentSdkEvent[][]): AgentSdkClient {
+      let turn = 0;
+      return {
+        query() {
+          const events = script[turn] ?? [];
+          turn++;
+          return {
+            async *[Symbol.asyncIterator]() {
+              await Promise.resolve();
+              for (const e of events) yield e;
+            },
+          };
+        },
+        interrupt: () => Promise.resolve(),
+        end: () => Promise.resolve(),
+      };
+    }
+
+    it('persists the park onto the record and clears it when a turn resumes', async () => {
+      const dir = await sandbox();
+      const manager = createSessionManager({ stateDir: dir });
+      const handle = await manager.spawnManaged({
+        id: 'm1',
+        client: scriptedClient([
+          [{ type: 'turn_result', ok: false, summary: USAGE_LIMIT }],
+          [{ type: 'turn_result', ok: true, summary: 'done' }],
+        ]),
+        prompt: 'go',
+        autoContinue: { schedule: () => () => undefined },
+      });
+      await tick();
+
+      expect(manager.list().find((r) => r.id === 'm1')?.parkedOnUsageLimit).toBe(true);
+      const onDisk = await waitForRegistry(dir, (rs) => rs[0]?.parkedOnUsageLimit === true);
+      expect(onDisk[0]?.parkedOnUsageLimit).toBe(true);
+
+      // The kick's turn un-parks it, and the marker goes with the park: it describes the state
+      // the session is in, never a history of where it has been.
+      handle.resumeFromUsageLimitStall!();
+      await tick();
+      expect(manager.list().find((r) => r.id === 'm1')?.parkedOnUsageLimit).toBeUndefined();
+    });
+
+    it('recover() revives a park that shutdown stamped terminal, and announces it once', async () => {
+      const dir = await sandbox();
+      // What a clean daemon shutdown leaves behind: stop() stamped the parked session `done`.
+      const parked: SessionRecord = {
+        id: 'm1',
+        kind: 'managed',
+        state: 'done',
+        startedAtMs: 1,
+        resumeId: 'sdk-1',
+        parkedOnUsageLimit: true,
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([parked]));
+
+      const manager = createSessionManager({ stateDir: dir });
+      const recovered = await manager.recover();
+
+      // Reported as parked, so the caller can tell the operator what became of it; reconciled
+      // as an orphan, so the promise that it resumes stays keepable (orphans re-attach on the
+      // next prompt).
+      expect(recovered).toEqual([{ ...parked, state: 'orphaned' }]);
+      expect(manager.list()).toEqual([
+        { id: 'm1', kind: 'managed', state: 'orphaned', startedAtMs: 1, resumeId: 'sdk-1' },
+      ]);
+
+      // The marker is consumed: the next start finds an ordinary orphan and announces nothing.
+      expect(await manager.recover()).toEqual([]);
+    });
+  });
 });
