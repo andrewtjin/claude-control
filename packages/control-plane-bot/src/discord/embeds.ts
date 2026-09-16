@@ -53,6 +53,53 @@ const COLOR_MUTED = 0x95a5a6;
  *  degrade — it makes the whole command throw. */
 const FIELD_VALUE_MAX = 1024;
 
+/** Discord's hard cap on an embed TITLE and on a field `name`, validated by discord.js the same
+ *  way — and with the same consequence — as the field value above. */
+const TITLE_MAX = 256;
+
+/** Discord's cap on an embed footer's `text`, validated like the rest. */
+const FOOTER_MAX = 2048;
+
+/** Longest URL this module will render as a markdown link. A login link is a bounded thing (an
+ *  authorize endpoint plus query parameters); past this it is malformed, and a link that cannot
+ *  work must be named as broken rather than drawn as if it might. */
+const LINK_TARGET_MAX = 2048;
+
+/** A URL made safe to interpolate as a markdown link TARGET — `[text](<here>)`.
+ *
+ *  Two failure modes, one fix. A `)` anywhere in the value closes the link early, so the tail of
+ *  the URL spills into the card as prose and the link points somewhere else entirely — a
+ *  half-URL the reader may still click. Whitespace and angle brackets break the target the same
+ *  way. Every one of them is percent-encoded, which preserves what the URL MEANS (a server
+ *  decodes `%29` back to `)`) while removing what it can do to the markup, and the result is
+ *  wrapped in `<…>` so Discord parses it as one target and does not also unfurl a preview.
+ *
+ *  Encoding, not rejecting: this is the card a locked-out account is recovered through, and a
+ *  parenthesis in a state parameter is ordinary, not an attack. */
+function markdownLinkTarget(url: string): string {
+  // Hand-rolled percent-encoding, not encodeURIComponent: that function deliberately leaves
+  // `(`, `)` and `'` alone as unreserved marks — exactly the characters that break the markup —
+  // so using it here would look correct and do nothing. Every character in the class is ASCII,
+  // which is what makes the one-byte escape complete.
+  return `<${url.replace(/[()<>\s"'`\\]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`)}>`;
+}
+
+/** Clamp a string on its way to `setTitle` (or a field name). Every title here is built from at
+ *  least one wire-supplied fragment (a tool name, a notification title, a session id) and the wire
+ *  bounds none of them, so the clamp belongs at the builder: the last place that can still keep
+ *  the card renderable. */
+function clampTitle(text: string): string {
+  return truncateLabeled(text, TITLE_MAX);
+}
+
+/** Clamp a string on its way to `setDescription`. Same reason as {@link clampTitle}, with more at
+ *  stake: the description carries the most untrusted material on a card (a hook-supplied summary,
+ *  a daemon message, model prose), and an over-limit one makes the BUILDER throw — which costs the
+ *  whole card, not its tail. */
+function clampDescription(text: string): string {
+  return truncateLabeled(text, EMBED_DESCRIPTION_LIMIT);
+}
+
 /**
  * Clamp a field value to Discord's 1024-char cap by dropping whole trailing LINES and
  * appending a "… +N more" marker, so the field degrades to "show the first lines" instead
@@ -74,11 +121,13 @@ export function clampFieldValue(value: string, max = FIELD_VALUE_MAX): string {
   return `${(kept[0] ?? '').slice(0, max - 1)}…`;
 }
 
-/** `addFields` with the value clamped — every data-driven field in this module goes
- *  through here so no snapshot shape (more accounts, more limits, longer labels) can
- *  ever make a command throw at the validation layer again. */
+/** `addFields` with BOTH halves clamped — every data-driven field in this module goes through
+ *  here so no snapshot shape (more accounts, more limits, longer labels, a pathological session
+ *  id) can ever make a command throw at the validation layer again. The name is clamped as well
+ *  as the value because a field name is just as often wire-supplied (an account label, a session
+ *  id, a question) and discord.js rejects an over-long one exactly as hard. */
 function addClampedField(embed: EmbedBuilder, name: string, value: string): void {
-  embed.addFields({ name, value: clampFieldValue(value) });
+  embed.addFields({ name: clampTitle(name), value: clampFieldValue(value) });
 }
 
 // The default bar renderer is the credential-free unicode `layeredBar`. It is injected as an
@@ -184,13 +233,16 @@ export function buildUsageEmbed(
     // Signal differences at a glance: 🟢 active / ⚪ idle / ⚠️ erroring, plus a cached-data
     // marker so a stale tier-0 snapshot is never mistaken for a live read.
     const marker = `${accountMarker(account)} ${account.active ? 'active' : 'idle'}`;
-    embed.addFields({
-      name: `${account.label} — ${marker}${cachedSuffix(account)}`,
-      value: fitFieldValue(
+    // Through addClampedField, not a raw addFields: the account LABEL is registry text this side
+    // does not bound, and it is the field name here.
+    addClampedField(
+      embed,
+      `${account.label} — ${marker}${cachedSuffix(account)}`,
+      fitFieldValue(
         (unicodeFallback) =>
           `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${resetLine(outlook, account.accountId)}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
       ),
-    });
+    );
   }
   if (usage.plan) {
     // One compact field: the reason line already carries the whole burn order (see the
@@ -320,9 +372,11 @@ export function buildTimelineEmbed(
       }
       return lines.join('\n');
     };
-    embed.addFields({
-      name: `${accountMarker(a)} ${a.label}${cachedSuffix(wire)}`,
-      value: fitFieldValue(
+    // Same reason as /usage above: the label is unbounded registry text and it is the field name.
+    addClampedField(
+      embed,
+      `${accountMarker(a)} ${a.label}${cachedSuffix(wire)}`,
+      fitFieldValue(
         (unicodeFallback) =>
           `${
             unicodeFallback
@@ -330,7 +384,7 @@ export function buildTimelineEmbed(
               : accountLines(barRenderer, trackStyle)
           }${errorSuffix(wire)}`,
       ),
-    });
+    );
   }
 
   if (outlook.events.length > 0) {
@@ -345,12 +399,13 @@ export function buildTimelineEmbed(
           return `${mark} ${discordRelative(e.atMs)} — **${e.label}** · ${describeEvent(e.kind, e.percentUsed, e.predicted)}`;
         })
         .join('\n');
-    embed.addFields({
-      name: 'Upcoming resets',
-      value: fitFieldValue((unicodeFallback) =>
+    addClampedField(
+      embed,
+      'Upcoming resets',
+      fitFieldValue((unicodeFallback) =>
         upcoming(unicodeFallback ? UNICODE_TRACK_STYLE : trackStyle),
       ),
-    });
+    );
   }
 
   if (usage.plan) {
@@ -495,12 +550,16 @@ export function buildSettingsEmbed(snapshot: SettingsSnapshot): EmbedBuilder {
     const source = s.source === 'default' ? '' : ` _(via ${s.source})_`;
     return `**${s.name}** — ${s.value}${source}`;
   });
-  return new EmbedBuilder()
-    .setTitle('Daemon settings')
-    .setColor(COLOR_INFO)
-    .setDescription(lines.join('\n'))
-    .setFooter({ text: 'as of daemon start' })
-    .setTimestamp(snapshot.startedAtMs);
+  return (
+    new EmbedBuilder()
+      .setTitle('Daemon settings')
+      .setColor(COLOR_INFO)
+      // Knob names and values come from the daemon and grow with its config surface; clamped so a
+      // long settings list degrades to its head rather than making `/settings` throw.
+      .setDescription(clampDescription(lines.join('\n')))
+      .setFooter({ text: 'as of daemon start' })
+      .setTimestamp(snapshot.startedAtMs)
+  );
 }
 
 export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
@@ -536,7 +595,10 @@ export function buildPermissionRequestEmbed(
   const embed = new EmbedBuilder()
     .setTitle('Permission requested')
     .setColor(COLOR_WARN)
-    .setDescription(summary)
+    // The summary is hook-supplied and unbounded on the wire. Unclamped, an over-long one makes
+    // this builder throw on the push path — no card, no buttons, and the session stays blocked
+    // until the hold lapses. Truncated-but-delivered beats correct-but-absent.
+    .setDescription(clampDescription(summary))
     .setFooter({ text: `Approve or Deny below · or /approve /deny${modeNote}` });
   // Detail is hook-supplied tool input — unbounded (a long Bash command, a big diff).
   if (detail) addClampedField(embed, 'Detail', detail);
@@ -582,7 +644,7 @@ export function buildQuestionEmbed(
     // its row-rule choice through the real cut, and so what it cut is closed behind it: the
     // output is fenced, and an eight-row table already overruns a field.
     embed.addFields({
-      name: truncateLabeled(name, 256),
+      name: clampTitle(name),
       value: formatTablesClamped(q.question, FIELD_VALUE_MAX, clampFieldValue),
     });
   });
@@ -602,11 +664,8 @@ export function buildAnsweredQuestionEmbed(
     if (answer.otherText != null && answer.otherText.length > 0) {
       lines.push(`✏️ ${answer.otherText}`);
     }
-    addClampedField(
-      embed,
-      truncateLabeled(answer.question, 256),
-      lines.length > 0 ? lines.join('\n') : '(no selection)',
-    );
+    // addClampedField clamps the name (the question text) as well as the value.
+    addClampedField(embed, answer.question, lines.length > 0 ? lines.join('\n') : '(no selection)');
   }
   return embed;
 }
@@ -666,11 +725,23 @@ export function buildToolOutputEmbed(p: {
   const attachedNote = p.attached
     ? `\n📎 full output attached (${p.totalChars} chars) — tap to expand`
     : '';
+  // The preview is raw tool output, bounded by the caller but not by this side. Clamp it to
+  // whatever the fence and the attachment note leave of the description budget, BEFORE the fence
+  // is wrapped around it, so the fence always closes and the builder never rejects the card.
+  const fenceOverhead = '```\n'.length + '\n```'.length;
+  const preview = truncateLabeled(
+    p.preview,
+    Math.max(16, EMBED_DESCRIPTION_LIMIT - attachedNote.length - fenceOverhead),
+  );
   const embed = new EmbedBuilder()
-    .setTitle(truncateLabeled(p.title, 256))
+    .setTitle(clampTitle(p.title))
     .setColor(COLOR_INFO)
-    .setDescription(`\`\`\`\n${p.preview}\n\`\`\`${attachedNote}`);
-  if (p.footer !== undefined && p.footer !== '') embed.setFooter({ text: p.footer });
+    .setDescription(`\`\`\`\n${preview}\n\`\`\`${attachedNote}`);
+  if (p.footer !== undefined && p.footer !== '') {
+    // Footer text has its own (2048) ceiling; the origin tag is assembled from a folder path and a
+    // session id, neither of which this side bounds.
+    embed.setFooter({ text: truncateLabeled(p.footer, FOOTER_MAX) });
+  }
   return embed;
 }
 
@@ -688,10 +759,12 @@ export function buildDoneEmbed(p: {
 }): EmbedBuilder {
   const message = p.lastAssistantMessage ?? p.body ?? 'Session finished.';
   const embed = new EmbedBuilder()
-    .setTitle(`${NOTIFICATION_ICON.done} ${p.title ?? 'Done'}`)
+    // Title and session id both ride in from the hook payload unbounded — clamped here for the
+    // same reason the body already is.
+    .setTitle(clampTitle(`${NOTIFICATION_ICON.done} ${p.title ?? 'Done'}`))
     .setColor(NOTIFICATION_COLOR.done)
     .setDescription(formatTablesClamped(message, EMBED_DESCRIPTION_LIMIT, truncateLabeled));
-  if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
+  if (p.sessionId) addClampedField(embed, 'Session', p.sessionId);
   return embed;
 }
 
@@ -706,7 +779,7 @@ export function buildWaitingEmbed(p: {
   body?: string;
 }): EmbedBuilder {
   const embed = new EmbedBuilder()
-    .setTitle(`${NOTIFICATION_ICON.waiting} ${p.title ?? 'Waiting on you'}`)
+    .setTitle(clampTitle(`${NOTIFICATION_ICON.waiting} ${p.title ?? 'Waiting on you'}`))
     .setColor(NOTIFICATION_COLOR.waiting)
     .setDescription(
       // The fallback is a fixed short line — nothing to re-render and nothing to clamp.
@@ -714,7 +787,7 @@ export function buildWaitingEmbed(p: {
         ? formatTablesClamped(p.body, EMBED_DESCRIPTION_LIMIT, truncateLabeled)
         : 'A session is waiting for your reply.',
     );
-  if (p.sessionId) embed.addFields({ name: 'Session', value: p.sessionId });
+  if (p.sessionId) addClampedField(embed, 'Session', p.sessionId);
   return embed;
 }
 
@@ -730,22 +803,21 @@ export function buildQuarantineEmbed(p: {
   reauthCommand: string;
 }): EmbedBuilder {
   const embed = new EmbedBuilder()
-    .setTitle(`${NOTIFICATION_ICON.quarantine} ${p.title ?? 'Account needs re-login'}`)
+    .setTitle(clampTitle(`${NOTIFICATION_ICON.quarantine} ${p.title ?? 'Account needs re-login'}`))
     .setColor(NOTIFICATION_COLOR.quarantine)
     .setDescription(
-      truncateLabeled(
+      clampDescription(
         p.body && p.body.length > 0
           ? p.body
           : 'An account can no longer refresh its token and was quarantined.',
-        EMBED_DESCRIPTION_LIMIT,
       ),
-    )
-    .addFields({
-      name: 'Fix it',
-      value:
-        `From here: \`${p.reauthCommand}\` — open the link, log in, paste the code back.\n` +
-        `On the host: \`${p.reloginCommand}\`, then \`cctl switch <label>\`.`,
-    });
+    );
+  addClampedField(
+    embed,
+    'Fix it',
+    `From here: \`${p.reauthCommand}\` — open the link, log in, paste the code back.\n` +
+      `On the host: \`${p.reloginCommand}\`, then \`cctl switch <label>\`.`,
+  );
   return embed;
 }
 
@@ -760,18 +832,31 @@ export function buildReauthLinkEmbed(p: {
   url: string;
   expiresAt: number;
 }): EmbedBuilder {
-  return new EmbedBuilder()
-    .setTitle('🔑 Re-authenticate account')
-    .setColor(COLOR_WARN)
-    .setDescription(
-      `Log back into **${p.label}** (${p.accountId}). You must sign in as the SAME account — ` +
-        `a different login is refused so its usage history stays intact.\n\n` +
-        `1. [Open the login page](${p.url}) and sign in.\n` +
-        `2. The page shows a code like \`AbCd1234#xYz\` — copy the WHOLE thing, including the ` +
-        `part after the \`#\`.\n` +
-        `3. Tap **Paste code** below.\n\n` +
-        `Link expires <t:${Math.floor(p.expiresAt / 1000)}:R>.`,
-    );
+  // A URL longer than this cannot be a working login link on any surface, and rendering one would
+  // only mean a link that silently goes nowhere — so it is named as broken rather than shown.
+  const step1 =
+    p.url.length <= LINK_TARGET_MAX
+      ? `1. [Open the login page](${markdownLinkTarget(p.url)}) and sign in.\n`
+      : `1. ⚠️ The login link came through malformed (${p.url.length} characters) — re-run the ` +
+        `re-auth, or log in at the host.\n`;
+  return (
+    new EmbedBuilder()
+      .setTitle('🔑 Re-authenticate account')
+      .setColor(COLOR_WARN)
+      // Label, account id and URL all arrive from the daemon; the clamp keeps a pathological one
+      // from taking down the card that is the user's only way back into the account.
+      .setDescription(
+        clampDescription(
+          `Log back into **${p.label}** (${p.accountId}). You must sign in as the SAME account — ` +
+            `a different login is refused so its usage history stays intact.\n\n` +
+            step1 +
+            `2. The page shows a code like \`AbCd1234#xYz\` — copy the WHOLE thing, including the ` +
+            `part after the \`#\`.\n` +
+            `3. Tap **Paste code** below.\n\n` +
+            `Link expires <t:${Math.floor(p.expiresAt / 1000)}:R>.`,
+        ),
+      )
+  );
 }
 
 /** The reauth outcome card. The daemon's message is already the honest account of what happened
@@ -784,12 +869,14 @@ export function buildReauthResultEmbed(ok: boolean, message: string): EmbedBuild
     .setDescription(truncateLabeled(message, EMBED_DESCRIPTION_LIMIT));
 }
 
-/** Rendered for an incoming switch.result push. */
+/** Rendered for an incoming switch.result push. The daemon's message is unbounded on the wire
+ *  (it can carry a vault error verbatim), so it is clamped for the same reason the permission
+ *  summary is: an over-long one would take the whole card down instead of its tail. */
 export function buildSwitchResultEmbed(ok: boolean, message: string): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(ok ? 'Switched' : 'Switch failed')
     .setColor(ok ? COLOR_OK : COLOR_WARN)
-    .setDescription(message);
+    .setDescription(clampDescription(message));
 }
 
 // ---------------------------------------------------------------------------
@@ -898,10 +985,12 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
     embed.setDescription(prefix.length > 0 ? prefix.trimEnd() : 'No output yet.');
   }
 
-  embed.addFields({ name: 'Session', value: model.sessionId });
-  if (model.accountId) embed.addFields({ name: 'Account', value: model.accountId });
+  // Session and account ids are wire strings this side never bounds; clamped like every other
+  // data-driven field so a malformed id cannot make the card's edit throw.
+  addClampedField(embed, 'Session', model.sessionId);
+  if (model.accountId) addClampedField(embed, 'Account', model.accountId);
   const notes = sessionNotes(model);
-  if (notes) embed.addFields({ name: 'Notes', value: notes });
+  if (notes) addClampedField(embed, 'Notes', notes);
   return embed;
 }
 
@@ -918,10 +1007,10 @@ export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder 
         ? formatTablesClamped(model.summary, EMBED_DESCRIPTION_LIMIT, truncateLabeled)
         : 'Session ended.',
     );
-  embed.addFields({ name: 'Session', value: model.sessionId });
-  if (model.accountId) embed.addFields({ name: 'Account', value: model.accountId });
+  addClampedField(embed, 'Session', model.sessionId);
+  if (model.accountId) addClampedField(embed, 'Account', model.accountId);
   embed.addFields({ name: 'Output', value: `${model.totalOutputChars} chars streamed` });
   const notes = sessionNotes(model);
-  if (notes) embed.addFields({ name: 'Notes', value: notes });
+  if (notes) addClampedField(embed, 'Notes', notes);
   return embed;
 }
