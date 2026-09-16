@@ -11,10 +11,19 @@
 // That is also why the imports below `./server.js` are DYNAMIC. Only `ChannelServer` is needed to
 // answer `initialize`; the logger, identity resolution and the daemon link are all pulled in
 // afterwards, so their module graphs land behind a handshake that has already been served.
+//
+// Every collaborator this function reaches for is also an OPTIONAL argument. Not for flexibility —
+// there is exactly one production wiring and it is the default of every one of them — but because
+// the three things this file actually decides (refuse an unidentified session, refuse a session
+// that never handshook, stop the link before releasing the attachment) are decisions no other
+// module makes, and a composition root that can only be exercised by spawning a real Claude Code
+// session is a composition root nothing ever checks.
 
-import { ChannelServer } from './server.js';
+import { ChannelServer, SERVER_VERSION } from './server.js';
 import { noopLogger, type Logger } from './logger.js';
-import type { DaemonLink, DeliverResult } from './daemonLink.js';
+import type { Readable, Writable } from 'node:stream';
+import type { AttachIdentity, ChannelItem, DeliverResult, RunOutcome } from './daemonLink.js';
+import type { IdentityResult } from './identity.js';
 
 /** How long a detach may delay exit. Short: the daemon expires stale attachments anyway, so the
  *  worst case of skipping it is a brief window where a replacement server sees a 409. */
@@ -28,13 +37,42 @@ const DETACH_GRACE_MS = 2_000;
  *  with nothing written anywhere to say so. */
 const HANDSHAKE_TIMEOUT_MS = 60_000;
 
+/** The slice of {@link import('./daemonLink.js').DaemonLink} this composition uses. Declared
+ *  structurally so the wiring can be driven without the real loopback client — and so the type
+ *  states plainly that shutdown needs BOTH halves: `stop` ends the poll loop, `detach` releases
+ *  the attachment, and doing the second without the first races a poll against its own teardown. */
+export interface ChannelLink {
+  run(deliver: (item: ChannelItem) => Promise<DeliverResult>): Promise<RunOutcome>;
+  reply(text: string): Promise<DeliverResult>;
+  stop(): void;
+  detach(): Promise<void>;
+}
+
+/** Everything {@link runChannelServer} composes. Every field defaults to the production wiring;
+ *  they exist so the composition itself is checkable (see this module's header). */
+export interface ChannelRunOptions {
+  /** The MCP wire. Defaults to this process's stdio, which is what Claude Code hands us. */
+  input?: Readable;
+  output?: Writable;
+  /** Defaults to the real registry + process-tree resolution in `./identity.js`. */
+  resolveIdentity?: () => Promise<IdentityResult>;
+  /** Defaults to a real `DaemonLink` against the daemon's published loopback endpoint. Allowed to
+   *  be async because the production one imports its module graph on demand. */
+  createLink?: (identity: AttachIdentity, logger: Logger) => ChannelLink | Promise<ChannelLink>;
+  /** Defaults to the real stdin-EOF/SIGTERM/SIGINT wiring, which exits the process. */
+  installShutdown?: (stop: () => Promise<void>, logger: Logger) => (reason: string) => void;
+  /** Defaults to pino on stderr — the only place an operator can see this process. */
+  logger?: Logger;
+  handshakeTimeoutMs?: number;
+}
+
 /** Run the channel server to completion. Resolves with the process exit code. */
-export async function runChannelServer(): Promise<number> {
+export async function runChannelServer(options: ChannelRunOptions = {}): Promise<number> {
   // The transport is built before the link and the real logger exist, so both live in one cell
   // that later stages fill in. `reply` reads the link from it and, while there isn't one, an
   // honest reason it cannot send — kept accurate as startup progresses rather than leaving the
   // model to guess why nothing happened.
-  const channel: { link?: DaemonLink; logger: Logger; refusal: string } = {
+  const channel: { link?: ChannelLink; logger: Logger; refusal: string } = {
     logger: noopLogger,
     refusal: 'the channel is still starting up',
   };
@@ -49,9 +87,12 @@ export async function runChannelServer(): Promise<number> {
 
   let shutdown: (reason: string) => void = () => {};
   const server = new ChannelServer({
-    input: process.stdin,
-    output: process.stdout,
+    input: options.input ?? process.stdin,
+    output: options.output ?? process.stdout,
     logger: forwarding,
+    // The version an operator can act on, rather than the `ChannelServer` default sitting in
+    // `serverInfo` unmentioned by anything that composes it.
+    version: SERVER_VERSION,
     onReply: (text): Promise<DeliverResult> =>
       channel.link?.reply(text) ?? Promise.resolve({ ok: false, error: channel.refusal }),
     // An EPIPE on stdio means Claude Code is gone. Without this the stream error would be an
@@ -63,19 +104,19 @@ export async function runChannelServer(): Promise<number> {
 
   // stdout is the JSON-RPC wire; every log line goes to stderr, which Claude Code captures into
   // `~/.claude/debug/<session-id>.txt` — the only place an operator can see this process at all.
-  const { createLogger } = await import('@claude-control/shared-protocol');
-  const logger = createLogger({ defaultLevel: 'info', sink: process.stderr });
+  const logger = options.logger ?? (await createStderrLogger());
   channel.logger = logger;
 
   // Installed before the identity gate so even the degraded, never-attached server exits cleanly
   // on a signal instead of lingering until Claude Code kills the pipe.
-  shutdown = installShutdown(() => {
+  shutdown = (options.installShutdown ?? installProcessShutdown)(() => {
+    // stop() FIRST: it aborts the in-flight long poll, so the detach below is not racing a poll
+    // that is about to re-attach the session we are trying to release.
     channel.link?.stop();
     return channel.link?.detach() ?? Promise.resolve();
   }, logger);
 
-  const { resolveIdentity } = await import('./identity.js');
-  const identity = await resolveIdentity();
+  const identity = await (options.resolveIdentity ?? defaultResolveIdentity)();
   if (!identity.ok) {
     // Fail closed: with no verified session id there is no safe address to attach to, and
     // attaching to a guess would deliver one operator's message into another's terminal. The
@@ -100,20 +141,20 @@ export async function runChannelServer(): Promise<number> {
 
   // Attaching before the client has finished its handshake would let the daemon hand us an item
   // the session cannot yet receive, and channel delivery has no way to discover that afterwards.
-  if (!(await server.ready(HANDSHAKE_TIMEOUT_MS))) {
+  const handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
+  if (!(await server.ready(handshakeTimeoutMs))) {
     // Not attaching is the safe answer: an attachment tells the daemon this session has a live
     // channel, which stops it using the turn-boundary fallback that would still have worked.
     channel.refusal =
       'the session never completed its MCP handshake, so the channel is not attached';
     logger.error(
-      { timeoutMs: HANDSHAKE_TIMEOUT_MS },
+      { timeoutMs: handshakeTimeoutMs },
       'channel: no notifications/initialized from the client; not attaching',
     );
     return 0;
   }
 
-  const { DaemonLink } = await import('./daemonLink.js');
-  const link = new DaemonLink({ identity, logger });
+  const link = await (options.createLink ?? defaultCreateLink)(identity, logger);
   channel.link = link;
   channel.refusal = 'the cctl daemon is not reachable';
 
@@ -126,14 +167,34 @@ export async function runChannelServer(): Promise<number> {
   return outcome.reason === 'conflict' ? 1 : 0;
 }
 
+/** The real logger, imported dynamically so pino's module graph lands behind the handshake. */
+async function createStderrLogger(): Promise<Logger> {
+  const { createLogger } = await import('@claude-control/shared-protocol');
+  return createLogger({ defaultLevel: 'info', sink: process.stderr });
+}
+
+/** The real identity resolution. Dynamic for the same reason: its graph reaches switch-engine's
+ *  path derivation, which must not sit in front of `initialize`. */
+async function defaultResolveIdentity(): Promise<IdentityResult> {
+  const { resolveIdentity } = await import('./identity.js');
+  return resolveIdentity();
+}
+
+/** The real daemon link. Dynamic because its discovery pulls in the daemon package (node:sqlite,
+ *  ws, the Agent SDK — ~0.65s of module loading) the first time it looks for the endpoint. */
+async function defaultCreateLink(identity: AttachIdentity, logger: Logger): Promise<ChannelLink> {
+  const { DaemonLink } = await import('./daemonLink.js');
+  return new DaemonLink({ identity, logger });
+}
+
 /** Wire every way this process is asked to stop: stdin EOF (the normal one — Claude Code closes
  *  the pipe when the session ends), the termination signals, and a transport failure reported by
  *  the server. Returns the shutdown function so the caller can trigger it too. Detach is
  *  best-effort and hard-bounded, because an unreachable daemon must not turn shutdown into a
  *  hang. */
-function installShutdown(
+function installProcessShutdown(
   stop: () => Promise<void>,
-  logger: { info(obj: unknown, msg?: string): void },
+  logger: Logger,
 ): (reason: string) => void {
   let stopping = false;
   const shutdown = (reason: string): void => {

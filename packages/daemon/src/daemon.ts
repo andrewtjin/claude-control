@@ -351,12 +351,27 @@ const STEERING_TTL_MS = 30 * 60_000;
  *  idle or closed window) — refusing the next /say with an honest error beats silently
  *  dropping the oldest, and it bounds what a dead session can accumulate in memory. */
 const STEERING_QUEUE_CAP = 8;
-/** Which of the two queues a persisted row belongs to. Tagged rather than inferred from the
- *  session id, because only ONE of them can be restored after a restart: an interactive session
- *  is another process that outlives this daemon, while a managed session's SDK subprocess does
- *  not — see {@link Daemon.reloadPendingSteering}. */
+/** Which queue a persisted row belongs to. Tagged rather than inferred from the session id,
+ *  because only SOME of them can be restored after a restart: an interactive session is another
+ *  process that outlives this daemon, while a managed session's SDK subprocess does not — see
+ *  {@link Daemon.reloadPendingSteering}. */
 const INTERACTIVE_STEERING_KIND = 'interactive';
 const MANAGED_STEERING_KIND = 'managed';
+/** A prompt currently sitting on a session's LIVE channel rather than in either turn-boundary
+ *  queue. The registry holding those is pure memory, so without a row of its own a `taskkill /F`,
+ *  a crash or a logoff drops every queued prompt after the phone has already been told "sent" —
+ *  the very promise the other two kinds exist to keep. A restart cannot put one straight back on
+ *  a channel (nothing is attached yet, and whether anything re-attaches is not knowable at
+ *  startup), so these reload onto the turn-boundary queue and are promoted back the moment a
+ *  channel server attaches — see {@link Daemon.promoteSteeringToChannel}. */
+const CHANNEL_STEERING_KIND = 'channel';
+
+/** How many delivered inject ids to remember per session, and for how many sessions. Small on
+ *  purpose: the set exists only to recognise a delivery confirmation that races the fallback of
+ *  the very prompt it confirms — a window of milliseconds — and the channel queue itself caps at
+ *  {@link CHANNEL_QUEUE_CAP}. Unbounded it would be a per-session leak for the daemon's life. */
+const DELIVERED_INJECT_MEMORY = 4 * CHANNEL_QUEUE_CAP;
+const DELIVERED_INJECT_SESSIONS = 64;
 
 /** One queued/delivered steering text, held in arrival order. `rowId` is its row in the store's
  *  mirror of this queue, carried so a delivery or a drop retires exactly the row it consumed
@@ -365,6 +380,11 @@ interface QueuedSteering {
   text: string;
   queuedAtMs: number;
   rowId: number;
+  /** Present when this text has been on a channel — it fell back off one, or it was queued while
+   *  one was attached. It is the id the channel path acks with, so keeping it here is what lets a
+   *  delivery confirmation arriving AFTER the fallback retire the right entry, and what lets a
+   *  promotion back onto a channel stay the same prompt instead of becoming a second copy of it. */
+  injectId?: string | undefined;
 }
 
 /** Outcome of resolving a label/watch/unregister ref (or a prompt.inject sessionId) against the
@@ -575,6 +595,20 @@ export class Daemon {
    *  launch command intended, because Claude Code's startup notice has been observed reporting a
    *  channel as unconfigured in a session where that same channel then delivered normally. */
   private readonly channels: ChannelRegistry;
+  /** `injectId` → the `pending_steering` row mirroring it (and whose session it is), for prompts
+   *  currently on a channel. The registry is memory-only and deliberately store-free, so the
+   *  daemon holds the one link between an item it handed the registry and the row that outlives
+   *  this process. The session id rides along because a delivery confirmation can arrive naming an
+   *  attachment that is already gone, and attributing it is what keeps the prompt from being
+   *  delivered twice. Entries leave on delivery, on expiry, and on the fallback that turns the row
+   *  into a turn-boundary one — anything left here names a row still waiting on a channel. */
+  private readonly channelRows = new Map<string, { rowId: number; sessionId: string }>();
+  /** Inject ids this daemon has a `sent` acknowledgement for, per session, bounded by
+   *  {@link DELIVERED_INJECT_MEMORY}. Channel delivery is at-least-once: a confirmation can
+   *  arrive after a sweep or a detach has already handed the same item back for turn-boundary
+   *  delivery, and without a record of what has landed the operator's instruction is delivered to
+   *  the session a second time. */
+  private readonly deliveredInjects = new Map<string, Set<string>>();
   /** Sweeps attachments whose server is gone — its process first (immediate and certain), then
    *  poll silence (the fallback for a process that is alive but wedged). */
   private channelSweepTimer: ReturnType<typeof setInterval> | undefined;
@@ -2119,6 +2153,18 @@ export class Daemon {
       }
       return false;
     }
+    // Durable from the same instant the operator is told "sent". The registry above is pure
+    // memory, so without this row a kill, a crash or a logoff between here and the channel
+    // server's next poll drops the prompt with nothing anywhere to say it existed — and "sent"
+    // is the last word the phone would ever get on it.
+    const rowId = this.store.insertPendingSteering({
+      sessionId,
+      kind: CHANNEL_STEERING_KIND,
+      text,
+      queuedAtMs: result.queuedAtMs,
+      injectId: result.injectId,
+    });
+    this.channelRows.set(result.injectId, { rowId, sessionId });
     const excerpt = text.length > 120 ? `${text.slice(0, 120)}…` : text;
     this.sendEnvelope({
       type: 'hook.notification',
@@ -2157,36 +2203,71 @@ export class Daemon {
    */
   private recoverChannelInjections(sessionId: string, items: ChannelInjection[]): void {
     if (items.length === 0) return;
+    // Anything the session has already been confirmed to receive is NOT undelivered work. A
+    // `sent` acknowledgement can arrive after the sweep or detach that handed the item back —
+    // same prompt, same inject id — and falling it back anyway delivers the operator's
+    // instruction to the session a second time at its next turn boundary.
+    const undelivered = items.filter((item) => {
+      if (!this.wasDelivered(sessionId, item.injectId)) return true;
+      this.retireChannelRow(item.injectId);
+      return false;
+    });
+    if (undelivered.length === 0) return;
     const tracked = this.readInteractiveSession(sessionId);
     if (tracked === undefined) {
+      // Nothing here can deliver, and nothing later will either, so the durable rows go with the
+      // report: leaving them would have the next daemon start restore text this one has just
+      // told the operator was lost.
+      for (const item of undelivered) this.retireChannelRow(item.injectId);
       this.sendEnvelope({
         type: 'error',
         payload: {
           code: 'channel_detached',
           message:
-            `${items.length} message(s) for session '${sessionId}' were never delivered: its ` +
+            `${undelivered.length} message(s) for session '${sessionId}' were never delivered: its ` +
             `channel closed and the session is not registered, so there is no turn-boundary ` +
             `queue to fall back to. Re-send once it is running again.`,
         },
       });
       this.logger.warn(
-        { sessionId, count: items.length },
+        { sessionId, count: undelivered.length },
         'channel: undelivered injections dropped; session not registered',
       );
       return;
     }
     const queue = this.pendingSteering.get(sessionId) ?? [];
-    const accepted = items.slice(0, Math.max(0, STEERING_QUEUE_CAP - queue.length));
-    const dropped = items.length - accepted.length;
+    const accepted = undelivered.slice(0, Math.max(0, STEERING_QUEUE_CAP - queue.length));
+    const droppedItems = undelivered.slice(accepted.length);
+    const dropped = droppedItems.length;
     for (const item of accepted) {
-      const rowId = this.store.insertPendingSteering({
-        sessionId,
-        kind: INTERACTIVE_STEERING_KIND,
+      // MOVED, not re-inserted: the prompt already has a row (it got one the moment the operator
+      // was told "sent"), and inserting a second one would have a restart restore the same text
+      // twice while the first row never retires. The move also keeps the inject id, which is what
+      // lets a delivery confirmation arriving later still find this entry — and what lets a
+      // replacement channel server take the prompt back as the same prompt.
+      const existing = this.channelRows.get(item.injectId);
+      const rowId =
+        existing?.rowId ??
+        this.store.insertPendingSteering({
+          sessionId,
+          kind: INTERACTIVE_STEERING_KIND,
+          text: item.text,
+          queuedAtMs: item.queuedAtMs,
+          injectId: item.injectId,
+        });
+      if (existing !== undefined) {
+        this.channelRows.delete(item.injectId);
+        this.store.movePendingSteering(existing.rowId, INTERACTIVE_STEERING_KIND, item.injectId);
+      }
+      queue.push({
         text: item.text,
         queuedAtMs: item.queuedAtMs,
+        rowId,
+        injectId: item.injectId,
       });
-      queue.push({ text: item.text, queuedAtMs: item.queuedAtMs, rowId });
     }
+    // Whatever the steering cap refused is lost for real, so its rows go too.
+    for (const item of droppedItems) this.retireChannelRow(item.injectId);
     this.pendingSteering.set(sessionId, queue);
     if (accepted.length > 0) {
       this.sendEnvelope({
@@ -2215,7 +2296,7 @@ export class Daemon {
         payload: {
           code: 'steer_queue_full',
           message:
-            `${dropped} of ${items.length} message(s) recovered from session '${sessionId}'s ` +
+            `${dropped} of ${undelivered.length} message(s) recovered from session '${sessionId}'s ` +
             `closed channel could NOT be queued: its turn-boundary queue is already full at ` +
             `${STEERING_QUEUE_CAP} and nothing is delivering. Those ${dropped} (the most recent) ` +
             `were dropped — re-send them once the session catches up.`,
@@ -2237,6 +2318,10 @@ export class Daemon {
    * disagree about whether an expiry is worth telling the operator.
    */
   private cardChannelExpiry(sessionId: string, expired: ChannelInjection[]): void {
+    // Expired means gone, so the durable rows go with them. A row that outlived its expiry would
+    // be restored by the next daemon start as text still waiting to deliver — text this daemon
+    // has just told the operator was dropped.
+    for (const item of expired) this.retireChannelRow(item.injectId);
     this.sendEnvelope({
       type: 'hook.notification',
       payload: {
@@ -2252,6 +2337,131 @@ export class Daemon {
       },
     });
     this.logger.warn({ sessionId, count: expired.length }, 'channel: queued injections expired');
+  }
+
+  /**
+   * Put a freshly-attached session's queued prompts back on its channel.
+   *
+   * The counterpart to {@link recoverChannelInjections}, and the reason that fallback is not a
+   * one-way trip. Everything that retires a channel — a clean detach, a dead pid, the stale
+   * sweep, this daemon's own shutdown — moves undelivered prompts onto the turn-boundary queue,
+   * where they wait for a boundary an IDLE session never reaches. A replacement channel server
+   * attaching for the same session is exactly the moment those prompts could be delivered at
+   * once, so that is when they come back. Without this the operator's prompt waits forever behind
+   * a card that said "Sent to live session", and every later prompt overtakes it.
+   *
+   * EVERYTHING queued for the session is promoted, not only what fell off a channel. A plain
+   * `/say` that arrived in the second between the session starting and its channel server
+   * finishing its identity resolution is in exactly the same position — queued against a boundary
+   * that may never come, when a live channel is now available — and it is indistinguishable from
+   * the fallback case to the person waiting on it. Promoting is never a downgrade: the channel is
+   * the faster of the two paths, and anything it cannot take stays where it is.
+   *
+   * Deliberately NOT carded. The operator has already been told these deliver at a turn boundary;
+   * promotion only makes them arrive sooner, and this project's card discipline is about never
+   * OVERSTATING delivery. A third card per message would be noise about good news.
+   */
+  private promoteSteeringToChannel(sessionId: string): void {
+    const queue = this.pendingSteering.get(sessionId);
+    if (queue === undefined || queue.length === 0) return;
+    // Mint an id for anything that has never been on a channel: the channel path acks by inject
+    // id, so an item without one could be delivered but never confirmed, and would then be
+    // recovered and delivered again.
+    const candidates = queue.map((entry) => ({
+      entry,
+      injection: {
+        injectId: entry.injectId ?? randomUUID(),
+        text: entry.text,
+        queuedAtMs: entry.queuedAtMs,
+      } satisfies ChannelInjection,
+    }));
+    const { accepted } = this.channels.restore(
+      sessionId,
+      candidates.map((c) => c.injection),
+    );
+    if (accepted.length === 0) return;
+    const promoted = new Set(accepted.map((item) => item.injectId));
+    for (const { entry, injection } of candidates) {
+      if (!promoted.has(injection.injectId)) continue;
+      // The row MOVES between queues rather than being rewritten, so the prompt keeps its arrival
+      // order and its original queue time; only which path owns it changes.
+      this.store.movePendingSteering(entry.rowId, CHANNEL_STEERING_KIND, injection.injectId);
+      this.channelRows.set(injection.injectId, { rowId: entry.rowId, sessionId });
+    }
+    const remaining = candidates
+      .filter(({ injection }) => !promoted.has(injection.injectId))
+      .map(({ entry }) => entry);
+    if (remaining.length === 0) this.pendingSteering.delete(sessionId);
+    else this.pendingSteering.set(sessionId, remaining);
+    this.logger.info(
+      { sessionId, promoted: accepted.length, stillQueued: remaining.length },
+      'channel: queued prompts promoted onto a newly attached channel',
+    );
+  }
+
+  /**
+   * Record that a session's channel confirmed one prompt, and retire that prompt wherever it is.
+   *
+   * `sent` is the daemon's only evidence a prompt reached the session, and it can arrive after
+   * the item has already been handed back for turn-boundary delivery — a sweep, a detach or a
+   * shutdown landing between the push and the acknowledgement. Retiring the entry here is what
+   * stops the same operator instruction being delivered a second time, and remembering the id is
+   * what stops a recovery running the OTHER way round from re-queuing it a moment later.
+   */
+  private markInjectDelivered(sessionId: string | undefined, injectId: string): void {
+    // Whose prompt this is, even when the attachment that confirmed it has already been retired:
+    // the row bookkeeping remembers the session, and without that attribution a confirmation
+    // arriving after a sweep cannot stop the same text being delivered again.
+    const owner = sessionId ?? this.channelRows.get(injectId)?.sessionId;
+    this.retireChannelRow(injectId);
+    for (const [queueSessionId, queue] of this.pendingSteering) {
+      const index = queue.findIndex((entry) => entry.injectId === injectId);
+      if (index === -1) continue;
+      const [removed] = queue.splice(index, 1);
+      if (removed !== undefined) this.store.deletePendingSteering(removed.rowId);
+      if (queue.length === 0) this.pendingSteering.delete(queueSessionId);
+      this.rememberDelivered(queueSessionId, injectId);
+      this.logger.info(
+        { sessionId: queueSessionId, injectId },
+        'channel: delivery confirmed after the prompt had already fallen back; not re-delivering',
+      );
+      return;
+    }
+    if (owner !== undefined) this.rememberDelivered(owner, injectId);
+  }
+
+  /** Forget the durable row mirroring one channel-held prompt, if this daemon still owns it. A
+   *  prompt that has already moved to the turn-boundary queue is not in this map and is not this
+   *  method's business — its row belongs to that queue now. */
+  private retireChannelRow(injectId: string): void {
+    const row = this.channelRows.get(injectId);
+    if (row === undefined) return;
+    this.channelRows.delete(injectId);
+    this.store.deletePendingSteering(row.rowId);
+  }
+
+  /** Remember one delivered inject id, evicting the oldest once past the bounds. Insertion order
+   *  is the eviction order for both the per-session set and the map of sessions, which is what
+   *  makes "oldest" cheap to find without a second structure. */
+  private rememberDelivered(sessionId: string, injectId: string): void {
+    let seen = this.deliveredInjects.get(sessionId);
+    if (seen === undefined) {
+      seen = new Set<string>();
+      this.deliveredInjects.set(sessionId, seen);
+      if (this.deliveredInjects.size > DELIVERED_INJECT_SESSIONS) {
+        const oldest = this.deliveredInjects.keys().next();
+        if (!oldest.done) this.deliveredInjects.delete(oldest.value);
+      }
+    }
+    seen.add(injectId);
+    if (seen.size > DELIVERED_INJECT_MEMORY) {
+      const oldest = seen.keys().next();
+      if (!oldest.done) seen.delete(oldest.value);
+    }
+  }
+
+  private wasDelivered(sessionId: string, injectId: string): boolean {
+    return this.deliveredInjects.get(sessionId)?.has(injectId) === true;
   }
 
   /**
@@ -2342,7 +2552,7 @@ export class Daemon {
     const undeliverable = new Map<string, number>();
     let restored = 0;
     for (const row of rows) {
-      if (row.kind !== INTERACTIVE_STEERING_KIND) {
+      if (row.kind !== INTERACTIVE_STEERING_KIND && row.kind !== CHANNEL_STEERING_KIND) {
         this.store.deletePendingSteering(row.id);
         undeliverable.set(row.sessionId, (undeliverable.get(row.sessionId) ?? 0) + 1);
         continue;
@@ -2352,10 +2562,26 @@ export class Daemon {
         expired.set(row.sessionId, (expired.get(row.sessionId) ?? 0) + 1);
         continue;
       }
+      if (row.kind === CHANNEL_STEERING_KIND) {
+        // A prompt that was on a live channel when the previous daemon died cannot go straight
+        // back on one: nothing is attached yet, and whether that session's channel server is even
+        // still running is not knowable here. So it joins the turn-boundary queue, which is a
+        // real delivery path for a terminal session that outlived the daemon — and if a channel
+        // server does re-attach, `attach` promotes it straight back onto the faster path. The
+        // kind moves with it, because the map and the rows must not disagree about which queue
+        // owns the prompt: a row left tagged 'channel' would survive the delete that retires this
+        // queue and be restored again at the NEXT start, long after it delivered.
+        this.store.movePendingSteering(row.id, INTERACTIVE_STEERING_KIND, row.injectId);
+      }
       // Rows arrive id-ordered, and the id IS arrival order, so appending rebuilds each queue in
       // the order the operator wrote it — the one property they will notice if it is wrong.
       const queue = this.pendingSteering.get(row.sessionId) ?? [];
-      queue.push({ text: row.text, queuedAtMs: row.queuedAtMs, rowId: row.id });
+      queue.push({
+        text: row.text,
+        queuedAtMs: row.queuedAtMs,
+        rowId: row.id,
+        injectId: row.injectId,
+      });
       this.pendingSteering.set(row.sessionId, queue);
       restored += 1;
     }
@@ -2944,7 +3170,13 @@ export class Daemon {
     return {
       attach: (input) => {
         const result = this.channels.attach(input);
-        if (result.ok) return { ok: true, attachId: result.attachment.attachId };
+        if (result.ok) {
+          // The session has a live channel again, so anything of its own that has been waiting
+          // for a turn boundary can take the faster path instead — including prompts a previous
+          // channel handed back, and prompts this daemon restored from a previous run.
+          this.promoteSteeringToChannel(input.sessionId);
+          return { ok: true, attachId: result.attachment.attachId };
+        }
         // A shutdown refusal is retryable and a duplicate server is not, so the client can back
         // off in one case and exit in the other instead of guessing from prose.
         return result.reason === 'closing'
@@ -2956,7 +3188,16 @@ export class Daemon {
       },
       take: (attachId, source) => this.channels.take(attachId, source),
       ack: (attachId, injectId, state) => {
+        // Read the attachment BEFORE the ack, so a confirmation still names its session even for
+        // an item the registry no longer holds.
+        const sessionId = this.channels.get(attachId)?.sessionId;
         const result = this.channels.ack(attachId, injectId, state);
+        if (state === 'sent') {
+          // Acted on whatever the registry says, because a `sent` ack is proof of delivery even
+          // when it arrives after the item was handed back — which is precisely the case that
+          // otherwise delivers the operator's instruction twice.
+          this.markInjectDelivered(sessionId, injectId);
+        }
         if (result.requeued) {
           this.logger.warn(
             { attachId, injectId },

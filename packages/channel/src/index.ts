@@ -45,6 +45,7 @@ export {
 
 export {
   ChannelServer,
+  SERVER_VERSION,
   sanitizeMetaKeys,
   SERVER_NAME,
   type ChannelServerOptions,
@@ -58,4 +59,4 @@ export { noopLogger, type Logger } from './logger.js';
 // Importing THIS barrel eagerly loads identity + daemonLink, which the composition itself is
 // careful to defer. A caller that only needs to run the server should import the `./run` subpath
 // instead and keep that saving.
-export { runChannelServer } from './run.js';
+export { runChannelServer, type ChannelLink, type ChannelRunOptions } from './run.js';

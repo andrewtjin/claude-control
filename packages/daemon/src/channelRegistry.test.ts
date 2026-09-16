@@ -187,6 +187,49 @@ describe('take', () => {
     expect(expiries).toEqual([{ sessionId: 'sess-1', texts: ['too old'] }]);
   });
 
+  it('expires IN-FLIGHT items too, so a client that never acks cannot pin the cap', () => {
+    const clock = fakeClock();
+    const expiries: string[] = [];
+    const reg = new ChannelRegistry({
+      clock: clock.now,
+      onExpire: (_sessionId, expired: ChannelInjection[]) =>
+        expiries.push(...expired.map((i) => i.text)),
+    });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    const id = attached.attachment.attachId;
+
+    // A client that polls but never acknowledges is what a wedged session looks like from here.
+    for (let i = 0; i < CHANNEL_QUEUE_CAP; i++) reg.enqueue('sess-1', `m${i}`);
+    reg.take(id);
+    expect(reg.enqueue('sess-1', 'no room')).toEqual({ ok: false, reason: 'queue_full' });
+
+    // Without an expiry on the in-flight set those eight hold the cap for the rest of the
+    // session's life: every later prompt is refused as "queue full" while none of them can ever
+    // be delivered, and half-hour-old guidance stays nominally deliverable.
+    clock.advance(CHANNEL_TTL_MS + 1);
+    expect(reg.take(id)).toEqual([]);
+    expect(expiries).toHaveLength(CHANNEL_QUEUE_CAP);
+    expect(reg.enqueue('sess-1', 'room again').ok).toBe(true);
+  });
+
+  it('treats a late ack for an expired item as a no-op', () => {
+    const clock = fakeClock();
+    const reg = new ChannelRegistry({ clock: clock.now });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    const id = attached.attachment.attachId;
+    const queued = reg.enqueue('sess-1', 'aged out mid-flight');
+    if (!queued.ok) throw new Error('enqueue failed');
+    reg.take(id);
+    clock.advance(CHANNEL_TTL_MS + 1);
+    reg.take(id); // the poll that expires it; the operator's expiry card has already gone out
+
+    // Requeuing it on a late report would deliver text the operator was told never arrived.
+    expect(reg.ack(id, queued.injectId, 'failed')).toEqual({ ok: false, requeued: false });
+    expect(reg.take(id)).toEqual([]);
+  });
+
   it('says nothing when nothing expired', () => {
     let calls = 0;
     const reg = new ChannelRegistry({
@@ -341,5 +384,89 @@ describe('detach and sweep', () => {
     clock.advance(longPollMs);
     expect(reg.sweepStale()).toEqual([]);
     expect(new ChannelRegistry().staleAfterMs).toBe(3 * CHANNEL_POLL_MS);
+  });
+});
+
+describe('restore', () => {
+  /** An injection as the daemon's turn-boundary queue would hand it back — same id, same
+   *  original queue time. */
+  const injection = (injectId: string, text: string, queuedAtMs: number): ChannelInjection => ({
+    injectId,
+    text,
+    queuedAtMs,
+  });
+
+  it('puts a prompt back on the channel with its identity and queue time intact', () => {
+    const clock = fakeClock();
+    const reg = new ChannelRegistry({ clock: clock.now });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    const id = attached.attachment.attachId;
+
+    // Without this the fallback is one-way: a prompt that came off a cleanly-detached channel
+    // waits for a turn boundary an idle session never reaches, even once a replacement server
+    // has attached and could deliver it at once.
+    const result = reg.restore('sess-1', [injection('i-1', 'the original prompt', 999_000)]);
+    expect(result.accepted.map((i) => i.injectId)).toEqual(['i-1']);
+    expect(result.rejected).toEqual([]);
+    expect(reg.take(id)).toEqual([
+      // A re-stamped queue time would hand a prompt that already spent 29 minutes waiting a
+      // fresh half hour; a re-minted id would make an ack for it unmatchable.
+      { injectId: 'i-1', text: 'the original prompt', queuedAtMs: 999_000 },
+    ]);
+  });
+
+  it('orders restored prompts ahead of anything queued more recently', () => {
+    const clock = fakeClock(1_000_000);
+    const reg = new ChannelRegistry({ clock: clock.now });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    const id = attached.attachment.attachId;
+    reg.enqueue('sess-1', 'sent just now');
+
+    reg.restore('sess-1', [
+      injection('old-1', 'sent first', 900_000),
+      injection('old-2', 'sent second', 950_000),
+    ]);
+
+    // Delivery order is the one property an operator will notice, and it is the ARRIVAL order —
+    // not the order the daemon happened to hand the items back in.
+    expect(reg.take(id)?.map((i) => i.text)).toEqual([
+      'sent first',
+      'sent second',
+      'sent just now',
+    ]);
+  });
+
+  it('refuses at the cap rather than smuggling past the limit enqueue enforces', () => {
+    const reg = new ChannelRegistry({ queueCap: 3 });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    reg.enqueue('sess-1', 'already here');
+
+    const result = reg.restore('sess-1', [
+      injection('a', 'one', 1),
+      injection('b', 'two', 2),
+      injection('c', 'three', 3),
+    ]);
+    expect(result.accepted.map((i) => i.injectId)).toEqual(['a', 'b']);
+    // The caller still owns what did not fit, so it stays on the queue it came from rather than
+    // disappearing between the two paths.
+    expect(result.rejected.map((i) => i.injectId)).toEqual(['c']);
+  });
+
+  it('refuses everything when nothing is attached, so the caller keeps its work', () => {
+    const reg = new ChannelRegistry();
+    const items = [injection('a', 'one', 1)];
+    expect(reg.restore('nobody', items)).toEqual({ accepted: [], rejected: items });
+  });
+
+  it('wakes a held poll, so a restored prompt is not stranded until the next one', () => {
+    const woken: string[] = [];
+    const reg = new ChannelRegistry({ onEnqueue: (id) => woken.push(id) });
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    reg.restore('sess-1', [injection('a', 'deliver me now', 1)]);
+    expect(woken).toEqual([attached.attachment.attachId]);
   });
 });

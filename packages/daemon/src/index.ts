@@ -85,7 +85,29 @@ export {
   type SessionWatchInput,
   type SessionCommandResult,
   type TrackedSessionView,
+  type HookReceiverChannelHandlers,
+  type ChannelAttachRequest,
+  type ChannelInjectionView,
 } from './hookReceiver.js';
+
+// The daemon's half of live-channel delivery. Exported because the channel package composes
+// exactly these against its own server and link to prove the wire BETWEEN the two packages,
+// which is otherwise only ever exercised against a stub of whichever side is not under test.
+export {
+  ChannelRegistry,
+  CHANNEL_POLL_MS,
+  CHANNEL_QUEUE_CAP,
+  CHANNEL_TTL_MS,
+  CHANNEL_ATTACH_STALE_MS,
+  type ChannelAttachInput,
+  type ChannelAttachment,
+  type ChannelIdentitySource,
+  type ChannelInjection,
+  type ChannelRegistryOptions,
+  type EnqueueResult,
+  type RestoreResult,
+  type TakeSource,
+} from './channelRegistry.js';
 
 export {
   hookEndpointPath,
