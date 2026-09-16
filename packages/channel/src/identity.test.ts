@@ -105,6 +105,8 @@ describe('resolveIdentity — verified environment', () => {
       pid: 1,
       parentPid: 4242,
       parentOf,
+      // The invented pids in this test do not exist on the machine running it.
+      isLive: () => true,
     });
 
     expect(result).toEqual({
@@ -116,8 +118,9 @@ describe('resolveIdentity — verified environment', () => {
       name: 'work-ee',
       ambiguous: false,
     });
-    // The ancestor walk must stay OFF the verified path: it is the slow half of this module and
-    // the MCP handshake is waiting on it.
+    // The verified path cross-checks the process tree, but it must not PAY for it in the ordinary
+    // shape: the session that spawned this server IS its immediate parent, which Node hands over
+    // for free, so the walk answers without a single parent lookup.
     expect(calls).toEqual([]);
   });
 
@@ -128,6 +131,12 @@ describe('resolveIdentity — verified environment', () => {
     const result = await resolveIdentity({
       env: { CLAUDE_CONFIG_DIR: claudeDir, CLAUDE_CODE_SESSION_ID: 'sess-cfg' },
       platform: 'win32',
+      // Where the registry lives is the only question here, so the tree is stubbed rather than
+      // answered with a real process-table query.
+      pid: 1,
+      parentPid: 7,
+      parentOf: chainOf({}).parentOf,
+      isLive: () => true,
     });
 
     expect(result).toMatchObject({ ok: true, sessionId: 'sess-cfg', source: 'env' });
@@ -158,6 +167,82 @@ describe('resolveIdentity — verified environment', () => {
     expect(reason).toMatch(/contradict/i);
   });
 
+  it('REFUSES a confirmed env id whose nearest live ancestor is a different session', async () => {
+    // The inherited-environment hazard, measured on this platform: Claude Code exports
+    // CLAUDE_CODE_SESSION_ID into Bash-tool subprocesses, so a `claude` started from inside the
+    // OUTER session reads the outer session's id. Both sessions are live and both are registered,
+    // so the env var confirms perfectly — and attaching on that alone writes every message the
+    // operator sends to `outer` into `inner`'s terminal, in a different repo.
+    const sessionsDir = await registry([
+      { pid: 900, sessionId: 'outer', cwd: 'C:\\repo\\outer' },
+      { pid: 4242, sessionId: 'inner', cwd: 'C:\\repo\\inner' },
+    ]);
+    const { parentOf } = chainOf({ 4242: 900 });
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'outer' },
+      sessionsDir,
+      pid: 1,
+      // Our real owner is the INNER session; the outer one is its parent.
+      parentPid: 4242,
+      parentOf,
+      isLive: () => true,
+      sleep: () => Promise.resolve(),
+    });
+
+    expect(result.ok).toBe(false);
+    const reason = (result as { reason: string }).reason;
+    expect(reason).toContain('outer');
+    expect(reason).toContain('inner');
+    expect(reason).toMatch(/contradict|inherited/i);
+  });
+
+  it('REFUSES a confirmed env id when nothing above this process is a live session', async () => {
+    // An unreadable or session-less process tree is an absence of evidence. It is the one state
+    // in which the inherited-env case above cannot be told apart from the ordinary one, so it
+    // refuses: the cost is this session's channel plus a printed reason, and the cost of the
+    // alternative is one operator's instruction landing in someone else's terminal.
+    const sessionsDir = await registry([{ pid: 900, sessionId: 'somewhere' }]);
+    const { parentOf } = chainOf({});
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'somewhere' },
+      sessionsDir,
+      pid: 1,
+      parentPid: 77, // a process that is not a Claude Code session, with no visible parent
+      parentOf,
+      isLive: () => true,
+      sleep: () => Promise.resolve(),
+    });
+
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toContain('live Claude Code session');
+  });
+
+  it('stops the cross-check walk at the first registered ancestor', async () => {
+    // The walk is bounded by what it is looking FOR, not by the depth of the tree: once a
+    // registered session is found there is nothing further up that could change the answer, and
+    // every extra hop on this platform is a whole-process-table query.
+    const sessionsDir = await registry([
+      { pid: 500, sessionId: 'ours' },
+      { pid: 900, sessionId: 'grandparent' },
+    ]);
+    const { parentOf, calls } = chainOf({ 500: 900, 900: 1 });
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'ours' },
+      sessionsDir,
+      pid: 1,
+      parentPid: 500,
+      parentOf,
+      isLive: () => true,
+      sleep: () => Promise.resolve(),
+    });
+
+    expect(result).toMatchObject({ ok: true, sessionId: 'ours', source: 'env', pid: 500 });
+    expect(calls).toEqual([]);
+  });
+
   it('re-reads the registry so a torn write does not cost the session its identity', async () => {
     // The registry entry is absent on the first read and present on the second — a torn write,
     // which `readSessionRegistry` skips by design, or a file not yet created at startup.
@@ -179,8 +264,10 @@ describe('resolveIdentity — verified environment', () => {
       env: { CLAUDE_CODE_SESSION_ID: 'mine' },
       sessionsDir,
       pid: 1,
-      parentPid: 900,
+      // Our real owner — the session whose registry file is the one being written late.
+      parentPid: 4242,
       parentOf: chainOf({}).parentOf,
+      isLive: () => true,
       sleep,
     });
 
@@ -440,6 +527,8 @@ describe('liveness', () => {
 
   it('prefers the live file when two registry entries claim the same sessionId', async () => {
     // A resumed session leaves its previous pid's file behind; attaching to that pid is wrong.
+    // Which of the two is right is settled by the process tree rather than by liveness alone:
+    // the one that is actually our ancestor is the one whose cwd and pid describe us.
     const sessionsDir = await registry([
       { pid: 100, sessionId: 'shared', cwd: 'C:\\stale' },
       { pid: 900, sessionId: 'shared', cwd: 'C:\\live' },
@@ -448,6 +537,9 @@ describe('liveness', () => {
     const result = await resolveIdentity({
       env: { CLAUDE_CODE_SESSION_ID: 'shared' },
       sessionsDir,
+      pid: 1,
+      parentPid: 900,
+      parentOf: chainOf({}).parentOf,
       isLive: (pid) => pid === 900,
       sleep: () => Promise.resolve(),
     });
@@ -458,6 +550,70 @@ describe('liveness', () => {
   it('pidIsLive agrees with reality for this process and for a pid that cannot exist', () => {
     expect(pidIsLive(process.pid)).toBe(true);
     expect(pidIsLive(0x7ffffff0)).toBe(false);
+  });
+
+  it('pidIsLive reads ESRCH as the ONLY code that means dead', () => {
+    // EPERM is what Windows raises for a process that exists but cannot be signalled, and it is
+    // routine on a shared machine; an unmapped errno is simply an unknown answer. Reading either
+    // as "dead" would make this module and the daemon's own probe disagree about the same pid,
+    // and the session would lose an identity it actually has. `process.kill` is stubbed because
+    // conjuring a real EPERM process is not something a unit test can do portably.
+    const kill = vi.spyOn(process, 'kill');
+    try {
+      for (const code of ['EPERM', 'EINVAL', undefined]) {
+        kill.mockImplementationOnce(() => {
+          throw Object.assign(new Error('probe failed'), { code });
+        });
+        expect(pidIsLive(4242)).toBe(true);
+      }
+      kill.mockImplementationOnce(() => {
+        throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+      });
+      expect(pidIsLive(4242)).toBe(false);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it('keeps procStart and pidDomain, and refuses a pid from another platform', async () => {
+    // Claude Code stamps both, and they are the only evidence that a pid means what it says. A
+    // narrowing that dropped them would guarantee nothing downstream could ever use them; a
+    // domain naming another platform means the pid belongs to a different pid namespace
+    // entirely, where our own `process.kill` probe is asking about an unrelated process.
+    const root = await mkdtemp(join(tmpdir(), 'cctl-channel-identity-'));
+    dirs.push(root);
+    const sessionsDir = join(root, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(
+      join(sessionsDir, '900.json'),
+      JSON.stringify({
+        pid: 900,
+        sessionId: 'elsewhere',
+        cwd: '/repo',
+        procStart: '134339581700251254',
+        pidDomain: 'linux:some-box',
+      }),
+      'utf8',
+    );
+
+    const entries = await readSessionRegistry(sessionsDir);
+    expect(entries[0]).toMatchObject({
+      procStart: '134339581700251254',
+      pidDomain: 'linux:some-box',
+    });
+
+    const result = await resolveIdentity({
+      env: { CLAUDE_CODE_SESSION_ID: 'elsewhere' },
+      platform: 'win32',
+      sessionsDir,
+      pid: 1,
+      parentPid: 900,
+      parentOf: chainOf({}).parentOf,
+      // Even with the pid probe saying yes, a foreign pid namespace is not ours.
+      isLive: () => true,
+      sleep: () => Promise.resolve(),
+    });
+    expect(result.ok).toBe(false);
   });
 });
 
