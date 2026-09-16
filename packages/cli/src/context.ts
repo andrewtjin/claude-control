@@ -59,7 +59,16 @@ export function buildEngine(
   const options: ConstructorParameters<typeof SwitchEngine>[0] = {
     paths,
     logger: adapter,
-    refreshDeps: { overload: { logger: adapter } },
+    refreshDeps: {
+      overload: {
+        // The status-page probe an overloaded (529) token endpoint triggers, passed explicitly
+        // like the daemon passes it: the module's contract is that every outbound call it can
+        // make was handed to it, and a call reached through a global instead is one no test can
+        // intercept and no composition root can point somewhere else.
+        statusFetch: (url, init) => globalThis.fetch(url, init),
+        logger: adapter,
+      },
+    },
   };
   if (Number.isFinite(intervalEnv) && intervalEnv >= 0) {
     options.minSwitchIntervalMs = intervalEnv;

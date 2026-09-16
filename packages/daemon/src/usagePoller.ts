@@ -20,6 +20,7 @@ import {
   planWeight,
   type AccountUsageInput,
   type AdvisorOptions,
+  type AutoSwitchPolicy,
   type BillingSignals,
   type PlanTierSignals,
 } from '@claude-control/usage-advisor';
@@ -152,9 +153,21 @@ export interface AccountPollResult {
   outcome: 'live' | 'cached' | 'skipped';
 }
 
-export interface SnapshotResult {
+/** What one poll cycle MEASURED, before anything the poller cannot measure is folded in.
+ *  Deliberately carries no plan: a plan is only meaningful once the caller's history-derived
+ *  predictions are merged (see {@link UsagePoller.assemble}), and a shape that handed one out
+ *  before that is exactly how the plan and the executor came to reason about different
+ *  accounts. */
+export interface PollCycleResult {
   results: AccountPollResult[];
   accounts: AccountUsage[];
+}
+
+export interface SnapshotResult extends PollCycleResult {
+  /** The EXACT advisor inputs `plan` was computed from, predictions already merged. Every
+   *  consumer that has to agree with the plan — the auto-switch executor, the probe's candidate
+   *  filter, the post-switch kick — reads these rather than re-deriving its own. */
+  inputs: AccountUsageInput[];
   plan: UsagePlan;
 }
 
@@ -187,10 +200,11 @@ export class UsagePoller {
     this.overloadDeps = { now: this.clock, random: this.random, ...options.overload };
   }
 
-  /** Poll every account (subject to each one's floor/backoff), then assemble the burn-down
-   *  plan from whatever usage is now current for each — freshly polled or carried over from
-   *  a prior call. Accounts never before polled always poll (no prior result to carry). */
-  async pollAll(accounts: PollAccount[]): Promise<SnapshotResult> {
+  /** Poll every account (subject to each one's floor/backoff) and report whatever usage is now
+   *  current for each — freshly polled or carried over from a prior call. Accounts never before
+   *  polled always poll (no prior result to carry). The plan comes from {@link assemble}, once
+   *  the caller has the predictions only it can supply. */
+  async pollAll(accounts: PollAccount[]): Promise<PollCycleResult> {
     // Poll every account concurrently: `pollOne` catches its own failures and always resolves
     // to a (possibly degraded) result, so `Promise.all` can never reject, and one slow/silent
     // account can no longer stall the others. Per-account timing/backoff state is keyed by
@@ -198,10 +212,41 @@ export class UsagePoller {
     // account order regardless of which fetch settles first.
     const results = await Promise.all(accounts.map((account) => this.pollOne(account)));
 
-    const accountUsages = results.map((r) => r.usage.accountUsage);
-    const advisorInputs: AccountUsageInput[] = results.map((r) => r.usage.advisorInput);
-    const plan = computePlan(advisorInputs, this.advisorOptions);
-    return { results, accounts: accountUsages, plan };
+    return { results, accounts: results.map((r) => r.usage.accountUsage) };
+  }
+
+  /**
+   * Fold the caller's history-derived reset predictions into this cycle's advisor inputs and
+   * compute the burn-down plan from them.
+   *
+   * ONE merge point, deliberately. The endpoint stops publishing a weekly reset once an
+   * account's window closes, so the prediction is the only thing that makes a dormant account
+   * visible at all — and an input merged for the executor but not for the plan makes the phone
+   * recommend one account while the daemon hops to another. Everything that must agree with the
+   * plan therefore reads the `inputs` this returns, not the raw per-account results.
+   *
+   * Predictions are optional: a caller with no history (or none for an account) gets exactly
+   * what the endpoint reported, which is what an account with no history at all deserves.
+   */
+  assemble(
+    polled: PollCycleResult,
+    predictedResets: ReadonlyMap<string, number> = new Map(),
+  ): SnapshotResult {
+    const inputs: AccountUsageInput[] = polled.results.map((r) => {
+      const predicted = normalizePredictedReset(predictedResets.get(r.accountId));
+      return predicted === undefined
+        ? r.usage.advisorInput
+        : { ...r.usage.advisorInput, predictedResetAt: predicted };
+    });
+    return { ...polled, inputs, plan: computePlan(inputs, this.advisorOptions) };
+  }
+
+  /** The executor's policy this poller's plan is gated by, when the composition root passed one
+   *  (see `AdvisorOptions.autoSwitchPolicy`). Exposed read-only so a caller that must mirror the
+   *  executor's view of an account — which limits it can even SEE — reads the same policy object
+   *  the plan was computed under instead of keeping a second copy that can drift from it. */
+  get autoSwitchPolicy(): AutoSwitchPolicy | undefined {
+    return this.advisorOptions?.autoSwitchPolicy;
   }
 
   /**
@@ -487,6 +532,16 @@ export class UsagePoller {
   }
 }
 
+/** The single reading of a history-derived prediction: a finite, non-negative INTEGER epoch ms,
+ *  or nothing at all. Shared by the advisor merge and the wire payload so the timestamp the plan
+ *  was computed from is the one the phone is shown — and because the wire schema declares
+ *  exactly this shape, a looser value would make `encode()` throw and drop the whole snapshot.
+ */
+function normalizePredictedReset(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.round(value);
+}
+
 /** Overwrite a retained result's identity flags with the caller's current ones. Usage
  *  numbers age with the poll floor; WHO is active does not — it changes the instant a
  *  switch commits, and both frontends and the auto-switcher must see that immediately. The
@@ -530,11 +585,11 @@ export function toUsageSnapshotPayload(
 ): PayloadOf<'usage.snapshot'> {
   const factsById = new Map(registry.map((a) => [a.id, a]));
   const accounts = snapshot.accounts.map((account) => {
-    const predicted = history.predictedResetByAccount.get(account.accountId);
+    const predicted = normalizePredictedReset(
+      history.predictedResetByAccount.get(account.accountId),
+    );
     const withReset =
-      predicted !== undefined && Number.isFinite(predicted) && predicted >= 0
-        ? { ...account, predictedResetAt: Math.round(predicted) }
-        : account;
+      predicted !== undefined ? { ...account, predictedResetAt: predicted } : account;
     return { ...withReset, ...registryFields(factsById.get(account.accountId), nowMs) };
   });
   const burn = history.burnUnitsPerDay;

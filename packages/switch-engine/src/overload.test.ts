@@ -9,6 +9,7 @@ import {
   probeClaudeStatus,
   withOverloadRetry,
   CLAUDE_STATUS_URL,
+  LOCKED_CALL_BUDGET_MS,
   LOCKED_OVERLOAD_BUDGET_CAP_MS,
   OVERLOAD_MIN_ATTEMPT_MS,
   OVERLOAD_BACKOFF_CAP_MS,
@@ -16,9 +17,11 @@ import {
   RETRY_AFTER_CAP_MS,
   SHORT_OVERLOAD_BUDGET,
   STATUS_CACHE_TTL_MS,
+  STATUS_PROBE_TIMEOUT_MS,
   type OverloadAttemptContext,
   type OverloadRetryDeps,
 } from './overload.js';
+import { LOCK_STALE_MS } from './lock.js';
 
 /** What a status-page fetch resolves to, spelled out so the fixtures below type-check as one. */
 interface StatusPageResponse {
@@ -460,5 +463,59 @@ describe('isOverloadCode', () => {
     expect(isOverloadCode('network')).toBe(false);
     // Not a status code at all — the shape must not be matched loosely.
     expect(isOverloadCode('http_529x')).toBe(false);
+  });
+});
+
+describe('the whole-call budget a lock holder runs under', () => {
+  it('sizes the worst case at half the window a contender reclaims the lock on', () => {
+    // Every attempt is deadlined by the call budget; the advisory status probe is the one step
+    // outside it, so this sum IS the most network time a holder can spend. The other half of
+    // the window is what the refresh spends off the network — the credential writes it exists
+    // to make — and neither half may be racing a reclaim.
+    expect(LOCKED_CALL_BUDGET_MS + STATUS_PROBE_TIMEOUT_MS).toBeLessThanOrEqual(LOCK_STALE_MS / 2);
+    // The retry phase's own cap still fits inside the budget it now shares with the first
+    // attempt, so the two bounds cannot contradict each other.
+    expect(LOCKED_OVERLOAD_BUDGET_CAP_MS).toBeLessThan(LOCKED_CALL_BUDGET_MS);
+  });
+
+  it('hands the FIRST attempt a deadline only when the caller asked for one', async () => {
+    const { deps } = harness(statusPage('none'));
+    let remaining: number | undefined;
+    const record = (ctx: OverloadAttemptContext) => {
+      remaining = ctx.remainingMs;
+      return Promise.resolve(response(200));
+    };
+
+    // No budget: the first request is the one the caller would have made anyway, so it keeps
+    // its own timeout and nothing here shortens it.
+    await withOverloadRetry(record, deps);
+    expect(remaining).toBe(Number.POSITIVE_INFINITY);
+
+    await withOverloadRetry(record, { ...deps, callBudgetMs: 5_000 });
+    expect(remaining).toBe(5_000);
+  });
+
+  it('spends the budget on whichever phase used it, first attempt included', async () => {
+    // One slow first attempt, then a 529: the retry phase's own budget would still allow more
+    // tries, but the caller's total time is already gone.
+    const { deps, advance } = harness(statusPage('none'));
+    const slowOverloaded = vi.fn(() => {
+      advance(9_000);
+      return Promise.resolve(response(529));
+    });
+    const bounded = await withOverloadRetry(slowOverloaded, { ...deps, callBudgetMs: 10_000 });
+    expect(slowOverloaded).toHaveBeenCalledTimes(1);
+    expect(bounded.retries).toBe(0);
+    expect(bounded.response.status).toBe(529);
+
+    // The same attempt without a whole-call budget keeps retrying on the retry budget alone —
+    // which is exactly the time a lock holder could not account for.
+    const { deps: freeDeps, advance: advanceFree } = harness(statusPage('none'));
+    const slowAgain = vi.fn(() => {
+      advanceFree(9_000);
+      return Promise.resolve(response(529));
+    });
+    await withOverloadRetry(slowAgain, freeDeps);
+    expect(slowAgain.mock.calls.length).toBeGreaterThan(1);
   });
 });
