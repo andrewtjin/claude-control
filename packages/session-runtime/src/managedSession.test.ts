@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { startManagedSession } from './managedSession.js';
+import { SessionBusyError, startManagedSession } from './managedSession.js';
 import type { AgentSdkClient, AgentSdkEvent, AgentSdkQueryOptions } from './managedSession.js';
 import type {
   PermissionDecision,
@@ -930,5 +930,234 @@ describe('startManagedSession usage-limit stall', () => {
     await timers.fire();
     expect(calls).toHaveLength(3);
     expect(handle.getState()).toBe('waiting_input');
+  });
+
+  it('reports the park to its registry, and reports the un-park when a turn starts', async () => {
+    const { client } = fakeClient([
+      [{ type: 'turn_result', ok: false, summary: USAGE_LIMIT_529 }],
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const parked: boolean[] = [];
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+      onUsageLimitPark: (value) => parked.push(value),
+    });
+    await tick();
+
+    expect(parked).toEqual([true]);
+    expect(handle.isParkedOnUsageLimit!()).toBe(true);
+    handle.resumeFromUsageLimitStall!();
+    await tick();
+    // Only CHANGES are reported, so a listener can persist each one without debouncing.
+    expect(parked).toEqual([true, false]);
+    expect(handle.isParkedOnUsageLimit!()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Turn identity: a turn's stream can outlive the turn's outcome
+// ---------------------------------------------------------------------------
+
+/** A turn whose stream stays OPEN until the test closes it — the shape a real SDK turn takes
+ *  when it reports its death and leaves the iterator running. Everything the fixed-array turns
+ *  above cannot express (a retry coming due mid-stream, a straggler event) lives here. */
+function openTurn(): {
+  turn: Turn;
+  push: (e: AgentSdkEvent) => Promise<void>;
+  close: () => Promise<void>;
+} {
+  const queued: AgentSdkEvent[] = [];
+  let ended = false;
+  let wake: (() => void) | undefined;
+  const bump = (): void => {
+    wake?.();
+    wake = undefined;
+  };
+  const turn: Turn = () => ({
+    async *[Symbol.asyncIterator]() {
+      for (;;) {
+        while (queued.length > 0) {
+          const next = queued.shift();
+          if (next !== undefined) yield next;
+        }
+        if (ended) return;
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+      }
+    },
+  });
+  return {
+    turn,
+    async push(e) {
+      queued.push(e);
+      bump();
+      await tick();
+    },
+    async close() {
+      ended = true;
+      bump();
+      await tick();
+    },
+  };
+}
+
+describe('startManagedSession turn identity', () => {
+  it('holds a retry that comes due while the failed turn is still streaming, then runs it at teardown', async () => {
+    const dying = openTurn();
+    const { client, calls } = fakeClient([
+      dying.turn,
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+    await dying.push({ type: 'session_init', sessionId: 'sdk-1' });
+    await dying.push({ type: 'assistant_text', text: 'partial work' });
+    await dying.push({ type: 'turn_result', ok: false, summary: SERVER_500 });
+    expect(timers.pending).toHaveLength(1);
+
+    // The backoff elapses while the dead turn's stream is STILL open. Starting the retry here
+    // would leave the client driving two turns at once.
+    await timers.fire();
+    expect(calls).toHaveLength(1);
+
+    // Teardown is the first moment the session is genuinely idle — the retry runs there.
+    await dying.close();
+    await tick();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.prompt).toBe('continue');
+    expect(handle.getState()).toBe('waiting_input');
+  });
+
+  it('a send() refused as busy leaves the held-back retry to run the continuation', async () => {
+    const dying = openTurn();
+    const { client, calls } = fakeClient([
+      dying.turn,
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+    await dying.push({ type: 'turn_result', ok: false, summary: SERVER_500 });
+    await timers.fire();
+
+    // The one guard the whole session serializes on: with a stream still open, nothing — not
+    // the retry above, not a phone reply — may start a second query.
+    await expect(handle.send('hello?')).rejects.toThrow(SessionBusyError);
+    expect(calls).toHaveLength(1);
+    await dying.close();
+    await tick();
+    expect(calls).toHaveLength(2);
+  });
+
+  it('stop() cancels a retry that is already due but waiting on the stream', async () => {
+    const dying = openTurn();
+    const { client, calls } = fakeClient([
+      dying.turn,
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    await tick();
+    await dying.push({ type: 'turn_result', ok: false, summary: SERVER_500 });
+    await timers.fire(); // due, but held back by the open stream
+
+    await handle.stop();
+    await dying.close();
+    await tick();
+    // The session was stopped: a retry that was merely waiting for a turn boundary must die
+    // with it, exactly like one still sitting on its backoff timer.
+    expect(calls).toHaveLength(1);
+    expect(handle.getState()).toBe('done');
+  });
+
+  it('ignores a failure reported by a turn that a later turn superseded', async () => {
+    const superseded = openTurn();
+    const { client, calls } = fakeClient([
+      superseded.turn,
+      [{ type: 'turn_result', ok: true, summary: 'done' }],
+    ]);
+    const timers = manualSchedule();
+    // A send() issued before the kickoff microtask runs starts its turn first; the kickoff
+    // then supersedes it, and the two streams overlap for real.
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule },
+    });
+    const events = collectEvents(handle);
+    void handle.send('urgent');
+    await tick();
+    expect(calls.map((c) => c.prompt)).toEqual(['urgent', 'go']);
+
+    // The superseded turn now reports a transient death. It is describing work the session has
+    // already replaced: no retry, no failure card, no budget spent.
+    await superseded.push({ type: 'turn_result', ok: false, summary: SERVER_500 });
+    expect(timers.pending).toHaveLength(0);
+    expect(events.some((e) => e.kind === 'summary' && e.text.startsWith('Session failed'))).toBe(
+      false,
+    );
+    expect(handle.getState()).toBe('waiting_input');
+
+    // …and its stream closing does not advertise the session as idle for a turn it no longer
+    // owns, nor start anything of its own.
+    await superseded.close();
+    await tick();
+    expect(calls).toHaveLength(2);
+  });
+
+  it('spends the budget on the retries of ONE turn, however the chain is interleaved', async () => {
+    const first = openTurn();
+    const { client, calls } = fakeClient([
+      first.turn,
+      [{ type: 'turn_result', ok: false, summary: SERVER_500 }],
+      [{ type: 'turn_result', ok: false, summary: SERVER_500 }],
+    ]);
+    const timers = manualSchedule();
+    const handle = startManagedSession({
+      id: 's1',
+      client,
+      prompt: 'go',
+      autoContinue: { schedule: timers.schedule, maxAttempts: 2, baseDelayMs: 10 },
+    });
+    const events = collectEvents(handle);
+    await tick();
+
+    // Attempt 1 comes due mid-stream and is held; the chain continues from the teardown.
+    await first.push({ type: 'turn_result', ok: false, summary: SERVER_500 });
+    await timers.fire();
+    await first.close();
+    await tick();
+    expect(calls).toHaveLength(2);
+
+    // Attempt 2 is the last the budget allows; the third death ends the session.
+    await timers.fire();
+    expect(calls).toHaveLength(3);
+    expect(handle.getState()).toBe('failed');
+    expect(
+      events.filter((e) => e.kind === 'milestone' && e.text.startsWith('Auto-continue')),
+    ).toHaveLength(2);
+    expect(timers.pending.filter((p) => !p.fired && !p.canceled)).toHaveLength(0);
   });
 });

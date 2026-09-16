@@ -138,9 +138,14 @@ export interface SessionManager {
   /**
    * Startup reconciliation: any persisted record that is not in a terminal state and has
    * no live handle in this process gets stamped `orphaned` — its owning process is gone,
-   * most likely a previous daemon run that crashed mid-session. Returns the records that
-   * were changed (empty on a clean start). Safe to call more than once; a no-op after the
-   * first call finds nothing left to reconcile.
+   * most likely a previous daemon run that crashed mid-session. A record carrying
+   * {@link SessionRecord.parkedOnUsageLimit} is reconciled the same way even though its state
+   * IS terminal: shutdown stamps a parked session `done` like any other, so that state is an
+   * artifact of the process ending rather than the session finishing. Returns the records that
+   * were changed (empty on a clean start); a revived park is returned with its marker so the
+   * caller can say what happened, while the stored record's marker is consumed so the next
+   * start does not announce it again. Safe to call more than once; a no-op after the first call
+   * finds nothing left to reconcile.
    */
   recover(): Promise<SessionRecord[]>;
   /**
@@ -227,6 +232,21 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
     void persist().catch(() => undefined);
   }
 
+  /** Mirror a managed session's usage-limit PARK onto its record. Fired from the handle's
+   *  `onUsageLimitPark` (a change notification, like `onSessionId`) because the park is the one
+   *  idle state that carries a promise — "it resumes after a switch" — and `state` cannot carry
+   *  it across a restart: shutdown stamps a parked session terminal exactly like a finished one.
+   *  `recover()` is what consumes the marker. Fire-and-forget persist for the same reason
+   *  `persistResumeId` is: the in-memory record is already right, and the next state-changing
+   *  write retries. */
+  function persistUsageLimitPark(id: string, parked: boolean): void {
+    const current = records.get(id);
+    if (!current || (current.parkedOnUsageLimit ?? false) === parked) return;
+    if (parked) current.parkedOnUsageLimit = true;
+    else delete current.parkedOnUsageLimit;
+    void persist().catch(() => undefined);
+  }
+
   /** Wire a freshly-created handle's status/summary events back into its record, keeping
    *  the on-disk registry current without callers having to remember to do it. */
   function trackHandle(handle: SessionHandle, record: SessionRecord): void {
@@ -287,6 +307,7 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
         : {}),
       ...(resumeOpts.autoContinue !== undefined ? { autoContinue: resumeOpts.autoContinue } : {}),
       onSessionId: (sdkSessionId) => persistResumeId(record.id, sdkSessionId),
+      onUsageLimitPark: (parked) => persistUsageLimitPark(record.id, parked),
     });
 
     // A fresh record that keeps identity but resets the live view to the new handle's state.
@@ -324,6 +345,7 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
           : {}),
         ...(spawnOpts.autoContinue !== undefined ? { autoContinue: spawnOpts.autoContinue } : {}),
         onSessionId: (sdkSessionId) => persistResumeId(id, sdkSessionId),
+        onUsageLimitPark: (parked) => persistUsageLimitPark(id, parked),
       });
       const record: SessionRecord = {
         id,
@@ -377,9 +399,17 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
       const orphaned: SessionRecord[] = [];
       for (const record of records.values()) {
         if (handles.has(record.id)) continue; // live in this process, not orphaned
-        if (TERMINAL_STATES.has(record.state)) continue; // already settled
+        // A PARKED session's terminal state is a shutdown artifact, not an outcome: it was idle
+        // holding a prompt to replay after an account switch when its process ended, and the
+        // operator was told so. Reconciling it like any other record whose owner died — orphaned,
+        // and re-attachable from its resume anchor — is the only reading that keeps that promise
+        // keepable. The marker is CONSUMED here (the caller gets it on the returned copy), so the
+        // next start reconciles an ordinary orphan instead of re-announcing this one forever.
+        const wasParked = record.parkedOnUsageLimit === true;
+        if (!wasParked && TERMINAL_STATES.has(record.state)) continue; // already settled
+        delete record.parkedOnUsageLimit;
         record.state = 'orphaned';
-        orphaned.push(record);
+        orphaned.push(wasParked ? { ...record, parkedOnUsageLimit: true } : record);
       }
       if (orphaned.length > 0) await persist();
       return orphaned;
