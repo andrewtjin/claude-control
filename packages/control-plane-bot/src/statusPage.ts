@@ -56,6 +56,8 @@ export function buildStatusPage(html: string): StatusPage {
     `script-src 'sha256-${scriptHash}'`,
     // The shell fetches /api/status from its own origin and nothing else.
     "connect-src 'self'",
+    // The favicon is an inline data: URI, so no request leaves the page for it.
+    'img-src data:',
     "base-uri 'none'",
     "form-action 'none'",
     "frame-ancestors 'none'",

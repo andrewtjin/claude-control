@@ -174,12 +174,19 @@ function isStoreFile(v: unknown): v is UptimeStoreFile {
     if (!isFiniteNumber(t.relayMs) || !isFiniteNumber(t.discordMs)) return false;
   }
   if (!Array.isArray(f.outages)) return false;
-  for (const o of f.outages as unknown[]) {
+  const outages = f.outages as unknown[];
+  for (const [i, o] of outages.entries()) {
     if (typeof o !== 'object' || o === null) return false;
     const x = o as Record<string, unknown>;
-    if (!Array.isArray(x.components) || !isFiniteNumber(x.start)) return false;
-    if (x.end !== null && !isFiniteNumber(x.end)) return false;
+    if (!Array.isArray(x.components) || x.components.length === 0) return false;
+    if (!x.components.every((c) => c === 'relay' || c === 'discord')) return false;
+    if (!isFiniteNumber(x.start)) return false;
+    if (x.end !== null && (!isFiniteNumber(x.end) || x.end < x.start)) return false;
     if (!['stopped', 'restart', 'stalled', 'discord'].includes(x.cause as string)) return false;
+    // The accounting only ever looks at the LAST entry for an open outage (openOutage below). One
+    // anywhere else would never be closed by a readiness change, never pruned, and would read as
+    // "ongoing" forever; a file in that shape is not a history this module can continue.
+    if (x.end === null && i !== outages.length - 1) return false;
   }
   return true;
 }
@@ -208,6 +215,9 @@ export class UptimeRecorder {
   private readonly stallMs: number;
   private store: UptimeStoreFile | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
+  // Set by stop(). start() checks it after its own await, so a stop that lands while the history
+  // is still loading never leaves an interval running that nothing will clear.
+  private stopped = false;
   // Every mutation runs through this chain so the interval's tick and a shutdown's final tick can
   // never interleave their read-modify-write of the store and the file.
   private queue: Promise<void> = Promise.resolve();
@@ -233,6 +243,7 @@ export class UptimeRecorder {
       this.prune(this.store, now);
       await this.persist(this.store);
     });
+    if (this.stopped) return;
     this.timer = setInterval(() => {
       this.tick().catch((err: unknown) => {
         this.logger.warn({ err }, 'uptime: tick failed');
@@ -253,8 +264,11 @@ export class UptimeRecorder {
   }
 
   /** Final tick plus the clean-shutdown marker, so the next start can name the gap `stopped` and
-   *  date it precisely instead of from the last periodic tick. */
+   *  date it precisely instead of from the last periodic tick. The final tick samples the gateway
+   *  like any other, so call this BEFORE tearing the gateway down or the shutdown itself reads as
+   *  a Discord drop. */
   async stop(): Promise<void> {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     await this.enqueue(async () => {
@@ -363,8 +377,12 @@ export class UptimeRecorder {
    *  and now is an outage of both components. Zero-length or negative (clock stepped back) gaps
    *  record nothing, since there is nothing honest to say about them. */
   private resume(file: UptimeStoreFile, now: number): UptimeStoreFile {
-    const downSince = file.stoppedAt ?? file.lastTick;
-    const cause: OutageCause = file.stoppedAt === undefined ? 'restart' : 'stopped';
+    // A stop marker older than the last tick is stale (something ticked after the stop, or the
+    // file is a partial restore): the later instant is the last one vouched for, and the marker
+    // no longer describes how the previous run ended.
+    const marker = file.stoppedAt !== undefined && file.stoppedAt >= file.lastTick;
+    const downSince = marker ? file.stoppedAt! : file.lastTick;
+    const cause: OutageCause = marker ? 'stopped' : 'restart';
     const store: UptimeStoreFile = {
       version: 1,
       since: file.since,
@@ -384,6 +402,8 @@ export class UptimeRecorder {
   /** The accounting step shared by tick() and stop(): attest [lastTick, now) or record it as a
    *  stall, then reconcile the Discord outage state against the gateway's readiness right now. */
   private account(store: UptimeStoreFile, now: number): void {
+    // Any accounting after a stop outdates its marker; stop() re-stamps it after this returns.
+    delete store.stoppedAt;
     const prev = store.lastTick;
     if (now < prev) {
       this.logger.warn({ prev, now }, 'uptime: clock stepped backwards; interval skipped');
@@ -433,7 +453,15 @@ export class UptimeRecorder {
       if (key < cutoffKey) delete store.days[key];
     }
     store.outages = store.outages.filter((o) => (o.end ?? now) >= cutoff);
-    if (store.outages.length > MAX_OUTAGES) store.outages = store.outages.slice(-MAX_OUTAGES);
+    if (store.outages.length > MAX_OUTAGES) {
+      // The newest by START survive, and the open entry (if any) stays last. Order is established
+      // here rather than assumed: a resumed history appends a restart that began before entries
+      // recorded earlier, so list position is not age.
+      const open = openOutage(store);
+      const closed = store.outages.filter((o) => o !== open).sort((a, b) => a.start - b.start);
+      const keep = closed.slice(-(MAX_OUTAGES - (open ? 1 : 0)));
+      store.outages = open ? [...keep, open] : keep;
+    }
   }
 
   private async persist(store: UptimeStoreFile): Promise<void> {

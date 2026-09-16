@@ -17,6 +17,7 @@ describe('buildStatusPage', () => {
     expect(page.csp).toContain(`script-src 'sha256-${hash(script)}'`);
     expect(page.csp).toContain("default-src 'none'");
     expect(page.csp).toContain("connect-src 'self'");
+    expect(page.csp).toContain('img-src data:');
     expect(page.csp).toContain("frame-ancestors 'none'");
   });
 

@@ -169,8 +169,9 @@ tick, so a dropped gateway shows as a Discord-only incident while the relay keep
 
 Because the page is served by the process it describes, the one thing it cannot show is its
 own total outage. `deploy/Caddyfile` covers that: while the bot container is down, Caddy
-answers `/` with a static "relay unreachable" page instead of a bare 502, and leaves every
-other path (`/health`, the daemons' WebSocket upgrade) untouched. Deleting `uptime.json`
+answers a browser's request for `/` with a static "relay unreachable" page instead of a bare
+502, and leaves everything else untouched: `/health`, every other path, and the daemons'
+WebSocket upgrade (which uses the same path but is told apart by its headers). Deleting `uptime.json`
 starts the history over; a file the bot cannot read is set aside as `uptime.json.invalid`.
 
 ## Updating

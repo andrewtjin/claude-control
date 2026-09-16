@@ -432,13 +432,19 @@ describe('UptimeRecorder', () => {
   it('start() ticks on its own at the sample interval', async () => {
     const r = make();
     await r.start();
+    // Observed BEFORE stop(), which would otherwise attest the same interval itself and hide a
+    // timer that never fired.
     now += SAMPLE;
     await vi.advanceTimersByTimeAsync(SAMPLE);
+    await vi.waitFor(async () => expect((await readStore()).lastTick).toBe(T0 + SAMPLE));
+    now += SAMPLE;
+    await vi.advanceTimersByTimeAsync(SAMPLE);
+    await vi.waitFor(async () => expect((await readStore()).lastTick).toBe(T0 + 2 * SAMPLE));
     await r.stop();
-    expect(today(await readStore())).toEqual({ relayMs: SAMPLE, discordMs: SAMPLE });
+    expect(today(await readStore())).toEqual({ relayMs: 2 * SAMPLE, discordMs: 2 * SAMPLE });
   });
 
-  it('a tick and a stop issued together serialize into one consistent file', async () => {
+  it('a stop issued right behind a tick, without awaiting it, lands both in the file', async () => {
     const r = make();
     await r.start();
     now += SAMPLE;
@@ -447,6 +453,134 @@ describe('UptimeRecorder', () => {
     expect(store.stoppedAt).toBe(now);
     expect(store.lastTick).toBe(now);
     expect(today(store)).toEqual({ relayMs: SAMPLE, discordMs: SAMPLE });
+  });
+
+  it('a stop that lands while start() is still loading leaves no timer behind', async () => {
+    const r = make();
+    const starting = r.start();
+    await r.stop();
+    await starting;
+    const stopped = await readStore();
+    now += 2 * SAMPLE;
+    await vi.advanceTimersByTimeAsync(2 * SAMPLE);
+    expect(await readStore()).toEqual(stopped);
+    expect(stopped.stoppedAt).toBe(T0);
+  });
+
+  it('stop() samples the gateway like a tick, so it must run before the gateway is torn down', async () => {
+    const r = make();
+    await r.start();
+    now += SAMPLE;
+    await r.tick();
+    ready = false;
+    now += 5000;
+    await r.stop();
+    const store = await readStore();
+    expect(today(store)).toEqual({ relayMs: SAMPLE + 5000, discordMs: SAMPLE });
+    expect(store.outages).toEqual<Outage[]>([
+      { components: ['discord'], start: T0 + SAMPLE, end: null, cause: 'discord' },
+    ]);
+  });
+
+  it('a tick after a stop outdates the marker, so the next start dates the gap from the tick', async () => {
+    const r1 = make();
+    await r1.start();
+    now += SAMPLE;
+    await r1.stop();
+    now += 3 * 60 * MIN;
+    await r1.tick(); // a stray tick long after the stop: a stall, and the marker is gone
+    let store = await readStore();
+    expect(store.stoppedAt).toBeUndefined();
+    expect(store.outages.map((o) => o.cause)).toEqual(['stalled']);
+    now += 1000;
+    const r2 = make();
+    await r2.start();
+    store = await readStore();
+    expect(store.outages.map((o) => o.cause)).toEqual(['stalled', 'restart']);
+    expect(store.outages[1]).toMatchObject({ start: now - 1000, end: now });
+    await r2.stop();
+  });
+
+  it('a stop marker older than the last tick is ignored rather than fabricating an overlap', async () => {
+    const seeded: UptimeStoreFile = {
+      version: 1,
+      since: T0 - 2 * 60 * MIN,
+      lastTick: T0 - MIN,
+      stoppedAt: T0 - 60 * MIN,
+      days: { [utcDayKey(T0)]: { relayMs: 2 * 60 * MIN - MIN, discordMs: 2 * 60 * MIN - MIN } },
+      outages: [],
+    };
+    await writeFile(path, JSON.stringify(seeded));
+    const r = make();
+    await r.start();
+    expect((await readStore()).outages).toEqual<Outage[]>([
+      { components: ['relay', 'discord'], start: T0 - MIN, end: T0, cause: 'restart' },
+    ]);
+    expect(lastDay(r, 'relay').downMs).toBe(MIN);
+    await r.stop();
+  });
+
+  it('a history whose open outage is not the last entry is set aside', async () => {
+    const seeded: UptimeStoreFile = {
+      version: 1,
+      since: T0 - DAY,
+      lastTick: T0 - SAMPLE,
+      days: {},
+      outages: [
+        { components: ['discord'], start: T0 - 30 * MIN, end: null, cause: 'discord' },
+        { components: ['discord'], start: T0 - 10 * MIN, end: T0 - 8 * MIN, cause: 'discord' },
+      ],
+    };
+    await writeFile(path, JSON.stringify(seeded));
+    const r = make();
+    await r.start();
+    expect((await readStore()).since).toBe(T0);
+    expect((await stat(`${path}.invalid`)).isFile()).toBe(true);
+    await r.stop();
+  });
+
+  it('a history with an outage that ends before it starts is set aside', async () => {
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 1,
+        since: T0 - DAY,
+        lastTick: T0 - SAMPLE,
+        days: {},
+        outages: [{ components: ['relay'], start: T0, end: T0 - 1, cause: 'stalled' }],
+      }),
+    );
+    const r = make();
+    await r.start();
+    expect((await readStore()).since).toBe(T0);
+    await r.stop();
+  });
+
+  it('a report during a stall drops the unattested tail, so today shows the gap', async () => {
+    const r = make();
+    await r.start();
+    now += SAMPLE;
+    await r.tick();
+    now += 10 * MIN;
+    expect(lastDay(r, 'relay')).toEqual({
+      date: '2026-09-15',
+      elapsedMs: SAMPLE + 10 * MIN,
+      downMs: 10 * MIN,
+    });
+    await r.stop();
+  });
+
+  it('a failing persist rejects the caller and leaves the queue usable', async () => {
+    // A directory where the file should be: the atomic rename onto it fails every time.
+    // A FILE where the state directory should be: nothing can be created beneath it, so every
+    // write fails. (A directory at the file's own path would just be set aside as unreadable.)
+    await writeFile(join(dir, 'blocker'), '');
+    path = join(dir, 'blocker', 'uptime.json');
+    const r = make();
+    await expect(r.start()).rejects.toThrow();
+    await expect(r.tick()).rejects.toThrow();
+    await expect(r.stop()).rejects.toThrow();
+    // Nothing hangs: every call above settled, each with its own rejection.
   });
 
   it('the report carries the live daemon count and the window parameters through unchanged', async () => {

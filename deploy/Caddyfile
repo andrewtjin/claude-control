@@ -7,17 +7,21 @@
 	reverse_proxy bot:8765
 
 	# The bot serves its own status page at `/`, which by construction it cannot do while it is
-	# down (a deploy, a crash loop, an OOM kill). For that one path Caddy answers a bad-gateway
-	# with a static page that says so, keeping the same status code. Every other path, including
-	# `/health` (which `cctl doctor` reads) and the daemons' WebSocket upgrade, is left exactly as
-	# before so nothing that parses the relay's replies sees a new shape.
+	# down (a deploy, a crash loop, an OOM kill). For a browser's request to that one path Caddy
+	# answers a bad-gateway with a static page that says so, keeping the same status code. The
+	# daemons' WebSocket upgrade goes to the same path, so it is excluded by its Connection header;
+	# it, `/health` (which `cctl doctor` reads) and every other path are left exactly as before, so
+	# nothing that parses the relay's replies sees a new shape.
 	handle_errors {
 		@page {
 			path /
+			not header Connection *Upgrade*
 			expression {err.status_code} in [502, 503, 504]
 		}
 		handle @page {
 			header Content-Type "text/html; charset=utf-8"
+			header X-Content-Type-Options nosniff
+			header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
 			respond <<HTML
 				<!doctype html>
 				<html lang="en">

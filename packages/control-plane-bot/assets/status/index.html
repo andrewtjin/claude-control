@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>cctl relay status</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%230ca30c'/%3E%3C/svg%3E"
+    />
     <style>
       :root {
         color-scheme: light dark;
@@ -201,9 +205,10 @@
       .axis .narrow {
         display: none;
       }
-      /* A phone cannot fit 90 legible bars: show the newest 30 and say so in the caption. */
+      /* A phone cannot fit 90 legible bars: the script marks all but the newest few `old`, and
+         this hides them and swaps the caption to match. */
       @media (max-width: 640px) {
-        .bar:nth-child(-n + 60) {
+        .bar.old {
           display: none;
         }
         .axis .wide {
@@ -212,6 +217,10 @@
         .axis .narrow {
           display: inline;
         }
+      }
+      /* Everything below the banner is from the last successful poll once the relay stops answering. */
+      .stale .card {
+        opacity: 0.55;
       }
       h2 {
         font-size: 17px;
@@ -419,8 +428,12 @@
           $('banner-text').textContent = text;
         };
 
+        // How many of the newest days a phone-width layout shows (the stylesheet hides the rest).
+        const NARROW_DAYS = 30;
         const renderComponents = (report) => {
           const root = $('components');
+          // The bars are rebuilt; a tooltip anchored to a removed bar would otherwise stay put.
+          hideTip();
           root.textContent = '';
           for (const c of report.components) {
             const box = el('div', 'component');
@@ -447,20 +460,22 @@
                 report.windowDays +
                 ' days',
             );
-            for (const day of c.days) {
-              const bar = el('div', 'bar ' + dayClass(day));
+            c.days.forEach((day, i) => {
+              const old = i < c.days.length - NARROW_DAYS ? ' old' : '';
+              const bar = el('div', 'bar ' + dayClass(day) + old);
               bar.addEventListener('mouseenter', () =>
                 showTip(bar, fmtDay(utcDate(day.date)) + ' (UTC)', dayText(day)),
               );
               bar.addEventListener('mouseleave', hideTip);
               bars.appendChild(bar);
-            }
+            });
             box.appendChild(bars);
 
             const axis = el('div', 'axis');
-            // One caption per layout: the phone rule in the stylesheet hides the oldest 60 bars.
+            // One caption per layout; the stylesheet shows whichever matches the bars on screen.
+            const shown = Math.min(c.days.length, NARROW_DAYS);
             axis.appendChild(el('span', 'from wide', report.windowDays + ' days ago'));
-            axis.appendChild(el('span', 'from narrow', report.windowDays - 60 + ' days ago'));
+            axis.appendChild(el('span', 'from narrow', shown + ' days ago'));
             axis.appendChild(el('span', 'line'));
             axis.appendChild(el('span', 'pct', fmtPct(c.uptimePercent) + ' uptime'));
             axis.appendChild(el('span', 'line'));
@@ -538,18 +553,30 @@
 
         let last = null;
         const refresh = async () => {
+          let report;
           try {
             const res = await fetch('/api/status', { cache: 'no-store' });
             if (!res.ok) throw new Error('HTTP ' + res.status);
-            last = await res.json();
-            render(last);
+            report = await res.json();
           } catch (err) {
-            // The shell is already on screen, so the relay going away mid-view is itself the news.
+            // The shell is already on screen, so the relay going away mid-view is itself the
+            // news. What stays on screen is the last successful poll, dimmed and dated as such.
             setBanner('critical', 'Relay unreachable');
-            if (last === null) {
-              $('footer').textContent = 'Could not load the status report: ' + (err && err.message);
-            }
+            document.body.classList.add('stale');
+            $('footer').textContent = last
+              ? 'Relay unreachable as of ' +
+                fmtTime(Date.now()) +
+                ' UTC; showing the report from ' +
+                fmtTime(last.generatedAt) +
+                ' UTC.'
+              : 'Could not load the status report: ' + (err && err.message);
+            return;
           }
+          // Outside the try on purpose: a rendering defect must surface as an error, not as a
+          // claim that the relay is unreachable.
+          last = report;
+          document.body.classList.remove('stale');
+          render(report);
         };
         refresh();
         setInterval(refresh, REFRESH_MS);

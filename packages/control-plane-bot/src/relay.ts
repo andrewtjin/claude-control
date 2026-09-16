@@ -263,15 +263,17 @@ export class RelayServer implements RelaySender {
    *  - GET / and GET /api/status: the status page and its report, when a provider is configured.
    *    The report carries availability totals and a daemon COUNT, never identities.
    *  Anything else is a 404. A query string is ignored for routing, so a cache-busting `/?t=…`
-   *  still finds the page. */
+   *  still finds the page. HEAD is answered like GET (node omits the body on its own), since
+   *  external uptime monitors default to it. */
   private onHttpRequest(req: IncomingMessage, res: ServerResponse): void {
     const path = (req.url ?? '').split('?')[0];
-    if (req.method === 'GET' && path === '/health') {
+    const read = req.method === 'GET' || req.method === 'HEAD';
+    if (read && path === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
       return;
     }
-    if (this.status && req.method === 'GET' && (path === '/' || path === '/api/status')) {
+    if (this.status && read && (path === '/' || path === '/api/status')) {
       this.serveStatus(this.status, path, res);
       return;
     }
@@ -302,7 +304,9 @@ export class RelayServer implements RelaySender {
       const report = status.report({ connectedDaemons: this.connectionsByDaemon.size });
       res.writeHead(200, {
         'content-type': 'application/json',
-        'cache-control': 'no-store',
+        // The report only moves once per sample, so a short shared cache costs nothing in
+        // freshness and lets any intermediary absorb a burst against this unauthenticated route.
+        'cache-control': 'public, max-age=15',
         'x-content-type-options': 'nosniff',
       });
       res.end(JSON.stringify(report));

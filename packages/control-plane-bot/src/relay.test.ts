@@ -627,11 +627,11 @@ describe('RelayServer', () => {
       expect(reportCalls).toEqual([]);
     });
 
-    it('serves the report at /api/status with the live daemon count, uncached', async () => {
+    it('serves the report at /api/status with the live daemon count, briefly cacheable', async () => {
       let res = await fetch(`http://127.0.0.1:${statusPort}/api/status`);
       expect(res.status).toBe(200);
       expect(res.headers.get('content-type')).toBe('application/json');
-      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(res.headers.get('cache-control')).toBe('public, max-age=15');
       expect(await res.json()).toMatchObject({ connectedDaemons: 0, overall: 'operational' });
 
       const token = await bindDaemon('user-a', 'daemon-1');
@@ -658,10 +658,24 @@ describe('RelayServer', () => {
       expect((await fetch(`http://127.0.0.1:${statusPort}/api/status`)).status).toBe(200);
     });
 
-    it('only GET reaches the status routes', async () => {
+    it('only GET and HEAD reach the status routes', async () => {
       const res = await fetch(`http://127.0.0.1:${statusPort}/`, { method: 'POST' });
       expect(res.status).toBe(404);
       expect((await fetch(`http://127.0.0.1:${statusPort}/api/status/`)).status).toBe(404);
+    });
+
+    it('HEAD answers with the same status and headers and no body, for uptime monitors', async () => {
+      const page = await fetch(`http://127.0.0.1:${statusPort}/`, { method: 'HEAD' });
+      expect(page.status).toBe(200);
+      expect(page.headers.get('content-type')).toBe('text/html; charset=utf-8');
+      expect(await page.text()).toBe('');
+      const health = await fetch(`http://127.0.0.1:${statusPort}/health`, { method: 'HEAD' });
+      expect(health.status).toBe(200);
+      expect(await health.text()).toBe('');
+      const report = await fetch(`http://127.0.0.1:${statusPort}/api/status`, { method: 'HEAD' });
+      expect(report.status).toBe(200);
+      expect(report.headers.get('cache-control')).toBe('public, max-age=15');
+      expect(await report.text()).toBe('');
     });
   });
 });

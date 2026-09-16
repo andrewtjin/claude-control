@@ -154,22 +154,31 @@ async function main(): Promise<void> {
   holder.relay = relay;
 
   const boundPort = await relay.listen();
-  await gateway.start();
-  // Availability counts from here: the relay is listening and the gateway has logged in. Starting
-  // the recorder any earlier would book the login itself as a Discord outage on every deploy.
+  // Availability counts from here: the relay is accepting daemon sockets. The Discord component
+  // is sampled only on the recorder's ticks, so the login below has one sample interval of grace
+  // before a slow login would open a Discord incident; an ordinary deploy books none.
   await uptime.start();
-  logger.info({ port: boundPort, stateDir }, 'control-plane bot is up');
 
   const shutdown = (): void => {
     logger.info({}, 'shutting down');
-    // uptime.stop() leaves the clean-shutdown marker, so the next start dates this gap exactly and
-    // shows it as a planned restart rather than a crash.
-    void Promise.allSettled([gateway.stop(), relay.close(), uptime.stop()]).then(() =>
-      process.exit(0),
-    );
+    // The recorder's final tick samples the gateway, so it runs BEFORE the gateway is torn down:
+    // client.destroy() flips readiness to false synchronously, and a final tick after that would
+    // book a phantom Discord drop against every planned restart. The tick also leaves the
+    // clean-shutdown marker, so the next start dates this gap exactly and shows it as planned.
+    void uptime
+      .stop()
+      .catch((err: unknown) => {
+        logger.warn({ err }, 'uptime: final tick failed');
+      })
+      .then(() => Promise.allSettled([gateway.stop(), relay.close()]))
+      .then(() => process.exit(0));
   };
+  // Registered before the login so a stop signal during it still ends the run cleanly.
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  await gateway.start();
+  logger.info({ port: boundPort, stateDir }, 'control-plane bot is up');
 }
 
 main().catch((err: unknown) => fail(err instanceof Error ? err.message : String(err)));
