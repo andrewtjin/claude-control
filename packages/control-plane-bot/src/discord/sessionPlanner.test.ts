@@ -501,3 +501,42 @@ describe('SessionPlanner — stream mode ordering and fences', () => {
     expect(ups[1]!.content).toBeUndefined();
   });
 });
+
+describe('SessionPlanner — state lines only ask for what the deployment can do', () => {
+  /** The stream-mode line for one state, as the reader sees it. */
+  function lineFor(state: Status['state'], repliesReadable: boolean): string {
+    const plan = new SessionPlanner({ repliesReadable }).onStatus(
+      ROUTE,
+      status(state),
+      0,
+      'stream',
+    );
+    const line = lineSends(plan.ops)[0];
+    return line?.kind === 'sendMessage' ? (line.content ?? '') : '';
+  }
+
+  // The permission card for a session that has a thread is posted INTO that thread (the gateway's
+  // cardSink), which is also where this line lands — and when the thread cannot take the card,
+  // both fall back to the same DM. So the line points at the card, never at a place.
+  it('points at the permission card itself, not at the DMs', () => {
+    const line = lineFor('waiting_permission', true);
+    expect(line).toContain('card');
+    expect(line).not.toMatch(/DM/i);
+  });
+
+  it('invites a reply only where a reply can be read', () => {
+    expect(lineFor('waiting_input', true)).toContain('reply here');
+    const unread = lineFor('waiting_input', false);
+    expect(unread).not.toContain('reply here');
+    expect(unread).toContain('/say');
+    expect(unread).toContain('not read');
+  });
+
+  it('does not offer typing as the way to wake a dormant session when typing is not read', () => {
+    expect(lineFor('orphaned', true)).toContain('send a message here');
+    const unread = lineFor('orphaned', false);
+    expect(unread).not.toContain('send a message here');
+    expect(unread).toContain('/say');
+    expect(unread).toContain('not read');
+  });
+});

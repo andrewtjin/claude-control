@@ -69,8 +69,13 @@ export async function readJsonIfExists<T>(path: string): Promise<T | undefined> 
 /** `readJsonIfExists` for state the bot can rebuild (thread targets, channel pins): content that
  *  does not parse — a truncated write, a hand edit gone wrong, a 0-byte file — or a file that
  *  cannot be read at all (a directory in its place, a permissions problem) reads as ABSENT, so a
- *  damaged cache file can never keep the bot from logging in. The next write of that cache
- *  surfaces a path that still cannot be written, to the caller that asked for the write. */
+ *  damaged cache file can never keep the bot from logging in.
+ *
+ *  What a later write does about a path that is still unwritable differs by store, deliberately:
+ *  the pin store AWAITS its write, so the failure reaches the user who asked for it (`/thread-here`
+ *  answers that it could not save), while the thread registry records write-behind — delivery must
+ *  never queue on disk — so its failures only reach the log, and the cost of a permanently
+ *  unwritable path there is fresh threads after a restart rather than an error anyone is shown. */
 export async function readJsonOrAbsent<T>(path: string): Promise<T | undefined> {
   try {
     return await readJsonIfExists<T>(path);

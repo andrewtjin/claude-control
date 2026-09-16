@@ -898,3 +898,65 @@ describe('buildThreadHereResult — status', () => {
     expect(result.kind === 'text' && result.text).not.toContain('Cleared.');
   });
 });
+
+// A deployment that configured no session channel omits the privileged MessageContent intent, so
+// MessageCreate never fires — yet `/thread-here` can still pin a channel and produce threads. The
+// threads deliver perfectly and hear nothing, and a user who is not told that learns it by having
+// their first reply disappear.
+describe('buildThreadHereResult — a deployment that cannot read thread replies', () => {
+  const CHANNEL = '333333333333333333';
+
+  it('warns on a fresh pin that replies typed in the thread are not read', () => {
+    const result = buildThreadHereResult({ kind: 'pinned', channelId: CHANNEL }, false);
+    expect(result.kind === 'text' && result.text).toContain('not read on this deployment');
+    // And still says what DOES work.
+    expect(result.kind === 'text' && result.text).toContain('/say');
+  });
+
+  it('warns on a re-pin too — the limitation did not go away', () => {
+    const result = buildThreadHereResult({ kind: 'already-pinned', channelId: CHANNEL }, false);
+    expect(result.kind === 'text' && result.text).toContain('not read on this deployment');
+  });
+
+  it('warns on the status reply for a healthy channel', () => {
+    const result = buildThreadHereResult(
+      {
+        kind: 'status',
+        status: {
+          destination: 'channel',
+          channelId: CHANNEL,
+          source: 'pin',
+          health: { kind: 'ok' },
+        },
+      },
+      false,
+    );
+    expect(result.kind === 'text' && result.text).toContain('not read on this deployment');
+  });
+
+  // Nothing to mis-describe: these replies send the user to their DMs, or to a channel the bot
+  // cannot use — in both cases no thread is being promised.
+  it('says nothing about replies when the answer is DMs, or a channel that does not work', () => {
+    const cleared = buildThreadHereResult({ kind: 'cleared' }, false);
+    expect(cleared.kind === 'text' && cleared.text).not.toContain('not read');
+    const broken = buildThreadHereResult(
+      {
+        kind: 'status',
+        status: {
+          destination: 'channel',
+          channelId: CHANNEL,
+          source: 'pin',
+          health: { kind: 'unreachable' },
+        },
+      },
+      false,
+    );
+    expect(broken.kind === 'text' && broken.text).not.toContain('not read');
+  });
+
+  it('reads exactly as before on a deployment that can read replies', () => {
+    const result = buildThreadHereResult({ kind: 'pinned', channelId: CHANNEL }, true);
+    expect(result.kind === 'text' && result.text).not.toContain('not read');
+    expect(result).toEqual(buildThreadHereResult({ kind: 'pinned', channelId: CHANNEL }));
+  });
+});

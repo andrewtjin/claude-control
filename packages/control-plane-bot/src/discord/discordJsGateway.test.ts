@@ -21,10 +21,13 @@ import {
   InteractionContextType,
   PermissionFlagsBits,
   PermissionsBitField,
+  type ButtonInteraction,
   type ChatInputCommandInteraction,
   type EmbedBuilder,
   type Message,
+  type ModalSubmitInteraction,
   type SendableChannels,
+  type StringSelectMenuInteraction,
 } from 'discord.js';
 import type { Envelope, EnvelopeDraft } from '@claude-control/shared-protocol';
 import {
@@ -35,7 +38,10 @@ import {
   gatewayIntents,
   missingThreadPermissionLabels,
   promptThreadTarget,
+  threadingConfigured,
 } from './discordJsGateway.js';
+import { permissionButtons } from './buttons.js';
+import { encodeQuestionModal, encodeQuestionSelect } from './questionCards.js';
 import type {
   CommandResult,
   ThreadHereAction,
@@ -44,7 +50,7 @@ import type {
 } from './commands.js';
 import type { SessionThreadParent } from './sessionChannels.js';
 import type { DeliveryTarget } from './threadRegistry.js';
-import type { SessionRoute } from './sessionPlanner.js';
+import { SessionPlanner, type SessionRoute } from './sessionPlanner.js';
 import type { CardRef } from './permissionCards.js';
 import type { RelaySender } from '../relay.js';
 import type { PairingService } from '../pairing.js';
@@ -191,8 +197,8 @@ class PermissionTestGateway extends DiscordJsGateway {
   resolveCalls: CardRef[] = [];
   fakeMessage: FakePermissionMessage | undefined;
 
-  seedPermissionCard(requestId: string, ref: CardRef): void {
-    this.permissionCards.record(requestId, ref);
+  seedPermissionCard(requestId: string, ref: CardRef, ownerId = 'u1'): void {
+    this.permissionCards.record(requestId, ref, ownerId);
   }
 
   cardCount(): number {
@@ -267,8 +273,8 @@ class QuestionTestGateway extends DiscordJsGateway {
   resolveCalls: CardRef[] = [];
   fakeMessage: FakePermissionMessage | undefined;
 
-  seedQuestionCard(requestId: string, ref: CardRef): void {
-    this.questionCards.record(requestId, ref);
+  seedQuestionCard(requestId: string, ref: CardRef, ownerId = 'u1'): void {
+    this.questionCards.record(requestId, ref, ownerId);
   }
 
   cardCount(): number {
@@ -470,7 +476,9 @@ describe('DiscordJsGateway — thread messages become session input', () => {
     expect(spawn?.payload).toMatchObject({
       prompt: 'and another thing',
       resumeSessionId: 's1',
-      idempotencyKey: 'thread:m2',
+      // Suffixed: ONE message can produce both an inject and a spawn (see the escalation test
+      // below), and the daemon dedupes on this key.
+      idempotencyKey: 'thread:m2:spawn',
     });
     expect(gw.reactions).toContainEqual({ threadId: 't1', messageId: 'm2', emoji: '🔄' });
 
@@ -503,6 +511,14 @@ describe('DiscordJsGateway — thread messages become session input', () => {
     );
     const spawn = sent.find((d) => d.type === 'session.spawn');
     expect(spawn?.payload).toMatchObject({ prompt: 'keep going', resumeSessionId: 's1' });
+    // The escalation is the case that makes the suffix load-bearing: both frames are born of the
+    // same Discord message, so a shared idempotency key would let the daemon drop the spawn as a
+    // resend of the inject it just refused — and the typed message would vanish.
+    const inject = sent.find((d) => d.type === 'prompt.inject');
+    const injectKey = (inject?.payload as { idempotencyKey: string }).idempotencyKey;
+    const spawnKey = (spawn?.payload as { idempotencyKey: string }).idempotencyKey;
+    expect(injectKey).toBe('thread:m1');
+    expect(spawnKey).not.toBe(injectKey);
   });
 
   it('lands any other correlated refusal in the thread, not the DMs', async () => {
@@ -1259,5 +1275,418 @@ describe('missingThreadPermissionLabels', () => {
   // would pin a channel on the strength of an absence.
   it('treats an absent permission set as everything missing', () => {
     expect(missingThreadPermissionLabels(null)).toHaveLength(ALL.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Card ownership: seeing a card is not the same as being able to answer it
+// ---------------------------------------------------------------------------
+
+/** A relay fake that records WHO each frame was addressed to — the whole point of the ownership
+ *  guard is that a stranger's tap must not reach the stranger's own daemon. */
+function addressedFakeRelay() {
+  const sent: { userId: string; draft: EnvelopeDraft }[] = [];
+  const relay: RelaySender = {
+    sendToUser(userId, build) {
+      sent.push({ userId, draft: build(`daemon-for-${userId}`) });
+      return { ok: true, id: `env-${sent.length}` };
+    },
+    isOnline: () => true,
+  };
+  return { relay, sent };
+}
+
+/** A sendable channel whose messages carry the ids `deliver` records a card by. */
+class FakeCardSink {
+  readonly sends: unknown[] = [];
+  send(payload: unknown): Promise<{ channelId: string; id: string }> {
+    this.sends.push(payload);
+    return Promise.resolve({ channelId: 'c1', id: `m${this.sends.length}` });
+  }
+}
+
+/** Everything one component interaction does, recorded. Covers the three shapes the handlers take
+ *  (button, select, modal submit) because the ownership guard is identical across them. */
+class FakeInteraction {
+  readonly replies: { content?: string }[] = [];
+  readonly updates: unknown[] = [];
+  readonly followUps: unknown[] = [];
+  readonly fields: { getTextInputValue: () => string };
+  deferrals = 0;
+  modals = 0;
+  constructor(
+    readonly user: { id: string },
+    readonly customId: string,
+    readonly values: string[] = [],
+    text = '',
+  ) {
+    this.fields = { getTextInputValue: () => text };
+  }
+  reply(payload: { content?: string }): Promise<void> {
+    this.replies.push(payload);
+    return Promise.resolve();
+  }
+  update(payload: unknown): Promise<void> {
+    this.updates.push(payload);
+    return Promise.resolve();
+  }
+  followUp(payload: unknown): Promise<void> {
+    this.followUps.push(payload);
+    return Promise.resolve();
+  }
+  deferUpdate(): Promise<void> {
+    this.deferrals += 1;
+    return Promise.resolve();
+  }
+  showModal(): Promise<void> {
+    this.modals += 1;
+    return Promise.resolve();
+  }
+}
+
+/** The gateway with its card sink faked, so a real permission/question card can be DELIVERED (which
+ *  is what records its owner) and then tapped through the real interaction routing. */
+class CardAuthGateway extends DiscordJsGateway {
+  readonly sink = new FakeCardSink();
+  protected override cardSink(): Promise<SendableChannels> {
+    return Promise.resolve(this.sink as unknown as SendableChannels);
+  }
+  driveButton(interaction: FakeInteraction): Promise<void> {
+    return this.onButton(interaction as unknown as ButtonInteraction);
+  }
+  driveSelect(interaction: FakeInteraction): Promise<void> {
+    return this.onQuestionSelect(interaction as unknown as StringSelectMenuInteraction);
+  }
+  driveModal(interaction: FakeInteraction): Promise<void> {
+    return this.onQuestionModal(interaction as unknown as ModalSubmitInteraction);
+  }
+  /** Still live, still the same owner — what "untouched" means from this side. */
+  permissionOwner(requestId: string): string | undefined {
+    return this.permissionCards.ownerOf(requestId);
+  }
+  questionOwner(requestId: string): string | undefined {
+    return this.questionCards.ownerOf(requestId);
+  }
+}
+
+const OWNER = 'owner-1';
+const STRANGER = 'stranger-2';
+
+const permissionEnvelope = envelope('permission.request', {
+  requestId: 'p1',
+  sessionId: 's1',
+  tool: 'Bash',
+  summary: 'run the tests',
+});
+
+const questionEnvelope = envelope('question.request', {
+  requestId: 'q1',
+  sessionId: 's1',
+  questions: [
+    {
+      question: 'Which color?',
+      header: 'Color',
+      options: [{ label: 'red' }, { label: 'blue' }],
+      multiSelect: false,
+    },
+  ],
+});
+
+describe('DiscordJsGateway — only the card owner can answer it', () => {
+  /** The real buttons off the real card, so a test taps exactly what a reader taps. */
+  const row = permissionButtons({ requestId: 'p1' })[0] ?? [];
+  const approveId = row[0]?.customId ?? '';
+  /** The first tap of the destructive session-scope Deny: it only SWAPS the row, but that swap is
+   *  still an edit of the owner's message. */
+  const denySessionId = row[2]?.customId ?? '';
+
+  async function delivered(kind: 'permission' | 'question') {
+    const { relay, sent } = addressedFakeRelay();
+    const gw = new CardAuthGateway({ relay, pairing: stubPairing });
+    await gw.deliver(OWNER, kind === 'permission' ? permissionEnvelope : questionEnvelope);
+    return { gw, sent };
+  }
+
+  it("refuses a stranger's Approve: no frame, no edit, card still the owner's", async () => {
+    const { gw, sent } = await delivered('permission');
+    const tap = new FakeInteraction({ id: STRANGER }, approveId);
+
+    await gw.driveButton(tap);
+
+    expect(tap.replies[0]?.content).toBe("This card isn't yours.");
+    expect(tap.updates).toEqual([]); // the owner's buttons were not stripped
+    expect(sent).toEqual([]); // nothing reached the stranger's daemon
+    expect(gw.permissionOwner('p1')).toBe(OWNER); // still live, still theirs
+  });
+
+  it("refuses a stranger's FIRST tap of a two-tap Deny, before the row is swapped", async () => {
+    const { gw, sent } = await delivered('permission');
+    const tap = new FakeInteraction({ id: STRANGER }, denySessionId);
+
+    await gw.driveButton(tap);
+
+    expect(tap.replies[0]?.content).toBe("This card isn't yours.");
+    expect(tap.updates).toEqual([]);
+    expect(sent).toEqual([]);
+  });
+
+  it('lets the owner approve: the frame goes to THEIR daemon and the buttons are stripped', async () => {
+    const { gw, sent } = await delivered('permission');
+    const tap = new FakeInteraction({ id: OWNER }, approveId);
+
+    await gw.driveButton(tap);
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.userId).toBe(OWNER);
+    expect(sent[0]?.draft.type).toBe('permission.response');
+    expect(tap.updates).toEqual([{ components: [] }]);
+  });
+
+  it("refuses a stranger's select without touching the owner's accumulated answers", async () => {
+    const { gw, sent } = await delivered('question');
+    const selectId = encodeQuestionSelect('q1', 0);
+
+    // The stranger picks 'blue' (option index 1) — refused, and NOT recorded.
+    const strangerTap = new FakeInteraction({ id: STRANGER }, selectId, ['1']);
+    await gw.driveSelect(strangerTap);
+    expect(strangerTap.replies[0]?.content).toBe("This card isn't yours.");
+    expect(sent).toEqual([]);
+    expect(gw.questionOwner('q1')).toBe(OWNER);
+
+    // The owner then answers 'red' (index 0), completing the card: their own answer is what gets
+    // relayed, which is how we know the stranger's pick never entered the shared collector.
+    const ownerTap = new FakeInteraction({ id: OWNER }, selectId, ['0']);
+    await gw.driveSelect(ownerTap);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.userId).toBe(OWNER);
+    expect(sent[0]?.draft.payload).toMatchObject({
+      requestId: 'q1',
+      answers: [{ question: 'Which color?', selected: ['red'] }],
+    });
+  });
+
+  it("refuses a stranger's Other-modal submit", async () => {
+    const { gw, sent } = await delivered('question');
+    const submit = new FakeInteraction(
+      { id: STRANGER },
+      encodeQuestionModal('q1', 0),
+      [],
+      'something else',
+    );
+
+    await gw.driveModal(submit);
+
+    expect(submit.replies[0]?.content).toBe("This card isn't yours.");
+    expect(sent).toEqual([]);
+    expect(gw.questionOwner('q1')).toBe(OWNER);
+  });
+
+  // A card this process has no record of (evicted at the FIFO bound, or sent before a restart) has
+  // no owner to compare a tap against. Refusing there would make live cards unanswerable by the
+  // person they were sent to — the failure the guard exists to prevent — so unknown stays allowed.
+  it('does not refuse a tap on a card it has no record of', async () => {
+    const { relay, sent } = addressedFakeRelay();
+    const gw = new CardAuthGateway({ relay, pairing: stubPairing });
+
+    const tap = new FakeInteraction({ id: OWNER }, approveId);
+    await gw.driveButton(tap);
+
+    expect(tap.replies.map((r) => r.content)).not.toContain("This card isn't yours.");
+    expect(sent).toHaveLength(1);
+  });
+});
+
+describe('DiscordJsGateway — a prompt card always reaches the user somehow', () => {
+  it('delivers an over-long permission summary as a clamped card rather than nothing', async () => {
+    const { relay } = addressedFakeRelay();
+    const gw = new CardAuthGateway({ relay, pairing: stubPairing });
+
+    await expect(
+      gw.deliver(
+        OWNER,
+        envelope('permission.request', {
+          requestId: 'p-big',
+          sessionId: 's1',
+          tool: 'Bash',
+          summary: 'y'.repeat(5_000),
+        }),
+      ),
+    ).resolves.toBeUndefined();
+
+    // Something was actually sent, with the card and its buttons on it.
+    expect(gw.sink.sends).toHaveLength(1);
+    const payload = gw.sink.sends[0] as { embeds?: unknown[]; components?: unknown[] };
+    expect(payload.embeds).toHaveLength(1);
+    expect(payload.components?.length).toBeGreaterThan(0);
+    // And the card is answerable: its owner was recorded, so a later tap resolves.
+    expect(gw.permissionOwner('p-big')).toBe(OWNER);
+  });
+
+  it('falls back to a plain-text notice when the card cannot be delivered at all', async () => {
+    const { relay } = addressedFakeRelay();
+    /** A gateway whose card sink always fails — standing in for any render or send failure. */
+    class BrokenSinkGateway extends CardAuthGateway {
+      readonly notices: string[] = [];
+      protected override cardSink(): Promise<SendableChannels> {
+        return Promise.reject(new Error('channel is on fire'));
+      }
+      protected override notifyUndeliverableCard(
+        discordUserId: string,
+        env: Envelope,
+      ): Promise<void> {
+        this.notices.push(`${discordUserId}:${env.type}`);
+        return Promise.resolve();
+      }
+    }
+    const gw = new BrokenSinkGateway({ relay, pairing: stubPairing });
+
+    await expect(gw.deliver(OWNER, permissionEnvelope)).resolves.toBeUndefined();
+
+    // The user is told a session is waiting on them; silence would read as the daemon being dead.
+    expect(gw.notices).toEqual([`${OWNER}:permission.request`]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A thread never falls through to an older session
+// ---------------------------------------------------------------------------
+
+describe('DiscordJsGateway — a demoted session keeps its thread', () => {
+  /** A gateway whose thread channel can be made unsendable mid-session — what a transient
+   *  permission loss looks like to `sinkFor`, exercised through the real demotion path rather than
+   *  a seeded registry entry. */
+  class DemotableGateway extends DiscordJsGateway {
+    sendable = true;
+    readonly thread = new FakeSink();
+    readonly dm = new FakeSink();
+    protected override fetchThreadChannel(): Promise<SendableChannels | undefined> {
+      return Promise.resolve(
+        this.sendable ? (this.thread as unknown as SendableChannels) : undefined,
+      );
+    }
+    protected override fetchDmChannel(): Promise<SendableChannels> {
+      return Promise.resolve(this.dm as unknown as SendableChannels);
+    }
+    protected override reactInThread(): Promise<void> {
+      return Promise.resolve();
+    }
+    protected override sendInThread(): Promise<void> {
+      return Promise.resolve();
+    }
+    driveThreadMessage(message: {
+      author: { id: string; bot: boolean };
+      channelId: string;
+      channel: { isThread(): boolean };
+      content: string;
+      id: string;
+    }): Promise<void> {
+      return this.onThreadMessage(message);
+    }
+  }
+
+  /** s1 runs and ends in thread t1; s2 is its resume, bound to the SAME thread — the ordinary
+   *  shape of a thread that has outlived one session. */
+  async function twoSessionsInOneThread() {
+    const { relay, sent } = addressedFakeRelay();
+    const parent = fakeThreadParent();
+    const gw = new DemotableGateway({
+      relay,
+      pairing: stubPairing,
+      sessionChannelResolver: () => Promise.resolve(parent),
+    });
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'running' }));
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's1', state: 'done' }));
+    await gw.deliver(
+      'u1',
+      envelope('session.status', {
+        sessionId: 's2',
+        state: 'running',
+        spawnRequestId: 'r1',
+        resumedFrom: 's1',
+      }),
+    );
+    return { gw, sent };
+  }
+
+  const TYPED = {
+    author: { id: 'u1', bot: false },
+    channelId: 't1',
+    channel: { isThread: () => true },
+    content: 'keep going',
+    id: 'm9',
+  };
+
+  it('steers a typed reply to the NEWEST session even after it is demoted to DM delivery', async () => {
+    const { gw, sent } = await twoSessionsInOneThread();
+
+    // The thread stops being sendable: the next frame for s2 demotes it to DM delivery.
+    gw.sendable = false;
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's2', state: 'waiting_input' }));
+    expect(gw.dm.sends.length).toBeGreaterThan(0); // the demotion really happened
+
+    await gw.driveThreadMessage(TYPED);
+
+    // s1 has ENDED, so steering it would not merely reach the wrong session — it would RESUME it.
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.draft.type).toBe('prompt.inject');
+    expect(sent[0]?.draft.payload).toMatchObject({ sessionId: 's2', text: 'keep going' });
+  });
+
+  it('returns to the thread once it is sendable again', async () => {
+    const { gw } = await twoSessionsInOneThread();
+    gw.sendable = false;
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's2', state: 'waiting_input' }));
+    const dmSends = gw.dm.sends.length;
+    const threadSends = gw.thread.sends.length;
+
+    gw.sendable = true;
+    await gw.deliver('u1', envelope('session.status', { sessionId: 's2', state: 'orphaned' }));
+
+    expect(gw.thread.sends.length).toBeGreaterThan(threadSends); // back in the thread
+    expect(gw.dm.sends.length).toBe(dmSends); // and not also in the DM
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Copy that matches where the card lands, and whether replies are read at all
+// ---------------------------------------------------------------------------
+
+describe('session copy agrees with where prompts go and whether replies are read', () => {
+  it('points at the card where the card actually is — the thread, not the DMs', () => {
+    // A prompt for a session that has a thread is routed INTO that thread, and stream mode is
+    // chosen only for a session that HAS one — so the line and the card share a surface.
+    const permission = envelope('permission.request', {
+      requestId: 'p1',
+      sessionId: 's1',
+      tool: 'Bash',
+      summary: 'run tests',
+    });
+    expect(promptThreadTarget(permission, () => ({ kind: 'thread', threadId: 't1' }))).toBe('t1');
+
+    const plan = new SessionPlanner().onStatus(
+      { discordUserId: 'u1', sessionId: 's1' },
+      { sessionId: 's1', state: 'waiting_permission' },
+      0,
+      'stream',
+    );
+    const line = plan.ops.find((op) => op.kind === 'sendMessage' && op.content !== undefined);
+    const content = line?.kind === 'sendMessage' ? (line.content ?? '') : '';
+    expect(content).toContain('card');
+    expect(content).not.toMatch(/DM/i);
+  });
+
+  // The planner's flag and the privileged intent are two faces of one deployment fact; deriving
+  // both from `threadingConfigured` is what keeps them from drifting.
+  it('reads replies exactly when the deployment asks for the MessageContent intent', () => {
+    const threaded = { sessionChannelId: '123' };
+    const dmOnly = {};
+    expect(threadingConfigured(threaded)).toBe(true);
+    expect(gatewayIntents(threadingConfigured(threaded))).toContain(
+      GatewayIntentBits.MessageContent,
+    );
+    expect(threadingConfigured(dmOnly)).toBe(false);
+    expect(gatewayIntents(threadingConfigured(dmOnly))).not.toContain(
+      GatewayIntentBits.MessageContent,
+    );
   });
 });

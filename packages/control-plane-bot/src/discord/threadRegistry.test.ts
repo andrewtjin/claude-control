@@ -111,10 +111,30 @@ describe('ThreadRegistry — latestForThread (reverse lookup)', () => {
     expect(reg.latestForThread('t1')).toEqual({ discordUserId: 'u1', sessionId: 's1' });
   });
 
-  it('ignores DM entries entirely', () => {
+  it('ignores a DM entry that never had a thread of its own', () => {
     const reg = new ThreadRegistry();
     reg.set('u1', 's1', { kind: 'dm' });
     expect(reg.latestForThread('t1')).toBeUndefined();
+  });
+
+  // The demotion case, which is what made this lookup dangerous: delivery for the NEWEST session
+  // fell back to the DM, the entry forgot its thread, and the thread then resolved to the PREVIOUS
+  // session — so typing in it steered a conversation the user was not looking at, and (once that
+  // session had ended) resumed it.
+  it('still resolves a session that was demoted to DM delivery from this thread', () => {
+    const reg = new ThreadRegistry();
+    reg.set('u1', 's-old', { kind: 'thread', threadId: 't1' });
+    reg.set('u1', 's-new', { kind: 'dm', threadId: 't1' });
+    expect(reg.latestForThread('t1')).toEqual({ discordUserId: 'u1', sessionId: 's-new' });
+  });
+
+  it('carries a demoted entry through a snapshot/restore cycle', () => {
+    const reg = new ThreadRegistry();
+    reg.set('u1', 's-old', { kind: 'thread', threadId: 't1' });
+    reg.set('u1', 's-new', { kind: 'dm', threadId: 't1' });
+    const restored = ThreadRegistry.fromSnapshot(reg.snapshot());
+    expect(restored.get('u1', 's-new')).toEqual({ kind: 'dm', threadId: 't1' });
+    expect(restored.latestForThread('t1')).toEqual({ discordUserId: 'u1', sessionId: 's-new' });
   });
 
   it("the LAST session bound to a thread wins — the resume chain's newest link", () => {

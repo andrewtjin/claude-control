@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import type { EmbedBuilder } from 'discord.js';
 import type {
   AccountUsage,
   TokenStatsSnapshot,
@@ -946,6 +947,43 @@ describe('reauth cards', () => {
     expect(embed.description).toContain('<t:1700000000:R>');
   });
 
+  it('keeps a URL containing ")" inside the link instead of letting it break out', () => {
+    // A bare `)` in the value closes the markdown link early: the tail spills into the card as
+    // prose and the link points at a PREFIX of the real URL — still clickable, and no longer the
+    // login the user is being sent to.
+    const url = 'https://claude.ai/oauth/authorize?state=st(1)&code=true';
+    const description =
+      buildReauthLinkEmbed({
+        label: 'spare',
+        accountId: 'acct-9',
+        url,
+        expiresAt: 1_700_000_000_000,
+      }).toJSON().description ?? '';
+
+    const target = /\[Open the login page\]\(<([^>]*)>\)/.exec(description)?.[1] ?? '';
+    // One unbroken target that still names every part of the URL, and decodes back to it exactly.
+    expect(target).toBe('https://claude.ai/oauth/authorize?state=st%281%29&code=true');
+    expect(decodeURIComponent(target)).toBe(url);
+    // Nothing of the URL leaked out of the link and into the prose.
+    expect(description).not.toContain('st(1)');
+  });
+
+  it('names a malformed login link as broken rather than drawing a link that cannot work', () => {
+    const description =
+      buildReauthLinkEmbed({
+        label: 'spare',
+        accountId: 'acct-9',
+        url: `https://claude.ai/oauth/authorize?state=${'x'.repeat(4000)}`,
+        expiresAt: 1_700_000_000_000,
+      }).toJSON().description ?? '';
+
+    expect(description).not.toContain('[Open the login page]');
+    expect(description).toContain('malformed');
+    // The card still renders, and the paste-code step is still readable.
+    expect(description.length).toBeLessThanOrEqual(4096);
+    expect(description).toContain('Paste code');
+  });
+
   it('buildReauthResultEmbed titles success and failure differently', () => {
     const ok = buildReauthResultEmbed(true, 'Re-authenticated spare; quarantine cleared.').toJSON();
     const failed = buildReauthResultEmbed(false, 'That login link expired.').toJSON();
@@ -1404,5 +1442,204 @@ describe('buildStatsEmbed', () => {
     const byAccount = (json.fields ?? []).find((f) => f.name === 'By account');
     expect(byAccount?.value.length).toBeLessThanOrEqual(1024);
     expect(byAccount?.value).toMatch(/… \+\d+ more/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Every builder, one hostile field at a time
+// ---------------------------------------------------------------------------
+
+/** discord.js VALIDATES an embed's parts as they are set, so an over-long one does not degrade —
+ *  it throws inside the builder. On the push path that throw costs the WHOLE card (and, for a
+ *  permission or question card, leaves the session blocked until its hold lapses), so every string
+ *  a builder takes from the wire has to be clamped at the builder. This table walks the exported
+ *  surface with a 10,000-char value in each untrusted slot: building at all is the assertion, and
+ *  the per-part ceilings below keep it meaningful if discord.js's own validation is ever disabled
+ *  at the library level. */
+describe('embed builders survive an over-long untrusted field', () => {
+  const HOSTILE = 'x'.repeat(10_000);
+
+  /** Discord's own ceilings, asserted independently of discord.js's validator. */
+  const TITLE_MAX = 256;
+  const DESCRIPTION_MAX = 4096;
+  const FIELD_NAME_MAX = 256;
+  const FIELD_VALUE_MAX = 1024;
+  const FOOTER_MAX = 2048;
+
+  const hostileAccount = account({
+    accountId: HOSTILE,
+    label: HOSTILE,
+    error: HOSTILE,
+    limits: [{ kind: 'session', percent: 42, isActive: true }],
+  });
+  const hostilePlan: UsagePlan = {
+    recommendedAccountId: HOSTILE,
+    ranking: [],
+    reason: HOSTILE,
+    advisories: [{ kind: 'all_healthy', message: HOSTILE }],
+  };
+  const hostileCard: SessionCardModel = {
+    sessionId: HOSTILE,
+    state: 'running',
+    stopping: false,
+    summary: HOSTILE,
+    accountId: HOSTILE,
+    outputTail: HOSTILE,
+    totalOutputChars: HOSTILE.length,
+    attached: true,
+    hasGap: true,
+    sourceTruncated: true,
+    hadError: true,
+  };
+
+  const cases: [string, () => EmbedBuilder][] = [
+    ['buildUsageEmbed', () => buildUsageEmbed({ accounts: [hostileAccount], plan: hostilePlan })],
+    [
+      'buildTimelineEmbed',
+      () => buildTimelineEmbed({ accounts: [hostileAccount], plan: hostilePlan }),
+    ],
+    ['buildAccountsEmbed', () => buildAccountsEmbed([hostileAccount])],
+    [
+      'buildStatsEmbed',
+      () =>
+        buildStatsEmbed({
+          windowStartMs: 0,
+          windowEndMs: 86_400_000,
+          overall: { input: 1, output: 1, cacheCreation: 1, cacheRead: 1, turns: 1 },
+          byAccount: [
+            {
+              accountId: HOSTILE,
+              label: HOSTILE,
+              totals: { input: 1, output: 1, cacheCreation: 1, cacheRead: 1, turns: 1 },
+            },
+          ],
+          byModel: [
+            {
+              label: HOSTILE,
+              totals: { input: 1, output: 1, cacheCreation: 1, cacheRead: 1, turns: 1 },
+            },
+          ],
+          byDay: [
+            {
+              label: HOSTILE,
+              totals: { input: 1, output: 1, cacheCreation: 1, cacheRead: 1, turns: 1 },
+            },
+          ],
+          coverage: {
+            filesScanned: 1,
+            filesSkippedByMtime: 0,
+            filesUnreadable: 0,
+            dirsUnreadable: 0,
+            malformedLines: 0,
+            duplicateTurns: 0,
+          },
+        }),
+    ],
+    [
+      'buildSettingsEmbed',
+      () =>
+        buildSettingsEmbed({
+          startedAtMs: 0,
+          settings: [{ name: HOSTILE, value: HOSTILE, source: 'env' }],
+        }),
+    ],
+    [
+      'buildSessionListEmbed',
+      () => buildSessionListEmbed([{ sessionId: HOSTILE, state: 'running', summary: HOSTILE }]),
+    ],
+    [
+      'buildPermissionRequestEmbed',
+      () => buildPermissionRequestEmbed(HOSTILE, HOSTILE, HOSTILE.slice(0, 40)),
+    ],
+    [
+      'buildQuestionEmbed',
+      () =>
+        buildQuestionEmbed(
+          [
+            {
+              question: HOSTILE,
+              header: HOSTILE,
+              options: [{ label: HOSTILE, description: HOSTILE }],
+              multiSelect: false,
+            },
+          ],
+          'plan',
+        ),
+    ],
+    [
+      'buildAnsweredQuestionEmbed',
+      () =>
+        buildAnsweredQuestionEmbed([
+          { question: HOSTILE, selected: [HOSTILE], otherText: HOSTILE },
+        ]),
+    ],
+    [
+      'buildLapsedQuestionEmbed',
+      () => buildLapsedQuestionEmbed('expired', { fields: [{ name: 'q', value: 'a' }] }),
+    ],
+    [
+      'buildLapsedPermissionEmbed',
+      () => buildLapsedPermissionEmbed('expired', { description: 'ran a command' }),
+    ],
+    [
+      'buildToolOutputEmbed',
+      () =>
+        buildToolOutputEmbed({
+          title: HOSTILE,
+          preview: HOSTILE,
+          attached: true,
+          totalChars: HOSTILE.length,
+          footer: HOSTILE,
+        }),
+    ],
+    [
+      'buildDoneEmbed',
+      () =>
+        buildDoneEmbed({
+          sessionId: HOSTILE,
+          lastAssistantMessage: HOSTILE,
+          body: HOSTILE,
+          title: HOSTILE,
+        }),
+    ],
+    [
+      'buildWaitingEmbed',
+      () => buildWaitingEmbed({ sessionId: HOSTILE, title: HOSTILE, body: HOSTILE }),
+    ],
+    [
+      'buildQuarantineEmbed',
+      () =>
+        buildQuarantineEmbed({
+          title: HOSTILE,
+          body: HOSTILE,
+          reloginCommand: HOSTILE,
+          reauthCommand: HOSTILE,
+        }),
+    ],
+    [
+      'buildReauthLinkEmbed',
+      () =>
+        buildReauthLinkEmbed({
+          label: HOSTILE,
+          accountId: HOSTILE,
+          url: HOSTILE,
+          expiresAt: 1_700_000_000_000,
+        }),
+    ],
+    ['buildReauthResultEmbed', () => buildReauthResultEmbed(false, HOSTILE)],
+    ['buildSwitchResultEmbed', () => buildSwitchResultEmbed(false, HOSTILE)],
+    ['buildSessionCardEmbed', () => buildSessionCardEmbed(hostileCard)],
+    ['buildSessionSummaryEmbed', () => buildSessionSummaryEmbed({ ...hostileCard, state: 'done' })],
+  ];
+
+  it.each(cases)('%s builds a card Discord would accept', (_name, build) => {
+    const json = build().toJSON();
+    expect((json.title ?? '').length).toBeLessThanOrEqual(TITLE_MAX);
+    expect((json.description ?? '').length).toBeLessThanOrEqual(DESCRIPTION_MAX);
+    for (const field of json.fields ?? []) {
+      expect(field.name.length).toBeLessThanOrEqual(FIELD_NAME_MAX);
+      expect(field.value.length).toBeLessThanOrEqual(FIELD_VALUE_MAX);
+    }
+    expect((json.footer?.text ?? '').length).toBeLessThanOrEqual(FOOTER_MAX);
   });
 });
