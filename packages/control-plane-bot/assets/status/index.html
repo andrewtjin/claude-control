@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>cctl relay status</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --page: #f9f9f7;
+        --surface: #fcfcfb;
+        --ink: #0b0b0b;
+        --ink-2: #52514e;
+        --muted: #898781;
+        --hairline: #e1e0d9;
+        --border: rgba(11, 11, 11, 0.1);
+        --good: #0ca30c;
+        --warning: #fab219;
+        --critical: #d03b3b;
+        --nodata: #e1e0d9;
+        --tip-bg: #0b0b0b;
+        --tip-ink: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --page: #0d0d0d;
+          --surface: #1a1a19;
+          --ink: #ffffff;
+          --ink-2: #c3c2b7;
+          --muted: #898781;
+          --hairline: #2c2c2a;
+          --border: rgba(255, 255, 255, 0.1);
+          --nodata: #2c2c2a;
+          --tip-bg: #fcfcfb;
+          --tip-ink: #0b0b0b;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+      }
+      body {
+        background: var(--page);
+        color: var(--ink);
+        font:
+          15px/1.5 system-ui,
+          -apple-system,
+          'Segoe UI',
+          sans-serif;
+        padding: 0 16px 48px;
+      }
+      main {
+        max-width: 800px;
+        margin: 0 auto;
+      }
+      header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 28px 0 20px;
+      }
+      header h1 {
+        font-size: 20px;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: -0.01em;
+      }
+      header h1 span {
+        color: var(--muted);
+        font-weight: 400;
+      }
+      #daemons {
+        color: var(--ink-2);
+        font-size: 14px;
+        white-space: nowrap;
+      }
+      #banner {
+        border-radius: 6px;
+        padding: 16px 20px;
+        font-size: 18px;
+        font-weight: 700;
+        color: #fff;
+        background: var(--muted);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      #banner.operational {
+        background: var(--good);
+      }
+      #banner.degraded {
+        background: var(--warning);
+        color: #0b0b0b;
+      }
+      #banner.critical {
+        background: var(--critical);
+      }
+      #banner .icon {
+        width: 22px;
+        height: 22px;
+        flex: none;
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        margin-top: 24px;
+      }
+      .component {
+        padding: 16px 20px;
+      }
+      .component + .component {
+        border-top: 1px solid var(--hairline);
+      }
+      .component .row {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 12px;
+        margin-bottom: 10px;
+      }
+      .component .name {
+        font-weight: 600;
+      }
+      .component .desc {
+        color: var(--muted);
+        font-weight: 400;
+        font-size: 13px;
+        margin-left: 8px;
+      }
+      .component .state {
+        font-size: 14px;
+        font-weight: 600;
+        white-space: nowrap;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .state.operational {
+        color: var(--good);
+      }
+      .state.down {
+        color: var(--critical);
+      }
+      .state .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: currentColor;
+        display: inline-block;
+      }
+      .bars {
+        display: flex;
+        gap: 2px;
+        height: 32px;
+      }
+      .bar {
+        flex: 1 1 0;
+        min-width: 0;
+        border-radius: 2px;
+        background: var(--nodata);
+        cursor: default;
+      }
+      .bar.good {
+        background: var(--good);
+      }
+      .bar.warning {
+        background: var(--warning);
+      }
+      .bar.critical {
+        background: var(--critical);
+      }
+      .bar:hover {
+        outline: 2px solid var(--ink);
+        outline-offset: 1px;
+      }
+      .axis {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 8px;
+      }
+      .axis .line {
+        flex: 1;
+        height: 1px;
+        background: var(--hairline);
+        margin: 0 10px;
+      }
+      .axis .pct {
+        color: var(--ink-2);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .axis .narrow {
+        display: none;
+      }
+      /* A phone cannot fit 90 legible bars: show the newest 30 and say so in the caption. */
+      @media (max-width: 640px) {
+        .bar:nth-child(-n + 60) {
+          display: none;
+        }
+        .axis .wide {
+          display: none;
+        }
+        .axis .narrow {
+          display: inline;
+        }
+      }
+      h2 {
+        font-size: 17px;
+        font-weight: 600;
+        margin: 36px 0 12px;
+      }
+      .day {
+        padding: 14px 20px;
+      }
+      .day + .day {
+        border-top: 1px solid var(--hairline);
+      }
+      .day h3 {
+        font-size: 14px;
+        font-weight: 600;
+        margin: 0 0 4px;
+      }
+      .day .none {
+        color: var(--muted);
+        font-size: 14px;
+        margin: 0;
+      }
+      .incident {
+        margin: 6px 0 0;
+        font-size: 14px;
+      }
+      .incident .title {
+        font-weight: 600;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .incident .swatch {
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+        display: inline-block;
+        background: var(--critical);
+      }
+      .incident .swatch.warning {
+        background: var(--warning);
+      }
+      .incident .when {
+        color: var(--ink-2);
+        margin-left: 18px;
+        display: block;
+        font-variant-numeric: tabular-nums;
+      }
+      footer {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 28px;
+        line-height: 1.6;
+      }
+      footer a {
+        color: inherit;
+      }
+      #tip {
+        position: fixed;
+        pointer-events: none;
+        background: var(--tip-bg);
+        color: var(--tip-ink);
+        font-size: 12px;
+        line-height: 1.4;
+        padding: 6px 9px;
+        border-radius: 4px;
+        max-width: 240px;
+        z-index: 10;
+        font-variant-numeric: tabular-nums;
+      }
+      #tip[hidden] {
+        display: none;
+      }
+      #tip b {
+        display: block;
+      }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>cctl <span>relay status</span></h1>
+        <div id="daemons" aria-live="polite"></div>
+      </header>
+      <div id="banner" role="status">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2" />
+          <path
+            id="banner-glyph"
+            d=""
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span id="banner-text">Loading…</span>
+      </div>
+      <section class="card" id="components" aria-label="Components"></section>
+      <h2>Past incidents</h2>
+      <section class="card" id="incidents" aria-label="Past incidents"></section>
+      <footer id="footer"></footer>
+    </main>
+    <div id="tip" role="tooltip" hidden></div>
+    <script>
+      (() => {
+        'use strict';
+        const DAY_MS = 86400000;
+        const INCIDENT_DAYS = 14;
+        const REFRESH_MS = 60000;
+        const GLYPH = {
+          operational: 'M7.5 12.5l3 3 6-7',
+          degraded: 'M12 7v6M12 16.5v.5',
+          critical: 'M12 7v6M12 16.5v.5',
+        };
+        const TITLES = {
+          stopped: 'Relay restarted (planned)',
+          restart: 'Relay restarted (unclean)',
+          stalled: 'Relay unresponsive',
+          discord: 'Discord gateway disconnected',
+        };
+        const $ = (id) => document.getElementById(id);
+        const el = (tag, cls, text) => {
+          const node = document.createElement(tag);
+          if (cls) node.className = cls;
+          if (text !== undefined) node.textContent = text;
+          return node;
+        };
+        const utcDate = (key) => {
+          const [y, m, d] = key.split('-').map(Number);
+          return new Date(Date.UTC(y, m - 1, d));
+        };
+        const fmtDay = (date) =>
+          date.toLocaleDateString('en-US', {
+            timeZone: 'UTC',
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          });
+        const fmtTime = (ms) =>
+          new Date(ms).toLocaleTimeString('en-US', {
+            timeZone: 'UTC',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false,
+          });
+        const fmtDuration = (ms) => {
+          const s = Math.round(ms / 1000);
+          // Anything the sample cannot resolve reads as "less than a second", never as nothing.
+          if (s < 1) return '<1s';
+          if (s < 60) return s + 's';
+          const m = Math.floor(s / 60);
+          if (m < 60) return m + 'm ' + (s % 60) + 's';
+          const h = Math.floor(m / 60);
+          if (h < 24) return h + 'h ' + (m % 60) + 'm';
+          return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+        };
+        const fmtPct = (p) => (p === null ? '—' : (Math.floor(p * 100) / 100).toFixed(2) + '%');
+        // A day is partial trouble below 5% downtime and a major outage past it; a whole-day
+        // threshold, like the bars on every hosted status page, not an incident count.
+        const dayClass = (day) => {
+          if (day.elapsedMs === 0) return 'nodata';
+          if (day.downMs === 0) return 'good';
+          return day.downMs / day.elapsedMs < 0.05 ? 'warning' : 'critical';
+        };
+        const dayText = (day) => {
+          if (day.elapsedMs === 0) return 'No data';
+          if (day.downMs === 0) return 'Operational';
+          const pct = (1 - day.downMs / day.elapsedMs) * 100;
+          return 'Down ' + fmtDuration(day.downMs) + ' · ' + fmtPct(pct) + ' uptime';
+        };
+
+        const tip = $('tip');
+        const showTip = (target, title, body) => {
+          tip.textContent = '';
+          tip.appendChild(el('b', null, title));
+          tip.appendChild(document.createTextNode(body));
+          tip.hidden = false;
+          const r = target.getBoundingClientRect();
+          const w = tip.offsetWidth;
+          const left = Math.max(
+            8,
+            Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2),
+          );
+          tip.style.left = left + 'px';
+          tip.style.top = r.top - tip.offsetHeight - 8 + 'px';
+        };
+        const hideTip = () => {
+          tip.hidden = true;
+        };
+
+        const setBanner = (kind, text) => {
+          const banner = $('banner');
+          banner.className = kind;
+          $('banner-glyph').setAttribute('d', GLYPH[kind]);
+          $('banner-text').textContent = text;
+        };
+
+        const renderComponents = (report) => {
+          const root = $('components');
+          root.textContent = '';
+          for (const c of report.components) {
+            const box = el('div', 'component');
+            const row = el('div', 'row');
+            const name = el('span', 'name', c.name);
+            name.appendChild(el('span', 'desc', c.description));
+            row.appendChild(name);
+            const state = el('span', 'state ' + c.status);
+            state.appendChild(el('span', 'dot'));
+            state.appendChild(
+              document.createTextNode(c.status === 'operational' ? 'Operational' : 'Down'),
+            );
+            row.appendChild(state);
+            box.appendChild(row);
+
+            const bars = el('div', 'bars');
+            bars.setAttribute('role', 'img');
+            bars.setAttribute(
+              'aria-label',
+              c.name +
+                ': ' +
+                fmtPct(c.uptimePercent) +
+                ' uptime over ' +
+                report.windowDays +
+                ' days',
+            );
+            for (const day of c.days) {
+              const bar = el('div', 'bar ' + dayClass(day));
+              bar.addEventListener('mouseenter', () =>
+                showTip(bar, fmtDay(utcDate(day.date)) + ' (UTC)', dayText(day)),
+              );
+              bar.addEventListener('mouseleave', hideTip);
+              bars.appendChild(bar);
+            }
+            box.appendChild(bars);
+
+            const axis = el('div', 'axis');
+            // One caption per layout: the phone rule in the stylesheet hides the oldest 60 bars.
+            axis.appendChild(el('span', 'from wide', report.windowDays + ' days ago'));
+            axis.appendChild(el('span', 'from narrow', report.windowDays - 60 + ' days ago'));
+            axis.appendChild(el('span', 'line'));
+            axis.appendChild(el('span', 'pct', fmtPct(c.uptimePercent) + ' uptime'));
+            axis.appendChild(el('span', 'line'));
+            axis.appendChild(el('span', 'to', 'Today'));
+            box.appendChild(axis);
+            root.appendChild(box);
+          }
+        };
+
+        const renderIncidents = (report) => {
+          const root = $('incidents');
+          root.textContent = '';
+          const today = Math.floor(report.generatedAt / DAY_MS) * DAY_MS;
+          // Time of day alone when the instant falls on the listed day; with its date otherwise,
+          // so an outage that ran across days reads unambiguously.
+          const fmtStamp = (ms, dayStart) =>
+            ms >= dayStart && ms < dayStart + DAY_MS
+              ? fmtTime(ms)
+              : fmtDay(new Date(ms)) + ' ' + fmtTime(ms);
+          for (let i = 0; i < INCIDENT_DAYS; i++) {
+            const dayStart = today - i * DAY_MS;
+            const dayEnd = dayStart + DAY_MS;
+            const box = el('div', 'day');
+            box.appendChild(el('h3', null, fmtDay(new Date(dayStart))));
+            // An outage is listed under the day it began. One that began before the listed
+            // fortnight but reached into it goes under the oldest listed day, with its real start,
+            // so a long outage that ended recently is never silently absent from the list.
+            const oldest = i === INCIDENT_DAYS - 1;
+            const here = report.incidents.filter(
+              (o) =>
+                (o.start >= dayStart && o.start < dayEnd) ||
+                (oldest && o.start < dayStart && (o.end === null || o.end >= dayStart)),
+            );
+            if (here.length === 0) {
+              box.appendChild(el('p', 'none', 'No incidents reported.'));
+            }
+            for (const o of here) {
+              const item = el('div', 'incident');
+              const title = el('span', 'title');
+              title.appendChild(el('span', 'swatch' + (o.cause === 'discord' ? ' warning' : '')));
+              title.appendChild(document.createTextNode(TITLES[o.cause] || o.cause));
+              item.appendChild(title);
+              const when =
+                o.end === null
+                  ? 'Since ' + fmtStamp(o.start, dayStart) + ' UTC · ongoing'
+                  : fmtStamp(o.start, dayStart) +
+                    ' – ' +
+                    fmtStamp(o.end, dayStart) +
+                    ' UTC · ' +
+                    fmtDuration(o.end - o.start);
+              item.appendChild(el('span', 'when', when));
+              box.appendChild(item);
+            }
+            root.appendChild(box);
+          }
+        };
+
+        const render = (report) => {
+          const down = report.components.filter((c) => c.status !== 'operational');
+          if (down.length === 0) setBanner('operational', 'All systems operational');
+          else setBanner('degraded', down.map((c) => c.name).join(', ') + ' down');
+          const n = report.connectedDaemons;
+          $('daemons').textContent = n + (n === 1 ? ' daemon connected' : ' daemons connected');
+          renderComponents(report);
+          renderIncidents(report);
+          $('footer').textContent =
+            'Tracking since ' +
+            fmtDay(new Date(report.since)) +
+            '. The relay records its own availability every ' +
+            Math.round(report.sampleMs / 1000) +
+            ' seconds; all times are UTC. Updated ' +
+            fmtTime(report.generatedAt) +
+            ' UTC.';
+        };
+
+        let last = null;
+        const refresh = async () => {
+          try {
+            const res = await fetch('/api/status', { cache: 'no-store' });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            last = await res.json();
+            render(last);
+          } catch (err) {
+            // The shell is already on screen, so the relay going away mid-view is itself the news.
+            setBanner('critical', 'Relay unreachable');
+            if (last === null) {
+              $('footer').textContent = 'Could not load the status report: ' + (err && err.message);
+            }
+          }
+        };
+        refresh();
+        setInterval(refresh, REFRESH_MS);
+        document.addEventListener('scroll', hideTip, { passive: true });
+      })();
+    </script>
+  </body>
+</html>

@@ -566,6 +566,103 @@ describe('RelayServer', () => {
       const res = await fetch(`http://127.0.0.1:${port}/health`);
       expect(res.status).toBe(200);
     });
+
+    it('answers 404 for the status routes when no provider is configured', async () => {
+      expect((await fetch(`http://127.0.0.1:${port}/`)).status).toBe(404);
+      expect((await fetch(`http://127.0.0.1:${port}/api/status`)).status).toBe(404);
+    });
+  });
+
+  describe('status routes', () => {
+    // A second relay on the SAME bindings, so bindDaemon() below authenticates against it and the
+    // live daemon count in the report can be observed going from 0 to 1.
+    const html = '<html><head><style>a{}</style></head><body><script>1</script></body></html>';
+    const csp = "default-src 'none'; style-src 'sha256-x'; script-src 'sha256-y'";
+    let statusRelay: RelayServer;
+    let statusPort: number;
+    let reportCalls: number[];
+    let failReport: boolean;
+
+    beforeEach(async () => {
+      reportCalls = [];
+      failReport = false;
+      statusRelay = new RelayServer({
+        bindings,
+        pairing,
+        gateway: fake.gateway,
+        heartbeatMs: 0,
+        port: 0,
+        status: {
+          page: { html, csp },
+          report: (live) => {
+            reportCalls.push(live.connectedDaemons);
+            if (failReport) throw new Error('boom');
+            return {
+              generatedAt: 1,
+              since: 0,
+              windowDays: 1,
+              sampleMs: 1,
+              overall: 'operational',
+              connectedDaemons: live.connectedDaemons,
+              components: [],
+              incidents: [],
+            };
+          },
+        },
+      });
+      statusPort = await statusRelay.listen();
+    });
+
+    afterEach(async () => {
+      await statusRelay.close();
+    });
+
+    it('serves the page at / as HTML with the hash CSP, and ignores a query string', async () => {
+      const res = await fetch(`http://127.0.0.1:${statusPort}/?t=1`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toBe('text/html; charset=utf-8');
+      expect(res.headers.get('content-security-policy')).toBe(csp);
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+      expect(await res.text()).toBe(html);
+      expect(reportCalls).toEqual([]);
+    });
+
+    it('serves the report at /api/status with the live daemon count, uncached', async () => {
+      let res = await fetch(`http://127.0.0.1:${statusPort}/api/status`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toBe('application/json');
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(await res.json()).toMatchObject({ connectedDaemons: 0, overall: 'operational' });
+
+      const token = await bindDaemon('user-a', 'daemon-1');
+      const ws = await connect(statusPort);
+      sendEnvelope(ws, {
+        daemonId: 'daemon-1',
+        type: 'hello',
+        payload: { protocolVersion: PROTOCOL_VERSION, daemonToken: token },
+      });
+      await nextMessage(ws);
+      res = await fetch(`http://127.0.0.1:${statusPort}/api/status`);
+      expect(await res.json()).toMatchObject({ connectedDaemons: 1 });
+      expect(reportCalls).toEqual([0, 1]);
+      ws.close();
+    });
+
+    it('a failing report costs one 500 and leaves the relay serving', async () => {
+      failReport = true;
+      const res = await fetch(`http://127.0.0.1:${statusPort}/api/status`);
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ error: 'status unavailable' });
+      failReport = false;
+      expect((await fetch(`http://127.0.0.1:${statusPort}/health`)).status).toBe(200);
+      expect((await fetch(`http://127.0.0.1:${statusPort}/api/status`)).status).toBe(200);
+    });
+
+    it('only GET reaches the status routes', async () => {
+      const res = await fetch(`http://127.0.0.1:${statusPort}/`, { method: 'POST' });
+      expect(res.status).toBe(404);
+      expect((await fetch(`http://127.0.0.1:${statusPort}/api/status/`)).status).toBe(404);
+    });
   });
 });
 

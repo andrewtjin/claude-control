@@ -21,6 +21,7 @@ import {
   MessageFlags,
   ModalBuilder,
   PermissionFlagsBits,
+  Status,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
   TextInputBuilder,
@@ -572,6 +573,17 @@ export class DiscordJsGateway implements DiscordGateway {
 
   async stop(): Promise<void> {
     await this.client.destroy();
+  }
+
+  /** Whether the bot is connected to Discord RIGHT NOW, for the status page's Discord component.
+   *  `client.isReady()` alone is not enough: it reads the manager-level status, which discord.js
+   *  sets to Ready once at login and never reverts, so it stays true through a dropped gateway.
+   *  It still answers "never logged in" and "destroyed"; the per-shard status, which does follow
+   *  disconnects and reconnects, answers the rest. */
+  isReady(): boolean {
+    if (!this.client.isReady()) return false;
+    const shards = this.client.ws.shards;
+    return shards.size > 0 && shards.every((shard) => shard.status === Status.Ready);
   }
 
   /** DiscordGateway.deliver — push one daemon-originated envelope to the owning user.

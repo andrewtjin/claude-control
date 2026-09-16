@@ -18,9 +18,29 @@ export {
   type RelayServerOptions,
   type RelaySender,
   type SendResult,
+  type StatusProvider,
 } from './relay.js';
 export { type Logger, noopLogger } from './logger.js';
 export { atomicWriteFile, readJsonIfExists } from './fsutil.js';
+export {
+  UptimeRecorder,
+  splitByUtcDay,
+  utcDayKey,
+  startOfUtcDay,
+  COMPONENT_NAMES,
+  DEFAULT_SAMPLE_MS,
+  DEFAULT_WINDOW_DAYS,
+  type UptimeRecorderOptions,
+  type UptimeStoreFile,
+  type StatusReport,
+  type ComponentReport,
+  type ComponentId,
+  type ComponentStatus,
+  type DayAvailability,
+  type Outage,
+  type OutageCause,
+} from './uptime.js';
+export { loadStatusPage, buildStatusPage, type StatusPage } from './statusPage.js';
 
 export { DaemonStateCache, type SessionStatus } from './discord/stateCache.js';
 export {

@@ -5,4 +5,44 @@
 
 {$RELAY_HOSTNAME} {
 	reverse_proxy bot:8765
+
+	# The bot serves its own status page at `/`, which by construction it cannot do while it is
+	# down (a deploy, a crash loop, an OOM kill). For that one path Caddy answers a bad-gateway
+	# with a static page that says so, keeping the same status code. Every other path, including
+	# `/health` (which `cctl doctor` reads) and the daemons' WebSocket upgrade, is left exactly as
+	# before so nothing that parses the relay's replies sees a new shape.
+	handle_errors {
+		@page {
+			path /
+			expression {err.status_code} in [502, 503, 504]
+		}
+		handle @page {
+			header Content-Type "text/html; charset=utf-8"
+			respond <<HTML
+				<!doctype html>
+				<html lang="en">
+				<head>
+				<meta charset="utf-8">
+				<meta name="viewport" content="width=device-width, initial-scale=1">
+				<meta name="color-scheme" content="light dark">
+				<title>cctl relay status</title>
+				<style>
+				body{margin:0;padding:0 16px 48px;background:#f9f9f7;color:#0b0b0b;font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+				@media (prefers-color-scheme:dark){body{background:#0d0d0d;color:#fff}p{color:#c3c2b7}}
+				main{max-width:800px;margin:0 auto}
+				h1{font-size:20px;font-weight:600;margin:0;padding:28px 0 20px}
+				h1 span{color:#898781;font-weight:400}
+				div{background:#d03b3b;color:#fff;border-radius:6px;padding:16px 20px;font-size:18px;font-weight:700}
+				p{color:#52514e;font-size:14px}
+				</style>
+				</head>
+				<body><main>
+				<h1>cctl <span>relay status</span></h1>
+				<div>Relay unreachable</div>
+				<p>The relay process is not answering. Daemons cannot connect until it is back; the uptime history resumes when it returns.</p>
+				</main></body>
+				</html>
+				HTML {err.status_code}
+		}
+	}
 }
