@@ -85,6 +85,36 @@ describe('classifyFailureText', () => {
   ])('does not guess on unrecognized text "%s"', (text) => {
     expect(classifyFailureText(text)).toEqual({ transient: false });
   });
+
+  // The same rule for the other three status patterns, which is where it bites hardest: a
+  // stray 429 in a tool's output parks the session until a human switches accounts, and a
+  // stray 529/408 spends the whole retry budget on text that never named a failure.
+  it.each([
+    'ENOENT: no such file or directory, open /repo/build/429/out.json',
+    'Type error at src/router.ts:529:12 - property does not exist',
+    'Wrote 408 rows to the cache',
+    'the tool exploded after 429 iterations',
+    'assertion failed: expected 408, got 200',
+  ])('reads a bare status number in unrelated prose as nothing: "%s"', (text) => {
+    expect(classifyFailureText(text)).toEqual({ transient: false });
+  });
+
+  // …while every shape a real API failure actually arrives in still classifies.
+  it.each([
+    ['API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}', 'usage'],
+    ['Request failed with status code 429', 'usage'],
+    ['HTTP 429 from api.anthropic.com', 'usage'],
+    ['API Error: 529 Overloaded.', 'overloaded'],
+    ['Request failed with status code 529', 'overloaded'],
+    ['HTTP 408', 'timeout'],
+    ['API Error: 408 Request Timeout', 'timeout'],
+  ])('still recognizes the real API shape "%s"', (text, expected) => {
+    expect(classifyFailureText(text)).toEqual(
+      expected === 'usage'
+        ? { transient: false, usageLimit: true }
+        : { transient: true, kind: expected },
+    );
+  });
 });
 
 describe('classifyStopFailureType', () => {
