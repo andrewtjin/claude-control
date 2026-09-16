@@ -32,16 +32,27 @@ const USAGE_LIMIT: ApiFailureClassification = { transient: false, usageLimit: tr
 
 /**
  * One HTTP status, matched ONLY where the surrounding text says it IS a status ("API Error:
- * 429", "HTTP 500", "status code 408").
+ * 429", "HTTP 500", "status code 408", "statusCode: 429", "upstream returned 529", "Request
+ * failed: 429", or the parenthesised "(408)" an abort/timeout message trails).
  *
  * Everything classified here is free text written by someone else — a tool's stderr, a stack
  * frame, a shell command — where a bare three-digit number means nothing: `build/429/out.json`
  * is not a rate limit and `foo.ts:529:12` is not an outage. Matching one anywhere turns ordinary
  * output into a parked session or a burst of pointless retries, so every status pattern below
  * shares this anchor and none can drift away from it.
+ *
+ * TWO shapes and no third. Either a word that NAMES the number as a status introduces it, or the
+ * number stands alone inside its own parentheses — a parenthetical holding nothing but three
+ * digits is a code being quoted, never a path segment, a source position or a row count. Widening
+ * past those two is how the anchor stops being one.
  */
 function httpStatusSource(status: string): string {
-  return `(?:api error|http|status(?: code)?)[:\\s]+${status}\\b`;
+  // `status(?:[ _-]?code)?` so the separator between the two words is optional: an SDK error
+  // carries the field name `statusCode`, and a mandatory separator silently excludes it.
+  return (
+    `(?:(?:api error|http|status(?:[ _-]?code)?|returned|failed)[:\\s]+${status}\\b` +
+    `|\\(\\s*${status}\\s*\\))`
+  );
 }
 
 /** The usage/rate-limit vocabulary (HTTP 429, the API's `rate_limit_error`, the CLI's own
@@ -49,7 +60,14 @@ function httpStatusSource(status: string): string {
  *  still part of, composed below so the two can never drift — because this one permanent
  *  cause has a distinct recovery: not retrying, not giving up, but switching accounts. */
 const USAGE_LIMIT_PATTERN: RegExp = new RegExp(
-  [httpStatusSource('429'), /rate.?limit/.source, /usage limit/.source].join('|'),
+  [
+    httpStatusSource('429'),
+    /rate.?limit/.source,
+    /usage limit/.source,
+    // 429's own reason phrase. It arrives as the WHOLE message ("429 Too Many Requests"), where
+    // the number leads and no word introduces it — so the phrase, not the status, is the anchor.
+    /too many requests/.source,
+  ].join('|'),
   'i',
 );
 
