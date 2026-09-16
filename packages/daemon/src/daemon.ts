@@ -365,13 +365,33 @@ const MANAGED_STEERING_KIND = 'managed';
  *  startup), so these reload onto the turn-boundary queue and are promoted back the moment a
  *  channel server attaches — see {@link Daemon.promoteSteeringToChannel}. */
 const CHANNEL_STEERING_KIND = 'channel';
+/** Every tag a session's queued text can be stored under. Cleanup that means "this session owes
+ *  nothing any more" has to name all of them: a delete scoped to one kind leaves the others in
+ *  the table, and the next daemon start restores whatever it finds there — so a single forgotten
+ *  kind turns a discarded prompt into guidance delivered to a later session of the same id. */
+const ALL_STEERING_KINDS = [
+  INTERACTIVE_STEERING_KIND,
+  MANAGED_STEERING_KIND,
+  CHANNEL_STEERING_KIND,
+] as const;
 
-/** How many delivered inject ids to remember per session, and for how many sessions. Small on
- *  purpose: the set exists only to recognise a delivery confirmation that races the fallback of
- *  the very prompt it confirms — a window of milliseconds — and the channel queue itself caps at
- *  {@link CHANNEL_QUEUE_CAP}. Unbounded it would be a per-session leak for the daemon's life. */
-const DELIVERED_INJECT_MEMORY = 4 * CHANNEL_QUEUE_CAP;
-const DELIVERED_INJECT_SESSIONS = 64;
+/** How many delivered inject ids to remember per session, and for how many sessions.
+ *
+ *  The set exists only to recognise a delivery confirmation that races the fallback of the very
+ *  prompt it confirms, so it is bounded rather than a per-session leak for the daemon's life. The
+ *  per-session bound is a multiple of {@link CHANNEL_QUEUE_CAP} because that is what an
+ *  unacknowledged burst costs: one channel generation can hold a full queue, and a session whose
+ *  channel server is being replaced repeatedly can have several generations of ids outstanding at
+ *  once — at four generations an id could be evicted before its own hand-back, which is precisely
+ *  the race this set exists to win, so it keeps eight.
+ *
+ *  The session bound is a count of SESSIONS remembered, evicted least-recently-used (see
+ *  {@link Daemon.rememberDelivered}): by insertion order the busiest session on a long-lived
+ *  daemon is dropped for having been seen first, which is exactly backwards. */
+const DELIVERED_INJECT_MEMORY = 8 * CHANNEL_QUEUE_CAP;
+/** Exported so a test can fill the map exactly rather than hard-coding a copy of this number,
+ *  which would go on passing while proving nothing the day the bound moves. */
+export const DELIVERED_INJECT_SESSIONS = 64;
 
 /** One queued/delivered steering text, held in arrival order. `rowId` is its row in the store's
  *  mirror of this queue, carried so a delivery or a drop retires exactly the row it consumed
@@ -2414,7 +2434,21 @@ export class Daemon {
     // arriving after a sweep cannot stop the same text being delivered again.
     const owner = sessionId ?? this.channelRows.get(injectId)?.sessionId;
     this.retireChannelRow(injectId);
-    for (const [queueSessionId, queue] of this.pendingSteering) {
+    // Cancelling a queued prompt is a delete of an operator's message, so when the ack CAN be
+    // attributed it is honoured only against the session it came from. An inject id names one
+    // session's prompt; an ack for it arriving over a DIFFERENT session's channel is not evidence
+    // that prompt was delivered, and acting on it would silently swallow a message nothing has
+    // confirmed anything about.
+    //
+    // With no attributable owner every queue is searched, because the id is then the only
+    // evidence there is — and it is good evidence: it is a uuid this daemon minted and handed to
+    // exactly one channel, so a queue carrying it IS the prompt being confirmed. That case is the
+    // ordinary late ack (an attachment the registry has already dropped takes its row bookkeeping
+    // with it), and refusing it there would re-deliver the instruction at the next turn boundary.
+    const scope = owner === undefined ? [...this.pendingSteering.keys()] : [owner];
+    for (const queueSessionId of scope) {
+      const queue = this.pendingSteering.get(queueSessionId);
+      if (queue === undefined) continue;
       const index = queue.findIndex((entry) => entry.injectId === injectId);
       if (index === -1) continue;
       const [removed] = queue.splice(index, 1);
@@ -2440,18 +2474,30 @@ export class Daemon {
     this.store.deletePendingSteering(row.rowId);
   }
 
-  /** Remember one delivered inject id, evicting the oldest once past the bounds. Insertion order
-   *  is the eviction order for both the per-session set and the map of sessions, which is what
-   *  makes "oldest" cheap to find without a second structure. */
+  /**
+   * Remember one delivered inject id, evicting once past either bound.
+   *
+   * The MAP of sessions evicts least-recently-used, not oldest-inserted. Both bounds exist to
+   * stop a long-lived daemon leaking, and under insertion order the session it drops first is the
+   * one it saw first — which on a daemon that has been up for days is the session the operator
+   * has been working in all along, while sixty-four sessions they opened once each are kept. An
+   * eviction is a silently re-delivered prompt, so it has to fall on the session least likely to
+   * need this memory next, and use — a write here or a read in {@link wasDelivered} — is the only
+   * signal there is.
+   *
+   * Each session's own ids stay insertion-ordered: an id is written once and never confirmed
+   * again, so for them insertion order already IS recency, and a second structure would buy
+   * nothing.
+   */
   private rememberDelivered(sessionId: string, injectId: string): void {
-    let seen = this.deliveredInjects.get(sessionId);
-    if (seen === undefined) {
-      seen = new Set<string>();
-      this.deliveredInjects.set(sessionId, seen);
-      if (this.deliveredInjects.size > DELIVERED_INJECT_SESSIONS) {
-        const oldest = this.deliveredInjects.keys().next();
-        if (!oldest.done) this.deliveredInjects.delete(oldest.value);
-      }
+    const seen = this.touchDelivered(sessionId) ?? new Set<string>();
+    // Re-inserted even when it already existed — that is what moves it to the newest end.
+    this.deliveredInjects.set(sessionId, seen);
+    // Evicted AFTER the insert, so the session just used can never be the one dropped: a Map
+    // iterates insertion order, and this key is now the last of them.
+    if (this.deliveredInjects.size > DELIVERED_INJECT_SESSIONS) {
+      const oldest = this.deliveredInjects.keys().next();
+      if (!oldest.done) this.deliveredInjects.delete(oldest.value);
     }
     seen.add(injectId);
     if (seen.size > DELIVERED_INJECT_MEMORY) {
@@ -2460,8 +2506,23 @@ export class Daemon {
     }
   }
 
+  /** Mark a session as the most recently used one and hand back its remembered ids, if it has
+   *  any. Deleting and re-inserting is how a key becomes the newest in a Map — there is no
+   *  cheaper way to move one, and the alternative is carrying a second index for a structure
+   *  bounded at {@link DELIVERED_INJECT_SESSIONS} entries. */
+  private touchDelivered(sessionId: string): Set<string> | undefined {
+    const seen = this.deliveredInjects.get(sessionId);
+    if (seen === undefined) return undefined;
+    this.deliveredInjects.delete(sessionId);
+    this.deliveredInjects.set(sessionId, seen);
+    return seen;
+  }
+
+  /** Was this prompt already confirmed delivered to this session? A read counts as use: asking
+   *  is what a session does while its channel is churning, and that is exactly when its memory
+   *  must not be the next one evicted. */
   private wasDelivered(sessionId: string, injectId: string): boolean {
-    return this.deliveredInjects.get(sessionId)?.has(injectId) === true;
+    return this.touchDelivered(sessionId)?.has(injectId) === true;
   }
 
   /**
@@ -3419,7 +3480,19 @@ export class Daemon {
     // gated on the registry), and a later re-register must not inherit stale guidance — neither
     // from this run nor, now that the queue is persisted, from any earlier one.
     this.pendingSteering.delete(existing.id);
-    this.store.deletePendingSteeringForSession(existing.id, INTERACTIVE_STEERING_KIND);
+    // EVERY kind, not just this queue's. The same prompt is tagged `channel` while it sits on a
+    // live channel, and a delete scoped to one tag leaves that row in the table — where the next
+    // daemon start reloads it onto the turn-boundary queue as text still waiting to deliver. Then
+    // a re-register of the same session id inherits exactly the stale guidance from a dead
+    // channel this promises it will not, and the first Stop hook hands it over.
+    for (const kind of ALL_STEERING_KINDS) {
+      this.store.deletePendingSteeringForSession(existing.id, kind);
+    }
+    // The in-memory half of the same promise: whatever is still sitting on the session's live
+    // channel is the same operator text by a faster route, and the registry would go on handing
+    // it to a channel server for a session this daemon has just been told to stop tracking. Their
+    // rows have gone with the delete above, so only the id bookkeeping is left to retire.
+    for (const item of this.channels.discard(existing.id)) this.channelRows.delete(item.injectId);
     this.rememberSessionCmdKey(input.idempotencyKey);
     // Echo the view of what was removed so the CLI can confirm WHICH session it just forgot.
     return { ok: true, status: 'applied', session: interactiveView(existing) };

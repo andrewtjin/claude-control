@@ -194,6 +194,29 @@ export class ChannelRegistry {
     return [...flying, ...queued].sort((a, b) => a.queuedAtMs - b.queuedAtMs);
   }
 
+  /**
+   * Drop everything queued and in flight for a session, leaving its attachment in place, and
+   * return what was dropped so the caller can retire its own bookkeeping for those items.
+   *
+   * For the case where the work is no longer owed but the connection is still legitimate: the
+   * operator stopping cctl's tracking of a session says nothing about the channel server, which
+   * belongs to a Claude Code process that is still running and whose channel must keep working if
+   * they register it again. {@link detach} would force that server to re-attach under a new id
+   * for no reason — what has to go here is the work, not the connection.
+   *
+   * Deliberately NOT a fallback: the caller is discarding precisely because there is nowhere left
+   * to deliver. The items are returned rather than swallowed so it can say what it dropped.
+   */
+  discard(sessionId: string): ChannelInjection[] {
+    const attachment = this.attachmentFor(sessionId);
+    if (attachment === undefined) return [];
+    const flying = this.inFlight.get(attachment.attachId);
+    const dropped = [...(flying?.values() ?? []), ...(this.queues.get(attachment.attachId) ?? [])];
+    this.queues.set(attachment.attachId, []);
+    flying?.clear();
+    return dropped.sort((a, b) => a.queuedAtMs - b.queuedAtMs);
+  }
+
   get(attachId: string): ChannelAttachment | undefined {
     return this.attachments.get(attachId);
   }

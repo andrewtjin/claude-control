@@ -470,3 +470,29 @@ describe('restore', () => {
     expect(woken).toEqual([attached.attachment.attachId]);
   });
 });
+
+describe('discard', () => {
+  it('drops queued and in-flight work but keeps the server attached', () => {
+    // For the case where the work stops being owed while the connection stays legitimate: the
+    // operator unregistering a session says nothing about the Claude Code process behind it, so
+    // forcing its channel server to re-attach would be churn for no reason.
+    const reg = new ChannelRegistry();
+    const attached = reg.attach(attachInput());
+    if (!attached.ok) throw new Error('attach failed');
+    const id = attached.attachment.attachId;
+    reg.enqueue('sess-1', 'handed out');
+    reg.take(id);
+    reg.enqueue('sess-1', 'still queued');
+
+    expect(reg.discard('sess-1').map((i) => i.text)).toEqual(['handed out', 'still queued']);
+    expect(reg.isAttached('sess-1')).toBe(true);
+    // Nothing is left to deliver, and the cap it was holding is free again.
+    expect(reg.enqueue('sess-1', 'a later prompt').ok).toBe(true);
+    expect(reg.take(id)?.map((i) => i.text)).toEqual(['a later prompt']);
+  });
+
+  it('is a no-op for a session with no channel', () => {
+    const reg = new ChannelRegistry();
+    expect(reg.discard('nobody')).toEqual([]);
+  });
+});
