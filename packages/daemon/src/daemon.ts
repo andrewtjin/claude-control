@@ -55,6 +55,7 @@ import {
   planWeight,
   selectWeeklyBudget,
   type AccountUsageInput,
+  type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
 import type { ProbeCandidate } from './accountProbe.js';
 import type { Store } from './store.js';
@@ -132,6 +133,13 @@ export interface DaemonOptions {
    *  `autoSwitcher` is also present — spending quota to widen a target pool nothing is going to
    *  choose from would be a cost with no payoff. Absent = the feature is off. */
   accountProbe?: AccountProbeLike;
+  /** The policy the auto-switch executor runs under. The daemon does not decide with it — the
+   *  executor owns that — it only needs the parts that say what an account even LOOKS like to
+   *  the policy, so the probe never spends a turn on an account the policy can already place,
+   *  nor skips one it cannot (see {@link policyVisibleLimits}). Defaults to the policy the
+   *  poller's plan is gated by, which is the same object the composition root hands the
+   *  executor; absent everywhere = the executor's own defaults. */
+  autoSwitchPolicy?: AutoSwitchPolicy;
   /** The effective-settings report resolved at startup (see cli/settings.ts). When present
    *  it is re-pushed with every poll cycle — settings never change mid-run, but the bot's
    *  cache is in-memory, so the repeat is what survives a bot restart. */
@@ -411,14 +419,30 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 type EnvelopeDraftSansDaemonId = DistributiveOmit<EnvelopeDraft, 'daemonId'>;
 
 /**
+ * The limits the auto-switch policy can SEE, mirroring the rule its own candidate gate applies:
+ * with the Fable cap opted out, a `weekly_scoped` limit is invisible to every part of that
+ * decision, so an account reporting nothing else reports nothing at all to it. Read here for
+ * the same reason the weekly resolution below is the policy's own function — a clock the policy
+ * will not look at must not count as a clock we have.
+ */
+function policyVisibleLimits(
+  account: AccountUsageInput,
+  policy: AutoSwitchPolicy,
+): AccountUsageInput['limits'] {
+  return (policy.fableCapTriggers ?? true)
+    ? account.limits
+    : account.limits.filter((limit) => limit.kind !== 'weekly_scoped');
+}
+
+/**
  * The accounts this cycle proved it cannot place on a weekly clock — the ones auto-switch is
  * structurally unable to choose (`decideAutoSwitch` drops an unresolvable weekly reset outright).
  *
- * The weekly resolution is `selectWeeklyBudget`, the SAME function the policy itself calls, so
- * "the probe thinks this account is unknown" and "the policy would refuse it" can never become
- * two different judgements. It already folds in the history-derived prediction, which is what
- * separates a DORMANT account (used once, window since closed, prediction stands in) from a
- * never-used one — only the latter is worth a turn.
+ * The weekly resolution is `selectWeeklyBudget` over the limits the POLICY can see, the same
+ * pair the policy itself uses, so "the probe thinks this account is unknown" and "the policy
+ * would refuse it" can never become two different judgements. It already folds in the
+ * history-derived prediction, which is what separates a DORMANT account (used once, window since
+ * closed, prediction stands in) from a never-used one — only the latter is worth a turn.
  *
  * Gated on a LIVE poll: a degraded cycle reports no limits either, and an account is not
  * unproven just because our read of it failed. Active, quarantined and auto-switch-excluded
@@ -429,6 +453,7 @@ function unknownDescentCandidates(
   results: AccountPollResult[],
   inputs: AccountUsageInput[],
   now: number,
+  policy: AutoSwitchPolicy,
 ): ProbeCandidate[] {
   const polled = new Map(results.map((r) => [r.accountId, r.outcome]));
   return inputs
@@ -438,7 +463,8 @@ function unknownDescentCandidates(
         !a.quarantined &&
         a.autoSwitchExcluded !== true &&
         polled.get(a.accountId) === 'live' &&
-        selectWeeklyBudget(a.limits, now, a.predictedResetAt)?.resetsAt === undefined,
+        selectWeeklyBudget(policyVisibleLimits(a, policy), now, a.predictedResetAt)?.resetsAt ===
+          undefined,
     )
     .map((a) => ({ accountId: a.accountId, label: a.label }));
 }
@@ -453,6 +479,7 @@ export class Daemon {
   private readonly controlPlaneClient: ControlPlaneClient;
   private readonly autoSwitcher: AutoSwitcherLike | undefined;
   private readonly accountProbe: AccountProbeLike | undefined;
+  private readonly autoSwitchPolicy: AutoSwitchPolicy;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
   private readonly createAgentSdkClient: () => AgentSdkClient;
   private readonly autoContinue: AutoContinuePolicy | undefined;
@@ -512,6 +539,11 @@ export class Daemon {
   /** Recently seen `session.prune` idempotencyKeys, so a re-sent/replayed prune answers once
    *  instead of posting a second (empty) result. Bounded FIFO like the stop keys. */
   private readonly seenPruneKeys = new Set<string>();
+  /** Recently seen `switch.command` idempotencyKeys. A switch is the least replay-safe command
+   *  the phone can send: a frame re-delivered after the operator has moved on silently drags the
+   *  live account back to the earlier target and files a second activation in the audit trail,
+   *  where it reads as a hop nobody asked for. Bounded FIFO like the stop keys. */
+  private readonly seenSwitchKeys = new Set<string>();
   /** Recently seen `cctl session register|label|watch` idempotencyKeys, so a re-sent command
    *  answers "already handled" instead of re-applying. Bounded FIFO — see
    *  {@link rememberSessionCmdKey}. */
@@ -558,6 +590,12 @@ export class Daemon {
    *  an account absent here (daemon just started, or never polled) is treated as usable,
    *  the same unknown-is-not-exhausted posture `hasUsableHeadroom` takes. */
   private readonly latestAdvisorInputs = new Map<string, AccountUsageInput>();
+  /** Whether a poll cycle is running right now. The interval that drives the cycle does not
+   *  wait for it, and one cycle can outlast one interval (the activation probe alone is allowed
+   *  two minutes), so without this a slow cycle would have the next one started on top of it:
+   *  duplicate snapshot pushes to the phone, and a last-write-wins race on
+   *  {@link latestAdvisorInputs} decided by whichever cycle happened to finish second. */
+  private pollCycleInFlight = false;
   private started = false;
 
   constructor(options: DaemonOptions) {
@@ -570,6 +608,10 @@ export class Daemon {
     this.controlPlaneClient = options.controlPlaneClient;
     this.autoSwitcher = options.autoSwitcher;
     this.accountProbe = options.accountProbe;
+    // Falls back to the poller's copy rather than to the defaults: the composition root hands
+    // the SAME policy object to the executor and to the plan, so reading it back off the plan
+    // is reading the executor's policy, not a second one that can drift from it.
+    this.autoSwitchPolicy = options.autoSwitchPolicy ?? options.poller.autoSwitchPolicy ?? {};
     this.settingsReport = options.settingsReport;
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
     this.autoContinue = options.autoContinue;
@@ -882,6 +924,25 @@ export class Daemon {
   }
 
   private async runPollCycle(): Promise<void> {
+    // Skip rather than queue: every phase below re-reads whatever it needs (the registry, the
+    // store, the endpoint), so a cycle that had to wait its turn would only publish a reading
+    // the next tick is about to take anyway. Debug, not warn — one long probe is an ordinary
+    // cycle, and this line exists to explain a gap in the cadence, not to report a fault.
+    if (this.pollCycleInFlight) {
+      this.logger.debug({}, 'poll cycle still running; skipping this tick');
+      return;
+    }
+    this.pollCycleInFlight = true;
+    try {
+      await this.pollCycle();
+    } finally {
+      this.pollCycleInFlight = false;
+    }
+  }
+
+  /** One poll cycle's actual work — see {@link runPollCycle}, which owns the one-at-a-time
+   *  guard around it. */
+  private async pollCycle(): Promise<void> {
     await this.timePhase('attributionJournal.sync', () => this.attributionJournal.sync());
 
     const [accounts, activeId] = await this.timePhase('listAccounts+getActiveId', () =>
@@ -906,15 +967,17 @@ export class Daemon {
     // this only keeps their (secret) verifiers from idling in memory for the daemon's lifetime.
     this.pendingReauths.sweep(this.clock());
 
-    const snapshot = await this.timePhase('pollAll', () => this.poller.pollAll(pollAccounts));
+    const polled = await this.timePhase('pollAll', () => this.poller.pollAll(pollAccounts));
     // Refresh the post-switch kick's per-account view first, before anything below can
     // fail: even a 'skipped' result carries the poller's last real advisorInput, so this
     // map always holds the freshest numbers the poller has (see resumeUsageStalledSessions).
-    for (const result of snapshot.results) {
+    // Re-stamped from the merged inputs once those exist; this pass is what keeps the view
+    // fresh even when the persist or history phase throws.
+    for (const result of polled.results) {
       this.latestAdvisorInputs.set(result.accountId, result.usage.advisorInput);
     }
     await this.timePhase('persistSnapshots', () => {
-      for (const result of snapshot.results) {
+      for (const result of polled.results) {
         if (result.outcome === 'skipped') continue; // nothing new to persist
         this.store.insertUsageSnapshot({
           accountId: result.accountId,
@@ -950,6 +1013,22 @@ export class Daemon {
       ),
     );
 
+    // The history-derived predictions ride into the advisor inputs HERE, before the plan is
+    // computed — the ONE place they are merged. Without them a DORMANT account is invisible:
+    // the endpoint publishes no reset once a weekly window closes, and an unresolvable weekly
+    // clock disqualifies an account outright, so the accounts holding a full untouched
+    // allowance are exactly the ones nothing would ever reach. Merging them for the executor
+    // alone is worse than not merging at all — the plan the phone renders and the hop the
+    // daemon makes would then be computed from different accounts. The policy labels a
+    // predicted reset and holds it to a stricter bar (see autoswitch.ts); an account with no
+    // history at all carries no prediction and is skipped as before.
+    const snapshot = this.poller.assemble(polled, history.predictedResetByAccount);
+    // Re-stamped from the MERGED inputs, so the post-switch kick reasons about exactly what
+    // the plan and the executor saw.
+    for (const input of snapshot.inputs) {
+      this.latestAdvisorInputs.set(input.accountId, input);
+    }
+
     await this.timePhase('sendUsageSnapshot', () => {
       this.sendEnvelope({
         type: 'usage.snapshot',
@@ -969,20 +1048,11 @@ export class Daemon {
     // engine failures itself; this catch only guards against bugs in the evaluator so a
     // broken policy can never take down the poll loop.
     if (this.autoSwitcher) {
-      // The prediction rides along because without it a DORMANT account is invisible to the
-      // policy: the endpoint publishes no reset once a weekly window closes, and an unknown
-      // weekly clock disqualifies an account outright — so the accounts holding a full
-      // untouched allowance are exactly the ones auto-switch would never reach. The policy
-      // labels a predicted reset and holds it to a stricter bar (see autoswitch.ts); an
-      // account with no history at all stays absent here and is skipped as before.
-      const inputs = snapshot.results.map((r) => {
-        const predicted = history.predictedResetByAccount.get(r.accountId);
-        return predicted === undefined
-          ? r.usage.advisorInput
-          : { ...r.usage.advisorInput, predictedResetAt: predicted };
-      });
+      // `snapshot.inputs` — the same array the plan above was computed from, predictions and
+      // all. An executor deciding on anything else is the divergence the merge above exists
+      // to rule out.
       await this.timePhase('autoSwitch', () =>
-        this.autoSwitcher?.evaluate(inputs).catch((err: unknown) => {
+        this.autoSwitcher?.evaluate(snapshot.inputs).catch((err: unknown) => {
           this.logger.error({ err }, 'auto-switch evaluation failed');
         }),
       );
@@ -991,7 +1061,7 @@ export class Daemon {
       // above chooses from, so with no policy running there is nothing to widen it for. Runs
       // AFTER the evaluation, so a cycle that already had a hop to make makes it first.
       await this.timePhase('probeUnknown', () =>
-        this.probeUnknownAccounts(snapshot.results, inputs),
+        this.probeUnknownAccounts(snapshot.results, snapshot.inputs),
       );
     }
 
@@ -1019,7 +1089,12 @@ export class Daemon {
   ): Promise<void> {
     const probe = this.accountProbe;
     if (probe === undefined) return;
-    const candidates = unknownDescentCandidates(results, inputs, this.clock());
+    const candidates = unknownDescentCandidates(
+      results,
+      inputs,
+      this.clock(),
+      this.autoSwitchPolicy,
+    );
     if (candidates.length === 0) return;
     try {
       for (const accountId of await probe.probeUnknown(candidates)) {
@@ -1184,7 +1259,20 @@ export class Daemon {
   // ---- inbound handlers ----
 
   private async handleSwitchCommand(msg: MessageOf<'switch.command'>): Promise<void> {
-    const { requestId, targetAccountId } = msg.payload;
+    const { requestId, targetAccountId, idempotencyKey } = msg.payload;
+    // Check-then-remember synchronously, before the first await, exactly as the sibling
+    // handlers do: two copies of the same frame arriving back to back must not both reach
+    // activate(). Silent (log only) like session.stop — the phone already had its
+    // switch.result from the frame that was applied, and a second one for the same key would
+    // report a switch that did not happen this time.
+    if (this.seenSwitchKeys.has(idempotencyKey)) {
+      this.logger.info({ requestId, idempotencyKey }, 'duplicate switch.command ignored');
+      return;
+    }
+    // Burned up front, on the attempt rather than on success: a failed switch already answers
+    // the phone with an explicit ok:false it can act on, and a replayed frame silently
+    // retrying an activation is the outcome this guard exists to prevent.
+    rememberBounded(this.seenSwitchKeys, idempotencyKey, MAX_SEEN_STOP_KEYS);
     try {
       // Phone-side commands carry whatever the user typed — an id or a label. Resolve it the
       // same way `cctl switch` does, or `/switch account:spare` fails while the identical
@@ -1210,7 +1298,11 @@ export class Daemon {
         payload: {
           requestId,
           ok: result.ok,
-          outcome: 'hot_applied',
+          // Read off the SAME fact as `ok`, never hardcoded beside it: `activate()` resolves
+          // only on success today, but a payload that says "hot applied" next to `ok: false`
+          // is a lie the phone would render, and the two fields drifting apart is not a
+          // failure mode worth leaving available.
+          outcome: result.ok ? 'hot_applied' : 'failed',
           activeAccountId: result.activeAccountId,
           message: `switched to ${switchedTo}`,
         },

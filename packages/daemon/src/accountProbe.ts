@@ -136,6 +136,16 @@ export interface AccountProbeOptions {
 interface ProbeAttemptState {
   nextAttemptAtMs: number;
   consecutiveFailures: number;
+  /** Successful probes that provably opened no weekly window. The caller recomputes candidacy
+   *  from live polls every cycle and only ever offers accounts whose weekly clock it still
+   *  cannot resolve — so being handed this account again AFTER a successful probe is the
+   *  evidence that the billed turn opened nothing. Without it, an account whose plan simply
+   *  publishes no weekly limit is re-probed on the plain floor forever: a real turn an hour,
+   *  every hour, for a window that is never going to appear. */
+  noWindowSuccesses: number;
+  /** Whether the last completed attempt on this account succeeded — what makes the next
+   *  re-offer countable as evidence above. */
+  lastSucceeded: boolean;
 }
 
 export class AccountProbe {
@@ -184,23 +194,42 @@ export class AccountProbe {
     if (candidate === undefined) return [];
 
     this.inFlight = true;
+    const prior = this.state.get(candidate.accountId);
     // Stamped BEFORE the attempt, so a probe that throws its way out still spends its slot.
     this.state.set(candidate.accountId, {
       nextAttemptAtMs: now + this.cooldownMs,
-      consecutiveFailures: this.state.get(candidate.accountId)?.consecutiveFailures ?? 0,
+      consecutiveFailures: prior?.consecutiveFailures ?? 0,
+      noWindowSuccesses: prior?.noWindowSuccesses ?? 0,
+      lastSucceeded: prior?.lastSucceeded ?? false,
     });
     try {
       await this.probeOne(candidate);
-      // A success that does not actually open the window is self-limiting rather than
-      // self-correcting: the account stays a candidate and is re-probed no sooner than the
-      // floor. The normal case removes it from the candidate set entirely on the next poll.
+      // A success that opens no window leaves the account exactly where it was — still a
+      // candidate, still costing a billed turn every cooldown — so a repeat offer after a
+      // success backs it off on the SAME doubling ladder a failure gets, up to the same daily
+      // ceiling. The count is cleared by the window actually appearing: that takes the account
+      // out of the candidate set, and nothing ever offers it again.
+      const noWindowSuccesses =
+        prior?.lastSucceeded === true
+          ? prior.noWindowSuccesses + 1
+          : (prior?.noWindowSuccesses ?? 0);
+      const waitMs = Math.min(this.cooldownMs * 2 ** noWindowSuccesses, this.backoffCapMs);
       this.state.set(candidate.accountId, {
-        nextAttemptAtMs: this.clock() + this.cooldownMs,
+        nextAttemptAtMs: this.clock() + waitMs,
         consecutiveFailures: 0,
+        noWindowSuccesses,
+        lastSucceeded: true,
       });
       this.logger.info(
-        { accountId: candidate.accountId, label: candidate.label },
-        'activation probe opened an unknown account usage window',
+        {
+          accountId: candidate.accountId,
+          label: candidate.label,
+          noWindowSuccesses,
+          nextAttemptInMs: waitMs,
+        },
+        noWindowSuccesses === 0
+          ? 'activation probe opened an unknown account usage window'
+          : 'activation probe ran but the account still reports no weekly window; backing off',
       );
       return [candidate.accountId];
     } catch (err) {
@@ -227,7 +256,8 @@ export class AccountProbe {
   private recordFailure(candidate: ProbeCandidate, err: unknown): void {
     const blameless =
       (err instanceof RefreshError && isOverloadCode(err.code)) || err instanceof LockTimeoutError;
-    const priorFailures = this.state.get(candidate.accountId)?.consecutiveFailures ?? 0;
+    const prior = this.state.get(candidate.accountId);
+    const priorFailures = prior?.consecutiveFailures ?? 0;
     const consecutiveFailures = blameless ? priorFailures : priorFailures + 1;
     const backoffMs = blameless
       ? this.cooldownMs
@@ -235,6 +265,10 @@ export class AccountProbe {
     this.state.set(candidate.accountId, {
       nextAttemptAtMs: this.clock() + backoffMs,
       consecutiveFailures,
+      // Untouched by a failure: it counts turns that were BILLED and opened nothing, and a
+      // failed attempt is evidence about neither.
+      noWindowSuccesses: prior?.noWindowSuccesses ?? 0,
+      lastSucceeded: false,
     });
     this.logger.warn(
       { accountId: candidate.accountId, label: candidate.label, err, consecutiveFailures },
@@ -259,15 +293,22 @@ export class AccountProbe {
     const bundle = await this.vault.readBundle(accountId);
     const dir = join(this.configDirRoot, `probe-${randomUUID()}`);
     await mkdir(dir, { recursive: true });
+    // Whether a CLI was ever pointed at the seeded credentials. The harvest exists to recover a
+    // token the CLI ROTATED, so a seed that failed before any turn ran has nothing to recover:
+    // the vault's copy is untouched, and harvesting anyway would read back a dir we never
+    // finished writing and fail the probe with "the seeded token may be spent" — the exact
+    // opposite of what happened, and a diagnosis that sends a healthy account for a re-login.
+    let turnAttempted = false;
     try {
       await this.seed(dir, bundle);
+      turnAttempted = true;
       await this.runTurn(dir, accountId);
     } finally {
       // Both of these run however the turn ended, and in this order: the harvest reads the dir
       // the discard is about to delete. `harvest` owns its own failure reporting and rethrows,
       // which is what makes a lost rotation fail the probe even after a clean turn.
       try {
-        await this.harvest(dir, accountId, bundle.claudeAiOauth);
+        if (turnAttempted) await this.harvest(dir, accountId, bundle.claudeAiOauth);
       } finally {
         await this.discard(dir);
       }
