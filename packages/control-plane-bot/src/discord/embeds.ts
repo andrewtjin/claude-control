@@ -185,57 +185,117 @@ function embedTextLength(embed: EmbedBuilder): number {
   );
 }
 
-/** Split `budget` characters across field values, SHORTEST first so a field already under its
- *  fair share hands its surplus to the longer ones instead of every field being cut to the same
- *  length. Clamping is by whole lines (see {@link clampFieldValue}), for the same reason it is
- *  there: a mid-line cut can leave half an emoji-sprite token on screen. */
-function shareValueBudget(fields: readonly APIEmbedField[], budget: number): APIEmbedField[] {
-  const values = fields.map((f) => f.value);
-  const shortestFirst = values
+/** The shortest a field NAME is cut to when names have to give way. A label that short still
+ *  identifies an account or a session; below it the list would be twenty-five ellipses, which is
+ *  worse than fewer, readable entries plus the overflow marker that the last resort produces. */
+const NAME_FLOOR = 24;
+
+/** Cut a one-line label to `max` characters with an ellipsis; the name-side twin of
+ *  {@link clampFieldValue}, which cuts by lines and would be wrong for a label. */
+function cutLabel(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return max <= 1 ? '…' : `${text.slice(0, max - 1)}…`;
+}
+
+/** Split `budget` characters across one PART of every field (its `value`, or its `name` when the
+ *  names alone are the overrun), SHORTEST first so a field already under its fair share hands its
+ *  surplus to the longer ones instead of every field being cut to the same length. Each part keeps
+ *  at least `floor` characters: a value of '' is rejected by discord.js and an empty slot would
+ *  read as a rendering bug, and a name below {@link NAME_FLOOR} no longer names anything. Values
+ *  are clamped by whole lines (see {@link clampFieldValue}), for the same reason it is there: a
+ *  mid-line cut can leave half an emoji-sprite token on screen. */
+function sharePartBudget(
+  fields: readonly APIEmbedField[],
+  budget: number,
+  part: 'name' | 'value',
+  floor: number,
+): APIEmbedField[] {
+  const texts = fields.map((f) => f[part]);
+  // The overflow marker is exempt: its text is the count the reader needs, it is a few characters
+  // long, and cutting it to an ellipsis would silently un-say how much of the list is missing.
+  const isMarker = (index: number) => fields[index]?.name === OVERFLOW_FIELD_NAME;
+  const shortestFirst = texts
     .map((_, index) => index)
-    .sort((a, b) => (values[a]?.length ?? 0) - (values[b]?.length ?? 0));
-  let remaining = budget;
+    .filter((index) => !isMarker(index))
+    .sort((a, b) => (texts[a]?.length ?? 0) - (texts[b]?.length ?? 0));
+  let remaining =
+    budget - texts.reduce((sum, text, index) => (isMarker(index) ? sum + text.length : sum), 0);
   let slots = shortestFirst.length;
   for (const index of shortestFirst) {
-    // At least one character per field: a value of '' is rejected by discord.js, and an empty
-    // slot would read as a rendering bug rather than as a field that had to give way.
-    const share = Math.max(1, Math.floor(remaining / slots));
-    const value = values[index] ?? '';
-    values[index] = value.length > share ? clampFieldValue(value, share) : value;
-    remaining -= values[index]?.length ?? 0;
+    const share = Math.max(floor, Math.floor(remaining / slots));
+    const text = texts[index] ?? '';
+    texts[index] =
+      text.length > share
+        ? part === 'value'
+          ? clampFieldValue(text, share)
+          : cutLabel(text, share)
+        : text;
+    remaining -= texts[index]?.length ?? 0;
     slots -= 1;
   }
-  return fields.map((f, index) => ({ ...f, value: values[index] ?? f.value }));
+  return fields.map((f, index) => ({ ...f, [part]: texts[index] ?? f[part] }));
+}
+
+/** Retire one entry from the END of the field list without losing the fact that it is gone: the
+ *  overflow marker stays last and counts the entry it displaced, and a list with no marker yet
+ *  gets one in the retired entry's place. Returns false once nothing but the marker is left, which
+ *  is the caller's signal to stop. */
+function retireTrailingField(embed: EmbedBuilder): boolean {
+  const fields = embed.data.fields ?? [];
+  const lastIndex = fields.length - 1;
+  const hasMarker = fields[lastIndex]?.name === OVERFLOW_FIELD_NAME;
+  if (fields.length === 0 || (hasMarker && fields.length === 1)) return false;
+  const dropped = (droppedFieldCounts.get(embed) ?? 0) + 1;
+  droppedFieldCounts.set(embed, dropped);
+  // With a marker in place the entry BEFORE it goes; without one the last entry becomes the marker.
+  if (hasMarker) embed.spliceFields(lastIndex - 1, 1);
+  embed.spliceFields((embed.data.fields?.length ?? 1) - 1, 1, {
+    name: OVERFLOW_FIELD_NAME,
+    value: `… and ${dropped} more`,
+  });
+  return true;
 }
 
 /**
  * The last step of every builder here: bring a finished embed under Discord's TOTAL ceiling.
  *
- * Field VALUES give way first, and evenly, because they are the bulk and every multi-field embed
- * in this module is a list of PEERS — shrinking all of them keeps the shape of the answer, where
- * cutting the tail would silently drop whole accounts or sessions the reader asked about. Only
- * when the parts this cannot shrink are themselves over budget (a long description; 25 long field
- * NAMES, which alone can reach 6400 characters) does it fall back to trimming the description and
- * then dropping trailing fields.
+ * Field VALUES are what normally gives way, and evenly, because they are the bulk and every
+ * multi-field embed in this module is a list of PEERS — shrinking all of them keeps the shape of
+ * the answer, where cutting the tail would silently drop whole accounts or sessions the reader
+ * asked about. Field NAMES give way only when they cannot be afforded even with every value at
+ * its minimum (25 wire-supplied labels at Discord's 256-character cap are 6400 characters by
+ * themselves), and then only down to {@link NAME_FLOOR}; they are settled BEFORE the values so the
+ * values share what the names leave rather than being cut to nothing for room the names then give
+ * back. Then the description. Only when all of that still overruns are trailing entries retired —
+ * and every retirement is counted in the overflow marker, so the reader can always tell the list
+ * was cut.
  */
 function fitEmbed(embed: EmbedBuilder): EmbedBuilder {
   if (embedTextLength(embed) <= EMBED_TOTAL_MAX) return embed;
+  const partTotal = (fields: readonly APIEmbedField[], part: 'name' | 'value') =>
+    fields.reduce((sum, f) => sum + f[part].length, 0);
   const fields = embed.data.fields ?? [];
   if (fields.length > 0) {
-    // Everything that is not a field value is fixed cost by now; what is left is what the values
-    // share between them.
-    const fixed = embedTextLength(embed) - fields.reduce((sum, f) => sum + f.value.length, 0);
-    embed.setFields(shareValueBudget(fields, Math.max(0, EMBED_TOTAL_MAX - fixed)));
+    const outsideFields =
+      embedTextLength(embed) - partTotal(fields, 'name') - partTotal(fields, 'value');
+    // What the names may keep once every value is granted its one-character minimum.
+    const namesBudget = EMBED_TOTAL_MAX - outsideFields - fields.length;
+    const named =
+      partTotal(fields, 'name') > namesBudget
+        ? sharePartBudget(fields, Math.max(0, namesBudget), 'name', NAME_FLOOR)
+        : [...fields];
+    const valuesBudget = EMBED_TOTAL_MAX - outsideFields - partTotal(named, 'name');
+    embed.setFields(sharePartBudget(named, Math.max(0, valuesBudget), 'value', 1));
   }
   const description = embed.data.description;
   if (description !== undefined && embedTextLength(embed) > EMBED_TOTAL_MAX) {
     const over = embedTextLength(embed) - EMBED_TOTAL_MAX;
     embed.setDescription(clampFieldValue(description, Math.max(1, description.length - over)));
   }
-  // Last resort, and only reachable when the field NAMES alone overrun the budget: drop from the
-  // end, which is the least-relevant entry on every list this module renders.
-  while (embedTextLength(embed) > EMBED_TOTAL_MAX && (embed.data.fields?.length ?? 0) > 0) {
-    embed.spliceFields((embed.data.fields?.length ?? 1) - 1, 1);
+  // Last resort: retire from the end, which is the least-relevant entry on every list this module
+  // renders, until the marker is the only thing left to retire.
+  while (embedTextLength(embed) > EMBED_TOTAL_MAX && retireTrailingField(embed)) {
+    // Each pass retires exactly one entry and re-measures; nothing else to do here.
   }
   return embed;
 }

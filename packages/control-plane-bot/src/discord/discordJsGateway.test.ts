@@ -43,6 +43,7 @@ import {
 } from './discordJsGateway.js';
 import { encodeButton, permissionButtons, sessionCardButtons } from './buttons.js';
 import { encodeQuestionModal, encodeQuestionSelect } from './questionCards.js';
+import { encodeReauthPasteButton } from './reauthCards.js';
 import type {
   CommandResult,
   ThreadHereAction,
@@ -1643,6 +1644,41 @@ describe('DiscordJsGateway — only the card owner can answer it', () => {
       expect(tap.replies[0]?.content).toBe("This card isn't yours.");
       expect(tap.updates).toEqual([]);
       expect(sent).toEqual([]);
+    });
+
+    it("refuses a stranger's Paste-code tap on the owner's re-auth card, showing no modal", async () => {
+      // The re-auth card is the one card with no registry behind it; where it sits (the owner's
+      // thread) is what names its owner, and a stranger must not be handed the login modal.
+      const { gw, sent } = await ownersSessionThread();
+      const tap = new FakeInteraction(
+        { id: STRANGER },
+        encodeReauthPasteButton('rq1'),
+        [],
+        '',
+        IN_THREAD,
+      );
+
+      await gw.driveButton(tap);
+
+      expect(tap.replies[0]?.content).toBe("This card isn't yours.");
+      expect(tap.modals).toBe(0);
+      expect(sent).toEqual([]);
+    });
+
+    it('shows the thread owner the Paste-code modal', async () => {
+      const { gw } = await ownersSessionThread();
+      const tap = new FakeInteraction(
+        { id: OWNER },
+        encodeReauthPasteButton('rq1'),
+        [],
+        '',
+        IN_THREAD,
+      );
+
+      await gw.driveButton(tap);
+
+      expect(tap.modals).toBe(1);
+      expect(tap.replies).toEqual([]);
     });
 
     it('lets the session thread owner arm and confirm their own Stop', async () => {

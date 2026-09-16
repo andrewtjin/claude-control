@@ -1090,7 +1090,15 @@ export class DiscordJsGateway implements DiscordGateway {
       this.threadProbeBackoff.delete(threadId);
       return channel;
     }
-    this.threadProbeBackoff.set(threadId, this.clock() + THREAD_PROBE_BACKOFF_MS);
+    const now = this.clock();
+    // Only a thread that recovers clears its own entry, so a thread deleted for good would keep
+    // its slot for the life of the process. Entries whose window closed long ago are stale
+    // bookkeeping and are dropped here, where the map is being touched anyway; a thread still
+    // receiving frames simply earns a fresh entry (and one fetch) after that quiet spell.
+    for (const [id, retryAtMs] of this.threadProbeBackoff) {
+      if (now - retryAtMs > THREAD_PROBE_BACKOFF_MS * 10) this.threadProbeBackoff.delete(id);
+    }
+    this.threadProbeBackoff.set(threadId, now + THREAD_PROBE_BACKOFF_MS);
     return undefined;
   }
 
@@ -2179,6 +2187,10 @@ export class DiscordJsGateway implements DiscordGateway {
     // reauthCards.ts for why this button stays out of the two-tap grammar entirely).
     const pasteRequestId = decodeReauthPasteButton(interaction.customId);
     if (pasteRequestId !== null) {
+      // No registry names a reauth card's owner, but where the card sits does (the owner's DM, or
+      // a thread the persisted registry attributes to one user): a stranger must not be handed
+      // the modal for someone else's login.
+      if (await this.refuseForeignCard(interaction, this.cardOwner(interaction, undefined))) return;
       await interaction.showModal(this.buildReauthModal(pasteRequestId));
       return;
     }

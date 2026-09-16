@@ -1736,6 +1736,31 @@ describe('embed builders survive an over-long untrusted field', () => {
     expect(Math.max(...lengths) - Math.min(...lengths)).toBeLessThanOrEqual(1);
     expect(embedTextLength(json)).toBeLessThanOrEqual(EMBED_TOTAL_MAX);
   });
+
+  it('keeps every entry readable and the marker honest when the NAMES alone overrun the budget', () => {
+    // Forty sessions whose ids fill the 256-char name cap: the names of the twenty-five that fit
+    // the count cap are 6400 characters by themselves, before a single value is counted.
+    const total = 40;
+    const json = buildSessionListEmbed(
+      Array.from({ length: total }, (_, i) => ({
+        sessionId: `${'s'.repeat(300)}-${i}`,
+        state: 'running' as const,
+      })),
+    ).toJSON();
+    const fields = json.fields ?? [];
+    expect(fields.length).toBeLessThanOrEqual(FIELD_COUNT_MAX);
+    expect(embedTextLength(json)).toBeLessThanOrEqual(EMBED_TOTAL_MAX);
+    // The marker is the last field and accounts for every entry that is not shown.
+    const marker = fields[fields.length - 1];
+    expect(marker?.name).toBe('…');
+    expect(marker?.value).toBe(`… and ${total - (fields.length - 1)} more`);
+    // Nothing shown was cut to nothing: names keep enough of the id to identify the session.
+    for (const field of fields.slice(0, -1)) {
+      expect(field.name.length).toBeGreaterThanOrEqual(24);
+      expect(field.name.endsWith('…')).toBe(true);
+      expect(field.value.length).toBeGreaterThan(0);
+    }
+  });
 });
 
 describe('the reauth login link is measured as it will be RENDERED', () => {
