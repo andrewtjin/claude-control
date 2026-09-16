@@ -302,6 +302,71 @@ describe('reauth.* (phone re-login)', () => {
     }
   });
 
+  it('bounds the account ref — untrusted slash/modal input must not be unbounded', () => {
+    // The ref is whatever the user typed, and the daemon echoes it back in its refusal message
+    // and its logs. No real id or label approaches this length.
+    const ok = decode(
+      rawFrame('reauth.start', {
+        requestId: 'req-1',
+        accountRef: 'x'.repeat(256),
+        idempotencyKey: 'idem-1',
+      }),
+    );
+    expect(ok.ok).toBe(true);
+    const tooLong = decode(
+      rawFrame('reauth.start', {
+        requestId: 'req-1',
+        accountRef: 'x'.repeat(257),
+        idempotencyKey: 'idem-1',
+      }),
+    );
+    expect(tooLong.ok).toBe(false);
+    if (!tooLong.ok) expect(tooLong.error).toMatch(/accountRef/);
+  });
+
+  it('refuses a link url that is not a bounded http(s) URL', () => {
+    const link = (url: string): string =>
+      rawFrame('reauth.link', {
+        requestId: 'req-1',
+        ok: true,
+        accountId: 'acct-1',
+        label: 'spare',
+        url,
+        expiresAt: 1_000_000,
+        message: 'log in',
+      });
+    // Every renderer turns this into something the user taps, so a non-http(s) scheme must never
+    // survive the parse.
+    expect(decode(link('javascript:alert(1)')).ok).toBe(false);
+    expect(decode(link('data:text/html,<script>1</script>')).ok).toBe(false);
+    expect(decode(link('not a url at all')).ok).toBe(false);
+    // Bounded: the relay carries it and a chat client embeds it verbatim.
+    expect(decode(link(`https://claude.ai/oauth/authorize?state=${'x'.repeat(2048)}`)).ok).toBe(
+      false,
+    );
+    expect(decode(link('https://claude.ai/oauth/authorize?code=true&state=st-1')).ok).toBe(true);
+  });
+
+  it('refuses an ok link that carries no url or no expiry', () => {
+    // `ok` promises the two things a success card is made of. A success with neither can only be
+    // drawn as a button that goes nowhere.
+    const partial = (extra: Record<string, unknown>): string =>
+      rawFrame('reauth.link', {
+        requestId: 'req-1',
+        ok: true,
+        accountId: 'acct-1',
+        label: 'spare',
+        message: 'log in',
+        ...extra,
+      });
+    expect(decode(partial({ expiresAt: 1_000_000 })).ok).toBe(false);
+    expect(decode(partial({ url: 'https://claude.ai/oauth/authorize' })).ok).toBe(false);
+    expect(decode(partial({ url: null, expiresAt: null })).ok).toBe(false);
+    expect(
+      decode(partial({ url: 'https://claude.ai/oauth/authorize', expiresAt: 1_000_000 })).ok,
+    ).toBe(true);
+  });
+
   it('bounds the pasted code — untrusted modal input must not be unbounded', () => {
     const tooLong = decode(
       rawFrame('reauth.code', {
