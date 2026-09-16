@@ -1063,10 +1063,21 @@ export class HookReceiver {
 
     if (path === '/cli/channel/attach') {
       const sessionId = str(body.sessionId);
-      const pid = typeof body.pid === 'number' ? body.pid : undefined;
+      // A POSITIVE INTEGER, not any number. The daemon probes this pid with `process.kill(pid, 0)`
+      // to decide whether a channel server is still there, and `0` is not a pid: it addresses the
+      // CALLER's whole process group, so the probe answers "alive" for as long as the daemon
+      // itself is running and the attachment is never swept. Negatives address a group too, and a
+      // fractional value is not a pid on any platform.
+      const pid =
+        typeof body.pid === 'number' && Number.isInteger(body.pid) && body.pid > 0
+          ? body.pid
+          : undefined;
       const identitySource = str(body.identitySource);
       if (!sessionId || pid === undefined) {
-        this.respond(res, 400, { ok: false, error: 'sessionId and pid are required' });
+        this.respond(res, 400, {
+          ok: false,
+          error: 'sessionId and a positive integer pid are required',
+        });
         return;
       }
       if (identitySource !== 'env' && identitySource !== 'ancestry') {
@@ -1160,6 +1171,17 @@ export class HookReceiver {
             error: 'injectId and state (sent|failed) are required',
           });
           return;
+        }
+        if (state === 'failed') {
+          // The client's own reason for the failure, which is the ONLY description of why a
+          // session could not take a prompt that exists anywhere on this side of the pipe: the
+          // requeue below is otherwise indistinguishable from a healthy retry, and an operator
+          // watching a prompt bounce has nothing to read. Logged, not carded — the daemon
+          // requeues and retries, so this is diagnosis, not news.
+          this.logger.warn(
+            { attachId, injectId, error: str(body.error) },
+            'channel: server reported a failed delivery',
+          );
         }
         const ok = handlers.ack(attachId, injectId, state);
         this.respond(res, ok ? 200 : 404, ok ? { ok: true } : { ok: false, error: 'unknown item' });
