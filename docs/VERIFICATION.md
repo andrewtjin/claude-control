@@ -199,7 +199,7 @@ Cosmetic caveat: the engine re-serializes the file minified onto one line, so a 
 shows a full-file rewrite even though content is preserved — pretty-print-preserving
 writes are a polish backlog item.
 
-### 9. Fresh-machine install ⏳ PENDING
+### 9. Fresh-machine install ⏳ OPEN
 
 **Claim to verify:** on a fresh Windows profile (or fresh VM) with only Node ≥ 22.13
 present, `npm i -g @andrewtjin/cctl` followed by `cctl setup` reaches a paired,
@@ -210,7 +210,7 @@ any doc (README's quick start is the whole prompt).
 to get unstuck.
 **Result:** not yet run.
 
-### 10. Reboot / autostart survival ⏳ PENDING
+### 10. Reboot / autostart survival ⏳ OPEN
 
 **Claim to verify:** after `cctl daemon install` (directly or via `cctl setup`), the
 daemon is up and reconnected to the relay **after a full reboot, without any user
@@ -220,7 +220,7 @@ action** — no login shell, no manual `cctl daemon run`.
 succeeded; confirm `/usage` on the phone reflects a fresh poll.
 **Result:** not yet run.
 
-### 11. VPS compose + wss end-to-end ⏳ PENDING
+### 11. VPS compose + wss end-to-end ⏳ OPEN
 
 **Claim to verify:** `docker compose up` from `deploy/` (per `docs/SELF_HOST.md`) on a
 real VPS with a real hostname brings up a working bot behind Caddy's automatic TLS,
