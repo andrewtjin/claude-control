@@ -202,7 +202,14 @@ export class DaemonLink {
         }
       }
       const polled = await this.poll(deliver);
-      if (polled === 'failed') {
+      if (polled === 'failed' || polled === 'undelivered') {
+        // `undelivered` shares the backoff with a failed poll deliberately. The daemon requeues a
+        // failed item at the FRONT of its queue, so the very next poll hands back the very same
+        // item — without a pause that is an unthrottled poll/deliver/ack loop against the
+        // daemon's single-threaded receiver (measured at ~10^5 round trips a second, enough to
+        // exhaust memory on a transport that never yields). A transport the session cannot take
+        // items on is also the kind of condition that clears with time if it clears at all,
+        // which is precisely what an exponential backoff is for.
         if (!(await this.backoff())) break;
       } else if (polled === 'empty') {
         // Floor an empty result. It is a success (backoff stays reset) but must not become a
@@ -267,8 +274,12 @@ export class DaemonLink {
    *
    *  `failed` means back off. `empty` is a SUCCESS — the daemon's bound simply elapsed — so the
    *  backoff resets and only a small floor separates it from the next poll. `delivered` re-polls
-   *  at once, which is what keeps a busy session responsive. */
-  private async poll(deliver: Deliver): Promise<'delivered' | 'empty' | 'failed'> {
+   *  at once, which is what keeps a busy session responsive. `undelivered` is a poll that
+   *  succeeded but whose items the session's transport refused: the round trip worked, so it is
+   *  not a poll failure, but re-polling immediately would spin against an item the daemon has
+   *  already put back at the head of the queue — so it backs off like a failure and, unlike the
+   *  other successes, does NOT reset the backoff. */
+  private async poll(deliver: Deliver): Promise<'delivered' | 'empty' | 'failed' | 'undelivered'> {
     const attachId = this.attachId;
     if (attachId === undefined) return 'failed';
     // Generously above the daemon's own bound: the server is supposed to answer within
@@ -309,12 +320,13 @@ export class DaemonLink {
       );
       return 'failed';
     }
-    this.backoffMs = 0;
     const items = readItems(result.body);
+    let refused = false;
     for (const item of items) {
       if (this.abort.signal.aborted) break;
       const delivered = await deliver(item);
       if (!delivered.ok) {
+        refused = true;
         this.logger.error(
           { sessionId: this.identity.sessionId, injectId: item.injectId, error: delivered.error },
           'channel: the session transport rejected an item; acking failed so the daemon can requeue it',
@@ -322,6 +334,11 @@ export class DaemonLink {
       }
       await this.ack(item.injectId, delivered);
     }
+    // Reset only on a round trip that ACTUALLY landed. Resetting before the deliveries (which is
+    // where this used to sit) makes every retry of a permanently-refusing item start from the
+    // base delay, so the backoff below never grows past its first step.
+    if (refused) return 'undelivered';
+    this.backoffMs = 0;
     return items.length > 0 ? 'delivered' : 'empty';
   }
 

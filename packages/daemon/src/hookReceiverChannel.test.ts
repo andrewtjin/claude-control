@@ -86,6 +86,9 @@ let recovered: string[];
 /** Every `take` the receiver made, in order, tagged with why — the liveness contract is exactly
  *  that a daemon-side push is not a poll. */
 let takeSources: ('poll' | 'wake')[];
+/** Log lines the receiver emitted, so a test can assert on the one place a client's own reason
+ *  for a failed delivery is recorded — it reaches no other surface. */
+let logged: { level: string; obj: unknown; msg: string | undefined }[];
 
 /** The same binding daemon.ts installs, minus the envelope plumbing. */
 function handlersFor(reg: ChannelRegistry): HookReceiverChannelHandlers {
@@ -118,12 +121,24 @@ beforeEach(async () => {
   replies = [];
   recovered = [];
   takeSources = [];
+  logged = [];
+  const capture =
+    (level: string) =>
+    (obj: unknown, msg?: string): void => {
+      logged.push({ level, obj, msg });
+    };
   receiver = new HookReceiver({
     store,
     secret: SECRET,
     emit: () => undefined,
     daemonId: () => 'daemon-1',
     channelPollMs: POLL_MS,
+    logger: {
+      debug: capture('debug'),
+      info: capture('info'),
+      warn: capture('warn'),
+      error: capture('error'),
+    },
   });
   registry = new ChannelRegistry({ onEnqueue: (id) => receiver.wakeChannelPoll(id) });
   receiver.setChannelHandlers(handlersFor(registry));
@@ -155,6 +170,25 @@ describe('auth and validation', () => {
   it('requires sessionId and pid to attach', async () => {
     const res = await post(port, '/cli/channel/attach', { sessionId: 's' }, auth);
     expect(res.status).toBe(400);
+  });
+
+  it('requires the pid to be a real pid, not merely a number', async () => {
+    // `0` is the one that matters. The daemon probes this pid with `process.kill(pid, 0)` to
+    // decide whether the channel server is still there, and pid 0 addresses the DAEMON's own
+    // process group — so the probe answers "alive" for as long as the daemon runs and the
+    // attachment is never swept. Negatives address a group too; a fractional value is not a pid.
+    for (const pid of [0, -1, -4242, 1.5, Number.NaN]) {
+      const res = await post(port, '/cli/channel/attach', { sessionId: 's', pid }, auth);
+      expect({ pid, status: res.status }).toEqual({ pid, status: 400 });
+    }
+    // …and a real pid still attaches, so this is not a blanket refusal.
+    const ok = await post(
+      port,
+      '/cli/channel/attach',
+      { sessionId: 's', pid: 1, identitySource: 'env' },
+      auth,
+    );
+    expect(ok.status).toBe(200);
   });
 
   it('rejects an identitySource it does not recognise', async () => {
@@ -388,6 +422,35 @@ describe('ack, reply, detach', () => {
       auth,
     );
     expect(res.status).toBe(400);
+  });
+
+  it("records the client's own reason when a delivery failed", async () => {
+    const attachId = await attach();
+    const queued = registry.enqueue('sess-1', 'hello');
+    if (!queued.ok) throw new Error('enqueue failed');
+    await post(port, '/cli/channel/next', { attachId }, auth);
+    const res = await post(
+      port,
+      '/cli/channel/ack',
+      {
+        attachId,
+        injectId: queued.injectId,
+        state: 'failed',
+        error: 'the stdio transport is closed',
+      },
+      auth,
+    );
+    expect(res.status).toBe(200);
+
+    // The requeue that follows is indistinguishable from a healthy retry, so without this the
+    // only description of WHY a session could not take a prompt is discarded on arrival and an
+    // operator watching a prompt bounce has nothing to read.
+    const line = logged.find((l) => l.msg?.includes('failed delivery'));
+    expect(line?.level).toBe('warn');
+    expect(line?.obj).toMatchObject({
+      injectId: queued.injectId,
+      error: 'the stdio transport is closed',
+    });
   });
 
   it('routes a reply back to the daemon', async () => {

@@ -639,17 +639,43 @@ function threadHereStatusMessage(status: ThreadHereStatus): string {
   );
 }
 
+/** Appended to any reply that promises a user threads, on a deployment that cannot READ those
+ *  threads. Pinning a channel is a user action; requesting the privileged MessageContent intent is
+ *  an operator one, and the intents are fixed at boot — so a pin here produces threads that deliver
+ *  perfectly and hear nothing. Without this sentence the user's first reply in the thread simply
+ *  disappears, which is the worst possible way to learn the limitation. */
+const REPLIES_NOT_READ_NOTE =
+  ' Output lands in the thread, but replies you type there are not read on this deployment — use ' +
+  '`/say <session> <text>` to send text into a session.';
+
 /** Render a settled `/thread-here` invocation.
  *
  *  Every success says what happens to sessions ALREADY running, because the honest answer is
  *  "nothing" — a session's thread is pinned for its life the moment it is created, and a user who
- *  expects their in-flight session to move would otherwise read the silence as a bug. */
-export function buildThreadHereResult(outcome: ThreadHereOutcome): CommandResult {
+ *  expects their in-flight session to move would otherwise read the silence as a bug.
+ *
+ *  `repliesReadable` is the deployment fact the caller supplies (the same one its gateway intents
+ *  are chosen by); it only ever ADDS {@link REPLIES_NOT_READ_NOTE} to a reply that sends the user
+ *  to a channel. Defaulted so the ordinary, fully-configured deployment reads exactly as before. */
+export function buildThreadHereResult(
+  outcome: ThreadHereOutcome,
+  repliesReadable = true,
+): CommandResult {
+  // Only where the reply has just told the user their sessions live in a channel: on a DM
+  // destination, or one the bot cannot currently use, there is no thread to mis-describe.
+  const note = repliesReadable ? '' : REPLIES_NOT_READ_NOTE;
   switch (outcome.kind) {
     case 'rejected':
       return { kind: 'error', message: threadHereRejectionMessage(outcome.rejection) };
     case 'status':
-      return { kind: 'text', text: threadHereStatusMessage(outcome.status) };
+      return {
+        kind: 'text',
+        text:
+          threadHereStatusMessage(outcome.status) +
+          (outcome.status.destination === 'channel' && outcome.status.health.kind === 'ok'
+            ? note
+            : ''),
+      };
     case 'pinned':
       return {
         kind: 'text',
@@ -657,14 +683,16 @@ export function buildThreadHereResult(outcome: ThreadHereOutcome): CommandResult
           `Pinned. New session threads will be created in <#${outcome.channelId}>` +
           `${outcome.previousChannelId !== undefined ? ` instead of <#${outcome.previousChannelId}>` : ''}. ` +
           'Sessions already running keep the thread or DM they started in. Run ' +
-          '`/thread-here action:clear` to go back to DMs.',
+          '`/thread-here action:clear` to go back to DMs.' +
+          note,
       };
     case 'already-pinned':
       return {
         kind: 'text',
         text:
           `Still pinned to <#${outcome.channelId}> — I rechecked, and I can still create threads ` +
-          'here. Nothing changed.',
+          'here. Nothing changed.' +
+          note,
       };
     case 'cleared':
       return {

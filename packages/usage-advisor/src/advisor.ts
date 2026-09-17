@@ -330,32 +330,20 @@ function buildReason(
   greedy: boolean,
   now: number,
 ): string {
-  if (!recommended) {
-    if (analyses.length === 0) return 'No accounts configured.';
-    // Greedy can leave the plan without a target while the fleet is perfectly healthy: every
-    // usable account fails the executor's gate — excluded, too little 5-hour headroom, near its
-    // own wall, or no known weekly reset — and none of them is the live one. Reporting an
-    // outage there would be a plain falsehood (the accounts have quota; auto-switch just may
-    // not take it), and so would blaming exclusion when something else disqualified them.
-    const usable = analyses.filter((a) => a.usable);
-    if (usable.length > 0) {
-      return usable.every((a) => a.input.autoSwitchExcluded === true)
-        ? 'No auto-switch target: every usable account is excluded from auto-switch.'
-        : 'No auto-switch target: no usable account qualifies right now (a target needs 5-hour ' +
-            'headroom, room under its own limits and a known weekly reset; an excluded account ' +
-            'never qualifies).';
-    }
-    const anyQuarantined = analyses.some((a) => a.input.quarantined);
-    return anyQuarantined
-      ? 'No usable account: all are exhausted or quarantined.'
-      : 'No usable account: all are out of quota.';
-  }
+  if (analyses.length === 0) return 'No accounts configured.';
 
   // Greedy drops excluded accounts from the queue, and they normally land in the holds below
   // with the label saying why. But when dropping them empties the queue there is no queue
   // sentence left to hold them against, and a budget about to evaporate would vanish from the
   // plan entirely — the one fact exclusion does NOT make irrelevant, since the operator can
   // still burn it by hand. So it is named as manual work instead.
+  //
+  // Computed BEFORE the no-target branch below, because a burn queue greedy emptied is exactly
+  // the case that also leaves the plan without a recommendation: everything greedy would hop to
+  // was dropped. Deciding "no target" first would throw the expiring budget away on the way to
+  // saying so, which is the one thing this whole branch exists to prevent — and "burn it by
+  // hand" is already the honest instruction, with the exclusion label spelling out why nothing
+  // automatic will do it.
   const manual = burns.length === 0 ? dropped : [];
   const named = burns.length > 0 ? burns : manual;
   if (named.length > 0) {
@@ -377,6 +365,26 @@ function buildReason(
         ? `${greedy ? 'Greedy auto-switch burns' : 'Burn'} ${renderQueue(burns, now)}`
         : `Burn by hand: ${renderQueue(manual, now)}`;
     return `${lead}${holdPart}.`;
+  }
+
+  if (!recommended) {
+    // Greedy can leave the plan without a target while the fleet is perfectly healthy: every
+    // usable account fails the executor's gate — excluded, too little 5-hour headroom, near its
+    // own wall, or no known weekly reset — and none of them is the live one. Reporting an
+    // outage there would be a plain falsehood (the accounts have quota; auto-switch just may
+    // not take it), and so would blaming exclusion when something else disqualified them.
+    const usable = analyses.filter((a) => a.usable);
+    if (usable.length > 0) {
+      return usable.every((a) => a.input.autoSwitchExcluded === true)
+        ? 'No auto-switch target: every usable account is excluded from auto-switch.'
+        : 'No auto-switch target: no usable account qualifies right now (a target needs 5-hour ' +
+            'headroom, room under its own limits and a known weekly reset; an excluded account ' +
+            'never qualifies).';
+    }
+    const anyQuarantined = analyses.some((a) => a.input.quarantined);
+    return anyQuarantined
+      ? 'No usable account: all are exhausted or quarantined.'
+      : 'No usable account: all are out of quota.';
   }
 
   return `${recommended.input.label} has the most available headroom (${roundPct(recommended.headroomPct)}%)${exclusionSuffix(recommended)}.`;

@@ -24,6 +24,7 @@ import {
   type AttachIdentity,
   type ChannelItem,
   type Deliver,
+  type DeliverResult,
   type Discover,
 } from './daemonLink.js';
 import { ChannelServer } from './server.js';
@@ -512,6 +513,92 @@ describe('backoff', () => {
     // 10, 20 while failing; the empty poll succeeds (resetting the backoff) and costs only the
     // floor; then the next failure starts over at 10.
     expect(slept).toEqual([10, 20, EMPTY_POLL_FLOOR_MS, 10]);
+  });
+
+  it('throttles a delivery the session keeps refusing, exponentially', async () => {
+    // The daemon requeues a failed item at the FRONT of its queue, so the next poll hands back
+    // the very same item. Without a pause this is an unthrottled poll/deliver/ack loop against
+    // the daemon's single-threaded receiver — measured at ~10^5 round trips a second, enough to
+    // exhaust memory on a transport that never yields to the event loop.
+    const settled = deferred();
+    const stub = await startStub((req, res) => {
+      if (req.path === '/cli/channel/attach') return json(res, 200, { ok: true, attachId: 'a' });
+      if (req.path === '/cli/channel/ack') return json(res, 200, { ok: true });
+      // Always the same item back, exactly as the daemon's requeue-at-the-front does.
+      return json(res, 200, { ok: true, items: [{ injectId: 'stuck', text: 'ship it' }] });
+    });
+
+    const slept: number[] = [];
+    const attempts: string[] = [];
+    const link = track(
+      new DaemonLink({
+        identity: IDENTITY,
+        discover: fixedDiscover(stub.port).discover,
+        backoffBaseMs: 10,
+        backoffCapMs: 40,
+        sleep: (ms) => {
+          slept.push(ms);
+          if (slept.length >= 5) settled.resolve();
+          return Promise.resolve();
+        },
+      }),
+    );
+    const running = link.run((item) => {
+      attempts.push(item.injectId);
+      return Promise.resolve({ ok: false, error: 'the stdio transport is closed' });
+    });
+    await settled.promise;
+    link.stop();
+    await running;
+
+    // Every retry is paced, and the pacing GROWS: a refusal that is not going to clear must not
+    // cost a round trip per millisecond for the rest of the session's life.
+    expect(slept.slice(0, 5)).toEqual([10, 20, 40, 40, 40]);
+    // …and the item really was retried, so the throttle is not just an early exit.
+    expect(attempts.length).toBeGreaterThan(1);
+    expect(new Set(attempts)).toEqual(new Set(['stuck']));
+  });
+
+  it('resets the backoff once a delivery lands, so a one-off refusal is not remembered', async () => {
+    const settled = deferred();
+    const stub = await startStub((req, res) => {
+      if (req.path === '/cli/channel/attach') return json(res, 200, { ok: true, attachId: 'a' });
+      if (req.path === '/cli/channel/ack') return json(res, 200, { ok: true });
+      const polls = stub.requests.filter((r) => r.path === '/cli/channel/next').length;
+      if (polls <= 2) {
+        return json(res, 200, { ok: true, items: [{ injectId: `i${polls}`, text: 'x' }] });
+      }
+      if (polls === 3) return json(res, 200, { ok: true, items: [] });
+      settled.resolve();
+      return; // hold
+    });
+
+    const slept: number[] = [];
+    let refuse = true;
+    const link = track(
+      new DaemonLink({
+        identity: IDENTITY,
+        discover: fixedDiscover(stub.port).discover,
+        backoffBaseMs: 10,
+        backoffCapMs: 1000,
+        sleep: (ms) => {
+          slept.push(ms);
+          return Promise.resolve();
+        },
+      }),
+    );
+    const running = link.run(() => {
+      const result: DeliverResult = refuse ? { ok: false, error: 'not yet' } : { ok: true };
+      refuse = false;
+      return Promise.resolve(result);
+    });
+    await settled.promise;
+    link.stop();
+    await running;
+
+    // One refusal costs one backoff step; the delivery that follows resets it, so the empty poll
+    // after it pays only the floor rather than a remembered penalty.
+    expect(slept).toEqual([10, EMPTY_POLL_FLOOR_MS]);
   });
 });
 

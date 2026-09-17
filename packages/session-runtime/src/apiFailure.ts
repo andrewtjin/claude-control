@@ -30,12 +30,54 @@ export interface ApiFailureClassification {
 const NOT_TRANSIENT: ApiFailureClassification = { transient: false };
 const USAGE_LIMIT: ApiFailureClassification = { transient: false, usageLimit: true };
 
+/**
+ * One HTTP status, matched ONLY where the surrounding text says it IS a status ("API Error:
+ * 429", "HTTP 500", "status code 408", "statusCode: 429", "upstream returned 529", "Request
+ * failed: 429", or the parenthesised "(408)" an abort/timeout message trails).
+ *
+ * Everything classified here is free text written by someone else — a tool's stderr, a stack
+ * frame, a shell command — where a bare three-digit number means nothing: `build/429/out.json`
+ * is not a rate limit and `foo.ts:529:12` is not an outage. Matching one anywhere turns ordinary
+ * output into a parked session or a burst of pointless retries, so every status pattern below
+ * shares this anchor and none can drift away from it.
+ *
+ * TWO shapes and no third. Either a word that NAMES the number as a status introduces it, or the
+ * number stands alone inside its own parentheses — a parenthetical holding nothing but three
+ * digits is a code being quoted, never a path segment, a source position or a row count. Widening
+ * past those two is how the anchor stops being one.
+ */
+function httpStatusSource(status: string): string {
+  // `status(?:[ _-]?code)?` so the separator between the two words is optional: an SDK error
+  // carries the field name `statusCode`, and a mandatory separator silently excludes it.
+  //
+  // `returned` and `failed` name a status only when the number ENDS the clause: "upstream
+  // returned 529" and "Request failed: 429" do, while "returned 429 rows" and "failed: 500 unit
+  // tests" are counts in passing. The parenthesised form is held to the same rule ("timed out
+  // (408)" trails a message; "batch (429) complete" does not), so only a code that nothing but
+  // punctuation or a line end follows is a code being quoted. A reason phrase after the number
+  // ("529 Overloaded") is caught by that phrase's own pattern, never by this one.
+  const clauseEnd = '(?!\\s*[\\w$])';
+  return (
+    `(?:(?:api error|http|status(?:[ _-]?code)?)[:\\s]+${status}\\b` +
+    `|(?:returned|failed)[:\\s]+${status}${clauseEnd}` +
+    `|\\(\\s*${status}\\s*\\)${clauseEnd})`
+  );
+}
+
 /** The usage/rate-limit vocabulary (HTTP 429, the API's `rate_limit_error`, the CLI's own
  *  "Claude usage limit reached" copy). Split out of {@link PERMANENT_PATTERN} — which it is
  *  still part of, composed below so the two can never drift — because this one permanent
  *  cause has a distinct recovery: not retrying, not giving up, but switching accounts. */
 const USAGE_LIMIT_PATTERN: RegExp = new RegExp(
-  [/\b429\b/, /rate.?limit/, /usage limit/].map((r) => r.source).join('|'),
+  [
+    httpStatusSource('429'),
+    /rate.?limit/.source,
+    /usage limit/.source,
+    // 429's own reason phrase. It arrives as the WHOLE message ("429 Too Many Requests"), where
+    // the number leads and no word introduces it — so the phrase is the anchor, tied to its own
+    // number on either side: "too many requests queued" in a tool's log is not a rate limit.
+    /\b429\b[^\n]{0,40}too many requests|too many requests[^\n]{0,40}\b429\b/.source,
+  ].join('|'),
   'i',
 );
 
@@ -60,24 +102,33 @@ const PERMANENT_PATTERN: RegExp = new RegExp(
 
 /** 529 first: it is the one 5xx-adjacent status with its own vocabulary ("Overloaded"),
  *  and the CLI's own message ("API Error: 529 Overloaded. …") should classify by the more
- *  specific kind rather than the generic server bucket. */
-const OVERLOADED_PATTERN = /\b529\b|overloaded/i;
+ *  specific kind rather than the generic server bucket. The status half carries the shared
+ *  anchor (see {@link httpStatusSource}); the word "Overloaded" needs none. */
+const OVERLOADED_PATTERN = new RegExp(`${httpStatusSource('529')}|overloaded`, 'i');
 
 /** The CLI's synthetic give-up messages ("API Error: 500 Internal server error. …"),
  *  HTTP-shaped statuses from SDK/transport errors, and the named 5xx reason phrases.
  *  The status match is anchored to an HTTP-ish context ("API Error: 502", "status 503",
  *  "HTTP 500") rather than any bare 3-digit number, so "line 500 of foo.ts" in an
  *  unrelated error text never reads as a server failure. */
-const SERVER_ERROR_PATTERN =
-  /(?:api error|http|status(?: code)?)[:\s]+5\d\d\b|internal server error|server error|bad gateway|service unavailable|gateway timeout/i;
+const SERVER_ERROR_PATTERN = new RegExp(
+  `${httpStatusSource('5\\d\\d')}|internal server error|server error|bad gateway|` +
+    `service unavailable|gateway timeout`,
+  'i',
+);
 
 /** Mid-response drops and network-level failures — the CLI's own "…mid-response/mid-stream"
  *  wording plus the Node error codes a dead route/socket surfaces through the SDK. */
 const CONNECTION_PATTERN =
   /connection closed mid-response|response stalled mid-stream|connection (?:error|refused|reset)|fetch failed|network error|socket hang up|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN/i;
 
-/** Request-level timeouts (408, the CLI's "Request timed out", API_TIMEOUT_MS expiry). */
-const TIMEOUT_PATTERN = /\b408\b|request timed out|timed? ?out waiting|api.?timeout/i;
+/** Request-level timeouts (408, the CLI's "Request timed out", API_TIMEOUT_MS expiry). The
+ *  status half carries the shared anchor — a bare "408" is as likely to be a byte count or a
+ *  line number as a status. */
+const TIMEOUT_PATTERN = new RegExp(
+  `${httpStatusSource('408')}|request timed out|timed? ?out waiting|api.?timeout`,
+  'i',
+);
 
 /**
  * Classify a failure's free text (a failed turn's summary, or a thrown stream error's

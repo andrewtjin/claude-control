@@ -26,17 +26,33 @@ export interface CardRef {
  *  concurrent hooks, not by total requests ever sent. */
 const MAX_ENTRIES = 64;
 
+/** A card's location plus the Discord user it was delivered TO. The owner is tracked because a
+ *  permission card can land in a per-session thread, which other people can be members of, and an
+ *  interaction carries no proof of whose card it is — only who tapped it. */
+interface CardEntry {
+  ref: CardRef;
+  ownerId: string;
+}
+
 export class PermissionCardRegistry {
   // Map keeps insertion order, which IS FIFO eviction order.
-  private readonly byRequestId = new Map<string, CardRef>();
+  private readonly byRequestId = new Map<string, CardEntry>();
 
-  /** Remember where a just-sent permission card landed. Called once, right after the send. */
-  record(requestId: string, ref: CardRef): void {
+  /** Remember where a just-sent permission card landed, and who it belongs to. Called once, right
+   *  after the send. */
+  record(requestId: string, ref: CardRef, ownerId: string): void {
     if (this.byRequestId.size >= MAX_ENTRIES) {
       const oldest = this.byRequestId.keys().next().value;
       if (oldest !== undefined) this.byRequestId.delete(oldest);
     }
-    this.byRequestId.set(requestId, ref);
+    this.byRequestId.set(requestId, { ref, ownerId });
+  }
+
+  /** The Discord user this card was delivered to, or `undefined` when the card is unknown here
+   *  (evicted, or sent before a restart). Unknown means unknown — the caller must not read it as a
+   *  mismatch, or every card would become unanswerable after a bot restart. */
+  ownerOf(requestId: string): string | undefined {
+    return this.byRequestId.get(requestId)?.ownerId;
   }
 
   /** Look up and drop in one step. A `permission.lapsed` edits its card at most once (the
@@ -46,9 +62,9 @@ export class PermissionCardRegistry {
    *  card was sent) — the caller's contract is to drop that case silently, never send a new
    *  message for a card it can no longer edit. */
   take(requestId: string): CardRef | undefined {
-    const ref = this.byRequestId.get(requestId);
-    if (ref !== undefined) this.byRequestId.delete(requestId);
-    return ref;
+    const entry = this.byRequestId.get(requestId);
+    if (entry !== undefined) this.byRequestId.delete(requestId);
+    return entry?.ref;
   }
 
   /** Current retained-entry count — exposed for tests and diagnostics. */

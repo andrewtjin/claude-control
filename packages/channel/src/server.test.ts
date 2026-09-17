@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { PassThrough } from 'node:stream';
 import { createInterface } from 'node:readline';
-import { ChannelServer, SERVER_NAME, sanitizeMetaKeys } from './server.js';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { ChannelServer, SERVER_NAME, SERVER_VERSION, sanitizeMetaKeys } from './server.js';
 import type { DeliverResult } from './daemonLink.js';
 
 // Real streams and real newline framing: the server is driven exactly the way Claude Code drives
@@ -114,6 +117,50 @@ describe('handshake', () => {
     // cctl already approves permissions through its hook path. A second declared approver would
     // put two independent answers on one tool call.
     expect(Object.keys(experimental)).toEqual(['claude/channel']);
+  });
+
+  it('reports a version an operator can act on, not a fossil default', async () => {
+    const h = harness();
+    const result = (await h.handshake()).result as Record<string, unknown>;
+    // The composition root passes the shipped version, and the constructor default is the same
+    // constant, so no caller can end up publishing a stale literal in `serverInfo`.
+    expect(result.serverInfo).toEqual({ name: SERVER_NAME, version: SERVER_VERSION });
+    expect(SERVER_VERSION).not.toBe('0.1.0');
+  });
+
+  it('reports the SAME version the published package and the CLI do', async () => {
+    // This server ships inside the `cctl` bundle and has no release of its own, so its version is
+    // hand-maintained against the two files that already carry the shipped one. Three hand-kept
+    // copies drift on the first release bump that misses one, and the drift is silent: the
+    // operator is told a version that is not the one they installed, and files against it. Read
+    // out of the real files rather than restated here, or this assertion would be a fourth copy.
+    const packages = fileURLToPath(new URL('../../', import.meta.url));
+    const published = JSON.parse(
+      await readFile(join(packages, 'cctl-publish', 'package.json'), 'utf8'),
+    ) as { version?: string };
+    const settings = await readFile(join(packages, 'cli', 'src', 'settings.ts'), 'utf8');
+    const cliVersion = /export const VERSION = '([^']+)'/.exec(settings)?.[1];
+
+    // Both are asserted to LOOK like versions first: a moved file or a renamed constant would
+    // otherwise leave two `undefined`s comparing equal and the test passing on nothing.
+    expect(published.version).toMatch(/^\d+\.\d+\.\d+/);
+    expect(cliVersion).toMatch(/^\d+\.\d+\.\d+/);
+    expect(SERVER_VERSION).toBe(published.version);
+    expect(SERVER_VERSION).toBe(cliVersion);
+  });
+
+  it('frames channel content as an operator request, naming the verbs it cannot authorise', async () => {
+    const h = harness();
+    const result = (await h.handshake()).result as Record<string, unknown>;
+    // The threat model's mitigation for the escalation a channel introduces: a message reaching
+    // the model here can ORIGINATE instructions, so the guidance has to name the moves that would
+    // widen the sender's own reach rather than offer generic caution.
+    const instructions = String(result.instructions);
+    expect(instructions).toMatch(/cctl switch/);
+    expect(instructions).toMatch(/cctl accounts/);
+    expect(instructions).toMatch(/never authoris/i);
+    expect(instructions).toMatch(/credential/i);
+    expect(instructions).toMatch(/channel enable\|disable/);
   });
 
   it('echoes whatever protocol version the client advertises', async () => {
@@ -421,6 +468,80 @@ describe('transport failure', () => {
     const h = harness();
     await h.handshake();
     expect(await h.server.push('this one really does get through')).toEqual({ ok: true });
+  });
+
+  it('fails the transport when the pipe is already closed, so shutdown actually fires', async () => {
+    const h = harness();
+    await h.handshake();
+    // A pipe that is already ended emits no `error` — there is nothing left to fail — so a write
+    // that merely REPORTS the closure leaves the process alive around a dead wire: every later
+    // push fails the same way, the daemon keeps handing this session items, and the detach that
+    // would release the attachment never runs.
+    h.output.end();
+
+    expect(await h.server.push('nobody is reading this')).toMatchObject({ ok: false });
+    expect(h.transportErrors).toHaveLength(1);
+    expect(h.transportErrors[0]?.message).toMatch(/closed/i);
+  });
+
+  it('reports a closed transport once, not once per write', async () => {
+    const h = harness();
+    await h.handshake();
+    h.output.destroy();
+
+    await h.server.push('one');
+    await h.server.push('two');
+    // The shutdown path is one-way; a second notification would run it again mid-teardown.
+    expect(h.transportErrors).toHaveLength(1);
+  });
+});
+
+describe('handler failures', () => {
+  it('answers a throwing handler with a JSON-RPC error instead of hanging the client', async () => {
+    const h = harness(() => {
+      throw new Error('the outbox exploded');
+    });
+    await h.handshake();
+    h.send({
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'tools/call',
+      params: { name: 'reply', arguments: { text: 'anyone there?' } },
+    });
+
+    const response = await h.frames.next();
+    expect(response.id).toBe(7);
+    // Silence would leave the model waiting on a response that never comes, which is
+    // indistinguishable from a wedged session; the throw itself would be an unhandled rejection.
+    expect(response.error).toMatchObject({ code: -32603 });
+    expect(String((response.error as { message: string }).message)).toContain(
+      'the outbox exploded',
+    );
+  });
+
+  it('keeps serving after a handler throws', async () => {
+    let calls = 0;
+    const h = harness(() => {
+      calls += 1;
+      if (calls === 1) throw new Error('first one blew up');
+      return Promise.resolve({ ok: true });
+    });
+    await h.handshake();
+    const call = (id: number): void =>
+      h.send({
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: { name: 'reply', arguments: { text: `try ${id}` } },
+      });
+
+    call(1);
+    expect((await h.frames.next()).error).toBeDefined();
+    // An unhandled rejection would have taken the process down between these two calls, costing
+    // the session its channel for the rest of its life over one bad frame.
+    call(2);
+    const second = await h.frames.next();
+    expect((second.result as { isError: boolean }).isError).toBe(false);
   });
 });
 

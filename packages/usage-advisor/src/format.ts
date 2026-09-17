@@ -19,6 +19,12 @@ export function humanizeDuration(ms: number): string {
   return `${minutes}m`;
 }
 
+/** A fixed 24 hours. Deliberately NOT a calendar day: a countdown that spans a DST transition
+ *  is 23 or 25 wall-clock hours long, so this under-reports by a day across a spring-forward
+ *  boundary in a zone that observes one. Accepted, because the whole unit is a floor on the
+ *  runway left (see below) and a floor that is occasionally one day low is exactly the error
+ *  this rounding already chooses; a calendar-correct count would need a timezone the advisor
+ *  deliberately does not take. */
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**

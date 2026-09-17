@@ -55,6 +55,7 @@ import {
   planWeight,
   selectWeeklyBudget,
   type AccountUsageInput,
+  type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
 import type { ProbeCandidate } from './accountProbe.js';
 import type { Store } from './store.js';
@@ -84,6 +85,7 @@ import {
   CHANNEL_TTL_MS,
   ChannelRegistry,
   type ChannelInjection,
+  type ExpiredInjection,
 } from './channelRegistry.js';
 import { ControlPlaneClient } from './controlPlaneClient.js';
 import { LOOP_LAG_THRESHOLD_MS, startLoopLagMonitor } from './loopLagMonitor.js';
@@ -105,9 +107,12 @@ export interface SwitchEngineLike {
 }
 
 /** The slice of `AutoSwitcher` the daemon calls each poll cycle — narrowed to an interface
- *  so lifecycle tests can fake it (mirroring `SwitchEngineLike`). */
+ *  so lifecycle tests can fake it (mirroring `SwitchEngineLike`). Resolves with the account id
+ *  the evaluation ACTIVATED, or `undefined` when it activated nothing; the daemon needs that
+ *  distinction to tell its own hop apart from a switch somebody else made mid-cycle (see the
+ *  absorb in {@link Daemon.pollCycle}). */
 export interface AutoSwitcherLike {
-  evaluate(accounts: AccountUsageInput[]): Promise<void>;
+  evaluate(accounts: AccountUsageInput[]): Promise<string | undefined>;
 }
 
 /** The slice of `AccountProbe` the daemon calls each poll cycle — narrowed for the same reason
@@ -132,6 +137,13 @@ export interface DaemonOptions {
    *  `autoSwitcher` is also present — spending quota to widen a target pool nothing is going to
    *  choose from would be a cost with no payoff. Absent = the feature is off. */
   accountProbe?: AccountProbeLike;
+  /** The policy the auto-switch executor runs under. The daemon does not decide with it — the
+   *  executor owns that — it only needs the parts that say what an account even LOOKS like to
+   *  the policy, so the probe never spends a turn on an account the policy can already place,
+   *  nor skips one it cannot (see {@link policyVisibleLimits}). Defaults to the policy the
+   *  poller's plan is gated by, which is the same object the composition root hands the
+   *  executor; absent everywhere = the executor's own defaults. */
+  autoSwitchPolicy?: AutoSwitchPolicy;
   /** The effective-settings report resolved at startup (see cli/settings.ts). When present
    *  it is re-pushed with every poll cycle — settings never change mid-run, but the bot's
    *  cache is in-memory, so the repeat is what survives a bot restart. */
@@ -164,8 +176,9 @@ export interface DaemonOptions {
    *  missing file makes every hook take the silent no-daemon fast path; the heartbeat bounds
    *  that outage to one interval. Injectable so tests can prove the re-publish quickly. */
   endpointRepublishMs?: number;
-  /** Injectable clock (house convention: no fake timers). Only used for the quarantine-notice
-   *  debounce; defaults to `Date.now`. */
+  /** Injectable clock (house convention: no fake timers) — what every age the daemon measures
+   *  is read from, including the quarantine-notice debounce and the switch-key TTL. Defaults to
+   *  `Date.now`. */
   clock?: () => number;
   /** Does this pid name a live process? The channel server records its pid on attach, and that
    *  pid is the only SYNCHRONOUS evidence the daemon has that the server still exists — poll
@@ -296,6 +309,52 @@ function rememberBounded(keys: Set<string>, key: string, bound: number): void {
   }
 }
 
+/**
+ * How long a `switch.command` idempotency key stays "already handled".
+ *
+ * The sibling dedupes key off a fresh random value per command, so remembering one until it is
+ * evicted costs nothing: the same key twice can only ever be the same frame twice. A switch tapped
+ * from a card is different — its key is derived from the LOGICAL action (who, what, which account)
+ * so that a double-tap from two phones collapses to one command, which means tapping "switch to
+ * main" again tomorrow produces the exact same key. Remembering that key forever turns the second,
+ * genuinely new command into silence: dropped here, and answered by no `switch.result`, so the
+ * phone shows a request that never resolves. The sender ages its own copy of the key out after
+ * fifteen minutes; matching that is what keeps the two ends agreeing on which frames are replays.
+ */
+export const SEEN_SWITCH_KEY_TTL_MS = 15 * 60_000;
+
+/** Remember a key WITH the moment it was seen — the same FIFO bound as {@link rememberBounded}
+ *  (a Map iterates in insertion order too), for the sets that also have to forget. Re-inserted
+ *  rather than updated in place so a refreshed key becomes the youngest for eviction, matching
+ *  what its timestamp now claims. */
+function rememberBoundedAt(
+  keys: Map<string, number>,
+  key: string,
+  bound: number,
+  nowMs: number,
+): void {
+  keys.delete(key);
+  keys.set(key, nowMs);
+  if (keys.size > bound) {
+    const oldest = keys.keys().next().value;
+    if (oldest !== undefined) keys.delete(oldest);
+  }
+}
+
+/** Whether `key` was seen within `ttlMs` — exactly AT the boundary still counts as seen, so the
+ *  two ends of a deterministic key never disagree by one millisecond. An expired entry is dropped
+ *  on the way past, which is all the sweeping these maps need: a key nobody asks about again is
+ *  evicted by the bound instead. */
+function seenWithin(keys: Map<string, number>, key: string, nowMs: number, ttlMs: number): boolean {
+  const seenAtMs = keys.get(key);
+  if (seenAtMs === undefined) return false;
+  if (nowMs - seenAtMs > ttlMs) {
+    keys.delete(key);
+    return false;
+  }
+  return true;
+}
+
 /** Bound on the `cctl session register|label|watch` idempotency set. Same FIFO discipline as
  *  the stop keys; a little larger because a busy user may register/label several sessions. The
  *  underlying operations are value-idempotent anyway (setting a label/watch flag to the same
@@ -343,12 +402,47 @@ const STEERING_TTL_MS = 30 * 60_000;
  *  idle or closed window) — refusing the next /say with an honest error beats silently
  *  dropping the oldest, and it bounds what a dead session can accumulate in memory. */
 const STEERING_QUEUE_CAP = 8;
-/** Which of the two queues a persisted row belongs to. Tagged rather than inferred from the
- *  session id, because only ONE of them can be restored after a restart: an interactive session
- *  is another process that outlives this daemon, while a managed session's SDK subprocess does
- *  not — see {@link Daemon.reloadPendingSteering}. */
+/** Which queue a persisted row belongs to. Tagged rather than inferred from the session id,
+ *  because only SOME of them can be restored after a restart: an interactive session is another
+ *  process that outlives this daemon, while a managed session's SDK subprocess does not — see
+ *  {@link Daemon.reloadPendingSteering}. */
 const INTERACTIVE_STEERING_KIND = 'interactive';
 const MANAGED_STEERING_KIND = 'managed';
+/** A prompt currently sitting on a session's LIVE channel rather than in either turn-boundary
+ *  queue. The registry holding those is pure memory, so without a row of its own a `taskkill /F`,
+ *  a crash or a logoff drops every queued prompt after the phone has already been told "sent" —
+ *  the very promise the other two kinds exist to keep. A restart cannot put one straight back on
+ *  a channel (nothing is attached yet, and whether anything re-attaches is not knowable at
+ *  startup), so these reload onto the turn-boundary queue and are promoted back the moment a
+ *  channel server attaches — see {@link Daemon.promoteSteeringToChannel}. */
+const CHANNEL_STEERING_KIND = 'channel';
+/** Every tag a session's queued text can be stored under. Cleanup that means "this session owes
+ *  nothing any more" has to name all of them: a delete scoped to one kind leaves the others in
+ *  the table, and the next daemon start restores whatever it finds there — so a single forgotten
+ *  kind turns a discarded prompt into guidance delivered to a later session of the same id. */
+const ALL_STEERING_KINDS = [
+  INTERACTIVE_STEERING_KIND,
+  MANAGED_STEERING_KIND,
+  CHANNEL_STEERING_KIND,
+] as const;
+
+/** How many delivered inject ids to remember per session, and for how many sessions.
+ *
+ *  The set exists only to recognise a delivery confirmation that races the fallback of the very
+ *  prompt it confirms, so it is bounded rather than a per-session leak for the daemon's life. The
+ *  per-session bound is a multiple of {@link CHANNEL_QUEUE_CAP} because that is what an
+ *  unacknowledged burst costs: one channel generation can hold a full queue, and a session whose
+ *  channel server is being replaced repeatedly can have several generations of ids outstanding at
+ *  once — at four generations an id could be evicted before its own hand-back, which is precisely
+ *  the race this set exists to win, so it keeps eight.
+ *
+ *  The session bound is a count of SESSIONS remembered, evicted least-recently-used (see
+ *  {@link Daemon.rememberDelivered}): by insertion order the busiest session on a long-lived
+ *  daemon is dropped for having been seen first, which is exactly backwards. */
+const DELIVERED_INJECT_MEMORY = 8 * CHANNEL_QUEUE_CAP;
+/** Exported so a test can fill the map exactly rather than hard-coding a copy of this number,
+ *  which would go on passing while proving nothing the day the bound moves. */
+export const DELIVERED_INJECT_SESSIONS = 64;
 
 /** One queued/delivered steering text, held in arrival order. `rowId` is its row in the store's
  *  mirror of this queue, carried so a delivery or a drop retires exactly the row it consumed
@@ -357,6 +451,11 @@ interface QueuedSteering {
   text: string;
   queuedAtMs: number;
   rowId: number;
+  /** Present when this text has been on a channel — it fell back off one, or it was queued while
+   *  one was attached. It is the id the channel path acks with, so keeping it here is what lets a
+   *  delivery confirmation arriving AFTER the fallback retire the right entry, and what lets a
+   *  promotion back onto a channel stay the same prompt instead of becoming a second copy of it. */
+  injectId?: string | undefined;
 }
 
 /** Outcome of resolving a label/watch/unregister ref (or a prompt.inject sessionId) against the
@@ -411,14 +510,30 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 type EnvelopeDraftSansDaemonId = DistributiveOmit<EnvelopeDraft, 'daemonId'>;
 
 /**
+ * The limits the auto-switch policy can SEE, mirroring the rule its own candidate gate applies:
+ * with the Fable cap opted out, a `weekly_scoped` limit is invisible to every part of that
+ * decision, so an account reporting nothing else reports nothing at all to it. Read here for
+ * the same reason the weekly resolution below is the policy's own function — a clock the policy
+ * will not look at must not count as a clock we have.
+ */
+function policyVisibleLimits(
+  account: AccountUsageInput,
+  policy: AutoSwitchPolicy,
+): AccountUsageInput['limits'] {
+  return (policy.fableCapTriggers ?? true)
+    ? account.limits
+    : account.limits.filter((limit) => limit.kind !== 'weekly_scoped');
+}
+
+/**
  * The accounts this cycle proved it cannot place on a weekly clock — the ones auto-switch is
  * structurally unable to choose (`decideAutoSwitch` drops an unresolvable weekly reset outright).
  *
- * The weekly resolution is `selectWeeklyBudget`, the SAME function the policy itself calls, so
- * "the probe thinks this account is unknown" and "the policy would refuse it" can never become
- * two different judgements. It already folds in the history-derived prediction, which is what
- * separates a DORMANT account (used once, window since closed, prediction stands in) from a
- * never-used one — only the latter is worth a turn.
+ * The weekly resolution is `selectWeeklyBudget` over the limits the POLICY can see, the same
+ * pair the policy itself uses, so "the probe thinks this account is unknown" and "the policy
+ * would refuse it" can never become two different judgements. It already folds in the
+ * history-derived prediction, which is what separates a DORMANT account (used once, window since
+ * closed, prediction stands in) from a never-used one — only the latter is worth a turn.
  *
  * Gated on a LIVE poll: a degraded cycle reports no limits either, and an account is not
  * unproven just because our read of it failed. Active, quarantined and auto-switch-excluded
@@ -429,6 +544,7 @@ function unknownDescentCandidates(
   results: AccountPollResult[],
   inputs: AccountUsageInput[],
   now: number,
+  policy: AutoSwitchPolicy,
 ): ProbeCandidate[] {
   const polled = new Map(results.map((r) => [r.accountId, r.outcome]));
   return inputs
@@ -438,7 +554,8 @@ function unknownDescentCandidates(
         !a.quarantined &&
         a.autoSwitchExcluded !== true &&
         polled.get(a.accountId) === 'live' &&
-        selectWeeklyBudget(a.limits, now, a.predictedResetAt)?.resetsAt === undefined,
+        selectWeeklyBudget(policyVisibleLimits(a, policy), now, a.predictedResetAt)?.resetsAt ===
+          undefined,
     )
     .map((a) => ({ accountId: a.accountId, label: a.label }));
 }
@@ -453,6 +570,7 @@ export class Daemon {
   private readonly controlPlaneClient: ControlPlaneClient;
   private readonly autoSwitcher: AutoSwitcherLike | undefined;
   private readonly accountProbe: AccountProbeLike | undefined;
+  private readonly autoSwitchPolicy: AutoSwitchPolicy;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
   private readonly createAgentSdkClient: () => AgentSdkClient;
   private readonly autoContinue: AutoContinuePolicy | undefined;
@@ -512,6 +630,14 @@ export class Daemon {
   /** Recently seen `session.prune` idempotencyKeys, so a re-sent/replayed prune answers once
    *  instead of posting a second (empty) result. Bounded FIFO like the stop keys. */
   private readonly seenPruneKeys = new Set<string>();
+  /** Recently seen `switch.command` idempotencyKeys, each with the moment it was seen. A switch
+   *  is the least replay-safe command the phone can send: a frame re-delivered after the operator
+   *  has moved on silently drags the live account back to the earlier target and files a second
+   *  activation in the audit trail, where it reads as a hop nobody asked for. Bounded FIFO like
+   *  the stop keys, and ALSO aged out — alone among the daemon's dedupes, because a switch key can
+   *  be derived rather than random and so recur legitimately (see
+   *  {@link SEEN_SWITCH_KEY_TTL_MS}). */
+  private readonly seenSwitchKeys = new Map<string, number>();
   /** Recently seen `cctl session register|label|watch` idempotencyKeys, so a re-sent command
    *  answers "already handled" instead of re-applying. Bounded FIFO — see
    *  {@link rememberSessionCmdKey}. */
@@ -543,6 +669,20 @@ export class Daemon {
    *  launch command intended, because Claude Code's startup notice has been observed reporting a
    *  channel as unconfigured in a session where that same channel then delivered normally. */
   private readonly channels: ChannelRegistry;
+  /** `injectId` → the `pending_steering` row mirroring it (and whose session it is), for prompts
+   *  currently on a channel. The registry is memory-only and deliberately store-free, so the
+   *  daemon holds the one link between an item it handed the registry and the row that outlives
+   *  this process. The session id rides along because a delivery confirmation can arrive naming an
+   *  attachment that is already gone, and attributing it is what keeps the prompt from being
+   *  delivered twice. Entries leave on delivery, on expiry, and on the fallback that turns the row
+   *  into a turn-boundary one — anything left here names a row still waiting on a channel. */
+  private readonly channelRows = new Map<string, { rowId: number; sessionId: string }>();
+  /** Inject ids this daemon has a `sent` acknowledgement for, per session, bounded by
+   *  {@link DELIVERED_INJECT_MEMORY}. Channel delivery is at-least-once: a confirmation can
+   *  arrive after a sweep or a detach has already handed the same item back for turn-boundary
+   *  delivery, and without a record of what has landed the operator's instruction is delivered to
+   *  the session a second time. */
+  private readonly deliveredInjects = new Map<string, Set<string>>();
   /** Sweeps attachments whose server is gone — its process first (immediate and certain), then
    *  poll silence (the fallback for a process that is alive but wedged). */
   private channelSweepTimer: ReturnType<typeof setInterval> | undefined;
@@ -552,12 +692,31 @@ export class Daemon {
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
    *  not re-pushed on every restart). */
   private quarantineState = new Map<string, QuarantineNoticeState>();
+  /** The account each LIVE managed session is currently running its turns against — the value
+   *  stamped on its `session.status`/`session.output` frames. Mutable because a session outlives
+   *  the account it was spawned on: a usage-limit park resumed after a switch runs everything
+   *  from there on against the newly-active credentials, and a frame still naming the spawn-time
+   *  account tells the phone the wrong one (and mis-attributes the work in the session table).
+   *  Seeded when the pipes are attached, re-stamped by the post-switch kick, dropped when the
+   *  session goes terminal — so it is bounded by live sessions, like the route maps above. */
+  private readonly sessionAccounts = new Map<string, string>();
+  /** The active account as of the last poll cycle, so a switch made OUTSIDE this daemon (a local
+   *  `cctl switch`, which writes the vault directly and never reaches handleSwitchCommand) is
+   *  detectable at all. `undefined` until the first observation: whatever account the daemon
+   *  starts on is nobody's switch. */
+  private lastObservedActiveId: string | null | undefined;
   /** Each account's advisor input from the most recent poll cycle — what the post-switch
    *  stalled-session kick consults to answer "does the switch target have usage left?"
    *  without a blocking re-poll (see {@link resumeUsageStalledSessions}). In-memory only:
    *  an account absent here (daemon just started, or never polled) is treated as usable,
    *  the same unknown-is-not-exhausted posture `hasUsableHeadroom` takes. */
   private readonly latestAdvisorInputs = new Map<string, AccountUsageInput>();
+  /** Whether a poll cycle is running right now. The interval that drives the cycle does not
+   *  wait for it, and one cycle can outlast one interval (the activation probe alone is allowed
+   *  two minutes), so without this a slow cycle would have the next one started on top of it:
+   *  duplicate snapshot pushes to the phone, and a last-write-wins race on
+   *  {@link latestAdvisorInputs} decided by whichever cycle happened to finish second. */
+  private pollCycleInFlight = false;
   private started = false;
 
   constructor(options: DaemonOptions) {
@@ -570,6 +729,10 @@ export class Daemon {
     this.controlPlaneClient = options.controlPlaneClient;
     this.autoSwitcher = options.autoSwitcher;
     this.accountProbe = options.accountProbe;
+    // Falls back to the poller's copy rather than to the defaults: the composition root hands
+    // the SAME policy object to the executor and to the plan, so reading it back off the plan
+    // is reading the executor's policy, not a second one that can drift from it.
+    this.autoSwitchPolicy = options.autoSwitchPolicy ?? options.poller.autoSwitchPolicy ?? {};
     this.settingsReport = options.settingsReport;
     this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
     this.autoContinue = options.autoContinue;
@@ -882,6 +1045,25 @@ export class Daemon {
   }
 
   private async runPollCycle(): Promise<void> {
+    // Skip rather than queue: every phase below re-reads whatever it needs (the registry, the
+    // store, the endpoint), so a cycle that had to wait its turn would only publish a reading
+    // the next tick is about to take anyway. Debug, not warn — one long probe is an ordinary
+    // cycle, and this line exists to explain a gap in the cadence, not to report a fault.
+    if (this.pollCycleInFlight) {
+      this.logger.debug({}, 'poll cycle still running; skipping this tick');
+      return;
+    }
+    this.pollCycleInFlight = true;
+    try {
+      await this.pollCycle();
+    } finally {
+      this.pollCycleInFlight = false;
+    }
+  }
+
+  /** One poll cycle's actual work — see {@link runPollCycle}, which owns the one-at-a-time
+   *  guard around it. */
+  private async pollCycle(): Promise<void> {
     await this.timePhase('attributionJournal.sync', () => this.attributionJournal.sync());
 
     const [accounts, activeId] = await this.timePhase('listAccounts+getActiveId', () =>
@@ -906,15 +1088,20 @@ export class Daemon {
     // this only keeps their (secret) verifiers from idling in memory for the daemon's lifetime.
     this.pendingReauths.sweep(this.clock());
 
-    const snapshot = await this.timePhase('pollAll', () => this.poller.pollAll(pollAccounts));
+    const polled = await this.timePhase('pollAll', () => this.poller.pollAll(pollAccounts));
     // Refresh the post-switch kick's per-account view first, before anything below can
     // fail: even a 'skipped' result carries the poller's last real advisorInput, so this
     // map always holds the freshest numbers the poller has (see resumeUsageStalledSessions).
-    for (const result of snapshot.results) {
+    // Re-stamped from the merged inputs once those exist; this pass is what keeps the view
+    // fresh even when the persist or history phase throws.
+    for (const result of polled.results) {
       this.latestAdvisorInputs.set(result.accountId, result.usage.advisorInput);
     }
+    // Ordered after that refresh so the headroom guard inside the kick reads this cycle's
+    // numbers, not the previous one's.
+    this.noticeActiveAccountChange(activeId, accounts);
     await this.timePhase('persistSnapshots', () => {
-      for (const result of snapshot.results) {
+      for (const result of polled.results) {
         if (result.outcome === 'skipped') continue; // nothing new to persist
         this.store.insertUsageSnapshot({
           accountId: result.accountId,
@@ -950,6 +1137,22 @@ export class Daemon {
       ),
     );
 
+    // The history-derived predictions ride into the advisor inputs HERE, before the plan is
+    // computed — the ONE place they are merged. Without them a DORMANT account is invisible:
+    // the endpoint publishes no reset once a weekly window closes, and an unresolvable weekly
+    // clock disqualifies an account outright, so the accounts holding a full untouched
+    // allowance are exactly the ones nothing would ever reach. Merging them for the executor
+    // alone is worse than not merging at all — the plan the phone renders and the hop the
+    // daemon makes would then be computed from different accounts. The policy labels a
+    // predicted reset and holds it to a stricter bar (see autoswitch.ts); an account with no
+    // history at all carries no prediction and is skipped as before.
+    const snapshot = this.poller.assemble(polled, history.predictedResetByAccount);
+    // Re-stamped from the MERGED inputs, so the post-switch kick reasons about exactly what
+    // the plan and the executor saw.
+    for (const input of snapshot.inputs) {
+      this.latestAdvisorInputs.set(input.accountId, input);
+    }
+
     await this.timePhase('sendUsageSnapshot', () => {
       this.sendEnvelope({
         type: 'usage.snapshot',
@@ -968,30 +1171,40 @@ export class Daemon {
     // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
     // engine failures itself; this catch only guards against bugs in the evaluator so a
     // broken policy can never take down the poll loop.
-    if (this.autoSwitcher) {
-      // The prediction rides along because without it a DORMANT account is invisible to the
-      // policy: the endpoint publishes no reset once a weekly window closes, and an unknown
-      // weekly clock disqualifies an account outright — so the accounts holding a full
-      // untouched allowance are exactly the ones auto-switch would never reach. The policy
-      // labels a predicted reset and holds it to a stricter bar (see autoswitch.ts); an
-      // account with no history at all stays absent here and is skipped as before.
-      const inputs = snapshot.results.map((r) => {
-        const predicted = history.predictedResetByAccount.get(r.accountId);
-        return predicted === undefined
-          ? r.usage.advisorInput
-          : { ...r.usage.advisorInput, predictedResetAt: predicted };
-      });
-      await this.timePhase('autoSwitch', () =>
-        this.autoSwitcher?.evaluate(inputs).catch((err: unknown) => {
+    // Read into a local so the narrowing survives into the callback below (a property's does
+    // not), which is also what lets the evaluation report its hop back without an `?.` swallowing
+    // the value.
+    const autoSwitcher = this.autoSwitcher;
+    if (autoSwitcher !== undefined) {
+      // `snapshot.inputs` — the same array the plan above was computed from, predictions and
+      // all. An executor deciding on anything else is the divergence the merge above exists
+      // to rule out.
+      const hopped = await this.timePhase('autoSwitch', () =>
+        autoSwitcher.evaluate(snapshot.inputs).catch((err: unknown) => {
           this.logger.error({ err }, 'auto-switch evaluation failed');
+          return undefined;
         }),
       );
 
+      // Absorb the hop this daemon just made — BY ITS ID, never by re-reading the live account.
+      // The next cycle compares what it reads against this value and resumes parked sessions on a
+      // difference, which is right for a human's switch and wrong for the policy's own hop
+      // (resuming paused work unattended is a bigger policy step than hopping). A re-read cannot
+      // tell those two apart: a `cctl switch` typed on this host writes the vault directly, so one
+      // landing anywhere between this cycle's own read and here — a window the probe below can
+      // stretch to minutes — would come back as "the active account is X" with nothing to say who
+      // made it X, and be swallowed. An id the evaluator reports is the one thing that names the
+      // author, so nothing else is absorbed and every switch this daemon did not make survives to
+      // the comparison it exists for.
+      if (hopped !== undefined) this.lastObservedActiveId = hopped;
+
       // Inside the auto-switch block on purpose: the probe exists to widen the pool the policy
       // above chooses from, so with no policy running there is nothing to widen it for. Runs
-      // AFTER the evaluation, so a cycle that already had a hop to make makes it first.
+      // AFTER the evaluation, so a cycle that already had a hop to make makes it first. It needs
+      // no absorb of its own: a probe runs its turn in a throwaway config dir precisely so it
+      // never activates anything (see accountProbe.ts), so it moves nothing to absorb.
       await this.timePhase('probeUnknown', () =>
-        this.probeUnknownAccounts(snapshot.results, inputs),
+        this.probeUnknownAccounts(snapshot.results, snapshot.inputs),
       );
     }
 
@@ -1019,7 +1232,12 @@ export class Daemon {
   ): Promise<void> {
     const probe = this.accountProbe;
     if (probe === undefined) return;
-    const candidates = unknownDescentCandidates(results, inputs, this.clock());
+    const candidates = unknownDescentCandidates(
+      results,
+      inputs,
+      this.clock(),
+      this.autoSwitchPolicy,
+    );
     if (candidates.length === 0) return;
     try {
       for (const accountId of await probe.probeUnknown(candidates)) {
@@ -1184,7 +1402,21 @@ export class Daemon {
   // ---- inbound handlers ----
 
   private async handleSwitchCommand(msg: MessageOf<'switch.command'>): Promise<void> {
-    const { requestId, targetAccountId } = msg.payload;
+    const { requestId, targetAccountId, idempotencyKey } = msg.payload;
+    // Check-then-remember synchronously, before the first await, exactly as the sibling
+    // handlers do: two copies of the same frame arriving back to back must not both reach
+    // activate(). Silent (log only) like session.stop — the phone already had its
+    // switch.result from the frame that was applied, and a second one for the same key would
+    // report a switch that did not happen this time.
+    const nowMs = this.clock();
+    if (seenWithin(this.seenSwitchKeys, idempotencyKey, nowMs, SEEN_SWITCH_KEY_TTL_MS)) {
+      this.logger.info({ requestId, idempotencyKey }, 'duplicate switch.command ignored');
+      return;
+    }
+    // Burned up front, on the attempt rather than on success: a failed switch already answers
+    // the phone with an explicit ok:false it can act on, and a replayed frame silently
+    // retrying an activation is the outcome this guard exists to prevent.
+    rememberBoundedAt(this.seenSwitchKeys, idempotencyKey, MAX_SEEN_STOP_KEYS, nowMs);
     try {
       // Phone-side commands carry whatever the user typed — an id or a label. Resolve it the
       // same way `cctl switch` does, or `/switch account:spare` fails while the identical
@@ -1210,7 +1442,11 @@ export class Daemon {
         payload: {
           requestId,
           ok: result.ok,
-          outcome: 'hot_applied',
+          // Read off the SAME fact as `ok`, never hardcoded beside it: `activate()` resolves
+          // only on success today, but a payload that says "hot applied" next to `ok: false`
+          // is a lie the phone would render, and the two fields drifting apart is not a
+          // failure mode worth leaving available.
+          outcome: result.ok ? 'hot_applied' : 'failed',
           activeAccountId: result.activeAccountId,
           message: `switched to ${switchedTo}`,
         },
@@ -1221,6 +1457,10 @@ export class Daemon {
       // that stalled on the previous account's usage limit (auto-switch deliberately does
       // not kick — resuming paused work unattended is a bigger policy step than hopping).
       if (result.ok) {
+        // Recorded as seen BEFORE the kick, so the poll cycle's own change detection (which
+        // exists for switches that never come through here — see noticeActiveAccountChange)
+        // reads this hop as already handled rather than kicking the same sessions twice.
+        this.lastObservedActiveId = resolved.account.id;
         this.resumeUsageStalledSessions(resolved.account.id, resolved.account.label);
       }
     } catch (err) {
@@ -1429,6 +1669,32 @@ export class Daemon {
    * handle's own `resumeFromUsageLimitStall` (blind-fired across the registry; only parked
    * sessions react), so the daemon never has to know what prompt resumes a session.
    */
+  /**
+   * Notice that the ACTIVE account changed since the last poll cycle and treat it like the
+   * `/switch` it is.
+   *
+   * A `cctl switch spare` typed on this host writes the vault directly — it never reaches
+   * {@link handleSwitchCommand} — so the poll cycle is the only place the daemon can observe it
+   * at all. The operator who typed it is exactly as present as the one who typed `/switch` on
+   * the phone, and sessions parked on a usage limit are waiting for precisely this event; before
+   * this, they waited through it. Hops this daemon made itself are absorbed BY ID in the cycle
+   * that made them (see the absorb in {@link pollCycle}), so auto-switch still never resumes
+   * parked work — while a switch it did not make survives to this comparison however late in the
+   * cycle it landed.
+   */
+  private noticeActiveAccountChange(activeId: string | null, accounts: StoredAccount[]): void {
+    const previous = this.lastObservedActiveId;
+    this.lastObservedActiveId = activeId;
+    // First observation of this run, no account at all, or nothing changed: nothing to resume.
+    if (previous === undefined || activeId === null || previous === activeId) return;
+    const label = accounts.find((a) => a.id === activeId)?.label;
+    this.logger.info({ accountId: activeId }, 'active account changed outside this daemon');
+    this.resumeUsageStalledSessions(
+      activeId,
+      label !== undefined && label !== '' ? label : activeId,
+    );
+  }
+
   private resumeUsageStalledSessions(accountId: string, accountLabel: string): void {
     const input = this.latestAdvisorInputs.get(accountId);
     if (input !== undefined && !hasUsableHeadroom(input, this.clock())) {
@@ -1442,7 +1708,12 @@ export class Daemon {
     let kicked = 0;
     for (const record of this.sessionManager.list()) {
       const handle = this.sessionManager.get(record.id);
-      if (handle?.resumeFromUsageLimitStall?.() === true) kicked++;
+      if (handle?.resumeFromUsageLimitStall?.() !== true) continue;
+      kicked++;
+      // The resumed turn runs against the credentials just switched to, so from this frame on
+      // the session IS this account's work — the spawn-time one it was stamped with would
+      // mis-name every status and output line that follows (see {@link sessionAccounts}).
+      this.sessionAccounts.set(record.id, accountId);
     }
     if (kicked === 0) return;
 
@@ -1671,6 +1942,28 @@ export class Daemon {
       this.answerPromptInjectRefusal(msg, record);
       return;
     }
+    // A re-attach inherits the record's working directory, and directories do not outlive
+    // everything that made them (a worktree gets removed, a branch folder is cleaned up). The
+    // SDK child then never produces its first event and the session sits at `starting` forever,
+    // so the same refusal a spawn gives a bad `cwd` has to apply here — while there is still a
+    // request to answer it against.
+    if (record.cwd !== undefined) {
+      const problem = await describeBadDirectory(record.cwd);
+      if (problem !== undefined) {
+        this.logger.warn({ sessionId, cwd: record.cwd }, 'resume refused: bad working directory');
+        this.sendEnvelope({
+          type: 'error',
+          payload: {
+            code: 'resume_failed',
+            message:
+              `prompt.inject: session '${sessionId}' cannot be re-attached because its working ` +
+              `directory ${problem} (${record.cwd})`,
+            relatesTo: msg.id,
+          },
+        });
+        return;
+      }
+    }
     try {
       const resumed = await this.sessionManager.resumeOrphan(sessionId, {
         client: this.createAgentSdkClient(),
@@ -1786,6 +2079,24 @@ export class Daemon {
   private drainManagedInjects(sessionId: string): void {
     const queue = this.pendingManagedInjects.get(sessionId);
     if (queue === undefined || queue.length === 0) return;
+    const handle = this.sessionManager.get(sessionId);
+    if (!handle) {
+      // The session went away between queueing and this boundary; nothing can deliver.
+      this.dropManagedInjects(sessionId);
+      return;
+    }
+    // Idle is not the same as READY. A session parked on a usage limit reports exactly the
+    // `waiting_input` a finished turn does, but sending into it spends a request on the account
+    // that just ran out, ends the park, and re-forms it around this text — so the prompt the
+    // post-switch kick was holding is lost and the operator's /switch resumes the wrong thing.
+    // The queue keeps waiting: the kick's own turn boundary is the one that drains it.
+    if (handle.isParkedOnUsageLimit?.() === true) {
+      this.logger.info(
+        { sessionId, queued: queue.length },
+        'holding queued prompt.inject: the session is parked on a usage limit',
+      );
+      return;
+    }
     const next = queue.shift();
     if (queue.length === 0) this.pendingManagedInjects.delete(sessionId);
     if (next === undefined) return;
@@ -1793,12 +2104,6 @@ export class Daemon {
     // fire-and-forget, and a row still sitting here at the next startup would read as text that
     // never delivered and be reported as lost.
     this.store.deletePendingSteering(next.rowId);
-    const handle = this.sessionManager.get(sessionId);
-    if (!handle) {
-      // The session went away between queueing and this boundary; the rest cannot deliver either.
-      this.dropManagedInjects(sessionId);
-      return;
-    }
     handle.send(next.text).catch((err: unknown) => {
       this.logger.warn({ sessionId, err }, 'queued prompt.inject rejected at the turn boundary');
     });
@@ -1938,6 +2243,18 @@ export class Daemon {
       }
       return false;
     }
+    // Durable from the same instant the operator is told "sent". The registry above is pure
+    // memory, so without this row a kill, a crash or a logoff between here and the channel
+    // server's next poll drops the prompt with nothing anywhere to say it existed — and "sent"
+    // is the last word the phone would ever get on it.
+    const rowId = this.store.insertPendingSteering({
+      sessionId,
+      kind: CHANNEL_STEERING_KIND,
+      text,
+      queuedAtMs: result.queuedAtMs,
+      injectId: result.injectId,
+    });
+    this.channelRows.set(result.injectId, { rowId, sessionId });
     const excerpt = text.length > 120 ? `${text.slice(0, 120)}…` : text;
     this.sendEnvelope({
       type: 'hook.notification',
@@ -1976,36 +2293,71 @@ export class Daemon {
    */
   private recoverChannelInjections(sessionId: string, items: ChannelInjection[]): void {
     if (items.length === 0) return;
+    // Anything the session has already been confirmed to receive is NOT undelivered work. A
+    // `sent` acknowledgement can arrive after the sweep or detach that handed the item back —
+    // same prompt, same inject id — and falling it back anyway delivers the operator's
+    // instruction to the session a second time at its next turn boundary.
+    const undelivered = items.filter((item) => {
+      if (!this.wasDelivered(sessionId, item.injectId)) return true;
+      this.retireChannelRow(item.injectId);
+      return false;
+    });
+    if (undelivered.length === 0) return;
     const tracked = this.readInteractiveSession(sessionId);
     if (tracked === undefined) {
+      // Nothing here can deliver, and nothing later will either, so the durable rows go with the
+      // report: leaving them would have the next daemon start restore text this one has just
+      // told the operator was lost.
+      for (const item of undelivered) this.retireChannelRow(item.injectId);
       this.sendEnvelope({
         type: 'error',
         payload: {
           code: 'channel_detached',
           message:
-            `${items.length} message(s) for session '${sessionId}' were never delivered: its ` +
+            `${undelivered.length} message(s) for session '${sessionId}' were never delivered: its ` +
             `channel closed and the session is not registered, so there is no turn-boundary ` +
             `queue to fall back to. Re-send once it is running again.`,
         },
       });
       this.logger.warn(
-        { sessionId, count: items.length },
+        { sessionId, count: undelivered.length },
         'channel: undelivered injections dropped; session not registered',
       );
       return;
     }
     const queue = this.pendingSteering.get(sessionId) ?? [];
-    const accepted = items.slice(0, Math.max(0, STEERING_QUEUE_CAP - queue.length));
-    const dropped = items.length - accepted.length;
+    const accepted = undelivered.slice(0, Math.max(0, STEERING_QUEUE_CAP - queue.length));
+    const droppedItems = undelivered.slice(accepted.length);
+    const dropped = droppedItems.length;
     for (const item of accepted) {
-      const rowId = this.store.insertPendingSteering({
-        sessionId,
-        kind: INTERACTIVE_STEERING_KIND,
+      // MOVED, not re-inserted: the prompt already has a row (it got one the moment the operator
+      // was told "sent"), and inserting a second one would have a restart restore the same text
+      // twice while the first row never retires. The move also keeps the inject id, which is what
+      // lets a delivery confirmation arriving later still find this entry — and what lets a
+      // replacement channel server take the prompt back as the same prompt.
+      const existing = this.channelRows.get(item.injectId);
+      const rowId =
+        existing?.rowId ??
+        this.store.insertPendingSteering({
+          sessionId,
+          kind: INTERACTIVE_STEERING_KIND,
+          text: item.text,
+          queuedAtMs: item.queuedAtMs,
+          injectId: item.injectId,
+        });
+      if (existing !== undefined) {
+        this.channelRows.delete(item.injectId);
+        this.store.movePendingSteering(existing.rowId, INTERACTIVE_STEERING_KIND, item.injectId);
+      }
+      queue.push({
         text: item.text,
         queuedAtMs: item.queuedAtMs,
+        rowId,
+        injectId: item.injectId,
       });
-      queue.push({ text: item.text, queuedAtMs: item.queuedAtMs, rowId });
     }
+    // Whatever the steering cap refused is lost for real, so its rows go too.
+    for (const item of droppedItems) this.retireChannelRow(item.injectId);
     this.pendingSteering.set(sessionId, queue);
     if (accepted.length > 0) {
       this.sendEnvelope({
@@ -2034,7 +2386,7 @@ export class Daemon {
         payload: {
           code: 'steer_queue_full',
           message:
-            `${dropped} of ${items.length} message(s) recovered from session '${sessionId}'s ` +
+            `${dropped} of ${undelivered.length} message(s) recovered from session '${sessionId}'s ` +
             `closed channel could NOT be queued: its turn-boundary queue is already full at ` +
             `${STEERING_QUEUE_CAP} and nothing is delivering. Those ${dropped} (the most recent) ` +
             `were dropped — re-send them once the session catches up.`,
@@ -2048,29 +2400,227 @@ export class Daemon {
   }
 
   /**
-   * Card the operator about injections the channel queue expired before any client took them.
+   * Card the operator about injections the channel queue expired.
    *
    * The registry drops them (30-minute-old guidance delivered into whatever the session is doing
    * now is worse than nothing) but it is transport-free, so it cannot say so. `takePendingSteering`
    * sends exactly this card for the identical situation on the steering path; the two must not
    * disagree about whether an expiry is worth telling the operator.
+   *
+   * The body separates the two expiries the registry reports, because only one of them is a
+   * statement about what the session did NOT receive. A prompt that aged out in the queue was
+   * never collected by anything. A prompt that aged out IN FLIGHT was handed to a channel server
+   * that never confirmed writing it: the session may have received it, and the only honest thing
+   * this card can say about it is that cctl has stopped waiting. Folding the second into the
+   * first would tell the operator a message did not arrive when it may well have — the same
+   * overstatement in the other direction as rendering an unverifiable write as a delivery.
    */
-  private cardChannelExpiry(sessionId: string, expired: ChannelInjection[]): void {
+  private cardChannelExpiry(sessionId: string, expired: ExpiredInjection[]): void {
+    // Expired means gone, so the durable rows go with them. A row that outlived its expiry would
+    // be restored by the next daemon start as text still waiting to deliver — text this daemon
+    // has just told the operator was dropped.
+    for (const item of expired) this.retireChannelRow(item.injectId);
+    const handedOut = expired.filter((item) => item.handedOut).length;
+    const uncollected = expired.length - handedOut;
+    const minutes = CHANNEL_TTL_MS / 60_000;
+    const clauses: string[] = [];
+    if (uncollected > 0) {
+      clauses.push(
+        `${uncollected} message${uncollected === 1 ? '' : 's'} sent to this session's live ` +
+          `channel aged past ${minutes} minutes before its channel server collected ` +
+          `${uncollected === 1 ? 'it' : 'them'} — dropped, not delivered.`,
+      );
+    }
+    if (handedOut > 0) {
+      clauses.push(
+        `${handedOut}${uncollected > 0 ? ' other' : ''} message${handedOut === 1 ? ' was' : 's were'} ` +
+          `handed to the channel server but never confirmed, and aged past the same ${minutes} ` +
+          `minutes — the session may have received ` +
+          `${handedOut === 1 ? 'it' : 'them'}; nothing is waiting to deliver ` +
+          `${handedOut === 1 ? 'it' : 'them'} now.`,
+      );
+    }
     this.sendEnvelope({
       type: 'hook.notification',
       payload: {
         event: 'notification',
         sessionId,
         title: 'Channel message expired',
-        body:
-          `${expired.length} message${expired.length === 1 ? '' : 's'} sent to this session's ` +
-          `live channel aged past ${CHANNEL_TTL_MS / 60_000} minutes before its channel server ` +
-          `collected ${expired.length === 1 ? 'it' : 'them'} — dropped, not delivered.`,
+        body: clauses.join(' '),
         level: 'warn',
         notificationType: 'channel_expired',
       },
     });
-    this.logger.warn({ sessionId, count: expired.length }, 'channel: queued injections expired');
+    this.logger.warn(
+      { sessionId, count: expired.length, handedOut },
+      'channel: queued injections expired',
+    );
+  }
+
+  /**
+   * Put a freshly-attached session's queued prompts back on its channel.
+   *
+   * The counterpart to {@link recoverChannelInjections}, and the reason that fallback is not a
+   * one-way trip. Everything that retires a channel — a clean detach, a dead pid, the stale
+   * sweep, this daemon's own shutdown — moves undelivered prompts onto the turn-boundary queue,
+   * where they wait for a boundary an IDLE session never reaches. A replacement channel server
+   * attaching for the same session is exactly the moment those prompts could be delivered at
+   * once, so that is when they come back. Without this the operator's prompt waits forever behind
+   * a card that said "Sent to live session", and every later prompt overtakes it.
+   *
+   * EVERYTHING queued for the session is promoted, not only what fell off a channel. A plain
+   * `/say` that arrived in the second between the session starting and its channel server
+   * finishing its identity resolution is in exactly the same position — queued against a boundary
+   * that may never come, when a live channel is now available — and it is indistinguishable from
+   * the fallback case to the person waiting on it. Promoting is never a downgrade: the channel is
+   * the faster of the two paths, and anything it cannot take stays where it is.
+   *
+   * Deliberately NOT carded. The operator has already been told these deliver at a turn boundary;
+   * promotion only makes them arrive sooner, and this project's card discipline is about never
+   * OVERSTATING delivery. A third card per message would be noise about good news.
+   */
+  private promoteSteeringToChannel(sessionId: string): void {
+    const queue = this.pendingSteering.get(sessionId);
+    if (queue === undefined || queue.length === 0) return;
+    // Mint an id for anything that has never been on a channel: the channel path acks by inject
+    // id, so an item without one could be delivered but never confirmed, and would then be
+    // recovered and delivered again.
+    const candidates = queue.map((entry) => ({
+      entry,
+      injection: {
+        injectId: entry.injectId ?? randomUUID(),
+        text: entry.text,
+        queuedAtMs: entry.queuedAtMs,
+      } satisfies ChannelInjection,
+    }));
+    const { accepted } = this.channels.restore(
+      sessionId,
+      candidates.map((c) => c.injection),
+    );
+    if (accepted.length === 0) return;
+    const promoted = new Set(accepted.map((item) => item.injectId));
+    for (const { entry, injection } of candidates) {
+      if (!promoted.has(injection.injectId)) continue;
+      // The row MOVES between queues rather than being rewritten, so the prompt keeps its arrival
+      // order and its original queue time; only which path owns it changes.
+      this.store.movePendingSteering(entry.rowId, CHANNEL_STEERING_KIND, injection.injectId);
+      this.channelRows.set(injection.injectId, { rowId: entry.rowId, sessionId });
+    }
+    const remaining = candidates
+      .filter(({ injection }) => !promoted.has(injection.injectId))
+      .map(({ entry }) => entry);
+    if (remaining.length === 0) this.pendingSteering.delete(sessionId);
+    else this.pendingSteering.set(sessionId, remaining);
+    this.logger.info(
+      { sessionId, promoted: accepted.length, stillQueued: remaining.length },
+      'channel: queued prompts promoted onto a newly attached channel',
+    );
+  }
+
+  /**
+   * Record that a session's channel confirmed one prompt, and retire that prompt wherever it is.
+   *
+   * `sent` is the daemon's only evidence a prompt reached the session, and it can arrive after
+   * the item has already been handed back for turn-boundary delivery — a sweep, a detach or a
+   * shutdown landing between the push and the acknowledgement. Retiring the entry here is what
+   * stops the same operator instruction being delivered a second time, and remembering the id is
+   * what stops a recovery running the OTHER way round from re-queuing it a moment later.
+   */
+  private markInjectDelivered(sessionId: string | undefined, injectId: string): void {
+    // Whose prompt this is, even when the attachment that confirmed it has already been retired:
+    // the row bookkeeping remembers the session, and without that attribution a confirmation
+    // arriving after a sweep cannot stop the same text being delivered again.
+    const owner = sessionId ?? this.channelRows.get(injectId)?.sessionId;
+    this.retireChannelRow(injectId);
+    // Cancelling a queued prompt is a delete of an operator's message, so when the ack CAN be
+    // attributed it is honoured only against the session it came from. An inject id names one
+    // session's prompt; an ack for it arriving over a DIFFERENT session's channel is not evidence
+    // that prompt was delivered, and acting on it would silently swallow a message nothing has
+    // confirmed anything about.
+    //
+    // With no attributable owner every queue is searched, because the id is then the only
+    // evidence there is — and it is good evidence: it is a uuid this daemon minted and handed to
+    // exactly one channel, so a queue carrying it IS the prompt being confirmed. That case is the
+    // ordinary late ack (an attachment the registry has already dropped takes its row bookkeeping
+    // with it), and refusing it there would re-deliver the instruction at the next turn boundary.
+    const scope = owner === undefined ? [...this.pendingSteering.keys()] : [owner];
+    for (const queueSessionId of scope) {
+      const queue = this.pendingSteering.get(queueSessionId);
+      if (queue === undefined) continue;
+      const index = queue.findIndex((entry) => entry.injectId === injectId);
+      if (index === -1) continue;
+      const [removed] = queue.splice(index, 1);
+      if (removed !== undefined) this.store.deletePendingSteering(removed.rowId);
+      if (queue.length === 0) this.pendingSteering.delete(queueSessionId);
+      this.rememberDelivered(queueSessionId, injectId);
+      this.logger.info(
+        { sessionId: queueSessionId, injectId },
+        'channel: delivery confirmed after the prompt had already fallen back; not re-delivering',
+      );
+      return;
+    }
+    if (owner !== undefined) this.rememberDelivered(owner, injectId);
+  }
+
+  /** Forget the durable row mirroring one channel-held prompt, if this daemon still owns it. A
+   *  prompt that has already moved to the turn-boundary queue is not in this map and is not this
+   *  method's business — its row belongs to that queue now. */
+  private retireChannelRow(injectId: string): void {
+    const row = this.channelRows.get(injectId);
+    if (row === undefined) return;
+    this.channelRows.delete(injectId);
+    this.store.deletePendingSteering(row.rowId);
+  }
+
+  /**
+   * Remember one delivered inject id, evicting once past either bound.
+   *
+   * The MAP of sessions evicts least-recently-used, not oldest-inserted. Both bounds exist to
+   * stop a long-lived daemon leaking, and under insertion order the session it drops first is the
+   * one it saw first — which on a daemon that has been up for days is the session the operator
+   * has been working in all along, while sixty-four sessions they opened once each are kept. An
+   * eviction is a silently re-delivered prompt, so it has to fall on the session least likely to
+   * need this memory next, and use — a write here or a read in {@link wasDelivered} — is the only
+   * signal there is.
+   *
+   * Each session's own ids stay insertion-ordered: an id is written once and never confirmed
+   * again, so for them insertion order already IS recency, and a second structure would buy
+   * nothing.
+   */
+  private rememberDelivered(sessionId: string, injectId: string): void {
+    const seen = this.touchDelivered(sessionId) ?? new Set<string>();
+    // Re-inserted even when it already existed — that is what moves it to the newest end.
+    this.deliveredInjects.set(sessionId, seen);
+    // Evicted AFTER the insert, so the session just used can never be the one dropped: a Map
+    // iterates insertion order, and this key is now the last of them.
+    if (this.deliveredInjects.size > DELIVERED_INJECT_SESSIONS) {
+      const oldest = this.deliveredInjects.keys().next();
+      if (!oldest.done) this.deliveredInjects.delete(oldest.value);
+    }
+    seen.add(injectId);
+    if (seen.size > DELIVERED_INJECT_MEMORY) {
+      const oldest = seen.keys().next();
+      if (!oldest.done) seen.delete(oldest.value);
+    }
+  }
+
+  /** Mark a session as the most recently used one and hand back its remembered ids, if it has
+   *  any. Deleting and re-inserting is how a key becomes the newest in a Map — there is no
+   *  cheaper way to move one, and the alternative is carrying a second index for a structure
+   *  bounded at {@link DELIVERED_INJECT_SESSIONS} entries. */
+  private touchDelivered(sessionId: string): Set<string> | undefined {
+    const seen = this.deliveredInjects.get(sessionId);
+    if (seen === undefined) return undefined;
+    this.deliveredInjects.delete(sessionId);
+    this.deliveredInjects.set(sessionId, seen);
+    return seen;
+  }
+
+  /** Was this prompt already confirmed delivered to this session? A read counts as use: asking
+   *  is what a session does while its channel is churning, and that is exactly when its memory
+   *  must not be the next one evicted. */
+  private wasDelivered(sessionId: string, injectId: string): boolean {
+    return this.touchDelivered(sessionId)?.has(injectId) === true;
   }
 
   /**
@@ -2161,7 +2711,7 @@ export class Daemon {
     const undeliverable = new Map<string, number>();
     let restored = 0;
     for (const row of rows) {
-      if (row.kind !== INTERACTIVE_STEERING_KIND) {
+      if (row.kind !== INTERACTIVE_STEERING_KIND && row.kind !== CHANNEL_STEERING_KIND) {
         this.store.deletePendingSteering(row.id);
         undeliverable.set(row.sessionId, (undeliverable.get(row.sessionId) ?? 0) + 1);
         continue;
@@ -2171,10 +2721,26 @@ export class Daemon {
         expired.set(row.sessionId, (expired.get(row.sessionId) ?? 0) + 1);
         continue;
       }
+      if (row.kind === CHANNEL_STEERING_KIND) {
+        // A prompt that was on a live channel when the previous daemon died cannot go straight
+        // back on one: nothing is attached yet, and whether that session's channel server is even
+        // still running is not knowable here. So it joins the turn-boundary queue, which is a
+        // real delivery path for a terminal session that outlived the daemon — and if a channel
+        // server does re-attach, `attach` promotes it straight back onto the faster path. The
+        // kind moves with it, because the map and the rows must not disagree about which queue
+        // owns the prompt: a row left tagged 'channel' would survive the delete that retires this
+        // queue and be restored again at the NEXT start, long after it delivered.
+        this.store.movePendingSteering(row.id, INTERACTIVE_STEERING_KIND, row.injectId);
+      }
       // Rows arrive id-ordered, and the id IS arrival order, so appending rebuilds each queue in
       // the order the operator wrote it — the one property they will notice if it is wrong.
       const queue = this.pendingSteering.get(row.sessionId) ?? [];
-      queue.push({ text: row.text, queuedAtMs: row.queuedAtMs, rowId: row.id });
+      queue.push({
+        text: row.text,
+        queuedAtMs: row.queuedAtMs,
+        rowId: row.id,
+        injectId: row.injectId,
+      });
       this.pendingSteering.set(row.sessionId, queue);
       restored += 1;
     }
@@ -2497,6 +3063,27 @@ export class Daemon {
         'found orphaned sessions from a previous run; each re-attaches on its next operator prompt',
       );
     }
+    // A session that was PARKED on a usage limit was promised something the others were not:
+    // "it resumes after a switch to an account with usage left". The process holding it is gone,
+    // so no switch can resume it any more and nothing else would ever say so — the phone would
+    // just stop hearing from a session it was told was waiting. Recovery makes it re-attachable
+    // (an orphan), and this is the card that tells the operator it is on them now.
+    for (const record of orphaned.filter((r) => r.parkedOnUsageLimit === true)) {
+      this.sendEnvelope({
+        type: 'hook.notification',
+        payload: {
+          event: 'notification',
+          sessionId: record.id,
+          title: 'A parked session did not survive the restart',
+          body:
+            `Session ${record.id} was parked on a usage limit when the daemon stopped, so the ` +
+            `switch that would have resumed it never reached it. Send it a message to pick it ` +
+            `up where it stopped.`,
+          level: 'warn',
+          notificationType: 'usage_stall_lost',
+        },
+      });
+    }
   }
 
   /**
@@ -2511,12 +3098,20 @@ export class Daemon {
     accountId: string | undefined,
     spawnOrigin?: SpawnOrigin,
   ): void {
+    // The account is looked up per event rather than closed over, because it can change under a
+    // live session (see {@link sessionAccounts}). This is where it is seeded: a spawn's payload
+    // or a re-attached record's account is the truth until a switch says otherwise.
+    if (accountId !== undefined) this.sessionAccounts.set(handle.id, accountId);
     handle.onEvent((event) => {
+      const runningAs = this.sessionAccounts.get(handle.id) ?? accountId;
       if (event.kind === 'status' && (event.state === 'done' || event.state === 'failed')) {
         this.sweepManagedPermissionRoutes(handle.id);
         this.sweepManagedQuestionRoutes(handle.id);
+        // Read above, dropped here: the terminal frame still names the account the session was
+        // actually running under when it ended.
+        this.sessionAccounts.delete(handle.id);
       }
-      this.forwardSessionEvent(handle.id, accountId, event, spawnOrigin);
+      this.forwardSessionEvent(handle.id, runningAs, event, spawnOrigin);
     });
     // Optional on SessionHandle (observed terminals have no structured permission seam);
     // managed handles always implement it.
@@ -2734,7 +3329,13 @@ export class Daemon {
     return {
       attach: (input) => {
         const result = this.channels.attach(input);
-        if (result.ok) return { ok: true, attachId: result.attachment.attachId };
+        if (result.ok) {
+          // The session has a live channel again, so anything of its own that has been waiting
+          // for a turn boundary can take the faster path instead — including prompts a previous
+          // channel handed back, and prompts this daemon restored from a previous run.
+          this.promoteSteeringToChannel(input.sessionId);
+          return { ok: true, attachId: result.attachment.attachId };
+        }
         // A shutdown refusal is retryable and a duplicate server is not, so the client can back
         // off in one case and exit in the other instead of guessing from prose.
         return result.reason === 'closing'
@@ -2746,7 +3347,16 @@ export class Daemon {
       },
       take: (attachId, source) => this.channels.take(attachId, source),
       ack: (attachId, injectId, state) => {
+        // Read the attachment BEFORE the ack, so a confirmation still names its session even for
+        // an item the registry no longer holds.
+        const sessionId = this.channels.get(attachId)?.sessionId;
         const result = this.channels.ack(attachId, injectId, state);
+        if (state === 'sent') {
+          // Acted on whatever the registry says, because a `sent` ack is proof of delivery even
+          // when it arrives after the item was handed back — which is precisely the case that
+          // otherwise delivers the operator's instruction twice.
+          this.markInjectDelivered(sessionId, injectId);
+        }
         if (result.requeued) {
           this.logger.warn(
             { attachId, injectId },
@@ -2968,7 +3578,19 @@ export class Daemon {
     // gated on the registry), and a later re-register must not inherit stale guidance — neither
     // from this run nor, now that the queue is persisted, from any earlier one.
     this.pendingSteering.delete(existing.id);
-    this.store.deletePendingSteeringForSession(existing.id, INTERACTIVE_STEERING_KIND);
+    // EVERY kind, not just this queue's. The same prompt is tagged `channel` while it sits on a
+    // live channel, and a delete scoped to one tag leaves that row in the table — where the next
+    // daemon start reloads it onto the turn-boundary queue as text still waiting to deliver. Then
+    // a re-register of the same session id inherits exactly the stale guidance from a dead
+    // channel this promises it will not, and the first Stop hook hands it over.
+    for (const kind of ALL_STEERING_KINDS) {
+      this.store.deletePendingSteeringForSession(existing.id, kind);
+    }
+    // The in-memory half of the same promise: whatever is still sitting on the session's live
+    // channel is the same operator text by a faster route, and the registry would go on handing
+    // it to a channel server for a session this daemon has just been told to stop tracking. Their
+    // rows have gone with the delete above, so only the id bookkeeping is left to retire.
+    for (const item of this.channels.discard(existing.id)) this.channelRows.delete(item.injectId);
     this.rememberSessionCmdKey(input.idempotencyKey);
     // Echo the view of what was removed so the CLI can confirm WHICH session it just forgot.
     return { ok: true, status: 'applied', session: interactiveView(existing) };

@@ -118,7 +118,11 @@ describe('HookReceiver', () => {
     });
 
     it('answers an over-cap body with a 400 the sender can read, not a reset socket', async () => {
-      const huge = JSON.stringify({ event: 'Stop', pad: 'x'.repeat(1_000_100) });
+      // Several MB, not a few bytes over: the cap is hit on an early chunk and the rest of the
+      // upload keeps arriving, which is what makes the receiver DRAIN the remainder rather than
+      // leave a paused stream (or tear the socket down) between the refusal and the response.
+      // A body that fits in roughly one chunk never exercises that path at all.
+      const huge = JSON.stringify({ event: 'Stop', pad: 'x'.repeat(8_000_000) });
       const res = await post(port, '/', huge, { 'x-claude-control-secret': SECRET });
       expect(res.status).toBe(400);
       expect(res.body).toMatchObject({ ok: false, error: 'malformed body: body too large' });

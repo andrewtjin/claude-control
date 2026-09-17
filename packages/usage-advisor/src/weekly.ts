@@ -14,7 +14,10 @@
 //   - RESET is the soonest still-future reset across BOTH weekly kinds. They are two views of
 //     one weekly window and the endpoint stamps them within the same second, so taking either
 //     is honest; taking whichever is actually present is what stops a `weekly_all` entry with
-//     a null reset from shadowing a `weekly_scoped` entry that has one.
+//     a null reset from shadowing a `weekly_scoped` entry that has one. The one exception is
+//     a snapshot that contradicts itself: when the limit that supplied the PERCENT carries a
+//     reset already in the past, that percent describes a window which has rolled, and the
+//     sibling's future reset is not its clock — see `selectWeeklyBudget`.
 //   - When neither kind carries a future reset, the caller's history-derived PREDICTION stands
 //     in, flagged so no renderer can present a prediction as an observation.
 //
@@ -54,9 +57,20 @@ export function selectWeeklyBudget(
   const source = withPercent.find((l) => l.kind === 'weekly_all') ?? withPercent[0] ?? weekly[0];
   if (source === undefined) return undefined;
 
+  // The clock must describe the SAME window as the percent above.
+  //
+  // An ABSENT reset on the percent's own limit says nothing, so the sibling limit answers for
+  // it — two views of one weekly window, stamped by the endpoint within the same second (that
+  // is the rule this module exists to encode). A reset the percent's own limit reports as
+  // already PAST is different: it is positive evidence that this entry describes a window which
+  // has since rolled, so its percent is stale too. Borrowing the sibling's still-future reset
+  // there would pair a closed window's usage with a live clock and hand it to every renderer as
+  // an OBSERVED fact. When that happens, fall back to the prediction (which is flagged as one)
+  // or report no clock at all — both are honest, and a wrong deadline is not.
+  const sourceResetIsStale = isFiniteNumber(source.resetsAt) && source.resetsAt <= nowMs;
   // A prediction is only a clock if it points forward. A caller handing back a stale one
   // (history that never caught up) is refused here rather than fed to a reset simulation.
-  const observed = soonestFutureReset(weekly, nowMs);
+  const observed = sourceResetIsStale ? undefined : soonestFutureReset(weekly, nowMs);
   const usablePrediction =
     isFiniteNumber(predictedResetAt) && predictedResetAt > nowMs ? predictedResetAt : undefined;
   const resetsAt = observed ?? usablePrediction;

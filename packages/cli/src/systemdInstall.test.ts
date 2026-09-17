@@ -25,10 +25,15 @@ function memFs(initial: Record<string, string> = {}) {
   return { fs, files };
 }
 
-/** Records every `systemctl --user` / `loginctl` call; `activeState` answers the query and
- *  `failOn` injects a failure for one verb. */
+/** Records every `systemctl --user` / `loginctl` call; `activeState` and `unitFileState` answer
+ *  the two `show -p … --value` queries (an enabled unit is the default, since that is what a
+ *  successful install leaves behind) and `failOn` injects a failure for one verb. */
 function fakeSystemd(
-  options: { activeState?: string; failOn?: (args: string[]) => Error | undefined } = {},
+  options: {
+    activeState?: string;
+    unitFileState?: string;
+    failOn?: (args: string[]) => Error | undefined;
+  } = {},
 ) {
   const calls: string[][] = [];
   const lingerCalls: string[][] = [];
@@ -36,7 +41,11 @@ function fakeSystemd(
     calls.push(args);
     const failure = options.failOn?.(args);
     if (failure) throw failure;
-    if (args[0] === 'show') return options.activeState ?? 'inactive';
+    if (args[0] === 'show') {
+      return args[2] === 'UnitFileState'
+        ? (options.unitFileState ?? 'enabled')
+        : (options.activeState ?? 'inactive');
+    }
     return '';
   };
   const loginctl: LoginctlRunner = (args) => {
@@ -100,15 +109,51 @@ describe('installDaemonUnit', () => {
     expect(lingerCalls).toEqual([['enable-linger']]);
   });
 
-  it('is unchanged for identical content and runs nothing at all', () => {
+  it('is unchanged for identical content that is already enabled, asking only that', () => {
     const { fs } = memFs({ [UNIT]: renderDaemonUnit(shimPath) });
     const { run, loginctl, calls, lingerCalls } = fakeSystemd();
     expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toEqual({
       outcome: 'unchanged',
       notes: [],
     });
-    expect(calls).toEqual([]);
+    expect(calls).toEqual([['show', '-p', 'UnitFileState', '--value', DAEMON_UNIT_NAME]]);
     expect(lingerCalls).toEqual([]);
+  });
+
+  it('re-enables a unit whose file is current but which the manager never enabled', () => {
+    // The state a failed `enable` used to leave behind: the file is exactly right, so a
+    // content-only check calls it 'unchanged' forever while nothing starts it at login.
+    const { fs } = memFs({ [UNIT]: renderDaemonUnit(shimPath) });
+    const { run, loginctl, calls } = fakeSystemd({ unitFileState: 'disabled' });
+    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT }).outcome).toBe(
+      'updated',
+    );
+    expect(calls).toContainEqual(['enable', DAEMON_UNIT_NAME]);
+  });
+
+  it('leaves a current unit alone when the manager will not say whether it is enabled', () => {
+    // `show` exits 0 with an EMPTY value for a unit the manager has never been told about. That
+    // is not a "disabled" — it is no answer at all — and reading it as one rewrites and
+    // re-enables an already-correct unit on every install, reporting each no-op as work done.
+    const { fs } = memFs({ [UNIT]: renderDaemonUnit(shimPath) });
+    const { run, loginctl, calls, lingerCalls } = fakeSystemd({ unitFileState: '' });
+    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toEqual({
+      outcome: 'unchanged',
+      notes: [],
+    });
+    expect(calls).toEqual([['show', '-p', 'UnitFileState', '--value', DAEMON_UNIT_NAME]]);
+    expect(lingerCalls).toEqual([]);
+  });
+
+  it('leaves a current unit alone when the manager cannot be asked at all', () => {
+    // The same non-answer by a different route: no bus, no systemctl, nothing to ask.
+    const { fs } = memFs({ [UNIT]: renderDaemonUnit(shimPath) });
+    const { run, loginctl } = fakeSystemd({
+      failOn: (args) => (args[0] === 'show' ? new Error('Failed to connect to bus') : undefined),
+    });
+    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT }).outcome).toBe(
+      'unchanged',
+    );
   });
 
   it('rewrites and reloads when the shim moves', () => {
@@ -137,14 +182,74 @@ describe('installDaemonUnit', () => {
     expect(calls).toContainEqual(['enable', DAEMON_UNIT_NAME]);
   });
 
-  it('propagates an enable failure', () => {
-    const { fs } = memFs();
+  it('propagates an enable failure and takes the unregistered file back out', () => {
+    const { fs, files } = memFs();
     const { run, loginctl } = fakeSystemd({
       failOn: (args) => (args[0] === 'enable' ? new Error('Failed to enable unit') : undefined),
     });
     expect(() => installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toThrow(
       'Failed to enable unit',
     );
+    // A file the manager never linked is not a registration; leaving it behind is what made the
+    // next install a no-op.
+    expect(files.has(UNIT)).toBe(false);
+  });
+
+  it('restores the previous unit when a rewrite cannot be enabled, and re-reads it to the manager', () => {
+    const previous = renderDaemonUnit('/old/bin/cctl');
+    const { fs, files } = memFs({ [UNIT]: previous });
+    const { run, loginctl, calls } = fakeSystemd({
+      failOn: (args) => (args[0] === 'enable' ? new Error('Failed to connect to bus') : undefined),
+    });
+    expect(() => installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toThrow(
+      'Failed to connect to bus',
+    );
+    // The still-registered old unit outlives a failed upgrade rather than being replaced by one
+    // that was never enabled.
+    expect(files.get(UNIT)).toBe(previous);
+    // …and the manager is told, because the reload before the failed enable already handed it
+    // the NEW text: without this it holds a parsed definition for content no longer on disk, and
+    // a `systemctl --user start` in between would run the unit nobody has.
+    expect(calls).toEqual([['daemon-reload'], ['enable', DAEMON_UNIT_NAME], ['daemon-reload']]);
+  });
+
+  it('does not let a failing rollback reload replace the failure the caller has to see', () => {
+    const previous = renderDaemonUnit('/old/bin/cctl');
+    const { fs, files } = memFs({ [UNIT]: previous });
+    let reloads = 0;
+    const { run, loginctl } = fakeSystemd({
+      failOn: (args) => {
+        if (args[0] === 'enable') return new Error('Failed to connect to bus');
+        // The bus is gone, so the rollback's own reload cannot work either — which must not
+        // become the error the operator reads, nor abandon the restored file.
+        if (args[0] === 'daemon-reload' && ++reloads > 1) return new Error('reload also failed');
+        return undefined;
+      },
+    });
+    expect(() => installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toThrow(
+      'Failed to connect to bus',
+    );
+    expect(files.get(UNIT)).toBe(previous);
+  });
+
+  it('retries and enables on the next install after a failed one', () => {
+    const { fs, files } = memFs();
+    let allowEnable = false;
+    const { run, loginctl, calls } = fakeSystemd({
+      failOn: (args) =>
+        args[0] === 'enable' && !allowEnable ? new Error('Failed to connect to bus') : undefined,
+    });
+    expect(() => installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT })).toThrow(
+      'Failed to connect to bus',
+    );
+    allowEnable = true;
+    calls.length = 0;
+
+    expect(installDaemonUnit({ shimPath, run, loginctl, fs, unitPath: UNIT }).outcome).toBe(
+      'created',
+    );
+    expect(calls).toContainEqual(['enable', DAEMON_UNIT_NAME]);
+    expect(files.get(UNIT)).toBe(renderDaemonUnit(shimPath));
   });
 });
 
@@ -168,12 +273,26 @@ describe('queryDaemonUnit', () => {
     expect(calls).toEqual([]);
   });
 
-  it("reports the manager's ActiveState for a registered unit", () => {
+  it("reports the manager's ActiveState and UnitFileState for an enabled unit", () => {
     const { fs } = memFs({ [UNIT]: renderDaemonUnit(shimPath) });
     const { run } = fakeSystemd({ activeState: 'active' });
     expect(queryDaemonUnit({ run, fs, unitPath: UNIT })).toEqual({
       registered: true,
       state: 'active',
+      enabled: 'enabled',
+    });
+  });
+
+  it('does not call a present-but-disabled unit registered', () => {
+    // It will not start at the next login, so a green "registered" line would hide the only
+    // thing wrong with this host — and `cctl daemon install`, which the unregistered line
+    // recommends, is exactly the fix.
+    const { fs } = memFs({ [UNIT]: renderDaemonUnit(shimPath) });
+    const { run } = fakeSystemd({ activeState: 'active', unitFileState: 'disabled' });
+    expect(queryDaemonUnit({ run, fs, unitPath: UNIT })).toEqual({
+      registered: false,
+      state: 'active',
+      enabled: 'disabled',
     });
   });
 

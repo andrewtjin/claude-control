@@ -313,12 +313,27 @@ function worstPercent(limits: LimitInput[], now: number): number | undefined {
   return worstLimit(limits, now)?.percent;
 }
 
-/** The limit behind `worstPercent`, so a reason can name it. On a tie the first reported one
- *  wins — deterministic, and the endpoint lists the 5h window before the weekly limits. */
+/** How a tie on percent is broken: the widest budget first. Only reached when two live limits
+ *  report the SAME percent, and only the NAME the reason quotes is at stake (the percent is
+ *  identical either way). Input order is the wrong answer there because the endpoint lists the
+ *  5h window before the weekly ones: an account simultaneously out of its 5-hour window and out
+ *  of its week would be reported as "at 100% of its 5-hour window", which reads as "back in a
+ *  few hours" when in fact the week is gone. Naming the longest-lived constraint is the honest
+ *  answer, and a total order keeps the pick deterministic. */
+const LIMIT_TIE_RANK: Record<LimitInput['kind'], number> = {
+  weekly_all: 3,
+  weekly_scoped: 2,
+  session: 1,
+};
+
+/** The limit behind `worstPercent`, so a reason can name it. */
 function worstLimit(limits: LimitInput[], now: number): LimitInput | undefined {
   const live = effectiveLimits(limits, now);
   if (live.length === 0) return undefined;
-  return live.reduce((worst, l) => (l.percent > worst.percent ? l : worst));
+  return live.reduce((worst, l) => {
+    if (l.percent !== worst.percent) return l.percent > worst.percent ? l : worst;
+    return LIMIT_TIE_RANK[l.kind] > LIMIT_TIE_RANK[worst.kind] ? l : worst;
+  });
 }
 
 /** How a reason names each limit kind — the words the usage table already uses for them. */

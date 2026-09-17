@@ -37,10 +37,12 @@ import { classifyFailureText } from './apiFailure.js';
  * nothing (re-asking is exact; `continue` into an unanswered prompt is a guess).
  */
 export interface AutoContinuePolicy {
-  /** Consecutive transient failures tolerated before giving up as `failed`. The counter
-   *  resets only on a CLEAN turn completion (`turn_result ok:true`), never on partial
-   *  progress — a flapping API that always dies mid-turn must still exhaust the budget
-   *  rather than retry forever. Default 5. */
+  /** Transient failures tolerated before giving up as `failed`, counted per RETRY LINEAGE:
+   *  every retry of the same original turn spends one, and a turn a human (or the post-switch
+   *  kick) starts begins a new lineage with a full budget. Partial progress does not refill it
+   *  — a flapping API that always dies mid-turn must exhaust the budget rather than retry
+   *  forever — and a failure reported by a turn some later turn has already superseded spends
+   *  nothing, because it is not a failure of the work the session is doing now. Default 5. */
   maxAttempts?: number;
   /** First retry delay; doubles per consecutive failure. Default 15s. */
   baseDelayMs?: number;
@@ -162,6 +164,48 @@ export interface ManagedSessionOptions {
   /** Ride out transient API failures instead of going `failed` — see {@link AutoContinuePolicy}.
    *  Omitted = today's behavior (any failed turn is terminal). */
   autoContinue?: AutoContinuePolicy;
+  /** Called whenever the session PARKS on a usage limit (`true`) or leaves the park because a
+   *  turn started (`false`). A registry-facing side channel like {@link onSessionId}, and for
+   *  the same reason: the park is the one idle state a session can be in that a restart cannot
+   *  infer from the record, because shutdown stamps a parked session terminal exactly like a
+   *  finished one — and the operator was told it resumes after a switch. Fires only on a
+   *  CHANGE, so a listener can persist it without debouncing. */
+  onUsageLimitPark?: (parked: boolean) => void;
+}
+
+/**
+ * One turn's identity and its private bookkeeping.
+ *
+ * Turns need identity because a turn's stream can outlive the turn's OUTCOME: the SDK reports
+ * a failure and keeps the iterator open, so events (a straggler `turn_result`, a late throw)
+ * can arrive after the session has already moved on to a retry, a human's reply, or a
+ * post-switch resume. Held in session-level variables — as the failure latch and the output
+ * flag once were — those stragglers decide things for a turn that is no longer running: a
+ * second failure gets handled, a second retry gets scheduled, and the budget meant to bound
+ * the loop is spent on the wrong lineage. Attributing every event to the turn that produced it
+ * makes "is this still the session's current work?" a one-line question with one answer.
+ */
+interface TurnContext {
+  /** Monotonic within a session; only the LATEST turn's events are acted on. */
+  id: number;
+  /** What started this turn — re-asked verbatim if it dies having produced nothing. */
+  prompt: string;
+  /** How many auto-continue retries have already run for the original turn this one descends
+   *  from. 0 for a turn started by the kickoff, a human `send()` or the stall kick. */
+  attempt: number;
+  /** Whether this turn produced real output, which is what makes `continue` meaningful. */
+  producedOutput: boolean;
+  /** Exactly one failure decision per turn: an `error`, the failed `turn_result` behind it and
+   *  a stream throw after either are all the same death. */
+  failureHandled: boolean;
+}
+
+/** A retry that has come due: the prompt to run, the budget it spends, and the turn whose
+ *  failure it answers (so a retry can tell it has been superseded). */
+interface PendingRetry {
+  prompt: string;
+  attempt: number;
+  forTurnId: number;
 }
 
 /** Map a structured SDK event straight to its display event. The kind is already known here,
@@ -243,28 +287,25 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
   // any await), so a caller who calls send() twice without awaiting between still gets a
   // deterministic accept/reject in call order.
   let busy = false;
+  // The turn the session is currently doing, by id. Everything a turn reports is checked
+  // against this: a stream that keeps delivering after its turn was superseded is talking
+  // about work the session has already replaced (see TurnContext).
+  let latestTurnId = 0;
+  let turnSeq = 0;
   // ---- auto-continue (see AutoContinuePolicy) ----
   const autoContinue = opts.autoContinue;
   const acMaxAttempts = autoContinue?.maxAttempts ?? DEFAULT_AUTO_CONTINUE_MAX_ATTEMPTS;
   const acBaseDelayMs = autoContinue?.baseDelayMs ?? DEFAULT_AUTO_CONTINUE_BASE_DELAY_MS;
   const acMaxDelayMs = autoContinue?.maxDelayMs ?? DEFAULT_AUTO_CONTINUE_MAX_DELAY_MS;
   const schedule = autoContinue?.schedule ?? defaultSchedule;
-  // Consecutive transient failures with no clean turn completion between them — the
-  // give-up bar. Reset only by `turn_result ok:true` (or a human send), never by partial
-  // progress, so a flapping API exhausts the budget instead of retrying forever.
-  let consecutiveFailures = 0;
   // Cancels the scheduled retry turn; present only during a backoff wait. Anyone who
   // starts different work (send/interrupt/stop, or a surprise successful turn_result)
   // must cancel it so a stale retry can never fire into their session.
   let cancelRetry: (() => void) | undefined;
-  // Per-turn (reset at runTurn start): the prompt that started the current turn — re-asked
-  // verbatim when the turn dies before producing anything — and whether the turn produced
-  // any real output, which flips the retry prompt to the CLI's documented `continue`.
-  let currentTurnPrompt = opts.prompt;
-  let turnProducedOutput = false;
-  // Per-turn latch: an `error` event, the failed `turn_result` behind it, and a stream
-  // throw after either are the SAME death — exactly one failure decision per turn.
-  let failureHandled = false;
+  // A retry whose backoff already elapsed but whose failed turn was STILL streaming, so it
+  // waits for that turn's teardown instead of running beside it (see startRetry). Cancelled
+  // by the same callers that cancel the timer — once due, a retry is no less stale.
+  let pendingRetry: PendingRetry | undefined;
   // ---- usage-limit stall (rides the same autoContinue umbrella) ----
   // True while the session is PARKED on a usage-limit death: not failed (a different
   // account fixes it), not retrying on a timer (waiting doesn't help within the window) —
@@ -306,6 +347,54 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     for (const e of summarizeText(text)) emit(e);
   }
 
+  /** Park or un-park the session on a usage limit, telling the registry when the fact CHANGES.
+   *  The park is the only idle state that is a PROMISE ("it resumes after a switch"), and the
+   *  record is the only place that promise can survive the process — see
+   *  {@link ManagedSessionOptions.onUsageLimitPark}. */
+  function setStalled(parked: boolean): void {
+    if (stalledOnUsageLimit === parked) return;
+    stalledOnUsageLimit = parked;
+    opts.onUsageLimitPark?.(parked);
+  }
+
+  /** Drop every retry that has not started yet: the pending backoff timer AND a retry already
+   *  due but waiting on a still-streaming turn. Both are equally stale once the session starts
+   *  different work, so every caller that cancels one must cancel the other. Reports whether
+   *  there was anything to cancel, which is how `interrupt()` tells "stop the auto-continue"
+   *  apart from "interrupt the turn in flight". */
+  function cancelPendingRetry(): boolean {
+    const had = cancelRetry !== undefined || pendingRetry !== undefined;
+    if (cancelRetry !== undefined) {
+      cancelRetry();
+      cancelRetry = undefined;
+    }
+    pendingRetry = undefined;
+    return had;
+  }
+
+  /**
+   * Run a retry that has come due — or decline to, which is the whole point of routing every
+   * retry through here.
+   *
+   * A retry is only ever correct for the session state it was scheduled against. Superseded
+   * (some later turn started in the meantime): the failure it answers is not what the session
+   * is doing any more, so it is dropped outright. Terminal: there is nothing to continue.
+   * BUSY: the failed turn reported its death but its stream is still open, so the client is
+   * still driving it — a second `query()` alongside it makes the client drive two turns at
+   * once, where in the live adapter the newer one takes over the permission gate and orphans
+   * whatever the older had parked. The retry rides that turn's teardown instead (runTurn's
+   * `finally`), which is the first moment the session is genuinely idle.
+   */
+  function startRetry(retry: PendingRetry): void {
+    if (retry.forTurnId !== latestTurnId) return;
+    if (state === 'done' || state === 'failed') return;
+    if (busy) {
+      pendingRetry = retry;
+      return;
+    }
+    void runTurn(retry.prompt, retry.attempt);
+  }
+
   /**
    * The one failure decision point for a turn, wherever the death was reported from (a
    * failed `turn_result`, an `error` event, or a thrown stream). Transient + budget left →
@@ -314,9 +403,9 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
    * more output would read as a contradiction). Anything else → exactly the pre-existing
    * terminal behavior, via the caller-supplied `displayGiveUp`.
    */
-  function handleTurnFailure(text: string, displayGiveUp: () => void): void {
-    if (failureHandled) return;
-    failureHandled = true;
+  function handleTurnFailure(text: string, turn: TurnContext, displayGiveUp: () => void): void {
+    if (turn.failureHandled) return;
+    turn.failureHandled = true;
 
     const classification = autoContinue === undefined ? undefined : classifyFailureText(text);
 
@@ -328,11 +417,10 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     // kick that hits another exhausted account just re-parks here — self-limiting, one
     // request per switch.
     if (classification?.usageLimit === true) {
-      stalledOnUsageLimit = true;
       // Same rule as the retry prompt below: `continue` only means something when the dead
       // turn advanced a resumable conversation; otherwise re-asking is exact.
-      stallRetryPrompt =
-        turnProducedOutput && resumeId !== undefined ? 'continue' : currentTurnPrompt;
+      stallRetryPrompt = turn.producedOutput && resumeId !== undefined ? 'continue' : turn.prompt;
+      setStalled(true);
       const failureNote = text.length > 160 ? `${text.slice(0, 157)}...` : text;
       emit({
         kind: 'milestone',
@@ -343,14 +431,17 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     }
 
     const transient = classification?.transient === true;
-    if (!transient || consecutiveFailures >= acMaxAttempts) {
+    // The budget belongs to the lineage, not the session: `turn.attempt` is how many retries
+    // of this same original turn already ran, so a chain that keeps dying ends at exactly
+    // maxAttempts however many clean turns happened before it started.
+    if (!transient || turn.attempt >= acMaxAttempts) {
       displayGiveUp();
       setState('failed');
       return;
     }
 
-    consecutiveFailures += 1;
-    const delayMs = Math.min(acBaseDelayMs * 2 ** (consecutiveFailures - 1), acMaxDelayMs);
+    const attempt = turn.attempt + 1;
+    const delayMs = Math.min(acBaseDelayMs * 2 ** (attempt - 1), acMaxDelayMs);
     // `continue` is the CLI's documented recovery for a turn that got partway ("the
     // response above may be incomplete"); a turn that produced nothing is re-asked
     // verbatim instead — nothing advanced, so re-asking is exact, while `continue` into
@@ -358,23 +449,26 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     // guard covers the death-before-session_init corner (live-observed shape): without a
     // resume anchor the retry starts a FRESH conversation, where a bare `continue` has
     // nothing to refer to — re-asking is the only prompt that means anything there.
-    const retryPrompt =
-      turnProducedOutput && resumeId !== undefined ? 'continue' : currentTurnPrompt;
+    const retryPrompt = turn.producedOutput && resumeId !== undefined ? 'continue' : turn.prompt;
     const failureNote = text.length > 160 ? `${text.slice(0, 157)}...` : text;
     emit({
       kind: 'milestone',
-      text: `Auto-continue: retrying in ${humanizeDelay(delayMs)} (attempt ${consecutiveFailures}/${acMaxAttempts}) after: ${failureNote}`,
+      text: `Auto-continue: retrying in ${humanizeDelay(delayMs)} (attempt ${attempt}/${acMaxAttempts}) after: ${failureNote}`,
     });
     cancelRetry = schedule(() => {
       cancelRetry = undefined;
-      void runTurn(retryPrompt);
+      startRetry({ prompt: retryPrompt, attempt, forTurnId: turn.id });
     }, delayMs);
   }
 
-  function handleEvent(event: AgentSdkEvent): void {
+  function handleEvent(event: AgentSdkEvent, turn: TurnContext): void {
     // A turn's own `client.interrupt()`/close race can deliver a straggler after we've
     // already gone terminal; ignore it rather than resurrect a finished session.
     if (state === 'done' || state === 'failed') return;
+    // Likewise for a turn the session has moved past: its stream is still delivering, but
+    // whatever it says is about work that has already been retried, answered or resumed. Acting
+    // on it re-decides a settled failure and starts turns nobody asked for (see TurnContext).
+    if (turn.id !== latestTurnId) return;
 
     if (event.type === 'session_init') {
       resumeId = event.sessionId;
@@ -387,14 +481,14 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     // Failure signals divert BEFORE the generic display block: when a retry is about to be
     // scheduled, the failure display must not fire at all (see handleTurnFailure).
     if (event.type === 'turn_result' && !event.ok) {
-      handleTurnFailure(event.summary, () => {
+      handleTurnFailure(event.summary, turn, () => {
         const display = agentEventToDisplay(event);
         if (display !== undefined) emit(display);
       });
       return;
     }
     if (event.type === 'error') {
-      handleTurnFailure(event.message, () => {
+      handleTurnFailure(event.message, turn, () => {
         const display = agentEventToDisplay(event);
         if (display !== undefined) emit(display);
       });
@@ -412,7 +506,7 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       case 'assistant_text':
       case 'tool_use':
       case 'tool_result':
-        turnProducedOutput = true;
+        turn.producedOutput = true;
         setState('running');
         break;
       case 'permission_required':
@@ -441,28 +535,33 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
         setState('waiting_permission');
         break;
       case 'turn_result':
-        // Failures diverted above, so this is a CLEAN completion: the failure streak is
-        // over. The pending-retry cancel is defensive — a success after an error event
-        // already scheduled a retry would otherwise fire a phantom turn later.
-        consecutiveFailures = 0;
-        if (cancelRetry !== undefined) {
-          cancelRetry();
-          cancelRetry = undefined;
-        }
+        // Failures diverted above, so this is a CLEAN completion: nothing is left to retry.
+        // The cancel is defensive — a success after an `error` event already scheduled a retry
+        // would otherwise fire a phantom turn later.
+        cancelPendingRetry();
         setState('waiting_input');
         break;
     }
   }
 
-  async function runTurn(prompt: string): Promise<void> {
+  /** Run one turn to completion. `attempt` carries the retry lineage (see TurnContext): the
+   *  kickoff, a human `send()` and the stall kick all start a fresh one at 0, while an
+   *  auto-continue retry inherits and extends the chain it belongs to. */
+  async function runTurn(prompt: string, attempt = 0): Promise<void> {
+    const turn: TurnContext = {
+      id: ++turnSeq,
+      prompt,
+      attempt,
+      producedOutput: false,
+      failureHandled: false,
+    };
+    // Claim the session before the first await, so anything still streaming from an older
+    // turn is a straggler from this instant on, and a synchronous send()/kick sees `busy`.
+    latestTurnId = turn.id;
     busy = true;
-    // Fresh turn, fresh failure bookkeeping (the failure streak itself spans turns). Any
-    // turn starting also ends a usage-limit park — whether it's the kick replaying the
+    // Any turn starting also ends a usage-limit park — whether it's the kick replaying the
     // stalled prompt or a human send() choosing their own continuation.
-    stalledOnUsageLimit = false;
-    currentTurnPrompt = prompt;
-    turnProducedOutput = false;
-    failureHandled = false;
+    setStalled(false);
     try {
       const queryOpts: AgentSdkQueryOptions = {
         ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
@@ -471,7 +570,7 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
         ...(opts.permissionMode !== undefined ? { permissionMode: opts.permissionMode } : {}),
       };
       for await (const event of opts.client.query(prompt, queryOpts)) {
-        handleEvent(event);
+        handleEvent(event, turn);
       }
     } catch (err) {
       // A rejected iterator (transport failure, SDK crash) is still just "the turn
@@ -480,13 +579,26 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       // single failure decision as event-reported deaths (auto-continue applies here
       // too: a mid-stream disconnect often surfaces as a throw, not a result message).
       const message = err instanceof Error ? err.message : String(err);
-      if (state !== 'done' && state !== 'failed') {
-        handleTurnFailure(message, () => {
+      // Superseded turns are skipped for the same reason their events are (see handleEvent):
+      // a dead turn's transport giving up is not a failure of the work running now.
+      if (state !== 'done' && state !== 'failed' && turn.id === latestTurnId) {
+        handleTurnFailure(message, turn, () => {
           emitText(`Error: ${message}`);
         });
       }
     } finally {
-      busy = false;
+      // Only the turn that still owns the session releases it: a superseded turn's stream
+      // closing late must never advertise an idle session while its successor is mid-query.
+      if (turn.id === latestTurnId) {
+        busy = false;
+        // The session is idle for the first time since a due retry was held back — this is
+        // the moment it was waiting for (see startRetry).
+        const due = pendingRetry;
+        if (due !== undefined) {
+          pendingRetry = undefined;
+          startRetry(due);
+        }
+      }
     }
   }
 
@@ -536,16 +648,14 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
           new Error(`cannot send to session '${opts.id}' in terminal state '${state}'`),
         );
       }
-      // A human reply outranks a scheduled auto-continue: their text IS the continuation,
-      // and their intervention ends the failure streak the counter was tracking.
-      if (cancelRetry !== undefined) {
-        cancelRetry();
-        cancelRetry = undefined;
-        consecutiveFailures = 0;
-      }
+      // A human reply outranks a scheduled auto-continue: their text IS the continuation, and
+      // the turn it starts begins a fresh lineage with a full budget — their intervention is
+      // exactly the "someone is handling this" the streak was counting the absence of.
+      cancelPendingRetry();
       void runTurn(text);
       return Promise.resolve();
     },
+    isParkedOnUsageLimit: () => stalledOnUsageLimit,
     resumeFromUsageLimitStall(): boolean {
       // Only a session actually parked on a usage limit reacts — everything else reports
       // false so the daemon can blind-fire this across the whole registry after a switch.
@@ -557,12 +667,13 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       return true;
     },
     async interrupt(): Promise<void> {
+      const hadRetry = cancelPendingRetry();
       // During a backoff wait there is no in-flight turn — the interrupt's meaning is
       // "stop the pending auto-continue". The session settles idle awaiting input, the
-      // same place a clean turn end would have left it.
-      if (cancelRetry !== undefined) {
-        cancelRetry();
-        cancelRetry = undefined;
+      // same place a clean turn end would have left it. A retry held back by a turn that is
+      // STILL streaming is the other case: that turn is real in-flight work, so cancelling
+      // the retry is not enough and the client interrupt below still applies.
+      if (hadRetry && !busy) {
         setState('waiting_input');
         return;
       }
@@ -571,10 +682,7 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     async stop(): Promise<void> {
       // A pending retry must die with the session — a timer firing after teardown would
       // start a turn on a client that has already been end()ed.
-      if (cancelRetry !== undefined) {
-        cancelRetry();
-        cancelRetry = undefined;
-      }
+      cancelPendingRetry();
       // Client teardown is best-effort: end() can reject when the transport is already dead
       // (the SDK subprocess died out from under us), and the session is no less over for it.
       // What MUST happen is the terminal state stamp — without it the registry keeps this

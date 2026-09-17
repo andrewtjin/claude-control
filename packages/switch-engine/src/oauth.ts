@@ -26,6 +26,7 @@ import { QuarantineError, RefreshError } from './errors.js';
 import {
   describeStatus,
   withOverloadRetry,
+  LOCKED_CALL_BUDGET_MS,
   LOCKED_OVERLOAD_BUDGET_CAP_MS,
   OVERLOAD_STATUSES,
   type OverloadRetryDeps,
@@ -122,14 +123,20 @@ export async function refreshCredentials(
           // A timeout rejects into this catch as a transient RefreshError, never a
           // QuarantineError — and, because it is a throw rather than a status, it is never
           // retried here: a hung endpoint is a different failure from an overloaded one.
-          // The retry deadline rides along with it so the LAST attempt cannot outlive the
+          // The loop's deadline rides along with it so no attempt can outlive the call's
           // budget: this whole call runs inside the credential lock, and a lock held past its
-          // stale window is reclaimed mid-refresh by the next process that wants it.
+          // stale window is reclaimed mid-refresh by the next process that wants it. The
+          // per-request timeout stays as the bound for a caller that overrides the budget away.
           signal: AbortSignal.any([AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS), ctx.signal]),
         }),
-      // Retries here lengthen a lock hold that everything else queues behind, so they get the
-      // locked caller's tighter cap rather than the poller-sized budget.
-      { budgetCapMs: LOCKED_OVERLOAD_BUDGET_CAP_MS, ...deps.overload },
+      // Everything here happens inside a lock hold that everything else queues behind, so the
+      // retries get the locked caller's tighter cap AND the whole call — first attempt and
+      // status probe included — is deadlined well inside the window a contender reclaims on.
+      {
+        budgetCapMs: LOCKED_OVERLOAD_BUDGET_CAP_MS,
+        callBudgetMs: LOCKED_CALL_BUDGET_MS,
+        ...deps.overload,
+      },
     );
     res = outcome.response;
     attempts = outcome.retries + 1;

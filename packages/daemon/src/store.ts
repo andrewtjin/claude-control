@@ -128,25 +128,38 @@ export interface OutboxRow {
 
 /**
  * One prompt queued for a session that could not take it yet, mirrored out of the daemon's
- * in-memory queues (see daemon.ts `queueSteering` / `queueManagedInject`).
+ * in-memory queues (see daemon.ts `queueSteering` / `queueManagedInject` / `injectViaChannel`).
  *
  * Unlike the sessions table above, this is NOT display-only: the phone was told each of these
- * texts was queued and would deliver at the session's next turn boundary, and an in-memory queue
- * met that promise with silence across a restart — the next boundary found nothing and nothing
- * ever said so. The rows are the durable half of that promise, so a restart can either put the
- * text back or account for it.
+ * texts was queued (or sent) and would reach the session, and an in-memory queue met that promise
+ * with silence across a restart — the next boundary found nothing and nothing ever said so. The
+ * rows are the durable half of that promise, so a restart can either put the text back or account
+ * for it.
+ *
+ * ONE ROW PER PROMPT, for its whole life. A prompt is inserted when cctl accepts it and deleted
+ * when it is delivered or given up on; changing which queue holds it is an UPDATE of `kind`, not
+ * a delete and a re-insert. That is what lets the channel and the turn-boundary queue hand the
+ * same prompt back and forth without the durable record either duplicating it or losing it.
  */
 export interface PendingSteeringRow {
   id: number;
   sessionId: string;
-  /** Which queue the row belongs to — 'interactive' (a registered terminal session, answered at
-   *  its next hook) or 'managed' (an SDK session, sent at its next idle turn). Recorded rather
-   *  than inferred from the session id, because the two drain on different signals and a restart
-   *  can only put ONE of them back: the terminal session is another process and outlives this
-   *  daemon; the managed session's subprocess does not. */
+  /** Which queue currently holds the row — 'interactive' (a registered terminal session, answered
+   *  at its next hook), 'managed' (an SDK session, sent at its next idle turn), or 'channel' (a
+   *  live MCP channel server is expected to collect it). Recorded rather than inferred from the
+   *  session id, because the three drain on different signals and a restart can only put SOME of
+   *  them back: a terminal session is another process and outlives this daemon; a managed
+   *  session's subprocess does not; a channel's server may or may not re-attach. */
   kind: string;
   text: string;
   queuedAtMs: number;
+  /** The id the channel path acks this prompt with, when it has one. Stamped once and carried
+   *  across every move, which is what makes a prompt recognisable as the SAME prompt after it has
+   *  bounced between the channel and the turn-boundary queue: without it, a delivery confirmation
+   *  arriving after a fallback cannot be matched to the text it confirms, and the operator's
+   *  instruction is delivered a second time. Absent for rows that have never been on a channel,
+   *  and for rows written before the column existed. */
+  injectId?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,13 +295,27 @@ export class Store {
         sessionId TEXT NOT NULL,
         kind TEXT NOT NULL,
         text TEXT NOT NULL,
-        queuedAtMs INTEGER NOT NULL
+        queuedAtMs INTEGER NOT NULL,
+        injectId TEXT
       );
       -- The autoincrement id doubles as arrival order, which is the order queued text must be
       -- delivered in, so every read here is id-ordered and the index carries the id along.
       CREATE INDEX IF NOT EXISTS idx_pending_steering_session
         ON pending_steering (sessionId, kind, id);
     `);
+    // A database written before `injectId` existed has rows that predate the channel path
+    // entirely, so NULL is the honest value: they were never on a channel and nothing will ever
+    // ack them. Added before the unique index below, which those NULLs are exempt from (SQLite
+    // permits any number of NULLs in a UNIQUE index) — the index is there to make "one row per
+    // inject id" a property the schema enforces rather than one the daemon merely intends.
+    const pendingSteeringColumns = this.db.prepare(`PRAGMA table_info(pending_steering)`).all();
+    if (!pendingSteeringColumns.some((col) => col['name'] === 'injectId')) {
+      this.db.exec(`ALTER TABLE pending_steering ADD COLUMN injectId TEXT`);
+    }
+    this.db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_steering_inject
+         ON pending_steering (injectId)`,
+    );
     // `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a database created
     // before the `origin` column existed must be upgraded here. Legacy rows default to
     // 'hook': the resolve path has always treated every row as hook-originated, so the
@@ -818,12 +845,17 @@ export class Store {
   // queue entry would mean a restart re-delivers text that already landed.
 
   private toPendingSteeringRow(row: Record<string, unknown>): PendingSteeringRow {
+    const injectId = row['injectId'];
     return {
       id: requireNumber(row, 'id'),
       sessionId: requireString(row, 'sessionId'),
       kind: requireString(row, 'kind'),
       text: requireString(row, 'text'),
       queuedAtMs: requireNumber(row, 'queuedAtMs'),
+      // Nullable by schema (see the migration in `migrate`), so this one column is narrowed
+      // leniently rather than through `requireString` — a legacy row with no inject id is a
+      // legitimate row, not a schema disagreement.
+      injectId: typeof injectId === 'string' && injectId.length > 0 ? injectId : undefined,
     };
   }
 
@@ -832,10 +864,26 @@ export class Store {
   insertPendingSteering(row: Omit<PendingSteeringRow, 'id'>): number {
     const result = this.db
       .prepare(
-        `INSERT INTO pending_steering (sessionId, kind, text, queuedAtMs) VALUES (?, ?, ?, ?)`,
+        `INSERT INTO pending_steering (sessionId, kind, text, queuedAtMs, injectId)
+         VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(row.sessionId, row.kind, row.text, row.queuedAtMs);
+      .run(row.sessionId, row.kind, row.text, row.queuedAtMs, row.injectId ?? null);
     return Number(result.lastInsertRowid);
+  }
+
+  /** Move one prompt between delivery queues, keeping the row (and therefore its arrival order
+   *  and its original queue time) intact.
+   *
+   *  The alternative — delete here, insert there — is what makes a prompt look like two different
+   *  prompts to anything that reads these rows later, and it re-stamps the arrival order that
+   *  decides delivery sequence. `injectId` travels with the move because it is the only thing
+   *  that identifies this prompt to the channel path: a prompt promoted onto a channel needs one
+   *  to be ackable, and a prompt falling back off a channel must KEEP the one it already had so a
+   *  late delivery confirmation still matches it. */
+  movePendingSteering(id: number, kind: string, injectId: string | undefined): void {
+    this.db
+      .prepare(`UPDATE pending_steering SET kind = ?, injectId = ? WHERE id = ?`)
+      .run(kind, injectId ?? null, id);
   }
 
   /** Oldest-first across every session — arrival order is the order queued text delivers in,

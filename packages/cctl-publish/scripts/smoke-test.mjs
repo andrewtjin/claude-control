@@ -2,10 +2,11 @@
 // Prepublish smoke test: proves the bundle actually WORKS standalone, not just that esbuild
 // exited zero. Stages a throwaway directory outside the workspace holding dist/bin.js and a
 // node_modules containing exactly what this package DECLARES as dependencies — no pnpm
-// symlinks, no workspace tree above it — then checks two things a user hits in order:
+// symlinks, no workspace tree above it — then checks three things a user hits in order:
 //
-//   1. the bundle boots (`--version`, `--help`), i.e. nothing it imports is missing; and
-//   2. the Agent SDK can find its native Claude Code binary from that layout.
+//   1. the bundle boots (`--version`, `--help`), i.e. nothing it imports is missing;
+//   2. the Agent SDK can find its native Claude Code binary from that layout; and
+//   3. `cctl channel serve` answers MCP over stdio, and still refuses when unidentified.
 //
 // Check (2) exists because check (1) cannot see it. The SDK does not implement Claude Code — it
 // spawns a ~250MB per-platform native binary shipped as a separate package, located at CALL
@@ -17,10 +18,19 @@
 // re-runs that lookup from the staged layout, which is the cheapest honest stand-in for a real
 // `npm i -g` short of installing from the registry.
 //
+// Check (3) covers the one command in the bundle that Claude Code starts by itself, over stdio,
+// with nobody watching (the shipped plugin's .mcp.json invokes `cctl channel serve`). A break
+// there produces no failing command and no error anybody reads — sessions simply never get a
+// channel. Two questions, both answerable without a daemon, a session or a config directory: does
+// `initialize` come back (the composition defers almost everything behind lazy imports, and a
+// dynamic import esbuild rewrote wrongly would fail HERE and nowhere else), and does `reply` still
+// refuse when the server could not work out which session it belongs to — the fail-closed rule
+// that separates "this session has no channel" from "one operator's prompt in another's terminal".
+//
 // Deliberately does NOT run `doctor`: doctor probes REAL machine surfaces (DPAPI, the vault
 // key store, live credentials) and on CI's ubuntu runner it would even create a real key
 // file in the runner's home — a smoke test must stay side-effect-free.
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import {
   mkdtempSync,
@@ -156,6 +166,119 @@ if (size === 0) throw new Error('native CLI binary is empty: ' + resolved);
 process.stdout.write(resolved + ' (' + Math.round(size / 1048576) + 'MB, via ' + shape + ')');
 `;
 
+/** How long the channel probe will wait for the server to finish identifying itself. Generous
+ *  relative to what it measures (a few lazy imports), tight enough that a hung server fails the
+ *  publish instead of stalling it. */
+const CHANNEL_PROBE_TIMEOUT_MS = 30_000;
+
+/**
+ * Drive `cctl channel serve` over a real stdio pipe, exactly the way Claude Code does.
+ *
+ * Hermetic by construction: `CLAUDE_CONFIG_DIR` points at an empty directory inside the staged
+ * tree, so there is no session registry to read, no daemon to find and nothing on the real machine
+ * to touch. That absence is also the second half of the check — with no registry the server cannot
+ * establish which session it belongs to, and the rule is that it keeps serving the protocol while
+ * accepting nothing. A server that answered `reply` here would be one that attaches to a guess,
+ * which delivers one operator's message into a different session's terminal.
+ */
+async function probeChannelServe() {
+  const configDir = join(cleanDir, 'claude-config');
+  mkdirSync(configDir, { recursive: true });
+  const child = spawn(process.execPath, [stagedBundle, 'channel', 'serve'], {
+    cwd: cleanDir,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
+  });
+
+  const frames = [];
+  let stderr = '';
+  let buffered = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    buffered += chunk;
+    // Newline-delimited JSON, and stdout is the WIRE: anything on it that is not a frame is
+    // itself the defect (a stray `console.log` in the bundle breaks every session's channel).
+    let index = buffered.indexOf('\n');
+    while (index !== -1) {
+      const line = buffered.slice(0, index).trim();
+      buffered = buffered.slice(index + 1);
+      if (line.length > 0) {
+        try {
+          frames.push(JSON.parse(line));
+        } catch {
+          fail(`cctl channel serve wrote a non-JSON line to the MCP wire: ${line}`);
+        }
+      }
+      index = buffered.indexOf('\n');
+    }
+  });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => (stderr += chunk));
+
+  const say = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
+  const waitForFrame = async (match) => {
+    const deadline = Date.now() + CHANNEL_PROBE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const found = frames.find(match);
+      if (found !== undefined) return found;
+      if (child.exitCode !== null) return undefined;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return undefined;
+  };
+
+  try {
+    say({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } });
+    say({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    const initialized = await waitForFrame((frame) => frame.id === 1);
+    if (initialized?.result?.serverInfo?.name === undefined) {
+      fail(
+        'cctl channel serve never answered `initialize` — Claude Code would show a broken MCP ' +
+          `server and no session would get a channel.\nstderr: ${stderr}`,
+      );
+      return;
+    }
+    process.stdout.write(
+      `ok: cctl channel serve -> ${initialized.result.serverInfo.name} ` +
+        `${initialized.result.serverInfo.version}\n`,
+    );
+
+    // Identity resolution runs behind the handshake, so the refusal is not necessarily in place
+    // the instant `initialize` is answered; ask until it is, or until the bound says it never
+    // will be. Each attempt is a fresh id so the answers cannot be confused for one another.
+    const deadline = Date.now() + CHANNEL_PROBE_TIMEOUT_MS;
+    let lastAnswer = '';
+    for (let id = 2; Date.now() < deadline; id += 1) {
+      say({
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: { name: 'reply', arguments: { text: 'smoke test' } },
+      });
+      const answer = await waitForFrame((frame) => frame.id === id);
+      lastAnswer = answer?.result?.content?.[0]?.text ?? '';
+      if (answer?.result?.isError === true && /could not be identified/.test(lastAnswer)) {
+        process.stdout.write('ok: cctl channel serve refuses to accept work unidentified\n');
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    fail(
+      'cctl channel serve did not refuse `reply` with no session registry to identify itself ' +
+        `from — the fail-closed rule is what keeps one operator's prompt out of another ` +
+        `session's terminal.\nlast answer: ${lastAnswer}\nstderr: ${stderr}`,
+    );
+  } finally {
+    // Closing stdin is how Claude Code ends this process; killing it is the backstop.
+    child.stdin.end();
+    const exited = await Promise.race([
+      new Promise((resolve) => child.once('exit', () => resolve(true))),
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    if (!exited) child.kill();
+  }
+}
+
 try {
   const candidates = hostBinaryCandidates();
   copyFileSync(bundlePath, stagedBundle);
@@ -216,6 +339,9 @@ try {
       process.stdout.write(`ok: native CLI binary resolves -> ${probe.stdout.trim()}\n`);
     }
   }
+
+  // (3) The MCP server Claude Code spawns per session. Same skip rule as (2).
+  if (!failed) await probeChannelServe();
 } finally {
   // Never leaves the staged tree behind, pass or fail.
   rmSync(cleanDir, { recursive: true, force: true });
@@ -225,4 +351,6 @@ if (failed) {
   process.stderr.write('smoke test failed.\n');
   process.exit(1);
 }
-process.stdout.write('smoke test passed: bundle boots standalone and can start sessions.\n');
+process.stdout.write(
+  'smoke test passed: bundle boots standalone, can start sessions, and serves the channel.\n',
+);

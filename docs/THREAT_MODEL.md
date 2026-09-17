@@ -117,10 +117,18 @@ Two second-order risks specific to cctl, because channel `content` lands inside 
 and is therefore a prompt-injection surface:
 
 - A message can ask Claude to run `cctl switch` or `cctl accounts` — i.e. to **move credentials
-  between accounts**. Those verbs deserve an explicit refusal in the channel's instructions.
+  between accounts**.
 - A message can ask Claude to edit the channel allowlist or the access configuration that gates who
   may send in the first place. Nothing reaching the model through a channel may be treated as
   authority to widen its own access.
+
+Both are named explicitly in the channel server's MCP `instructions`
+(`packages/channel/src/server.ts`), which frame channel content as an operator _request_ carrying
+only the authority the user of that session already granted, and list what it can never authorise:
+credential handling, the cctl account and channel verbs, edits to cctl's hook/allowlist/managed
+settings, and sending secrets anywhere — including back out through `reply`. That is guidance to a
+model rather than an enforcement boundary, and it is deliberately specific: a generic caution is
+not something a model can act on, whereas a named verb is.
 
 _Mitigation:_ the channel is **off until an administrator writes the approval file**, and it is
 per-session — a session launched without it cannot be retrofitted, by design of the CLI. `cctl

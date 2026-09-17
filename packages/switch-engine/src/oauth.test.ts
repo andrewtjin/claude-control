@@ -3,7 +3,9 @@ import { refreshCredentials, type RefreshDeps } from './oauth.js';
 import { QuarantineError, RefreshError } from './errors.js';
 import {
   createStatusProbeCache,
+  LOCKED_CALL_BUDGET_MS,
   LOCKED_OVERLOAD_BUDGET_CAP_MS,
+  OVERLOAD_MIN_ATTEMPT_MS,
   PATIENT_OVERLOAD_BUDGET,
   SHORT_OVERLOAD_BUDGET,
   type OverloadRetryDeps,
@@ -198,6 +200,30 @@ describe('refreshCredentials', () => {
       expect((err as RefreshError).message).toBe(
         'token endpoint overloaded (529) after 3 attempts; status.claude.com: none',
       );
+    });
+
+    it('bounds the WHOLE refresh, not just its retries, because it holds the credential lock', async () => {
+      // A token endpoint that answers 529 slowly: the first attempt alone eats nearly the whole
+      // budget a lock holder has. The retry phase's own cap would still allow another try; the
+      // time the caller has left does not, and a refresh that kept going here would be writing
+      // credentials under a lock another process had already reclaimed.
+      let nowMs = 0;
+      const slowOverloaded = vi.fn(() => {
+        nowMs += LOCKED_CALL_BUDGET_MS - OVERLOAD_MIN_ATTEMPT_MS;
+        return Promise.resolve({
+          ok: false,
+          status: 529,
+          text: () => Promise.resolve('overloaded'),
+        });
+      });
+
+      const err = await refreshCredentials(current, {
+        fetch: slowOverloaded,
+        overload: { ...overloadDeps('none'), now: () => nowMs },
+      }).catch((e: unknown) => e);
+
+      expect(slowOverloaded).toHaveBeenCalledTimes(1);
+      expect((err as RefreshError).code).toBe('http_529');
     });
 
     it('is patient during a reported incident and names it in the message', async () => {

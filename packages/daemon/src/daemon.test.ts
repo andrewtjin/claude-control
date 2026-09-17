@@ -1035,7 +1035,8 @@ describe('Daemon lifecycle', () => {
   it("feeds each poll cycle's advisor inputs to the auto-switcher when one is wired", async () => {
     const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
       void accounts;
-      return Promise.resolve();
+      // Resolves with the account this evaluation activated; this one hops nothing.
+      return Promise.resolve(undefined);
     });
     // Rebuild with the optional collaborator present — afterEach stops whatever `daemon`
     // points to, so reassigning keeps cleanup intact.
@@ -1083,7 +1084,8 @@ describe('Daemon lifecycle', () => {
 
     const evaluate = vi.fn((accounts: AccountUsageInput[]) => {
       void accounts;
-      return Promise.resolve();
+      // Resolves with the account this evaluation activated; this one hops nothing.
+      return Promise.resolve(undefined);
     });
     daemon = new Daemon({
       store,
@@ -1164,7 +1166,7 @@ describe('Daemon lifecycle', () => {
       attributionJournal,
       hookReceiver,
       controlPlaneClient,
-      autoSwitcher: { evaluate: () => Promise.resolve() },
+      autoSwitcher: { evaluate: () => Promise.resolve(undefined) },
       accountProbe: { probeUnknown },
       createAgentSdkClient: () => fakeAgentSdkClient,
       pollIntervalMs: 100_000,
@@ -1207,7 +1209,7 @@ describe('Daemon lifecycle', () => {
       attributionJournal,
       hookReceiver,
       controlPlaneClient,
-      autoSwitcher: { evaluate: () => Promise.resolve() },
+      autoSwitcher: { evaluate: () => Promise.resolve(undefined) },
       accountProbe: { probeUnknown },
       createAgentSdkClient: () => fakeAgentSdkClient,
       pollIntervalMs: 100_000,
@@ -1253,7 +1255,7 @@ describe('Daemon lifecycle', () => {
       attributionJournal,
       hookReceiver,
       controlPlaneClient,
-      autoSwitcher: { evaluate: () => Promise.resolve() },
+      autoSwitcher: { evaluate: () => Promise.resolve(undefined) },
       accountProbe: { probeUnknown },
       createAgentSdkClient: () => fakeAgentSdkClient,
       pollIntervalMs: 100_000,

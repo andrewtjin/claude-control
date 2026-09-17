@@ -190,32 +190,50 @@ export function questionSelectSpecs(requestId: string, questions: WireQuestions)
  *  with no ref to edit if the daemon was offline. A lapse consumes with `take`, and a successful
  *  submit consumes with `take` too, so a spurious later lapse for an already-answered card finds
  *  nothing and is dropped. */
+/** A card's location plus the Discord user it was delivered TO. Mirrors the permission registry's
+ *  entry and exists for the same reason: a question card can land in a per-session thread other
+ *  people can be members of, and an interaction proves only who TAPPED it, never whose card it is.
+ *  Without the owner recorded here, a stranger's pick would answer the owner's question from the
+ *  stranger's own daemon and strip the owner's pickers. */
+interface CardEntry {
+  ref: CardRef;
+  ownerId: string;
+}
+
 export class QuestionCardRegistry {
   // Map insertion order IS FIFO eviction order.
-  private readonly byRequestId = new Map<string, CardRef>();
+  private readonly byRequestId = new Map<string, CardEntry>();
 
-  /** Remember where a just-sent question card landed. Called once, right after the send. */
-  record(requestId: string, ref: CardRef): void {
+  /** Remember where a just-sent question card landed, and who it belongs to. Called once, right
+   *  after the send. */
+  record(requestId: string, ref: CardRef, ownerId: string): void {
     if (this.byRequestId.size >= MAX_ENTRIES) {
       const oldest = this.byRequestId.keys().next().value;
       if (oldest !== undefined) this.byRequestId.delete(oldest);
     }
-    this.byRequestId.set(requestId, ref);
+    this.byRequestId.set(requestId, { ref, ownerId });
+  }
+
+  /** The Discord user this card was delivered to, or `undefined` when the card is unknown here
+   *  (evicted, or sent before a restart). Unknown means unknown — a caller must not read it as a
+   *  mismatch, or a restart would make every live card unanswerable. */
+  ownerOf(requestId: string): string | undefined {
+    return this.byRequestId.get(requestId)?.ownerId;
   }
 
   /** Peek the ref without dropping it — the submit path needs the location BEFORE it knows the
    *  relay send succeeded, and must keep the card retryable if it did not. */
   get(requestId: string): CardRef | undefined {
-    return this.byRequestId.get(requestId);
+    return this.byRequestId.get(requestId)?.ref;
   }
 
   /** Look up and drop in one step — the consume step of a successful submit or a lapse. Returns
    *  `undefined` for a requestId this registry never saw (evicted, or a restart since the send);
    *  the caller drops that case silently. */
   take(requestId: string): CardRef | undefined {
-    const ref = this.byRequestId.get(requestId);
-    if (ref !== undefined) this.byRequestId.delete(requestId);
-    return ref;
+    const entry = this.byRequestId.get(requestId);
+    if (entry !== undefined) this.byRequestId.delete(requestId);
+    return entry?.ref;
   }
 
   /** Current retained-entry count — exposed for tests and diagnostics. */
