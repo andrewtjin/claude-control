@@ -34,7 +34,7 @@ function questions(
 describe('QuestionCardRegistry', () => {
   it('get() peeks without dropping; take() returns then forgets', () => {
     const reg = new QuestionCardRegistry();
-    reg.record('req-1', { channelId: 'c1', messageId: 'm1' });
+    reg.record('req-1', { channelId: 'c1', messageId: 'm1' }, 'u1');
     // get is non-consuming — the submit path peeks before it knows the relay send succeeded.
     expect(reg.get('req-1')).toEqual({ channelId: 'c1', messageId: 'm1' });
     expect(reg.get('req-1')).toEqual({ channelId: 'c1', messageId: 'm1' });
@@ -53,9 +53,10 @@ describe('QuestionCardRegistry', () => {
 
   it('evicts the oldest entry once the cap is exceeded (bounded memory)', () => {
     const reg = new QuestionCardRegistry();
-    for (let i = 0; i < 64; i++) reg.record(`req-${i}`, { channelId: 'c', messageId: `m${i}` });
+    for (let i = 0; i < 64; i++)
+      reg.record(`req-${i}`, { channelId: 'c', messageId: `m${i}` }, 'u1');
     expect(reg.size()).toBe(64);
-    reg.record('req-64', { channelId: 'c', messageId: 'm64' });
+    reg.record('req-64', { channelId: 'c', messageId: 'm64' }, 'u1');
     expect(reg.size()).toBe(64);
     expect(reg.get('req-0')).toBeUndefined(); // oldest evicted
     expect(reg.get('req-64')).toEqual({ channelId: 'c', messageId: 'm64' });

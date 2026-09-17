@@ -116,6 +116,16 @@ export interface SessionPlannerConfig {
    *  {@link SessionPlanner.attachIfNeeded}). Test seam; the default keeps every part far
    *  below Discord's upload cap even at 4-bytes-per-char UTF-8. */
   attachPartChars?: number;
+  /** Whether a reply TYPED in a session thread reaches the bot at all. False on a deployment that
+   *  configured no session channel: it omits the privileged MessageContent intent (see
+   *  `gatewayIntents`), so MessageCreate never fires — yet `/thread-here` can still pin a channel
+   *  and produce threads. Copy that says "reply here" on such a deployment invites the one action
+   *  that cannot work, so the state lines ask for the command that does instead.
+   *
+   *  Defaults TRUE because that is what every threaded deployment (the only one whose sessions
+   *  render in stream mode by configuration) actually does; the gateway passes the flag it derives
+   *  from the same predicate the intents come from, so the two can never disagree. */
+  repliesReadable?: boolean;
 }
 
 const DEFAULT_COALESCE_WINDOW_MS = 2_000;
@@ -231,6 +241,7 @@ export class SessionPlanner {
   private readonly attachThreshold: number;
   private readonly gapGraceMs: number | undefined;
   private readonly attachPartChars: number;
+  private readonly repliesReadable: boolean;
 
   constructor(config: SessionPlannerConfig = {}) {
     this.window = config.coalesceWindowMs ?? DEFAULT_COALESCE_WINDOW_MS;
@@ -238,6 +249,7 @@ export class SessionPlanner {
     this.attachThreshold = config.attachThresholdChars ?? DEFAULT_ATTACH_THRESHOLD_CHARS;
     this.gapGraceMs = config.gapGraceMs;
     this.attachPartChars = config.attachPartChars ?? DEFAULT_ATTACH_PART_CHARS;
+    this.repliesReadable = config.repliesReadable ?? true;
   }
 
   /** A `session.status` update. Card mode: creates the card on the first-ever event for the
@@ -641,16 +653,31 @@ export class SessionPlanner {
    *  already shows liveness, and done/failed speak through the terminal summary embed. */
   private streamStateLine(view: SessionView, state: SessionState, ops: GatewayOp[]): void {
     if (state === 'waiting_permission') {
+      // "in your DMs" was false wherever it mattered most: a prompt about a session that has a
+      // thread is posted INTO that thread (the gateway's cardSink), which is where this line is
+      // too — and when the thread cannot take the card, the session's own frames fall back to the
+      // same DM the card does. So the card is always in the conversation the reader is reading:
+      // point at it, not at a place.
       ops.push(
-        this.line(view, '🔐 waiting for a permission decision — check the card in your DMs'),
+        this.line(view, '🔐 waiting for a permission decision — approve or deny on the card here'),
       );
     } else if (state === 'waiting_input') {
-      ops.push(this.line(view, '⌨️ waiting for input — reply here to continue'));
+      // Only invite typing where typing is heard (see SessionPlannerConfig.repliesReadable).
+      ops.push(
+        this.line(
+          view,
+          this.repliesReadable
+            ? '⌨️ waiting for input — reply here to continue'
+            : '⌨️ waiting for input — use `/say <session> <text>`; replies typed here are not read',
+        ),
+      );
     } else if (state === 'orphaned') {
       ops.push(
         this.line(
           view,
-          '🪦 the daemon restarted and this session went dormant — send a message here to resume it',
+          this.repliesReadable
+            ? '🪦 the daemon restarted and this session went dormant — send a message here to resume it'
+            : '🪦 the daemon restarted and this session went dormant — use `/say <session> <text>` to wake it; replies typed here are not read',
         ),
       );
     }

@@ -724,6 +724,83 @@ describe('reauthenticate (authorization-code re-login)', () => {
     // The single-use code is not spent on a request that could never have been applied.
     expect(h.exchange).not.toHaveBeenCalled();
   });
+
+  it('refuses a partial identity that contradicts the stored account, writing nothing', async () => {
+    // The dangerous shape: another person's grant whose response carries an address and an
+    // organization but NO uuid. The bundle written for it folds the stored identity in
+    // underneath, so a guard reading that merged block compares the account against itself and
+    // waves the login through — leaving a hybrid identity over a foreign access token, live.
+    const someoneElse: ExchangeFn = () =>
+      Promise.resolve({
+        claudeAiOauth: oauth('FOREIGN', NOW + HOUR, 'r-FOREIGN'),
+        oauthAccount: { emailAddress: 'someone.else@x.com', organizationName: 'Other Org' },
+      });
+    const h = await harness(undefined, someoneElse);
+    const { accountA } = await seedAActiveWithB(h);
+
+    const err = await h.engine.reauthenticate(accountA.id, params).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RefreshError);
+    expect((err as RefreshError).code).toBe('relogin_identity_mismatch');
+    // Vault untouched — no foreign token, no hybrid identity block.
+    const stored = await h.vault.readBundle(accountA.id);
+    expect(stored.claudeAiOauth.accessToken).toBe('A');
+    expect(stored.oauthAccount?.emailAddress).toBe('A@x.com');
+    // ...and so are the live files this account holds right now.
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect((await h.credStore.readOauthAccount())?.emailAddress).toBe('A@x.com');
+  });
+
+  it('refuses a foreign login when the row has no uuid to check it against', async () => {
+    // A row captured before identity anchors were recorded has only an address. A response that
+    // names a uuid it has never seen and answers nothing else contradicts nothing — and proves
+    // nothing either, so it must not be adopted.
+    const foreign: ExchangeFn = () =>
+      Promise.resolve({
+        claudeAiOauth: oauth('FOREIGN', NOW + HOUR, 'r-FOREIGN'),
+        oauthAccount: { accountUuid: 'uuid-someone-else' },
+      });
+    const h = await harness(undefined, foreign);
+    const existing = await h.engine.addAccount('A', {
+      claudeAiOauth: oauth('OLD', NOW + HOUR),
+      oauthAccount: { emailAddress: 'a@x.com' },
+    });
+
+    const err = await h.engine.reauthenticate(existing.id, params).catch((e: unknown) => e);
+
+    expect((err as RefreshError).code).toBe('relogin_identity_mismatch');
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('OLD');
+  });
+
+  it('accepts a partial identity that matches the stored one', async () => {
+    // The legitimate partial response: no uuid, but everything it does say is this account's.
+    // Refusing it would strand a re-login on a provider that answers with less than it used to.
+    const sameAccount: ExchangeFn = () =>
+      Promise.resolve({
+        claudeAiOauth: oauth('reauthed-A', NOW + HOUR, 'reauthed-r-A'),
+        oauthAccount: { emailAddress: 'OLD@x.com' },
+      });
+    const h = await harness(undefined, sameAccount);
+    const existing = await h.engine.addAccount('A', bundleWithUuid('OLD', 'uuid-A', NOW + HOUR));
+
+    const { account, identityVerified } = await h.engine.reauthenticate(existing.id, params);
+
+    // Nothing contradicted, but nothing PROVEN either — the report must not claim a check ran.
+    expect(identityVerified).toBe(false);
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('reauthed-A');
+    expect(account.accountUuid).toBe('uuid-A');
+  });
+
+  it('lets a row that knows no identity at all adopt the login it is given', async () => {
+    // Nothing to contradict and nothing to lose: this is how such a row gains its anchors.
+    const h = await harness();
+    const existing = await h.engine.addAccount('A', { claudeAiOauth: oauth('OLD', NOW + HOUR) });
+
+    const { account } = await h.engine.reauthenticate(existing.id, params);
+
+    expect(account.accountUuid).toBe('uuid-A');
+    expect((await h.vault.readBundle(existing.id)).claudeAiOauth.accessToken).toBe('reauthed-A');
+  });
 });
 
 describe('activate — happy path', () => {
@@ -948,7 +1025,12 @@ describe('derived account metadata is repaired from the stored bundle', () => {
     await writeFile(join(h.paths.vaultDir, 'accounts.json'), '{ not json');
 
     await expect(h.engine.backfillAccountMetadata()).resolves.toBe(0);
-    expect(h.logs.filter((l) => l.level === 'warn')).toHaveLength(1);
+    // Logged, never thrown. The level is debug for this particular failure only because the
+    // registry is what broke, and the command that asked for the repair reports that itself —
+    // see "how an opportunistic repair reports that it could not run" at the end of this file.
+    expect(h.logs.filter((l) => l.level === 'debug').map((l) => l.msg)).toContain(
+      'account metadata sweep did not run',
+    );
   });
 });
 
@@ -1723,5 +1805,45 @@ describe('dedupeAccounts through the engine', () => {
     });
     expect((await h.engine.listAccounts()).map((a) => a.id)).toEqual([kept.id]);
     expect(await h.engine.dedupeAccounts()).toEqual({ merged: [], relabelled: [] });
+  });
+});
+
+describe('how an opportunistic repair reports that it could not run', () => {
+  it('drops to debug when the REGISTRY is what is broken — the command reports that itself', async () => {
+    // Both repairs run ahead of a read command, and both read the registry first. When that is
+    // the failure, the command is about to throw it with a phrased message of its own; two raw
+    // log lines in front of that error tell the operator nothing new and bury the one line that
+    // does.
+    const h = await harness();
+    await mkdir(h.paths.vaultDir, { recursive: true });
+    await writeFile(join(h.paths.vaultDir, 'accounts.json'), '{ this is not json', 'utf8');
+
+    expect(await h.engine.backfillAccountMetadata()).toBe(0);
+    expect(await h.engine.dedupeAccounts()).toEqual({ merged: [], relabelled: [] });
+
+    expect(h.logs.filter((l) => l.level === 'warn')).toEqual([]);
+    expect(h.logs.filter((l) => l.level === 'debug').map((l) => l.msg)).toEqual([
+      'account metadata sweep did not run',
+      'duplicate-account check did not run',
+    ]);
+  });
+
+  it('still warns when the repair itself fails on a registry that reads fine', async () => {
+    // A hand-edited row with no label: the registry parses, so nothing downstream will refuse
+    // it, and the dedupe pass that indexes labels is the only thing that notices. That IS the
+    // self-heal failing, and the only place it can ever be seen is this warn line.
+    const h = await harness();
+    await mkdir(h.paths.vaultDir, { recursive: true });
+    await writeFile(
+      join(h.paths.vaultDir, 'accounts.json'),
+      JSON.stringify({ activeId: null, accounts: [{ id: 'no-label-row' }] }),
+      'utf8',
+    );
+
+    await h.engine.dedupeAccounts();
+
+    expect(
+      h.logs.some((l) => l.level === 'warn' && l.msg === 'duplicate-account check did not run'),
+    ).toBe(true);
   });
 });

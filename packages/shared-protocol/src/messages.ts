@@ -309,29 +309,65 @@ const ReauthStartPayload = z.object({
   requestId: RequestId,
   /** Whatever the user typed — an id or a label, resolved daemon-side exactly like
    *  switch.command's targetAccountId. Named `accountRef` (not accountId) because unlike the
-   *  other account fields this one is HONESTLY unresolved at send time. */
-  accountRef: z.string().min(1),
+   *  other account fields this one is HONESTLY unresolved at send time. Bounded like
+   *  PairClaimPayload.hostLabel: it is untrusted modal/slash input that the daemon echoes into
+   *  its logs and into the refusal message below, and no real account id or label comes close
+   *  to 256 characters. */
+  accountRef: z.string().min(1).max(256),
   idempotencyKey: IdempotencyKey,
 });
+
+/** An authorization URL a frontend will turn into something the user taps. Bounded because the
+ *  relay carries it and the bot embeds it in a chat message, and scheme-checked because "make
+ *  this string clickable" is the one thing every renderer does with it — a `javascript:` or
+ *  `data:` URL reaching a link renderer is the whole reason a plain `z.string()` is the wrong
+ *  shape here. 2048 is the classic practical URL ceiling and leaves the authorize URL (which
+ *  carries a PKCE challenge and state) an order of magnitude of room. */
+const AuthorizeUrl = z
+  .string()
+  .max(2048)
+  .refine(
+    (raw) => {
+      // `new URL` is the only parser that agrees with the one a browser/renderer will use;
+      // anything it rejects is not a URL at all, and anything outside http(s) is not a login
+      // page. It throws on failure, so the try/catch IS the validity check.
+      try {
+        const { protocol } = new URL(raw);
+        return protocol === 'https:' || protocol === 'http:';
+      } catch {
+        return false;
+      }
+    },
+    { message: 'must be an http(s) URL' },
+  );
 
 /** The daemon's answer to reauth.start: a login link, or an honest refusal (unknown ref,
  *  mint failure). One response type per request type — link answers start, result answers
  *  code — so a card renderer never has to guess which stage a failure belongs to. */
-const ReauthLinkPayload = z.object({
-  requestId: RequestId,
-  ok: z.boolean(),
-  /** The RESOLVED account id/label, present only when ok — the paste button's customId
-   *  carries requestId, but the card must NAME the account so concurrent reauths for two
-   *  accounts stay legible. */
-  accountId: AccountId.nullish(),
-  label: z.string().nullish(),
-  url: z.string().nullish(),
-  /** Epoch ms the daemon's own pending flow dies (its in-memory TTL) — NOT a claim about the
-   *  provider's authorize-page or code lifetime, which is unverified. */
-  expiresAt: z.number().int().nonnegative().nullish(),
-  message: z.string(),
-  error: z.string().nullish(),
-});
+const ReauthLinkPayload = z
+  .object({
+    requestId: RequestId,
+    ok: z.boolean(),
+    /** The RESOLVED account id/label, present only when ok — the paste button's customId
+     *  carries requestId, but the card must NAME the account so concurrent reauths for two
+     *  accounts stay legible. */
+    accountId: AccountId.nullish(),
+    label: z.string().nullish(),
+    url: AuthorizeUrl.nullish(),
+    /** Epoch ms the daemon's own pending flow dies (its in-memory TTL) — NOT a claim about the
+     *  provider's authorize-page or code lifetime, which is unverified. */
+    expiresAt: z.number().int().nonnegative().nullish(),
+    message: z.string(),
+    error: z.string().nullish(),
+  })
+  // `ok` is a PROMISE that the two fields the success card is made of are there: the link to
+  // open and the deadline to open it by. Without this the shape admits a "success" a renderer
+  // can only draw as a button that goes nowhere, and every consumer has to re-derive the
+  // invariant from the payload — so it is stated once, here, at the parse boundary.
+  .refine((p) => !p.ok || (p.url != null && p.expiresAt != null), {
+    message: 'ok requires url and expiresAt',
+    path: ['url'],
+  });
 
 /** The pasted "code#state" text, verbatim. A dumb bounded string on purpose: the daemon owns
  *  trimming/splitting (a stricter wire shape would reject a mobile copy-paste's stray

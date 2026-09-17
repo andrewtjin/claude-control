@@ -144,8 +144,12 @@ describe('autostartBackend', () => {
     expect(autostartBackend(host({ platform: 'linux', wsl: WSL_OK, override: 'none' }))).toBe(
       'none',
     );
+    // Inside WSL, where the task is otherwise preferred, the ask still wins — the user manager
+    // is there to answer it.
     expect(
-      autostartBackend(host({ platform: 'linux', wsl: WSL_OK, override: 'systemd-user' })),
+      autostartBackend(
+        host({ platform: 'linux', wsl: WSL_OK, systemdUser: true, override: 'systemd-user' }),
+      ),
     ).toBe('systemd-user');
     expect(
       autostartBackend(host({ platform: 'linux', systemdUser: true, override: 'wsl-task' })),
@@ -153,6 +157,12 @@ describe('autostartBackend', () => {
     expect(autostartBackend(host({ platform: 'linux', wsl: WSL_OK, override: 'wsl-task' }))).toBe(
       'wsl-task',
     );
+    // The mirror image of the wsl-task case above: no user manager, so the systemd ask cannot
+    // be met either — and a box that asked for systemd must not quietly get a Windows task.
+    expect(autostartBackend(host({ platform: 'linux', override: 'systemd-user' }))).toBe('none');
+    expect(
+      autostartBackend(host({ platform: 'linux', wsl: WSL_OK, override: 'systemd-user' })),
+    ).toBe('none');
   });
 
   it('ignores the override off Linux', () => {
@@ -207,6 +217,10 @@ describe('autostartUnsupportedNote', () => {
         host({ platform: 'linux', systemdUser: true, override: 'wsl-task' }),
       ),
     ).toContain('not a WSL distro');
+    // ...and the systemd ask no host can meet says which manager never answered.
+    expect(
+      autostartUnsupportedNote(host({ platform: 'linux', override: 'systemd-user' })),
+    ).toContain('systemctl --user');
   });
 });
 

@@ -4,8 +4,17 @@
 // `sessions` mirror in daemon.db) plus an optional active-account header, and hands them here.
 // Kept IO-free so the exact output is unit-tested, and plain-by-default (color only via an
 // injected palette), matching render.ts's contract: pad on plain text, paint after.
+//
+// The header's DERIVATION lives here too (`weeklyResetHeader`), not in the command action: it
+// is a pure snapshot->display decision, and keeping it beside the renderer is what lets a test
+// hold this header and `cctl usage`'s line to the same input and prove they agree.
 
-import { humanizeDaysUntil } from '@claude-control/usage-advisor';
+import type { AccountUsage } from '@claude-control/shared-protocol';
+import {
+  computeOutlook,
+  humanizeDaysUntil,
+  timelineInputFromWire,
+} from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 /** One row of the session table. `watch` is `undefined` for kinds with no streaming concept
@@ -28,6 +37,43 @@ export interface SessionStatusHeader {
    *  rather than a formatted string so this renderer stays the single place that decides how a
    *  countdown reads, and as a duration rather than a timestamp so it stays clock-free. */
   weeklyResetInMs?: number;
+  /** True when that countdown is derived from stored history rather than reported by the
+   *  endpoint. Carried separately from the duration because the runway is equally real either
+   *  way — what changes is whether the header may present it as an observation. */
+  weeklyResetPredicted?: boolean;
+}
+
+/**
+ * Derive the header's weekly countdown from one account's latest usage snapshot.
+ *
+ * Takes the history-derived `predictedResetAt` alongside the snapshot because the endpoint
+ * STOPS publishing a weekly reset once that window closes — precisely when the prediction is
+ * the only clock there is. Without it this header alone goes silent about a reset `cctl usage`
+ * and the timeline are both still counting down to. The prediction rides its own flag rather
+ * than being folded into the duration, so nothing downstream can pass it off as observed.
+ *
+ * Returns the fields to spread into a {@link SessionStatusHeader}: empty when there is no
+ * snapshot or no weekly clock at all. `nowMs` is a parameter — the subtraction happens where a
+ * real clock is in hand, and this module stays clock-free.
+ */
+export function weeklyResetHeader(
+  usage: AccountUsage | undefined,
+  predictedResetAt: number | undefined,
+  nowMs: number,
+): { weeklyResetInMs?: number; weeklyResetPredicted?: boolean } {
+  if (!usage) return {};
+  const outlook = computeOutlook(
+    timelineInputFromWire([
+      { ...usage, ...(predictedResetAt !== undefined ? { predictedResetAt } : {}) },
+    ]),
+    nowMs,
+  );
+  const budget = outlook.accounts[0]?.budget;
+  if (!budget) return {};
+  return {
+    weeklyResetInMs: budget.weeklyResetAt - nowMs,
+    weeklyResetPredicted: budget.resetPredicted,
+  };
 }
 
 /** Short display id for a session that has no label — the first 8 chars, enough to disambiguate
@@ -41,14 +87,18 @@ function watchCell(watch: boolean | undefined): string {
   return watch ? 'on' : 'off';
 }
 
-/** Render the active-account header line, or a gentle "no data yet" when nothing is known. */
+/** Render the active-account header line, or a gentle "no data yet" when nothing is known.
+ *  A predicted countdown carries the same " (predicted)" mark `cctl usage` and the timeline
+ *  print, so one surface can never read as an endpoint reading while another calls the same
+ *  number a projection. */
 function renderHeader(header: SessionStatusHeader | undefined, palette: Palette): string {
   if (!header || header.activeLabel === undefined) {
     return palette.dim('Active account: (none - start the daemon: cctl daemon run)');
   }
+  const mark = header.weeklyResetPredicted === true ? ' (predicted)' : '';
   const budget =
     header.weeklyResetInMs !== undefined
-      ? `  ·  ${humanizeDaysUntil(header.weeklyResetInMs)} left`
+      ? `  ·  ${humanizeDaysUntil(header.weeklyResetInMs)} left${mark}`
       : '';
   return `Active account: ${palette.bold(header.activeLabel)}${palette.dim(budget)}`;
 }

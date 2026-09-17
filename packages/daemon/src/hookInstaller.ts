@@ -288,18 +288,29 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<'r
     // pin it back down to `unknown[]` rather than letting `any` leak into the map/filter below.
     const existingGroups: unknown[] = existing;
 
+    // Tracked per event, not just globally: only an event we actually took something out of may
+    // be rewritten. One whose entries are all somebody else's has to come through byte-for-byte,
+    // even when another event did change and forces a write.
+    let prunedHere = false;
     const prunedGroups = existingGroups
       .map((g) => {
         if (!isHookGroup(g)) return g; // not recognizably ours to interpret — leave as-is
         const keptHooks = g.hooks.filter((h) => !isHookEntry(h) || !isOwnedHookCommand(h.command));
-        if (keptHooks.length !== g.hooks.length) changed = true;
+        if (keptHooks.length !== g.hooks.length) prunedHere = true;
         return { ...g, hooks: keptHooks };
       })
       // A group left with zero hooks by the prune above is dead weight — drop it too.
       .filter((g) => !isHookGroup(g) || g.hooks.length > 0);
-    if (prunedGroups.length !== existingGroups.length) changed = true;
+    if (prunedGroups.length !== existingGroups.length) prunedHere = true;
+    if (!prunedHere) continue;
+    changed = true;
 
-    hooksSection[event] = prunedGroups;
+    // An event whose last group was ours is not "installed with nothing" — it is not installed,
+    // and `"PermissionRequest": []` left in a file we were told to withdraw from still shapes
+    // that file around us. Drop the key so an uninstall leaves settings.json as it would have
+    // been had we never written to it.
+    if (prunedGroups.length === 0) delete hooksSection[event];
+    else hooksSection[event] = prunedGroups;
   }
 
   if (!changed) return 'none';

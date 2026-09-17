@@ -33,6 +33,10 @@
 //   CCTL_MAX_PENDING_CONNECTIONS  (optional) cap on concurrent unauthenticated daemon sockets;
 //                            unset uses the relay's built-in default. Raise it for a self-host
 //                            serving many daemons that may reconnect at once.
+//   CCTL_MAX_PENDING_PER_PEER  (optional) cap on how many of those one source address may hold,
+//                            so no single source can fill the pool. Raise it for a self-host whose
+//                            daemons all arrive from one address (a NAT or a proxy that does not
+//                            set x-forwarded-for), where they otherwise share one peer's slice.
 //
 // Discord application prerequisite WHEN CCTL_SESSION_CHANNEL_ID or CCTL_SESSION_CHANNELS is
 // set: the privileged MESSAGE CONTENT intent must be enabled in the developer portal — replies
@@ -64,6 +68,20 @@ function fail(message: string): never {
   process.exit(1);
 }
 
+/** An optional positive-integer knob from the environment, or `undefined` when the operator set
+ *  nothing (which means "use the built-in default"). An unset value and a mistyped one are
+ *  deliberately NOT the same thing: silently falling back on a typo would leave the operator
+ *  believing a ceiling they raised is in force. */
+function positiveIntEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    fail(`${name} must be a positive integer, got "${raw}"`);
+  }
+  return parsed;
+}
+
 async function main(): Promise<void> {
   const token = process.env.DISCORD_BOT_TOKEN;
   if (!token) {
@@ -75,17 +93,11 @@ async function main(): Promise<void> {
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     fail(`CCTL_RELAY_PORT must be a port number, got "${process.env.CCTL_RELAY_PORT}"`);
   }
-  // Optional cap on concurrent unauthenticated daemon sockets (see relay.ts). Unset = the relay's
-  // built-in default; validated here like the port so a typo fails loudly at startup.
-  let maxPendingConnections: number | undefined;
-  const rawMaxPending = process.env.CCTL_MAX_PENDING_CONNECTIONS;
-  if (rawMaxPending !== undefined && rawMaxPending !== '') {
-    const parsed = Number(rawMaxPending);
-    if (!Number.isInteger(parsed) || parsed < 1) {
-      fail(`CCTL_MAX_PENDING_CONNECTIONS must be a positive integer, got "${rawMaxPending}"`);
-    }
-    maxPendingConnections = parsed;
-  }
+  // Optional caps on unauthenticated daemon sockets (see relay.ts): the total, and how many one
+  // peer may hold. Unset = the relay's built-in defaults; validated here like the port so a typo
+  // fails loudly at startup rather than silently reverting to a default the operator did not pick.
+  const maxPendingConnections = positiveIntEnv('CCTL_MAX_PENDING_CONNECTIONS');
+  const maxPendingPerPeer = positiveIntEnv('CCTL_MAX_PENDING_PER_PEER');
   const stateDir = process.env.CCTL_BOT_STATE_DIR ?? join(homedir(), '.claude-control-bot');
   mkdirSync(stateDir, { recursive: true });
 
@@ -150,6 +162,7 @@ async function main(): Promise<void> {
     logger,
     status: { page: statusPage, report: (live) => uptime.report(live) },
     ...(maxPendingConnections !== undefined ? { maxPendingConnections } : {}),
+    ...(maxPendingPerPeer !== undefined ? { maxPendingPerPeer } : {}),
   });
   holder.relay = relay;
 

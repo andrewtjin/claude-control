@@ -391,6 +391,69 @@ describe('AccountProbe', () => {
     expect(dirs).toHaveLength(1); // only the third attempt got as far as seeding a dir
   });
 
+  it('backs off a success that opens no window, on the same ladder and the same ceiling', async () => {
+    // An account whose plan reports no weekly limit at all is probed successfully forever: the
+    // turn is billed, the window never appears, and the caller offers it again next cycle. The
+    // re-offer is the evidence, so it has to move the floor.
+    const cooldownMs = 1000;
+    const backoffCapMs = 4 * cooldownMs;
+    const { probe, dirs } = makeProbe({ cooldownMs, backoffCapMs });
+
+    // First success: the plain floor, because this one may well have opened the window.
+    await expect(probe.probeUnknown([CANDIDATE])).resolves.toEqual([CANDIDATE.accountId]);
+    now += cooldownMs;
+    // Offered again => the first turn opened nothing.
+    await expect(probe.probeUnknown([CANDIDATE])).resolves.toEqual([CANDIDATE.accountId]);
+    expect(dirs).toHaveLength(2);
+
+    now += cooldownMs;
+    await expect(probe.probeUnknown([CANDIDATE])).resolves.toEqual([]); // inside the doubled window
+    expect(dirs).toHaveLength(2);
+    now += cooldownMs;
+    await expect(probe.probeUnknown([CANDIDATE])).resolves.toEqual([CANDIDATE.accountId]);
+    expect(dirs).toHaveLength(3);
+
+    // And it settles at the ceiling instead of drifting out forever.
+    now += backoffCapMs - 1;
+    await expect(probe.probeUnknown([CANDIDATE])).resolves.toEqual([]);
+    now += 1;
+    await expect(probe.probeUnknown([CANDIDATE])).resolves.toEqual([CANDIDATE.accountId]);
+    expect(dirs).toHaveLength(4);
+  });
+
+  it('diagnoses a seed that never ran a turn as the write it was, not a spent token', async () => {
+    // Nothing can rotate a token that was never written: the harvest exists to recover a
+    // rotation, so on this path it must not run — and must not be the story the operator gets.
+    const poisoned = bundle();
+    Object.defineProperty(poisoned.claudeAiOauth, 'accessToken', {
+      enumerable: true,
+      get: () => {
+        throw new Error('credential write failed');
+      },
+    });
+    readBundle.mockResolvedValue(poisoned);
+    const failures: unknown[] = [];
+    const { probe, dirs } = makeProbe({
+      logger: {
+        debug: () => {},
+        info: () => {},
+        warn: (obj: unknown) => failures.push(obj),
+        error: () => {},
+      },
+    });
+
+    await expect(probe.probeUnknown([CANDIDATE])).resolves.toEqual([]);
+
+    // No turn was ever started, and the vault was never asked to take a rotation back.
+    expect(dirs).toHaveLength(0);
+    expect(reloginFromConfigDir).not.toHaveBeenCalled();
+    const reported = (failures[0] as { err?: Error }).err;
+    expect(reported?.message).toContain('credential write failed');
+    expect(reported?.message).not.toContain('spent');
+    // The dir still goes, credentials or not.
+    expect(await rootIsEmpty()).toBe(true);
+  });
+
   it('does nothing when no candidate is eligible', async () => {
     const { probe } = makeProbe();
     await expect(probe.probeUnknown([])).resolves.toEqual([]);

@@ -78,6 +78,15 @@ export interface RelayServerOptions {
    *  connections are shed with close 1013. Defaults to {@link MAX_PENDING_CONNECTIONS}; lowered in
    *  tests to exercise the bound. */
   maxPendingConnections?: number;
+  /** Max concurrent unauthenticated sockets from ONE peer. The global cap above bounds memory;
+   *  this one bounds who gets to spend it, so a single source cannot fill the pool and turn every
+   *  other daemon's hello into a 1013. Defaults to {@link MAX_PENDING_PER_PEER}. */
+  maxPendingPerPeer?: number;
+  /** How long a connected socket may go without a successful `hello`/`pair.claim` before it is
+   *  closed (4008) and its pending slot returned. Defaults to {@link FIRST_FRAME_TIMEOUT_MS};
+   *  injectable so a test can prove the reaper frees capacity without waiting ten seconds — which
+   *  is precisely the property that makes the caps self-healing rather than one-way. */
+  handshakeTimeoutMs?: number;
   /** Max outbound backpressure (ws `bufferedAmount`) tolerated on one daemon socket before it is
    *  dropped as unreachable. Defaults to {@link MAX_SOCKET_BUFFER_BYTES}; lowered in tests. */
   maxSocketBufferBytes?: number;
@@ -96,6 +105,9 @@ interface Connection {
 interface SocketState {
   daemonId?: string;
   handshakeTimer: ReturnType<typeof setTimeout> | null;
+  /** Which peer this socket's pending slot is charged to (see {@link peerKey}), so releasing it
+   *  never has to guess — the address is read once, at connection time, from the upgrade request. */
+  peer: string;
 }
 
 const FIRST_FRAME_TIMEOUT_MS = 10_000;
@@ -116,6 +128,16 @@ const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 // more handshake state, and the FIRST_FRAME_TIMEOUT_MS reaper drains pending sockets so the cap
 // self-heals. Overridable via CCTL_MAX_PENDING_CONNECTIONS for a self-host with many daemons.
 const MAX_PENDING_CONNECTIONS = 64;
+// Ceiling on concurrent unauthenticated sockets from ONE peer. The global cap alone is a shared
+// resource with no owner: at ~6.4 connections per second — trivial from a single host — one source
+// fills all 64 slots and holds them for the whole handshake window, and from then on every real
+// daemon's hello and every pair.claim is refused with 1013 while the relay looks healthy. A
+// per-peer slice makes that cost scale with the number of sources an attacker has rather than with
+// their connection rate, and leaves the pool's remaining capacity for everyone else. 8 is many
+// times what a legitimate peer needs (a host reconnects one socket at a time, and a shared NAT or
+// proxy fronting several daemons still only handshakes briefly), so the bound is invisible in
+// normal use.
+const MAX_PENDING_PER_PEER = 8;
 // Ceiling on a single daemon socket's outbound backpressure. The relay is a non-accumulating
 // pass-through — it keeps no message queue — so the only way it grows memory without bound is ws's
 // own send buffer when a daemon stops draining its socket. 8 MiB is far above the KB-scale command
@@ -138,7 +160,13 @@ export class RelayServer implements RelaySender {
   // Unauthenticated sockets (connected, no successful hello yet). Bounded by maxPendingConnections
   // so a handshake flood can't exhaust memory/handles; an entry leaves on hello, close, or timeout.
   private readonly pendingConnections = new Set<WebSocket>();
+  // How many of those are charged to each peer, so the per-peer cap is O(1) to enforce and to
+  // release. Keyed by {@link peerKey}; an entry is deleted at zero so the map tracks LIVE peers,
+  // never every address that ever connected.
+  private readonly pendingByPeer = new Map<string, number>();
   private readonly maxPendingConnections: number;
+  private readonly maxPendingPerPeer: number;
+  private readonly handshakeTimeoutMs: number;
   private readonly maxSocketBufferBytes: number;
   private readonly status: StatusProvider | undefined;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -150,6 +178,8 @@ export class RelayServer implements RelaySender {
     this.logger = options.logger ?? noopLogger;
     this.status = options.status;
     this.maxPendingConnections = options.maxPendingConnections ?? MAX_PENDING_CONNECTIONS;
+    this.maxPendingPerPeer = options.maxPendingPerPeer ?? MAX_PENDING_PER_PEER;
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? FIRST_FRAME_TIMEOUT_MS;
     this.maxSocketBufferBytes = options.maxSocketBufferBytes ?? MAX_SOCKET_BUFFER_BYTES;
     // An explicit http.Server (rather than letting WebSocketServer's `port` option create one
     // implicitly) so a plain GET can be answered on the same port the daemon sockets use —
@@ -161,8 +191,10 @@ export class RelayServer implements RelaySender {
       server: this.httpServer,
       maxPayload: options.maxFrameBytes ?? MAX_FRAME_BYTES,
     });
-    this.wss.on('connection', (socket) => {
-      this.onConnection(socket);
+    // The upgrade request rides along so the connection can be charged to a peer — it is the only
+    // place the client's address is available.
+    this.wss.on('connection', (socket, request) => {
+      this.onConnection(socket, peerKey(request));
     });
     this.httpServer.listen(options.port ?? 0);
 
@@ -317,21 +349,46 @@ export class RelayServer implements RelaySender {
     }
   }
 
-  private onConnection(socket: WebSocket): void {
+  /** Charge one unauthenticated socket to the global pool and to its peer. */
+  private addPending(socket: WebSocket, peer: string): void {
+    this.pendingConnections.add(socket);
+    this.pendingByPeer.set(peer, (this.pendingByPeer.get(peer) ?? 0) + 1);
+  }
+
+  /** Release a pending slot — on hello, on close, or on the handshake reaper's close. Idempotent:
+   *  a socket that authenticates and later closes runs this twice, and the Set membership check is
+   *  what keeps the peer count from going negative (which would hand that peer free capacity). */
+  private releasePending(socket: WebSocket, peer: string): void {
+    if (!this.pendingConnections.delete(socket)) return;
+    const remaining = (this.pendingByPeer.get(peer) ?? 1) - 1;
+    if (remaining > 0) this.pendingByPeer.set(peer, remaining);
+    else this.pendingByPeer.delete(peer);
+  }
+
+  private onConnection(socket: WebSocket, peer: string): void {
     // Shed load BEFORE allocating any handshake state: a flood of sockets that connect and never
     // authenticate would otherwise pin one handshake timer (and up to one buffered frame) each.
-    // 1013 = "try again later"; the FIRST_FRAME_TIMEOUT_MS reaper drains legitimate pending sockets
-    // so this capacity returns on its own.
+    // 1013 = "try again later"; the handshake reaper drains legitimate pending sockets so this
+    // capacity returns on its own.
+    //
+    // Two caps, in this order: the global one protects the process, the per-peer one protects
+    // everyone ELSE's share of it — without it a single source saturates the pool and every real
+    // hello and pair.claim is refused while the relay itself is perfectly healthy.
     if (this.pendingConnections.size >= this.maxPendingConnections) {
       socket.close(1013, 'relay busy');
       return;
     }
-    this.pendingConnections.add(socket);
+    if ((this.pendingByPeer.get(peer) ?? 0) >= this.maxPendingPerPeer) {
+      this.logger.warn({ peer }, 'relay: too many unauthenticated connections from one peer');
+      socket.close(1013, 'too many pending connections');
+      return;
+    }
+    this.addPending(socket, peer);
 
-    const state: SocketState = { handshakeTimer: null };
+    const state: SocketState = { handshakeTimer: null, peer };
     state.handshakeTimer = setTimeout(() => {
       if (!state.daemonId) socket.close(4008, 'handshake timeout');
-    }, FIRST_FRAME_TIMEOUT_MS);
+    }, this.handshakeTimeoutMs);
 
     socket.on('message', (raw: RawData) => {
       this.onMessage(socket, state, rawDataToString(raw)).catch((err: unknown) => {
@@ -342,7 +399,7 @@ export class RelayServer implements RelaySender {
     socket.on('close', () => {
       // Free the pending slot (a no-op once authenticated — the entry was removed on hello), so a
       // clean disconnect and a timed-out handshake both return capacity to the pending cap.
-      this.pendingConnections.delete(socket);
+      this.releasePending(socket, state.peer);
       if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
       // Only evict the mapping if it still points at THIS socket. On a reconnect, handleHello
       // has already replaced the entry with the new socket; a late 'close' from the old socket
@@ -434,14 +491,18 @@ export class RelayServer implements RelaySender {
     // TWO live processes present the same identity and steal delivery from each other on
     // every reconnect, and diagnosing that starts from this line.
     const existing = this.connectionsByDaemon.get(daemonId);
-    if (existing) {
+    // Same identity guard the close and pong handlers use, and needed for the same reason: this
+    // method is async (it awaits credential verification before `state.daemonId` is set), so two
+    // hello frames on ONE socket can both reach here — and without the check the second would
+    // terminate the connection it is authenticating.
+    if (existing && existing.socket !== socket) {
       this.logger.info({ daemonId }, 'hello replaced an existing live socket for this daemon id');
       existing.socket.terminate();
     }
 
     state.daemonId = daemonId;
     // Authenticated: it no longer occupies an unauthenticated-handshake slot.
-    this.pendingConnections.delete(socket);
+    this.releasePending(socket, state.peer);
     if (state.handshakeTimer) {
       clearTimeout(state.handshakeTimer);
       state.handshakeTimer = null;
@@ -522,6 +583,39 @@ export class RelayServer implements RelaySender {
       conn.socket.ping();
     }
   }
+}
+
+/**
+ * Who a connection is charged against for the per-peer pending cap.
+ *
+ * The LAST `x-forwarded-for` entry when there is one (this relay runs behind a proxy in every real
+ * deployment, where the socket's remote address is the proxy and would make every client one
+ * peer), else the socket's own remote address.
+ *
+ * Last, not first, and that is the whole property. A proxy APPENDS the address it saw to whatever
+ * the client already sent, so the trailing entry is the one the proxy wrote and every earlier one
+ * is the client's own text. Keyed on the first entry, a peer that varies the header lands in an
+ * unlimited number of buckets and the per-peer cap confines it not at all — it would be a cap in
+ * name only, leaving just the global pool, which is exactly the starvation this defends against.
+ * Keyed on the last, forged entries change nothing: every connection from one source still charges
+ * one bucket. An address that cannot be read at all shares one bucket — unknown peers are not
+ * assumed to be distinct.
+ *
+ * This assumes EXACTLY ONE trusted proxy in front of the relay, which is what ships: a second
+ * untrusted hop would append after the trusted one and the trailing entry would be attacker text
+ * again. Add a hop and this has to count back by however many are trusted.
+ */
+function peerKey(request: IncomingMessage): string {
+  const forwarded = request.headers['x-forwarded-for'];
+  // Node joins repeated headers with ', ' for this one, but the typings still allow an array, and
+  // the hop the proxy appended is the last entry of the last value either way.
+  const hops = (Array.isArray(forwarded) ? forwarded.join(',') : (forwarded ?? ''))
+    .split(',')
+    .map((hop) => hop.trim())
+    .filter((hop) => hop.length > 0);
+  const nearest = hops[hops.length - 1];
+  if (nearest !== undefined) return nearest;
+  return request.socket.remoteAddress ?? 'unknown';
 }
 
 /** `ws` delivers message payloads as `Buffer | ArrayBuffer | Buffer[]` depending on framing;

@@ -37,7 +37,11 @@ import { selectWeeklyBudget } from './weekly.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** One weekly quota cycle: the fixed cadence every account's weekly window repeats on. */
+/** One weekly quota cycle: the fixed cadence every account's weekly window repeats on. Fixed
+ *  24-hour days, not calendar ones, so a cycle spanning a DST transition is an hour out and a
+ *  simulated reset drifts by that hour per boundary crossed. A deliberate floor: the simulation
+ *  projects a burn rate days ahead, where an hour is far inside the noise, and correcting it
+ *  would mean giving this pure module a timezone it has no business knowing. */
 const WEEK_MS = 7 * DAY_MS;
 
 /** How far ahead the simulation runs. Two weekly cycles: long enough that every account resets

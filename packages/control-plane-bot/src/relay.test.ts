@@ -870,3 +870,189 @@ describe('RelayServer outbound backpressure cap', () => {
     expect(frame).toEqual({ code: 4009, reason: 'outbound buffer cap exceeded' });
   });
 });
+
+describe('RelayServer handshake reaper and per-peer pending cap', () => {
+  // The pending pool is a shared resource with no owner: at a few connections per second — trivial
+  // from one host — an attacker fills every slot and holds each for the whole handshake window,
+  // and from then on every real hello and pair.claim is refused with 1013 while the relay looks
+  // healthy. Two properties keep that from being possible: the reaper returns capacity on its own,
+  // and one peer cannot take all of it.
+  let bindings: BindingStore;
+  let pairing: PairingService;
+  let fake: ReturnType<typeof createFakeGateway>;
+  let relay: RelayServer;
+  let port: number;
+
+  /** Connect claiming a given forwarded address — how the relay tells peers apart behind a proxy. */
+  function connectAsPeer(p: number, peer: string): Promise<WebSocket> {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${p}`, { headers: { 'x-forwarded-for': peer } });
+      ws.once('open', () => resolve(ws));
+      ws.once('error', reject);
+    });
+  }
+
+  beforeEach(async () => {
+    bindings = new BindingStore();
+    pairing = new PairingService({ bindings });
+    fake = createFakeGateway();
+    relay = new RelayServer({
+      bindings,
+      pairing,
+      gateway: fake.gateway,
+      heartbeatMs: 0,
+      port: 0,
+      // One slot, so a single socket that never authenticates IS the whole pool — the starvation
+      // this defends against, in miniature.
+      maxPendingConnections: 1,
+      maxPendingPerPeer: 1,
+      // The real 10s window would make this a ten-second test; the property (capacity comes back
+      // on its own) holds at any duration, which is why the timeout is injectable.
+      handshakeTimeoutMs: 300,
+    });
+    port = await relay.listen();
+  });
+
+  afterEach(async () => {
+    await relay.close();
+  });
+
+  it('reaps a socket that never authenticates, returning its slot to the pool', async () => {
+    const squatter = await connect(port);
+    // Pool full: a real daemon's connection is refused with "try again later".
+    const shed = await connect(port);
+    expect(await waitForClose(shed)).toBe(1013);
+
+    // The squatter never says hello, so the reaper closes it…
+    expect(await waitForClose(squatter)).toBe(4008);
+
+    // …and the capacity it was holding is available again, with no intervention.
+    const fresh = await connect(port);
+    expect(await expectSilenceFor(fresh, 60)).toBe('silence');
+    expect(fresh.readyState).toBe(WebSocket.OPEN);
+    fresh.close();
+  });
+
+  it('caps one peer without spending the pool everyone else needs', async () => {
+    const flood = new RelayServer({
+      bindings,
+      pairing,
+      gateway: fake.gateway,
+      heartbeatMs: 0,
+      port: 0,
+      // Room for plenty of sockets overall, but only two per peer.
+      maxPendingConnections: 16,
+      maxPendingPerPeer: 2,
+      handshakeTimeoutMs: 5_000,
+    });
+    const floodPort = await flood.listen();
+    try {
+      const a1 = await connectAsPeer(floodPort, '198.51.100.9');
+      const a2 = await connectAsPeer(floodPort, '198.51.100.9');
+      const a3 = await connectAsPeer(floodPort, '198.51.100.9');
+      expect(await waitForClose(a3)).toBe(1013);
+
+      // A different source is unaffected — the pool still has capacity, and it is not the noisy
+      // peer's to spend.
+      const b1 = await connectAsPeer(floodPort, '203.0.113.4');
+      expect(await expectSilenceFor(b1, 60)).toBe('silence');
+      expect(b1.readyState).toBe(WebSocket.OPEN);
+
+      // And the capped peer gets its slice back as soon as it stops holding it.
+      a1.close();
+      await waitForClose(a1);
+      const a4 = await connectAsPeer(floodPort, '198.51.100.9');
+      expect(await expectSilenceFor(a4, 60)).toBe('silence');
+      expect(a4.readyState).toBe(WebSocket.OPEN);
+
+      a2.close();
+      a4.close();
+      b1.close();
+    } finally {
+      await flood.close();
+    }
+  });
+
+  it('charges a peer that forges leading x-forwarded-for entries to ONE bucket', async () => {
+    const flood = new RelayServer({
+      bindings,
+      pairing,
+      gateway: fake.gateway,
+      heartbeatMs: 0,
+      port: 0,
+      maxPendingConnections: 16,
+      maxPendingPerPeer: 2,
+      handshakeTimeoutMs: 5_000,
+    });
+    const floodPort = await flood.listen();
+    try {
+      // The proxy APPENDS what it saw, so everything before the last entry is the client's own
+      // text. Keyed on the first entry, these three are three different peers and the per-peer cap
+      // never bites; keyed on the hop the proxy wrote, they are one.
+      const forged = (claim: string): Promise<WebSocket> =>
+        connectAsPeer(floodPort, `${claim}, 198.51.100.9`);
+      const a1 = await forged('10.0.0.1');
+      const a2 = await forged('10.0.0.2');
+      const a3 = await forged('10.0.0.3');
+      expect(await waitForClose(a3)).toBe(1013);
+
+      // …and a real second source behind the same proxy is still untouched by the noise.
+      const b1 = await connectAsPeer(floodPort, '10.0.0.1, 203.0.113.4');
+      expect(await expectSilenceFor(b1, 60)).toBe('silence');
+      expect(b1.readyState).toBe(WebSocket.OPEN);
+
+      a1.close();
+      a2.close();
+      b1.close();
+    } finally {
+      await flood.close();
+    }
+  });
+});
+
+describe('RelayServer duplicate hello on one socket', () => {
+  let bindings: BindingStore;
+  let pairing: PairingService;
+  let fake: ReturnType<typeof createFakeGateway>;
+  let relay: RelayServer;
+  let port: number;
+
+  beforeEach(async () => {
+    bindings = new BindingStore();
+    pairing = new PairingService({ bindings });
+    fake = createFakeGateway();
+    relay = new RelayServer({ bindings, pairing, gateway: fake.gateway, heartbeatMs: 0, port: 0 });
+    port = await relay.listen();
+  });
+
+  afterEach(async () => {
+    await relay.close();
+  });
+
+  // Two hello frames written back-to-back both enter the handshake before either finishes
+  // verifying credentials (the verify is async), so the second one finds the FIRST one's entry
+  // already in the connection map. Without an identity check, "replace the existing socket" then
+  // terminates the socket doing the replacing: the daemon is dropped for presenting the same
+  // identity twice on one connection, and only a reconnect brings it back.
+  it('does not terminate the connection that is authenticating itself', async () => {
+    const token = mintToken();
+    await bindings.bind('user-a', 'daemon-1', await hashToken(token), 'host', Date.now());
+    const ws = await connect(port);
+    const hello: EnvelopeDraft = {
+      daemonId: 'daemon-1',
+      type: 'hello',
+      payload: { protocolVersion: PROTOCOL_VERSION, daemonToken: token },
+    };
+
+    sendEnvelope(ws, hello);
+    sendEnvelope(ws, hello);
+    const first = await nextMessage(ws);
+    expect(first.type).toBe('hello.result');
+
+    // Give any (wrong) termination time to land, then assert the daemon is still there.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    expect(relay.isOnline('user-a')).toBe(true);
+    ws.close();
+  });
+});

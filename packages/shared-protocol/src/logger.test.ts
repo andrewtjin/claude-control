@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   existsSync,
   mkdirSync,
@@ -11,6 +11,23 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLogger } from './logger.js';
+
+// A ledger of every `closeSync` the file sink performs, so a test can prove a descriptor is
+// closed exactly ONCE — a second close of a number the OS may already have recycled would shut
+// an unrelated file. `vi.spyOn` cannot touch a builtin's ESM namespace, so the module is
+// replaced with a thin passthrough (the same seam switch-engine's lock tests use); every other
+// function, and `closeSync` itself, is the real thing.
+const closed = vi.hoisted(() => ({ fds: [] as number[] }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    closeSync: ((fd: number): void => {
+      closed.fds.push(fd);
+      return actual.closeSync(fd);
+    }) as typeof actual.closeSync,
+  };
+});
 
 /** A stand-in for the console stream that just records every chunk written to it, so tests can
  *  assert on exactly what a real terminal (or a real pipe) would have received — no real process
@@ -37,7 +54,14 @@ afterEach(() => {
     const dir = tempDirs.pop();
     if (dir) rmSync(dir, { recursive: true, force: true });
   }
+  closed.fds.length = 0;
+  vi.useRealTimers();
 });
+
+/** The sink's one-shot rotation threshold, mirrored from logger.ts. Shared by the rotation
+ *  tests and the recovery tests below, which use an oversized file as their reproducible way to
+ *  make a healed sink fail a second time. */
+const ROTATE_BYTES = 10 * 1024 * 1024;
 
 describe('createLogger: format mode selection', () => {
   it('defaults to pretty on a TTY', () => {
@@ -307,6 +331,35 @@ describe('createLogger: reserved payload keys', () => {
     expect(parsed.sessionId).toBe('s1');
   });
 
+  it("renames a payload field that would collide with pino's base pid/hostname", () => {
+    // Several call sites log the pid of ANOTHER process (a spawned session, a reaped child).
+    // Unreserved, that key would duplicate pino's own base field — the line would then claim the
+    // child's pid as the logger's own in NDJSON and show nothing at all in pretty output, where
+    // the base fields are dropped as constant noise.
+    const jsonSink = new CapturingSink(false);
+    const logger = createLogger({ defaultLevel: 'info', env: {}, sink: jsonSink });
+    logger.info({ pid: 4242, hostname: 'child-box' }, 'child exited');
+    const line = jsonSink.chunks[0]!;
+    // One `pid` key on the line, and it is pino's — a duplicate would let the payload win the
+    // parse, which is exactly the spoof this rename prevents.
+    expect(line.match(/"pid":/g)).toHaveLength(1);
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    expect(parsed.pid).toBe(process.pid);
+    expect(typeof parsed.hostname).toBe('string');
+    expect(parsed.hostname).not.toBe('child-box');
+    expect(parsed.pidField).toBe(4242);
+    expect(parsed.hostnameField).toBe('child-box');
+
+    // And the renamed keys survive into the terminal, where the un-renamed ones never would.
+    const prettySink = new CapturingSink(true);
+    createLogger({ defaultLevel: 'info', env: {}, sink: prettySink }).info(
+      { pid: 4242, hostname: 'child-box' },
+      'child exited',
+    );
+    expect(prettySink.chunks[0]).toContain('pidField=4242');
+    expect(prettySink.chunks[0]).toContain('hostnameField=child-box');
+  });
+
   it('leaves an ordinary payload untouched', () => {
     const sink = new CapturingSink(false);
     const logger = createLogger({ defaultLevel: 'info', env: {}, sink });
@@ -456,8 +509,6 @@ describe('createLogger: file sink', () => {
 });
 
 describe('createLogger: file sink rotation', () => {
-  const ROTATE_BYTES = 10 * 1024 * 1024;
-
   it('rotates a file already at/over the threshold before the first line of a new run lands', () => {
     const dir = freshTempDir();
     const filePath = join(dir, 'daemon.log');
@@ -516,5 +567,53 @@ describe('createLogger: file sink rotation', () => {
     logger.info({}, 'still alive after a failed rotation');
     expect(warnings).toHaveLength(1);
     expect(sink.chunks.some((c) => c.includes('still alive after a failed rotation'))).toBe(true);
+    // The descriptor is closed by the rotation and then NOT closed again by the degradation the
+    // failed rename triggers. A second close would target a number the OS is free to have
+    // handed to some other file this process opened in between, and shut that instead.
+    expect(closed.fds).toHaveLength(1);
+  });
+});
+
+describe('createLogger: file sink recovery', () => {
+  it('reopens a degraded sink once the retry interval passes, and re-arms the warning', () => {
+    // A transient fault (a scanner holding the file, a directory not created yet) must not
+    // disable the file sink for the rest of the process's life — nobody is watching a service's
+    // stderr to notice, let alone restart it.
+    const dir = freshTempDir();
+    const parent = join(dir, 'not-yet');
+    const filePath = join(parent, 'daemon.log');
+    const sink = new CapturingSink(true);
+    const warnings: string[] = [];
+    // Only `Date` is faked: the retry clock is `Date.now()`, and faking the timer functions too
+    // would stall everything else this process has scheduled for no benefit here.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const logger = createLogger({
+      defaultLevel: 'info',
+      env: { CCTL_LOG_FILE: filePath },
+      sink,
+      warn: (message) => warnings.push(message),
+    });
+    // The missing parent directory fails the open, so the sink starts out degraded.
+    expect(warnings).toHaveLength(1);
+
+    // Inside the retry interval the blocker is gone but the sink has not earned another attempt
+    // yet — it must not turn every log call into a syscall.
+    mkdirSync(parent);
+    logger.info({}, 'still inside the retry interval');
+    expect(existsSync(filePath)).toBe(false);
+    expect(sink.chunks.some((c) => c.includes('still inside the retry interval'))).toBe(true);
+
+    // Past the interval, the next line reopens the file and lands in it.
+    vi.setSystemTime(Date.now() + 31_000);
+    logger.info({}, 'healed');
+    expect(readFileSync(filePath, 'utf8')).toContain('healed');
+    expect(warnings).toHaveLength(1);
+
+    // A LATER fault gets its own warning rather than being swallowed by the first: a rotation
+    // blocker plus an oversized file makes the healed sink fail again.
+    mkdirSync(`${filePath}.old`);
+    writeFileSync(filePath, Buffer.alloc(ROTATE_BYTES, 'x'));
+    logger.info({}, 'tips the healed file over the threshold');
+    expect(warnings).toHaveLength(2);
   });
 });

@@ -85,6 +85,84 @@ describe('classifyFailureText', () => {
   ])('does not guess on unrecognized text "%s"', (text) => {
     expect(classifyFailureText(text)).toEqual({ transient: false });
   });
+
+  // The same rule for the other three status patterns, which is where it bites hardest: a
+  // stray 429 in a tool's output parks the session until a human switches accounts, and a
+  // stray 529/408 spends the whole retry budget on text that never named a failure.
+  it.each([
+    'ENOENT: no such file or directory, open /repo/build/429/out.json',
+    'Type error at src/router.ts:529:12 - property does not exist',
+    'Wrote 408 rows to the cache',
+    'the tool exploded after 429 iterations',
+    'assertion failed: expected 408, got 200',
+  ])('reads a bare status number in unrelated prose as nothing: "%s"', (text) => {
+    expect(classifyFailureText(text)).toEqual({ transient: false });
+  });
+
+  // …while every shape a real API failure actually arrives in still classifies.
+  it.each([
+    ['API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}', 'usage'],
+    ['Request failed with status code 429', 'usage'],
+    ['HTTP 429 from api.anthropic.com', 'usage'],
+    ['API Error: 529 Overloaded.', 'overloaded'],
+    ['Request failed with status code 529', 'overloaded'],
+    ['HTTP 408', 'timeout'],
+    ['API Error: 408 Request Timeout', 'timeout'],
+  ])('still recognizes the real API shape "%s"', (text, expected) => {
+    expect(classifyFailureText(text)).toEqual(
+      expected === 'usage'
+        ? { transient: false, usageLimit: true }
+        : { transient: true, kind: expected },
+    );
+  });
+
+  // The shapes that do NOT lead with one of the canonical introducer words: the reason phrase
+  // standing on its own, a status behind "returned"/"failed:", a camelCase field name, and the
+  // parenthesised code an abort message trails. Each one is a real failure the anchor has to
+  // reach, and each one is a way for an over-tight anchor to strand a session that a park or a
+  // retry would have saved.
+  it.each([
+    ['429 Too Many Requests', 'usage'],
+    ['Error: Request failed: 429', 'usage'],
+    ['status: 429', 'usage'],
+    ['statusCode: 429', 'usage'],
+    ['status_code: 429', 'usage'],
+    ['upstream returned 529', 'overloaded'],
+    ['upstream returned 529 Overloaded', 'overloaded'],
+    ['Request failed: 429 {"type":"error","error":{"type":"rate_limit_error"}}', 'usage'],
+    ['HTTP 429 Too Many Requests', 'usage'],
+    ['AbortError: The operation timed out (408)', 'timeout'],
+    ['AbortError: The operation timed out (408).', 'timeout'],
+    ['gateway returned 503', 'server_error'],
+  ])('recognizes the introducer-less real shape "%s"', (text, expected) => {
+    expect(classifyFailureText(text)).toEqual(
+      expected === 'usage'
+        ? { transient: false, usageLimit: true }
+        : { transient: true, kind: expected },
+    );
+  });
+
+  // …and the same prose the widened anchor must still read as nothing. "assertion failed:
+  // expected 408" is the trap the new `failed:` introducer opens if the status is allowed to
+  // sit anywhere after the word rather than immediately behind it.
+  it.each([
+    'ENOENT: no such file or directory, open /repo/build/429/out.json',
+    'Type error at src/router.ts:529:12 - property does not exist',
+    'Wrote 408 rows to the cache',
+    'assertion failed: expected 408, got 200',
+    'the job failed after 429 retries',
+    'renamed statuses/429 to statuses/older',
+    // The weak introducers and the parenthetical only count when the number ends the clause.
+    'returned 429 rows from the cache',
+    'the query returned 500 rows',
+    'failed: 500 unit tests',
+    'batch (429) complete',
+    'deleted (500) stale files',
+    // The reason phrase counts only beside its own number.
+    'there were too many requests queued in the local test harness',
+  ])('keeps reading the widened-anchor near-miss as nothing: "%s"', (text) => {
+    expect(classifyFailureText(text)).toEqual({ transient: false });
+  });
 });
 
 describe('classifyStopFailureType', () => {

@@ -23,6 +23,7 @@ import {
   defaultProtector,
   generatePkce,
   generateState,
+  isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
   type StoredAccount,
@@ -105,6 +106,7 @@ import {
 } from './render.js';
 import {
   renderSessionStatus,
+  weeklyResetHeader,
   type SessionStatusHeader,
   type SessionStatusRow,
 } from './sessionRender.js';
@@ -174,11 +176,35 @@ export function buildProgram(): Command {
     .description('claude-control - switch Claude accounts, see usage, control sessions')
     .version(VERSION);
 
-  // Commander only auto-adds a `help` subcommand when the program itself has no action handler
-  // of its own — ours does (the bare-`cctl` summary at the bottom of this function), which would
-  // otherwise silently disable `cctl help`/`cctl help <command>` rather than dispatching them.
-  // Force it on explicitly so both keep working regardless of that handler.
-  program.helpCommand(true);
+  // `help` is a command of ours rather than Commander's implicit one. Two reasons, and the
+  // second is why it is not just `helpCommand(true)`: Commander only auto-adds its help command
+  // when the program has no action handler of its own (ours does — the bare-`cctl` summary at
+  // the bottom of this function), and its dispatch takes exactly ONE command name, so
+  // `cctl help accounts reauth` would print the GROUP's help and silently drop the rest.
+  // A variadic path walks the tree instead, which is what a grouped command surface needs.
+  program
+    .command('help [command...]')
+    .description('display help for a command (e.g. cctl help accounts reauth)')
+    .action((names: string[]) => {
+      let target: Command = program;
+      const walked: string[] = [];
+      for (const name of names) {
+        const next = target.commands.find((c) => c.name() === name || c.aliases().includes(name));
+        // Named as far as it resolved, so a typo in a nested path says WHERE it stopped rather
+        // than repeating the whole line back.
+        if (!next) {
+          fail(
+            `unknown command "${name}"${walked.length > 0 ? ` under "${walked.join(' ')}"` : ''}` +
+              ' - run cctl help for the command list',
+          );
+        }
+        walked.push(name);
+        target = next;
+      }
+      // `helpInformation()` rather than `help()`: the latter ends in `process.exit`, which skips
+      // the `finally` blocks the rest of this CLI relies on (see context.ts's `fail`).
+      process.stdout.write(target.helpInformation());
+    });
 
   // Commander's own refusals (an unknown command, a missing argument) reach stderr through this
   // hook. They take the same red as `fail()`'s line so every `error:` the CLI prints looks
@@ -215,6 +241,14 @@ export function buildProgram(): Command {
           fail(`${resolved.account.label} is quarantined; re-login required.`);
         if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
         if (err instanceof UnknownAccountError) fail(err.message);
+        // The token endpoint shedding load is an outage, not a broken account: the engine has
+        // already spent its retry budget and checked the status page, so its message is the
+        // whole story and this switch simply did not happen. Printed as the CLI's own refusal
+        // (one error line, exit 1) so it reads like every other refusal here instead of
+        // escaping as an unhandled failure.
+        if (err instanceof SwitchEngineError && isOverloadCode(err.code)) {
+          fail(`${err.message}. Nothing was changed - try again shortly.`);
+        }
         throw err;
       }
     });
@@ -441,7 +475,11 @@ export function buildProgram(): Command {
     .description("show this CLI's build and the running daemon's last-reported build")
     .action(async () => {
       const report = await readSettingsReport(daemonSettingsPath());
-      process.stdout.write(renderVersionInfo(VERSION, report) + '\n');
+      // The report is written at daemon start and never cleared, so the build it names is only
+      // a live fact while a heartbeat says one is still running — the same source `cctl daemon
+      // status` and `cctl settings` read.
+      const heartbeat = await readHeartbeat(daemonHeartbeatPath());
+      process.stdout.write(renderVersionInfo(VERSION, report, heartbeat.state === 'alive') + '\n');
     });
 
   program
@@ -732,7 +770,7 @@ export function buildProgram(): Command {
       // are still meaningful without it.
       const task = queryAutostart();
 
-      const heartbeat = await readHeartbeat(join(dataDir, 'daemon-heartbeat.json'));
+      const heartbeat = await readHeartbeat(daemonHeartbeatPath(paths));
       const identity = await dpapiIdentityStore(
         join(dataDir, 'daemon-identity.enc'),
         defaultProtector(),
@@ -912,7 +950,7 @@ async function attemptPair(code: string, relayUrl: string): Promise<PairResult> 
  *  heartbeat for up to 10s so a just-kicked daemon has time to report in; without it, reads
  *  once — the right call when nothing was kicked, i.e. a platform with no autostart. */
 async function verifyDaemonAlive(options: { wait?: boolean } = {}): Promise<boolean> {
-  const heartbeatPath = join(dirname(defaultPaths().vaultDir), 'daemon-heartbeat.json');
+  const heartbeatPath = daemonHeartbeatPath();
   const deadline = Date.now() + ((options.wait ?? true) ? 10_000 : 0);
   for (;;) {
     if ((await readHeartbeat(heartbeatPath)).state === 'alive') return true;
@@ -996,7 +1034,7 @@ async function readStatusSummary(): Promise<SetupSummary> {
     hooksInstalledAt(settingsPath),
     dpapiIdentityStore(join(dataDir, 'daemon-identity.enc'), defaultProtector()).load(),
   ]);
-  const heartbeat = await readHeartbeat(join(dataDir, 'daemon-heartbeat.json'));
+  const heartbeat = await readHeartbeat(daemonHeartbeatPath(paths));
   return {
     accounts: accounts.map((a) => ({ label: a.label, active: a.id === activeId })),
     hooksInstalled,
@@ -1643,7 +1681,10 @@ function buildSessionCommands(program: Command): void {
     .command('status')
     .description('show tracked sessions and the active account (reads the daemon db offline)')
     .action(async () => {
-      const { accounts, activeId, usageFor } = await readUsageState(Date.now());
+      // One moment for the whole view: the snapshot read and the countdown derived from it must
+      // not straddle two clock reads.
+      const nowMs = Date.now();
+      const { accounts, activeId, usageFor, predictedResetFor } = await readUsageState(nowMs);
       const labelById = new Map(accounts.map((a) => [a.id, a.label] as const));
 
       // Read the display-only sessions mirror. Opening a not-yet-created db yields an empty one;
@@ -1659,7 +1700,12 @@ function buildSessionCommands(program: Command): void {
       const activeAccount = accounts.find((a) => a.id === activeId);
       const header: SessionStatusHeader = {
         ...(activeAccount ? { activeLabel: activeAccount.label } : {}),
-        ...(activeId ? weeklyResetFor(usageFor(activeId)) : {}),
+        // The PREDICTED reset travels with the snapshot: the endpoint stops publishing a weekly
+        // reset once that window closes, so without it this header goes silent about a runway
+        // `cctl usage` is still counting down.
+        ...(activeId
+          ? weeklyResetHeader(usageFor(activeId), predictedResetFor(activeId), nowMs)
+          : {}),
       };
       process.stdout.write(renderSessionStatus(rows, header, detectPalette()) + '\n');
     });
@@ -1681,18 +1727,6 @@ function sessionRowFromStore(row: SessionRow, labelById: Map<string, string>): S
   if (typeof parsed.watch === 'boolean') out.watch = parsed.watch;
   if (accountId !== undefined) out.accountLabel = labelById.get(accountId) ?? accountId;
   return out;
-}
-
-/** How long until the active account's weekly reset, for the status header — the same runway
- *  `cctl usage` shows inline. Empty when there is no usage snapshot or no known weekly reset.
- *  Returns the remaining duration, not the reset instant: the renderer is clock-free, so the
- *  subtraction has to happen here, where a real clock is already in hand. */
-function weeklyResetFor(usage: AccountUsage | undefined): { weeklyResetInMs?: number } {
-  if (!usage) return {};
-  const nowMs = Date.now();
-  const outlook = computeOutlook(timelineInputFromWire([usage]), nowMs);
-  const budget = outlook.accounts[0]?.budget;
-  return budget ? { weeklyResetInMs: budget.weeklyResetAt - nowMs } : {};
 }
 
 /** Shared driver for register/label/watch: resolve the session id, POST to the daemon with a

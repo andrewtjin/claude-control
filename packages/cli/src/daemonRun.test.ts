@@ -1,14 +1,19 @@
-// Tests for the daemon composition root's own logic. `dpapiIdentityStore` and
-// `makeAgentSdkClientFactory` carry testable behavior — the rest of daemonRun.ts is assembly
-// of subsystems tested in their own packages (and daemon.test.ts proves the composition
-// shape against a live loopback relay).
+// Tests for the daemon composition root's own logic. `dpapiIdentityStore`,
+// `makeAgentSdkClientFactory` and `runShutdownSequence` carry testable behavior — the rest of
+// daemonRun.ts is assembly of subsystems tested in their own packages (and daemon.test.ts
+// proves the composition shape against a live loopback relay).
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InsecurePassthroughProtector, noopLogger } from '@claude-control/switch-engine';
-import { dpapiIdentityStore, makeAgentSdkClientFactory } from './daemonRun.js';
+import {
+  dpapiIdentityStore,
+  makeAgentSdkClientFactory,
+  runShutdownSequence,
+  type ShutdownSequence,
+} from './daemonRun.js';
 
 describe('dpapiIdentityStore', () => {
   let dir: string;
@@ -70,4 +75,70 @@ describe('makeAgentSdkClientFactory', () => {
     // Remote approve/deny depends on the client exposing the permission-resolution seam.
     expect(typeof first.resolvePermission).toBe('function');
   });
+});
+
+describe('runShutdownSequence', () => {
+  /** Records the order steps ran in; `hang` pins `stopDaemon` unresolved to play the case the
+   *  ordering exists for. */
+  function steps(options: { hang?: boolean; failing?: keyof ShutdownSequence } = {}): {
+    sequence: ShutdownSequence;
+    order: string[];
+  } {
+    const order: string[] = [];
+    const step = (name: keyof ShutdownSequence): (() => Promise<void>) => {
+      return () => {
+        order.push(name);
+        if (options.failing === name) return Promise.reject(new Error(`${name} failed`));
+        return Promise.resolve();
+      };
+    };
+    return {
+      order,
+      sequence: {
+        stopDaemon: () => {
+          order.push('stopDaemon');
+          if (options.hang === true) return new Promise<void>(() => undefined);
+          if (options.failing === 'stopDaemon') return Promise.reject(new Error('stop failed'));
+          return Promise.resolve();
+        },
+        removeEndpoint: step('removeEndpoint'),
+        releaseLock: step('releaseLock'),
+        markStopped: () => order.push('markStopped'),
+        flushHeartbeat: step('flushHeartbeat'),
+      },
+    };
+  }
+
+  it('writes the clean-stop marker after the teardown work, immediately before the flush', async () => {
+    const { sequence, order } = steps();
+    await runShutdownSequence(sequence);
+    expect(order).toEqual([
+      'stopDaemon',
+      'removeEndpoint',
+      'releaseLock',
+      'markStopped',
+      'flushHeartbeat',
+    ]);
+  });
+
+  it('never claims a clean stop while the stop itself is still running', async () => {
+    const { sequence, order } = steps({ hang: true });
+    void runShutdownSequence(sequence);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The marker is what `cctl daemon status` renders as "stopped cleanly". A daemon wedged in
+    // stop() still holds its instance lock and its receiver port, so writing it here would send
+    // the next start into a fight it was told nothing about.
+    expect(order).toEqual(['stopDaemon']);
+  });
+
+  it.each(['stopDaemon', 'removeEndpoint', 'releaseLock'] as const)(
+    'still marks and flushes when %s fails',
+    async (failing) => {
+      const { sequence, order } = steps({ failing });
+      await runShutdownSequence(sequence);
+      // Best-effort throughout: a failed step must not strand the process in exactly the state
+      // (alive, lock held, no marker) that gets misreported afterwards.
+      expect(order.slice(-2)).toEqual(['markStopped', 'flushHeartbeat']);
+    },
+  );
 });

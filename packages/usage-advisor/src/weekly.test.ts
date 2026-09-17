@@ -52,14 +52,44 @@ describe('selectWeeklyBudget', () => {
   });
 
   it('picks the soonest still-future reset and ignores one already in the past', () => {
-    const budget = selectWeeklyBudget(
+    const soonest = selectWeeklyBudget(
       [
-        { kind: 'weekly_all', percent: 40, resetsAt: NOW - HOUR_MS },
-        { kind: 'weekly_scoped', percent: 10, resetsAt: NOW + 3 * HOUR_MS },
+        { kind: 'weekly_all', percent: 40, resetsAt: NOW + 3 * HOUR_MS },
+        { kind: 'weekly_scoped', percent: 10, resetsAt: NOW + HOUR_MS },
       ],
       NOW,
     );
-    expect(budget?.resetsAt).toBe(NOW + 3 * HOUR_MS);
+    expect(soonest?.resetsAt).toBe(NOW + HOUR_MS);
+
+    const staleSibling = selectWeeklyBudget(
+      [
+        { kind: 'weekly_all', percent: 40, resetsAt: NOW + 3 * HOUR_MS },
+        { kind: 'weekly_scoped', percent: 10, resetsAt: NOW - HOUR_MS },
+      ],
+      NOW,
+    );
+    expect(staleSibling?.resetsAt).toBe(NOW + 3 * HOUR_MS);
+  });
+
+  it("never dresses the percent's own closed window in the other limit's live clock", () => {
+    // A self-contradicting snapshot: the limit that supplies the percent says its window has
+    // already rolled, while the sub-cap still reports a future reset. Pairing the two would
+    // report a closed window's usage against a deadline it has nothing to do with, and flag it
+    // as observed.
+    const limits: LimitInput[] = [
+      { kind: 'weekly_all', percent: 40, resetsAt: NOW - HOUR_MS },
+      { kind: 'weekly_scoped', percent: 10, resetsAt: NOW + 3 * HOUR_MS },
+    ];
+    const noClock = selectWeeklyBudget(limits, NOW);
+    expect(noClock?.kind).toBe('weekly_all');
+    expect(noClock?.percent).toBe(40);
+    expect(noClock?.resetsAt).toBeUndefined();
+    expect(noClock?.predicted).toBe(false);
+
+    // With history to fall back on, the prediction stands in — and says so.
+    const predicted = selectWeeklyBudget(limits, NOW, NOW + 5 * HOUR_MS);
+    expect(predicted?.resetsAt).toBe(NOW + 5 * HOUR_MS);
+    expect(predicted?.predicted).toBe(true);
   });
 
   it('uses the prediction only when no observed reset is still in the future', () => {

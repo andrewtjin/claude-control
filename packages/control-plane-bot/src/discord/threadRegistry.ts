@@ -19,8 +19,23 @@ import { join } from 'node:path';
 import { atomicWriteFile, readJsonOrAbsent } from '../fsutil.js';
 
 /** Where a session's frames are delivered. `thread` once a Discord thread exists for it; `dm` when
- *  thread creation was not possible and we fell back to (and pinned) the user's direct messages. */
-export type DeliveryTarget = { kind: 'thread'; threadId: string } | { kind: 'dm' };
+ *  thread creation was not possible and we fell back to (and pinned) the user's direct messages.
+ *
+ *  A `dm` entry KEEPS the thread id when it is the DEMOTION of an existing thread (the thread
+ *  stopped being sendable — a revoked permission, a Discord hiccup) rather than a session that
+ *  never had one. That id is provenance, not routing: dropping it used to steer typed replies
+ *  wrong, because {@link ThreadRegistry.latestForThread} then skipped the demoted (newest) session
+ *  and answered with an OLDER one still bound to the thread — so typing in the thread injected
+ *  into, or resumed, the wrong session. Keeping it also lets a later sendable check re-attach the
+ *  session to its own thread. */
+export type DeliveryTarget =
+  { kind: 'thread'; threadId: string } | { kind: 'dm'; threadId?: string };
+
+/** The thread a target belongs to — live (`thread`) or remembered through a demotion (`dm` with an
+ *  id) — and `undefined` only for a session that never had a thread at all. */
+export function boundThreadId(target: DeliveryTarget): string | undefined {
+  return target.threadId;
+}
 
 /** On-disk shape. Versioned so a future field addition can migrate rather than mis-parse. A flat
  *  array (not a nested object) keeps the file diff-friendly and trivial to reason about. */
@@ -59,11 +74,17 @@ export class ThreadRegistry {
    *  sessions over its life (each resume binds a NEW sessionId to the same thread), and the newest
    *  binding is the conversation the user is continuing, so the LAST match wins: Map iteration is
    *  insertion-ordered, `set` never reorders an existing key, and a resumed session is always
-   *  recorded after its predecessor — both in memory and through a snapshot/restore cycle. */
+   *  recorded after its predecessor — both in memory and through a snapshot/restore cycle.
+   *
+   *  A session DEMOTED to the DM still counts as bound to its thread here. It is still the newest
+   *  conversation in that thread, and the alternative is worse than a demoted match: falling
+   *  through to the previous session would silently steer — and, once it has ended, resume — a
+   *  conversation the user is not looking at. Delivery is the demotion's business; identity is
+   *  this method's. */
   latestForThread(threadId: string): { discordUserId: string; sessionId: string } | undefined {
     let found: { discordUserId: string; sessionId: string } | undefined;
     for (const [k, target] of this.map) {
-      if (target.kind !== 'thread' || target.threadId !== threadId) continue;
+      if (boundThreadId(target) !== threadId) continue;
       const sep = k.indexOf(KEY_SEPARATOR);
       found = { discordUserId: k.slice(0, sep), sessionId: k.slice(sep + 1) };
     }
@@ -97,7 +118,11 @@ export class ThreadRegistry {
 function isDeliveryTarget(value: unknown): value is DeliveryTarget {
   if (typeof value !== 'object' || value === null) return false;
   const t = value as { kind?: unknown; threadId?: unknown };
-  return t.kind === 'dm' || (t.kind === 'thread' && typeof t.threadId === 'string');
+  // A `dm` may carry the thread it was demoted from; anything else in that slot is a damaged row,
+  // and dropping just the id (rather than the entry) would resurrect the fall-through this
+  // provenance exists to prevent.
+  if (t.kind === 'dm') return t.threadId === undefined || typeof t.threadId === 'string';
+  return t.kind === 'thread' && typeof t.threadId === 'string';
 }
 
 function isRegistryEntry(value: unknown): value is RegistrySnapshot['entries'][number] {

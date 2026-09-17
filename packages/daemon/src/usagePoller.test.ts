@@ -9,6 +9,7 @@ import {
   type FetchLike,
   type FetchLikeResponse,
   type PollAccount,
+  type PollCycleResult,
   type SnapshotResult,
 } from './usagePoller.js';
 import {
@@ -16,6 +17,7 @@ import {
   PATIENT_OVERLOAD_BUDGET,
   type OverloadRetryDeps,
 } from '@claude-control/switch-engine';
+import { computePlan } from '@claude-control/usage-advisor';
 import { extractWeeklyReading, readFleetHistory } from './usageHistory.js';
 import { parseUsageEndpointResponse } from './usageParse.js';
 
@@ -587,7 +589,7 @@ describe('UsagePoller', () => {
       advisorOptions: { now: () => 0 },
     });
 
-    const snapshot = await poller.pollAll([account, account2]);
+    const snapshot = poller.assemble(await poller.pollAll([account, account2]));
     // The failing account does not sink the cycle: every account is still reported + planned.
     expect(snapshot.accounts).toHaveLength(2);
     expect(snapshot.plan.ranking).toHaveLength(2);
@@ -615,10 +617,12 @@ describe('UsagePoller', () => {
       clock: () => 0,
       advisorOptions: { now: () => 0 },
     });
-    const snapshot = await poller.pollAll([
-      { ...account, active: true },
-      { ...account2, active: false },
-    ]);
+    const snapshot = poller.assemble(
+      await poller.pollAll([
+        { ...account, active: true },
+        { ...account2, active: false },
+      ]),
+    );
     // acct-2 has far more headroom (95%) than acct-1 (10%), so it should be recommended.
     expect(snapshot.plan.recommendedAccountId).toBe('acct-2');
     expect(snapshot.plan.ranking).toHaveLength(2);
@@ -844,7 +848,7 @@ describe('toUsageSnapshotPayload — what actually goes on the wire', () => {
       clock: () => NOW,
       advisorOptions: { now: () => NOW },
     });
-    return poller.pollAll([account, account2]);
+    return poller.assemble(await poller.pollAll([account, account2]));
   }
 
   // The regression this whole test exists for: `encode()` VALIDATES before serializing, and a
@@ -984,5 +988,78 @@ describe('toUsageSnapshotPayload — what actually goes on the wire', () => {
     expect(payload.accounts.find((a) => a.accountId === 'acct-1')?.planWeight).toBe(5);
     expect(payload.accounts.find((a) => a.accountId === 'acct-2')?.planWeight).toBeUndefined();
     expect(payload.accounts.find((a) => a.accountId === 'acct-2')?.billing).toBeUndefined();
+  });
+});
+
+describe('assemble — one set of inputs behind the plan', () => {
+  const NOW = Date.parse('2026-07-25T19:00:00.000Z');
+  const HOUR_MS = 60 * 60 * 1000;
+  const iso = (atMs: number) => new Date(atMs).toISOString();
+
+  /** acct-1 is live with a weekly reset days out; acct-2's weekly window has CLOSED, so the
+   *  endpoint reports its usage with no reset at all — an account only history can place on a
+   *  clock. */
+  const bodyFor = (token: string) =>
+    token === 'Bearer tok-acct-1'
+      ? {
+          limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + 6 * 24 * HOUR_MS) }],
+        }
+      : { limits: [{ kind: 'weekly_all', percent: 30 }] };
+
+  async function pollBoth(): Promise<{ poller: UsagePoller; polled: PollCycleResult }> {
+    const poller = new UsagePoller({
+      fetch: (_url, init) =>
+        Promise.resolve(jsonResponse(200, bodyFor(init.headers.authorization ?? ''))),
+      getToken: (id: string) => Promise.resolve(`tok-${id}`),
+      getCachedUsage: () => Promise.resolve(undefined),
+      clock: () => NOW,
+      advisorOptions: { now: () => NOW },
+    });
+    return { poller, polled: await poller.pollAll([account, { ...account2, active: false }]) };
+  }
+
+  it('a prediction reaches the inputs and the plan together, never one without the other', async () => {
+    const { poller, polled } = await pollBoth();
+
+    // No prediction: nothing places acct-2 on a weekly clock, so the most headroom wins.
+    const blind = poller.assemble(polled);
+    expect(blind.inputs.find((a) => a.accountId === 'acct-2')?.predictedResetAt).toBeUndefined();
+    expect(blind.plan.recommendedAccountId).toBe('acct-1');
+
+    // With one: acct-2's untouched weekly budget is about to evaporate, which outranks any
+    // amount of headroom — and the plan says so BECAUSE the inputs it was computed from say so.
+    const informed = poller.assemble(polled, new Map([['acct-2', NOW + 3 * HOUR_MS]]));
+    expect(informed.inputs.find((a) => a.accountId === 'acct-2')?.predictedResetAt).toBe(
+      NOW + 3 * HOUR_MS,
+    );
+    expect(informed.plan.recommendedAccountId).toBe('acct-2');
+    // The plan is a pure function of exactly these inputs — the same array any executor the
+    // caller hands them to will decide on.
+    expect(informed.plan).toEqual(computePlan(informed.inputs, { now: () => NOW }));
+  });
+
+  it('reads a prediction exactly as the wire does — rounded, or not at all', async () => {
+    const { poller, polled } = await pollBoth();
+    const predictions = new Map([
+      ['acct-1', NOW + 1234.6],
+      ['acct-2', Number.NaN],
+    ]);
+    const snapshot = poller.assemble(polled, predictions);
+    const wire = toUsageSnapshotPayload(
+      snapshot,
+      { predictedResetByAccount: predictions },
+      [],
+      NOW,
+    );
+
+    expect(snapshot.inputs.find((a) => a.accountId === 'acct-1')?.predictedResetAt).toBe(
+      Math.round(NOW + 1234.6),
+    );
+    expect(wire.accounts.find((a) => a.accountId === 'acct-1')?.predictedResetAt).toBe(
+      Math.round(NOW + 1234.6),
+    );
+    // A prediction that is not a usable timestamp is absent on both sides rather than invented.
+    expect(snapshot.inputs.find((a) => a.accountId === 'acct-2')?.predictedResetAt).toBeUndefined();
+    expect(wire.accounts.find((a) => a.accountId === 'acct-2')?.predictedResetAt).toBeUndefined();
   });
 });

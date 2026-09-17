@@ -233,6 +233,30 @@ describe('decideAutoSwitch — choosing among candidates', () => {
     );
   });
 
+  it('names the weekly budget, not the 5-hour window, when both are equally spent', () => {
+    // The endpoint lists the 5-hour window first, so first-wins would report this account as
+    // merely "at 100% of its 5-hour window" — which reads as "back in a few hours" when the
+    // whole week is in fact gone.
+    const spare = acct('spare', {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 13 * H }]);
+    const bothSpent = acct('hot', { active: true }, [
+      { kind: 'session', percent: 100, resetsAt: NOW + 2 * H },
+      { kind: 'weekly_all', percent: 100, resetsAt: NOW + 48 * H },
+    ]);
+    expect(decideAutoSwitch([bothSpent, spare], NOW)?.reason).toContain(
+      'hot is at 100% of its weekly budget',
+    );
+
+    // Same rule one rung down: the Fable sub-cap outranks the window, and the full budget
+    // outranks the sub-cap.
+    const windowAndCap = acct('hot', { active: true }, [
+      { kind: 'session', percent: 100, resetsAt: NOW + 2 * H },
+      { kind: 'weekly_scoped', percent: 100, resetsAt: NOW + 48 * H },
+    ]);
+    expect(decideAutoSwitch([windowAndCap, spare], NOW)?.reason).toContain(
+      'hot is at 100% of its Fable weekly cap',
+    );
+  });
+
   it('returns null when every other account is ineligible', () => {
     const q = acct('q', { quarantined: true });
     expect(decideAutoSwitch([lowActive(), q], NOW)).toBeNull();

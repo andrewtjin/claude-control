@@ -1103,16 +1103,34 @@ export function renderSettings(
 // `cctl version` (pure)
 // ---------------------------------------------------------------------------
 
-/** Render `cctl version`: the build running this CLI, plus the daemon's build as of its last
- *  recorded start — reusing the exact report `cctl settings` already reads, rather than a
- *  second path to the same file. An npm update replaces the CLI's files immediately but an
- *  already-running daemon process keeps executing what it loaded at start, so the two can
- *  legitimately disagree; that skew is exactly what the warning line exists to catch. */
-export function renderVersionInfo(cliVersion: string, report: SettingsReport | undefined): string {
+/**
+ * Render `cctl version`: the build running this CLI, plus the daemon's build — reusing the exact
+ * report `cctl settings` already reads, rather than a second path to the same file.
+ *
+ * An npm update replaces the CLI's files immediately while an already-running daemon keeps
+ * executing what it loaded at start, so the two can legitimately disagree; that skew is what the
+ * warning exists to catch. It is a fact about a RUNNING daemon only, which is why `daemonRunning`
+ * (the same heartbeat `cctl daemon status` and `cctl settings` judge liveness by) is a parameter
+ * and not an inference from the report: the report is written at daemon start and never cleared,
+ * so after a stop its build lingers. Warning on that would name a skew with a process that does
+ * not exist, and tell the reader to restart a daemon that is already down. A stopped daemon
+ * therefore reports the build it last started with, and nothing else.
+ */
+export function renderVersionInfo(
+  cliVersion: string,
+  report: SettingsReport | undefined,
+  daemonRunning: boolean,
+): string {
   const cli = `v${cliVersion}`;
   const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
   if (daemonBuild === undefined) {
     return [`cli build: ${cli}`, 'daemon build: no daemon has run yet'].join('\n');
+  }
+  if (!daemonRunning) {
+    return [
+      `cli build: ${cli}`,
+      `last started daemon build: ${daemonBuild} (no daemon is running)`,
+    ].join('\n');
   }
   const lines = [`cli build: ${cli}`, `daemon build: ${daemonBuild}`];
   if (daemonBuild !== cli) {

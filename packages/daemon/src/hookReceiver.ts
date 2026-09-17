@@ -1004,6 +1004,13 @@ export class HookReceiver {
         // 'data' listener still attached, the next chunk would only pause it again.
         req.removeAllListeners('data');
         req.resume();
+        // …and the response WAITS for that drain. Answering while the sender is still uploading
+        // ends a connection it is mid-write on, which the sender reads as a reset — the same
+        // network-failure-instead-of-refusal this branch exists to avoid, just arriving a moment
+        // later. Only a body big enough to outlive the round trip reaches that state, which is
+        // exactly the body a cap is for. Bounded, so a sender that never finishes cannot hold the
+        // handler open: past the bound the refusal ships anyway and the socket closes under it.
+        await drainRequest(req, OVER_CAP_DRAIN_MS);
       }
       this.respond(res, 400, { ok: false, error: `malformed body: ${message}` });
       return;
@@ -1063,10 +1070,21 @@ export class HookReceiver {
 
     if (path === '/cli/channel/attach') {
       const sessionId = str(body.sessionId);
-      const pid = typeof body.pid === 'number' ? body.pid : undefined;
+      // A POSITIVE INTEGER, not any number. The daemon probes this pid with `process.kill(pid, 0)`
+      // to decide whether a channel server is still there, and `0` is not a pid: it addresses the
+      // CALLER's whole process group, so the probe answers "alive" for as long as the daemon
+      // itself is running and the attachment is never swept. Negatives address a group too, and a
+      // fractional value is not a pid on any platform.
+      const pid =
+        typeof body.pid === 'number' && Number.isInteger(body.pid) && body.pid > 0
+          ? body.pid
+          : undefined;
       const identitySource = str(body.identitySource);
       if (!sessionId || pid === undefined) {
-        this.respond(res, 400, { ok: false, error: 'sessionId and pid are required' });
+        this.respond(res, 400, {
+          ok: false,
+          error: 'sessionId and a positive integer pid are required',
+        });
         return;
       }
       if (identitySource !== 'env' && identitySource !== 'ancestry') {
@@ -1160,6 +1178,17 @@ export class HookReceiver {
             error: 'injectId and state (sent|failed) are required',
           });
           return;
+        }
+        if (state === 'failed') {
+          // The client's own reason for the failure, which is the ONLY description of why a
+          // session could not take a prompt that exists anywhere on this side of the pipe: the
+          // requeue below is otherwise indistinguishable from a healthy retry, and an operator
+          // watching a prompt bounce has nothing to read. Logged, not carded — the daemon
+          // requeues and retries, so this is diagnosis, not news.
+          this.logger.warn(
+            { attachId, injectId, error: str(body.error) },
+            'channel: server reported a failed delivery',
+          );
         }
         const ok = handlers.ack(attachId, injectId, state);
         this.respond(res, ok ? 200 : 404, ok ? { ok: true } : { ok: false, error: 'unknown item' });
@@ -1971,6 +2000,32 @@ function secretsMatch(presented: string | undefined, expected: string): boolean 
   const a = createHash('sha256').update(presented).digest();
   const b = createHash('sha256').update(expected).digest();
   return timingSafeEqual(a, b);
+}
+
+/** How long the receiver will keep reading (and discarding) the tail of an over-cap upload so
+ *  its refusal is readable. Generous enough for a multi-megabyte body on loopback, short enough
+ *  that a sender that stalls mid-upload cannot pin the handler. */
+const OVER_CAP_DRAIN_MS = 5_000;
+
+/** Read and discard whatever is left of a request body, resolving when the sender finishes (or
+ *  the connection dies, or the bound elapses). The stream is already flowing and listener-less
+ *  when this is called, so this only waits — it never accumulates anything. */
+function drainRequest(req: IncomingMessage, timeoutMs: number): Promise<void> {
+  if (req.readableEnded === true || req.destroyed) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      req.off('end', done);
+      req.off('error', done);
+      req.off('close', done);
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    timer.unref();
+    req.once('end', done);
+    req.once('error', done);
+    req.once('close', done);
+  });
 }
 
 /** Read and JSON-parse a request body, bounded so a misbehaving/malicious sender can't exhaust
