@@ -59,7 +59,7 @@ alone (usage, burn advice, manual and automatic switching). Pair later with
 
 ## Platform
 
-**Windows and Linux (including WSL2) v0.5.0.** macOS is at a very early stage:
+**Windows and Linux (including WSL2) v0.5.1.** macOS is at a very early stage:
 the Keychain vault and switch paths ship and are unit-tested, but they have not
 been exercised on real Mac hardware, so treat macOS as experimental rather than
 supported.

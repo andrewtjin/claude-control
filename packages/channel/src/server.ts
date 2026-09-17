@@ -27,7 +27,7 @@ export const SERVER_NAME = 'cctl-channel';
  *  workspace package's private `0.1.0` would name something nobody can install or file against.
  *  Hand-maintained alongside `packages/cctl-publish/package.json` and `packages/cli/src/settings.ts`
  *  `VERSION`, which is how this repo already carries the shipped version. */
-export const SERVER_VERSION = '0.6.0';
+export const SERVER_VERSION = '0.5.1';
 
 /**
  * Server-level guidance, handed to the client as MCP `instructions` on initialize.
