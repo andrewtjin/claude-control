@@ -176,6 +176,10 @@ describe('channel end to end: session server ↔ daemon receiver', () => {
     });
     await waitFor(() => r.replies.length > 0);
     expect(r.replies).toEqual(['shipped']);
+    // The daemon records the reply before its HTTP response reaches the link, and the tool result
+    // is written to the pipe only after that, so the client-visible half is awaited on its own
+    // rather than assumed to have landed with the daemon-side one.
+    await waitFor(() => r.clientSaw.some((m) => m.id === 2));
     const toolResult = r.clientSaw.find((m) => m.id === 2);
     expect((toolResult?.result as { content: Array<{ text: string }> }).content[0]?.text).toContain(
       'Handed to cctl',
