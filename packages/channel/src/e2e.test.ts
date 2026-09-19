@@ -28,6 +28,11 @@ interface Rig {
   replies: string[];
   /** Items the daemon was handed back when a channel closed with work still on it. */
   recovered: string[];
+  /** Every ack the daemon side received, in arrival order. The client seeing a notification says
+   *  only that the bytes left the server; the ack is what clears the daemon's in-flight entry, and
+   *  it travels back over its own HTTP round trip, so a test that stops the link after the client
+   *  saw the prompt must wait for this too or the daemon still counts the item as owed. */
+  acked: { injectId: string; state: 'sent' | 'failed' }[];
   say(message: unknown): void;
   /** The session-side end of the stdio pipe, so a test can kill it the way an exiting Claude
    *  Code kills it. */
@@ -56,6 +61,7 @@ async function rig(sessionId: string): Promise<Rig> {
   const store = new Store(':memory:');
   const recovered: string[] = [];
   const replies: string[] = [];
+  const acked: Rig['acked'] = [];
   const receiver = new HookReceiver({
     store,
     secret: SECRET,
@@ -77,7 +83,11 @@ async function rig(sessionId: string): Promise<Rig> {
         : { ok: false, error: result.reason, retryable: result.reason === 'closing' };
     },
     take: (attachId, source) => registry.take(attachId, source),
-    ack: (attachId, injectId, state) => registry.ack(attachId, injectId, state).ok,
+    ack: (attachId, injectId, state) => {
+      const ok = registry.ack(attachId, injectId, state).ok;
+      acked.push({ injectId, state });
+      return ok;
+    },
     reply: (attachId, text) => {
       if (registry.get(attachId) === undefined) return false;
       replies.push(text);
@@ -127,6 +137,7 @@ async function rig(sessionId: string): Promise<Rig> {
     clientSaw,
     replies,
     recovered,
+    acked,
     say,
     output: fromServer,
     running,
@@ -162,10 +173,10 @@ describe('channel end to end: session server ↔ daemon receiver', () => {
 
     // The ack really cleared the in-flight entry on the daemon side: a detach now hands nothing
     // back, which is the difference between "delivered" and "still owed to the operator".
-    await waitFor(() => r.registry.take(r.link.currentAttachId ?? '', 'wake')?.length === 0);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => r.acked.some((a) => a.state === 'sent'));
     const attachId = r.link.currentAttachId;
     expect(attachId).toBeDefined();
+    expect(r.registry.take(attachId ?? '', 'wake')).toEqual([]);
 
     // And the model's answer travels the other way on the same authenticated connection.
     r.say({
@@ -190,6 +201,9 @@ describe('channel end to end: session server ↔ daemon receiver', () => {
     const r = await rig('sess-e2e-clean');
     r.registry.enqueue('sess-e2e-clean', 'do this one thing');
     await waitFor(() => r.clientSaw.some((m) => m.method === 'notifications/claude/channel'));
+    // "Delivered" is the daemon's word, not the client's: only once the link's ack has landed is
+    // the item off the daemon's books, and a stop before that would hand it back as still owed.
+    await waitFor(() => r.acked.some((a) => a.state === 'sent'));
 
     r.link.stop();
     await r.running;
