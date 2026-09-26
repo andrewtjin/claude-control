@@ -22,7 +22,7 @@ import type {
 } from './types.js';
 import type { FolderBindingSnapshot } from './types.js';
 import type { Protector } from './dpapi.js';
-import { canonicalizeFolder, folderKey } from './folderPath.js';
+import { folderUniquenessKey } from './folderPath.js';
 import { sanitizeTerminalText } from './terminalSafe.js';
 import {
   buildFolderBindingSnapshot,
@@ -218,31 +218,6 @@ function validateMember(value: unknown, where: string): StoredAccount {
     throw new VaultError(`${where} (${id}) has non-numeric timestamps`);
   }
   return value as unknown as StoredAccount;
-}
-
-/**
- * The cross-group uniqueness key for a stored folder: the SAME physical directory must map to one
- * key however it is spelled. {@link folderKey} alone only folds case, so two spellings of one
- * directory (a `C:/x` vs `C:\x` separator difference, a trailing separator, an embedded `.`/`..`)
- * would slip past it and let two groups silently "own" the same folder — with only one reachable.
- *
- * So the folder is run through the shared {@link canonicalizeFolder} FIRST (string-only: `realpath`
- * always throws, since load must not touch the filesystem per stored folder), then keyed. A folder
- * that bind stored is already canonical, so this is a no-op for it and the uniqueness check is
- * unchanged; it only additionally collapses a NON-canonical spelling that reached the
- * operator-editable file some other way (a hand-edit, a vault copied under a different separator
- * convention). A path canonicalization rejects (device/ADS/drive-relative/control chars) has no
- * canonical form, so it falls back to its raw key — still detecting identical bad spellings.
- */
-function folderUniquenessKey(folder: string, platform: NodeJS.Platform): string {
-  const canon = canonicalizeFolder(folder, {
-    platform,
-    cwd: platform === 'win32' ? 'C:\\' : '/',
-    realpath: () => {
-      throw new Error('no filesystem access at load');
-    },
-  });
-  return folderKey(canon.ok ? canon.path : folder, platform);
 }
 
 /**
@@ -901,9 +876,11 @@ export class Vault {
   async removeFolderFromGroup(groupId: string, folder: string): Promise<StoredGroup> {
     const st = await this.loadState();
     const group = this.mustGroup(st, groupId);
-    const key = folderKey(folder, this.platform);
+    // Key on folderUniquenessKey (canonicalize-then-fold), the same key bind and the load validator
+    // use, so a canonical query still removes a folder stored under a non-canonical spelling.
+    const key = folderUniquenessKey(folder, this.platform);
     const before = group.folders.length;
-    group.folders = group.folders.filter((f) => folderKey(f, this.platform) !== key);
+    group.folders = group.folders.filter((f) => folderUniquenessKey(f, this.platform) !== key);
     if (group.folders.length === before) {
       throw new VaultError(`folder ${folder} is not bound to group ${groupId}`);
     }
@@ -933,25 +910,36 @@ export class Vault {
   }
 
   /** Validate a set of NEW folders against the current bindings: each must be a non-empty string,
-   *  unique within the set, and not already held by a DIFFERENT group (`ignoreGroupId` is the group
-   *  being grown, whose own folders are not a conflict with itself). Returns them unchanged. */
+   *  unique within the set, not already held by a DIFFERENT group, and not already held by the group
+   *  being grown (`ignoreGroupId`). Returns them unchanged.
+   *
+   *  Keys on {@link folderUniquenessKey} — the SAME key {@link validateGroupsFile} enforces at load.
+   *  folderKey alone (case-fold only) would let two non-canonical spellings of one directory (a
+   *  `C:/x` vs `C:\x` separator difference) both pass here yet collapse to one key at load, and would
+   *  let the target group re-add its OWN folder; either way the write persists a `groups.json` the
+   *  next load rejects, bricking every command until the file is hand-repaired. `ignoreGroupId` is
+   *  still honoured — a group's own folders are checked as a self-collision, not a cross-group one, so
+   *  the error names the right cause — but re-adding is refused rather than silently duplicated. */
   private checkNewFolders(
     st: RegistryState,
     folders: readonly string[],
     ignoreGroupId: string | null,
   ): string[] {
-    const existing = new Set<string>();
+    const otherGroups = new Set<string>();
+    const ownGroup = new Set<string>();
     for (const g of st.groups) {
-      if (g.id === ignoreGroupId) continue;
-      for (const f of g.folders) existing.add(folderKey(f, this.platform));
+      const bucket = g.id === ignoreGroupId ? ownGroup : otherGroups;
+      for (const f of g.folders) bucket.add(folderUniquenessKey(f, this.platform));
     }
     const seen = new Set<string>();
     const out: string[] = [];
     for (const folder of folders) {
       if (typeof folder !== 'string' || folder === '') throw new VaultError('a folder is empty');
-      const key = folderKey(folder, this.platform);
-      if (existing.has(key))
+      const key = folderUniquenessKey(folder, this.platform);
+      if (otherGroups.has(key))
         throw new VaultError(`folder ${folder} is already bound to another group`);
+      if (ownGroup.has(key))
+        throw new VaultError(`folder ${folder} is already bound to this group`);
       if (seen.has(key)) throw new VaultError(`folder ${folder} is listed twice`);
       seen.add(key);
       out.push(folder);

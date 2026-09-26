@@ -226,6 +226,36 @@ export function folderKey(path: string, platform: NodeJS.Platform): string {
   return platform === 'win32' ? path.toLowerCase() : path;
 }
 
+/**
+ * The cross-group uniqueness key for a folder: the SAME physical directory must map to one key
+ * however it is spelled. {@link folderKey} alone only folds case, so two spellings of one directory
+ * (a `C:/x` vs `C:\x` separator difference, a trailing separator, an embedded `.`/`..`) would slip
+ * past it and let two groups silently "own" the same folder — with only one reachable.
+ *
+ * So the folder is run through {@link canonicalizeFolder} FIRST (string-only: `realpath` always
+ * throws, since this must not touch the filesystem — the load validator keys stored folders with it
+ * and load must not stat per-folder), then keyed. A folder that bind stored is already canonical, so
+ * this is a no-op for it; it only additionally collapses a NON-canonical spelling that reached the
+ * operator-editable file some other way (a hand-edit, a vault copied under a different separator
+ * convention). A path canonicalization rejects (device/ADS/drive-relative/control chars) has no
+ * canonical form, so it falls back to its raw key — still detecting identical bad spellings.
+ *
+ * This is the SINGLE key both the write-time binding guards (`checkNewFolders`, `exactBinding`,
+ * `removeFolderFromGroup`) and the load-time validator (`validateGroupsFile`) must use: keying the
+ * two sides differently lets a write persist a `groups.json` the next load rejects (a fail-closed
+ * brick). It is NOT part of the embeddable trio, so it may reference the module's other functions.
+ */
+export function folderUniquenessKey(folder: string, platform: NodeJS.Platform): string {
+  const canon = canonicalizeFolder(folder, {
+    platform,
+    cwd: platform === 'win32' ? 'C:\\' : '/',
+    realpath: () => {
+      throw new Error('no filesystem access when keying a stored folder');
+    },
+  });
+  return folderKey(canon.ok ? canon.path : folder, platform);
+}
+
 /** Whether `child` is `parent` itself or lives beneath it. Compares on {@link folderKey} and only
  *  on a `parent + separator` boundary, so `C:\research` never "contains" `C:\research2`.
  *  Self-contained (calls only `folderKey`, which the embedding puts in the same scope). */
@@ -272,10 +302,14 @@ export function exactBinding(
   groups: readonly FolderBoundGroup[],
   platform: NodeJS.Platform,
 ): string | null {
-  const key = folderKey(folder, platform);
+  // Key on {@link folderUniquenessKey}, the same key the store's write guards and load validator
+  // use — folderKey alone would MISS a stored folder held under a non-canonical spelling (a
+  // hand-edit, or a vault copied under a different separator convention), reporting a bound folder
+  // as free and letting bind point a second group at it.
+  const key = folderUniquenessKey(folder, platform);
   for (const g of groups) {
     for (const f of g.folders) {
-      if (folderKey(f, platform) === key) return g.id;
+      if (folderUniquenessKey(f, platform) === key) return g.id;
     }
   }
   return null;

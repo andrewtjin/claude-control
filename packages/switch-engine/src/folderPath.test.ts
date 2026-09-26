@@ -317,6 +317,13 @@ describe('exactBinding', () => {
   it('does not match a nested subfolder (that is allowed to bind elsewhere)', () => {
     expect(exactBinding('C:\\work\\client', groups, 'win32')).toBeNull();
   });
+  it('matches a stored folder under a different separator spelling (keyed canonically)', () => {
+    // A stored non-canonical spelling (hand-edit, or a vault copied under a different separator
+    // convention) must still be found, or bind would report a bound folder as free.
+    const skewed = [{ id: 'g1', folders: ['C:/g/8'] }];
+    expect(exactBinding('C:\\g\\8', skewed, 'win32')).toBe('g1');
+    expect(exactBinding('c:/G/8/', skewed, 'win32')).toBe('g1');
+  });
 });
 
 describe('checkBindTarget', () => {
