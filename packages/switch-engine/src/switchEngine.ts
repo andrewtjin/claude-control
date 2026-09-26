@@ -57,6 +57,7 @@ import type {
   BindResult,
   ClaudeOauth,
   CredentialBundle,
+  FolderBindingSnapshot,
   GroupLiveResult,
   OauthAccount,
   RecoverResult,
@@ -428,6 +429,32 @@ export class SwitchEngine {
 
   listAccounts(): Promise<StoredAccount[]> {
     return this.vault.listAccounts();
+  }
+  // ---- read-only group / snapshot accessors (for the CLI's bindings / where / accounts views) ----
+  //
+  // The vault is private to the engine, but the CLI must read the folder-bound groups to render
+  // `bindings`, tag `accounts`/`usage` with a binding, and resolve `where`. These are thin
+  // pass-throughs (metadata reads, no decryption, no lock) so the CLI reaches the SAME configured
+  // vault the engine already holds instead of constructing a second one with a duplicated protector.
+  /** All folder-bound groups (full member rows). */
+  listGroups(): Promise<StoredGroup[]> {
+    return this.vault.listGroups();
+  }
+  /** One folder-bound group by id, or undefined. */
+  getGroup(id: string): Promise<StoredGroup | undefined> {
+    return this.vault.getGroup(id);
+  }
+  /** The shared pool AND every reserved member in one view; each reserved row carries its groupId. */
+  listAllAccounts(): Promise<AccountView[]> {
+    return this.vault.listAllAccounts();
+  }
+  /** The groups.json generation the snapshot is derived from — used to judge snapshot freshness. */
+  getGroupsGeneration(): Promise<number> {
+    return this.vault.getGroupsGeneration();
+  }
+  /** The non-secret guard snapshot as last written, or undefined when none exists yet. */
+  readSnapshot(): Promise<FolderBindingSnapshot | undefined> {
+    return this.vault.readFolderBindings();
   }
   addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
     return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
