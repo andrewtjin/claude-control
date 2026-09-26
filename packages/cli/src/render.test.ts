@@ -891,6 +891,12 @@ describe('renderWhere', () => {
     expect(out).toContain('CLAUDE_CONFIG_DIR=C:\\data\\profiles\\g1');
     expect(out).toContain('claudeCode.environmentVariables');
     expect(out).toContain('.vscode\\settings.json');
+    // The printed snippet must parse and carry the extension's array-of-{name,value} shape.
+    const json = out.slice(out.indexOf('{'));
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    expect(parsed['claudeCode.environmentVariables']).toEqual([
+      { name: 'CLAUDE_CONFIG_DIR', value: 'C:\\data\\profiles\\g1' },
+    ]);
   });
 
   it('explains an unbound folder as the global account', () => {

@@ -595,8 +595,11 @@ export function renderWhere(view: WhereView, palette: Palette = PLAIN_PALETTE): 
   const members = b.members.map((m) => sanitizeForTerminal(m)).join(', ');
   const live = b.liveMemberLabel ? sanitizeForTerminal(b.liveMemberLabel) : 'none usable';
   const profile = sanitizeForTerminal(b.profileDir);
+  // The Claude Code extension's setting is an ARRAY of {name, value} pairs (its default is []),
+  // not an object map; an object here would be ignored and the extension would launch on the
+  // global account.
   const vscodeSnippet = JSON.stringify(
-    { 'claudeCode.environmentVariables': { CLAUDE_CONFIG_DIR: b.profileDir } },
+    { 'claudeCode.environmentVariables': [{ name: 'CLAUDE_CONFIG_DIR', value: b.profileDir }] },
     null,
     2,
   );

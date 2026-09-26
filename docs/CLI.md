@@ -113,9 +113,18 @@ For PowerShell, `cctl shell-init powershell` prints a function to add to your pr
 (`$PROFILE`); afterwards typing `claude` in any bound folder starts on the right account,
 and typing it anywhere else behaves exactly as before. The command prints where to put it.
 
-In **VS Code**, point the integrated terminal (and the Claude Code extension) at the
-folder's account by adding the snippet `cctl where` prints to the folder's
-`.vscode/settings.json`:
+In **VS Code**, point the Claude Code extension at the folder's account by adding the snippet
+`cctl where` prints to the folder's `.vscode/settings.json` (the extension's
+`claudeCode.environmentVariables` setting is a list of `{ "name", "value" }` pairs). A
+`claude` typed in VS Code's integrated terminal is covered by the shell wrapper above:
+
+```json
+{
+  "claudeCode.environmentVariables": [
+    { "name": "CLAUDE_CONFIG_DIR", "value": "<the profile dir cctl where prints>" }
+  ]
+}
+```
 
 ```
 cctl where              # explain how THIS folder resolves, with the env line and a
