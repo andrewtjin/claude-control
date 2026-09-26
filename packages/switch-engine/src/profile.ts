@@ -451,6 +451,13 @@ export interface EnsureProfileOptions {
   maxBackupsPerFile?: number;
   /** Clock for backup filenames; injectable for deterministic tests. Default `Date.now`. */
   now?: () => number;
+  /** Absolute path of MAIN's `.claude.json` — the CLI identity file whose onboarding/UI keys are
+   *  merged into the profile so it skips onboarding, the theme picker and migrations. The CLI keeps
+   *  this file OUTSIDE the config dir in the default layout (`~/.claude.json`, a sibling of
+   *  `~/.claude`); it only lives inside the config dir when `CLAUDE_CONFIG_DIR` is set. Deriving it
+   *  from `mainConfigDir` therefore misses the real file in the default layout, so callers pass the
+   *  resolved path explicitly. Defaults to `<mainConfigDir>/.claude.json` for the colocated case. */
+  mainClaudeJsonPath?: string;
 }
 
 const DEFAULT_MAX_BACKUPS = 5;
@@ -490,13 +497,14 @@ export function planGroupProfile(
   profileDir: string,
   mainConfigDir: string,
   fs: ProfileFs = createNodeProfileFs(),
+  mainClaudeJsonPath: string = join(mainConfigDir, '.claude.json'),
 ): ProfilePlan {
   const profileDev = volumeOf(profileDir, fs);
   const dirs = SHARED_PROFILE_DIRS.map((name) => planDir(name, profileDir, mainConfigDir, fs));
   const files = sharedFileNames(mainConfigDir, fs).map((name) =>
     planFile(name, profileDir, mainConfigDir, fs, profileDev),
   );
-  const claudeJson = planClaudeJson(profileDir, mainConfigDir, fs);
+  const claudeJson = planClaudeJson(profileDir, mainClaudeJsonPath, fs);
   return { profileDir, mainConfigDir, dirs, files, claudeJson };
 }
 
@@ -637,9 +645,13 @@ function isCrossVolume(target: string, profileDev: bigint | null, fs: ProfileFs)
   }
 }
 
-function planClaudeJson(profileDir: string, mainConfigDir: string, fs: ProfileFs): ClaudeJsonPlan {
+function planClaudeJson(
+  profileDir: string,
+  mainClaudeJsonPath: string,
+  fs: ProfileFs,
+): ClaudeJsonPlan {
   const profilePath = join(profileDir, '.claude.json');
-  const mainPath = join(mainConfigDir, '.claude.json');
+  const mainPath = mainClaudeJsonPath;
   const merge = computeClaudeJsonMerge(
     fs.readTextIfExists(profilePath),
     fs.readTextIfExists(mainPath),
@@ -799,6 +811,7 @@ export function ensureGroupProfile(
   const log = opts.logger ?? noopLogger;
   const maxBackups = opts.maxBackupsPerFile ?? DEFAULT_MAX_BACKUPS;
   const now = opts.now ?? Date.now;
+  const mainClaudeJsonPath = opts.mainClaudeJsonPath ?? join(mainConfigDir, '.claude.json');
 
   createProfileRoot(profileDir, fs);
 
@@ -811,7 +824,7 @@ export function ensureGroupProfile(
     claudeJsonMerged: false,
   };
 
-  const plan = planGroupProfile(profileDir, mainConfigDir, fs);
+  const plan = planGroupProfile(profileDir, mainConfigDir, fs, mainClaudeJsonPath);
 
   for (const dir of plan.dirs) {
     try {
@@ -834,7 +847,7 @@ export function ensureGroupProfile(
   }
 
   try {
-    applyClaudeJson(plan.claudeJson, profileDir, mainConfigDir, fs, report);
+    applyClaudeJson(plan.claudeJson, profileDir, mainClaudeJsonPath, fs, report);
   } catch (err) {
     log.warn({ err }, 'profile: .claude.json merge failed');
     report.skipped.push({
@@ -902,7 +915,7 @@ function applyFile(
         // The plan predicted same-volume from the profile root's device, but the target's own
         // device is the real authority; honor a late EXDEV with the platform's fallback.
         if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
-        applyCrossVolume(file, fs, report);
+        applyCrossVolume(file, profileDir, fs, report, maxBackups, now);
       }
       return;
     case 'symlink':
@@ -913,7 +926,7 @@ function applyFile(
       report.linkedFiles.push(file.name);
       return;
     case 'copy':
-      applyCrossVolume(file, fs, report);
+      applyCrossVolume(file, profileDir, fs, report, maxBackups, now);
       return;
     case 'repair':
       repairHardLink(file, profileDir, fs, report, maxBackups, now);
@@ -922,8 +935,18 @@ function applyFile(
 }
 
 /** Windows cross-volume fallback: main's content copied into the profile, only when it has drifted,
- *  so the steady state is a no-op and the report stays quiet on an unchanged profile. */
-function applyCrossVolume(file: FilePlan, fs: ProfileFs, report: ProfileReport): void {
+ *  so the steady state is a no-op and the report stays quiet on an unchanged profile. A profile copy
+ *  that has diverged from main is about to be overwritten with main's bytes; it is backed up first,
+ *  giving the same bounded-backup guarantee the same-volume repair path provides — otherwise a
+ *  profile-side edit to a shared file would be lost on the next sweep with no recovery. */
+function applyCrossVolume(
+  file: FilePlan,
+  profileDir: string,
+  fs: ProfileFs,
+  report: ProfileReport,
+  maxBackups: number,
+  now: () => number,
+): void {
   if (fs.platform !== 'win32') {
     // A POSIX EXDEV surfacing here (e.g. a late hardlink EXDEV) still wants the symlink fallback.
     if (fs.lstatKind(file.link) !== null) fs.removePath(file.link);
@@ -937,6 +960,9 @@ function applyCrossVolume(file: FilePlan, fs: ProfileFs, report: ProfileReport):
     report.linkedFiles.push(file.name); // up-to-date copy — counts as linked, no write
     return;
   }
+  // A differing profile copy is the loser here (main is the shared source of truth on this path);
+  // preserve it before the overwrite so the edit is recoverable, mirroring repairHardLink.
+  if (current !== null) backupFile(file.name, file.link, profileDir, fs, maxBackups, now);
   fs.writeFileAtomic(file.link, mainData, SHARED_FILE_MODE);
   report.copiedFallback.push(file.name);
 }
@@ -1019,7 +1045,7 @@ function pruneBackups(name: string, backupDir: string, fs: ProfileFs, maxBackups
 function applyClaudeJson(
   plan: ClaudeJsonPlan,
   profileDir: string,
-  mainConfigDir: string,
+  mainClaudeJsonPath: string,
   fs: ProfileFs,
   report: ProfileReport,
 ): void {
@@ -1032,7 +1058,7 @@ function applyClaudeJson(
   }
   if (plan.action === 'nochange') return;
   const profilePath = join(profileDir, '.claude.json');
-  const mainPath = join(mainConfigDir, '.claude.json');
+  const mainPath = mainClaudeJsonPath;
   const merge = computeClaudeJsonMerge(
     fs.readTextIfExists(profilePath),
     fs.readTextIfExists(mainPath),

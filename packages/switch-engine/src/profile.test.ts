@@ -756,6 +756,126 @@ describe('ensureGroupProfile (fake fs — platform primitives)', () => {
     // Untouched: still the foreign target.
     expect(fs.readlinkTarget(join(PROFILE, 'settings.json'))).toBe('C:/somewhere/else.json');
   });
+
+  it('backs up a diverged profile copy before overwriting it on the Windows cross-volume path', () => {
+    // The steady-state copy path on Windows overwrites the profile with main's bytes when they
+    // differ. A profile-side edit to a shared file is the loser and must be preserved first — the
+    // same bounded-backup guarantee the same-volume repair path gives — or a work-session edit is
+    // lost with no recovery on the next sweep.
+    const fs = makeMemFs({ platform: 'win32', separateVolumeUnder: 'C:/profiles' });
+    seedFile(fs, join(MAIN, 'settings.json'), JSON.stringify({ tag: 'MAIN-v1' }));
+
+    const first = ensureGroupProfile(PROFILE, MAIN, { fs });
+    expect(first.copiedFallback).toContain('settings.json');
+
+    // A work session edits the profile's independent copy (a fresh inode, as an atomic write lands).
+    seedFile(fs, join(PROFILE, 'settings.json'), JSON.stringify({ tag: 'PROFILE-EDIT' }));
+
+    const second = ensureGroupProfile(PROFILE, MAIN, { fs });
+    expect(second.copiedFallback).toContain('settings.json');
+    // The profile is back on main's content...
+    expect(fs.readTextIfExists(join(PROFILE, 'settings.json'))).toBe(
+      JSON.stringify({ tag: 'MAIN-v1' }),
+    );
+    // ...but the losing edit is recoverable from a bounded backup.
+    const backups = fs
+      .readdirNames(join(PROFILE, '.cctl-backup'))
+      .filter((f) => f.startsWith('settings.json.'));
+    expect(backups.length).toBe(1);
+    expect(fs.readTextIfExists(join(PROFILE, '.cctl-backup', backups[0] as string))).toBe(
+      JSON.stringify({ tag: 'PROFILE-EDIT' }),
+    );
+  });
+
+  it('does not back up an unchanged Windows cross-volume copy (steady state stays quiet)', () => {
+    const fs = makeMemFs({ platform: 'win32', separateVolumeUnder: 'C:/profiles' });
+    seedFile(fs, join(MAIN, 'settings.json'), 'CONTENT');
+
+    ensureGroupProfile(PROFILE, MAIN, { fs });
+    const second = ensureGroupProfile(PROFILE, MAIN, { fs });
+
+    expect(second.copiedFallback).toEqual([]);
+    // No repair/backup happens when the copy already matches main, so the backup dir never appears.
+    expect(fs.lstatKind(join(PROFILE, '.cctl-backup'))).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Main `.claude.json` living OUTSIDE the config dir — the default layout (no CLAUDE_CONFIG_DIR),
+// where the CLI keeps the identity file at ~/.claude.json, a sibling of ~/.claude. The path must be
+// supplied explicitly; deriving it from the config dir misses the real file and drops every
+// onboarding/theme/migration/mcp/trust key from the profile.
+// ---------------------------------------------------------------------------------------------
+
+describe('ensureGroupProfile — main .claude.json outside the config dir', () => {
+  it('merges onboarding/theme/migration/mcp/trust from a sibling .claude.json when its path is passed', () => {
+    const { root, main, profile } = sandbox();
+    // Default layout: config dir is <root>/main (~/.claude); the identity file is a SIBLING at
+    // <root>/.claude.json (~/.claude.json), NOT inside the config dir.
+    const siblingJson = join(root, '.claude.json');
+    writeFileSync(
+      siblingJson,
+      JSON.stringify({
+        hasCompletedOnboarding: true,
+        theme: 'dark',
+        migrationVersion: 3,
+        installMethod: 'npm-global',
+        mcpServers: { linear: { command: 'npx', args: ['-y', 'linear-mcp'] } },
+        oauthAccount: { accountUuid: 'PERSONAL' },
+        projects: { 'C:/work/ai-research': { hasTrustDialogAccepted: true } },
+      }),
+    );
+    // The profile already owns its WORK identity, which must survive the merge.
+    mkdirSync(profile, { recursive: true });
+    writeFileSync(
+      join(profile, '.claude.json'),
+      JSON.stringify({ oauthAccount: { accountUuid: 'WORK' }, projects: {} }),
+    );
+
+    const report = ensureGroupProfile(profile, main, { mainClaudeJsonPath: siblingJson });
+
+    const merged = parseClaude(readFileSync(join(profile, '.claude.json'), 'utf8'));
+    expect(merged.hasCompletedOnboarding).toBe(true);
+    expect(merged.theme).toBe('dark');
+    expect(merged.migrationVersion).toBe(3);
+    expect(merged.installMethod).toBe('npm-global');
+    expect(merged.mcpServers).toEqual({ linear: { command: 'npx', args: ['-y', 'linear-mcp'] } });
+    expect(merged.projects?.['C:/work/ai-research']?.hasTrustDialogAccepted).toBe(true);
+    // The profile's own account identity is untouched.
+    expect(merged.oauthAccount?.accountUuid).toBe('WORK');
+    expect(report.claudeJsonMerged).toBe(true);
+  });
+
+  it('drops those keys when main is derived from the config dir (the pre-fix behavior)', () => {
+    const { root, main, profile } = sandbox();
+    const siblingJson = join(root, '.claude.json');
+    writeFileSync(siblingJson, JSON.stringify({ hasCompletedOnboarding: true, theme: 'dark' }));
+    mkdirSync(profile, { recursive: true });
+    writeFileSync(
+      join(profile, '.claude.json'),
+      JSON.stringify({ oauthAccount: { accountUuid: 'WORK' } }),
+    );
+
+    // No mainClaudeJsonPath: the default derivation <main>/.claude.json does not exist, so nothing
+    // is carried over — while the profile's identity is still preserved.
+    ensureGroupProfile(profile, main);
+
+    const merged = parseClaude(readFileSync(join(profile, '.claude.json'), 'utf8'));
+    expect(merged.hasCompletedOnboarding).toBeUndefined();
+    expect(merged.theme).toBeUndefined();
+    expect(merged.oauthAccount?.accountUuid).toBe('WORK');
+  });
+
+  it('planGroupProfile reads the sibling path from its fourth argument', () => {
+    const { root, main, profile } = sandbox();
+    const siblingJson = join(root, '.claude.json');
+    writeFileSync(siblingJson, JSON.stringify({ theme: 'dark' }));
+
+    // The profile has no .claude.json yet, so the plan is a write; the doctor path must consult the
+    // sibling file (not <main>/.claude.json) exactly as the execute path does.
+    const plan = planGroupProfile(profile, main, createNodeProfileFs(), siblingJson);
+    expect(plan.claudeJson.action).toBe('write');
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
