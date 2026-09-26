@@ -128,6 +128,20 @@ export {
 } from './bindGuard.js';
 
 export {
+  bindTokensDir,
+  mintBindToken,
+  removeBindToken,
+  cleanupBindTokens,
+  BIND_TOKEN_DIR_NAME,
+  BIND_TOKEN_MAX_AGE_MS,
+  BIND_TOKEN_PATTERN,
+  type BindTokenKind,
+  type BindTokenRecord,
+  type MintBindTokenOptions,
+  type CleanupBindTokensOptions,
+} from './bindToken.js';
+
+export {
   ControlPlaneClient,
   ControlPlaneRejectionError,
   type ConnectionState,

@@ -16,8 +16,9 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { canonicalizeFolder } from '@claude-control/switch-engine';
+import { canonicalizeFolder, folderKey } from '@claude-control/switch-engine';
 import { bindGuardPath, generateBindGuardSource, writeBindGuard } from './bindGuard.js';
+import { bindTokensDir, mintBindToken, type BindTokenKind } from './bindToken.js';
 
 interface GuardResult {
   code: number | null;
@@ -102,6 +103,18 @@ describe('bind guard script', () => {
     await writeFile(snapshotPath, JSON.stringify(snapshot), 'utf8');
   }
 
+  /** The folderKey of a slot config dir the guard will compute for that dir ('' for the global
+   *  slot) — the key a relaxation token must be minted for to be honored. */
+  function slotKey(configDir: string | undefined): string {
+    return configDir ? folderKey(canon(configDir), process.platform) : '';
+  }
+
+  /** Mint a real relaxation token into the tokens dir the guard reads, returning the token value the
+   *  launcher would put in the env var. */
+  function mintToken(kind: BindTokenKind, profileKey: string): string {
+    return mintBindToken({ tokensDir: bindTokensDir(snapshotPath), kind, profileKey });
+  }
+
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'cctl-guard-'));
     scriptPath = bindGuardPath(root);
@@ -144,7 +157,22 @@ describe('bind guard script', () => {
     expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
   });
 
-  it('(A) with --override (CCTL_BIND_OVERRIDE=1) → allow with a systemMessage, never a block', async () => {
+  it('(A) with a valid --override token → allow with a systemMessage, never a block', async () => {
+    await writeSnapshot();
+    // A global-slot session (no CLAUDE_CONFIG_DIR): the override token is minted for the '' slot.
+    const token = mintToken('override', slotKey(undefined));
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+      CCTL_BIND_OVERRIDE: token,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ systemMessage: expectedReasonA() });
+  });
+
+  it('(A) an inherited CCTL_BIND_OVERRIDE=1 (no token) is NOT honored → still blocks', async () => {
+    // The core of the ambient-bypass defect: a plain "1" carried in from the shell must not relax the
+    // binding, because it has no per-launch token record behind it.
     await writeSnapshot();
     const result = await runGuard(scriptPath, PAYLOAD, {
       ...baseEnv(),
@@ -152,7 +180,82 @@ describe('bind guard script', () => {
       CCTL_BIND_OVERRIDE: '1',
     });
     expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ systemMessage: expectedReasonA() });
+    expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
+  });
+
+  it('(A) an override token minted for a DIFFERENT slot is NOT honored → still blocks', async () => {
+    // A token whose recorded slot key does not match this session's slot (here: minted for a profile
+    // dir, used by a global session) must not relax the binding.
+    await writeSnapshot();
+    const token = mintToken('override', slotKey(profileDir));
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+      CCTL_BIND_OVERRIDE: token,
+    });
+    expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
+  });
+
+  it('(A) an override token of the wrong kind (explicit) is NOT honored → still blocks', async () => {
+    await writeSnapshot();
+    const token = mintToken('explicit', slotKey(undefined));
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+      CCTL_BIND_OVERRIDE: token,
+    });
+    expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
+  });
+
+  it('(A) session on ANOTHER group slot names that account, not "the shared account"', async () => {
+    // A session on group X's reserved slot, working in a folder bound to group W. The block is
+    // correct, but the reason must name the account the session is really on (group X), not claim it
+    // "runs on the shared account" — which is false and misdirects the fix.
+    const xFolderReal = join(root, 'xwork');
+    const xProfileReal = join(root, 'xprofile');
+    await mkdir(xFolderReal, { recursive: true });
+    await mkdir(xProfileReal, { recursive: true });
+    const xFolder = canon(xFolderReal);
+    const xProfile = canon(xProfileReal);
+    const snapshot = {
+      schemaVersion: 1,
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: canon(root),
+      groups: [
+        {
+          id: 'group-w',
+          label: 'Alice + Bob',
+          profileDir,
+          folders: [boundFolder],
+          members: ['Alice', 'Bob'],
+        },
+        {
+          id: 'group-x',
+          label: 'Work',
+          profileDir: xProfile,
+          folders: [xFolder],
+          members: ['work@x'],
+        },
+      ],
+    };
+    await writeFile(snapshotPath, JSON.stringify(snapshot), 'utf8');
+
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+      CLAUDE_CONFIG_DIR: xProfile,
+    });
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { decision?: string; reason?: string };
+    expect(parsed.decision).toBe('block');
+    // Names group X's account and folders, and does NOT falsely claim the shared account.
+    expect(parsed.reason).toContain('work@x');
+    expect(parsed.reason).toContain(xFolder);
+    expect(parsed.reason).not.toContain('the shared account');
+    // And the remediation points at --override / relaunch, not the shell-wrapper hint that only makes
+    // sense for a genuinely-global session.
+    expect(parsed.reason).toContain('--override');
   });
 
   it('correct pairing (project bound to G, session on G) → silent allow', async () => {
@@ -179,7 +282,26 @@ describe('bind guard script', () => {
     expect(parsed.reason).toContain('cctl claude --account');
   });
 
-  it('(B) with --account (CCTL_LAUNCH_EXPLICIT=1) → allow silently', async () => {
+  it('(B) with a valid --account token → allow, with a visible systemMessage (never silent)', async () => {
+    await writeSnapshot();
+    // The session runs on the group slot, so the token must be minted for that profile dir's key.
+    const token = mintToken('explicit', slotKey(profileDir));
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: outsideFolder,
+      CLAUDE_CONFIG_DIR: profileDir,
+      CCTL_LAUNCH_EXPLICIT: token,
+    });
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { systemMessage?: string };
+    expect(parsed.systemMessage).toBeDefined();
+    expect(parsed.systemMessage).toContain(outsideFolder);
+    expect(parsed.systemMessage).toContain('--account');
+  });
+
+  it('(B) an inherited CCTL_LAUNCH_EXPLICIT=1 (no token) is NOT honored → still blocks', async () => {
+    // A reserved-account session that inherited a plain "1" (e.g. a nested claude spawned by a tool)
+    // must not silently escape its folders; only a per-launch token relaxes case B.
     await writeSnapshot();
     const result = await runGuard(scriptPath, PAYLOAD, {
       ...baseEnv(),
@@ -187,48 +309,53 @@ describe('bind guard script', () => {
       CLAUDE_CONFIG_DIR: profileDir,
       CCTL_LAUNCH_EXPLICIT: '1',
     });
-    expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
-  });
-
-  it('warn mode emits the block text as a systemMessage and never blocks (env override)', async () => {
-    await writeSnapshot();
-    const result = await runGuard(scriptPath, PAYLOAD, {
-      ...baseEnv(),
-      CLAUDE_PROJECT_DIR: boundFolder,
-      CCTL_BIND_ENFORCE: 'warn',
-    });
     expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ systemMessage: expectedReasonA() });
+    const parsed = JSON.parse(result.stdout) as { decision?: string; reason?: string };
+    expect(parsed.decision).toBe('block');
+    expect(parsed.reason).toContain(outsideFolder);
   });
 
-  it('warn mode from the snapshot (no env) also emits a systemMessage', async () => {
+  it('warn mode from the snapshot emits the block text as a systemMessage and never blocks', async () => {
     await writeSnapshot({ enforce: 'warn' });
     const result = await runGuard(scriptPath, PAYLOAD, {
       ...baseEnv(),
       CLAUDE_PROJECT_DIR: boundFolder,
     });
+    expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({ systemMessage: expectedReasonA() });
   });
 
-  it('off mode is silent even on a clear violation (env override beats snapshot block)', async () => {
+  it('off mode from the snapshot is silent even on a clear violation', async () => {
+    await writeSnapshot({ enforce: 'off' });
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+    });
+    expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+  });
+
+  it('an ambient CCTL_BIND_ENFORCE=off does NOT weaken snapshot block → still blocks', async () => {
+    // The enforcement mode is read only from the snapshot (the daemon/CLI resolve the env into it).
+    // A session that inherited CCTL_BIND_ENFORCE=off must not be able to turn enforcement off.
     await writeSnapshot();
     const result = await runGuard(scriptPath, PAYLOAD, {
       ...baseEnv(),
       CLAUDE_PROJECT_DIR: boundFolder,
       CCTL_BIND_ENFORCE: 'off',
     });
-    expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
   });
 
-  it('env CCTL_BIND_ENFORCE overrides the snapshot enforce mode', async () => {
-    // Snapshot says off, env says block → the env wins and the violation is blocked.
+  it('an ambient CCTL_BIND_ENFORCE=block does NOT strengthen snapshot off → stays silent', async () => {
+    // Symmetric to the above: the env cannot re-enable a mode the snapshot has set to off either.
     await writeSnapshot({ enforce: 'off' });
     const result = await runGuard(scriptPath, PAYLOAD, {
       ...baseEnv(),
       CLAUDE_PROJECT_DIR: boundFolder,
       CCTL_BIND_ENFORCE: 'block',
     });
-    expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
+    expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
   });
 
   it('a missing snapshot fails OPEN: exit 0, empty stdout, one stderr line', async () => {

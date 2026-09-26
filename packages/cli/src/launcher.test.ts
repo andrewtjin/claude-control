@@ -158,17 +158,22 @@ describe('buildLaunchEnv', () => {
     context: 'binding',
   };
 
-  it('group slot pins CLAUDE_CONFIG_DIR and sets --account/--override flags', () => {
+  const EXPLICIT_TOKEN = '0123456789abcdef0123456789abcdef';
+  const OVERRIDE_TOKEN = 'fedcba9876543210fedcba9876543210';
+
+  it('group slot pins CLAUDE_CONFIG_DIR and carries the --account/--override tokens', () => {
     const env = buildLaunchEnv({
       baseEnv: { PATH: 'x' },
       slot: groupSlot,
-      explicit: true,
-      override: true,
+      explicitToken: EXPLICIT_TOKEN,
+      overrideToken: OVERRIDE_TOKEN,
       dropInheritedConfigDir: false,
     });
     expect(env.CLAUDE_CONFIG_DIR).toBe('C:\\profiles\\g1');
-    expect(env.CCTL_LAUNCH_EXPLICIT).toBe('1');
-    expect(env.CCTL_BIND_OVERRIDE).toBe('1');
+    // The knobs carry the per-launch token, not a bare "1" the guard could not distinguish from
+    // an inherited value.
+    expect(env.CCTL_LAUNCH_EXPLICIT).toBe(EXPLICIT_TOKEN);
+    expect(env.CCTL_BIND_OVERRIDE).toBe(OVERRIDE_TOKEN);
     expect(env.PATH).toBe('x');
   });
 
@@ -176,8 +181,6 @@ describe('buildLaunchEnv', () => {
     const env = buildLaunchEnv({
       baseEnv: {},
       slot: groupSlot,
-      explicit: false,
-      override: false,
       dropInheritedConfigDir: false,
     });
     expect(env.CCTL_LAUNCH_EXPLICIT).toBeUndefined();
@@ -186,22 +189,20 @@ describe('buildLaunchEnv', () => {
 
   it('clears any inherited guard knobs so they never leak into a launch', () => {
     const env = buildLaunchEnv({
-      baseEnv: { CCTL_LAUNCH_EXPLICIT: '1', CCTL_BIND_OVERRIDE: '1' },
+      baseEnv: { CCTL_LAUNCH_EXPLICIT: '1', CCTL_BIND_OVERRIDE: '1', CCTL_BIND_ENFORCE: 'off' },
       slot: { kind: 'global', label: 'main', context: 'global' },
-      explicit: false,
-      override: false,
       dropInheritedConfigDir: false,
     });
     expect(env.CCTL_LAUNCH_EXPLICIT).toBeUndefined();
     expect(env.CCTL_BIND_OVERRIDE).toBeUndefined();
+    // A stale enforcement mode must not travel past the launch either.
+    expect(env.CCTL_BIND_ENFORCE).toBeUndefined();
   });
 
   it('global slot drops an inherited CLAUDE_CONFIG_DIR only when told to', () => {
     const dropped = buildLaunchEnv({
       baseEnv: { CLAUDE_CONFIG_DIR: 'C:\\profiles\\g1' },
       slot: { kind: 'global', label: 'main', context: 'global' },
-      explicit: false,
-      override: false,
       dropInheritedConfigDir: true,
     });
     expect(dropped.CLAUDE_CONFIG_DIR).toBeUndefined();
@@ -209,8 +210,6 @@ describe('buildLaunchEnv', () => {
     const kept = buildLaunchEnv({
       baseEnv: { CLAUDE_CONFIG_DIR: 'C:\\some\\other' },
       slot: { kind: 'global', label: 'main', context: 'global' },
-      explicit: false,
-      override: false,
       dropInheritedConfigDir: false,
     });
     expect(kept.CLAUDE_CONFIG_DIR).toBe('C:\\some\\other');
@@ -277,17 +276,17 @@ describe('spawnClaude (real spawn via a fake claude)', () => {
     expect(out.argv).toEqual(args);
   });
 
-  it('applies the group env (CLAUDE_CONFIG_DIR + explicit) to the child', async () => {
+  it('applies the group env (CLAUDE_CONFIG_DIR + explicit token) to the child', async () => {
+    const token = 'abcabcabcabcabcabcabcabcabcabcab';
     const env = buildLaunchEnv({
       baseEnv: { ...process.env },
       slot: { kind: 'group', profileDir: 'C:\\profiles\\g1', label: 'work', context: 'binding' },
-      explicit: true,
-      override: false,
+      explicitToken: token,
       dropInheritedConfigDir: false,
     });
     const { out } = await runFake([], env);
     expect(out.env.CLAUDE_CONFIG_DIR).toBe('C:\\profiles\\g1');
-    expect(out.env.CCTL_LAUNCH_EXPLICIT).toBe('1');
+    expect(out.env.CCTL_LAUNCH_EXPLICIT).toBe(token);
     expect(out.env.CCTL_BIND_OVERRIDE).toBeUndefined();
   });
 
