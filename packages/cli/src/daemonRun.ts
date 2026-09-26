@@ -19,6 +19,7 @@ import {
   Vault,
   defaultPaths,
   defaultProtector,
+  folderBindingsPath,
   type Logger,
   type Paths,
   type Protector,
@@ -35,7 +36,9 @@ import {
   HookReceiver,
   Store,
   UsagePoller,
+  bindGuardPath,
   buildDaemonHookSpecs,
+  ensureBindGuard,
   hookEndpointPath,
   hookForwarderPath,
   hookSecretPath,
@@ -504,6 +507,18 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         settingsPath,
         hooks: buildDaemonHookSpecs({ secret: hookSecret, forwarderPath }),
         ownedCommandMarker: DEFAULT_SECRET_HEADER,
+      });
+      // Reconcile the enforcement guard beside the forwarder, keyed off whether any folder is bound.
+      // Without this the guard is never installed and folder bindings are recorded but never enforced
+      // at prompt time. The snapshot it reads was refreshed just before this in Daemon.start(), so a
+      // restart always leaves the guard consistent with the live registry. Fail-open with the rest of
+      // this closure: a settings.json we cannot write only degrades enforcement, never daemon startup.
+      const hasBindings = (await engine.listGroups()).length > 0;
+      await ensureBindGuard({
+        settingsPath,
+        guardPath: bindGuardPath(dataDir),
+        snapshotPath: folderBindingsPath(paths.vaultDir),
+        hasBindings,
       });
     },
     // Publish the receiver's actual loopback port so `cctl session register|label|watch` can

@@ -532,10 +532,14 @@ leg (own `vault-key` item only) are NOT evidence for this gate.
 **State of the code:** the engine layer (the slot-aware switch engine, the two-file
 reservation fence, profile-dir materialization, `bindFolder`/`unbindFolder`, `checkSlots`/
 `repairSlots`) is unit-proven headless — including crash-safety by injected fault after every
-bind/unbind step. The wire, Discord and docs layer is additive and tested. But the whole point
-of the feature is that a **real** second account runs isolated in a bound folder, and nothing
-below has been exercised against real Anthropic logins, a real Claude Code binary, or the VS
-Code extension. Green tests are not a bound account.
+bind/unbind step. Guard **installation** is now unit-proven too: `ensureBindGuard` writes the
+guard script and lands its `UserPromptSubmit` entry in `settings.json`, and both callers that
+invoke it (the daemon's hook self-heal on start, and `cctl bind`/`unbind`) are exercised — so a
+bound folder always has the guard wired without a regression back to "installed by nobody". The
+wire, Discord and docs layer is additive and tested. But the whole point of the feature is that a
+**real** second account runs isolated in a bound folder, and the guard's runtime _decision_ has
+not been exercised against real Anthropic logins, a real Claude Code binary, or the VS Code
+extension. Green tests are not a bound account.
 
 **Claim to verify (each needs a real run):**
 

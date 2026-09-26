@@ -1,15 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   installHooks,
   installBindGuard,
+  ensureBindGuard,
+  removeBindGuard,
   uninstallHooks,
   buildDaemonHookSpecs,
   type HookCommandSpec,
 } from './hookInstaller.js';
-import { buildBindGuardCommand } from './bindGuard.js';
+import { BIND_GUARD_MARKER, bindGuardPath, buildBindGuardCommand } from './bindGuard.js';
 import { DEFAULT_HOOK_EVENT_NAMES, DEFAULT_SECRET_HEADER } from './hookReceiver.js';
 
 async function readJson(path: string): Promise<unknown> {
@@ -625,5 +627,158 @@ describe('installBindGuard', () => {
     const outcome = await uninstallHooks({ settingsPath });
     expect(outcome).toBe('removed');
     expect(upsCommands(await readJson(settingsPath))).toEqual(['other-tool --x']);
+  });
+});
+
+describe('ensureBindGuard', () => {
+  let dir: string;
+  let settingsPath: string;
+  let guardPath: string;
+  const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const snapshotPath = '/data/folder-bindings.json';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ensure-bind-guard-'));
+    settingsPath = join(dir, 'settings.json');
+    // The guard script is written under this data dir; bindGuardPath decides the exact name.
+    guardPath = bindGuardPath(dir);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function upsCommands(settings: unknown): string[] {
+    const hooks = (settings as { hooks?: Record<string, unknown> }).hooks ?? {};
+    const groups = hooks[UPS];
+    if (!Array.isArray(groups)) return [];
+    return groups.flatMap((g: unknown) => {
+      const entries = (g as { hooks?: unknown }).hooks;
+      return Array.isArray(entries)
+        ? entries.map((h: unknown) => (h as { command?: string }).command ?? '')
+        : [];
+    });
+  }
+
+  async function exists(path: string): Promise<boolean> {
+    try {
+      await access(path);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it('with bindings: writes the guard script AND lands the marker in settings.json', async () => {
+    // This is the invariant the whole feature rests on: after this call the guard is enforceable.
+    const outcome = await ensureBindGuard({
+      settingsPath,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+    });
+    expect(outcome).toBe('installed');
+
+    // The hook entry carries the guard fingerprint that doctor and uninstall recognize.
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw.includes(BIND_GUARD_MARKER)).toBe(true);
+    expect(upsCommands(JSON.parse(raw))).toEqual([buildBindGuardCommand({ guardPath })]);
+
+    // The script the command points at was actually written, with the snapshot path baked in —
+    // installing the hook without the script would register a command with nothing behind it.
+    expect(await exists(guardPath)).toBe(true);
+    const script = await readFile(guardPath, 'utf8');
+    expect(script.includes(JSON.stringify(snapshotPath))).toBe(true);
+  });
+
+  it('installs beside a pre-existing forwarder without evicting it (the upgrade path)', async () => {
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await installHooks({
+      settingsPath,
+      hooks: [{ event: UPS, command: forwarder }],
+      ownedCommandMarker: DEFAULT_SECRET_HEADER,
+    });
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    expect(upsCommands(await readJson(settingsPath)).sort()).toEqual(
+      [buildBindGuardCommand({ guardPath }), forwarder].sort(),
+    );
+  });
+
+  it('is idempotent: re-running with bindings keeps exactly one guard entry', async () => {
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    expect(upsCommands(await readJson(settingsPath))).toEqual([
+      buildBindGuardCommand({ guardPath }),
+    ]);
+  });
+
+  it('with no bindings: removes only the guard, leaving the forwarder installed', async () => {
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await installHooks({
+      settingsPath,
+      hooks: [{ event: UPS, command: forwarder }],
+      ownedCommandMarker: DEFAULT_SECRET_HEADER,
+    });
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+
+    const removed = await ensureBindGuard({
+      settingsPath,
+      guardPath,
+      snapshotPath,
+      hasBindings: false,
+    });
+    expect(removed).toBe('removed');
+    expect(upsCommands(await readJson(settingsPath))).toEqual([forwarder]);
+  });
+
+  it('with no bindings and nothing installed: reports absent and writes nothing', async () => {
+    const outcome = await ensureBindGuard({
+      settingsPath,
+      guardPath,
+      snapshotPath,
+      hasBindings: false,
+    });
+    expect(outcome).toBe('absent');
+    expect(await exists(settingsPath)).toBe(false);
+  });
+});
+
+describe('removeBindGuard', () => {
+  let dir: string;
+  let settingsPath: string;
+  const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const guardCmd = buildBindGuardCommand({ guardPath: '/data/bind-guard.cjs' });
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'remove-bind-guard-'));
+    settingsPath = join(dir, 'settings.json');
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('drops a group emptied by the guard removal but preserves an already-empty foreign group', async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: {
+          [UPS]: [{ hooks: [{ type: 'command', command: guardCmd }] }, { matcher: 'x', hooks: [] }],
+        },
+      }),
+    );
+    const changed = await removeBindGuard({ settingsPath });
+    expect(changed).toBe(true);
+    const settings = (await readJson(settingsPath)) as {
+      hooks: Record<string, unknown[]>;
+    };
+    // Our guard-only group is gone; the foreign empty group is untouched.
+    expect(settings.hooks[UPS]).toEqual([{ matcher: 'x', hooks: [] }]);
+  });
+
+  it('returns false and rewrites nothing when there is no guard to remove', async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ hooks: { [UPS]: [{ hooks: [{ type: 'command', command: 'other' }] }] } }),
+    );
+    expect(await removeBindGuard({ settingsPath })).toBe(false);
   });
 });

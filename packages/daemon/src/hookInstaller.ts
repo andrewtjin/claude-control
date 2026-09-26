@@ -23,7 +23,7 @@
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { BIND_GUARD_MARKER } from './bindGuard.js';
+import { BIND_GUARD_MARKER, buildBindGuardCommand, writeBindGuard } from './bindGuard.js';
 import {
   DEFAULT_HOOK_EVENT_NAMES,
   DEFAULT_SECRET_HEADER,
@@ -210,6 +210,106 @@ export async function installBindGuard(options: InstallBindGuardOptions): Promis
 
   hooksSection[event] = groups;
   await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// removeBindGuard / ensureBindGuard
+// ---------------------------------------------------------------------------
+
+export interface RemoveBindGuardOptions {
+  settingsPath: string;
+  /** The event the guard was installed on. Defaults to UserPromptSubmit (spec §9). */
+  eventName?: string;
+}
+
+/**
+ * Remove a previously installed enforcement guard entry (recognized by the guard script filename),
+ * leaving the relay forwarder and every other entry — other tools' hooks, foreign keys — untouched.
+ * The counterpart to {@link installBindGuard}, used when the last folder binding goes away so a stale
+ * guard cannot linger. A group left empty ONLY because its guard entry was removed is dropped; a
+ * group that was already empty (someone else's state) is preserved. Returns whether anything changed.
+ */
+export async function removeBindGuard(options: RemoveBindGuardOptions): Promise<boolean> {
+  const settings = await readSettings(options.settingsPath);
+  if (!isRecord(settings.hooks)) return false;
+  const hooksSection: JsonObject = settings.hooks;
+  const event = options.eventName ?? DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const existing = hooksSection[event];
+  if (!Array.isArray(existing)) return false;
+
+  let changed = false;
+  const kept: unknown[] = [];
+  for (const group of existing as unknown[]) {
+    if (!isHookGroup(group)) {
+      kept.push(group);
+      continue;
+    }
+    const before = group.hooks.length;
+    const keptHooks = group.hooks.filter((h) => !isHookEntry(h) || !isBindGuardCommand(h.command));
+    if (keptHooks.length === before) {
+      kept.push(group);
+      continue;
+    }
+    changed = true;
+    // A group emptied solely by removing our guard is dead weight — drop it. One still holding the
+    // forwarder (or anything else) is rewritten without the guard.
+    if (keptHooks.length > 0) kept.push({ ...group, hooks: keptHooks });
+  }
+
+  if (!changed) return false;
+  if (kept.length === 0) delete hooksSection[event];
+  else hooksSection[event] = kept;
+  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  return true;
+}
+
+export interface EnsureBindGuardOptions {
+  settingsPath: string;
+  /** Where the guard script lives on disk — `bindGuardPath(dataDir)`. (Re)written when bindings
+   *  exist so the installed command always points at a current script. */
+  guardPath: string;
+  /** The non-secret folder-bindings snapshot the guard reads — `folderBindingsPath(vaultDir)`. Baked
+   *  into the generated script, so a change here rewrites (not accumulates) the guard. */
+  snapshotPath: string;
+  /** Whether any folder is currently bound. Guard install is meaningful only then; when false the
+   *  guard is removed instead, so an unbind of the last folder leaves nothing behind. */
+  hasBindings: boolean;
+  /** Node executable the hook command runs the script with. Defaults to the current process's. */
+  nodePath?: string;
+  eventName?: string;
+}
+
+/**
+ * Reconcile the enforcement guard with whether any folder is bound: when bindings exist, write the
+ * guard script and register its UserPromptSubmit hook beside the forwarder; when none exist, remove a
+ * previously installed guard. Idempotent and safe to call on every daemon start and after every
+ * bind/unbind — this is the ONE path that actually installs the guard, so folder bindings are
+ * enforced at prompt time rather than only recorded. Returns what it did.
+ *
+ * Writing the script and installing the hook are deliberately paired here: installing the hook
+ * without writing the script would register a `node <script>` command with nothing behind it.
+ */
+export async function ensureBindGuard(
+  options: EnsureBindGuardOptions,
+): Promise<'installed' | 'removed' | 'absent'> {
+  if (!options.hasBindings) {
+    const removed = await removeBindGuard({
+      settingsPath: options.settingsPath,
+      ...(options.eventName !== undefined ? { eventName: options.eventName } : {}),
+    });
+    return removed ? 'removed' : 'absent';
+  }
+  // Script first, so the installed command always has a current script behind it.
+  await writeBindGuard(options.guardPath, options.snapshotPath);
+  await installBindGuard({
+    settingsPath: options.settingsPath,
+    command: buildBindGuardCommand({
+      guardPath: options.guardPath,
+      ...(options.nodePath !== undefined ? { nodePath: options.nodePath } : {}),
+    }),
+    ...(options.eventName !== undefined ? { eventName: options.eventName } : {}),
+  });
+  return 'installed';
 }
 
 /** Merge one hook spec into `hooksSection[event]`, preserving every well-formed group/entry

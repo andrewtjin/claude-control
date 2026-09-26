@@ -6,20 +6,23 @@
 // render layer (see render.ts) so operator- and filesystem-supplied text can never drive the terminal.
 
 import { readFileSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { Command } from 'commander';
 import {
   SwitchEngineError,
   canonicalizeFolder,
+  folderBindingsPath,
   groupSlotId,
   profilesRoot,
   resolveAccountRef,
   resolveBinding,
   type AccountView,
+  type Paths,
   type StoredAccount,
   type StoredGroup,
 } from '@claude-control/switch-engine';
 import { defaultPaths } from '@claude-control/switch-engine';
+import { bindGuardPath, ensureBindGuard } from '@claude-control/daemon';
 import { buildEngine, fail } from './context.js';
 import { detectPalette, sanitizeForTerminal } from './ansi.js';
 import {
@@ -58,6 +61,28 @@ function canonicalizeCliFolder(input: string): string {
  *  (`<profilesRoot>/<groupId>`). Computed here rather than read from the (possibly stale) snapshot. */
 function groupProfilePath(vaultDir: string, groupId: string): string {
   return join(profilesRoot(vaultDir), groupId);
+}
+
+/** Install (or, after the last unbind, remove) the enforcement guard hook so a binding change takes
+ *  effect immediately — without waiting for a daemon restart. Best-effort: an unwritable settings.json
+ *  is reported as a warning, never a command failure, because the daemon also reconciles the guard on
+ *  its next start. Keeps the bind/unbind actions from each re-deriving the same paths. */
+export async function reconcileBindGuard(engine: Engine, paths: Paths): Promise<void> {
+  const hasBindings = (await engine.listGroups()).length > 0;
+  try {
+    await ensureBindGuard({
+      settingsPath: join(paths.claudeDir, 'settings.json'),
+      guardPath: bindGuardPath(dirname(paths.vaultDir)),
+      snapshotPath: folderBindingsPath(paths.vaultDir),
+      hasBindings,
+    });
+  } catch (err) {
+    process.stderr.write(
+      `warning: could not update the enforcement guard hook ` +
+        `(${err instanceof Error ? err.message : String(err)}); ` +
+        `restart the daemon to enforce bindings: cctl daemon restart\n`,
+    );
+  }
 }
 
 /** Build the display view of every group: members with the reconciled live one marked. */
@@ -177,6 +202,8 @@ export function buildBindCommands(program: Command): void {
           );
         }
         process.stdout.write(lines.join('\n') + '\n');
+        // Wire the guard now so this binding is enforced without waiting for a daemon restart.
+        await reconcileBindGuard(engine, defaultPaths());
       } catch (err) {
         if (err instanceof SwitchEngineError) fail(err.message);
         throw err;
@@ -211,6 +238,8 @@ export function buildBindCommands(program: Command): void {
         }
         lines.push('  the profile dir is kept for history; its live credentials were cleared.');
         process.stdout.write(lines.join('\n') + '\n');
+        // Remove the guard when the last folder is now unbound; keep it otherwise.
+        await reconcileBindGuard(engine, defaultPaths());
       } catch (err) {
         if (err instanceof SwitchEngineError) fail(err.message);
         throw err;

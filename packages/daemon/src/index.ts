@@ -140,11 +140,15 @@ export {
 export {
   installHooks,
   installBindGuard,
+  ensureBindGuard,
+  removeBindGuard,
   uninstallHooks,
   buildDaemonHookSpecs,
   type HookCommandSpec,
   type InstallHooksOptions,
   type InstallBindGuardOptions,
+  type EnsureBindGuardOptions,
+  type RemoveBindGuardOptions,
   type UninstallHooksOptions,
   type BuildDaemonHookSpecsOptions,
 } from './hookInstaller.js';
