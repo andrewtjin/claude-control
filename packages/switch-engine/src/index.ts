@@ -15,6 +15,8 @@ export {
   VAULT_KEY_SERVICE,
   VAULT_KEY_ACCOUNT,
   CLAUDE_CLI_KEYCHAIN_SERVICE,
+  CLAUDE_CLI_KEYCHAIN_ACCOUNT,
+  resolveClaudeCliKeychainTarget,
   type ExecRunner,
 } from './keychain.js';
 export { defaultProtector, defaultLiveCredentialChannel } from './protector.js';

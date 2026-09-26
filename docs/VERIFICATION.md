@@ -267,13 +267,18 @@ cross-repo split gates 2, 4 and 6 use.
 
 **Verify (assumptions A1–A4, defined in `claude-control-orchestrator/tasks/mac-compatibility-plan.md`):**
 
-- **A1 — item name/account.** The CLI's live credentials are assumed to live in Keychain
-  service `Claude Code-credentials` under the login user; confirm the exact account name via an
-  **attribute-only** dump. Never `-w`/`-g` on the live item — those print the OAuth token, and
-  this file is public. A miss here is a config fix (`CLAUDE_CLI_KEYCHAIN_SERVICE` /
-  `CLAUDE_CLI_KEYCHAIN_ACCOUNT`), not a code change.
+- **A1 — item name/account.** The current CLI stores its live credentials in Keychain under the
+  fixed account `claude-code-user`, service `Claude Code` + `-credentials` + (when the config dir
+  is customized) `-` + the first 8 hex chars of `sha256(NFC(configDir))`; older CLIs used a single
+  item under the **login username** and the un-suffixed service (read as a fallback). Confirm the
+  live account/service via an **attribute-only** dump. Never `-w`/`-g` on the live item — those
+  print the OAuth token, and this file is public. A miss here is a config fix
+  (`CLAUDE_CLI_KEYCHAIN_SERVICE` / `CLAUDE_CLI_KEYCHAIN_ACCOUNT`), not a code change.
 - **A2 — payload shape.** The item decodes to the same `{claudeAiOauth:{…}}` shape as
-  `.credentials.json`, confirmed **keys-only**, never by echoing values.
+  `.credentials.json`, confirmed **keys-only**, never by echoing values. A value over ~2400 bytes
+  is base64-encoded and split into `claude-code-user#<i>` chunk items plus a `claude-code-user#m`
+  metadata item (`{n,l}`); confirm the chunk/metadata **attribute names** exist when the credential
+  is large, again keys-only.
 - **A3 — `CLAUDE_CONFIG_DIR` + `--fresh`.** A fresh login with `CLAUDE_CONFIG_DIR` set writes a
   `.credentials.json` **into that dir** (the CLI respects it, as on Windows per WT-1) → `--fresh`
   capture is safe. If instead the login mutates the global Keychain item (clobbering the live
