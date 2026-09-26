@@ -49,12 +49,16 @@ function runForwarder(
   env?: NodeJS.ProcessEnv,
 ): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [scriptPath, ...(args ?? ['--secret-header', SECRET_ARG])], {
-      // A hook is spawned under the session's launch env, which the forwarder now reads
-      // CLAUDE_CONFIG_DIR from. Tests pin it explicitly (and clear an inherited one by
-      // default) so the injected `configDir` is deterministic regardless of the runner's env.
-      env: env ?? envWithoutConfigDir(),
-    });
+    const child = spawn(
+      process.execPath,
+      [scriptPath, ...(args ?? ['--secret-header', SECRET_ARG])],
+      {
+        // A hook is spawned under the session's launch env, which the forwarder now reads
+        // CLAUDE_CONFIG_DIR from. Tests pin it explicitly (and clear an inherited one by
+        // default) so the injected `configDir` is deterministic regardless of the runner's env.
+        env: env ?? envWithoutConfigDir(),
+      },
+    );
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString('utf8')));
@@ -208,13 +212,10 @@ describe('hook forwarder script', () => {
     try {
       await writeHookEndpoint(hookEndpointPath(dataDir), { port });
       const payload = '[1,2,3]';
-      const result = await runForwarder(
-        scriptPath,
-        payload,
-        undefined,
-        undefined,
-        { ...envWithoutConfigDir(), CLAUDE_CONFIG_DIR: 'C:\\profiles\\g' },
-      );
+      const result = await runForwarder(scriptPath, payload, undefined, undefined, {
+        ...envWithoutConfigDir(),
+        CLAUDE_CONFIG_DIR: 'C:\\profiles\\g',
+      });
       expect(result.code).toBe(0);
       await until(() => requests.length === 1);
       expect(requests[0]?.body).toBe(payload);

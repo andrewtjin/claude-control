@@ -554,7 +554,11 @@ export function renderBindings(
   if (input.groups.length === 0) {
     return 'No folder-bound accounts. Bind one with: cctl bind <folder> <account>[,<account>...]';
   }
-  return renderBindingGroups(input.groups, palette) + '\n\n' + renderBindingsFooter(input.footer, palette);
+  return (
+    renderBindingGroups(input.groups, palette) +
+    '\n\n' +
+    renderBindingsFooter(input.footer, palette)
+  );
 }
 
 /** The resolution `cctl where` explains for a folder. */

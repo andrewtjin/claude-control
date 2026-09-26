@@ -28,7 +28,11 @@ interface GuardResult {
 /** Spawn the guard the way Claude Code's hook runner does: payload on stdin, decision on stdout.
  *  `env` is the FULL child env — tests build it explicitly so CLAUDE_PROJECT_DIR / CLAUDE_CONFIG_DIR
  *  and the enforcement knobs are deterministic regardless of the runner's own environment. */
-function runGuard(scriptPath: string, payload: string, env: NodeJS.ProcessEnv): Promise<GuardResult> {
+function runGuard(
+  scriptPath: string,
+  payload: string,
+  env: NodeJS.ProcessEnv,
+): Promise<GuardResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [scriptPath], { env });
     let stdout = '';
@@ -131,7 +135,10 @@ describe('bind guard script', () => {
 
   it('(A) project bound to a group, session on the shared account → block with the exact reason', async () => {
     await writeSnapshot();
-    const result = await runGuard(scriptPath, PAYLOAD, { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder });
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+    });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe('');
     expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
@@ -196,7 +203,10 @@ describe('bind guard script', () => {
 
   it('warn mode from the snapshot (no env) also emits a systemMessage', async () => {
     await writeSnapshot({ enforce: 'warn' });
-    const result = await runGuard(scriptPath, PAYLOAD, { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder });
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+    });
     expect(JSON.parse(result.stdout)).toEqual({ systemMessage: expectedReasonA() });
   });
 
@@ -226,7 +236,10 @@ describe('bind guard script', () => {
     const missingPath = join(root, 'nope', 'folder-bindings.json');
     const guard2 = join(root, 'guard2.cjs');
     await writeBindGuard(guard2, missingPath);
-    const result = await runGuard(guard2, PAYLOAD, { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder });
+    const result = await runGuard(guard2, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+    });
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('');
     expect(result.stderr.trim().split('\n')).toHaveLength(1);
@@ -235,7 +248,10 @@ describe('bind guard script', () => {
 
   it('a corrupt snapshot fails OPEN with one stderr line', async () => {
     await writeFile(snapshotPath, '{ this is not json', 'utf8');
-    const result = await runGuard(scriptPath, PAYLOAD, { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder });
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+    });
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('');
     expect(result.stderr.trim().split('\n')).toHaveLength(1);
@@ -243,7 +259,10 @@ describe('bind guard script', () => {
 
   it('an unknown schemaVersion fails OPEN', async () => {
     await writeSnapshot({ schemaVersion: 2 });
-    const result = await runGuard(scriptPath, PAYLOAD, { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder });
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+    });
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('');
     expect(result.stderr).toContain('cctl bind-guard:');
@@ -255,7 +274,10 @@ describe('bind guard script', () => {
     await mkdir(dirAsSnapshot, { recursive: true });
     const guard3 = join(root, 'guard3.cjs');
     await writeBindGuard(guard3, dirAsSnapshot);
-    const result = await runGuard(guard3, PAYLOAD, { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder });
+    const result = await runGuard(guard3, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+    });
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('');
     expect(result.stderr).toContain('cctl bind-guard:');

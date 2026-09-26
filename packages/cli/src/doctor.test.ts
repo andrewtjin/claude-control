@@ -341,7 +341,9 @@ describe('checkGuardHook', () => {
       join(claudeDir, 'settings.json'),
       JSON.stringify({
         hooks: {
-          UserPromptSubmit: [{ hooks: [{ type: 'command', command: '"node" "x\bind-guard.cjs"' }] }],
+          UserPromptSubmit: [
+            { hooks: [{ type: 'command', command: '"node" "x\bind-guard.cjs"' }] },
+          ],
         },
       }),
     );

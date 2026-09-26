@@ -249,13 +249,18 @@ describe('spawnClaude (real spawn via a fake claude)', () => {
 
   /** Run the fake claude (node + script) capturing its printed JSON. Uses a pipe stdio so the test
    *  can read stdout; production inherits stdio, but the argv/env/exit-code path is identical. */
-  function runFake(args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; out: FakeOutput }> {
+  function runFake(
+    args: string[],
+    env: NodeJS.ProcessEnv,
+  ): Promise<{ code: number; out: FakeOutput }> {
     return new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [fakeScript, ...args], { env, shell: false });
       let stdout = '';
       child.stdout.on('data', (c: Buffer) => (stdout += c.toString('utf8')));
       child.on('error', reject);
-      child.on('close', (code) => resolve({ code: code ?? -1, out: JSON.parse(stdout) as FakeOutput }));
+      child.on('close', (code) =>
+        resolve({ code: code ?? -1, out: JSON.parse(stdout) as FakeOutput }),
+      );
     });
   }
 

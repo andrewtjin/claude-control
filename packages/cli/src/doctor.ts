@@ -332,7 +332,11 @@ export async function checkGuardSnapshot(
     ]);
     if (snapshot === undefined) {
       if (groups.length === 0) {
-        return { name: 'guard-snapshot', ok: true, detail: 'no folder bindings; nothing to enforce' };
+        return {
+          name: 'guard-snapshot',
+          ok: true,
+          detail: 'no folder bindings; nothing to enforce',
+        };
       }
       return {
         name: 'guard-snapshot',
@@ -392,7 +396,11 @@ export function checkVersionSkew(
   daemonAlive: boolean,
 ): DoctorCheck {
   if (!daemonAlive || daemonBuild === undefined) {
-    return { name: 'daemon-version', ok: true, detail: `CLI is ${cliVersion}; no running daemon to compare` };
+    return {
+      name: 'daemon-version',
+      ok: true,
+      detail: `CLI is ${cliVersion}; no running daemon to compare`,
+    };
   }
   if (daemonBuild === cliVersion) {
     return { name: 'daemon-version', ok: true, detail: `CLI and daemon both ${cliVersion}` };

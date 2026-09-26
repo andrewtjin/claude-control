@@ -363,7 +363,8 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<'r
         if (!isHookGroup(g)) return g; // not recognizably ours to interpret — leave as-is
         // Remove both of ours: the forwarder (owned marker) and the enforcement guard (script name).
         const keptHooks = g.hooks.filter(
-          (h) => !isHookEntry(h) || (!isOwnedHookCommand(h.command) && !isBindGuardCommand(h.command)),
+          (h) =>
+            !isHookEntry(h) || (!isOwnedHookCommand(h.command) && !isBindGuardCommand(h.command)),
         );
         if (keptHooks.length !== g.hooks.length) prunedHere = true;
         return { ...g, hooks: keptHooks };
