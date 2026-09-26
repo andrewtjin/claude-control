@@ -391,10 +391,12 @@ function decodeKeychainJsonText(raw: string): string {
 }
 
 /**
- * Read the stored value for a target, reassembling the CLI's chunk layout. A metadata item present
- * but broken (corrupt JSON, missing chunk, wrong length, non-base64) is a corrupt credential and
- * surfaces as a typed {@link VaultError} rather than silently reading as "logged out". No metadata
- * item means the value, if any, is a single unchunked item holding the raw JSON.
+ * Read the stored value for a target, reassembling the CLI's chunk layout. No metadata item — or a
+ * metadata item whose contents are unusable (non-JSON, or `n`/`l` out of the CLI's bounds) — means
+ * the value, if any, is the single unchunked plain item holding the raw JSON: the CLI reads that
+ * item in both cases, so we do too. A metadata item whose bounds are VALID but whose chunk set is
+ * broken (missing chunk, wrong length, non-base64) is a genuinely corrupt credential and surfaces as
+ * a typed {@link VaultError} rather than silently reading as "logged out" — the CLI's throw case.
  */
 export async function readChunkedValue(
   run: ExecRunner,
@@ -407,7 +409,17 @@ export async function readChunkedValue(
     return plain === undefined ? undefined : decodeKeychainJsonText(plain);
   }
   const meta = parseChunkMeta(metaRaw);
-  if (!meta) throw new VaultError('live-credential Keychain metadata is corrupt');
+  if (!meta) {
+    // The metadata item exists but its contents are unusable — non-JSON, or `n`/`l` outside the
+    // CLI's bounds (n<=0, n>256, l<=0, l>n*2400). The CLI does NOT fail here: its metadata reader
+    // returns null for such values and it then reads the plain unchunked item, so a leftover or
+    // aborted `#m` sitting beside a valid plain item still reads back the live credential. Mirror
+    // that fallback rather than hard-erroring on a value the real CLI recovers. A metadata item
+    // whose bounds are VALID but whose chunk set is broken is a genuinely corrupt credential and
+    // still throws below — that is the CLI's throw case too.
+    const plain = await readKeychainItem(run, service, account);
+    return plain === undefined ? undefined : decodeKeychainJsonText(plain);
+  }
   const chunks = await Promise.all(
     Array.from({ length: meta.n }, (_unused, i) =>
       readKeychainItem(run, service, chunkAccount(account, i)),

@@ -330,19 +330,45 @@ describe('writeChunkedValue / readChunkedValue', () => {
     expect(await readChunkedValue(run, TARGET)).toBe(smaller);
   });
 
-  // Corruption cases: each surfaces as a typed VaultError, never a crash or a silent "logged out".
-  it('throws on corrupt (non-JSON) metadata', async () => {
+  // Unusable metadata (non-JSON, or n/l out of the CLI's bounds) is NOT a corrupt credential: the
+  // CLI's metadata reader returns null for it and reads the plain unchunked item instead. We match
+  // that — a leftover or aborted `#m` beside a valid plain item still reads back the credential, and
+  // one with no plain item reads as "logged out" (undefined), never a hard error.
+  it('falls back to the plain item when metadata is non-JSON', async () => {
     const { run, store } = rig();
     store.set(metaKey, 'not json');
-    await expect(readChunkedValue(run, TARGET)).rejects.toThrow(VaultError);
+    store.set(plainKey, JSON.stringify({ claudeAiOauth: OAUTH }));
+    expect(await readChunkedValue(run, TARGET)).toBe(JSON.stringify({ claudeAiOauth: OAUTH }));
   });
 
-  it('throws on non-numeric chunk count in metadata', async () => {
+  it('reads undefined (logged out) when metadata is non-JSON and there is no plain item', async () => {
+    const { run, store } = rig();
+    store.set(metaKey, 'not json');
+    expect(await readChunkedValue(run, TARGET)).toBeUndefined();
+  });
+
+  it('falls back to the plain item when metadata has a non-numeric chunk count', async () => {
     const { run, store } = rig();
     store.set(metaKey, JSON.stringify({ n: 'two', l: 8 }));
-    await expect(readChunkedValue(run, TARGET)).rejects.toThrow(VaultError);
+    store.set(plainKey, JSON.stringify({ claudeAiOauth: OAUTH }));
+    expect(await readChunkedValue(run, TARGET)).toBe(JSON.stringify({ claudeAiOauth: OAUTH }));
   });
 
+  // n out of the CLI's bounds (n<=0 and n>256): parseChunkMeta rejects both, so the plain item wins.
+  for (const meta of [
+    { n: 0, l: 5 },
+    { n: 300, l: 5 },
+  ]) {
+    it(`falls back to the plain item when metadata n=${meta.n} is out of bounds`, async () => {
+      const { run, store } = rig();
+      store.set(metaKey, JSON.stringify(meta));
+      store.set(plainKey, JSON.stringify({ claudeAiOauth: OAUTH }));
+      expect(await readChunkedValue(run, TARGET)).toBe(JSON.stringify({ claudeAiOauth: OAUTH }));
+    });
+  }
+
+  // A metadata item whose bounds are VALID but whose chunk set is broken IS a corrupt credential and
+  // still surfaces as a typed VaultError, never a crash or a silent "logged out" — the CLI throws here too.
   it('throws when a chunk is missing', async () => {
     const { run, store } = rig();
     store.set(metaKey, JSON.stringify({ n: 2, l: 8 }));
