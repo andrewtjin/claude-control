@@ -347,9 +347,14 @@ describe('embeddableFolderPathSource', () => {
     folderKey: typeof folderKey;
     isWithin: typeof isWithin;
   } {
+    // `new Function` is exactly how the enforcement guard reconstitutes the embedded source, so the
+    // test proves the real mechanism rather than a proxy for it — the implied-eval rule is disabled
+    // here deliberately, not worked around.
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
     const factory = new Function(
       `${embeddableFolderPathSource()}\nreturn { canonicalizeFolder, folderKey, isWithin };`,
     );
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
     return factory() as ReturnType<typeof loadEmbedded>;
   }
 

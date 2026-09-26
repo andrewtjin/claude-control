@@ -64,6 +64,27 @@ export function defaultVaultKeyPath(
   return join(machineLocalDataRoot(env, platform), 'claude-control', 'vault.key');
 }
 
+/** Root under which a folder-bound group's private profile dir is materialized — a SIBLING of the
+ *  vault dir (`<machineLocalDataRoot>/claude-control/profiles`), derived from `vaultDir` so the two
+ *  never disagree about where they sit. The group profile holds live credentials like `~/.claude`
+ *  does, so it must be as machine-local as the vault. */
+export function profilesRoot(vaultDir: string): string {
+  return join(vaultDir, '..', 'profiles');
+}
+
+/** The profile dir for one group: `<profilesRoot>/<groupId>`. The id is an unguessable UUID, so it
+ *  is safe to name a directory after. */
+export function groupProfileDir(vaultDir: string, groupId: string): string {
+  return join(profilesRoot(vaultDir), groupId);
+}
+
+/** The non-secret snapshot the enforcement guard reads — a SIBLING of the vault dir
+ *  (`<machineLocalDataRoot>/claude-control/folder-bindings.json`), not inside it: the guard is a
+ *  dependency-free hook that must read it without any knowledge of the vault's internals. */
+export function folderBindingsPath(vaultDir: string): string {
+  return join(vaultDir, '..', 'folder-bindings.json');
+}
+
 /** Build a `Paths` rooted entirely inside `root` — used by tests to sandbox all IO. */
 export function sandboxPaths(root: string): Paths {
   const claudeDir = join(root, 'claude');

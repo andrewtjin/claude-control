@@ -11,8 +11,25 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { CredentialBundle, OauthAccount, Registry, StoredAccount } from './types.js';
+import type {
+  AccountView,
+  CredentialBundle,
+  GroupsFile,
+  OauthAccount,
+  Registry,
+  StoredAccount,
+  StoredGroup,
+} from './types.js';
+import type { FolderBindingSnapshot } from './types.js';
 import type { Protector } from './dpapi.js';
+import { folderKey } from './folderPath.js';
+import {
+  buildFolderBindingSnapshot,
+  readFolderBindingSnapshot,
+  writeFolderBindingSnapshot,
+  type BindEnforceMode,
+} from './folderBindings.js';
+import { folderBindingsPath, groupProfileDir } from './paths.js';
 import { atomicWriteFile, ensureDir, readJsonIfExists, removeIfExists } from './fsutil.js';
 import { UnknownAccountError, VaultError } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
@@ -28,10 +45,15 @@ export interface DedupeReport {
 /** Refuse a label another row already answers to (any case) or that spells an account id:
  *  `resolveAccountRef` matches id first, then exact label, then case-insensitive label, so
  *  either collision would leave one of the two accounts unreachable by name. `exceptId` is
- *  the row being renamed, whose own label is not a collision with itself. */
-function assertLabelFree(reg: Registry, label: string, exceptId: string | undefined): void {
+ *  the row being renamed, whose own label is not a collision with itself.
+ *
+ *  Checked across ALL rows — shared AND reserved — because `resolveAccountRef` resolves a name
+ *  against the one logical registry: a label a group member already carries must be as off-limits
+ *  to a shared account as another shared account's is, or `cctl switch <name>` could not tell the
+ *  two apart. */
+function assertLabelFree(rows: StoredAccount[], label: string, exceptId: string | undefined): void {
   const lower = label.toLowerCase();
-  const taken = reg.accounts.find(
+  const taken = rows.find(
     (a) => a.id === label || (a.id !== exceptId && a.label.toLowerCase() === lower),
   );
   if (taken) {
@@ -40,6 +62,74 @@ function assertLabelFree(reg: Registry, label: string, exceptId: string | undefi
         'two accounts answering to one name could not be told apart on switch',
     );
   }
+}
+
+/** The reusable core of {@link Vault.dedupeAccounts}, run once over the shared rows and once over
+ *  each group's members — every set of rows that answers to one logical registry must be internally
+ *  consistent under the same rules (one row per login, one name per row). Mutates and returns `rows`
+ *  in place; the caller persists only the sets that actually {@link DedupeCoreResult.changed}.
+ *  `activeId` (the shared active id, or a group's) picks the survivor when the same login is stored
+ *  twice, exactly as the single-file version did. */
+interface DedupeCoreResult {
+  removedIds: Set<string>;
+  merged: DedupeReport['merged'];
+  relabelled: DedupeReport['relabelled'];
+  changed: boolean;
+}
+function dedupeRows(
+  rows: StoredAccount[],
+  activeId: string | null,
+  clock: () => number,
+): { rows: StoredAccount[]; result: DedupeCoreResult } {
+  const merged: DedupeReport['merged'] = [];
+  const relabelled: DedupeReport['relabelled'] = [];
+
+  const byLogin = new Map<string, StoredAccount[]>();
+  for (const a of rows) {
+    if (a.accountUuid === undefined) continue;
+    byLogin.set(a.accountUuid, [...(byLogin.get(a.accountUuid) ?? []), a]);
+  }
+  const removedIds = new Set<string>();
+  for (const group of byLogin.values()) {
+    if (group.length < 2) continue;
+    // The active row wins; absent one, the most recently CAPTURED (largest createdAtMs) — a capture
+    // always writes fresh tokens, whereas updatedAtMs also moves on a metadata touch.
+    const keep =
+      group.find((r) => r.id === activeId) ??
+      group.reduce((best, r) => (r.createdAtMs > best.createdAtMs ? r : best));
+    for (const r of group) {
+      if (r === keep) continue;
+      removedIds.add(r.id);
+      merged.push({ label: r.label, keptId: keep.id, removedId: r.id });
+    }
+  }
+  const next = rows.filter((a) => !removedIds.has(a.id));
+
+  // Earlier rows keep their label; every label already on record (any case) and every id is off
+  // limits for the suffix, so the result is unique under the same rules a rename obeys.
+  const taken = new Set(next.map((a) => a.label.toLowerCase()));
+  const seen = new Set<string>();
+  for (const a of [...next].sort((x, y) => x.createdAtMs - y.createdAtMs)) {
+    const lower = a.label.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      continue;
+    }
+    let n = 2;
+    let candidate = `${a.label} (${n})`;
+    while (taken.has(candidate.toLowerCase()) || next.some((o) => o.id === candidate)) {
+      n += 1;
+      candidate = `${a.label} (${n})`;
+    }
+    relabelled.push({ id: a.id, from: a.label, to: candidate });
+    a.label = candidate;
+    a.updatedAtMs = clock();
+    taken.add(candidate.toLowerCase());
+    seen.add(candidate.toLowerCase());
+  }
+
+  const changed = merged.length > 0 || relabelled.length > 0;
+  return { rows: next, result: { removedIds, merged, relabelled, changed } };
 }
 
 /** The registry file's shape: an object whose `accounts`, when present, is an array of rows
@@ -61,6 +151,170 @@ function isRegistryShape(value: unknown): value is { activeId?: unknown; account
  *  `accounts` array in place, and a shared array would leak accounts between vaults. */
 function emptyRegistry(): Registry {
   return { activeId: null, accounts: [] };
+}
+
+/** Registry schema tag written into `accounts.json` from this build on. Its presence marks a file
+ *  the group split is aware of; its ABSENCE is the legacy pre-split shape (see {@link Registry}). */
+const ACCOUNTS_SCHEMA_VERSION = 2;
+/** Schema tag for `groups.json`. Only value ever accepted on load — an unknown one fails closed
+ *  rather than being read as a shape this build does not understand. */
+const GROUPS_SCHEMA_VERSION = 1;
+
+/**
+ * Upper bounds on the group registry, enforced on every load and every mutation.
+ *
+ * These are refusal points, not capacity targets: the files are read into memory, parsed, and
+ * (for the guard snapshot) copied around, so an unbounded count turns one hostile or corrupt file
+ * into an out-of-memory or a wedged daemon. The numbers are far above any real fleet — dozens of
+ * folders per group, dozens of groups — so a legitimate operator never meets them.
+ */
+export const MAX_GROUPS = 64;
+export const MAX_GROUP_MEMBERS = 32;
+export const MAX_GROUP_FOLDERS = 256;
+
+/** Property names that, if copied onto an object literal or used as a plain-object map key, reach
+ *  through to `Object.prototype` (prototype pollution). Registry files are operator-editable and,
+ *  for `groups.json`, part of the downgrade-fence contract with older builds, so a file bearing one
+ *  of these is refused rather than parsed. */
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** Throw if `obj` carries any {@link FORBIDDEN_KEYS} as an OWN property. `JSON.parse` materializes
+ *  a literal `"__proto__"` key as a real own property (it uses define-semantics, not assignment),
+ *  so this catches it where a plain `obj.__proto__` read would not. `where` names the offending
+ *  location for the closed-fail message. */
+function assertNoForbiddenKeys(obj: object, where: string): void {
+  for (const key of Object.getOwnPropertyNames(obj)) {
+    if (FORBIDDEN_KEYS.has(key)) {
+      throw new VaultError(`${where} contains a forbidden key "${key}"`);
+    }
+  }
+}
+
+/** Whether a value is a plain (non-null, non-array) object worth validating field by field. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validate one row that `groups.json` claims is a reserved account, failing CLOSED (a named
+ * {@link VaultError}, nothing written) on anything malformed.
+ *
+ * Stricter than the shared-registry shape check: a shared row an older build wrote may legitimately
+ * lack derived fields, but every member here was moved out of a row this build created, so the full
+ * required shape must be intact — a member missing its id or timestamps is corruption, not an old
+ * file, and reading it loosely would let a broken row flow into a live credential decision.
+ */
+function validateMember(value: unknown, where: string): StoredAccount {
+  if (!isPlainObject(value)) throw new VaultError(`${where} is not an object`);
+  assertNoForbiddenKeys(value, where);
+  const id = value.id;
+  if (typeof id !== 'string' || id === '') throw new VaultError(`${where} has no string id`);
+  if (typeof value.label !== 'string') throw new VaultError(`${where} (${id}) has no string label`);
+  if (typeof value.quarantined !== 'boolean') {
+    throw new VaultError(`${where} (${id}) has no boolean quarantined flag`);
+  }
+  if (typeof value.createdAtMs !== 'number' || typeof value.updatedAtMs !== 'number') {
+    throw new VaultError(`${where} (${id}) has non-numeric timestamps`);
+  }
+  return value as unknown as StoredAccount;
+}
+
+/**
+ * Parse and STRICTLY validate `groups.json`, healing nothing and writing nothing.
+ *
+ * Fails closed (named {@link VaultError}) on: a wrong top-level shape or schema version; a group
+ * that is not an object or carries a forbidden key; a missing id/label; an over-cap or empty member
+ * list (an empty group has no reason to exist and would leave `activeId` unsatisfiable); a member
+ * that fails {@link validateMember}; a member id repeated across the whole file (two rows answering
+ * to one account); an `activeId` that is neither null nor one of the group's own members; an
+ * over-cap folder list; or a folder that collides (by {@link folderKey}) with one already claimed
+ * by any group. The caller separately heals a member id that ALSO lingers in `accounts.json`.
+ */
+function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFile {
+  if (!isPlainObject(value)) throw new VaultError('groups.json is not an object');
+  assertNoForbiddenKeys(value, 'groups.json');
+  if (value.schemaVersion !== GROUPS_SCHEMA_VERSION) {
+    throw new VaultError(
+      `groups.json has an unsupported schemaVersion (${JSON.stringify(value.schemaVersion)}); ` +
+        'a newer build wrote it — this one refuses to read it rather than drop the bindings it holds',
+    );
+  }
+  if (typeof value.generation !== 'number' || !Number.isInteger(value.generation)) {
+    throw new VaultError('groups.json generation is not an integer');
+  }
+  const rawGroups = value.groups;
+  if (!Array.isArray(rawGroups)) throw new VaultError('groups.json groups is not an array');
+  if (rawGroups.length > MAX_GROUPS) {
+    throw new VaultError(`groups.json holds ${rawGroups.length} groups (max ${MAX_GROUPS})`);
+  }
+
+  const seenMemberIds = new Set<string>();
+  const seenFolderKeys = new Set<string>();
+  const groups: StoredGroup[] = [];
+  for (let i = 0; i < rawGroups.length; i += 1) {
+    const g: unknown = rawGroups[i];
+    const where = `groups[${i}]`;
+    if (!isPlainObject(g)) throw new VaultError(`${where} is not an object`);
+    assertNoForbiddenKeys(g, where);
+    if (typeof g.id !== 'string' || g.id === '') throw new VaultError(`${where} has no string id`);
+    if (typeof g.label !== 'string') throw new VaultError(`${where} (${g.id}) has no string label`);
+    if (typeof g.createdAtMs !== 'number' || typeof g.updatedAtMs !== 'number') {
+      throw new VaultError(`${where} (${g.id}) has non-numeric timestamps`);
+    }
+    if (!Array.isArray(g.members) || g.members.length === 0) {
+      throw new VaultError(`${where} (${g.id}) has no members`);
+    }
+    if (g.members.length > MAX_GROUP_MEMBERS) {
+      throw new VaultError(
+        `${where} (${g.id}) holds ${g.members.length} members (max ${MAX_GROUP_MEMBERS})`,
+      );
+    }
+    const members: StoredAccount[] = [];
+    for (let j = 0; j < g.members.length; j += 1) {
+      const member = validateMember(g.members[j], `${where}.members[${j}]`);
+      if (seenMemberIds.has(member.id)) {
+        throw new VaultError(`account ${member.id} appears in more than one group`);
+      }
+      seenMemberIds.add(member.id);
+      members.push(member);
+    }
+    const activeId = g.activeId;
+    if (activeId !== null) {
+      if (typeof activeId !== 'string' || !members.some((m) => m.id === activeId)) {
+        throw new VaultError(`${where} (${g.id}) activeId is not one of its members`);
+      }
+    }
+    const rawFolders = g.folders;
+    if (!Array.isArray(rawFolders))
+      throw new VaultError(`${where} (${g.id}) folders is not an array`);
+    if (rawFolders.length > MAX_GROUP_FOLDERS) {
+      throw new VaultError(
+        `${where} (${g.id}) holds ${rawFolders.length} folders (max ${MAX_GROUP_FOLDERS})`,
+      );
+    }
+    const folders: string[] = [];
+    for (const folder of rawFolders) {
+      if (typeof folder !== 'string' || folder === '') {
+        throw new VaultError(`${where} (${g.id}) has a non-string folder`);
+      }
+      const key = folderKey(folder, platform);
+      if (seenFolderKeys.has(key)) {
+        throw new VaultError(`folder ${folder} is bound by more than one group`);
+      }
+      seenFolderKeys.add(key);
+      folders.push(folder);
+    }
+    groups.push({
+      id: g.id,
+      label: g.label,
+      members,
+      activeId,
+      folders,
+      createdAtMs: g.createdAtMs,
+      updatedAtMs: g.updatedAtMs,
+    });
+  }
+  return { schemaVersion: GROUPS_SCHEMA_VERSION, generation: value.generation, groups };
 }
 
 /**
@@ -257,6 +511,59 @@ function applyBundleMetadata(
   return changed;
 }
 
+/**
+ * The whole registry as one in-memory picture: the shared side (`accounts.json`) and the reserved
+ * side (`groups.json`), already healed of a crash-mid-move duplicate. Every vault mutator loads one
+ * of these, mutates the relevant slice, and persists ONLY the file(s) it touched.
+ */
+interface RegistryState {
+  /** The shared account rows — `accounts.json` minus any row that is really a group member. */
+  shared: StoredAccount[];
+  /** The GLOBAL slot's active account (a shared id), or null. Reserved ids are healed to null. */
+  activeId: string | null;
+  /** Top-level keys of `accounts.json` this build does not own, kept verbatim so a future field an
+   *  older-but-newer-than-this build writes survives our rewrites (`schemaVersion`/`activeId`/
+   *  `accounts` are excluded — those we own). */
+  unknownKeys: Record<string, unknown>;
+  /** The reserved side. */
+  groups: StoredGroup[];
+  /** `groups.json`'s generation; the next groups write is `generation + 1`. */
+  generation: number;
+  /** True when a member id (or a reserved active id) still lingered in `accounts.json` and the next
+   *  shared write must drop it. See {@link Vault.heal}. */
+  needsSharedRewrite: boolean;
+}
+
+/** Every row in the one logical registry — shared rows plus every group's members — as a flat list,
+ *  for the checks (label uniqueness, login uniqueness) that must see the whole namespace at once. */
+function allRowsOf(st: RegistryState): StoredAccount[] {
+  const rows = st.shared.slice();
+  for (const g of st.groups) rows.push(...g.members);
+  return rows;
+}
+
+/** Locate a row by id across both files. `group` is the group holding it, or undefined when the row
+ *  is shared — which is exactly the signal a mutator needs to pick which file to persist. */
+function findRowIn(
+  st: RegistryState,
+  id: string,
+): { row: StoredAccount; group?: StoredGroup } | undefined {
+  const shared = st.shared.find((a) => a.id === id);
+  if (shared) return { row: shared };
+  for (const g of st.groups) {
+    const m = g.members.find((a) => a.id === id);
+    if (m) return { row: m, group: g };
+  }
+  return undefined;
+}
+
+/** Fold one {@link dedupeRows} pass into the caller's running report and removed-id set. */
+function collectDedupe(report: DedupeReport, removed: Set<string>, result: DedupeCoreResult): void {
+  report.merged.push(...result.merged);
+  report.relabelled.push(...result.relabelled);
+  for (const id of result.removedIds) removed.add(id);
+}
+
 export class Vault {
   constructor(
     private readonly vaultDir: string,
@@ -266,65 +573,399 @@ export class Vault {
      *  discarding it, so read-only vault handles and tests stay one-liners; the engine passes
      *  its own. */
     private readonly log: Logger = noopLogger,
+    /** Selects the folder-key case rule for validating that no folder is bound by two groups.
+     *  A parameter (not a `process.platform` read) so a test can drive either rule. */
+    private readonly platform: NodeJS.Platform = process.platform,
   ) {}
 
   // ---- registry (non-secret) ----
 
-  async loadRegistry(): Promise<Registry> {
-    const reg = await readJsonIfExists<unknown>(this.registryPath());
-    if (reg === undefined) return emptyRegistry();
-    // An older file may lack fields (they default), but a file whose shape is wrong is refused
-    // by name and left exactly as it is: reading it as empty would have the next write replace
-    // the operator's account index with nothing.
-    if (!isRegistryShape(reg)) {
+  /**
+   * Load and validate BOTH registry files into one healed picture.
+   *
+   * Reads `accounts.json` (the shared side, same tolerant shape check as before) and `groups.json`
+   * (the reserved side, validated STRICTLY by {@link validateGroupsFile}); a malformed file is
+   * refused by name and left untouched. Then it HEALS a crash mid-move: the move primitives write
+   * one file before the other, so a crash between can leave a member's row in BOTH — the groups.json
+   * copy always wins (the account is reserved), and the shared copy is dropped here (and flushed by
+   * {@link heal} or the next shared write). A global `activeId` pointing at a now-reserved account is
+   * likewise healed to null.
+   */
+  private async loadState(): Promise<RegistryState> {
+    const raw = await readJsonIfExists<unknown>(this.registryPath());
+    // An older file may lack fields (they default), but a file whose shape is wrong is refused by
+    // name and left exactly as it is: reading it as empty would have the next write replace the
+    // operator's account index with nothing.
+    if (raw !== undefined && !isRegistryShape(raw)) {
       throw new VaultError(
         `the account registry at ${this.registryPath()} is malformed (expected ` +
           '{"activeId": ..., "accounts": [...]}); fix the file or move it aside - it was left untouched',
       );
     }
+    const reg = (raw ?? emptyRegistry()) as Record<string, unknown>;
+    if (raw !== undefined) assertNoForbiddenKeys(reg, 'accounts.json');
+    const sharedRows = ((reg.accounts as StoredAccount[] | undefined) ?? []).slice();
+    let activeId = typeof reg.activeId === 'string' ? reg.activeId : null;
+    // Everything except the three keys this build owns is preserved across writes.
+    const unknownKeys: Record<string, unknown> = {};
+    for (const key of Object.keys(reg)) {
+      if (key === 'schemaVersion' || key === 'activeId' || key === 'accounts') continue;
+      unknownKeys[key] = reg[key];
+    }
+
+    const rawGroups = await readJsonIfExists<unknown>(this.groupsPath());
+    const groupsFile: GroupsFile =
+      rawGroups === undefined
+        ? { schemaVersion: GROUPS_SCHEMA_VERSION, generation: 0, groups: [] }
+        : validateGroupsFile(rawGroups, this.platform);
+
+    // Heal: a member id must never also be a shared row (groups.json wins), and the global active id
+    // must never be a reserved account.
+    const memberIds = new Set<string>();
+    for (const g of groupsFile.groups) for (const m of g.members) memberIds.add(m.id);
+    let needsSharedRewrite = false;
+    const shared = sharedRows.filter((a) => {
+      if (memberIds.has(a.id)) {
+        needsSharedRewrite = true;
+        return false;
+      }
+      return true;
+    });
+    if (activeId !== null && memberIds.has(activeId)) {
+      activeId = null;
+      needsSharedRewrite = true;
+    }
+
     return {
-      activeId: typeof reg.activeId === 'string' ? reg.activeId : null,
-      accounts: (reg.accounts ?? []) as StoredAccount[],
+      shared,
+      activeId,
+      unknownKeys,
+      groups: groupsFile.groups,
+      generation: groupsFile.generation,
+      needsSharedRewrite,
     };
   }
 
-  private async saveRegistry(reg: Registry): Promise<void> {
-    await atomicWriteFile(this.registryPath(), JSON.stringify(reg, null, 2));
+  /** The SHARED registry as the pre-split callers know it: `{ activeId, accounts }`, healed of any
+   *  reserved row. Reserved accounts have MOVED to `groups.json`, so — by design — the global pool
+   *  this returns never includes one, which is exactly what the downgrade fence needs. */
+  async loadRegistry(): Promise<Registry> {
+    const st = await this.loadState();
+    return { activeId: st.activeId, accounts: st.shared };
+  }
+
+  /** Persist the shared side. Stamps the current schema version and re-emits any preserved unknown
+   *  top-level keys, so an old row this build could not name survives and the file always carries a
+   *  version tag going forward. */
+  private async saveShared(st: RegistryState): Promise<void> {
+    const out = {
+      ...st.unknownKeys,
+      schemaVersion: ACCOUNTS_SCHEMA_VERSION,
+      activeId: st.activeId,
+      accounts: st.shared,
+    };
+    await atomicWriteFile(this.registryPath(), JSON.stringify(out, null, 2));
+  }
+
+  /** Persist the reserved side, incrementing `generation` (the guard snapshot carries it, so a
+   *  bump is what lets a stale snapshot be detected). Mutates `st.generation` to the value written
+   *  so a caller that then writes the snapshot reports the right number. */
+  private async saveGroups(st: RegistryState): Promise<void> {
+    st.generation += 1;
+    const file: GroupsFile = {
+      schemaVersion: GROUPS_SCHEMA_VERSION,
+      generation: st.generation,
+      groups: st.groups,
+    };
+    await atomicWriteFile(this.groupsPath(), JSON.stringify(file, null, 2));
+  }
+
+  /**
+   * Flush a pending crash-mid-move heal: rewrite `accounts.json` without a row that has since become
+   * a group member (and clear a global active id that points at one). Returns whether it wrote.
+   *
+   * The window it closes matters to the fence: while a reserved row lingers in `accounts.json`, an
+   * OLDER cctl that only reads that file would see it, poll it, and rotate its token — corrupting the
+   * group slot. Callers run this under the engine lock on start so the window is closed proactively
+   * rather than only on the next shared write.
+   */
+  async heal(): Promise<boolean> {
+    const st = await this.loadState();
+    if (!st.needsSharedRewrite) return false;
+    await this.saveShared(st);
+    return true;
   }
 
   async listAccounts(): Promise<StoredAccount[]> {
-    return (await this.loadRegistry()).accounts;
+    return (await this.loadState()).shared;
   }
 
+  /**
+   * The one logical registry as a unified list: shared rows first, then every group's members, each
+   * member tagged with its `groupId`. This is what the CLI's `accounts list`, `doctor`, and the
+   * name resolver read — {@link listAccounts} stays SHARED-only because that is the global pool.
+   */
+  async listAllAccounts(): Promise<AccountView[]> {
+    const st = await this.loadState();
+    const views: AccountView[] = st.shared.map((a) => ({ ...a }));
+    for (const g of st.groups) {
+      for (const m of g.members) views.push({ ...m, groupId: g.id });
+    }
+    return views;
+  }
+
+  /** Find an account by id ACROSS the whole registry (shared or reserved). Returns the row itself
+   *  (no group tag); callers needing the tag use {@link listAllAccounts}. */
   async getAccount(id: string): Promise<StoredAccount | undefined> {
-    return (await this.listAccounts()).find((a) => a.id === id);
+    const st = await this.loadState();
+    return findRowIn(st, id)?.row;
   }
 
-  /** The RAW registry record of the last committed switch. It can lag reality after a
+  /** The RAW registry record of the last committed GLOBAL switch. It can lag reality after a
    *  `/login` inside the Claude CLI — consumers who need "who is live right now" must use
    *  `SwitchEngine.getActiveId()`, which reconciles this against the live login identity. */
   async getActiveId(): Promise<string | null> {
-    return (await this.loadRegistry()).activeId;
+    return (await this.loadState()).activeId;
+  }
+
+  // ---- groups (the reserved side) ----
+
+  /** Every group, reserved side of the one logical registry. */
+  async listGroups(): Promise<StoredGroup[]> {
+    return (await this.loadState()).groups;
+  }
+
+  /** One group by id, or undefined. */
+  async getGroup(id: string): Promise<StoredGroup | undefined> {
+    return (await this.loadState()).groups.find((g) => g.id === id);
+  }
+
+  /** The current `groups.json` generation — for the doctor's snapshot-freshness check. */
+  async getGroupsGeneration(): Promise<number> {
+    return (await this.loadState()).generation;
+  }
+
+  /**
+   * Create a new group by RESERVING shared accounts into it: their rows move out of `accounts.json`
+   * and into a fresh group in `groups.json`.
+   *
+   * Crash-safe ORDER — groups.json is written FIRST, then accounts.json. A crash between leaves the
+   * moved rows in both files, which {@link loadState} heals toward the groups.json copy, so the
+   * reservation is effectively committed the instant groups.json lands. Refuses an empty member set,
+   * a member that is unknown or already reserved elsewhere, a folder already bound to another group,
+   * and any cap breach.
+   */
+  async createGroup(opts: {
+    memberIds: readonly string[];
+    folders?: readonly string[];
+    label?: string;
+  }): Promise<StoredGroup> {
+    const st = await this.loadState();
+    if (st.groups.length >= MAX_GROUPS) {
+      throw new VaultError(`cannot create another group (max ${MAX_GROUPS})`);
+    }
+    if (opts.memberIds.length === 0) throw new VaultError('a group needs at least one member');
+    if (opts.memberIds.length > MAX_GROUP_MEMBERS) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
+    }
+    const folders = this.checkNewFolders(st, opts.folders ?? [], null);
+    const moved = this.takeSharedRows(st, opts.memberIds);
+    const now = this.clock();
+    const label = opts.label?.trim() || moved.map((m) => m.label).join(', ');
+    const group: StoredGroup = {
+      id: randomUUID(),
+      label,
+      members: moved,
+      activeId: null,
+      folders,
+      createdAtMs: now,
+      updatedAtMs: now,
+    };
+    st.groups.push(group);
+    await this.saveGroups(st); // groups.json FIRST
+    this.removeSharedRows(st, opts.memberIds);
+    await this.saveShared(st); // accounts.json SECOND
+    return group;
+  }
+
+  /**
+   * Reserve already-shared accounts INTO an existing group (grow its member set). Same crash-safe
+   * order as {@link createGroup}: groups.json first, then accounts.json.
+   */
+  async reserveAccounts(groupId: string, memberIds: readonly string[]): Promise<StoredGroup> {
+    const st = await this.loadState();
+    const group = this.mustGroup(st, groupId);
+    if (memberIds.length === 0) throw new VaultError('no accounts to reserve');
+    if (group.members.length + memberIds.length > MAX_GROUP_MEMBERS) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
+    }
+    const moved = this.takeSharedRows(st, memberIds);
+    group.members.push(...moved);
+    group.updatedAtMs = this.clock();
+    await this.saveGroups(st); // groups.json FIRST
+    this.removeSharedRows(st, memberIds);
+    await this.saveShared(st); // accounts.json SECOND
+    return group;
+  }
+
+  /**
+   * Release members of a group back to the shared pool (the reverse move). ORDER is reversed too:
+   * accounts.json is written FIRST, then groups.json. A crash between leaves the rows in both files,
+   * which {@link loadState} heals toward the groups.json copy — so an interrupted release safely
+   * REVERTS to reserved rather than half-completing. Dissolves the group when its last member leaves.
+   */
+  async releaseAccounts(groupId: string, memberIds: readonly string[]): Promise<void> {
+    const st = await this.loadState();
+    const group = this.mustGroup(st, groupId);
+    if (memberIds.length === 0) return;
+    const ids = new Set(memberIds);
+    const released: StoredAccount[] = [];
+    for (const id of ids) {
+      const member = group.members.find((m) => m.id === id);
+      if (!member) throw new VaultError(`account ${id} is not a member of group ${groupId}`);
+      released.push(member);
+    }
+    st.shared.push(...released);
+    await this.saveShared(st); // accounts.json FIRST
+    group.members = group.members.filter((m) => !ids.has(m.id));
+    if (group.activeId !== null && ids.has(group.activeId)) group.activeId = null;
+    if (group.members.length === 0) st.groups = st.groups.filter((g) => g !== group);
+    else group.updatedAtMs = this.clock();
+    await this.saveGroups(st); // groups.json SECOND
+  }
+
+  /** Bind another (already-canonical) folder to a group. Refuses a folder any group already holds
+   *  by its exact key; a nested subfolder is a different key and is allowed (longest-match wins at
+   *  resolution). */
+  async addFolderToGroup(groupId: string, canonicalFolder: string): Promise<StoredGroup> {
+    const st = await this.loadState();
+    const group = this.mustGroup(st, groupId);
+    const folders = this.checkNewFolders(st, [canonicalFolder], groupId);
+    if (group.folders.length >= MAX_GROUP_FOLDERS) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_FOLDERS} folders`);
+    }
+    group.folders.push(...folders);
+    group.updatedAtMs = this.clock();
+    await this.saveGroups(st);
+    return group;
+  }
+
+  /** Remove a folder binding from a group (compared by key). A no-op group with zero folders is
+   *  left in place — moving its members back is {@link releaseAccounts}, a separate decision. */
+  async removeFolderFromGroup(groupId: string, folder: string): Promise<StoredGroup> {
+    const st = await this.loadState();
+    const group = this.mustGroup(st, groupId);
+    const key = folderKey(folder, this.platform);
+    const before = group.folders.length;
+    group.folders = group.folders.filter((f) => folderKey(f, this.platform) !== key);
+    if (group.folders.length === before) {
+      throw new VaultError(`folder ${folder} is not bound to group ${groupId}`);
+    }
+    group.updatedAtMs = this.clock();
+    await this.saveGroups(st);
+    return group;
+  }
+
+  /** Set (or clear) which member is live in a group's slot. A non-null id must be a member. */
+  async setGroupActive(groupId: string, memberId: string | null): Promise<StoredGroup> {
+    const st = await this.loadState();
+    const group = this.mustGroup(st, groupId);
+    if (memberId !== null && !group.members.some((m) => m.id === memberId)) {
+      throw new UnknownAccountError(memberId);
+    }
+    group.activeId = memberId;
+    group.updatedAtMs = this.clock();
+    await this.saveGroups(st);
+    return group;
+  }
+
+  /** Resolve a group by id or throw a named error. */
+  private mustGroup(st: RegistryState, groupId: string): StoredGroup {
+    const group = st.groups.find((g) => g.id === groupId);
+    if (!group) throw new VaultError(`no group with id "${groupId}"`);
+    return group;
+  }
+
+  /** Validate a set of NEW folders against the current bindings: each must be a non-empty string,
+   *  unique within the set, and not already held by a DIFFERENT group (`ignoreGroupId` is the group
+   *  being grown, whose own folders are not a conflict with itself). Returns them unchanged. */
+  private checkNewFolders(
+    st: RegistryState,
+    folders: readonly string[],
+    ignoreGroupId: string | null,
+  ): string[] {
+    const existing = new Set<string>();
+    for (const g of st.groups) {
+      if (g.id === ignoreGroupId) continue;
+      for (const f of g.folders) existing.add(folderKey(f, this.platform));
+    }
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const folder of folders) {
+      if (typeof folder !== 'string' || folder === '') throw new VaultError('a folder is empty');
+      const key = folderKey(folder, this.platform);
+      if (existing.has(key))
+        throw new VaultError(`folder ${folder} is already bound to another group`);
+      if (seen.has(key)) throw new VaultError(`folder ${folder} is listed twice`);
+      seen.add(key);
+      out.push(folder);
+    }
+    if (out.length > MAX_GROUP_FOLDERS) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_FOLDERS} folders`);
+    }
+    return out;
+  }
+
+  /** Look up shared rows to move into a group: every id must currently be a SHARED account (an
+   *  unknown id, or one already reserved elsewhere, is refused by name). Returns the rows; the
+   *  caller writes groups.json before {@link removeSharedRows} drops them from the shared side. */
+  private takeSharedRows(st: RegistryState, memberIds: readonly string[]): StoredAccount[] {
+    const rows: StoredAccount[] = [];
+    for (const id of memberIds) {
+      const shared = st.shared.find((a) => a.id === id);
+      if (shared) {
+        rows.push(shared);
+        continue;
+      }
+      const owner = st.groups.find((g) => g.members.some((m) => m.id === id));
+      if (owner) {
+        throw new VaultError(`account ${id} is already reserved to group ${owner.id}`);
+      }
+      throw new UnknownAccountError(id);
+    }
+    return rows;
+  }
+
+  /** Drop moved rows from the shared side and clear a global active id that pointed at one. */
+  private removeSharedRows(st: RegistryState, memberIds: readonly string[]): void {
+    const ids = new Set(memberIds);
+    st.shared = st.shared.filter((a) => !ids.has(a.id));
+    if (st.activeId !== null && ids.has(st.activeId)) st.activeId = null;
   }
 
   // ---- account lifecycle ----
 
   /**
-   * Create a new account: persist its encrypted bundle and a metadata row derived from the
-   * bundle. Returns the generated id. Metadata is copied out of the bundle so listing never
-   * needs to decrypt.
+   * Create a new SHARED account: persist its encrypted bundle and a metadata row derived from the
+   * bundle. Returns the generated id. Metadata is copied out of the bundle so listing never needs
+   * to decrypt.
+   *
+   * The label/login collision checks run against the WHOLE registry (shared + reserved): a login
+   * already reserved to a group, or a label a group member carries, is refused here too, or the
+   * name resolver could not tell the two apart. A newly added account is always shared — reserving
+   * it into a group is a separate {@link reserveAccounts} step.
    */
   async addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
-    const reg = await this.loadRegistry();
+    const st = await this.loadState();
     const next = label.trim();
     if (next === '') throw new VaultError('a label cannot be empty');
-    assertLabelFree(reg, next, undefined);
+    const allRows = allRowsOf(st);
+    assertLabelFree(allRows, next, undefined);
     // The same login stored twice is the other way two rows come to answer to one name (and
     // to poll one quota twice). The identity block names the login; when it names a row that
     // is already here, that row is the one to refresh, never a second copy.
     const uuid = bundle.oauthAccount?.accountUuid;
-    const stored =
-      uuid !== undefined ? reg.accounts.find((a) => a.accountUuid === uuid) : undefined;
+    const stored = uuid !== undefined ? allRows.find((a) => a.accountUuid === uuid) : undefined;
     if (stored) {
       throw new VaultError(
         `this login is account ${stored.id} ("${stored.label}"), which is already stored; run ` +
@@ -346,27 +987,52 @@ export class Vault {
     // re-login (see planWeight() / `cctl accounts list` for how absence renders).
     applyBundleMetadata(account, bundle, this.log);
     // Writes the blob only — the row is not in the registry yet, so its metadata refresh is a
-    // no-op here; `saveRegistry` below is what persists the row built above.
+    // no-op here; `saveShared` below is what persists the row built above.
     await this.writeBundle(account.id, bundle);
-    reg.accounts.push(account);
-    await this.saveRegistry(reg);
+    st.shared.push(account);
+    await this.saveShared(st);
     return account;
   }
 
+  /**
+   * Remove an account wherever it lives. A shared row is dropped from `accounts.json` (clearing the
+   * global active id if it pointed at it); a member is dropped from its group (clearing that group's
+   * active id, and DISSOLVING the group when its last member leaves — a memberless group is invalid).
+   * The encrypted bundle is removed either way.
+   */
   async removeAccount(id: string): Promise<void> {
-    const reg = await this.loadRegistry();
-    reg.accounts = reg.accounts.filter((a) => a.id !== id);
-    if (reg.activeId === id) reg.activeId = null;
-    await this.saveRegistry(reg);
+    const st = await this.loadState();
+    let wrote = false;
+    if (st.shared.some((a) => a.id === id)) {
+      st.shared = st.shared.filter((a) => a.id !== id);
+      if (st.activeId === id) st.activeId = null;
+      await this.saveShared(st);
+      wrote = true;
+    } else {
+      const group = st.groups.find((g) => g.members.some((m) => m.id === id));
+      if (group) {
+        group.members = group.members.filter((m) => m.id !== id);
+        if (group.activeId === id) group.activeId = null;
+        if (group.members.length === 0) st.groups = st.groups.filter((g) => g !== group);
+        else group.updatedAtMs = this.clock();
+        await this.saveGroups(st);
+        wrote = true;
+      }
+    }
+    // The id was neither shared nor reserved, but a crash-mid-move heal may still be pending; flush
+    // it so a removal request never leaves a half-moved row behind.
+    if (!wrote && st.needsSharedRewrite) await this.saveShared(st);
     await removeIfExists(this.bundlePath(id));
   }
 
-  /** Mark an account's active-flag in the registry (after a committed switch). */
+  /** Mark the GLOBAL slot's active account (after a committed global switch). The id must be a
+   *  SHARED account — a reserved account is made live in its own group's slot via
+   *  {@link setGroupActive}, never here. */
   async setActive(id: string): Promise<void> {
-    const reg = await this.loadRegistry();
-    if (!reg.accounts.some((a) => a.id === id)) throw new UnknownAccountError(id);
-    reg.activeId = id;
-    await this.saveRegistry(reg);
+    const st = await this.loadState();
+    if (!st.shared.some((a) => a.id === id)) throw new UnknownAccountError(id);
+    st.activeId = id;
+    await this.saveShared(st);
   }
 
   /** Quarantine an account whose refresh token is dead; it stays listed but unusable. */
@@ -412,8 +1078,10 @@ export class Vault {
   async renameAccount(id: string, label: string): Promise<StoredAccount> {
     const next = label.trim();
     if (next === '') throw new VaultError('a label cannot be empty');
-    return this.patchAccount(id, (account, reg) => {
-      assertLabelFree(reg, next, id);
+    return this.patchAccount(id, (account, st) => {
+      // Uniqueness is checked across the WHOLE registry — a name the resolver could confuse with a
+      // reserved account is as unusable as one it confuses with a shared account.
+      assertLabelFree(allRowsOf(st), next, id);
       account.label = next;
     });
   }
@@ -422,78 +1090,60 @@ export class Vault {
    * Resolve duplicates that predate the refusals in {@link addAccount}: the same login stored
    * twice is merged onto one row (the active one, else the most recently captured: a capture
    * always writes fresh tokens, whereas the registry's updated clock also moves on metadata
-   * touches and says nothing about which tokens are newer), and two logins under one label keep the earlier row's
-   * label while the later ones get a numbered suffix. Both leave every account reachable by
-   * exactly one name. Rewrites the registry only when something changed; the merged rows'
-   * bundles are removed with them.
+   * touches and says nothing about which tokens are newer), and two logins under one label keep the
+   * earlier row's label while the later ones get a numbered suffix. Both leave every account
+   * reachable by exactly one name.
+   *
+   * Run separately over the shared rows and over EACH group's members — every set that answers to
+   * the one logical registry must be internally consistent, and a member's survivor is chosen by
+   * its own group's active id, not the global one. Only the files that actually changed are
+   * rewritten (a clean vault is left byte-identical); a merged row's bundle is removed with it.
    */
   async dedupeAccounts(): Promise<DedupeReport> {
-    const reg = await this.loadRegistry();
+    const st = await this.loadState();
     const report: DedupeReport = { merged: [], relabelled: [] };
-
-    const byLogin = new Map<string, StoredAccount[]>();
-    for (const a of reg.accounts) {
-      if (a.accountUuid === undefined) continue;
-      byLogin.set(a.accountUuid, [...(byLogin.get(a.accountUuid) ?? []), a]);
-    }
     const removed = new Set<string>();
-    for (const rows of byLogin.values()) {
-      if (rows.length < 2) continue;
-      const keep =
-        rows.find((r) => r.id === reg.activeId) ??
-        rows.reduce((best, r) => (r.createdAtMs > best.createdAtMs ? r : best));
-      for (const r of rows) {
-        if (r === keep) continue;
-        removed.add(r.id);
-        report.merged.push({ label: r.label, keptId: keep.id, removedId: r.id });
-      }
-    }
-    reg.accounts = reg.accounts.filter((a) => !removed.has(a.id));
 
-    // Earlier rows keep their label; every label already on record (any case) and every id is
-    // off limits for the suffix, so the result is unique under the same rules a rename obeys.
-    const taken = new Set(reg.accounts.map((a) => a.label.toLowerCase()));
-    const seen = new Set<string>();
-    for (const a of [...reg.accounts].sort((x, y) => x.createdAtMs - y.createdAtMs)) {
-      const lower = a.label.toLowerCase();
-      if (!seen.has(lower)) {
-        seen.add(lower);
-        continue;
+    const sharedResult = dedupeRows(st.shared, st.activeId, this.clock);
+    st.shared = sharedResult.rows;
+    collectDedupe(report, removed, sharedResult.result);
+    let groupsChanged = false;
+    for (const group of st.groups) {
+      const res = dedupeRows(group.members, group.activeId, this.clock);
+      group.members = res.rows;
+      if (res.result.changed) {
+        group.updatedAtMs = this.clock();
+        groupsChanged = true;
       }
-      let n = 2;
-      let next = `${a.label} (${n})`;
-      while (taken.has(next.toLowerCase()) || reg.accounts.some((o) => o.id === next)) {
-        n += 1;
-        next = `${a.label} (${n})`;
-      }
-      report.relabelled.push({ id: a.id, from: a.label, to: next });
-      a.label = next;
-      a.updatedAtMs = this.clock();
-      taken.add(next.toLowerCase());
-      seen.add(next.toLowerCase());
+      collectDedupe(report, removed, res.result);
     }
 
-    if (report.merged.length > 0 || report.relabelled.length > 0) {
-      await this.saveRegistry(reg);
-      for (const id of removed) await removeIfExists(this.bundlePath(id));
-    }
+    if (sharedResult.result.changed) await this.saveShared(st);
+    if (groupsChanged) await this.saveGroups(st);
+    if (removed.size > 0) for (const id of removed) await removeIfExists(this.bundlePath(id));
     return report;
   }
 
-  /** Apply `mutate` to one registry row and persist it. The whole registry rides along so a
-   *  mutation can be validated against the OTHER rows under the same load — a rename checks for
-   *  a label collision this way — instead of a second read that could see a different file. */
+  /** Apply `mutate` to one registry row wherever it lives and persist the file that holds it. The
+   *  whole loaded state rides along so a mutation can be validated against the OTHER rows under the
+   *  same load — a rename checks for a label collision this way — instead of a second read that
+   *  could see a different file. */
   private async patchAccount(
     id: string,
-    mutate: (a: StoredAccount, reg: Registry) => void,
+    mutate: (a: StoredAccount, st: RegistryState) => void,
   ): Promise<StoredAccount> {
-    const reg = await this.loadRegistry();
-    const account = reg.accounts.find((a) => a.id === id);
-    if (!account) throw new UnknownAccountError(id);
-    mutate(account, reg);
-    account.updatedAtMs = this.clock();
-    await this.saveRegistry(reg);
-    return account;
+    const st = await this.loadState();
+    const found = findRowIn(st, id);
+    if (!found) throw new UnknownAccountError(id);
+    mutate(found.row, st);
+    found.row.updatedAtMs = this.clock();
+    if (found.group) {
+      found.group.updatedAtMs = this.clock();
+      await this.saveGroups(st);
+    } else {
+      await this.saveShared(st);
+    }
+    return found.row;
   }
 
   // ---- secret bundles (DPAPI) ----
@@ -549,12 +1199,17 @@ export class Vault {
    * an error, and — being a registry read-modify-write — the credential lock MUST be held.
    */
   async syncMetadata(id: string, bundle: CredentialBundle): Promise<boolean> {
-    const reg = await this.loadRegistry();
-    const account = reg.accounts.find((a) => a.id === id);
-    if (!account) return false;
-    if (!applyBundleMetadata(account, bundle, this.log)) return false;
-    account.updatedAtMs = this.clock();
-    await this.saveRegistry(reg);
+    const st = await this.loadState();
+    const found = findRowIn(st, id);
+    if (!found) return false;
+    if (!applyBundleMetadata(found.row, bundle, this.log)) return false;
+    found.row.updatedAtMs = this.clock();
+    if (found.group) {
+      found.group.updatedAtMs = this.clock();
+      await this.saveGroups(st);
+    } else {
+      await this.saveShared(st);
+    }
     return true;
   }
 
@@ -571,11 +1226,14 @@ export class Vault {
    * since the scan), and — being a registry read-modify-write — the credential lock MUST be held.
    */
   async markMetadataBackfillFailed(id: string): Promise<void> {
-    const reg = await this.loadRegistry();
-    const account = reg.accounts.find((a) => a.id === id);
-    if (!account) return;
-    account.metadataBackfillFailedAtMs = this.clock();
-    await this.saveRegistry(reg);
+    const st = await this.loadState();
+    const found = findRowIn(st, id);
+    if (!found) return;
+    // Deliberately does NOT bump updatedAtMs (see doc above) — but the row still moves to the file
+    // that holds it. A group member's failed-backfill mark belongs in groups.json, not accounts.json.
+    found.row.metadataBackfillFailedAtMs = this.clock();
+    if (found.group) await this.saveGroups(st);
+    else await this.saveShared(st);
   }
 
   // ---- rollback snapshot (mid-switch only) ----
@@ -610,8 +1268,42 @@ export class Vault {
     }
   }
 
+  // ---- folder-bindings snapshot (non-secret, for the enforcement guard) ----
+
+  /**
+   * Rebuild and atomically write `folder-bindings.json` from the current reserved side of the
+   * registry, and return what was written. Callers run this LAST in every group mutation and on
+   * daemon start, so the guard always reads a snapshot no older than the last committed change.
+   * `enforce` and `mainConfigDir` come from the caller's policy/config; the profile-dir mapping is
+   * the vault's own path convention.
+   */
+  async writeFolderBindings(opts: {
+    enforce: BindEnforceMode;
+    mainConfigDir: string;
+  }): Promise<FolderBindingSnapshot> {
+    const st = await this.loadState();
+    const snapshot = buildFolderBindingSnapshot({
+      groups: st.groups,
+      generation: st.generation,
+      enforce: opts.enforce,
+      mainConfigDir: opts.mainConfigDir,
+      profileDirOf: (groupId) => groupProfileDir(this.vaultDir, groupId),
+    });
+    await writeFolderBindingSnapshot(folderBindingsPath(this.vaultDir), snapshot);
+    return snapshot;
+  }
+
+  /** Read the snapshot for a trusted cctl-side caller (the doctor's freshness check), or undefined
+   *  when it has never been written. Validates strictly; the guard has its own fail-open reader. */
+  async readFolderBindings(): Promise<FolderBindingSnapshot | undefined> {
+    return readFolderBindingSnapshot(folderBindingsPath(this.vaultDir));
+  }
+
   private registryPath(): string {
     return join(this.vaultDir, 'accounts.json');
+  }
+  private groupsPath(): string {
+    return join(this.vaultDir, 'groups.json');
   }
   private bundlePath(id: string): string {
     return join(this.vaultDir, id, 'cred.enc');

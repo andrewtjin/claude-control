@@ -68,9 +68,35 @@ export {
   Vault,
   ACCOUNT_METADATA_REV,
   METADATA_BACKFILL_RETRY_MS,
+  MAX_GROUPS,
+  MAX_GROUP_MEMBERS,
+  MAX_GROUP_FOLDERS,
   needsMetadataBackfill,
   type DedupeReport,
 } from './vault.js';
+// Folder canonicalization — shared verbatim between this package and the enforcement guard, which
+// embeds the compiled source of the canonicalizer trio (see folderPath.ts).
+export {
+  canonicalizeFolder,
+  folderKey,
+  isWithin,
+  resolveBinding,
+  exactBinding,
+  checkBindTarget,
+  embeddableFolderPathSource,
+  type CanonicalizeDeps,
+  type CanonicalizeResult,
+  type BindTargetDeps,
+  type FolderBoundGroup,
+} from './folderPath.js';
+// The non-secret folder-bindings snapshot the guard reads.
+export {
+  buildFolderBindingSnapshot,
+  readFolderBindingSnapshot,
+  writeFolderBindingSnapshot,
+  type BindEnforceMode,
+  type BuildSnapshotInput,
+} from './folderBindings.js';
 export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
 export {
   CredentialStore,
