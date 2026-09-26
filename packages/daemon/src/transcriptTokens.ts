@@ -50,6 +50,13 @@ export interface TranscriptTurn {
   /** Epoch ms of the turn, from the line's `timestamp`. Lines without a parseable one are skipped
    *  (an unattributable, undatable turn cannot be placed in a window or against an account). */
   tsMs: number;
+  /** The session this turn belongs to, from the transcript file name (a sub-agent turn inherits its
+   *  parent session id — see {@link sessionIdForFile}). Attribution maps this to the session's slot
+   *  so a folder-bound group's turns join against the member live in that group's slot, not the
+   *  global account. `null` when the file name is not a recognizable session id. Optional so a caller
+   *  that never tracked sessions (older callers, some tests) is unaffected — the reader always sets
+   *  it, and an absent value attributes to the global slot exactly as `null` does. */
+  sessionId?: string | null;
   /** `message.model`, verbatim. Never normalized or filtered: model ids change without notice, and
    *  silently dropping an unrecognized one would understate the totals. */
   model: string;
@@ -133,7 +140,10 @@ async function discoverTranscriptFiles(
  *  count. Tolerant by construction: an unknown `type`, a missing `message`, a missing `usage`, a
  *  missing/unparseable `timestamp` and a non-numeric token field are all normal shapes in a real
  *  transcript, and each one means "skip this line", never "abort this file". */
-function turnFromLine(parsed: unknown): { turn: TranscriptTurn; messageId: string | null } | null {
+function turnFromLine(
+  parsed: unknown,
+  sessionId: string | null,
+): { turn: TranscriptTurn; messageId: string | null } | null {
   if (typeof parsed !== 'object' || parsed === null) return null;
   const line = parsed as Record<string, unknown>;
   if (line.type !== 'assistant') return null;
@@ -147,11 +157,13 @@ function turnFromLine(parsed: unknown): { turn: TranscriptTurn; messageId: strin
   if (!Number.isFinite(tsMs)) return null;
 
   const u = usage as Record<string, unknown>;
-  const model = (message as Record<string, unknown>).model;
-  const messageId = (message as Record<string, unknown>).id;
+  const message2 = message as Record<string, unknown>;
+  const model = message2.model;
+  const messageId = message2.id;
   return {
     turn: {
       tsMs,
+      sessionId,
       model: typeof model === 'string' && model !== '' ? model : 'unknown',
       inputTokens: countOf(u.input_tokens),
       outputTokens: countOf(u.output_tokens),
@@ -160,6 +172,27 @@ function turnFromLine(parsed: unknown): { turn: TranscriptTurn; messageId: strin
     },
     messageId: typeof messageId === 'string' && messageId !== '' ? messageId : null,
   };
+}
+
+/**
+ * The session id a transcript file belongs to. Claude Code writes a session's turns to
+ * `<claudeDir>/projects/<encoded-cwd>/<session>.jsonl`, and a sub-agent's turns to
+ * `<encoded-cwd>/<session>/subagents/**​/agent-*.jsonl` — a sub-agent's spend is its parent
+ * session's, so the id is the `<session>` directory segment before `subagents`. A top-level file's
+ * id is its base name without the `.jsonl` extension. Returns `null` for any other shape (which
+ * attribution treats as the global slot). Pure string work on the path — no IO.
+ */
+export function sessionIdForFile(file: string): string | null {
+  const segments = file.split(/[\\/]+/).filter((s) => s !== '');
+  const subIdx = segments.lastIndexOf('subagents');
+  if (subIdx > 0) {
+    const parent = segments[subIdx - 1];
+    return parent !== undefined && parent !== '' ? parent : null;
+  }
+  const base = segments[segments.length - 1];
+  if (base === undefined || !base.endsWith('.jsonl')) return null;
+  const id = base.slice(0, -'.jsonl'.length);
+  return id !== '' ? id : null;
 }
 
 /** A token count from an untrusted field: anything that is not a finite non-negative number reads
@@ -206,7 +239,7 @@ export async function readTranscriptTurns(
       continue;
     }
     try {
-      await scanFile(file, options.sinceMs, seenMessageIds, scan);
+      await scanFile(file, sessionIdForFile(file), options.sinceMs, seenMessageIds, scan);
       scan.filesScanned++;
     } catch {
       // Deleted mid-scan, locked, or an IO error: one unreadable file is reported in the counts
@@ -221,6 +254,7 @@ export async function readTranscriptTurns(
  *  decodes lines whose raw bytes contain the usage needle (rule 3). */
 async function scanFile(
   file: string,
+  sessionId: string | null,
   sinceMs: number,
   seenMessageIds: Set<string>,
   scan: TranscriptScan,
@@ -234,7 +268,7 @@ async function scanFile(
       scan.malformedLines++; // torn/partial line — skip it, never abort the file
       return;
     }
-    const found = turnFromLine(parsed);
+    const found = turnFromLine(parsed, sessionId);
     if (!found || found.turn.tsMs < sinceMs) return;
     if (found.messageId !== null) {
       if (seenMessageIds.has(found.messageId)) {

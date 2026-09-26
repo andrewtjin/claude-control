@@ -36,6 +36,7 @@ import {
   readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
+  slotBySessionMap,
   uninstallHooks,
   type SessionRow,
 } from '@claude-control/daemon';
@@ -364,8 +365,11 @@ export function buildProgram(): Command {
       // unattributed bucket (which the renderer shows rather than hides).
       const store = new Store(daemonDbPath(paths));
       let intervals;
+      let slotBySession;
       try {
         intervals = store.listActivationIntervals();
+        // Folder-bound sessions attribute against their group slot's timeline, not the global one.
+        slotBySession = slotBySessionMap(store.listSessions());
       } finally {
         store.close();
       }
@@ -376,6 +380,7 @@ export function buildProgram(): Command {
         windowStartMs,
         windowEndMs,
         labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+        slotBySession,
       });
       process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });

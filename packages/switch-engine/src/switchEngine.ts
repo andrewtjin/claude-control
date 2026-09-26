@@ -176,7 +176,7 @@ export interface SwitchEngineOptions {
    *  a deterministic one. */
   isProcessAlive?: (pid: number) => boolean;
   /** The enforcement mode stamped into the guard snapshot written after every group mutation.
-   *  Defaults to `'block'`; the daemon (Stage B) passes the operator's configured value. */
+   *  Defaults to `'block'`; the daemon passes the operator's configured value. */
   bindEnforce?: BindEnforceMode;
   /** Fault-injection seam for the multi-step group mutations, called at labeled checkpoints so a
    *  test can throw partway through and prove the next `ensureGroupLive`/`repairSlots` converges.
@@ -2224,6 +2224,9 @@ export class SwitchEngine {
       fromAccountId: prevActiveId,
       toAccountId: targetId,
       origin: options.origin ?? 'manual',
+      // The slot this activation landed in, so attribution can build one timeline per slot: a group
+      // hop must not appear on the global account's timeline (and vice versa).
+      slot: rt.id,
       ...(options.reason !== undefined ? { detail: options.reason } : {}),
     });
     await this.finishIntent(rt);
