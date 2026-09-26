@@ -514,3 +514,39 @@ describe('liveSlotToken', () => {
     expect(await h.engine.liveSlotToken(B.id)).toBeUndefined();
   });
 });
+
+describe('spawn/session slot resolution helpers', () => {
+  it('configDirForAccount returns the profile dir for a reserved member, undefined for shared', async () => {
+    const h = await harness();
+    const { A, C, group } = await setupGroup(h);
+    expect(await h.engine.configDirForAccount(A.id)).toBe(groupProfileDir(h.paths.vaultDir, group.id));
+    expect(await h.engine.configDirForAccount(C.id)).toBeUndefined();
+  });
+
+  it('slotForConfigDir maps a profile dir to its group slot and everything else to global', async () => {
+    const h = await harness();
+    const { group, slotId } = await setupGroup(h);
+    const profileDir = groupProfileDir(h.paths.vaultDir, group.id);
+    expect(await h.engine.slotForConfigDir(profileDir)).toBe(slotId);
+    // Absent / main / unrecognized dirs are global.
+    expect(await h.engine.slotForConfigDir(null)).toBe('global');
+    expect(await h.engine.slotForConfigDir(undefined)).toBe('global');
+    expect(await h.engine.slotForConfigDir(h.paths.claudeDir)).toBe('global');
+    expect(await h.engine.slotForConfigDir('C:\\nowhere')).toBe('global');
+    // A trailing separator and a different drive-letter case still match on win32.
+    expect(await h.engine.slotForConfigDir(profileDir + '\\')).toBe(slotId);
+    expect(await h.engine.slotForConfigDir(profileDir.toUpperCase())).toBe(slotId);
+  });
+
+  it('resolveCwdBinding matches the longest bound folder, else null', async () => {
+    const h = await harness();
+    const { group } = await setupGroup(h); // bound folder: C:\work
+    expect(await h.engine.resolveCwdBinding('C:\\work')).toEqual({ groupId: group.id });
+    expect(await h.engine.resolveCwdBinding('C:\\work\\sub\\deeper')).toEqual({
+      groupId: group.id,
+    });
+    expect(await h.engine.resolveCwdBinding('C:\\other')).toBeNull();
+    // Never a bare string prefix: C:\work2 is not within C:\work.
+    expect(await h.engine.resolveCwdBinding('C:\\work2')).toBeNull();
+  });
+});

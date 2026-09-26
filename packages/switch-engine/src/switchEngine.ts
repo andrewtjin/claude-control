@@ -39,7 +39,14 @@ import {
 } from './oauth.js';
 import { folderBindingsPath, groupProfileDir, profilesRoot, type Paths } from './paths.js';
 import { atomicWriteFile, removeIfExists } from './fsutil.js';
-import { canonicalizeFolder, checkBindTarget, exactBinding, isWithin } from './folderPath.js';
+import {
+  canonicalizeFolder,
+  checkBindTarget,
+  exactBinding,
+  folderKey,
+  isWithin,
+  resolveBinding,
+} from './folderPath.js';
 import { createNodeProfileFs, ensureGroupProfile, planGroupProfile } from './profile.js';
 import {
   buildFolderBindingSnapshot,
@@ -748,6 +755,53 @@ export class SwitchEngine {
       expiresAt: creds.expiresAt,
       ...(oauth?.accountUuid !== undefined ? { accountUuid: oauth.accountUuid } : {}),
     };
+  }
+
+  /**
+   * The config dir a managed spawn should run in for `accountId`, or `undefined` for a shared
+   * account (which runs in the global/main config dir and inherits the global live login). This is
+   * the `configDirForAccount` seam the daemon wires into the Agent SDK client: a reserved member
+   * binds to its group's profile dir, so its session's per-request credential reads come from that
+   * slot rather than the shared `~/.claude`.
+   */
+  async configDirForAccount(accountId: string): Promise<string | undefined> {
+    const { group } = await this.slotForAccount(accountId);
+    if (group === undefined) return undefined;
+    return groupProfileDir(this.paths.vaultDir, group.id);
+  }
+
+  /**
+   * The slot a session's launch-time `CLAUDE_CONFIG_DIR` names: the group whose profile dir the
+   * config dir canonically equals, else the global slot. An absent, main, or unrecognized dir maps
+   * to global. Canonicalized so a case difference or trailing separator still matches on Windows.
+   */
+  async slotForConfigDir(configDir: string | null | undefined): Promise<SlotId> {
+    if (configDir === undefined || configDir === null || configDir === '') return 'global';
+    const key = folderKey(this.canonReserved(configDir), this.platform);
+    for (const g of await this.vault.listGroups()) {
+      const profileKey = folderKey(
+        this.canonReserved(groupProfileDir(this.paths.vaultDir, g.id)),
+        this.platform,
+      );
+      if (key === profileKey) return groupSlotId(g.id);
+    }
+    return 'global';
+  }
+
+  /**
+   * Resolve a spawn's working directory to the group it is bound to, or `null` for an unbound cwd
+   * (which runs on the global slot). Canonicalizes leniently — an unresolvable cwd is simply
+   * unbound, never an error — and applies §5's longest-match rule.
+   */
+  async resolveCwdBinding(cwd: string): Promise<{ groupId: string } | null> {
+    const groups = await this.vault.listGroups();
+    if (groups.length === 0) return null;
+    const match = resolveBinding(
+      this.canonReserved(cwd),
+      groups.map((g) => ({ id: g.id, folders: g.folders })),
+      this.platform,
+    );
+    return match === null ? null : { groupId: match.groupId };
   }
 
   // ---- group lifecycle (bind / unbind / ensure-live) ----
