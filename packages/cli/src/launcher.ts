@@ -22,8 +22,7 @@ import { canonicalizeFolder, isWithin } from '@claude-control/switch-engine';
 
 /** How to invoke a resolved claude candidate, or why we refuse to. */
 export type LaunchTarget =
-  | { kind: 'run'; command: string; prefixArgs: string[] }
-  | { kind: 'refused'; reason: string };
+  { kind: 'run'; command: string; prefixArgs: string[] } | { kind: 'refused'; reason: string };
 
 /** The slot a launch runs in — drives the banner and the child env. */
 export interface LaunchSlot {
@@ -61,13 +60,12 @@ export function findClaudeOnPath(deps: FindClaudeDeps): string | undefined {
   // Split on the delimiter of the TARGET platform, not the host — so the lookup is correct whether
   // it runs on Windows or POSIX (and testable for either from either).
   const pathDelimiter = deps.platform === 'win32' ? ';' : ':';
-  const join = deps.platform === 'win32' ? win32.join : posix.join;
   const dirs = (deps.pathEnv ?? process.env.PATH ?? '')
     .split(pathDelimiter)
     .filter((d) => d.length > 0);
   if (deps.platform !== 'win32') {
     for (const dir of dirs) {
-      const candidate = join(dir, 'claude');
+      const candidate = posix.join(dir, 'claude');
       if (existsSync(candidate)) return candidate;
     }
     return undefined;

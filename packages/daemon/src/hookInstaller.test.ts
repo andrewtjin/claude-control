@@ -516,7 +516,10 @@ describe('installBindGuard', () => {
   let dir: string;
   let settingsPath: string;
   const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
-  const guardCmd = buildBindGuardCommand({ nodePath: '/usr/bin/node', guardPath: '/data/bind-guard.cjs' });
+  const guardCmd = buildBindGuardCommand({
+    nodePath: '/usr/bin/node',
+    guardPath: '/data/bind-guard.cjs',
+  });
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'bind-guard-install-'));
@@ -528,7 +531,7 @@ describe('installBindGuard', () => {
 
   function upsCommands(settings: unknown): string[] {
     const hooks = (settings as { hooks?: Record<string, unknown> }).hooks ?? {};
-    const groups = (hooks as Record<string, unknown>)[UPS];
+    const groups = hooks[UPS];
     if (!Array.isArray(groups)) return [];
     return groups.flatMap((g: unknown) => {
       const entries = (g as { hooks?: unknown }).hooks;
@@ -550,7 +553,10 @@ describe('installBindGuard', () => {
   });
 
   it('replaces a stale guard generation (different node/script/snapshot path) rather than accumulating', async () => {
-    const oldCmd = buildBindGuardCommand({ nodePath: '/old/node', guardPath: '/old/bind-guard.cjs' });
+    const oldCmd = buildBindGuardCommand({
+      nodePath: '/old/node',
+      guardPath: '/old/bind-guard.cjs',
+    });
     await installBindGuard({ settingsPath, command: oldCmd });
     await installBindGuard({ settingsPath, command: guardCmd });
     // Only the current generation remains — both carry the bind-guard.cjs fingerprint.
@@ -593,7 +599,9 @@ describe('installBindGuard', () => {
       }),
     );
     await installBindGuard({ settingsPath, command: guardCmd });
-    expect(upsCommands(await readJson(settingsPath)).sort()).toEqual([guardCmd, 'other-tool --x'].sort());
+    expect(upsCommands(await readJson(settingsPath)).sort()).toEqual(
+      [guardCmd, 'other-tool --x'].sort(),
+    );
   });
 
   it('uninstallHooks removes the guard along with the forwarder, leaving other tools alone', async () => {

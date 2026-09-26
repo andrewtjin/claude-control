@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   RefreshError,
   VaultError,
+  type ActivateResult,
   type DedupeReport,
   type StoredAccount,
 } from '@claude-control/switch-engine';
@@ -41,9 +42,11 @@ const engine = vi.hoisted(() => ({
   unbindFolder: vi.fn((f: string): Promise<never> =>
     Promise.reject(new Error(`unbindFolder(${f}) not stubbed`)),
   ),
-  ensureGroupLive: vi.fn((): Promise<never> => Promise.reject(new Error('ensureGroupLive not stubbed'))),
+  ensureGroupLive: vi.fn((): Promise<never> =>
+    Promise.reject(new Error('ensureGroupLive not stubbed')),
+  ),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
-  activate: vi.fn((id: string): Promise<never> =>
+  activate: vi.fn((id: string): Promise<ActivateResult> =>
     Promise.reject(new Error(`activate(${id}) not stubbed`)),
   ),
   setAutoSwitchExcluded: vi.fn(() => Promise.resolve()),
@@ -900,6 +903,8 @@ describe('folder-bound account commands', () => {
     id: 'a-1',
     label: 'work@me.com',
     quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
     ...over,
   });
 
@@ -934,7 +939,10 @@ describe('folder-bound account commands', () => {
   it('bind surfaces an engine refusal as a single error line', async () => {
     engine.listAccounts.mockResolvedValue([acct()]);
     engine.bindFolder.mockRejectedValueOnce(
-      new RefreshError('already bound to something else; unbind it first', 'folder_bound_elsewhere'),
+      new RefreshError(
+        'already bound to something else; unbind it first',
+        'folder_bound_elsewhere',
+      ),
     );
     const r = await runCli(['bind', '.', 'work@me.com']);
     expect(r.exited).toBe(true);
@@ -945,12 +953,20 @@ describe('folder-bound account commands', () => {
     const member = acct({ id: 'm-1', label: 'client@me.com' });
     engine.listAccounts.mockResolvedValue([member]);
     engine.activate.mockResolvedValueOnce({
+      ok: true,
+      activeAccountId: 'm-1',
       wroteCredentials: true,
       refreshed: false,
       adoptedPreviousRotation: false,
     });
     engine.listGroups.mockResolvedValue([
-      { id: 'g1', label: 'client', members: [member], activeId: 'm-1', folders: ['C:\\repos\\client'] },
+      {
+        id: 'g1',
+        label: 'client',
+        members: [member],
+        activeId: 'm-1',
+        folders: ['C:\\repos\\client'],
+      },
     ]);
     const r = await runCli(['switch', 'client@me.com']);
     expect(r.out).toContain('client@me.com');

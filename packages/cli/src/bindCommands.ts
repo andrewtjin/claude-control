@@ -95,7 +95,7 @@ async function resolveAcrossAll(engine: Engine, ref: string): Promise<AccountVie
   const all = (await engine.listAllAccounts()) as StoredAccount[];
   const resolved = resolveAccountRef(all, ref);
   if (!resolved.ok) fail(resolved.message);
-  return resolved.account as AccountView;
+  return resolved.account;
 }
 
 export function buildBindCommands(program: Command): void {
@@ -119,7 +119,11 @@ export function buildBindCommands(program: Command): void {
         if (!ids.includes(acct.id)) ids.push(acct.id);
       }
       try {
-        const result = await engine.bindFolder(folder, ids, opts.label ? { label: opts.label } : {});
+        const result = await engine.bindFolder(
+          folder,
+          ids,
+          opts.label ? { label: opts.label } : {},
+        );
         const palette = detectPalette();
         const lines: string[] = [];
         const groupLabel = sanitizeForTerminal(result.group.label);
@@ -132,11 +136,13 @@ export function buildBindCommands(program: Command): void {
             : `Bound ${boundFolder} to the existing folder account: ${groupLabel}.`,
         );
         if (result.movedOffGlobal !== null) {
-          const movedLabel = result.group.members.find((m) => m.id === result.movedOffGlobal)?.label;
+          const movedLabel = result.group.members.find(
+            (m) => m.id === result.movedOffGlobal,
+          )?.label;
           const toLabel = result.globalSwitchedTo
             ? sanitizeForTerminal(
-                ((await engine.listAccounts()).find((a) => a.id === result.globalSwitchedTo)
-                  ?.label ?? result.globalSwitchedTo),
+                (await engine.listAccounts()).find((a) => a.id === result.globalSwitchedTo)
+                  ?.label ?? result.globalSwitchedTo,
               )
             : 'none';
           lines.push(
@@ -144,7 +150,9 @@ export function buildBindCommands(program: Command): void {
               `(it is now reserved to this folder); global is now on ${toLabel}.`,
           );
         }
-        const profileDir = sanitizeForTerminal(groupProfilePath(defaultPaths().vaultDir, result.group.id));
+        const profileDir = sanitizeForTerminal(
+          groupProfilePath(defaultPaths().vaultDir, result.group.id),
+        );
         if (result.live.noWorkingAccount) {
           lines.push(
             palette.red(
@@ -153,8 +161,12 @@ export function buildBindCommands(program: Command): void {
             ),
           );
         } else {
-          const liveLabel = result.group.members.find((m) => m.id === result.live.liveMember)?.label;
-          lines.push(`  profile ready on ${sanitizeForTerminal(liveLabel ?? 'a member')}: ${profileDir}`);
+          const liveLabel = result.group.members.find(
+            (m) => m.id === result.live.liveMember,
+          )?.label;
+          lines.push(
+            `  profile ready on ${sanitizeForTerminal(liveLabel ?? 'a member')}: ${profileDir}`,
+          );
         }
         if (result.runningSessions.length > 0) {
           lines.push(
@@ -210,7 +222,9 @@ export function buildBindCommands(program: Command): void {
   // -------------------------------------------------------------------------
   program
     .command('bindings')
-    .description('show folder bindings: folders, accounts, live member, profile dir, snapshot freshness')
+    .description(
+      'show folder bindings: folders, accounts, live member, profile dir, snapshot freshness',
+    )
     .action(async () => {
       const engine = buildEngine();
       const [groups, snapshot, groupsGeneration] = await Promise.all([
@@ -257,7 +271,9 @@ export function buildBindCommands(program: Command): void {
             matchedFolder: binding.folder,
             members: group.members.map((m) => m.label),
             profileDir: groupProfilePath(defaultPaths().vaultDir, group.id),
-            liveMemberLabel: liveId ? (group.members.find((m) => m.id === liveId)?.label ?? null) : null,
+            liveMemberLabel: liveId
+              ? (group.members.find((m) => m.id === liveId)?.label ?? null)
+              : null,
           },
         };
       }
@@ -379,8 +395,9 @@ async function runClaude(opts: {
     } else {
       const globalLive = await engine.getActiveId('global');
       const label =
-        (globalLive ? (await engine.listAccounts()).find((a) => a.id === globalLive)?.label : null) ??
-        'the shared account';
+        (globalLive
+          ? (await engine.listAccounts()).find((a) => a.id === globalLive)?.label
+          : null) ?? 'the shared account';
       slot = { kind: 'global', label, context: 'global' };
     }
   }

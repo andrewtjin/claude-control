@@ -94,8 +94,18 @@ import {
   uninstallAutostart,
   type AutostartResult,
 } from './autostart.js';
-import { colorEnabled, detectPalette, outlookStyle, pacingStyle, sanitizeForTerminal } from './ansi.js';
-import { buildBindCommands, describeSwitchedGroup, renderBindingsAppendix } from './bindCommands.js';
+import {
+  colorEnabled,
+  detectPalette,
+  outlookStyle,
+  pacingStyle,
+  sanitizeForTerminal,
+} from './ansi.js';
+import {
+  buildBindCommands,
+  describeSwitchedGroup,
+  renderBindingsAppendix,
+} from './bindCommands.js';
 import {
   renderAccountHeal,
   renderAccountsTable,
@@ -255,10 +265,7 @@ export function buildProgram(): Command {
       const engine = buildEngine();
       // Resolve across the WHOLE registry (shared pool + reserved members) so `cctl switch <member>`
       // reaches a folder-bound account; activate() routes it to its group slot by membership.
-      const resolved = resolveAccountRef(
-        (await engine.listAllAccounts()) as StoredAccount[],
-        ref,
-      );
+      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
       try {
         const result = await engine.activate(resolved.account.id, {
