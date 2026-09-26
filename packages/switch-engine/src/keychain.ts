@@ -556,8 +556,18 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
 
   async writeLiveCredentials(oauth: ClaudeOauth): Promise<void> {
     // Read the primary first so a value that grows past the threshold reuses the existing siblings
-    // and the chunk cleanup fires against the right prior layout.
-    const existing = await this.readObject(this.target);
+    // and the chunk cleanup fires against the right prior layout. A CORRUPT existing item (bad
+    // chunk metadata, a missing chunk, non-JSON) must never block this write: that is precisely the
+    // state a heal needs to recover from, and the write is what heals it. readObject throws on any
+    // such corruption, so treat a failed read as "no usable prior value" and fall through to the
+    // canonical wrapped shape — matching the CLI's own write, which reads metadata leniently and
+    // overwrites unconditionally. writeChunkedValue then re-derives and tears down the prior layout.
+    let existing: unknown;
+    try {
+      existing = await this.readObject(this.target);
+    } catch {
+      existing = undefined;
+    }
     // Preserve the CLI's shape: only wrap when the existing payload wraps (or nothing exists yet,
     // where the .credentials.json-compatible wrapped shape is the safer canonical form).
     const next =

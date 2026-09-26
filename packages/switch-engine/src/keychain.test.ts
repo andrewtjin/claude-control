@@ -433,6 +433,19 @@ describe('KeychainCredentialChannel', () => {
     await expect(channel.readLiveCredentials()).rejects.toThrow(VaultError);
   });
 
+  it('heals a corrupt item on write instead of dead-locking a switch-in', async () => {
+    // A metadata pointer to a chunk set that does not exist (valid bounds, missing chunks): reading
+    // this item throws, and that is exactly the state a switch INTO the account must recover from.
+    // The write is the heal — it must overwrite unconditionally (like the CLI's own write), not
+    // read-then-throw before writing anything. Before the fix this dead-locked the switch.
+    const store = new Map([[`${itemKey}#m`, JSON.stringify({ n: 2, l: 8 })]]);
+    const { channel } = channelWith(store);
+    await expect(channel.writeLiveCredentials(OAUTH)).resolves.toBeUndefined();
+    // The stale chunk metadata is torn down and the credential now reads back cleanly.
+    expect(store.has(`${itemKey}#m`)).toBe(false);
+    expect(await channel.readLiveCredentials()).toEqual(OAUTH);
+  });
+
   it('falls back to the legacy un-suffixed item (fixed account, never the login username)', async () => {
     // No CLI ever keyed the item by the login username. The pre-`-credentials` item lived at the
     // un-suffixed service under the same fixed claude-code-user account, and the CLI's own legacy
