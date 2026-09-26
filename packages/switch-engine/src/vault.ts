@@ -22,7 +22,7 @@ import type {
 } from './types.js';
 import type { FolderBindingSnapshot } from './types.js';
 import type { Protector } from './dpapi.js';
-import { folderKey } from './folderPath.js';
+import { canonicalizeFolder, folderKey } from './folderPath.js';
 import {
   buildFolderBindingSnapshot,
   readFolderBindingSnapshot,
@@ -220,6 +220,31 @@ function validateMember(value: unknown, where: string): StoredAccount {
 }
 
 /**
+ * The cross-group uniqueness key for a stored folder: the SAME physical directory must map to one
+ * key however it is spelled. {@link folderKey} alone only folds case, so two spellings of one
+ * directory (a `C:/x` vs `C:\x` separator difference, a trailing separator, an embedded `.`/`..`)
+ * would slip past it and let two groups silently "own" the same folder — with only one reachable.
+ *
+ * So the folder is run through the shared {@link canonicalizeFolder} FIRST (string-only: `realpath`
+ * always throws, since load must not touch the filesystem per stored folder), then keyed. A folder
+ * that bind stored is already canonical, so this is a no-op for it and the uniqueness check is
+ * unchanged; it only additionally collapses a NON-canonical spelling that reached the
+ * operator-editable file some other way (a hand-edit, a vault copied under a different separator
+ * convention). A path canonicalization rejects (device/ADS/drive-relative/control chars) has no
+ * canonical form, so it falls back to its raw key — still detecting identical bad spellings.
+ */
+function folderUniquenessKey(folder: string, platform: NodeJS.Platform): string {
+  const canon = canonicalizeFolder(folder, {
+    platform,
+    cwd: platform === 'win32' ? 'C:\\' : '/',
+    realpath: () => {
+      throw new Error('no filesystem access at load');
+    },
+  });
+  return folderKey(canon.ok ? canon.path : folder, platform);
+}
+
+/**
  * Parse and STRICTLY validate `groups.json`, healing nothing and writing nothing.
  *
  * Fails closed (named {@link VaultError}) on: a wrong top-level shape or schema version; a group
@@ -227,8 +252,9 @@ function validateMember(value: unknown, where: string): StoredAccount {
  * list (an empty group has no reason to exist and would leave `activeId` unsatisfiable); a member
  * that fails {@link validateMember}; a member id repeated across the whole file (two rows answering
  * to one account); an `activeId` that is neither null nor one of the group's own members; an
- * over-cap folder list; or a folder that collides (by {@link folderKey}) with one already claimed
- * by any group. The caller separately heals a member id that ALSO lingers in `accounts.json`.
+ * over-cap folder list; or a folder that collides (by {@link folderUniquenessKey}, i.e. after
+ * canonicalization) with one already claimed by any group. The caller separately heals a member id
+ * that ALSO lingers in `accounts.json`.
  */
 function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFile {
   if (!isPlainObject(value)) throw new VaultError('groups.json is not an object');
@@ -297,7 +323,7 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
       if (typeof folder !== 'string' || folder === '') {
         throw new VaultError(`${where} (${g.id}) has a non-string folder`);
       }
-      const key = folderKey(folder, platform);
+      const key = folderUniquenessKey(folder, platform);
       if (seenFolderKeys.has(key)) {
         throw new VaultError(`folder ${folder} is bound by more than one group`);
       }
@@ -619,19 +645,38 @@ export class Vault {
         ? { schemaVersion: GROUPS_SCHEMA_VERSION, generation: 0, groups: [] }
         : validateGroupsFile(rawGroups, this.platform);
 
-    // Heal: a member id must never also be a shared row (groups.json wins), and the global active id
-    // must never be a reserved account.
+    // Heal: no shared row may duplicate a reserved account (groups.json wins), and the global active
+    // id must never be a reserved account. Uniqueness is enforced on BOTH keys a row is identified
+    // by: its `id` AND its login (`accountUuid`). Id alone is not enough — an OLDER cctl that
+    // predates groups.json cannot see a reserved row, so `accounts add` of that same login writes a
+    // fresh shared row under a NEW random id carrying the same accountUuid. Dropping on id would miss
+    // it, leaving the reserved login back in the global pool: a global auto-switch candidate and a
+    // network-refresh target that would rotate the login's single-use token out from under the group
+    // slot. So a shared row whose login matches any reserved member is dropped here too.
     const memberIds = new Set<string>();
-    for (const g of groupsFile.groups) for (const m of g.members) memberIds.add(m.id);
+    const reservedUuids = new Set<string>();
+    for (const g of groupsFile.groups) {
+      for (const m of g.members) {
+        memberIds.add(m.id);
+        if (m.accountUuid !== undefined) reservedUuids.add(m.accountUuid);
+      }
+    }
     let needsSharedRewrite = false;
+    const droppedIds = new Set<string>();
     const shared = sharedRows.filter((a) => {
-      if (memberIds.has(a.id)) {
+      if (
+        memberIds.has(a.id) ||
+        (a.accountUuid !== undefined && reservedUuids.has(a.accountUuid))
+      ) {
         needsSharedRewrite = true;
+        droppedIds.add(a.id);
         return false;
       }
       return true;
     });
-    if (activeId !== null && memberIds.has(activeId)) {
+    // A global active id pointing at a reserved member (by id) or at a dropped duplicate row (by id)
+    // is stale — the row it named is gone from the shared side, so the global slot has no valid seat.
+    if (activeId !== null && (memberIds.has(activeId) || droppedIds.has(activeId))) {
       activeId = null;
       needsSharedRewrite = true;
     }
