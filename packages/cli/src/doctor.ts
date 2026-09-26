@@ -14,7 +14,7 @@ import {
   type Paths,
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
-import { BIND_GUARD_MARKER } from '@claude-control/daemon';
+import { isBindGuardInSettingsText } from '@claude-control/daemon';
 import type { SwitchEngine } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
@@ -379,7 +379,12 @@ export function checkGuardHook(paths: Paths, hasBindings: boolean): DoctorCheck 
     // settings.json the guard installer would REFUSE to write to (invalid JSON), which otherwise
     // looks identical ("guard absent") while the real cause — and fix — is different.
     JSON.parse(raw);
-    installed = raw.includes(BIND_GUARD_MARKER);
+    // Recognize the guard by the SAME exact installed shape the installer uses, not a bare
+    // `bind-guard.cjs` substring: a foreign hook that merely mentions the filename (e.g.
+    // `node linter.js --config bind-guard.cjs.rc`), or an incidental mention in a comment or path,
+    // must NOT read as the enforcement guard — otherwise doctor reports a security control installed
+    // when nothing enforces the bindings.
+    installed = isBindGuardInSettingsText(raw);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       installed = false;

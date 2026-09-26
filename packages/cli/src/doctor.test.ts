@@ -345,7 +345,7 @@ describe('checkGuardHook', () => {
       JSON.stringify({
         hooks: {
           UserPromptSubmit: [
-            { hooks: [{ type: 'command', command: '"node" "x\bind-guard.cjs"' }] },
+            { hooks: [{ type: 'command', command: '"node" "/data/bind-guard.cjs"' }] },
           ],
         },
       }),
@@ -356,6 +356,30 @@ describe('checkGuardHook', () => {
   });
 
   it('fails when bindings exist but the guard is not installed', () => {
+    const check = checkGuardHook(sandboxPaths(dir), true);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('NOT enforced');
+  });
+
+  it('does NOT read a foreign hook that merely mentions the filename as the guard', async () => {
+    // A foreign hook whose command references bind-guard.cjs as an unrelated argument (e.g. a config
+    // file) must not read as our enforcement guard: doctor must agree with the installer's exact-shape
+    // recognition, or it reports a security control installed when nothing enforces the bindings.
+    const { writeFile, mkdir } = await import('node:fs/promises');
+    const claudeDir = join(dir, 'claude');
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      join(claudeDir, 'settings.json'),
+      JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [
+            {
+              hooks: [{ type: 'command', command: 'node linter.js --config bind-guard.cjs.rc' }],
+            },
+          ],
+        },
+      }),
+    );
     const check = checkGuardHook(sandboxPaths(dir), true);
     expect(check.ok).toBe(false);
     expect(check.detail).toContain('NOT enforced');

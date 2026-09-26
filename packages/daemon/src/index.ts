@@ -157,6 +157,7 @@ export {
   ensureBindGuard,
   removeBindGuard,
   uninstallHooks,
+  isBindGuardInSettingsText,
   buildDaemonHookSpecs,
   type HookCommandSpec,
   type InstallHooksOptions,

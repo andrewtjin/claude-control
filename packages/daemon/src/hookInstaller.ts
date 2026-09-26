@@ -408,8 +408,14 @@ async function linkOrCopy(src: string, dest: string): Promise<void> {
 
 /** Whether a settings.json text carries OUR guard hook (the precise installed command shape). Parses
  *  when it can, so a foreign hook that merely mentions the filename does not read as ours; falls back
- *  to a conservative negative on unparseable text (the caller then re-links, which is safe). */
-function isBindGuardInSettingsText(text: string): boolean {
+ *  to a conservative negative on unparseable text (the caller then re-links, which is safe).
+ *
+ *  Exported so `cctl doctor` recognizes an installed guard by the SAME exact-shape rule the installer
+ *  uses. A looser check (e.g. a bare `bind-guard.cjs` substring over the whole file) would let a
+ *  foreign look-alike hook — or an incidental mention of the filename in a comment or path — read as
+ *  the guard, so doctor would report the enforcement guard installed when it is not. Keeping one
+ *  definition stops the two detectors from drifting. */
+export function isBindGuardInSettingsText(text: string): boolean {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
