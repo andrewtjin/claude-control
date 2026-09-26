@@ -16,20 +16,26 @@
 // launcher verbatim. The POSIX shims npm generates are shell scripts that already forward with "$@",
 // so bash/zsh/fish need no such rewrite.
 //
-// TWO PowerShell-only limitations the wrapper cannot remove, so it documents them instead of
-// pretending they are gone:
-//   - Pipeline stdin. A PowerShell function does NOT auto-forward pipeline input to a native command
-//     invoked inside it. `... | claude -p` would reach the child with an empty, never-closing stdin
-//     unless the wrapper explicitly forwards `$input`. The wrapper forwards it, but only when the
-//     call actually has pipeline input (`$MyInvocation.ExpectingInput`): piping an empty `$input`
-//     into a native command hands it a closed empty pipe, which would break an interactive launch
-//     that must inherit the console instead.
-//   - A literal double quote in an argument. Windows PowerShell 5.1 and PowerShell < 7.3 pass
-//     native-command arguments in "Legacy" mode, which cannot carry an embedded `"` through
-//     `& native @args`: the quote is dropped and the following arguments merge into that one. This
-//     is a property of the PowerShell -> native-process boundary, not of this launcher's own spawn
-//     (which is verbatim), and PowerShell 7.3+ fixes it with $PSNativeCommandArgumentPassing =
-//     'Standard'. The wrapper text warns about it rather than silently corrupting the argument.
+// PowerShell-only boundary quirks the wrapper handles or documents rather than pretending they are
+// gone:
+//   - Pipeline stdin forwarding. A PowerShell function does NOT auto-forward pipeline input to a
+//     native command invoked inside it. `... | claude -p` would reach the child with an empty,
+//     never-closing stdin unless the wrapper explicitly forwards `$input`. The wrapper forwards it,
+//     but only when the call actually has pipeline input (`$MyInvocation.ExpectingInput`): piping an
+//     empty `$input` into a native command hands it a closed empty pipe, which would break an
+//     interactive launch that must inherit the console instead.
+//   - Pipeline stdin encoding. Windows PowerShell 5.1 encodes a native-command pipe with
+//     `$OutputEncoding`, which defaults to ASCII — so a forwarded `$input` carrying non-ASCII text
+//     would arrive with every such byte turned into `?`. The wrapper sets `$OutputEncoding` to UTF-8
+//     (function-scoped, so it never leaks into the session) before the pipe, so piped input reaches
+//     Claude Code verbatim; on PowerShell 7+ that variable is already UTF-8.
+//   - Legacy native-argument passing (cannot be removed in-place, so documented). Windows PowerShell
+//     5.1 and PowerShell < 7.3 pass native-command arguments in "Legacy" mode, which cannot carry an
+//     embedded `"` through `& native @args` (the quote is dropped and the following arguments merge
+//     into that one) and drops an empty-string argument (`""`) entirely. This is a property of the
+//     PowerShell -> native-process boundary, not of this launcher's own spawn (which is verbatim),
+//     and PowerShell 7.3+ fixes it with $PSNativeCommandArgumentPassing = 'Standard'. The wrapper
+//     text warns about both facets rather than silently corrupting the arguments.
 
 export type SupportedShell = 'powershell' | 'bash' | 'zsh' | 'fish';
 
@@ -98,17 +104,20 @@ export function renderShellInit(shell: SupportedShell, target?: ShellInitTarget)
               '# layer can reinterpret arguments: & | < > ^ and %VAR% in a prompt or flag reach Claude',
               '# Code verbatim. Re-run this command after moving or reinstalling node or cctl.',
               '# CAVEAT (Windows PowerShell 5.1 / PowerShell < 7.3): an argument containing a literal',
-              '# double quote (") is mangled and merges with the arguments after it, because those',
-              '# PowerShell versions pass native-command arguments in Legacy mode. Use PowerShell 7.3+',
-              "# ($PSNativeCommandArgumentPassing = 'Standard') for verbatim double quotes.",
+              '# double quote (") is mangled and merges with the arguments after it, and an empty-string',
+              '# argument ("") is dropped entirely (so `claude -p ""` degrades to `claude -p`), because',
+              '# those PowerShell versions pass native-command arguments in Legacy mode. Use PowerShell',
+              "# 7.3+ ($PSNativeCommandArgumentPassing = 'Standard') for verbatim arguments. Piped stdin",
+              '# is forwarded as UTF-8.',
             ]
           : [
               `# ${POWERSHELL_WRAPPER_MARKER}.`,
               '# NOTE: cctl resolved to a .cmd shim, so arguments still pass through cmd.exe. Double-quote',
               '# any value containing & | < > ^ ; note quoting does not stop %VAR% expansion.',
               '# CAVEAT (Windows PowerShell 5.1 / PowerShell < 7.3): even quoted, an argument containing a',
-              '# literal double quote (") is mangled and merges with the arguments after it. Use',
-              '# PowerShell 7.3+ for verbatim double quotes.',
+              '# literal double quote (") is mangled and merges with the arguments after it, and an',
+              '# empty-string argument ("") is dropped entirely. Use PowerShell 7.3+ for verbatim',
+              '# arguments.',
             ];
       // The invocation the two guard branches share (with vs. without piped stdin).
       const invoke =
@@ -121,6 +130,12 @@ export function renderShellInit(shell: SupportedShell, target?: ShellInitTarget)
       // inherit the console; the else-branch invokes the child with the console's stdin intact.
       const body = [
         '  if ($MyInvocation.ExpectingInput) {',
+        // Windows PowerShell 5.1 encodes a native-command pipe with $OutputEncoding, whose default is
+        // ASCII — so `... | claude -p` would turn every non-ASCII stdin byte into "?". Force UTF-8 for
+        // the pipe so piped input reaches Claude Code verbatim. The assignment is function-scoped, so
+        // it never leaks into the caller's session; on PowerShell 7+ $OutputEncoding is already UTF-8,
+        // making this a no-op there.
+        '    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
         `    $input | ${invoke}`,
         '  } else {',
         `    ${invoke}`,

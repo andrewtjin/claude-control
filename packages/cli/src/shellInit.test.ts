@@ -74,6 +74,39 @@ describe('renderShellInit', () => {
     }
   });
 
+  it('powershell (both forms): forces UTF-8 on the stdin pipe so non-ASCII input is not turned into "?"', () => {
+    // Windows PowerShell 5.1 encodes a native-command pipe with $OutputEncoding (default ASCII), so a
+    // forwarded $input carrying non-ASCII text would arrive with every such byte replaced by "?". The
+    // wrapper must set $OutputEncoding to UTF-8 inside the ExpectingInput branch, before the pipe.
+    for (const out of [
+      renderShellInit('powershell', { nodePath: 'node.exe', cctlEntry: 'C:\\cctl\\bin.js' }),
+      renderShellInit('powershell'),
+    ]) {
+      const branch = out.slice(out.indexOf('if ($MyInvocation.ExpectingInput) {'));
+      const encodingLine = branch.indexOf(
+        '$OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+      );
+      const pipeLine = branch.indexOf('$input |');
+      expect(encodingLine).toBeGreaterThanOrEqual(0);
+      // The encoding is set BEFORE the pipe, or it does not take effect for it.
+      expect(encodingLine).toBeLessThan(pipeLine);
+    }
+  });
+
+  it('powershell (both forms): warns that empty-string arguments are dropped on PowerShell < 7.3', () => {
+    // `& native @args` under Legacy native-argument passing drops an empty-string argument entirely, so
+    // `claude -p ""` silently degrades to `claude -p`. The wrapper cannot fix this in place on 5.1, so
+    // it must document it alongside the double-quote caveat.
+    for (const out of [
+      renderShellInit('powershell', { nodePath: 'node.exe', cctlEntry: 'C:\\cctl\\bin.js' }),
+      renderShellInit('powershell'),
+    ]) {
+      // The exact wrapping differs between the two headers, so match the load-bearing tokens.
+      expect(out).toContain('empty-string');
+      expect(out).toContain('dropped');
+    }
+  });
+
   it('powershell: the emitted wrapper carries the stable detector marker', () => {
     expect(renderShellInit('powershell')).toContain(POWERSHELL_WRAPPER_MARKER);
     expect(
