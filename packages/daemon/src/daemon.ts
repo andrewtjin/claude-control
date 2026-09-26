@@ -60,6 +60,7 @@ import {
 import {
   hasUsableHeadroom,
   humanizeDuration,
+  isAutoSwitchCandidate,
   planWeight,
   selectWeeklyBudget,
   type AccountUsageInput,
@@ -188,8 +189,10 @@ export interface DaemonOptions {
   settingsReport?: PayloadOf<'settings.snapshot'>;
   /** Real Agent SDK adapter (live boundary), overridable so tests never touch a real SDK. The
    *  optional `configDir` binds the spawned session's `CLAUDE_CONFIG_DIR` to a folder-bound group's
-   *  profile dir; absent, the session runs in the shared/global config dir (the historical model). */
-  createAgentSdkClient?: (configDir?: string) => AgentSdkClient;
+   *  profile dir; absent, the session runs in the shared/global config dir (the historical model).
+   *  `scrubInheritedConfigDir` (global spawns only) drops an inherited `CLAUDE_CONFIG_DIR` that names
+   *  a group profile, so a global session is never silently redirected onto a group's account. */
+  createAgentSdkClient?: (configDir?: string, scrubInheritedConfigDir?: boolean) => AgentSdkClient;
   /** Auto-continue policy stamped onto every managed session this daemon spawns or resumes
    *  (see session-runtime's AutoContinuePolicy): transient API failures retry with backoff
    *  instead of stamping the session `failed`, and usage-limit failures PARK the session for
@@ -630,7 +633,10 @@ export class Daemon {
   private readonly accountProbe: AccountProbeLike | undefined;
   private readonly autoSwitchPolicy: AutoSwitchPolicy;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
-  private readonly createAgentSdkClient: (configDir?: string) => AgentSdkClient;
+  private readonly createAgentSdkClient: (
+    configDir?: string,
+    scrubInheritedConfigDir?: boolean,
+  ) => AgentSdkClient;
   private readonly autoContinue: AutoContinuePolicy | undefined;
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
   private readonly publishHookEndpoint: ((port: number) => Promise<void>) | undefined;
@@ -815,10 +821,11 @@ export class Daemon {
     // same; this fallback keeps a bare `new Daemon` working in tests.
     this.createAgentSdkClient =
       options.createAgentSdkClient ??
-      ((configDir?: string) =>
-        defaultCreateAgentSdkClient(
-          configDir !== undefined ? { configDirForAccount: () => configDir } : {},
-        ));
+      ((configDir?: string, scrubInheritedConfigDir?: boolean) =>
+        defaultCreateAgentSdkClient({
+          ...(configDir !== undefined ? { configDirForAccount: () => configDir } : {}),
+          ...(scrubInheritedConfigDir ? { scrubInheritedConfigDir: true } : {}),
+        }));
     this.autoContinue = options.autoContinue;
     this.installHooks = options.installHooks;
     this.publishHookEndpoint = options.publishHookEndpoint;
@@ -1495,10 +1502,12 @@ export class Daemon {
     const now = this.clock();
     const live = memberInputs.find((i) => i.active);
     if (live === undefined || hasUsableHeadroom(live, now)) return;
-    // A usable alternative member means auto-switch can move; the exhaustion is not terminal.
-    const canHop = memberInputs.some(
-      (i) => i.accountId !== live.accountId && !i.quarantined && hasUsableHeadroom(i, now),
-    );
+    // A member auto-switch would actually hop to means the exhaustion is not terminal. This must be
+    // the EXACT complement of the executor's hop predicate — the same policy, the same candidate
+    // gate — so the alert never suppresses on a member the executor refuses (excluded from
+    // auto-switch, no resolvable weekly reset, too little session headroom, or stale near the wall).
+    // `isAutoSwitchCandidate` already rejects the active member, so no separate self-exclusion.
+    const canHop = memberInputs.some((i) => isAutoSwitchCandidate(i, now, this.autoSwitchPolicy));
     if (canHop) return;
     const budget = selectWeeklyBudget(live.limits, now, live.predictedResetAt);
     const resetText =
@@ -1647,8 +1656,12 @@ export class Daemon {
     this.statsScanInFlight = true;
     try {
       // Accounts are fetched per request rather than captured from the poll cycle: a requested
-      // scan is not tied to one, and a label that changed since the last poll should show up.
-      const accounts = await this.switchEngine.listAccounts();
+      // scan is not tied to one, and a label that changed since the last poll should show up. The
+      // WHOLE fleet is used — reserved (folder-bound) members included — so a folder-bound session's
+      // turns resolve to their member's label instead of showing an unlabeled account id.
+      const accounts = this.switchEngine.listAllAccounts
+        ? await this.switchEngine.listAllAccounts()
+        : await this.switchEngine.listAccounts();
       const snapshot = await this.scanTokenStats(
         this.clock() - days * DAY_MS,
         accounts,
@@ -1832,8 +1845,14 @@ export class Daemon {
   private async handleReauthStart(msg: MessageOf<'reauth.start'>): Promise<void> {
     const { requestId, accountRef } = msg.payload;
     try {
-      // Same id-or-label resolution as `/switch`, so a ref that works there works here.
-      const resolved = resolveAccountRef(await this.switchEngine.listAccounts(), accountRef);
+      // Same id-or-label resolution as `/switch`, so a ref that works there works here — including
+      // reserved (folder-bound) members, which live in the group registry and are absent from the
+      // shared-only account list. The engine's reauth then heals whichever slot the account is live
+      // in. Falls back to the shared list only for an engine that predates folder support.
+      const fleet = this.switchEngine.listAllAccounts
+        ? await this.switchEngine.listAllAccounts()
+        : await this.switchEngine.listAccounts();
+      const resolved = resolveAccountRef(fleet, accountRef);
       if (!resolved.ok) throw new Error(resolved.message);
 
       const { verifier, challenge } = generatePkce();
@@ -3243,7 +3262,14 @@ export class Daemon {
     let handle: SessionHandle;
     try {
       const resumeAnchor = this.resolveSpawnResumeAnchor(resumeSessionId ?? undefined);
-      const client = this.createAgentSdkClient(spawnSlot.configDir);
+      // A global spawn (no bound config dir) must not silently run on a group profile that a
+      // CLAUDE_CONFIG_DIR this daemon inherited happens to name — the SDK analog of the launcher's
+      // global-path config-dir scrub. Only a dir that resolves to a group slot is dropped, so a
+      // legitimate custom global config dir is left untouched (it maps to the global slot).
+      const scrubInheritedConfigDir =
+        spawnSlot.configDir === undefined &&
+        (await this.slotForSessionConfigDir(process.env.CLAUDE_CONFIG_DIR)) !== 'global';
+      const client = this.createAgentSdkClient(spawnSlot.configDir, scrubInheritedConfigDir);
       handle = await this.sessionManager.spawnManaged({
         client,
         prompt,
