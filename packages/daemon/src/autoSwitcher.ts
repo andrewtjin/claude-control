@@ -60,6 +60,11 @@ export interface EvaluateOptions {
   slotKey?: string;
   /** Restrict hop targets to this id set (the slot's own pool). Passed through to the policy. */
   candidateIds?: ReadonlySet<string>;
+  /** Human name of the slot this hop is in — the bound folder(s) for a group slot. When present it
+   *  is woven into the `switch.result` message so the phone notice for a GROUP hop says WHICH folder
+   *  group rotated, exactly as the operator needs to tell a group hop apart from the global one.
+   *  Absent for the global slot, whose notice keeps its historical wording. */
+  slotLabel?: string;
 }
 
 export class AutoSwitcher {
@@ -122,6 +127,9 @@ export class AutoSwitcher {
     // Stamp BEFORE attempting so a throwing engine still gets its cooldown — for THIS slot only.
     this.lastAttemptAtMs.set(slotKey, now);
 
+    // A group hop's notice names its folder so it is not read as a global switch; the global slot
+    // passes no label and keeps its historical wording.
+    const scope = opts.slotLabel !== undefined ? ` (${opts.slotLabel})` : '';
     const requestId = `autoswitch-${this.newRequestId()}`;
     try {
       const result = await this.activate(decision.targetAccountId, {
@@ -134,7 +142,7 @@ export class AutoSwitcher {
         ok: result.ok,
         outcome: result.ok ? 'hot_applied' : 'failed',
         activeAccountId: result.activeAccountId,
-        message: `auto-switch: ${decision.reason}`,
+        message: `auto-switch${scope}: ${decision.reason}`,
       });
       // The engine's own word for what is live now, not the target we asked for: the two agree
       // today, and a caller that absorbs this id must absorb what actually happened.
@@ -149,7 +157,7 @@ export class AutoSwitcher {
         ok: false,
         outcome: 'failed',
         activeAccountId: currentActive,
-        message: `auto-switch to ${decision.targetLabel} failed`,
+        message: `auto-switch${scope} to ${decision.targetLabel} failed`,
         error: message,
       });
       return undefined;

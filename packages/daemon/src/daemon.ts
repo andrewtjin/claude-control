@@ -150,7 +150,7 @@ export interface SwitchEngineLike {
 export interface AutoSwitcherLike {
   evaluate(
     accounts: AccountUsageInput[],
-    opts?: { slotKey?: string; candidateIds?: ReadonlySet<string> },
+    opts?: { slotKey?: string; candidateIds?: ReadonlySet<string>; slotLabel?: string },
   ): Promise<string | undefined>;
 }
 
@@ -306,6 +306,34 @@ const DEFAULT_SLOT_ALERT_WINDOW_MS = 30 * 60_000;
  *  message the spawn handler relays to the phone; distinct from a generic spawn failure so the
  *  handler can answer with the refusal reason rather than a raw error string. */
 class SpawnBindingError extends Error {}
+
+/**
+ * Operator-facing body for an alert about a slot invariant `repairSlots` just corrected. The
+ * violation's `detail` already names the offending account/folder (the "why it was wrong"); this
+ * appends what cctl did about it (the "what changed") so the operator learns a slot's account moved
+ * under them and is not left to reverse-engineer it from a silent credential swap. Kept raw — the
+ * bot renderer escapes push title/body — matching the out-of-quota alert's channel posture.
+ */
+function describeRepairedViolation(v: SlotViolation): string {
+  switch (v.kind) {
+    case 'reserved_live_in_global':
+      // A member surfaced in the shared slot; the fence moved the shared slot back to a shared account.
+      return `${v.detail}; cctl moved the shared slot back to a shared account.`;
+    case 'nonmember_live_in_group':
+      // A stranger surfaced in a group profile; the rightful member was re-activated in it.
+      return `${v.detail}; cctl restored the folder group's own account.`;
+    case 'group_active_mismatch':
+      // The recorded member and the profile's live identity disagreed; the recorded member was re-activated.
+      return `${v.detail}; cctl re-activated the folder group's recorded account.`;
+    case 'account_in_multiple_slots':
+      // One account was live in more than one slot; each slot was re-seated on its rightful account.
+      return `${v.detail}; cctl re-seated each slot on its own account.`;
+    default:
+      // broken_profile_link is not repaired by repairSlots (ensureGroupProfile owns it); a future
+      // repairable kind lands here with an honest generic corrective clause rather than silence.
+      return `${v.detail}; cctl repaired it.`;
+  }
+}
 
 /** Whether `pid` names a live process. `process.kill(pid, 0)` sends no signal — it only asks the
  *  OS whether the pid exists. ESRCH ("no such process") is the only code that means dead; every
@@ -1385,8 +1413,11 @@ export class Daemon {
     }
     if (violations.length === 0) return;
 
-    // Repair fixes (a)-(d); the alert is about what SURVIVES a repair (a broken profile link, an
-    // unrecognized login) — the conditions a human must act on — not the ones the daemon just fixed.
+    // Repair fixes (a)-(d). A repair is a SILENT correction of a credential move the operator did
+    // not make — a reserved member that surfaced in the shared slot, a stranger that surfaced in a
+    // profile — so it must be surfaced, not just logged: the operator has to know a slot's account
+    // changed under them and why. One alert per repaired KIND per window (same channel and dedup as
+    // the out-of-quota alert), naming what was moved. Surviving violations still get their own alert.
     let remaining = violations;
     const repairSlots = this.switchEngine.repairSlots?.bind(this.switchEngine);
     if (repairSlots) {
@@ -1398,6 +1429,11 @@ export class Daemon {
             { repaired: result.repaired.map((v) => v.kind), actions: result.actions },
             'repaired slot invariant breaches',
           );
+          for (const kind of new Set(result.repaired.map((v) => v.kind))) {
+            const v = result.repaired.find((x) => x.kind === kind);
+            if (v === undefined) continue;
+            this.emitSlotAlert(`repaired:${kind}`, describeRepairedViolation(v));
+          }
         }
       } catch (err) {
         this.logger.warn({ err }, 'repairSlots failed');
@@ -1483,8 +1519,11 @@ export class Daemon {
       // spent) is a standing condition worth one alert per window.
       this.maybeAlertGroupExhausted(group, memberInputs);
 
+      // Name the folder(s) on the group hop's phone notice so it reads as a group rotation, not a
+      // global switch — the same folder choice the exhaustion alert makes.
+      const slotLabel = group.folders.length > 0 ? group.folders.join(', ') : group.label;
       const hop = await autoSwitcher
-        .evaluate(memberInputs, { slotKey: slot, candidateIds: memberIds })
+        .evaluate(memberInputs, { slotKey: slot, candidateIds: memberIds, slotLabel })
         .catch((err: unknown) => {
           this.logger.error({ err, slot }, 'auto-switch evaluation failed');
           return undefined;
@@ -3352,12 +3391,27 @@ export class Daemon {
       const acct = (await engine.listAllAccounts()).find((a) => a.id === accountId);
       if (acct?.groupId !== undefined) {
         // Reserved member: make its group live before the spawn reads the profile's credentials.
-        if (engine.ensureGroupLive) await engine.ensureGroupLive(acct.groupId);
-        return {
-          slot: groupSlotId(acct.groupId),
-          accountId,
-          configDir: await engine.configDirForAccount(accountId),
-        };
+        // A failure to place the session in the group slot (ensure-live threw, or no config dir
+        // resolves) is a REFUSAL, not a resolution fault: a reserved account must never fall back
+        // to the global slot, or the session would silently run under the global account. Rethrow
+        // as SpawnBindingError so the handler answers the phone instead of spawning on global.
+        try {
+          if (engine.ensureGroupLive) await engine.ensureGroupLive(acct.groupId);
+          const configDir = await engine.configDirForAccount(accountId);
+          if (configDir === undefined) {
+            throw new SpawnBindingError(
+              `account "${acct.label}" is bound to a folder but its profile could not be ` +
+                'prepared; re-login the member (cctl bindings)',
+            );
+          }
+          return { slot: groupSlotId(acct.groupId), accountId, configDir };
+        } catch (err) {
+          if (err instanceof SpawnBindingError) throw err;
+          throw new SpawnBindingError(
+            `account "${acct.label}" is bound to a folder but its group could not be made live ` +
+              `(${err instanceof Error ? err.message : String(err)}); re-login the member (cctl bindings)`,
+          );
+        }
       }
       // Shared (or unknown) account. A KNOWN shared account may only be spawned when it is the
       // account live in the global slot; an unknown id keeps the legacy attribution-tag behavior.
@@ -3375,20 +3429,36 @@ export class Daemon {
     if (cwd !== undefined && engine.resolveCwdBinding) {
       const binding = await engine.resolveCwdBinding(cwd);
       if (binding !== null) {
-        const live = engine.ensureGroupLive
-          ? await engine.ensureGroupLive(binding.groupId)
-          : undefined;
-        const member = live?.liveMember ?? (await engine.getActiveId(groupSlotId(binding.groupId)));
-        if (member === null || member === undefined) {
+        // Once the cwd is known to be bound, the session MUST run in the group slot. Any failure to
+        // place it there is a REFUSAL, never a fall-through to the global slot: a bound-folder
+        // session that ran under the global account would spend the wrong quota and defeat the
+        // binding. Every failure path below raises SpawnBindingError so the handler answers the
+        // phone with a clear message instead of spawning on global.
+        try {
+          const live = engine.ensureGroupLive
+            ? await engine.ensureGroupLive(binding.groupId)
+            : undefined;
+          const member =
+            live?.liveMember ?? (await engine.getActiveId(groupSlotId(binding.groupId)));
+          if (member === null || member === undefined) {
+            throw new SpawnBindingError(
+              'the folder bound to this session has no working account; re-login a member (cctl bindings)',
+            );
+          }
+          const configDir = await engine.configDirForAccount(member);
+          if (configDir === undefined) {
+            throw new SpawnBindingError(
+              'the folder bound to this session has no working account; re-login a member (cctl bindings)',
+            );
+          }
+          return { slot: groupSlotId(binding.groupId), accountId: member, configDir };
+        } catch (err) {
+          if (err instanceof SpawnBindingError) throw err;
           throw new SpawnBindingError(
-            'the folder bound to this session has no working account; re-login a member (cctl bindings)',
+            `the folder bound to this session could not be made live ` +
+              `(${err instanceof Error ? err.message : String(err)}); re-login a member (cctl bindings)`,
           );
         }
-        return {
-          slot: groupSlotId(binding.groupId),
-          accountId: member,
-          configDir: await engine.configDirForAccount(member),
-        };
       }
     }
     return { slot: 'global', accountId: undefined, configDir: undefined };

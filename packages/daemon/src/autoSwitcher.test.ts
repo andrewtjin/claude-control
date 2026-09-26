@@ -193,6 +193,37 @@ describe('AutoSwitcher — per-slot restriction and cooldown', () => {
     );
   });
 
+  it('names the slot on the phone notice when a slotLabel is given (a group hop)', async () => {
+    const { switcher, notify } = makeSwitcher();
+    await switcher.evaluate(groupSnapshot(), {
+      slotKey: 'group:g1',
+      candidateIds: new Set(['m1', 'm2']),
+      slotLabel: 'C:/ai-research',
+    });
+    // A group hop's notice scopes the folder so the phone reads it as a group rotation, not a
+    // global switch — the label is woven into the same switch.result message.
+    expect(notify.mock.calls[0]?.[0]?.message).toContain('auto-switch (C:/ai-research):');
+  });
+
+  it('carries the slot label into a failed hop notice too', async () => {
+    const activate = vi.fn(() => Promise.reject(new Error('cadence guard: retry in 42s')));
+    const { switcher, notify } = makeSwitcher({ activate });
+    await switcher.evaluate(groupSnapshot(), {
+      slotKey: 'group:g1',
+      candidateIds: new Set(['m1', 'm2']),
+      slotLabel: 'C:/ai-research',
+    });
+    expect(notify.mock.calls[0]?.[0]?.message).toContain('auto-switch (C:/ai-research) to');
+  });
+
+  it('omits the slot scope for a global hop (historical wording preserved)', async () => {
+    const { switcher, notify } = makeSwitcher();
+    await switcher.evaluate(lowSnapshot(), { slotKey: 'global' });
+    const message = notify.mock.calls[0]?.[0]?.message ?? '';
+    expect(message).toContain('auto-switch:');
+    expect(message).not.toContain('auto-switch (');
+  });
+
   it('keeps each slot cooldown independent', async () => {
     const { switcher, activate } = makeSwitcher();
     // A global hop puts the GLOBAL bucket into cooldown.

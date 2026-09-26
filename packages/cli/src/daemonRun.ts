@@ -52,7 +52,7 @@ import {
   type IdentityStore,
 } from '@claude-control/daemon';
 import { createAgentSdkClient, createSessionManager } from '@claude-control/session-runtime';
-import type { AgentSdkClient } from '@claude-control/session-runtime';
+import type { AgentSdkClient, CreateAgentSdkClientDeps } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath, fail, resolveBindEnforce } from './context.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
@@ -141,33 +141,46 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
  * ResumeOrphanOptions). Exported for its colocated test; the rest of runDaemon is
  * untestable assembly.
  *
- * DECISION — no `configDirForAccount` is injected here, on purpose. Binding per-account
- * CLAUDE_CONFIG_DIRs would give per-session credential isolation, but it forgoes the
- * project's single-shared-~/.claude design (the CLI reads some config outside
- * CLAUDE_CONFIG_DIR, so per-account config dirs don't isolate) and with it credential
- * HOT-SWAP: a `cctl switch` on the PC rewrites the shared live credentials that running
- * sessions read per-request, whereas a
- * session pinned to its own config dir would never see the swap. So sessions inherit
- * whichever account the switch engine last ACTIVATED (activate-before-spawn model),
- * `accountId` stays an attribution tag rather than a credential selector, and a spawn whose
- * accountId was never activated is made LOUD through the daemon's logger instead of running
- * silently mis-attributed.
+ * The caller (the daemon's spawn/resume path) decides truth about which config dir a session
+ * binds to, and passes exactly one of two shapes:
+ *  - `configDir` undefined → a GLOBAL session. It is NOT pinned to a config dir, on purpose:
+ *    that preserves the single-shared-~/.claude design (the CLI reads some config outside
+ *    CLAUDE_CONFIG_DIR, so per-account config dirs don't isolate) and credential HOT-SWAP (a
+ *    `cctl switch` rewrites the shared live credentials running sessions read per-request,
+ *    whereas a session pinned to its own config dir would never see the swap). The session
+ *    inherits whichever account the switch engine last ACTIVATED (activate-before-spawn model),
+ *    `accountId` stays an attribution tag, and an accountId that was never activated is made
+ *    LOUD through the daemon's logger instead of running silently mis-attributed.
+ *  - `configDir` set → a FOLDER-BOUND session. It MUST be pinned to that group's profile dir:
+ *    the group slot is a distinct config dir whose `.credentials.json` holds the group's live
+ *    member, and hot-swap still works within the group (a `cctl switch <member>` rewrites the
+ *    profile's credentials the pinned session reads per-request). Not pinning it would run a
+ *    bound-folder session under the global account — the exact defect this branch exists to
+ *    prevent — so `configDir` is honored by binding `env.CLAUDE_CONFIG_DIR` to it via
+ *    `configDirForAccount`.
  *
- * `configDir` is ignored here for exactly that reason; `scrubInheritedConfigDir` is honored,
- * though: it does not bind an account, it only drops an inherited CLAUDE_CONFIG_DIR that names a
- * group profile so a global session is not silently redirected onto a group's account.
+ * `scrubInheritedConfigDir` (global sessions only) is honored too: it does not bind an account,
+ * it only drops an inherited CLAUDE_CONFIG_DIR that names a group profile so a global session is
+ * not silently redirected onto a group's account.
+ *
+ * `create` is injectable so the composition-root wiring (configDir → deps) can be verified
+ * without constructing the real SDK client; it defaults to the live adapter.
  */
 export function makeAgentSdkClientFactory(
   logger: Logger,
+  create: (deps: CreateAgentSdkClientDeps) => AgentSdkClient = createAgentSdkClient,
 ): (configDir?: string, scrubInheritedConfigDir?: boolean) => AgentSdkClient {
-  return (_configDir?: string, scrubInheritedConfigDir?: boolean) =>
-    createAgentSdkClient({
+  return (configDir?: string, scrubInheritedConfigDir?: boolean) =>
+    create({
       onUnboundAccountId: (accountId) =>
         logger.warn(
           { accountId },
           'session accountId is not bound to a config dir; it runs under the globally ' +
             'active account - confirm the switch engine activated it before spawn',
         ),
+      // A folder-bound spawn passes the group's profile dir; pin the session's CLAUDE_CONFIG_DIR
+      // to it so the session runs on the group's live member, not the global account.
+      ...(configDir !== undefined ? { configDirForAccount: () => configDir } : {}),
       ...(scrubInheritedConfigDir ? { scrubInheritedConfigDir: true } : {}),
     });
 }

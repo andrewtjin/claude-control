@@ -155,6 +155,12 @@ function fakeEngine(opts: {
   live: Map<SlotId, string | null>;
   violations?: SlotViolation[];
   repair?: RepairResult;
+  /** Bind a cwd to a group so a spawn resolves into a group slot (default: everything unbound). */
+  cwdBinding?: (cwd: string) => { groupId: string } | null;
+  /** The profile dir for a reserved account (default: `/profiles/<accountId>` for members). */
+  configDirFor?: (accountId: string) => string | undefined;
+  /** Override ensureGroupLive to model a group that cannot be made live (throws or no member). */
+  ensureGroupLiveImpl?: (groupId: string) => Promise<GroupLiveResult>;
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
@@ -165,6 +171,7 @@ function fakeEngine(opts: {
     liveSlots: opts.live,
     engine: undefined as unknown as SwitchEngineLike,
   };
+  const memberIds = new Set(opts.groups.flatMap((g) => g.members.map((m) => m.id)));
   controls.engine = {
     recover: (): Promise<RecoverResult> => Promise.resolve({ recovered: false, action: 'none' }),
     activate: (id: string): Promise<ActivateResult> => {
@@ -185,8 +192,21 @@ function fakeEngine(opts: {
       Promise.resolve(new Map(controls.liveSlots)),
     getActiveId: (slot: SlotId = 'global'): Promise<string | null> =>
       Promise.resolve(controls.liveSlots.get(slot) ?? null),
+    // A reserved member's profile dir; undefined for a shared account. Overridable for the case
+    // where a member exists but its profile cannot be prepared.
+    configDirForAccount: (accountId: string): Promise<string | undefined> =>
+      Promise.resolve(
+        opts.configDirFor
+          ? opts.configDirFor(accountId)
+          : memberIds.has(accountId)
+            ? `/profiles/${accountId}`
+            : undefined,
+      ),
+    resolveCwdBinding: (cwd: string): Promise<{ groupId: string } | null> =>
+      Promise.resolve(opts.cwdBinding ? opts.cwdBinding(cwd) : null),
     ensureGroupLive: (groupId: string): Promise<GroupLiveResult> => {
       controls.ensureGroupLiveCalls.push(groupId);
+      if (opts.ensureGroupLiveImpl) return opts.ensureGroupLiveImpl(groupId);
       const live = controls.liveSlots.get(groupSlotId(groupId)) ?? null;
       return Promise.resolve({
         groupId,
@@ -212,10 +232,13 @@ function fakeEngine(opts: {
   return controls;
 }
 
-function stubSessionManager(): SessionManager {
+function stubSessionManager(spawnCalls?: { count: number }): SessionManager {
   const records: SessionRecord[] = [];
   return {
-    spawnManaged: () => Promise.reject(new Error('unused')),
+    spawnManaged: () => {
+      if (spawnCalls) spawnCalls.count++;
+      return Promise.reject(new Error('unused'));
+    },
     attachObserved: () => Promise.reject(new Error('unused')),
     get: () => undefined,
     list: () => records,
@@ -252,6 +275,7 @@ async function createRig(opts: {
   withAutoSwitcher?: boolean;
   slotAlertWindowMs?: number;
   pollIntervalMs?: number;
+  spawnCalls?: { count: number };
 }): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
@@ -291,7 +315,7 @@ async function createRig(opts: {
   const daemon = new Daemon({
     store,
     switchEngine: opts.controls.engine,
-    sessionManager: stubSessionManager(),
+    sessionManager: stubSessionManager(opts.spawnCalls),
     poller,
     attributionJournal: new AttributionJournal({ store, vaultDir }),
     hookReceiver: new HookReceiver({
@@ -338,6 +362,20 @@ function slotAlerts(relay: SteadyRelay): Array<PayloadOf<'hook.notification'>> {
     .filter((e) => e.type === 'hook.notification')
     .map((e) => e.payload)
     .filter((p) => p.notificationType === 'slot_alert');
+}
+
+function switchResults(relay: SteadyRelay): Array<PayloadOf<'switch.result'>> {
+  return relay.received
+    .filter((e) => e.type === 'switch.result')
+    .map((e) => (e.type === 'switch.result' ? e.payload : undefined))
+    .filter((p): p is PayloadOf<'switch.result'> => p !== undefined);
+}
+
+function errorFrames(relay: SteadyRelay): Array<PayloadOf<'error'>> {
+  return relay.received
+    .filter((e) => e.type === 'error')
+    .map((e) => (e.type === 'error' ? e.payload : undefined))
+    .filter((p): p is PayloadOf<'error'> => p !== undefined);
 }
 
 // One shared account (live global), a group of two members (m1 live), all healthy.
@@ -485,6 +523,175 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     // Global hopped to the healthy SHARED account (never a group member); the group hopped to its
     // own healthy member (never the shared pool).
     expect(hopped).toEqual(['m2', 's2']);
+  });
+
+  it('names the folder group on the phone notice for a GROUP hop (not a global switch)', async () => {
+    // Regression: a group auto-switch pushed the same switch.result as a global one, so the phone
+    // could not tell which folder rotated. The group hop's notice must name its bound folder; the
+    // global hop's notice keeps its historical wording (no folder scope).
+    const m1 = view('m1', 'Member One', 'g1');
+    const m2 = view('m2', 'Member Two', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const group: StoredGroup = {
+      id: 'g1',
+      label: 'work@corp',
+      members: [m1, m2],
+      activeId: 'm1',
+      folders: ['C:/ai-research'],
+      createdAtMs: 0,
+      updatedAtMs: 0,
+    };
+    const live = new Map<SlotId, string | null>([
+      ['global', 's1'],
+      [groupSlotId('g1'), 'm1'],
+    ]);
+    const controls = fakeEngine({ accounts: [s1, s2, m1, m2], groups: [group], live });
+    const rig = await createRig({ controls, bodyFor, withAutoSwitcher: true });
+    await rig.start();
+    await waitFor(() => controls.activateCalls.length >= 2);
+    await waitFor(() => switchResults(rig.relay).length >= 2);
+
+    const results = switchResults(rig.relay);
+    // The group hop's notice names the bound folder and lands on the group's own member.
+    const groupNotice = results.find((r) => r.activeAccountId === 'm2');
+    expect(groupNotice?.message).toContain('(C:/ai-research)');
+    // The global hop's notice does NOT carry a folder scope (it rotated the shared pool).
+    const globalNotice = results.find((r) => r.activeAccountId === 's2');
+    expect(globalNotice?.message).not.toContain('(C:/ai-research)');
+    expect(globalNotice?.message).toContain('auto-switch:');
+  });
+});
+
+describe('daemon folder-bound slots — repair is surfaced to the operator', () => {
+  it('alerts once per window naming what a repair moved, per repaired kind', async () => {
+    // repairSlots silently moves credentials back where they belong (a reserved member that
+    // surfaced in the shared slot, a stranger that surfaced in a profile). The operator must be
+    // told a slot's account changed under them — one alert per repaired KIND per window.
+    const { accounts, groups, live } = twoAccountGroup();
+    const repairedGlobal: SlotViolation = {
+      kind: 'reserved_live_in_global',
+      detail: 'reserved account "Member One" is live in the global slot',
+      accountId: 'm1',
+      slot: 'global',
+    };
+    const repairedGroup: SlotViolation = {
+      kind: 'nonmember_live_in_group',
+      detail: 'non-member "Shared" is live in the C:/work group',
+      accountId: 's1',
+      groupId: 'g1',
+    };
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      violations: [repairedGlobal, repairedGroup],
+      repair: {
+        repaired: [repairedGlobal, repairedGroup],
+        remaining: [],
+        actions: ['moved the global slot off reserved "Member One" onto "Shared"'],
+      },
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({
+        limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }],
+      }),
+      slotAlertWindowMs: 60 * 60_000,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => slotAlerts(rig.relay).length >= 2);
+
+    const bodies = slotAlerts(rig.relay).map((a) => a.body);
+    // One alert per repaired kind, each naming the offending account AND what cctl did about it.
+    const globalAlert = bodies.find((b) => b.includes('is live in the global slot'));
+    expect(globalAlert).toContain('cctl moved the shared slot back to a shared account');
+    const groupAlert = bodies.find((b) => b.includes('is live in the C:/work group'));
+    expect(groupAlert).toContain("cctl restored the folder group's own account");
+
+    // Several more cycles inside the window must not repeat either alert.
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 3);
+    expect(slotAlerts(rig.relay)).toHaveLength(2);
+  });
+});
+
+describe('daemon folder-bound slots — a spawn that cannot take its group slot is refused', () => {
+  // A working directory that exists (so the bad-cwd guard passes) but is bound to a group that
+  // cannot be placed. process.cwd() is a real directory on every runner.
+  const boundCwd = process.cwd();
+
+  it('refuses (not falls back to global) when the bound group has no working account', async () => {
+    const { accounts, groups } = twoAccountGroup();
+    const live = new Map<SlotId, string | null>([
+      ['global', 's1'],
+      [groupSlotId('g1'), null],
+    ]);
+    const spawnCalls = { count: 0 };
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      cwdBinding: (cwd) => (cwd === boundCwd ? { groupId: 'g1' } : null),
+      // The group has no live member and none can be activated.
+      ensureGroupLiveImpl: (groupId) =>
+        Promise.resolve({ groupId, liveMember: null, activated: false, noWorkingAccount: true }),
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({ limits: [] }),
+      spawnCalls,
+    });
+    await rig.start();
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'session.spawn',
+      payload: { requestId: 'r-nowork', prompt: 'go', idempotencyKey: 'k', cwd: boundCwd },
+    });
+    await waitFor(() => errorFrames(rig.relay).some((e) => e.relatesTo !== undefined));
+
+    const err = errorFrames(rig.relay)[0];
+    expect(err?.code).toBe('spawn_failed');
+    expect(err?.message).toContain('no working account');
+    // The whole point: the session was NOT spawned on the global account as a fallback.
+    expect(spawnCalls.count).toBe(0);
+    expect(rig.relay.received.some((e) => e.type === 'session.status')).toBe(false);
+  });
+
+  it('refuses (not falls back to global) when making the bound group live throws', async () => {
+    const { accounts, groups } = twoAccountGroup();
+    const live = new Map<SlotId, string | null>([
+      ['global', 's1'],
+      [groupSlotId('g1'), 'm1'],
+    ]);
+    const spawnCalls = { count: 0 };
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      cwdBinding: (cwd) => (cwd === boundCwd ? { groupId: 'g1' } : null),
+      // A resolution fault (e.g. a profile write error) must become a refusal for a BOUND folder,
+      // never a silent global fallback that spends the wrong account.
+      ensureGroupLiveImpl: () => Promise.reject(new Error('profile write failed')),
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({ limits: [] }),
+      spawnCalls,
+    });
+    await rig.start();
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'session.spawn',
+      payload: { requestId: 'r-throw', prompt: 'go', idempotencyKey: 'k', cwd: boundCwd },
+    });
+    await waitFor(() => errorFrames(rig.relay).some((e) => e.relatesTo !== undefined));
+
+    const err = errorFrames(rig.relay)[0];
+    expect(err?.code).toBe('spawn_failed');
+    expect(err?.message).toContain('could not be made live');
+    expect(spawnCalls.count).toBe(0);
+    expect(rig.relay.received.some((e) => e.type === 'session.status')).toBe(false);
   });
 });
 
