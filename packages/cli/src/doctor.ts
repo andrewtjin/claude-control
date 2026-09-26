@@ -421,20 +421,29 @@ export function checkVersionSkew(
   daemonBuild: string | undefined,
   daemonAlive: boolean,
 ): DoctorCheck {
+  // The daemon-build value comes from the settings report, which stores it 'v'-prefixed
+  // (`v${VERSION}`), while callers here pass the bare package VERSION. `cctl version` reconciles
+  // this by prefixing its CLI value before comparing; do the mirror here by stripping an optional
+  // leading 'v' from both sides, so an identical build never reads as a skew merely because one
+  // string carries the 'v' and the other does not. Display the normalized numbers too, so a real
+  // skew shows two genuinely different versions and the pass line matches `cctl version`.
+  const strip = (v: string): string => v.replace(/^v/i, '');
+  const cli = strip(cliVersion);
   if (!daemonAlive || daemonBuild === undefined) {
     return {
       name: 'daemon-version',
       ok: true,
-      detail: `CLI is ${cliVersion}; no running daemon to compare`,
+      detail: `CLI is ${cli}; no running daemon to compare`,
     };
   }
-  if (daemonBuild === cliVersion) {
-    return { name: 'daemon-version', ok: true, detail: `CLI and daemon both ${cliVersion}` };
+  const daemon = strip(daemonBuild);
+  if (daemon === cli) {
+    return { name: 'daemon-version', ok: true, detail: `CLI and daemon both ${cli}` };
   }
   return {
     name: 'daemon-version',
     ok: false,
-    detail: `CLI is ${cliVersion} but the running daemon is ${daemonBuild} — restart it so both match: cctl daemon restart`,
+    detail: `CLI is ${cli} but the running daemon is ${daemon} — restart it so both match: cctl daemon restart`,
   };
 }
 
