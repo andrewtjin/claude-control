@@ -176,9 +176,10 @@ function turnFromLine(
 
 /**
  * The session id a transcript file belongs to. Claude Code writes a session's turns to
- * `<claudeDir>/projects/<encoded-cwd>/<session>.jsonl`, and a sub-agent's turns to
- * `<encoded-cwd>/<session>/subagents/**​/agent-*.jsonl` — a sub-agent's spend is its parent
- * session's, so the id is the `<session>` directory segment before `subagents`. A top-level file's
+ * `<claudeDir>/projects/<encoded-cwd>/<session>.jsonl`, and a sub-agent's turns under a nested
+ * `<encoded-cwd>/<session>/subagents/` tree (`agent-*.jsonl` at any depth) — a sub-agent's spend is
+ * its parent session's, so the id is the `<session>` directory segment before `subagents`. A
+ * top-level file's
  * id is its base name without the `.jsonl` extension. Returns `null` for any other shape (which
  * attribution treats as the global slot). Pure string work on the path — no IO.
  */

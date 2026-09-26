@@ -3898,7 +3898,7 @@ export class Daemon {
    */
   private async slotForSessionConfigDir(configDir: string | null | undefined): Promise<SlotId> {
     if (this.switchEngine.slotForConfigDir === undefined) return 'global';
-    return this.switchEngine.slotForConfigDir(configDir).catch(() => 'global' as SlotId);
+    return this.switchEngine.slotForConfigDir(configDir).catch((): SlotId => 'global');
   }
 
   /** Opt an interactive session into daemon tracking. Async because it reads the switch engine

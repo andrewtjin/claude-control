@@ -336,7 +336,7 @@ function countUsageSnapshots(relay: SteadyRelay): number {
 function slotAlerts(relay: SteadyRelay): Array<PayloadOf<'hook.notification'>> {
   return relay.received
     .filter((e) => e.type === 'hook.notification')
-    .map((e) => (e as Extract<Envelope, { type: 'hook.notification' }>).payload)
+    .map((e) => e.payload)
     .filter((p) => p.notificationType === 'slot_alert');
 }
 
