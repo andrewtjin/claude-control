@@ -23,6 +23,7 @@
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { BIND_GUARD_MARKER } from './bindGuard.js';
 import {
   DEFAULT_HOOK_EVENT_NAMES,
   DEFAULT_SECRET_HEADER,
@@ -108,6 +109,16 @@ function isOwnedHookCommand(command: string): boolean {
   );
 }
 
+/** Recognize the enforcement guard command by the guard script's filename. This is DELIBERATELY
+ *  separate from {@link isOwnedHookCommand}: the guard and the forwarder both live in the shared
+ *  matcher-less UserPromptSubmit group, and if either counted as "the other's" the installer's
+ *  owned-entry prune would evict one when refreshing the other. The forwarder's install therefore
+ *  never touches a guard entry (it is not `isOwnedHookCommand`), and the guard's install never
+ *  touches a forwarder entry (below). A full `uninstallHooks` removes both. */
+function isBindGuardCommand(command: string): boolean {
+  return command.includes(BIND_GUARD_MARKER);
+}
+
 // ---------------------------------------------------------------------------
 // installHooks
 // ---------------------------------------------------------------------------
@@ -143,6 +154,61 @@ export async function installHooks(options: InstallHooksOptions): Promise<void> 
     mergeOneHook(hooksSection, spec);
   }
 
+  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// installBindGuard
+// ---------------------------------------------------------------------------
+
+export interface InstallBindGuardOptions {
+  settingsPath: string;
+  /** The full guard command line (see `buildBindGuardCommand`). */
+  command: string;
+  /** The event the guard fires on. Defaults to UserPromptSubmit (spec §9); overridable only so a
+   *  caller with renamed events can keep them consistent. */
+  eventName?: string;
+}
+
+/**
+ * Install the enforcement guard as a SECOND entry under the (matcher-less) UserPromptSubmit group,
+ * alongside the relay forwarder — never replacing it. This is a narrower merge than
+ * {@link installHooks}: it prunes only PRIOR GENERATIONS OF THE GUARD (recognized by the script
+ * filename, so a node/script/snapshot path change is replaced, not accumulated) and leaves every
+ * other entry — the forwarder, other tools' hooks, foreign keys — byte-value-equivalent. Idempotent:
+ * a settings.json already carrying the current guard command is rewritten to the same shape.
+ *
+ * "Upgrade from a settings.json that only has the old hooks" is exactly this path: the forwarder
+ * entry is present, no guard is, and this adds one without disturbing the forwarder.
+ */
+export async function installBindGuard(options: InstallBindGuardOptions): Promise<void> {
+  const settings = await readSettings(options.settingsPath);
+  const hooksSection: JsonObject = isRecord(settings.hooks) ? settings.hooks : {};
+  settings.hooks = hooksSection;
+
+  const event = options.eventName ?? DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const existing = hooksSection[event];
+  const groups: unknown[] = Array.isArray(existing) ? existing : [];
+
+  // The guard runs unconditionally, like the forwarder — the matcher-less group is where both live.
+  let targetGroup = groups.find((g): g is HookGroup => isHookGroup(g) && g.matcher === undefined);
+  if (!targetGroup) {
+    targetGroup = { hooks: [] };
+    groups.push(targetGroup);
+  }
+
+  // Drop only stale generations of OUR guard; keep the forwarder and everything else untouched.
+  targetGroup.hooks = targetGroup.hooks.filter(
+    (h) => !isHookEntry(h) || !isBindGuardCommand(h.command) || h.command === options.command,
+  );
+  const alreadyPresent = targetGroup.hooks.some(
+    (h) => isHookEntry(h) && h.command === options.command,
+  );
+  if (!alreadyPresent) {
+    targetGroup.hooks.push({ type: 'command', command: options.command });
+  }
+
+  hooksSection[event] = groups;
   await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
 }
 
@@ -295,7 +361,11 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<'r
     const prunedGroups = existingGroups
       .map((g) => {
         if (!isHookGroup(g)) return g; // not recognizably ours to interpret — leave as-is
-        const keptHooks = g.hooks.filter((h) => !isHookEntry(h) || !isOwnedHookCommand(h.command));
+        // Remove both of ours: the forwarder (owned marker) and the enforcement guard (script name).
+        const keptHooks = g.hooks.filter(
+          (h) =>
+            !isHookEntry(h) || (!isOwnedHookCommand(h.command) && !isBindGuardCommand(h.command)),
+        );
         if (keptHooks.length !== g.hooks.length) prunedHere = true;
         return { ...g, hooks: keptHooks };
       })

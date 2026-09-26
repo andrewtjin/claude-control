@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   installHooks,
+  installBindGuard,
   uninstallHooks,
   buildDaemonHookSpecs,
   type HookCommandSpec,
 } from './hookInstaller.js';
-import { DEFAULT_SECRET_HEADER } from './hookReceiver.js';
+import { buildBindGuardCommand } from './bindGuard.js';
+import { DEFAULT_HOOK_EVENT_NAMES, DEFAULT_SECRET_HEADER } from './hookReceiver.js';
 
 async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, 'utf8'));
@@ -507,5 +509,121 @@ describe('buildDaemonHookSpecs', () => {
       'CustomStop',
       'CustomStopFailure',
     ]);
+  });
+});
+
+describe('installBindGuard', () => {
+  let dir: string;
+  let settingsPath: string;
+  const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const guardCmd = buildBindGuardCommand({
+    nodePath: '/usr/bin/node',
+    guardPath: '/data/bind-guard.cjs',
+  });
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'bind-guard-install-'));
+    settingsPath = join(dir, 'settings.json');
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function upsCommands(settings: unknown): string[] {
+    const hooks = (settings as { hooks?: Record<string, unknown> }).hooks ?? {};
+    const groups = hooks[UPS];
+    if (!Array.isArray(groups)) return [];
+    return groups.flatMap((g: unknown) => {
+      const entries = (g as { hooks?: unknown }).hooks;
+      return Array.isArray(entries)
+        ? entries.map((h: unknown) => (h as { command?: string }).command ?? '')
+        : [];
+    });
+  }
+
+  it('creates settings.json and installs the guard on UserPromptSubmit', async () => {
+    await installBindGuard({ settingsPath, command: guardCmd });
+    expect(upsCommands(await readJson(settingsPath))).toEqual([guardCmd]);
+  });
+
+  it('is idempotent: installing twice yields exactly one guard entry', async () => {
+    await installBindGuard({ settingsPath, command: guardCmd });
+    await installBindGuard({ settingsPath, command: guardCmd });
+    expect(upsCommands(await readJson(settingsPath))).toEqual([guardCmd]);
+  });
+
+  it('replaces a stale guard generation (different node/script/snapshot path) rather than accumulating', async () => {
+    const oldCmd = buildBindGuardCommand({
+      nodePath: '/old/node',
+      guardPath: '/old/bind-guard.cjs',
+    });
+    await installBindGuard({ settingsPath, command: oldCmd });
+    await installBindGuard({ settingsPath, command: guardCmd });
+    // Only the current generation remains — both carry the bind-guard.cjs fingerprint.
+    expect(upsCommands(await readJson(settingsPath))).toEqual([guardCmd]);
+  });
+
+  it('upgrade path: adds the guard alongside pre-existing forwarder hooks without evicting them', async () => {
+    // A settings.json that only has the old forwarder hooks (installed by an older cctl).
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await installHooks({
+      settingsPath,
+      hooks: [
+        { event: UPS, command: forwarder },
+        { event: 'Stop', command: forwarder },
+      ],
+      ownedCommandMarker: DEFAULT_SECRET_HEADER,
+    });
+    await installBindGuard({ settingsPath, command: guardCmd });
+    const settings = await readJson(settingsPath);
+    // The forwarder AND the guard share the matcher-less UserPromptSubmit group.
+    expect(upsCommands(settings).sort()).toEqual([guardCmd, forwarder].sort());
+  });
+
+  it('a later forwarder re-install does not evict the guard', async () => {
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await installBindGuard({ settingsPath, command: guardCmd });
+    await installHooks({
+      settingsPath,
+      hooks: [{ event: UPS, command: forwarder }],
+      ownedCommandMarker: DEFAULT_SECRET_HEADER,
+    });
+    expect(upsCommands(await readJson(settingsPath)).sort()).toEqual([guardCmd, forwarder].sort());
+  });
+
+  it("preserves another tool's UserPromptSubmit hook", async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: { [UPS]: [{ hooks: [{ type: 'command', command: 'other-tool --x' }] }] },
+      }),
+    );
+    await installBindGuard({ settingsPath, command: guardCmd });
+    expect(upsCommands(await readJson(settingsPath)).sort()).toEqual(
+      [guardCmd, 'other-tool --x'].sort(),
+    );
+  });
+
+  it('uninstallHooks removes the guard along with the forwarder, leaving other tools alone', async () => {
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: {
+          [UPS]: [
+            {
+              hooks: [
+                { type: 'command', command: forwarder },
+                { type: 'command', command: guardCmd },
+                { type: 'command', command: 'other-tool --x' },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+    const outcome = await uninstallHooks({ settingsPath });
+    expect(outcome).toBe('removed');
+    expect(upsCommands(await readJson(settingsPath))).toEqual(['other-tool --x']);
   });
 });

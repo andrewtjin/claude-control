@@ -2,10 +2,14 @@ import { describe, it, expect } from 'vitest';
 import {
   renderAccountHeal,
   renderAccountsTable,
+  renderBindingGroups,
+  renderBindings,
+  renderBindingsFooter,
   renderDaemonStatus,
   renderPacingLine,
   renderTokenStats,
   renderUsage,
+  renderWhere,
   type DaemonStatusView,
   type UsageRow,
 } from './render.js';
@@ -767,5 +771,125 @@ describe('renderAccountHeal', () => {
     const painted = renderAccountHeal(report, ANSI_PALETTE);
     expect(painted.startsWith(`${ESC}[33mmerged${ESC}[0m duplicate account jina25`)).toBe(true);
     expect(painted).toContain(`\n${ESC}[33mrenamed${ESC}[0m account jina25 (x-3)`);
+  });
+});
+
+describe('renderBindingGroups', () => {
+  const group = {
+    label: 'work + client',
+    folders: ['C:\\repos\\work', 'C:\\repos\\client'],
+    members: [
+      { label: 'work@me.com', live: true, quarantined: false, excluded: false },
+      { label: 'client@me.com', live: false, quarantined: false, excluded: true },
+    ],
+    profileDir: 'C:\\data\\profiles\\g1',
+    noWorkingAccount: false,
+  };
+
+  it('lists folders, members with the live one marked, and the profile dir', () => {
+    const out = renderBindingGroups([group], PLAIN_PALETTE);
+    expect(out).toContain('work + client');
+    expect(out).toContain('folder:  C:\\repos\\work');
+    expect(out).toContain('folder:  C:\\repos\\client');
+    expect(out).toContain('*work@me.com');
+    expect(out).toContain('client@me.com (excluded)');
+    expect(out).toContain('profile: C:\\data\\profiles\\g1');
+  });
+
+  it('returns empty string when there are no groups', () => {
+    expect(renderBindingGroups([], PLAIN_PALETTE)).toBe('');
+  });
+
+  it('flags a group with no working account', () => {
+    const dead = { ...group, members: [], noWorkingAccount: true };
+    expect(renderBindingGroups([dead], PLAIN_PALETTE)).toContain('none usable');
+  });
+
+  it('strips terminal control/bidi sequences from labels and folders', () => {
+    const evil = {
+      ...group,
+      // A label that keeps "work" readable once the leading ESC (which starts an SGR sequence) and a
+      // bidi override are stripped.
+      label: '\u001b[31mwork\u202e',
+      folders: ['C:\\r\u200eepos'],
+      members: [{ label: 'a\u0007b', live: false, quarantined: false, excluded: false }],
+      profileDir: 'C:\\p',
+    };
+    const out = renderBindingGroups([evil], PLAIN_PALETTE);
+    expect(out).not.toContain('\u001b');
+    expect(out).not.toContain('\u202e');
+    expect(out).not.toContain('\u200e');
+    expect(out).not.toContain('\u0007');
+    // The ESC byte is gone but the "[31m" text would remain; here the label is ESC-led so "work"
+    // survives cleanly.
+    expect(out).toContain('work');
+  });
+});
+
+describe('renderBindings', () => {
+  it('shows a helpful message when nothing is bound', () => {
+    const out = renderBindings(
+      { groups: [], footer: { snapshotGeneration: null, groupsGeneration: 0, enforce: 'block' } },
+      PLAIN_PALETTE,
+    );
+    expect(out).toContain('No folder-bound accounts');
+  });
+
+  it('reports a stale snapshot', () => {
+    const out = renderBindings(
+      {
+        groups: [
+          {
+            label: 'g',
+            folders: ['C:\\x'],
+            members: [{ label: 'a', live: true, quarantined: false, excluded: false }],
+            profileDir: 'C:\\p',
+            noWorkingAccount: false,
+          },
+        ],
+        footer: { snapshotGeneration: 2, groupsGeneration: 5, enforce: 'warn' },
+      },
+      PLAIN_PALETTE,
+    );
+    expect(out).toContain('enforcement: warn');
+    expect(out).toContain('STALE');
+    expect(out).toContain('snapshot generation 2');
+  });
+
+  it('reports a fresh snapshot', () => {
+    const out = renderBindingsFooter(
+      { snapshotGeneration: 4, groupsGeneration: 4, enforce: 'block' },
+      PLAIN_PALETTE,
+    );
+    expect(out).toContain('fresh (generation 4)');
+  });
+});
+
+describe('renderWhere', () => {
+  it('explains a bound folder with the env line and a VS Code snippet', () => {
+    const out = renderWhere(
+      {
+        folder: 'C:\\repos\\work',
+        bound: {
+          groupLabel: 'work',
+          matchedFolder: 'C:\\repos\\work',
+          members: ['work@me.com'],
+          profileDir: 'C:\\data\\profiles\\g1',
+          liveMemberLabel: 'work@me.com',
+        },
+      },
+      PLAIN_PALETTE,
+    );
+    expect(out).toContain('runs on: work (work@me.com)');
+    expect(out).toContain('CLAUDE_CONFIG_DIR=C:\\data\\profiles\\g1');
+    expect(out).toContain('claudeCode.environmentVariables');
+    expect(out).toContain('.vscode\\settings.json');
+  });
+
+  it('explains an unbound folder as the global account', () => {
+    const out = renderWhere({ folder: 'C:\\tmp', bound: null }, PLAIN_PALETTE);
+    expect(out).toContain('global (shared) account');
+    expect(out).toContain('CLAUDE_CONFIG_DIR is not set');
+    expect(out).toContain('cctl bind C:\\tmp');
   });
 });

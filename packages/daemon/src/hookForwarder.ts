@@ -106,8 +106,24 @@ process.stdin.on('data', (chunk) => {
 });
 process.stdin.on('end', () => {
   let event;
+  // The body sent to the daemon: the original payload, plus this session's launch-time
+  // config dir. A session's account IS the config dir it runs in (CLAUDE_CONFIG_DIR at
+  // launch), and the hook payload carries no such field, so the daemon can only map an
+  // event to its slot (global vs a folder-bound group profile) if the forwarder stamps it.
+  // The var reaches this hook unchanged (Claude Code passes the launch env through, minus
+  // dynamic-linker vars, so a session started under a profile dir sees it). Absent or empty
+  // => null, which the daemon reads as the global slot. Injection is best-effort and never
+  // affects the never-block contract: a payload that is not a JSON object is forwarded
+  // byte-for-byte, exactly as before.
+  let outbound = body;
   try {
-    event = JSON.parse(body).hook_event_name;
+    const parsed = JSON.parse(body);
+    event = parsed.hook_event_name;
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const cfg = process.env.CLAUDE_CONFIG_DIR;
+      parsed.configDir = typeof cfg === 'string' && cfg.length > 0 ? cfg : null;
+      outbound = JSON.stringify(parsed);
+    }
   } catch {}
   // Unknown/unparsable events ride the response: never guess that an answer is ignorable.
   const awaitResponse = typeof event !== 'string' || RESPONSE_EVENTS.indexOf(event) >= 0;
@@ -158,7 +174,7 @@ process.stdin.on('end', () => {
       res.on('error', bail);
     });
   }
-  req.end(body);
+  req.end(outbound);
 });
 `;
 

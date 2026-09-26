@@ -120,6 +120,14 @@ export {
 export { hookForwarderPath, writeHookForwarder, HOOK_FORWARDER_SOURCE } from './hookForwarder.js';
 
 export {
+  bindGuardPath,
+  buildBindGuardCommand,
+  generateBindGuardSource,
+  writeBindGuard,
+  BIND_GUARD_MARKER,
+} from './bindGuard.js';
+
+export {
   ControlPlaneClient,
   ControlPlaneRejectionError,
   type ConnectionState,
@@ -131,10 +139,12 @@ export {
 
 export {
   installHooks,
+  installBindGuard,
   uninstallHooks,
   buildDaemonHookSpecs,
   type HookCommandSpec,
   type InstallHooksOptions,
+  type InstallBindGuardOptions,
   type UninstallHooksOptions,
   type BuildDaemonHookSpecsOptions,
 } from './hookInstaller.js';

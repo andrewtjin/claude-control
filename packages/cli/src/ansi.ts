@@ -24,6 +24,43 @@
 import { colorEnabled, sgr, type Paint } from '@claude-control/shared-protocol';
 import { severityOf, type OutlookStyle, type PacingStyle } from '@claude-control/usage-advisor';
 
+// Every account label and folder path that reaches the terminal is operator- or filesystem-
+// controlled text, and both can carry bytes a terminal INTERPRETS rather than prints: SGR/OSC
+// escapes (an attacker-set label could recolor or retitle the window, or hide text), C0/C1/DEL
+// control codes, and the Unicode bidirectional/format controls that let a right-to-left run
+// reorder a path so what the eye reads is not what the binding matched. A folder name comes from
+// the filesystem and a label from `accounts add`, so neither is trustworthy on a shared box. This
+// strips all of it to plain, left-to-right, printable text before anything is styled or padded.
+//
+// Colon at index-1 aside (kept — it's the sole legal Windows drive designator), nothing here is a
+// path operation; it is purely "make this string safe to write to a TTY". Width is preserved for
+// everything it KEEPS (removed controls were zero-width or interpreted, never columns), so a value
+// sanitized here still aligns under the render helpers' plain-text padding.
+//
+// The set matches folderPath.ts's control-char refusal (C0/C1/DEL) plus the bidi/format controls
+// a path canonicalizer has no reason to reject but a terminal must never honor.
+const TERMINAL_UNSAFE = new RegExp(
+  [
+    '[\\u0000-\\u001f\\u007f-\\u009f]', // C0 controls + DEL + C1 controls (incl. ESC, the CSI/OSC lead-in)
+    '[\\u200e\\u200f]', // LRM / RLM
+    '[\\u202a-\\u202e]', // LRE RLE PDF LRO RLO
+    '[\\u2066-\\u2069]', // LRI RLI FSI PDI
+    '\\ufeff', // ZERO WIDTH NO-BREAK SPACE / BOM
+  ].join('|'),
+  'gu',
+);
+
+/**
+ * Strip every terminal-interpreted control from a label or folder path: C0/C1/DEL (which includes
+ * the ESC that begins an SGR/OSC sequence) and the Unicode bidi/format controls
+ * (U+200E/F, U+202A–202E, U+2066–2069, U+FEFF). The result is plain, left-to-right, printable text
+ * safe to color, pad, and write to any terminal surface. Removals are all zero-width or interpreted
+ * bytes, so a kept value's visible width is unchanged. Idempotent.
+ */
+export function sanitizeForTerminal(value: string): string {
+  return value.replace(TERMINAL_UNSAFE, '');
+}
+
 // `colorEnabled` (the NO_COLOR/TTY gate) and `sgr` (the SGR wrapper every paint below is built
 // from) are defined once in shared-protocol and re-exported/reused here rather than redeclared:
 // shared-protocol's own pretty-log renderer (`createLogger`) makes the identical decisions for

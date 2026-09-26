@@ -5,7 +5,7 @@
 // interface on top of pino; the CLI keeps it quiet by default (warn+) and leaves the stream it
 // renders to up to the caller (see `buildEngine`).
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createLogger, type LogSink } from '@claude-control/shared-protocol';
 import {
@@ -16,6 +16,7 @@ import {
   type Paths,
 } from '@claude-control/switch-engine';
 import { detectPalette, type Palette } from './ansi.js';
+import { daemonConfigPath } from './settings.js';
 
 /** The daemon's sqlite database — a sibling of the vault under the claude-control data dir.
  *  The CLI reads it (e.g. `cctl usage`) without needing the daemon process to be running.
@@ -50,6 +51,32 @@ export function daemonDbPath(paths: Paths = defaultPaths()): string {
  * it (its resolved default-or-explicit log path) so this engine's logger writes to the SAME
  * file its own logger does, without disturbing every other env-driven knob this reads.
  */
+/** Resolve the effective folder-binding enforcement mode the engine should bake into any guard
+ *  snapshot it writes (bind/unbind/refreshSnapshot). Precedence matches the daemon's own settings
+ *  resolution — env over the persisted config.json (`env.CCTL_BIND_ENFORCE`) over the 'block'
+ *  default — so the snapshot the guard reads reflects what `cctl settings set CCTL_BIND_ENFORCE`
+ *  persisted, even for sessions launched without the env var set. Read synchronously (a tiny JSON
+ *  file) because buildEngine is synchronous; a missing/corrupt file just falls through to default. */
+export function resolveBindEnforce(env: NodeJS.ProcessEnv = process.env): BindEnforceMode {
+  const valid = (v: unknown): BindEnforceMode | undefined =>
+    v === 'block' || v === 'warn' || v === 'off' ? v : undefined;
+  const fromEnv = valid(env.CCTL_BIND_ENFORCE);
+  if (fromEnv) return fromEnv;
+  try {
+    const parsed = JSON.parse(readFileSync(daemonConfigPath(), 'utf8')) as unknown;
+    if (parsed !== null && typeof parsed === 'object' && 'env' in parsed) {
+      const envBlock = (parsed as { env?: unknown }).env;
+      if (envBlock !== null && typeof envBlock === 'object') {
+        const fromFile = valid((envBlock as Record<string, unknown>).CCTL_BIND_ENFORCE);
+        if (fromFile) return fromFile;
+      }
+    }
+  } catch {
+    // No config, unreadable, or not JSON — the 'block' default is correct.
+  }
+  return 'block';
+}
+
 export function buildEngine(
   paths: Paths = defaultPaths(),
   logSink: LogSink = process.stderr,
@@ -71,6 +98,8 @@ export function buildEngine(
   const options: ConstructorParameters<typeof SwitchEngine>[0] = {
     paths,
     logger: adapter,
+    // The enforcement mode baked into any guard snapshot this engine writes (see resolveBindEnforce).
+    bindEnforce: resolveBindEnforce(env),
     refreshDeps: {
       overload: {
         // The status-page probe an overloaded (529) token endpoint triggers, passed explicitly

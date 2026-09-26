@@ -95,7 +95,18 @@ import {
   uninstallAutostart,
   type AutostartResult,
 } from './autostart.js';
-import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
+import {
+  colorEnabled,
+  detectPalette,
+  outlookStyle,
+  pacingStyle,
+  sanitizeForTerminal,
+} from './ansi.js';
+import {
+  buildBindCommands,
+  describeSwitchedGroup,
+  renderBindingsAppendix,
+} from './bindCommands.js';
 import {
   renderAccountHeal,
   renderAccountsTable,
@@ -118,7 +129,17 @@ import {
   type SessionCommandSuccess,
   type SessionVerb,
 } from './sessionClient.js';
-import { checkLiveLogin, probeRelay, renderDoctor, runDoctor, summarize } from './doctor.js';
+import {
+  checkGuardHook,
+  checkGuardSnapshot,
+  checkLiveLogin,
+  checkSlots,
+  checkVersionSkew,
+  probeRelay,
+  renderDoctor,
+  runDoctor,
+  summarize,
+} from './doctor.js';
 import {
   connectWithTimeout,
   normalizePairingCode,
@@ -170,6 +191,20 @@ async function healAccounts(engine: ReturnType<typeof buildEngine>): Promise<voi
   process.stdout.write(renderAccountHeal(await engine.dedupeAccounts(), detectPalette()));
 }
 
+/** After a `cctl settings set/unset` of CCTL_BIND_ENFORCE, rewrite the guard snapshot so the new
+ *  mode takes effect without waiting for a daemon restart. A no-op (best-effort, never fatal to the
+ *  settings write that already succeeded) for any other setting. buildEngine() resolves the
+ *  just-persisted value, so the rewritten snapshot carries it. */
+async function refreshSnapshotIfBindEnforce(settingName: string): Promise<void> {
+  if (settingName !== 'CCTL_BIND_ENFORCE') return;
+  try {
+    await buildEngine().refreshSnapshot();
+  } catch {
+    // The setting is already persisted; a failed snapshot rewrite heals on the next daemon poll or
+    // bind. Never turn a successful settings change into a command failure over it.
+  }
+}
+
 export function buildProgram(): Command {
   const program = new Command();
   program
@@ -214,9 +249,14 @@ export function buildProgram(): Command {
     outputError: (str, write) => write(paintErrorLine(str, detectPalette(process.stderr))),
   });
 
+  // passThroughOptions on `cctl claude` (see bindCommands.ts) needs positional-options mode on the
+  // program so our --account/--override are parsed before Claude Code's own flags pass through.
+  program.enablePositionalOptions();
+
   buildAccountCommands(program);
   buildSessionCommands(program);
   buildChannelCommands(program);
+  buildBindCommands(program);
 
   program
     .command('switch <ref>')
@@ -224,7 +264,9 @@ export function buildProgram(): Command {
     .option('--force', 'bypass the switch-cadence guard (deliberate override)')
     .action(async (ref: string, opts: { force?: boolean }) => {
       const engine = buildEngine();
-      const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+      // Resolve across the WHOLE registry (shared pool + reserved members) so `cctl switch <member>`
+      // reaches a folder-bound account; activate() routes it to its group slot by membership.
+      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
       try {
         const result = await engine.activate(resolved.account.id, {
@@ -236,7 +278,14 @@ export function buildProgram(): Command {
           result.refreshed ? 'token refreshed' : null,
           result.adoptedPreviousRotation ? 'adopted previous rotation' : null,
         ].filter(Boolean);
-        process.stdout.write(`Activated ${resolved.account.label} (${bits.join(', ')}).\n`);
+        // A reserved account's switch moves its FOLDER group's slot, not the global one — say which.
+        const group = await describeSwitchedGroup(engine, resolved.account.id);
+        const where = group
+          ? ` in the ${sanitizeForTerminal(group.folders.join(', '))} folder group`
+          : '';
+        process.stdout.write(
+          `Activated ${sanitizeForTerminal(resolved.account.label)}${where} (${bits.join(', ')}).\n`,
+        );
       } catch (err) {
         if (err instanceof QuarantineError)
           fail(`${resolved.account.label} is quarantined; re-login required.`);
@@ -296,6 +345,7 @@ export function buildProgram(): Command {
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
+      text += await renderBindingsAppendix(buildEngine(), detectPalette());
       process.stdout.write(text + '\n');
     });
 
@@ -456,6 +506,11 @@ export function buildProgram(): Command {
       } catch (err) {
         fail(err instanceof Error ? err.message : String(err));
       }
+      // The guard reads its enforce mode from a snapshot, not config.json — so a change to
+      // CCTL_BIND_ENFORCE only takes effect once the snapshot is rewritten. Do it now (the engine
+      // resolves the just-persisted value) so a running session sees the new mode without waiting
+      // for a daemon restart.
+      await refreshSnapshotIfBindEnforce(setting.name);
       process.stdout.write(renderSettingSaved(setting, checked.value, filePath, detectPalette()));
     });
 
@@ -472,6 +527,9 @@ export function buildProgram(): Command {
       } catch (err) {
         fail(err instanceof Error ? err.message : String(err));
       }
+      // Unsetting CCTL_BIND_ENFORCE returns the guard to its default mode — rewrite the snapshot so
+      // that takes effect immediately (see the `set` path).
+      await refreshSnapshotIfBindEnforce(setting.name);
       process.stdout.write(renderSettingForgotten(setting, filePath, removed, detectPalette()));
     });
 
@@ -491,7 +549,21 @@ export function buildProgram(): Command {
     .command('doctor')
     .description('check the local environment')
     .action(async () => {
-      const checks = await runDoctor(defaultPaths());
+      const paths = defaultPaths();
+      const engine = buildEngine(paths);
+      const checks = await runDoctor(paths);
+      // Folder-bound-account checks: slot invariants, guard snapshot freshness, guard hook presence,
+      // and CLI/daemon build skew — appended so the base environment report stays unchanged.
+      const groups = await engine.listGroups();
+      const report = await readSettingsReport(daemonSettingsPath());
+      const heartbeat = await readHeartbeat(daemonHeartbeatPath());
+      const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
+      checks.push(
+        await checkSlots(engine),
+        await checkGuardSnapshot(engine),
+        checkGuardHook(paths, groups.length > 0),
+        checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
+      );
       process.stdout.write(renderDoctor(checks, detectPalette()) + '\n');
       const { passed, failed } = summarize(checks);
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);
@@ -1378,7 +1450,12 @@ function buildAccountCommands(program: Command): void {
       await healAccounts(engine);
       await engine.backfillAccountMetadata();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
-      process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
+      const palette = detectPalette();
+      process.stdout.write(
+        renderAccountsTable(list, activeId, palette) +
+          (await renderBindingsAppendix(engine, palette)) +
+          '\n',
+      );
     });
 
   accounts
@@ -1397,9 +1474,17 @@ function buildAccountCommands(program: Command): void {
         const account = await buildEngine().captureCurrentLogin(label);
         process.stdout.write(`Added ${account.label} (${account.id}) and set it active.\n`);
       } catch (err) {
-        // A refused duplicate (label or login already stored) is the vault's own message;
-        // anything else is the capture finding no login to store.
+        // A refused duplicate (label or login already stored) is the vault's own message.
         if (err instanceof VaultError) fail(err.message);
+        // Run inside a group profile, capture reads a folder-bound account's live seat — never a
+        // fresh login to store. Surface the engine's own guidance instead of the no-login message.
+        if (err instanceof SwitchEngineError && err.code === 'capture_in_profile') {
+          fail(
+            `${err.message}. Onboard a new account from a normal (non-folder-bound) shell, ` +
+              `or use: cctl accounts add <label> --fresh.`,
+          );
+        }
+        // Anything else is the capture finding no login to store.
         fail('no live login to capture. Run `claude` and log in first, then retry.');
       }
     });

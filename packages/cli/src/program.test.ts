@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   RefreshError,
   VaultError,
+  type ActivateResult,
   type DedupeReport,
   type StoredAccount,
 } from '@claude-control/switch-engine';
@@ -25,8 +26,27 @@ const engine = vi.hoisted(() => ({
     Promise.reject(new Error(`captureCurrentLogin(${label}) not stubbed`)),
   ),
   listAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
+  // The folder-bound registry view: defaults to the shared pool (set below to delegate to
+  // listAccounts) so switch/where/accounts tests that stub listAccounts drive it too.
+  listAllAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
+  listGroups: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
+  liveSlots: vi.fn((): Promise<Map<string, string | null>> => Promise.resolve(new Map())),
+  getGroup: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
+  getGroupsGeneration: vi.fn((): Promise<number> => Promise.resolve(0)),
+  readSnapshot: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
+  checkSlots: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
+  refreshSnapshot: vi.fn((): Promise<void> => Promise.resolve()),
+  bindFolder: vi.fn((f: string): Promise<never> =>
+    Promise.reject(new Error(`bindFolder(${f}) not stubbed`)),
+  ),
+  unbindFolder: vi.fn((f: string): Promise<never> =>
+    Promise.reject(new Error(`unbindFolder(${f}) not stubbed`)),
+  ),
+  ensureGroupLive: vi.fn((): Promise<never> =>
+    Promise.reject(new Error('ensureGroupLive not stubbed')),
+  ),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
-  activate: vi.fn((id: string): Promise<never> =>
+  activate: vi.fn((id: string): Promise<ActivateResult> =>
     Promise.reject(new Error(`activate(${id}) not stubbed`)),
   ),
   setAutoSwitchExcluded: vi.fn(() => Promise.resolve()),
@@ -34,6 +54,9 @@ const engine = vi.hoisted(() => ({
     Promise.reject(new Error(`renameAccount(${id}, ${label}) not stubbed`)),
   ),
 }));
+// `cctl switch` resolves across the whole registry; keep the mock's whole-registry view in sync with
+// whatever a test stubbed on listAccounts (the shared pool) so the existing switch tests still drive it.
+engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
 vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
   buildEngine: () => engine,
@@ -872,5 +895,92 @@ describe('color on a terminal', () => {
     const r = await onTerminal(process.stderr, () => runCli(['settings', 'unset']));
     expect(r.exited).toBe(true);
     expect(r.err).toBe(`${ESC}[31merror: missing required argument 'name'${ESC}[0m\n`);
+  });
+});
+
+describe('folder-bound account commands', () => {
+  const acct = (over: Partial<StoredAccount> = {}): StoredAccount => ({
+    id: 'a-1',
+    label: 'work@me.com',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    ...over,
+  });
+
+  it('shell-init powershell prints a claude wrapper function', async () => {
+    const r = await runCli(['shell-init', 'powershell']);
+    expect(r.out).toContain('function claude {');
+    expect(r.out).toContain('cctl claude @args');
+  });
+
+  it('shell-init rejects an unsupported shell', async () => {
+    const r = await runCli(['shell-init', 'cmd']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('unsupported shell');
+  });
+
+  it('bindings with nothing bound prints the empty-state message', async () => {
+    engine.listGroups.mockResolvedValueOnce([]);
+    engine.liveSlots.mockResolvedValueOnce(new Map());
+    engine.readSnapshot.mockResolvedValueOnce(undefined);
+    engine.getGroupsGeneration.mockResolvedValueOnce(0);
+    const r = await runCli(['bindings']);
+    expect(r.out).toContain('No folder-bound accounts');
+  });
+
+  it('where on an unbound folder explains the global account', async () => {
+    engine.listGroups.mockResolvedValue([]);
+    engine.liveSlots.mockResolvedValue(new Map());
+    const r = await runCli(['where', '.']);
+    expect(r.out).toContain('global (shared) account');
+  });
+
+  it('bind surfaces an engine refusal as a single error line', async () => {
+    engine.listAccounts.mockResolvedValue([acct()]);
+    engine.bindFolder.mockRejectedValueOnce(
+      new RefreshError(
+        'already bound to something else; unbind it first',
+        'folder_bound_elsewhere',
+      ),
+    );
+    const r = await runCli(['bind', '.', 'work@me.com']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('already bound to something else');
+  });
+
+  it('switch of a folder-bound member names its folder group', async () => {
+    const member = acct({ id: 'm-1', label: 'client@me.com' });
+    engine.listAccounts.mockResolvedValue([member]);
+    engine.activate.mockResolvedValueOnce({
+      ok: true,
+      activeAccountId: 'm-1',
+      wroteCredentials: true,
+      refreshed: false,
+      adoptedPreviousRotation: false,
+    });
+    engine.listGroups.mockResolvedValue([
+      {
+        id: 'g1',
+        label: 'client',
+        members: [member],
+        activeId: 'm-1',
+        folders: ['C:\\repos\\client'],
+      },
+    ]);
+    const r = await runCli(['switch', 'client@me.com']);
+    expect(r.out).toContain('client@me.com');
+    expect(r.out).toContain('folder group');
+    expect(r.out).toContain('C:\\repos\\client');
+  });
+
+  it('accounts add inside a profile renders the capture-in-profile guidance', async () => {
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new RefreshError('cannot capture inside a folder profile', 'capture_in_profile'),
+    );
+    const r = await runCli(['accounts', 'add', 'newlabel']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('cannot capture inside a folder profile');
+    expect(r.err).toContain('--fresh');
   });
 });
