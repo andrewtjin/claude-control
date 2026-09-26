@@ -23,6 +23,7 @@ import type {
 import type { FolderBindingSnapshot } from './types.js';
 import type { Protector } from './dpapi.js';
 import { folderKey } from './folderPath.js';
+import { sanitizeTerminalText } from './terminalSafe.js';
 import {
   buildFolderBindingSnapshot,
   readFolderBindingSnapshot,
@@ -957,7 +958,10 @@ export class Vault {
    */
   async addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
     const st = await this.loadState();
-    const next = label.trim();
+    // Strip terminal-interpreted controls (ANSI escapes, newlines, bidi/format controls) before the
+    // label is stored — it is later rendered on the CLI, in Discord, and in the enforcement guard's
+    // decision text, and a label is the one field an operator types freely.
+    const next = sanitizeTerminalText(label).trim();
     if (next === '') throw new VaultError('a label cannot be empty');
     const allRows = allRowsOf(st);
     assertLabelFree(allRows, next, undefined);
@@ -1076,7 +1080,8 @@ export class Vault {
    * re-casing an account's own label ("Work" -> "work") is an ordinary rename.
    */
   async renameAccount(id: string, label: string): Promise<StoredAccount> {
-    const next = label.trim();
+    // Same stripping as addAccount: a rename is the other place a label is typed freely.
+    const next = sanitizeTerminalText(label).trim();
     if (next === '') throw new VaultError('a label cannot be empty');
     return this.patchAccount(id, (account, st) => {
       // Uniqueness is checked across the WHOLE registry — a name the resolver could confuse with a

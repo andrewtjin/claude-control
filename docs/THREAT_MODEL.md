@@ -197,6 +197,15 @@ running on the wrong account. It is **not** a security boundary:
   reason the channel `instructions` name credential handling and the cctl account verbs as
   things channel content may never authorise (risk 1).
 
+The guard's own **decision text is a sanitized surface**, on par with the CLI terminal and the
+Discord embeds above. Its `reason`/`systemMessage` interpolate a folder path and account labels
+— filesystem- and operator-controlled text that can carry ANSI escapes, newlines, or Unicode
+bidi/format controls — and Claude Code decodes that string and prints it (block) or hands it to
+the model (warn/override). The guard therefore strips the same control set the CLI does
+(`sanitizeTerminalText`, shared verbatim by embedding) before emitting, and bound folders reject
+those controls at canonicalization, so neither a crafted folder name nor a crafted label can
+forge a `[system]` directive or reorder what the operator reads.
+
 Two structural properties are load-bearing and must not regress:
 
 - **MCP servers are shared into profiles.** The `mcpServers` block is merged main → profile,

@@ -71,6 +71,20 @@ export function canonicalizeFolder(input: string, deps: CanonicalizeDeps): Canon
     if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
       return { ok: false, reason: 'path contains a control character' };
     }
+    // Unicode bidirectional/format controls (LRM/RLM, the embeddings/overrides U+202A-202E, the
+    // isolates U+2066-2069, and the BOM U+FEFF). A canonicalizer has no reason to accept them, and
+    // on a terminal a right-to-left override reorders a rendered path so the eye reads a different
+    // folder than the one matched. Rejecting keeps every bound folder's canonical key — and the
+    // guard snapshot built from it — plain left-to-right printable text.
+    if (
+      code === 0x200e ||
+      code === 0x200f ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069) ||
+      code === 0xfeff
+    ) {
+      return { ok: false, reason: 'path contains a bidirectional or format control character' };
+    }
   }
 
   // NFC up front so every later comparison and the emitted name are in one canonical form; NFD and

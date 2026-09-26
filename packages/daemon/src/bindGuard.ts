@@ -22,7 +22,10 @@
 
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { embeddableFolderPathSource } from '@claude-control/switch-engine';
+import {
+  embeddableFolderPathSource,
+  embeddableSanitizeSource,
+} from '@claude-control/switch-engine';
 
 /** Stable on-disk location of the guard script, beside `hook-forward.cjs` in the daemon data dir.
  *  Keeping the two colocated means one directory holds every generated hook script. */
@@ -77,6 +80,8 @@ const fs = require('fs');
 
 ${embeddableFolderPathSource()}
 
+${embeddableSanitizeSource()}
+
 // The non-secret folder-bindings snapshot, baked in at install time.
 const SNAPSHOT_PATH = ${JSON.stringify(opts.snapshotPath)};
 
@@ -90,16 +95,21 @@ function failOpen(reason) {
 }
 
 // Block the prompt with the given reason — unless warn mode, where the same text rides a
-// systemMessage and the prompt proceeds.
+// systemMessage and the prompt proceeds. The reason interpolates a folder path and account
+// labels, both operator/filesystem-controlled; it is sanitized here (the single output sink) so a
+// control char, ANSI escape, newline, or bidi/format control in either can never reach the
+// terminal or the model. JSON.stringify only escapes the wire JSON, not the string Claude Code
+// decodes and prints.
 function emitBlock(reason, enforce) {
   if (enforce === 'warn') return emitSystemMessage(reason);
-  process.stdout.write(JSON.stringify({ decision: 'block', reason: reason }));
+  process.stdout.write(JSON.stringify({ decision: 'block', reason: sanitizeTerminalText(reason) }));
   process.exit(0);
 }
 
-// Show a non-blocking message to the operator (warn mode, and the --override notice).
+// Show a non-blocking message to the operator (warn mode, and the --override notice). Sanitized at
+// this sink for the same reason as emitBlock.
 function emitSystemMessage(message) {
-  process.stdout.write(JSON.stringify({ systemMessage: message }));
+  process.stdout.write(JSON.stringify({ systemMessage: sanitizeTerminalText(message) }));
   process.exit(0);
 }
 
