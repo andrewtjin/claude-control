@@ -767,9 +767,7 @@ describe('decideAutoSwitch — candidate id restriction', () => {
     // A reserved account must never be chosen by the global decision even when it is the only
     // healthy spare — the global pool (here just the active shared account) excludes it.
     const accounts = [lowActive(), spare('reserved')];
-    expect(
-      decideAutoSwitch(accounts, NOW, {}, { candidateIds: new Set(['hot']) }),
-    ).toBeNull();
+    expect(decideAutoSwitch(accounts, NOW, {}, { candidateIds: new Set(['hot']) })).toBeNull();
   });
 
   it('an empty id set allows no target (do nothing)', () => {

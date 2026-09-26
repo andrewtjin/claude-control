@@ -798,11 +798,8 @@ describe('CCTL_BIND_ENFORCE resolution', () => {
     ).toBe('off');
     // Env shadows the file entirely.
     expect(
-      resolveDaemonConfig(
-        { CCTL_BIND_ENFORCE: 'warn' },
-        {},
-        { env: { CCTL_BIND_ENFORCE: 'off' } },
-      ).values.bindEnforce,
+      resolveDaemonConfig({ CCTL_BIND_ENFORCE: 'warn' }, {}, { env: { CCTL_BIND_ENFORCE: 'off' } })
+        .values.bindEnforce,
     ).toBe('warn');
   });
 
@@ -811,11 +808,12 @@ describe('CCTL_BIND_ENFORCE resolution', () => {
     const enforceRow = rows.find((r) => r.name === 'folder-binding enforcement');
     expect(enforceRow?.value).toBe('warn');
     expect(enforceRow?.source).toBe('env');
-    expect(rows.find((r) => r.name === 'folder-binding enforcement' && r.source === 'default')).toBe(
-      undefined,
-    );
-    expect(resolveDaemonConfig({}).rows.find((r) => r.name === 'folder-binding enforcement')?.value)
-      .toBe('block');
+    expect(
+      rows.find((r) => r.name === 'folder-binding enforcement' && r.source === 'default'),
+    ).toBe(undefined);
+    expect(
+      resolveDaemonConfig({}).rows.find((r) => r.name === 'folder-binding enforcement')?.value,
+    ).toBe('block');
   });
 });
 

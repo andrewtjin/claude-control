@@ -152,13 +152,7 @@ const RELAY_ENV_NAME = 'CCTL_RELAY_URL';
  *  reads with, so `cctl settings set` can only store what the daemon will honor — a value the
  *  daemon would silently treat as unset is the one typo the file exists to protect from. */
 export type SettingKind =
-  | 'bool'
-  | 'number'
-  | 'url'
-  | 'log-level'
-  | 'log-format'
-  | 'bind-enforce'
-  | 'path';
+  'bool' | 'number' | 'url' | 'log-level' | 'log-format' | 'bind-enforce' | 'path';
 
 export interface DaemonEnvSetting {
   /** The env var name — also the key inside config.json's `env` block. */
@@ -882,7 +876,7 @@ export function resolveDaemonConfig(
       value: bindEnforce,
       source: sourceOf('CCTL_BIND_ENFORCE', bindEnforceEnv !== undefined),
       detail:
-        "CCTL_BIND_ENFORCE (block: stop a session on the wrong account; warn: allow but flag; " +
+        'CCTL_BIND_ENFORCE (block: stop a session on the wrong account; warn: allow but flag; ' +
         'off: silent)',
     },
   ];

@@ -519,7 +519,9 @@ describe('spawn/session slot resolution helpers', () => {
   it('configDirForAccount returns the profile dir for a reserved member, undefined for shared', async () => {
     const h = await harness();
     const { A, C, group } = await setupGroup(h);
-    expect(await h.engine.configDirForAccount(A.id)).toBe(groupProfileDir(h.paths.vaultDir, group.id));
+    expect(await h.engine.configDirForAccount(A.id)).toBe(
+      groupProfileDir(h.paths.vaultDir, group.id),
+    );
     expect(await h.engine.configDirForAccount(C.id)).toBeUndefined();
   });
 
