@@ -527,6 +527,45 @@ item. Record the verdict **arch-scoped** (arm64 ≠ Intel — do not generalize 
 **Result:** not yet run — no Mac available. The fake-runner unit tests and the `macos-latest` CI
 leg (own `vault-key` item only) are NOT evidence for this gate.
 
+### 19. Folder-bound accounts — real accounts, real isolation ⏳ OPEN
+
+**State of the code:** the engine layer (the slot-aware switch engine, the two-file
+reservation fence, profile-dir materialization, `bindFolder`/`unbindFolder`, `checkSlots`/
+`repairSlots`) is unit-proven headless — including crash-safety by injected fault after every
+bind/unbind step. The wire, Discord and docs layer is additive and tested. But the whole point
+of the feature is that a **real** second account runs isolated in a bound folder, and nothing
+below has been exercised against real Anthropic logins, a real Claude Code binary, or the VS
+Code extension. Green tests are not a bound account.
+
+**Claim to verify (each needs a real run):**
+
+- **Two real accounts, isolated.** Bind a folder to a spare account, launch Claude Code there
+  with `cctl claude` (and via the installed `claude` wrapper from `cctl shell-init`), and
+  confirm the session runs on the bound account while a session in an unbound folder stays on
+  the global account — memories, skills, plugins and MCP servers visible in **both**.
+- **The guard blocks a real mismatch.** Start Claude Code in the bound folder on the shared
+  account (no wrapper) and confirm the `UserPromptSubmit` guard blocks the prompt with the
+  documented message; confirm `--override` and `bind-enforce warn`/`off` behave as documented;
+  confirm the guard fails open when the snapshot is absent.
+- **VS Code extension route.** With the `cctl where` snippet in a folder's
+  `.vscode/settings.json`, confirm the VS Code Claude Code extension launches on the bound
+  account (this is a different launch path from a terminal `claude` and must be confirmed
+  separately).
+- **Remote Control in a bound session.** Confirm a first-party `/rc`-style remote session
+  started in a bound folder stays on the bound account (Remote Control is account-bound; this
+  is exactly the interaction most likely to strand it — see the RC note in the repo memory).
+- **Rapid switching with no global hop.** Drive an in-set auto-switch / phone `/switch` between
+  a bound group's members repeatedly and confirm the global slot never changes and no reserved
+  account is ever left live in two slots (`cctl doctor`/`checkSlots` clean throughout), and
+  that a single-member group's exhaustion alerts rather than hops.
+
+**What no headless test can close:** that a real refresh-token rotation stays confined to its
+slot across a real switch, that the profile's shared junctions/hardlinks survive Claude Code's
+own writes over a real session's lifetime, and that the three real launch paths (terminal,
+wrapper, VS Code) all set `CLAUDE_CONFIG_DIR` the way the guard expects.
+
+**Result:** not yet run.
+
 ## Reminder
 
 The undocumented endpoints (2, 3, 15) and hook names (5) can change without notice. Parsing

@@ -59,6 +59,11 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   session to finish a turn — which never happens while you're away. Turn on
   `cctl channel enable` and it lands immediately instead, on a session nobody is
   watching. One consent prompt at setup, none afterwards.
+- **Bind a folder to an account.** `cctl bind <folder> <account>` ties a project (and
+  everything under it) to one account or a set — sessions started there run on that
+  account and never spend the one you keep for everything else, while memories, skills,
+  plugins and settings stay shared. A guard catches a session launched on the wrong
+  account before it runs. Windows and Linux; see `docs/CLI.md`.
 
 ## Local-only (no Discord)
 
