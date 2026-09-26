@@ -100,109 +100,140 @@ export async function refreshCredentials(
   const now = deps.now ?? Date.now;
   if (!doFetch) throw new RefreshError('no fetch implementation available', 'no_fetch');
 
-  // The CLI posts refresh as JSON and includes `client_id` and `scope` (it defaults scope to its
-  // login scope set). We send the credential's OWN scopes when known: a refresh may only narrow,
-  // never widen, the original grant (RFC 6749 §6), so echoing back the scopes the last token
-  // response reported is always accepted, whereas the CLI's default set could exceed a
-  // narrowly-granted legacy token and be rejected. Fall back to that default only when the stored
-  // credential never recorded its scopes.
-  const scope =
-    current.scopes && current.scopes.length > 0 ? current.scopes.join(' ') : OAUTH_REFRESH_SCOPES;
-  const body = JSON.stringify({
-    grant_type: 'refresh_token',
-    refresh_token: current.refreshToken,
-    client_id: deps.clientId ?? CLAUDE_CODE_CLIENT_ID,
-    scope,
-  });
+  // Perform one refresh POST with a given scope string and interpret the response. Factored out
+  // because the CLI's invalid_scope fallback (below) runs this a second time with a different
+  // scope set. `isScopeFallback` flips how a repeated invalid_scope is classified.
+  const attemptRefresh = async (scope: string, isScopeFallback: boolean): Promise<ClaudeOauth> => {
+    // The CLI posts refresh as JSON with `client_id` and `scope`. See refreshScope() for why the
+    // scope is not simply the stored set.
+    const body = JSON.stringify({
+      grant_type: 'refresh_token',
+      refresh_token: current.refreshToken,
+      client_id: deps.clientId ?? CLAUDE_CODE_CLIENT_ID,
+      scope,
+    });
 
-  let res: Awaited<ReturnType<FetchLike>>;
-  let attempts = 1;
-  let retried = false;
-  let statusVerdict: StatusVerdict | undefined;
-  try {
-    // Each attempt builds its own request (a fresh abort signal above all — a reused, already
-    // fired one would abort the retry the instant it started).
-    const outcome = await withOverloadRetry(
-      (ctx) =>
-        doFetch(deps.tokenEndpoint ?? DEFAULT_TOKEN_ENDPOINT, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            accept: 'application/json',
-            ...deps.extraHeaders,
-          },
-          body,
-          // A timeout rejects into this catch as a transient RefreshError, never a
-          // QuarantineError — and, because it is a throw rather than a status, it is never
-          // retried here: a hung endpoint is a different failure from an overloaded one.
-          // The loop's deadline rides along with it so no attempt can outlive the call's
-          // budget: this whole call runs inside the credential lock, and a lock held past its
-          // stale window is reclaimed mid-refresh by the next process that wants it. The
-          // per-request timeout stays as the bound for a caller that overrides the budget away.
-          signal: AbortSignal.any([AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS), ctx.signal]),
-        }),
-      // Everything here happens inside a lock hold that everything else queues behind, so the
-      // retries get the locked caller's tighter cap AND the whole call — first attempt and
-      // status probe included — is deadlined well inside the window a contender reclaims on.
-      {
-        budgetCapMs: LOCKED_OVERLOAD_BUDGET_CAP_MS,
-        callBudgetMs: LOCKED_CALL_BUDGET_MS,
-        ...deps.overload,
-      },
-    );
-    res = outcome.response;
-    attempts = outcome.retries + 1;
-    retried = outcome.retries > 0;
-    statusVerdict = outcome.verdict;
-  } catch (err) {
-    throw new RefreshError('network error during token refresh', 'network', { cause: err });
-  }
+    let res: Awaited<ReturnType<FetchLike>>;
+    let attempts = 1;
+    let retried = false;
+    let statusVerdict: StatusVerdict | undefined;
+    try {
+      // Each attempt builds its own request (a fresh abort signal above all — a reused, already
+      // fired one would abort the retry the instant it started).
+      const outcome = await withOverloadRetry(
+        (ctx) =>
+          doFetch(deps.tokenEndpoint ?? DEFAULT_TOKEN_ENDPOINT, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              accept: 'application/json',
+              ...deps.extraHeaders,
+            },
+            body,
+            // A timeout rejects into this catch as a transient RefreshError, never a
+            // QuarantineError — and, because it is a throw rather than a status, it is never
+            // retried here: a hung endpoint is a different failure from an overloaded one.
+            // The loop's deadline rides along with it so no attempt can outlive the call's
+            // budget: this whole call runs inside the credential lock, and a lock held past its
+            // stale window is reclaimed mid-refresh by the next process that wants it. The
+            // per-request timeout stays as the bound for a caller that overrides the budget away.
+            signal: AbortSignal.any([AbortSignal.timeout(DEFAULT_REFRESH_TIMEOUT_MS), ctx.signal]),
+          }),
+        // Everything here happens inside a lock hold that everything else queues behind, so the
+        // retries get the locked caller's tighter cap AND the whole call — first attempt and
+        // status probe included — is deadlined well inside the window a contender reclaims on.
+        {
+          budgetCapMs: LOCKED_OVERLOAD_BUDGET_CAP_MS,
+          callBudgetMs: LOCKED_CALL_BUDGET_MS,
+          ...deps.overload,
+        },
+      );
+      res = outcome.response;
+      attempts = outcome.retries + 1;
+      retried = outcome.retries > 0;
+      statusVerdict = outcome.verdict;
+    } catch (err) {
+      throw new RefreshError('network error during token refresh', 'network', { cause: err });
+    }
 
-  const raw = await res.text();
-  if (!res.ok) {
-    // A 400 mentioning invalid_grant is the permanent-death signal; everything else is transient.
-    //
-    // Unless we RETRIED to get here. The token exchange is not idempotent: the refresh token is
-    // single-use and rotates, so a 529 emitted after the service already accepted the request
-    // leaves the next identical attempt replaying a token that is legitimately spent. That
-    // invalid_grant describes our own retry, not a dead account, and quarantining on it would
-    // strand a healthy user behind a re-login card. Report it as transient instead and let the
-    // next refresh — a single attempt against a fresh read — establish the truth.
-    if (res.status === 400 && /invalid_grant/i.test(raw)) {
-      if (retried) {
+    const raw = await res.text();
+    if (!res.ok) {
+      // A 400 mentioning invalid_grant is the permanent-death signal; everything else is transient.
+      //
+      // Unless we RETRIED to get here. The token exchange is not idempotent: the refresh token is
+      // single-use and rotates, so a 529 emitted after the service already accepted the request
+      // leaves the next identical attempt replaying a token that is legitimately spent. That
+      // invalid_grant describes our own retry, not a dead account, and quarantining on it would
+      // strand a healthy user behind a re-login card. Report it as transient instead and let the
+      // next refresh — a single attempt against a fresh read — establish the truth.
+      if (res.status === 400 && /invalid_grant/i.test(raw)) {
+        if (retried) {
+          throw new RefreshError(
+            `refresh token rejected (invalid_grant) after ${attempts} attempts against an ` +
+              `overloaded endpoint; treating as transient because a retried refresh may have ` +
+              `replayed an already-rotated token`,
+            'invalid_grant_after_retry',
+          );
+        }
+        throw new QuarantineError(`refresh token rejected (invalid_grant): ${truncate(raw)}`);
+      }
+      // The endpoint refused the requested scope set. The CLI's own refresh retries once on this
+      // (its tengu_oauth_refresh_invalid_scope_fallback), so on the FIRST attempt we surface a
+      // distinct 'invalid_scope' code the outer fallback catches. After that fallback it is
+      // permanent: report it as a plain http_400 so callers back it off like any other bad request.
+      // invalid_scope is NEVER invalid_grant, so it never quarantines the account either way.
+      if (res.status === 400 && oauthErrorCode(raw) === 'invalid_scope') {
+        if (isScopeFallback) {
+          throw new RefreshError(`token endpoint returned 400: ${truncate(raw)}`, 'http_400');
+        }
         throw new RefreshError(
-          `refresh token rejected (invalid_grant) after ${attempts} attempts against an ` +
-            `overloaded endpoint; treating as transient because a retried refresh may have ` +
-            `replayed an already-rotated token`,
-          'invalid_grant_after_retry',
+          `refresh rejected (invalid_scope): ${truncate(raw)}`,
+          'invalid_scope',
         );
       }
-      throw new QuarantineError(`refresh token rejected (invalid_grant): ${truncate(raw)}`);
-    }
-    // Still overloaded after the whole budget. Keep the `http_<status>` code (callers branch on
-    // it to avoid punishing an account for a fleet-wide outage) but say so in words, and skip
-    // the response body: the useful fact is the outage, not whatever the load shedder wrote.
-    if (OVERLOAD_STATUSES.has(res.status)) {
+      // Still overloaded after the whole budget. Keep the `http_<status>` code (callers branch on
+      // it to avoid punishing an account for a fleet-wide outage) but say so in words, and skip
+      // the response body: the useful fact is the outage, not whatever the load shedder wrote.
+      if (OVERLOAD_STATUSES.has(res.status)) {
+        throw new RefreshError(
+          `token endpoint overloaded (${res.status}) after ${attempts} attempts; ` +
+            `status.claude.com: ${describeStatus(statusVerdict)}`,
+          `http_${res.status}`,
+        );
+      }
       throw new RefreshError(
-        `token endpoint overloaded (${res.status}) after ${attempts} attempts; ` +
-          `status.claude.com: ${describeStatus(statusVerdict)}`,
+        `token endpoint returned ${res.status}: ${truncate(raw)}`,
         `http_${res.status}`,
       );
     }
-    throw new RefreshError(
-      `token endpoint returned ${res.status}: ${truncate(raw)}`,
-      `http_${res.status}`,
-    );
-  }
 
-  let parsed: unknown;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new RefreshError('token endpoint returned non-JSON', 'bad_response', { cause: err });
+    }
+
+    return mapTokenResponse(current, parsed, now());
+  };
+
+  // Primary attempt uses the CLI's computed refresh scope (see refreshScope). On an invalid_scope
+  // rejection the CLI retries ONCE with the credential's own recorded scopes; we do the same, but
+  // only when there is a stored set to fall back to (an empty set has nothing to narrow toward and
+  // would just re-send the base default the primary attempt already tried).
   try {
-    parsed = JSON.parse(raw);
+    return await attemptRefresh(refreshScope(current.scopes), false);
   } catch (err) {
-    throw new RefreshError('token endpoint returned non-JSON', 'bad_response', { cause: err });
+    if (
+      err instanceof RefreshError &&
+      err.code === 'invalid_scope' &&
+      current.scopes &&
+      current.scopes.length > 0
+    ) {
+      return await attemptRefresh(current.scopes.join(' '), true);
+    }
+    throw err;
   }
-
-  return mapTokenResponse(current, parsed, now());
 }
 
 // ---------------------------------------------------------------------------
@@ -226,11 +257,56 @@ export const DEFAULT_REDIRECT_URI = 'https://platform.claude.com/oauth/code/call
 export const OAUTH_AUTHORIZE_SCOPES =
   'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins';
 
-/** The scope set the CLI sends by default on a token REFRESH — its login scopes minus the
- *  console-only `org:create_api_key`. Used only when a stored credential has no recorded scopes of
- *  its own to echo back (see {@link refreshCredentials}). */
-export const OAUTH_REFRESH_SCOPES =
-  'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins';
+/** The base scope set the CLI ALWAYS sends on a token REFRESH — its login scopes minus the
+ *  console-only `org:create_api_key`, which the CLI never puts on a refresh. This set is present on
+ *  every refresh regardless of what the stored credential recorded, so a refresh can never ratchet
+ *  the granted scopes down (matches the CLI's `s9e()`). */
+const OAUTH_REFRESH_BASE_SCOPES = [
+  'user:profile',
+  'user:inference',
+  'user:sessions:claude_code',
+  'user:mcp_servers',
+  'user:file_upload',
+  'user:plugins',
+] as const;
+
+/** The base refresh scope set as the space-joined string the CLI puts on the wire. */
+export const OAUTH_REFRESH_SCOPES = OAUTH_REFRESH_BASE_SCOPES.join(' ');
+
+/** The only scopes the CLI carries over from the stored credential onto a refresh, on top of the
+ *  always-present base set (its `n=[Lhn,Nhn]` project scopes). Anything else the credential holds
+ *  — notably `org:create_api_key` — is dropped from the refresh request. */
+const OAUTH_REFRESH_CARRIED_SCOPES = ['user:projects:read', 'user:projects:write'];
+
+/** Compute the scope string the CLI sends on a refresh: `$zr(stored) = dedupe([...s9e, ...stored ∩
+ *  {projects:read, projects:write}])`. The base login set is always included (no ratchet-down) and
+ *  `org:create_api_key` is never sent; only the two project scopes carry over from the stored
+ *  credential when it holds them. Order matches the CLI: base set first, then any carried scope. */
+function refreshScope(storedScopes: string[] | undefined): string {
+  const carried = (storedScopes ?? []).filter((s) => OAUTH_REFRESH_CARRIED_SCOPES.includes(s));
+  return [...new Set([...OAUTH_REFRESH_BASE_SCOPES, ...carried])].join(' ');
+}
+
+/** Extract the OAuth error code from a token-endpoint error body the way the CLI does (its `Ca`):
+ *  the `error` field is the code when it is a string, or its `.type` when it is an object. Returns
+ *  undefined for a non-JSON or shapeless body. Used to detect `invalid_scope` precisely rather than
+ *  by a loose substring match. */
+function oauthErrorCode(raw: string): string | undefined {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof data !== 'object' || data === null) return undefined;
+  const err = (data as Record<string, unknown>).error;
+  if (typeof err === 'string') return err;
+  if (typeof err === 'object' && err !== null) {
+    const type = (err as Record<string, unknown>).type;
+    return typeof type === 'string' ? type : undefined;
+  }
+  return undefined;
+}
 
 export interface ExchangeDeps extends RefreshDeps {
   /** Override the redirect_uri presented at authorize + exchange (both must match). */

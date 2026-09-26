@@ -3,6 +3,7 @@ import { refreshCredentials, OAUTH_REFRESH_SCOPES, type RefreshDeps } from './oa
 import { QuarantineError, RefreshError } from './errors.js';
 import {
   createStatusProbeCache,
+  isOverloadCode,
   LOCKED_CALL_BUDGET_MS,
   LOCKED_OVERLOAD_BUDGET_CAP_MS,
   OVERLOAD_MIN_ATTEMPT_MS,
@@ -110,7 +111,10 @@ describe('refreshCredentials', () => {
     });
   });
 
-  it('echoes the credential’s own recorded scopes on refresh (never widens the grant)', async () => {
+  it('always sends the full base refresh scope set — a refresh never ratchets scopes down', async () => {
+    // The CLI's refresh scope is $zr(stored) = dedupe([...s9e, ...stored ∩ project scopes]); the
+    // base login set is always present even when the stored credential recorded a narrower set, so
+    // a session keeps remote control, MCP connectors, file upload and plugins across a refresh.
     const fetch = fakeFetch(
       200,
       JSON.stringify({ access_token: 'a', refresh_token: 'b', expires_in: 60 }),
@@ -118,7 +122,40 @@ describe('refreshCredentials', () => {
     const scoped = { ...current, scopes: ['user:profile', 'user:inference'] };
     await refreshCredentials(scoped, { fetch });
     const [, init] = fetch.mock.calls[0] as [string, { body: string }];
-    expect((JSON.parse(init.body) as { scope: string }).scope).toBe('user:profile user:inference');
+    expect((JSON.parse(init.body) as { scope: string }).scope).toBe(OAUTH_REFRESH_SCOPES);
+  });
+
+  it('never sends org:create_api_key on a refresh, even when the credential holds it', async () => {
+    // org:create_api_key is a console-only authorize scope; the CLI's refresh drops it. Carrying it
+    // onto a refresh could exceed the grant and be rejected.
+    const fetch = fakeFetch(
+      200,
+      JSON.stringify({ access_token: 'a', refresh_token: 'b', expires_in: 60 }),
+    );
+    const scoped = { ...current, scopes: ['org:create_api_key', 'user:profile', 'user:inference'] };
+    await refreshCredentials(scoped, { fetch });
+    const [, init] = fetch.mock.calls[0] as [string, { body: string }];
+    const sent = (JSON.parse(init.body) as { scope: string }).scope.split(' ');
+    expect(sent).not.toContain('org:create_api_key');
+    expect((JSON.parse(init.body) as { scope: string }).scope).toBe(OAUTH_REFRESH_SCOPES);
+  });
+
+  it('carries the two project scopes from the stored credential onto the base set', async () => {
+    // The only scopes the CLI carries over from the stored credential are user:projects:read /
+    // user:projects:write (its `n=[Lhn,Nhn]`), appended after the base set and de-duplicated.
+    const fetch = fakeFetch(
+      200,
+      JSON.stringify({ access_token: 'a', refresh_token: 'b', expires_in: 60 }),
+    );
+    const scoped = {
+      ...current,
+      scopes: ['user:profile', 'user:projects:read', 'user:projects:write'],
+    };
+    await refreshCredentials(scoped, { fetch });
+    const [, init] = fetch.mock.calls[0] as [string, { body: string }];
+    expect((JSON.parse(init.body) as { scope: string }).scope).toBe(
+      `${OAUTH_REFRESH_SCOPES} user:projects:read user:projects:write`,
+    );
   });
 
   it('maps invalid_grant to a QuarantineError (permanent death)', async () => {
@@ -162,6 +199,68 @@ describe('refreshCredentials', () => {
     const fetch = fakeFetch(200, JSON.stringify({ access_token: 'new-access', expires_in: 60 }));
     const next = await refreshCredentials(current, { fetch, now: () => 0 });
     expect(next.refreshToken).toBe('old-refresh');
+  });
+
+  describe('invalid_scope fallback (mirrors the CLI)', () => {
+    const scoped = { ...current, scopes: ['user:profile', 'user:inference'] };
+
+    it('retries ONCE with the credential’s own stored scopes and succeeds', async () => {
+      // The primary attempt sends the base refresh set; a 400 invalid_scope triggers a single
+      // retry with the stored scopes (the CLI's tengu_oauth_refresh_invalid_scope_fallback).
+      const fetch = scriptedFetch([
+        [400, JSON.stringify({ error: 'invalid_scope' })],
+        [200, TOKENS],
+      ]);
+      const next = await refreshCredentials(scoped, depsFor(fetch, 'none'));
+      expect(next.accessToken).toBe('new-access');
+      expect(fetch).toHaveBeenCalledTimes(2);
+      // First attempt: base set. Retry: exactly the credential's stored scopes, nothing widened.
+      const first = JSON.parse(
+        (fetch.mock.calls[0] as unknown as [string, { body: string }])[1].body,
+      ) as { scope: string };
+      const retry = JSON.parse(
+        (fetch.mock.calls[1] as unknown as [string, { body: string }])[1].body,
+      ) as { scope: string };
+      expect(first.scope).toBe(OAUTH_REFRESH_SCOPES);
+      expect(retry.scope).toBe('user:profile user:inference');
+    });
+
+    it('detects invalid_scope in the object error shape too (error.type)', async () => {
+      const fetch = scriptedFetch([
+        [400, JSON.stringify({ error: { type: 'invalid_scope' } })],
+        [200, TOKENS],
+      ]);
+      const next = await refreshCredentials(scoped, depsFor(fetch, 'none'));
+      expect(next.accessToken).toBe('new-access');
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('classifies a repeated invalid_scope after the retry as a permanent http_400 (never quarantine)', async () => {
+      // A permanent 400 must NOT loop and must NOT quarantine: invalid_scope is never invalid_grant.
+      // Callers key retry/backoff off the code — pollTokenGetter, usagePoller and accountProbe all
+      // treat only isOverloadCode(...) failures as blameless; http_400 is not one, so they count it
+      // as a real failure and grow their exponential backoff (capped), rather than retrying forever
+      // or holding the account blind. refreshAndPersist only quarantines a QuarantineError, so a
+      // http_400 leaves the vault untouched.
+      const fetch = scriptedFetch([[400, JSON.stringify({ error: 'invalid_scope' })]]);
+      const err = await refreshCredentials(scoped, depsFor(fetch, 'none')).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(RefreshError);
+      expect(err).not.toBeInstanceOf(QuarantineError);
+      expect((err as RefreshError).code).toBe('http_400');
+      expect(isOverloadCode((err as RefreshError).code)).toBe(false);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry when the credential has no stored scopes to fall back to', async () => {
+      // `current` records no scopes, so the retry would only re-send the base default already tried.
+      const fetch = scriptedFetch([[400, JSON.stringify({ error: 'invalid_scope' })]]);
+      const err = await refreshCredentials(current, depsFor(fetch, 'none')).catch(
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(RefreshError);
+      expect(err).not.toBeInstanceOf(QuarantineError);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('when the token endpoint is overloaded', () => {
