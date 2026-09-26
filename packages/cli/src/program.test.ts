@@ -911,7 +911,9 @@ describe('folder-bound account commands', () => {
   it('shell-init powershell prints a claude wrapper function', async () => {
     const r = await runCli(['shell-init', 'powershell']);
     expect(r.out).toContain('function claude {');
-    expect(r.out).toContain('cctl claude @args');
+    // Forwards all args whether it invokes node directly (node-direct form) or the cctl shim
+    // (fallback form); both end the body with `claude @args`.
+    expect(r.out).toContain('claude @args');
   });
 
   it('shell-init rejects an unsupported shell', async () => {

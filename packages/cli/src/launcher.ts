@@ -5,10 +5,18 @@
 // Why no shell (spawn shell:false, an argv array): a session's arguments are operator-supplied and
 // routinely contain characters cmd.exe and POSIX shells treat specially (spaces, quotes, & | ^,
 // non-ASCII). Going through a shell would require quoting them correctly for TWO different shells
-// and still leave an injection surface; passing an argv array to the real binary passes every
-// argument through verbatim, exactly once. That is also why a Windows `.cmd`/`.bat`/`.ps1` shim is
-// never spawned as-is: those only run under a shell. An npm/pnpm `.cmd` shim is a thin wrapper
-// around `node <cli.js>`, so it is UNWRAPPED to that node invocation; anything else is refused.
+// and still leave an injection surface; from this launcher's own spawn, passing an argv array to the
+// real binary passes every argument through verbatim, exactly once. That is also why a Windows
+// `.cmd`/`.bat`/`.ps1` shim is never spawned as-is: those only run under a shell. An npm/pnpm `.cmd`
+// shim is a thin wrapper around `node <cli.js>`, so it is UNWRAPPED to that node invocation; anything
+// else is refused.
+//
+// NOTE ON THE ENTRY HOP: this verbatim guarantee covers the spawn below, not how the operator's
+// shell reaches cctl in the first place. When cctl is installed via npm, `cctl` on PATH is a
+// generated `cctl.cmd` shim that forwards its arguments through cmd.exe — so a PowerShell caller
+// hits a cmd.exe layer BEFORE this file runs, and `%*` re-expansion there would corrupt the very
+// characters above. That entry hop is closed by the PowerShell shell-init wrapper (see
+// shellInit.ts), which invokes the node entry directly and skips the .cmd shim.
 //
 // The functions here are split so the decisions are unit-testable in isolation from the spawn:
 // findClaudeOnPath (PATH lookup), resolveLaunchTarget (how to invoke a candidate), buildLaunchEnv

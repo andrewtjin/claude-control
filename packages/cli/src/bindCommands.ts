@@ -38,7 +38,12 @@ import {
   spawnClaude,
   type LaunchSlot,
 } from './launcher.js';
-import { isSupportedShell, renderShellInit, SUPPORTED_SHELLS } from './shellInit.js';
+import {
+  isSupportedShell,
+  renderShellInit,
+  resolveShellInitTarget,
+  SUPPORTED_SHELLS,
+} from './shellInit.js';
 
 type Engine = ReturnType<typeof buildEngine>;
 
@@ -290,7 +295,10 @@ export function buildBindCommands(program: Command): void {
       if (!isSupportedShell(shell)) {
         fail(`unsupported shell "${shell}". Supported: ${SUPPORTED_SHELLS.join(', ')}.`);
       }
-      process.stdout.write(renderShellInit(shell));
+      // Resolve the running node + cctl entry so the PowerShell wrapper can bypass the npm .cmd shim
+      // (see shellInit.ts): otherwise cmd.exe would re-expand `%*` and corrupt session arguments.
+      const target = resolveShellInitTarget({ execPath: process.execPath, argv: process.argv });
+      process.stdout.write(renderShellInit(shell, target));
     });
 
   // -------------------------------------------------------------------------
