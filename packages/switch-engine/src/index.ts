@@ -119,3 +119,31 @@ export {
 // other packages replace a state file the way this one already does, instead of hand-rolling a
 // plain writeFile that a concurrent reader can catch half-written.
 export { atomicWriteFile } from './fsutil.js';
+// Profile directory materialization: builds/re-verifies a group's config dir against main.
+export {
+  ensureGroupProfile,
+  planGroupProfile,
+  computeClaudeJsonMerge,
+  createNodeProfileFs,
+  defaultProfilesRoot,
+  groupProfileDir,
+  SHARED_PROFILE_DIRS,
+  PROFILE_LOCAL_DIRS,
+  SHARED_PROFILE_FILES,
+  CLAUDE_JSON_MERGE_ALLOWLIST,
+  type ProfileFs,
+  type ProfilePlatform,
+  type EntryKind,
+  type FileIdentity,
+  type ProfilePlan,
+  type DirPlan,
+  type FilePlan,
+  type ClaudeJsonPlan,
+  type DirAction,
+  type FileAction,
+  type ClaudeJsonAction,
+  type RepairWinner,
+  type ProfileReport,
+  type ProfileSkip,
+  type EnsureProfileOptions,
+} from './profile.js';
