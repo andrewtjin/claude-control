@@ -745,3 +745,60 @@ describe('decideAutoSwitch — the Fable weekly cap (weekly_scoped)', () => {
     expect(decision?.reason).toContain('in 1d');
   });
 });
+
+describe('decideAutoSwitch — candidate id restriction', () => {
+  // The active account low-triggers; two spares are eligible. The restriction decides which
+  // (if any) may be the target — the slot's own pool, never the whole fleet.
+  function spare(id: string): AccountUsageInput {
+    return acct(id, {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
+  }
+
+  it('chooses only from the id set when one is given', () => {
+    const accounts = [lowActive(), spare('member'), spare('outsider')];
+    // Unrestricted, the sort tie-breaks on label: 'member' < 'outsider'.
+    expect(decideAutoSwitch(accounts, NOW)?.targetAccountId).toBe('member');
+    // Restricted to the outsider, it is the only allowed target.
+    expect(
+      decideAutoSwitch(accounts, NOW, {}, { candidateIds: new Set(['outsider']) })?.targetAccountId,
+    ).toBe('outsider');
+  });
+
+  it('does nothing when the only eligible candidates are outside the id set', () => {
+    // A reserved account must never be chosen by the global decision even when it is the only
+    // healthy spare — the global pool (here just the active shared account) excludes it.
+    const accounts = [lowActive(), spare('reserved')];
+    expect(
+      decideAutoSwitch(accounts, NOW, {}, { candidateIds: new Set(['hot']) }),
+    ).toBeNull();
+  });
+
+  it('an empty id set allows no target (do nothing)', () => {
+    const accounts = [lowActive(), spare('a'), spare('b')];
+    expect(decideAutoSwitch(accounts, NOW, {}, { candidateIds: new Set() })).toBeNull();
+  });
+
+  it('never restricts the account being hopped away from', () => {
+    // The active account is not in the set, but the slot can still LEAVE it: the restriction
+    // gates targets only. A two-member group hops inside itself even though the wider fleet
+    // holds healthier accounts.
+    const active = acct('m1', { active: true }, [
+      { kind: 'session', percent: 96, resetsAt: NOW + 2 * H },
+      { kind: 'weekly_all', percent: 50, resetsAt: NOW + 48 * H },
+    ]);
+    const member = spare('m2');
+    const foreign = spare('global-healthy');
+    const decision = decideAutoSwitch(
+      [active, member, foreign],
+      NOW,
+      {},
+      { candidateIds: new Set(['m1', 'm2']) },
+    );
+    expect(decision?.targetAccountId).toBe('m2');
+  });
+
+  it('undefined id set behaves exactly as before (no restriction)', () => {
+    const accounts = [lowActive(), spare('a')];
+    expect(decideAutoSwitch(accounts, NOW, {}, {})?.targetAccountId).toBe('a');
+    expect(decideAutoSwitch(accounts, NOW)?.targetAccountId).toBe('a');
+  });
+});

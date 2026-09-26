@@ -13,6 +13,7 @@ export {
   DEFAULT_GREEDY_PREDICTED_RESET_MARGIN_MS,
   type AutoSwitchDecision,
   type AutoSwitchPolicy,
+  type DecideAutoSwitchOptions,
 } from './autoswitch.js';
 export { formatTokens, humanizeDaysUntil, humanizeDuration, roundPct } from './format.js';
 export {
