@@ -131,6 +131,20 @@ export function groupSlotId(groupId: string): SlotId {
   return `group:${groupId}`;
 }
 
+/** The live token read from the slot an account is currently live in (see
+ *  {@link SwitchEngine.liveSlotToken}). Carries no refresh token — the daemon's poller uses the
+ *  access token as-is and never refreshes a slot-live account. */
+export interface SlotLiveToken {
+  /** The slot the account is live in. */
+  slot: SlotId;
+  accessToken: string;
+  /** Epoch ms the access token expires. */
+  expiresAt: number;
+  /** The identity block's account uuid for that slot, when readable — used for the local
+   *  bundle-vs-registry identity check before the token is handed to the poller. */
+  accountUuid?: string;
+}
+
 /**
  * A set of accounts reserved to a set of folders, persisted in `groups.json` beside the registry.
  *

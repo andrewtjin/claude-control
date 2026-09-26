@@ -480,3 +480,37 @@ describe('liveSlots', () => {
     expect(live.get(slotId)).toBe(A.id);
   });
 });
+
+describe('liveSlotToken', () => {
+  it('reads the live token from a group member is live in, not the vault bundle', async () => {
+    const h = await harness();
+    const { A, group, slotId } = await setupGroup(h);
+    await h.engine.activate(A.id); // A live in its group slot
+
+    const tok = await h.engine.liveSlotToken(A.id);
+    expect(tok?.slot).toBe(slotId);
+    expect(tok?.accessToken).toBe('A');
+    expect(tok?.accountUuid).toBe('uuid-A');
+    // Even after the group profile's live token rotates (a running session refreshes it), the
+    // getter reads the fresh slot copy, never the stale vault bundle.
+    await groupStore(h.paths, group.id).writeLiveCredentials(oauth('A2', NOW + 9 * HOUR));
+    expect((await h.engine.liveSlotToken(A.id))?.accessToken).toBe('A2');
+  });
+
+  it('reads the global slot token for a globally live account', async () => {
+    const h = await harness();
+    const { C } = await setupGroup(h);
+    await h.engine.activate(C.id);
+    const tok = await h.engine.liveSlotToken(C.id);
+    expect(tok?.slot).toBe('global');
+    expect(tok?.accessToken).toBe('C');
+  });
+
+  it('returns undefined for an account not live in any slot', async () => {
+    const h = await harness();
+    const { A, B } = await setupGroup(h);
+    await h.engine.activate(A.id);
+    // B is a member but not the live one.
+    expect(await h.engine.liveSlotToken(B.id)).toBeUndefined();
+  });
+});

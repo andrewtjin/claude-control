@@ -65,6 +65,7 @@ import type {
   RepairResult,
   RunningSession,
   SlotId,
+  SlotLiveToken,
   SlotViolation,
   StoredAccount,
   StoredGroup,
@@ -704,6 +705,49 @@ export class SwitchEngine {
       out.set(slotId, await this.getActiveId(slotId));
     }
     return out;
+  }
+
+  /** Every folder-bound group, full rows. A read-only pass-through of the vault's group side, so the
+   *  daemon can run its per-slot poll (a group's members, its live member, its label/folders) without
+   *  reaching into the vault behind the engine. */
+  listGroups(): Promise<StoredGroup[]> {
+    return this.vault.listGroups();
+  }
+
+  /** The unified account listing — shared rows plus reserved members, each tagged with its `groupId`.
+   *  Read-only pass-through of the vault (see {@link Vault.listAllAccounts}); the daemon needs the full
+   *  fleet (not just the shared pool `listAccounts` returns) to poll and attribute reserved members. */
+  listAllAccounts(): Promise<AccountView[]> {
+    return this.vault.listAllAccounts();
+  }
+
+  /**
+   * The LIVE token from the slot an account is currently live in, or `undefined` when the account is
+   * not live in any slot. The live `.credentials.json` is the freshest copy of a slot-live account's
+   * token — a running session rotates it ahead of the vault bundle — and it must never be
+   * network-refreshed (its single-use refresh token belongs to that session). The daemon's poll-token
+   * getter uses this so a group-live member is polled with its own fresh token instead of falling back
+   * to the global tier-0 cache, which only ever describes the global account.
+   */
+  async liveSlotToken(accountId: string): Promise<SlotLiveToken | undefined> {
+    let slotId: SlotId | undefined;
+    for (const [sid, live] of await this.liveSlots()) {
+      if (live === accountId) {
+        slotId = sid;
+        break;
+      }
+    }
+    if (slotId === undefined) return undefined;
+    const rt = this.slotRuntime(slotId);
+    const creds = await rt.credStore.readLiveCredentials().catch(() => undefined);
+    if (!creds) return undefined;
+    const oauth = await rt.credStore.readOauthAccount().catch(() => undefined);
+    return {
+      slot: slotId,
+      accessToken: creds.accessToken,
+      expiresAt: creds.expiresAt,
+      ...(oauth?.accountUuid !== undefined ? { accountUuid: oauth.accountUuid } : {}),
+    };
   }
 
   // ---- group lifecycle (bind / unbind / ensure-live) ----
