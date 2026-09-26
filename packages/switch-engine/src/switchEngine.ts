@@ -1069,7 +1069,10 @@ export class SwitchEngine {
     const rt = this.slotRuntime(slotId);
     // The profile must exist before any live read/write; idempotent, so it costs nothing steady-state.
     if (rt.profileDir !== undefined) {
-      ensureGroupProfile(rt.profileDir, this.paths.claudeDir, { logger: this.log });
+      ensureGroupProfile(rt.profileDir, this.paths.claudeDir, {
+        logger: this.log,
+        mainClaudeJsonPath: this.paths.claudeJsonPath,
+      });
     }
 
     const liveMember = await this.getActiveId(slotId);
@@ -1282,7 +1285,12 @@ export class SwitchEngine {
     const rt = this.slotRuntime(groupSlotId(group.id));
     if (rt.profileDir === undefined) return [];
     try {
-      const plan = planGroupProfile(rt.profileDir, this.paths.claudeDir, createNodeProfileFs());
+      const plan = planGroupProfile(
+        rt.profileDir,
+        this.paths.claudeDir,
+        createNodeProfileFs(),
+        this.paths.claudeJsonPath,
+      );
       const broken = plan.files.filter((f) => f.action === 'repair').map((f) => f.name);
       if (broken.length === 0) return [];
       return [
@@ -2111,7 +2119,10 @@ export class SwitchEngine {
       // A group slot must exist before its live files are written. Idempotent: a no-op when the
       // profile is already materialised, so running it on every activation costs nothing steady-state.
       if (group !== undefined && rt.profileDir !== undefined) {
-        ensureGroupProfile(rt.profileDir, this.paths.claudeDir, { logger: this.log });
+        ensureGroupProfile(rt.profileDir, this.paths.claudeDir, {
+          logger: this.log,
+          mainClaudeJsonPath: this.paths.claudeJsonPath,
+        });
       }
       return await this.activateInSlot(rt, group, targetId, options);
     } finally {
