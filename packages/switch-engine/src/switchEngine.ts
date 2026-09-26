@@ -741,20 +741,6 @@ export class SwitchEngine {
     return out;
   }
 
-  /** Every folder-bound group, full rows. A read-only pass-through of the vault's group side, so the
-   *  daemon can run its per-slot poll (a group's members, its live member, its label/folders) without
-   *  reaching into the vault behind the engine. */
-  listGroups(): Promise<StoredGroup[]> {
-    return this.vault.listGroups();
-  }
-
-  /** The unified account listing — shared rows plus reserved members, each tagged with its `groupId`.
-   *  Read-only pass-through of the vault (see {@link Vault.listAllAccounts}); the daemon needs the full
-   *  fleet (not just the shared pool `listAccounts` returns) to poll and attribute reserved members. */
-  listAllAccounts(): Promise<AccountView[]> {
-    return this.vault.listAllAccounts();
-  }
-
   /**
    * The LIVE token from the slot an account is currently live in, or `undefined` when the account is
    * not live in any slot. The live `.credentials.json` is the freshest copy of a slot-live account's
