@@ -1270,7 +1270,10 @@ async function addFreshAccount(label: string): Promise<void> {
  */
 async function reloginAccount(ref: string): Promise<void> {
   const engine = buildEngine();
-  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  // Resolve against the WHOLE fleet, reserved (folder-bound) members included: a re-login must reach
+  // exactly the accounts binding reserves, whose ids/labels live in the group registry, not the
+  // shared-only account list. The engine then heals the slot the account is actually live in.
+  const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
   if (!resolved.ok) fail(resolved.message);
   const account = resolved.account;
 
@@ -1339,7 +1342,10 @@ async function reloginAccount(ref: string): Promise<void> {
  */
 async function reauthAccount(ref: string): Promise<void> {
   const engine = buildEngine();
-  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  // Resolve against the WHOLE fleet, reserved (folder-bound) members included: the headless reauth
+  // path must reach exactly the accounts binding reserves, whose ids/labels live in the group
+  // registry, not the shared-only account list. The engine then heals the slot the account is live in.
+  const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
   if (!resolved.ok) fail(resolved.message);
   const account = resolved.account;
 

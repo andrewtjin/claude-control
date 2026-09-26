@@ -534,6 +534,57 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
     expect(slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'))).toHaveLength(1);
   });
 
+  it('alerts when the only spare member has headroom but is auto-switch-excluded', async () => {
+    // The group's live member is out of quota; its one spare has headroom but the operator excluded
+    // it from auto-switch. Auto-switch therefore cannot hop, so the exhaustion is terminal and must
+    // be alerted. The alert's hop check must be the exact complement of the executor's candidate
+    // gate — a plain "has headroom" test would see the spare and wrongly suppress the alert.
+    const live = view('m1', 'work@corp', 'g1');
+    const excludedSpare: AccountView = {
+      ...view('m2', 'work@backup', 'g1'),
+      autoSwitchExcluded: true,
+    };
+    const shared = view('s1', 'Shared');
+    const group: StoredGroup = {
+      id: 'g1',
+      label: 'work@corp',
+      members: [live, excludedSpare],
+      activeId: 'm1',
+      folders: ['C:/ai-research'],
+      createdAtMs: 0,
+      updatedAtMs: 0,
+    };
+    const liveSlots = new Map<SlotId, string | null>([
+      ['global', 's1'],
+      [groupSlotId('g1'), 'm1'],
+    ]);
+    const controls = fakeEngine({
+      accounts: [shared, live, excludedSpare],
+      groups: [group],
+      live: liveSlots,
+    });
+    // m1 (live) fully spent; m2 (excluded spare) has ample headroom but is not an eligible target.
+    const bodyFor = (accountId: string): unknown =>
+      accountId === 'm1'
+        ? { limits: [{ kind: 'weekly_all', percent: 100, resets_at: iso(NOW + 3 * HOUR_MS) }] }
+        : { limits: [{ kind: 'weekly_all', percent: 5, resets_at: iso(NOW + DAY_MS) }] };
+    const rig = await createRig({
+      controls,
+      bodyFor,
+      withAutoSwitcher: true,
+      slotAlertWindowMs: 60 * 60_000,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => slotAlerts(rig.relay).some((a) => a.body.includes('out of quota')));
+
+    const exhaustion = slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'));
+    expect(exhaustion.length).toBeGreaterThanOrEqual(1);
+    expect(exhaustion[0]?.body).toContain('C:/ai-research account work@corp is out of quota');
+    // The excluded spare is never chosen as a hop target, so no activation happened.
+    expect(controls.activateCalls.map((c) => c.id)).not.toContain('m2');
+  });
+
   it('names every bound folder when a multi-folder group is exhausted', async () => {
     // A group can hold several folders; the alert joins them so the operator sees all stalled slots.
     const only = view('m1', 'work@corp', 'g1');
@@ -568,5 +619,58 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
 
     const exhaustion = slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'));
     expect(exhaustion[0]?.body).toContain('C:/ai-research, C:/experiments');
+  });
+});
+
+describe('daemon folder-bound slots — reauth resolves reserved members', () => {
+  // The phone /reauth path must reach a folder-bound member. Reserved members live in the group
+  // registry (listAllAccounts), not the shared-only account list (listAccounts) — resolving against
+  // the shared list alone would report "No account matches" for exactly the accounts binding reserves.
+  function reauthLink(relay: SteadyRelay, requestId: string): PayloadOf<'reauth.link'> | undefined {
+    const frame = relay.received.find(
+      (e) => e.type === 'reauth.link' && e.payload.requestId === requestId,
+    );
+    return frame?.type === 'reauth.link' ? frame.payload : undefined;
+  }
+
+  it('mints a link for a reserved member resolved by id and by label', async () => {
+    const member = view('m1', 'work@corp', 'g1');
+    const shared = view('s1', 'Shared');
+    const group: StoredGroup = {
+      id: 'g1',
+      label: 'work@corp',
+      members: [member],
+      activeId: 'm1',
+      folders: ['C:/ai-research'],
+      createdAtMs: 0,
+      updatedAtMs: 0,
+    };
+    const liveSlots = new Map<SlotId, string | null>([
+      ['global', 's1'],
+      [groupSlotId('g1'), 'm1'],
+    ]);
+    const controls = fakeEngine({ accounts: [shared, member], groups: [group], live: liveSlots });
+    // The reserved member is intentionally ABSENT from the shared-only list — this is the state that
+    // made the shared-only resolution fail; the whole-fleet list is what must be consulted instead.
+    expect((await controls.engine.listAccounts()).map((a) => a.id)).toEqual(['s1']);
+
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    await rig.start();
+
+    for (const [requestId, ref] of [
+      ['rq-id', 'm1'],
+      ['rq-label', 'work@corp'],
+    ] as const) {
+      rig.relay.push({
+        daemonId: 'd',
+        type: 'reauth.start',
+        payload: { requestId, accountRef: ref, idempotencyKey: `ik-${requestId}` },
+      });
+      await waitFor(() => reauthLink(rig.relay, requestId) !== undefined);
+      const link = reauthLink(rig.relay, requestId);
+      expect(link?.ok).toBe(true);
+      expect(link?.accountId).toBe('m1');
+      expect(link?.url).toBeTruthy();
+    }
   });
 });

@@ -151,9 +151,15 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
  * `accountId` stays an attribution tag rather than a credential selector, and a spawn whose
  * accountId was never activated is made LOUD through the daemon's logger instead of running
  * silently mis-attributed.
+ *
+ * `configDir` is ignored here for exactly that reason; `scrubInheritedConfigDir` is honored,
+ * though: it does not bind an account, it only drops an inherited CLAUDE_CONFIG_DIR that names a
+ * group profile so a global session is not silently redirected onto a group's account.
  */
-export function makeAgentSdkClientFactory(logger: Logger): () => AgentSdkClient {
-  return () =>
+export function makeAgentSdkClientFactory(
+  logger: Logger,
+): (configDir?: string, scrubInheritedConfigDir?: boolean) => AgentSdkClient {
+  return (_configDir?: string, scrubInheritedConfigDir?: boolean) =>
     createAgentSdkClient({
       onUnboundAccountId: (accountId) =>
         logger.warn(
@@ -161,6 +167,7 @@ export function makeAgentSdkClientFactory(logger: Logger): () => AgentSdkClient 
           'session accountId is not bound to a config dir; it runs under the globally ' +
             'active account - confirm the switch engine activated it before spawn',
         ),
+      ...(scrubInheritedConfigDir ? { scrubInheritedConfigDir: true } : {}),
     });
 }
 
