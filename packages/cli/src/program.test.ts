@@ -34,6 +34,14 @@ const engine = vi.hoisted(() => ({
   getGroup: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
   getGroupsGeneration: vi.fn((): Promise<number> => Promise.resolve(0)),
   readSnapshot: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
+  getGuardSnapshotFreshness: vi.fn(
+    (): Promise<{
+      present: boolean;
+      fresh: boolean;
+      enforce: 'block' | 'warn' | 'off';
+      generation: number | null;
+    }> => Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
+  ),
   checkSlots: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
   refreshSnapshot: vi.fn((): Promise<void> => Promise.resolve()),
   bindFolder: vi.fn((f: string): Promise<never> =>
@@ -925,8 +933,12 @@ describe('folder-bound account commands', () => {
   it('bindings with nothing bound prints the empty-state message', async () => {
     engine.listGroups.mockResolvedValueOnce([]);
     engine.liveSlots.mockResolvedValueOnce(new Map());
-    engine.readSnapshot.mockResolvedValueOnce(undefined);
-    engine.getGroupsGeneration.mockResolvedValueOnce(0);
+    engine.getGuardSnapshotFreshness.mockResolvedValueOnce({
+      present: false,
+      fresh: false,
+      enforce: 'block',
+      generation: null,
+    });
     const r = await runCli(['bindings']);
     expect(r.out).toContain('No folder-bound accounts');
   });

@@ -829,7 +829,7 @@ describe('renderBindingGroups', () => {
 describe('renderBindings', () => {
   it('shows a helpful message when nothing is bound', () => {
     const out = renderBindings(
-      { groups: [], footer: { snapshotGeneration: null, groupsGeneration: 0, enforce: 'block' } },
+      { groups: [], footer: { present: false, fresh: false, enforce: 'block' } },
       PLAIN_PALETTE,
     );
     expect(out).toContain('No folder-bound accounts');
@@ -847,21 +847,28 @@ describe('renderBindings', () => {
             noWorkingAccount: false,
           },
         ],
-        footer: { snapshotGeneration: 2, groupsGeneration: 5, enforce: 'warn' },
+        footer: { present: true, fresh: false, enforce: 'warn' },
       },
       PLAIN_PALETTE,
     );
     expect(out).toContain('enforcement: warn');
     expect(out).toContain('STALE');
-    expect(out).toContain('snapshot generation 2');
   });
 
   it('reports a fresh snapshot', () => {
     const out = renderBindingsFooter(
-      { snapshotGeneration: 4, groupsGeneration: 4, enforce: 'block' },
+      { present: true, fresh: true, enforce: 'block' },
       PLAIN_PALETTE,
     );
-    expect(out).toContain('fresh (generation 4)');
+    expect(out).toContain('fresh');
+  });
+
+  it('reports a missing snapshot', () => {
+    const out = renderBindingsFooter(
+      { present: false, fresh: false, enforce: 'block' },
+      PLAIN_PALETTE,
+    );
+    expect(out).toContain('missing');
   });
 });
 

@@ -515,13 +515,16 @@ export function renderBindingGroups(
   return blocks.join('\n\n');
 }
 
-/** The freshness + enforce footer for `cctl bindings`. The snapshot the guard reads is a copy of the
- *  groups file, stamped with the generation it was built from; if that lags the live groups
- *  generation, the guard is enforcing a stale view (a daemon restart or `cctl settings` rewrite
- *  refreshes it). */
+/** The freshness + enforce footer for `cctl bindings`. Freshness is judged by the guard-relevant
+ *  CONTENT of the snapshot the guard reads (bound folders, profile dirs, member labels, enforce), not
+ *  the groups generation — the generation also bumps on a routine group member switch the guard never
+ *  sees, which must not read as stale. A genuine STALE means a bound folder/profile/member/enforce
+ *  changed without the snapshot being rewritten (a bind/unbind or a daemon restart rewrites it). */
 export interface BindingsFooterView {
-  snapshotGeneration: number | null;
-  groupsGeneration: number;
+  /** Whether a guard snapshot exists at all. */
+  present: boolean;
+  /** Whether the snapshot's guard-relevant content matches the live registry. */
+  fresh: boolean;
   enforce: 'block' | 'warn' | 'off';
 }
 
@@ -531,16 +534,16 @@ export function renderBindingsFooter(
 ): string {
   const enforceLine = `enforcement: ${view.enforce}`;
   let freshness: string;
-  if (view.snapshotGeneration === null) {
+  if (!view.present) {
     freshness = palette.yellow(
       'guard snapshot: missing (the guard cannot enforce until the daemon writes it, or a bind does)',
     );
-  } else if (view.snapshotGeneration === view.groupsGeneration) {
-    freshness = `guard snapshot: fresh (generation ${view.groupsGeneration})`;
+  } else if (view.fresh) {
+    freshness = 'guard snapshot: fresh';
   } else {
     freshness = palette.yellow(
-      `guard snapshot: STALE (snapshot generation ${view.snapshotGeneration}, groups ` +
-        `${view.groupsGeneration}); restart the daemon or run a cctl settings change to refresh it`,
+      'guard snapshot: STALE (the guard is enforcing an out-of-date binding view); ' +
+        'run cctl bind/unbind again or restart the daemon to refresh it',
     );
   }
   return `${enforceLine}\n${freshness}`;

@@ -82,11 +82,11 @@ export function buildEngine(
   logSink: LogSink = process.stderr,
   env: NodeJS.ProcessEnv = process.env,
   // The folder-binding guard's enforcement mode, stamped into the snapshot the engine writes on
-  // every group mutation and on `refreshSnapshot`. The daemon resolves it from
-  // CCTL_BIND_ENFORCE (env > config file > default) and passes it here so the snapshot the guard
-  // reads reflects a live setting change; one-shot CLI callers omit it and take the engine's own
-  // `block` default.
-  bindEnforce?: BindEnforceMode,
+  // every group mutation and on `refreshSnapshot`. A one-shot CLI caller may pass a plain mode (or
+  // omit it and take the resolved default); the long-lived daemon passes a RESOLVER so each
+  // snapshot write re-reads the operator's current setting, and a live `cctl settings set
+  // bind-enforce <mode>` is not reverted by a daemon-side rewrite.
+  bindEnforce?: BindEnforceMode | (() => BindEnforceMode),
 ): SwitchEngine {
   const adapter: Logger = createLogger({ defaultLevel: 'warn', sink: logSink, env });
   // The switch-cadence guard defaults to 60s; operators can tune (or 0-disable) it via env.

@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { sandboxPaths, type Paths, type StoredGroup } from '@claude-control/switch-engine';
 import { BIND_GUARD_MARKER, bindGuardPath } from '@claude-control/daemon';
-import { reconcileBindGuard } from './bindCommands.js';
+import { reconcileBindGuard, relaxationBannerLine } from './bindCommands.js';
 
 /** A minimal stand-in for the switch engine: `reconcileBindGuard` only asks it how many groups
  *  (folder bindings) exist. `count` is what `listGroups` reports — the one input that decides
@@ -80,5 +80,35 @@ describe('reconcileBindGuard', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// A honored --override / --account relaxation is surfaced on the launcher's OWN stderr, not only via
+// the guard's systemMessage (which Claude Code drops in a headless -p / SDK run). The banner names the
+// actual session cwd — where the relaxation applies — and sanitizes both label and path.
+describe('relaxationBannerLine', () => {
+  it('names the session cwd (not the bound folder) for an override', () => {
+    const line = relaxationBannerLine('override', 'work@corp', 'C:/other/place');
+    expect(line).toContain('--override in effect');
+    expect(line).toContain('work@corp');
+    expect(line).toContain('C:/other/place');
+    expect(line).toContain('bound to a different account');
+    expect(line.endsWith('\n')).toBe(true);
+  });
+
+  it('explains a reserved account run on purpose for --account', () => {
+    const line = relaxationBannerLine('explicit', 'work@corp', 'C:/somewhere');
+    expect(line).toContain('--account in effect');
+    expect(line).toContain('reserved to its folders');
+    expect(line).toContain('C:/somewhere');
+  });
+
+  it('strips terminal control sequences from a crafted label and cwd', () => {
+    const line = relaxationBannerLine('override', 'a\u001b[31mred\u0007', 'C:/x\r\nFAKE: injected');
+    expect(line).not.toContain('\u001b');
+    expect(line).not.toContain('\u0007');
+    // The CR/LF that would forge a new banner line is gone (only the single trailing newline remains).
+    expect(line.indexOf('\n')).toBe(line.length - 1);
+    expect(line).not.toContain('\r');
   });
 });

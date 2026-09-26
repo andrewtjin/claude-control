@@ -59,6 +59,35 @@ export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBin
   };
 }
 
+/**
+ * Whether two snapshots are equal in the fields the guard actually reads — enforce mode, main config
+ * dir, and every group's id/label/profileDir/folders/members. The `generation` is DELIBERATELY
+ * ignored: it bumps on registry writes the guard never sees (a group's active member, metadata), and
+ * comparing it would report a snapshot as stale after a routine switch even though nothing the guard
+ * enforces changed. Pure.
+ */
+export function folderBindingSnapshotContentEqual(
+  a: FolderBindingSnapshot,
+  b: FolderBindingSnapshot,
+): boolean {
+  return guardRelevantKey(a) === guardRelevantKey(b);
+}
+
+/** A deterministic string of only the guard-relevant fields, for content comparison. */
+function guardRelevantKey(s: FolderBindingSnapshot): string {
+  return JSON.stringify({
+    enforce: s.enforce,
+    mainConfigDir: s.mainConfigDir,
+    groups: s.groups.map((g) => ({
+      id: g.id,
+      label: g.label,
+      profileDir: g.profileDir,
+      folders: g.folders,
+      members: g.members,
+    })),
+  });
+}
+
 /** Atomically write the snapshot. Non-secret, so it uses the ordinary 0o644 file mode rather than
  *  the vault's 0o600 — the guard runs as the same user, but the file is meant to be plainly
  *  readable and carries nothing sensitive. */

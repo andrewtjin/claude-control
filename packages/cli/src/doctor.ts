@@ -322,15 +322,14 @@ export async function checkSlots(engine: Pick<SwitchEngine, 'checkSlots'>): Prom
  *  the daemon restarts or a `cctl settings` change rewrites it. No groups + no snapshot is a pass
  *  (nothing to enforce). */
 export async function checkGuardSnapshot(
-  engine: Pick<SwitchEngine, 'readSnapshot' | 'getGroupsGeneration' | 'listGroups'>,
+  engine: Pick<SwitchEngine, 'getGuardSnapshotFreshness' | 'listGroups'>,
 ): Promise<DoctorCheck> {
   try {
-    const [snapshot, groupsGeneration, groups] = await Promise.all([
-      engine.readSnapshot(),
-      engine.getGroupsGeneration(),
+    const [freshness, groups] = await Promise.all([
+      engine.getGuardSnapshotFreshness(),
       engine.listGroups(),
     ]);
-    if (snapshot === undefined) {
+    if (!freshness.present) {
       if (groups.length === 0) {
         return {
           name: 'guard-snapshot',
@@ -344,13 +343,17 @@ export async function checkGuardSnapshot(
         detail: `${groups.length} folder binding(s) but no guard snapshot — restart the daemon (cctl daemon restart) to write it`,
       };
     }
-    const fresh = snapshot.generation === groupsGeneration;
+    // Freshness is by CONTENT, not the groups generation: a routine group member switch bumps the
+    // generation on fields the snapshot does not carry and must not read as stale. A genuine STALE
+    // means a bound folder / profile / member / enforce mode changed without the snapshot being
+    // rewritten — a bind/unbind or a daemon restart rewrites it (a settings change only does so for
+    // CCTL_BIND_ENFORCE, so it is not offered as the general fix).
     return {
       name: 'guard-snapshot',
-      ok: fresh,
-      detail: fresh
-        ? `fresh (generation ${groupsGeneration}, enforce=${snapshot.enforce})`
-        : `STALE (snapshot generation ${snapshot.generation}, groups ${groupsGeneration}) — restart the daemon or run a cctl settings change to refresh it`,
+      ok: freshness.fresh,
+      detail: freshness.fresh
+        ? `fresh (generation ${freshness.generation}, enforce=${freshness.enforce})`
+        : `STALE (the guard is enforcing an out-of-date binding view) — run \`cctl bind\`/\`cctl unbind\` again or restart the daemon (cctl daemon restart) to rewrite it`,
     };
   } catch (err) {
     return {
@@ -367,14 +370,36 @@ export async function checkGuardSnapshot(
 export function checkGuardHook(paths: Paths, hasBindings: boolean): DoctorCheck {
   const settingsPath = join(paths.claudeDir, 'settings.json');
   let installed = false;
+  let unparseable = false;
   try {
-    const raw = readFileSync(settingsPath, 'utf8');
+    let raw = readFileSync(settingsPath, 'utf8');
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1); // tolerate a PowerShell/Notepad UTF-8 BOM
+    // Parse rather than substring-match alone: parsing tells a genuine install apart from a
+    // settings.json the guard installer would REFUSE to write to (invalid JSON), which otherwise
+    // looks identical ("guard absent") while the real cause — and fix — is different.
+    JSON.parse(raw);
     installed = raw.includes(BIND_GUARD_MARKER);
-  } catch {
-    installed = false;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      installed = false;
+    } else if (err instanceof SyntaxError) {
+      unparseable = true;
+    }
   }
   if (installed) {
     return { name: 'guard-hook', ok: true, detail: `installed in ${settingsPath}` };
+  }
+  if (unparseable) {
+    // The installer refuses to overwrite invalid JSON, so the guard is NOT installed and bindings are
+    // unenforced no matter how many binds run until the file is repaired. Say so plainly rather than
+    // reporting a generic "not installed".
+    return {
+      name: 'guard-hook',
+      ok: !hasBindings,
+      detail: hasBindings
+        ? `guard NOT installed — ${settingsPath} is not valid JSON, so the installer refuses to write to it and folder bindings are NOT enforced. Fix the file (e.g. remove comments/trailing commas), then run \`cctl bind\` again or restart the daemon.`
+        : `${settingsPath} is not valid JSON (no bindings need the guard yet, but a bind would fail to install it until the file is fixed)`,
+    };
   }
   return {
     name: 'guard-hook',

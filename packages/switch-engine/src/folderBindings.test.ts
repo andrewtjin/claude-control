@@ -3,7 +3,11 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Vault } from './vault.js';
-import { buildFolderBindingSnapshot, readFolderBindingSnapshot } from './folderBindings.js';
+import {
+  buildFolderBindingSnapshot,
+  folderBindingSnapshotContentEqual,
+  readFolderBindingSnapshot,
+} from './folderBindings.js';
 import { folderBindingsPath, groupProfileDir } from './paths.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { VaultError } from './errors.js';
@@ -111,6 +115,55 @@ describe('buildFolderBindingSnapshot (pure)', () => {
     expect(text).not.toContain('secret-id');
     expect(text).not.toContain('uuid-secret');
     expect(text).toContain('jina');
+  });
+});
+
+describe('folderBindingSnapshotContentEqual (pure)', () => {
+  const base = () =>
+    buildFolderBindingSnapshot({
+      groups: [
+        {
+          id: 'g1',
+          label: 'Work',
+          members: [
+            { id: 'm1', label: 'jina', quarantined: false, createdAtMs: 1, updatedAtMs: 1 },
+          ],
+          activeId: 'm1',
+          folders: ['C:\\work'],
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        },
+      ],
+      generation: 5,
+      enforce: 'block',
+      mainConfigDir: 'C:\\main',
+      profileDirOf: (id) => `C:\\profiles\\${id}`,
+    });
+
+  it('is equal when ONLY the generation differs (a routine group switch bumps generation)', () => {
+    const a = base();
+    const b = { ...base(), generation: 99 };
+    expect(folderBindingSnapshotContentEqual(a, b)).toBe(true);
+  });
+
+  it('is unequal when a bound folder changes', () => {
+    const a = base();
+    const b = base();
+    b.groups[0]!.folders = ['C:\\work', 'C:\\extra'];
+    expect(folderBindingSnapshotContentEqual(a, b)).toBe(false);
+  });
+
+  it('is unequal when the enforce mode changes', () => {
+    const a = base();
+    const b = { ...base(), enforce: 'off' as const };
+    expect(folderBindingSnapshotContentEqual(a, b)).toBe(false);
+  });
+
+  it('is unequal when a member label changes', () => {
+    const a = base();
+    const b = base();
+    b.groups[0]!.members = ['someone-else'];
+    expect(folderBindingSnapshotContentEqual(a, b)).toBe(false);
   });
 });
 

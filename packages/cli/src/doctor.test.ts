@@ -285,8 +285,8 @@ describe('checkGuardSnapshot', () => {
 
   it('passes when there are no bindings and no snapshot', async () => {
     const check = await checkGuardSnapshot({
-      readSnapshot: () => Promise.resolve(undefined),
-      getGroupsGeneration: () => Promise.resolve(0),
+      getGuardSnapshotFreshness: () =>
+        Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
       listGroups: () => Promise.resolve([]),
     });
     expect(check.ok).toBe(true);
@@ -295,28 +295,28 @@ describe('checkGuardSnapshot', () => {
 
   it('fails when bindings exist but the snapshot is missing', async () => {
     const check = await checkGuardSnapshot({
-      readSnapshot: () => Promise.resolve(undefined),
-      getGroupsGeneration: () => Promise.resolve(3),
+      getGuardSnapshotFreshness: () =>
+        Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
       listGroups: () => Promise.resolve(baseGroups as never),
     });
     expect(check.ok).toBe(false);
     expect(check.detail).toContain('no guard snapshot');
   });
 
-  it('passes when the snapshot generation matches', async () => {
+  it('passes when the snapshot content matches the live registry', async () => {
     const check = await checkGuardSnapshot({
-      readSnapshot: () => Promise.resolve({ generation: 4, enforce: 'block' } as never),
-      getGroupsGeneration: () => Promise.resolve(4),
+      getGuardSnapshotFreshness: () =>
+        Promise.resolve({ present: true, fresh: true, enforce: 'block', generation: 4 }),
       listGroups: () => Promise.resolve(baseGroups as never),
     });
     expect(check.ok).toBe(true);
     expect(check.detail).toContain('fresh');
   });
 
-  it('fails when the snapshot lags the groups generation', async () => {
+  it('fails when the snapshot content lags the live registry', async () => {
     const check = await checkGuardSnapshot({
-      readSnapshot: () => Promise.resolve({ generation: 2, enforce: 'warn' } as never),
-      getGroupsGeneration: () => Promise.resolve(6),
+      getGuardSnapshotFreshness: () =>
+        Promise.resolve({ present: true, fresh: false, enforce: 'warn', generation: 2 }),
       listGroups: () => Promise.resolve(baseGroups as never),
     });
     expect(check.ok).toBe(false);

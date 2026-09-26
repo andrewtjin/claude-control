@@ -50,6 +50,7 @@ import {
 import { createNodeProfileFs, ensureGroupProfile, planGroupProfile } from './profile.js';
 import {
   buildFolderBindingSnapshot,
+  folderBindingSnapshotContentEqual,
   writeFolderBindingSnapshot,
   type BindEnforceMode,
 } from './folderBindings.js';
@@ -177,8 +178,11 @@ export interface SwitchEngineOptions {
    *  a deterministic one. */
   isProcessAlive?: (pid: number) => boolean;
   /** The enforcement mode stamped into the guard snapshot written after every group mutation.
-   *  Defaults to `'block'`; the daemon passes the operator's configured value. */
-  bindEnforce?: BindEnforceMode;
+   *  Defaults to `'block'`. Pass a plain mode for a one-shot CLI process; pass a RESOLVER for a
+   *  long-lived process (the daemon), which is called at each snapshot write so a live
+   *  `cctl settings set bind-enforce <mode>` takes effect without a restart. A cached value would let
+   *  a daemon-side snapshot rewrite (e.g. from repairSlots) revert an operator's live change. */
+  bindEnforce?: BindEnforceMode | (() => BindEnforceMode);
   /** Fault-injection seam for the multi-step group mutations, called at labeled checkpoints so a
    *  test can throw partway through and prove the next `ensureGroupLive`/`repairSlots` converges.
    *  Undefined in production, where every checkpoint is a zero-cost no-op. */
@@ -382,8 +386,10 @@ export class SwitchEngine {
   private readonly bindFs: BindFs;
   /** See {@link SwitchEngineOptions.isProcessAlive}. */
   private readonly isProcessAlive: (pid: number) => boolean;
-  /** See {@link SwitchEngineOptions.bindEnforce}. */
-  private readonly bindEnforce: BindEnforceMode;
+  /** Resolves the enforcement mode at snapshot-write time. See {@link SwitchEngineOptions.bindEnforce}
+   *  — a plain mode is wrapped in a constant function; a resolver is read on every write so a live
+   *  settings change is honored by daemon-side writers too. */
+  private readonly resolveBindEnforce: () => BindEnforceMode;
   /** See {@link SwitchEngineOptions.faultAt}. */
   private readonly faultAt: ((checkpoint: string) => void) | undefined;
 
@@ -414,7 +420,13 @@ export class SwitchEngine {
     this.lockOptions = options.lockOptions ?? {};
     this.bindFs = options.bindFs ?? defaultBindFs();
     this.isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
-    this.bindEnforce = options.bindEnforce ?? 'block';
+    this.resolveBindEnforce =
+      typeof options.bindEnforce === 'function'
+        ? options.bindEnforce
+        : (
+            (mode) => () =>
+              mode
+          )(options.bindEnforce ?? 'block');
     this.faultAt = options.faultAt;
   }
 
@@ -1492,20 +1504,27 @@ export class SwitchEngine {
     return out;
   }
 
-  /** Rewrite the guard snapshot from the current registry, assuming the lock is held. Called LAST in
-   *  every group mutation. */
-  private async writeSnapshotLocked(): Promise<void> {
+  /** Build the guard snapshot object from the current registry (no IO beyond the vault reads). The
+   *  enforce mode is resolved HERE, at build time, so a long-lived daemon honors a live settings
+   *  change instead of a value cached at construction. */
+  private async buildSnapshotObject(): Promise<FolderBindingSnapshot> {
     const [groups, generation] = await Promise.all([
       this.vault.listGroups(),
       this.vault.getGroupsGeneration(),
     ]);
-    const snapshot = buildFolderBindingSnapshot({
+    return buildFolderBindingSnapshot({
       groups,
       generation,
-      enforce: this.bindEnforce,
+      enforce: this.resolveBindEnforce(),
       mainConfigDir: this.canonReserved(this.paths.claudeDir),
       profileDirOf: (groupId) => this.canonReserved(groupProfileDir(this.paths.vaultDir, groupId)),
     });
+  }
+
+  /** Rewrite the guard snapshot from the current registry, assuming the lock is held. Called LAST in
+   *  every group mutation. */
+  private async writeSnapshotLocked(): Promise<void> {
+    const snapshot = await this.buildSnapshotObject();
     await writeFolderBindingSnapshot(folderBindingsPath(this.paths.vaultDir), snapshot);
   }
 
@@ -1513,6 +1532,33 @@ export class SwitchEngine {
    *  always reads a snapshot consistent with the live registry. */
   async refreshSnapshot(): Promise<void> {
     await this.withCredentialLock(() => this.writeSnapshotLocked());
+  }
+
+  /**
+   * Whether the guard snapshot on disk still reflects the guard-relevant registry (bound folders,
+   * profile dirs, member labels, enforce mode) — the ONLY inputs the guard reads. Freshness is by
+   * CONTENT, not by the groups generation: a routine group member switch bumps the generation on
+   * fields the snapshot does not carry (activeId, metadata), which must not read as stale, and a real
+   * change to a bound folder always changes the content compared here. Returns what a health surface
+   * needs: whether a snapshot exists, whether it is fresh, its enforce mode and its generation.
+   */
+  async getGuardSnapshotFreshness(): Promise<{
+    present: boolean;
+    fresh: boolean;
+    enforce: BindEnforceMode;
+    generation: number | null;
+  }> {
+    const stored = await this.vault.readFolderBindings();
+    if (stored === undefined) {
+      return { present: false, fresh: false, enforce: this.resolveBindEnforce(), generation: null };
+    }
+    const current = await this.buildSnapshotObject();
+    return {
+      present: true,
+      fresh: folderBindingSnapshotContentEqual(stored, current),
+      enforce: stored.enforce,
+      generation: stored.generation,
+    };
   }
 
   /** Whether a config dir points at (or into) the profiles root — the one place a capture must

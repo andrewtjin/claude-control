@@ -54,6 +54,7 @@ import {
   resolveShellInitTarget,
   SUPPORTED_SHELLS,
 } from './shellInit.js';
+import { resolveGuardProfileSettingsPaths } from './guardProfiles.js';
 
 type Engine = ReturnType<typeof buildEngine>;
 
@@ -80,13 +81,17 @@ function groupProfilePath(vaultDir: string, groupId: string): string {
  *  is reported as a warning, never a command failure, because the daemon also reconciles the guard on
  *  its next start. Keeps the bind/unbind actions from each re-deriving the same paths. */
 export async function reconcileBindGuard(engine: Engine, paths: Paths): Promise<void> {
-  const hasBindings = (await engine.listGroups()).length > 0;
+  const groups = await engine.listGroups();
+  const hasBindings = groups.length > 0;
   try {
     await ensureBindGuard({
       settingsPath: join(paths.claudeDir, 'settings.json'),
       guardPath: bindGuardPath(dirname(paths.vaultDir)),
       snapshotPath: folderBindingsPath(paths.vaultDir),
       hasBindings,
+      // Propagate the guard into (or clean it out of) every group profile's settings.json — a
+      // group-slot session reads its profile copy, which a temp+rename write to main un-shares.
+      profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, groups, hasBindings),
     });
   } catch (err) {
     process.stderr.write(
@@ -268,19 +273,18 @@ export function buildBindCommands(program: Command): void {
     )
     .action(async () => {
       const engine = buildEngine();
-      const [groups, snapshot, groupsGeneration] = await Promise.all([
+      const [groups, freshness] = await Promise.all([
         buildGroupViews(engine),
-        engine.readSnapshot(),
-        engine.getGroupsGeneration(),
+        engine.getGuardSnapshotFreshness(),
       ]);
       process.stdout.write(
         renderBindings(
           {
             groups,
             footer: {
-              snapshotGeneration: snapshot ? snapshot.generation : null,
-              groupsGeneration,
-              enforce: snapshot ? snapshot.enforce : 'block',
+              present: freshness.present,
+              fresh: freshness.fresh,
+              enforce: freshness.enforce,
             },
           },
           detectPalette(),
@@ -359,6 +363,28 @@ export function buildBindCommands(program: Command): void {
         args,
       });
     });
+}
+
+/**
+ * The stderr banner line shown when a per-launch relaxation is in effect. Emitted by the launcher
+ * itself — not only via the guard's UserPromptSubmit systemMessage — because Claude Code drops that
+ * systemMessage in a headless (`-p` / SDK) run, where the guard warning would otherwise be invisible;
+ * this line is the reliable signal in every mode. It names the actual session cwd, where the
+ * relaxation applies, rather than the account's own bound folder. Both inputs pass sanitizeForTerminal
+ * at this sink so a crafted label/path cannot inject terminal control sequences.
+ */
+export function relaxationBannerLine(
+  kind: 'override' | 'explicit',
+  label: string,
+  cwd: string,
+): string {
+  const safeLabel = sanitizeForTerminal(label);
+  const safeCwd = sanitizeForTerminal(cwd);
+  return kind === 'override'
+    ? `cctl: --override in effect: allowing ${safeLabel} in ${safeCwd}, which is bound to a ` +
+        `different account.\n`
+    : `cctl: --account in effect: ${safeLabel} is reserved to its folders; running it in ` +
+        `${safeCwd} on purpose.\n`;
 }
 
 /** Orchestrate `cctl claude`: resolve the slot (explicit account > folder binding > global), make it
@@ -490,6 +516,16 @@ async function runClaude(opts: {
   process.stderr.write(
     `cctl: Claude Code on ${sanitizeForTerminal(slot.label)} (${sanitizeForTerminal(slot.context)})\n`,
   );
+  // When a relaxation is in effect, say so on the launcher's OWN stderr — not only via the guard's
+  // systemMessage. Claude Code drops UserPromptSubmit systemMessages in a headless (-p / SDK) run, so
+  // the guard warning would be invisible there; this banner line is the reliable signal in every mode.
+  // It names the actual session cwd (where the relaxation applies), not the account's bound folder.
+  if (overrideToken !== undefined) {
+    process.stderr.write(relaxationBannerLine('override', slot.label, process.cwd()));
+  }
+  if (explicitToken !== undefined) {
+    process.stderr.write(relaxationBannerLine('explicit', slot.label, process.cwd()));
+  }
 
   try {
     const code = await spawnClaude({

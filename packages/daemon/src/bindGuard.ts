@@ -69,9 +69,12 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *     -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT) allows it, with a visible
  *     systemMessage so the bypass is never silent.
  *   - The relaxation env vars are NOT plain switches: each must name a token file the launcher minted
- *     for THIS launch's slot (see bindToken.ts). An inherited or persisted value (e.g. a stray "1")
- *     has no backing record and is not honored, so a folder binding cannot be defeated by ambient
- *     env. A honored relaxation is always surfaced.
+ *     for THIS launch's slot (see bindToken.ts) whose launching process is still alive. An inherited
+ *     or persisted value (e.g. a stray "1"), or a token left behind by a dead launch, has no honored
+ *     backing record, so a folder binding cannot be defeated by ambient env. A honored relaxation
+ *     emits a systemMessage, which Claude Code surfaces in an INTERACTIVE session; a non-interactive
+ *     (-p / SDK) run drops UserPromptSubmit systemMessages, so there the launcher's own stderr banner
+ *     (see launcher.ts / bindCommands.ts) is the visible signal that a relaxation is in effect.
  *   - enforce = snapshot.enforce (block|warn|off) ?? 'block' — read ONLY from the snapshot, which the
  *     daemon/CLI resolve from CCTL_BIND_ENFORCE (env > config > default) and write. The guard does
  *     not re-read the env var: doing so let any session's ambient environment silently turn
@@ -103,8 +106,25 @@ const SNAPSHOT_PATH = ${JSON.stringify(opts.snapshotPath)};
 const TOKENS_DIR = ${JSON.stringify(tokensDir)};
 const TOKEN_PATTERN = /^[0-9a-f]{32}$/;
 
+// True when the launching process that minted a token is still running. A relaxation lasts only for
+// the lifetime of the launch that requested it: a session that merely inherited the env value after
+// that launch died (a hard kill, an orphaned child) is not relaxed. kill(pid, 0) sends no signal — it
+// throws ESRCH when the process is gone and EPERM when it exists but is not signalable (still alive).
+function launcherAlive(pid) {
+  if (typeof pid !== 'number' || !isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e && e.code === 'EPERM';
+  }
+}
+
 // True when \`envValue\` names a valid relaxation token of the expected kind, minted for the slot this
-// session runs on (sessionConfigKey: the folderKey of CLAUDE_CONFIG_DIR, '' for the global slot).
+// session runs on (sessionConfigKey: the folderKey of CLAUDE_CONFIG_DIR, '' for the global slot), AND
+// the launch that minted it is still alive. Binding the honor to the launcher pid means a token that
+// outlives its launch — a file left behind by a hard kill, or a value inherited by an unrelated
+// same-slot session — cannot relax a binding: the mismatch is caught here, not left to file cleanup.
 function honorRelaxation(envValue, expectedKind, sessionConfigKey) {
   if (typeof envValue !== 'string' || !TOKEN_PATTERN.test(envValue)) return false;
   var record;
@@ -115,7 +135,8 @@ function honorRelaxation(envValue, expectedKind, sessionConfigKey) {
   }
   if (!record || record.v !== 1 || record.kind !== expectedKind) return false;
   var recordKey = typeof record.profileKey === 'string' ? record.profileKey : '';
-  return recordKey === sessionConfigKey;
+  if (recordKey !== sessionConfigKey) return false;
+  return launcherAlive(record.launcherPid);
 }
 
 // Exit 0 (never block) and leave a single diagnostic line — the fail-open path for every internal
@@ -301,9 +322,10 @@ function run(input) {
     }
     if (!within) {
       var folders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
-      // --account relaxes case B, but only via a token minted for this session's slot; an inherited
-      // env value is not honored. Unlike before, a honored relaxation is surfaced (never silent) so
-      // it is clear the reserved account is being used outside its folders on purpose.
+      // --account relaxes case B, but only via a token minted for this session's slot whose launch is
+      // still alive; an inherited env value is not honored. A honored relaxation emits a systemMessage
+      // (surfaced in interactive sessions; the launcher banner is the headless signal) so it is clear
+      // the reserved account is being used outside its folders on purpose.
       if (honorRelaxation(process.env.CCTL_LAUNCH_EXPLICIT, 'explicit', sessionConfigKey)) {
         var membersB = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
         return emitSystemMessage(

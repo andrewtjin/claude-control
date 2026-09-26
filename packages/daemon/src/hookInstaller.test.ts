@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { linkSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -780,5 +781,161 @@ describe('removeBindGuard', () => {
       JSON.stringify({ hooks: { [UPS]: [{ hooks: [{ type: 'command', command: 'other' }] }] } }),
     );
     expect(await removeBindGuard({ settingsPath })).toBe(false);
+  });
+});
+
+// A settings.json written by PowerShell/Notepad carries a UTF-8 BOM, which strict JSON.parse rejects.
+// The installer must tolerate it, or the guard silently never installs and bindings go unenforced.
+describe('ensureBindGuard on a BOM-prefixed settings.json', () => {
+  let dir: string;
+  let settingsPath: string;
+  let guardPath: string;
+  const snapshotPath = '/data/folder-bindings.json';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ensure-bind-guard-bom-'));
+    settingsPath = join(dir, 'settings.json');
+    guardPath = bindGuardPath(dir);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('installs the guard into a settings.json that begins with a UTF-8 BOM', async () => {
+    await writeFile(settingsPath, '﻿' + JSON.stringify({ someKey: true }, null, 2), 'utf8');
+    const outcome = await ensureBindGuard({
+      settingsPath,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+    });
+    expect(outcome).toBe('installed');
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw.includes(BIND_GUARD_MARKER)).toBe(true);
+    // The pre-existing key is preserved; the file is rewritten without the BOM (valid JSON).
+    expect(raw.charCodeAt(0)).not.toBe(0xfeff);
+    expect((JSON.parse(raw) as { someKey?: boolean }).someKey).toBe(true);
+  });
+});
+
+// The guard entry is recognized by its exact installed command SHAPE, not a loose substring, so a
+// foreign hook that merely mentions the filename is never pruned or replaced.
+describe('ensureBindGuard preserves a foreign look-alike hook', () => {
+  let dir: string;
+  let settingsPath: string;
+  let guardPath: string;
+  const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const snapshotPath = '/data/folder-bindings.json';
+  const FOREIGN = 'node /home/me/my-linter.js --config bind-guard.cjs.rc';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ensure-bind-guard-foreign-'));
+    settingsPath = join(dir, 'settings.json');
+    guardPath = bindGuardPath(dir);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function upsCommands(settings: unknown): string[] {
+    const groups = (settings as { hooks?: Record<string, unknown> }).hooks?.[UPS];
+    if (!Array.isArray(groups)) return [];
+    return groups.flatMap((g: unknown) => {
+      const entries = (g as { hooks?: unknown }).hooks;
+      return Array.isArray(entries)
+        ? entries.map((h: unknown) => (h as { command?: string }).command ?? '')
+        : [];
+    });
+  }
+
+  it('installs the guard without evicting a foreign hook containing "bind-guard.cjs"', async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ hooks: { [UPS]: [{ hooks: [{ type: 'command', command: FOREIGN }] }] } }),
+    );
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    const cmds = upsCommands(await readJson(settingsPath));
+    expect(cmds).toContain(FOREIGN);
+    expect(cmds).toContain(buildBindGuardCommand({ guardPath }));
+  });
+
+  it('removes only our guard, leaving the foreign look-alike hook intact', async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ hooks: { [UPS]: [{ hooks: [{ type: 'command', command: FOREIGN }] }] } }),
+    );
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: false });
+    expect(upsCommands(await readJson(settingsPath))).toEqual([FOREIGN]);
+  });
+});
+
+// A group-slot session reads its profile's settings.json, which is shared with main by a hard link a
+// temp+rename guard install severs. The reconcile must propagate the guard into each profile so the
+// slot is enforced, and clean any stranded guard on the last unbind.
+describe('ensureBindGuard propagation into group profiles', () => {
+  let dir: string;
+  let mainSettings: string;
+  let profileSettings: string;
+  let guardPath: string;
+  const snapshotPath = '/data/folder-bindings.json';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ensure-bind-guard-prof-'));
+    mainSettings = join(dir, 'settings.json');
+    const profileDir = join(dir, 'profiles', 'g1');
+    await mkdir(profileDir, { recursive: true });
+    await writeFile(mainSettings, JSON.stringify({ hooks: {} }, null, 2), 'utf8');
+    profileSettings = join(profileDir, 'settings.json');
+    // profile.ts shares settings.json with main by a hard link (steady state before the guard write).
+    linkSync(mainSettings, profileSettings);
+    guardPath = bindGuardPath(dir);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function hasGuard(text: string): boolean {
+    return text.includes(BIND_GUARD_MARKER);
+  }
+
+  it('lands the guard in the profile settings.json (which main un-shared by temp+rename)', async () => {
+    await ensureBindGuard({
+      settingsPath: mainSettings,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+      profileSettingsPaths: [profileSettings],
+    });
+    // Both the main and the profile copy carry the guard: the group-slot session is enforced.
+    expect(hasGuard(await readFile(mainSettings, 'utf8'))).toBe(true);
+    expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(true);
+    // And they are one inode again (the profile link was healed to the guard-carrying main), so a
+    // doctor slot check does not report a broken profile link on the happy path.
+    expect(statSync(mainSettings).ino).toBe(statSync(profileSettings).ino);
+  });
+
+  it('cleans a guard entry stranded in a severed profile copy on the last unbind', async () => {
+    // Simulate the severed state: main has no guard, but the profile copy (its own inode) does.
+    writeFileSync(
+      profileSettings,
+      JSON.stringify({
+        hooks: {
+          [DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit]: [
+            { hooks: [{ type: 'command', command: buildBindGuardCommand({ guardPath }) }] },
+          ],
+        },
+      }),
+    );
+    expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(true);
+
+    await ensureBindGuard({
+      settingsPath: mainSettings,
+      guardPath,
+      snapshotPath,
+      hasBindings: false,
+      profileSettingsPaths: [profileSettings],
+    });
+    expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(false);
   });
 });

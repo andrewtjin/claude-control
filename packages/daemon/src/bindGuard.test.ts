@@ -183,6 +183,25 @@ describe('bind guard script', () => {
     expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
   });
 
+  it('(A) an override token whose launcher process is DEAD is NOT honored → still blocks', async () => {
+    // The token file can outlive its launch (a hard kill skips the finally-block cleanup). A session
+    // that inherited the env value after the launcher died must not be relaxed: the guard honors a
+    // token only while the process that minted it is alive.
+    await writeSnapshot();
+    const token = mintBindToken({
+      tokensDir: bindTokensDir(snapshotPath),
+      kind: 'override',
+      profileKey: slotKey(undefined),
+      launcherPid: 2_000_000_000, // a pid that is not a live process
+    });
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+      CCTL_BIND_OVERRIDE: token,
+    });
+    expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
+  });
+
   it('(A) an override token minted for a DIFFERENT slot is NOT honored → still blocks', async () => {
     // A token whose recorded slot key does not match this session's slot (here: minted for a profile
     // dir, used by a global session) must not relax the binding.
@@ -297,6 +316,28 @@ describe('bind guard script', () => {
     expect(parsed.systemMessage).toBeDefined();
     expect(parsed.systemMessage).toContain(outsideFolder);
     expect(parsed.systemMessage).toContain('--account');
+  });
+
+  it('(B) an --account token whose launcher process is DEAD is NOT honored → still blocks', async () => {
+    // Same launch-lifetime rule as case A: a token left behind by a dead launcher does not relax a
+    // reserved-account session that inherited its env value.
+    await writeSnapshot();
+    const token = mintBindToken({
+      tokensDir: bindTokensDir(snapshotPath),
+      kind: 'explicit',
+      profileKey: slotKey(profileDir),
+      launcherPid: 2_000_000_000,
+    });
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: outsideFolder,
+      CLAUDE_CONFIG_DIR: profileDir,
+      CCTL_LAUNCH_EXPLICIT: token,
+    });
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { decision?: string; reason?: string };
+    expect(parsed.decision).toBe('block');
+    expect(parsed.reason).toContain(outsideFolder);
   });
 
   it('(B) an inherited CCTL_LAUNCH_EXPLICIT=1 (no token) is NOT honored → still blocks', async () => {

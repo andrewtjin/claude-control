@@ -16,7 +16,11 @@ import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { Vault } from './vault.js';
 import { groupProfileDir, sandboxPaths, folderBindingsPath, type Paths } from './paths.js';
-import { readFolderBindingSnapshot } from './folderBindings.js';
+import {
+  readFolderBindingSnapshot,
+  writeFolderBindingSnapshot,
+  type BindEnforceMode,
+} from './folderBindings.js';
 import { groupSlotId } from './types.js';
 import { realpathSync, statSync } from 'node:fs';
 import type { ClaudeOauth, CredentialBundle } from './types.js';
@@ -43,6 +47,9 @@ interface Harness {
   /** Build another engine over the SAME on-disk state (a simulated process restart), optionally
    *  with a fault injector. */
   restart: (faultAt?: (cp: string) => void) => SwitchEngine;
+  /** Change the enforcement mode the engine's snapshot resolver returns, simulating a live
+   *  `cctl settings set bind-enforce <mode>` under a long-lived daemon. */
+  setEnforce: (mode: BindEnforceMode) => void;
 }
 
 function makeRefresh(clock: () => number) {
@@ -66,6 +73,9 @@ async function harness(platform: NodeJS.Platform = 'win32'): Promise<Harness> {
   const clock = (): number => now;
   const protector = new InsecurePassthroughProtector();
   const alive = new Set<number>();
+  // Resolved at each snapshot write, not cached at construction, so a live change is honored by a
+  // daemon-side rewrite (see the enforce-resolver test).
+  let enforceMode: BindEnforceMode = 'block';
   // Real fs for canonicalization (the sandbox dirs exist), but a sandbox home so the "home dir is
   // refused" rule can be exercised without touching the real user home.
   const bindFs: BindFs = {
@@ -93,6 +103,7 @@ async function harness(platform: NodeJS.Platform = 'win32'): Promise<Harness> {
       platform,
       bindFs,
       isProcessAlive: (pid) => alive.has(pid),
+      bindEnforce: () => enforceMode,
       ...(faultAt ? { faultAt } : {}),
     });
 
@@ -114,6 +125,9 @@ async function harness(platform: NodeJS.Platform = 'win32'): Promise<Harness> {
       return realpathSync.native(p);
     },
     restart: (faultAt) => mkEngine(faultAt),
+    setEnforce: (mode) => {
+      enforceMode = mode;
+    },
   };
 }
 
@@ -516,4 +530,78 @@ describe('unbindFolder — crash safety', () => {
       expect(new Set(live).size).toBe(live.length);
     },
   );
+});
+
+describe('guard snapshot enforce mode is resolved at write time', () => {
+  it('a daemon-side snapshot rewrite reflects a live enforce change, not the construction-time value', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.bindFolder(work, [A.id, B.id]);
+
+    // Bound under the construction-time default.
+    const first = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(first.enforce).toBe('block');
+
+    // Operator changes the mode live; a later daemon-side rewrite (refreshSnapshot stands in for any
+    // maintainSlots/repairSlots write) must carry the NEW mode. A cached value would revert it.
+    h.setEnforce('off');
+    await h.engine.refreshSnapshot();
+    const second = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(second.enforce).toBe('off');
+
+    // And the dangerous direction: turning enforcement back ON is honored just the same.
+    h.setEnforce('block');
+    await h.engine.refreshSnapshot();
+    const third = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(third.enforce).toBe('block');
+  });
+});
+
+describe('getGuardSnapshotFreshness is by content, not generation', () => {
+  it('stays fresh after a routine group member switch that bumps the generation', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.bindFolder(work, [A.id, B.id]);
+
+    const before = await h.engine.getGuardSnapshotFreshness();
+    expect(before.present).toBe(true);
+    expect(before.fresh).toBe(true);
+    const genBefore = await h.engine.getGroupsGeneration();
+
+    // Switch the group's active member. This bumps the groups generation (active member + metadata
+    // writes) but changes NOTHING the guard reads (bound folders, profile dir, member labels,
+    // enforce), and does not rewrite the snapshot — so a generation-based check would cry STALE.
+    // Advance past the per-slot switch cadence so the hop is allowed.
+    h.setNow(NOW + HOUR);
+    await h.engine.activate(B.id);
+    expect(await h.engine.getGroupsGeneration()).toBeGreaterThan(genBefore);
+
+    const after = await h.engine.getGuardSnapshotFreshness();
+    expect(after.present).toBe(true);
+    expect(after.fresh).toBe(true);
+  });
+
+  it('reports STALE when the on-disk snapshot no longer matches a guard-relevant field', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.bindFolder(work, [A.id, B.id]);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+
+    // Simulate a snapshot that lags a real change to a guard-relevant field (here the enforce mode):
+    // rewrite the stored snapshot with a different enforce, leaving the registry as is. Because
+    // freshness compares guard-relevant CONTENT, this must report stale even though the generation is
+    // untouched — the case a content check must still catch.
+    const stored = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    await writeFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir), {
+      ...stored,
+      enforce: stored.enforce === 'off' ? 'block' : 'off',
+    });
+
+    const after = await h.engine.getGuardSnapshotFreshness();
+    expect(after.present).toBe(true);
+    expect(after.fresh).toBe(false);
+  });
 });

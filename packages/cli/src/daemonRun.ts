@@ -53,7 +53,7 @@ import {
 } from '@claude-control/daemon';
 import { createAgentSdkClient, createSessionManager } from '@claude-control/session-runtime';
 import type { AgentSdkClient } from '@claude-control/session-runtime';
-import { buildEngine, daemonDbPath, fail } from './context.js';
+import { buildEngine, daemonDbPath, fail, resolveBindEnforce } from './context.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
@@ -67,6 +67,7 @@ import {
   writeSettingsReport,
 } from './settings.js';
 import { crashLogPath, installCrashLogging } from './daemonSupervise.js';
+import { resolveGuardProfileSettingsPaths } from './guardProfiles.js';
 import {
   acquireInstanceLock,
   probePredecessorEndpoint,
@@ -292,11 +293,13 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     env: loggingEnv,
   });
 
-  // The guard's enforcement mode is resolved (env > config file > default) into the engine, so
-  // the folder-bindings snapshot it writes on start and on every group mutation carries the mode
-  // the guard hook then reads — a live `cctl settings set CCTL_BIND_ENFORCE ...` takes effect on
-  // the next daemon start.
-  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv, config.values.bindEnforce);
+  // The guard's enforcement mode is resolved (env > config file > default) at EACH snapshot write via
+  // this resolver, not cached at construction — so a live `cctl settings set CCTL_BIND_ENFORCE ...`
+  // takes effect on the next snapshot the daemon writes (a bind, a repair, a refresh) rather than
+  // being reverted by a daemon-side rewrite until the next restart.
+  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv, () =>
+    resolveBindEnforce(loggingEnv),
+  );
   // Two rows for one login would be polled as two accounts and shown twice on the phone;
   // resolve any left by an older build before the first poll (logged, never fatal).
   await engine.dedupeAccounts();
@@ -513,12 +516,16 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       // at prompt time. The snapshot it reads was refreshed just before this in Daemon.start(), so a
       // restart always leaves the guard consistent with the live registry. Fail-open with the rest of
       // this closure: a settings.json we cannot write only degrades enforcement, never daemon startup.
-      const hasBindings = (await engine.listGroups()).length > 0;
+      const groups = await engine.listGroups();
+      const hasBindings = groups.length > 0;
       await ensureBindGuard({
         settingsPath,
         guardPath: bindGuardPath(dataDir),
         snapshotPath: folderBindingsPath(paths.vaultDir),
         hasBindings,
+        // A group-slot session reads its profile's settings.json, which a temp+rename write to main
+        // severs from the guard; propagate the guard into (or clean it out of) each profile too.
+        profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, groups, hasBindings),
       });
     },
     // Publish the receiver's actual loopback port so `cctl session register|label|watch` can
