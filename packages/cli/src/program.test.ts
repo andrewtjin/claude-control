@@ -61,6 +61,7 @@ const engine = vi.hoisted(() => ({
   renameAccount: vi.fn((id: string, label: string): Promise<StoredAccount> =>
     Promise.reject(new Error(`renameAccount(${id}, ${label}) not stubbed`)),
   ),
+  removeAccount: vi.fn((): Promise<void> => Promise.resolve()),
 }));
 // `cctl switch` resolves across the whole registry; keep the mock's whole-registry view in sync with
 // whatever a test stubbed on listAccounts (the shared pool) so the existing switch tests still drive it.
@@ -838,6 +839,62 @@ describe('accounts exclude / include', () => {
     const included = await run(['accounts', 'include', 'Work']);
     expect(included).toMatch(/already available/);
 
+    expect(engine.setAutoSwitchExcluded).not.toHaveBeenCalled();
+  });
+});
+
+describe('reserved (folder-bound) members are reachable by row-level account mutations', () => {
+  // A reserved member lives in groups.json, so it appears in the whole-registry view
+  // (listAllAccounts) but NOT in the shared-only global pool (listAccounts). Row-level mutations must
+  // resolve against the whole registry — exactly as relogin/reauth do — or a folder-bound account is
+  // unreachable by exclude/include/rename/remove even though `accounts list` shows it.
+  const reserved: StoredAccount = {
+    id: 'res-1',
+    label: 'workacct',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  };
+
+  beforeEach(() => {
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    engine.listAllAccounts.mockImplementation(() => Promise.resolve([reserved]));
+    engine.setAutoSwitchExcluded.mockClear();
+    engine.renameAccount.mockClear();
+    engine.removeAccount.mockClear();
+    engine.backfillAccountMetadata.mockImplementation(() => Promise.resolve(0));
+  });
+
+  afterEach(() => {
+    // Restore the module-level delegation the other suites rely on.
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
+  });
+
+  it('excludes a reserved member by label though it is absent from the shared pool', async () => {
+    const out = await run(['accounts', 'exclude', 'workacct']);
+    expect(engine.setAutoSwitchExcluded).toHaveBeenCalledWith('res-1', true);
+    expect(out).toMatch(/Excluded workacct from auto-switch/);
+  });
+
+  it('renames a reserved member by label', async () => {
+    engine.renameAccount.mockResolvedValueOnce({ ...reserved, label: 'newname' });
+    const r = await runCli(['accounts', 'rename', 'workacct', 'newname']);
+    expect(r.exited).toBe(false);
+    expect(engine.renameAccount).toHaveBeenCalledWith('res-1', 'newname');
+    expect(r.out).toBe('Renamed workacct to newname (res-1).\n');
+  });
+
+  it('removes a reserved member by id', async () => {
+    const out = await run(['accounts', 'remove', 'res-1']);
+    expect(engine.removeAccount).toHaveBeenCalledWith('res-1');
+    expect(out).toMatch(/Removed workacct/);
+  });
+
+  it('still reports an unknown ref (not in the whole registry) as no match', async () => {
+    const r = await runCli(['accounts', 'exclude', 'ghost']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toMatch(/No account matches "ghost"/);
     expect(engine.setAutoSwitchExcluded).not.toHaveBeenCalled();
   });
 });

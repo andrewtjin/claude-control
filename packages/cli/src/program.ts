@@ -1422,7 +1422,11 @@ async function reauthAccount(ref: string): Promise<void> {
  */
 async function setExclusion(ref: string, excluded: boolean): Promise<void> {
   const engine = buildEngine();
-  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  // Resolve against the WHOLE fleet, reserved (folder-bound) members included: a row-level mutation
+  // must reach exactly the accounts binding reserves, whose ids/labels live in the group registry, not
+  // the shared-only pool. The engine routes the write to the file that holds the row (groups.json for a
+  // reserved member). Same resolution as relogin/reauth.
+  const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
   if (!resolved.ok) fail(resolved.message);
   const already = resolved.account.autoSwitchExcluded === true;
   if (already === excluded) {
@@ -1539,7 +1543,9 @@ function buildAccountCommands(program: Command): void {
     .description('remove a stored account by id or label')
     .action(async (ref: string) => {
       const engine = buildEngine();
-      const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+      // Resolve across the WHOLE fleet so a reserved (folder-bound) member is reachable by id or
+      // label; removeAccount drops it from its group (dissolving a group left memberless).
+      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
       await engine.removeAccount(resolved.account.id);
       process.stdout.write(`Removed ${resolved.account.label}.\n`);
@@ -1551,7 +1557,9 @@ function buildAccountCommands(program: Command): void {
     .description('give a stored account a new label (its id and usage history are unchanged)')
     .action(async (ref: string, newLabel: string) => {
       const engine = buildEngine();
-      const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+      // Resolve across the WHOLE fleet so a reserved (folder-bound) member is reachable by id or
+      // label; renameAccount asserts label uniqueness across all rows and writes the file holding it.
+      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
       // Answered here rather than written: nothing would change, so nothing should be saved or
       // reported as a rename.
