@@ -68,3 +68,13 @@ export class UnknownAccountError extends SwitchEngineError {
     super(`no account with id "${id}"`, 'unknown_account');
   }
 }
+
+/** A profile directory could not be materialized because of a genuine IO fault (the profile root
+ *  itself could not be created, a link/write syscall failed for a reason other than a foreign
+ *  pre-existing entry). Foreign entries are never a fault — they are reported in the profile
+ *  report's `skipped` list and left untouched — so this fires only when the sweep cannot proceed. */
+export class ProfileError extends SwitchEngineError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, 'profile_error', options);
+  }
+}
