@@ -1112,6 +1112,26 @@ export class SwitchEngine {
         );
       }
     }
+
+    // No member could be seated. Any credentials still physically live in the profile at this point
+    // belong to a non-member or an unrecognized login: a rightful member would have been reconciled
+    // by the early return above (getActiveId recognizes a live member — quarantined or not — and its
+    // credentials, so it never reaches here). Fail the slot closed by clearing that squatter, so a
+    // session started in the bound folder is "not logged in" rather than silently running as an
+    // account the folder does not reserve. This mirrors the global slot's clear-when-no-replacement
+    // fallback (see repairGlobalSlot / clearGlobalLive) and preserves the "at most one slot" and
+    // reserved-fence invariants that repairSlots is contracted to heal.
+    const squatterCreds = await rt.credStore.readLiveCredentials().catch(() => undefined);
+    if (squatterCreds) {
+      await this.clearSlotLive(rt);
+      return {
+        groupId: group.id,
+        liveMember: null,
+        activated: false,
+        noWorkingAccount: true,
+        clearedSquatter: true,
+      };
+    }
     return { groupId: group.id, liveMember: null, activated: false, noWorkingAccount: true };
   }
 
@@ -1172,6 +1192,8 @@ export class SwitchEngine {
       for (const group of groups) {
         const res = await this.ensureGroupLiveLocked(group);
         if (res.activated) actions.push(`re-activated a member in ${describeMembers(group)}`);
+        else if (res.clearedSquatter)
+          actions.push(`cleared a non-member login from ${describeMembers(group)}`);
       }
 
       // Snapshot LAST — an activeId may have moved (its generation is what freshness checks read).

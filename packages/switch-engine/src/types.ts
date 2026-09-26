@@ -300,6 +300,10 @@ export interface GroupLiveResult {
   /** True when every eligible member failed to activate — the binding exists but has no working
    *  account. */
   noWorkingAccount: boolean;
+  /** True when no member could be seated AND a non-member/unrecognized login squatting in the profile
+   *  was cleared to fail the slot closed. Lets the repair/doctor report the eviction (an eviction
+   *  leaves `activated` false, so it would otherwise be silent). */
+  clearedSquatter?: boolean;
 }
 
 /** What {@link SwitchEngine.bindFolder} did — reported so the CLI can tell the operator exactly what
