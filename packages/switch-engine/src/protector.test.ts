@@ -6,11 +6,11 @@ import {
   KeychainProtector,
   resolveClaudeCliKeychainTarget,
   CLAUDE_CLI_KEYCHAIN_SERVICE,
+  CLAUDE_CLI_KEYCHAIN_ACCOUNT,
 } from './keychain.js';
 import { FileKeyProtector } from './fileKey.js';
 import { FileCredentialChannel } from './credentialStore.js';
 import { sandboxPaths } from './paths.js';
-import { userInfo } from 'node:os';
 
 describe('defaultProtector', () => {
   it('dispatches win32 → DPAPI and darwin → Keychain', () => {
@@ -48,20 +48,20 @@ describe('defaultLiveCredentialChannel', () => {
     expect(channel.target).toEqual({ service: 'Custom-Item', account: 'alt-user' });
   });
 
-  it('defaults the channel target to the shipped service and the login user with no env', () => {
+  it('defaults the channel target to the derived service and the fixed account with no env', () => {
     const channel = defaultLiveCredentialChannel(paths, 'darwin', {}) as KeychainCredentialChannel;
     expect(channel.target).toEqual({
       service: CLAUDE_CLI_KEYCHAIN_SERVICE,
-      account: userInfo().username,
+      account: CLAUDE_CLI_KEYCHAIN_ACCOUNT,
     });
   });
 });
 
 describe('resolveClaudeCliKeychainTarget', () => {
-  it('defaults to the shipped service and the login user when env is unset', () => {
+  it('defaults to the derived service and the fixed account when env is unset', () => {
     const t = resolveClaudeCliKeychainTarget({});
     expect(t.service).toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
-    expect(t.account).toBe(userInfo().username);
+    expect(t.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
   });
 
   it('applies CLAUDE_CLI_KEYCHAIN_SERVICE / _ACCOUNT overrides', () => {
@@ -78,7 +78,7 @@ describe('resolveClaudeCliKeychainTarget', () => {
       CLAUDE_CLI_KEYCHAIN_ACCOUNT: '',
     });
     expect(t.service).toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
-    expect(t.account).toBe(userInfo().username);
+    expect(t.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
   });
 
   it('treats a whitespace-only override as unset too (not just a bare empty string)', () => {
@@ -87,6 +87,6 @@ describe('resolveClaudeCliKeychainTarget', () => {
       CLAUDE_CLI_KEYCHAIN_ACCOUNT: '\t',
     });
     expect(t.service).toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
-    expect(t.account).toBe(userInfo().username);
+    expect(t.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
   });
 });
