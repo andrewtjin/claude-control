@@ -483,6 +483,50 @@ killed daemon lost nothing, and the nested session refused with a printed reason
 
 **Result:** not yet run.
 
+### 18. macOS Keychain interop round-trip — cctl ↔ CLI ⏳ OPEN
+
+**Claim to verify:** on macOS the CLI and cctl address the exact same login-Keychain item, so a
+credential written by one is read back — and refreshed — by the other, in BOTH size regimes:
+
+- **cctl writes → CLI reads + refreshes:** after a `switch`, a `claude` launched under the new
+  account reads the swapped item, and its own token rotation writes the new (single-use) token back
+  to the very item cctl reads.
+- **CLI writes → cctl reads:** a fresh `claude` login writes the item; the daemon reads that live
+  credential with no re-login.
+- **unchunked (≤2400 bytes) and chunked (>2400 bytes):** the small case is one item; the large case
+  is the base64 chunk set plus the `#m` metadata item. A real credential can cross the threshold, so
+  both must round-trip — including a shrink back under the threshold, which must tear down the stale
+  chunk set and leave a single unchunked item the CLI still reads.
+
+**Unit-proven already:** the chunk/reassembly layout, the metadata-last write ordering, the
+shrink/grow cleanup, the un-suffixed legacy-read fallback, and the corrupt-set → typed-error paths
+are covered in `packages/switch-engine/src/keychain.test.ts` — but every one drives a **fake
+`ExecRunner`**. They prove our encoding is self-consistent, NOT that the real `security(1)` item
+attributes match what the CLI's secure-storage layer reads, and NOT that a >2400-byte value survives
+the real `security -i` write path.
+
+**What no headless test can close:** whether the CLI's Bun secure-storage and our `security(1)`
+path resolve to the same `kSecAttrService`/`kSecAttrAccount` item (and the same chunk/metadata
+sibling names) on real hardware, and whether the CLI accepts a chunk set we wrote — and we accept
+one it wrote — without forcing a re-login.
+
+**Verify (attribute/keys-only — NEVER `-w`/`-g` on the live item; this file is public):**
+
+- cctl-writes-CLI-reads: `switch` to a spare, run `claude -p` under it, confirm it authenticates
+  with no re-login; force a token refresh and confirm the rotated token lands where cctl reads.
+- CLI-writes-cctl-reads: fresh `claude` login, then `cctl doctor` reports `login` green off the same
+  item.
+- chunked: repeat both directions with a credential large enough to exceed 2400 bytes (confirm the
+  `#m` + `#<i>` siblings exist, keys-only), then shrink it back and confirm the unchunked item is
+  authoritative and the stale chunks are gone.
+
+**Pass (each stamped with evidence):** both directions round-trip in both size regimes, a CLI-side
+refresh after a cctl write is read back by cctl, and the shrink path leaves exactly one unchunked
+item. Record the verdict **arch-scoped** (arm64 ≠ Intel — do not generalize one to the other).
+
+**Result:** not yet run — no Mac available. The fake-runner unit tests and the `macos-latest` CI
+leg (own `vault-key` item only) are NOT evidence for this gate.
+
 ## Reminder
 
 The undocumented endpoints (2, 3, 15) and hook names (5) can change without notice. Parsing
