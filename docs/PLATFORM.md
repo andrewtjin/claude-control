@@ -53,6 +53,13 @@
 - **Observed sessions** (watching a live terminal you started yourself) target ConPTY,
   the Windows pseudo-console. This is an optional dependency (`node-pty`) — its
   absence degrades gracefully with a clear message rather than crashing `cctl run`.
+- **Folder-bound accounts** work on Windows and Linux and are **refused on macOS**
+  (`cctl bind` exits with an honest "not supported on macOS yet"). A binding gives each
+  account its own config dir holding a live `.credentials.json`; on macOS the live login
+  is a cross-app **Keychain** item, not a file, so a per-account slot would need a
+  per-account Keychain item, and reading a cross-app item can raise a GUI prompt a
+  headless daemon cannot answer — the same unsolved constraint the macOS section below
+  describes. See `docs/CLI.md` ("Folder-bound accounts").
 
 Everything else — the daemon, the bot, the CLI, usage polling, remote/managed
 sessions — is portable Node ≥ 22.5.

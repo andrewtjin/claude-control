@@ -25,6 +25,7 @@ import type { SessionStatus } from './stateCache.js';
 import {
   accountMarker,
   discordRelative,
+  escapeDiscordMarkdown,
   EMBED_DESCRIPTION_LIMIT,
   EMBED_FIELD_VALUE_LIMIT,
   layeredBar,
@@ -359,6 +360,37 @@ function exclusionSuffix(account: Pick<AccountUsage, 'autoSwitchExcluded'> | und
   return account?.autoSwitchExcluded === true ? '\n⏸ excluded from auto-switch' : '';
 }
 
+/** "\n📁 live in <folder> group" / "\n📁 bound: <folder>" — the folder binding a reserved account
+ *  carries, or '' for a shared (global-pool) account and for a daemon predating the group fields.
+ *
+ *  `groupId` present is the sole test for "reserved": a shared account omits it, which reads the
+ *  same as an older daemon, so both render exactly as before. `groupActive` picks the wording —
+ *  the member currently live in its group's slot is "live in", a merely-reserved member is "bound:"
+ *  — because that is the one distinction a reader needs (which of a folder's accounts is in use
+ *  right now). The label is the daemon's pre-rendered folder binding; it is user-derived, so it
+ *  goes through the markdown escaper like every other label on the card. */
+function groupSuffix(
+  account: Pick<AccountUsage, 'groupId' | 'groupLabel' | 'groupActive'> | undefined,
+): string {
+  if (account?.groupId == null) return '';
+  const label = escapeDiscordMarkdown(account.groupLabel ?? 'a folder binding');
+  return account.groupActive === true ? `\n📁 live in ${label} group` : `\n📁 bound: ${label}`;
+}
+
+/** A human tag for a session's credential slot, or `undefined` when there is nothing to add.
+ *
+ *  `global` and an absent slot both render with NO tag — that is the normal, pre-feature case, and
+ *  the wire contract is explicit that an older daemon omitting the field must look exactly like
+ *  today. Only a `group:` slot earns a tag, and a deliberately vague one: the session frame carries
+ *  the raw slot id, not the folder label (which lives on the usage snapshot), so naming the folder
+ *  here would be a guess. Any other prefix a future daemon introduces is ignored, per the wire
+ *  contract's "render a known prefix and ignore the rest". */
+function describeSlot(slot: string | null | undefined): string | undefined {
+  if (slot == null || slot === 'global') return undefined;
+  if (slot.startsWith('group:')) return 'folder-bound group';
+  return undefined;
+}
+
 /** Embed accent color for a usage snapshot: the worst severity across every limit of
  *  every account, or neutral blue when no limit data exists yet. */
 function usageColor(accounts: AccountUsage[]): number {
@@ -407,10 +439,10 @@ export function buildUsageEmbed(
     // does not bound, and it is the field name here.
     addClampedField(
       embed,
-      `${account.label} — ${marker}${cachedSuffix(account)}`,
+      `${escapeDiscordMarkdown(account.label)} — ${marker}${cachedSuffix(account)}`,
       fitFieldValue(
         (unicodeFallback) =>
-          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${resetLine(outlook, account.accountId)}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
+          `${formatLimits(account, nowMs, unicodeFallback ? DEFAULT_BAR_RENDERER : barRenderer)}${resetLine(outlook, account.accountId)}${groupSuffix(account)}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
       ),
     );
   }
@@ -534,8 +566,11 @@ export function buildTimelineEmbed(
       } else if (!a.quarantined) {
         lines.push('weekly reset time unknown');
       }
-      // Same two registry facts /usage and /accounts now carry, so the three account views
-      // agree — `planBillingSuffix` leads with a newline, which is already the separator here.
+      // The same folder-binding and registry facts /usage and /accounts carry, so the three
+      // account views agree — both suffixes lead with a newline, which is already the separator
+      // here, so it is dropped before the line is pushed.
+      const group = groupSuffix(wire);
+      if (group !== '') lines.push(group.slice(1));
       const planBilling = planBillingSuffix(wire);
       if (planBilling !== '') lines.push(planBilling.slice(1));
       if (spanMs > 0) {
@@ -549,7 +584,7 @@ export function buildTimelineEmbed(
     // Same reason as /usage above: the label is unbounded registry text and it is the field name.
     addClampedField(
       embed,
-      `${accountMarker(a)} ${a.label}${cachedSuffix(wire)}`,
+      `${accountMarker(a)} ${escapeDiscordMarkdown(a.label)}${cachedSuffix(wire)}`,
       fitFieldValue(
         (unicodeFallback) =>
           `${
@@ -618,7 +653,10 @@ function tokenSum(totals: TokenTotals): number {
 function statsLines(rows: readonly { label: string; totals: TokenTotals }[]): string {
   if (rows.length === 0) return 'nothing recorded';
   return rows
-    .map((r) => `**${r.label}** — ${formatTokens(tokenSum(r.totals))} · ${r.totals.turns} turns`)
+    .map(
+      (r) =>
+        `**${escapeDiscordMarkdown(r.label)}** — ${formatTokens(tokenSum(r.totals))} · ${r.totals.turns} turns`,
+    )
     .join('\n');
 }
 
@@ -709,8 +747,8 @@ export function buildAccountsEmbed(accounts: AccountUsage[]): EmbedBuilder {
     const age = account.source === 'cached' ? ` (${discordRelative(account.fetchedAtMs)})` : '';
     addClampedField(
       embed,
-      `${accountMarker(account)} ${account.label}`,
-      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
+      `${accountMarker(account)} ${escapeDiscordMarkdown(account.label)}`,
+      `${account.active ? 'active' : 'idle'} · source: ${account.source}${age}${groupSuffix(account)}${planBillingSuffix(account)}${exclusionSuffix(account)}${errorSuffix(account)}`,
     );
   }
   return fitEmbed(embed);
@@ -747,7 +785,18 @@ export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
   for (const session of sessions) {
     // Summaries are daemon-relayed model text — unbounded, so clamp like everything else.
     const summaryLine = session.summary ? ` — ${session.summary}` : '';
-    addClampedField(embed, session.sessionId, `${session.state}${summaryLine}`);
+    // The account the session runs on, and its folder binding when it is on a group slot: a
+    // reserved account is only ever live in its own group's slot, so the slot is the one fact the
+    // account id alone does not convey. Both are omitted when absent (an older daemon, or a plain
+    // global session), so the row reads exactly as before.
+    const accountLine = session.accountId ? `\naccount: ${session.accountId}` : '';
+    const slotTag = describeSlot(session.slot);
+    const slotLine = slotTag ? `\n📁 ${slotTag}` : '';
+    addClampedField(
+      embed,
+      session.sessionId,
+      `${session.state}${summaryLine}${accountLine}${slotLine}`,
+    );
   }
   return fitEmbed(embed);
 }
@@ -1031,7 +1080,7 @@ export function buildReauthLinkEmbed(p: {
   // to keep the steps whole. Clamping the finished description instead would cut the tail, which
   // is exactly the part that has to survive.
   const intro = clampFieldValue(
-    `Log back into **${p.label}** (${p.accountId}). You must sign in as the SAME account — ` +
+    `Log back into **${escapeDiscordMarkdown(p.label)}** (${p.accountId}). You must sign in as the SAME account — ` +
       `a different login is refused so its usage history stays intact.\n\n`,
     Math.max(1, EMBED_DESCRIPTION_LIMIT - steps.length),
   );
@@ -1108,6 +1157,10 @@ export interface SessionCardModel {
   stopping: boolean;
   summary?: string;
   accountId?: string;
+  /** The session's credential slot as the wire reported it (`"global"` or `"group:<id>"`), or
+   *  absent for a session a daemon predating folder-bound accounts reported. Rendered only for a
+   *  group slot — see {@link describeSlot} — so a plain global session's card is unchanged. */
+  slot?: string;
   /** The tail of accumulated stdout, already sliced by the planner to a phone-friendly length. */
   outputTail?: string;
   totalOutputChars: number;
@@ -1177,6 +1230,8 @@ export function buildSessionCardEmbed(model: SessionCardModel): EmbedBuilder {
   // data-driven field so a malformed id cannot make the card's edit throw.
   addClampedField(embed, 'Session', model.sessionId);
   if (model.accountId) addClampedField(embed, 'Account', model.accountId);
+  const slotTag = describeSlot(model.slot);
+  if (slotTag) addClampedField(embed, 'Slot', slotTag);
   const notes = sessionNotes(model);
   if (notes) addClampedField(embed, 'Notes', notes);
   return fitEmbed(embed);
@@ -1197,6 +1252,8 @@ export function buildSessionSummaryEmbed(model: SessionCardModel): EmbedBuilder 
     );
   addClampedField(embed, 'Session', model.sessionId);
   if (model.accountId) addClampedField(embed, 'Account', model.accountId);
+  const slotTag = describeSlot(model.slot);
+  if (slotTag) addClampedField(embed, 'Slot', slotTag);
   addClampedField(embed, 'Output', `${model.totalOutputChars} chars streamed`);
   const notes = sessionNotes(model);
   if (notes) addClampedField(embed, 'Notes', notes);
