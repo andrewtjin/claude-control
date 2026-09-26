@@ -103,11 +103,101 @@ export interface StoredAccount {
   updatedAtMs: number;
 }
 
-/** The registry index persisted at `vault/accounts.json`. */
+/** The registry index persisted at `vault/accounts.json`.
+ *
+ *  Holds only SHARED (global-pool) rows. A reserved account's row is MOVED out of here into
+ *  `groups.json` (see {@link StoredGroup}) so that an older cctl — which rewrites this file knowing
+ *  only `{activeId, accounts}` — never sees, refreshes, or switches to a reserved account, and its
+ *  writes can never drop a binding. That downgrade fence is the whole reason for the split. */
 export interface Registry {
-  /** Id of the account whose credentials are currently written to the live files. */
+  /** Schema tag, `2` once the group split exists. ABSENT means a file written by a build that
+   *  predates the feature; it is read as the pre-split shape (all rows shared) and upgraded on the
+   *  next write. Never fail a load purely because this is missing — that is the legacy path. */
+  schemaVersion?: number;
+  /** Id of the SHARED account whose credentials are currently written to the global live files.
+   *  A reserved account is never live here (its group slot holds it); see {@link StoredGroup}. */
   activeId: string | null;
   accounts: StoredAccount[];
+}
+
+/** Identifies one credential slot. `global` is today's config dir; a group gets its own profile
+ *  dir addressed as `group:<groupId>`. A template-literal type so a slot id and an ordinary string
+ *  are not silently interchangeable at call sites. */
+export type SlotId = 'global' | `group:${string}`;
+
+/** Build the {@link SlotId} for a group. The one place the `group:` prefix is spelled, so callers
+ *  never hand-concatenate it (and a rename of the scheme stays a one-line change). */
+export function groupSlotId(groupId: string): SlotId {
+  return `group:${groupId}`;
+}
+
+/**
+ * A set of accounts reserved to a set of folders, persisted in `groups.json` beside the registry.
+ *
+ * The members' FULL rows live here, not in `accounts.json` — see {@link Registry} for why. Sessions
+ * started under one of `folders` run on this group's slot; auto-switch rotates only among `members`;
+ * the members are never used anywhere else.
+ */
+export interface StoredGroup {
+  /** Random UUID. Unguessable because it also names the on-disk profile dir. */
+  id: string;
+  /** Display name. Defaults to the joined member labels when the operator gives none. */
+  label: string;
+  /** The FULL rows of the reserved accounts, moved out of the registry into this group. */
+  members: StoredAccount[];
+  /** The member currently live in this group's slot, or `null` when none is. Always a member id
+   *  (or null); validated on load. */
+  activeId: string | null;
+  /** Canonical folder paths bound to this group (see `folderPath.ts`). Unique across all groups. */
+  folders: string[];
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+/** The `groups.json` file: the reserved side of the one logical registry. */
+export interface GroupsFile {
+  schemaVersion: 1;
+  /** Bumped on every write; the guard snapshot (see {@link FolderBindingSnapshot}) carries it so a
+   *  stale snapshot can be detected. */
+  generation: number;
+  groups: StoredGroup[];
+}
+
+/** A row as the unified listing returns it: a {@link StoredAccount} plus, for a reserved account,
+ *  the id of the group holding it. The tag is VIEW-ONLY — it is derived from which file the row was
+ *  found in and is never written back into `accounts.json`. */
+export interface AccountView extends StoredAccount {
+  /** Present iff the account is reserved to a group; the group's id. */
+  groupId?: string;
+}
+
+/**
+ * The non-secret snapshot the enforcement guard reads: `<vaultDir>/../folder-bindings.json`.
+ *
+ * Written LAST in every group mutation and on daemon start, atomically. It carries no tokens — only
+ * what the guard needs to decide whether a session's config dir matches the folder it is running in.
+ */
+export interface FolderBindingSnapshot {
+  schemaVersion: 1;
+  /** The {@link GroupsFile} generation this snapshot was derived from. */
+  generation: number;
+  /** How the guard should act on a mismatch. Mirrors the daemon's current policy. */
+  enforce: 'block' | 'warn' | 'off';
+  /** The main Claude Code config dir the global slot runs in (canonical). */
+  mainConfigDir: string;
+  groups: FolderBindingSnapshotGroup[];
+}
+
+/** One group as the guard snapshot describes it. Members are LABELS only (for the block message);
+ *  no ids, no tokens. */
+export interface FolderBindingSnapshotGroup {
+  id: string;
+  label: string;
+  /** The group's profile dir; the guard matches a session's canonical config dir against it. */
+  profileDir: string;
+  folders: string[];
+  /** Member display labels, for the "bound to <members>" message. */
+  members: string[];
 }
 
 /** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets. */
