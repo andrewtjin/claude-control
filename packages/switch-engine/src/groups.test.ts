@@ -447,6 +447,56 @@ describe('strict validation of groups.json fails CLOSED, naming the field, leavi
       /appears in more than one group/,
     ));
 
+  it('refuses the same login (accountUuid) in two groups', () =>
+    expectRefusal(
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: 0,
+        groups: [
+          group({ members: [{ ...member, accountUuid: 'login-x' }] }),
+          group({ id: 'g2', members: [{ ...member, id: 'm2', accountUuid: 'login-x' }] }),
+        ],
+      }),
+      /login login-x appears in more than one group/,
+    ));
+
+  it('accepts a login repeated WITHIN one group (a dedupe-able duplicate, not a cross-group one)', async () => {
+    // Two members of ONE group sharing a login is what dedupeAccounts collapses; failing the load
+    // closed would make it unrepairable, so validation must accept it.
+    const { v } = await withGroupsFile(
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: 0,
+        groups: [
+          group({
+            members: [
+              { ...member, accountUuid: 'login-dup' },
+              { ...member, id: 'm2', accountUuid: 'login-dup' },
+            ],
+          }),
+        ],
+      }),
+    );
+    await expect(v.listGroups()).resolves.toHaveLength(1);
+  });
+
+  it('accepts distinct logins and rows that carry no accountUuid', async () => {
+    const { v } = await withGroupsFile(
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: 0,
+        groups: [
+          group({ members: [{ ...member, accountUuid: 'login-a' }] }),
+          group({ id: 'g2', members: [{ ...member, id: 'm2', accountUuid: 'login-b' }] }),
+          // A pre-metadata row (no accountUuid) is keyed by id alone and must not collide on undefined.
+          group({ id: 'g3', members: [{ ...member, id: 'm3' }] }),
+          group({ id: 'g4', members: [{ ...member, id: 'm4' }] }),
+        ],
+      }),
+    );
+    await expect(v.listGroups()).resolves.toHaveLength(4);
+  });
+
   it('refuses the same folder bound by two groups', () =>
     expectRefusal(
       JSON.stringify({

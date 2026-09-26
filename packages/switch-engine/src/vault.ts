@@ -227,7 +227,9 @@ function validateMember(value: unknown, where: string): StoredAccount {
  * that is not an object or carries a forbidden key; a missing id/label; an over-cap or empty member
  * list (an empty group has no reason to exist and would leave `activeId` unsatisfiable); a member
  * that fails {@link validateMember}; a member id repeated across the whole file (two rows answering
- * to one account); an `activeId` that is neither null nor one of the group's own members; an
+ * to one account); a member login (`accountUuid`) repeated across the whole file (one login placed in
+ * two group slots — both slots would attribute to it, double-counting its usage and making
+ * resolution ambiguous); an `activeId` that is neither null nor one of the group's own members; an
  * over-cap folder list; or a folder that collides (by {@link folderUniquenessKey}, i.e. after
  * canonicalization) with one already claimed by any group. The caller separately heals a member id
  * that ALSO lingers in `accounts.json`.
@@ -251,6 +253,7 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
   }
 
   const seenMemberIds = new Set<string>();
+  const seenAccountUuids = new Set<string>();
   const seenFolderKeys = new Set<string>();
   const groups: StoredGroup[] = [];
   for (let i = 0; i < rawGroups.length; i += 1) {
@@ -272,14 +275,32 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
       );
     }
     const members: StoredAccount[] = [];
+    // Logins this group carries. A login repeated WITHIN one group is a dedupe-able duplicate that
+    // `dedupeAccounts` collapses per group, so it is accepted here (failing closed would make it
+    // unrepairable); a login that ALSO appears in an EARLIER group is not, so the cross-group check
+    // compares against `seenAccountUuids` (prior groups only) and this set is merged in afterward.
+    const thisGroupUuids = new Set<string>();
     for (let j = 0; j < g.members.length; j += 1) {
       const member = validateMember(g.members[j], `${where}.members[${j}]`);
       if (seenMemberIds.has(member.id)) {
         throw new VaultError(`account ${member.id} appears in more than one group`);
       }
       seenMemberIds.add(member.id);
+      // A login (accountUuid) may reserve to at most one group. The same login in two groups places
+      // the one logical login in two slots: both attribute to it (double-counting its usage) and
+      // resolveAccountRef becomes ambiguous. Rows predating metadata capture carry no accountUuid;
+      // those are keyed by id alone (nothing to compare) rather than colliding on `undefined`.
+      if (member.accountUuid !== undefined) {
+        if (seenAccountUuids.has(member.accountUuid)) {
+          throw new VaultError(
+            `account login ${member.accountUuid} appears in more than one group`,
+          );
+        }
+        thisGroupUuids.add(member.accountUuid);
+      }
       members.push(member);
     }
+    for (const uuid of thisGroupUuids) seenAccountUuids.add(uuid);
     const activeId = g.activeId;
     if (activeId !== null) {
       if (typeof activeId !== 'string' || !members.some((m) => m.id === activeId)) {
