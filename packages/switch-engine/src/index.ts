@@ -94,6 +94,9 @@ export {
   type BindTargetDeps,
   type FolderBoundGroup,
 } from './folderPath.js';
+// Terminal-safe text stripping — shared verbatim between cctl-side renderers (the CLI re-exports
+// it) and the enforcement guard, which embeds the compiled source (see terminalSafe.ts).
+export { sanitizeTerminalText, embeddableSanitizeSource } from './terminalSafe.js';
 // The non-secret folder-bindings snapshot the guard reads.
 export {
   buildFolderBindingSnapshot,
