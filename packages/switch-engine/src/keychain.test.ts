@@ -1,9 +1,18 @@
 import { describe, it, expect } from 'vitest';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { userInfo } from 'node:os';
 import {
   KeychainKeySource,
   KeychainProtector,
   KeychainCredentialChannel,
+  resolveClaudeCliKeychainTarget,
+  resolveClaudeCliLegacyKeychainTarget,
+  readChunkedValue,
+  writeChunkedValue,
+  CHUNK_THRESHOLD_BYTES,
+  CLAUDE_CLI_KEYCHAIN_SERVICE,
+  CLAUDE_CLI_KEYCHAIN_ACCOUNT,
+  CLAUDE_CLI_LEGACY_KEYCHAIN_SERVICE,
   VAULT_KEY_SERVICE,
   VAULT_KEY_ACCOUNT,
   type ExecRunner,
@@ -12,9 +21,11 @@ import { VaultError } from './errors.js';
 import type { ClaudeOauth } from './types.js';
 
 // --- Fake `security(1)` --------------------------------------------------------------------
-// Simulates the two subcommands we use, including the exit-44 "not found" stderr shape and
-// the `-i` stdin command mode, while recording every argv and stdin payload for hygiene
-// assertions.
+// Simulates the subcommands we use — find-generic-password (read), `-i` add-generic-password
+// (upsert), delete-generic-password (delete) — including the exit-44 "not found" stderr shape and
+// the `-i` stdin command mode, while recording every argv and stdin payload for hygiene assertions.
+// The store is keyed by "<service> <account>", the same pair Keychain generic passwords key on
+// (kSecAttrService / kSecAttrAccount), so a chunk item ("<account>#<i>") is just another key.
 
 interface SecurityCall {
   args: string[];
@@ -24,6 +35,12 @@ interface SecurityCall {
 /** The token following a flag, '' when absent — keeps the strict indexer happy. */
 function argAfter(tokens: string[], flag: string): string {
   return tokens[tokens.indexOf(flag) + 1] ?? '';
+}
+
+function notFoundError(): Error & { stderr: string } {
+  const err = new Error('security failed') as Error & { stderr: string };
+  err.stderr = 'security: SecKeychainSearchCopyNext: The specified item could not be found.';
+  return err;
 }
 
 function fakeSecurity(store: Map<string, string>): { run: ExecRunner; calls: SecurityCall[] } {
@@ -41,26 +58,22 @@ function fakeSecurity(store: Map<string, string>): { run: ExecRunner; calls: Sec
     calls.push({ args, input });
     if (file !== 'security') throw new Error(`unexpected binary: ${file}`);
     if (args[0] === 'find-generic-password') {
-      const service = argAfter(args, '-s');
-      const account = argAfter(args, '-a');
-      const value = store.get(keyOf(service, account));
-      if (value === undefined) {
-        const err = new Error('security failed') as Error & { stderr: string };
-        err.stderr = 'security: SecKeychainSearchCopyNext: The specified item could not be found.';
-        throw err;
-      }
+      const value = store.get(keyOf(argAfter(args, '-s'), argAfter(args, '-a')));
+      if (value === undefined) throw notFoundError();
       return value + '\n';
+    }
+    if (args[0] === 'delete-generic-password') {
+      const key = keyOf(argAfter(args, '-s'), argAfter(args, '-a'));
+      if (!store.has(key)) throw notFoundError();
+      store.delete(key);
+      return '';
     }
     if (args[0] === '-i') {
       // Parse the one stdin command line the way `security -i` tokenizes: whitespace-split
       // with double-quoted segments honoring \" and \\ escapes.
-      const line = (input ?? '').trim();
-      const tokens = tokenize(line);
+      const tokens = tokenize((input ?? '').trim());
       if (tokens[0] !== 'add-generic-password') throw new Error(`unexpected: ${tokens[0]}`);
-      const service = argAfter(tokens, '-s');
-      const account = argAfter(tokens, '-a');
-      const value = argAfter(tokens, '-w');
-      store.set(keyOf(service, account), value);
+      store.set(keyOf(argAfter(tokens, '-s'), argAfter(tokens, '-a')), argAfter(tokens, '-w'));
       return '';
     }
     throw new Error(`unexpected security args: ${args.join(' ')}`);
@@ -164,16 +177,230 @@ describe('KeychainProtector', () => {
   });
 });
 
+// --- resolveClaudeCliKeychainTarget --------------------------------------------------------
+// The CLI derives the credential service as `Claude Code` + OAUTH_FILE_SUFFIX("") + `-credentials`
+// + a config-dir suffix, and stores under the fixed account `claude-code-user`. From the CLI:
+//   kJ(n="")=`Claude Code${OAUTH_FILE_SUFFIX}${n}${o}`, o = configDir customized
+//     ? `-${sha256(NFC(configDir)).hex.slice(0,8)}` : "";   DN()="claude-code-user"
+// CLAUDE_SECURESTORAGE_CONFIG_DIR wins when set (empty string => default, no suffix); otherwise
+// CLAUDE_CONFIG_DIR both selects and supplies the path to hash.
+
+describe('resolveClaudeCliKeychainTarget', () => {
+  it('defaults to the un-suffixed service and the fixed account when no config dir is set', () => {
+    const t = resolveClaudeCliKeychainTarget({});
+    expect(t.service).toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
+    expect(t.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
+  });
+
+  it('hashes CLAUDE_CONFIG_DIR into the service suffix', () => {
+    const dir = '/Users/x/.claude-alt';
+    const suffix = createHash('sha256').update(dir.normalize('NFC')).digest('hex').slice(0, 8);
+    const t = resolveClaudeCliKeychainTarget({ CLAUDE_CONFIG_DIR: dir });
+    expect(t.service).toBe(`${CLAUDE_CLI_KEYCHAIN_SERVICE}-${suffix}`);
+  });
+
+  it('prefers CLAUDE_SECURESTORAGE_CONFIG_DIR for the hash; empty string means default', () => {
+    const dir = '/opt/secure-claude';
+    const suffix = createHash('sha256').update(dir.normalize('NFC')).digest('hex').slice(0, 8);
+    // Set-non-empty wins over CLAUDE_CONFIG_DIR entirely.
+    expect(
+      resolveClaudeCliKeychainTarget({
+        CLAUDE_SECURESTORAGE_CONFIG_DIR: dir,
+        CLAUDE_CONFIG_DIR: '/somewhere/else',
+      }).service,
+    ).toBe(`${CLAUDE_CLI_KEYCHAIN_SERVICE}-${suffix}`);
+    // Set-but-empty means "default config dir": no suffix, and it suppresses CLAUDE_CONFIG_DIR too.
+    expect(
+      resolveClaudeCliKeychainTarget({
+        CLAUDE_SECURESTORAGE_CONFIG_DIR: '',
+        CLAUDE_CONFIG_DIR: '/somewhere/else',
+      }).service,
+    ).toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
+  });
+
+  it('honors explicit CLAUDE_CLI_KEYCHAIN_SERVICE/_ACCOUNT overrides, trimming blanks to defaults', () => {
+    const overridden = resolveClaudeCliKeychainTarget({
+      CLAUDE_CLI_KEYCHAIN_SERVICE: '  Custom-Item  ',
+      CLAUDE_CLI_KEYCHAIN_ACCOUNT: 'alt-user',
+      CLAUDE_CONFIG_DIR: '/ignored/when/service/is/overridden',
+    });
+    expect(overridden.service).toBe('Custom-Item');
+    expect(overridden.account).toBe('alt-user');
+    // A blank override is an operator slip, not an empty item name: fall back to the derived value.
+    const blank = resolveClaudeCliKeychainTarget({
+      CLAUDE_CLI_KEYCHAIN_SERVICE: '   ',
+      CLAUDE_CLI_KEYCHAIN_ACCOUNT: '',
+    });
+    expect(blank.service).toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
+    expect(blank.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
+  });
+});
+
+// --- chunk layout: writeChunkedValue / readChunkedValue ------------------------------------
+// The CLI's storage layer stores a value at/under 2400 UTF-8 bytes as one item holding the raw
+// value; a larger value is base64-encoded and split into 2400-char chunk items ("<account>#<i>")
+// plus a metadata item ("<account>#m") holding {n: chunkCount, l: base64Length}, written LAST so a
+// reader keying off "#m" never sees a half-written set. A shrink deletes the stale chunks/metadata.
+
+const TARGET = { service: 'svc', account: 'acct' };
+const metaKey = `${TARGET.service} ${TARGET.account}#m`;
+const plainKey = `${TARGET.service} ${TARGET.account}`;
+const chunkKey = (i: number) => `${TARGET.service} ${TARGET.account}#${i}`;
+
+/** One shared store + its runner, for layout assertions after a write. */
+function rig(): { run: ExecRunner; store: Map<string, string> } {
+  const store = new Map<string, string>();
+  return { run: fakeSecurity(store).run, store };
+}
+
+describe('writeChunkedValue / readChunkedValue', () => {
+  // The five sizes the layout must be exercised at: empty, just under, exactly at, just over the
+  // threshold, and several chunks' worth.
+  for (const bytes of [0, CHUNK_THRESHOLD_BYTES - 1, CHUNK_THRESHOLD_BYTES]) {
+    it(`stores a ${bytes}-byte value UNCHUNKED and reads it back`, async () => {
+      const { run, store } = rig();
+      const value = 'x'.repeat(bytes);
+      await writeChunkedValue(run, TARGET, value);
+      // Unchunked: the plain item holds the raw value, and there is no metadata.
+      expect(store.get(plainKey)).toBe(value);
+      expect(store.has(metaKey)).toBe(false);
+      expect(await readChunkedValue(run, TARGET)).toBe(value);
+    });
+  }
+
+  for (const bytes of [CHUNK_THRESHOLD_BYTES + 1, CHUNK_THRESHOLD_BYTES * 3]) {
+    it(`stores a ${bytes}-byte value CHUNKED (base64, metadata last) and reads it back`, async () => {
+      const { run, store } = rig();
+      const value = 'x'.repeat(bytes);
+      await writeChunkedValue(run, TARGET, value);
+
+      const encoded = Buffer.from(value, 'utf8').toString('base64');
+      const count = Math.ceil(encoded.length / CHUNK_THRESHOLD_BYTES);
+      // Metadata records the base64 length and chunk count; the unchunked item is gone.
+      expect(JSON.parse(store.get(metaKey)!)).toEqual({ n: count, l: encoded.length });
+      expect(store.has(plainKey)).toBe(false);
+      // Chunks reassemble to the base64 of the value, none missing, no stray #p marker.
+      const joined = Array.from({ length: count }, (_unused, i) => store.get(chunkKey(i))).join('');
+      expect(joined).toBe(encoded);
+      expect(store.has(`${TARGET.service} ${TARGET.account}#p`)).toBe(false);
+      expect(await readChunkedValue(run, TARGET)).toBe(value);
+    });
+  }
+
+  it('reads undefined when no item exists', async () => {
+    const { run } = rig();
+    expect(await readChunkedValue(run, TARGET)).toBeUndefined();
+  });
+
+  it('cleans up the old chunk set when a value shrinks below the threshold', async () => {
+    const { run, store } = rig();
+    const big = 'y'.repeat(CHUNK_THRESHOLD_BYTES * 3);
+    await writeChunkedValue(run, TARGET, big);
+    const bigCount = Math.ceil(
+      Buffer.from(big, 'utf8').toString('base64').length / CHUNK_THRESHOLD_BYTES,
+    );
+    expect(store.has(metaKey)).toBe(true);
+
+    const small = 'z'.repeat(10);
+    await writeChunkedValue(run, TARGET, small);
+    // The plain item is now authoritative; metadata, every old chunk and the #p marker are gone.
+    expect(store.get(plainKey)).toBe(small);
+    expect(store.has(metaKey)).toBe(false);
+    for (let i = 0; i < bigCount; i++) expect(store.has(chunkKey(i))).toBe(false);
+    expect(store.has(`${TARGET.service} ${TARGET.account}#p`)).toBe(false);
+    expect(await readChunkedValue(run, TARGET)).toBe(small);
+  });
+
+  it('drops stale higher-index chunks when a chunked value shrinks to fewer chunks', async () => {
+    const { run, store } = rig();
+    await writeChunkedValue(run, TARGET, 'y'.repeat(CHUNK_THRESHOLD_BYTES * 3));
+    const largeCount = Math.ceil(
+      Buffer.from('y'.repeat(CHUNK_THRESHOLD_BYTES * 3), 'utf8').toString('base64').length /
+        CHUNK_THRESHOLD_BYTES,
+    );
+
+    const smaller = 'w'.repeat(CHUNK_THRESHOLD_BYTES + 1);
+    await writeChunkedValue(run, TARGET, smaller);
+    const smallerCount = Math.ceil(
+      Buffer.from(smaller, 'utf8').toString('base64').length / CHUNK_THRESHOLD_BYTES,
+    );
+    expect(smallerCount).toBeLessThan(largeCount);
+    // Only the new chunks survive; the tail of the previous, larger set is deleted.
+    for (let i = smallerCount; i < largeCount; i++) expect(store.has(chunkKey(i))).toBe(false);
+    expect(await readChunkedValue(run, TARGET)).toBe(smaller);
+  });
+
+  // Unusable metadata (non-JSON, or n/l out of the CLI's bounds) is NOT a corrupt credential: the
+  // CLI's metadata reader returns null for it and reads the plain unchunked item instead. We match
+  // that — a leftover or aborted `#m` beside a valid plain item still reads back the credential, and
+  // one with no plain item reads as "logged out" (undefined), never a hard error.
+  it('falls back to the plain item when metadata is non-JSON', async () => {
+    const { run, store } = rig();
+    store.set(metaKey, 'not json');
+    store.set(plainKey, JSON.stringify({ claudeAiOauth: OAUTH }));
+    expect(await readChunkedValue(run, TARGET)).toBe(JSON.stringify({ claudeAiOauth: OAUTH }));
+  });
+
+  it('reads undefined (logged out) when metadata is non-JSON and there is no plain item', async () => {
+    const { run, store } = rig();
+    store.set(metaKey, 'not json');
+    expect(await readChunkedValue(run, TARGET)).toBeUndefined();
+  });
+
+  it('falls back to the plain item when metadata has a non-numeric chunk count', async () => {
+    const { run, store } = rig();
+    store.set(metaKey, JSON.stringify({ n: 'two', l: 8 }));
+    store.set(plainKey, JSON.stringify({ claudeAiOauth: OAUTH }));
+    expect(await readChunkedValue(run, TARGET)).toBe(JSON.stringify({ claudeAiOauth: OAUTH }));
+  });
+
+  // n out of the CLI's bounds (n<=0 and n>256): parseChunkMeta rejects both, so the plain item wins.
+  for (const meta of [
+    { n: 0, l: 5 },
+    { n: 300, l: 5 },
+  ]) {
+    it(`falls back to the plain item when metadata n=${meta.n} is out of bounds`, async () => {
+      const { run, store } = rig();
+      store.set(metaKey, JSON.stringify(meta));
+      store.set(plainKey, JSON.stringify({ claudeAiOauth: OAUTH }));
+      expect(await readChunkedValue(run, TARGET)).toBe(JSON.stringify({ claudeAiOauth: OAUTH }));
+    });
+  }
+
+  // A metadata item whose bounds are VALID but whose chunk set is broken IS a corrupt credential and
+  // still surfaces as a typed VaultError, never a crash or a silent "logged out" — the CLI throws here too.
+  it('throws when a chunk is missing', async () => {
+    const { run, store } = rig();
+    store.set(metaKey, JSON.stringify({ n: 2, l: 8 }));
+    store.set(chunkKey(0), 'YWJj'); // only #0, #1 absent
+    await expect(readChunkedValue(run, TARGET)).rejects.toThrow(VaultError);
+  });
+
+  it('throws when the reassembled length disagrees with the metadata', async () => {
+    const { run, store } = rig();
+    store.set(metaKey, JSON.stringify({ n: 1, l: 10 }));
+    store.set(chunkKey(0), 'YWJj'); // 4 chars, not 10
+    await expect(readChunkedValue(run, TARGET)).rejects.toThrow(VaultError);
+  });
+
+  it('throws when the reassembled chunks are not valid base64', async () => {
+    const { run, store } = rig();
+    store.set(metaKey, JSON.stringify({ n: 1, l: 4 }));
+    store.set(chunkKey(0), '!!!!'); // right length, not base64
+    await expect(readChunkedValue(run, TARGET)).rejects.toThrow(VaultError);
+  });
+});
+
 // --- KeychainCredentialChannel ---------------------------------------------------------------
 
 const OAUTH: ClaudeOauth = { accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: 123 };
-const SERVICE = 'Claude Code-credentials';
+const SERVICE = CLAUDE_CLI_KEYCHAIN_SERVICE;
 const itemKey = `${SERVICE} tester`;
 
 function channelWith(store: Map<string, string>) {
   const fake = fakeSecurity(store);
   return {
-    channel: new KeychainCredentialChannel({ account: 'tester', run: fake.run }),
+    channel: new KeychainCredentialChannel({ service: SERVICE, account: 'tester', run: fake.run }),
     calls: fake.calls,
     store,
   };
@@ -201,6 +428,82 @@ describe('KeychainCredentialChannel', () => {
   it('reads undefined when the item does not exist (= nobody logged in)', async () => {
     const { channel } = channelWith(new Map());
     expect(await channel.readLiveCredentials()).toBeUndefined();
+  });
+
+  it('reads a large chunked credential the CLI would have written', async () => {
+    // A refresh token long enough to push the wrapped JSON past the threshold, forcing chunking.
+    const big: ClaudeOauth = { ...OAUTH, refreshToken: 'r'.repeat(CHUNK_THRESHOLD_BYTES * 2) };
+    const value = JSON.stringify({ claudeAiOauth: big });
+    const store = new Map<string, string>();
+    const write = fakeSecurity(store);
+    await writeChunkedValue(write.run, { service: SERVICE, account: 'tester' }, value);
+    const { channel } = channelWith(store);
+    expect(await channel.readLiveCredentials()).toEqual(big);
+  });
+
+  it('round-trips a credential that grows past the threshold, then back', async () => {
+    const { channel, store } = channelWith(new Map());
+    const big: ClaudeOauth = { ...OAUTH, refreshToken: 'r'.repeat(CHUNK_THRESHOLD_BYTES * 2) };
+    await channel.writeLiveCredentials(big);
+    expect(store.has(`${itemKey}#m`)).toBe(true); // chunked
+    expect(await channel.readLiveCredentials()).toEqual(big);
+
+    await channel.writeLiveCredentials(OAUTH); // shrink back
+    expect(store.has(`${itemKey}#m`)).toBe(false); // unchunked again
+    expect(await channel.readLiveCredentials()).toEqual(OAUTH);
+  });
+
+  it('surfaces a corrupt chunked item as a VaultError (never a silent logout)', async () => {
+    const store = new Map([[`${itemKey}#m`, JSON.stringify({ n: 2, l: 8 })]]); // metadata, no chunks
+    const { channel } = channelWith(store);
+    await expect(channel.readLiveCredentials()).rejects.toThrow(VaultError);
+  });
+
+  it('heals a corrupt item on write instead of dead-locking a switch-in', async () => {
+    // A metadata pointer to a chunk set that does not exist (valid bounds, missing chunks): reading
+    // this item throws, and that is exactly the state a switch INTO the account must recover from.
+    // The write is the heal — it must overwrite unconditionally (like the CLI's own write), not
+    // read-then-throw before writing anything. Before the fix this dead-locked the switch.
+    const store = new Map([[`${itemKey}#m`, JSON.stringify({ n: 2, l: 8 })]]);
+    const { channel } = channelWith(store);
+    await expect(channel.writeLiveCredentials(OAUTH)).resolves.toBeUndefined();
+    // The stale chunk metadata is torn down and the credential now reads back cleanly.
+    expect(store.has(`${itemKey}#m`)).toBe(false);
+    expect(await channel.readLiveCredentials()).toEqual(OAUTH);
+  });
+
+  it('falls back to the legacy un-suffixed item (fixed account, never the login username)', async () => {
+    // No CLI ever keyed the item by the login username. The pre-`-credentials` item lived at the
+    // un-suffixed service under the same fixed claude-code-user account, and the CLI's own legacy
+    // read is `security find-generic-password -a claude-code-user -w -s <un-suffixed service>`.
+    // With the primary absent, the channel must resolve through that legacy target.
+    const legacy = resolveClaudeCliLegacyKeychainTarget();
+    const store = new Map([
+      [`${legacy.service} ${legacy.account}`, JSON.stringify({ claudeAiOauth: OAUTH })],
+    ]);
+    const fake = fakeSecurity(store);
+    // No service/account override: the channel derives both the primary and the legacy target.
+    const channel = new KeychainCredentialChannel({ run: fake.run });
+    expect(await channel.readLiveCredentials()).toEqual(OAUTH);
+    // The legacy account is the CLI's fixed one, not the OS login user — the whole point of the fix.
+    expect(legacy.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
+    expect(legacy.account).not.toBe(userInfo().username);
+    // The legacy read hits the fixed account, and never the login username, on argv.
+    const reads = fake.calls.filter((c) => c.args[0] === 'find-generic-password');
+    expect(reads.some((c) => c.args.includes(CLAUDE_CLI_KEYCHAIN_ACCOUNT))).toBe(true);
+    expect(reads.some((c) => c.args.includes(userInfo().username))).toBe(false);
+  });
+
+  it('derives the legacy service as the un-suffixed base plus the SAME config-dir suffix', () => {
+    // The legacy item shares the primary's config-dir hash suffix; only the `-credentials` segment
+    // is absent (the CLI's kJ("") vs kJ("-credentials")).
+    const dir = '/Users/x/.config/claude';
+    const suffix = createHash('sha256').update(dir).digest('hex').slice(0, 8);
+    const legacy = resolveClaudeCliLegacyKeychainTarget({ CLAUDE_CONFIG_DIR: dir });
+    const primary = resolveClaudeCliKeychainTarget({ CLAUDE_CONFIG_DIR: dir });
+    expect(legacy.service).toBe(`${CLAUDE_CLI_LEGACY_KEYCHAIN_SERVICE}-${suffix}`);
+    expect(primary.service).toBe(`${CLAUDE_CLI_KEYCHAIN_SERVICE}-${suffix}`);
+    expect(legacy.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
   });
 
   it('write preserves sibling keys in a wrapped payload (surgical rule)', async () => {

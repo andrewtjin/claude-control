@@ -70,6 +70,16 @@ describe('buildAuthorizeUrl', () => {
     expect(url.toString()).not.toContain(verifier);
   });
 
+  it('defaults to the claude.ai subscription authorize host, not the Console page', () => {
+    // cctl mints subscription tokens (subscription client id + subscription scopes), which is the
+    // CLI's login-with-claude.ai path — it authorizes against claude.ai, never the Console page
+    // (platform.claude.com), whose login uses a different client id and scope set. Pointing a
+    // Pro/Max user at the Console page would defeat the re-login flow.
+    const url = new URL(buildAuthorizeUrl({ challenge: 'ch', state: 'st' }));
+    expect(url.origin + url.pathname).toBe('https://claude.com/cai/oauth/authorize');
+    expect(url.host).not.toBe('platform.claude.com');
+  });
+
   it('honors injected overrides so tests and future endpoint changes need no code edit', () => {
     const url = new URL(
       buildAuthorizeUrl(

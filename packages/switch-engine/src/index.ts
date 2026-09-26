@@ -15,6 +15,10 @@ export {
   VAULT_KEY_SERVICE,
   VAULT_KEY_ACCOUNT,
   CLAUDE_CLI_KEYCHAIN_SERVICE,
+  CLAUDE_CLI_KEYCHAIN_ACCOUNT,
+  CLAUDE_CLI_LEGACY_KEYCHAIN_SERVICE,
+  resolveClaudeCliKeychainTarget,
+  resolveClaudeCliLegacyKeychainTarget,
   type ExecRunner,
 } from './keychain.js';
 export { defaultProtector, defaultLiveCredentialChannel } from './protector.js';
@@ -30,6 +34,7 @@ export {
   DEFAULT_AUTHORIZE_ENDPOINT,
   DEFAULT_REDIRECT_URI,
   OAUTH_AUTHORIZE_SCOPES,
+  OAUTH_REFRESH_SCOPES,
   DEFAULT_REFRESH_SKEW_MS,
   type RefreshDeps,
   type ExchangeDeps,
