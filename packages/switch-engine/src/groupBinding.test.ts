@@ -62,7 +62,11 @@ function makeRefresh(clock: () => number) {
     });
 }
 
-async function harness(platform: NodeJS.Platform = 'win32'): Promise<Harness> {
+// The harness canonicalizes and containment-checks REAL sandbox directories (mkdtemp + realpath),
+// so the engine's path rules must match the host filesystem: win32 on Windows, POSIX elsewhere.
+// Windows-specific path semantics (drive letters, UNC, ADS) are covered with a mock fs in
+// folderPath.test.ts, which is host-independent.
+async function harness(platform: NodeJS.Platform = process.platform): Promise<Harness> {
   const root = await mkdtemp(join(tmpdir(), 'ce-bind-'));
   dirs.push(root);
   const paths = sandboxPaths(root);

@@ -59,7 +59,10 @@ async function harness(): Promise<Harness> {
     refreshSkewMs: 5 * 60 * 1000,
     minSwitchIntervalMs: 60_000,
     lockOptions: { timeoutMs: 2000, pollMs: 10 },
-    platform: 'win32',
+    // Real sandbox dirs are canonicalized/containment-checked here, so path rules must match the
+    // host filesystem (win32 on Windows, POSIX elsewhere). Win32-specific path semantics are
+    // covered with a mock fs in folderPath.test.ts.
+    platform: process.platform,
     bindFs,
     isProcessAlive: () => false,
   });
@@ -67,7 +70,7 @@ async function harness(): Promise<Harness> {
     root,
     paths,
     engine,
-    vault: new Vault(paths.vaultDir, protector, clock, undefined, 'win32'),
+    vault: new Vault(paths.vaultDir, protector, clock, undefined, process.platform),
     credStore: new CredentialStore(paths),
     folder: async (name) => {
       const p = join(root, name);

@@ -344,25 +344,35 @@ describe('spawnClaude (real spawn via a fake claude)', () => {
     expect(code).toBe(7);
   });
 
-  it('unwraps and runs a synthetic .cmd shim end to end', async () => {
-    // A real npm-style shim pointing at the fake cli.js next to it.
-    const cmdPath = join(dir, 'claude.cmd');
-    await writeFile(cmdPath, `"%_prog%" "%dp0%\\fake-cli.js" %*\r\n`, 'utf8');
-    const target = resolveLaunchTarget(cmdPath, { platform: 'win32', nodePath: process.execPath });
-    expect(target).toEqual({ kind: 'run', command: process.execPath, prefixArgs: [fakeScript] });
-    if (target.kind !== 'run') throw new Error('unreachable');
-    const captured = await new Promise<FakeOutput>((resolve, reject) => {
-      const child = spawn(target.command, [...target.prefixArgs, 'hello', 'x y'], {
-        env: { ...process.env },
-        shell: false,
+  // A .cmd shim is unwrapped with win32 path rules and the entry is joined onto the shim's real
+  // on-disk directory; that only round-trips to a spawnable file when the host itself is Windows
+  // (win32.join yields backslashes a POSIX fs will not resolve). The unwrap logic is covered
+  // host-independently by the unwrapNpmCmdShim unit tests above; this end-to-end spawn is win32-only.
+  it.runIf(process.platform === 'win32')(
+    'unwraps and runs a synthetic .cmd shim end to end',
+    async () => {
+      // A real npm-style shim pointing at the fake cli.js next to it.
+      const cmdPath = join(dir, 'claude.cmd');
+      await writeFile(cmdPath, `"%_prog%" "%dp0%\\fake-cli.js" %*\r\n`, 'utf8');
+      const target = resolveLaunchTarget(cmdPath, {
+        platform: 'win32',
+        nodePath: process.execPath,
       });
-      let stdout = '';
-      child.stdout.on('data', (c: Buffer) => (stdout += c.toString('utf8')));
-      child.on('error', reject);
-      child.on('close', () => resolve(JSON.parse(stdout) as FakeOutput));
-    });
-    expect(captured.argv).toEqual(['hello', 'x y']);
-  });
+      expect(target).toEqual({ kind: 'run', command: process.execPath, prefixArgs: [fakeScript] });
+      if (target.kind !== 'run') throw new Error('unreachable');
+      const captured = await new Promise<FakeOutput>((resolve, reject) => {
+        const child = spawn(target.command, [...target.prefixArgs, 'hello', 'x y'], {
+          env: { ...process.env },
+          shell: false,
+        });
+        let stdout = '';
+        child.stdout.on('data', (c: Buffer) => (stdout += c.toString('utf8')));
+        child.on('error', reject);
+        child.on('close', () => resolve(JSON.parse(stdout) as FakeOutput));
+      });
+      expect(captured.argv).toEqual(['hello', 'x y']);
+    },
+  );
 });
 
 describe('spawnClaude signal shielding', () => {

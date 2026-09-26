@@ -404,7 +404,9 @@ describe('relogin heals the slot where the account is live', () => {
 
 describe('capture refuses inside a profile', () => {
   it('captureFromConfigDir refuses a config dir inside the profiles root', async () => {
-    const h = await harness();
+    // This refusal compares REAL sandbox paths (the profile dir vs the profiles root), so the
+    // engine's path rules must match the host filesystem rather than the harness's win32 default.
+    const h = await harness(process.platform);
     const { group } = await setupGroup(h);
     const profileDir = groupProfileDir(h.paths.vaultDir, group.id);
     await mkdir(profileDir, { recursive: true });
@@ -428,7 +430,8 @@ describe('capture refuses inside a profile', () => {
       protector: h.protector,
       liveCredentialChannel: new FileCredentialChannel(insidePaths.credentialsPath),
       clock: h.clock,
-      platform: 'win32',
+      // Real sandbox paths (profile dir inside the profiles root): host path rules, not win32.
+      platform: process.platform,
     });
     await expect(inside.captureCurrentLogin('x')).rejects.toMatchObject({
       code: 'capture_in_profile',
