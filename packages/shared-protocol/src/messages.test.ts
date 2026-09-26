@@ -949,3 +949,75 @@ describe('usage.snapshot pacing inputs (additive, N/N-1 tolerant)', () => {
     expect(() => encode(frame({ accounts: [account], burnUnitsPerDay: -1 } as never))).toThrow();
   });
 });
+
+describe('usage.snapshot folder-bound group fields (additive, N/N-1 tolerant)', () => {
+  const account = {
+    accountId: 'acct-1',
+    label: 'Work',
+    active: false,
+    source: 'live',
+    fetchedAtMs: 1,
+    limits: [{ kind: 'weekly_all', percent: 40 }],
+  };
+
+  it('parses without them — a shared account and a pre-feature daemon both stay valid', () => {
+    const result = decode(rawFrame('usage.snapshot', { accounts: [account] }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      const row = result.envelope.payload.accounts[0];
+      expect(row?.groupId ?? undefined).toBeUndefined();
+      expect(row?.groupLabel ?? undefined).toBeUndefined();
+      expect(row?.groupActive ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries the group id, label and live-member flag through', () => {
+    const result = decode(
+      rawFrame('usage.snapshot', {
+        accounts: [{ ...account, groupId: 'grp-7', groupLabel: 'client work', groupActive: true }],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      const row = result.envelope.payload.accounts[0];
+      expect(row?.groupId).toBe('grp-7');
+      expect(row?.groupLabel).toBe('client work');
+      expect(row?.groupActive).toBe(true);
+    }
+  });
+
+  it('refuses a non-boolean groupActive — a live-member mark is a verdict, not a hint', () => {
+    expect(
+      decode(rawFrame('usage.snapshot', { accounts: [{ ...account, groupActive: 'yes' }] })).ok,
+    ).toBe(false);
+  });
+});
+
+describe('session.status slot (additive, N/N-1 tolerant)', () => {
+  const base: PayloadOf<'session.status'> = { sessionId: 'sess-3', state: 'running' };
+
+  it('parses without a slot — a pre-feature daemon omits it and the card just loses the tag', () => {
+    const result = decode(rawFrame('session.status', base));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.slot ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries a group slot string through a round-trip', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'session.status',
+      payload: { ...base, slot: 'group:grp-7' },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'session.status')) {
+      expect(result.envelope.payload.slot).toBe('group:grp-7');
+    }
+  });
+
+  it('refuses an empty slot string rather than carrying a meaningless tag', () => {
+    expect(decode(rawFrame('session.status', { ...base, slot: '' })).ok).toBe(false);
+  });
+});
