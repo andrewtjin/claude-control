@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  bannerContextForLaunch,
   buildLaunchEnv,
   configDirPointsIntoProfiles,
   findClaudeOnPath,
@@ -111,7 +112,20 @@ describe('unwrapNpmCmdShim', () => {
 });
 
 describe('findClaudeOnPath', () => {
-  it('prefers claude.exe over claude.cmd across PATH dirs (Windows)', () => {
+  it('prefers claude.exe over claude.cmd within the SAME PATH dir (Windows)', () => {
+    const present = new Set(['C:\\bin\\claude.cmd', 'C:\\bin\\claude.exe']);
+    const found = findClaudeOnPath({
+      platform: 'win32',
+      pathEnv: 'C:\\bin',
+      pathExt: '.EXE;.CMD',
+      existsSync: (p) => present.has(p),
+    });
+    expect(found).toBe('C:\\bin\\claude.exe');
+  });
+
+  it('an earlier PATH dir wins over a later one regardless of extension (Windows) — matches how the shell resolves bare `claude`, so cctl launches the same binary', () => {
+    // A claude.cmd in the FIRST PATH dir must beat a claude.exe in a later dir: the extension
+    // preference is within a directory, not across directories.
     const present = new Set(['C:\\npm\\claude.cmd', 'C:\\bin\\claude.exe']);
     const found = findClaudeOnPath({
       platform: 'win32',
@@ -119,7 +133,7 @@ describe('findClaudeOnPath', () => {
       pathExt: '.EXE;.CMD',
       existsSync: (p) => present.has(p),
     });
-    expect(found).toBe('C:\\bin\\claude.exe');
+    expect(found).toBe('C:\\npm\\claude.cmd');
   });
 
   it('falls back to claude.cmd when no exe exists (Windows)', () => {
@@ -230,6 +244,37 @@ describe('configDirPointsIntoProfiles', () => {
   it('is false for an unset config dir', () => {
     const root = process.platform === 'win32' ? 'C:\\data\\profiles' : '/data/profiles';
     expect(configDirPointsIntoProfiles(undefined, root, deps)).toBe(false);
+  });
+});
+
+describe('bannerContextForLaunch', () => {
+  const globalSlot: LaunchSlot = { kind: 'global', label: 'acct@example', context: 'global' };
+  const groupSlot: LaunchSlot = {
+    kind: 'group',
+    label: 'work',
+    context: 'C:\\repo binding',
+    profileDir: 'C:\\data\\profiles\\g1',
+  };
+
+  it('names an inherited CLAUDE_CONFIG_DIR that survives a global launch (not dropped)', () => {
+    // A non-profile inherited dir is NOT dropped, so the child runs on it — the banner must say so
+    // instead of claiming the global slot.
+    const ctx = bannerContextForLaunch(globalSlot, 'C:\\custom\\store', false);
+    expect(ctx).toContain('C:\\custom\\store');
+    expect(ctx).toContain('not the global slot');
+  });
+
+  it('leaves the context unchanged when the inherited dir is being dropped', () => {
+    expect(bannerContextForLaunch(globalSlot, 'C:\\data\\profiles\\g1', true)).toBe('global');
+  });
+
+  it('leaves the context unchanged when no CLAUDE_CONFIG_DIR is inherited', () => {
+    expect(bannerContextForLaunch(globalSlot, undefined, false)).toBe('global');
+    expect(bannerContextForLaunch(globalSlot, '', false)).toBe('global');
+  });
+
+  it('never touches a group slot (it pins its own CLAUDE_CONFIG_DIR)', () => {
+    expect(bannerContextForLaunch(groupSlot, 'C:\\custom\\store', false)).toBe('C:\\repo binding');
   });
 });
 

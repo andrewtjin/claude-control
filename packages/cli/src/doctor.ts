@@ -18,6 +18,7 @@ import { BIND_GUARD_MARKER } from '@claude-control/daemon';
 import type { SwitchEngine } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
+import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
 
 export interface DoctorCheck {
   name: string;
@@ -435,6 +436,99 @@ export function checkVersionSkew(
     ok: false,
     detail: `CLI is ${cliVersion} but the running daemon is ${daemonBuild} — restart it so both match: cctl daemon restart`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// PowerShell `claude` wrapper (Windows) — stale embedded paths
+// ---------------------------------------------------------------------------
+
+/** Candidate PowerShell profile locations on Windows — Windows PowerShell 5.1 and PowerShell 7, plus
+ *  a OneDrive-redirected Documents (the common case where `$PROFILE` does not live under
+ *  `%USERPROFILE%\Documents`). Best-effort; used only by the wrapper check. Pure over `env`. */
+export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = env.USERPROFILE;
+  if (!home || home.length === 0) return [];
+  const docRoots = [join(home, 'Documents')];
+  if (env.OneDrive && env.OneDrive.length > 0) docRoots.push(join(env.OneDrive, 'Documents'));
+  if (env.OneDriveCommercial && env.OneDriveCommercial.length > 0) {
+    docRoots.push(join(env.OneDriveCommercial, 'Documents'));
+  }
+  const paths: string[] = [];
+  for (const root of docRoots) {
+    // Windows PowerShell 5.1 uses the WindowsPowerShell folder; PowerShell 7+ uses PowerShell.
+    for (const dir of ['WindowsPowerShell', 'PowerShell']) {
+      paths.push(join(root, dir, 'Microsoft.PowerShell_profile.ps1'));
+      paths.push(join(root, dir, 'profile.ps1'));
+    }
+  }
+  return paths;
+}
+
+/** Whether an installed PowerShell `claude` wrapper still points at a node binary and cctl entry that
+ *  exist. A node upgrade/move or a cctl reinstall can change the absolute paths the wrapper embedded,
+ *  after which typing `claude` fails with a raw CommandNotFoundException or a "Cannot find module"
+ *  stack trace that never mentions cctl. This check turns that into an actionable line. Pure over its
+ *  inputs: `profileText` undefined means no profile carried the wrapper (a pass), the `shim` form has
+ *  no embedded paths to go stale (a pass), and only the node-direct form is existence-checked. */
+export function checkPowerShellWrapper(
+  profileText: string | undefined,
+  existsSyncFn: (p: string) => boolean = existsSync,
+): DoctorCheck {
+  if (profileText === undefined) {
+    return {
+      name: 'ps-wrapper',
+      ok: true,
+      detail: 'no PowerShell profile carries a cctl claude wrapper',
+    };
+  }
+  const parsed = parsePowerShellWrapper(profileText);
+  if (parsed === undefined) {
+    return {
+      name: 'ps-wrapper',
+      ok: true,
+      detail: 'no cctl claude wrapper in the PowerShell profile',
+    };
+  }
+  if (parsed.kind === 'shim') {
+    return {
+      name: 'ps-wrapper',
+      ok: true,
+      detail: 'cctl claude wrapper installed (cctl-shim form; no embedded paths to go stale)',
+    };
+  }
+  const missing: string[] = [];
+  if (!existsSyncFn(parsed.nodePath)) missing.push(`node (${parsed.nodePath})`);
+  if (!existsSyncFn(parsed.cctlEntry)) missing.push(`cctl entry (${parsed.cctlEntry})`);
+  if (missing.length === 0) {
+    return {
+      name: 'ps-wrapper',
+      ok: true,
+      detail: 'cctl claude wrapper points at an existing node and cctl entry',
+    };
+  }
+  return {
+    name: 'ps-wrapper',
+    ok: false,
+    detail:
+      `the PowerShell claude wrapper points at ${missing.join(' and ')} that no longer exist(s) — ` +
+      'regenerate it: cctl shell-init powershell | Out-File -Append $PROFILE',
+  };
+}
+
+/** Read the first PowerShell profile that carries a cctl wrapper (by its marker), for the wrapper
+ *  check. Returns undefined when none of the candidate profiles exist or carry the wrapper. */
+export function readPowerShellWrapperProfile(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  for (const p of powerShellProfilePaths(env)) {
+    try {
+      const text = readFileSync(p, 'utf8');
+      if (text.includes(POWERSHELL_WRAPPER_MARKER)) return text;
+    } catch {
+      // Absent or unreadable profile: skip and try the next candidate.
+    }
+  }
+  return undefined;
 }
 
 /** Run every check for the given paths. */

@@ -133,9 +133,11 @@ import {
   checkGuardHook,
   checkGuardSnapshot,
   checkLiveLogin,
+  checkPowerShellWrapper,
   checkSlots,
   checkVersionSkew,
   probeRelay,
+  readPowerShellWrapperProfile,
   renderDoctor,
   runDoctor,
   summarize,
@@ -564,6 +566,11 @@ export function buildProgram(): Command {
         checkGuardHook(paths, groups.length > 0),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
       );
+      // Windows only: flag a PowerShell `claude` wrapper whose embedded node/cctl paths have gone
+      // stale (a node upgrade/move or cctl reinstall), which otherwise fails with a cryptic error.
+      if (process.platform === 'win32') {
+        checks.push(checkPowerShellWrapper(readPowerShellWrapperProfile()));
+      }
       process.stdout.write(renderDoctor(checks, detectPalette()) + '\n');
       const { passed, failed } = summarize(checks);
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);

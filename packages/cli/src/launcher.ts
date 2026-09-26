@@ -15,8 +15,13 @@
 // shell reaches cctl in the first place. When cctl is installed via npm, `cctl` on PATH is a
 // generated `cctl.cmd` shim that forwards its arguments through cmd.exe — so a PowerShell caller
 // hits a cmd.exe layer BEFORE this file runs, and `%*` re-expansion there would corrupt the very
-// characters above. That entry hop is closed by the PowerShell shell-init wrapper (see
-// shellInit.ts), which invokes the node entry directly and skips the .cmd shim.
+// characters above. The PowerShell shell-init wrapper (see shellInit.ts) closes most of that entry
+// hop by invoking the node entry directly and skipping the .cmd shim, so & | < > ^ and %VAR% reach
+// this file verbatim. ONE character it cannot rescue on Windows PowerShell 5.1 / PowerShell < 7.3: a
+// literal double quote in an argument is dropped and the following arguments merge into it, because
+// those PowerShell versions pass native-command arguments in Legacy mode (fixed by
+// $PSNativeCommandArgumentPassing = 'Standard' in PowerShell 7.3+). That corruption is at the
+// PowerShell -> node.exe boundary, above this file; the spawn below is still verbatim.
 //
 // The functions here are split so the decisions are unit-testable in isolation from the spawn:
 // findClaudeOnPath (PATH lookup), resolveLaunchTarget (how to invoke a candidate), buildLaunchEnv
@@ -57,11 +62,15 @@ export interface FindClaudeDeps {
 }
 
 /**
- * Find the `claude` command on PATH. On Windows the search PREFERS a standalone `claude.exe` over a
- * `claude.cmd` shim (the exe needs no unwrapping), then falls back to any other PATHEXT match so the
- * caller can report exactly what it found and why it will not run it. On POSIX it looks for an
- * executable named `claude` (a shebang script or symlink runs fine under spawn). Returns the
- * resolved path WITH extension, or undefined when nothing matches.
+ * Find the `claude` command on PATH. On Windows the search resolves the way the shell's own bare
+ * `claude` does: each PATH directory is tried in order, and only WITHIN a directory does an extension
+ * preference apply. So a `claude.cmd` in an earlier PATH directory beats a `claude.exe` in a later
+ * one — otherwise `cctl claude` could launch a different binary than typing `claude` would. Within a
+ * single directory the launchable extensions are preferred (`.exe`, which needs no unwrapping, then
+ * `.cmd`, the npm shim we unwrap), then any other PATHEXT match so the caller can report exactly what
+ * it found and why it will not run it. On POSIX it looks for an executable named `claude` (a shebang
+ * script or symlink runs fine under spawn). Returns the resolved path WITH extension, or undefined
+ * when nothing matches.
  */
 export function findClaudeOnPath(deps: FindClaudeDeps): string | undefined {
   const existsSync = deps.existsSync ?? nodeExistsSync;
@@ -78,14 +87,18 @@ export function findClaudeOnPath(deps: FindClaudeDeps): string | undefined {
     }
     return undefined;
   }
-  // Windows: split PATHEXT so we can prefer .exe, then .cmd, then anything else.
+  // Windows: PATHEXT gives the within-directory extension order. Prefer the launchable extensions
+  // first (.exe, then the .cmd shim), then any remaining PATHEXT entry.
   const exts = (deps.pathExt ?? process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
     .split(';')
     .map((e) => e.trim().toLowerCase())
     .filter((e) => e.length > 0);
-  const preferenceOrder = ['.exe', '.cmd', ...exts.filter((e) => e !== '.exe' && e !== '.cmd')];
-  for (const ext of preferenceOrder) {
-    for (const dir of dirs) {
+  const extOrder = ['.exe', '.cmd', ...exts.filter((e) => e !== '.exe' && e !== '.cmd')];
+  // PATH directories are the OUTER loop, in order, matching real Windows command resolution: the
+  // first directory that holds any `claude` wins, and the extension preference decides only among
+  // matches inside that same directory.
+  for (const dir of dirs) {
+    for (const ext of extOrder) {
       const candidate = win32.join(dir, `claude${ext}`);
       if (existsSync(candidate)) return candidate;
     }
@@ -217,6 +230,33 @@ export function buildLaunchEnv(opts: BuildLaunchEnvOptions): NodeJS.ProcessEnv {
   }
   if (opts.overrideToken !== undefined) env.CCTL_BIND_OVERRIDE = opts.overrideToken;
   return env;
+}
+
+/**
+ * The banner context for a launch, corrected so a global launch never claims the global store when
+ * the child will actually run on an inherited CLAUDE_CONFIG_DIR. A global launch drops an inherited
+ * CLAUDE_CONFIG_DIR only when it points into the profiles root; any OTHER inherited value survives,
+ * so the child uses that config store — a different account than the global slot. In that case the
+ * context names the inherited dir instead of silently reading "global". Group slots (which pin their
+ * own CLAUDE_CONFIG_DIR) and launches with no surviving inherited dir keep their context verbatim.
+ */
+export function bannerContextForLaunch(
+  slot: LaunchSlot,
+  inheritedConfigDir: string | undefined,
+  dropInheritedConfigDir: boolean,
+): string {
+  if (
+    slot.kind === 'global' &&
+    typeof inheritedConfigDir === 'string' &&
+    inheritedConfigDir.length > 0 &&
+    !dropInheritedConfigDir
+  ) {
+    return (
+      `${slot.context}; inherited CLAUDE_CONFIG_DIR=${inheritedConfigDir} — the child uses that ` +
+      `config store, not the global slot`
+    );
+  }
+  return slot.context;
 }
 
 export interface ConfigDirCheckDeps {
