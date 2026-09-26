@@ -158,7 +158,20 @@ export async function refreshCredentials(
 
     const raw = await res.text();
     if (!res.ok) {
-      // A 400 mentioning invalid_grant is the permanent-death signal; everything else is transient.
+      // Classify by the PRECISE OAuth error code, not a substring of the body. The code is the
+      // `error` field (or its `.type` when `error` is an object) — see oauthErrorCode — which is
+      // exactly what the CLI's dead-token guard keys off (Ca(data).code). A loose substring scan
+      // would misfire on a body that merely mentions "invalid_grant" (e.g. an invalid_scope
+      // description that quotes it), quarantining a healthy account behind a re-login card, which
+      // is the dangerous direction. Keying both invalid_grant and invalid_scope off this one code
+      // also makes them mutually exclusive, so their order below cannot matter.
+      const errorCode = oauthErrorCode(raw);
+
+      // invalid_grant is the permanent-death signal: the refresh token is spent and the account
+      // must be quarantined and re-logged-in. The CLI treats it as dead on a 400 OR a 401 (its
+      // guard: `if(n!==400&&n!==401)return!1; return Ca(data).code==="invalid_grant"`), so a token
+      // endpoint that answers a spent refresh with 401+invalid_grant must park the account rather
+      // than retry it forever.
       //
       // Unless we RETRIED to get here. The token exchange is not idempotent: the refresh token is
       // single-use and rotates, so a 529 emitted after the service already accepted the request
@@ -166,7 +179,7 @@ export async function refreshCredentials(
       // invalid_grant describes our own retry, not a dead account, and quarantining on it would
       // strand a healthy user behind a re-login card. Report it as transient instead and let the
       // next refresh — a single attempt against a fresh read — establish the truth.
-      if (res.status === 400 && /invalid_grant/i.test(raw)) {
+      if ((res.status === 400 || res.status === 401) && errorCode === 'invalid_grant') {
         if (retried) {
           throw new RefreshError(
             `refresh token rejected (invalid_grant) after ${attempts} attempts against an ` +
@@ -182,7 +195,7 @@ export async function refreshCredentials(
       // distinct 'invalid_scope' code the outer fallback catches. After that fallback it is
       // permanent: report it as a plain http_400 so callers back it off like any other bad request.
       // invalid_scope is NEVER invalid_grant, so it never quarantines the account either way.
-      if (res.status === 400 && oauthErrorCode(raw) === 'invalid_scope') {
+      if (res.status === 400 && errorCode === 'invalid_scope') {
         if (isScopeFallback) {
           throw new RefreshError(`token endpoint returned 400: ${truncate(raw)}`, 'http_400');
         }

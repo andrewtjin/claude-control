@@ -163,6 +163,60 @@ describe('refreshCredentials', () => {
     await expect(refreshCredentials(current, { fetch })).rejects.toBeInstanceOf(QuarantineError);
   });
 
+  it('detects invalid_grant in the object error shape too (error.type)', async () => {
+    // The CLI keys off the precise code, which is `error` when a string or its `.type` when an
+    // object. Both must quarantine.
+    const fetch = fakeFetch(400, JSON.stringify({ error: { type: 'invalid_grant' } }));
+    await expect(refreshCredentials(current, { fetch })).rejects.toBeInstanceOf(QuarantineError);
+  });
+
+  it('does NOT quarantine a 400 whose real code is invalid_scope but whose text mentions invalid_grant', async () => {
+    // The classifier keys off the precise OAuth error code, not a substring of the body: a body
+    // whose actual `error` is invalid_scope must never quarantine just because its description
+    // happens to contain the word "invalid_grant". A loose scan would strand a healthy account
+    // behind a re-login card — the dangerous direction.
+    const fetch = fakeFetch(
+      400,
+      JSON.stringify({
+        error: 'invalid_scope',
+        error_description: 'the requested scope is not invalid_grant-compatible',
+      }),
+    );
+    const err = await refreshCredentials(current, { fetch }).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(QuarantineError);
+    // `current` records no scopes, so there is nothing to fall back to and the primary
+    // invalid_scope surfaces directly (never reclassified as invalid_grant).
+    expect((err as RefreshError).code).toBe('invalid_scope');
+  });
+
+  it('does NOT quarantine a 400 whose body merely mentions invalid_grant in non-code text', async () => {
+    // No precise `error` code of invalid_grant → transient, not a quarantine. Matches the CLI,
+    // which parses JSON and reads Ca(data).code rather than scanning the raw body.
+    const fetch = fakeFetch(
+      400,
+      JSON.stringify({ error: 'server_error', error_description: 'downstream said invalid_grant' }),
+    );
+    const err = await refreshCredentials(current, { fetch }).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(QuarantineError);
+    expect((err as RefreshError).code).toBe('http_400');
+  });
+
+  it('quarantines an invalid_grant returned as HTTP 401, matching the CLI dead-token guard', async () => {
+    // The CLI's guard accepts 400 OR 401 for a spent refresh token. A 401 + invalid_grant is a
+    // dead account and must be parked, not retried forever as a generic transient 401.
+    const fetch = fakeFetch(401, JSON.stringify({ error: 'invalid_grant' }));
+    await expect(refreshCredentials(current, { fetch })).rejects.toBeInstanceOf(QuarantineError);
+  });
+
+  it('does NOT quarantine a bare 401 without an invalid_grant code (stays transient)', async () => {
+    // A 401 that is not invalid_grant says nothing about the refresh token being dead; keep it a
+    // transient http_401 so a blip does not park a healthy account.
+    const fetch = fakeFetch(401, JSON.stringify({ error: 'unauthorized' }));
+    const err = await refreshCredentials(current, { fetch }).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(QuarantineError);
+    expect((err as RefreshError).code).toBe('http_401');
+  });
+
   it('maps a 5xx to a transient RefreshError, not quarantine', async () => {
     const fetch = fakeFetch(503, 'upstream unavailable');
     const err = await refreshCredentials(current, { fetch }).catch((e: unknown) => e);
