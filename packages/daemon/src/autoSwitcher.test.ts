@@ -150,3 +150,63 @@ describe('AutoSwitcher', () => {
     expect(activate).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('AutoSwitcher — per-slot restriction and cooldown', () => {
+  /** Two group members (one exhausted-active, one healthy) plus a healthy shared account outside
+   *  the group — the shape the daemon feeds one group's decision. */
+  function groupSnapshot(): AccountUsageInput[] {
+    return [
+      {
+        accountId: 'm1',
+        label: 'm1',
+        active: true,
+        quarantined: false,
+        limits: [{ kind: 'session', percent: 96, resetsAt: NOW + 2 * H }],
+      },
+      {
+        accountId: 'm2',
+        label: 'm2',
+        active: false,
+        quarantined: false,
+        limits: [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 12 * H }],
+      },
+      {
+        accountId: 'outsider',
+        label: 'outsider',
+        active: false,
+        quarantined: false,
+        limits: [{ kind: 'weekly_all', percent: 5, resetsAt: NOW + 6 * H }],
+      },
+    ];
+  }
+
+  it('hops only within the candidate id set (a 2-member group hops inside itself)', async () => {
+    const { switcher, activate } = makeSwitcher();
+    await switcher.evaluate(groupSnapshot(), {
+      slotKey: 'group:g1',
+      candidateIds: new Set(['m1', 'm2']),
+    });
+    // Never the outsider, even though its reset is sooner — it is outside the group's pool.
+    expect(activate).toHaveBeenCalledExactlyOnceWith(
+      'm2',
+      expect.objectContaining({ origin: 'auto' }),
+    );
+  });
+
+  it('keeps each slot cooldown independent', async () => {
+    const { switcher, activate } = makeSwitcher();
+    // A global hop puts the GLOBAL bucket into cooldown.
+    await switcher.evaluate(lowSnapshot(), { slotKey: 'global' });
+    expect(activate).toHaveBeenCalledTimes(1);
+    // A second global attempt is suppressed by the global cooldown …
+    await switcher.evaluate(lowSnapshot(), { slotKey: 'global' });
+    expect(activate).toHaveBeenCalledTimes(1);
+    // … but a group's own bucket is untouched, so its hop still lands.
+    await switcher.evaluate(groupSnapshot(), {
+      slotKey: 'group:g1',
+      candidateIds: new Set(['m1', 'm2']),
+    });
+    expect(activate).toHaveBeenCalledTimes(2);
+    expect(activate).toHaveBeenLastCalledWith('m2', expect.anything());
+  });
+});

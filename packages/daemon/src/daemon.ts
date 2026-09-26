@@ -15,7 +15,14 @@ import type {
   ActivateResult,
   ReauthResult,
   StoredAccount,
+  AccountView,
+  StoredGroup,
+  SlotId,
+  SlotViolation,
+  RepairResult,
+  GroupLiveResult,
 } from '@claude-control/switch-engine';
+import { groupSlotId } from '@claude-control/switch-engine';
 import {
   buildAuthorizeUrl,
   generatePkce,
@@ -52,6 +59,7 @@ import {
 } from '@claude-control/shared-protocol';
 import {
   hasUsableHeadroom,
+  humanizeDuration,
   planWeight,
   selectWeeklyBudget,
   type AccountUsageInput,
@@ -64,6 +72,7 @@ import {
   toUsageSnapshotPayload,
   type AccountPollResult,
   type PollAccount,
+  type RegistryFacts,
 } from './usagePoller.js';
 import { readFleetHistory, RESET_LOOKBACK_MS } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
@@ -98,7 +107,25 @@ export interface SwitchEngineLike {
   recover(): Promise<RecoverResult>;
   activate(id: string, options?: ActivateOptions): Promise<ActivateResult>;
   listAccounts(): Promise<StoredAccount[]>;
-  getActiveId(): Promise<string | null>;
+  /** The account live in one slot (defaults to global — the historical single-arg contract). */
+  getActiveId(slot?: SlotId): Promise<string | null>;
+  // ---- folder-bound slots (optional so lifecycle-only fakes need not implement them; the real
+  //      engine always provides them, and the daemon degrades to global-only when they are absent).
+  /** The whole fleet — shared rows plus reserved members, each tagged with its `groupId`. The
+   *  per-slot poll needs the reserved members `listAccounts` omits. */
+  listAllAccounts?(): Promise<AccountView[]>;
+  /** Every folder-bound group, for its members/label/folders and recorded live member. */
+  listGroups?(): Promise<StoredGroup[]>;
+  /** The reconciled live account of each slot (global + every group). */
+  liveSlots?(): Promise<Map<SlotId, string | null>>;
+  /** Materialize a group's profile and make its slot hold a working member (self-healing). */
+  ensureGroupLive?(groupId: string): Promise<GroupLiveResult>;
+  /** Read-only detection of illegal slot occupancy (a)-(e); the daemon watchdog alerts on it. */
+  checkSlots?(): Promise<SlotViolation[]>;
+  /** Repair the (a)-(d) breaches `checkSlots` finds, under the engine lock. */
+  repairSlots?(): Promise<RepairResult>;
+  /** Rewrite the guard snapshot from the current registry + configured enforce mode. */
+  refreshSnapshot?(): Promise<void>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
   reauthenticate(
     id: string,
@@ -112,7 +139,10 @@ export interface SwitchEngineLike {
  *  distinction to tell its own hop apart from a switch somebody else made mid-cycle (see the
  *  absorb in {@link Daemon.pollCycle}). */
 export interface AutoSwitcherLike {
-  evaluate(accounts: AccountUsageInput[]): Promise<string | undefined>;
+  evaluate(
+    accounts: AccountUsageInput[],
+    opts?: { slotKey?: string; candidateIds?: ReadonlySet<string> },
+  ): Promise<string | undefined>;
 }
 
 /** The slice of `AccountProbe` the daemon calls each poll cycle — narrowed for the same reason
@@ -190,6 +220,10 @@ export interface DaemonOptions {
   /** Minimum gap between repeat quarantine-notice pushes for the SAME account, so an account
    *  whose refresh flaps in and out of quarantine can't spam the phone. */
   quarantineNoticeDebounceMs?: number;
+  /** Minimum gap between repeat per-slot alerts of the SAME kind (a group out of quota, an
+   *  invariant-kind breach), so a persistent condition alerts once per window rather than every
+   *  poll cycle. Defaults to {@link DEFAULT_SLOT_ALERT_WINDOW_MS}. */
+  slotAlertWindowMs?: number;
   /** Grace window for `session.stop` escalation (interrupt → THIS long → hard stop); defaults
    *  to escalateStop's own 5s. Injectable so tests can exercise the hard-stop rung with a
    *  short real-time window instead of fake timers (house convention). */
@@ -249,6 +283,10 @@ const DEFAULT_SESSION_STOP_ON_SHUTDOWN_MS = 5_000;
 /** 30 minutes: re-login is a minutes-long human action on the PC, so nagging more often than
  *  ~twice an hour for the same still-broken account is pure noise. */
 const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
+/** 30 minutes: a group out of quota, or an unrepaired slot invariant, is a standing condition a
+ *  human acts on in minutes; re-alerting more often than ~twice an hour is noise. Same reasoning as
+ *  the quarantine-notice debounce. */
+const DEFAULT_SLOT_ALERT_WINDOW_MS = 30 * 60_000;
 
 /** Whether `pid` names a live process. `process.kill(pid, 0)` sends no signal — it only asks the
  *  OS whether the pid exists. ESRCH ("no such process") is the only code that means dead; every
@@ -580,6 +618,7 @@ export class Daemon {
   private endpointRepublishTimer: ReturnType<typeof setInterval> | undefined;
   private readonly clock: () => number;
   private readonly quarantineNoticeDebounceMs: number;
+  private readonly slotAlertWindowMs: number;
   private readonly stopGraceMs: number | undefined;
   private readonly sessionStopOnShutdownMs: number;
   private readonly pollIntervalMs: number;
@@ -700,11 +739,28 @@ export class Daemon {
    *  Seeded when the pipes are attached, re-stamped by the post-switch kick, dropped when the
    *  session goes terminal — so it is bounded by live sessions, like the route maps above. */
   private readonly sessionAccounts = new Map<string, string>();
+  /** The slot each LIVE managed session runs in — global, or a folder-bound group's — keyed by
+   *  session id. A session's slot is fixed at spawn/register time (the config dir it launched
+   *  under), so this only grows on spawn/register and shrinks when the session goes terminal. It
+   *  scopes the post-switch resume: a switch in one slot resumes only that slot's parked sessions,
+   *  never another slot's. Absent = global (a session the daemon never mapped runs on the shared
+   *  account). */
+  private readonly sessionSlots = new Map<string, SlotId>();
   /** The active account as of the last poll cycle, so a switch made OUTSIDE this daemon (a local
    *  `cctl switch`, which writes the vault directly and never reaches handleSwitchCommand) is
    *  detectable at all. `undefined` until the first observation: whatever account the daemon
    *  starts on is nobody's switch. */
   private lastObservedActiveId: string | null | undefined;
+  /** The last-observed live member of each GROUP slot, so a group switch made outside this daemon
+   *  (a local `cctl switch <member>`) is detected and resumes only that group's parked sessions —
+   *  the per-group counterpart of {@link lastObservedActiveId}. `undefined` for a slot not yet
+   *  observed this run. */
+  private readonly lastObservedGroupActiveId = new Map<SlotId, string | null>();
+  /** Dedup clock for per-window slot alerts (a group out of quota, an invariant-kind breach),
+   *  keyed by a stable alert key. An alert re-fires only once its window has elapsed, so a
+   *  persistent condition does not spam the phone every poll cycle. In-memory: a restart re-alerts
+   *  once, which is the right behavior for a still-broken condition. */
+  private readonly slotAlertAtMs = new Map<string, number>();
   /** Each account's advisor input from the most recent poll cycle — what the post-switch
    *  stalled-session kick consults to answer "does the switch target have usage left?"
    *  without a blocking re-poll (see {@link resumeUsageStalledSessions}). In-memory only:
@@ -742,6 +798,7 @@ export class Daemon {
     this.clock = options.clock ?? Date.now;
     this.quarantineNoticeDebounceMs =
       options.quarantineNoticeDebounceMs ?? DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS;
+    this.slotAlertWindowMs = options.slotAlertWindowMs ?? DEFAULT_SLOT_ALERT_WINDOW_MS;
     this.stopGraceMs = options.stopGraceMs;
     this.sessionStopOnShutdownMs =
       options.sessionStopOnShutdownMs ?? DEFAULT_SESSION_STOP_ON_SHUTDOWN_MS;
@@ -791,6 +848,18 @@ export class Daemon {
     const recovery = await this.switchEngine.recover();
     if (recovery.recovered) {
       this.logger.info({ recovery }, 'switch engine recovery ran on daemon startup');
+    }
+
+    // Rewrite the folder-bindings guard snapshot once at startup, so it reflects the current
+    // registry and the daemon's configured enforcement mode (CCTL_BIND_ENFORCE, wired into the
+    // engine at construction) even after an offline registry edit. Fail-open: the guard degrades
+    // to its own default when the snapshot is stale, and nothing else here depends on it.
+    if (this.switchEngine.refreshSnapshot) {
+      try {
+        await this.switchEngine.refreshSnapshot();
+      } catch (err) {
+        this.logger.warn({ err }, 'could not refresh the folder-bindings snapshot on startup');
+      }
     }
 
     // Install the CLI session-command logic BEFORE binding, so a `cctl session` request that
@@ -1066,12 +1135,25 @@ export class Daemon {
   private async pollCycle(): Promise<void> {
     await this.timePhase('attributionJournal.sync', () => this.attributionJournal.sync());
 
-    const [accounts, activeId] = await this.timePhase('listAccounts+getActiveId', () =>
-      Promise.all([this.switchEngine.listAccounts(), this.switchEngine.getActiveId()]),
-    );
+    // Every folder-bound group, read first so slot maintenance can run BEFORE the fleet is polled:
+    // ensuring a group is live and repairing illegal occupancy can change who is live where, and
+    // the numbers this cycle ships must reflect the repaired state, not the state it walked in on.
+    const groups = await this.timePhase('listGroups', () => this.loadGroups());
+    await this.timePhase('maintainSlots', () => this.maintainSlots(groups));
+
+    // Load the whole fleet and every slot's live account AFTER maintenance. `accounts` is the WHOLE
+    // fleet — shared rows plus reserved group members — so the poll and the wire cover reserved
+    // accounts too; `activeId` is the GLOBAL slot's live account, which is the only account the
+    // wire `active` flag ever names (a group's live member is marked by `groupActive` instead).
+    const { accounts, liveSlots } = await this.timePhase('loadFleet', () => this.loadFleet());
+    const activeId = liveSlots.get('global') ?? null;
+
     const pollAccounts: PollAccount[] = accounts.map((a) => ({
       accountId: a.id,
       label: a.label,
+      // Global-only: the wire `active` flag names the global slot's live account alone. A group's
+      // live member is surfaced through `groupActive` (see toUsageSnapshotPayload wiring below),
+      // never `active`, so nothing downstream mistakes a reserved member for a global candidate.
       active: a.id === activeId,
       quarantined: a.quarantined,
       // `?? false` rather than the raw optional: absent in the registry means "not excluded",
@@ -1100,6 +1182,9 @@ export class Daemon {
     // Ordered after that refresh so the headroom guard inside the kick reads this cycle's
     // numbers, not the previous one's.
     this.noticeActiveAccountChange(activeId, accounts);
+    // The per-group counterpart: an external `cctl switch <member>` (or a phone /switch) resumes
+    // only that group's parked sessions.
+    this.noticeGroupActiveChanges(groups, liveSlots);
     await this.timePhase('persistSnapshots', () => {
       for (const result of polled.results) {
         if (result.outcome === 'skipped') continue; // nothing new to persist
@@ -1153,10 +1238,14 @@ export class Daemon {
       this.latestAdvisorInputs.set(input.accountId, input);
     }
 
+    // Registry facts carry the folder-binding fields (groupId/groupLabel/groupActive) onto the wire
+    // beside plan/billing, so `/accounts` and `/usage` can group reserved accounts under their
+    // binding and mark the live member of each group.
+    const registryFacts = this.buildRegistryFacts(accounts, groups, liveSlots);
     await this.timePhase('sendUsageSnapshot', () => {
       this.sendEnvelope({
         type: 'usage.snapshot',
-        payload: toUsageSnapshotPayload(snapshot, history, accounts, this.clock()),
+        payload: toUsageSnapshotPayload(snapshot, history, registryFacts, this.clock()),
       });
     });
 
@@ -1176,27 +1265,13 @@ export class Daemon {
     // the value.
     const autoSwitcher = this.autoSwitcher;
     if (autoSwitcher !== undefined) {
-      // `snapshot.inputs` — the same array the plan above was computed from, predictions and
-      // all. An executor deciding on anything else is the divergence the merge above exists
-      // to rule out.
-      const hopped = await this.timePhase('autoSwitch', () =>
-        autoSwitcher.evaluate(snapshot.inputs).catch((err: unknown) => {
-          this.logger.error({ err }, 'auto-switch evaluation failed');
-          return undefined;
-        }),
+      // One decision PER SLOT: the global slot over the shared pool, and each group over its own
+      // members. `snapshot.inputs` is the same array the plan above was computed from (predictions
+      // merged); the per-slot helper slices it and overrides `active` to the slot's live member so
+      // each decision reasons about its own slot alone (see runSlotAutoSwitch).
+      await this.timePhase('autoSwitch', () =>
+        this.runSlotAutoSwitch(autoSwitcher, snapshot.inputs, accounts, groups, liveSlots),
       );
-
-      // Absorb the hop this daemon just made — BY ITS ID, never by re-reading the live account.
-      // The next cycle compares what it reads against this value and resumes parked sessions on a
-      // difference, which is right for a human's switch and wrong for the policy's own hop
-      // (resuming paused work unattended is a bigger policy step than hopping). A re-read cannot
-      // tell those two apart: a `cctl switch` typed on this host writes the vault directly, so one
-      // landing anywhere between this cycle's own read and here — a window the probe below can
-      // stretch to minutes — would come back as "the active account is X" with nothing to say who
-      // made it X, and be swallowed. An id the evaluator reports is the one thing that names the
-      // author, so nothing else is absorbed and every switch this daemon did not make survives to
-      // the comparison it exists for.
-      if (hopped !== undefined) this.lastObservedActiveId = hopped;
 
       // Inside the auto-switch block on purpose: the probe exists to widen the pool the policy
       // above chooses from, so with no policy running there is nothing to widen it for. Runs
@@ -1214,6 +1289,221 @@ export class Daemon {
     // cycle in fifteen that carries the scan is identifiable in the log rather than looking like
     // an unexplained spike on an otherwise ordinary cycle.
     await this.timePhase('tokenStats', () => this.maybePushTokenStats(accounts));
+  }
+
+  /** Every folder-bound group, or `[]` when the engine predates folder support. */
+  private async loadGroups(): Promise<StoredGroup[]> {
+    return (await this.switchEngine.listGroups?.()) ?? [];
+  }
+
+  /**
+   * The whole fleet and every slot's live account. Uses the slot-aware engine methods when present
+   * (the real engine always has them); degrades to the historical global-only shape for a fake that
+   * implements only `listAccounts`/`getActiveId`, so lifecycle tests need no folder plumbing.
+   */
+  private async loadFleet(): Promise<{
+    accounts: AccountView[];
+    liveSlots: Map<SlotId, string | null>;
+  }> {
+    const accounts = this.switchEngine.listAllAccounts
+      ? await this.switchEngine.listAllAccounts()
+      : await this.switchEngine.listAccounts();
+    const liveSlots = this.switchEngine.liveSlots
+      ? await this.switchEngine.liveSlots()
+      : new Map<SlotId, string | null>([['global', await this.switchEngine.getActiveId()]]);
+    return { accounts, liveSlots };
+  }
+
+  /**
+   * Self-heal every group slot and repair illegal slot occupancy, once per cycle. For each group:
+   * `ensureGroupLive` materializes its profile and makes a usable member live (a no-op steady-state),
+   * and a group left with no working account is alerted on. Then `checkSlots` finds any invariant
+   * breach and `repairSlots` fixes the (a)-(d) ones under the engine lock; whatever a repair could
+   * NOT resolve (a broken profile link, an unrecognized login) raises one alert per kind per window.
+   */
+  private async maintainSlots(groups: StoredGroup[]): Promise<void> {
+    const ensureGroupLive = this.switchEngine.ensureGroupLive?.bind(this.switchEngine);
+    if (ensureGroupLive) {
+      for (const group of groups) {
+        try {
+          const result = await ensureGroupLive(group.id);
+          if (result.noWorkingAccount) {
+            this.emitSlotAlert(
+              `no_account:${group.id}`,
+              `${group.label} has no working account — every member failed to activate; re-login one`,
+            );
+          }
+        } catch (err) {
+          this.logger.warn({ err, groupId: group.id }, 'ensureGroupLive failed');
+        }
+      }
+    }
+
+    const checkSlots = this.switchEngine.checkSlots?.bind(this.switchEngine);
+    if (!checkSlots) return;
+    let violations: SlotViolation[];
+    try {
+      violations = await checkSlots();
+    } catch (err) {
+      this.logger.warn({ err }, 'checkSlots failed');
+      return;
+    }
+    if (violations.length === 0) return;
+
+    // Repair fixes (a)-(d); the alert is about what SURVIVES a repair (a broken profile link, an
+    // unrecognized login) — the conditions a human must act on — not the ones the daemon just fixed.
+    let remaining = violations;
+    const repairSlots = this.switchEngine.repairSlots?.bind(this.switchEngine);
+    if (repairSlots) {
+      try {
+        const result = await repairSlots();
+        remaining = result.remaining;
+        if (result.repaired.length > 0) {
+          this.logger.info(
+            { repaired: result.repaired.map((v) => v.kind), actions: result.actions },
+            'repaired slot invariant breaches',
+          );
+        }
+      } catch (err) {
+        this.logger.warn({ err }, 'repairSlots failed');
+      }
+    }
+
+    for (const kind of new Set(remaining.map((v) => v.kind))) {
+      const v = remaining.find((x) => x.kind === kind);
+      if (v === undefined) continue;
+      this.emitSlotAlert(
+        `violation:${kind}`,
+        `cctl: slot invariant unresolved (${kind}) — ${v.detail}`,
+      );
+    }
+  }
+
+  /**
+   * Build the wire's registry facts for the whole fleet, carrying the folder-binding fields
+   * (groupId/groupLabel/groupActive) onto the usage snapshot beside plan/billing. A shared account
+   * is returned as-is (it already satisfies the facts shape and carries no group fields); a reserved
+   * member is tagged with its group's id, label, and whether it is the member live in the group slot.
+   */
+  private buildRegistryFacts(
+    accounts: AccountView[],
+    groups: StoredGroup[],
+    liveSlots: Map<SlotId, string | null>,
+  ): RegistryFacts[] {
+    const labelByGroup = new Map(groups.map((g) => [g.id, g.label]));
+    return accounts.map((a): RegistryFacts => {
+      if (a.groupId === undefined) return a;
+      const groupLabel = labelByGroup.get(a.groupId);
+      return {
+        ...a,
+        groupId: a.groupId,
+        ...(groupLabel !== undefined ? { groupLabel } : {}),
+        groupActive: liveSlots.get(groupSlotId(a.groupId)) === a.id,
+      };
+    });
+  }
+
+  /**
+   * Run the auto-switch executor ONCE PER SLOT: the global slot over the shared pool, and each group
+   * over its own members. The one snapshot `inputs` array is sliced per slot and its `active` flag
+   * is overridden to the slot's live member, so each decision reasons about its own slot alone; the
+   * candidate id set restricts each hop's TARGETS to that slot's accounts (a reserved account is
+   * never a global target, nor a foreign account a group's), and a per-slot cooldown key keeps one
+   * slot's hop from spending another's cooldown. A hop is absorbed by id (like the global one always
+   * was) so the next cycle's change-notice does not read the daemon's own hop as an external switch.
+   */
+  private async runSlotAutoSwitch(
+    autoSwitcher: AutoSwitcherLike,
+    inputs: AccountUsageInput[],
+    accounts: AccountView[],
+    groups: StoredGroup[],
+    liveSlots: Map<SlotId, string | null>,
+  ): Promise<void> {
+    const inputById = new Map(inputs.map((i) => [i.accountId, i]));
+    const reservedIds = new Set(accounts.filter((a) => a.groupId !== undefined).map((a) => a.id));
+
+    // Global slot: shared accounts only (reserved members are never global candidates). Their
+    // `active` flag is already global-live from the poll, so the subset is ready to decide on.
+    const sharedInputs = inputs.filter((i) => !reservedIds.has(i.accountId));
+    const sharedIds = new Set(sharedInputs.map((i) => i.accountId));
+    const globalHop = await autoSwitcher
+      .evaluate(sharedInputs, { slotKey: 'global', candidateIds: sharedIds })
+      .catch((err: unknown) => {
+        this.logger.error({ err, slot: 'global' }, 'auto-switch evaluation failed');
+        return undefined;
+      });
+    if (globalHop !== undefined) this.lastObservedActiveId = globalHop;
+
+    // Each group over its own members, with the group's live member marked active.
+    for (const group of groups) {
+      const slot = groupSlotId(group.id);
+      const memberIds = new Set(group.members.map((m) => m.id));
+      const groupLive = liveSlots.get(slot) ?? null;
+      const memberInputs = group.members
+        .map((m) => inputById.get(m.id))
+        .filter((i): i is AccountUsageInput => i !== undefined)
+        .map((i) => ({ ...i, active: i.accountId === groupLive }));
+
+      // A group that cannot hop away from an exhausted live member (single member, or every member
+      // spent) is a standing condition worth one alert per window.
+      this.maybeAlertGroupExhausted(group, memberInputs);
+
+      const hop = await autoSwitcher
+        .evaluate(memberInputs, { slotKey: slot, candidateIds: memberIds })
+        .catch((err: unknown) => {
+          this.logger.error({ err, slot }, 'auto-switch evaluation failed');
+          return undefined;
+        });
+      if (hop !== undefined) this.lastObservedGroupActiveId.set(slot, hop);
+    }
+  }
+
+  /**
+   * Alert once per window when a group's live member is out of quota and no other member can take
+   * over — the single-member group, or the group whose every member is spent. Nothing to alert on
+   * while a hop is still possible (auto-switch handles that) or while the live member has headroom.
+   */
+  private maybeAlertGroupExhausted(group: StoredGroup, memberInputs: AccountUsageInput[]): void {
+    const now = this.clock();
+    const live = memberInputs.find((i) => i.active);
+    if (live === undefined || hasUsableHeadroom(live, now)) return;
+    // A usable alternative member means auto-switch can move; the exhaustion is not terminal.
+    const canHop = memberInputs.some(
+      (i) => i.accountId !== live.accountId && !i.quarantined && hasUsableHeadroom(i, now),
+    );
+    if (canHop) return;
+    const budget = selectWeeklyBudget(live.limits, now, live.predictedResetAt);
+    const resetText =
+      budget?.resetsAt !== undefined
+        ? `until it resets in ${humanizeDuration(budget.resetsAt - now)}`
+        : 'until it resets';
+    this.emitSlotAlert(
+      `exhausted:${group.id}`,
+      `${group.label} account ${live.label} is out of quota ${resetText}`,
+    );
+  }
+
+  /**
+   * Emit a per-slot alert to the log and the phone, deduplicated to once per {@link slotAlertWindowMs}
+   * per key so a persistent condition does not spam the phone every cycle. The phone card rides the
+   * same `hook.notification` channel the daemon already uses for operator-facing alerts.
+   */
+  private emitSlotAlert(key: string, message: string): void {
+    const now = this.clock();
+    const last = this.slotAlertAtMs.get(key);
+    if (last !== undefined && now - last < this.slotAlertWindowMs) return;
+    this.slotAlertAtMs.set(key, now);
+    this.logger.warn({ alert: key }, message);
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        title: 'Folder-bound account alert',
+        body: message,
+        level: 'warn',
+        notificationType: 'slot_alert',
+      },
+    });
   }
 
   /**
@@ -1417,12 +1707,21 @@ export class Daemon {
     // the phone with an explicit ok:false it can act on, and a replayed frame silently
     // retrying an activation is the outcome this guard exists to prevent.
     rememberBoundedAt(this.seenSwitchKeys, idempotencyKey, MAX_SEEN_STOP_KEYS, nowMs);
+    // The target's slot, resolved once for the absorb, the resume scope, and the failure
+    // envelope's "who is live now". A reserved member switches its GROUP slot (activate routes by
+    // membership); a shared account switches the global slot.
+    let targetSlot: SlotId = 'global';
     try {
-      // Phone-side commands carry whatever the user typed — an id or a label. Resolve it the
-      // same way `cctl switch` does, or `/switch account:spare` fails while the identical
-      // ref works locally. Unknown/ambiguous refs are refused with the resolver's message.
-      const resolved = resolveAccountRef(await this.switchEngine.listAccounts(), targetAccountId);
+      // Phone-side commands carry whatever the user typed — an id or a label. Resolve it against
+      // the WHOLE fleet (shared plus reserved members) so `/switch <member>` reaches a folder-bound
+      // account and activate() routes it to its group slot; anything else works exactly as before.
+      const fleet: AccountView[] = this.switchEngine.listAllAccounts
+        ? await this.switchEngine.listAllAccounts()
+        : await this.switchEngine.listAccounts();
+      const resolved = resolveAccountRef(fleet, targetAccountId);
       if (!resolved.ok) throw new Error(resolved.message);
+      const targetGroupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
+      if (targetGroupId !== undefined) targetSlot = groupSlotId(targetGroupId);
       // Phone-initiated: stamped 'phone' so the audit trail (and activation_intervals) can tell
       // this apart from the CLI's own 'manual' /switch and from a policy-driven 'auto' hop.
       const result = await this.switchEngine.activate(resolved.account.id, { origin: 'phone' });
@@ -1458,15 +1757,20 @@ export class Daemon {
       // not kick — resuming paused work unattended is a bigger policy step than hopping).
       if (result.ok) {
         // Recorded as seen BEFORE the kick, so the poll cycle's own change detection (which
-        // exists for switches that never come through here — see noticeActiveAccountChange)
-        // reads this hop as already handled rather than kicking the same sessions twice.
-        this.lastObservedActiveId = resolved.account.id;
-        this.resumeUsageStalledSessions(resolved.account.id, resolved.account.label);
+        // exists for switches that never come through here — see noticeActiveAccountChange /
+        // noticeGroupActiveChanges) reads this hop as already handled rather than kicking twice.
+        // A group switch records against the group slot; a global one against the global slot.
+        if (targetSlot === 'global') this.lastObservedActiveId = resolved.account.id;
+        else this.lastObservedGroupActiveId.set(targetSlot, resolved.account.id);
+        // Scoped to the switched slot: a group switch resumes only that group's parked sessions.
+        this.resumeUsageStalledSessions(resolved.account.id, resolved.account.label, targetSlot);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // Report the live account of the SLOT the target belongs to, not always the global one, so a
+      // failed group switch names the group's current live member.
       const activeAccountId =
-        (await this.switchEngine.getActiveId().catch(() => null)) ?? targetAccountId;
+        (await this.switchEngine.getActiveId(targetSlot).catch(() => null)) ?? targetAccountId;
       this.sendEnvelope({
         type: 'switch.result',
         payload: {
@@ -1692,10 +1996,46 @@ export class Daemon {
     this.resumeUsageStalledSessions(
       activeId,
       label !== undefined && label !== '' ? label : activeId,
+      'global',
     );
   }
 
-  private resumeUsageStalledSessions(accountId: string, accountLabel: string): void {
+  /**
+   * The group counterpart of {@link noticeActiveAccountChange}: notice a group slot's live member
+   * changing outside this daemon (a local `cctl switch <member>` or a phone `/switch <member>` that
+   * committed since the last cycle) and resume ONLY that group's parked sessions. A hop this daemon
+   * made itself is absorbed by id in {@link runSlotAutoSwitch}, exactly as the global one is.
+   */
+  private noticeGroupActiveChanges(
+    groups: StoredGroup[],
+    liveSlots: Map<SlotId, string | null>,
+  ): void {
+    for (const group of groups) {
+      const slot = groupSlotId(group.id);
+      const live = liveSlots.get(slot) ?? null;
+      const previous = this.lastObservedGroupActiveId.get(slot);
+      this.lastObservedGroupActiveId.set(slot, live);
+      if (previous === undefined || live === null || previous === live) continue;
+      const label = group.members.find((m) => m.id === live)?.label;
+      this.logger.info(
+        { accountId: live, slot },
+        'group active member changed outside this daemon',
+      );
+      this.resumeUsageStalledSessions(
+        live,
+        label !== undefined && label !== '' ? label : live,
+        slot,
+      );
+    }
+  }
+
+  /**
+   * Kick parked sessions of ONE slot back into work after that slot's live account changed. Scoping
+   * to the slot is what keeps a global switch from resuming a folder-bound group's sessions (they
+   * run on a different account entirely) and vice versa: a session's slot is fixed at spawn/register
+   * time (see {@link sessionSlots}), and only sessions of `slot` are candidates here.
+   */
+  private resumeUsageStalledSessions(accountId: string, accountLabel: string, slot: SlotId): void {
     const input = this.latestAdvisorInputs.get(accountId);
     if (input !== undefined && !hasUsableHeadroom(input, this.clock())) {
       this.logger.info(
@@ -1707,6 +2047,9 @@ export class Daemon {
 
     let kicked = 0;
     for (const record of this.sessionManager.list()) {
+      // Only this slot's sessions: a session mapped to another slot runs on another account and
+      // its park has nothing to do with this switch. An unmapped session is global by default.
+      if ((this.sessionSlots.get(record.id) ?? 'global') !== slot) continue;
       const handle = this.sessionManager.get(record.id);
       if (handle?.resumeFromUsageLimitStall?.() !== true) continue;
       kicked++;

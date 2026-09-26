@@ -47,6 +47,21 @@ export interface AutoSwitcherOptions {
  *  every poll cycle. 10 minutes ≈ several poll cycles of breathing room. */
 export const DEFAULT_AUTOSWITCH_COOLDOWN_MS = 10 * 60_000;
 
+/** The cooldown key for the global slot — the default when no slot is named, so a caller that
+ *  never passes a key keeps the single-slot behavior it always had. */
+const GLOBAL_SLOT_KEY = 'global';
+
+/** Per-evaluation context beyond the snapshot: which slot's rotation this decision is, and which
+ *  accounts may be hop TARGETS in it. Absent = the global slot with no target restriction, exactly
+ *  the pre-slot behavior. */
+export interface EvaluateOptions {
+  /** Distinct cooldown bucket for this slot, so a group hop never spends the global slot's
+   *  cooldown (or another group's). Defaults to the global bucket. */
+  slotKey?: string;
+  /** Restrict hop targets to this id set (the slot's own pool). Passed through to the policy. */
+  candidateIds?: ReadonlySet<string>;
+}
+
 export class AutoSwitcher {
   private readonly activate: (
     accountId: string,
@@ -59,7 +74,9 @@ export class AutoSwitcher {
   private readonly newRequestId: () => string;
   private readonly logger: Logger;
 
-  private lastAttemptAtMs = -Infinity;
+  /** Last attempt time PER slot bucket, so each slot's cooldown runs independently — a group hop
+   *  and a global hop never share a clock. */
+  private readonly lastAttemptAtMs = new Map<string, number>();
 
   constructor(options: AutoSwitcherOptions) {
     this.activate = options.activate;
@@ -83,17 +100,27 @@ export class AutoSwitcher {
    * activation — a refused hop left the live account wherever it already was, and claiming it as
    * ours would swallow that account's real owner just the same.
    */
-  async evaluate(accounts: AccountUsageInput[]): Promise<string | undefined> {
+  async evaluate(
+    accounts: AccountUsageInput[],
+    opts: EvaluateOptions = {},
+  ): Promise<string | undefined> {
     const now = this.clock();
-    const decision = decideAutoSwitch(accounts, now, this.policy);
+    const slotKey = opts.slotKey ?? GLOBAL_SLOT_KEY;
+    const decision = decideAutoSwitch(
+      accounts,
+      now,
+      this.policy,
+      opts.candidateIds !== undefined ? { candidateIds: opts.candidateIds } : {},
+    );
     if (!decision) return undefined;
 
-    if (now - this.lastAttemptAtMs < this.cooldownMs) {
-      this.logger.debug({ decision }, 'auto-switch wanted but still in cooldown');
+    const lastAttempt = this.lastAttemptAtMs.get(slotKey) ?? -Infinity;
+    if (now - lastAttempt < this.cooldownMs) {
+      this.logger.debug({ decision, slotKey }, 'auto-switch wanted but still in cooldown');
       return undefined;
     }
-    // Stamp BEFORE attempting so a throwing engine still gets its cooldown.
-    this.lastAttemptAtMs = now;
+    // Stamp BEFORE attempting so a throwing engine still gets its cooldown — for THIS slot only.
+    this.lastAttemptAtMs.set(slotKey, now);
 
     const requestId = `autoswitch-${this.newRequestId()}`;
     try {
