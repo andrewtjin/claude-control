@@ -418,6 +418,32 @@ describe('strict validation of groups.json fails CLOSED, naming the field, leavi
       /bound by more than one group/,
     ));
 
+  it('refuses the same folder bound by two groups under different separator spellings', () =>
+    expectRefusal(
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: 0,
+        groups: [
+          group({ folders: ['C:\\research'] }),
+          group({ id: 'g2', members: [{ ...member, id: 'm2' }], folders: ['C:/research'] }),
+        ],
+      }),
+      /bound by more than one group/,
+    ));
+
+  it('refuses one folder spelled with a trailing separator against its plain form', () =>
+    expectRefusal(
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: 0,
+        groups: [
+          group({ folders: ['C:\\research'] }),
+          group({ id: 'g2', members: [{ ...member, id: 'm2' }], folders: ['C:\\research\\'] }),
+        ],
+      }),
+      /bound by more than one group/,
+    ));
+
   it('refuses an activeId that is not a member', () =>
     expectRefusal(
       JSON.stringify({
@@ -515,5 +541,46 @@ describe('downgrade fence — an older cctl cannot see or drop reserved accounts
     // And the shared pool is exactly what the old writer left.
     expect((await v.listAccounts()).map((r) => r.id)).toEqual([shared.id]);
     expect(await v.getActiveId()).toBe(shared.id);
+  });
+
+  it('an older `accounts add` of a reserved login (fresh id, same accountUuid) is healed out of the shared pool', async () => {
+    const { v, accountsPath } = await vaultAt();
+    const reserved = await v.addAccount('work', bundle('a')); // accountUuid 'uuid-a'
+    await v.createGroup({ memberIds: [reserved.id] });
+
+    // An OLDER cctl predates groups.json, so it cannot see the reserved row. Running `accounts add`
+    // of that same login writes a NEW shared row under a fresh id carrying the SAME accountUuid — the
+    // duplicate that a heal keyed on id alone would miss, leaving the reserved login back in the
+    // global pool (an auto-switch candidate and a network-refresh target for its single-use token).
+    const accounts = await readJson(accountsPath);
+    (accounts.accounts as Record<string, unknown>[]).push({
+      id: 'stray-dup',
+      label: 'work-again',
+      accountUuid: 'uuid-a',
+      quarantined: false,
+      createdAtMs: 5,
+      updatedAtMs: 5,
+    });
+    accounts.activeId = 'stray-dup';
+    await writeFile(accountsPath, JSON.stringify(accounts), 'utf8');
+
+    // The healed view: the reserved login is absent from the shared/global pool, and the stale global
+    // active id pointing at the stray copy is dropped.
+    expect((await v.listAccounts()).map((r) => r.id)).toEqual([]);
+    expect(await v.getActiveId()).toBeNull();
+    // getAccount by the stray id no longer resolves — refreshToken() would refuse it as unknown
+    // rather than network-refreshing (and rotating) the reserved login's token.
+    expect(await v.getAccount('stray-dup')).toBeUndefined();
+    // The unified view still holds the reserved login exactly once, on its group.
+    const all = await v.listAllAccounts();
+    expect(all.filter((r) => r.accountUuid === 'uuid-a')).toHaveLength(1);
+    expect(all.find((r) => r.accountUuid === 'uuid-a')?.groupId).toBeDefined();
+
+    // heal() flushes the drop so an older cctl reading accounts.json never sees the reserved login.
+    expect(await v.heal()).toBe(true);
+    const afterHeal = await readJson(accountsPath);
+    expect((afterHeal.accounts as unknown[]).length).toBe(0);
+    expect(afterHeal.activeId).toBeNull();
+    expect(await v.heal()).toBe(false);
   });
 });
