@@ -23,6 +23,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { embeddableFolderPathSource } from '@claude-control/switch-engine';
+import { bindTokensDir } from './bindToken.js';
 
 /** Stable on-disk location of the guard script, beside `hook-forward.cjs` in the daemon data dir.
  *  Keeping the two colocated means one directory holds every generated hook script. */
@@ -54,31 +55,63 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  * folder-bindings snapshot (`folderBindingsPath(vaultDir)`); it is baked in as a string literal so
  * the script needs no arguments and no knowledge of the vault layout.
  *
- * The script implements spec §9 exactly:
+ * The script implements the enforcement rules:
  *   - session slot = the group whose canonical profileDir equals the session's canonical
  *     CLAUDE_CONFIG_DIR, else the global slot (outside every group).
- *   - (A) the project dir is bound to a group the session is NOT running on -> block with the exact
- *     reason text, unless CCTL_BIND_OVERRIDE=1 (the launcher's --override), which allows with a
+ *   - (A) the project dir is bound to a group the session is NOT running on -> block. The block
+ *     reason names the account the session is actually on (a different group, or the shared account).
+ *     A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a visible
  *     systemMessage warning instead.
  *   - (B) the session runs on a group's slot but the project dir is not within that group's folders
- *     -> block, unless CCTL_LAUNCH_EXPLICIT=1 (the launcher's --account), which allows silently.
- *   - enforce = env CCTL_BIND_ENFORCE (block|warn|off) ?? snapshot.enforce ?? 'block'. warn never
- *     blocks and emits the same text as a systemMessage; off exits 0 silently.
+ *     -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT) allows it, with a visible
+ *     systemMessage so the bypass is never silent.
+ *   - The relaxation env vars are NOT plain switches: each must name a token file the launcher minted
+ *     for THIS launch's slot (see bindToken.ts). An inherited or persisted value (e.g. a stray "1")
+ *     has no backing record and is not honored, so a folder binding cannot be defeated by ambient
+ *     env. A honored relaxation is always surfaced.
+ *   - enforce = snapshot.enforce (block|warn|off) ?? 'block' — read ONLY from the snapshot, which the
+ *     daemon/CLI resolve from CCTL_BIND_ENFORCE (env > config > default) and write. The guard does
+ *     not re-read the env var: doing so let any session's ambient environment silently turn
+ *     enforcement off. warn never blocks and emits the same text as a systemMessage; off exits 0
+ *     silently (an operator-configured mode, not an ambient one).
  *   - any error / missing / unparseable / unknown-schema snapshot -> exit 0 with one stderr line.
  */
 export function generateBindGuardSource(opts: { snapshotPath: string }): string {
-  // The exact block reason for case A (spec §9). Kept as a single source-of-truth constant on the
-  // TS side too so the test can assert the generated script reproduces it byte-for-byte.
+  // The directory holding per-launch relaxation tokens, baked in beside the snapshot path so the
+  // guard and the launcher agree on it from the snapshot path alone.
+  const tokensDir = bindTokensDir(opts.snapshotPath);
   return `'use strict';
 // claude-control bind guard (written by cctl; safe to delete — it is re-created on the next
 // bind / daemon start). A second UserPromptSubmit hook that enforces folder-account bindings.
 // Dependency-free CommonJS. Fails OPEN (exit 0) on any error so it can never lock a session out.
 const fs = require('fs');
+const path = require('path');
 
 ${embeddableFolderPathSource()}
 
 // The non-secret folder-bindings snapshot, baked in at install time.
 const SNAPSHOT_PATH = ${JSON.stringify(opts.snapshotPath)};
+
+// Where the launcher writes a per-launch relaxation token (see bindToken.ts). A token is honored
+// only when the env var names a file here whose recorded slot matches this session's slot; a plain
+// inherited value has no such file and is ignored, so a binding cannot be bypassed by ambient env.
+const TOKENS_DIR = ${JSON.stringify(tokensDir)};
+const TOKEN_PATTERN = /^[0-9a-f]{32}$/;
+
+// True when \`envValue\` names a valid relaxation token of the expected kind, minted for the slot this
+// session runs on (sessionConfigKey: the folderKey of CLAUDE_CONFIG_DIR, '' for the global slot).
+function honorRelaxation(envValue, expectedKind, sessionConfigKey) {
+  if (typeof envValue !== 'string' || !TOKEN_PATTERN.test(envValue)) return false;
+  var record;
+  try {
+    record = JSON.parse(fs.readFileSync(path.join(TOKENS_DIR, envValue + '.json'), 'utf8'));
+  } catch (e) {
+    return false;
+  }
+  if (!record || record.v !== 1 || record.kind !== expectedKind) return false;
+  var recordKey = typeof record.profileKey === 'string' ? record.profileKey : '';
+  return recordKey === sessionConfigKey;
+}
 
 // Exit 0 (never block) and leave a single diagnostic line — the fail-open path for every internal
 // fault and every unusable snapshot.
@@ -140,9 +173,10 @@ function run(input) {
     return failOpen('snapshot schema not recognized');
   }
 
-  // enforce: env overrides the snapshot's mode; default block. off is silent.
-  var enforce =
-    readValidEnforce(process.env.CCTL_BIND_ENFORCE) || readValidEnforce(snapshot.enforce) || 'block';
+  // enforce: read ONLY from the snapshot (the daemon/CLI resolve CCTL_BIND_ENFORCE env > config >
+  // default into it). The guard must not re-read the env var, or any session's ambient environment
+  // could silently turn enforcement off. off is silent: it is an operator-configured mode.
+  var enforce = readValidEnforce(snapshot.enforce) || 'block';
   if (enforce === 'off') process.exit(0);
 
   // The project dir under evaluation: CLAUDE_PROJECT_DIR (set on every hook spawn), else the
@@ -159,19 +193,22 @@ function run(input) {
   var projectDir = projCanon.path;
 
   // The session's slot: the group whose canonical profileDir equals the session's canonical
-  // CLAUDE_CONFIG_DIR. No config dir, or no match, means the global (shared) slot.
+  // CLAUDE_CONFIG_DIR. No config dir, or no match, means the global (shared) slot. sessionConfigKey
+  // is the canonical folderKey of CLAUDE_CONFIG_DIR ('' for the global slot); a relaxation token is
+  // honored only when it was minted for this same slot key.
   var sessionGroup = null;
+  var sessionConfigKey = '';
   var rawConfig = process.env.CLAUDE_CONFIG_DIR;
   if (typeof rawConfig === 'string' && rawConfig.length > 0) {
     var cfgCanon = canonicalizeFolder(rawConfig, deps);
     if (cfgCanon.ok) {
-      var cfgKey = folderKey(cfgCanon.path, platform);
+      sessionConfigKey = folderKey(cfgCanon.path, platform);
       for (var i = 0; i < snapshot.groups.length; i++) {
         var g = snapshot.groups[i];
         if (g && typeof g.profileDir === 'string') {
           var pc = canonicalizeFolder(g.profileDir, deps);
           var pk = pc.ok ? folderKey(pc.path, platform) : folderKey(g.profileDir, platform);
-          if (pk === cfgKey) {
+          if (pk === sessionConfigKey) {
             sessionGroup = g;
             break;
           }
@@ -204,15 +241,39 @@ function run(input) {
     var members = Array.isArray(projectBinding.group.members)
       ? projectBinding.group.members.join(', ')
       : '';
-    var reasonA =
-      'cctl: ' +
-      projectBinding.folder +
-      ' is bound to ' +
-      members +
-      ', but this session runs on the shared account. Exit and start it with: cctl claude' +
-      '   (or set up the claude wrapper: cctl shell-init powershell)';
-    // --override (CCTL_BIND_OVERRIDE=1) allows the session but warns, in every enforce mode.
-    if (process.env.CCTL_BIND_OVERRIDE === '1') return emitSystemMessage(reasonA);
+    // The reason must name the account this session is ACTUALLY on. A session on the global slot runs
+    // on the shared account; a session on another group's slot runs on that group's reserved account,
+    // so telling it to "cctl claude" (which would put it on the bound folder's account) is right, but
+    // "runs on the shared account" would be false. Branch on sessionGroup accordingly.
+    var reasonA;
+    if (sessionGroup) {
+      var sMembers = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
+      var sFolders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
+      reasonA =
+        'cctl: ' +
+        projectBinding.folder +
+        ' is bound to ' +
+        members +
+        ', but this session runs on ' +
+        sMembers +
+        ' (bound to ' +
+        sFolders +
+        '). Exit and start it here with: cctl claude' +
+        '   (or add --override to use this account here anyway)';
+    } else {
+      reasonA =
+        'cctl: ' +
+        projectBinding.folder +
+        ' is bound to ' +
+        members +
+        ', but this session runs on the shared account. Exit and start it with: cctl claude' +
+        '   (or set up the claude wrapper: cctl shell-init powershell)';
+    }
+    // --override relaxes case A, but only via a token the launcher minted for this launch's slot; an
+    // inherited env value is not honored, so the binding still applies. A honored override is visible.
+    if (honorRelaxation(process.env.CCTL_BIND_OVERRIDE, 'override', sessionConfigKey)) {
+      return emitSystemMessage(reasonA);
+    }
     return emitBlock(reasonA, enforce);
   }
 
@@ -229,9 +290,22 @@ function run(input) {
       }
     }
     if (!within) {
-      // --account (CCTL_LAUNCH_EXPLICIT=1) is a deliberate launch of this account here: allowed.
-      if (process.env.CCTL_LAUNCH_EXPLICIT === '1') process.exit(0);
       var folders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
+      // --account relaxes case B, but only via a token minted for this session's slot; an inherited
+      // env value is not honored. Unlike before, a honored relaxation is surfaced (never silent) so
+      // it is clear the reserved account is being used outside its folders on purpose.
+      if (honorRelaxation(process.env.CCTL_LAUNCH_EXPLICIT, 'explicit', sessionConfigKey)) {
+        var membersB = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
+        return emitSystemMessage(
+          'cctl: running ' +
+            membersB +
+            ' (bound to ' +
+            folders +
+            ') in ' +
+            projectDir +
+            ' — launched explicitly with --account. This account is reserved to its folders.',
+        );
+      }
       var reasonB =
         'cctl: this session runs on the account bound to ' +
         folders +

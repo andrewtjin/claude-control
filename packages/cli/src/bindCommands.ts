@@ -12,6 +12,7 @@ import {
   SwitchEngineError,
   canonicalizeFolder,
   folderBindingsPath,
+  folderKey,
   groupSlotId,
   profilesRoot,
   resolveAccountRef,
@@ -22,7 +23,13 @@ import {
   type StoredGroup,
 } from '@claude-control/switch-engine';
 import { defaultPaths } from '@claude-control/switch-engine';
-import { bindGuardPath, ensureBindGuard } from '@claude-control/daemon';
+import {
+  bindGuardPath,
+  ensureBindGuard,
+  bindTokensDir,
+  mintBindToken,
+  removeBindToken,
+} from '@claude-control/daemon';
 import { buildEngine, fail } from './context.js';
 import { detectPalette, sanitizeForTerminal } from './ansi.js';
 import {
@@ -455,11 +462,27 @@ async function runClaude(opts: {
       cwd: process.cwd(),
       realpath: (p) => realpathSync.native(p),
     });
+  // Mint per-launch relaxation tokens for the guard so the knobs cannot be forged by ambient env: a
+  // token is a random value the guard verifies against a record on disk keyed to THIS launch's slot,
+  // and it is removed the instant the session exits. CCTL_LAUNCH_EXPLICIT is only meaningful for a
+  // group slot (the guard's case B is a group-slot rule), so an explicit shared-account launch mints
+  // none.
+  const tokensDir = bindTokensDir(folderBindingsPath(paths.vaultDir));
+  const slotKey = slotProfileKey(slot, platform);
+  let explicitToken: string | undefined;
+  let overrideToken: string | undefined;
+  if (explicit && slot.kind === 'group') {
+    explicitToken = mintBindToken({ tokensDir, kind: 'explicit', profileKey: slotKey });
+  }
+  if (opts.override) {
+    overrideToken = mintBindToken({ tokensDir, kind: 'override', profileKey: slotKey });
+  }
+
   const env = buildLaunchEnv({
     baseEnv: process.env,
     slot,
-    explicit,
-    override: opts.override,
+    ...(explicitToken !== undefined ? { explicitToken } : {}),
+    ...(overrideToken !== undefined ? { overrideToken } : {}),
     dropInheritedConfigDir,
   });
 
@@ -477,7 +500,25 @@ async function runClaude(opts: {
     process.exitCode = code;
   } catch (err) {
     fail(`failed to launch Claude Code: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    // The token is valid only while its launch is alive: drop it as soon as the child exits (or the
+    // launch fails). A leftover from a hard kill is pruned by age on the next mint.
+    if (explicitToken !== undefined) removeBindToken(tokensDir, explicitToken);
+    if (overrideToken !== undefined) removeBindToken(tokensDir, overrideToken);
   }
+}
+
+/** The folderKey of a launch slot's config dir — '' for the global slot, the canonical key of the
+ *  group's profile dir otherwise. The guard binds a relaxation token to this key so a token minted
+ *  for one slot cannot relax a session running on another. */
+function slotProfileKey(slot: LaunchSlot, platform: NodeJS.Platform): string {
+  if (slot.kind !== 'group' || slot.profileDir === undefined) return '';
+  const r = canonicalizeFolder(slot.profileDir, {
+    platform,
+    cwd: process.cwd(),
+    realpath: (p) => realpathSync.native(p),
+  });
+  return r.ok ? folderKey(r.path, platform) : folderKey(slot.profileDir, platform);
 }
 
 /** Also used by `cctl switch`: describe the group a just-switched member belongs to (or null when it

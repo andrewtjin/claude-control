@@ -176,10 +176,14 @@ export function unwrapNpmCmdShim(cmdPath: string, cmdText: string): string | und
 export interface BuildLaunchEnvOptions {
   baseEnv: NodeJS.ProcessEnv;
   slot: LaunchSlot;
-  /** --account: mark the launch as an explicit account choice (relaxes the guard's case B). */
-  explicit: boolean;
-  /** --override: allow a session in a folder bound to a DIFFERENT account (relaxes case A). */
-  override: boolean;
+  /** --account: the per-launch token that relaxes the guard's case B (undefined = not explicit). The
+   *  guard honors CCTL_LAUNCH_EXPLICIT only when it names a token minted for this launch, so a plain
+   *  inherited value cannot relax the binding. Set on a group slot only (case B is a group-slot rule).
+   */
+  explicitToken?: string;
+  /** --override: the per-launch token that relaxes the guard's case A (undefined = no override). Like
+   *  {@link explicitToken}, the guard honors CCTL_BIND_OVERRIDE only when it names a matching token. */
+  overrideToken?: string;
   /** For a global slot: whether an inherited CLAUDE_CONFIG_DIR points into the profiles root and so
    *  must be dropped (see {@link configDirPointsIntoProfiles}). Ignored for a group slot. */
   dropInheritedConfigDir: boolean;
@@ -190,22 +194,28 @@ export interface BuildLaunchEnvOptions {
  * profile (that IS the account). A global slot inherits the parent env untouched EXCEPT that a
  * CLAUDE_CONFIG_DIR pointing into the profiles root is dropped — otherwise a launch from a shell
  * that still has a previous `cctl claude` group session's var set would silently reuse that group's
- * account instead of the global one. CCTL_LAUNCH_EXPLICIT / CCTL_BIND_OVERRIDE are the guard's
- * relaxation knobs, set from --account / --override.
+ * account instead of the global one.
+ *
+ * CCTL_LAUNCH_EXPLICIT / CCTL_BIND_OVERRIDE are the guard's relaxation knobs; they carry a per-launch
+ * token (not a bare "1"), so the guard can tell a value THIS launch set from one inherited from the
+ * shell. Any inherited copy of these knobs — and of CCTL_BIND_ENFORCE — is cleared first so nothing
+ * from the parent environment leaks into (or past) this launch.
  */
 export function buildLaunchEnv(opts: BuildLaunchEnvOptions): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...opts.baseEnv };
-  // Start from a clean guard state so an inherited knob never leaks into this launch.
+  // Start from a clean guard state so an inherited knob never leaks into this launch. CCTL_BIND_ENFORCE
+  // is cleared too: the guard reads its mode from the snapshot, and a stale value must not travel on.
   delete env.CCTL_LAUNCH_EXPLICIT;
   delete env.CCTL_BIND_OVERRIDE;
+  delete env.CCTL_BIND_ENFORCE;
 
   if (opts.slot.kind === 'group') {
     env.CLAUDE_CONFIG_DIR = opts.slot.profileDir;
-    if (opts.explicit) env.CCTL_LAUNCH_EXPLICIT = '1';
+    if (opts.explicitToken !== undefined) env.CCTL_LAUNCH_EXPLICIT = opts.explicitToken;
   } else if (opts.dropInheritedConfigDir) {
     delete env.CLAUDE_CONFIG_DIR;
   }
-  if (opts.override) env.CCTL_BIND_OVERRIDE = '1';
+  if (opts.overrideToken !== undefined) env.CCTL_BIND_OVERRIDE = opts.overrideToken;
   return env;
 }
 
