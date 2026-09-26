@@ -4,7 +4,7 @@
 // summary are pure so their output is unit-tested. Each check reports a human detail so a
 // failure is actionable, never a bare boolean.
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   defaultLiveCredentialChannel,
@@ -14,6 +14,8 @@ import {
   type Paths,
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
+import { BIND_GUARD_MARKER } from '@claude-control/daemon';
+import type { SwitchEngine } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 
@@ -285,6 +287,120 @@ export async function checkChannelAllowlist(
       ? `${status.detail} — re-run \`cctl channel enable\` to restore it`
       : 'idle-session prompts not enabled; /say delivers at the next turn boundary instead. ' +
         '`cctl channel enable` changes that.',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Folder-bound accounts (slots, guard snapshot, guard hook, version skew)
+// ---------------------------------------------------------------------------
+
+/** The slot invariant checker (engine.checkSlots) is the single authority for "is any account live
+ *  where it must not be" — a reserved account squatting in global, a non-member in a group profile, a
+ *  group's active id disagreeing with its live login, a broken profile link. A clean result is a
+ *  pass; any violation is a failure naming each one, with the fix being `cctl doctor` -> repair (the
+ *  daemon repairs these automatically on each poll). */
+export async function checkSlots(engine: Pick<SwitchEngine, 'checkSlots'>): Promise<DoctorCheck> {
+  try {
+    const violations = await engine.checkSlots();
+    if (violations.length === 0) {
+      return { name: 'slots', ok: true, detail: 'no slot invariant violations' };
+    }
+    return {
+      name: 'slots',
+      ok: false,
+      detail:
+        `${violations.length} slot violation(s): ` +
+        violations.map((v) => `${v.kind} (${v.detail})`).join('; '),
+    };
+  } catch (err) {
+    return { name: 'slots', ok: false, detail: `could not check slots: ${(err as Error).message}` };
+  }
+}
+
+/** The guard reads a snapshot copy of the groups file, stamped with the generation it was built
+ *  from. If that lags the live groups generation, the guard is enforcing a stale binding view until
+ *  the daemon restarts or a `cctl settings` change rewrites it. No groups + no snapshot is a pass
+ *  (nothing to enforce). */
+export async function checkGuardSnapshot(
+  engine: Pick<SwitchEngine, 'readSnapshot' | 'getGroupsGeneration' | 'listGroups'>,
+): Promise<DoctorCheck> {
+  try {
+    const [snapshot, groupsGeneration, groups] = await Promise.all([
+      engine.readSnapshot(),
+      engine.getGroupsGeneration(),
+      engine.listGroups(),
+    ]);
+    if (snapshot === undefined) {
+      if (groups.length === 0) {
+        return { name: 'guard-snapshot', ok: true, detail: 'no folder bindings; nothing to enforce' };
+      }
+      return {
+        name: 'guard-snapshot',
+        ok: false,
+        detail: `${groups.length} folder binding(s) but no guard snapshot — restart the daemon (cctl daemon restart) to write it`,
+      };
+    }
+    const fresh = snapshot.generation === groupsGeneration;
+    return {
+      name: 'guard-snapshot',
+      ok: fresh,
+      detail: fresh
+        ? `fresh (generation ${groupsGeneration}, enforce=${snapshot.enforce})`
+        : `STALE (snapshot generation ${snapshot.generation}, groups ${groupsGeneration}) — restart the daemon or run a cctl settings change to refresh it`,
+    };
+  } catch (err) {
+    return {
+      name: 'guard-snapshot',
+      ok: false,
+      detail: `could not read the guard snapshot: ${(err as Error).message}`,
+    };
+  }
+}
+
+/** Whether the enforcement guard hook is installed in the main config dir's settings.json. When
+ *  bindings exist but the guard is absent, nothing enforces them — a failure. With no bindings, its
+ *  presence is optional and reported without failing. */
+export function checkGuardHook(paths: Paths, hasBindings: boolean): DoctorCheck {
+  const settingsPath = join(paths.claudeDir, 'settings.json');
+  let installed = false;
+  try {
+    const raw = readFileSync(settingsPath, 'utf8');
+    installed = raw.includes(BIND_GUARD_MARKER);
+  } catch {
+    installed = false;
+  }
+  if (installed) {
+    return { name: 'guard-hook', ok: true, detail: `installed in ${settingsPath}` };
+  }
+  return {
+    name: 'guard-hook',
+    ok: !hasBindings,
+    detail: hasBindings
+      ? `not installed in ${settingsPath}, but folder bindings exist — bindings are NOT enforced. Run \`cctl bind\` again (it reinstalls the guard) or restart the daemon.`
+      : 'not installed (no folder bindings need it yet)',
+  };
+}
+
+/** Compare this CLI's build against the running daemon's last-reported build (the same two values
+ *  `cctl version` shows). After an `npm i -g` upgrade the running daemon keeps its old build until
+ *  restarted, so a live daemon on a different build is a real skew — the guard script, snapshot
+ *  format, and poll behavior may not match. `daemonBuild` is undefined / `daemonAlive` false when no
+ *  daemon is running to compare, which is a pass. Pure. */
+export function checkVersionSkew(
+  cliVersion: string,
+  daemonBuild: string | undefined,
+  daemonAlive: boolean,
+): DoctorCheck {
+  if (!daemonAlive || daemonBuild === undefined) {
+    return { name: 'daemon-version', ok: true, detail: `CLI is ${cliVersion}; no running daemon to compare` };
+  }
+  if (daemonBuild === cliVersion) {
+    return { name: 'daemon-version', ok: true, detail: `CLI and daemon both ${cliVersion}` };
+  }
+  return {
+    name: 'daemon-version',
+    ok: false,
+    detail: `CLI is ${cliVersion} but the running daemon is ${daemonBuild} — restart it so both match: cctl daemon restart`,
   };
 }
 

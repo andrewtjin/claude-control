@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,10 @@ import {
   checkVaultProtection,
   checkNodeVersion,
   checkSessionRuntime,
+  checkSlots,
+  checkGuardSnapshot,
+  checkGuardHook,
+  checkVersionSkew,
   healthUrlFromRelay,
   probeRelay,
   checkLiveLogin,
@@ -245,5 +249,135 @@ describe('checkLiveLogin (darwin)', () => {
     expect(res.detail).toContain('service="Custom-Item"');
     expect(res.detail).toContain('account="alt-user"');
     expect(res.detail).not.toContain('Claude Code-credentials');
+  });
+});
+
+describe('checkSlots', () => {
+  it('passes when there are no violations', async () => {
+    const check = await checkSlots({ checkSlots: () => Promise.resolve([]) });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('no slot invariant');
+  });
+
+  it('fails and names each violation', async () => {
+    const check = await checkSlots({
+      checkSlots: () =>
+        Promise.resolve([
+          { kind: 'reserved_live_in_global', detail: 'work@me.com is live in global' },
+        ]),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('reserved_live_in_global');
+    expect(check.detail).toContain('work@me.com');
+  });
+
+  it('fails cleanly when the check throws', async () => {
+    const check = await checkSlots({
+      checkSlots: () => Promise.reject(new Error('lock busy')),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('lock busy');
+  });
+});
+
+describe('checkGuardSnapshot', () => {
+  const baseGroups = [{ id: 'g1' }];
+
+  it('passes when there are no bindings and no snapshot', async () => {
+    const check = await checkGuardSnapshot({
+      readSnapshot: () => Promise.resolve(undefined),
+      getGroupsGeneration: () => Promise.resolve(0),
+      listGroups: () => Promise.resolve([]),
+    });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('nothing to enforce');
+  });
+
+  it('fails when bindings exist but the snapshot is missing', async () => {
+    const check = await checkGuardSnapshot({
+      readSnapshot: () => Promise.resolve(undefined),
+      getGroupsGeneration: () => Promise.resolve(3),
+      listGroups: () => Promise.resolve(baseGroups as never),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('no guard snapshot');
+  });
+
+  it('passes when the snapshot generation matches', async () => {
+    const check = await checkGuardSnapshot({
+      readSnapshot: () => Promise.resolve({ generation: 4, enforce: 'block' } as never),
+      getGroupsGeneration: () => Promise.resolve(4),
+      listGroups: () => Promise.resolve(baseGroups as never),
+    });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('fresh');
+  });
+
+  it('fails when the snapshot lags the groups generation', async () => {
+    const check = await checkGuardSnapshot({
+      readSnapshot: () => Promise.resolve({ generation: 2, enforce: 'warn' } as never),
+      getGroupsGeneration: () => Promise.resolve(6),
+      listGroups: () => Promise.resolve(baseGroups as never),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('STALE');
+  });
+});
+
+describe('checkGuardHook', () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-guardhook-'));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('passes when the guard command is present in settings.json', async () => {
+    const { writeFile, mkdir } = await import('node:fs/promises');
+    const claudeDir = join(dir, 'claude');
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      join(claudeDir, 'settings.json'),
+      JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [{ hooks: [{ type: 'command', command: '"node" "x\bind-guard.cjs"' }] }],
+        },
+      }),
+    );
+    const check = checkGuardHook(sandboxPaths(dir), true);
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('installed');
+  });
+
+  it('fails when bindings exist but the guard is not installed', () => {
+    const check = checkGuardHook(sandboxPaths(dir), true);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('NOT enforced');
+  });
+
+  it('passes (optional) when there are no bindings and no guard', () => {
+    const check = checkGuardHook(sandboxPaths(dir), false);
+    expect(check.ok).toBe(true);
+  });
+});
+
+describe('checkVersionSkew', () => {
+  it('passes when no daemon is running', () => {
+    expect(checkVersionSkew('1.0.0', undefined, false).ok).toBe(true);
+    expect(checkVersionSkew('1.0.0', '0.9.0', false).ok).toBe(true);
+  });
+
+  it('passes when the builds match', () => {
+    const check = checkVersionSkew('1.0.0', '1.0.0', true);
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('both 1.0.0');
+  });
+
+  it('fails on a live-daemon build mismatch with a restart hint', () => {
+    const check = checkVersionSkew('1.0.0', '0.9.0', true);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('0.9.0');
+    expect(check.detail).toContain('cctl daemon restart');
   });
 });
