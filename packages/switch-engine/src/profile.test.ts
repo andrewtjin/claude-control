@@ -87,7 +87,7 @@ function parseClaude(text: string | null): ClaudeJson {
 // ---------------------------------------------------------------------------------------------
 
 describe('computeClaudeJsonMerge', () => {
-  it('copies allowlisted onboarding keys main -> profile and leaves everything else', () => {
+  it('mirrors onboarding keys main -> profile, seeds only-absent prefs, and leaves everything else', () => {
     const profile = JSON.stringify({
       oauthAccount: { accountUuid: 'PROFILE-ACCT', emailAddress: 'work@example.com' },
       theme: 'light',
@@ -95,6 +95,7 @@ describe('computeClaudeJsonMerge', () => {
     const main = JSON.stringify({
       hasCompletedOnboarding: true,
       theme: 'dark',
+      editorMode: 'vim',
       installMethod: 'npm',
       somePrivateKey: 'should-not-copy',
       oauthAccount: { accountUuid: 'MAIN-ACCT' },
@@ -103,10 +104,13 @@ describe('computeClaudeJsonMerge', () => {
     const out = parseClaude(merge.serialized);
     // Identity is the profile's, never main's.
     expect(out.oauthAccount?.accountUuid).toBe('PROFILE-ACCT');
-    // Allowlisted keys flow from main (theme is overwritten, onboarding/install added).
+    // Mirror keys flow from main on every merge (onboarding/install added).
     expect(out.hasCompletedOnboarding).toBe(true);
-    expect(out.theme).toBe('dark');
     expect(out.installMethod).toBe('npm');
+    // theme is a seed-once pref the profile already owns: its own value is preserved, not overwritten.
+    expect(out.theme).toBe('light');
+    // editorMode is a seed-once pref the profile lacks: seeded from main.
+    expect(out.editorMode).toBe('vim');
     // A non-allowlisted key in main is not copied.
     expect('somePrivateKey' in out).toBe(false);
     expect(merge.profileCorrupt).toBe(false);
@@ -214,6 +218,87 @@ describe('computeClaudeJsonMerge', () => {
     const first = computeClaudeJsonMerge(profile, main).serialized as string;
     const second = computeClaudeJsonMerge(first, main).serialized as string;
     expect(second).toBe(first);
+  });
+
+  it('never overwrites the profile’s own MCP servers and UI prefs with main’s (seed-once)', () => {
+    // A folder-bound session set its own MCP servers and UI preferences; a merge (which runs on every
+    // daemon poll) must keep them, not revert them to main's values.
+    const profile = JSON.stringify({
+      oauthAccount: { accountUuid: 'WORK' },
+      mcpServers: { workmcp: { command: 'node', args: ['work-server.js'] } },
+      theme: 'dark',
+      editorMode: 'vim',
+      verbose: true,
+      autoCompactEnabled: false,
+      preferredNotifChannel: 'iterm2',
+      diffTool: 'meld',
+      showSpinnerTree: true,
+      diffSidebarOpen: false,
+      githubRepoPaths: { '/work/repo': 'git@github.com:acme/work.git' },
+    });
+    const main = JSON.stringify({
+      mcpServers: { personalmcp: { command: 'npx', args: ['-y', 'other'] } },
+      theme: 'light',
+      editorMode: 'normal',
+      verbose: false,
+      autoCompactEnabled: true,
+      preferredNotifChannel: 'terminal_bell',
+      diffTool: 'auto',
+      showSpinnerTree: false,
+      diffSidebarOpen: true,
+      githubRepoPaths: { '/personal/repo': 'git@github.com:me/personal.git' },
+      // A mirror key still flows from main even on this path.
+      hasCompletedOnboarding: true,
+    });
+    const out = parseClaude(computeClaudeJsonMerge(profile, main).serialized);
+    // Every seed-once key the profile already owns is preserved verbatim.
+    expect(out.mcpServers).toEqual({ workmcp: { command: 'node', args: ['work-server.js'] } });
+    expect(out.theme).toBe('dark');
+    expect(out.editorMode).toBe('vim');
+    expect(out.verbose).toBe(true);
+    expect(out.autoCompactEnabled).toBe(false);
+    expect(out.preferredNotifChannel).toBe('iterm2');
+    expect(out.diffTool).toBe('meld');
+    expect(out.showSpinnerTree).toBe(true);
+    expect(out.diffSidebarOpen).toBe(false);
+    expect(out.githubRepoPaths).toEqual({ '/work/repo': 'git@github.com:acme/work.git' });
+    // Mirror bookkeeping still comes from main.
+    expect(out.hasCompletedOnboarding).toBe(true);
+    // Identity untouched.
+    expect(out.oauthAccount?.accountUuid).toBe('WORK');
+  });
+
+  it('seeds a seed-once key from main only when the profile has no value of its own', () => {
+    // A fresh profile with no MCP servers / theme of its own still inherits main's, so onboarding and
+    // the theme picker are skipped and MCP tools are available on first use.
+    const profile = JSON.stringify({ oauthAccount: { accountUuid: 'WORK' } });
+    const main = JSON.stringify({
+      mcpServers: { linear: { command: 'npx', args: ['-y', 'linear-mcp'] } },
+      theme: 'dark',
+    });
+    const out = parseClaude(computeClaudeJsonMerge(profile, main).serialized);
+    expect(out.mcpServers).toEqual({ linear: { command: 'npx', args: ['-y', 'linear-mcp'] } });
+    expect(out.theme).toBe('dark');
+    expect(out.oauthAccount?.accountUuid).toBe('WORK');
+  });
+
+  it('preserves a profile seed-once value even when main lacks that key entirely', () => {
+    // main has no theme; the profile's own theme must survive (never reset to a default).
+    const profile = JSON.stringify({ oauthAccount: { accountUuid: 'WORK' }, theme: 'dark' });
+    const main = JSON.stringify({ hasCompletedOnboarding: true });
+    const out = parseClaude(computeClaudeJsonMerge(profile, main).serialized);
+    expect(out.theme).toBe('dark');
+    expect(out.hasCompletedOnboarding).toBe(true);
+  });
+
+  it('keeps a falsy profile seed-once value (a false/empty pref is still owned by the profile)', () => {
+    // `Object.hasOwn`, not truthiness, decides ownership: a profile that set showSpinnerTree=false
+    // owns it and must not have main's `true` seeded over the top.
+    const profile = JSON.stringify({ showSpinnerTree: false, verbose: false });
+    const main = JSON.stringify({ showSpinnerTree: true, verbose: true });
+    const out = parseClaude(computeClaudeJsonMerge(profile, main).serialized);
+    expect(out.showSpinnerTree).toBe(false);
+    expect(out.verbose).toBe(false);
   });
 });
 
@@ -875,6 +960,49 @@ describe('ensureGroupProfile — main .claude.json outside the config dir', () =
     // sibling file (not <main>/.claude.json) exactly as the execute path does.
     const plan = planGroupProfile(profile, main, createNodeProfileFs(), siblingJson);
     expect(plan.claudeJson.action).toBe('write');
+  });
+
+  it('a later sweep keeps runtime prefs and MCP servers set inside the bound session', () => {
+    // The scenario a daemon poll re-runs: a folder-bound session changed its own theme/editorMode and
+    // added a user-scoped MCP server; the very next materialization sweep must not revert them to
+    // main's, and must report no change (steady state) rather than silently rewriting the file.
+    const { root, main, profile } = sandbox();
+    const siblingJson = join(root, '.claude.json');
+    writeFileSync(
+      siblingJson,
+      JSON.stringify({
+        hasCompletedOnboarding: true,
+        theme: 'light',
+        editorMode: 'normal',
+        mcpServers: { personalmcp: { command: 'npx', args: ['-y', 'personal'] } },
+      }),
+    );
+    // First sweep materializes the profile, seeding main's prefs into a fresh profile.
+    ensureGroupProfile(profile, main, { mainClaudeJsonPath: siblingJson });
+
+    // The bound session then changes its own prefs and adds a user-scoped MCP server.
+    const seeded = parseClaude(readFileSync(join(profile, '.claude.json'), 'utf8'));
+    seeded.theme = 'dark';
+    seeded.editorMode = 'vim';
+    (seeded as Record<string, unknown>).mcpServers = {
+      workmcp: { command: 'node', args: ['work-server.js'] },
+    };
+    // Written in the same 2-space form the merge emits, so a genuine steady state is reachable and the
+    // no-rewrite assertion below reflects the merge rule, not a formatting difference.
+    writeFileSync(join(profile, '.claude.json'), JSON.stringify(seeded, null, 2));
+
+    // The next poll's sweep.
+    const report = ensureGroupProfile(profile, main, { mainClaudeJsonPath: siblingJson });
+
+    const after = parseClaude(readFileSync(join(profile, '.claude.json'), 'utf8'));
+    // The session's own choices survive the sweep.
+    expect(after.theme).toBe('dark');
+    expect(after.editorMode).toBe('vim');
+    expect(after.mcpServers).toEqual({ workmcp: { command: 'node', args: ['work-server.js'] } });
+    // Mirror bookkeeping is still present.
+    expect(after.hasCompletedOnboarding).toBe(true);
+    // The sweep is a no-op on the file (nothing to mirror changed), so it does not rewrite it.
+    expect(report.claudeJsonMerged).toBe(false);
   });
 });
 

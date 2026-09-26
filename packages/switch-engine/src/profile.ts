@@ -25,9 +25,11 @@
 //     newest-content-wins, with a bounded backup of the losing copy.
 //
 // The profile's own identity files (`.credentials.json`, `.claude.json`) are never linked — the
-// slot engine owns them. `.claude.json` is instead merged: an allowlist of onboarding/UI keys is
-// copied from main so the profile does not re-run onboarding, while the profile's `oauthAccount`
-// and every account/usage cache are left untouched.
+// slot engine owns them. `.claude.json` is instead merged: onboarding/migration bookkeeping is
+// mirrored from main every sweep so the profile never re-runs onboarding, while user-scoped MCP
+// servers and UI preferences are seeded from main only once (so a fresh profile skips the theme
+// picker) and thereafter belong to the profile. The profile's `oauthAccount` and every account/usage
+// cache are always left untouched.
 
 import { homedir } from 'node:os';
 import { basename, dirname, join, normalize } from 'node:path';
@@ -131,11 +133,12 @@ export const SHARED_PROFILE_FILES: readonly string[] = [
 ];
 
 /**
- * Allowlist of `.claude.json` keys copied main -> profile so a fresh profile skips onboarding, the
- * theme picker, migrations and update nags. Everything NOT here is left to the profile — crucially
- * `oauthAccount` and the usage/subscription caches, which are the account identity itself.
+ * `.claude.json` keys MIRRORED main -> profile on every sweep. These are onboarding, migration and
+ * update/nag bookkeeping: a session never sets them per profile, and keeping them equal to main is
+ * the whole point of the copy — a fresh (or re-verified) profile must not re-run onboarding, re-apply
+ * a migration, or re-show a one-time prompt. Overwriting them on every run is therefore correct.
  */
-export const CLAUDE_JSON_MERGE_ALLOWLIST: readonly string[] = [
+export const CLAUDE_JSON_MIRROR_KEYS: readonly string[] = [
   'hasCompletedOnboarding',
   'lastOnboardingVersion',
   'installMethod',
@@ -146,6 +149,20 @@ export const CLAUDE_JSON_MERGE_ALLOWLIST: readonly string[] = [
   'hasIdeOnboardingBeenShown',
   'officialMarketplaceAutoInstallAttempted',
   'officialMarketplaceAutoInstalled',
+  'bypassPermissionsModeAccepted',
+  'hasAcknowledgedCostThreshold',
+];
+
+/**
+ * `.claude.json` keys SEEDED main -> profile only when the profile has no value of its own. These are
+ * user-scoped configuration and UI preferences — MCP servers and editor/theme choices — that a
+ * session running inside the profile may legitimately change. Copying from main gives a fresh profile
+ * a working set (and skips the theme picker), but once the profile owns a value the user's own choice
+ * must persist: this materialization re-runs on every daemon poll, so mirroring these each time would
+ * silently revert a folder-bound session's user-scoped MCP servers and UI prefs to main's on the next
+ * cycle — a config data loss with no backup, unlike the shared files' newest-wins repair path.
+ */
+export const CLAUDE_JSON_SEED_KEYS: readonly string[] = [
   'mcpServers',
   'githubRepoPaths',
   'theme',
@@ -154,16 +171,30 @@ export const CLAUDE_JSON_MERGE_ALLOWLIST: readonly string[] = [
   'autoCompactEnabled',
   'preferredNotifChannel',
   'diffTool',
-  'bypassPermissionsModeAccepted',
-  'hasAcknowledgedCostThreshold',
   'showSpinnerTree',
   'diffSidebarOpen',
 ];
 
-/** Key-name patterns whose matching `.claude.json` keys are also copied main -> profile: migration
- *  bookkeeping and the per-launch "unpin ... launch effort" flags, all of which would otherwise
- *  make a fresh profile re-run a migration or re-show a one-time prompt. */
-const CLAUDE_JSON_MERGE_PATTERNS: readonly RegExp[] = [
+/**
+ * Every allowlisted `.claude.json` key copied main -> profile: the union of the always-mirrored
+ * bookkeeping keys and the seed-once user preferences. Everything NOT here is left to the profile —
+ * crucially `oauthAccount` and the usage/subscription caches, which are the account identity itself.
+ * The copy RULE differs by list (mirror every sweep vs. seed only when absent); this is the combined
+ * roster of names that may ever be copied.
+ */
+export const CLAUDE_JSON_MERGE_ALLOWLIST: readonly string[] = [
+  ...CLAUDE_JSON_MIRROR_KEYS,
+  ...CLAUDE_JSON_SEED_KEYS,
+];
+
+/** Set forms for O(1) classification in the merge loop. */
+const MIRROR_KEY_SET: ReadonlySet<string> = new Set(CLAUDE_JSON_MIRROR_KEYS);
+const SEED_KEY_SET: ReadonlySet<string> = new Set(CLAUDE_JSON_SEED_KEYS);
+
+/** Key-name patterns whose matching `.claude.json` keys are MIRRORED main -> profile every sweep:
+ *  migration bookkeeping and the per-launch "unpin ... launch effort" flags, all of which would
+ *  otherwise make a fresh profile re-run a migration or re-show a one-time prompt. */
+const CLAUDE_JSON_MIRROR_PATTERNS: readonly RegExp[] = [
   /MigrationComplete$/,
   /MigrationTimestamp$/,
   /^unpin\w+LaunchEffort$/,
@@ -711,11 +742,19 @@ export function computeClaudeJsonMerge(
   for (const key of Object.keys(profileObj)) {
     if (!FORBIDDEN_KEYS.has(key)) out[key] = profileObj[key];
   }
-  // 2. Overlay the allowlisted onboarding/UI keys from main.
+  // 2. Overlay allowlisted keys from main. A MIRROR key (onboarding/migration/nag bookkeeping) is
+  //    copied on every sweep so the profile never re-runs onboarding or a migration. A SEED key
+  //    (user-scoped MCP servers and UI preferences) is copied only when the profile has no value of
+  //    its own, so a preference the user set inside a folder-bound session survives the next poll
+  //    instead of being reverted to main's on every cycle.
   for (const key of Object.keys(mainObj)) {
     if (FORBIDDEN_KEYS.has(key)) continue;
     if (key === 'projects') continue; // merged field-by-field below, not wholesale
-    if (isAllowlisted(key)) out[key] = mainObj[key];
+    if (MIRROR_KEY_SET.has(key) || matchesMirrorPattern(key)) {
+      out[key] = mainObj[key];
+    } else if (SEED_KEY_SET.has(key) && !Object.hasOwn(profileObj, key)) {
+      out[key] = mainObj[key];
+    }
   }
   // 3. Per-project overlay: main overlays the profile, trust OR-merged (main -> profile only).
   out.projects = mergeProjects(profileObj.projects, mainObj.projects);
@@ -723,9 +762,9 @@ export function computeClaudeJsonMerge(
   return { serialized: JSON.stringify(out, null, 2), profileCorrupt: false, mainUnreadable };
 }
 
-function isAllowlisted(key: string): boolean {
-  if (CLAUDE_JSON_MERGE_ALLOWLIST.includes(key)) return true;
-  return CLAUDE_JSON_MERGE_PATTERNS.some((re) => re.test(key));
+/** Whether a key name matches one of the mirror patterns (migration/launch-effort bookkeeping). */
+function matchesMirrorPattern(key: string): boolean {
+  return CLAUDE_JSON_MIRROR_PATTERNS.some((re) => re.test(key));
 }
 
 /** Merge `projects` maps: union of project keys, main's entry overlaying the profile's, with each

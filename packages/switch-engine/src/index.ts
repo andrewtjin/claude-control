@@ -140,6 +140,8 @@ export {
   PROFILE_LOCAL_DIRS,
   SHARED_PROFILE_FILES,
   CLAUDE_JSON_MERGE_ALLOWLIST,
+  CLAUDE_JSON_MIRROR_KEYS,
+  CLAUDE_JSON_SEED_KEYS,
   type ProfileFs,
   type ProfilePlatform,
   type EntryKind,
