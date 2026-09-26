@@ -281,6 +281,95 @@ describe('repairSlots — an unrecognized login is alerted on but never adopted'
   });
 });
 
+describe('repairSlots — a group with no seatable member fails the slot closed', () => {
+  it('evicts a non-member squatter when every member is quarantined (c, fail closed)', async () => {
+    const h = await harness();
+    const { A, B, C } = await seed(h);
+    const work = await h.folder('work');
+    const bind = await h.engine.bindFolder(work, [A.id, B.id]); // members A,B; A live
+
+    // Both members lose their tokens (invalid_grant on refresh -> quarantined), so none can be seated.
+    await h.vault.quarantine(A.id, 'dead');
+    await h.vault.quarantine(B.id, 'dead');
+
+    // Accident: shared non-member C is /logged into the group profile.
+    await login(groupStore(h.paths, bind.group.id), 'C', oauth('C', NOW + 10 * HOUR));
+
+    const before = await h.engine.checkSlots();
+    expect(before.some((v) => v.kind === 'nonmember_live_in_group' && v.accountId === C.id)).toBe(
+      true,
+    );
+
+    const res = await h.engine.repairSlots();
+
+    // The squatter is physically gone: an empty profile is "not logged in", never C's live token.
+    const store = groupStore(h.paths, bind.group.id);
+    expect(await store.readLiveCredentials().catch(() => undefined)).toBeUndefined();
+    expect(await store.readOauthAccount().catch(() => undefined)).toBeUndefined();
+    // The eviction is reported (it does not activate a member, so it must be surfaced explicitly).
+    expect(res.actions.some((a) => /cleared a non-member login/.test(a))).toBe(true);
+    // The invariant is restored — repair is not a no-op for this class.
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+
+  it('evicts an unrecognized login when every member is quarantined (c′, fail closed)', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    const bind = await h.engine.bindFolder(work, [A.id, B.id]);
+    await h.vault.quarantine(A.id, 'dead');
+    await h.vault.quarantine(B.id, 'dead');
+
+    // A login for an account cctl has never stored (foreign uuid) inside the profile.
+    const store = groupStore(h.paths, bind.group.id);
+    await store.writeLiveCredentials(oauth('Z', NOW + 10 * HOUR, 'r-Z'));
+    await store.writeOauthAccount({ accountUuid: 'uuid-Z', emailAddress: 'Z@x.com' });
+
+    const countBefore = (await h.vault.listAllAccounts()).length;
+    await h.engine.repairSlots();
+
+    // The unknown login is cleared (fail closed), never turned into a stored account.
+    expect((await h.vault.listAllAccounts()).length).toBe(countBefore);
+    expect(await store.readLiveCredentials().catch(() => undefined)).toBeUndefined();
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+
+  it('does not let a reserved member squat in a second group with no seatable member (a, fail closed)', async () => {
+    const h = await harness();
+    const W1 = await h.engine.addAccount('W1', bundleFor('W1'));
+    const W2 = await h.engine.addAccount('W2', bundleFor('W2'));
+    const S = await h.engine.addAccount('S', bundleFor('S'));
+    await h.engine.activate(S.id); // global = shared S
+
+    const f1 = await h.folder('research1');
+    const f2 = await h.folder('research2');
+    const g1 = await h.engine.bindFolder(f1, [W1.id]); // G1 = {W1}, W1 live in G1
+    const g2 = await h.engine.bindFolder(f2, [W2.id]); // G2 = {W2}, W2 live in G2
+
+    await h.vault.quarantine(W2.id, 'invalid_grant'); // G2 has no seatable member
+
+    // Accident: reserved W1 is /logged into G2's profile — W1 now appears in two slots.
+    await login(groupStore(h.paths, g2.group.id), 'W1', oauth('W1', NOW + 15 * HOUR, 'rot-W1-g2'));
+
+    const before = await h.engine.checkSlots();
+    expect(
+      before.some((v) => v.kind === 'account_in_multiple_slots' && v.accountId === W1.id),
+    ).toBe(true);
+
+    await h.engine.repairSlots();
+
+    // W1 is live in exactly ONE slot again (its own G1); G2 is failed closed.
+    expect(await h.engine.getActiveId(groupSlotId(g1.group.id))).toBe(W1.id);
+    const g2store = groupStore(h.paths, g2.group.id);
+    expect(await g2store.readLiveCredentials().catch(() => undefined)).toBeUndefined();
+    const liveIds = [...(await h.engine.liveSlots()).values()].filter(
+      (v): v is string => v !== null,
+    );
+    expect(new Set(liveIds).size).toBe(liveIds.length);
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+});
+
 describe('checkSlots — broken profile links (e)', () => {
   it('detects a broken hard link and repairSlots heals it via the profile ensure', async () => {
     const h = await harness();
