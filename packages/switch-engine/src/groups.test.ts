@@ -194,6 +194,48 @@ describe('folder + active mutations on a group', () => {
     expect(g2.folders).toEqual(['C:\\two']);
   });
 
+  // The write-time folder guards must key a folder EXACTLY as the load validator does, or a write
+  // can persist a groups.json the next load rejects (fail-closed brick). These pin that agreement.
+  it('refuses re-adding a folder the group already holds, leaving the file loadable', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('a', bundle('a'));
+    const g1 = await v.createGroup({ memberIds: [a.id], folders: ['C:\\proj'] });
+    // Re-adding the group's OWN folder is refused, not silently duplicated.
+    await expect(v.addFolderToGroup(g1.id, 'C:\\proj')).rejects.toThrow(
+      /already bound to this group/,
+    );
+    // A case- or separator-variant of the same directory is refused just the same.
+    await expect(v.addFolderToGroup(g1.id, 'c:/PROJ')).rejects.toThrow(
+      /already bound to this group/,
+    );
+    expect((await v.getGroup(g1.id))?.folders).toEqual(['C:\\proj']);
+    // No duplicate reached the file, so a fresh load succeeds.
+    expect((await readJson(groupsPath)).groups).toHaveLength(1);
+    await expect(v.listGroups()).resolves.toHaveLength(1);
+  });
+
+  it('refuses a cross-group folder collision under a different separator spelling', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('a', bundle('a'));
+    const b = await v.addAccount('b', bundle('b'));
+    const g1 = await v.createGroup({ memberIds: [a.id], folders: ['C:/g/8'] });
+    const g2 = await v.createGroup({ memberIds: [b.id], folders: ['C:\\other'] });
+    // The backslash spelling is the same physical dir g1 already holds → refused.
+    await expect(v.addFolderToGroup(g2.id, 'C:\\g\\8')).rejects.toThrow(
+      /already bound to another group/,
+    );
+    expect((await v.getGroup(g1.id))?.folders).toEqual(['C:/g/8']);
+  });
+
+  it('removes a folder stored under a non-canonical spelling when queried canonically', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('a', bundle('a'));
+    const g1 = await v.createGroup({ memberIds: [a.id], folders: ['C:/g/8', 'C:\\keep'] });
+    // Stored with forward slashes; removal keys canonically, so the backslash form still matches.
+    await v.removeFolderFromGroup(g1.id, 'C:\\g\\8');
+    expect((await v.getGroup(g1.id))?.folders).toEqual(['C:\\keep']);
+  });
+
   it('sets and clears the live member, refusing a non-member', async () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
@@ -404,6 +446,56 @@ describe('strict validation of groups.json fails CLOSED, naming the field, leavi
       }),
       /appears in more than one group/,
     ));
+
+  it('refuses the same login (accountUuid) in two groups', () =>
+    expectRefusal(
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: 0,
+        groups: [
+          group({ members: [{ ...member, accountUuid: 'login-x' }] }),
+          group({ id: 'g2', members: [{ ...member, id: 'm2', accountUuid: 'login-x' }] }),
+        ],
+      }),
+      /login login-x appears in more than one group/,
+    ));
+
+  it('accepts a login repeated WITHIN one group (a dedupe-able duplicate, not a cross-group one)', async () => {
+    // Two members of ONE group sharing a login is what dedupeAccounts collapses; failing the load
+    // closed would make it unrepairable, so validation must accept it.
+    const { v } = await withGroupsFile(
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: 0,
+        groups: [
+          group({
+            members: [
+              { ...member, accountUuid: 'login-dup' },
+              { ...member, id: 'm2', accountUuid: 'login-dup' },
+            ],
+          }),
+        ],
+      }),
+    );
+    await expect(v.listGroups()).resolves.toHaveLength(1);
+  });
+
+  it('accepts distinct logins and rows that carry no accountUuid', async () => {
+    const { v } = await withGroupsFile(
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: 0,
+        groups: [
+          group({ members: [{ ...member, accountUuid: 'login-a' }] }),
+          group({ id: 'g2', members: [{ ...member, id: 'm2', accountUuid: 'login-b' }] }),
+          // A pre-metadata row (no accountUuid) is keyed by id alone and must not collide on undefined.
+          group({ id: 'g3', members: [{ ...member, id: 'm3' }] }),
+          group({ id: 'g4', members: [{ ...member, id: 'm4' }] }),
+        ],
+      }),
+    );
+    await expect(v.listGroups()).resolves.toHaveLength(4);
+  });
 
   it('refuses the same folder bound by two groups', () =>
     expectRefusal(
