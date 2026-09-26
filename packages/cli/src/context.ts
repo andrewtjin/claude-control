@@ -8,7 +8,13 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createLogger, type LogSink } from '@claude-control/shared-protocol';
-import { SwitchEngine, defaultPaths, type Logger, type Paths } from '@claude-control/switch-engine';
+import {
+  SwitchEngine,
+  defaultPaths,
+  type BindEnforceMode,
+  type Logger,
+  type Paths,
+} from '@claude-control/switch-engine';
 import { detectPalette, type Palette } from './ansi.js';
 
 /** The daemon's sqlite database — a sibling of the vault under the claude-control data dir.
@@ -48,6 +54,12 @@ export function buildEngine(
   paths: Paths = defaultPaths(),
   logSink: LogSink = process.stderr,
   env: NodeJS.ProcessEnv = process.env,
+  // The folder-binding guard's enforcement mode, stamped into the snapshot the engine writes on
+  // every group mutation and on `refreshSnapshot`. The daemon resolves it from
+  // CCTL_BIND_ENFORCE (env > config file > default) and passes it here so the snapshot the guard
+  // reads reflects a live setting change; one-shot CLI callers omit it and take the engine's own
+  // `block` default.
+  bindEnforce?: BindEnforceMode,
 ): SwitchEngine {
   const adapter: Logger = createLogger({ defaultLevel: 'warn', sink: logSink, env });
   // The switch-cadence guard defaults to 60s; operators can tune (or 0-disable) it via env.
@@ -78,6 +90,9 @@ export function buildEngine(
   const skewEnv = Number(process.env.CCTL_REFRESH_SKEW_MS);
   if (Number.isFinite(skewEnv) && skewEnv >= 0) {
     options.refreshSkewMs = skewEnv;
+  }
+  if (bindEnforce !== undefined) {
+    options.bindEnforce = bindEnforce;
   }
   return new SwitchEngine(options);
 }

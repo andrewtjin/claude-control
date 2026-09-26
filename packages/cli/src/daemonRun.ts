@@ -289,7 +289,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     env: loggingEnv,
   });
 
-  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv);
+  // The guard's enforcement mode is resolved (env > config file > default) into the engine, so
+  // the folder-bindings snapshot it writes on start and on every group mutation carries the mode
+  // the guard hook then reads — a live `cctl settings set CCTL_BIND_ENFORCE ...` takes effect on
+  // the next daemon start.
+  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv, config.values.bindEnforce);
   // Two rows for one login would be polled as two accounts and shown twice on the phone;
   // resolve any left by an older build before the first poll (logged, never fatal).
   await engine.dedupeAccounts();
