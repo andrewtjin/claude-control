@@ -123,8 +123,16 @@ export interface AutoSwitchDecision {
  * thresholds, the stale-data tightening, which limits are visible, and the predicate itself.
  * Shared with the advisor through `isAutoSwitchCandidate`, so a greedy plan can only name an
  * account this executor would actually hop to.
+ *
+ * `candidateIds`, when given, restricts the hop TARGET pool to that id set — the daemon runs
+ * one decision per slot (global over the shared pool, each group over its own members), and a
+ * reserved account must never be chosen by the global decision, nor a foreign account by a
+ * group's. It gates only where a hop may GO: the active account (the one being hopped away
+ * from) is never filtered by it, so a slot can always leave its current account even when that
+ * account is not in the set. Absent = no restriction (every account is a potential target),
+ * so callers that predate the parameter behave exactly as before.
  */
-function candidateGate(now: number, policy: AutoSwitchPolicy) {
+function candidateGate(now: number, policy: AutoSwitchPolicy, candidateIds?: ReadonlySet<string>) {
   const triggerPercent = policy.triggerPercent ?? DEFAULT_TRIGGER_PERCENT;
   const minSessionHeadroomPct = policy.minSessionHeadroomPct ?? DEFAULT_MIN_SESSION_HEADROOM_PCT;
   const staleAfterMs = policy.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
@@ -151,6 +159,11 @@ function candidateGate(now: number, policy: AutoSwitchPolicy) {
   const weeklyResetAt = (a: AccountUsageInput) => weeklyBudget(visibleLimits(a), a, now)?.resetsAt;
   const isCandidate = (a: AccountUsageInput): boolean =>
     !a.active &&
+    // Outside the slot's target pool: a reserved account can never be a global hop target, nor
+    // a foreign account a group's — the id set is the only thing that keeps the two slots'
+    // rotations from crossing. Checked before health so an ineligible-and-foreign account is
+    // rejected for the honest reason.
+    (candidateIds === undefined || candidateIds.has(a.accountId)) &&
     !a.quarantined &&
     !a.autoSwitchExcluded &&
     100 - sessionUsedPct(a, now) >= minSessionHeadroomPct &&
@@ -175,6 +188,14 @@ export function isAutoSwitchCandidate(
   return candidateGate(now, policy).isCandidate(account);
 }
 
+/** Options that shape a single decision beyond the policy knobs. */
+export interface DecideAutoSwitchOptions {
+  /** Restrict hop TARGETS to this id set (the slot's own pool: shared accounts for global,
+   *  the group's members for a group). The active account is never filtered by it, so a slot
+   *  can always leave its current account. Absent = no restriction. */
+  candidateIds?: ReadonlySet<string>;
+}
+
 /**
  * Decide whether to auto-switch, and to which account. Returns `null` unless ALL of:
  * an active account exists, a trigger fires (its remaining quota is low, or greedy mode
@@ -182,13 +203,16 @@ export function isAutoSwitchCandidate(
  * exists. Limits whose reset time is already past are ignored everywhere — their
  * percents describe a window that no longer exists (stale cached snapshots routinely
  * carry them).
+ *
+ * `opts.candidateIds` restricts hop targets to a slot's own pool; see `candidateGate`.
  */
 export function decideAutoSwitch(
   accounts: AccountUsageInput[],
   now = Date.now(),
   policy: AutoSwitchPolicy = {},
+  opts: DecideAutoSwitchOptions = {},
 ): AutoSwitchDecision | null {
-  const gate = candidateGate(now, policy);
+  const gate = candidateGate(now, policy, opts.candidateIds);
   const { triggerPercent, snapshotAge, lowThreshold, visibleLimits, weeklyResetAt } = gate;
 
   const active = accounts.find((a) => a.active);

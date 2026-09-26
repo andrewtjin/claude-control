@@ -175,6 +175,55 @@ the package dependency closure, not by policy. Do not treat the relay as zero-kn
 "holds no long-term credentials, but sees session traffic in flight." (This matches the disclosures
 in `README.md` and `docs/ARCHITECTURE.md`.)
 
+### 5. Folder-bound account profiles hold live credentials, and the guard is not a boundary
+
+Binding a folder to an account stores that account's live login in a **profile config dir**
+(`<machine-local data>/claude-control/profiles/<groupId>/`). That dir holds a
+`.credentials.json` with an OAuth token, exactly as `~/.claude` does for the global account —
+it is not an extra secret store, it is the same class of secret in another location, created
+owner-private (POSIX `0700`; Windows under `%LOCALAPPDATA%` with the vault's ACL). The
+feature therefore does not change asset 1: tokens still never leave the machine, and the
+profile dirs are covered by "endpoint compromise" below like the rest of the config dirs.
+
+The enforcement guard (`docs/ARCHITECTURE.md`) prevents a session from **accidentally**
+running on the wrong account. It is **not** a security boundary:
+
+- It cannot stop a **same-user adversary with a shell**. Anyone who can run commands as the
+  user can read a profile's credentials directly, set `CLAUDE_CONFIG_DIR` by hand, or set
+  `CCTL_BIND_OVERRIDE`/`CCTL_BIND_ENFORCE=off` — the guard reads those same env vars and, by
+  design, fails **open** on any error. It defends against a slip, not against the operator.
+- It cannot stop a **prompt-injected model that already has shell access**. A session that can
+  run commands can move itself between accounts regardless of the guard, which is one more
+  reason the channel `instructions` name credential handling and the cctl account verbs as
+  things channel content may never authorise (risk 1).
+
+The guard's own **decision text is a sanitized surface**, on par with the CLI terminal and the
+Discord embeds above. Its `reason`/`systemMessage` interpolate a folder path and account labels
+— filesystem- and operator-controlled text that can carry ANSI escapes, newlines, or Unicode
+bidi/format controls — and Claude Code decodes that string and prints it (block) or hands it to
+the model (warn/override). The guard therefore strips the same control set the CLI does
+(`sanitizeTerminalText`, shared verbatim by embedding) before emitting, and bound folders reject
+those controls at canonicalization, so neither a crafted folder name nor a crafted label can
+forge a `[system]` directive or reorder what the operator reads.
+
+Two structural properties are load-bearing and must not regress:
+
+- **MCP servers are shared into profiles.** The `mcpServers` block is merged main → profile,
+  so a tool configured once is available under every bound account. A bound session therefore
+  reaches the same MCP servers — and their access — as a global one; that is intended, and it
+  means a binding isolates the _account_, not the tool surface.
+- **Trust flows one way, main → profile.** A project's `hasTrustDialogAccepted` (and the
+  account-neutral `.claude.json` allowlist) propagates from main into a profile, never from a
+  profile back into main. A folder trusted only inside a bound profile can never silently mark
+  itself trusted for the global account.
+
+Finally, the bot's process-wide `allowedMentions: { parse: [] }` default must stay: card and
+session text is built from wire payloads (a session's own output, an account label, a folder
+path) that can carry `@everyone`/mention syntax from untrusted material, and the default is
+what keeps a rendered label or a tool's output from pinging a channel. User-derived labels and
+folders are additionally markdown-escaped before they enter an embed, so a crafted account name
+or folder path cannot inject a link or break formatting on the phone.
+
 ## Out of scope
 
 - **Endpoint compromise of the user's machine.** If the machine is compromised, the vault's

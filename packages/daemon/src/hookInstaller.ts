@@ -21,8 +21,19 @@
 // The exact `settings.json` hooks schema (event names, matcher semantics, the
 // installed CLI version's exact expectations) is reverse-engineered — see docs/VERIFICATION.md.
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  link,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { buildBindGuardCommand, writeBindGuard } from './bindGuard.js';
 import {
   DEFAULT_HOOK_EVENT_NAMES,
   DEFAULT_SECRET_HEADER,
@@ -108,6 +119,23 @@ function isOwnedHookCommand(command: string): boolean {
   );
 }
 
+/** Recognize the enforcement guard command by its exact installed SHAPE, not by a loose substring.
+ *  Every guard command we write is `"<node>" "<guardPath>"` where the quoted script path ends in the
+ *  guard filename (see {@link buildBindGuardCommand}); this matches precisely that — two
+ *  double-quoted tokens, the second ending `…bind-guard.cjs"`. A bare `command.includes('bind-guard.cjs')`
+ *  would also match a foreign hook that merely mentions the name (e.g. `node linter.js --config
+ *  bind-guard.cjs.rc`) and silently prune or replace it on install/remove.
+ *
+ *  This is DELIBERATELY separate from {@link isOwnedHookCommand}: the guard and the forwarder both
+ *  live in the shared matcher-less UserPromptSubmit group, and if either counted as "the other's" the
+ *  installer's owned-entry prune would evict one when refreshing the other. The forwarder's install
+ *  therefore never touches a guard entry (it is not `isOwnedHookCommand`), and the guard's install
+ *  never touches a forwarder entry (below). A full `uninstallHooks` removes both. */
+const BIND_GUARD_COMMAND_RE = /^"[^"]+"\s+"[^"]*bind-guard\.cjs"$/;
+function isBindGuardCommand(command: string): boolean {
+  return BIND_GUARD_COMMAND_RE.test(command);
+}
+
 // ---------------------------------------------------------------------------
 // installHooks
 // ---------------------------------------------------------------------------
@@ -144,6 +172,340 @@ export async function installHooks(options: InstallHooksOptions): Promise<void> 
   }
 
   await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// installBindGuard
+// ---------------------------------------------------------------------------
+
+export interface InstallBindGuardOptions {
+  settingsPath: string;
+  /** The full guard command line (see `buildBindGuardCommand`). */
+  command: string;
+  /** The event the guard fires on. Defaults to UserPromptSubmit (spec §9); overridable only so a
+   *  caller with renamed events can keep them consistent. */
+  eventName?: string;
+}
+
+/**
+ * Install the enforcement guard as a SECOND entry under the (matcher-less) UserPromptSubmit group,
+ * alongside the relay forwarder — never replacing it. This is a narrower merge than
+ * {@link installHooks}: it prunes only PRIOR GENERATIONS OF THE GUARD (recognized by the script
+ * filename, so a node/script/snapshot path change is replaced, not accumulated) and leaves every
+ * other entry — the forwarder, other tools' hooks, foreign keys — byte-value-equivalent. Idempotent:
+ * a settings.json already carrying the current guard command is rewritten to the same shape.
+ *
+ * "Upgrade from a settings.json that only has the old hooks" is exactly this path: the forwarder
+ * entry is present, no guard is, and this adds one without disturbing the forwarder.
+ */
+export async function installBindGuard(options: InstallBindGuardOptions): Promise<void> {
+  const settings = await readSettings(options.settingsPath);
+  const hooksSection: JsonObject = isRecord(settings.hooks) ? settings.hooks : {};
+  settings.hooks = hooksSection;
+
+  const event = options.eventName ?? DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const existing = hooksSection[event];
+  const groups: unknown[] = Array.isArray(existing) ? existing : [];
+
+  // The guard runs unconditionally, like the forwarder — the matcher-less group is where both live.
+  let targetGroup = groups.find((g): g is HookGroup => isHookGroup(g) && g.matcher === undefined);
+  if (!targetGroup) {
+    targetGroup = { hooks: [] };
+    groups.push(targetGroup);
+  }
+
+  // Drop only stale generations of OUR guard; keep the forwarder and everything else untouched.
+  targetGroup.hooks = targetGroup.hooks.filter(
+    (h) => !isHookEntry(h) || !isBindGuardCommand(h.command) || h.command === options.command,
+  );
+  const alreadyPresent = targetGroup.hooks.some(
+    (h) => isHookEntry(h) && h.command === options.command,
+  );
+  if (!alreadyPresent) {
+    targetGroup.hooks.push({ type: 'command', command: options.command });
+  }
+
+  hooksSection[event] = groups;
+  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// removeBindGuard / ensureBindGuard
+// ---------------------------------------------------------------------------
+
+export interface RemoveBindGuardOptions {
+  settingsPath: string;
+  /** The event the guard was installed on. Defaults to UserPromptSubmit (spec §9). */
+  eventName?: string;
+}
+
+/**
+ * Remove a previously installed enforcement guard entry (recognized by the guard script filename),
+ * leaving the relay forwarder and every other entry — other tools' hooks, foreign keys — untouched.
+ * The counterpart to {@link installBindGuard}, used when the last folder binding goes away so a stale
+ * guard cannot linger. A group left empty ONLY because its guard entry was removed is dropped; a
+ * group that was already empty (someone else's state) is preserved. Returns whether anything changed.
+ */
+export async function removeBindGuard(options: RemoveBindGuardOptions): Promise<boolean> {
+  const settings = await readSettings(options.settingsPath);
+  if (!isRecord(settings.hooks)) return false;
+  const hooksSection: JsonObject = settings.hooks;
+  const event = options.eventName ?? DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const existing = hooksSection[event];
+  if (!Array.isArray(existing)) return false;
+
+  let changed = false;
+  const kept: unknown[] = [];
+  for (const group of existing as unknown[]) {
+    if (!isHookGroup(group)) {
+      kept.push(group);
+      continue;
+    }
+    const before = group.hooks.length;
+    const keptHooks = group.hooks.filter((h) => !isHookEntry(h) || !isBindGuardCommand(h.command));
+    if (keptHooks.length === before) {
+      kept.push(group);
+      continue;
+    }
+    changed = true;
+    // A group emptied solely by removing our guard is dead weight — drop it. One still holding the
+    // forwarder (or anything else) is rewritten without the guard.
+    if (keptHooks.length > 0) kept.push({ ...group, hooks: keptHooks });
+  }
+
+  if (!changed) return false;
+  if (kept.length === 0) delete hooksSection[event];
+  else hooksSection[event] = kept;
+  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  return true;
+}
+
+export interface EnsureBindGuardOptions {
+  settingsPath: string;
+  /** Where the guard script lives on disk — `bindGuardPath(dataDir)`. (Re)written when bindings
+   *  exist so the installed command always points at a current script. */
+  guardPath: string;
+  /** The non-secret folder-bindings snapshot the guard reads — `folderBindingsPath(vaultDir)`. Baked
+   *  into the generated script, so a change here rewrites (not accumulates) the guard. */
+  snapshotPath: string;
+  /** Whether any folder is currently bound. Guard install is meaningful only then; when false the
+   *  guard is removed instead, so an unbind of the last folder leaves nothing behind. */
+  hasBindings: boolean;
+  /** Node executable the hook command runs the script with. Defaults to the current process's. */
+  nodePath?: string;
+  eventName?: string;
+  /**
+   * `settings.json` inside each group profile dir. A group-slot session runs with
+   * `CLAUDE_CONFIG_DIR` set to its profile, so it reads THAT settings.json, not main's — but the
+   * profile's settings.json is shared with main by a hard link that a temp+rename write to main
+   * severs. Relying on the profile reconcile's newest-wins repair to carry a SECURITY control across
+   * that link leaves a window where a group-slot session runs unguarded. So when bindings exist the
+   * guard is propagated into each profile settings.json directly (by re-linking it to the
+   * guard-carrying main inode); on removal any guard entry stranded in a severed profile copy is
+   * cleaned. Absent for callers that do not manage group profiles.
+   */
+  profileSettingsPaths?: string[];
+}
+
+/**
+ * Reconcile the enforcement guard with whether any folder is bound: when bindings exist, write the
+ * guard script and register its UserPromptSubmit hook beside the forwarder; when none exist, remove a
+ * previously installed guard. Idempotent and safe to call on every daemon start and after every
+ * bind/unbind — this is the ONE path that actually installs the guard, so folder bindings are
+ * enforced at prompt time rather than only recorded. Returns what it did.
+ *
+ * Writing the script and installing the hook are deliberately paired here: installing the hook
+ * without writing the script would register a `node <script>` command with nothing behind it.
+ */
+export async function ensureBindGuard(
+  options: EnsureBindGuardOptions,
+): Promise<'installed' | 'removed' | 'absent'> {
+  const eventOpt = options.eventName !== undefined ? { eventName: options.eventName } : {};
+  const profileSettingsPaths = options.profileSettingsPaths ?? [];
+  if (!options.hasBindings) {
+    const removed = await removeBindGuard({ settingsPath: options.settingsPath, ...eventOpt });
+    // A guard entry can be stranded in a profile settings.json whose hard link to main was severed
+    // by an earlier write; clean those too so the last unbind leaves nothing enforcing.
+    for (const profilePath of profileSettingsPaths) {
+      try {
+        await removeBindGuard({ settingsPath: profilePath, ...eventOpt });
+      } catch {
+        // Best-effort: a profile we cannot rewrite is not fatal to the unbind.
+      }
+    }
+    return removed ? 'removed' : 'absent';
+  }
+  // Script first, so the installed command always has a current script behind it.
+  await writeBindGuard(options.guardPath, options.snapshotPath);
+  await installBindGuard({
+    settingsPath: options.settingsPath,
+    command: buildBindGuardCommand({
+      guardPath: options.guardPath,
+      ...(options.nodePath !== undefined ? { nodePath: options.nodePath } : {}),
+    }),
+    ...eventOpt,
+  });
+  // Propagate the guard into each group profile's settings.json. The install above wrote main via
+  // temp+rename (a fresh inode), so any profile still hard-linked to the OLD main inode now points at
+  // a copy WITHOUT the guard; re-link each to the guard-carrying main inode so a group-slot session
+  // reading its profile settings.json is enforced (and the profile link is not left broken).
+  for (const profilePath of profileSettingsPaths) {
+    try {
+      await propagateGuardToProfile(options.settingsPath, profilePath);
+    } catch {
+      // Best-effort: a profile we cannot re-link only degrades enforcement for that one slot until
+      // the next reconcile; it must never break the bind that already succeeded.
+    }
+  }
+  return 'installed';
+}
+
+/**
+ * Ensure a group profile's `settings.json` carries the guard by sharing main's (guard-carrying) inode.
+ * Leaves a profile that already contains the guard untouched (so a group session's own edits are not
+ * clobbered, and the profile reconcile's newest-wins repair still owns steady-state link healing);
+ * otherwise removes the diverged profile copy and hard-links it to main. Cross-volume, where a hard
+ * link is impossible, falls back to copying main's content.
+ */
+async function propagateGuardToProfile(
+  mainSettingsPath: string,
+  profileSettingsPath: string,
+): Promise<void> {
+  let profileRaw: string | undefined;
+  try {
+    profileRaw = await readFile(profileSettingsPath, 'utf8');
+  } catch (err) {
+    // No profile settings.json yet: link one to main so the slot is enforced from the first prompt.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      await linkOrCopy(mainSettingsPath, profileSettingsPath);
+      return;
+    }
+    throw err;
+  }
+  // Already enforced (guard present in the profile's own copy): leave it to the profile reconcile.
+  if (isBindGuardInSettingsText(profileRaw)) return;
+  // Already one inode with main (which carries the guard): nothing to do.
+  try {
+    const [mainId, profileId] = await Promise.all([
+      stat(mainSettingsPath),
+      stat(profileSettingsPath),
+    ]);
+    if (mainId.ino === profileId.ino && mainId.dev === profileId.dev && mainId.ino !== 0) return;
+  } catch {
+    // fall through to re-link
+  }
+  // The profile copy has diverged from main (a severed hard link) and lacks the guard, yet may carry
+  // unique local edits — the re-link below overwrites it. Save its current content first so those
+  // edits are recoverable, matching the profile reconcile's newest-wins-with-backup contract; a
+  // straight unbacked overwrite here would silently discard them. Best-effort: a backup we cannot
+  // write must not block enforcing the guard on this slot.
+  try {
+    await backupProfileSettings(profileSettingsPath, profileRaw);
+  } catch {
+    // A backup that cannot be written is not worth failing the guard propagation over.
+  }
+  await linkOrCopy(mainSettingsPath, profileSettingsPath);
+}
+
+/** How many timestamped backups of a repaired profile settings.json to keep — the same bound the
+ *  profile reconcile uses for the shared files it repairs. */
+const MAX_PROFILE_SETTINGS_BACKUPS = 5;
+
+/** Save a group profile's existing settings.json content to `<profileDir>/.cctl-backup/settings.json.<ms>`
+ *  before it is overwritten by a guard re-link, pruning to the newest {@link MAX_PROFILE_SETTINGS_BACKUPS}.
+ *  Mirrors the switch-engine profile reconcile's backup shape (same dir name, `<name>.<ms>` stamp with a
+ *  `-N` suffix to break a same-millisecond collision) so both repair paths recover a clobbered file the
+ *  same way. */
+async function backupProfileSettings(profileSettingsPath: string, content: string): Promise<void> {
+  const backupDir = join(dirname(profileSettingsPath), '.cctl-backup');
+  await mkdir(backupDir, { recursive: true });
+  // A counter breaks a same-millisecond collision so a rapid double-repair keeps both copies.
+  let stamp = `${Date.now()}`;
+  let dest = join(backupDir, `settings.json.${stamp}`);
+  let bump = 0;
+  for (;;) {
+    try {
+      await stat(dest);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') break;
+      throw err;
+    }
+    bump += 1;
+    stamp = `${Date.now()}-${bump}`;
+    dest = join(backupDir, `settings.json.${stamp}`);
+  }
+  await writeFile(dest, content, 'utf8');
+  await pruneProfileSettingsBackups(backupDir);
+}
+
+/** Keep only the newest {@link MAX_PROFILE_SETTINGS_BACKUPS} `settings.json.<ms>` backups, dropping the
+ *  oldest by their millisecond stamp (lexicographic on equal-width integers preserves numeric order; a
+ *  `-N` collision suffix sorts after its base, i.e. as newer, which is correct). */
+async function pruneProfileSettingsBackups(backupDir: string): Promise<void> {
+  const prefix = 'settings.json.';
+  let entries: string[];
+  try {
+    entries = (await readdir(backupDir)).filter((e) => e.startsWith(prefix)).sort();
+  } catch {
+    return;
+  }
+  for (let i = 0; i < entries.length - MAX_PROFILE_SETTINGS_BACKUPS; i += 1) {
+    const entry = entries[i];
+    if (entry === undefined) continue;
+    try {
+      await unlink(join(backupDir, entry));
+    } catch {
+      // A backup that cannot be pruned is not worth failing a repair over.
+    }
+  }
+}
+
+/** Replace `dest` with a hard link to `src`, falling back to a content copy across volumes (EXDEV). */
+async function linkOrCopy(src: string, dest: string): Promise<void> {
+  await mkdir(dirname(dest), { recursive: true });
+  try {
+    await unlink(dest);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  try {
+    await link(src, dest);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
+      await copyFile(src, dest);
+      return;
+    }
+    throw err;
+  }
+}
+
+/** Whether a settings.json text carries OUR guard hook (the precise installed command shape). Parses
+ *  when it can, so a foreign hook that merely mentions the filename does not read as ours; falls back
+ *  to a conservative negative on unparseable text (the caller then re-links, which is safe).
+ *
+ *  Exported so `cctl doctor` recognizes an installed guard by the SAME exact-shape rule the installer
+ *  uses. A looser check (e.g. a bare `bind-guard.cjs` substring over the whole file) would let a
+ *  foreign look-alike hook — or an incidental mention of the filename in a comment or path — read as
+ *  the guard, so doctor would report the enforcement guard installed when it is not. Keeping one
+ *  definition stops the two detectors from drifting. */
+export function isBindGuardInSettingsText(text: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+  } catch {
+    return false;
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.hooks)) return false;
+  for (const groups of Object.values(parsed.hooks)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!isHookGroup(group)) continue;
+      for (const entry of group.hooks) {
+        if (isHookEntry(entry) && isBindGuardCommand(entry.command)) return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Merge one hook spec into `hooksSection[event]`, preserving every well-formed group/entry
@@ -231,6 +593,12 @@ async function readSettings(path: string): Promise<JsonObject> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
     throw err;
   }
+  // Strip a leading UTF-8 BOM before parsing. PowerShell's `Set-Content -Encoding utf8` / `Out-File`
+  // and Notepad's "UTF-8 with BOM" prepend U+FEFF, which JSON.parse rejects; without this a
+  // hand-edited settings.json on a Windows box would be treated as corrupt and the guard would never
+  // install (the failure is swallowed by every caller), leaving folder bindings recorded but not
+  // enforced. Re-serialization writes it back without the BOM, which Claude Code reads fine.
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -295,7 +663,11 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<'r
     const prunedGroups = existingGroups
       .map((g) => {
         if (!isHookGroup(g)) return g; // not recognizably ours to interpret — leave as-is
-        const keptHooks = g.hooks.filter((h) => !isHookEntry(h) || !isOwnedHookCommand(h.command));
+        // Remove both of ours: the forwarder (owned marker) and the enforcement guard (script name).
+        const keptHooks = g.hooks.filter(
+          (h) =>
+            !isHookEntry(h) || (!isOwnedHookCommand(h.command) && !isBindGuardCommand(h.command)),
+        );
         if (keptHooks.length !== g.hooks.length) prunedHere = true;
         return { ...g, hooks: keptHooks };
       })

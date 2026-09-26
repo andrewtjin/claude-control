@@ -1,14 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { linkSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   installHooks,
+  installBindGuard,
+  ensureBindGuard,
+  removeBindGuard,
   uninstallHooks,
   buildDaemonHookSpecs,
   type HookCommandSpec,
 } from './hookInstaller.js';
-import { DEFAULT_SECRET_HEADER } from './hookReceiver.js';
+import { BIND_GUARD_MARKER, bindGuardPath, buildBindGuardCommand } from './bindGuard.js';
+import { DEFAULT_HOOK_EVENT_NAMES, DEFAULT_SECRET_HEADER } from './hookReceiver.js';
 
 async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, 'utf8'));
@@ -507,5 +512,460 @@ describe('buildDaemonHookSpecs', () => {
       'CustomStop',
       'CustomStopFailure',
     ]);
+  });
+});
+
+describe('installBindGuard', () => {
+  let dir: string;
+  let settingsPath: string;
+  const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const guardCmd = buildBindGuardCommand({
+    nodePath: '/usr/bin/node',
+    guardPath: '/data/bind-guard.cjs',
+  });
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'bind-guard-install-'));
+    settingsPath = join(dir, 'settings.json');
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function upsCommands(settings: unknown): string[] {
+    const hooks = (settings as { hooks?: Record<string, unknown> }).hooks ?? {};
+    const groups = hooks[UPS];
+    if (!Array.isArray(groups)) return [];
+    return groups.flatMap((g: unknown) => {
+      const entries = (g as { hooks?: unknown }).hooks;
+      return Array.isArray(entries)
+        ? entries.map((h: unknown) => (h as { command?: string }).command ?? '')
+        : [];
+    });
+  }
+
+  it('creates settings.json and installs the guard on UserPromptSubmit', async () => {
+    await installBindGuard({ settingsPath, command: guardCmd });
+    expect(upsCommands(await readJson(settingsPath))).toEqual([guardCmd]);
+  });
+
+  it('is idempotent: installing twice yields exactly one guard entry', async () => {
+    await installBindGuard({ settingsPath, command: guardCmd });
+    await installBindGuard({ settingsPath, command: guardCmd });
+    expect(upsCommands(await readJson(settingsPath))).toEqual([guardCmd]);
+  });
+
+  it('replaces a stale guard generation (different node/script/snapshot path) rather than accumulating', async () => {
+    const oldCmd = buildBindGuardCommand({
+      nodePath: '/old/node',
+      guardPath: '/old/bind-guard.cjs',
+    });
+    await installBindGuard({ settingsPath, command: oldCmd });
+    await installBindGuard({ settingsPath, command: guardCmd });
+    // Only the current generation remains — both carry the bind-guard.cjs fingerprint.
+    expect(upsCommands(await readJson(settingsPath))).toEqual([guardCmd]);
+  });
+
+  it('upgrade path: adds the guard alongside pre-existing forwarder hooks without evicting them', async () => {
+    // A settings.json that only has the old forwarder hooks (installed by an older cctl).
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await installHooks({
+      settingsPath,
+      hooks: [
+        { event: UPS, command: forwarder },
+        { event: 'Stop', command: forwarder },
+      ],
+      ownedCommandMarker: DEFAULT_SECRET_HEADER,
+    });
+    await installBindGuard({ settingsPath, command: guardCmd });
+    const settings = await readJson(settingsPath);
+    // The forwarder AND the guard share the matcher-less UserPromptSubmit group.
+    expect(upsCommands(settings).sort()).toEqual([guardCmd, forwarder].sort());
+  });
+
+  it('a later forwarder re-install does not evict the guard', async () => {
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await installBindGuard({ settingsPath, command: guardCmd });
+    await installHooks({
+      settingsPath,
+      hooks: [{ event: UPS, command: forwarder }],
+      ownedCommandMarker: DEFAULT_SECRET_HEADER,
+    });
+    expect(upsCommands(await readJson(settingsPath)).sort()).toEqual([guardCmd, forwarder].sort());
+  });
+
+  it("preserves another tool's UserPromptSubmit hook", async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: { [UPS]: [{ hooks: [{ type: 'command', command: 'other-tool --x' }] }] },
+      }),
+    );
+    await installBindGuard({ settingsPath, command: guardCmd });
+    expect(upsCommands(await readJson(settingsPath)).sort()).toEqual(
+      [guardCmd, 'other-tool --x'].sort(),
+    );
+  });
+
+  it('uninstallHooks removes the guard along with the forwarder, leaving other tools alone', async () => {
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: {
+          [UPS]: [
+            {
+              hooks: [
+                { type: 'command', command: forwarder },
+                { type: 'command', command: guardCmd },
+                { type: 'command', command: 'other-tool --x' },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+    const outcome = await uninstallHooks({ settingsPath });
+    expect(outcome).toBe('removed');
+    expect(upsCommands(await readJson(settingsPath))).toEqual(['other-tool --x']);
+  });
+});
+
+describe('ensureBindGuard', () => {
+  let dir: string;
+  let settingsPath: string;
+  let guardPath: string;
+  const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const snapshotPath = '/data/folder-bindings.json';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ensure-bind-guard-'));
+    settingsPath = join(dir, 'settings.json');
+    // The guard script is written under this data dir; bindGuardPath decides the exact name.
+    guardPath = bindGuardPath(dir);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function upsCommands(settings: unknown): string[] {
+    const hooks = (settings as { hooks?: Record<string, unknown> }).hooks ?? {};
+    const groups = hooks[UPS];
+    if (!Array.isArray(groups)) return [];
+    return groups.flatMap((g: unknown) => {
+      const entries = (g as { hooks?: unknown }).hooks;
+      return Array.isArray(entries)
+        ? entries.map((h: unknown) => (h as { command?: string }).command ?? '')
+        : [];
+    });
+  }
+
+  async function exists(path: string): Promise<boolean> {
+    try {
+      await access(path);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it('with bindings: writes the guard script AND lands the marker in settings.json', async () => {
+    // This is the invariant the whole feature rests on: after this call the guard is enforceable.
+    const outcome = await ensureBindGuard({
+      settingsPath,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+    });
+    expect(outcome).toBe('installed');
+
+    // The hook entry carries the guard fingerprint that doctor and uninstall recognize.
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw.includes(BIND_GUARD_MARKER)).toBe(true);
+    expect(upsCommands(JSON.parse(raw))).toEqual([buildBindGuardCommand({ guardPath })]);
+
+    // The script the command points at was actually written, with the snapshot path baked in —
+    // installing the hook without the script would register a command with nothing behind it.
+    expect(await exists(guardPath)).toBe(true);
+    const script = await readFile(guardPath, 'utf8');
+    expect(script.includes(JSON.stringify(snapshotPath))).toBe(true);
+  });
+
+  it('installs beside a pre-existing forwarder without evicting it (the upgrade path)', async () => {
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await installHooks({
+      settingsPath,
+      hooks: [{ event: UPS, command: forwarder }],
+      ownedCommandMarker: DEFAULT_SECRET_HEADER,
+    });
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    expect(upsCommands(await readJson(settingsPath)).sort()).toEqual(
+      [buildBindGuardCommand({ guardPath }), forwarder].sort(),
+    );
+  });
+
+  it('is idempotent: re-running with bindings keeps exactly one guard entry', async () => {
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    expect(upsCommands(await readJson(settingsPath))).toEqual([
+      buildBindGuardCommand({ guardPath }),
+    ]);
+  });
+
+  it('with no bindings: removes only the guard, leaving the forwarder installed', async () => {
+    const forwarder = `"/n" "/data/hook-forward.cjs" --secret-header "${DEFAULT_SECRET_HEADER}: shh"`;
+    await installHooks({
+      settingsPath,
+      hooks: [{ event: UPS, command: forwarder }],
+      ownedCommandMarker: DEFAULT_SECRET_HEADER,
+    });
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+
+    const removed = await ensureBindGuard({
+      settingsPath,
+      guardPath,
+      snapshotPath,
+      hasBindings: false,
+    });
+    expect(removed).toBe('removed');
+    expect(upsCommands(await readJson(settingsPath))).toEqual([forwarder]);
+  });
+
+  it('with no bindings and nothing installed: reports absent and writes nothing', async () => {
+    const outcome = await ensureBindGuard({
+      settingsPath,
+      guardPath,
+      snapshotPath,
+      hasBindings: false,
+    });
+    expect(outcome).toBe('absent');
+    expect(await exists(settingsPath)).toBe(false);
+  });
+});
+
+describe('removeBindGuard', () => {
+  let dir: string;
+  let settingsPath: string;
+  const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const guardCmd = buildBindGuardCommand({ guardPath: '/data/bind-guard.cjs' });
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'remove-bind-guard-'));
+    settingsPath = join(dir, 'settings.json');
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('drops a group emptied by the guard removal but preserves an already-empty foreign group', async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: {
+          [UPS]: [{ hooks: [{ type: 'command', command: guardCmd }] }, { matcher: 'x', hooks: [] }],
+        },
+      }),
+    );
+    const changed = await removeBindGuard({ settingsPath });
+    expect(changed).toBe(true);
+    const settings = (await readJson(settingsPath)) as {
+      hooks: Record<string, unknown[]>;
+    };
+    // Our guard-only group is gone; the foreign empty group is untouched.
+    expect(settings.hooks[UPS]).toEqual([{ matcher: 'x', hooks: [] }]);
+  });
+
+  it('returns false and rewrites nothing when there is no guard to remove', async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ hooks: { [UPS]: [{ hooks: [{ type: 'command', command: 'other' }] }] } }),
+    );
+    expect(await removeBindGuard({ settingsPath })).toBe(false);
+  });
+});
+
+// A settings.json written by PowerShell/Notepad carries a UTF-8 BOM, which strict JSON.parse rejects.
+// The installer must tolerate it, or the guard silently never installs and bindings go unenforced.
+describe('ensureBindGuard on a BOM-prefixed settings.json', () => {
+  let dir: string;
+  let settingsPath: string;
+  let guardPath: string;
+  const snapshotPath = '/data/folder-bindings.json';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ensure-bind-guard-bom-'));
+    settingsPath = join(dir, 'settings.json');
+    guardPath = bindGuardPath(dir);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('installs the guard into a settings.json that begins with a UTF-8 BOM', async () => {
+    await writeFile(settingsPath, '﻿' + JSON.stringify({ someKey: true }, null, 2), 'utf8');
+    const outcome = await ensureBindGuard({
+      settingsPath,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+    });
+    expect(outcome).toBe('installed');
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw.includes(BIND_GUARD_MARKER)).toBe(true);
+    // The pre-existing key is preserved; the file is rewritten without the BOM (valid JSON).
+    expect(raw.charCodeAt(0)).not.toBe(0xfeff);
+    expect((JSON.parse(raw) as { someKey?: boolean }).someKey).toBe(true);
+  });
+});
+
+// The guard entry is recognized by its exact installed command SHAPE, not a loose substring, so a
+// foreign hook that merely mentions the filename is never pruned or replaced.
+describe('ensureBindGuard preserves a foreign look-alike hook', () => {
+  let dir: string;
+  let settingsPath: string;
+  let guardPath: string;
+  const UPS = DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit;
+  const snapshotPath = '/data/folder-bindings.json';
+  const FOREIGN = 'node /home/me/my-linter.js --config bind-guard.cjs.rc';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ensure-bind-guard-foreign-'));
+    settingsPath = join(dir, 'settings.json');
+    guardPath = bindGuardPath(dir);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function upsCommands(settings: unknown): string[] {
+    const groups = (settings as { hooks?: Record<string, unknown> }).hooks?.[UPS];
+    if (!Array.isArray(groups)) return [];
+    return groups.flatMap((g: unknown) => {
+      const entries = (g as { hooks?: unknown }).hooks;
+      return Array.isArray(entries)
+        ? entries.map((h: unknown) => (h as { command?: string }).command ?? '')
+        : [];
+    });
+  }
+
+  it('installs the guard without evicting a foreign hook containing "bind-guard.cjs"', async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ hooks: { [UPS]: [{ hooks: [{ type: 'command', command: FOREIGN }] }] } }),
+    );
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    const cmds = upsCommands(await readJson(settingsPath));
+    expect(cmds).toContain(FOREIGN);
+    expect(cmds).toContain(buildBindGuardCommand({ guardPath }));
+  });
+
+  it('removes only our guard, leaving the foreign look-alike hook intact', async () => {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ hooks: { [UPS]: [{ hooks: [{ type: 'command', command: FOREIGN }] }] } }),
+    );
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: true });
+    await ensureBindGuard({ settingsPath, guardPath, snapshotPath, hasBindings: false });
+    expect(upsCommands(await readJson(settingsPath))).toEqual([FOREIGN]);
+  });
+});
+
+// A group-slot session reads its profile's settings.json, which is shared with main by a hard link a
+// temp+rename guard install severs. The reconcile must propagate the guard into each profile so the
+// slot is enforced, and clean any stranded guard on the last unbind.
+describe('ensureBindGuard propagation into group profiles', () => {
+  let dir: string;
+  let mainSettings: string;
+  let profileSettings: string;
+  let guardPath: string;
+  const snapshotPath = '/data/folder-bindings.json';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ensure-bind-guard-prof-'));
+    mainSettings = join(dir, 'settings.json');
+    const profileDir = join(dir, 'profiles', 'g1');
+    await mkdir(profileDir, { recursive: true });
+    await writeFile(mainSettings, JSON.stringify({ hooks: {} }, null, 2), 'utf8');
+    profileSettings = join(profileDir, 'settings.json');
+    // profile.ts shares settings.json with main by a hard link (steady state before the guard write).
+    linkSync(mainSettings, profileSettings);
+    guardPath = bindGuardPath(dir);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function hasGuard(text: string): boolean {
+    return text.includes(BIND_GUARD_MARKER);
+  }
+
+  it('lands the guard in the profile settings.json (which main un-shared by temp+rename)', async () => {
+    await ensureBindGuard({
+      settingsPath: mainSettings,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+      profileSettingsPaths: [profileSettings],
+    });
+    // Both the main and the profile copy carry the guard: the group-slot session is enforced.
+    expect(hasGuard(await readFile(mainSettings, 'utf8'))).toBe(true);
+    expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(true);
+    // And they are one inode again (the profile link was healed to the guard-carrying main), so a
+    // doctor slot check does not report a broken profile link on the happy path.
+    expect(statSync(mainSettings).ino).toBe(statSync(profileSettings).ino);
+  });
+
+  it('cleans a guard entry stranded in a severed profile copy on the last unbind', async () => {
+    // Simulate the severed state: main has no guard, but the profile copy (its own inode) does.
+    writeFileSync(
+      profileSettings,
+      JSON.stringify({
+        hooks: {
+          [DEFAULT_HOOK_EVENT_NAMES.userPromptSubmit]: [
+            { hooks: [{ type: 'command', command: buildBindGuardCommand({ guardPath }) }] },
+          ],
+        },
+      }),
+    );
+    expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(true);
+
+    await ensureBindGuard({
+      settingsPath: mainSettings,
+      guardPath,
+      snapshotPath,
+      hasBindings: false,
+      profileSettingsPaths: [profileSettings],
+    });
+    expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(false);
+  });
+
+  it('backs up a diverged, guard-less profile copy before the guard re-link (no silent edit loss)', async () => {
+    // Sever the profile from main and give it a unique local edit but NO guard. writeFileSync in place
+    // would keep the shared inode (and mutate main too), so unlink + write a fresh independent file.
+    await rm(profileSettings);
+    await writeFile(
+      profileSettings,
+      JSON.stringify({ permissions: { allow: ['UNIQUE_PROFILE_EDIT'] }, hooks: {} }),
+      'utf8',
+    );
+
+    await ensureBindGuard({
+      settingsPath: mainSettings,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+      profileSettingsPaths: [profileSettings],
+    });
+
+    // The guard is now enforced in the profile...
+    expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(true);
+    // ...and the unique edit was saved to <profileDir>/.cctl-backup/ rather than silently discarded.
+    const backupDir = join(dir, 'profiles', 'g1', '.cctl-backup');
+    const backups = (await readdir(backupDir)).filter((e) => e.startsWith('settings.json.'));
+    expect(backups.length).toBe(1);
+    const backedUp = JSON.parse(await readFile(join(backupDir, backups[0] as string), 'utf8')) as {
+      permissions?: { allow?: string[] };
+    };
+    expect(backedUp.permissions?.allow).toContain('UNIQUE_PROFILE_EDIT');
   });
 });

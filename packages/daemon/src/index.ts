@@ -6,6 +6,7 @@
 
 export {
   Store,
+  slotBySessionMap,
   type UsageSnapshotRow,
   type ActivationIntervalRow,
   type PendingPermissionRow,
@@ -119,6 +120,28 @@ export {
 export { hookForwarderPath, writeHookForwarder, HOOK_FORWARDER_SOURCE } from './hookForwarder.js';
 
 export {
+  bindGuardPath,
+  buildBindGuardCommand,
+  generateBindGuardSource,
+  writeBindGuard,
+  BIND_GUARD_MARKER,
+} from './bindGuard.js';
+
+export {
+  bindTokensDir,
+  mintBindToken,
+  removeBindToken,
+  cleanupBindTokens,
+  BIND_TOKEN_DIR_NAME,
+  BIND_TOKEN_MAX_AGE_MS,
+  BIND_TOKEN_PATTERN,
+  type BindTokenKind,
+  type BindTokenRecord,
+  type MintBindTokenOptions,
+  type CleanupBindTokensOptions,
+} from './bindToken.js';
+
+export {
   ControlPlaneClient,
   ControlPlaneRejectionError,
   type ConnectionState,
@@ -130,10 +153,17 @@ export {
 
 export {
   installHooks,
+  installBindGuard,
+  ensureBindGuard,
+  removeBindGuard,
   uninstallHooks,
+  isBindGuardInSettingsText,
   buildDaemonHookSpecs,
   type HookCommandSpec,
   type InstallHooksOptions,
+  type InstallBindGuardOptions,
+  type EnsureBindGuardOptions,
+  type RemoveBindGuardOptions,
   type UninstallHooksOptions,
   type BuildDaemonHookSpecsOptions,
 } from './hookInstaller.js';

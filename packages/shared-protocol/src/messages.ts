@@ -82,6 +82,20 @@ export const AccountUsage = z.object({
    *  a healthy account is never hopped to. Additive and tolerant like `predictedResetAt`: a
    *  daemon predating the field omits it, which reads the same as "not excluded". */
   autoSwitchExcluded: z.boolean().nullish(),
+  /** The id of the folder-bound group this account is reserved to, or absent for a shared
+   *  (global-pool) account. Present so `/accounts` and `/usage` can group reserved accounts under
+   *  their folder binding and never present one as a global-pool candidate. Display/grouping only —
+   *  nothing routes or authorizes on it. Additive and tolerant like `autoSwitchExcluded`: a daemon
+   *  predating the field omits it, which reads the same as "shared". */
+  groupId: z.string().nullish(),
+  /** The display label of that group (its folders' binding), pre-rendered by the daemon so the
+   *  phone need not resolve a group id it does not otherwise hold. Absent for a shared account or a
+   *  daemon predating the field. Display-only, same contract as `groupId`. */
+  groupLabel: z.string().nullish(),
+  /** True when this account is the one currently LIVE in its group's slot (the group counterpart of
+   *  the global `active`). Absent/false for a shared account, a non-live member, or an older daemon.
+   *  Display-only: the phone marks which member of a group is in use, and routes on nothing here. */
+  groupActive: z.boolean().nullish(),
 });
 
 // ---------------------------------------------------------------------------
@@ -592,6 +606,14 @@ const SessionStatusPayload = z.object({
     'orphaned',
   ]),
   accountId: AccountId.nullish(),
+  /** Which credential slot this session runs in: `"global"` for the shared config dir, or
+   *  `"group:<groupId>"` for a folder-bound group's profile. Present so a session card can show the
+   *  folder binding an account alone does not convey (a reserved account is only ever live in its
+   *  own group's slot). Additive and tolerant like `spawnRequestId`: a daemon predating folder-bound
+   *  accounts omits it and the card simply shows the account with no slot tag, exactly as today.
+   *  A free-form string, not an enum, so a future slot kind never trips an older bot's envelope
+   *  parse — the bot renders a known prefix and ignores the rest. */
+  slot: z.string().min(1).nullish(),
   resumeId: SessionId.nullish(),
   summary: z.string().nullish(),
   /** The `session.spawn` requestId this session was born from, echoed on its status frames.

@@ -47,6 +47,26 @@ export interface AutoSwitcherOptions {
  *  every poll cycle. 10 minutes ≈ several poll cycles of breathing room. */
 export const DEFAULT_AUTOSWITCH_COOLDOWN_MS = 10 * 60_000;
 
+/** The cooldown key for the global slot — the default when no slot is named, so a caller that
+ *  never passes a key keeps the single-slot behavior it always had. */
+const GLOBAL_SLOT_KEY = 'global';
+
+/** Per-evaluation context beyond the snapshot: which slot's rotation this decision is, and which
+ *  accounts may be hop TARGETS in it. Absent = the global slot with no target restriction, exactly
+ *  the pre-slot behavior. */
+export interface EvaluateOptions {
+  /** Distinct cooldown bucket for this slot, so a group hop never spends the global slot's
+   *  cooldown (or another group's). Defaults to the global bucket. */
+  slotKey?: string;
+  /** Restrict hop targets to this id set (the slot's own pool). Passed through to the policy. */
+  candidateIds?: ReadonlySet<string>;
+  /** Human name of the slot this hop is in — the bound folder(s) for a group slot. When present it
+   *  is woven into the `switch.result` message so the phone notice for a GROUP hop says WHICH folder
+   *  group rotated, exactly as the operator needs to tell a group hop apart from the global one.
+   *  Absent for the global slot, whose notice keeps its historical wording. */
+  slotLabel?: string;
+}
+
 export class AutoSwitcher {
   private readonly activate: (
     accountId: string,
@@ -59,7 +79,9 @@ export class AutoSwitcher {
   private readonly newRequestId: () => string;
   private readonly logger: Logger;
 
-  private lastAttemptAtMs = -Infinity;
+  /** Last attempt time PER slot bucket, so each slot's cooldown runs independently — a group hop
+   *  and a global hop never share a clock. */
+  private readonly lastAttemptAtMs = new Map<string, number>();
 
   constructor(options: AutoSwitcherOptions) {
     this.activate = options.activate;
@@ -83,18 +105,31 @@ export class AutoSwitcher {
    * activation — a refused hop left the live account wherever it already was, and claiming it as
    * ours would swallow that account's real owner just the same.
    */
-  async evaluate(accounts: AccountUsageInput[]): Promise<string | undefined> {
+  async evaluate(
+    accounts: AccountUsageInput[],
+    opts: EvaluateOptions = {},
+  ): Promise<string | undefined> {
     const now = this.clock();
-    const decision = decideAutoSwitch(accounts, now, this.policy);
+    const slotKey = opts.slotKey ?? GLOBAL_SLOT_KEY;
+    const decision = decideAutoSwitch(
+      accounts,
+      now,
+      this.policy,
+      opts.candidateIds !== undefined ? { candidateIds: opts.candidateIds } : {},
+    );
     if (!decision) return undefined;
 
-    if (now - this.lastAttemptAtMs < this.cooldownMs) {
-      this.logger.debug({ decision }, 'auto-switch wanted but still in cooldown');
+    const lastAttempt = this.lastAttemptAtMs.get(slotKey) ?? -Infinity;
+    if (now - lastAttempt < this.cooldownMs) {
+      this.logger.debug({ decision, slotKey }, 'auto-switch wanted but still in cooldown');
       return undefined;
     }
-    // Stamp BEFORE attempting so a throwing engine still gets its cooldown.
-    this.lastAttemptAtMs = now;
+    // Stamp BEFORE attempting so a throwing engine still gets its cooldown — for THIS slot only.
+    this.lastAttemptAtMs.set(slotKey, now);
 
+    // A group hop's notice names its folder so it is not read as a global switch; the global slot
+    // passes no label and keeps its historical wording.
+    const scope = opts.slotLabel !== undefined ? ` (${opts.slotLabel})` : '';
     const requestId = `autoswitch-${this.newRequestId()}`;
     try {
       const result = await this.activate(decision.targetAccountId, {
@@ -107,7 +142,7 @@ export class AutoSwitcher {
         ok: result.ok,
         outcome: result.ok ? 'hot_applied' : 'failed',
         activeAccountId: result.activeAccountId,
-        message: `auto-switch: ${decision.reason}`,
+        message: `auto-switch${scope}: ${decision.reason}`,
       });
       // The engine's own word for what is live now, not the target we asked for: the two agree
       // today, and a caller that absorbs this id must absorb what actually happened.
@@ -122,7 +157,7 @@ export class AutoSwitcher {
         ok: false,
         outcome: 'failed',
         activeAccountId: currentActive,
-        message: `auto-switch to ${decision.targetLabel} failed`,
+        message: `auto-switch${scope} to ${decision.targetLabel} failed`,
         error: message,
       });
       return undefined;

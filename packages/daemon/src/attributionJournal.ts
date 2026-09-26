@@ -47,9 +47,13 @@ function isAuditEntry(value: unknown): value is AuditEntry {
     typeof v.event === 'string' &&
     (v.fromAccountId === null || typeof v.fromAccountId === 'string') &&
     (v.toAccountId === null || typeof v.toAccountId === 'string') &&
-    (v.origin === undefined || typeof v.origin === 'string')
+    (v.origin === undefined || typeof v.origin === 'string') &&
+    (v.slot === undefined || typeof v.slot === 'string')
   );
 }
+
+/** The slot an activation names, defaulting to the global slot for a pre-slot audit line. */
+const GLOBAL_SLOT = 'global';
 
 /** The subset of the audit log that actually changes which account is live: an `activated`
  *  event with a real target. (`quarantined`/`recovered`/`refresh_adopted` never flip the live
@@ -60,13 +64,20 @@ interface ActivationEvent {
   /** `null` for an entry written before the audit trail carried `origin` — see
    *  `ActivationIntervalRow.origin` (store.ts) for why that stays null rather than a guess. */
   origin: string | null;
+  /** The slot this activation was for; a pre-slot audit line is the global slot. */
+  slot: string;
 }
 
 function toActivationEvents(entries: AuditEntry[]): ActivationEvent[] {
   const events: ActivationEvent[] = [];
   for (const e of entries) {
     if (e.event === 'activated' && e.toAccountId !== null) {
-      events.push({ ts: e.ts, toAccountId: e.toAccountId, origin: e.origin ?? null });
+      events.push({
+        ts: e.ts,
+        toAccountId: e.toAccountId,
+        origin: e.origin ?? null,
+        slot: e.slot ?? GLOBAL_SLOT,
+      });
     }
   }
   // Oldest-first — the order intervals must be derived in.
@@ -80,25 +91,50 @@ interface DerivedInterval {
   startedAtMs: number;
   endedAtMs: number | null;
   origin: string | null;
+  slot: string;
 }
 
-/** Turn the ts-sorted activation list into contiguous, non-overlapping intervals: each
- *  activation opens an interval that the NEXT activation closes. Because `activations` is
- *  sorted ascending, every `endedAtMs` is >= its `startedAtMs`, so intervals never overlap
- *  even if the raw audit log had an out-of-order (clock-skewed) timestamp. */
+/**
+ * Turn the ts-sorted activation list into contiguous, non-overlapping intervals — PER SLOT. Each
+ * slot has its own live account at any instant (the global slot and each group slot switch
+ * independently), so an activation closes only the previous activation OF THE SAME SLOT: a group
+ * hop must not truncate the global account's interval, and vice versa. Within a slot, because the
+ * activations are ts-sorted, every `endedAtMs` is >= its `startedAtMs`, so intervals never overlap
+ * even if the raw audit log had an out-of-order (clock-skewed) timestamp. The combined result is
+ * sorted by (startedAtMs, slot, accountId) so it compares positionally against the store's ordering.
+ */
 function deriveIntervals(activations: ActivationEvent[]): DerivedInterval[] {
-  const intervals: DerivedInterval[] = [];
-  for (let i = 0; i < activations.length; i++) {
-    const activation = activations[i];
-    if (!activation) continue;
-    const next = activations[i + 1];
-    intervals.push({
-      accountId: activation.toAccountId,
-      startedAtMs: activation.ts,
-      endedAtMs: next ? next.ts : null,
-      origin: activation.origin,
-    });
+  // Group the ts-sorted activations by slot, preserving order within each slot.
+  const bySlot = new Map<string, ActivationEvent[]>();
+  for (const activation of activations) {
+    let list = bySlot.get(activation.slot);
+    if (list === undefined) {
+      list = [];
+      bySlot.set(activation.slot, list);
+    }
+    list.push(activation);
   }
+  const intervals: DerivedInterval[] = [];
+  for (const [slot, slotActivations] of bySlot) {
+    for (let i = 0; i < slotActivations.length; i++) {
+      const activation = slotActivations[i];
+      if (!activation) continue;
+      const next = slotActivations[i + 1];
+      intervals.push({
+        accountId: activation.toAccountId,
+        startedAtMs: activation.ts,
+        endedAtMs: next ? next.ts : null,
+        origin: activation.origin,
+        slot,
+      });
+    }
+  }
+  intervals.sort(
+    (a, b) =>
+      a.startedAtMs - b.startedAtMs ||
+      a.slot.localeCompare(b.slot) ||
+      a.accountId.localeCompare(b.accountId),
+  );
   return intervals;
 }
 
@@ -115,7 +151,9 @@ function intervalsEqual(existing: ActivationIntervalRow[], target: DerivedInterv
       e.accountId !== t.accountId ||
       e.startedAtMs !== t.startedAtMs ||
       e.endedAtMs !== t.endedAtMs ||
-      e.origin !== t.origin
+      e.origin !== t.origin ||
+      // A legacy row's NULL slot reads as the global slot, matching the target derived for it.
+      (e.slot ?? GLOBAL_SLOT) !== t.slot
     )
       return false;
   }
