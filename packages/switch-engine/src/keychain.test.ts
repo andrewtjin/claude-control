@@ -6,11 +6,13 @@ import {
   KeychainProtector,
   KeychainCredentialChannel,
   resolveClaudeCliKeychainTarget,
+  resolveClaudeCliLegacyKeychainTarget,
   readChunkedValue,
   writeChunkedValue,
   CHUNK_THRESHOLD_BYTES,
   CLAUDE_CLI_KEYCHAIN_SERVICE,
   CLAUDE_CLI_KEYCHAIN_ACCOUNT,
+  CLAUDE_CLI_LEGACY_KEYCHAIN_SERVICE,
   VAULT_KEY_SERVICE,
   VAULT_KEY_ACCOUNT,
   type ExecRunner,
@@ -431,22 +433,38 @@ describe('KeychainCredentialChannel', () => {
     await expect(channel.readLiveCredentials()).rejects.toThrow(VaultError);
   });
 
-  it('falls back to the legacy login-username item when the primary is absent', async () => {
-    // Older CLIs stored a single unchunked item under the login username and the un-suffixed
-    // service. A config-dir-suffixed primary that has no item must still resolve via that fallback.
+  it('falls back to the legacy un-suffixed item (fixed account, never the login username)', async () => {
+    // No CLI ever keyed the item by the login username. The pre-`-credentials` item lived at the
+    // un-suffixed service under the same fixed claude-code-user account, and the CLI's own legacy
+    // read is `security find-generic-password -a claude-code-user -w -s <un-suffixed service>`.
+    // With the primary absent, the channel must resolve through that legacy target.
+    const legacy = resolveClaudeCliLegacyKeychainTarget();
     const store = new Map([
-      [
-        `${CLAUDE_CLI_KEYCHAIN_SERVICE} ${userInfo().username}`,
-        JSON.stringify({ claudeAiOauth: OAUTH }),
-      ],
+      [`${legacy.service} ${legacy.account}`, JSON.stringify({ claudeAiOauth: OAUTH })],
     ]);
     const fake = fakeSecurity(store);
-    const channel = new KeychainCredentialChannel({
-      service: `${CLAUDE_CLI_KEYCHAIN_SERVICE}-abcd1234`,
-      account: CLAUDE_CLI_KEYCHAIN_ACCOUNT,
-      run: fake.run,
-    });
+    // No service/account override: the channel derives both the primary and the legacy target.
+    const channel = new KeychainCredentialChannel({ run: fake.run });
     expect(await channel.readLiveCredentials()).toEqual(OAUTH);
+    // The legacy account is the CLI's fixed one, not the OS login user — the whole point of the fix.
+    expect(legacy.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
+    expect(legacy.account).not.toBe(userInfo().username);
+    // The legacy read hits the fixed account, and never the login username, on argv.
+    const reads = fake.calls.filter((c) => c.args[0] === 'find-generic-password');
+    expect(reads.some((c) => c.args.includes(CLAUDE_CLI_KEYCHAIN_ACCOUNT))).toBe(true);
+    expect(reads.some((c) => c.args.includes(userInfo().username))).toBe(false);
+  });
+
+  it('derives the legacy service as the un-suffixed base plus the SAME config-dir suffix', () => {
+    // The legacy item shares the primary's config-dir hash suffix; only the `-credentials` segment
+    // is absent (the CLI's kJ("") vs kJ("-credentials")).
+    const dir = '/Users/x/.config/claude';
+    const suffix = createHash('sha256').update(dir).digest('hex').slice(0, 8);
+    const legacy = resolveClaudeCliLegacyKeychainTarget({ CLAUDE_CONFIG_DIR: dir });
+    const primary = resolveClaudeCliKeychainTarget({ CLAUDE_CONFIG_DIR: dir });
+    expect(legacy.service).toBe(`${CLAUDE_CLI_LEGACY_KEYCHAIN_SERVICE}-${suffix}`);
+    expect(primary.service).toBe(`${CLAUDE_CLI_KEYCHAIN_SERVICE}-${suffix}`);
+    expect(legacy.account).toBe(CLAUDE_CLI_KEYCHAIN_ACCOUNT);
   });
 
   it('write preserves sibling keys in a wrapped payload (surgical rule)', async () => {

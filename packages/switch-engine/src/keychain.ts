@@ -14,7 +14,8 @@
 //     via its secure-storage layer under a fixed account and a service name derived from the
 //     config directory, and it splits values over ~2400 bytes into a metadata item plus numbered
 //     base64 chunks. We read and write that exact layout so the CLI reads back what we write, and
-//     keep a plain read of the older login-username item as a fallback for pre-secure-storage CLIs.
+//     keep a plain read of the older un-suffixed-service item (same fixed account) as a fallback
+//     for pre-`-credentials` CLIs.
 //
 // Hygiene rule shared with dpapi.ts: SECRETS NEVER APPEAR ON ARGV. Reads are safe (`security
 // find-generic-password -w` takes only service/account on argv and prints the secret on
@@ -30,7 +31,6 @@
 
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { userInfo } from 'node:os';
 import { AesGcmProtector } from './aesgcm.js';
 import { VaultError } from './errors.js';
 import type { Protector } from './dpapi.js';
@@ -179,8 +179,9 @@ export class KeychainProtector implements Protector {
 // `{"claudeAiOauth":{...}, ...}` JSON as `.credentials.json`, EXCEPT that a value over ~2400 bytes
 // is base64-encoded and split into numbered chunk items plus a metadata item — see the layout in
 // {@link readChunkedValue}/{@link writeChunkedValue}. We match that layout exactly so the CLI reads
-// back what we write. Older, pre-secure-storage CLIs kept a single unchunked item under the login
-// username; we still READ that as a fallback but never write it.
+// back what we write. Older, pre-`-credentials` CLIs kept a single unchunked item under the
+// un-suffixed service (same fixed `claude-code-user` account); we still READ that as a fallback but
+// never write it.
 
 /** The base service name for the CLI's live-credential item (`Claude Code` + the prod-empty OAuth
  *  file suffix + `-credentials`). The current CLI appends a config-dir hash suffix on top of this
@@ -188,9 +189,16 @@ export class KeychainProtector implements Protector {
  *  callers that report the base name. */
 export const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
-/** The fixed account the current CLI stores its credential under (its secure-storage `name`).
- *  Older CLIs used the login username instead — see the legacy fallback in the channel below. */
+/** The fixed account the CLI stores its credential under (its secure-storage `name`). This has
+ *  ALWAYS been the account — no CLI keyed the item by the login username, including the legacy
+ *  un-suffixed item the channel below reads as a fallback. */
 export const CLAUDE_CLI_KEYCHAIN_ACCOUNT = 'claude-code-user';
+
+/** The base service name the CLI used BEFORE it moved the live credential under the `-credentials`
+ *  service: the same `Claude Code` prefix without the `-credentials` segment (the CLI's `kJ("")`).
+ *  A pre-`-credentials` CLI stored a single unchunked item here, under the same `claude-code-user`
+ *  account. Read-only fallback; never written. */
+export const CLAUDE_CLI_LEGACY_KEYCHAIN_SERVICE = 'Claude Code';
 
 /** Values at or below this many UTF-8 bytes are stored in a single item; larger ones are base64ed
  *  and split into chunks of this many base64 characters each. Matches the CLI's threshold.
@@ -230,6 +238,25 @@ function sha256Hex(input: string): string {
 /** The default service name for the current CLI's item: the base name plus any config-dir suffix. */
 function cliCredentialService(env: NodeJS.ProcessEnv): string {
   return `${CLAUDE_CLI_KEYCHAIN_SERVICE}${credentialServiceConfigSuffix(env)}`;
+}
+
+/** The legacy (pre-`-credentials`) service name: the un-suffixed base plus the SAME config-dir
+ *  suffix the current item carries, matching the CLI's own legacy read
+ *  (`security find-generic-password -a claude-code-user -w -s <un-suffixed service>`). */
+function cliLegacyCredentialService(env: NodeJS.ProcessEnv): string {
+  return `${CLAUDE_CLI_LEGACY_KEYCHAIN_SERVICE}${credentialServiceConfigSuffix(env)}`;
+}
+
+/** The legacy Keychain target the channel reads as a fallback: the un-suffixed service (with the
+ *  same config-dir suffix as the primary) under the CLI's fixed `claude-code-user` account. There is
+ *  no env override here — a pre-`-credentials` item only ever lived at this derived location, and the
+ *  primary-target overrides address the CURRENT item, not the historical one. `env` is injected for
+ *  testability. */
+export function resolveClaudeCliLegacyKeychainTarget(env: NodeJS.ProcessEnv = process.env): {
+  service: string;
+  account: string;
+} {
+  return { service: cliLegacyCredentialService(env), account: CLAUDE_CLI_KEYCHAIN_ACCOUNT };
 }
 
 /** Effective service/account for the CLI's live Keychain item, applying operator env overrides over
@@ -487,8 +514,8 @@ export async function writeChunkedValue(
  *   wrapped — `{"claudeAiOauth":{...}, ...}` (the `.credentials.json` shape), or
  *   bare    — the oauth block itself at top level.
  * The primary item follows the current CLI's chunked layout; a missing item reads as `undefined`
- * ("nobody logged in"). If the primary is absent, a legacy item (older CLIs' unchunked login-user
- * item) is read as a fallback.
+ * ("nobody logged in"). If the primary is absent, a legacy item (older CLIs' unchunked item under
+ * the un-suffixed service and the same fixed account) is read as a fallback.
  */
 export class KeychainCredentialChannel implements LiveCredentialChannel {
   /** The exact service/account this instance reads and writes. Public (not just internal state) so
@@ -496,8 +523,8 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
    *  instead of recomputing it via a second, independent call that could drift out of sync with
    *  what this channel was actually constructed with. */
   readonly target: { service: string; account: string };
-  /** Read-only fallback for pre-secure-storage CLIs: a single unchunked item under the login
-   *  username and the un-suffixed service. Never written to. */
+  /** Read-only fallback for pre-`-credentials` CLIs: a single unchunked item under the un-suffixed
+   *  service and the same fixed `claude-code-user` account as the primary. Never written to. */
   private readonly legacyTarget: { service: string; account: string };
   private readonly run: ExecRunner;
 
@@ -507,7 +534,10 @@ export class KeychainCredentialChannel implements LiveCredentialChannel {
       service: options?.service ?? resolved.service,
       account: options?.account ?? resolved.account,
     };
-    this.legacyTarget = { service: CLAUDE_CLI_KEYCHAIN_SERVICE, account: userInfo().username };
+    // The legacy item was never keyed by the login username; it used the un-suffixed service with
+    // the same fixed account. Derived from the process env directly (not the primary override), so
+    // it points at the CLI's historical location regardless of any primary-target override.
+    this.legacyTarget = resolveClaudeCliLegacyKeychainTarget();
     this.run = options?.run ?? defaultExecRunner;
   }
 
