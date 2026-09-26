@@ -134,8 +134,6 @@ export {
   planGroupProfile,
   computeClaudeJsonMerge,
   createNodeProfileFs,
-  defaultProfilesRoot,
-  groupProfileDir,
   SHARED_PROFILE_DIRS,
   PROFILE_LOCAL_DIRS,
   SHARED_PROFILE_FILES,

@@ -19,8 +19,6 @@ import {
   planGroupProfile,
   computeClaudeJsonMerge,
   createNodeProfileFs,
-  defaultProfilesRoot,
-  groupProfileDir,
   SHARED_PROFILE_DIRS,
   type ProfileFs,
   type ProfilePlatform,
@@ -1011,20 +1009,6 @@ describe('ensureGroupProfile — main .claude.json outside the config dir', () =
 // ---------------------------------------------------------------------------------------------
 
 describe('profile path helpers', () => {
-  it('derives the profiles root from the machine-local data root', () => {
-    const win = defaultProfilesRoot({ LOCALAPPDATA: 'D:/Local' }, 'win32');
-    expect(normalize(win)).toBe(normalize('D:/Local/claude-control/profiles'));
-    const linux = defaultProfilesRoot({ XDG_DATA_HOME: '/data' }, 'linux');
-    expect(linux).toBe(normalize('/data/claude-control/profiles'));
-  });
-
-  it('names a group dir under the root and refuses an id that tries to escape it', () => {
-    const root = normalize('/root/profiles');
-    expect(groupProfileDir('abc', root)).toBe(join(root, 'abc'));
-    // A traversal attempt is reduced to its basename — the id names one directory, never a path.
-    expect(groupProfileDir('../../etc', root)).toBe(join(root, 'etc'));
-  });
-
   it('the node seam reports junctions/symlinks as symlink kind', () => {
     // Guards the lstat ordering (a junction reports isSymbolicLink() true and must be caught first).
     const fs = createNodeProfileFs();

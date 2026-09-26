@@ -5,7 +5,7 @@
 // calls `defaultPaths()`; tests build a `Paths` by hand.
 
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 export interface Paths {
   /** The Claude config dir — honors `CLAUDE_CONFIG_DIR`, else `~/.claude`. */
@@ -73,9 +73,10 @@ export function profilesRoot(vaultDir: string): string {
 }
 
 /** The profile dir for one group: `<profilesRoot>/<groupId>`. The id is an unguessable UUID, so it
- *  is safe to name a directory after. */
+ *  is safe to name a directory after; `basename` still reduces it to a single directory name so an id
+ *  carrying separators can never escape the profiles root. */
 export function groupProfileDir(vaultDir: string, groupId: string): string {
-  return join(profilesRoot(vaultDir), groupId);
+  return join(profilesRoot(vaultDir), basename(groupId));
 }
 
 /** The non-secret snapshot the enforcement guard reads — a SIBLING of the vault dir

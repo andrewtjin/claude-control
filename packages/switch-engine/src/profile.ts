@@ -31,8 +31,7 @@
 // picker) and thereafter belong to the profile. The profile's `oauthAccount` and every account/usage
 // cache are always left untouched.
 
-import { homedir } from 'node:os';
-import { basename, dirname, join, normalize } from 'node:path';
+import { dirname, join, normalize } from 'node:path';
 import {
   closeSync,
   copyFileSync,
@@ -1124,29 +1123,4 @@ function applyClaudeJson(
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-/** The default profiles root for this machine: `<machineLocalDataRoot>/claude-control/profiles`.
- *  Exposed so callers name a group's profile dir consistently without re-deriving the layout. */
-export function defaultProfilesRoot(
-  env: NodeJS.ProcessEnv = process.env,
-  platform: NodeJS.Platform = process.platform,
-): string {
-  const home = homedir();
-  const root =
-    platform === 'win32'
-      ? env.LOCALAPPDATA?.trim() || join(home, 'AppData', 'Local')
-      : platform === 'darwin'
-        ? join(home, 'Library', 'Application Support')
-        : env.XDG_DATA_HOME?.trim() || join(home, '.local', 'share');
-  return join(root, 'claude-control', 'profiles');
-}
-
-/** The profile dir for a group id under a profiles root. `basename` guards against an id that tries
- *  to escape the root with separators — the id names one directory, never a path. */
-export function groupProfileDir(
-  groupId: string,
-  profilesRoot: string = defaultProfilesRoot(),
-): string {
-  return join(profilesRoot, basename(groupId));
 }
