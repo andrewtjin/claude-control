@@ -67,6 +67,7 @@ import {
 } from '@claude-control/usage-advisor';
 import type { ProbeCandidate } from './accountProbe.js';
 import type { Store } from './store.js';
+import { slotBySessionMap } from './store.js';
 import {
   UsagePoller,
   toUsageSnapshotPayload,
@@ -126,6 +127,13 @@ export interface SwitchEngineLike {
   repairSlots?(): Promise<RepairResult>;
   /** Rewrite the guard snapshot from the current registry + configured enforce mode. */
   refreshSnapshot?(): Promise<void>;
+  /** The config dir a managed spawn runs in for an account (a reserved member's profile dir, or
+   *  undefined for a shared account) — the seam wired into the SDK client. */
+  configDirForAccount?(accountId: string): Promise<string | undefined>;
+  /** The slot a session's launch-time config dir names (a group profile, else global). */
+  slotForConfigDir?(configDir: string | null | undefined): Promise<SlotId>;
+  /** The group a working directory is bound to, or null for an unbound cwd. */
+  resolveCwdBinding?(cwd: string): Promise<{ groupId: string } | null>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
   reauthenticate(
     id: string,
@@ -178,8 +186,10 @@ export interface DaemonOptions {
    *  it is re-pushed with every poll cycle — settings never change mid-run, but the bot's
    *  cache is in-memory, so the repeat is what survives a bot restart. */
   settingsReport?: PayloadOf<'settings.snapshot'>;
-  /** Real Agent SDK adapter (live boundary), overridable so tests never touch a real SDK. */
-  createAgentSdkClient?: () => AgentSdkClient;
+  /** Real Agent SDK adapter (live boundary), overridable so tests never touch a real SDK. The
+   *  optional `configDir` binds the spawned session's `CLAUDE_CONFIG_DIR` to a folder-bound group's
+   *  profile dir; absent, the session runs in the shared/global config dir (the historical model). */
+  createAgentSdkClient?: (configDir?: string) => AgentSdkClient;
   /** Auto-continue policy stamped onto every managed session this daemon spawns or resumes
    *  (see session-runtime's AutoContinuePolicy): transient API failures retry with backoff
    *  instead of stamping the session `failed`, and usage-limit failures PARK the session for
@@ -287,6 +297,12 @@ const DEFAULT_QUARANTINE_NOTICE_DEBOUNCE_MS = 30 * 60_000;
  *  human acts on in minutes; re-alerting more often than ~twice an hour is noise. Same reasoning as
  *  the quarantine-notice debounce. */
 const DEFAULT_SLOT_ALERT_WINDOW_MS = 30 * 60_000;
+
+/** A managed spawn was refused because its account/slot cannot be honored (a shared account that is
+ *  not the live global one, or a bound folder with no working member). Carries an operator-facing
+ *  message the spawn handler relays to the phone; distinct from a generic spawn failure so the
+ *  handler can answer with the refusal reason rather than a raw error string. */
+class SpawnBindingError extends Error {}
 
 /** Whether `pid` names a live process. `process.kill(pid, 0)` sends no signal — it only asks the
  *  OS whether the pid exists. ESRCH ("no such process") is the only code that means dead; every
@@ -425,8 +441,12 @@ interface TrackedInteractiveSession {
    *  cannot regress live hook cards — see the note in {@link Daemon.watchSession}. */
   watch: boolean;
   /** The account that was live when the session was registered — an attribution tag, matching
-   *  the accountId semantics on managed sessions. */
+   *  the accountId semantics on managed sessions. For a session registered from a folder-bound
+   *  config dir this is that slot's live member, not the global account. */
   accountId?: string;
+  /** The slot the session runs in (`'global'` or `'group:<id>'`), derived from its config dir at
+   *  registration. Absent reads as global. */
+  slot?: string;
   registeredAtMs: number;
   updatedAtMs: number;
 }
@@ -610,7 +630,7 @@ export class Daemon {
   private readonly accountProbe: AccountProbeLike | undefined;
   private readonly autoSwitchPolicy: AutoSwitchPolicy;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
-  private readonly createAgentSdkClient: () => AgentSdkClient;
+  private readonly createAgentSdkClient: (configDir?: string) => AgentSdkClient;
   private readonly autoContinue: AutoContinuePolicy | undefined;
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
   private readonly publishHookEndpoint: ((port: number) => Promise<void>) | undefined;
@@ -790,7 +810,15 @@ export class Daemon {
     // is reading the executor's policy, not a second one that can drift from it.
     this.autoSwitchPolicy = options.autoSwitchPolicy ?? options.poller.autoSwitchPolicy ?? {};
     this.settingsReport = options.settingsReport;
-    this.createAgentSdkClient = options.createAgentSdkClient ?? defaultCreateAgentSdkClient;
+    // The default adapter binds the config dir when one is given (a folder-bound spawn), else runs
+    // in the shared config dir. The composition root's factory (makeAgentSdkClientFactory) does the
+    // same; this fallback keeps a bare `new Daemon` working in tests.
+    this.createAgentSdkClient =
+      options.createAgentSdkClient ??
+      ((configDir?: string) =>
+        defaultCreateAgentSdkClient(
+          configDir !== undefined ? { configDirForAccount: () => configDir } : {},
+        ));
     this.autoContinue = options.autoContinue;
     this.installHooks = options.installHooks;
     this.publishHookEndpoint = options.publishHookEndpoint;
@@ -1652,6 +1680,9 @@ export class Daemon {
       windowStartMs,
       windowEndMs: this.clock(),
       labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+      // A folder-bound session's turns join against the member live in its group's slot, not the
+      // global account — so map each recorded session to its slot for the aggregator.
+      slotBySession: slotBySessionMap(this.store.listSessions()),
     });
   }
 
@@ -2308,12 +2339,22 @@ export class Daemon {
       }
     }
     try {
+      // Re-attach on the SAME slot the session ran on: bind its account's config dir (a group
+      // profile for a reserved member, else the shared config dir) so a resumed folder-bound
+      // session keeps reading its group's credentials.
+      const configDir =
+        record.accountId !== undefined && this.switchEngine.configDirForAccount !== undefined
+          ? await this.switchEngine.configDirForAccount(record.accountId).catch(() => undefined)
+          : undefined;
       const resumed = await this.sessionManager.resumeOrphan(sessionId, {
-        client: this.createAgentSdkClient(),
+        client: this.createAgentSdkClient(configDir),
         prompt: text,
         permissionMode: MANAGED_SESSION_PERMISSION_MODE,
         ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
       });
+      if (configDir !== undefined && this.switchEngine.slotForConfigDir !== undefined) {
+        this.sessionSlots.set(resumed.id, await this.switchEngine.slotForConfigDir(configDir));
+      }
       this.attachSessionPipes(resumed, record.accountId);
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
     } catch (err) {
@@ -3164,10 +3205,40 @@ export class Daemon {
         return;
       }
     }
+    // Resolve which slot this spawn runs in: an explicit reserved account (its group profile), an
+    // explicit shared account (must be the live global one), a bound working directory (its group),
+    // or global. This is where a folder-bound spawn is pointed at its group's profile dir and its
+    // group is made live; a refusal (§8's two forbidden cases) is answered before anything spawns.
+    let spawnSlot: { slot: SlotId; accountId: string | undefined; configDir: string | undefined };
+    try {
+      spawnSlot = await this.resolveSpawnSlot(cwd ?? undefined, accountId ?? undefined);
+    } catch (err) {
+      if (err instanceof SpawnBindingError) {
+        this.logger.warn({ requestId, err }, 'session.spawn refused: account/slot binding');
+        this.sendEnvelope({
+          type: 'error',
+          payload: {
+            code: 'spawn_failed',
+            message: `session.spawn: ${err.message}`,
+            relatesTo: msg.id,
+          },
+        });
+        return;
+      }
+      // A resolution fault (a failed ensure-live, an engine read error) is not a refusal — fall
+      // back to the global slot rather than blocking the spawn, and let the loud-account warning
+      // and the poll cycle's own repair catch a genuinely broken binding.
+      this.logger.error({ err, requestId }, 'session.spawn slot resolution failed; using global');
+      spawnSlot = { slot: 'global', accountId: accountId ?? undefined, configDir: undefined };
+    }
+    // The account the session is attributed to and spawned on: for a bound folder this is the
+    // group's live member the resolver chose, not the (absent) payload account.
+    const spawnAccountId = spawnSlot.accountId;
+
     let handle: SessionHandle;
     try {
       const resumeAnchor = this.resolveSpawnResumeAnchor(resumeSessionId ?? undefined);
-      const client = this.createAgentSdkClient();
+      const client = this.createAgentSdkClient(spawnSlot.configDir);
       handle = await this.sessionManager.spawnManaged({
         client,
         prompt,
@@ -3176,7 +3247,7 @@ export class Daemon {
         permissionMode: MANAGED_SESSION_PERMISSION_MODE,
         ...(resumeAnchor !== undefined ? { resumeSessionId: resumeAnchor } : {}),
         ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
-        ...(accountId !== undefined && accountId !== null ? { accountId } : {}),
+        ...(spawnAccountId !== undefined ? { accountId: spawnAccountId } : {}),
         ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
       });
     } catch (err) {
@@ -3193,6 +3264,9 @@ export class Daemon {
       });
       return;
     }
+    // Record the session's slot (fixed at spawn) so its status frames carry it and the post-switch
+    // resume scopes to it. Only non-global is stored; an absent entry reads as global.
+    if (spawnSlot.slot !== 'global') this.sessionSlots.set(handle.id, spawnSlot.slot);
 
     // The spawn origin rides every status frame the new session emits (see
     // forwardSessionEvent): a spawn mints a sessionId the requester has no other way to
@@ -3205,7 +3279,7 @@ export class Daemon {
         ? { resumedFrom: resumeSessionId }
         : {}),
     };
-    this.attachSessionPipes(handle, accountId ?? undefined, origin);
+    this.attachSessionPipes(handle, spawnAccountId, origin);
     // Announce the session NOW, before its first turn produces anything. The session
     // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
     // output BEFORE the starting→running transition — so without this frame the requester
@@ -3214,10 +3288,79 @@ export class Daemon {
     // status is guaranteed to arrive ahead of every event the pipes forward.
     this.forwardSessionEvent(
       handle.id,
-      accountId ?? undefined,
+      spawnAccountId,
       { kind: 'status', state: 'starting' },
       origin,
+      spawnSlot.slot,
     );
+  }
+
+  /**
+   * Resolve which slot a managed spawn runs in, honoring §8's decision tree:
+   *  - an explicit RESERVED account → its group slot (the group is ensured live first, and the
+   *    session binds to the group's profile dir);
+   *  - an explicit SHARED account → the global slot, but only when it is the account live in the
+   *    global slot (a session cannot switch the global slot out from under others) — otherwise
+   *    refused;
+   *  - no account but a BOUND working directory → that group's slot, spawned on its live member;
+   *  - anything else → the global slot, inheriting the global live login (the historical model).
+   * Returns the account to attribute/spawn, the config dir to bind (a group profile, or undefined
+   * for the shared config dir), and the slot to record.
+   */
+  private async resolveSpawnSlot(
+    cwd: string | undefined,
+    accountId: string | undefined,
+  ): Promise<{ slot: SlotId; accountId: string | undefined; configDir: string | undefined }> {
+    const engine = this.switchEngine;
+    // Folder support absent (older engine / lifecycle fake): the historical global behavior.
+    if (engine.configDirForAccount === undefined || engine.listAllAccounts === undefined) {
+      return { slot: 'global', accountId, configDir: undefined };
+    }
+
+    if (accountId !== undefined) {
+      const acct = (await engine.listAllAccounts()).find((a) => a.id === accountId);
+      if (acct?.groupId !== undefined) {
+        // Reserved member: make its group live before the spawn reads the profile's credentials.
+        if (engine.ensureGroupLive) await engine.ensureGroupLive(acct.groupId);
+        return {
+          slot: groupSlotId(acct.groupId),
+          accountId,
+          configDir: await engine.configDirForAccount(accountId),
+        };
+      }
+      // Shared (or unknown) account. A KNOWN shared account may only be spawned when it is the
+      // account live in the global slot; an unknown id keeps the legacy attribution-tag behavior.
+      const globalLive = await engine.getActiveId('global');
+      if (acct !== undefined && accountId !== globalLive) {
+        throw new SpawnBindingError(
+          `account "${acct.label}" is a shared account and is not the live global account; ` +
+            'switch to it first (cctl switch) or start the session in its bound folder',
+        );
+      }
+      return { slot: 'global', accountId, configDir: undefined };
+    }
+
+    // No explicit account: resolve the working directory's binding.
+    if (cwd !== undefined && engine.resolveCwdBinding) {
+      const binding = await engine.resolveCwdBinding(cwd);
+      if (binding !== null) {
+        const live = engine.ensureGroupLive
+          ? await engine.ensureGroupLive(binding.groupId)
+          : undefined;
+        const member = live?.liveMember ?? (await engine.getActiveId(groupSlotId(binding.groupId)));
+        if (member === null || member === undefined) {
+          throw new SpawnBindingError(
+            'the folder bound to this session has no working account; re-login a member (cctl bindings)',
+          );
+        }
+        return {
+          slot: groupSlotId(binding.groupId),
+          accountId: member,
+          configDir: await engine.configDirForAccount(member),
+        };
+      }
+    }
+    return { slot: 'global', accountId: undefined, configDir: undefined };
   }
 
   /**
@@ -3447,14 +3590,17 @@ export class Daemon {
     if (accountId !== undefined) this.sessionAccounts.set(handle.id, accountId);
     handle.onEvent((event) => {
       const runningAs = this.sessionAccounts.get(handle.id) ?? accountId;
+      // Captured before any terminal delete so the terminal frame still carries the slot.
+      const slot = this.sessionSlots.get(handle.id) ?? 'global';
       if (event.kind === 'status' && (event.state === 'done' || event.state === 'failed')) {
         this.sweepManagedPermissionRoutes(handle.id);
         this.sweepManagedQuestionRoutes(handle.id);
-        // Read above, dropped here: the terminal frame still names the account the session was
-        // actually running under when it ended.
+        // Read above, dropped here: the terminal frame still names the account and slot the session
+        // was actually running under when it ended.
         this.sessionAccounts.delete(handle.id);
+        this.sessionSlots.delete(handle.id);
       }
-      this.forwardSessionEvent(handle.id, runningAs, event, spawnOrigin);
+      this.forwardSessionEvent(handle.id, runningAs, event, spawnOrigin, slot);
     });
     // Optional on SessionHandle (observed terminals have no structured permission seam);
     // managed handles always implement it.
@@ -3590,7 +3736,12 @@ export class Daemon {
     accountId: string | undefined,
     event: SessionEvent,
     spawnOrigin?: SpawnOrigin,
+    slot?: SlotId,
   ): void {
+    // The session's slot rides its status frames so the phone can show which folder-bound account
+    // (or the global one) a session runs on. Passed explicitly where a terminal frame has already
+    // dropped the map entry; otherwise looked up, defaulting to global for an unmapped session.
+    const sessionSlot = slot ?? this.sessionSlots.get(sessionId) ?? 'global';
     if (event.kind === 'status') {
       // Mirror the transition into the display-only Store table BEFORE shipping the envelope,
       // so `cctl session status` reflects the same state the phone just saw. Failure to mirror
@@ -3607,6 +3758,7 @@ export class Daemon {
           sessionId,
           state: event.state,
           ...(accountId !== undefined ? { accountId } : {}),
+          slot: sessionSlot,
           ...(spawnOrigin !== undefined ? { spawnRequestId: spawnOrigin.requestId } : {}),
           ...(spawnOrigin?.resumedFrom !== undefined
             ? { resumedFrom: spawnOrigin.resumedFrom }
@@ -3738,6 +3890,17 @@ export class Daemon {
     };
   }
 
+  /**
+   * Map a session's launch-time `CLAUDE_CONFIG_DIR` (as forwarded on the hook POST) to the slot it
+   * runs in. A folder-bound config dir names its group's slot; an absent/main/unrecognized dir — and
+   * an engine without folder support — is the global slot. A read fault never propagates: attribution
+   * is observability and must not block registration, so a failure degrades to global.
+   */
+  private async slotForSessionConfigDir(configDir: string | null | undefined): Promise<SlotId> {
+    if (this.switchEngine.slotForConfigDir === undefined) return 'global';
+    return this.switchEngine.slotForConfigDir(configDir).catch(() => 'global' as SlotId);
+  }
+
   /** Opt an interactive session into daemon tracking. Async because it reads the switch engine
    *  for the attribution tag. Idempotent on `idempotencyKey` AND value-idempotent (a re-register
    *  preserves the prior label/watch). */
@@ -3760,10 +3923,17 @@ export class Daemon {
       return { ok: true, status: 'already_registered', session: interactiveView(existing) };
     }
     const now = this.clock();
-    // Best-effort attribution: tag with the live account, but never let a switch-engine read
-    // failure block registration (observability plumbing must not depend on the vault).
+    // The session's SLOT, from its launch-time config dir: a session started in a folder-bound
+    // profile is attributed to that slot's live member, not the global account. A read failure or an
+    // engine without folder support falls back to the global slot — attribution is observability and
+    // must never block registration.
+    const slot = await this.slotForSessionConfigDir(input.configDir);
+    // Best-effort attribution: tag with the account live in the session's slot, preferring a prior
+    // registration's account. Never let a switch-engine read failure block registration.
     const activeId =
-      existing?.accountId ?? (await this.switchEngine.getActiveId().catch(() => null)) ?? undefined;
+      existing?.accountId ??
+      (await this.switchEngine.getActiveId(slot).catch(() => null)) ??
+      undefined;
     const label = input.label ?? existing?.label;
     const tracked: TrackedInteractiveSession = {
       id: input.sessionId,
@@ -3775,6 +3945,11 @@ export class Daemon {
       updatedAtMs: now,
       ...(label !== undefined ? { label } : {}),
       ...(activeId !== undefined ? { accountId: activeId } : {}),
+      ...(existing?.slot !== undefined
+        ? { slot: existing.slot }
+        : slot !== 'global'
+          ? { slot }
+          : {}),
     };
     this.writeInteractiveSession(tracked);
     this.rememberSessionCmdKey(input.idempotencyKey);
@@ -3971,6 +4146,7 @@ export class Daemon {
       kind: tracked.kind,
       state: tracked.state,
       accountId: tracked.accountId ?? null,
+      slot: tracked.slot ?? 'global',
       json: JSON.stringify(tracked),
       updatedAtMs: tracked.updatedAtMs,
     });
@@ -4005,6 +4181,7 @@ export class Daemon {
         kind: 'managed',
         state,
         accountId: accountId ?? record?.accountId ?? null,
+        slot: this.sessionSlots.get(sessionId) ?? 'global',
         json: JSON.stringify(json),
         updatedAtMs: this.clock(),
       });
