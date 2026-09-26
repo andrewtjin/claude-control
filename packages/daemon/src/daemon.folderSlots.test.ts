@@ -161,6 +161,8 @@ function fakeEngine(opts: {
   configDirFor?: (accountId: string) => string | undefined;
   /** Override ensureGroupLive to model a group that cannot be made live (throws or no member). */
   ensureGroupLiveImpl?: (groupId: string) => Promise<GroupLiveResult>;
+  /** Override checkSlots, e.g. to model a breach that the per-group self-heal clears. */
+  checkSlotsImpl?: () => Promise<SlotViolation[]>;
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
@@ -217,6 +219,7 @@ function fakeEngine(opts: {
     },
     checkSlots: (): Promise<SlotViolation[]> => {
       controls.checkSlotsCalls++;
+      if (opts.checkSlotsImpl) return opts.checkSlotsImpl();
       return Promise.resolve(opts.violations ?? []);
     },
     repairSlots: (): Promise<RepairResult> => {
@@ -560,6 +563,91 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     const globalNotice = results.find((r) => r.activeAccountId === 's2');
     expect(globalNotice?.message).not.toContain('(C:/ai-research)');
     expect(globalNotice?.message).toContain('auto-switch:');
+  });
+});
+
+describe('daemon folder-bound slots — a breach the self-heal clears is still surfaced', () => {
+  it('alerts once when ensureGroupLive re-seats the group over a stranger before checkSlots runs', async () => {
+    // ensureGroupLive re-activates a group's rightful member over whatever it finds in the profile,
+    // so by the time the post-heal checkSlots runs, a stranger that was live there is already gone.
+    // The breach seen BEFORE the heal must still reach the operator, exactly once per window.
+    const { accounts, groups, live } = twoAccountGroup();
+    const stranger: SlotViolation = {
+      kind: 'nonmember_live_in_group',
+      detail: 'non-member "Shared" is live in the C:/work group',
+      accountId: 's1',
+      groupId: 'g1',
+    };
+    let healed = false;
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      checkSlotsImpl: () => Promise.resolve(healed ? [] : [stranger]),
+      ensureGroupLiveImpl: (groupId) => {
+        healed = true;
+        return Promise.resolve({
+          groupId,
+          liveMember: 'm1',
+          activated: true,
+          noWorkingAccount: false,
+        });
+      },
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({
+        limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }],
+      }),
+      slotAlertWindowMs: 60 * 60_000,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => slotAlerts(rig.relay).length >= 1);
+
+    const body = slotAlerts(rig.relay)[0]?.body ?? '';
+    expect(body).toContain('is live in the C:/work group');
+    expect(body).toContain("cctl restored the folder group's own account");
+    // Nothing was left for repairSlots, and later cycles (the breach is gone) add no alert.
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 3);
+    expect(slotAlerts(rig.relay)).toHaveLength(1);
+    expect(controls.repairSlotsCalls).toBe(0);
+  });
+
+  it('does not alert on a profile link the self-heal re-linked (routine sync, not news)', async () => {
+    const { accounts, groups, live } = twoAccountGroup();
+    const brokenLink: SlotViolation = {
+      kind: 'broken_profile_link',
+      detail: 'profile of the C:/work group: settings.json is no longer linked to the main config',
+      groupId: 'g1',
+    };
+    let healed = false;
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      checkSlotsImpl: () => Promise.resolve(healed ? [] : [brokenLink]),
+      ensureGroupLiveImpl: (groupId) => {
+        healed = true;
+        return Promise.resolve({
+          groupId,
+          liveMember: 'm1',
+          activated: false,
+          noWorkingAccount: false,
+        });
+      },
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({
+        limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }],
+      }),
+      slotAlertWindowMs: 60 * 60_000,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 3);
+    expect(slotAlerts(rig.relay)).toHaveLength(0);
   });
 });
 

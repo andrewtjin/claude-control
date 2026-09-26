@@ -314,6 +314,14 @@ class SpawnBindingError extends Error {}
  * under them and is not left to reverse-engineer it from a silent credential swap. Kept raw — the
  * bot renderer escapes push title/body — matching the out-of-quota alert's channel posture.
  */
+/** Identity of one breach across two checks in the same cycle: the same kind about the same
+ *  account in the same slot or group is the same breach, whatever its detail text says. */
+function slotViolationKey(v: SlotViolation): string {
+  return [v.kind, v.accountId ?? '', v.slot ?? '', v.groupId ?? '', (v.slots ?? []).join(',')].join(
+    '|',
+  );
+}
+
 function describeRepairedViolation(v: SlotViolation): string {
   switch (v.kind) {
     case 'reserved_live_in_global':
@@ -1383,8 +1391,24 @@ export class Daemon {
    * and a group left with no working account is alerted on. Then `checkSlots` finds any invariant
    * breach and `repairSlots` fixes the (a)-(d) ones under the engine lock; whatever a repair could
    * NOT resolve (a broken profile link, an unrecognized login) raises one alert per kind per window.
+   * A breach the self-heal itself clears is caught by a check taken before it, and alerted on the
+   * same way as one repairSlots fixes.
    */
   private async maintainSlots(groups: StoredGroup[]): Promise<void> {
+    const checkSlots = this.switchEngine.checkSlots?.bind(this.switchEngine);
+    // Take the breach snapshot BEFORE the per-group self-heal. ensureGroupLive re-seats a group's
+    // rightful member over a stranger it finds in the profile as a side effect, so a check taken
+    // only afterwards never sees that breach and the operator is never told the folder's account
+    // changed under them.
+    let beforeHeal: SlotViolation[] = [];
+    if (checkSlots) {
+      try {
+        beforeHeal = await checkSlots();
+      } catch (err) {
+        this.logger.warn({ err }, 'checkSlots failed');
+      }
+    }
+
     const ensureGroupLive = this.switchEngine.ensureGroupLive?.bind(this.switchEngine);
     if (ensureGroupLive) {
       for (const group of groups) {
@@ -1402,7 +1426,6 @@ export class Daemon {
       }
     }
 
-    const checkSlots = this.switchEngine.checkSlots?.bind(this.switchEngine);
     if (!checkSlots) return;
     let violations: SlotViolation[];
     try {
@@ -1410,6 +1433,17 @@ export class Daemon {
     } catch (err) {
       this.logger.warn({ err }, 'checkSlots failed');
       return;
+    }
+
+    // Credential breaches the self-heal already cleared: present before it, gone after. They get
+    // the same alert (and the same per-kind dedup key) as a breach repairSlots fixes, so a breach
+    // is announced once whichever step corrected it. A severed profile link is left out on purpose:
+    // Claude Code's own temp-and-rename writes sever those links routinely and ensureGroupProfile
+    // re-links them every cycle, so alerting on it would be noise, not news.
+    const stillPresent = new Set(violations.map(slotViolationKey));
+    for (const v of beforeHeal) {
+      if (v.kind === 'broken_profile_link' || stillPresent.has(slotViolationKey(v))) continue;
+      this.emitSlotAlert(`repaired:${v.kind}`, describeRepairedViolation(v));
     }
     if (violations.length === 0) return;
 
