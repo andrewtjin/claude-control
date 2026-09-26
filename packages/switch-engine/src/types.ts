@@ -259,3 +259,113 @@ export interface RefreshTokenResult {
   /** Expiry (epoch ms) of the vault's access token after this call. */
   expiresAt: number;
 }
+
+/** A Claude Code session observed running under a bound folder, from `<mainConfigDir>/sessions/*.json`.
+ *  The engine cannot see a session's config dir (it is set at launch, not recorded), so a match is by
+ *  a LIVE pid whose recorded cwd sits within the folder — enough to warn "these will be blocked until
+ *  relaunched", never a hard guarantee that the session actually ran on the shared account. */
+export interface RunningSession {
+  /** The OS process id recorded in the session file, confirmed alive at scan time. */
+  pid: number;
+  /** The session's working directory, canonical, within the bound folder. */
+  cwd: string;
+  /** The session file it was read from, for diagnostics. */
+  sessionFile: string;
+}
+
+/** What {@link SwitchEngine.ensureGroupLive} settled a group's slot to — reported at the mechanism
+ *  level like {@link ActivateResult}: `liveMember` is the member whose credentials are now written to
+ *  the profile, never a claim that a running session picked them up. */
+export interface GroupLiveResult {
+  groupId: string;
+  /** The member now live in the group's slot, or `null` when none could be made live. */
+  liveMember: string | null;
+  /** True when this call wrote a member's credentials into the profile (as opposed to finding one
+   *  already correctly live). */
+  activated: boolean;
+  /** True when every eligible member failed to activate — the binding exists but has no working
+   *  account. */
+  noWorkingAccount: boolean;
+}
+
+/** What {@link SwitchEngine.bindFolder} did — reported so the CLI can tell the operator exactly what
+ *  moved (the whole point of the verb's chattiness in §10). */
+export interface BindResult {
+  /** The group the folder is now bound to (created or reused). */
+  group: StoredGroup;
+  /** True when a new group was created; false when the folder joined an existing group of the same
+   *  member set. */
+  created: boolean;
+  /** The account that was live in the GLOBAL slot and had to be moved off it (because it became a
+   *  reserved member), or `null` when no member was globally live. */
+  movedOffGlobal: string | null;
+  /** The shared account the global slot was switched to when a member was moved off it, or `null`
+   *  when no global switch was needed. */
+  globalSwitchedTo: string | null;
+  /** The outcome of making the group's slot live (see {@link GroupLiveResult}). */
+  live: GroupLiveResult;
+  /** Running sessions found under the folder that will keep running on their current account until
+   *  relaunched (the CLI warns about these). */
+  runningSessions: RunningSession[];
+}
+
+/** What {@link SwitchEngine.unbindFolder} did. */
+export interface UnbindResult {
+  /** The canonical folder that was unbound. */
+  folder: string;
+  /** True when removing this folder was the group's LAST binding, dissolving the group (members
+   *  returned to the shared pool); false when the group kept other folders. */
+  dissolved: boolean;
+  /** The surviving group when the folder was removed but the group persisted; absent on dissolve. */
+  group?: StoredGroup;
+  /** Member ids returned to the shared pool (only on dissolve). */
+  releasedMembers: string[];
+  /** True when the profile's live token had rotated under us and was adopted into the vault before
+   *  the profile's live credentials were cleared (only on dissolve). */
+  adoptedRotation: boolean;
+  /** Sessions observed running under the group's folders at unbind time — non-empty is what a
+   *  non-forced dissolve refuses on. */
+  runningSessions: RunningSession[];
+}
+
+/** The invariant {@link SwitchEngine.checkSlots} found broken. The kinds mirror §7's (a)-(e):
+ *  - `account_in_multiple_slots` (a): one account's credentials are live in more than one slot —
+ *    the single invariant the whole reservation fence exists to protect (a rotating refresh token
+ *    can only survive in one place).
+ *  - `reserved_live_in_global` (b): a group member's credentials are live in the global slot.
+ *  - `nonmember_live_in_group` (c): an account that is not a member (a shared account, another
+ *    group's member, or an unrecognized login) is live in a group's slot.
+ *  - `group_active_mismatch` (d): a group's recorded `activeId` names a different member than the
+ *    one whose identity is actually live in the profile.
+ *  - `broken_profile_link` (e): a shared file/dir in a profile is no longer correctly linked to
+ *    main (repaired by `ensureGroupProfile`, not by `repairSlots`). */
+export type SlotViolationKind =
+  | 'account_in_multiple_slots'
+  | 'reserved_live_in_global'
+  | 'nonmember_live_in_group'
+  | 'group_active_mismatch'
+  | 'broken_profile_link';
+
+/** One invariant breach, with enough context to alert on and to repair. Every message names the
+ *  offending account and/or folder (a hard requirement of the verb). */
+export interface SlotViolation {
+  kind: SlotViolationKind;
+  /** Human-readable, naming the offending account/folder. */
+  detail: string;
+  /** The offending account, when one is identifiable (absent for an unrecognized login). */
+  accountId?: string;
+  /** The slot the breach is about (absent for `account_in_multiple_slots`, which uses `slots`). */
+  slot?: SlotId;
+  /** For `account_in_multiple_slots`: every slot the account is live in. */
+  slots?: SlotId[];
+  /** The group the breach concerns, when it is a group slot. */
+  groupId?: string;
+}
+
+/** What {@link SwitchEngine.repairSlots} did: the violations it fixed, those it could only alert on
+ *  (unrecognized logins, broken profile links), and a human log of the corrective actions taken. */
+export interface RepairResult {
+  repaired: SlotViolation[];
+  remaining: SlotViolation[];
+  actions: string[];
+}

@@ -111,6 +111,7 @@ export {
   DEFAULT_MIN_SWITCH_INTERVAL_MS,
   type SwitchEngineOptions,
   type ActivateOptions,
+  type BindFs,
   type RefreshFn,
   type ExchangeFn,
   type ReauthResult,
