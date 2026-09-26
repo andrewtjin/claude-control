@@ -71,6 +71,11 @@ token was persisted; a follow-up `claude -p` authenticated on the refreshed toke
 run also live-validated two M0 alignment features: `accounts add --fresh` captured the
 spare without touching the live login, and the cadence guard refused an immediate
 switch-back ("next switch allowed in Ns") until `--force`.
+**Follow-up (RE-OPEN for endpoint move):** the above result was against the previous
+`console.anthropic.com/v1/oauth/token` host with a form-urlencoded body. `DEFAULT_TOKEN_ENDPOINT`
+now points at the CLI's current `platform.claude.com/v1/oauth/token` (the old host still answers as
+an alias), and the refresh body now matches the CLI: JSON with `client_id` and `scope`. Re-run the
+live probe to reconfirm rotation against the new host/format before shipping.
 
 ### 3. Usage endpoint ✅ CLOSED 2026-07-16
 
@@ -337,9 +342,11 @@ no headless test can check.
 
 **State of the code:** the PKCE mint, the authorize-URL shape, the paste parser, the code exchange,
 the identity guard, the in-place vault write and the whole daemon-side pending-flow state machine
-are unit-proven against injected fakes. What no headless test can check is whether the
-reverse-engineered endpoints and formats in `switch-engine/src/oauth.ts` are what the real service
-actually does — the same posture as gate 2, whose module this shares.
+are unit-proven against injected fakes. The endpoints, redirect, scope set and request shapes in
+`switch-engine/src/oauth.ts` are taken from the CLI's own prod OAuth config so a token cctl mints
+matches one the CLI would; what no headless test can check is that a live login accepts them
+end-to-end — the same posture as gate 2, whose module this shares. Note the `account`/`organization`
+field names `mapExchangeResponse` reads are still assumptions.
 
 **Verify (run the CLI verb first — same engine call as the phone, minus the daemon):**
 

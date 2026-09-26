@@ -15,10 +15,11 @@
 // "this account's stored REFRESH token is dead", which a bad/expired/reused authorization
 // code (a fresh-login artifact) can never establish. Only refreshCredentials may quarantine.
 //
-// The endpoint URLs, client id, and exact request/response shapes are reverse-
-// engineered from the CLI and MUST be confirmed against a real refresh/exchange before
-// trusting. Everything here is injectable so tests never hit the network.
-// See docs/VERIFICATION.md.
+// The endpoint URLs, client id, scope set, and exact request/response shapes are taken from the
+// Claude Code CLI's own prod OAuth config so a token cctl mints or refreshes is identical to one
+// the CLI would produce. The token endpoint moved hosts in a recent CLI; the previous host stays
+// a working alias, so it remains reachable through the injectable `tokenEndpoint`. Everything here
+// is injectable so tests never hit the network. See docs/VERIFICATION.md.
 
 import { createHash, randomBytes } from 'node:crypto';
 import type { ClaudeOauth, OauthAccount } from './types.js';
@@ -33,12 +34,14 @@ import {
   type StatusVerdict,
 } from './overload.js';
 
-/** The public OAuth client id the Claude Code CLI presents. Override if verification shows
- *  a different value. */
+/** The public OAuth client id the Claude Code CLI presents (its prod `CLIENT_ID`). */
 export const CLAUDE_CODE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
-/** Best-known token endpoint; confirm against the live service. */
-export const DEFAULT_TOKEN_ENDPOINT = 'https://console.anthropic.com/v1/oauth/token';
+/** Token endpoint the CLI uses (`TOKEN_URL`). It was previously served from
+ *  `console.anthropic.com/v1/oauth/token`, which still answers as an alias; a caller pinned to the
+ *  old host passes it via {@link RefreshDeps.tokenEndpoint}. The authorization-code exchange MUST
+ *  hit the same host that issued the code (the authorize page below), so both default here. */
+export const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 
 /** Refresh below this remaining access-token lifetime. */
 export const DEFAULT_REFRESH_SKEW_MS = 5 * 60 * 1000;
@@ -97,11 +100,20 @@ export async function refreshCredentials(
   const now = deps.now ?? Date.now;
   if (!doFetch) throw new RefreshError('no fetch implementation available', 'no_fetch');
 
-  const body = new URLSearchParams({
+  // The CLI posts refresh as JSON and includes `client_id` and `scope` (it defaults scope to its
+  // login scope set). We send the credential's OWN scopes when known: a refresh may only narrow,
+  // never widen, the original grant (RFC 6749 §6), so echoing back the scopes the last token
+  // response reported is always accepted, whereas the CLI's default set could exceed a
+  // narrowly-granted legacy token and be rejected. Fall back to that default only when the stored
+  // credential never recorded its scopes.
+  const scope =
+    current.scopes && current.scopes.length > 0 ? current.scopes.join(' ') : OAUTH_REFRESH_SCOPES;
+  const body = JSON.stringify({
     grant_type: 'refresh_token',
     refresh_token: current.refreshToken,
     client_id: deps.clientId ?? CLAUDE_CODE_CLIENT_ID,
-  }).toString();
+    scope,
+  });
 
   let res: Awaited<ReturnType<FetchLike>>;
   let attempts = 1;
@@ -115,7 +127,7 @@ export async function refreshCredentials(
         doFetch(deps.tokenEndpoint ?? DEFAULT_TOKEN_ENDPOINT, {
           method: 'POST',
           headers: {
-            'content-type': 'application/x-www-form-urlencoded',
+            'content-type': 'application/json',
             accept: 'application/json',
             ...deps.extraHeaders,
           },
@@ -197,16 +209,28 @@ export async function refreshCredentials(
 // Authorization-code + PKCE flow (headless re-login)
 // ---------------------------------------------------------------------------
 
-/** Best-known authorize page; confirm against the live service (docs/VERIFICATION.md). */
-export const DEFAULT_AUTHORIZE_ENDPOINT = 'https://claude.ai/oauth/authorize';
+/** The CLI's authorize page (`CONSOLE_AUTHORIZE_URL`). */
+export const DEFAULT_AUTHORIZE_ENDPOINT = 'https://platform.claude.com/oauth/authorize';
 
-/** The display-code callback the CLI's own login flow uses: instead of redirecting to a local
- *  listener, the console renders the authorization code as "<code>#<state>" text for the user
- *  to copy — which is exactly what makes a phone-side login possible (no port on the phone). */
-export const DEFAULT_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
+/** The display-code callback the CLI's own login flow uses (`MANUAL_REDIRECT_URL`): instead of
+ *  redirecting to a local listener, the page renders the authorization code as "<code>#<state>"
+ *  text for the user to copy — which is exactly what makes a phone-side login possible (no port on
+ *  the phone). It is served from the same host as the authorize page, and the exchange must present
+ *  this same value. */
+export const DEFAULT_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback';
 
-/** The scope set the Claude Code CLI requests at login. */
-export const OAUTH_AUTHORIZE_SCOPES = 'org:create_api_key user:profile user:inference';
+/** The scope set the Claude Code CLI requests at login (its authorize default). Fewer scopes here
+ *  than the CLI asks for can silently cost a session features it grants — remote-control sessions
+ *  (`user:sessions:claude_code`), claude.ai MCP connectors (`user:mcp_servers`), file upload
+ *  (`user:file_upload`), plugins (`user:plugins`) — so this must stay in lockstep with the CLI. */
+export const OAUTH_AUTHORIZE_SCOPES =
+  'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins';
+
+/** The scope set the CLI sends by default on a token REFRESH — its login scopes minus the
+ *  console-only `org:create_api_key`. Used only when a stored credential has no recorded scopes of
+ *  its own to echo back (see {@link refreshCredentials}). */
+export const OAUTH_REFRESH_SCOPES =
+  'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins';
 
 export interface ExchangeDeps extends RefreshDeps {
   /** Override the redirect_uri presented at authorize + exchange (both must match). */
@@ -243,7 +267,7 @@ export function buildAuthorizeUrl(
 ): string {
   const query = new URLSearchParams({
     // `code=true` selects the display-code flow (the callback page SHOWS the code instead of
-    // redirecting a local listener) — reverse-engineered like everything else here.
+    // redirecting a local listener) — the CLI appends this same param first.
     code: 'true',
     client_id: deps.clientId ?? CLAUDE_CODE_CLIENT_ID,
     response_type: 'code',
@@ -290,8 +314,8 @@ export async function exchangeAuthorizationCode(
   const now = deps.now ?? Date.now;
   if (!doFetch) throw new RefreshError('no fetch implementation available', 'no_fetch');
 
-  // JSON here, unlike refresh's form encoding — matching how the CLI's own login flow calls
-  // this grant (reverse-engineered; wet-verify per docs/VERIFICATION.md).
+  // JSON body, matching how the CLI's own login flow posts this grant (same fields, same host as
+  // the authorize page). The redirect_uri here MUST equal the one presented at authorize.
   const body = JSON.stringify({
     grant_type: 'authorization_code',
     code: params.code,

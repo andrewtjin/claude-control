@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { refreshCredentials, type RefreshDeps } from './oauth.js';
+import { refreshCredentials, OAUTH_REFRESH_SCOPES, type RefreshDeps } from './oauth.js';
 import { QuarantineError, RefreshError } from './errors.js';
 import {
   createStatusProbeCache,
@@ -90,19 +90,35 @@ describe('refreshCredentials', () => {
     expect(next.rateLimitTier).toBe('tier-1');
   });
 
-  it('sends grant_type=refresh_token with the current refresh token', async () => {
+  it('posts a JSON refresh body with grant_type, the current refresh token, client_id and scope', async () => {
     const fetch = fakeFetch(
       200,
       JSON.stringify({ access_token: 'a', refresh_token: 'b', expires_in: 60 }),
     );
+    // `current` records no scopes, so the CLI-default refresh scope set is sent.
     await refreshCredentials(current, { fetch, clientId: 'cid', tokenEndpoint: 'https://ep' });
     expect(fetch).toHaveBeenCalledOnce();
-    const call = fetch.mock.calls[0] as [string, { body: string }];
+    const call = fetch.mock.calls[0] as [string, { body: string; headers: Record<string, string> }];
     const [url, init] = call;
     expect(url).toBe('https://ep');
-    expect(init.body).toContain('grant_type=refresh_token');
-    expect(init.body).toContain('refresh_token=old-refresh');
-    expect(init.body).toContain('client_id=cid');
+    expect(init.headers['content-type']).toBe('application/json');
+    expect(JSON.parse(init.body)).toEqual({
+      grant_type: 'refresh_token',
+      refresh_token: 'old-refresh',
+      client_id: 'cid',
+      scope: OAUTH_REFRESH_SCOPES,
+    });
+  });
+
+  it('echoes the credential’s own recorded scopes on refresh (never widens the grant)', async () => {
+    const fetch = fakeFetch(
+      200,
+      JSON.stringify({ access_token: 'a', refresh_token: 'b', expires_in: 60 }),
+    );
+    const scoped = { ...current, scopes: ['user:profile', 'user:inference'] };
+    await refreshCredentials(scoped, { fetch });
+    const [, init] = fetch.mock.calls[0] as [string, { body: string }];
+    expect((JSON.parse(init.body) as { scope: string }).scope).toBe('user:profile user:inference');
   });
 
   it('maps invalid_grant to a QuarantineError (permanent death)', async () => {
