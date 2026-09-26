@@ -240,8 +240,15 @@ export async function refreshCredentials(
 // Authorization-code + PKCE flow (headless re-login)
 // ---------------------------------------------------------------------------
 
-/** The CLI's authorize page (`CONSOLE_AUTHORIZE_URL`). */
-export const DEFAULT_AUTHORIZE_ENDPOINT = 'https://platform.claude.com/oauth/authorize';
+/** The CLI's subscription authorize page (`CLAUDE_AI_AUTHORIZE_URL`). cctl mints SUBSCRIPTION
+ *  tokens — the subscription client id ({@link CLAUDE_CODE_CLIENT_ID}) plus the subscription scope
+ *  set ({@link OAUTH_AUTHORIZE_SCOPES}) — which is the CLI's login-with-claude.ai path, and that path
+ *  authorizes against claude.ai, not the Console. The Console page (`CONSOLE_AUTHORIZE_URL`,
+ *  platform.claude.com) belongs to the API-key login, which uses a DIFFERENT client id and scopes
+ *  cctl never presents; sending the subscription client id + scopes to the Console page would be an
+ *  internally inconsistent request the CLI never makes. The display-code redirect and the token
+ *  endpoint below are host-independent, so the authorize host is the only one that must match. */
+export const DEFAULT_AUTHORIZE_ENDPOINT = 'https://claude.com/cai/oauth/authorize';
 
 /** The display-code callback the CLI's own login flow uses (`MANUAL_REDIRECT_URL`): instead of
  *  redirecting to a local listener, the page renders the authorization code as "<code>#<state>"
