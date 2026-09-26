@@ -376,10 +376,26 @@ describe('checkVersionSkew', () => {
     expect(check.detail).toContain('both 1.0.0');
   });
 
+  it('passes when the same build differs only by the daemon report v-prefix', () => {
+    // The real caller passes the bare CLI VERSION while the daemon-build report row is stored
+    // 'v'-prefixed; an identical build must not read as a skew, matching what `cctl version` shows.
+    const check = checkVersionSkew('1.0.0', 'v1.0.0', true);
+    expect(check.ok).toBe(true);
+    expect(check.detail).toBe('CLI and daemon both 1.0.0');
+  });
+
   it('fails on a live-daemon build mismatch with a restart hint', () => {
     const check = checkVersionSkew('1.0.0', '0.9.0', true);
     expect(check.ok).toBe(false);
     expect(check.detail).toContain('0.9.0');
     expect(check.detail).toContain('cctl daemon restart');
+  });
+
+  it('still detects a real skew across the v-prefix and normalizes both numbers', () => {
+    const check = checkVersionSkew('1.0.0', 'v0.9.0', true);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toBe(
+      'CLI is 1.0.0 but the running daemon is 0.9.0 — restart it so both match: cctl daemon restart',
+    );
   });
 });
