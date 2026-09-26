@@ -30,7 +30,7 @@
 
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from 'node:fs';
-import { extname, isAbsolute, posix, win32 } from 'node:path';
+import { extname, posix, win32 } from 'node:path';
 import { canonicalizeFolder, isWithin } from '@claude-control/switch-engine';
 
 /** How to invoke a resolved claude candidate, or why we refuse to. */
@@ -174,9 +174,11 @@ export function unwrapNpmCmdShim(cmdPath: string, cmdText: string): string | und
   if (rel && rel[1]) {
     return win32.join(cmdDir, rel[1]);
   }
-  // A quoted absolute entry path anywhere in the shim.
+  // A quoted absolute entry path anywhere in the shim. A .cmd shim is a Windows artifact, so the
+  // path is validated with win32 rules regardless of the host running cctl (native isAbsolute would
+  // reject a drive-letter path on POSIX).
   const abs = cmdText.match(/"([A-Za-z]:\\[^"\r\n]*?\.(?:c|m)?js)"/);
-  if (abs && abs[1] && isAbsolute(abs[1])) {
+  if (abs && abs[1] && win32.isAbsolute(abs[1])) {
     return abs[1];
   }
   return undefined;
