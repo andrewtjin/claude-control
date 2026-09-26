@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { linkSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -937,5 +937,35 @@ describe('ensureBindGuard propagation into group profiles', () => {
       profileSettingsPaths: [profileSettings],
     });
     expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(false);
+  });
+
+  it('backs up a diverged, guard-less profile copy before the guard re-link (no silent edit loss)', async () => {
+    // Sever the profile from main and give it a unique local edit but NO guard. writeFileSync in place
+    // would keep the shared inode (and mutate main too), so unlink + write a fresh independent file.
+    await rm(profileSettings);
+    await writeFile(
+      profileSettings,
+      JSON.stringify({ permissions: { allow: ['UNIQUE_PROFILE_EDIT'] }, hooks: {} }),
+      'utf8',
+    );
+
+    await ensureBindGuard({
+      settingsPath: mainSettings,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+      profileSettingsPaths: [profileSettings],
+    });
+
+    // The guard is now enforced in the profile...
+    expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(true);
+    // ...and the unique edit was saved to <profileDir>/.cctl-backup/ rather than silently discarded.
+    const backupDir = join(dir, 'profiles', 'g1', '.cctl-backup');
+    const backups = (await readdir(backupDir)).filter((e) => e.startsWith('settings.json.'));
+    expect(backups.length).toBe(1);
+    const backedUp = JSON.parse(await readFile(join(backupDir, backups[0] as string), 'utf8')) as {
+      permissions?: { allow?: string[] };
+    };
+    expect(backedUp.permissions?.allow).toContain('UNIQUE_PROFILE_EDIT');
   });
 });

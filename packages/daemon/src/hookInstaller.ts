@@ -21,7 +21,17 @@
 // The exact `settings.json` hooks schema (event names, matcher semantics, the
 // installed CLI version's exact expectations) is reverse-engineered — see docs/VERIFICATION.md.
 
-import { copyFile, link, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  link,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { buildBindGuardCommand, writeBindGuard } from './bindGuard.js';
 import {
@@ -384,7 +394,70 @@ async function propagateGuardToProfile(
   } catch {
     // fall through to re-link
   }
+  // The profile copy has diverged from main (a severed hard link) and lacks the guard, yet may carry
+  // unique local edits — the re-link below overwrites it. Save its current content first so those
+  // edits are recoverable, matching the profile reconcile's newest-wins-with-backup contract; a
+  // straight unbacked overwrite here would silently discard them. Best-effort: a backup we cannot
+  // write must not block enforcing the guard on this slot.
+  try {
+    await backupProfileSettings(profileSettingsPath, profileRaw);
+  } catch {
+    // A backup that cannot be written is not worth failing the guard propagation over.
+  }
   await linkOrCopy(mainSettingsPath, profileSettingsPath);
+}
+
+/** How many timestamped backups of a repaired profile settings.json to keep — the same bound the
+ *  profile reconcile uses for the shared files it repairs. */
+const MAX_PROFILE_SETTINGS_BACKUPS = 5;
+
+/** Save a group profile's existing settings.json content to `<profileDir>/.cctl-backup/settings.json.<ms>`
+ *  before it is overwritten by a guard re-link, pruning to the newest {@link MAX_PROFILE_SETTINGS_BACKUPS}.
+ *  Mirrors the switch-engine profile reconcile's backup shape (same dir name, `<name>.<ms>` stamp with a
+ *  `-N` suffix to break a same-millisecond collision) so both repair paths recover a clobbered file the
+ *  same way. */
+async function backupProfileSettings(profileSettingsPath: string, content: string): Promise<void> {
+  const backupDir = join(dirname(profileSettingsPath), '.cctl-backup');
+  await mkdir(backupDir, { recursive: true });
+  // A counter breaks a same-millisecond collision so a rapid double-repair keeps both copies.
+  let stamp = `${Date.now()}`;
+  let dest = join(backupDir, `settings.json.${stamp}`);
+  let bump = 0;
+  for (;;) {
+    try {
+      await stat(dest);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') break;
+      throw err;
+    }
+    bump += 1;
+    stamp = `${Date.now()}-${bump}`;
+    dest = join(backupDir, `settings.json.${stamp}`);
+  }
+  await writeFile(dest, content, 'utf8');
+  await pruneProfileSettingsBackups(backupDir);
+}
+
+/** Keep only the newest {@link MAX_PROFILE_SETTINGS_BACKUPS} `settings.json.<ms>` backups, dropping the
+ *  oldest by their millisecond stamp (lexicographic on equal-width integers preserves numeric order; a
+ *  `-N` collision suffix sorts after its base, i.e. as newer, which is correct). */
+async function pruneProfileSettingsBackups(backupDir: string): Promise<void> {
+  const prefix = 'settings.json.';
+  let entries: string[];
+  try {
+    entries = (await readdir(backupDir)).filter((e) => e.startsWith(prefix)).sort();
+  } catch {
+    return;
+  }
+  for (let i = 0; i < entries.length - MAX_PROFILE_SETTINGS_BACKUPS; i += 1) {
+    const entry = entries[i];
+    if (entry === undefined) continue;
+    try {
+      await unlink(join(backupDir, entry));
+    } catch {
+      // A backup that cannot be pruned is not worth failing a repair over.
+    }
+  }
 }
 
 /** Replace `dest` with a hard link to `src`, falling back to a content copy across volumes (EXDEV). */
