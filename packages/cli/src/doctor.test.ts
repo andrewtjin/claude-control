@@ -14,6 +14,8 @@ import {
   checkGuardSnapshot,
   checkGuardHook,
   checkVersionSkew,
+  checkPowerShellWrapper,
+  powerShellProfilePaths,
   healthUrlFromRelay,
   probeRelay,
   checkLiveLogin,
@@ -21,6 +23,7 @@ import {
   type DoctorCheck,
   type ProbeFetch,
 } from './doctor.js';
+import { renderShellInit } from './shellInit.js';
 import { sandboxPaths, type LiveCredentialChannel } from '@claude-control/switch-engine';
 
 // This file lives at packages/cli/src/, so two levels up is packages/, where the publishable
@@ -381,5 +384,73 @@ describe('checkVersionSkew', () => {
     expect(check.ok).toBe(false);
     expect(check.detail).toContain('0.9.0');
     expect(check.detail).toContain('cctl daemon restart');
+  });
+});
+
+describe('powerShellProfilePaths', () => {
+  it('returns nothing without a USERPROFILE', () => {
+    expect(powerShellProfilePaths({})).toEqual([]);
+    expect(powerShellProfilePaths({ USERPROFILE: '' })).toEqual([]);
+  });
+
+  it('covers both PowerShell editions under the home Documents folder', () => {
+    const paths = powerShellProfilePaths({ USERPROFILE: 'C:\\Users\\me' });
+    // Windows PowerShell 5.1 (WindowsPowerShell) and PowerShell 7 (PowerShell) both.
+    expect(paths.some((p) => p.includes('WindowsPowerShell'))).toBe(true);
+    expect(
+      paths.some((p) => p.includes(join('PowerShell', 'Microsoft.PowerShell_profile.ps1'))),
+    ).toBe(true);
+    expect(paths.every((p) => p.startsWith(join('C:\\Users\\me', 'Documents')))).toBe(true);
+  });
+
+  it('also covers a OneDrive-redirected Documents folder', () => {
+    const paths = powerShellProfilePaths({
+      USERPROFILE: 'C:\\Users\\me',
+      OneDrive: 'C:\\Users\\me\\OneDrive',
+    });
+    expect(paths.some((p) => p.startsWith(join('C:\\Users\\me\\OneDrive', 'Documents')))).toBe(
+      true,
+    );
+  });
+});
+
+describe('checkPowerShellWrapper', () => {
+  it('passes when no profile carries a wrapper', () => {
+    expect(checkPowerShellWrapper(undefined).ok).toBe(true);
+    expect(checkPowerShellWrapper('function foo { echo hi }\n').ok).toBe(true);
+  });
+
+  it('passes on the shim form (no embedded paths to go stale)', () => {
+    const check = checkPowerShellWrapper(renderShellInit('powershell'));
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('shim');
+  });
+
+  it('passes when the node-direct wrapper points at existing paths', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe';
+    const entry = 'C:\\npm\\cctl\\dist\\bin.js';
+    const text = renderShellInit('powershell', { nodePath: node, cctlEntry: entry });
+    const check = checkPowerShellWrapper(text, (p) => p === node || p === entry);
+    expect(check.ok).toBe(true);
+  });
+
+  it('fails when the embedded node path no longer exists, naming it and the fix', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe';
+    const entry = 'C:\\npm\\cctl\\dist\\bin.js';
+    const text = renderShellInit('powershell', { nodePath: node, cctlEntry: entry });
+    // Simulate a node move/upgrade: the entry still exists, the node binary does not.
+    const check = checkPowerShellWrapper(text, (p) => p === entry);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain(node);
+    expect(check.detail).toContain('cctl shell-init powershell');
+  });
+
+  it('fails when the embedded cctl entry no longer exists (reinstall/relocate)', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe';
+    const entry = 'C:\\npm\\cctl\\dist\\bin.js';
+    const text = renderShellInit('powershell', { nodePath: node, cctlEntry: entry });
+    const check = checkPowerShellWrapper(text, (p) => p === node);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain(entry);
   });
 });

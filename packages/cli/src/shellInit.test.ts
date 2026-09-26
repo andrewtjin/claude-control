@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   isSupportedShell,
+  parsePowerShellWrapper,
+  POWERSHELL_WRAPPER_MARKER,
   renderShellInit,
   resolveShellInitTarget,
   SUPPORTED_SHELLS,
@@ -38,6 +40,45 @@ describe('renderShellInit', () => {
     });
     // A single quote inside a PowerShell single-quoted literal is escaped by doubling.
     expect(out).toContain("& 'C:\\o''brien\\node.exe' 'C:\\cctl\\bin.js' claude @args");
+  });
+
+  it('powershell (with target): forwards piped stdin only when the call has pipeline input', () => {
+    // A PowerShell function does not auto-forward pipeline input to a native command, so `... | claude
+    // -p` would deliver empty stdin unless the wrapper pipes $input in — guarded so an interactive
+    // no-pipe launch still inherits the console.
+    const out = renderShellInit('powershell', {
+      nodePath: 'node.exe',
+      cctlEntry: 'C:\\cctl\\bin.js',
+    });
+    expect(out).toContain('if ($MyInvocation.ExpectingInput) {');
+    expect(out).toContain('$input | & ');
+    // The else-branch invokes the child WITHOUT piping $input, so the console stdin is inherited.
+    expect(out).toContain('  } else {');
+  });
+
+  it('powershell (fallback): forwards piped stdin through the shim form too', () => {
+    const out = renderShellInit('powershell');
+    expect(out).toContain('if ($MyInvocation.ExpectingInput) {');
+    expect(out).toContain('$input | cctl claude @args');
+  });
+
+  it('powershell (both forms): warns that a literal double quote is mangled on PowerShell < 7.3', () => {
+    const withTarget = renderShellInit('powershell', {
+      nodePath: 'node.exe',
+      cctlEntry: 'C:\\cctl\\bin.js',
+    });
+    const fallback = renderShellInit('powershell');
+    for (const out of [withTarget, fallback]) {
+      expect(out).toContain('double quote');
+      expect(out).toContain('7.3');
+    }
+  });
+
+  it('powershell: the emitted wrapper carries the stable detector marker', () => {
+    expect(renderShellInit('powershell')).toContain(POWERSHELL_WRAPPER_MARKER);
+    expect(
+      renderShellInit('powershell', { nodePath: 'node.exe', cctlEntry: 'C:\\cctl\\bin.js' }),
+    ).toContain(POWERSHELL_WRAPPER_MARKER);
   });
 
   it('bash: a claude() function forwarding "$@" via command cctl', () => {
@@ -105,6 +146,39 @@ describe('resolveShellInitTarget', () => {
 
   it('falls back (undefined) when execPath is empty', () => {
     expect(resolveShellInitTarget({ execPath: '', argv: ['', '/a/bin.js'] })).toBeUndefined();
+  });
+});
+
+describe('parsePowerShellWrapper', () => {
+  it('round-trips the node/entry paths out of an emitted node-direct wrapper', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe';
+    const entry = 'C:\\Users\\me\\npm\\cctl\\dist\\bin.js';
+    const parsed = parsePowerShellWrapper(
+      renderShellInit('powershell', { nodePath: node, cctlEntry: entry }),
+    );
+    expect(parsed).toEqual({ kind: 'node-direct', nodePath: node, cctlEntry: entry });
+  });
+
+  it('un-doubles single quotes embedded in a path', () => {
+    const out = renderShellInit('powershell', {
+      nodePath: "C:\\o'brien\\node.exe",
+      cctlEntry: 'C:\\cctl\\bin.js',
+    });
+    expect(parsePowerShellWrapper(out)).toEqual({
+      kind: 'node-direct',
+      nodePath: "C:\\o'brien\\node.exe",
+      cctlEntry: 'C:\\cctl\\bin.js',
+    });
+  });
+
+  it('reports the shim (fallback) form as having no embedded paths', () => {
+    expect(parsePowerShellWrapper(renderShellInit('powershell'))).toEqual({ kind: 'shim' });
+  });
+
+  it('returns undefined when no cctl wrapper marker is present', () => {
+    expect(parsePowerShellWrapper('function foo { echo hi }\n')).toBeUndefined();
+    // A bash wrapper is not a PowerShell wrapper.
+    expect(parsePowerShellWrapper(renderShellInit('bash'))).toBeUndefined();
   });
 });
 

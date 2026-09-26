@@ -41,6 +41,7 @@ import {
 } from './render.js';
 import type { Palette } from './ansi.js';
 import {
+  bannerContextForLaunch,
   buildLaunchEnv,
   configDirPointsIntoProfiles,
   findClaudeOnPath,
@@ -462,6 +463,15 @@ async function runClaude(opts: {
       cwd: process.cwd(),
       realpath: (p) => realpathSync.native(p),
     });
+
+  // Banner honesty on a global launch: an inherited CLAUDE_CONFIG_DIR that does NOT point into the
+  // profiles root is left untouched (only a profile-root dir is dropped), so the child actually runs
+  // on THAT config store — a different account than the global slot the banner would otherwise name.
+  // bannerContextForLaunch names the inherited dir rather than silently claiming the global slot.
+  slot = {
+    ...slot,
+    context: bannerContextForLaunch(slot, process.env.CLAUDE_CONFIG_DIR, dropInheritedConfigDir),
+  };
   // Mint per-launch relaxation tokens for the guard so the knobs cannot be forged by ambient env: a
   // token is a random value the guard verifies against a record on disk keyed to THIS launch's slot,
   // and it is removed the instant the session exits. CCTL_LAUNCH_EXPLICIT is only meaningful for a
