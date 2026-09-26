@@ -1505,9 +1505,14 @@ export class Daemon {
       budget?.resetsAt !== undefined
         ? `until it resets in ${humanizeDuration(budget.resetsAt - now)}`
         : 'until it resets';
+    // Name the bound folder, not the group label: the label defaults to the joined member labels,
+    // so a single-account group would read "<label> account <label> ..." and never say which folder
+    // stalled. The folder is what the operator acts on. Join when a group holds several folders, and
+    // fall back to the label only if a group somehow has no folder recorded.
+    const folder = group.folders.length > 0 ? group.folders.join(', ') : group.label;
     this.emitSlotAlert(
       `exhausted:${group.id}`,
-      `${group.label} account ${live.label} is out of quota ${resetText}`,
+      `${folder} account ${live.label} is out of quota ${resetText}`,
     );
   }
 

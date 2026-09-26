@@ -489,15 +489,18 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
 });
 
 describe('daemon folder-bound slots — group out of quota alert', () => {
-  it('alerts once per window when a single-member group is exhausted', async () => {
-    const only = view('m1', 'Member One', 'g1');
+  it('alerts once per window and names the bound folder when a single-member group is exhausted', async () => {
+    // The owner's real shape: one work account bound to a research folder. The group label defaults
+    // to the joined member labels, so it EQUALS the member label here — the alert must name the
+    // FOLDER (the actionable thing), not the label, or it would read "work@corp account work@corp".
+    const only = view('m1', 'work@corp', 'g1');
     const shared = view('s1', 'Shared');
     const group: StoredGroup = {
       id: 'g1',
-      label: 'C:/solo',
+      label: 'work@corp',
       members: [only],
       activeId: 'm1',
-      folders: ['C:/solo'],
+      folders: ['C:/ai-research'],
       createdAtMs: 0,
       updatedAtMs: 0,
     };
@@ -522,10 +525,48 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
 
     const exhaustion = slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'));
     expect(exhaustion).toHaveLength(1);
-    expect(exhaustion[0]?.body).toContain('C:/solo');
-    expect(exhaustion[0]?.body).toContain('Member One');
+    // The bound folder is named (regression: the alert used to name the group label instead).
+    expect(exhaustion[0]?.body).toContain('C:/ai-research account work@corp is out of quota');
+    // The group label alone (would read "work@corp account work@corp") must not be what leads.
+    expect(exhaustion[0]?.body).not.toContain('work@corp account work@corp');
     // Several more cycles inside the window must not repeat the alert.
     await waitFor(() => countUsageSnapshots(rig.relay) >= 3);
     expect(slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'))).toHaveLength(1);
+  });
+
+  it('names every bound folder when a multi-folder group is exhausted', async () => {
+    // A group can hold several folders; the alert joins them so the operator sees all stalled slots.
+    const only = view('m1', 'work@corp', 'g1');
+    const shared = view('s1', 'Shared');
+    const group: StoredGroup = {
+      id: 'g1',
+      label: 'work@corp',
+      members: [only],
+      activeId: 'm1',
+      folders: ['C:/ai-research', 'C:/experiments'],
+      createdAtMs: 0,
+      updatedAtMs: 0,
+    };
+    const live = new Map<SlotId, string | null>([
+      ['global', 's1'],
+      [groupSlotId('g1'), 'm1'],
+    ]);
+    const controls = fakeEngine({ accounts: [shared, only], groups: [group], live });
+    const bodyFor = (accountId: string): unknown =>
+      accountId === 'm1'
+        ? { limits: [{ kind: 'weekly_all', percent: 100, resets_at: iso(NOW + 3 * HOUR_MS) }] }
+        : { limits: [{ kind: 'weekly_all', percent: 5, resets_at: iso(NOW + DAY_MS) }] };
+    const rig = await createRig({
+      controls,
+      bodyFor,
+      withAutoSwitcher: true,
+      slotAlertWindowMs: 60 * 60_000,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => slotAlerts(rig.relay).some((a) => a.body.includes('out of quota')));
+
+    const exhaustion = slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'));
+    expect(exhaustion[0]?.body).toContain('C:/ai-research, C:/experiments');
   });
 });
