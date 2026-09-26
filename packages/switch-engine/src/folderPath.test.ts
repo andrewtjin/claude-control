@@ -65,6 +65,20 @@ const CASES: Case[] = [
     deps: winDeps({ 'C:\\users\\foo': 'C:\\Users\\Foo' }),
     expected: { ok: true, path: 'C:\\Users\\Foo' },
   },
+  {
+    // The leaf does not exist yet, but its parent is a junction; realpath the deepest existing
+    // ancestor and re-attach the missing tail so resolution is not existence-dependent.
+    name: 'win resolves a junctioned ancestor when the leaf does not exist yet',
+    input: 'C:\\proj\\ghost',
+    deps: winDeps({ 'C:\\proj': 'C:\\research' }),
+    expected: { ok: true, path: 'C:\\research\\ghost' },
+  },
+  {
+    name: 'win resolves a junctioned ancestor two levels below a missing tail',
+    input: 'C:\\proj\\a\\b',
+    deps: winDeps({ 'C:\\proj': 'C:\\research' }),
+    expected: { ok: true, path: 'C:\\research\\a\\b' },
+  },
   // --- Windows: namespace prefixes ---
   {
     name: 'win strips \\\\?\\ extended-length prefix',
@@ -81,6 +95,26 @@ const CASES: Case[] = [
   {
     name: 'win rejects \\\\.\\ device namespace',
     input: '\\\\.\\PhysicalDrive0',
+    deps: winDeps(),
+    expected: { ok: false, reason: 'device namespace path is not a folder' },
+  },
+  {
+    // Mixed separators must not smuggle a device path past the reject: forward slashes are folded to
+    // backslashes before the device check, so this cannot normalize back into the \\.\ form.
+    name: 'win rejects a device namespace spelled with mixed separators',
+    input: '/\\.\\PhysicalDrive0',
+    deps: winDeps(),
+    expected: { ok: false, reason: 'device namespace path is not a folder' },
+  },
+  {
+    name: 'win rejects a device namespace spelled with all forward slashes',
+    input: '//./PhysicalDrive0',
+    deps: winDeps(),
+    expected: { ok: false, reason: 'device namespace path is not a folder' },
+  },
+  {
+    name: 'win rejects a \\\\?\\-wrapped device path spelled with mixed separators',
+    input: '//?/.\\PhysicalDrive0',
     deps: winDeps(),
     expected: { ok: false, reason: 'device namespace path is not a folder' },
   },
@@ -195,6 +229,12 @@ const CASES: Case[] = [
     input: '/link',
     deps: posixDeps({ '/link': '/real/target' }),
     expected: { ok: true, path: '/real/target' },
+  },
+  {
+    name: 'posix resolves a symlinked ancestor when the leaf does not exist yet',
+    input: '/proj/ghost',
+    deps: posixDeps({ '/proj': '/real/research' }),
+    expected: { ok: true, path: '/real/research/ghost' },
   },
   {
     name: 'posix NFD normalizes to NFC',

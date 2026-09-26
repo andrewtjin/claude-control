@@ -92,17 +92,23 @@ export function canonicalizeFolder(input: string, deps: CanonicalizeDeps): Canon
   let s = input.normalize('NFC');
 
   if (win) {
-    // Device namespace addresses a raw device, never a directory. Reject both slash spellings.
-    if (s.startsWith('\\\\.\\') || s.startsWith('//./')) {
+    // Windows accepts either slash as a separator. Fold forward slashes to backslashes up front so a
+    // device, extended-length, drive-relative or alternate-data-stream path spelled with mixed or
+    // forward separators (e.g. "/\.\PhysicalDrive0") is caught by the checks below, instead of
+    // slipping past a single-spelling check and normalizing back into the very form they reject.
+    s = s.replace(/\//g, '\\');
+
+    // Device namespace addresses a raw device, never a directory.
+    if (s.startsWith('\\\\.\\')) {
       return { ok: false, reason: 'device namespace path is not a folder' };
     }
     // Extended-length prefixes: fold them away so \\?\C:\x and C:\x canonicalize identically.
-    if (s.length >= 8 && (s.startsWith('\\\\?\\UNC\\') || s.startsWith('//?/UNC/'))) {
+    if (s.length >= 8 && s.startsWith('\\\\?\\UNC\\')) {
       s = '\\\\' + s.slice(8);
-    } else if (s.length >= 4 && (s.startsWith('\\\\?\\') || s.startsWith('//?/'))) {
+    } else if (s.length >= 4 && s.startsWith('\\\\?\\')) {
       s = s.slice(4);
       // \\?\ wrapping a device path reduces to a device path.
-      if (s.startsWith('.\\') || s.startsWith('./')) {
+      if (s.startsWith('.\\')) {
         return { ok: false, reason: 'device namespace path is not a folder' };
       }
     }
@@ -143,17 +149,48 @@ export function canonicalizeFolder(input: string, deps: CanonicalizeDeps): Canon
 
   const abs = toAbsolute(s);
 
-  // Prefer the real on-disk path when it exists — the ONLY step that resolves junctions, symlinks,
-  // 8.3 short names and true case. When the path is not present yet, fall back to pure-string
-  // normalization so a not-yet-created (or since-removed) folder still yields a stable key.
-  let resolved: string;
-  let usedRealpath = false;
-  try {
-    resolved = realpath(abs);
-    usedRealpath = true;
-  } catch {
-    resolved = abs;
+  // Prefer the real on-disk path — the ONLY step that resolves junctions, symlinks, 8.3 short names
+  // and true case. When the leaf does not exist yet, realpath the DEEPEST existing ancestor and
+  // re-attach the missing tail, so a not-yet-created folder reached through a junctioned/symlinked
+  // ancestor still resolves to the same key as an existing one (enforcement must not be existence-
+  // dependent). Only when nothing up to the root resolves do we fall back to the unresolved string.
+  function resolvePreferReal(p: string): { path: string; real: boolean } {
+    const tail: string[] = []; // stripped leaf segments, deepest first
+    let head = p;
+    for (;;) {
+      try {
+        const real = realpath(head);
+        let out = real;
+        for (let k = tail.length - 1; k >= 0; k -= 1) out = out + sep + tail[k];
+        return { path: out, real: true };
+      } catch {
+        // Locate the last segment (ignoring any trailing separators).
+        let end = head.length;
+        while (end > 0 && isSep(head[end - 1] ?? '')) end -= 1;
+        let start = end;
+        while (start > 0 && !isSep(head[start - 1] ?? '')) start -= 1;
+        const seg = head.slice(start, end);
+        // No strippable segment (reached the root or a bare drive) — cannot resolve further.
+        if (seg === '' || start === 0) return { path: p, real: false };
+        // Parent = everything before the segment, trailing separators removed.
+        let pe = start;
+        while (pe > 0 && isSep(head[pe - 1] ?? '')) pe -= 1;
+        let parent = head.slice(0, pe);
+        // A bare drive ("C:") is drive-relative, not the drive root; restore the root separator so
+        // the next probe targets "C:\" rather than a per-drive working directory.
+        if (win && parent.length === 2 && isLetter(parent[0] ?? '') && parent[1] === ':') {
+          parent = parent + '\\';
+        }
+        if (parent === '') return { path: p, real: false };
+        tail.push(seg);
+        head = parent;
+      }
+    }
   }
+
+  const pref = resolvePreferReal(abs);
+  let resolved = pref.path;
+  const usedRealpath = pref.real;
   if (usedRealpath) {
     resolved = resolved.normalize('NFC');
     if (win) {
