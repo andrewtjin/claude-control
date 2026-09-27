@@ -14,7 +14,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { closeSync, ftruncateSync, openSync, realpathSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -461,6 +461,21 @@ describe('bind guard — session alias rules', () => {
         scriptPath,
         payload({ title: 'X', transcript: t }),
         onSlot(aliasProfile),
+      );
+      expect(ok).toMatchObject({ code: 0, stdout: '', stderr: '' });
+    });
+
+    it('before the transcript exists, a folder reached through a link counts as the folder it runs in', async () => {
+      // Claude Code names the project dir after the folder as it spelled it (the link), while the
+      // guard's project folder is canonical (the target): both spellings identify it.
+      await writeSnapshot([bound(repo)]);
+      const link = join(root, 'link-to-repo');
+      await symlink(repo, link, WIN ? 'junction' : 'dir');
+      const t = join(root, 'projects', projectDirStem(link), 'not-yet.jsonl');
+      const ok = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(aliasProfile, link),
       );
       expect(ok).toMatchObject({ code: 0, stdout: '', stderr: '' });
     });

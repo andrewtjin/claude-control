@@ -328,7 +328,14 @@ function run(input) {
   if (key !== '') {
     var boundFolders = aliasFoldersForKey(groups, key);
     if (boundFolders.length > 0) {
-      recorded = recordedFolder(payload.transcript_path, projectDir, boundFolders, deps, platform);
+      recorded = recordedFolder(
+        payload.transcript_path,
+        projectDir,
+        rawProject,
+        boundFolders,
+        deps,
+        platform,
+      );
     }
   }
 
@@ -593,12 +600,14 @@ function aliasFoldersForKey(groups, key) {
 //   - the transcript's first recorded top-level cwd, canonicalized, when it can be read (a bounded
 //     head read, see firstRecordedCwd);
 //   - no transcript yet (a named launch before its first turn is written): the folder it runs in,
-//     when the transcript's project directory is that folder's;
+//     when the transcript's project directory is that folder's — judged on the folder as Claude
+//     Code spelled it (rawProject: its project-dir name encodes that spelling, which differs from
+//     the canonical one for a folder reached through a junction or symlink) and as canonicalized;
 //   - otherwise (unreadable — locked, a device, a bad path — or no cwd in the head) Claude Code's
 //     project-directory NAME narrows it: the bound folders whose name it is (lossy, so the folder it
 //     runs in wins a tie), or null = recorded in some other folder, so no alias rule applies.
 // Every read error is caught HERE: an unreadable transcript never fails the whole guard open.
-function recordedFolder(transcriptPath, projectDir, boundFolders, deps, platform) {
+function recordedFolder(transcriptPath, projectDir, rawProject, boundFolders, deps, platform) {
   if (typeof transcriptPath !== 'string' || transcriptPath === '') return projectDir;
   var dirName = path.basename(path.dirname(transcriptPath));
   var missing = false;
@@ -611,7 +620,12 @@ function recordedFolder(transcriptPath, projectDir, boundFolders, deps, platform
   } catch (e) {
     missing = !!(e && e.code === 'ENOENT');
   }
-  if (missing && projectDirMatches(dirName, projectDir)) return projectDir;
+  if (
+    missing &&
+    (projectDirMatches(dirName, rawProject) || projectDirMatches(dirName, projectDir))
+  ) {
+    return projectDir;
+  }
   var here = folderKey(projectDir, platform);
   var match = null;
   for (var i = 0; i < boundFolders.length; i++) {
