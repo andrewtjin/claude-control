@@ -2361,8 +2361,31 @@ export class SwitchEngine {
         : { claudeAiOauth: live };
       const account = await this.vault.addAccount(label, bundle);
       // The just-captured account IS the live one; record that so the first switch reconciles.
-      await this.vault.setActive(account.id);
+      await this.adoptAsGlobalLiveLocked(account.id);
       return account;
+    });
+  }
+
+  /**
+   * Record that `accountId` is now the global slot's live account WITHOUT a switch — a login cctl
+   * captured in place (`accounts add` of the current login, a first login with nothing live before
+   * it). Sets the registry's active id AND appends the same `activated` audit entry a switch writes:
+   * the attribution journal derives its activation timeline from that log alone, so without it a box
+   * that never switched has no interval at all and every turn reads as unattributed. Caller holds the
+   * credential lock.
+   */
+  private async adoptAsGlobalLiveLocked(accountId: string): Promise<void> {
+    const previous = await this.vault.getActiveId();
+    await this.vault.setActive(accountId);
+    if (previous === accountId) return;
+    this.audit.append({
+      ts: this.clock(),
+      event: 'activated',
+      fromAccountId: previous,
+      toAccountId: accountId,
+      origin: 'manual',
+      slot: 'global',
+      detail: 'adopted the current login',
     });
   }
 
@@ -2452,7 +2475,7 @@ export class SwitchEngine {
         const account = await this.vault.addAccount(label, bundle);
         if (!prior) {
           // Nothing to restore: the captured login is now the live one — record that.
-          await this.vault.setActive(account.id);
+          await this.adoptAsGlobalLiveLocked(account.id);
         }
         return account;
       } finally {
@@ -2509,7 +2532,7 @@ export class SwitchEngine {
           : { claudeAiOauth: creds };
         await this.vault.writeBundle(accountId, bundle);
         await this.vault.clearQuarantine(accountId);
-        if (!prior) await this.vault.setActive(accountId);
+        if (!prior) await this.adoptAsGlobalLiveLocked(accountId);
         const refreshed = await this.vault.getAccount(accountId);
         if (!refreshed) throw new UnknownAccountError(accountId);
         return refreshed;
