@@ -328,11 +328,11 @@ cctl: session "auth work" in C:\repo is bound to research, but this session runs
 account. Exit and resume it with: cctl claude --resume 0b1c2d3e-4f50-4617-8899-aabbccddeeff
 ```
 
-Before the session's transcript exists (its very first prompt) there is nothing to resume by id,
-so the command carries the whole alias as bound instead, quoted for your shell (single quotes:
-PowerShell on Windows, POSIX shells elsewhere), so it pastes as one argument whatever the alias
-holds: `cctl claude --resume 'auth work'`. `cctl session show` and the note `cctl session bind`
-prints about the session it runs in resume a session by its id the same way.
+The same holds on a session's very first prompt (`claude --name 'auth work'`, or a fork): Claude
+Code keeps the stopped session's transcript, so its id resumes it, while its name would now match
+both it and the conversation already bound (`--resume "auth work" matches 2 sessions`). The alias
+in the message is only there to say which binding applies. `cctl session show` and the note
+`cctl session bind` prints about the session it runs in resume a session by its id the same way.
 
 A session on an alias's accounts that carries another name (renamed away, or another
 conversation altogether) is stopped too — start it again normally with `cctl claude`, or, if it

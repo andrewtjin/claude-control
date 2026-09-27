@@ -9,7 +9,8 @@
 //   - a named `-p` session writes custom-title, agent-name, queue-operation (enqueue, content = the
 //     prompt), queue-operation (dequeue), then the user line whose cwd key FOLLOWS the message — so
 //     the prompt is written twice before the first cwd (a 70 KiB prompt put it at ~144 KB);
-//   - the first prompt of a NEW session (`--name`, or a fork) is judged before its transcript exists;
+//   - the first prompt of a NEW session (`--name`, or a fork) is judged before its transcript exists,
+//     and a blocked one still leaves its transcript behind;
 //   - `--fork-session` copies the conversation into a NEW transcript in the LAUNCH folder's project
 //     directory, every cwd rewritten to the launch folder, the same title;
 //   - resuming keeps hook cwd = CLAUDE_PROJECT_DIR = the launch folder and the original transcript;
@@ -130,6 +131,24 @@ function ccTranscript(
     { type: 'assistant', message: { role: 'assistant', content: 'OK' }, cwd, sessionId: id },
     { type: 'custom-title', customTitle: opts.title, sessionId: id },
     ...(opts.tail ?? []),
+  ];
+  writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  return file;
+}
+
+/** What Claude Code 2.1.283 leaves behind for a named session whose FIRST prompt the guard blocked
+ *  (measured): the transcript exists, with its title and the folder it runs in, and no turn. */
+function blockedTranscript(cwd: string, id: string, title: string): string {
+  const file = transcriptPath(cwd, id);
+  mkdirSync(join(file, '..'), { recursive: true });
+  const lines: object[] = [
+    { type: 'custom-title', customTitle: title, sessionId: id },
+    { type: 'agent-name', agentName: title, sessionId: id },
+    { type: 'queue-operation', operation: 'enqueue', sessionId: id, content: 'go on' },
+    { type: 'queue-operation', operation: 'dequeue', sessionId: id },
+    { type: 'system', subtype: 'informational', cwd, sessionId: id },
+    { type: 'last-prompt', lastPrompt: 'go on', sessionId: id },
+    { type: 'cost-state', sessionId: id },
   ];
   writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
   return file;
@@ -421,17 +440,43 @@ describe('a fork belongs to the folder it is launched in', () => {
   it('forked in its own folder on the shared account: blocked, and the printed command routes it', async () => {
     const { sub, groups } = setup();
     const fork = transcriptPath(sub, `${SID}f`);
-    // Before its transcript exists there is nothing to resume by id: the alias is printed.
+    // Its first prompt, before its transcript exists: THE fork, by id. The alias would now match the
+    // fork AND the conversation it came from (Claude Code writes the blocked fork's transcript), and
+    // `--resume <alias>` would stop at "matches 2 sessions" (measured).
     const first = guard({ slot: 'global', projectDir: sub, title: 'Sub Alias', transcript: fork });
-    expect(first.reason).toContain(
-      `cctl claude --resume ${shellQuoteArg('Sub Alias', process.platform)}`,
-    );
+    expect(hintArgs(first.reason)).toEqual(['--resume', `${SID}f`]);
+    expect(first.reason).not.toContain(shellQuoteArg('Sub Alias', process.platform));
+    blockedTranscript(sub, `${SID}f`, 'Sub Alias');
     expect(await launch(sub, hintArgs(first.reason), groups)).toBe('A');
-    // Once it exists, THE session is printed, and resuming it by id routes it too.
+    // Once it has turns, the same.
     ccTranscript(sub, `${SID}f`, { title: 'Sub Alias' });
     const later = guard({ slot: 'global', projectDir: sub, title: 'Sub Alias', transcript: fork });
     expect(hintArgs(later.reason)).toEqual(['--resume', `${SID}f`]);
     expect(await launch(sub, hintArgs(later.reason), groups)).toBe('A');
+  });
+});
+
+describe('the first prompt of a new session named after a bound conversation', () => {
+  // Measured: `claude --name X` on the shared account is blocked on its first prompt, before its
+  // transcript exists; Claude Code writes that transcript anyway, so `--resume X` then matches the
+  // bound conversation AND the new one ("matches 2 sessions"), while `--resume <its id>` opens it.
+  it('the printed command resumes THAT session by its id, on the binding, and the guard allows it', async () => {
+    const repo = dir('repo');
+    const groups = bindAlias(repo, 'X');
+    ccTranscript(repo, `${SID}c`, { title: 'X' });
+    const id = `${SID}d`;
+    const file = transcriptPath(repo, id);
+
+    const first = guard({ slot: 'global', projectDir: repo, title: 'X', transcript: file });
+    expect(first.decision).toBe('block');
+    const args = hintArgs(first.reason);
+    expect(args).toEqual(['--resume', id]);
+    blockedTranscript(repo, id, 'X');
+    const slot = await launch(repo, args, groups);
+    expect({
+      slot,
+      verdict: guard({ slot, projectDir: repo, title: 'X', transcript: file }),
+    }).toEqual({ slot: 'A', verdict: {} });
   });
 });
 

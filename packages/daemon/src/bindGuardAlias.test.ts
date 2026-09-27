@@ -680,11 +680,19 @@ describe('bind guard — session alias rules', () => {
       expect(reason.endsWith(`Exit and resume it with: cctl claude --resume ${SID}`)).toBe(true);
     });
 
-    it('by its alias before the transcript exists (nothing to resume by id yet), or for a malformed id', async () => {
+    it('by its id on its very first prompt too, before its transcript exists', async () => {
+      // Claude Code writes the blocked session's transcript anyway (measured), so resuming the id
+      // opens it; the alias would also match any conversation already carrying that name.
       await writeSnapshot([aliasGroup()]);
       const notYet = join(root, 'projects', projectDirStem(repo), `${SID}.jsonl`);
       const first = await runGuard(scriptPath, withId(SID, notYet), onSlot(undefined));
-      expect(decision(first).reason).toContain(resumeHint('Auth Work'));
+      const reason = decision(first).reason ?? '';
+      expect(reason).toContain(`session "Auth Work" in ${repo} is bound to research@x`);
+      expect(reason.endsWith(`Exit and resume it with: cctl claude --resume ${SID}`)).toBe(true);
+    });
+
+    it('by its alias only for a payload without a well-formed session id', async () => {
+      await writeSnapshot([aliasGroup()]);
       const dir = join(root, 'projects', projectDirStem(repo));
       await mkdir(dir, { recursive: true });
       const t = join(dir, 'x.jsonl');

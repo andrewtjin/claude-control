@@ -81,12 +81,13 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *     there, never by failing open.
  *   - (A) the rule names a group the session is NOT running on -> block. The block reason names the
  *     account the session is actually on (a different group, or the shared account); for an alias
- *     binding it names the alias and says to resume THE session: `cctl claude --resume <session id>`
- *     (the payload's session_id, a validated UUID) once its transcript exists — an id cannot be
- *     ambiguous the way a title several sessions share is — else `cctl claude --resume '<alias>'`,
- *     the whole alias as bound, quoted for the operator's shell (PowerShell on Windows, POSIX
- *     elsewhere). A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a
- *     visible systemMessage instead.
+ *     binding it names the alias (display text) and says to resume THE session:
+ *     `cctl claude --resume <session id>` (the payload's session_id, a validated UUID) — an id
+ *     cannot be ambiguous the way a title several sessions share is, and it works from the very
+ *     first prompt (Claude Code writes the blocked session's transcript). Only a payload without a
+ *     well-formed id gets `cctl claude --resume '<alias>'`, the whole alias as bound, quoted for the
+ *     operator's shell (PowerShell on Windows, POSIX elsewhere). A valid --override relaxation token
+ *     (CCTL_BIND_OVERRIDE) allows the session with a visible systemMessage instead.
  *   - (B) the session runs on a group's slot but the rule names no group here (a folder outside the
  *     group's folders, a session renamed away from the group's alias, or a same-titled conversation
  *     recorded in another folder) -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT)
@@ -334,12 +335,9 @@ function run(input) {
   // keeps its original folder, so an alias binding (F, X) means "the conversations titled X recorded
   // in F", wherever they run now. Only worked out when the title names some bound alias at all.
   var recorded = undefined;
-  var transcriptExists = false;
   var key = title !== null ? aliasKey(title) : '';
   if (key !== '' && aliasBoundAnywhere(groups, key)) {
-    var located = conversationFolder(payload.transcript_path, rawProject, projectDir, deps, platform);
-    recorded = located.folder;
-    transcriptExists = located.exists;
+    recorded = conversationFolder(payload.transcript_path, rawProject, projectDir, deps, platform);
   }
 
   // THE precedence rule, embedded verbatim from switch-engine (the launcher, cctl where and cctl
@@ -362,8 +360,7 @@ function run(input) {
     // the shared account" would be false. Branch on sessionGroup accordingly.
     var reasonA;
     if (required.via === 'alias') {
-      // The resume command carries the WHOLE alias as bound (printable by construction), quoted for
-      // the operator's shell; only the display copy is shortened.
+      // The alias is display text (shortened); the resume command names THE session by its id.
       var bound = boundAlias(requiredGroup, required.folder, required.aliasKey) || title.trim();
       var current = sessionGroup
         ? membersOf(sessionGroup) + ' (bound to ' + scopesOf(sessionGroup) + ')'
@@ -378,7 +375,7 @@ function run(input) {
         ', but this session runs on ' +
         current +
         '. Exit and resume it with: cctl claude --resume ' +
-        resumeArgument(payload.session_id, transcriptExists, bound, platform);
+        resumeArgument(payload.session_id, bound, platform);
     } else if (sessionGroup) {
       reasonA =
         'cctl: ' +
@@ -597,34 +594,28 @@ function aliasBoundAnywhere(groups, key) {
   return false;
 }
 
-// The folder a session's conversation belongs to for the alias rule, and whether its transcript
-// exists. No transcript path in the payload: the folder it runs in. Otherwise the embedded
-// readRecordedFolder / recordedFolderFor decide (see the policy in the script header); neither ever
-// throws, so an unreadable transcript never fails the whole guard open.
+// The folder a session's conversation belongs to for the alias rule. No transcript path in the
+// payload: the folder it runs in. Otherwise the embedded readRecordedFolder / recordedFolderFor decide
+// (see the policy in the script header); neither ever throws, so an unreadable transcript never fails
+// the whole guard open.
 function conversationFolder(transcriptPath, rawProject, projectDir, deps, platform) {
-  if (typeof transcriptPath !== 'string' || transcriptPath === '') {
-    return { folder: projectDir, exists: false };
-  }
+  if (typeof transcriptPath !== 'string' || transcriptPath === '') return projectDir;
   var read = readRecordedFolder(transcriptPath, fs, platform);
-  var folder = recordedFolderFor(
-    read,
-    { spelled: rawProject, canonical: projectDir },
-    function (f) {
-      var c = canonicalizeFolder(f, deps);
-      return c.ok ? c.path : f;
-    },
-  );
-  return { folder: folder, exists: read.status !== 'missing' };
+  return recordedFolderFor(read, { spelled: rawProject, canonical: projectDir }, function (f) {
+    var c = canonicalizeFolder(f, deps);
+    return c.ok ? c.path : f;
+  });
 }
 
-// The argument of the resume command an alias block prints: THE session's id once its transcript
-// exists (a UUID needs no quoting, and unlike a title it names exactly one conversation), else the
-// whole alias as bound, quoted for the operator's shell.
+// The argument of the resume command an alias block prints: THE session's id. A UUID needs no
+// quoting, and unlike a title it names exactly one conversation — also on a session's first prompt,
+// before its transcript exists: Claude Code writes the blocked session's transcript anyway, so the
+// alias then matches it as well as any conversation already carrying that name, and
+// \`--resume <alias>\` stops at "matches 2 sessions". Only a payload with no well-formed id (never
+// Claude Code's) falls back to the whole alias as bound, quoted for the operator's shell.
 var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-function resumeArgument(sessionId, transcriptExists, alias, platform) {
-  if (transcriptExists && typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId)) {
-    return sessionId;
-  }
+function resumeArgument(sessionId, alias, platform) {
+  if (typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId)) return sessionId;
   return shellQuoteArg(alias, platform);
 }
 
