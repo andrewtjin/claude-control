@@ -2,8 +2,10 @@
 //
 // Layout under `vaultDir`:
 //   accounts.json        registry: active id + StoredAccount[] (non-secret metadata)
+//   groups.json          the reserved side of the registry (folder-bound groups)
 //   <id>/cred.enc        DPAPI-encrypted CredentialBundle for one account
 //   .rollback.enc        DPAPI-encrypted snapshot of the previous live creds (mid-switch only)
+//   token-prints.json    one-way fingerprints of each bundle's tokens, a cache (see tokenPrints.ts)
 //
 // The registry is plaintext by design so the CLI can list accounts cheaply; it never holds
 // a token. Secrets exist only inside the .enc blobs, which are useless off this machine/user.
@@ -32,6 +34,14 @@ import {
 } from './folderBindings.js';
 import { folderBindingsPath, groupProfileDir } from './paths.js';
 import { atomicWriteFile, ensureDir, readJsonIfExists, removeIfExists } from './fsutil.js';
+import {
+  StoredTokens,
+  blobDigest,
+  readPrintIndex,
+  tokenPrints,
+  writePrintIndex,
+  type TokenPrints,
+} from './tokenPrints.js';
 import { UnknownAccountError, VaultError } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
 
@@ -234,7 +244,10 @@ function validateMember(value: unknown, where: string): StoredAccount {
  * canonicalization) with one already claimed by any group. The caller separately heals a member id
  * that ALSO lingers in `accounts.json`.
  */
-function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFile {
+function validateGroupsFile(
+  value: unknown,
+  platform: NodeJS.Platform,
+): { file: GroupsFile; extras: GroupsExtras } {
   if (!isPlainObject(value)) throw new VaultError('groups.json is not an object');
   assertNoForbiddenKeys(value, 'groups.json');
   if (value.schemaVersion !== GROUPS_SCHEMA_VERSION) {
@@ -256,12 +269,15 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
   const seenAccountUuids = new Set<string>();
   const seenFolderKeys = new Set<string>();
   const groups: StoredGroup[] = [];
+  const extras: GroupsExtras = { top: unownedFields(value, GROUPS_FILE_KEYS), byGroup: new Map() };
   for (let i = 0; i < rawGroups.length; i += 1) {
     const g: unknown = rawGroups[i];
     const where = `groups[${i}]`;
     if (!isPlainObject(g)) throw new VaultError(`${where} is not an object`);
     assertNoForbiddenKeys(g, where);
     if (typeof g.id !== 'string' || g.id === '') throw new VaultError(`${where} has no string id`);
+    const groupExtras = unownedFields(g, GROUP_KEYS);
+    if (Object.keys(groupExtras).length > 0) extras.byGroup.set(g.id, groupExtras);
     if (typeof g.label !== 'string') throw new VaultError(`${where} (${g.id}) has no string label`);
     if (typeof g.createdAtMs !== 'number' || typeof g.updatedAtMs !== 'number') {
       throw new VaultError(`${where} (${g.id}) has non-numeric timestamps`);
@@ -337,7 +353,50 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
       updatedAtMs: g.updatedAtMs,
     });
   }
-  return { schemaVersion: GROUPS_SCHEMA_VERSION, generation: value.generation, groups };
+  return {
+    file: { schemaVersion: GROUPS_SCHEMA_VERSION, generation: value.generation, groups },
+    extras,
+  };
+}
+
+/**
+ * The fields of `groups.json` this build does not own, carried forward on every rewrite — the same
+ * forward-compatibility `accounts.json` already has for its top-level keys and rows. A build of the
+ * same schema version that adds an optional field must not lose it the moment an older build touches
+ * a group (an ordinary switch rewrites the file). A change older builds must NOT carry forward blindly
+ * bumps the schema version instead, which this build refuses to read at all.
+ *
+ * Kept beside the typed groups rather than on them, so nothing this build hands out (the CLI views,
+ * the guard snapshot, the wire) ever carries a field it does not understand. A group this build
+ * removes takes its unknown fields with it; member rows keep theirs on the row, as shared rows do.
+ */
+interface GroupsExtras {
+  top: Record<string, unknown>;
+  byGroup: Map<string, Record<string, unknown>>;
+}
+
+/** The top-level keys of `groups.json` this build writes itself. */
+const GROUPS_FILE_KEYS: ReadonlySet<string> = new Set(['schemaVersion', 'generation', 'groups']);
+/** The keys of one group this build writes itself (see {@link StoredGroup}). */
+const GROUP_KEYS: ReadonlySet<string> = new Set([
+  'id',
+  'label',
+  'members',
+  'activeId',
+  'folders',
+  'createdAtMs',
+  'updatedAtMs',
+]);
+
+/** Every own field of `obj` whose key is not in `owned`, copied. (Forbidden prototype keys never
+ *  reach here: the file is refused on them before this runs.) */
+function unownedFields(
+  obj: Record<string, unknown>,
+  owned: ReadonlySet<string>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(obj)) if (!owned.has(key)) out[key] = obj[key];
+  return out;
 }
 
 /**
@@ -552,6 +611,8 @@ interface RegistryState {
   groups: StoredGroup[];
   /** `groups.json`'s generation; the next groups write is `generation + 1`. */
   generation: number;
+  /** The fields of `groups.json` this build does not own, re-emitted on every groups write. */
+  groupsExtras: GroupsExtras;
   /** True when a member id (or a reserved active id) still lingered in `accounts.json` and the next
    *  shared write must drop it. See {@link Vault.heal}. */
   needsSharedRewrite: boolean;
@@ -588,6 +649,19 @@ function collectDedupe(report: DedupeReport, removed: Set<string>, result: Dedup
 }
 
 export class Vault {
+  /** Token fingerprints by the digest of the blob they were read from (see {@link readStoredTokens}).
+   *  Filled for free wherever a bundle is decrypted or written, pruned to the current bundles on
+   *  every full read. */
+  private readonly printsByBlob = new Map<string, TokenPrints>();
+  /** Why each bundle blob that could not be decrypted failed, by the blob's digest, pruned the same
+   *  way. A bundle this machine cannot decrypt (a DPAPI master-key change, a restored backup) would
+   *  otherwise be retried on every check, a PowerShell spawn each on Windows, and fail the same way
+   *  every time. Keyed by digest, a bundle that is rewritten is simply tried again, and a decrypt
+   *  that later succeeds elsewhere (readBundle) lands in printsByBlob, which is consulted first. In
+   *  memory only, so a failure that was transient costs a new process one more attempt, never a
+   *  bundle left out for good. */
+  private readonly undecryptable = new Map<string, string>();
+
   constructor(
     private readonly vaultDir: string,
     private readonly protector: Protector,
@@ -637,9 +711,12 @@ export class Vault {
     }
 
     const rawGroups = await readJsonIfExists<unknown>(this.groupsPath());
-    const groupsFile: GroupsFile =
+    const { file: groupsFile, extras: groupsExtras } =
       rawGroups === undefined
-        ? { schemaVersion: GROUPS_SCHEMA_VERSION, generation: 0, groups: [] }
+        ? {
+            file: { schemaVersion: GROUPS_SCHEMA_VERSION, generation: 0, groups: [] },
+            extras: { top: {}, byGroup: new Map() },
+          }
         : validateGroupsFile(rawGroups, this.platform);
 
     // Heal: no shared row may duplicate a reserved account (groups.json wins), and the global active
@@ -684,6 +761,7 @@ export class Vault {
       unknownKeys,
       groups: groupsFile.groups,
       generation: groupsFile.generation,
+      groupsExtras,
       needsSharedRewrite,
     };
   }
@@ -711,7 +789,9 @@ export class Vault {
 
   /** Persist the reserved side, incrementing `generation` (the guard snapshot carries it, so a
    *  bump is what lets a stale snapshot be detected). Mutates `st.generation` to the value written
-   *  so a caller that then writes the snapshot reports the right number. */
+   *  so a caller that then writes the snapshot reports the right number. Fields this build does not
+   *  own are written back where they were read (see {@link GroupsExtras}); this build's own fields
+   *  are spread last, so an unknown field can never shadow one of them. */
   private async saveGroups(st: RegistryState): Promise<void> {
     st.generation += 1;
     const file: GroupsFile = {
@@ -719,7 +799,12 @@ export class Vault {
       generation: st.generation,
       groups: st.groups,
     };
-    await atomicWriteFile(this.groupsPath(), JSON.stringify(file, null, 2));
+    const out = {
+      ...st.groupsExtras.top,
+      ...file,
+      groups: st.groups.map((g) => ({ ...st.groupsExtras.byGroup.get(g.id), ...g })),
+    };
+    await atomicWriteFile(this.groupsPath(), JSON.stringify(out, null, 2));
   }
 
   /**
@@ -803,17 +888,14 @@ export class Vault {
     label?: string;
   }): Promise<StoredGroup> {
     const st = await this.loadState();
-    if (st.groups.length >= MAX_GROUPS) {
-      throw new VaultError(`cannot create another group (max ${MAX_GROUPS})`);
-    }
-    if (opts.memberIds.length === 0) throw new VaultError('a group needs at least one member');
-    if (opts.memberIds.length > MAX_GROUP_MEMBERS) {
-      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
-    }
-    const folders = this.checkNewFolders(st, opts.folders ?? [], null);
-    const moved = this.takeSharedRows(st, opts.memberIds);
+    const { folders, moved } = this.validateNewGroup(st, opts);
     const now = this.clock();
-    const label = opts.label?.trim() || moved.map((m) => m.label).join(', ');
+    // Stored terminal-safe, exactly as an account label is (see addAccount): the group label is
+    // rendered on the CLI, in the doctor, in the guard's decision text and in phone alerts, and an
+    // operator types it freely. A label with nothing printable left falls back to the default.
+    const label =
+      sanitizeTerminalText(opts.label ?? '').trim() ||
+      sanitizeTerminalText(moved.map((m) => m.label).join(', '));
     const group: StoredGroup = {
       id: randomUUID(),
       label,
@@ -828,6 +910,38 @@ export class Vault {
     this.removeSharedRows(st, opts.memberIds);
     await this.saveShared(st); // accounts.json SECOND
     return group;
+  }
+
+  /**
+   * Run every refusal {@link createGroup} would make — group count, member count, folder conflicts,
+   * members that are unknown or already reserved — WITHOUT writing anything. For a caller whose
+   * group creation is preceded by its own side effects (a bind moves the global slot off a
+   * to-be-member first): checking here first means a request that was always going to be refused
+   * is refused before anything moved, not after.
+   */
+  async checkCreateGroup(opts: {
+    memberIds: readonly string[];
+    folders?: readonly string[];
+  }): Promise<void> {
+    this.validateNewGroup(await this.loadState(), opts);
+  }
+
+  /** The shared validation behind {@link createGroup} and {@link checkCreateGroup}: throws the named
+   *  refusal, else returns the checked folders and the shared rows that would move. Pure over `st`. */
+  private validateNewGroup(
+    st: RegistryState,
+    opts: { memberIds: readonly string[]; folders?: readonly string[] },
+  ): { folders: string[]; moved: StoredAccount[] } {
+    if (st.groups.length >= MAX_GROUPS) {
+      throw new VaultError(`cannot create another group (max ${MAX_GROUPS})`);
+    }
+    if (opts.memberIds.length === 0) throw new VaultError('a group needs at least one member');
+    if (opts.memberIds.length > MAX_GROUP_MEMBERS) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
+    }
+    const folders = this.checkNewFolders(st, opts.folders ?? [], null);
+    const moved = this.takeSharedRows(st, opts.memberIds);
+    return { folders, moved };
   }
 
   /**
@@ -1207,7 +1321,8 @@ export class Vault {
 
   // ---- secret bundles (DPAPI) ----
 
-  /** Decrypt and return an account's credential bundle. */
+  /** Decrypt and return an account's credential bundle. The token fingerprints of the blob it read
+   *  are remembered on the way (see {@link readStoredTokens}), since the decrypt is already paid. */
   async readBundle(id: string): Promise<CredentialBundle> {
     let blob: string;
     try {
@@ -1218,7 +1333,105 @@ export class Vault {
       }
       throw err;
     }
-    return this.decodeBundle(blob);
+    const bundle = await this.decodeBundle(blob);
+    this.printsByBlob.set(blobDigest(blob), tokenPrints(bundle.claudeAiOauth));
+    return bundle;
+  }
+
+  /**
+   * Fingerprints of the tokens every stored account's bundle holds right now — the one place that
+   * can say whether a live token is some OTHER account's (see tokenPrints.ts for why this is not a
+   * plain decrypt of every bundle).
+   *
+   * Each bundle blob is read (cheap) and looked up by its digest: first in memory, then in the index
+   * file; only a blob neither has seen is decrypted. The index is rewritten when what is current
+   * differs from what it holds, so it follows every rotation and only ever describes bundles that
+   * exist. An account with no bundle holds nothing.
+   *
+   * One bundle that cannot be read (a directory or a file this user may not open in its place) or
+   * decrypted never fails the whole answer: every caller — the slot check, the repair, rotation
+   * adoption inside a switch — needs the other accounts' tokens, and one broken bundle must not
+   * block a switch that has nothing to do with it. It is left out, with a warning, and listed in the
+   * answer's `unreadable` so a report on the whole vault can say so. Left out, it cannot be
+   * recognized as a holder — the behavior a check over it had before it existed. A blob that failed
+   * to decrypt is not tried again until it changes (see {@link undecryptable}).
+   */
+  async readStoredTokens(): Promise<StoredTokens> {
+    const st = await this.loadState();
+    const persisted = await readPrintIndex(this.printsPath());
+    const current = new Map<string, TokenPrints>();
+    const failed = new Map<string, string>();
+    const byAccount = new Map<string, TokenPrints>();
+    const unreadable = new Map<string, string>();
+    for (const row of allRowsOf(st)) {
+      let blob: string;
+      try {
+        blob = await readFile(this.bundlePath(row.id), 'utf8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        const reason = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          { accountId: row.id, reason },
+          'could not read a stored bundle to fingerprint its token; it is left out of the check',
+        );
+        unreadable.set(row.id, reason);
+        continue;
+      }
+      const digest = blobDigest(blob);
+      let prints = this.printsByBlob.get(digest) ?? persisted.get(digest);
+      if (prints === undefined) {
+        const decoded = await this.printsOrFailure(row.id, digest, blob);
+        if (typeof decoded === 'string') {
+          failed.set(digest, decoded);
+          unreadable.set(row.id, decoded);
+          continue;
+        }
+        prints = decoded;
+      }
+      current.set(digest, prints);
+      byAccount.set(row.id, prints);
+    }
+    // Only what describes a bundle that exists now is kept, in memory and on disk.
+    this.printsByBlob.clear();
+    for (const [digest, prints] of current) this.printsByBlob.set(digest, prints);
+    this.undecryptable.clear();
+    for (const [digest, reason] of failed) this.undecryptable.set(digest, reason);
+    const stale =
+      persisted.size !== current.size || [...current.keys()].some((d) => !persisted.has(d));
+    if (stale) {
+      // A cache write that fails (another process replacing the same file this instant) costs a
+      // decrypt next time, never a wrong answer — so it is not allowed to fail the caller.
+      await writePrintIndex(this.printsPath(), current).catch((err: unknown) =>
+        this.log.debug(
+          { reason: err instanceof Error ? err.message : String(err) },
+          'could not update the token fingerprint index',
+        ),
+      );
+    }
+    return new StoredTokens(byAccount, unreadable);
+  }
+
+  /** Decrypt `blob` for its token fingerprints, or say why it cannot be — without trying again a
+   *  blob that already failed (see {@link undecryptable}). */
+  private async printsOrFailure(
+    accountId: string,
+    digest: string,
+    blob: string,
+  ): Promise<TokenPrints | string> {
+    const known = this.undecryptable.get(digest);
+    if (known !== undefined) return known;
+    try {
+      return tokenPrints((await this.decodeBundle(blob)).claudeAiOauth);
+    } catch (err) {
+      // The wrapper's message only: its cause can be a JSON parse error quoting the plaintext.
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(
+        { accountId, reason },
+        'could not decrypt a stored bundle to fingerprint its token; it is left out of the check ' +
+          'until it changes',
+      );
+      return reason;
+    }
   }
 
   /** Encrypt and persist an account's credential bundle, then refresh its metadata row via
@@ -1237,6 +1450,7 @@ export class Vault {
     ensureDir(join(this.vaultDir, id));
     const blob = await this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
     await atomicWriteFile(this.bundlePath(id), blob);
+    this.printsByBlob.set(blobDigest(blob), tokenPrints(bundle.claudeAiOauth));
     await this.syncMetadata(id, bundle);
   }
 
@@ -1369,5 +1583,8 @@ export class Vault {
   }
   private rollbackPath(): string {
     return join(this.vaultDir, '.rollback.enc');
+  }
+  private printsPath(): string {
+    return join(this.vaultDir, 'token-prints.json');
   }
 }

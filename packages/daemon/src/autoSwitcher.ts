@@ -11,7 +11,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { PayloadOf } from '@claude-control/shared-protocol';
-import { type Logger, noopLogger } from '@claude-control/switch-engine';
+import { type Logger, noopLogger, type SlotId } from '@claude-control/switch-engine';
 import {
   decideAutoSwitch,
   type AccountUsageInput,
@@ -24,13 +24,23 @@ export interface AutoSwitchActivateResult {
   activeAccountId: string;
 }
 
+/** What this class passes to the engine's activate() for one hop. */
+export interface AutoSwitchActivateOptions {
+  origin: 'auto';
+  reason: string;
+  /** The slot the hop was decided for; present whenever the caller named one. */
+  slot?: SlotId;
+}
+
 export interface AutoSwitcherOptions {
   /** Perform the hop — production wires this to `SwitchEngine.activate` (never forced). The
    *  origin/reason this class always passes lets the audit trail (and, via the attribution
-   *  journal, `activation_intervals`) tell a policy hop apart from a human's `/switch`. */
+   *  journal, `activation_intervals`) tell a policy hop apart from a human's `/switch`. `slot` is
+   *  the slot the decision was made for (see {@link EvaluateOptions.slotKey}); the engine refuses
+   *  the hop if the target no longer belongs to it by the time the switch runs. */
   activate: (
     accountId: string,
-    options: { origin: 'auto'; reason: string },
+    options: AutoSwitchActivateOptions,
   ) => Promise<AutoSwitchActivateResult>;
   /** Ship a `switch.result` payload to the phone (the daemon stamps the envelope). */
   notify: (payload: PayloadOf<'switch.result'>) => void;
@@ -55,9 +65,12 @@ const GLOBAL_SLOT_KEY = 'global';
  *  accounts may be hop TARGETS in it. Absent = the global slot with no target restriction, exactly
  *  the pre-slot behavior. */
 export interface EvaluateOptions {
-  /** Distinct cooldown bucket for this slot, so a group hop never spends the global slot's
-   *  cooldown (or another group's). Defaults to the global bucket. */
-  slotKey?: string;
+  /** The slot this decision is for. It keys a distinct cooldown bucket, so a group hop never
+   *  spends the global slot's cooldown (or another group's), and it is handed to activate() so a hop
+   *  whose target changed slot since the snapshot was taken (a bind reserved it, an unbind released
+   *  it) is refused instead of landing in a slot this decision was never about. Defaults to the
+   *  global bucket with no slot assertion — the pre-slot behavior. */
+  slotKey?: SlotId;
   /** Restrict hop targets to this id set (the slot's own pool). Passed through to the policy. */
   candidateIds?: ReadonlySet<string>;
   /** Human name of the slot this hop is in — the bound folder(s) for a group slot. When present it
@@ -70,7 +83,7 @@ export interface EvaluateOptions {
 export class AutoSwitcher {
   private readonly activate: (
     accountId: string,
-    options: { origin: 'auto'; reason: string },
+    options: AutoSwitchActivateOptions,
   ) => Promise<AutoSwitchActivateResult>;
   private readonly notify: (payload: PayloadOf<'switch.result'>) => void;
   private readonly policy: AutoSwitchPolicy;
@@ -135,6 +148,7 @@ export class AutoSwitcher {
       const result = await this.activate(decision.targetAccountId, {
         origin: 'auto',
         reason: decision.reason,
+        ...(opts.slotKey !== undefined ? { slot: opts.slotKey } : {}),
       });
       this.logger.info({ decision, result }, 'auto-switch executed');
       this.notify({

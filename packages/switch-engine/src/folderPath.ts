@@ -24,8 +24,12 @@ export interface CanonicalizeDeps {
 }
 
 /** Success carries the canonical path; failure carries a human reason (surfaced by the CLI and,
- *  for the guard, kept internal). */
-export type CanonicalizeResult = { ok: true; path: string } | { ok: false; reason: string };
+ *  for the guard, kept internal). A failure caused by a character no canonical path may hold (a
+ *  control, or a bidi/format control) also carries that character's index in the input: everything
+ *  before the separator preceding it is still an ordinary path, which is what lets the guard judge a
+ *  real folder with such a name by its nearest clean ancestor instead of giving up on it. */
+export type CanonicalizeResult =
+  { ok: true; path: string } | { ok: false; reason: string; unsafeCharIndex?: number };
 
 /**
  * Canonicalize a folder path to the stable form a binding is keyed on.
@@ -69,7 +73,7 @@ export function canonicalizeFolder(input: string, deps: CanonicalizeDeps): Canon
     // C0 (incl. NUL) and C1/DEL control ranges: never legal in a folder name, and a NUL is a
     // truncation/injection hazard once the value flows into a hook or shell.
     if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
-      return { ok: false, reason: 'path contains a control character' };
+      return { ok: false, reason: 'path contains a control character', unsafeCharIndex: i };
     }
     // Unicode bidirectional/format controls (LRM/RLM, the embeddings/overrides U+202A-202E, the
     // isolates U+2066-2069, and the BOM U+FEFF). A canonicalizer has no reason to accept them, and
@@ -83,7 +87,11 @@ export function canonicalizeFolder(input: string, deps: CanonicalizeDeps): Canon
       (code >= 0x2066 && code <= 0x2069) ||
       code === 0xfeff
     ) {
-      return { ok: false, reason: 'path contains a bidirectional or format control character' };
+      return {
+        ok: false,
+        reason: 'path contains a bidirectional or format control character',
+        unsafeCharIndex: i,
+      };
     }
   }
 

@@ -15,14 +15,19 @@ import { dirname, join } from 'node:path';
 import {
   CadenceError,
   QuarantineError,
+  SharedTokenError,
+  SlotError,
   SwitchEngineError,
+  SwitchFailedError,
   UnknownAccountError,
+  UnsettledSwitchError,
   VaultError,
   buildAuthorizeUrl,
   defaultPaths,
   defaultProtector,
   generatePkce,
   generateState,
+  groupSlotId,
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
@@ -130,11 +135,9 @@ import {
   type SessionVerb,
 } from './sessionClient.js';
 import {
-  checkGuardHook,
-  checkGuardSnapshot,
+  checkFolderBindings,
   checkLiveLogin,
   checkPowerShellWrapper,
-  checkSlots,
   checkVersionSkew,
   probeRelay,
   readPowerShellWrapperProfile,
@@ -268,12 +271,17 @@ export function buildProgram(): Command {
       const engine = buildEngine();
       // Resolve across the WHOLE registry (shared pool + reserved members) so `cctl switch <member>`
       // reaches a folder-bound account; activate() routes it to its group slot by membership.
-      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
+      const fleet = await engine.listAllAccounts();
+      const resolved = resolveAccountRef(fleet, ref);
       if (!resolved.ok) fail(resolved.message);
+      // The slot the account belonged to when it was resolved. Asserted on the switch, so a bind or
+      // unbind landing in between fails this command instead of switching a slot it never named.
+      const groupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
       try {
         const result = await engine.activate(resolved.account.id, {
           force: Boolean(opts.force),
           origin: 'manual',
+          slot: groupId !== undefined ? groupSlotId(groupId) : 'global',
         });
         const bits = [
           result.wroteCredentials ? 'credentials written' : 'no change',
@@ -293,6 +301,19 @@ export function buildProgram(): Command {
           fail(`${resolved.account.label} is quarantined; re-login required.`);
         if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
         if (err instanceof UnknownAccountError) fail(err.message);
+        if (err instanceof SlotError) {
+          fail(`${err.message}. Nothing was changed - check \`cctl bindings\`.`);
+        }
+        // A switch that failed after it began writing the live login, one an earlier switch still
+        // blocks, or a login stored under two accounts: the engine's message already says what the
+        // live login is now and what to do, in words — it is the whole error line.
+        if (
+          err instanceof SwitchFailedError ||
+          err instanceof UnsettledSwitchError ||
+          err instanceof SharedTokenError
+        ) {
+          fail(err.message);
+        }
         // The token endpoint shedding load is an outage, not a broken account: the engine has
         // already spent its retry budget and checked the status page, so its message is the
         // whole story and this switch simply did not happen. Printed as the CLI's own refusal
@@ -310,6 +331,9 @@ export function buildProgram(): Command {
     .description('recover from an interrupted switch (run at startup)')
     .action(async () => {
       const result = await buildEngine().recover();
+      // Still pending: the engine says where, why and what clears it, so it is the whole error.
+      if (result.action === 'unsettled')
+        fail(result.detail ?? 'an interrupted switch is unsettled');
       process.stdout.write(
         result.recovered
           ? `Recovered: ${result.action}${result.detail ? ` - ${result.detail}` : ''}.\n`
@@ -554,16 +578,14 @@ export function buildProgram(): Command {
       const paths = defaultPaths();
       const engine = buildEngine(paths);
       const checks = await runDoctor(paths);
-      // Folder-bound-account checks: slot invariants, guard snapshot freshness, guard hook presence,
-      // and CLI/daemon build skew — appended so the base environment report stays unchanged.
-      const groups = await engine.listGroups();
+      // Folder-bound-account checks (slot invariants, guard snapshot freshness, guard hook presence)
+      // and CLI/daemon build skew — appended so the base environment report stays unchanged. The
+      // binding checks report an unreadable groups.json as one failed check rather than throwing.
       const report = await readSettingsReport(daemonSettingsPath());
       const heartbeat = await readHeartbeat(daemonHeartbeatPath());
       const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
       checks.push(
-        await checkSlots(engine),
-        await checkGuardSnapshot(engine),
-        checkGuardHook(paths, groups.length > 0),
+        ...(await checkFolderBindings(engine, paths)),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
       );
       // Windows only: flag a PowerShell `claude` wrapper whose embedded node/cctl paths have gone

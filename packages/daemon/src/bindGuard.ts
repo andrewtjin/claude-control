@@ -60,7 +60,10 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *
  * The script implements the enforcement rules:
  *   - session slot = the group whose canonical profileDir equals the session's canonical
- *     CLAUDE_CONFIG_DIR, else the global slot (outside every group).
+ *     CLAUDE_CONFIG_DIR, else the global slot (outside every group). A CLAUDE_CONFIG_DIR naming the
+ *     snapshot's main config dir IS the global slot, keyed exactly like an unset one.
+ *   - a project folder whose name has no canonical form (a control or bidi/format character) is
+ *     judged by its nearest clean ancestor, which a binding covers exactly when it covers the folder.
  *   - (A) the project dir is bound to a group the session is NOT running on -> block. The block
  *     reason names the account the session is actually on (a different group, or the shared account).
  *     A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a visible
@@ -171,6 +174,26 @@ function readValidEnforce(value) {
   return value === 'block' || value === 'warn' || value === 'off' ? value : undefined;
 }
 
+// A real folder whose name carries a control or bidi/format character has no canonical form, so no
+// binding can name it or anything beneath it. It is still judged exactly: a bound folder contains it
+// precisely when that folder contains its nearest clean ancestor (the path up to the separator before
+// the offending character), since a binding can neither equal nor sit inside the offending segment.
+// Returns that ancestor's canonical path, or null when there is none to fall back on (a rejection
+// for any other reason, or no separator before the character).
+function cleanAncestor(raw, failure, deps, platform) {
+  if (typeof failure.unsafeCharIndex !== 'number') return null;
+  var win = platform === 'win32';
+  for (var q = failure.unsafeCharIndex - 1; q >= 0; q--) {
+    var ch = raw[q];
+    if (ch === '/' || (win && ch === '\\\\')) {
+      // Keep the separator so a bare root ("C:/", "/") stays a root rather than a relative name.
+      var anc = canonicalizeFolder(raw.slice(0, q + 1), deps);
+      return anc.ok ? anc.path : null;
+    }
+  }
+  return null;
+}
+
 function run(input) {
   const platform = process.platform;
   const deps = {
@@ -219,21 +242,43 @@ function run(input) {
         ? payload.cwd
         : '';
   if (!rawProject) process.exit(0);
+  // projectDir is the canonical folder containment is judged on; projectShown is how the folder is
+  // named in a message. They differ only for a folder with no canonical form (see cleanAncestor),
+  // which is judged by its nearest clean ancestor and shown as spelled (sanitized at the sink).
+  var projectDir;
+  var projectShown;
   var projCanon = canonicalizeFolder(rawProject, deps);
-  if (!projCanon.ok) return failOpen('project dir could not be canonicalized');
-  var projectDir = projCanon.path;
+  if (projCanon.ok) {
+    projectDir = projCanon.path;
+    projectShown = projCanon.path;
+  } else {
+    var ancestor = cleanAncestor(rawProject, projCanon, deps, platform);
+    if (ancestor === null) return failOpen('project dir could not be canonicalized');
+    projectDir = ancestor;
+    projectShown = rawProject;
+  }
+
+  // The main config dir's key. A CLAUDE_CONFIG_DIR naming it is the global slot spelled out (a shell
+  // that exports it), not a slot of its own.
+  var mainConfigKey = null;
+  if (typeof snapshot.mainConfigDir === 'string' && snapshot.mainConfigDir.length > 0) {
+    var mc = canonicalizeFolder(snapshot.mainConfigDir, deps);
+    mainConfigKey = folderKey(mc.ok ? mc.path : snapshot.mainConfigDir, platform);
+  }
 
   // The session's slot: the group whose canonical profileDir equals the session's canonical
-  // CLAUDE_CONFIG_DIR. No config dir, or no match, means the global (shared) slot. sessionConfigKey
-  // is the canonical folderKey of CLAUDE_CONFIG_DIR ('' for the global slot); a relaxation token is
-  // honored only when it was minted for this same slot key.
+  // CLAUDE_CONFIG_DIR. No config dir, the main config dir, or no match means the global (shared)
+  // slot. sessionConfigKey is the canonical folderKey of CLAUDE_CONFIG_DIR, and '' for the global
+  // slot however it is spelled — the key the launcher mints a global-slot relaxation token for; a
+  // token is honored only when it was minted for this same slot key.
   var sessionGroup = null;
   var sessionConfigKey = '';
   var rawConfig = process.env.CLAUDE_CONFIG_DIR;
   if (typeof rawConfig === 'string' && rawConfig.length > 0) {
     var cfgCanon = canonicalizeFolder(rawConfig, deps);
-    if (cfgCanon.ok) {
-      sessionConfigKey = folderKey(cfgCanon.path, platform);
+    var cfgKey = cfgCanon.ok ? folderKey(cfgCanon.path, platform) : null;
+    if (cfgKey !== null && cfgKey !== mainConfigKey) {
+      sessionConfigKey = cfgKey;
       for (var i = 0; i < snapshot.groups.length; i++) {
         var g = snapshot.groups[i];
         if (g && typeof g.profileDir === 'string') {
@@ -334,7 +379,7 @@ function run(input) {
             ' (bound to ' +
             folders +
             ') in ' +
-            projectDir +
+            projectShown +
             ' — launched explicitly with --account. This account is reserved to its folders.',
         );
       }
@@ -342,7 +387,7 @@ function run(input) {
         'cctl: this session runs on the account bound to ' +
         folders +
         ', but ' +
-        projectDir +
+        projectShown +
         ' is not one of its folders. That account is reserved to its folders. Run Claude Code ' +
         'here normally, or launch it explicitly with: cctl claude --account <account>';
       return emitBlock(reasonB, enforce);
