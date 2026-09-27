@@ -5,8 +5,11 @@ import { join } from 'node:path';
 import { Vault } from './vault.js';
 import {
   buildFolderBindingSnapshot,
+  describeGroupScopes,
   folderBindingSnapshotContentEqual,
+  groupScopeCount,
   readFolderBindingSnapshot,
+  scopedGroupOf,
 } from './folderBindings.js';
 import { folderBindingsPath, groupProfileDir } from './paths.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
@@ -76,10 +79,37 @@ describe('buildFolderBindingSnapshot (pure)', () => {
           label: 'Work',
           profileDir: 'C:\\profiles\\g1',
           folders: ['C:\\work'],
+          // A group with no alias scope still carries the (empty) field, so the guard never has to
+          // tell "none" from "older snapshot" apart from its own defensive read.
+          aliases: [],
           members: ['jina', 'debate'],
         },
       ],
     });
+  });
+
+  it('carries alias scopes as KEYS only (lower-cased, trimmed), never the typed alias', () => {
+    const groups: StoredGroup[] = [
+      {
+        id: 'g1',
+        label: 'Research',
+        members: [{ id: 'm1', label: 'work', quarantined: false, createdAtMs: 1, updatedAtMs: 1 }],
+        activeId: null,
+        folders: [],
+        aliases: [{ folder: 'C:\\repo', alias: '  Auth Work ' }],
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      },
+    ];
+    const snapshot = buildFolderBindingSnapshot({
+      groups,
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\m',
+      profileDirOf: (id) => id,
+    });
+    expect(snapshot.groups[0]?.aliases).toEqual([{ folder: 'C:\\repo', aliasKey: 'auth work' }]);
+    expect(JSON.stringify(snapshot)).not.toContain('Auth Work');
   });
 
   it('carries no member ids and no token material', () => {
@@ -164,6 +194,58 @@ describe('folderBindingSnapshotContentEqual (pure)', () => {
     const b = base();
     b.groups[0]!.members = ['someone-else'];
     expect(folderBindingSnapshotContentEqual(a, b)).toBe(false);
+  });
+
+  it('is unequal when an alias scope is added (the guard enforces it)', () => {
+    const a = base();
+    const b = base();
+    b.groups[0]!.aliases = [{ folder: 'C:\\repo', aliasKey: 'x' }];
+    expect(folderBindingSnapshotContentEqual(a, b)).toBe(false);
+  });
+
+  it('reads a snapshot written before alias scopes existed as having none', () => {
+    // An older writer left no `aliases` field; content-wise that is the same as an empty list, so a
+    // build upgrade alone must not report the snapshot as stale.
+    const a = base();
+    const older = base();
+    delete (older.groups[0] as { aliases?: unknown }).aliases;
+    expect(folderBindingSnapshotContentEqual(a, older)).toBe(true);
+  });
+});
+
+describe('scope helpers', () => {
+  const g = (over: Partial<StoredGroup>): StoredGroup => ({
+    id: 'g1',
+    label: 'Label',
+    members: [{ id: 'm1', label: 'work', quarantined: false, createdAtMs: 1, updatedAtMs: 1 }],
+    activeId: null,
+    folders: [],
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    ...over,
+  });
+
+  it('scopedGroupOf keys aliases and keeps folders', () => {
+    expect(
+      scopedGroupOf(g({ folders: ['C:\\a'], aliases: [{ folder: 'C:\\b', alias: ' X ' }] })),
+    ).toEqual({ id: 'g1', folders: ['C:\\a'], aliases: [{ folder: 'C:\\b', aliasKey: 'x' }] });
+  });
+
+  it('groupScopeCount counts folders and aliases together', () => {
+    expect(groupScopeCount(g({ folders: ['C:\\a'] }))).toBe(1);
+    expect(groupScopeCount(g({ aliases: [{ folder: 'C:\\b', alias: 'x' }] }))).toBe(1);
+    expect(
+      groupScopeCount(g({ folders: ['C:\\a'], aliases: [{ folder: 'C:\\b', alias: 'x' }] })),
+    ).toBe(2);
+  });
+
+  it('describeGroupScopes names folders then aliases, falling back to the label', () => {
+    expect(
+      describeGroupScopes(
+        g({ folders: ['C:\\a'], aliases: [{ folder: 'C:\\b', alias: 'Auth Work' }] }),
+      ),
+    ).toBe('C:\\a, session "Auth Work" in C:\\b');
+    expect(describeGroupScopes(g({}))).toBe('Label');
   });
 });
 

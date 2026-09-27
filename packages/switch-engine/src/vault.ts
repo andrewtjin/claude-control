@@ -18,11 +18,12 @@ import type {
   OauthAccount,
   Registry,
   StoredAccount,
+  StoredAliasScope,
   StoredGroup,
 } from './types.js';
 import type { FolderBindingSnapshot } from './types.js';
 import type { Protector } from './dpapi.js';
-import { folderUniquenessKey } from './folderPath.js';
+import { aliasKey, aliasScopeUniquenessKey, folderUniquenessKey } from './folderPath.js';
 import { sanitizeTerminalText } from './terminalSafe.js';
 import {
   buildFolderBindingSnapshot,
@@ -172,6 +173,12 @@ const GROUPS_SCHEMA_VERSION = 1;
 export const MAX_GROUPS = 64;
 export const MAX_GROUP_MEMBERS = 32;
 export const MAX_GROUP_FOLDERS = 256;
+/** Alias scopes per group — same order of magnitude as folders, same reasoning. */
+export const MAX_GROUP_ALIASES = 256;
+/** Longest alias a binding may carry. A session title is free text, and every bound alias is copied
+ *  into the guard snapshot the hook reads on each prompt, so an unbounded one would let a single
+ *  pasted blob bloat every prompt's read. Far above any title a person types. */
+export const MAX_ALIAS_LENGTH = 512;
 
 /** Property names that, if copied onto an object literal or used as a plain-object map key, reach
  *  through to `Object.prototype` (prototype pollution). Registry files are operator-editable and,
@@ -230,9 +237,12 @@ function validateMember(value: unknown, where: string): StoredAccount {
  * to one account); a member login (`accountUuid`) repeated across the whole file (one login placed in
  * two group slots — both slots would attribute to it, double-counting its usage and making
  * resolution ambiguous); an `activeId` that is neither null nor one of the group's own members; an
- * over-cap folder list; or a folder that collides (by {@link folderUniquenessKey}, i.e. after
- * canonicalization) with one already claimed by any group. The caller separately heals a member id
- * that ALSO lingers in `accounts.json`.
+ * over-cap folder list; a folder that collides (by {@link folderUniquenessKey}, i.e. after
+ * canonicalization) with one already claimed by any group; a malformed or over-cap `aliases` list
+ * (optional: a file written before alias scopes existed has none and loads as before); an alias
+ * scope whose (folder, alias key) pair any group already claims; or a group with NO scope at all
+ * (neither a folder nor an alias — it could never be used and nothing could address it to dissolve
+ * it). The caller separately heals a member id that ALSO lingers in `accounts.json`.
  */
 function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFile {
   if (!isPlainObject(value)) throw new VaultError('groups.json is not an object');
@@ -255,6 +265,7 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
   const seenMemberIds = new Set<string>();
   const seenAccountUuids = new Set<string>();
   const seenFolderKeys = new Set<string>();
+  const seenAliasKeys = new Set<string>();
   const groups: StoredGroup[] = [];
   for (let i = 0; i < rawGroups.length; i += 1) {
     const g: unknown = rawGroups[i];
@@ -327,17 +338,75 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
       seenFolderKeys.add(key);
       folders.push(folder);
     }
+    const aliases = validateAliasScopes(g.aliases, `${where} (${g.id})`, platform, seenAliasKeys);
+    if (folders.length === 0 && aliases.length === 0) {
+      throw new VaultError(`${where} (${g.id}) has no folder or session alias bound`);
+    }
     groups.push({
       id: g.id,
       label: g.label,
       members,
       activeId,
       folders,
+      // Written only when non-empty, so a group without alias scopes keeps the older file shape.
+      ...(aliases.length > 0 ? { aliases } : {}),
       createdAtMs: g.createdAtMs,
       updatedAtMs: g.updatedAtMs,
     });
   }
   return { schemaVersion: GROUPS_SCHEMA_VERSION, generation: value.generation, groups };
+}
+
+/**
+ * Validate one group's optional `aliases` list, failing CLOSED like the rest of the file. Absent
+ * reads as none (a file written before alias scopes existed). Each entry must be a plain object
+ * (no forbidden key) with a non-empty string folder and a string alias whose {@link aliasKey} is
+ * non-empty and which is no longer than {@link MAX_ALIAS_LENGTH}; its (folder, alias key) pair must
+ * not already be claimed by any group — `seen` carries the pairs across the whole file, keyed by
+ * {@link aliasScopeUniquenessKey}, the SAME key the write guards use (so a write can never persist
+ * a file the next load rejects).
+ */
+function validateAliasScopes(
+  raw: unknown,
+  where: string,
+  platform: NodeJS.Platform,
+  seen: Set<string>,
+): StoredAliasScope[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new VaultError(`${where} aliases is not an array`);
+  if (raw.length > MAX_GROUP_ALIASES) {
+    throw new VaultError(`${where} holds ${raw.length} session aliases (max ${MAX_GROUP_ALIASES})`);
+  }
+  const out: StoredAliasScope[] = [];
+  for (let k = 0; k < raw.length; k += 1) {
+    const entry: unknown = raw[k];
+    const at = `${where} aliases[${k}]`;
+    if (!isPlainObject(entry)) throw new VaultError(`${at} is not an object`);
+    assertNoForbiddenKeys(entry, at);
+    const { folder, alias } = entry;
+    if (typeof folder !== 'string' || folder === '') {
+      throw new VaultError(`${at} has no string folder`);
+    }
+    if (typeof alias !== 'string' || aliasKey(alias) === '') {
+      throw new VaultError(`${at} has no alias`);
+    }
+    if (alias.length > MAX_ALIAS_LENGTH) {
+      throw new VaultError(`${at} alias is longer than ${MAX_ALIAS_LENGTH} characters`);
+    }
+    // The uniqueness key joins the two halves with a NUL, so a NUL inside either would let two
+    // different scopes produce one key. The write path never stores one (the engine refuses control
+    // characters); a hand-edited file carrying one is refused rather than keyed ambiguously.
+    if (folder.includes('\u0000') || alias.includes('\u0000')) {
+      throw new VaultError(`${at} contains a NUL character`);
+    }
+    const key = aliasScopeUniquenessKey(folder, alias, platform);
+    if (seen.has(key)) {
+      throw new VaultError(`session alias "${alias}" in ${folder} is bound more than once`);
+    }
+    seen.add(key);
+    out.push({ folder, alias });
+  }
+  return out;
 }
 
 /**
@@ -794,12 +863,14 @@ export class Vault {
    * Crash-safe ORDER — groups.json is written FIRST, then accounts.json. A crash between leaves the
    * moved rows in both files, which {@link loadState} heals toward the groups.json copy, so the
    * reservation is effectively committed the instant groups.json lands. Refuses an empty member set,
-   * a member that is unknown or already reserved elsewhere, a folder already bound to another group,
-   * and any cap breach.
+   * a member that is unknown or already reserved elsewhere, a folder or alias scope already bound to
+   * another group, a group with no scope at all (the load validator would refuse it), and any cap
+   * breach.
    */
   async createGroup(opts: {
     memberIds: readonly string[];
     folders?: readonly string[];
+    aliases?: readonly StoredAliasScope[];
     label?: string;
   }): Promise<StoredGroup> {
     const st = await this.loadState();
@@ -811,6 +882,10 @@ export class Vault {
       throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
     }
     const folders = this.checkNewFolders(st, opts.folders ?? [], null);
+    const aliases = this.checkNewAliases(st, opts.aliases ?? [], null);
+    if (folders.length === 0 && aliases.length === 0) {
+      throw new VaultError('a group needs at least one folder or session alias');
+    }
     const moved = this.takeSharedRows(st, opts.memberIds);
     const now = this.clock();
     const label = opts.label?.trim() || moved.map((m) => m.label).join(', ');
@@ -820,6 +895,7 @@ export class Vault {
       members: moved,
       activeId: null,
       folders,
+      ...(aliases.length > 0 ? { aliases } : {}),
       createdAtMs: now,
       updatedAtMs: now,
     };
@@ -892,19 +968,70 @@ export class Vault {
     return group;
   }
 
-  /** Remove a folder binding from a group (compared by key). A no-op group with zero folders is
-   *  left in place — moving its members back is {@link releaseAccounts}, a separate decision. */
+  /** Remove a folder binding from a group (compared by key). Refuses to remove the group's LAST
+   *  scope: a scope-less group is refused on load, so writing one would brick every command —
+   *  dissolving (moving the members back via {@link releaseAccounts}) is the caller's decision. */
   async removeFolderFromGroup(groupId: string, folder: string): Promise<StoredGroup> {
     const st = await this.loadState();
     const group = this.mustGroup(st, groupId);
     // Key on folderUniquenessKey (canonicalize-then-fold), the same key bind and the load validator
     // use, so a canonical query still removes a folder stored under a non-canonical spelling.
     const key = folderUniquenessKey(folder, this.platform);
-    const before = group.folders.length;
-    group.folders = group.folders.filter((f) => folderUniquenessKey(f, this.platform) !== key);
-    if (group.folders.length === before) {
+    const kept = group.folders.filter((f) => folderUniquenessKey(f, this.platform) !== key);
+    if (kept.length === group.folders.length) {
       throw new VaultError(`folder ${folder} is not bound to group ${groupId}`);
     }
+    if (kept.length === 0 && (group.aliases?.length ?? 0) === 0) {
+      throw new VaultError(
+        `folder ${folder} is group ${groupId}'s last binding; dissolve it instead`,
+      );
+    }
+    group.folders = kept;
+    group.updatedAtMs = this.clock();
+    await this.saveGroups(st);
+    return group;
+  }
+
+  /** Bind a session alias in an (already-canonical) folder to a group. Refuses a (folder, alias key)
+   *  pair any group already holds — this one included — and a cap breach. */
+  async addAliasToGroup(groupId: string, scope: StoredAliasScope): Promise<StoredGroup> {
+    const st = await this.loadState();
+    const group = this.mustGroup(st, groupId);
+    const [added] = this.checkNewAliases(st, [scope], groupId);
+    const aliases = group.aliases ?? [];
+    if (aliases.length >= MAX_GROUP_ALIASES) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_ALIASES} session aliases`);
+    }
+    group.aliases = [...aliases, added!];
+    group.updatedAtMs = this.clock();
+    await this.saveGroups(st);
+    return group;
+  }
+
+  /** Remove an alias scope from a group, matched by (folder key, alias key). Refuses the group's LAST
+   *  scope for the same reason as {@link removeFolderFromGroup}. Drops the field entirely when the
+   *  group has no alias left, keeping the older file shape. */
+  async removeAliasFromGroup(groupId: string, scope: StoredAliasScope): Promise<StoredGroup> {
+    const st = await this.loadState();
+    const group = this.mustGroup(st, groupId);
+    const key = aliasScopeUniquenessKey(scope.folder, scope.alias, this.platform);
+    const before = group.aliases ?? [];
+    const kept = before.filter(
+      (a) => aliasScopeUniquenessKey(a.folder, a.alias, this.platform) !== key,
+    );
+    if (kept.length === before.length) {
+      throw new VaultError(
+        `session alias "${scope.alias}" in ${scope.folder} is not bound to group ${groupId}`,
+      );
+    }
+    if (kept.length === 0 && group.folders.length === 0) {
+      throw new VaultError(
+        `session alias "${scope.alias}" in ${scope.folder} is group ${groupId}'s last binding; ` +
+          'dissolve it instead',
+      );
+    }
+    if (kept.length > 0) group.aliases = kept;
+    else delete group.aliases;
     group.updatedAtMs = this.clock();
     await this.saveGroups(st);
     return group;
@@ -967,6 +1094,56 @@ export class Vault {
     }
     if (out.length > MAX_GROUP_FOLDERS) {
       throw new VaultError(`a group cannot hold more than ${MAX_GROUP_FOLDERS} folders`);
+    }
+    return out;
+  }
+
+  /** Validate NEW alias scopes against the current bindings, mirroring {@link checkNewFolders}: each
+   *  needs a non-empty folder and an alias with a non-empty {@link aliasKey}, within
+   *  {@link MAX_ALIAS_LENGTH}, no NUL, unique within the set, and not already held by any group
+   *  (`ignoreGroupId` only changes which message names the collision). Keys on
+   *  {@link aliasScopeUniquenessKey}, the SAME key {@link validateGroupsFile} enforces at load.
+   *  Returns copies of the scopes. */
+  private checkNewAliases(
+    st: RegistryState,
+    scopes: readonly StoredAliasScope[],
+    ignoreGroupId: string | null,
+  ): StoredAliasScope[] {
+    const otherGroups = new Set<string>();
+    const ownGroup = new Set<string>();
+    for (const g of st.groups) {
+      const bucket = g.id === ignoreGroupId ? ownGroup : otherGroups;
+      for (const a of g.aliases ?? []) {
+        bucket.add(aliasScopeUniquenessKey(a.folder, a.alias, this.platform));
+      }
+    }
+    const seen = new Set<string>();
+    const out: StoredAliasScope[] = [];
+    for (const scope of scopes) {
+      if (typeof scope.folder !== 'string' || scope.folder === '') {
+        throw new VaultError('a session alias needs a folder');
+      }
+      if (typeof scope.alias !== 'string' || aliasKey(scope.alias) === '') {
+        throw new VaultError('a session alias cannot be empty');
+      }
+      if (scope.alias.length > MAX_ALIAS_LENGTH) {
+        throw new VaultError(
+          `a session alias cannot be longer than ${MAX_ALIAS_LENGTH} characters`,
+        );
+      }
+      if (scope.folder.includes('\u0000') || scope.alias.includes('\u0000')) {
+        throw new VaultError('a session alias cannot contain a NUL character');
+      }
+      const key = aliasScopeUniquenessKey(scope.folder, scope.alias, this.platform);
+      const name = `session alias "${scope.alias}" in ${scope.folder}`;
+      if (otherGroups.has(key)) throw new VaultError(`${name} is already bound to another group`);
+      if (ownGroup.has(key)) throw new VaultError(`${name} is already bound to this group`);
+      if (seen.has(key)) throw new VaultError(`${name} is listed twice`);
+      seen.add(key);
+      out.push({ folder: scope.folder, alias: scope.alias });
+    }
+    if (out.length > MAX_GROUP_ALIASES) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_ALIASES} session aliases`);
     }
     return out;
   }

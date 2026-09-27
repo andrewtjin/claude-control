@@ -146,10 +146,22 @@ export interface SlotLiveToken {
 }
 
 /**
- * A set of accounts reserved to a set of folders, persisted in `groups.json` beside the registry.
+ * One alias scope of a group: sessions whose CUSTOM title matches `alias` (compared by `aliasKey`,
+ * the `claude --resume` rule: lower-cased and trimmed) in EXACTLY `folder` (canonical; not its
+ * subfolders) run on the group's slot. `alias` is kept as the operator entered it, for display.
+ */
+export interface StoredAliasScope {
+  folder: string;
+  alias: string;
+}
+
+/**
+ * A set of accounts reserved to a set of scopes, persisted in `groups.json` beside the registry.
+ * A scope is a folder (the folder and its subfolders) or a session alias in one folder; a group
+ * holds at least one of either, and dissolves when its last scope goes.
  *
  * The members' FULL rows live here, not in `accounts.json` — see {@link Registry} for why. Sessions
- * started under one of `folders` run on this group's slot; auto-switch rotates only among `members`;
+ * in one of the group's scopes run on this group's slot; auto-switch rotates only among `members`;
  * the members are never used anywhere else.
  */
 export interface StoredGroup {
@@ -162,8 +174,13 @@ export interface StoredGroup {
   /** The member currently live in this group's slot, or `null` when none is. Always a member id
    *  (or null); validated on load. */
   activeId: string | null;
-  /** Canonical folder paths bound to this group (see `folderPath.ts`). Unique across all groups. */
+  /** Canonical folder paths bound to this group (see `folderPath.ts`). Unique across all groups.
+   *  May be empty when the group is bound only by session aliases. */
   folders: string[];
+  /** Session-alias scopes (see {@link StoredAliasScope}). Absent (never an empty array on disk) when
+   *  the group has none, so a file with no alias bindings is byte-for-byte the shape a build without
+   *  them wrote and reads. A (folder, alias key) pair is unique across all groups. */
+  aliases?: StoredAliasScope[];
   createdAtMs: number;
   updatedAtMs: number;
 }
@@ -210,6 +227,10 @@ export interface FolderBindingSnapshotGroup {
   /** The group's profile dir; the guard matches a session's canonical config dir against it. */
   profileDir: string;
   folders: string[];
+  /** Alias scopes as KEYS only (the folder and the lower-cased, trimmed alias): the guard compares
+   *  a prompt's session title against them and never needs the typed text. Always present (possibly
+   *  empty) in a snapshot this build writes; a guard reading an older snapshot treats it as empty. */
+  aliases: { folder: string; aliasKey: string }[];
   /** Member display labels, for the "bound to <members>" message. */
   members: string[];
 }
@@ -306,13 +327,17 @@ export interface GroupLiveResult {
   clearedSquatter?: boolean;
 }
 
-/** What {@link SwitchEngine.bindFolder} did — reported so the CLI can tell the operator exactly what
- *  moved (the whole point of the verb's chattiness in §10). */
+/** What {@link SwitchEngine.bindFolder} / {@link SwitchEngine.bindAlias} did — reported so the CLI
+ *  can tell the operator exactly what moved (the whole point of the verb's chattiness in §10). */
 export interface BindResult {
-  /** The group the folder is now bound to (created or reused). */
+  /** The group the scope is now bound to (created or reused). */
   group: StoredGroup;
-  /** True when a new group was created; false when the folder joined an existing group of the same
-   *  member set. */
+  /** The canonical folder of the scope that was bound. */
+  folder: string;
+  /** For an alias bind: the alias as bound; absent for a folder bind. */
+  alias?: string;
+  /** True when a new group was created; false when the scope joined an existing group of the same
+   *  member set (or was already bound to it). */
   created: boolean;
   /** The account that was live in the GLOBAL slot and had to be moved off it (because it became a
    *  reserved member), or `null` when no member was globally live. */
@@ -322,19 +347,21 @@ export interface BindResult {
   globalSwitchedTo: string | null;
   /** The outcome of making the group's slot live (see {@link GroupLiveResult}). */
   live: GroupLiveResult;
-  /** Running sessions found under the folder that will keep running on their current account until
+  /** Running sessions found in the scope that will keep running on their current account until
    *  relaunched (the CLI warns about these). */
   runningSessions: RunningSession[];
 }
 
-/** What {@link SwitchEngine.unbindFolder} did. */
+/** What {@link SwitchEngine.unbindFolder} / {@link SwitchEngine.unbindAlias} did. */
 export interface UnbindResult {
-  /** The canonical folder that was unbound. */
+  /** The canonical folder of the scope that was unbound. */
   folder: string;
-  /** True when removing this folder was the group's LAST binding, dissolving the group (members
-   *  returned to the shared pool); false when the group kept other folders. */
+  /** For an alias unbind: the alias as it was stored; absent for a folder unbind. */
+  alias?: string;
+  /** True when removing this scope was the group's LAST binding, dissolving the group (members
+   *  returned to the shared pool); false when the group kept other scopes. */
   dissolved: boolean;
-  /** The surviving group when the folder was removed but the group persisted; absent on dissolve. */
+  /** The surviving group when the scope was removed but the group persisted; absent on dissolve. */
   group?: StoredGroup;
   /** Member ids returned to the shared pool (only on dissolve). */
   releasedMembers: string[];
@@ -343,6 +370,40 @@ export interface UnbindResult {
   adoptedRotation: boolean;
   /** Sessions observed running under the group's folders at unbind time — non-empty is what a
    *  non-forced dissolve refuses on. */
+  runningSessions: RunningSession[];
+}
+
+/** What {@link SwitchEngine.addGroupMembers} did. */
+export interface GroupGrowResult {
+  /** The group after growing. */
+  group: StoredGroup;
+  /** Account ids newly reserved into the group (requested ids already members are skipped). */
+  added: string[];
+  /** A to-be-member that was live in the GLOBAL slot and had to be moved off it first, or null. */
+  movedOffGlobal: string | null;
+  /** The shared account the global slot was switched to when one was moved off, or null. */
+  globalSwitchedTo: string | null;
+  /** The group's slot after the grow (normally unchanged: the live member keeps the slot). */
+  live: GroupLiveResult;
+}
+
+/** What {@link SwitchEngine.removeGroupMembers} did. */
+export interface GroupShrinkResult {
+  /** The surviving group; absent when removing the last member dissolved it. */
+  group?: StoredGroup;
+  /** Account ids returned to the shared pool. */
+  removed: string[];
+  /** True when the removal took the group's last member, dissolving it (V1 unbind semantics). */
+  dissolved: boolean;
+  /** When a removed member was LIVE in the slot: the member that took the slot over, or null when
+   *  no remaining member could (the slot was then cleared, failing closed). Undefined when no
+   *  removed member was live. */
+  switchedTo?: string | null;
+  /** True when the outgoing live member's rotated token was adopted into the vault before it left
+   *  the slot (on a switch this happens inside the activation; reported here for the clear/dissolve
+   *  paths). */
+  adoptedRotation: boolean;
+  /** Sessions observed in the group's scopes (what a non-forced dissolve refuses on). */
   runningSessions: RunningSession[];
 }
 

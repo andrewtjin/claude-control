@@ -313,22 +313,127 @@ export interface FolderBoundGroup {
   folders: readonly string[];
 }
 
+/**
+ * The comparison form of a session alias: `claude --resume <v>` matches a title when
+ * `title.toLowerCase().trim() === v.toLowerCase().trim()`, so an alias binding keys on exactly that.
+ * Self-contained so the enforcement guard can embed it (see {@link embeddableFolderPathSource}) and
+ * compare a prompt's `session_title` with the same rule the vault stored the binding under.
+ */
+export function aliasKey(alias: string): string {
+  return alias.toLowerCase().trim();
+}
+
+/** One alias scope as the precedence rule reads it: the EXACT folder (canonical) the alias lives in
+ *  and the alias's {@link aliasKey}. The snapshot carries only these keys, never the typed text. */
+export interface AliasScopeKey {
+  folder: string;
+  aliasKey: string;
+}
+
+/** A group's scopes as {@link resolveSessionBinding} reads them: folder scopes (the folder and every
+ *  subfolder) and alias scopes (one session title in one exact folder). Structural, so a vault group
+ *  mapped through `scopedGroupOf` and a guard snapshot row both satisfy it. */
+export interface ScopedGroup extends FolderBoundGroup {
+  aliases?: readonly AliasScopeKey[];
+}
+
+/** Which binding a session resolves to, and by which rule. */
+export type SessionBinding =
+  | { groupId: string; via: 'alias'; folder: string; aliasKey: string }
+  | { groupId: string; via: 'folder'; folder: string };
+
+/**
+ * THE precedence rule for a session, shared by the launcher, the guard, `cctl where` and
+ * `cctl session show` so none of them can disagree about which account a session belongs on:
+ *   1. the session's folder F and custom title X are alias-bound as (F, X) -> that group;
+ *   2. else the longest bound folder containing F -> that group;
+ *   3. else `null`, the global slot.
+ * An alias scope is EXACT-folder (canonical key equality, never a subfolder): `claude --resume X`
+ * only searches the launch folder's project, so the alias namespace is per folder. `title` is the
+ * session's CUSTOM title (null/undefined/blank = unnamed, rule 1 never applies) — a generated title
+ * changes under the operator and never binds.
+ *
+ * SELF-CONTAINED BY CONTRACT, like {@link canonicalizeFolder}: it calls only {@link aliasKey},
+ * {@link folderKey} and {@link isWithin}, which the embedding places in the same scope, and it reads
+ * every group field defensively because the guard feeds it an untrusted snapshot.
+ */
+export function resolveSessionBinding(
+  folder: string,
+  title: string | null | undefined,
+  groups: readonly ScopedGroup[],
+  platform: NodeJS.Platform,
+): SessionBinding | null {
+  const key = typeof title === 'string' ? aliasKey(title) : '';
+  if (key !== '') {
+    const here = folderKey(folder, platform);
+    for (const g of groups) {
+      // Typed explicitly: Array.isArray widens a readonly array to any[] (the guard's snapshot rows
+      // are untrusted, so the check itself must stay).
+      const scopes: readonly AliasScopeKey[] = g && Array.isArray(g.aliases) ? g.aliases : [];
+      for (const a of scopes) {
+        if (
+          a &&
+          typeof a.folder === 'string' &&
+          a.aliasKey === key &&
+          folderKey(a.folder, platform) === here
+        ) {
+          return { groupId: g.id, via: 'alias', folder: a.folder, aliasKey: a.aliasKey };
+        }
+      }
+    }
+  }
+  let best: { groupId: string; via: 'folder'; folder: string } | null = null;
+  for (const g of groups) {
+    const folders: readonly string[] = g && Array.isArray(g.folders) ? g.folders : [];
+    for (const f of folders) {
+      if (typeof f === 'string' && isWithin(folder, f, platform)) {
+        if (best === null || f.length > best.folder.length) {
+          best = { groupId: g.id, via: 'folder', folder: f };
+        }
+      }
+    }
+  }
+  return best;
+}
+
 /** Resolve which group (if any) a folder runs under: the LONGEST bound folder that contains it
- *  wins (a nested binding overrides its ancestor); no match means the global slot (`null`). */
+ *  wins (a nested binding overrides its ancestor); no match means the global slot (`null`). The
+ *  folder half of {@link resolveSessionBinding}, for callers with no session title (a new session). */
 export function resolveBinding(
   folder: string,
   groups: readonly FolderBoundGroup[],
   platform: NodeJS.Platform,
 ): { groupId: string; folder: string } | null {
-  let best: { groupId: string; folder: string } | null = null;
+  const match = resolveSessionBinding(folder, null, groups, platform);
+  return match === null ? null : { groupId: match.groupId, folder: match.folder };
+}
+
+/** The composite uniqueness key of an alias scope: the folder's {@link folderUniquenessKey} and the
+ *  alias's {@link aliasKey}, joined by a NUL (neither half can contain one once validated). The ONE
+ *  key the vault's load validator, its write guards and {@link exactAliasBinding} all use. */
+export function aliasScopeUniquenessKey(
+  folder: string,
+  alias: string,
+  platform: NodeJS.Platform,
+): string {
+  return folderUniquenessKey(folder, platform) + '\u0000' + aliasKey(alias);
+}
+
+/** The group holding the alias scope (`folder`, `alias`) — same folder, same {@link aliasKey} — if
+ *  any. `aliases` rows carry the alias as entered (the vault's shape). */
+export function exactAliasBinding(
+  folder: string,
+  alias: string,
+  groups: readonly { id: string; aliases?: readonly { folder: string; alias: string }[] }[],
+  platform: NodeJS.Platform,
+): string | null {
+  const key = aliasScopeUniquenessKey(folder, alias, platform);
   for (const g of groups) {
-    for (const f of g.folders) {
-      if (isWithin(folder, f, platform)) {
-        if (best === null || f.length > best.folder.length) best = { groupId: g.id, folder: f };
-      }
+    for (const a of g.aliases ?? []) {
+      if (aliasScopeUniquenessKey(a.folder, a.alias, platform) === key) return g.id;
     }
   }
-  return best;
+  return null;
 }
 
 /** The group holding this EXACT folder (same key), if any. Used to refuse re-binding a folder to a
@@ -408,20 +513,49 @@ export function checkBindTarget(
   return { ok: true };
 }
 
+/** Decide whether a canonical folder may hold an ALIAS scope. Lighter than {@link checkBindTarget}
+ *  on purpose: an alias scope covers one session title in that exact folder, never its subfolders,
+ *  so a volume root or the home directory (where people do run Claude Code) captures nothing else
+ *  and is allowed. What stays refused is a folder INSIDE cctl's own state or the main config dir —
+ *  a session running there could write the machinery that manages it. `homeDir` is unused. */
+export function checkAliasFolder(
+  folder: string,
+  deps: BindTargetDeps,
+): { ok: true } | { ok: false; reason: string } {
+  if (!deps.isDirectory(folder)) {
+    return { ok: false, reason: 'not an existing directory' };
+  }
+  const reserved: Array<{ path: string; name: string }> = [
+    { path: deps.vaultDir, name: 'the cctl vault directory' },
+    { path: deps.profilesRoot, name: 'the cctl profiles directory' },
+    { path: deps.mainConfigDir, name: 'the Claude Code config directory' },
+  ];
+  for (const r of reserved) {
+    if (isWithin(folder, r.path, deps.platform)) {
+      return { ok: false, reason: `is inside ${r.name}` };
+    }
+  }
+  return { ok: true };
+}
+
 /**
- * The embeddable source of the canonicalizer trio, for the enforcement hook script.
+ * The embeddable source of the canonicalizer and the precedence rule, for the enforcement hook.
  *
  * Returns a program string that, when run in an empty scope (e.g. via `new Function`), defines
- * `canonicalizeFolder`, `folderKey` and `isWithin` as locals. The hook appends its own
- * `return {...}` (or the caller does). Because each function is self-contained, the emitted text
- * carries everything it needs; the colocated test proves the embedded `canonicalizeFolder` still
- * agrees with the live one across the whole case table, which is what stops the two copies drifting.
+ * `canonicalizeFolder`, `folderKey`, `isWithin`, `aliasKey` and `resolveSessionBinding` as locals.
+ * The hook appends its own `return {...}` (or the caller does). Because each function is
+ * self-contained (or calls only the others emitted here), the text carries everything it needs; the
+ * colocated test proves the embedded copies agree with the live ones across the case tables, which
+ * is what stops the two copies drifting.
  */
 export function embeddableFolderPathSource(): string {
-  // `folderKey` must precede `isWithin` (which calls it) so both resolve in the emitted scope.
+  // `folderKey` must precede `isWithin` (which calls it), and both plus `aliasKey` must precede
+  // `resolveSessionBinding` (which calls all three), so every name resolves in the emitted scope.
   return [
     `const folderKey = ${folderKey.toString()};`,
     `const isWithin = ${isWithin.toString()};`,
+    `const aliasKey = ${aliasKey.toString()};`,
     `const canonicalizeFolder = ${canonicalizeFolder.toString()};`,
+    `const resolveSessionBinding = ${resolveSessionBinding.toString()};`,
   ].join('\n');
 }
