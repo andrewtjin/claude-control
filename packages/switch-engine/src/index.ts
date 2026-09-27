@@ -110,6 +110,17 @@ export {
   type BindTargetDeps,
   type FolderBoundGroup,
 } from './folderPath.js';
+// Where a transcript's conversation belongs — the one reading the launcher, the guard (embedded),
+// the session catalog and the running-session scan all key alias bindings on (see recordedFolder.ts).
+export {
+  readRecordedFolder,
+  recordedFolderFor,
+  embeddableRecordedFolderSource,
+  RECORDED_FOLDER_HEAD_BYTES,
+  RECORDED_FOLDER_TAIL_BYTES,
+  type RecordedFolderFs,
+  type RecordedFolderRead,
+} from './recordedFolder.js';
 // Terminal-safe text stripping — shared verbatim between cctl-side renderers (the CLI re-exports
 // it) and the enforcement guard, which embeds the compiled source (see terminalSafe.ts).
 export { sanitizeTerminalText, embeddableSanitizeSource } from './terminalSafe.js';

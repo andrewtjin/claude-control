@@ -11,6 +11,14 @@
 // test evals the embedded copy and proves it agrees with the live function on the full case table.
 // Do not "tidy" a nested helper up to module scope; that silently breaks the hook.
 
+import { embedFunctionAs } from './embed.js';
+import { projectDirMatches, projectDirStem } from './recordedFolder.js';
+
+// Claude Code's project-directory naming lives with the transcript reading that uses it
+// (recordedFolder.ts); re-exported here, where the guard's embedded helpers have always come from.
+export { embedFunctionAs } from './embed.js';
+export { projectDirMatches, projectDirStem } from './recordedFolder.js';
+
 /** Platform + filesystem seam for {@link canonicalizeFolder}. Passed in (never read from
  *  `process`/`node:*`) so the function stays self-contained and embeddable. */
 export interface CanonicalizeDeps {
@@ -358,39 +366,6 @@ export function aliasKey(alias: string): string {
 }
 
 /**
- * Claude Code's project-directory name for a session launched in `cwd` (its transcripts live in
- * `<config dir>/projects/<name>/`): every character that is not an ASCII letter or digit becomes
- * `-`, per UTF-16 code unit, exactly as Claude Code's own sanitizer does. Past 200 characters
- * Claude Code truncates and appends a hash cctl does not reproduce, so this returns the truncated
- * STEM; {@link projectDirMatches} accounts for the suffix. Lossy by construction (`C:\a_b` and
- * `C:\a-b` share one name), so a name only narrows where a session can live — its recorded cwd
- * decides.
- *
- * SELF-CONTAINED BY CONTRACT (the guard embeds it): references nothing at module scope.
- */
-export function projectDirStem(cwd: string): string {
-  const max = 200;
-  const name = cwd.replace(/[^a-zA-Z0-9]/g, '-');
-  return name.length <= max ? name : name.slice(0, max);
-}
-
-/**
- * Whether project directory `name` can hold sessions launched in `cwd`: its exact encoding, or, for
- * a long cwd, the truncated stem plus Claude Code's hash suffix. Case-insensitive, because Windows
- * drive letters and folders reach Claude Code in whatever case the shell used (and Claude Code
- * compares these names case-insensitively itself). A true answer is only a candidate.
- *
- * SELF-CONTAINED BY CONTRACT: calls only {@link projectDirStem}, which the embedding places in the
- * same scope.
- */
-export function projectDirMatches(name: string, cwd: string): boolean {
-  const stem = projectDirStem(cwd).toLowerCase();
-  const n = name.toLowerCase();
-  if (stem.length < 200) return n === stem;
-  return n === stem || n.startsWith(stem + '-');
-}
-
-/**
  * Quote `text` as ONE literal argument for the shell an operator pastes a printed command into:
  * PowerShell on Windows (the documented shell there), a POSIX shell elsewhere. Single quotes in
  * both, because only they make every other character inert (`$(...)`, `$HOME`, backticks, `"`, `&`
@@ -655,19 +630,4 @@ export function embeddableFolderPathSource(): string {
     embedFunctionAs(projectDirMatches, 'projectDirMatches'),
     embedFunctionAs(shellQuoteArg, 'shellQuoteArg'),
   ].join('\n');
-}
-
-/**
- * Emit `fn`'s source bound to `as` in the embedding scope — and ALSO to the function's own name
- * when that differs. A bundler that meets two top-level functions of one name renames one (esbuild
- * makes it `aliasKey2`), and renames the CALLS to it inside sibling functions too: the embedded
- * `resolveSessionBinding` would then call `aliasKey2`, which a plain `const aliasKey = ...` never
- * defines, and the guard would throw on every prompt (failing open — enforcement silently off). So
- * the emitted scope defines both names; the guard glue keeps calling the source name `as`. Order is
- * free: the functions only call each other at run time, after every `const` is initialized.
- */
-export function embedFunctionAs(fn: (...args: never[]) => unknown, as: string): string {
-  const own = fn.name;
-  if (own === as || !/^[A-Za-z_$][\w$]*$/.test(own)) return `const ${as} = ${fn.toString()};`;
-  return `const ${own} = ${fn.toString()};\nconst ${as} = ${own};`;
 }
