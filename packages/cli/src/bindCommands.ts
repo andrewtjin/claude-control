@@ -121,6 +121,7 @@ async function buildGroupViews(engine: Engine): Promise<BindingGroupView[]> {
   return groups.map((g) => {
     const liveMemberId = live.get(groupSlotId(g.id)) ?? null;
     return {
+      id: g.id,
       label: g.label,
       folders: g.folders,
       aliases: g.aliases ?? [],
@@ -224,6 +225,42 @@ export async function resolveLaunchBinding(input: {
   return { binding, alias };
 }
 
+/**
+ * `cctl unbind --group <id|label>`: dissolve a whole binding — every account back to the shared pool,
+ * V1 unbind semantics (refused while sessions run in its scopes, unless `force`). The way out for a
+ * binding left with no scope at all (which no folder or alias can name), and a shortcut for one with
+ * many. The ref is the group id (as `cctl bindings` / `cctl doctor` print it) or its exact label.
+ */
+async function unbindGroup(engine: Engine, ref: string, force: boolean): Promise<void> {
+  const groups = await engine.listGroups();
+  const byId = groups.find((g) => g.id === ref.trim());
+  const byLabel = groups.filter((g) => g.label === ref);
+  if (byId === undefined && byLabel.length > 1) {
+    fail(
+      `${byLabel.length} bindings are labelled "${ref}"; pass the id (cctl bindings lists them)`,
+    );
+  }
+  const group = byId ?? byLabel[0];
+  if (group === undefined) fail(`no binding with id or label "${ref}" (cctl bindings lists them)`);
+  try {
+    const res = await engine.removeGroupMembers(
+      group.id,
+      group.members.map((m) => m.id),
+      force ? { force: true } : {},
+    );
+    process.stdout.write(
+      `Dissolved the binding ${sanitizeForTerminal(group.label)}: ${res.removed.length} account(s) ` +
+        'returned to the shared pool' +
+        (res.adoptedRotation ? ' (adopted the profile’s latest token first)' : '') +
+        '.\n  the profile dir is kept for history; its live credentials were cleared.\n',
+    );
+    await reconcileBindGuard(engine, defaultPaths());
+  } catch (err) {
+    if (err instanceof SwitchEngineError) fail(err.message);
+    throw err;
+  }
+}
+
 /** Resolve one account ref against the full registry (shared pool + reserved members). */
 async function resolveAcrossAll(engine: Engine, ref: string): Promise<AccountView> {
   const all = (await engine.listAllAccounts()) as StoredAccount[];
@@ -321,11 +358,21 @@ export function buildBindCommands(program: Command): void {
   // unbind
   // -------------------------------------------------------------------------
   program
-    .command('unbind <folder>')
-    .description('remove a folder binding; the last folder of a group dissolves it')
+    .command('unbind [folder]')
+    .description(
+      'remove a folder binding; the last folder of a group dissolves it (--group <id|label>: ' +
+        'dissolve a whole binding, e.g. one left with no folder or session)',
+    )
     .option('--force', 'dissolve even when sessions are observed running under the folder')
-    .action(async (folder: string, opts: { force?: boolean }) => {
+    .option('--group <ref>', 'dissolve the binding with this id or label, whatever its scopes')
+    .action(async (folder: string | undefined, opts: { force?: boolean; group?: string }) => {
       const engine = buildEngine();
+      if (opts.group !== undefined) {
+        if (folder !== undefined) fail('pass a folder or --group, not both');
+        await unbindGroup(engine, opts.group, opts.force === true);
+        return;
+      }
+      if (folder === undefined) fail('pass the folder to unbind (or --group <id|label>)');
       try {
         const result = await engine.unbindFolder(folder, opts.force ? { force: true } : {});
         const folderText = sanitizeForTerminal(result.folder);

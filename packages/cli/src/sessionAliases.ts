@@ -34,7 +34,7 @@ import {
   type StoredGroup,
   type SwitchEngine,
 } from '@claude-control/switch-engine';
-import { detectPalette } from './ansi.js';
+import { detectPalette, sanitizeForTerminal } from './ansi.js';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import type { LaunchAliasDeps } from './launcher.js';
 import {
@@ -164,10 +164,13 @@ async function withBindings(deps: SessionAliasDeps, read: AccountsRead): Promise
   const groups = await engine.listGroups();
   const scoped = groups.map((g) => scopedGroupOf(g, deps.platform));
   const currentId = deps.env[SESSION_ID_ENV]?.trim().toLowerCase();
-  const currentSlot =
-    currentId !== undefined && currentId !== ''
-      ? await engine.slotForConfigDir(deps.env.CLAUDE_CONFIG_DIR ?? null)
-      : null;
+  // This session's own slot, from the RAW CLAUDE_CONFIG_DIR it runs with (deps.paths is the main
+  // config dir, seen through a group profile). A config dir cctl does not manage is an unknown slot,
+  // never a guess of 'global'.
+  const isSession = currentId !== undefined && currentId !== '';
+  const currentSlot = isSession
+    ? await engine.recognizedSlotForConfigDir(deps.env.CLAUDE_CONFIG_DIR ?? null)
+    : null;
   const slotLabel = (slot: string): string => {
     if (slot === 'global') return 'the shared account';
     const g = groups.find((x) => groupSlotId(x.id) === slot);
@@ -199,7 +202,7 @@ async function withBindings(deps: SessionAliasDeps, read: AccountsRead): Promise
       members: group?.members.map((mm) => mm.label) ?? [],
       requiredSlot,
       slot,
-      slotSource: slot === null ? null : isCurrent ? 'env' : 'recorded',
+      slotSource: isCurrent ? 'env' : slot === null ? null : 'recorded',
       slotLabel: slot === null ? null : slotLabel(slot),
       inScope: slot === null ? null : slot === requiredSlot,
     };
@@ -292,7 +295,10 @@ export async function runSessionShow(
   }
 
   if (resolution.kind === 'none') {
-    fail(`no session with id or alias "${target}" — cctl session aliases lists the aliases here`);
+    fail(
+      `no session with id or alias "${sanitizeForTerminal(target)}" — cctl session aliases lists ` +
+        'the aliases here',
+    );
   }
   if (resolution.kind === 'ambiguous') {
     if (options.json === true) {

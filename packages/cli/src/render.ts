@@ -5,7 +5,11 @@
 // TTY; see ansi.ts), and layout is always computed on plain text before painting, so
 // styled and plain output align identically.
 
-import type { DedupeReport, StoredAccount } from '@claude-control/switch-engine';
+import {
+  shellQuoteArg,
+  type DedupeReport,
+  type StoredAccount,
+} from '@claude-control/switch-engine';
 import type {
   AccountUsage,
   TokenBucketRow,
@@ -472,6 +476,8 @@ export interface BindingMemberView {
 
 /** One folder-bound group for display. */
 export interface BindingGroupView {
+  /** The group's id — what `cctl unbind --group` takes; shown only for a binding with no scope. */
+  id?: string;
   label: string;
   folders: string[];
   /** Session-alias scopes (the alias as bound, in its exact folder); absent or empty when none. */
@@ -514,10 +520,24 @@ export function renderBindingGroups(
       ? '  ' + palette.red('live:    none usable (re-login a member: cctl accounts relogin <ref>)')
       : null;
     const profileLine = '  profile: ' + palette.dim(sanitizeForTerminal(g.profileDir));
+    // No folder and no session: the binding routes nothing (a cctl without session aliases rewrote
+    // its file), while its accounts stay reserved. Say so, with both ways out.
+    const scopeless = g.folders.length === 0 && (g.aliases ?? []).length === 0;
+    const scopeLines = scopeless
+      ? [
+          '  ' +
+            palette.yellow(
+              'scope:   none — this binding routes nothing; bind a session or folder to these ' +
+                'accounts again, or release them: ' +
+                `cctl unbind --group ${sanitizeForTerminal(g.id ?? '<id>')}`,
+            ),
+        ]
+      : [];
     return [
       header,
       ...folderLines,
       ...aliasLines,
+      ...scopeLines,
       memberLine,
       ...(liveLine ? [liveLine] : []),
       profileLine,
@@ -587,6 +607,30 @@ export interface WhereAliasView {
   liveMemberLabel: string | null;
 }
 
+/**
+ * The command that resumes a named session on its bound account, safe to paste: the FULL alias as one
+ * single-quoted literal for the operator's shell (see switch-engine's shellQuoteArg — PowerShell on
+ * Windows, POSIX elsewhere), trimmed the way `claude --resume` trims it. Display text around it may
+ * be shortened; this never is. An alias a terminal could not show verbatim (one carrying a control or
+ * bidi character — a title read from a transcript, never a bound alias, which bind refuses) cannot be
+ * printed as a working argument, so the session id is used instead when the caller has it, else
+ * the bare picker form.
+ */
+export function resumeCommand(
+  alias: string,
+  opts: { sessionId?: string; platform?: NodeJS.Platform } = {},
+): string {
+  const platform = opts.platform ?? process.platform;
+  const text = alias.trim();
+  if (text !== '' && sanitizeForTerminal(text) === text) {
+    return `cctl claude --resume ${shellQuoteArg(text, platform)}`;
+  }
+  const id = opts.sessionId;
+  return id !== undefined && /^[0-9a-f-]{8,64}$/i.test(id)
+    ? `cctl claude --resume ${id}`
+    : 'cctl claude --resume';
+}
+
 /** The resolution `cctl where` explains for a folder. */
 export interface WhereView {
   /** The canonical folder queried. */
@@ -615,7 +659,7 @@ function whereAliasLines(view: WhereView, palette: Palette): string[] {
     lines.push(
       `  "${alias}" -> ${palette.bold(sanitizeForTerminal(a.groupLabel))} (${members}), live: ${live}`,
     );
-    lines.push(`    start or resume it with: cctl claude --resume "${alias}"`);
+    lines.push(`    start or resume it with: ${resumeCommand(a.alias)}`);
   }
   return lines;
 }
@@ -680,7 +724,8 @@ export interface SessionBindingView {
   members: string[];
   /** The slot the rule requires: 'global' or 'group:<id>'. */
   requiredSlot: string;
-  /** The slot the session runs (or last ran) in, or null when nothing recorded it. */
+  /** The slot the session runs (or last ran) in, or null when it is unknown: nothing recorded it,
+   *  or (slotSource 'env') this session runs on a config dir cctl does not manage. */
   slot: string | null;
   /** Where `slot` came from: this process's own session env, or the daemon's record. */
   slotSource: 'env' | 'recorded' | null;
@@ -762,14 +807,20 @@ function bindingLines(b: SessionBindingView, palette: Palette): string[] {
         : 'nothing: it runs on the shared account';
   const out = [`Bound to  ${bound}`];
   if (b.inScope === null) {
-    out.push(`Scope     ${palette.dim('unknown (no slot recorded for this session yet)')}`);
+    out.push(
+      `Scope     ${palette.dim(
+        b.slotSource === 'env'
+          ? 'unknown (this session runs on a config dir cctl does not manage)'
+          : 'unknown (no slot recorded for this session yet)',
+      )}`,
+    );
   } else if (b.inScope) {
     out.push(`Scope     in scope`);
   } else {
     const on = sanitizeForTerminal(b.slotLabel ?? b.slot ?? '?');
     const fix =
       b.via === 'alias'
-        ? `resume it with: cctl claude --resume "${sanitizeForTerminal(b.alias ?? '')}"`
+        ? `resume it with: ${resumeCommand(b.alias ?? '')}`
         : 'start it again with: cctl claude';
     out.push(
       palette.yellow(

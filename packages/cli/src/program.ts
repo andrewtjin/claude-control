@@ -135,6 +135,7 @@ import {
 } from './sessionClient.js';
 import {
   checkGuardHook,
+  checkBindingScopes,
   checkGuardSnapshot,
   checkLiveLogin,
   checkPowerShellWrapper,
@@ -577,6 +578,7 @@ export function buildProgram(): Command {
       const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
       checks.push(
         await checkSlots(engine),
+        await checkBindingScopes(engine),
         await checkGuardSnapshot(engine),
         checkGuardHook(paths, groups.length > 0),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),

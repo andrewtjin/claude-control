@@ -139,6 +139,19 @@ describe('the CLI failure path', () => {
     }
   });
 
+  it('strips terminal controls a message echoes, keeping its line breaks', () => {
+    const written: string[] = [];
+    const previous = process.exitCode;
+    try {
+      reportFatal(new CliFailure('no account matches "x\u001b]0;pwned\u0007"\nsecond line'), {
+        write: (text: string) => written.push(text),
+      });
+      expect(written.join('')).toBe('error: no account matches "x]0;pwned"\nsecond line\n');
+    } finally {
+      process.exitCode = previous;
+    }
+  });
+
   it('renders a non-Error throw without pretending it has a message', () => {
     const written: string[] = [];
     const previous = process.exitCode;

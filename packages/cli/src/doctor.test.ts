@@ -11,6 +11,7 @@ import {
   checkNodeVersion,
   checkSessionRuntime,
   checkSlots,
+  checkBindingScopes,
   checkGuardSnapshot,
   checkGuardHook,
   checkVersionSkew,
@@ -492,5 +493,47 @@ describe('checkPowerShellWrapper', () => {
     const check = checkPowerShellWrapper(text, (p) => p === node);
     expect(check.ok).toBe(false);
     expect(check.detail).toContain(entry);
+  });
+});
+
+describe('checkBindingScopes', () => {
+  const member = (id: string) => ({
+    id,
+    label: id,
+    quarantined: false,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+  });
+  const group = (id: string, over: Record<string, unknown> = {}) => ({
+    id,
+    label: `L-${id}`,
+    members: [member(`m-${id}`)],
+    activeId: null,
+    folders: [] as string[],
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    ...over,
+  });
+
+  it('passes when every binding has a folder or a session', async () => {
+    const check = await checkBindingScopes({
+      listGroups: () =>
+        Promise.resolve([
+          group('a', { folders: ['C:\\work'] }),
+          group('b', { aliases: [{ folder: 'C:\\repo', alias: 'x' }] }),
+        ]),
+    });
+    expect(check).toMatchObject({ name: 'binding-scopes', ok: true });
+  });
+
+  it('flags a binding left with no scope, naming it and the release command', async () => {
+    const check = await checkBindingScopes({
+      listGroups: () => Promise.resolve([group('g1'), group('g2', { folders: ['C:\\x'] })]),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('1 binding(s) route nothing');
+    expect(check.detail).toContain('L-g1 (m-g1)');
+    expect(check.detail).toContain('cctl unbind --group g1');
+    expect(check.detail).not.toContain('g2');
   });
 });

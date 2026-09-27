@@ -50,6 +50,9 @@ const engine = vi.hoisted(() => ({
   unbindFolder: vi.fn((f: string): Promise<never> =>
     Promise.reject(new Error(`unbindFolder(${f}) not stubbed`)),
   ),
+  removeGroupMembers: vi.fn((id: string): Promise<never> =>
+    Promise.reject(new Error(`removeGroupMembers(${id}) not stubbed`)),
+  ),
   ensureGroupLive: vi.fn((): Promise<never> =>
     Promise.reject(new Error('ensureGroupLive not stubbed')),
   ),
@@ -1087,5 +1090,74 @@ describe('folder-bound account commands', () => {
     expect(r.exited).toBe(true);
     expect(r.err).toContain('cannot capture inside a folder profile');
     expect(r.err).toContain('--fresh');
+  });
+});
+
+describe('cctl unbind --group', () => {
+  // A binding with no folder and no session left (what a cctl without session aliases leaves when
+  // it rewrites the file) can be named by no scope, so it is released by its id or label.
+  const member = { id: 'm-1', label: 'work', quarantined: false, createdAtMs: 1, updatedAtMs: 1 };
+  const scopeless = {
+    id: '11111111-2222-4333-8444-555555555555',
+    label: 'work',
+    members: [member],
+    activeId: 'm-1',
+    folders: [],
+  };
+  let dir: string;
+  beforeEach(async () => {
+    // The dissolve rewires the guard hook through defaultPaths(): keep it inside a temp dir.
+    dir = await mkdtemp(join(tmpdir(), 'cctl-unbind-group-'));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(dir, 'claude'));
+    vi.stubEnv('LOCALAPPDATA', dir);
+    vi.stubEnv('XDG_DATA_HOME', dir);
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    engine.listGroups.mockReset();
+    engine.listGroups.mockResolvedValue([]);
+    engine.removeGroupMembers.mockReset();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('dissolves the binding with that id: every account back to the shared pool', async () => {
+    engine.listGroups.mockResolvedValue([scopeless]);
+    engine.removeGroupMembers.mockResolvedValue({
+      removed: ['m-1'],
+      dissolved: true,
+      adoptedRotation: false,
+      runningSessions: [],
+    } as never);
+    const r = await runCli(['unbind', '--group', scopeless.id]);
+    expect(r.exited).toBe(false);
+    expect(engine.removeGroupMembers).toHaveBeenCalledWith(scopeless.id, ['m-1'], {});
+    expect(r.out).toContain('Dissolved the binding work: 1 account(s) returned to the shared pool');
+  });
+
+  it('accepts the exact label, and passes --force through', async () => {
+    engine.listGroups.mockResolvedValue([scopeless]);
+    engine.removeGroupMembers.mockResolvedValue({
+      removed: ['m-1'],
+      dissolved: true,
+      adoptedRotation: false,
+      runningSessions: [],
+    } as never);
+    await runCli(['unbind', '--group', 'work', '--force']);
+    expect(engine.removeGroupMembers).toHaveBeenCalledWith(scopeless.id, ['m-1'], { force: true });
+  });
+
+  it('refuses an unknown or ambiguous ref, and a folder together with --group', async () => {
+    engine.listGroups.mockResolvedValue([scopeless, { ...scopeless, id: 'other-id' }]);
+    expect((await runCli(['unbind', '--group', 'nope'])).err).toContain(
+      'no binding with id or label "nope"',
+    );
+    expect((await runCli(['unbind', '--group', 'work'])).err).toContain(
+      '2 bindings are labelled "work"; pass the id',
+    );
+    expect((await runCli(['unbind', '.', '--group', 'work'])).err).toContain(
+      'pass a folder or --group, not both',
+    );
+    expect((await runCli(['unbind'])).err).toContain('pass the folder to unbind');
+    expect(engine.removeGroupMembers).not.toHaveBeenCalled();
   });
 });

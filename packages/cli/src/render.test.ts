@@ -807,6 +807,17 @@ describe('renderBindingGroups', () => {
     expect(renderBindingGroups([], PLAIN_PALETTE)).toBe('');
   });
 
+  it('flags a binding with no folder and no session, with the command that releases it', () => {
+    const out = renderBindingGroups(
+      [{ ...group, id: 'g-1', folders: [], aliases: [] }],
+      PLAIN_PALETTE,
+    );
+    expect(out).toContain('scope:   none — this binding routes nothing');
+    expect(out).toContain('cctl unbind --group g-1');
+    // A binding with a scope never carries the line.
+    expect(renderBindingGroups([group], PLAIN_PALETTE)).not.toContain('scope:');
+  });
+
   it('flags a group with no working account', () => {
     const dead = { ...group, members: [], noWorkingAccount: true };
     expect(renderBindingGroups([dead], PLAIN_PALETTE)).toContain('none usable');
@@ -930,7 +941,9 @@ describe('renderWhere', () => {
     const out = renderWhere(view, PLAIN_PALETTE);
     expect(out).toContain('Named sessions bound here (they outrank the folder rule above):');
     expect(out).toContain('"Auth Work" -> Research (research@x, spare@x), live: research@x');
-    expect(out).toContain('start or resume it with: cctl claude --resume "Auth Work"');
+    // The resume command quotes the alias as ONE single-quoted literal (paste-safe in PowerShell and
+    // POSIX shells alike; a double-quoted "$(...)" would run a command).
+    expect(out).toContain("start or resume it with: cctl claude --resume 'Auth Work'");
     // Alongside a folder binding too, and before the VS Code snippet (whose JSON must still parse).
     const both = renderWhere(
       {
@@ -1253,7 +1266,8 @@ describe('renderSessionDetails — Bound to', () => {
       binding({ slot: 'global', slotLabel: 'the shared account', inScope: false }),
     );
     expect(lines).toContain(
-      'Scope     OUT of scope: it runs on the shared account; resume it with: cctl claude --resume "Auth Work"',
+      // Single-quoted: the paste-safe literal (see resumeCommand).
+      "Scope     OUT of scope: it runs on the shared account; resume it with: cctl claude --resume 'Auth Work'",
     );
     // A recorded (not live) slot is reported in the past tense.
     const recorded = render(

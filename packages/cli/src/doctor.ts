@@ -318,6 +318,42 @@ export async function checkSlots(engine: Pick<SwitchEngine, 'checkSlots'>): Prom
   }
 }
 
+/** A binding with no folder and no session alias routes nothing: it is what a cctl without session
+ *  aliases leaves behind when it rewrites a file holding an alias-only binding (it drops the alias
+ *  scopes it does not know). Its accounts stay reserved to it — usable nowhere but with an explicit
+ *  `--account` — until a scope is bound to them again or the binding is dissolved. Flagged by name
+ *  with the release command (by id: stable and paste-safe). */
+export async function checkBindingScopes(
+  engine: Pick<SwitchEngine, 'listGroups'>,
+): Promise<DoctorCheck> {
+  try {
+    const scopeless = (await engine.listGroups()).filter(
+      (g) => g.folders.length === 0 && (g.aliases ?? []).length === 0,
+    );
+    if (scopeless.length === 0) {
+      return { name: 'binding-scopes', ok: true, detail: 'every binding has a folder or session' };
+    }
+    return {
+      name: 'binding-scopes',
+      ok: false,
+      detail:
+        `${scopeless.length} binding(s) route nothing (no folder or session left): ` +
+        scopeless
+          .map((g) => `${g.label} (${g.members.map((m) => m.label).join(', ')})`)
+          .join('; ') +
+        ' — bind a session or folder to those accounts again (cctl session bind / cctl bind), or ' +
+        'release them: ' +
+        scopeless.map((g) => `cctl unbind --group ${g.id}`).join('; '),
+    };
+  } catch (err) {
+    return {
+      name: 'binding-scopes',
+      ok: false,
+      detail: `could not read the bindings: ${(err as Error).message}`,
+    };
+  }
+}
+
 /** The guard reads a snapshot copy of the groups file, stamped with the generation it was built
  *  from. If that lags the live groups generation, the guard is enforcing a stale binding view until
  *  the daemon restarts or a `cctl settings` change rewrites it. No groups + no snapshot is a pass

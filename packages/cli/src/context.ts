@@ -12,6 +12,7 @@ import { sessionIdentities } from '@claude-control/daemon';
 import {
   SwitchEngine,
   defaultPaths,
+  sanitizeTerminalText,
   type BindEnforceMode,
   type Logger,
   type Paths,
@@ -173,7 +174,14 @@ export function reportFatal(
   err: unknown,
   sink: { write(text: string): unknown } = process.stderr,
 ): void {
-  const line = `error: ${err instanceof Error ? err.message : String(err)}\n`;
+  // A message can echo operator- or file-supplied text (an account ref, a session alias or id, a
+  // folder), so what a terminal would interpret is stripped here, at the one sink — line by line, so
+  // a line break a message means to carry survives.
+  const message = (err instanceof Error ? err.message : String(err))
+    .split('\n')
+    .map((part) => sanitizeTerminalText(part))
+    .join('\n');
+  const line = `error: ${message}\n`;
   sink.write(paintErrorLine(line, detectPalette(process.stderr)));
   process.exitCode = 1;
 }

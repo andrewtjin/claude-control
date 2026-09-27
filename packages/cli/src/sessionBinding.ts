@@ -22,6 +22,7 @@ import {
   groupScopeCount,
   groupSlotId,
   resolveAccountRef,
+  shellQuoteArg,
   type AccountView,
   type StoredAccount,
   type StoredGroup,
@@ -31,6 +32,7 @@ import { readSessionCatalog, type SessionMeta } from '@claude-control/daemon';
 import { detectPalette, sanitizeForTerminal, type Palette } from './ansi.js';
 import { buildEngine, fail } from './context.js';
 import { reconcileBindGuard } from './bindCommands.js';
+import { resumeCommand } from './render.js';
 import { SESSION_ID_ENV, type SessionAliasDeps } from './sessionAliases.js';
 
 export interface SessionBindOptions {
@@ -159,8 +161,11 @@ async function resolveRefs(engine: SwitchEngine, refsArg: string): Promise<strin
   return ids;
 }
 
-/** The account this session runs on RIGHT NOW: its slot (from the process's CLAUDE_CONFIG_DIR — a
- *  group profile, else the global slot) and that slot's reconciled live account. */
+/** The account this session runs on RIGHT NOW: its slot (from the session's own, RAW
+ *  CLAUDE_CONFIG_DIR — the main config dir or unset for the global slot, a live group profile for
+ *  that group's) and that slot's reconciled live account. A config dir cctl does not manage is
+ *  refused rather than guessed: its account is unknown, and defaulting to the global one would bind
+ *  (and move the global slot off) an account this session is not on. */
 async function currentAccountId(engine: SwitchEngine, deps: SessionAliasDeps): Promise<string> {
   const sessionId = deps.env[SESSION_ID_ENV]?.trim();
   if (sessionId === undefined || sessionId === '') {
@@ -169,7 +174,15 @@ async function currentAccountId(engine: SwitchEngine, deps: SessionAliasDeps): P
         'account to default to (cctl session bind <alias> <account>[,<account>...])',
     );
   }
-  const slot = await engine.slotForConfigDir(deps.env.CLAUDE_CONFIG_DIR ?? null);
+  const configDir = deps.env.CLAUDE_CONFIG_DIR ?? null;
+  const slot = await engine.recognizedSlotForConfigDir(configDir);
+  if (slot === null) {
+    fail(
+      `cannot tell which account this session runs on: its CLAUDE_CONFIG_DIR ` +
+        `(${sanitizeForTerminal(configDir ?? '')}) is neither the main config dir nor a bound ` +
+        'profile. Pass the accounts: cctl session bind <alias> <account>[,<account>...]',
+    );
+  }
   const live = await engine.getActiveId(slot);
   if (live === null) {
     fail(
@@ -246,8 +259,10 @@ async function slotLines(
 
 /**
  * When THIS command runs inside a Claude Code session that is now outside its binding (its slot is
- * not the one the precedence rule names for it), say so plainly: it keeps its slot's account until it
- * exits, the guard will flag its next prompt, and how to resume it on the bound account.
+ * not the one the precedence rule names for it), say so plainly: it stays on its slot until it exits
+ * (following whatever account is live there — a running session picks up its slot's current login
+ * on its next request), the guard will flag its next prompt, and how to resume it on the bound
+ * account. Nothing is said for a session on a config dir cctl does not manage (its slot is unknown).
  */
 async function currentSessionNote(
   engine: SwitchEngine,
@@ -259,18 +274,19 @@ async function currentSessionNote(
   const title = customTitleOf(current);
   const required = await engine.resolveSessionBinding(current.folder, title);
   const requiredSlot = required === null ? 'global' : groupSlotId(required.groupId);
-  const slot = await engine.slotForConfigDir(deps.env.CLAUDE_CONFIG_DIR ?? null);
-  if (slot === requiredSlot) return null;
+  const slot = await engine.recognizedSlotForConfigDir(deps.env.CLAUDE_CONFIG_DIR ?? null);
+  if (slot === null || slot === requiredSlot) return null;
   const all = await engine.listAllAccounts();
   const liveNow = await engine.getActiveId(slot);
-  const on = liveNow === null ? 'its current slot' : labelsOf([liveNow], all);
+  const where = slot === 'global' ? 'the global slot' : 'its binding’s slot';
+  const on = liveNow === null ? where : `${where} (now ${labelsOf([liveNow], all)})`;
   const resume =
     title === null
       ? 'start it again here with: cctl claude'
-      : `resume it on the bound account with: cctl claude --resume "${sanitizeForTerminal(title)}"`;
+      : `resume it on the bound account with: ${resumeCommand(title, { sessionId: current.sessionId })}`;
   return palette.yellow(
-    `This session is now outside its binding: it keeps running on ${on} until it exits, and the ` +
-      `guard will flag its next prompt. Exit and ${resume}`,
+    `This session is now outside its binding: it stays on ${on} until it exits, and the guard ` +
+      `will flag its next prompt. Exit and ${resume}`,
   );
 }
 
@@ -331,8 +347,8 @@ export async function runSessionBind(
       lines.push(
         palette.yellow(
           `  ${res.runningSessions.length} running session(s) named "${sanitizeForTerminal(target.alias)}" ` +
-            'here keep their current account until relaunched with: ' +
-            `cctl claude --resume "${sanitizeForTerminal(target.alias)}"`,
+            'here stay on the slot they started on (following whatever account is live there) ' +
+            `until relaunched with: ${resumeCommand(target.alias)}`,
         ),
       );
     }
@@ -347,11 +363,18 @@ export async function runSessionBind(
       fail(
         `${scope} is bound to ${membersOf(owner)} together with ` +
           `${otherScopes(owner, target.alias, target.folder, deps.platform)}; adding accounts there would add ` +
-          `them to those too. Unbind it first (cctl session unbind "${sanitizeForTerminal(target.alias)}"` +
+          `them to those too. Unbind it first (cctl session unbind ` +
+          `${shellQuoteArg(sanitizeForTerminal(target.alias), deps.platform)}` +
           `${options.cwd !== undefined ? ' --cwd <folder>' : ''}), then bind it to the full list.`,
       );
     }
-    const res = await engineCall(() => engine.addGroupMembers(owner.id, toAdd));
+    // The engine re-checks, under its lock, that this alias is still the group's only scope — the
+    // check above is advisory (a bind elsewhere with the same accounts can reuse the group).
+    const res = await engineCall(() =>
+      engine.addGroupMembers(owner.id, toAdd, {
+        soleScope: { kind: 'alias', folder: target.folder, alias: target.alias },
+      }),
+    );
     const all = await engine.listAllAccounts();
     lines.push(
       `Added ${labelsOf(res.added, all)} to ${scope}; it is now bound to ${membersOf(res.group)}.`,
@@ -401,7 +424,13 @@ export async function runSessionUnbind(
       );
     }
     const all = await engine.listAllAccounts();
-    const res = await engineCall(() => engine.removeGroupMembers(owner.id, ids, force));
+    // As for growing: the engine re-checks the sole-scope precondition under its lock.
+    const res = await engineCall(() =>
+      engine.removeGroupMembers(owner.id, ids, {
+        ...force,
+        soleScope: { kind: 'alias', folder: target.folder, alias: target.alias },
+      }),
+    );
     if (res.dissolved) {
       lines.push(`Removed every account from ${scope}, which dissolved its binding.`);
       lines.push(`  ${res.removed.length} account(s) returned to the shared pool.`);
