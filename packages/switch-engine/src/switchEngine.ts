@@ -61,7 +61,7 @@ import { readdir, readFile, rm } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { groupSlotId } from './types.js';
 import type {
   AccountView,
@@ -254,6 +254,15 @@ interface PhysicalOccupant {
   /** Set when the credentials are provably `id`'s stored token while the identity block names a
    *  different account (`identityId`, or null for a login this vault does not know). */
   mismatch?: { identityId: string | null; identityUuid: string };
+}
+
+/** A profile dir no group owns that still holds a live login (see `orphanProfileLogins`). */
+interface OrphanLogin {
+  /** The dir's name — the id of the group that once owned it. */
+  name: string;
+  dir: string;
+  store: CredentialStore;
+  occupant: PhysicalOccupant;
 }
 
 /** Set equality by membership — the two account-id sets compare identical. */
@@ -544,19 +553,37 @@ export class SwitchEngine {
    * this way: removing the global active account leaves its live files for the historical reasons the
    * vault's own active-id clearing already encodes. Removing a member rewrites the guard snapshot,
    * which names members and — when the removal dissolves the group — enforces its folders.
+   *
+   * ORDER is the crash-safety contract, and it is the one an unbind's dissolve uses: adopt the seat's
+   * rotation, clear the seat, THEN drop the row. Dying after the clear leaves the account whole (row,
+   * bundle holding its latest token) with an empty seat the group re-fills, and a rerun completes the
+   * removal. The reverse order leaves the removed login live in the profile — and when the removal
+   * dissolved the group, in a profile no slot owns, which nothing else would ever clear.
    */
   removeAccount(id: string): Promise<void> {
     return this.withCredentialLock(async () => {
       await this.settlePendingSwitchesLocked();
-      // Decide BEFORE the row is gone: only a member that is currently live in its own group slot
-      // needs its profile seat cleared — or every seat of a group this removal dissolves.
       const { slotId, group } = await this.slotForAccount(id);
-      const liveInGroup = group !== undefined && (await this.getActiveId(slotId)) === id;
-      const dissolves = group !== undefined && group.members.length === 1;
-      await this.vault.removeAccount(id);
-      if (group === undefined) return;
+      if (group === undefined) {
+        await this.vault.removeAccount(id);
+        return;
+      }
       const rt = this.slotRuntime(slotId);
-      if (liveInGroup || dissolves) await this.clearSlotLive(rt);
+      // Only a member live in its own group slot has a seat to clear — or every seat of a group this
+      // removal dissolves.
+      const liveMember = await this.getActiveId(slotId);
+      const dissolves = group.members.length === 1;
+      if (liveMember === id || dissolves) {
+        // Whatever rotation the seat holds reaches the vault first, so dying between here and the row
+        // drop never costs the account its latest token.
+        const liveNow = await rt.credStore.readLiveCredentials().catch(() => undefined);
+        const liveOauth = await rt.credStore.readOauthAccount().catch(() => undefined);
+        await this.adoptRotationIfNeeded(liveMember, liveNow, liveOauth);
+        await this.clearSlotLive(rt);
+        this.fault('remove:after-clear-live');
+      }
+      await this.vault.removeAccount(id);
+      this.fault('remove:after-registry-drop');
       // A dissolved group's slot no longer exists: drop its recovery state too, so no intent is left
       // behind for a slot nothing will ever walk again (the same cleanup an unbind's dissolve does).
       if (dissolves) await this.clearSlotState(rt);
@@ -1248,8 +1275,8 @@ export class SwitchEngine {
    * The single authority for "is any slot in an illegal state", read by both `cctl doctor` and the
    * daemon watchdog. Read-only, apart from keeping the token-fingerprint cache current (see
    * tokenPrints.ts). Reports the §7 (a)-(e) violations, a slot whose live token and
-   * identity name different accounts, and a token stored under two accounts; {@link repairSlots}
-   * fixes all but (e) and the last.
+   * identity name different accounts, a profile no group owns that is still logged in, and a token
+   * stored under two accounts; {@link repairSlots} fixes all but (e) and the last.
    *
    * Slot occupancy is read PHYSICALLY here (the live token, then the live identity block, matched
    * against the WHOLE registry — see {@link physicalLiveId}), not through {@link getActiveId} —
@@ -1268,7 +1295,8 @@ export class SwitchEngine {
    *     anywhere, so a rotation is preserved before any slot is overwritten;
    *   - move the global slot off a reserved account onto a shared one (or clear it if none remains);
    *   - re-seat a slot whose live token and identity name different accounts;
-   *   - re-activate each group slot's rightful member, evicting a non-member.
+   *   - re-activate each group slot's rightful member, evicting a non-member;
+   *   - clear the live login of a profile no group owns (after adopting its rotation).
    * Unrecognized logins are never adopted (alert only), broken profile links (e) are left to
    * `ensureGroupProfile`, and a token stored under two accounts cannot be told apart from the files;
    * all three are reported in `remaining`. A hostile registry cannot widen access: every write only
@@ -1333,6 +1361,9 @@ export class SwitchEngine {
           actions.push(`cleared a non-member login from ${describeMembers(group)}`);
       }
 
+      // Step 5: a profile no group owns may not keep a login live.
+      await this.clearOrphanProfileLogins(allRows, groups, stored, actions);
+
       // Snapshot LAST — an activeId may have moved (its generation is what freshness checks read).
       await this.writeSnapshotLocked();
 
@@ -1395,6 +1426,18 @@ export class SwitchEngine {
           `accounts ${ids.map((id) => `"${labelOf(id)}"`).join(' and ')} store the same login ` +
           'token: either one login was stored twice (remove the extra account) or one of them holds ' +
           "the other's token (re-login that one: cctl accounts relogin <label>)",
+      });
+    }
+
+    // A profile no group owns that is still logged in.
+    for (const orphan of await this.orphanProfileLogins(allRows, groups, stored)) {
+      trailing.push({
+        kind: 'orphan_profile_login',
+        ...(orphan.occupant.id !== null ? { accountId: orphan.occupant.id } : {}),
+        groupId: orphan.name,
+        detail:
+          `${orphan.dir}, a profile no binding owns any more, still holds a live login` +
+          (orphan.occupant.id !== null ? ` of "${labelOf(orphan.occupant.id)}"` : ''),
       });
     }
 
@@ -1543,7 +1586,7 @@ export class SwitchEngine {
   }
 
   /**
-   * The physical live account of a set of live files (a slot's), matched
+   * The physical live account of a set of live files (a slot's, or an orphaned profile's), matched
    * against the WHOLE registry so a reserved/non-member login is recognized.
    *
    * The token decides first: a live token equal to a stored account's token IS that account's login,
@@ -1631,6 +1674,64 @@ export class SwitchEngine {
     }
     await this.clearSlotLive(rt);
     actions.push(`cleared another account's credentials from ${where} (no member could take it)`);
+  }
+
+  /**
+   * Profile dirs no group owns that still hold a live login (`orphan_profile_login`). A dissolved
+   * group's profile is kept for its history with its live seat cleared; one still logged in is what
+   * an interrupted removal by an older build leaves, and it is no slot — nothing else reads it, so the
+   * login would sit there, a second live copy of an account's token, for good. Cheap: one directory
+   * listing, and one read of a missing file per dissolved profile.
+   */
+  private async orphanProfileLogins(
+    allRows: AccountView[],
+    groups: StoredGroup[],
+    stored: StoredTokens,
+  ): Promise<OrphanLogin[]> {
+    const root = profilesRoot(this.paths.vaultDir);
+    let names: string[];
+    try {
+      names = await readdir(root);
+    } catch {
+      return []; // no profiles root yet: nothing was ever bound
+    }
+    const fold = (name: string): string => (this.platform === 'win32' ? name.toLowerCase() : name);
+    const owned = new Set(
+      groups.map((g) => fold(basename(groupProfileDir(this.paths.vaultDir, g.id)))),
+    );
+    const out: OrphanLogin[] = [];
+    for (const name of names) {
+      if (owned.has(fold(name))) continue;
+      const dir = join(root, name);
+      const store = this.configDirStore(dir);
+      const occupant = await this.physicalLiveId(store, allRows, stored);
+      if (occupant.hasCreds) out.push({ name, dir, store, occupant });
+    }
+    return out;
+  }
+
+  /** Clear the live login of every orphaned profile (see {@link orphanProfileLogins}), adopting its
+   *  rotation first when it provably belongs to a stored account — the adopt-then-clear order a
+   *  dissolve uses, so clearing never costs an account its latest token. */
+  private async clearOrphanProfileLogins(
+    allRows: AccountView[],
+    groups: StoredGroup[],
+    stored: StoredTokens,
+    actions: string[],
+  ): Promise<void> {
+    for (const orphan of await this.orphanProfileLogins(allRows, groups, stored)) {
+      if (orphan.occupant.id !== null && orphan.occupant.mismatch === undefined) {
+        const liveNow = await orphan.store.readLiveCredentials().catch(() => undefined);
+        const liveOauth = await orphan.store.readOauthAccount().catch(() => undefined);
+        await this.adoptRotationIfNeeded(orphan.occupant.id, liveNow, liveOauth);
+      }
+      await orphan.store.clearLiveCredentials();
+      await orphan.store.clearOauthAccount();
+      const who = allRows.find((r) => r.id === orphan.occupant.id)?.label;
+      actions.push(
+        `cleared ${who !== undefined ? `"${who}"'s` : 'a'} login from ${orphan.dir}, a profile no binding owns`,
+      );
+    }
   }
 
   // ---- group-lifecycle helpers ----
@@ -2111,7 +2212,7 @@ export class SwitchEngine {
     });
   }
 
-  /** A file-based CredentialStore over one config dir — a group profile, or a
+  /** A file-based CredentialStore over one config dir — a group profile, an orphaned profile, or a
    *  transient `CLAUDE_CONFIG_DIR` a login was performed in (the darwin flows read only the latter's
    *  `.claude.json`; its `.credentials.json` never exists there). Always file-based: only the global
    *  slot ever uses the platform's live-credential channel. */

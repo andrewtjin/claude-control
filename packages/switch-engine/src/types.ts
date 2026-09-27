@@ -370,6 +370,8 @@ export interface UnbindResult {
  *    identity block names a different account — a switch torn between its two live writes that no
  *    pending intent describes. Every reader that goes by the identity block misjudges who is live, so
  *    it is repaired by re-seating the account the token belongs to (or the slot's rightful one).
+ *  - `orphan_profile_login`: a profile dir no group owns still holds a live login. It is no slot, so
+ *    nothing else would ever notice or clear it; `repairSlots` clears it (after adopting its rotation).
  *  - `duplicate_stored_token`: two accounts' bundles store the same token — either the same login
  *    stored twice, or one account holding another's token. Nothing can tell which bundle is wrong
  *    from the files, so it is only alerted on (a re-login of the wrong one fixes it). */
@@ -380,6 +382,7 @@ export type SlotViolationKind =
   | 'group_active_mismatch'
   | 'broken_profile_link'
   | 'live_identity_mismatch'
+  | 'orphan_profile_login'
   | 'duplicate_stored_token';
 
 /** One invariant breach, with enough context to alert on and to repair. Every message names the
@@ -394,7 +397,8 @@ export interface SlotViolation {
   slot?: SlotId;
   /** For `account_in_multiple_slots`: every slot the account is live in. */
   slots?: SlotId[];
-  /** The group the breach concerns, when it is a group slot. */
+  /** The group the breach concerns, when it is a group slot. For `orphan_profile_login`, the name of
+   *  the profile dir (the id of the group that once owned it). */
   groupId?: string;
 }
 
