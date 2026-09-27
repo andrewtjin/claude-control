@@ -135,6 +135,9 @@ export interface SwitchEngineLike {
   slotForConfigDir?(configDir: string | null | undefined): Promise<SlotId>;
   /** The group a working directory is bound to, or null for an unbound cwd. */
   resolveCwdBinding?(cwd: string): Promise<{ groupId: string } | null>;
+  /** The group a session in `folder` with custom title `title` belongs to by the precedence rule
+   *  (that alias bound in exactly this folder, else the longest folder binding), or null = global. */
+  resolveSessionBinding?(folder: string, title: string | null): Promise<{ groupId: string } | null>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
   reauthenticate(
     id: string,
@@ -193,6 +196,11 @@ export interface DaemonOptions {
    *  `scrubInheritedConfigDir` (global spawns only) drops an inherited `CLAUDE_CONFIG_DIR` that names
    *  a group profile, so a global session is never silently redirected onto a group's account. */
   createAgentSdkClient?: (configDir?: string, scrubInheritedConfigDir?: boolean) => AgentSdkClient;
+  /** The CUSTOM title of a Claude Code session by id (read from its transcript), or null when it
+   *  has none or is unknown. A managed spawn that RESUMES a named session routes by it: an alias
+   *  binding of that title in the spawn's folder outranks the folder binding, exactly as the
+   *  launcher and the guard decide. Absent = spawns route by folder only. */
+  sessionTitleOf?: (sessionId: string) => Promise<string | null>;
   /** Auto-continue policy stamped onto every managed session this daemon spawns or resumes
    *  (see session-runtime's AutoContinuePolicy): transient API failures retry with backoff
    *  instead of stamping the session `failed`, and usage-limit failures PARK the session for
@@ -674,6 +682,7 @@ export class Daemon {
     scrubInheritedConfigDir?: boolean,
   ) => AgentSdkClient;
   private readonly autoContinue: AutoContinuePolicy | undefined;
+  private readonly sessionTitleOf: ((sessionId: string) => Promise<string | null>) | undefined;
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
   private readonly publishHookEndpoint: ((port: number) => Promise<void>) | undefined;
   private readonly endpointRepublishMs: number;
@@ -863,6 +872,7 @@ export class Daemon {
           ...(scrubInheritedConfigDir ? { scrubInheritedConfigDir: true } : {}),
         }));
     this.autoContinue = options.autoContinue;
+    this.sessionTitleOf = options.sessionTitleOf;
     this.installHooks = options.installHooks;
     this.publishHookEndpoint = options.publishHookEndpoint;
     this.endpointRepublishMs = options.endpointRepublishMs ?? DEFAULT_ENDPOINT_REPUBLISH_MS;
@@ -3309,7 +3319,11 @@ export class Daemon {
     // group is made live; a refusal (§8's two forbidden cases) is answered before anything spawns.
     let spawnSlot: { slot: SlotId; accountId: string | undefined; configDir: string | undefined };
     try {
-      spawnSlot = await this.resolveSpawnSlot(cwd ?? undefined, accountId ?? undefined);
+      spawnSlot = await this.resolveSpawnSlot(
+        cwd ?? undefined,
+        accountId ?? undefined,
+        resumeSessionId ?? undefined,
+      );
     } catch (err) {
       if (err instanceof SpawnBindingError) {
         this.logger.warn({ requestId, err }, 'session.spawn refused: account/slot binding');
@@ -3407,7 +3421,9 @@ export class Daemon {
    *  - an explicit SHARED account → the global slot, but only when it is the account live in the
    *    global slot (a session cannot switch the global slot out from under others) — otherwise
    *    refused;
-   *  - no account but a BOUND working directory → that group's slot, spawned on its live member;
+   *  - no account but a BOUND working directory → that group's slot, spawned on its live member —
+   *    where "bound" follows the precedence rule: a spawn that resumes a NAMED session whose alias
+   *    is bound in exactly this folder goes to that alias's group, ahead of the folder binding;
    *  - anything else → the global slot, inheriting the global live login (the historical model).
    * Returns the account to attribute/spawn, the config dir to bind (a group profile, or undefined
    * for the shared config dir), and the slot to record.
@@ -3415,6 +3431,7 @@ export class Daemon {
   private async resolveSpawnSlot(
     cwd: string | undefined,
     accountId: string | undefined,
+    resumeRef?: string,
   ): Promise<{ slot: SlotId; accountId: string | undefined; configDir: string | undefined }> {
     const engine = this.switchEngine;
     // Folder support absent (older engine / lifecycle fake): the historical global behavior.
@@ -3460,9 +3477,9 @@ export class Daemon {
       return { slot: 'global', accountId, configDir: undefined };
     }
 
-    // No explicit account: resolve the working directory's binding.
-    if (cwd !== undefined && engine.resolveCwdBinding) {
-      const binding = await engine.resolveCwdBinding(cwd);
+    // No explicit account: resolve the working directory's binding (and a resumed session's alias).
+    if (cwd !== undefined) {
+      const binding = await this.resolveSpawnBinding(cwd, resumeRef);
       if (binding !== null) {
         // Once the cwd is known to be bound, the session MUST run in the group slot. Any failure to
         // place it there is a REFUSAL, never a fall-through to the global slot: a bound-folder
@@ -3497,6 +3514,39 @@ export class Daemon {
       }
     }
     return { slot: 'global', accountId: undefined, configDir: undefined };
+  }
+
+  /**
+   * The binding an account-less managed spawn in `cwd` belongs to. A spawn that resumes a session
+   * with a CUSTOM title is judged by the precedence rule — that alias bound in exactly this folder
+   * outranks the folder binding — so it lands on the slot the guard will require of it (a resumed
+   * session reports its title on its first prompt). Otherwise, and whenever the title cannot be
+   * learned (no catalog seam, an unknown or never-started resume ref, a read failure), the folder
+   * rule decides, as before; the guard still judges the real title.
+   */
+  private async resolveSpawnBinding(
+    cwd: string,
+    resumeRef: string | undefined,
+  ): Promise<{ groupId: string } | null> {
+    const engine = this.switchEngine;
+    if (
+      resumeRef !== undefined &&
+      this.sessionTitleOf !== undefined &&
+      engine.resolveSessionBinding !== undefined
+    ) {
+      let anchor: string | undefined;
+      try {
+        anchor = this.resolveSpawnResumeAnchor(resumeRef);
+      } catch {
+        anchor = undefined; // the spawn path reports an unresumable ref itself
+      }
+      const title =
+        anchor === undefined ? null : await this.sessionTitleOf(anchor).catch(() => null);
+      if (title !== null && title.trim() !== '') {
+        return engine.resolveSessionBinding(cwd, title);
+      }
+    }
+    return engine.resolveCwdBinding ? engine.resolveCwdBinding(cwd) : null;
   }
 
   /**

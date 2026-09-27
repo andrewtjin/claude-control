@@ -202,6 +202,9 @@ bound here, the launch goes to its binding:
 cctl claude --resume "auth work"    # resumes the session on the accounts bound to "auth work"
 ```
 
+A session resumed from your phone follows the same rule: the daemon looks up the resumed
+session's name and starts it on that alias's binding.
+
 The guard checks each prompt with the same rule, using the session's name as Claude Code
 reports it. A named session that is running on the wrong account is stopped with how to fix it:
 

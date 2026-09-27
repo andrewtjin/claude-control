@@ -288,6 +288,150 @@ describe('Daemon: folder-bound slots on the session path', () => {
   });
 });
 
+const ALIAS_PROFILE_DIR = 'C:/profiles/g2';
+
+/**
+ * {@link groupEngine} plus a second group `g2` (one member m3, live) bound by the ALIAS "auth work"
+ * in `boundFolder` — the same folder `g1` is folder-bound to. `resolveSessionBinding` answers by the
+ * precedence rule: that alias in that folder -> g2, anything else in the folder -> g1.
+ */
+function aliasAwareEngine(boundFolder: string): GroupEngine {
+  const base = groupEngine(boundFolder);
+  const m3: AccountView = {
+    id: 'm3',
+    label: 'Alias Member',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    groupId: 'g2',
+  };
+  return {
+    ...base,
+    listAllAccounts: async (): Promise<AccountView[]> => [...(await base.listAllAccounts!()), m3],
+    getActiveId: (slot: SlotId = 'global'): Promise<string | null> =>
+      slot === groupSlotId('g2') ? Promise.resolve('m3') : base.getActiveId(slot),
+    ensureGroupLive: (groupId: string): Promise<GroupLiveResult> => {
+      if (groupId !== 'g2') return base.ensureGroupLive!(groupId);
+      base.ensureGroupLiveCalls.push(groupId);
+      return Promise.resolve({
+        groupId,
+        liveMember: 'm3',
+        activated: false,
+        noWorkingAccount: false,
+      });
+    },
+    configDirForAccount: (accountId: string): Promise<string | undefined> =>
+      accountId === 'm3'
+        ? Promise.resolve(ALIAS_PROFILE_DIR)
+        : base.configDirForAccount!(accountId),
+    slotForConfigDir: (configDir: string | null | undefined): Promise<SlotId> =>
+      configDir === ALIAS_PROFILE_DIR
+        ? Promise.resolve(groupSlotId('g2'))
+        : base.slotForConfigDir!(configDir),
+    resolveSessionBinding: (
+      folder: string,
+      title: string | null,
+    ): Promise<{ groupId: string } | null> =>
+      Promise.resolve(
+        folder !== boundFolder
+          ? null
+          : title !== null && title.trim().toLowerCase() === 'auth work'
+            ? { groupId: 'g2' }
+            : { groupId: 'g1' },
+      ),
+  };
+}
+
+describe('Daemon: a managed spawn that resumes a NAMED session follows its alias binding', () => {
+  async function spawnResuming(opts: {
+    titleOf?: (sessionId: string) => Promise<string | null>;
+    resumeSessionId?: string;
+  }): Promise<{ captured: Array<string | undefined>; engine: GroupEngine; accountId?: string }> {
+    const boundFolder = await sandbox();
+    const engine = aliasAwareEngine(boundFolder);
+    const captured: Array<string | undefined> = [];
+    harness = await createHarness({
+      switchEngine: engine,
+      createAgentSdkClient: (configDir?: string): AgentSdkClient => {
+        captured.push(configDir);
+        return scriptedAgentSdkClient([]);
+      },
+      ...(opts.titleOf !== undefined ? { sessionTitleOf: opts.titleOf } : {}),
+    });
+    await harness.daemon.start();
+    harness.relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r1',
+        prompt: 'go on',
+        idempotencyKey: 's1',
+        cwd: boundFolder,
+        ...(opts.resumeSessionId !== undefined ? { resumeSessionId: opts.resumeSessionId } : {}),
+      },
+    });
+    await waitFor(() => harness!.store.getSession('spawned-session') !== undefined);
+    const spawn = harness.sessionManager as unknown as {
+      spawnCalls: Array<{ accountId?: string }>;
+    };
+    return {
+      captured,
+      engine,
+      ...(spawn.spawnCalls[0]?.accountId !== undefined
+        ? { accountId: spawn.spawnCalls[0].accountId }
+        : {}),
+    };
+  }
+
+  const SDK_ID = '11111111-2222-4333-8444-555555555555';
+
+  it('resuming a session titled with a bound alias lands on the alias group’s profile and member', async () => {
+    const asked: string[] = [];
+    const res = await spawnResuming({
+      resumeSessionId: SDK_ID,
+      titleOf: (id) => {
+        asked.push(id);
+        return Promise.resolve('Auth Work');
+      },
+    });
+    // The title was looked up by the resume anchor (a raw SDK id passes through unchanged).
+    expect(asked).toEqual([SDK_ID]);
+    expect(res.captured).toEqual([ALIAS_PROFILE_DIR]);
+    expect(res.accountId).toBe('m3');
+    expect(res.engine.ensureGroupLiveCalls).toContain('g2');
+    expect(harness!.store.getSession('spawned-session')?.slot).toBe(groupSlotId('g2'));
+  });
+
+  it('resuming an unnamed session (or another title) keeps the folder binding', async () => {
+    const unnamed = await spawnResuming({
+      resumeSessionId: SDK_ID,
+      titleOf: () => Promise.resolve(null),
+    });
+    expect(unnamed.captured).toEqual([PROFILE_DIR]);
+    expect(unnamed.accountId).toBe('m1');
+  });
+
+  it('a title lookup that fails falls back to the folder binding (the guard judges the real title)', async () => {
+    const res = await spawnResuming({
+      resumeSessionId: SDK_ID,
+      titleOf: () => Promise.reject(new Error('transcript unreadable')),
+    });
+    expect(res.captured).toEqual([PROFILE_DIR]);
+  });
+
+  it('a fresh spawn (nothing resumed) never asks for a title', async () => {
+    const asked: string[] = [];
+    const res = await spawnResuming({
+      titleOf: (id) => {
+        asked.push(id);
+        return Promise.resolve('Auth Work');
+      },
+    });
+    expect(asked).toEqual([]);
+    expect(res.captured).toEqual([PROFILE_DIR]);
+  });
+});
+
 /** A session manager that mints a distinct id per spawn (`sess-1`, `sess-2`, …) so two managed
  *  sessions can coexist — the shared fake reuses one id, which cannot express this case. */
 function mintingSessionManager(): SessionManager & { handles: Map<string, SessionHandle> } {
