@@ -62,6 +62,19 @@ export class VaultError extends SwitchEngineError {
   }
 }
 
+/** An activation was refused because its target may not be live in the slot it was headed for:
+ *  - `slot_mismatch`: the caller named a slot the target does not belong to (a reserved account
+ *    asked for the global slot, a shared account for a group) — typically a decision made against a
+ *    membership picture that changed before the switch reached the lock;
+ *  - `not_slot_candidate`: the target is not a legitimate occupant of the slot being written;
+ *  - `group_gone`: the group whose slot was to be written no longer exists.
+ *  Always raised BEFORE anything live is written, so a refused switch changes nothing. */
+export class SlotError extends SwitchEngineError {
+  constructor(message: string, code: 'slot_mismatch' | 'not_slot_candidate' | 'group_gone') {
+    super(message, code);
+  }
+}
+
 /** Referenced an account id that is not in the registry. */
 export class UnknownAccountError extends SwitchEngineError {
   constructor(id: string) {

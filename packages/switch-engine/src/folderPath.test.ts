@@ -261,13 +261,13 @@ const CASES: Case[] = [
     name: 'rejects a NUL byte',
     input: 'C:\\foo\u0000bar',
     deps: winDeps(),
-    expected: { ok: false, reason: 'path contains a control character' },
+    expected: { ok: false, reason: 'path contains a control character', unsafeCharIndex: 6 },
   },
   {
     name: 'rejects a control character on posix',
     input: '/foo\u0007bar',
     deps: posixDeps(),
-    expected: { ok: false, reason: 'path contains a control character' },
+    expected: { ok: false, reason: 'path contains a control character', unsafeCharIndex: 4 },
   },
   {
     // A right-to-left override in a segment renders the tail reversed on a terminal, so the eye
@@ -275,25 +275,41 @@ const CASES: Case[] = [
     name: 'rejects a right-to-left override (U+202E) on win32',
     input: 'C:\\repos\\\u202egpj.evil',
     deps: winDeps(),
-    expected: { ok: false, reason: 'path contains a bidirectional or format control character' },
+    expected: {
+      ok: false,
+      reason: 'path contains a bidirectional or format control character',
+      unsafeCharIndex: 9,
+    },
   },
   {
     name: 'rejects a left-to-right/right-to-left mark (U+200F) on posix',
     input: '/repos/\u200fresearch',
     deps: posixDeps(),
-    expected: { ok: false, reason: 'path contains a bidirectional or format control character' },
+    expected: {
+      ok: false,
+      reason: 'path contains a bidirectional or format control character',
+      unsafeCharIndex: 7,
+    },
   },
   {
     name: 'rejects a directional isolate (U+2066) on posix',
     input: '/repos/\u2066research',
     deps: posixDeps(),
-    expected: { ok: false, reason: 'path contains a bidirectional or format control character' },
+    expected: {
+      ok: false,
+      reason: 'path contains a bidirectional or format control character',
+      unsafeCharIndex: 7,
+    },
   },
   {
     name: 'rejects a BOM/zero-width no-break space (U+FEFF) on win32',
     input: 'C:\\repos\\\ufeffresearch',
     deps: winDeps(),
-    expected: { ok: false, reason: 'path contains a bidirectional or format control character' },
+    expected: {
+      ok: false,
+      reason: 'path contains a bidirectional or format control character',
+      unsafeCharIndex: 9,
+    },
   },
 ];
 

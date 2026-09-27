@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path';
 import {
   CadenceError,
   QuarantineError,
+  SlotError,
   SwitchEngineError,
   UnknownAccountError,
   VaultError,
@@ -23,6 +24,7 @@ import {
   defaultProtector,
   generatePkce,
   generateState,
+  groupSlotId,
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
@@ -270,12 +272,17 @@ export function buildProgram(): Command {
       const engine = buildEngine();
       // Resolve across the WHOLE registry (shared pool + reserved members) so `cctl switch <member>`
       // reaches a folder-bound account; activate() routes it to its group slot by membership.
-      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
+      const fleet = await engine.listAllAccounts();
+      const resolved = resolveAccountRef(fleet, ref);
       if (!resolved.ok) fail(resolved.message);
+      // The slot the account belonged to when it was resolved. Asserted on the switch, so a bind or
+      // unbind landing in between fails this command instead of switching a slot it never named.
+      const groupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
       try {
         const result = await engine.activate(resolved.account.id, {
           force: Boolean(opts.force),
           origin: 'manual',
+          slot: groupId !== undefined ? groupSlotId(groupId) : 'global',
         });
         const bits = [
           result.wroteCredentials ? 'credentials written' : 'no change',
@@ -293,6 +300,9 @@ export function buildProgram(): Command {
           fail(`${resolved.account.label} is quarantined; re-login required.`);
         if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
         if (err instanceof UnknownAccountError) fail(err.message);
+        if (err instanceof SlotError) {
+          fail(`${err.message}. Nothing was changed - check \`cctl bindings\`.`);
+        }
         // The token endpoint shedding load is an outage, not a broken account: the engine has
         // already spent its retry budget and checked the status page, so its message is the
         // whole story and this switch simply did not happen. Printed as the CLI's own refusal

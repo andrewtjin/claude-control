@@ -874,19 +874,7 @@ export class Vault {
     label?: string;
   }): Promise<StoredGroup> {
     const st = await this.loadState();
-    if (st.groups.length >= MAX_GROUPS) {
-      throw new VaultError(`cannot create another group (max ${MAX_GROUPS})`);
-    }
-    if (opts.memberIds.length === 0) throw new VaultError('a group needs at least one member');
-    if (opts.memberIds.length > MAX_GROUP_MEMBERS) {
-      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
-    }
-    const folders = this.checkNewFolders(st, opts.folders ?? [], null);
-    const aliases = this.checkNewAliases(st, opts.aliases ?? [], null);
-    if (folders.length === 0 && aliases.length === 0) {
-      throw new VaultError('a group needs at least one folder or session alias');
-    }
-    const moved = this.takeSharedRows(st, opts.memberIds);
+    const { folders, aliases, moved } = this.validateNewGroup(st, opts);
     const now = this.clock();
     const label = opts.label?.trim() || moved.map((m) => m.label).join(', ');
     const group: StoredGroup = {
@@ -907,23 +895,83 @@ export class Vault {
   }
 
   /**
+   * Run every refusal {@link createGroup} would make — group count, member count, folder conflicts,
+   * members that are unknown or already reserved — WITHOUT writing anything. For a caller whose
+   * group creation is preceded by its own side effects (a bind moves the global slot off a
+   * to-be-member first): checking here first means a request that was always going to be refused
+   * is refused before anything moved, not after.
+   */
+  async checkCreateGroup(opts: {
+    memberIds: readonly string[];
+    folders?: readonly string[];
+    aliases?: readonly StoredAliasScope[];
+  }): Promise<void> {
+    this.validateNewGroup(await this.loadState(), opts);
+  }
+
+  /** The shared validation behind {@link createGroup} and {@link checkCreateGroup}: throws the named
+   *  refusal, else returns the checked scopes and the shared rows that would move. Pure over `st`. */
+  private validateNewGroup(
+    st: RegistryState,
+    opts: {
+      memberIds: readonly string[];
+      folders?: readonly string[];
+      aliases?: readonly StoredAliasScope[];
+    },
+  ): { folders: string[]; aliases: StoredAliasScope[]; moved: StoredAccount[] } {
+    if (st.groups.length >= MAX_GROUPS) {
+      throw new VaultError(`cannot create another group (max ${MAX_GROUPS})`);
+    }
+    if (opts.memberIds.length === 0) throw new VaultError('a group needs at least one member');
+    if (opts.memberIds.length > MAX_GROUP_MEMBERS) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
+    }
+    const folders = this.checkNewFolders(st, opts.folders ?? [], null);
+    const aliases = this.checkNewAliases(st, opts.aliases ?? [], null);
+    if (folders.length === 0 && aliases.length === 0) {
+      throw new VaultError('a group needs at least one folder or session alias');
+    }
+    const moved = this.takeSharedRows(st, opts.memberIds);
+    return { folders, aliases, moved };
+  }
+
+  /**
    * Reserve already-shared accounts INTO an existing group (grow its member set). Same crash-safe
    * order as {@link createGroup}: groups.json first, then accounts.json.
    */
   async reserveAccounts(groupId: string, memberIds: readonly string[]): Promise<StoredGroup> {
     const st = await this.loadState();
-    const group = this.mustGroup(st, groupId);
-    if (memberIds.length === 0) throw new VaultError('no accounts to reserve');
-    if (group.members.length + memberIds.length > MAX_GROUP_MEMBERS) {
-      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
-    }
-    const moved = this.takeSharedRows(st, memberIds);
+    const { group, moved } = this.validateReserve(st, groupId, memberIds);
     group.members.push(...moved);
     group.updatedAtMs = this.clock();
     await this.saveGroups(st); // groups.json FIRST
     this.removeSharedRows(st, memberIds);
     await this.saveShared(st); // accounts.json SECOND
     return group;
+  }
+
+  /**
+   * Run every refusal {@link reserveAccounts} would make — unknown group, member cap, members that
+   * are unknown or already reserved — WITHOUT writing anything; the grow counterpart of
+   * {@link checkCreateGroup}, for the same reason (a grow moves the global slot first).
+   */
+  async checkReserveAccounts(groupId: string, memberIds: readonly string[]): Promise<void> {
+    this.validateReserve(await this.loadState(), groupId, memberIds);
+  }
+
+  /** The shared validation behind {@link reserveAccounts} and {@link checkReserveAccounts}. Pure
+   *  over `st`: returns the group (a live reference into `st`) and the shared rows that would move. */
+  private validateReserve(
+    st: RegistryState,
+    groupId: string,
+    memberIds: readonly string[],
+  ): { group: StoredGroup; moved: StoredAccount[] } {
+    const group = this.mustGroup(st, groupId);
+    if (memberIds.length === 0) throw new VaultError('no accounts to reserve');
+    if (group.members.length + memberIds.length > MAX_GROUP_MEMBERS) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
+    }
+    return { group, moved: this.takeSharedRows(st, memberIds) };
   }
 
   /**
