@@ -74,8 +74,11 @@ function canon(p: string): string {
   return r.path;
 }
 
-/** A UserPromptSubmit payload. `title` undefined = the key is ABSENT (older Claude Code / unnamed). */
-function payload(opts: { title?: unknown; transcript?: string; omitTitle?: boolean } = {}): string {
+/** A UserPromptSubmit payload. `title` undefined = the key is ABSENT (older Claude Code / unnamed).
+ *  `cwd` is the folder Claude Code runs the session in (absent unless given). */
+function payload(
+  opts: { title?: unknown; transcript?: string; omitTitle?: boolean; cwd?: string } = {},
+): string {
   const p: Record<string, unknown> = {
     hook_event_name: 'UserPromptSubmit',
     session_id: 's-1',
@@ -83,6 +86,7 @@ function payload(opts: { title?: unknown; transcript?: string; omitTitle?: boole
   };
   if (opts.title !== undefined) p.session_title = opts.title;
   if (opts.transcript !== undefined) p.transcript_path = opts.transcript;
+  if (opts.cwd !== undefined) p.cwd = opts.cwd;
   return JSON.stringify(p);
 }
 
@@ -545,35 +549,87 @@ describe('bind guard — session alias rules', () => {
       expect(decision(r).reason).toContain('That account is reserved to its bindings.');
     });
 
-    it('a relocation into a .claude worktree moves the conversation there', async () => {
+    /** The transcript of a session titled `title` that started in `from` and moved to `to`, where
+     *  Claude Code files it (measured on 2.1.283: a relocation MOVES the transcript into the new
+     *  folder's project directory; the first cwd stays `from`; the relocation is re-appended). */
+    async function movedTo(from: string, to: string, title: string): Promise<string> {
+      const dir = join(root, 'projects', projectDirStem(to));
+      await mkdir(dir, { recursive: true });
+      const file = join(dir, `${Math.random().toString(16).slice(2)}.jsonl`);
+      const reloc = JSON.stringify({ type: 'relocated', relocatedCwd: to });
+      const lines = [userLine('a', from), reloc, userLine('b', to), customTitleLine(title), reloc];
+      await writeFile(file, lines.join('\n') + '\n', 'utf8');
+      return file;
+    }
+
+    it('a session that entered a .claude worktree (its transcript moved there) belongs there', async () => {
       const wt = join(root, 'repo', '.claude', 'worktrees', 'feature');
       await mkdir(wt, { recursive: true });
       const worktree = canon(wt);
       await writeSnapshot([bound(worktree)]);
+      const t = await movedTo(repo, worktree, 'X');
+      // Resumed from the repo root (CLAUDE_PROJECT_DIR), running in the worktree (the payload's cwd),
+      // on the worktree binding's account: in scope, with or without the cwd in the payload.
+      for (const cwd of [worktree, undefined]) {
+        const r = await runGuard(
+          scriptPath,
+          payload({ title: 'X', transcript: t, ...(cwd !== undefined ? { cwd } : {}) }),
+          onSlot(aliasProfile),
+        );
+        expect({ cwd, r }).toMatchObject({ cwd, r: { code: 0, stdout: '', stderr: '' } });
+      }
+      // ...and on the shared account it is held to its binding.
+      const shared = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t, cwd: worktree }),
+        onSlot(undefined),
+      );
+      expect(decision(shared).decision).toBe('block');
+      expect(decision(shared).reason).toContain(
+        `session "X" in ${worktree} is bound to research@x`,
+      );
+    });
+
+    it('a move out of the repository is judged by where the session runs: the payload cwd', async () => {
+      await writeSnapshot([bound(other)]);
+      const t = await movedTo(repo, other, 'X');
+      const onAlias = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t, cwd: other }),
+        onSlot(aliasProfile),
+      );
+      expect(onAlias).toMatchObject({ code: 0, stdout: '', stderr: '' });
+      const shared = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t, cwd: other }),
+        onSlot(undefined),
+      );
+      expect(decision(shared).decision).toBe('block');
+    });
+
+    it('a relocation line that did not move the transcript leaves the launch folder deciding', async () => {
+      const wt = join(root, 'repo', '.claude', 'worktrees', 'feature');
+      await mkdir(wt, { recursive: true });
+      const worktree = canon(wt);
       const t = await recordedIn(repo, 'X');
       await writeFile(t, JSON.stringify({ type: 'relocated', relocatedCwd: worktree }) + '\n', {
         encoding: 'utf8',
         flag: 'a',
       });
-      // Resumed from the repo root on the worktree binding's account: in scope.
-      const r = await runGuard(
+      await writeSnapshot([bound(worktree)]);
+      const notThere = await runGuard(
         scriptPath,
         payload({ title: 'X', transcript: t }),
         onSlot(aliasProfile),
       );
-      expect(r).toMatchObject({ code: 0, stdout: '', stderr: '' });
-      // ...and a relocation to a folder outside the launch folder's worktree root is ignored.
-      await writeFile(t, JSON.stringify({ type: 'relocated', relocatedCwd: other }) + '\n', {
-        encoding: 'utf8',
-        flag: 'a',
-      });
-      await writeSnapshot([bound(other)]);
-      const moved = await runGuard(
+      expect(decision(notThere).decision).toBe('block');
+      await writeSnapshot([bound(repo)]);
+      const here = await runGuard(
         scriptPath,
         payload({ title: 'X', transcript: t }),
         onSlot(aliasProfile),
       );
-      expect(decision(moved).decision).toBe('block');
+      expect(here).toMatchObject({ code: 0, stdout: '', stderr: '' });
     });
 
     describe.skipIf(!WIN)('a transcript locked by another process', () => {

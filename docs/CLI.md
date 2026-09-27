@@ -248,7 +248,9 @@ the daemon's phone spawns, `cctl where` and `cctl session show` alike:
 3. else the global account.
 
 The recorded folder is where the session was started (its transcript's first working
-directory). It matters because `claude --resume <alias>` run in a git repo root can also resume
+directory), or where it moved to since: entering or leaving a worktree (`EnterWorktree`,
+`ExitWorktree`) moves a session, and Claude Code moves its transcript along. It matters because
+`claude --resume <alias>` run in a git repo root can also resume
 a session recorded in one of the repo's subfolders or worktrees (or in a sibling folder whose
 name starts with the root's): the resumed conversation keeps belonging to its own folder, so it
 is routed and checked by that folder's alias binding, and a same-titled conversation of another
@@ -269,17 +271,25 @@ transcript's recorded folder the same way:
 
 - the first line with a working directory within the transcript's first 1 MiB (Claude Code
   writes a long first prompt twice before that line, so a smaller window would miss it);
-- moved by the last `relocated` line within its last 64 KiB — Claude Code records one when a
-  session enters or leaves a `.claude/worktrees/<name>` checkout, and re-appends it with the
-  session's title;
-- each trusted only when it agrees with the project directory the transcript lives in (Claude
-  Code names that directory after the folder the session started in); a relocation must stay
-  within the same repository's `.claude/worktrees`;
-- otherwise — no working directory within the window, one that disagrees, a transcript that does
-  not exist yet or cannot be read — the session counts for the folder it runs in when the project
-  directory's name can stand for that folder, and for no alias binding otherwise. The name is
-  lossy (`C:\a_b` and `C:\a-b` share one), so it never picks a bound folder the session does not
-  run in.
+- the last `relocated` line within its last 64 KiB — Claude Code records one whenever a session
+  changes folder (entering or leaving a `.claude/worktrees/<name>` checkout, or `/cd`), moves the
+  transcript into that folder's project directory, and re-appends the line with the session's
+  title;
+- the relocation counts when the project directory the transcript lives in is named after it
+  (Claude Code moved the file there) and it leads to where the session started or above it,
+  counting a `.claude/worktrees/<name>` checkout as its repository — so entering, leaving and
+  switching worktrees, from the repository root or one of its subfolders, all count. Folders are
+  compared where they really are (a link named like a worktree is judged by where it leads).
+  Otherwise the first working directory counts, when the project directory is named after it;
+- a working directory spelled with a `.`, `..` or empty path segment never counts (Claude Code
+  never records one, and it would name another folder than its project directory's);
+- otherwise — no working directory within the window, one that disagrees, a move out of the
+  repository, a transcript that does not exist yet or cannot be read — the session counts for the
+  folder it runs in when the project directory's name can stand for that folder, and for no alias
+  binding otherwise. A resumed session that moved runs in the folder it moved to (Claude Code
+  changes into it), so the guard judges it there, and `cctl claude` routes it there too. The name
+  is lossy (`C:\a_b` and `C:\a-b` share one), so it never picks a bound folder the session does
+  not run in.
 
 `cctl claude` reads Claude Code's own arguments to see which session it opens — `--resume
 <alias>`, `--resume <session id>`, `--resume <path to a .jsonl transcript>`, `--continue` (the

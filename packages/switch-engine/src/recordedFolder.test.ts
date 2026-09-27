@@ -3,11 +3,11 @@
 // enforcement guard runs, proven to agree with the live functions on every one of those files.
 
 import * as nodeFs from 'node:fs';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { embeddableFolderPathSource } from './folderPath.js';
+import { canonicalizeFolder, embeddableFolderPathSource } from './folderPath.js';
 import {
   RECORDED_FOLDER_HEAD_BYTES,
   RECORDED_FOLDER_TAIL_BYTES,
@@ -67,7 +67,13 @@ function ccSession(cwd: string, opts: { prompt?: string; title?: string } = {}):
 
 const relocatedTo = (cwd: string) => ({ type: 'relocated', relocatedCwd: cwd, sessionId: 's1' });
 
-const read = (file: string): RecordedFolderRead => readRecordedFolder(file, nodeFs, P);
+/** A recorded folder canonicalized as a string (these folders need not exist). */
+const canonical = (f: string): string => {
+  const c = canonicalizeFolder(f, { platform: P, cwd: root });
+  return c.ok ? c.path : f;
+};
+
+const read = (file: string): RecordedFolderRead => readRecordedFolder(file, nodeFs, P, canonical);
 
 describe('readRecordedFolder: the launch folder', () => {
   it('is the first top-level cwd of a Claude Code transcript', () => {
@@ -79,6 +85,7 @@ describe('readRecordedFolder: the launch folder', () => {
       launchFolder: repo,
       folder: repo,
       sawCwd: true,
+      relocatedCwd: null,
     });
   });
 
@@ -183,39 +190,98 @@ describe('readRecordedFolder: consistency with the project directory', () => {
 });
 
 describe('readRecordedFolder: relocations', () => {
+  // Measured on Claude Code 2.1.283 (EnterWorktree / ExitWorktree in a `-p` session): a relocation
+  // MOVES the transcript into the new folder's project directory and writes the `relocated` line
+  // there; the first cwd stays the folder the session started in; the relocation is re-appended
+  // with the title metadata, so it stays in the tail. A round trip moves the file back.
   const repo = () => folder('repo');
   const worktree = (name: string) => [repo(), '.claude', 'worktrees', name].join(SEP);
 
-  it('a session that entered a .claude worktree belongs there', () => {
-    const file = transcript(repo(), [...ccSession(repo()), relocatedTo(worktree('feature'))]);
-    expect(read(file)).toMatchObject({ launchFolder: repo(), folder: worktree('feature') });
+  /** The measured post-EnterWorktree transcript of a session started in `from` that moved to `to`:
+   *  filed under `to`'s project directory (unless `dirOf` says where), first cwd `from`. */
+  function moved(from: string, to: string, opts: { id?: string; dirOf?: string } = {}): string {
+    return transcript(
+      opts.dirOf ?? to,
+      [
+        ...ccSession(from),
+        relocatedTo(to),
+        { type: 'user', message: { role: 'user', content: 'next' }, cwd: to, sessionId: 's1' },
+        { type: 'custom-title', customTitle: 'T', sessionId: 's1' },
+        relocatedTo(to),
+      ],
+      opts.id,
+    );
+  }
+
+  it('a session that entered a .claude worktree lives in the worktree’s directory and belongs there', () => {
+    const file = moved(repo(), worktree('feature'));
+    expect(read(file)).toEqual({
+      status: 'read',
+      dirName: projectDirStem(worktree('feature')),
+      launchFolder: repo(),
+      folder: worktree('feature'),
+      sawCwd: true,
+      relocatedCwd: worktree('feature'),
+    });
   });
 
-  it('the LAST relocation wins: a round trip ends back in the launch folder', () => {
+  it('a round trip (into a worktree and back out) is filed back under the repository and belongs there', () => {
     const file = transcript(repo(), [
       ...ccSession(repo()),
-      relocatedTo(worktree('feature')),
+      relocatedTo(worktree('w2')),
+      relocatedTo(worktree('w2')),
+      relocatedTo(repo()),
       relocatedTo(repo()),
     ]);
-    expect(read(file).folder).toBe(repo());
+    expect(read(file)).toMatchObject({ launchFolder: repo(), folder: repo() });
+  });
+
+  it('a session started in a subfolder follows its repository’s worktree (created at the repository root)', () => {
+    const sub = [repo(), 'sub'].join(SEP);
+    expect(read(moved(sub, worktree('w'))).folder).toBe(worktree('w'));
+    // ...and back out to where it started.
+    expect(read(moved(sub, sub, { id: 's2' })).folder).toBe(sub);
   });
 
   it('a session launched in a worktree may move to its repository or a sibling worktree', () => {
-    const toRoot = transcript(worktree('a'), [...ccSession(worktree('a')), relocatedTo(repo())]);
-    expect(read(toRoot).folder).toBe(repo());
-    const toSibling = transcript(
-      worktree('a'),
-      [...ccSession(worktree('a')), relocatedTo(worktree('b'))],
-      's2',
-    );
-    expect(read(toSibling).folder).toBe(worktree('b'));
+    expect(read(moved(worktree('a'), repo())).folder).toBe(repo());
+    expect(read(moved(worktree('a'), worktree('b'), { id: 's2' })).folder).toBe(worktree('b'));
   });
 
-  it('a relocation outside the launch folder’s worktree root is not trusted', () => {
+  it('a relocation anywhere but the repository’s root or worktrees (a /cd, even into a subfolder) is not trusted', () => {
     for (const target of [folder('elsewhere'), [repo(), 'sub'].join(SEP), folder('repo-other')]) {
-      const file = transcript(repo(), [...ccSession(repo()), relocatedTo(target)]);
-      expect({ target, folder: read(file).folder }).toEqual({ target, folder: repo() });
+      const r = read(moved(repo(), target));
+      expect({ target, r }).toMatchObject({
+        target,
+        r: { launchFolder: null, folder: null, sawCwd: true, relocatedCwd: target },
+      });
     }
+  });
+
+  it('a relocation line the file’s directory does not stand for (the file never moved) leaves the launch folder deciding', () => {
+    const file = moved(repo(), worktree('feature'), { dirOf: repo() });
+    expect(read(file)).toMatchObject({
+      launchFolder: repo(),
+      folder: repo(),
+      relocatedCwd: worktree('feature'),
+    });
+    // ...and a head the directory does not stand for either is still not trusted.
+    const edited = moved(folder('bound'), worktree('feature'), {
+      dirOf: folder('other'),
+      id: 's2',
+    });
+    expect(read(edited)).toMatchObject({ folder: null, relocatedCwd: worktree('feature') });
+  });
+
+  it('reads the same past 200 characters, where the directory name is a truncated stem and a hash', () => {
+    const long = folder('deep'.repeat(60));
+    const wt = [long, '.claude', 'worktrees', 'w1'].join(SEP);
+    const dir = join(projects, `${projectDirStem(wt)}-1a2b3c`);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'long.jsonl');
+    const lines = [...ccSession(long), relocatedTo(wt), relocatedTo(wt)];
+    writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    expect(read(file)).toMatchObject({ launchFolder: long, folder: wt });
   });
 
   it('only the tail window is searched, and only whole lines of it', () => {
@@ -223,11 +289,17 @@ describe('readRecordedFolder: relocations', () => {
       type: 'assistant',
       message: { content: 'q'.repeat(RECORDED_FOLDER_TAIL_BYTES) },
     };
-    const early = transcript(repo(), [...ccSession(repo()), relocatedTo(worktree('f')), tailPad]);
-    expect(read(early).folder).toBe(repo());
+    // A relocation pushed out of the window is not seen: the file sits in the worktree's directory,
+    // which does not stand for the launch folder, so nothing is trusted.
+    const early = transcript(worktree('f'), [
+      ...ccSession(repo()),
+      relocatedTo(worktree('f')),
+      tailPad,
+    ]);
+    expect(read(early)).toMatchObject({ folder: null, relocatedCwd: null });
     // Inside the window it counts — and a relocation that is not a `relocated` record never does.
     const late = transcript(
-      repo(),
+      worktree('f'),
       [
         ...ccSession(repo()),
         tailPad,
@@ -239,12 +311,51 @@ describe('readRecordedFolder: relocations', () => {
     expect(read(late).folder).toBe(worktree('f'));
   });
 
-  it('no relocation is read when the launch folder is not accepted', () => {
-    const file = transcript(folder('elsewhere'), [
-      ...ccSession(repo()),
-      relocatedTo(worktree('f')),
-    ]);
-    expect(read(file).folder).toBeNull();
+  it('a spelling with a `..`, `.` or empty segment is never trusted, and never reported', () => {
+    const escape = [repo(), '.claude', 'worktrees', '..'].join(SEP);
+    const up = [repo(), '.claude', 'worktrees', 'w', '..', '..', '..', 'bound'].join(SEP);
+    const dot = [repo(), '.', '.claude', 'worktrees', 'w'].join(SEP);
+    const empty = [repo(), '', '.claude', 'worktrees', 'w'].join(SEP);
+    for (const target of [escape, up, dot, empty]) {
+      expect({ target, r: read(moved(repo(), target)) }).toMatchObject({
+        target,
+        r: { folder: null, relocatedCwd: null },
+      });
+    }
+    // A head spelled so: `C:\x\other\..\bound` names the directory of a real `C:\x\other\__\bound`.
+    const head = [root, 'other', '..', 'bound'].join(SEP);
+    expect(read(transcript(head, ccSession(head), 's3')).folder).toBeNull();
+    if (P === 'win32') {
+      // Windows drops a trailing dot or space from a name: `bound.` IS `bound`.
+      const trailing = [root, 'bound.'].join(SEP);
+      expect(read(transcript(trailing, ccSession(trailing), 's4')).folder).toBeNull();
+    }
+  });
+
+  it('compares worktree roots where the folders really are: a junction named like a worktree leads nowhere else', () => {
+    // Real folders this time: the comparison resolves them.
+    const realRoot = realpathSync.native(root);
+    const other = join(realRoot, 'other');
+    const bound = join(realRoot, 'bound');
+    mkdirSync(join(other, '.claude', 'worktrees'), { recursive: true });
+    mkdirSync(bound, { recursive: true });
+    const link = join(other, '.claude', 'worktrees', 'j');
+    symlinkSync(bound, link, P === 'win32' ? 'junction' : 'dir');
+    const real = join(other, '.claude', 'worktrees', 'real');
+    mkdirSync(real, { recursive: true });
+    const resolving = (file: string) =>
+      readRecordedFolder(file, nodeFs, P, (f) => {
+        const c = canonicalizeFolder(f, {
+          platform: P,
+          cwd: realRoot,
+          realpath: (p) => realpathSync.native(p),
+        });
+        return c.ok ? c.path : f;
+      });
+    // Spelled as a worktree of `other`, the junction is `bound`: outside other's repository.
+    expect(resolving(moved(other, link))).toMatchObject({ folder: null, relocatedCwd: link });
+    // A real worktree of `other` is trusted.
+    expect(resolving(moved(other, real, { id: 's2' })).folder).toBe(real);
   });
 });
 
@@ -258,6 +369,7 @@ describe('readRecordedFolder: files that cannot be read', () => {
       launchFolder: null,
       folder: null,
       sawCwd: false,
+      relocatedCwd: null,
     });
     const asDir = join(projects, projectDirStem(repo), 'dir.jsonl');
     mkdirSync(asDir, { recursive: true });
@@ -280,7 +392,10 @@ describe('readRecordedFolder: files that cannot be read', () => {
         nodeFs.closeSync(fd);
       },
     };
-    expect(readRecordedFolder(file, busy, P)).toMatchObject({ status: 'unreadable', folder: null });
+    expect(readRecordedFolder(file, busy, P, canonical)).toMatchObject({
+      status: 'unreadable',
+      folder: null,
+    });
     expect(closed).toBe(1);
   });
 });
@@ -357,18 +472,21 @@ describe('embeddableRecordedFolderSource', () => {
       transcript(folder('elsewhere'), ccSession(repo), 'd'),
       transcript(repo, [...ccSession(repo), relocatedTo(wt)], 'e'),
       transcript(repo, [...ccSession(repo), relocatedTo(folder('x'))], 'f'),
+      transcript(wt, [...ccSession(repo), relocatedTo(wt), relocatedTo(wt)], 'e2'),
+      transcript(folder('x'), [...ccSession(repo), relocatedTo(folder('x'))], 'f2'),
+      transcript(wt, [...ccSession(repo), relocatedTo([wt, '..'].join(SEP))], 'h'),
       transcript(repo, [{ type: 'summary' }], 'g'),
       join(projects, 'nope', 'missing.jsonl'),
       dirPath,
     ];
     for (const file of files) {
-      expect({ file, got: embedded.readRecordedFolder(file, nodeFs, P) }).toEqual({
+      expect({ file, got: embedded.readRecordedFolder(file, nodeFs, P, canonical) }).toEqual({
         file,
-        got: readRecordedFolder(file, nodeFs, P),
+        got: readRecordedFolder(file, nodeFs, P, canonical),
       });
     }
     const running = { spelled: repo, canonical: repo };
-    for (const r of files.map((f) => readRecordedFolder(f, nodeFs, P))) {
+    for (const r of files.map((f) => readRecordedFolder(f, nodeFs, P, canonical))) {
       expect(embedded.recordedFolderFor(r, running, (f) => f)).toBe(
         recordedFolderFor(r, running, (f) => f),
       );

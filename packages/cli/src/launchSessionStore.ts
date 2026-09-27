@@ -50,7 +50,7 @@ import {
   readRecordedFolder,
   type RecordedFolderRead,
 } from '@claude-control/switch-engine';
-import { sameFolder } from '@claude-control/daemon';
+import { canonicalRecordedFolder, sameFolder } from '@claude-control/daemon';
 import type { LaunchSessionDeps, LaunchSessionFacts } from './launcher.js';
 
 /** Claude Code's head and tail window for a transcript's quick read (its own constant). */
@@ -458,23 +458,32 @@ export function launchSessionStore(options: LaunchSessionStoreOptions): LaunchSe
   const gitWorktrees = options.gitWorktrees ?? gitWorktreeList;
   const readTranscript = options.readTranscript ?? readTranscriptFacts;
   const readFolder =
-    options.readFolder ?? ((file: string) => readRecordedFolder(file, nodeFs, platform));
+    options.readFolder ??
+    ((file: string) =>
+      readRecordedFolder(file, nodeFs, platform, (folder) =>
+        canonicalRecordedFolder(folder, platform),
+      ));
   const realpath = options.realpath ?? realpathOrSelf;
   const recordedHere = (folder: string, target: string): boolean =>
     sameFolder(folder, target, platform);
 
+  /** A session's titles (quick read) with what the shared reading records of its folder: the trusted
+   *  folder, the project directory (the fallback) and the last relocation (where a resume runs it). */
+  const withFolder = (
+    quick: TranscriptQuickRead,
+    recorded: RecordedFolderRead,
+  ): LaunchSessionFacts => ({
+    customTitle: quick.customTitle,
+    aiTitle: quick.aiTitle,
+    folder: recorded.folder,
+    dirName: recorded.dirName,
+    ...(recorded.relocatedCwd !== null ? { relocatedCwd: recorded.relocatedCwd } : {}),
+    ...(quick.entrypoint !== undefined ? { entrypoint: quick.entrypoint } : {}),
+  });
   /** A session the launch may open: its titles (quick read) and its recorded folder (the shared
    *  reading), with the project directory as the fallback. */
-  const factsOf = (file: string, quick: TranscriptQuickRead): LaunchSessionFacts => {
-    const recorded = readFolder(file);
-    return {
-      customTitle: quick.customTitle,
-      aiTitle: quick.aiTitle,
-      folder: recorded.folder,
-      dirName: recorded.dirName,
-      ...(quick.entrypoint !== undefined ? { entrypoint: quick.entrypoint } : {}),
-    };
-  };
+  const factsOf = (file: string, quick: TranscriptQuickRead): LaunchSessionFacts =>
+    withFolder(quick, readFolder(file));
   /** Read one transcript as a session the launch opens, or null when it cannot be read. */
   const sessionAt = async (file: string): Promise<LaunchSessionFacts | null> => {
     const quick = await readTranscript(file);
@@ -608,12 +617,7 @@ export function launchSessionStore(options: LaunchSessionStoreOptions): LaunchSe
         if (!recorded.sawCwd && f.size <= RECORDED_FOLDER_HEAD_BYTES) continue;
         const quick = await readTranscript(f.file);
         if (quick === null) return [];
-        candidates.push({
-          customTitle: quick.customTitle,
-          aiTitle: quick.aiTitle,
-          folder: recorded.folder,
-          dirName: recorded.dirName,
-        });
+        candidates.push(withFolder(quick, recorded));
         if (recorded.folder === null || recordedHere(recorded.folder, cwd)) return candidates;
       }
       // No session recorded here: what `--continue` opens (if anything) cannot be named.

@@ -442,7 +442,8 @@ describe('launchSessionStore', () => {
       const found = await s.sessionsTitled('Moved');
       expect(titles(found)).toEqual(['Moved']);
       // Found by Claude Code's own search; its conversation still belongs to the folder it was
-      // launched in, because a relocation outside that folder's worktree root is not trusted.
+      // launched in: the relocation did not move its transcript (the directory is still named after
+      // that folder), so it is not where the conversation lives.
       expect(found.map((f) => f.folder)).toEqual([join(base, 'origin')]);
     });
 
@@ -538,6 +539,7 @@ describe('launchSessionStore', () => {
           launchFolder: w,
           folder: w,
           sawCwd: true,
+          relocatedCwd: null,
         }),
       });
       expect(await s.continueSessions()).toEqual([]);

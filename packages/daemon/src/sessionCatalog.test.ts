@@ -246,9 +246,10 @@ describe('readSessionCatalog', () => {
 
   describe('folder', () => {
     // Claude Code relocates a session when it enters or leaves a `.claude/worktrees/<name>`
-    // checkout of its folder; the transcript itself never moves.
+    // checkout of its folder, and MOVES the transcript into the new folder's project directory
+    // (measured on 2.1.283): the first cwd stays where the session started.
     it('follows the LAST relocation, keeping the launch cwd as it was', async () => {
-      await writeSession(projectDirStem('/old'), 's', [
+      await writeSession(projectDirStem('/old/.claude/worktrees/twice'), 's', [
         userLine('/old', TS1),
         relocated('/old/.claude/worktrees/once'),
         relocated('/old/.claude/worktrees/twice'),
@@ -260,7 +261,7 @@ describe('readSessionCatalog', () => {
     });
 
     it('ignores a relocation with an empty or missing target', async () => {
-      await writeSession(projectDirStem('/old'), 's', [
+      await writeSession(projectDirStem('/old/.claude/worktrees/real'), 's', [
         userLine('/old', TS1),
         relocated('/old/.claude/worktrees/real'),
         relocated(''),
@@ -269,9 +270,17 @@ describe('readSessionCatalog', () => {
       expect((await only()).folder).toBe('/old/.claude/worktrees/real');
     });
 
-    it('ignores a relocation outside the launch folder’s worktree root', async () => {
-      await writeSession(projectDirStem('/old'), 's', [userLine('/old', TS1), relocated('/else')]);
-      expect((await only()).folder).toBe('/old');
+    it('does not trust a relocation out of the launch folder’s repository', async () => {
+      await writeSession(projectDirStem('/else'), 's', [userLine('/old', TS1), relocated('/else')]);
+      expect(await only()).toMatchObject({ launchCwd: null, folder: null });
+    });
+
+    it('leaves the launch folder deciding when the relocation did not move the transcript', async () => {
+      await writeSession(projectDirStem('/old'), 's', [
+        userLine('/old', TS1),
+        relocated('/old/.claude/worktrees/w'),
+      ]);
+      expect(await only()).toMatchObject({ launchCwd: '/old', folder: '/old' });
     });
 
     it('does not trust a launch folder its project directory does not encode (an edit)', async () => {

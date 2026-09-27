@@ -269,13 +269,21 @@ export async function resolveLaunchBinding(input: {
   const canonical =
     input.canonicalFolder ?? ((f: string) => canonicalStoredFolder(f, input.platform));
   const running = { spelled: input.launchSpelling ?? input.folder, canonical: input.folder };
-  /** The folder the candidate's conversation belongs to, as the guard will judge it. */
-  const recordedFolder = (c: LaunchCandidate): string | null =>
-    c.dirName === undefined
-      ? c.folder === null
-        ? null
-        : canonical(c.folder)
-      : recordedFolderFor({ folder: c.folder, dirName: c.dirName }, running, canonical);
+  /** The folder the candidate's conversation belongs to, as the guard will judge it: the guard knows
+   *  the folder a session runs in by CLAUDE_PROJECT_DIR (the launch folder) and by the hook payload's
+   *  cwd, which for a resumed relocated session is its relocated folder — so both are offered here,
+   *  in the guard's order. */
+  const recordedFolder = (c: LaunchCandidate): string | null => {
+    if (c.dirName === undefined) return c.folder === null ? null : canonical(c.folder);
+    const read = { folder: c.folder, dirName: c.dirName };
+    const here = recordedFolderFor(read, running, canonical);
+    if (here !== null || c.relocatedCwd === undefined) return here;
+    return recordedFolderFor(
+      read,
+      { spelled: c.relocatedCwd, canonical: canonical(c.relocatedCwd) },
+      canonical,
+    );
+  };
   const targets = opened.candidates.map((c) => ({
     title: c.title,
     binding: resolveSessionBinding(

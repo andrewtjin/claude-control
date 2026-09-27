@@ -12,6 +12,7 @@
 // command is now outside its binding.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -55,6 +56,7 @@ const userLine = (cwd: string, tsMs: number): string =>
     message: { role: 'user', content: 'hi' },
   });
 const customTitle = (t: string): string => JSON.stringify({ type: 'custom-title', customTitle: t });
+const relocated = (cwd: string): string => JSON.stringify({ type: 'relocated', relocatedCwd: cwd });
 const aiTitle = (t: string): string => JSON.stringify({ type: 'ai-title', aiTitle: t });
 
 let root: string;
@@ -177,6 +179,57 @@ describe('cctl session bind', () => {
     const h = harness({ ...inCurrentSession(), cwd: sub });
     await runSessionBind(undefined, 'work', {}, h.deps);
     expect((await engine.listGroups())[0]?.aliases).toEqual([{ folder: repo, alias: 'Auth Work' }]);
+  });
+
+  it('inside a session that entered a worktree: binds it there, warns it, and show and the guard agree', async () => {
+    // Measured on Claude Code 2.1.283: EnterWorktree MOVES the transcript into the worktree's project
+    // directory (its first cwd stays the repository), the session's tools run in the worktree, and
+    // resumed from the repository its hooks get CLAUDE_PROJECT_DIR = the repository.
+    const S_REL = 'aaaaaaaa-0000-4000-8000-0000000000e1';
+    await mkdir(join(repo, '.claude', 'worktrees', 'w1'), { recursive: true });
+    const wt = realpathSync.native(join(repo, '.claude', 'worktrees', 'w1'));
+    await writeSession(
+      wt,
+      S_REL,
+      [userLine(repo, NOW), relocated(wt), userLine(wt, NOW), customTitle('Rel X'), relocated(wt)],
+      NOW + 4 * HOUR,
+    );
+    const inRelocated = { env: { [SESSION_ID_ENV]: S_REL }, cwd: wt };
+
+    const h = harness(inRelocated);
+    await runSessionBind(undefined, 'work', {}, h.deps);
+    expect((await engine.listGroups())[0]?.aliases).toEqual([{ folder: wt, alias: 'Rel X' }]);
+    expect(h.text()).toContain('This session is now outside its binding');
+    expect(h.text()).toContain(`cctl claude --resume ${S_REL}`);
+
+    const show = harness(inRelocated);
+    await runSessionShow(undefined, { json: true }, show.deps);
+    const binding = (
+      JSON.parse(show.text()) as { sessions: { binding?: Record<string, unknown> }[] }
+    ).sessions[0]?.binding;
+    expect(binding).toMatchObject({ via: 'alias', folder: wt, slot: 'global', inScope: false });
+
+    // The guard, as Claude Code runs it for this session's next prompt after a resume from the repo.
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      CLAUDE_PROJECT_DIR: repo.split('\\').join('/'),
+    };
+    for (const k of ['CLAUDE_CONFIG_DIR', 'CCTL_BIND_OVERRIDE', 'CCTL_LAUNCH_EXPLICIT'])
+      delete env[k];
+    const r = spawnSync(process.execPath, [bindGuardPath(dirname(paths.vaultDir))], {
+      input: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: S_REL,
+        cwd: wt,
+        prompt: 'go on',
+        transcript_path: join(paths.claudeDir, 'projects', projectDirStem(wt), `${S_REL}.jsonl`),
+        session_title: 'Rel X',
+      }),
+      env,
+      encoding: 'utf8',
+    });
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout || '{}')).toMatchObject({ decision: 'block' });
   });
 
   it('refuses a session that only has a generated title: name it first', async () => {

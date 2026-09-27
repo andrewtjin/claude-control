@@ -13,21 +13,40 @@
 //     miss it. Only complete lines count; a cwd further out is not read at all;
 //   - a relocation: the LAST complete `{"type":"relocated","relocatedCwd":…}` line within the last
 //     64 KiB (Claude Code's own tail window — it re-appends the relocation with its title metadata,
-//     so the current one stays in it). Claude Code writes one when a session enters or leaves a
-//     `.claude/worktrees/<name>` checkout; it never moves the transcript file;
-//   - consistency: Claude Code files a transcript under the project directory named after the folder
-//     it launched in (every non-alphanumeric character -> `-`; see projectDirMatches) — true of
-//     resumed sessions (their file stays where it was), forks (a new file in the launch folder's
-//     directory with every cwd rewritten), junctions (Claude Code resolves them before naming the
-//     directory), a folder spelled in another case, and paths past 200 characters. So a launch
-//     folder that does not encode to its own directory's name can only come from an edit, and is
-//     not trusted; nor is a relocation outside the launch folder's worktree root (the folder the
-//     `.claude/worktrees/<name>` checkout belongs to);
-//   - fallback: when no launch folder is accepted (none within the window, an inconsistent one, or
-//     the file is missing or unreadable), the transcript belongs to the folder the session RUNS in
-//     only when the project-directory name can stand for that folder, and otherwise to no folder an
-//     alias rule can name. The name is lossy (`C:\a_b` and `C:\a-b` share one), so it is never used
-//     to pick a bound folder the session does not run in.
+//     so the current one stays in it). Claude Code writes one whenever a session changes folder
+//     (EnterWorktree, ExitWorktree, `/cd`), and MOVES the transcript into the new folder's project
+//     directory before writing it there: after EnterWorktree the file lives in
+//     `<repo>--claude-worktrees-<name>`, its first cwd still `<repo>`; ExitWorktree moves it back.
+//     Only when the new folder's directory is the one the file is already in (the same name) does it
+//     stay put. So the folder Claude Code files a transcript under is its last relocation, else its
+//     launch folder — exactly how Claude Code's own session search keys it;
+//   - consistency: the project directory is named after that folder (every non-alphanumeric
+//     character -> `-`; see projectDirMatches) — true of resumed sessions (their file stays where it
+//     is), forks (a new file in the launch folder's directory with every cwd rewritten and no
+//     relocation), junctions (Claude Code resolves them before naming the directory), a folder
+//     spelled in another case, and paths past 200 characters. So:
+//       - a last relocation the directory's name stands for is where the conversation moved. It is
+//         trusted when it stays in the launch folder's repository: the launch folder's worktree root
+//         (the folder a `.claude/worktrees/<name>` checkout belongs to, else the folder itself) lies
+//         within the relocation's, compared on CANONICAL paths (a junction under
+//         `.claude/worktrees` pointing elsewhere is judged by where it leads). That covers entering,
+//         leaving and switching worktrees, from the repository root or one of its subfolders. A
+//         relocation anywhere else (a `/cd` into another folder) is not trusted;
+//       - otherwise (no relocation, or one this directory's name does not stand for — its stamp was
+//         lost, or it was edited in), the launch folder, trusted only when the directory's name
+//         stands for it: a head claiming another folder can only come from an edit;
+//       - a spelling with an empty, `.` or `..` segment (or, on Windows, a segment ending in a dot or
+//         a space) is never trusted: canonicalized, it names another folder than the one its
+//         project-directory name encodes, and Claude Code never records one;
+//   - fallback: when nothing is trusted (no launch folder within the window, an inconsistent one, a
+//     relocation that leaves the repository, or the file is missing or unreadable), the transcript
+//     belongs to the folder the session RUNS in only when the project-directory name can stand for
+//     that folder, and otherwise to no folder an alias rule can name. The name is lossy (`C:\a_b` and
+//     `C:\a-b` share one), so it is never used to pick a bound folder the session does not run in.
+//     A resumed relocated session runs in its relocated folder (measured: Claude Code changes into
+//     it while CLAUDE_PROJECT_DIR stays the folder it was resumed from), so a caller that knows both
+//     offers both spellings: the guard the hook payload's `cwd`, the launcher the transcript's last
+//     relocation ({@link RecordedFolderRead.relocatedCwd}).
 //
 // EMBEDDING CONTRACT (as folderPath.ts): every function here the guard embeds references only its
 // parameters, its own nested helpers, node's global Buffer, and the other functions of THIS module
@@ -98,14 +117,21 @@ export interface RecordedFolderRead {
   status: 'read' | 'missing' | 'unreadable';
   /** The name of the project directory the transcript lives in — the fallback. */
   dirName: string;
-  /** The launch folder (first top-level cwd), as Claude Code spelled it, when accepted; else null. */
+  /** The launch folder (first top-level cwd), as Claude Code spelled it, when {@link folder} is
+   *  trusted; else null. */
   launchFolder: string | null;
-  /** Where the conversation belongs: an accepted relocation, else {@link launchFolder}; null when
-   *  no launch folder is accepted (the caller then applies the fallback, {@link recordedFolderFor}). */
+  /** Where the conversation belongs, as spelled: a trusted relocation, else the trusted launch
+   *  folder; null when neither is trusted (the caller then applies the fallback,
+   *  {@link recordedFolderFor}). */
   folder: string | null;
   /** Whether the window held a top-level cwd at all, accepted or not. False for a transcript that
    *  records no conversation (only bookkeeping lines) — or whose first cwd lies past the window. */
   sawCwd: boolean;
+  /** The last relocation within the tail window, as spelled, trusted or not (null when there is
+   *  none, or its spelling is one no folder is recorded under). NOT a binding key: it is where Claude
+   *  Code runs the session when it is resumed, which a caller may offer {@link recordedFolderFor} as
+   *  a spelling of the folder the session runs in. */
+  relocatedCwd: string | null;
 }
 
 /**
@@ -114,12 +140,19 @@ export interface RecordedFolderRead {
  * regular file (a directory, a FIFO, a device) is never opened. Synchronous: the guard is a
  * synchronous script, and every other caller reads a handful of transcripts, bounded by the windows.
  *
- * SELF-CONTAINED BY CONTRACT (the guard embeds it): see the file header.
+ * `canonicalize` turns a recorded folder into the form bindings are keyed on (the caller's rule:
+ * realpath-resolving where the folder exists). It is called only for a relocation the directory's
+ * name stands for, to compare worktree roots where the folders really are: compared as spelled, a
+ * junction named like a worktree could carry a conversation into any folder.
+ *
+ * SELF-CONTAINED BY CONTRACT (the guard embeds it): calls only its parameters, its nested helpers,
+ * Buffer and projectDirMatches (emitted beside it); see the file header.
  */
 export function readRecordedFolder(
   file: string,
   fs: RecordedFolderFs,
   platform: NodeJS.Platform,
+  canonicalize: (folder: string) => string,
 ): RecordedFolderRead {
   const HEAD_MAX_BYTES = 1024 * 1024;
   const TAIL_BYTES = 64 * 1024;
@@ -154,6 +187,39 @@ export function readRecordedFolder(
     return typeof value === 'string' && value !== '' ? value : null;
   }
 
+  // Whether `path` is spelled the way Claude Code records a folder: after its root (a drive, a UNC
+  // share or a separator), no segment is empty, `.` or `..` (nor, on Windows, ends in a dot or a
+  // space, which the filesystem drops), and on Windows no `\\?\` or `\\.\` prefix. Any other spelling
+  // canonicalizes to a different folder than the one its project-directory name encodes
+  // (`C:\x\a\..\b` is `C:\x\b`, yet named `C--x-a----b` like a real `C:\x\a\__\b`).
+  function plain(path: string): boolean {
+    const sep = win ? '\\' : '/';
+    const p = win ? path.replace(/\//g, '\\') : path;
+    let rest = p;
+    if (win && p.startsWith('\\\\')) {
+      const share = /^\\\\(?![?.]\\)[^\\]+\\[^\\]+(?:\\|$)/.exec(p);
+      if (share === null) return false;
+      rest = p.slice(share[0].length);
+    } else if (win && /^[A-Za-z]:\\/.test(p)) {
+      rest = p.slice(3);
+    } else if (p.startsWith(sep)) {
+      rest = p.slice(1);
+    }
+    if (rest === '') return true;
+    const segments = rest.split(sep);
+    if (segments[segments.length - 1] === '') segments.pop(); // one trailing separator
+    return segments.every((s) => s !== '' && s !== '.' && s !== '..' && !(win && /[. ]$/.test(s)));
+  }
+
+  // `canonicalize`, never throwing: a folder that cannot be canonicalized is compared as spelled.
+  function canonical(path: string): string {
+    try {
+      return canonicalize(path);
+    } catch {
+      return path;
+    }
+  }
+
   // A folder's worktree root, in a comparable form: the folder a `.claude/worktrees/<name>` checkout
   // belongs to, else the folder itself. Windows folds case and separators; trailing separators go.
   function worktreeRoot(path: string): string {
@@ -165,6 +231,12 @@ export function readRecordedFolder(
     return m !== null ? m[1]! : p;
   }
 
+  // Whether comparable folder `inner` is `outer` or lies beneath it.
+  function within(inner: string, outer: string): boolean {
+    const sep = win ? '\\' : '/';
+    return inner === outer || inner.startsWith(outer.endsWith(sep) ? outer : outer + sep);
+  }
+
   const dirName = parentName(file);
   const nothing = (status: RecordedFolderRead['status']): RecordedFolderRead => ({
     status,
@@ -172,6 +244,7 @@ export function readRecordedFolder(
     launchFolder: null,
     folder: null,
     sawCwd: false,
+    relocatedCwd: null,
   });
 
   let size: number;
@@ -209,13 +282,10 @@ export function readRecordedFolder(
     if (launch === null && got >= size && lineStart < got) {
       launch = cwdOf(head.subarray(lineStart, got));
     }
-    const sawCwd = launch !== null;
-    if (launch === null || !projectDirMatches(dirName, launch)) {
-      return { status: 'read', dirName, launchFolder: null, folder: null, sawCwd };
-    }
 
     // TAIL: the last TAIL_BYTES, read from one byte earlier so a line starting exactly at the
-    // window's edge is known to be whole; the partial first line is dropped.
+    // window's edge is known to be whole; the partial first line is dropped. Read whatever the head
+    // held: the file lives where its last relocation put it, so the head alone decides nothing.
     const tailStart = Math.max(0, size - TAIL_BYTES);
     const from = tailStart > 0 ? tailStart - 1 : 0;
     const tail = Buffer.alloc(size - from);
@@ -244,9 +314,32 @@ export function readRecordedFolder(
       }
       end = newline;
     }
-    const folder =
-      relocated !== null && worktreeRoot(relocated) === worktreeRoot(launch) ? relocated : launch;
-    return { status: 'read', dirName, launchFolder: launch, folder, sawCwd };
+
+    // Where Claude Code filed the conversation: its last relocation when the directory's name stands
+    // for it (Claude Code moved the file there), trusted only within the launch folder's repository;
+    // else its launch folder, trusted only when the name stands for it.
+    const plainRelocation = relocated !== null && plain(relocated) ? relocated : null;
+    let folder: string | null = null;
+    if (relocated !== null && projectDirMatches(dirName, relocated)) {
+      if (
+        plainRelocation !== null &&
+        launch !== null &&
+        plain(launch) &&
+        within(worktreeRoot(canonical(launch)), worktreeRoot(canonical(plainRelocation)))
+      ) {
+        folder = plainRelocation;
+      }
+    } else if (launch !== null && plain(launch) && projectDirMatches(dirName, launch)) {
+      folder = launch;
+    }
+    return {
+      status: 'read',
+      dirName,
+      launchFolder: folder !== null ? launch : null,
+      folder,
+      sawCwd: launch !== null,
+      relocatedCwd: plainRelocation,
+    };
   } catch {
     return nothing('unreadable');
   } finally {
@@ -263,7 +356,10 @@ export function readRecordedFolder(
  * given the folder the session RUNS in (as Claude Code spelled it — the name its project directory
  * is built from — and canonically): the accepted recorded folder, canonicalized by the caller's rule;
  * else the running folder, when the transcript's project-directory name can stand for it (a session
- * that runs where it was recorded); else null — no alias rule applies. See the file header.
+ * that runs where it was recorded); else null — no alias rule applies. See the file header. A caller
+ * that knows the running folder by more than one spelling (the guard: CLAUDE_PROJECT_DIR and the hook
+ * payload's cwd, which differ for a resumed relocated session) asks again with the next one when an
+ * answer is null.
  *
  * SELF-CONTAINED BY CONTRACT (the guard embeds it): calls only its parameters and projectDirMatches.
  */

@@ -228,6 +228,7 @@ export {
 export {
   readSessionCatalog,
   sessionIdentities,
+  canonicalRecordedFolder,
   aliasOf,
   aliasKey,
   projectDirMatches,

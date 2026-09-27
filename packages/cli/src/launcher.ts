@@ -732,6 +732,10 @@ export interface LaunchSessionFacts {
   /** The project directory the transcript lives in: with no trusted folder, it stands for the launch
    *  folder when it can (recordedFolderFor). Absent = unknown, so no fallback applies. */
   dirName?: string;
+  /** The transcript's last relocation (readRecordedFolder's `relocatedCwd`), trusted or not: the
+   *  folder Claude Code runs the session in when it resumes it, which the fallback may stand for
+   *  too. Absent = none recorded. */
+  relocatedCwd?: string;
 }
 
 /**
@@ -762,6 +766,9 @@ export interface LaunchCandidate {
   /** An existing session's project directory, the fallback when no folder is recorded (see
    *  {@link LaunchSessionFacts.dirName}). */
   dirName?: string;
+  /** Where an existing session runs once resumed, when it was relocated (see
+   *  {@link LaunchSessionFacts.relocatedCwd}). */
+  relocatedCwd?: string;
 }
 
 /** Which session(s) a launch may open. `candidates` empty = no session opens, or the launcher
@@ -836,7 +843,12 @@ export async function resolveLaunchSessions(
   const opened = (s: LaunchSessionFacts): LaunchCandidate => {
     const title = name ?? namedTitle(s.customTitle);
     if (fork) return { title, folder: context.launchFolder };
-    return { title, folder: s.folder, ...(s.dirName !== undefined ? { dirName: s.dirName } : {}) };
+    return {
+      title,
+      folder: s.folder,
+      ...(s.dirName !== undefined ? { dirName: s.dirName } : {}),
+      ...(s.relocatedCwd !== undefined ? { relocatedCwd: s.relocatedCwd } : {}),
+    };
   };
   const found = (s: LaunchSessionFacts | null): LaunchSessions => ({
     kind: 'candidates',

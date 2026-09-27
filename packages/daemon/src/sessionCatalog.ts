@@ -10,8 +10,10 @@
 // WHICH FOLDER. switch-engine's readRecordedFolder — the one reading the launcher, the enforcement
 // guard and the running-session scan use too, so `cctl session show` can never name a different
 // folder than the one a binding is judged by: the launch cwd (the first `cwd` within a bounded
-// head), unless a `relocated` line within a bounded tail moved the session, each trusted only when
-// consistent with the project directory's name. The name alone does not decide a folder: Claude
+// head), unless a `relocated` line within a bounded tail moved the session (Claude Code moves the
+// transcript with it), each trusted only when consistent with the project directory's name — and a
+// relocation only within the launch folder's repository, compared on canonical paths
+// ({@link canonicalRecordedFolder}). The name alone does not decide a folder: Claude
 // Code builds it by replacing every non-alphanumeric character with `-` (plus a hash past 200
 // characters), so `C:\a_b` and `C:\a-b` share one directory; it narrows which directories are worth
 // opening, and stands for a folder only through recordedFolderFor's fallback.
@@ -24,6 +26,7 @@ import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   aliasKey,
+  canonicalizeFolder,
   projectDirMatches,
   projectDirStem,
   readRecordedFolder,
@@ -100,6 +103,24 @@ const CUSTOM_TITLE_NEEDLE = Buffer.from('"type":"custom-title"');
 const AI_TITLE_NEEDLE = Buffer.from('"type":"ai-title"');
 const TIMESTAMP_NEEDLE = Buffer.from('"timestamp":');
 
+/**
+ * A folder a transcript records, in the canonical form bindings are keyed on: resolved through the
+ * filesystem (junctions, symlinks, true case) as far as it exists when `platform` is this machine's,
+ * else normalized as a string; the text itself when it has no canonical form. What the shared
+ * recorded-folder reading compares worktree roots on (readRecordedFolder's `canonicalize`), here and
+ * in the launcher.
+ */
+export function canonicalRecordedFolder(folder: string, platform: NodeJS.Platform): string {
+  const canon = canonicalizeFolder(folder, {
+    platform,
+    cwd: platform === 'win32' ? 'C:\\' : '/',
+    ...(platform === process.platform
+      ? { realpath: (p: string) => nodeFs.realpathSync.native(p) }
+      : {}),
+  });
+  return canon.ok ? canon.path : folder;
+}
+
 /** A top-level transcript's session id: a `<id>.jsonl` directly in a project directory. */
 function sessionIdOfName(name: string): string | null {
   if (!name.endsWith('.jsonl')) return null;
@@ -161,7 +182,9 @@ async function readMeta(
       meta.aiTitle = line.aiTitle;
     }
   });
-  const recorded = readRecordedFolder(file, nodeFs, platform);
+  const recorded = readRecordedFolder(file, nodeFs, platform, (folder) =>
+    canonicalRecordedFolder(folder, platform),
+  );
   meta.launchCwd = recorded.launchFolder;
   meta.folder = recorded.folder;
   return meta;

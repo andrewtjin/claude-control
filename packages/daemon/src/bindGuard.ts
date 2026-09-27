@@ -73,12 +73,15 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *     the payload's `session_title` (Claude Code's custom title; absent = unnamed — the transcript is
  *     never read for a title, so alias binding needs a Claude Code that sends it). R is the folder
  *     the conversation belongs to, read from the transcript at `transcript_path` by switch-engine's
- *     readRecordedFolder (embedded; only when X names some bound alias): its first cwd within a
- *     bounded head, moved by a relocation within a bounded tail, trusted only when consistent with
- *     the transcript's project-directory name; otherwise — no transcript yet, an unreadable one, or
- *     no trusted folder in it — F, when that name can stand for F, else no folder at all (so a
- *     lossy name never picks a bound folder the session does not run in). A read error is handled
- *     there, never by failing open.
+ *     readRecordedFolder (embedded; only when X names some bound alias): the last relocation within
+ *     a bounded tail when Claude Code moved the transcript there (trusted within the launch folder's
+ *     repository, compared on canonical paths), else the first cwd within a bounded head, each
+ *     trusted only when consistent with the transcript's project-directory name; otherwise — no
+ *     transcript yet, an unreadable one, or no trusted folder in it — the folder the session runs
+ *     in, spelled as F or as the payload's `cwd` (a resumed relocated session runs in its relocated
+ *     folder while F stays the folder it was resumed from), when that name can stand for it, else no
+ *     folder at all (so a lossy name never picks a bound folder the session does not run in). A read
+ *     error is handled there, never by failing open.
  *   - (A) the rule names a group the session is NOT running on -> block. The block reason names the
  *     account the session is actually on (a different group, or the shared account); for an alias
  *     binding it names the alias (display text) and says to resume THE session:
@@ -337,7 +340,14 @@ function run(input) {
   var recorded = undefined;
   var key = title !== null ? aliasKey(title) : '';
   if (key !== '' && aliasBoundAnywhere(groups, key)) {
-    recorded = conversationFolder(payload.transcript_path, rawProject, projectDir, deps, platform);
+    recorded = conversationFolder(
+      payload.transcript_path,
+      rawProject,
+      projectDir,
+      payload.cwd,
+      deps,
+      platform,
+    );
   }
 
   // THE precedence rule, embedded verbatim from switch-engine (the launcher, cctl where and cctl
@@ -596,15 +606,25 @@ function aliasBoundAnywhere(groups, key) {
 
 // The folder a session's conversation belongs to for the alias rule. No transcript path in the
 // payload: the folder it runs in. Otherwise the embedded readRecordedFolder / recordedFolderFor decide
-// (see the policy in the script header); neither ever throws, so an unreadable transcript never fails
-// the whole guard open.
-function conversationFolder(transcriptPath, rawProject, projectDir, deps, platform) {
+// (see the policy in the script header), with the folder the session runs in spelled first as
+// CLAUDE_PROJECT_DIR, then as the payload's cwd — they differ for a relocated session resumed from
+// its repository (Claude Code changes into the relocated folder but keeps the project dir it was
+// resumed from). Nothing here throws, so an unreadable transcript never fails the whole guard open.
+function conversationFolder(transcriptPath, rawProject, projectDir, payloadCwd, deps, platform) {
   if (typeof transcriptPath !== 'string' || transcriptPath === '') return projectDir;
-  var read = readRecordedFolder(transcriptPath, fs, platform);
-  return recordedFolderFor(read, { spelled: rawProject, canonical: projectDir }, function (f) {
+  var canonical = function (f) {
     var c = canonicalizeFolder(f, deps);
     return c.ok ? c.path : f;
-  });
+  };
+  var read = readRecordedFolder(transcriptPath, fs, platform, canonical);
+  var folder = recordedFolderFor(read, { spelled: rawProject, canonical: projectDir }, canonical);
+  if (folder === null && typeof payloadCwd === 'string' && payloadCwd !== '') {
+    var runs = canonicalizeFolder(payloadCwd, deps);
+    if (runs.ok) {
+      folder = recordedFolderFor(read, { spelled: payloadCwd, canonical: runs.path }, canonical);
+    }
+  }
+  return folder;
 }
 
 // The argument of the resume command an alias block prints: THE session's id. A UUID needs no

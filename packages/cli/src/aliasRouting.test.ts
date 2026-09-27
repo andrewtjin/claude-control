@@ -14,6 +14,9 @@
 //   - `--fork-session` copies the conversation into a NEW transcript in the LAUNCH folder's project
 //     directory, every cwd rewritten to the launch folder, the same title;
 //   - resuming keeps hook cwd = CLAUDE_PROJECT_DIR = the launch folder and the original transcript;
+//   - a relocation (EnterWorktree, ExitWorktree, `/cd`) MOVES the transcript into the new folder's
+//     project directory; resumed, the session runs there (hook cwd) while CLAUDE_PROJECT_DIR stays the
+//     folder it was resumed from;
 //   - Claude Code resolves a junction in its cwd (its project directory is the target's).
 
 import { spawnSync } from 'node:child_process';
@@ -175,10 +178,13 @@ async function launch(
   return decision.binding?.groupId === 'A' ? 'A' : 'global';
 }
 
-/** Run the real guard for one prompt on `slot`, as Claude Code does. {} = allowed silently. */
+/** Run the real guard for one prompt on `slot`, as Claude Code does. {} = allowed silently. The
+ *  payload's cwd is the folder Claude Code runs the session in: `projectDir` unless given (a resumed
+ *  relocated session runs in its relocated folder). */
 function guard(opts: {
   slot: 'A' | 'global';
   projectDir: string;
+  cwd?: string;
   title?: string;
   transcript: string;
 }): { decision?: string; reason?: string; systemMessage?: string } {
@@ -193,7 +199,7 @@ function guard(opts: {
     // Claude Code names the transcript after the session id.
     session_id: basename(opts.transcript, '.jsonl'),
     prompt: 'go on',
-    cwd: opts.projectDir,
+    cwd: opts.cwd ?? opts.projectDir,
     transcript_path: opts.transcript,
   };
   if (opts.title !== undefined) payload.session_title = opts.title;
@@ -280,57 +286,203 @@ describe('a long first prompt pushes the recorded folder past a small read windo
   });
 });
 
-describe('relocations: the launcher and the guard read the same last relocation', () => {
-  it('a session relocated into a .claude worktree belongs there: routed and judged alike', async () => {
+describe('relocations: Claude Code moves the transcript, and the launcher and the guard follow it', () => {
+  // Measured on Claude Code 2.1.283: EnterWorktree MOVES the transcript from the repository's project
+  // directory into `<repo>--claude-worktrees-<name>`; its first cwd stays the repository and the
+  // `relocated` lines in its tail name the worktree. Resumed from the repository (by id or title),
+  // CLAUDE_PROJECT_DIR is the repository while the hook payload's cwd is the worktree. ExitWorktree
+  // moves it back.
+
+  /** The measured transcript of a session named `title`, started in `from`, that moved to `to`:
+   *  filed under `to`'s project directory, turns in both folders, the relocation re-appended. */
+  function movedTranscript(
+    from: string,
+    to: string,
+    id: string,
+    opts: { title: string; prompt?: string },
+  ): string {
+    const file = transcriptPath(to, id);
+    mkdirSync(join(file, '..'), { recursive: true });
+    const prompt = opts.prompt ?? 'enter a worktree';
+    const lines: object[] = [
+      { type: 'custom-title', customTitle: opts.title, sessionId: id },
+      { type: 'agent-name', agentName: opts.title, sessionId: id },
+      { type: 'queue-operation', operation: 'enqueue', sessionId: id, content: prompt },
+      { type: 'queue-operation', operation: 'dequeue', sessionId: id },
+      {
+        type: 'user',
+        message: { role: 'user', content: prompt },
+        entrypoint: 'cli',
+        cwd: from,
+        sessionId: id,
+      },
+      {
+        type: 'assistant',
+        message: { role: 'assistant', content: 'tool' },
+        cwd: from,
+        sessionId: id,
+      },
+      { type: 'relocated', sessionId: id, relocatedCwd: to },
+      { type: 'user', message: { role: 'user', content: 'result' }, cwd: to, sessionId: id },
+      {
+        type: 'assistant',
+        message: { role: 'assistant', content: 'entered' },
+        cwd: to,
+        sessionId: id,
+      },
+      { type: 'custom-title', customTitle: opts.title, sessionId: id },
+      { type: 'relocated', relocatedCwd: to, sessionId: id },
+    ];
+    writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    return file;
+  }
+
+  it('bound to the worktree it moved into, resumed from the repository root: on the binding, never the shared account', async () => {
     const repo = dir('repo');
-    const wt = dir('repo', '.claude', 'worktrees', 'feature');
-    const groups = bindAlias(repo, 'X');
-    const id = `${SID}5`;
-    const file = ccTranscript(repo, id, {
+    const wt = dir('repo', '.claude', 'worktrees', 'w1');
+    const groups = bindAlias(wt, 'X');
+    const id = `${SID}1`;
+    const file = movedTranscript(repo, wt, id, { title: 'X' });
+    const worktrees = [repo, wt];
+
+    for (const args of [
+      ['--resume', 'X'],
+      ['--resume', id],
+    ]) {
+      const slot = await launch(repo, args, groups, worktrees);
+      const verdict = guard({ slot, projectDir: repo, cwd: wt, title: 'X', transcript: file });
+      expect({ args, slot, verdict }).toEqual({ args, slot: 'A', verdict: {} });
+    }
+    // Resumed from the worktree itself, the same.
+    expect(await launch(wt, ['--resume', id], groups, worktrees)).toBe('A');
+    // On the shared account it is held to its binding, and the printed command routes it.
+    const onShared = guard({
+      slot: 'global',
+      projectDir: repo,
+      cwd: wt,
       title: 'X',
-      tail: [{ type: 'relocated', sessionId: id, relocatedCwd: wt }],
+      transcript: file,
     });
-
-    const slot = await launch(repo, ['--resume', 'X'], groups);
-    const verdict = guard({ slot, projectDir: repo, title: 'X', transcript: file });
-
-    // Its conversation moved out of repo, so (repo, X) no longer covers it — on either side.
-    expect({ slot, verdict }).toEqual({ slot: 'global', verdict: {} });
+    expect(onShared.decision).toBe('block');
+    expect(hintArgs(onShared.reason)).toEqual(['--resume', id]);
+    expect(await launch(repo, hintArgs(onShared.reason), groups, worktrees)).toBe('A');
   });
 
-  it('a session recorded in a worktree and relocated back into the repository is routed and allowed', async () => {
+  it('bound to the repository, a session that moved into a worktree is no longer that conversation — on either side', async () => {
     const repo = dir('repo');
     const wt = dir('repo', '.claude', 'worktrees', 'feature');
     const groups = bindAlias(repo, 'X');
-    const id = `${SID}6`;
-    // Claude Code never moves the transcript: it stays in the worktree's project directory, which
-    // the repository's `<repo>--claude-worktrees-*` search scope reaches.
-    const file = ccTranscript(wt, id, {
-      title: 'X',
-      tail: [{ type: 'relocated', sessionId: id, relocatedCwd: repo }],
-    });
+    const file = movedTranscript(repo, wt, `${SID}5`, { title: 'X' });
 
-    const slot = await launch(repo, ['--resume', 'X'], groups);
+    const slot = await launch(repo, ['--resume', 'X'], groups, [repo, wt]);
+    const verdict = guard({ slot, projectDir: repo, cwd: wt, title: 'X', transcript: file });
+    expect({ slot, verdict }).toEqual({ slot: 'global', verdict: {} });
+    const onA = guard({ slot: 'A', projectDir: repo, cwd: wt, title: 'X', transcript: file });
+    expect(onA.decision).toBe('block');
+  });
+
+  it('a session started in a worktree that moved into the repository is routed and allowed', async () => {
+    const repo = dir('repo');
+    const wt = dir('repo', '.claude', 'worktrees', 'feature');
+    const groups = bindAlias(repo, 'X');
+    const file = movedTranscript(wt, repo, `${SID}6`, { title: 'X' });
+
+    const slot = await launch(repo, ['--resume', 'X'], groups, [repo, wt]);
     const verdict = guard({ slot, projectDir: repo, title: 'X', transcript: file });
-
     expect({ slot, verdict }).toEqual({ slot: 'A', verdict: {} });
   });
 
-  it('a round trip (out to a worktree and back) is routed and allowed', async () => {
+  it('a round trip (into a worktree and back out) is filed under the repository again: routed and allowed', async () => {
     const repo = dir('repo');
-    const wt = dir('repo', '.claude', 'worktrees', 'feature');
+    const wt = dir('repo', '.claude', 'worktrees', 'w2');
     const groups = bindAlias(repo, 'X');
     const id = `${SID}7`;
+    // Measured: relocations to the worktree, then back to the repository, each re-appended.
     const file = ccTranscript(repo, id, {
       title: 'X',
       tail: [
         { type: 'relocated', sessionId: id, relocatedCwd: wt },
+        { type: 'relocated', relocatedCwd: wt, sessionId: id },
         { type: 'relocated', sessionId: id, relocatedCwd: repo },
+        { type: 'relocated', relocatedCwd: repo, sessionId: id },
       ],
     });
-    const slot = await launch(repo, ['--resume', 'X'], groups);
+    const slot = await launch(repo, ['--resume', 'X'], groups, [repo, wt]);
     const verdict = guard({ slot, projectDir: repo, title: 'X', transcript: file });
     expect({ slot, verdict }).toEqual({ slot: 'A', verdict: {} });
+  });
+
+  it('a first cwd past the head window: both judge the moved session where it runs, its worktree', async () => {
+    const repo = dir('repo');
+    const wt = dir('repo', '.claude', 'worktrees', 'w1');
+    const groups = bindAlias(wt, 'Huge');
+    const id = `${SID}8`;
+    const file = movedTranscript(repo, wt, id, { title: 'Huge', prompt: 'x'.repeat(1_200_000) });
+
+    for (const args of [
+      ['--resume', 'Huge'],
+      ['--resume', id],
+    ]) {
+      const slot = await launch(repo, args, groups, [repo, wt]);
+      const verdict = guard({ slot, projectDir: repo, cwd: wt, title: 'Huge', transcript: file });
+      expect({ args, slot, verdict }).toEqual({ args, slot: 'A', verdict: {} });
+    }
+  });
+
+  it('a move out of the repository (a /cd elsewhere) is judged where the session runs, on both sides', async () => {
+    const repo = dir('repo');
+    const other = dir('other');
+    const groups = bindAlias(other, 'X');
+    const id = `${SID}9`;
+    const file = movedTranscript(repo, other, id, { title: 'X' });
+
+    for (const from of [repo, other]) {
+      const slot = await launch(from, ['--resume', id], groups);
+      const verdict = guard({ slot, projectDir: from, cwd: other, title: 'X', transcript: file });
+      expect({ from, slot, verdict }).toEqual({ from, slot: 'A', verdict: {} });
+    }
+  });
+});
+
+describe('a relocation that only names a bound folder never carries its account out of it', () => {
+  it('a junction under .claude/worktrees that leads to the bound folder', async () => {
+    const other = dir('other');
+    const bound = dir('bound');
+    mkdirSync(join(root, 'other', '.claude', 'worktrees'), { recursive: true });
+    const link = join(root, 'other', '.claude', 'worktrees', 'j');
+    symlinkSync(bound, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const groups = bindAlias(bound, 'X');
+    const id = `${SID}a`;
+    // The session runs in `other`; its transcript (in other's directory) was given a relocation.
+    const file = ccTranscript(other, id, {
+      title: 'X',
+      tail: [{ type: 'relocated', relocatedCwd: link, sessionId: id }],
+    });
+
+    const onA = guard({ slot: 'A', projectDir: other, title: 'X', transcript: file });
+    expect(onA.decision).toBe('block');
+    const slot = await launch(other, ['--resume', id], groups);
+    expect({
+      slot,
+      verdict: guard({ slot, projectDir: other, title: 'X', transcript: file }),
+    }).toEqual({ slot: 'global', verdict: {} });
+  });
+
+  it('a head spelled with `..`, filed under the name of a real folder it does not lead to', async () => {
+    // `<root>\other\..\bound` is named like the real folder `<root>\other\__\bound` (every
+    // non-alphanumeric character becomes `-`), where the session really runs.
+    const bound = dir('bound');
+    const runs = dir('other', '__', 'bound');
+    const groups = bindAlias(bound, 'X');
+    const spelled = [canon(root), 'other', '..', 'bound'].join(
+      process.platform === 'win32' ? '\\' : '/',
+    );
+    expect(projectDirStem(spelled)).toBe(projectDirStem(runs));
+    const file = ccTranscript(spelled, `${SID}b`, { title: 'X', dirOf: runs });
+
+    const onA = guard({ slot: 'A', projectDir: runs, title: 'X', transcript: file });
+    expect(onA.decision).toBe('block');
+    expect(await launch(runs, ['--resume', `${SID}b`], groups)).toBe('global');
   });
 });
 
