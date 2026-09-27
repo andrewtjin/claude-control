@@ -480,39 +480,100 @@ describe('bind guard — session alias rules', () => {
       expect(ok).toMatchObject({ code: 0, stdout: '', stderr: '' });
     });
 
-    it('a first line longer than the head window still yields its cwd', async () => {
+    it('a first cwd past the head window leaves the project-dir name: the folder it runs in, if it can stand for it', async () => {
       await writeSnapshot([bound(sub)]);
       const dir = join(root, 'projects', projectDirStem(sub));
       await mkdir(dir, { recursive: true });
       const file = join(dir, 'big.jsonl');
-      // cwd first, then a 3 MB pasted prompt on the same line: the line is never complete in the
-      // bounded read, so the value is taken from the raw head.
+      // cwd first, then a 3 MB pasted prompt on the same line: the line is never whole in the
+      // bounded read, so no cwd is read at all.
       await writeFile(
         file,
         `{"type":"user","cwd":${JSON.stringify(sub)},"message":{"content":"${'y'.repeat(3 * 1024 * 1024)}"}}\n`,
         'utf8',
       );
-      const r = await runGuard(
+      // Running in sub (whose name the directory carries): sub's alias rule, so the shared account
+      // is blocked.
+      const inSub = await runGuard(
         scriptPath,
         payload({ title: 'x', transcript: file }),
-        onSlot(undefined),
+        onSlot(undefined, sub),
       );
-      expect(decision(r).decision).toBe('block');
+      expect(decision(inSub).decision).toBe('block');
+      // Running in the repo root: the name cannot stand for the root, and a lossy name never picks
+      // a bound folder the session does not run in — no alias rule, as the launcher decides too.
+      const inRoot = await runGuard(
+        scriptPath,
+        payload({ title: 'x', transcript: file }),
+        onSlot(undefined, repo),
+      );
+      expect(inRoot).toMatchObject({ code: 0, stdout: '', stderr: '' });
     });
 
     it('an unreadable transcript falls back to its project-dir name, never failing open', async () => {
       await writeSnapshot([bound(sub)]);
-      // A DIRECTORY at the transcript path: stat works, it is not a file, so no cwd is read; the
-      // project-dir name (the sub folder's) decides.
+      // A DIRECTORY at the transcript path: stat works, it is not a file, so it is never opened;
+      // the project-dir name (the sub folder's) decides for a session running in sub.
       const dir = join(root, 'projects', projectDirStem(sub), 'as-dir.jsonl');
       await mkdir(dir, { recursive: true });
       const r = await runGuard(
         scriptPath,
         payload({ title: 'X', transcript: dir }),
-        onSlot(undefined),
+        onSlot(undefined, sub),
       );
       expect(r.stderr).toBe('');
       expect(decision(r).decision).toBe('block');
+    });
+
+    it('a transcript whose head claims a folder its project dir does not encode is not trusted', async () => {
+      // The conversation lives in `other`'s project dir; only its head's cwd was edited to claim the
+      // bound folder. Claude Code never writes that shape (it names the directory after the folder
+      // the session launched in), so the head is ignored and the project-dir name decides: the
+      // reserved account is running in `other`, outside its binding.
+      await writeSnapshot([bound(repo)]);
+      const dir = join(root, 'projects', projectDirStem(other));
+      await mkdir(dir, { recursive: true });
+      const file = join(dir, 'edited.jsonl');
+      await writeFile(file, [userLine('a', repo), customTitleLine('X')].join('\n') + '\n', 'utf8');
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: file }),
+        onSlot(aliasProfile, other),
+      );
+      expect(r.stderr).toBe('');
+      expect(decision(r).decision).toBe('block');
+      expect(decision(r).reason).toContain('That account is reserved to its bindings.');
+    });
+
+    it('a relocation into a .claude worktree moves the conversation there', async () => {
+      const wt = join(root, 'repo', '.claude', 'worktrees', 'feature');
+      await mkdir(wt, { recursive: true });
+      const worktree = canon(wt);
+      await writeSnapshot([bound(worktree)]);
+      const t = await recordedIn(repo, 'X');
+      await writeFile(t, JSON.stringify({ type: 'relocated', relocatedCwd: worktree }) + '\n', {
+        encoding: 'utf8',
+        flag: 'a',
+      });
+      // Resumed from the repo root on the worktree binding's account: in scope.
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(aliasProfile),
+      );
+      expect(r).toMatchObject({ code: 0, stdout: '', stderr: '' });
+      // ...and a relocation to a folder outside the launch folder's worktree root is ignored.
+      await writeFile(t, JSON.stringify({ type: 'relocated', relocatedCwd: other }) + '\n', {
+        encoding: 'utf8',
+        flag: 'a',
+      });
+      await writeSnapshot([bound(other)]);
+      const moved = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(aliasProfile),
+      );
+      expect(decision(moved).decision).toBe('block');
     });
 
     describe.skipIf(!WIN)('a transcript locked by another process', () => {
@@ -550,6 +611,88 @@ describe('bind guard — session alias rules', () => {
         expect(r.stderr).toBe('');
         expect(decision(r).decision).toBe('block');
       });
+
+      it('an unbound same-titled session in a lossy twin folder is not blocked while it is locked', async () => {
+        // (repo_x, X) is bound; repo-x shares its project-dir name and holds an unbound "X" run on
+        // the shared account. The name can stand for the folder the session runs in, so that is the
+        // folder it counts for — never the bound twin it does not run in.
+        await mkdir(join(root, 'repo_x'), { recursive: true });
+        await mkdir(join(root, 'repo-x'), { recursive: true });
+        const twinBound = canon(join(root, 'repo_x'));
+        const twin = canon(join(root, 'repo-x'));
+        expect(projectDirStem(twinBound)).toBe(projectDirStem(twin));
+        await writeSnapshot([bound(twinBound)]);
+        const t = await recordedIn(twin, 'X');
+        const script = join(root, 'hold.ps1');
+        await writeFile(
+          script,
+          "param([string]$Path)\n$fs=[System.IO.File]::Open($Path,'Open','ReadWrite','ReadWrite')\n" +
+            "$fs.Lock(0,$fs.Length)\nWrite-Output 'locked'\nStart-Sleep -Seconds 30\n",
+          'utf8',
+        );
+        holder = spawn('powershell.exe', ['-NoProfile', '-File', script, '-Path', t]);
+        await new Promise<void>((resolve, reject) => {
+          const to = setTimeout(() => reject(new Error('the lock holder never locked')), 15000);
+          holder!.stdout!.on('data', (c: Buffer) => {
+            if (c.toString().includes('locked')) {
+              clearTimeout(to);
+              resolve();
+            }
+          });
+        });
+        const r = await runGuard(
+          scriptPath,
+          payload({ title: 'X', transcript: t }),
+          onSlot(undefined, twin),
+        );
+        expect(r).toMatchObject({ code: 0, stdout: '', stderr: '' });
+        // The bound twin's own session, locked the same way, is still held to its binding.
+        const own = await runGuard(
+          scriptPath,
+          payload({ title: 'X', transcript: t }),
+          onSlot(undefined, twinBound),
+        );
+        expect(decision(own).decision).toBe('block');
+      });
+    });
+  });
+
+  describe('the resume command of an alias block names THE session', () => {
+    const SID = 'aaaaaaaa-0000-4000-8000-00000000000a';
+    const withId = (id: unknown, transcript: string) =>
+      JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: id,
+        session_title: 'Auth Work',
+        transcript_path: transcript,
+        prompt: 'hi',
+      });
+
+    it('by its id once the transcript exists — a title several sessions share could reopen the picker', async () => {
+      await writeSnapshot([aliasGroup()]);
+      const dir = join(root, 'projects', projectDirStem(repo));
+      await mkdir(dir, { recursive: true });
+      const t = join(dir, `${SID}.jsonl`);
+      await writeFile(t, [userLine('a', repo), customTitleLine('Auth Work')].join('\n') + '\n');
+      const r = await runGuard(scriptPath, withId(SID, t), onSlot(undefined));
+      const reason = decision(r).reason ?? '';
+      expect(reason).toContain(`session "Auth Work" in ${repo} is bound to research@x`);
+      expect(reason.endsWith(`Exit and resume it with: cctl claude --resume ${SID}`)).toBe(true);
+    });
+
+    it('by its alias before the transcript exists (nothing to resume by id yet), or for a malformed id', async () => {
+      await writeSnapshot([aliasGroup()]);
+      const notYet = join(root, 'projects', projectDirStem(repo), `${SID}.jsonl`);
+      const first = await runGuard(scriptPath, withId(SID, notYet), onSlot(undefined));
+      expect(decision(first).reason).toContain(resumeHint('Auth Work'));
+      const dir = join(root, 'projects', projectDirStem(repo));
+      await mkdir(dir, { recursive: true });
+      const t = join(dir, 'x.jsonl');
+      await writeFile(t, userLine('a', repo) + '\n');
+      for (const id of ["'; rm -rf ~ #", 42, `${SID}\n`, '']) {
+        const r = await runGuard(scriptPath, withId(id, t), onSlot(undefined));
+        expect(decision(r).reason).toContain(resumeHint('Auth Work'));
+      }
     });
   });
 

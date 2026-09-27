@@ -9,11 +9,13 @@
 //     mixing them would put a blocking decision on the path that must never stall a tool call;
 //   - the guard needs the folder canonicalizer, and the forwarder does not.
 //
-// The canonicalizer and the precedence rule are not re-implemented here. They are EMBEDDED verbatim
-// from switch-engine's `embeddableFolderPathSource()` (canonicalizeFolder / folderKey / isWithin /
-// aliasKey / resolveSessionBinding), whose colocated test proves the embedded copies still agree
-// with the live TS functions across the case tables. Only the glue below — reading the snapshot and
-// the session title, and shaping the decision per spec §9 — is written here.
+// The canonicalizer, the precedence rule and the transcript's recorded folder are not re-implemented
+// here. They are EMBEDDED verbatim from switch-engine's `embeddableFolderPathSource()`
+// (canonicalizeFolder / folderKey / isWithin / aliasKey / resolveSessionBinding / the project-dir
+// naming) and `embeddableRecordedFolderSource()` (readRecordedFolder / recordedFolderFor — the one
+// reading the launcher, the session catalog and the running-session scan also use), whose colocated
+// tests prove the embedded copies still agree with the live TS functions. Only the glue below —
+// reading the snapshot and the session title, and shaping the decision per spec §9 — is written here.
 //
 // Fail-open by construction: any thrown error, a missing/unparseable snapshot, or an unrecognized
 // schema exits 0 (never blocks) with a single stderr line. A guard that crashed closed would lock
@@ -24,6 +26,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   embeddableFolderPathSource,
+  embeddableRecordedFolderSource,
   embeddableSanitizeSource,
 } from '@claude-control/switch-engine';
 import { bindTokensDir } from './bindToken.js';
@@ -69,16 +72,21 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *     longest bound folder containing the project dir F -> that group; else the global slot. X is
  *     the payload's `session_title` (Claude Code's custom title; absent = unnamed — the transcript is
  *     never read for a title, so alias binding needs a Claude Code that sends it). R is the folder
- *     the conversation was recorded in: the first cwd of the transcript at `transcript_path` (a
- *     bounded head read, only when X names some bound alias), F before the transcript exists, else
- *     the bound folders Claude Code's project-dir name can stand for. A read error is handled there,
- *     never by failing open.
+ *     the conversation belongs to, read from the transcript at `transcript_path` by switch-engine's
+ *     readRecordedFolder (embedded; only when X names some bound alias): its first cwd within a
+ *     bounded head, moved by a relocation within a bounded tail, trusted only when consistent with
+ *     the transcript's project-directory name; otherwise — no transcript yet, an unreadable one, or
+ *     no trusted folder in it — F, when that name can stand for F, else no folder at all (so a
+ *     lossy name never picks a bound folder the session does not run in). A read error is handled
+ *     there, never by failing open.
  *   - (A) the rule names a group the session is NOT running on -> block. The block reason names the
  *     account the session is actually on (a different group, or the shared account); for an alias
- *     binding it says to resume the session with `cctl claude --resume '<alias>'` — the whole alias
- *     as bound, quoted for the operator's shell (PowerShell on Windows, POSIX elsewhere). A valid
- *     --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a visible
- *     systemMessage instead.
+ *     binding it names the alias and says to resume THE session: `cctl claude --resume <session id>`
+ *     (the payload's session_id, a validated UUID) once its transcript exists — an id cannot be
+ *     ambiguous the way a title several sessions share is — else `cctl claude --resume '<alias>'`,
+ *     the whole alias as bound, quoted for the operator's shell (PowerShell on Windows, POSIX
+ *     elsewhere). A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a
+ *     visible systemMessage instead.
  *   - (B) the session runs on a group's slot but the rule names no group here (a folder outside the
  *     group's folders, a session renamed away from the group's alias, or a same-titled conversation
  *     recorded in another folder) -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT)
@@ -112,6 +120,8 @@ const fs = require('fs');
 const path = require('path');
 
 ${embeddableFolderPathSource()}
+
+${embeddableRecordedFolderSource()}
 
 ${embeddableSanitizeSource()}
 
@@ -324,19 +334,12 @@ function run(input) {
   // keeps its original folder, so an alias binding (F, X) means "the conversations titled X recorded
   // in F", wherever they run now. Only worked out when the title names some bound alias at all.
   var recorded = undefined;
+  var transcriptExists = false;
   var key = title !== null ? aliasKey(title) : '';
-  if (key !== '') {
-    var boundFolders = aliasFoldersForKey(groups, key);
-    if (boundFolders.length > 0) {
-      recorded = recordedFolder(
-        payload.transcript_path,
-        projectDir,
-        rawProject,
-        boundFolders,
-        deps,
-        platform,
-      );
-    }
+  if (key !== '' && aliasBoundAnywhere(groups, key)) {
+    var located = conversationFolder(payload.transcript_path, rawProject, projectDir, deps, platform);
+    recorded = located.folder;
+    transcriptExists = located.exists;
   }
 
   // THE precedence rule, embedded verbatim from switch-engine (the launcher, cctl where and cctl
@@ -375,7 +378,7 @@ function run(input) {
         ', but this session runs on ' +
         current +
         '. Exit and resume it with: cctl claude --resume ' +
-        shellQuoteArg(bound, platform);
+        resumeArgument(payload.session_id, transcriptExists, bound, platform);
     } else if (sessionGroup) {
       reasonA =
         'cctl: ' +
@@ -582,105 +585,47 @@ function boundAlias(group, folder, key) {
   return null;
 }
 
-// Every bound folder holding an alias scope with this key, across all groups.
-function aliasFoldersForKey(groups, key) {
-  var out = [];
+// Whether any group holds an alias scope with this key — the only case the transcript is read.
+function aliasBoundAnywhere(groups, key) {
   for (var i = 0; i < groups.length; i++) {
     var aliases = aliasesOf(groups[i]);
     for (var j = 0; j < aliases.length; j++) {
       var a = aliases[j];
-      if (a && a.aliasKey === key && typeof a.folder === 'string') out.push(a.folder);
+      if (a && a.aliasKey === key && typeof a.folder === 'string') return true;
     }
   }
-  return out;
+  return false;
 }
 
-// The folder a session's conversation was recorded in, for the alias rule:
-//   - no transcript path in the payload: the folder it runs in;
-//   - the transcript's first recorded top-level cwd, canonicalized, when it can be read (a bounded
-//     head read, see firstRecordedCwd);
-//   - no transcript yet (a named launch before its first turn is written): the folder it runs in,
-//     when the transcript's project directory is that folder's — judged on the folder as Claude
-//     Code spelled it (rawProject: its project-dir name encodes that spelling, which differs from
-//     the canonical one for a folder reached through a junction or symlink) and as canonicalized;
-//   - otherwise (unreadable — locked, a device, a bad path — or no cwd in the head) Claude Code's
-//     project-directory NAME narrows it: the bound folders whose name it is (lossy, so the folder it
-//     runs in wins a tie), or null = recorded in some other folder, so no alias rule applies.
-// Every read error is caught HERE: an unreadable transcript never fails the whole guard open.
-function recordedFolder(transcriptPath, projectDir, rawProject, boundFolders, deps, platform) {
-  if (typeof transcriptPath !== 'string' || transcriptPath === '') return projectDir;
-  var dirName = path.basename(path.dirname(transcriptPath));
-  var missing = false;
-  try {
-    var cwd = firstRecordedCwd(transcriptPath);
-    if (typeof cwd === 'string') {
-      var c = canonicalizeFolder(cwd, deps);
-      return c.ok ? c.path : cwd;
-    }
-  } catch (e) {
-    missing = !!(e && e.code === 'ENOENT');
+// The folder a session's conversation belongs to for the alias rule, and whether its transcript
+// exists. No transcript path in the payload: the folder it runs in. Otherwise the embedded
+// readRecordedFolder / recordedFolderFor decide (see the policy in the script header); neither ever
+// throws, so an unreadable transcript never fails the whole guard open.
+function conversationFolder(transcriptPath, rawProject, projectDir, deps, platform) {
+  if (typeof transcriptPath !== 'string' || transcriptPath === '') {
+    return { folder: projectDir, exists: false };
   }
-  if (
-    missing &&
-    (projectDirMatches(dirName, rawProject) || projectDirMatches(dirName, projectDir))
-  ) {
-    return projectDir;
-  }
-  var here = folderKey(projectDir, platform);
-  var match = null;
-  for (var i = 0; i < boundFolders.length; i++) {
-    if (projectDirMatches(dirName, boundFolders[i])) {
-      if (folderKey(boundFolders[i], platform) === here) return boundFolders[i];
-      if (match === null) match = boundFolders[i];
-    }
-  }
-  return match;
+  var read = readRecordedFolder(transcriptPath, fs, platform);
+  var folder = recordedFolderFor(
+    read,
+    { spelled: rawProject, canonical: projectDir },
+    function (f) {
+      var c = canonicalizeFolder(f, deps);
+      return c.ok ? c.path : f;
+    },
+  );
+  return { folder: folder, exists: read.status !== 'missing' };
 }
 
-// The first top-level "cwd" a transcript records — the folder Claude Code launched the session in.
-// Reads at most HEAD_MAX_BYTES from the start of a regular file (a FIFO or device is never opened).
-// Complete lines are parsed as JSON; if the first line carrying a cwd is longer than the window (a
-// huge pasted prompt), the value is taken from the raw text instead. Throws only what the
-// filesystem throws (the caller decides what an error means).
-var HEAD_MAX_BYTES = 1024 * 1024;
-var CWD_NEEDLE = '"cwd":';
-function firstRecordedCwd(file) {
-  var st = fs.statSync(file);
-  if (!st.isFile()) return null;
-  var fd = fs.openSync(file, 'r');
-  var text;
-  var whole;
-  try {
-    var len = Math.min(st.size, HEAD_MAX_BYTES);
-    var buf = Buffer.alloc(len);
-    var got = fs.readSync(fd, buf, 0, len, 0);
-    text = buf.subarray(0, got).toString('utf8');
-    whole = got >= st.size;
-  } finally {
-    try {
-      fs.closeSync(fd);
-    } catch (e) {}
+// The argument of the resume command an alias block prints: THE session's id once its transcript
+// exists (a UUID needs no quoting, and unlike a title it names exactly one conversation), else the
+// whole alias as bound, quoted for the operator's shell.
+var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function resumeArgument(sessionId, transcriptExists, alias, platform) {
+  if (transcriptExists && typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId)) {
+    return sessionId;
   }
-  var lines = text.split('\\n');
-  var complete = whole ? lines.length : lines.length - 1;
-  for (var i = 0; i < complete; i++) {
-    if (lines[i].indexOf(CWD_NEEDLE) === -1) continue;
-    var obj;
-    try {
-      obj = JSON.parse(lines[i]);
-    } catch (e) {
-      continue;
-    }
-    if (obj && typeof obj.cwd === 'string' && obj.cwd !== '') return obj.cwd;
-  }
-  var m = /"cwd":("(?:[^"\\\\]|\\\\.)*")/.exec(text);
-  if (m) {
-    try {
-      var v = JSON.parse(m[1]);
-      if (typeof v === 'string' && v !== '') return v;
-    } catch (e) {}
-  }
-  return null;
+  return shellQuoteArg(alias, platform);
 }
 
 var input = '';
