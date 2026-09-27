@@ -9,11 +9,13 @@
 //     mixing them would put a blocking decision on the path that must never stall a tool call;
 //   - the guard needs the folder canonicalizer, and the forwarder does not.
 //
-// The canonicalizer is not re-implemented here. It is EMBEDDED verbatim from switch-engine's
-// `embeddableFolderPathSource()` (canonicalizeFolder / folderKey / isWithin), whose colocated test
-// proves the embedded copy still agrees with the live TS function across the whole case table.
-// Only the small amount of glue below — reading the snapshot, resolving the binding, and shaping
-// the decision per spec §9 — is written here, and it calls into that embedded trio.
+// The canonicalizer, the precedence rule and the transcript's recorded folder are not re-implemented
+// here. They are EMBEDDED verbatim from switch-engine's `embeddableFolderPathSource()`
+// (canonicalizeFolder / folderKey / isWithin / aliasKey / resolveSessionBinding / the project-dir
+// naming) and `embeddableRecordedFolderSource()` (readRecordedFolder / recordedFolderFor — the one
+// reading the launcher, the session catalog and the running-session scan also use), whose colocated
+// tests prove the embedded copies still agree with the live TS functions. Only the glue below —
+// reading the snapshot and the session title, and shaping the decision per spec §9 — is written here.
 //
 // Fail-open by construction: any thrown error, a missing/unparseable snapshot, or an unrecognized
 // schema exits 0 (never blocks) with a single stderr line. A guard that crashed closed would lock
@@ -24,6 +26,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   embeddableFolderPathSource,
+  embeddableRecordedFolderSource,
   embeddableSanitizeSource,
 } from '@claude-control/switch-engine';
 import { bindTokensDir } from './bindToken.js';
@@ -64,13 +67,33 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *     snapshot's main config dir IS the global slot, keyed exactly like an unset one.
  *   - a project folder whose name has no canonical form (a control or bidi/format character) is
  *     judged by its nearest clean ancestor, which a binding covers exactly when it covers the folder.
- *   - (A) the project dir is bound to a group the session is NOT running on -> block. The block
- *     reason names the account the session is actually on (a different group, or the shared account).
- *     A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a visible
- *     systemMessage warning instead.
- *   - (B) the session runs on a group's slot but the project dir is not within that group's folders
- *     -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT) allows it, with a visible
- *     systemMessage so the bypass is never silent.
+ *   - required slot = THE precedence rule (switch-engine's resolveSessionBinding, embedded): the
+ *     session's RECORDED folder R and custom title X alias-bound as (R, X) -> that group; else the
+ *     longest bound folder containing the project dir F -> that group; else the global slot. X is
+ *     the payload's `session_title` (Claude Code's custom title; absent = unnamed — the transcript is
+ *     never read for a title, so alias binding needs a Claude Code that sends it). R is the folder
+ *     the conversation belongs to, read from the transcript at `transcript_path` by switch-engine's
+ *     readRecordedFolder (embedded; only when X names some bound alias): its first cwd within a
+ *     bounded head, moved by a relocation within a bounded tail, trusted only when consistent with
+ *     the transcript's project-directory name; otherwise — no transcript yet, an unreadable one, or
+ *     no trusted folder in it — F, when that name can stand for F, else no folder at all (so a
+ *     lossy name never picks a bound folder the session does not run in). A read error is handled
+ *     there, never by failing open.
+ *   - (A) the rule names a group the session is NOT running on -> block. The block reason names the
+ *     account the session is actually on (a different group, or the shared account); for an alias
+ *     binding it names the alias and says to resume THE session: `cctl claude --resume <session id>`
+ *     (the payload's session_id, a validated UUID) once its transcript exists — an id cannot be
+ *     ambiguous the way a title several sessions share is — else `cctl claude --resume '<alias>'`,
+ *     the whole alias as bound, quoted for the operator's shell (PowerShell on Windows, POSIX
+ *     elsewhere). A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a
+ *     visible systemMessage instead.
+ *   - (B) the session runs on a group's slot but the rule names no group here (a folder outside the
+ *     group's folders, a session renamed away from the group's alias, or a same-titled conversation
+ *     recorded in another folder) -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT)
+ *     allows it, with a visible systemMessage so the bypass is never silent.
+ *   - every interpolated string (folders, labels, the untrusted session title) is sanitized at the
+ *     output sinks; shown text is clipped and lists are shortened, so a decision stays small. A
+ *     printed command is never clipped.
  *   - The relaxation env vars are NOT plain switches: each must name a token file the launcher minted
  *     for THIS launch's slot (see bindToken.ts) whose launching process is still alive. An inherited
  *     or persisted value (e.g. a stray "1"), or a token left behind by a dead launch, has no honored
@@ -97,6 +120,8 @@ const fs = require('fs');
 const path = require('path');
 
 ${embeddableFolderPathSource()}
+
+${embeddableRecordedFolderSource()}
 
 ${embeddableSanitizeSource()}
 
@@ -204,7 +229,9 @@ function run(input) {
     },
   };
 
-  // The hook payload is only needed for its \`cwd\` fallback when CLAUDE_PROJECT_DIR is unset.
+  // The hook payload supplies the session's custom title (session_title), its transcript's path
+  // (whose head records the folder the conversation belongs to) and the \`cwd\` fallback when
+  // CLAUDE_PROJECT_DIR is unset.
   var payload = {};
   try {
     var parsed = JSON.parse(input);
@@ -293,53 +320,81 @@ function run(input) {
     }
   }
 
-  // Resolve the project dir's binding: the longest bound folder that contains it wins (a nested
-  // binding overrides its ancestor). Uses the embedded isWithin, so the boundary + case rules match
-  // the TS canonicalizer exactly (C:\\research never contains C:\\research2).
-  var projectBinding = null;
-  for (var j = 0; j < snapshot.groups.length; j++) {
-    var grp = snapshot.groups[j];
-    if (!grp || !Array.isArray(grp.folders)) continue;
-    for (var k = 0; k < grp.folders.length; k++) {
-      var f = grp.folders[k];
-      if (typeof f === 'string' && isWithin(projectDir, f, platform)) {
-        if (projectBinding === null || f.length > projectBinding.folder.length) {
-          projectBinding = { group: grp, folder: f };
-        }
-      }
-    }
+  var groups = snapshot.groups;
+
+  // The session's alias: the prompt payload's session_title, which Claude Code sets to the session's
+  // CUSTOM title (/rename, --name) — present from the very first prompt of a named launch, absent for
+  // an unnamed session, never the generated title. Absent, or not a string, means "no custom title":
+  // the guard never reads a title out of the transcript (a Claude Code that does not send
+  // session_title cannot use alias bindings; see docs/CLI.md for the minimum version).
+  var title = typeof payload.session_title === 'string' ? payload.session_title : null;
+
+  // The folder the conversation BELONGS to — the alias rule's key. \`claude --resume <title>\` run in a
+  // repo root also resumes sessions recorded in its subfolders and worktrees, and the resumed session
+  // keeps its original folder, so an alias binding (F, X) means "the conversations titled X recorded
+  // in F", wherever they run now. Only worked out when the title names some bound alias at all.
+  var recorded = undefined;
+  var transcriptExists = false;
+  var key = title !== null ? aliasKey(title) : '';
+  if (key !== '' && aliasBoundAnywhere(groups, key)) {
+    var located = conversationFolder(payload.transcript_path, rawProject, projectDir, deps, platform);
+    recorded = located.folder;
+    transcriptExists = located.exists;
   }
+
+  // THE precedence rule, embedded verbatim from switch-engine (the launcher, cctl where and cctl
+  // session show run the same function): the alias bound for the session's recorded folder, else the
+  // longest bound folder containing the folder it runs in (a nested binding overrides its ancestor;
+  // the embedded isWithin keeps C:\\\\research from containing C:\\\\research2), else null = the
+  // global slot.
+  var required = resolveSessionBinding(projectDir, title, groups, platform, recorded);
+  var requiredGroup = required ? findGroup(groups, required.groupId) : null;
+  if (required && !requiredGroup) required = null;
 
   var sessionGroupId = sessionGroup ? sessionGroup.id : null;
 
-  // Case A: the project dir is bound to a group, and the session is not on that group's slot.
-  if (projectBinding && projectBinding.group.id !== sessionGroupId) {
-    var members = Array.isArray(projectBinding.group.members)
-      ? projectBinding.group.members.join(', ')
-      : '';
+  // Case A: the rule names a group, and the session is not on that group's slot.
+  if (required && required.groupId !== sessionGroupId) {
+    var members = membersOf(requiredGroup);
     // The reason must name the account this session is ACTUALLY on. A session on the global slot runs
     // on the shared account; a session on another group's slot runs on that group's reserved account,
-    // so telling it to "cctl claude" (which would put it on the bound folder's account) is right, but
-    // "runs on the shared account" would be false. Branch on sessionGroup accordingly.
+    // so telling it to "cctl claude" (which would put it on the bound account) is right, but "runs on
+    // the shared account" would be false. Branch on sessionGroup accordingly.
     var reasonA;
-    if (sessionGroup) {
-      var sMembers = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
-      var sFolders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
+    if (required.via === 'alias') {
+      // The resume command carries the WHOLE alias as bound (printable by construction), quoted for
+      // the operator's shell; only the display copy is shortened.
+      var bound = boundAlias(requiredGroup, required.folder, required.aliasKey) || title.trim();
+      var current = sessionGroup
+        ? membersOf(sessionGroup) + ' (bound to ' + scopesOf(sessionGroup) + ')'
+        : 'the shared account';
       reasonA =
-        'cctl: ' +
-        projectBinding.folder +
+        'cctl: session "' +
+        clip(bound) +
+        '" in ' +
+        clip(required.folder) +
         ' is bound to ' +
         members +
         ', but this session runs on ' +
-        sMembers +
+        current +
+        '. Exit and resume it with: cctl claude --resume ' +
+        resumeArgument(payload.session_id, transcriptExists, bound, platform);
+    } else if (sessionGroup) {
+      reasonA =
+        'cctl: ' +
+        clip(required.folder) +
+        ' is bound to ' +
+        members +
+        ', but this session runs on ' +
+        membersOf(sessionGroup) +
         ' (bound to ' +
-        sFolders +
+        scopesOf(sessionGroup) +
         '). Exit and start it here with: cctl claude' +
         '   (or add --override to use this account here anyway)';
     } else {
       reasonA =
         'cctl: ' +
-        projectBinding.folder +
+        clip(required.folder) +
         ' is bound to ' +
         members +
         ', but this session runs on the shared account. Exit and start it with: cctl claude' +
@@ -353,49 +408,224 @@ function run(input) {
     return emitBlock(reasonA, enforce);
   }
 
-  // Case B: the session runs on a group's slot, but the project dir is outside that group's folders.
-  if (sessionGroup) {
-    var within = false;
-    if (Array.isArray(sessionGroup.folders)) {
-      for (var m = 0; m < sessionGroup.folders.length; m++) {
-        var sf = sessionGroup.folders[m];
-        if (typeof sf === 'string' && isWithin(projectDir, sf, platform)) {
-          within = true;
-          break;
-        }
-      }
+  // Case B: the session runs on a group's slot, but the rule names no group here (a group-named
+  // required slot that differs was case A above). The reserved account is outside its scopes: a
+  // folder it is not bound to, or — for an alias scope — a session that is not (or no longer) that
+  // alias's conversation.
+  if (sessionGroup && !required) {
+    var scopes = scopesOf(sessionGroup);
+    var reservedTo = hasAliasScopes(sessionGroup) ? 'its bindings' : 'its folders';
+    // --account relaxes case B, but only via a token minted for this session's slot whose launch is
+    // still alive; an inherited env value is not honored. A honored relaxation emits a systemMessage
+    // (surfaced in interactive sessions; the launcher banner is the headless signal) so it is clear
+    // the reserved account is being used outside its scopes on purpose.
+    if (honorRelaxation(process.env.CCTL_LAUNCH_EXPLICIT, 'explicit', sessionConfigKey)) {
+      return emitSystemMessage(
+        'cctl: running ' +
+          membersOf(sessionGroup) +
+          ' (bound to ' +
+          scopes +
+          ') in ' +
+          clip(projectShown) +
+          ' — launched explicitly with --account. This account is reserved to ' +
+          reservedTo +
+          '.',
+      );
     }
-    if (!within) {
-      var folders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
-      // --account relaxes case B, but only via a token minted for this session's slot whose launch is
-      // still alive; an inherited env value is not honored. A honored relaxation emits a systemMessage
-      // (surfaced in interactive sessions; the launcher banner is the headless signal) so it is clear
-      // the reserved account is being used outside its folders on purpose.
-      if (honorRelaxation(process.env.CCTL_LAUNCH_EXPLICIT, 'explicit', sessionConfigKey)) {
-        var membersB = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
-        return emitSystemMessage(
-          'cctl: running ' +
-            membersB +
-            ' (bound to ' +
-            folders +
-            ') in ' +
-            projectShown +
-            ' — launched explicitly with --account. This account is reserved to its folders.',
-        );
-      }
-      var reasonB =
+    var aliasHere = aliasScopeIn(sessionGroup, projectDir, platform);
+    var reasonB;
+    if (aliasHere !== null && key !== '' && aliasHere.aliasKey === key) {
+      // Titled like this folder's bound alias, yet not in scope: the conversation was recorded in
+      // another folder (Claude Code resumed a same-titled session from a subfolder, worktree or
+      // prefix-sibling project), so it is not the bound one.
+      reasonB =
+        'cctl: this session runs on the account bound to session "' +
+        clip(aliasHere.alias) +
+        '" in ' +
+        clip(projectShown) +
+        ', but this session was recorded in ' +
+        (typeof recorded === 'string' ? clip(recorded) : 'another folder') +
+        ', so it is not that conversation. That account is reserved to its bindings. Exit and ' +
+        'start it with: cctl claude';
+    } else if (aliasHere !== null) {
+      // In the folder of one of its group's alias scopes, but not (or no longer) carrying that
+      // title. It may have been renamed away — or it may be another conversation altogether, so the
+      // advice covers both.
+      reasonB =
+        'cctl: this session runs on the account bound to session "' +
+        clip(aliasHere.alias) +
+        '" in ' +
+        clip(projectShown) +
+        ', but it is ' +
+        (key !== '' ? 'named "' + clip(title) + '"' : 'unnamed') +
+        '. That account is reserved to its bindings. Exit and start it here with: cctl claude' +
+        ' — or, if this is that session, rename it back: /rename ' +
+        aliasHere.alias;
+    } else if (hasAliasScopes(sessionGroup)) {
+      reasonB =
         'cctl: this session runs on the account bound to ' +
-        folders +
+        scopes +
+        ', but this session in ' +
+        clip(projectShown) +
+        ' is not one of its bindings. That account is reserved to its bindings. Run Claude Code ' +
+        'here normally, or launch it explicitly with: cctl claude --account <account>';
+    } else {
+      reasonB =
+        'cctl: this session runs on the account bound to ' +
+        scopes +
         ', but ' +
-        projectShown +
+        clip(projectShown) +
         ' is not one of its folders. That account is reserved to its folders. Run Claude Code ' +
         'here normally, or launch it explicitly with: cctl claude --account <account>';
-      return emitBlock(reasonB, enforce);
     }
+    return emitBlock(reasonB, enforce);
   }
 
   // No conflict.
   process.exit(0);
+}
+
+// ---- snapshot row helpers (every field is read defensively: the snapshot is operator-editable) ----
+
+function findGroup(groups, id) {
+  for (var i = 0; i < groups.length; i++) {
+    if (groups[i] && groups[i].id === id) return groups[i];
+  }
+  return null;
+}
+
+// Bounds on what one decision may print. A group can hold 32 members and 512 scopes, a label or a
+// folder can be long, and a decision is read by a terminal and the model on every blocked prompt:
+// lists name their first few entries and count the rest, and each shown string is clipped. A resume
+// command is never clipped (see case A).
+var LIST_SHOWN_MAX = 3;
+var TEXT_SHOWN_MAX = 160;
+
+function clip(text) {
+  var t = typeof text === 'string' ? text : '';
+  return t.length > TEXT_SHOWN_MAX ? t.slice(0, TEXT_SHOWN_MAX) + '...' : t;
+}
+
+function shortList(items) {
+  var shown = [];
+  for (var i = 0; i < items.length && i < LIST_SHOWN_MAX; i++) shown.push(clip(items[i]));
+  var rest = items.length - shown.length;
+  return shown.join(', ') + (rest > 0 ? ', and ' + rest + ' more' : '');
+}
+
+function membersOf(group) {
+  if (!group || !Array.isArray(group.members)) return '';
+  var labels = [];
+  for (var i = 0; i < group.members.length; i++) {
+    if (typeof group.members[i] === 'string') labels.push(group.members[i]);
+  }
+  return shortList(labels);
+}
+
+function aliasesOf(group) {
+  return group && Array.isArray(group.aliases) ? group.aliases : [];
+}
+
+function hasAliasScopes(group) {
+  return aliasesOf(group).length > 0;
+}
+
+// An alias row's display text: the alias as bound, or (a snapshot written before it was carried)
+// its key.
+function aliasShown(a) {
+  return typeof a.alias === 'string' && a.alias !== '' ? a.alias : a.aliasKey;
+}
+
+// A group's scopes for a message: its folders, then each alias scope as session "<alias>" in
+// <folder>, as a short list. For a group with no alias scope this is exactly its folder list.
+function scopesOf(group) {
+  var parts = [];
+  if (group && Array.isArray(group.folders)) {
+    for (var i = 0; i < group.folders.length; i++) {
+      if (typeof group.folders[i] === 'string') parts.push(group.folders[i]);
+    }
+  }
+  var aliases = aliasesOf(group);
+  for (var j = 0; j < aliases.length; j++) {
+    var a = aliases[j];
+    if (a && typeof a.folder === 'string' && typeof a.aliasKey === 'string') {
+      parts.push('session "' + clip(aliasShown(a)) + '" in ' + a.folder);
+    }
+  }
+  return shortList(parts);
+}
+
+// The group's alias scope in exactly this folder, as { alias, aliasKey }, or null.
+function aliasScopeIn(group, folder, platform) {
+  var here = folderKey(folder, platform);
+  var aliases = aliasesOf(group);
+  for (var i = 0; i < aliases.length; i++) {
+    var a = aliases[i];
+    if (
+      a &&
+      typeof a.folder === 'string' &&
+      typeof a.aliasKey === 'string' &&
+      folderKey(a.folder, platform) === here
+    ) {
+      return { alias: aliasShown(a), aliasKey: a.aliasKey };
+    }
+  }
+  return null;
+}
+
+// The alias as bound for the scope (folder, key) of this group, or null (an older snapshot).
+function boundAlias(group, folder, key) {
+  var aliases = aliasesOf(group);
+  for (var i = 0; i < aliases.length; i++) {
+    var a = aliases[i];
+    if (a && a.aliasKey === key && a.folder === folder && typeof a.alias === 'string' && a.alias) {
+      return a.alias;
+    }
+  }
+  return null;
+}
+
+// Whether any group holds an alias scope with this key — the only case the transcript is read.
+function aliasBoundAnywhere(groups, key) {
+  for (var i = 0; i < groups.length; i++) {
+    var aliases = aliasesOf(groups[i]);
+    for (var j = 0; j < aliases.length; j++) {
+      var a = aliases[j];
+      if (a && a.aliasKey === key && typeof a.folder === 'string') return true;
+    }
+  }
+  return false;
+}
+
+// The folder a session's conversation belongs to for the alias rule, and whether its transcript
+// exists. No transcript path in the payload: the folder it runs in. Otherwise the embedded
+// readRecordedFolder / recordedFolderFor decide (see the policy in the script header); neither ever
+// throws, so an unreadable transcript never fails the whole guard open.
+function conversationFolder(transcriptPath, rawProject, projectDir, deps, platform) {
+  if (typeof transcriptPath !== 'string' || transcriptPath === '') {
+    return { folder: projectDir, exists: false };
+  }
+  var read = readRecordedFolder(transcriptPath, fs, platform);
+  var folder = recordedFolderFor(
+    read,
+    { spelled: rawProject, canonical: projectDir },
+    function (f) {
+      var c = canonicalizeFolder(f, deps);
+      return c.ok ? c.path : f;
+    },
+  );
+  return { folder: folder, exists: read.status !== 'missing' };
+}
+
+// The argument of the resume command an alias block prints: THE session's id once its transcript
+// exists (a UUID needs no quoting, and unlike a title it names exactly one conversation), else the
+// whole alias as bound, quoted for the operator's shell.
+var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function resumeArgument(sessionId, transcriptExists, alias, platform) {
+  if (transcriptExists && typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId)) {
+    return sessionId;
+  }
+  return shellQuoteArg(alias, platform);
 }
 
 var input = '';

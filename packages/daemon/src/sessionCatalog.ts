@@ -7,17 +7,28 @@
 // exactly what `claude --resume <name>` matches — `(customTitle ?? aiTitle)`, lower-cased and
 // trimmed, equal to the argument likewise normalized — so an alias here means what it means there.
 //
-// WHICH FOLDER. The launch cwd (the first `cwd` a transcript records), unless a `relocated` line
-// moved the session (last-wins `relocatedCwd`). The project directory's NAME is not used for this:
-// Claude Code builds it by replacing every non-alphanumeric character with `-` (plus a hash past
-// 200 characters), so `C:\a_b` and `C:\a-b` share one directory. The name only narrows which
-// directories are worth opening; the recorded cwd decides.
+// WHICH FOLDER. switch-engine's readRecordedFolder — the one reading the launcher, the enforcement
+// guard and the running-session scan use too, so `cctl session show` can never name a different
+// folder than the one a binding is judged by: the launch cwd (the first `cwd` within a bounded
+// head), unless a `relocated` line within a bounded tail moved the session, each trusted only when
+// consistent with the project directory's name. The name alone does not decide a folder: Claude
+// Code builds it by replacing every non-alphanumeric character with `-` (plus a hash past 200
+// characters), so `C:\a_b` and `C:\a-b` share one directory; it narrows which directories are worth
+// opening, and stands for a folder only through recordedFolderFor's fallback.
 //
-// Same reading discipline as transcriptTokens.ts: stream on bytes, decode only lines whose raw
-// bytes can hold what is wanted, tolerate every malformed line.
+// Titles and timestamps: the same reading discipline as transcriptTokens.ts — stream on bytes,
+// decode only lines whose raw bytes can hold what is wanted, tolerate every malformed line.
 
+import * as nodeFs from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import {
+  aliasKey,
+  projectDirMatches,
+  projectDirStem,
+  readRecordedFolder,
+  type SessionIdentity,
+} from '@claude-control/switch-engine';
 import { forEachLine } from './transcriptTokens.js';
 
 /** One session, as its transcript describes it. */
@@ -27,9 +38,10 @@ export interface SessionMeta {
   file: string;
   /** The project directory's name under `<claudeDir>/projects`. */
   projectDir: string;
-  /** The first `cwd` the transcript records; `null` if it records none. */
+  /** The folder the session was launched in (its first recorded `cwd`), when trusted; else `null`. */
   launchCwd: string | null;
-  /** Where the session belongs now: the last `relocatedCwd`, else {@link launchCwd}. */
+  /** Where the session belongs now: a trusted relocation, else {@link launchCwd}; `null` when none
+   *  is trusted, where {@link projectDir} is the fallback (switch-engine recordedFolderFor). */
   folder: string | null;
   /** Last `customTitle` (`/rename`, `--name`); `null` if never set. */
   customTitle: string | null;
@@ -44,6 +56,8 @@ export interface SessionMeta {
 
 export interface SessionCatalog {
   sessions: SessionMeta[];
+  /** Transcripts that exist but could not be read, by session id: what they say is UNKNOWN. */
+  unreadable: { sessionId: string; projectDir: string }[];
   filesUnreadable: number;
   dirsUnreadable: number;
   malformedLines: number;
@@ -57,6 +71,8 @@ export interface ReadSessionCatalogOptions {
   projectDirFilter?: (name: string) => boolean;
   /** Read only these sessions' transcripts (compared case-insensitively). Absent = all. */
   sessionIds?: ReadonlySet<string>;
+  /** The platform whose path rules the recorded folder is read under (default: this one). */
+  platform?: NodeJS.Platform;
 }
 
 /** The alias `claude --resume` would match for this session: `customTitle ?? aiTitle`. A session
@@ -67,39 +83,21 @@ export function aliasOf(meta: Pick<SessionMeta, 'customTitle' | 'aiTitle'>): str
   return alias === null || alias.trim() === '' ? null : alias;
 }
 
-/** The comparison form of an alias: the resume search's `toLowerCase().trim()`. */
-export function aliasKey(alias: string): string {
-  return alias.toLowerCase().trim();
-}
+/** The comparison form of an alias: the resume search's `toLowerCase().trim()`. Re-exported from
+ *  switch-engine, which owns it: an alias BINDING keys on the same function (and the enforcement
+ *  guard embeds it), so the lookup here and the binding there can never compare titles differently. */
+export { aliasKey };
 
-/** The length past which Claude Code truncates a project directory name and appends a hash. */
-const PROJECT_DIR_MAX = 200;
-
-/** Claude Code's project-directory name for `cwd`, without the hash suffix it adds past 200
- *  characters (the hash is an implementation detail cctl does not reproduce). */
-export function projectDirStem(cwd: string): string {
-  const name = cwd.replace(/[^a-zA-Z0-9]/g, '-');
-  return name.length <= PROJECT_DIR_MAX ? name : name.slice(0, PROJECT_DIR_MAX);
-}
-
-/** Whether project directory `name` can hold sessions launched in `cwd`: its exact encoding, or,
- *  for a long cwd, the truncated stem plus Claude Code's hash. Case-insensitive, because Windows
- *  drive letters and folders reach Claude Code in whatever case the shell used. A true answer is
- *  only a candidate — the transcript's recorded cwd decides. */
-export function projectDirMatches(name: string, cwd: string): boolean {
-  const stem = projectDirStem(cwd).toLowerCase();
-  const n = name.toLowerCase();
-  if (stem.length < PROJECT_DIR_MAX) return n === stem;
-  return n === stem || n.startsWith(stem + '-');
-}
+/** Claude Code's project-directory naming (`projectDirStem`, `projectDirMatches`). Owned by
+ *  switch-engine, because the enforcement guard embeds the same functions to tell which folder a
+ *  prompt's transcript belongs to; re-exported here for the catalog's callers. */
+export { projectDirMatches, projectDirStem };
 
 // Byte needles. A needle containing quotes can only match STRUCTURE: inside a JSON string value
 // the same characters are escaped (`\"type\":\"custom-title\"`), so a message that merely quotes
 // one of these never matches and is never decoded.
 const CUSTOM_TITLE_NEEDLE = Buffer.from('"type":"custom-title"');
 const AI_TITLE_NEEDLE = Buffer.from('"type":"ai-title"');
-const RELOCATED_NEEDLE = Buffer.from('"type":"relocated"');
-const CWD_NEEDLE = Buffer.from('"cwd":');
 const TIMESTAMP_NEEDLE = Buffer.from('"timestamp":');
 
 /** A top-level transcript's session id: a `<id>.jsonl` directly in a project directory. */
@@ -120,13 +118,15 @@ function parseObject(bytes: Buffer): Record<string, unknown> | null {
   }
 }
 
-/** Read one transcript's metadata. Throws only on an IO failure (the caller counts it). */
+/** Read one transcript's metadata: titles and timestamps from a stream, the folder from the shared
+ *  recorded-folder reading. Throws only on an IO failure (the caller counts it). */
 async function readMeta(
   file: string,
   sessionId: string,
   projectDir: string,
   lastActivityMs: number,
   counters: { malformedLines: number },
+  platform: NodeJS.Platform,
 ): Promise<SessionMeta> {
   const meta: SessionMeta = {
     sessionId,
@@ -139,22 +139,18 @@ async function readMeta(
     firstActivityMs: null,
     lastActivityMs,
   };
-  let relocatedCwd: string | null = null;
   await forEachLine(file, (bytes) => {
     if (bytes.length === 0) return;
-    const wantsCwd = meta.launchCwd === null && bytes.includes(CWD_NEEDLE);
     const wantsTs = meta.firstActivityMs === null && bytes.includes(TIMESTAMP_NEEDLE);
     const isCustom = bytes.includes(CUSTOM_TITLE_NEEDLE);
     const isAi = bytes.includes(AI_TITLE_NEEDLE);
-    const isRelocated = bytes.includes(RELOCATED_NEEDLE);
-    if (!wantsCwd && !wantsTs && !isCustom && !isAi && !isRelocated) return;
+    if (!wantsTs && !isCustom && !isAi) return;
     const line = parseObject(bytes);
     if (line === null) {
       counters.malformedLines++;
       return;
     }
     // Top-level fields only: the needles can also match a nested object, which is not a record.
-    if (wantsCwd && typeof line.cwd === 'string' && line.cwd !== '') meta.launchCwd = line.cwd;
     if (wantsTs && typeof line.timestamp === 'string') {
       const ts = Date.parse(line.timestamp);
       if (Number.isFinite(ts)) meta.firstActivityMs = ts;
@@ -163,16 +159,46 @@ async function readMeta(
       meta.customTitle = line.customTitle;
     } else if (line.type === 'ai-title' && typeof line.aiTitle === 'string') {
       meta.aiTitle = line.aiTitle;
-    } else if (
-      line.type === 'relocated' &&
-      typeof line.relocatedCwd === 'string' &&
-      line.relocatedCwd !== ''
-    ) {
-      relocatedCwd = line.relocatedCwd;
     }
   });
-  meta.folder = relocatedCwd ?? meta.launchCwd;
+  const recorded = readRecordedFolder(file, nodeFs, platform);
+  meta.launchCwd = recorded.launchFolder;
+  meta.folder = recorded.folder;
   return meta;
+}
+
+/**
+ * What the transcripts under `claudeDir` record about these sessions: each one's custom title (a
+ * blank one names nothing), its folder and its project directory, keyed by LOWER-CASED id; a
+ * transcript that exists but cannot be read is reported as `unreadable` (its title is unknown, not
+ * absent); an id with no transcript is absent. The engine's `SessionIdentityLookup` — how the
+ * running-session scan learns the title of a session whose `sessions/<pid>.json` only carries a
+ * derived name (every `--resume` launch). Reads only these sessions' transcripts.
+ */
+export async function sessionIdentities(
+  claudeDir: string,
+  sessionIds: readonly string[],
+): Promise<Map<string, SessionIdentity>> {
+  const catalog = await readSessionCatalog({ claudeDir, sessionIds: new Set(sessionIds) });
+  const out = new Map<string, SessionIdentity>();
+  for (const u of catalog.unreadable) {
+    out.set(u.sessionId.toLowerCase(), {
+      customTitle: null,
+      folder: null,
+      dirName: u.projectDir,
+      unreadable: true,
+    });
+  }
+  // A readable copy (the newest one read) answers for the id, over an unreadable older copy.
+  for (const meta of catalog.sessions) {
+    const custom = meta.customTitle;
+    out.set(meta.sessionId.toLowerCase(), {
+      customTitle: custom !== null && custom.trim() !== '' ? custom : null,
+      folder: meta.folder,
+      dirName: meta.projectDir,
+    });
+  }
+  return out;
 }
 
 /**
@@ -187,6 +213,7 @@ export async function readSessionCatalog(
   const root = join(options.claudeDir, 'projects');
   const catalog: SessionCatalog = {
     sessions: [],
+    unreadable: [],
     filesUnreadable: 0,
     dirsUnreadable: 0,
     malformedLines: 0,
@@ -199,6 +226,7 @@ export async function readSessionCatalog(
     return catalog;
   }
 
+  const platform = options.platform ?? process.platform;
   const wantedIds =
     options.sessionIds === undefined
       ? undefined
@@ -224,9 +252,10 @@ export async function readSessionCatalog(
         const { mtimeMs } = await stat(file);
         const known = byId.get(sessionId);
         if (known !== undefined && known.lastActivityMs >= mtimeMs) continue;
-        byId.set(sessionId, await readMeta(file, sessionId, dir.name, mtimeMs, catalog));
+        byId.set(sessionId, await readMeta(file, sessionId, dir.name, mtimeMs, catalog, platform));
       } catch {
         catalog.filesUnreadable++;
+        catalog.unreadable.push({ sessionId, projectDir: dir.name });
       }
     }
   }

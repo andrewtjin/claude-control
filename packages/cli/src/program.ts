@@ -55,6 +55,7 @@ import {
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
+import { runSessionBind, runSessionUnbind } from './sessionBinding.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
@@ -288,9 +289,7 @@ export function buildProgram(): Command {
         ].filter(Boolean);
         // A reserved account's switch moves its FOLDER group's slot, not the global one — say which.
         const group = await describeSwitchedGroup(engine, resolved.account.id);
-        const where = group
-          ? ` in the ${sanitizeForTerminal(group.folders.join(', '))} folder group`
-          : '';
+        const where = group ? ` in ${sanitizeForTerminal(group.where)}` : '';
         process.stdout.write(
           `Activated ${sanitizeForTerminal(resolved.account.label)}${where} (${bits.join(', ')}).\n`,
         );
@@ -1822,6 +1821,42 @@ function buildSessionCommands(program: Command): void {
     .action(async (opts: { cwd?: string; all?: boolean; auto?: boolean; json?: boolean }) => {
       await runSessionAliases(opts, sessionAliasDeps());
     });
+
+  session
+    .command('bind [alias] [accounts]')
+    .description(
+      'bind a named session (its alias, in its folder) to accounts; alias default = this ' +
+        "session's name, accounts default = the account it runs on; a bound alias grows its list",
+    )
+    .option('--cwd <folder>', 'the folder the alias lives in (default: the session’s own folder)')
+    .option('--label <label>', 'a display name for a new binding (default: joined account labels)')
+    .action(
+      async (
+        alias: string | undefined,
+        accounts: string | undefined,
+        opts: { cwd?: string; label?: string },
+      ) => {
+        await runSessionBind(alias, accounts, opts, sessionAliasDeps());
+      },
+    );
+
+  session
+    .command('unbind [alias]')
+    .description(
+      "drop a named session's binding (alias default = this session's name), or shrink its " +
+        'account list with --accounts',
+    )
+    .option('--accounts <refs>', 'comma-separated accounts to remove instead of the whole binding')
+    .option('--cwd <folder>', 'the folder the alias lives in (default: the session’s own folder)')
+    .option('--force', 'dissolve even when sessions are observed running in the binding')
+    .action(
+      async (
+        alias: string | undefined,
+        opts: { accounts?: string; cwd?: string; force?: boolean },
+      ) => {
+        await runSessionUnbind(alias, opts, sessionAliasDeps());
+      },
+    );
 
   session
     .command('status')

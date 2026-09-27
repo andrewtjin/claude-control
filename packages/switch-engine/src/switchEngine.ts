@@ -43,17 +43,31 @@ import {
 import { folderBindingsPath, groupProfileDir, profilesRoot, type Paths } from './paths.js';
 import { atomicWriteFile, removeIfExists } from './fsutil.js';
 import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  aliasKey,
+  aliasScopeUniquenessKey,
   canonicalizeFolder,
+  checkAliasFolder,
   checkBindTarget,
+  exactAliasBinding,
   exactBinding,
   folderKey,
+  folderUniquenessKey,
   isWithin,
   resolveBinding,
+  resolveSessionBinding,
+  type SessionBinding,
 } from './folderPath.js';
+import { projectDirMatches, recordedFolderFor } from './recordedFolder.js';
+import { sanitizeTerminalText } from './terminalSafe.js';
 import { createNodeProfileFs, ensureGroupProfile, planGroupProfile } from './profile.js';
 import {
   buildFolderBindingSnapshot,
+  describeGroupScopes,
   folderBindingSnapshotContentEqual,
+  groupScopeCount,
+  scopedGroupOf,
   writeFolderBindingSnapshot,
   type BindEnforceMode,
 } from './folderBindings.js';
@@ -70,13 +84,19 @@ import type {
   ClaudeOauth,
   CredentialBundle,
   FolderBindingSnapshot,
+  GroupDissolveResult,
+  GroupGrowResult,
   GroupLiveResult,
+  GroupScopeRef,
+  GroupShrinkResult,
   OauthAccount,
   RecoverResult,
   RefreshTokenResult,
   ReloginResult,
   RepairResult,
   RunningSession,
+  SessionIdentity,
+  SessionIdentityLookup,
   SlotId,
   SlotLiveToken,
   SlotViolation,
@@ -85,8 +105,37 @@ import type {
   SwitchIntent,
   UnbindResult,
 } from './types.js';
-import { needsMetadataBackfill, Vault, type DedupeReport } from './vault.js';
+import { MAX_ALIAS_LENGTH, needsMetadataBackfill, Vault, type DedupeReport } from './vault.js';
 import type { StoredTokens } from './tokenPrints.js';
+
+/** What a bind/unbind acts on (see {@link GroupScopeRef}). */
+type BindScope = GroupScopeRef;
+
+/** A running Claude Code session as the scope matchers see it: the canonical cwd it runs in (what
+ *  a FOLDER scope covers), and — for an ALIAS scope — its custom title and the canonical folder its
+ *  conversation was recorded in (see {@link SwitchEngine.scanRunningSessions} for where each comes
+ *  from). `title` null = unnamed; `titleKnown` false = the title could not be learned at all, so the
+ *  session may carry any title. `recordedFolder` null = none an alias scope can name; `dirName` = the
+ *  project directory its transcript lives in, when known. */
+interface SessionRecordView {
+  cwd: string;
+  title: string | null;
+  titleKnown: boolean;
+  recordedFolder: string | null;
+  dirName: string | undefined;
+}
+
+/** The clause a running-session refusal adds for sessions counted only because they MAY be the
+ *  conversation (see {@link RunningSession.unidentified}), so the operator knows why. */
+function unidentifiedNote(sessions: readonly RunningSession[]): string {
+  const n = sessions.filter((s) => s.unidentified === true).length;
+  if (n === 0) return '';
+  return (
+    ` (${n} of them could not be identified — a transcript that cannot be read, or a session ` +
+    "that has not sent its first prompt yet, such as a fork — and run in the binding's folder, so " +
+    'they may be its conversation)'
+  );
+}
 
 /** The filesystem seam {@link SwitchEngine.bindFolder} / {@link SwitchEngine.unbindFolder} use to
  *  canonicalize a folder and check it is a real directory. Injected (never read from `node:*`
@@ -183,6 +232,12 @@ export interface SwitchEngineOptions {
   /** Process-liveness probe for the running-session scan. Defaults to a signal-0 check; tests inject
    *  a deterministic one. */
   isProcessAlive?: (pid: number) => boolean;
+  /** Reads a running session's custom title and recorded folder from its transcript, for the alias
+   *  half of the running-session scan. Claude Code's `sessions/<pid>.json` does not carry the title
+   *  of a RESUMED session (it records a derived name), so without this seam the scan can only use a
+   *  name the operator set at launch (`nameSource: "user"`). The CLI wires the daemon's session
+   *  catalog here; absent, only that launch-time name is used. */
+  sessionIdentity?: SessionIdentityLookup;
   /** The enforcement mode stamped into the guard snapshot written after every group mutation.
    *  Defaults to `'block'`. Pass a plain mode for a one-shot CLI process; pass a RESOLVER for a
    *  long-lived process (the daemon), which is called at each snapshot write so a live
@@ -288,9 +343,16 @@ function describeMembers(group: StoredGroup): string {
   return labels.length > 0 ? labels.join(' + ') : group.label;
 }
 
-/** A group's bound folders as a display list, for "already reserved to <folders>" messages. */
+/** A group's bound scopes as a display list, for "already reserved to <scopes>" messages. */
 function describeFolders(group: StoredGroup): string {
-  return group.folders.length > 0 ? group.folders.join(', ') : describeMembers(group);
+  return groupScopeCount(group) > 0 ? describeGroupScopes(group) : describeMembers(group);
+}
+
+/** A bind scope as a refusal/log names it: the quoted folder, or the alias in its folder. */
+function describeScope(scope: BindScope, canonicalFolder: string): string {
+  return scope.kind === 'folder'
+    ? `"${canonicalFolder}"`
+    : `session "${scope.alias}" in ${canonicalFolder}`;
 }
 
 /** The order {@link SwitchEngine.ensureGroupLiveLocked} tries members in: the recorded active member
@@ -439,6 +501,8 @@ export class SwitchEngine {
   private readonly bindFs: BindFs;
   /** See {@link SwitchEngineOptions.isProcessAlive}. */
   private readonly isProcessAlive: (pid: number) => boolean;
+  /** See {@link SwitchEngineOptions.sessionIdentity}. */
+  private readonly sessionIdentity: SessionIdentityLookup | undefined;
   /** Resolves the enforcement mode at snapshot-write time. See {@link SwitchEngineOptions.bindEnforce}
    *  — a plain mode is wrapped in a constant function; a resolver is read on every write so a live
    *  settings change is honored by daemon-side writers too. */
@@ -473,6 +537,7 @@ export class SwitchEngine {
     this.lockOptions = options.lockOptions ?? {};
     this.bindFs = options.bindFs ?? defaultBindFs();
     this.isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+    this.sessionIdentity = options.sessionIdentity;
     this.resolveBindEnforce =
       typeof options.bindEnforce === 'function'
         ? options.bindEnforce
@@ -921,8 +986,19 @@ export class SwitchEngine {
    * to global. Canonicalized so a case difference or trailing separator still matches on Windows.
    */
   async slotForConfigDir(configDir: string | null | undefined): Promise<SlotId> {
+    return (await this.recognizedSlotForConfigDir(configDir)) ?? 'global';
+  }
+
+  /**
+   * {@link slotForConfigDir} without the guess: the global slot for an absent config dir or the main
+   * one, a group's slot for its live profile, and `null` for anything else — a config dir cctl does
+   * not manage (a dissolved group's profile, a hand-made store), whose account is unknown. What a
+   * caller must use before acting on "the account this session runs on".
+   */
+  async recognizedSlotForConfigDir(configDir: string | null | undefined): Promise<SlotId | null> {
     if (configDir === undefined || configDir === null || configDir === '') return 'global';
     const key = folderKey(this.canonReserved(configDir), this.platform);
+    if (key === folderKey(this.canonReserved(this.paths.claudeDir), this.platform)) return 'global';
     for (const g of await this.vault.listGroups()) {
       const profileKey = folderKey(
         this.canonReserved(groupProfileDir(this.paths.vaultDir, g.id)),
@@ -930,7 +1006,7 @@ export class SwitchEngine {
       );
       if (key === profileKey) return groupSlotId(g.id);
     }
-    return 'global';
+    return null;
   }
 
   /**
@@ -947,6 +1023,32 @@ export class SwitchEngine {
       this.platform,
     );
     return match === null ? null : { groupId: match.groupId };
+  }
+
+  /**
+   * Resolve a session running in `folder` with custom title `title` to its binding by THE precedence
+   * rule (the alias scope of the folder the session was recorded in — `recordedFolder`, default
+   * `folder`, null = recorded in no folder an alias scope can name — else the longest folder binding
+   * of `folder`, else null = global). Folders are canonicalized leniently like
+   * {@link resolveCwdBinding}; `title` null/blank means an unnamed session, for which only folder
+   * bindings apply.
+   */
+  async resolveSessionBinding(
+    folder: string,
+    title: string | null | undefined,
+    recordedFolder?: string | null,
+  ): Promise<SessionBinding | null> {
+    const groups = await this.vault.listGroups();
+    if (groups.length === 0) return null;
+    return resolveSessionBinding(
+      this.canonReserved(folder),
+      title,
+      groups.map((g) => scopedGroupOf(g, this.platform)),
+      this.platform,
+      recordedFolder === undefined || recordedFolder === null
+        ? recordedFolder
+        : this.canonReserved(recordedFolder),
+    );
   }
 
   // ---- group lifecycle (bind / unbind / ensure-live) ----
@@ -979,15 +1081,40 @@ export class SwitchEngine {
     accountIds: readonly string[],
     opts: { label?: string } = {},
   ): Promise<BindResult> {
-    // A group slot is a second config dir; macOS has no per-config-dir credential slot yet, so
-    // creating one there would silently share the global Keychain item. Refuse up front.
-    if (this.platform === 'darwin') {
-      throw new RefreshError(
-        'folder-bound accounts are not supported on macOS yet (per-config-dir Keychain slots)',
-        'group_slot_unsupported',
-      );
-    }
-    const canonicalFolder = this.canonicalizeBindFolder(folder);
+    return this.bindScope({ kind: 'folder', folder }, accountIds, opts);
+  }
+
+  /**
+   * Bind a session ALIAS in one exact folder to a set of accounts: sessions in `folder` whose custom
+   * title matches `alias` (the `claude --resume` rule: case-insensitive, trimmed) run on the group's
+   * slot, and that rule outranks any folder binding of the same folder. Everything else is
+   * {@link bindFolder}'s contract, step for step and fault point for fault point: the same reuse of
+   * the group with exactly this member set, the same "unbind there first" refusals, the same global
+   * hand-off, the same crash-safe order with the snapshot written LAST. The alias is stored as
+   * entered; one carrying a control or bidi character, or longer than {@link MAX_ALIAS_LENGTH}, is
+   * refused (it flows into hook output and terminals).
+   */
+  async bindAlias(
+    folder: string,
+    alias: string,
+    accountIds: readonly string[],
+    opts: { label?: string } = {},
+  ): Promise<BindResult> {
+    return this.bindScope({ kind: 'alias', folder, alias }, accountIds, opts);
+  }
+
+  /** The shared body of {@link bindFolder} and {@link bindAlias}; see bindFolder for the order. */
+  private async bindScope(
+    scope: BindScope,
+    accountIds: readonly string[],
+    opts: { label?: string },
+  ): Promise<BindResult> {
+    this.refuseGroupSlotsOnDarwin();
+    const canonicalFolder =
+      scope.kind === 'folder'
+        ? this.canonicalizeBindFolder(scope.folder)
+        : this.canonicalizeAliasFolder(scope.folder);
+    if (scope.kind === 'alias') this.checkAliasText(scope.alias);
     // De-dupe the request but keep it non-empty and every id real; a bind of nothing, or of a
     // typo'd id, is a mistake to reject before anything moves.
     const requestedIds = [...new Set(accountIds)];
@@ -1007,7 +1134,7 @@ export class SwitchEngine {
       const groups = await this.vault.listGroups();
 
       // Refuse any requested account already reserved to a group whose member set differs from this
-      // request — that account belongs to another folder's set and must be unbound there first.
+      // request — that account belongs to another scope's set and must be unbound there first.
       for (const req of requested) {
         const owner = groups.find((g) => g.members.some((m) => m.id === req.id));
         if (owner && !setsEqual(new Set(owner.members.map((m) => m.id)), requestedSet)) {
@@ -1022,14 +1149,17 @@ export class SwitchEngine {
       const matching = groups.find((g) =>
         setsEqual(new Set(g.members.map((m) => m.id)), requestedSet),
       );
-      // If this folder is already bound, it must be bound to that same group — otherwise the request
-      // is trying to point one folder at two different account sets.
-      const exactOwnerId = exactBinding(canonicalFolder, groups, this.platform);
+      // If this scope is already bound, it must be bound to that same group — otherwise the request
+      // is trying to point one scope at two different account sets.
+      const exactOwnerId =
+        scope.kind === 'folder'
+          ? exactBinding(canonicalFolder, groups, this.platform)
+          : exactAliasBinding(canonicalFolder, scope.alias, groups, this.platform);
       if (exactOwnerId !== null && exactOwnerId !== matching?.id) {
         const owner = groups.find((g) => g.id === exactOwnerId)!;
         throw new RefreshError(
-          `"${canonicalFolder}" is already bound to ${describeMembers(owner)}; unbind it first`,
-          'folder_bound_elsewhere',
+          `${describeScope(scope, canonicalFolder)} is already bound to ${describeMembers(owner)}; unbind it first`,
+          scope.kind === 'folder' ? 'folder_bound_elsewhere' : 'alias_bound_elsewhere',
         );
       }
 
@@ -1039,50 +1169,41 @@ export class SwitchEngine {
       let globalSwitchedTo: string | null = null;
 
       if (matching !== undefined) {
-        // Reuse: the members are already reserved to this group, so only the folder is new. A member
+        // Reuse: the members are already reserved to this group, so only the scope is new. A member
         // of an existing group can never be globally live, so step 2 does not apply here.
-        group =
-          exactOwnerId === matching.id
-            ? matching
-            : await this.vault.addFolderToGroup(matching.id, canonicalFolder);
+        if (exactOwnerId === matching.id) {
+          group = matching;
+        } else if (scope.kind === 'folder') {
+          group = await this.vault.addFolderToGroup(matching.id, canonicalFolder);
+        } else {
+          group = await this.vault.addAliasToGroup(matching.id, {
+            folder: canonicalFolder,
+            alias: scope.alias,
+          });
+        }
         created = false;
       } else {
-        // Every refusal the group creation below can make (group count, member count, folder
+        const newGroup = {
+          memberIds: requestedIds,
+          ...(scope.kind === 'folder'
+            ? { folders: [canonicalFolder] }
+            : { aliases: [{ folder: canonicalFolder, alias: scope.alias }] }),
+        };
+        // Every refusal the group creation below can make (group count, member count, scope
         // conflicts) is checked NOW, before the global hand-off: a bind that was always going to be
         // refused must not first move the global slot off an account and then leave it moved.
-        await this.vault.checkCreateGroup({ memberIds: requestedIds, folders: [canonicalFolder] });
+        await this.vault.checkCreateGroup(newGroup);
         // New group: a requested member may be the GLOBAL live account. Move global off it FIRST
         // (while it is still a shared account activate() can route to global), so it is live nowhere
         // at the instant its row moves into the group.
-        const globalLive = await this.getActiveId('global');
-        if (globalLive !== null && requestedSet.has(globalLive)) {
-          const replacement = this.pickGlobalReplacement(
-            await this.vault.listAccounts(),
-            requestedSet,
-          );
-          if (replacement === undefined) {
-            throw new RefreshError(
-              `cannot bind: "${requested.find((r) => r.id === globalLive)!.label}" is the only usable ` +
-                'shared account, so moving it into a folder would leave the global slot with none',
-              'no_shared_account_remains',
-            );
-          }
-          // Deliberate operator move: force past the cadence guard (a bind should never be blocked by
-          // a recent hop) and adopt the outgoing account's rotation, which activateInSlot does for the
-          // previous live account automatically.
-          const globalRt = this.slotRuntime('global');
-          const res = await this.activateInSlot(globalRt, replacement.id, {
-            force: true,
-            origin: 'manual',
-            reason: 'freeing the global slot for a folder bind',
-          });
-          movedOffGlobal = globalLive;
-          globalSwitchedTo = res.activeAccountId;
-        }
+        ({ movedOffGlobal, globalSwitchedTo } = await this.moveGlobalOffLocked(
+          requested,
+          requestedSet,
+          'bind',
+        ));
         this.fault('bind:after-global-switch');
         group = await this.vault.createGroup({
-          memberIds: requestedIds,
-          folders: [canonicalFolder],
+          ...newGroup,
           ...(opts.label !== undefined ? { label: opts.label } : {}),
         });
         created = true;
@@ -1097,41 +1218,119 @@ export class SwitchEngine {
       // The snapshot the guard reads is written LAST, from the freshly-loaded group set.
       await this.writeSnapshotLocked();
 
-      const runningSessions = await this.runningSessionsUnder([canonicalFolder]);
-      return { group, created, movedOffGlobal, globalSwitchedTo, live, runningSessions };
+      const runningSessions =
+        scope.kind === 'folder'
+          ? await this.runningSessionsUnder([canonicalFolder])
+          : await this.runningAliasSessions(canonicalFolder, scope.alias);
+      return {
+        group: (await this.vault.getGroup(group.id)) ?? group,
+        folder: canonicalFolder,
+        ...(scope.kind === 'alias' ? { alias: scope.alias } : {}),
+        created,
+        movedOffGlobal,
+        globalSwitchedTo,
+        live,
+        runningSessions,
+      };
     });
   }
 
   /**
-   * Unbind a folder. Removing a group's LAST folder dissolves it; removing one of several just drops
-   * that binding. A dissolve refuses (without `force`) when a session is observed running under the
-   * group's folders — the profile's live credentials are about to be cleared, and a running session
+   * Unbind a folder. Removing a group's LAST scope dissolves it; removing one of several just drops
+   * that binding. A dissolve refuses (without `force`) when a session is observed running in the
+   * group's scopes — the profile's live credentials are about to be cleared, and a running session
    * would lose its account. On dissolve: adopt the profile's rotation into the vault, clear the
    * profile's live credentials (so the slot fails closed), move the member rows back to the shared
    * pool, discard the slot's crash-recovery state, and keep the profile dir (its history). The
    * snapshot is rewritten LAST.
    */
   async unbindFolder(folder: string, opts: { force?: boolean } = {}): Promise<UnbindResult> {
-    const canonicalFolder = this.canonicalizeBindFolder(folder, { mustExist: false });
+    return this.unbindScope({ kind: 'folder', folder }, opts);
+  }
+
+  /** Unbind a session alias in a folder — {@link unbindFolder}'s contract for an alias scope: the
+   *  scope goes, and the group dissolves (V1 semantics, same refusal and `force`) when it was the
+   *  last one. The folder need not exist any more (a deleted folder's binding still needs clearing). */
+  async unbindAlias(
+    folder: string,
+    alias: string,
+    opts: { force?: boolean } = {},
+  ): Promise<UnbindResult> {
+    return this.unbindScope({ kind: 'alias', folder, alias }, opts);
+  }
+
+  /** The shared body of {@link unbindFolder} and {@link unbindAlias}. */
+  private async unbindScope(scope: BindScope, opts: { force?: boolean }): Promise<UnbindResult> {
+    const resolvedFolder = this.canonicalizeBindFolder(scope.folder, { mustExist: false });
+    // The folder as spelled, canonicalized WITHOUT resolving links. A bound folder that was moved
+    // and replaced by a link to its new home resolves to the new home, where nothing is bound, while
+    // the binding still names the old path: this spelling is how that binding can still be removed.
+    const spelled = canonicalizeFolder(scope.folder, {
+      platform: this.platform,
+      cwd: this.bindFs.cwd(),
+    });
     return this.withCredentialLock(async () => {
       await this.settlePendingSwitchesLocked();
       const groups = await this.vault.listGroups();
-      const ownerId = exactBinding(canonicalFolder, groups, this.platform);
+      const ownerOf = (folder: string): string | null =>
+        scope.kind === 'folder'
+          ? exactBinding(folder, groups, this.platform)
+          : exactAliasBinding(folder, scope.alias, groups, this.platform);
+      let canonicalFolder = resolvedFolder;
+      let ownerId = ownerOf(resolvedFolder);
+      if (ownerId === null && spelled.ok && spelled.path !== resolvedFolder) {
+        ownerId = ownerOf(spelled.path);
+        if (ownerId !== null) canonicalFolder = spelled.path;
+      }
       if (ownerId === null) {
         throw new RefreshError(
-          `"${canonicalFolder}" is not bound to any folder-bound account`,
+          scope.kind === 'folder'
+            ? `"${resolvedFolder}" is not bound to any folder-bound account`
+            : `${describeScope(scope, resolvedFolder)} is not bound to any account`,
           'not_bound',
         );
       }
       const group = groups.find((g) => g.id === ownerId)!;
+      // Report the scope as it was STORED — the operator may have typed another case, spacing or
+      // separator spelling — matched by the same uniqueness key that found the owner (folder AND
+      // alias: one group may hold one alias in several folders).
+      const wanted =
+        scope.kind === 'folder'
+          ? folderUniquenessKey(canonicalFolder, this.platform)
+          : aliasScopeUniquenessKey(canonicalFolder, scope.alias, this.platform);
+      const storedAliasScope =
+        scope.kind === 'alias'
+          ? (group.aliases ?? []).find(
+              (a) => aliasScopeUniquenessKey(a.folder, a.alias, this.platform) === wanted,
+            )
+          : undefined;
+      const storedFolder =
+        scope.kind === 'folder'
+          ? group.folders.find((f) => folderUniquenessKey(f, this.platform) === wanted)
+          : storedAliasScope?.folder;
+      const shownFolder = storedFolder ?? canonicalFolder;
+      const storedAlias =
+        scope.kind === 'alias' ? (storedAliasScope?.alias ?? scope.alias) : undefined;
+      const aliasField = storedAlias !== undefined ? { alias: storedAlias } : {};
+      const shownScope: BindScope =
+        scope.kind === 'folder'
+          ? { kind: 'folder', folder: shownFolder }
+          : { kind: 'alias', folder: shownFolder, alias: storedAlias ?? scope.alias };
 
-      // Removing one of several folders keeps the group (and its live slot) intact — no session
+      // Removing one of several scopes keeps the group (and its live slot) intact — no session
       // concern, no member move.
-      if (group.folders.length > 1) {
-        const updated = await this.vault.removeFolderFromGroup(group.id, canonicalFolder);
+      if (groupScopeCount(group) > 1) {
+        const updated =
+          scope.kind === 'folder'
+            ? await this.vault.removeFolderFromGroup(group.id, canonicalFolder)
+            : await this.vault.removeAliasFromGroup(group.id, {
+                folder: canonicalFolder,
+                alias: scope.alias,
+              });
         await this.writeSnapshotLocked();
         return {
-          folder: canonicalFolder,
+          folder: shownFolder,
+          ...aliasField,
           dissolved: false,
           group: updated,
           releasedMembers: [],
@@ -1140,45 +1339,413 @@ export class SwitchEngine {
         };
       }
 
-      // Last folder: dissolve. Observed sessions block a non-forced dissolve.
-      const runningSessions = await this.runningSessionsUnder(group.folders);
-      if (runningSessions.length > 0 && opts.force !== true) {
-        throw new RefreshError(
-          `"${canonicalFolder}" (${describeMembers(group)}) has ${runningSessions.length} running ` +
-            'session(s) under it; exit them or rerun with --force',
-          'sessions_running',
-        );
+      const dissolved = await this.dissolveGroupLocked(
+        group,
+        opts.force === true,
+        describeScope(shownScope, shownFolder),
+      );
+      return { folder: shownFolder, ...aliasField, dissolved: true, ...dissolved };
+    });
+  }
+
+  /**
+   * Dissolve a group under the lock — the tail of an unbind of its last scope, and of removing its
+   * last member. Refuses without `force` when a session is observed running in any of the group's
+   * scopes. Order (each step idempotent; a crash between any two leaves a state a rerun completes):
+   * adopt the profile's rotation into the vault, clear the profile's live seat and the slot's
+   * recovery state, move the member rows back to the shared pool (the vault's crash-safe release
+   * order: an interrupted release reverts to reserved), and write the snapshot LAST. `what` names
+   * the scope for the refusal message.
+   */
+  private async dissolveGroupLocked(
+    group: StoredGroup,
+    force: boolean,
+    what: string,
+  ): Promise<{
+    releasedMembers: string[];
+    adoptedRotation: boolean;
+    runningSessions: RunningSession[];
+  }> {
+    const runningSessions = await this.runningSessionsInScopes(group);
+    if (runningSessions.length > 0 && !force) {
+      throw new RefreshError(
+        `${what} (${describeMembers(group)}) has ${runningSessions.length} running ` +
+          `session(s) under it${unidentifiedNote(runningSessions)}; exit them or rerun with --force`,
+        'sessions_running',
+      );
+    }
+
+    const slotId = groupSlotId(group.id);
+    const rt = this.slotRuntime(slotId);
+    // Adopt any CLI-side rotation of the profile's live token before it is discarded — the same
+    // reconcile-by-reading a switch does, so a token minted inside the profile is never lost.
+    const currentLive = await this.getActiveId(slotId);
+    const liveNow = await rt.credStore.readLiveCredentials();
+    const liveOauth = await rt.credStore.readOauthAccount();
+    const adoptedRotation = await this.adoptRotationIfNeeded(currentLive, liveNow, liveOauth);
+    this.fault('unbind:after-adopt');
+
+    // Clear the profile's live seat (fails the slot closed) and drop its crash-recovery state; the
+    // profile dir itself stays for history.
+    await this.clearSlotLive(rt);
+    await this.clearSlotState(rt);
+    this.fault('unbind:after-clear-live');
+
+    const releasedMembers = group.members.map((m) => m.id);
+    await this.vault.releaseAccounts(group.id, releasedMembers);
+    this.fault('unbind:after-release');
+
+    await this.writeSnapshotLocked();
+    return { releasedMembers, adoptedRotation, runningSessions };
+  }
+
+  /**
+   * Grow a group: reserve more shared accounts into it ("add this account to the accounts used by
+   * that binding"). Each account must exist and be SHARED — one reserved to another group is refused
+   * by name ("unbind it there first"); one already a member is skipped. Crash-safe order, as a bind:
+   *   1. a to-be-member live in the GLOBAL slot: move global off it first (adopting its rotation),
+   *      refusing — nothing changed — when no shared account would remain for global;
+   *   2. move the rows into the group (groups.json first);
+   *   3. ensure the group's slot is live (normally a no-op: the live member keeps the slot);
+   *   4. write the snapshot LAST (member labels are guard-relevant).
+   * Faults: `grow:after-global-switch`, `grow:after-row-move`, `grow:after-ensure-live`.
+   *
+   * `opts.soleScope`: the scope the caller means to grow, which must be the group's ONLY scope —
+   * checked under the lock, so a scope another process bound to the same group after the caller
+   * looked (a bind with the same member set reuses the group) can never be grown by accident.
+   */
+  async addGroupMembers(
+    groupId: string,
+    accountIds: readonly string[],
+    opts: { soleScope?: GroupScopeRef } = {},
+  ): Promise<GroupGrowResult> {
+    this.refuseGroupSlotsOnDarwin();
+    const requestedIds = [...new Set(accountIds)];
+    if (requestedIds.length === 0) {
+      throw new RefreshError('adding to a binding needs at least one account', 'bind_no_accounts');
+    }
+    return this.withCredentialLock(async () => {
+      // Who is live where decides the global hand-off and the group's seat below, so no slot may be
+      // left mid-switch.
+      await this.settlePendingSwitchesLocked();
+      const group = await this.mustGroupLocked(groupId);
+      if (opts.soleScope !== undefined) this.requireSoleScope(group, opts.soleScope, 'add');
+      const groups = await this.vault.listGroups();
+      const toAdd: StoredAccount[] = [];
+      for (const id of requestedIds) {
+        const row = await this.vault.getAccount(id);
+        if (!row) throw new UnknownAccountError(id);
+        const owner = groups.find((g) => g.members.some((m) => m.id === id));
+        if (owner?.id === group.id) continue; // already a member: nothing to move
+        if (owner) {
+          throw new RefreshError(
+            `account "${row.label}" is already reserved to ${describeFolders(owner)}; unbind it there first`,
+            'account_reserved_elsewhere',
+          );
+        }
+        toAdd.push(row);
+      }
+      if (toAdd.length === 0) {
+        return {
+          group,
+          added: [],
+          movedOffGlobal: null,
+          globalSwitchedTo: null,
+          live: await this.ensureGroupLiveLocked(group),
+        };
+      }
+      const addIds = toAdd.map((r) => r.id);
+      // Every refusal the reservation can make (member cap, a row that moved) is checked before the
+      // global hand-off, so a grow that was always going to be refused moves nothing first.
+      await this.vault.checkReserveAccounts(group.id, addIds);
+      const moved = await this.moveGlobalOffLocked(toAdd, new Set(addIds), 'add');
+      this.fault('grow:after-global-switch');
+      const grown = await this.vault.reserveAccounts(group.id, addIds);
+      this.fault('grow:after-row-move');
+      const live = await this.ensureGroupLiveLocked(grown);
+      this.fault('grow:after-ensure-live');
+      await this.writeSnapshotLocked();
+      return {
+        group: (await this.vault.getGroup(group.id)) ?? grown,
+        added: addIds,
+        ...moved,
+        live,
+      };
+    });
+  }
+
+  /**
+   * Shrink a group: return members to the shared pool. Every id must be a member (refused by name
+   * otherwise). Removing EVERY member dissolves the group with V1 unbind semantics (running-session
+   * refusal, `force`, adopt, clear, release). Otherwise, crash-safe order:
+   *   1. a leaving member LIVE in the slot is switched off first: the next usable remaining member
+   *      takes the slot (the activation adopts the leaver's rotated token); when none can, the
+   *      leaver's rotation is adopted and the slot is cleared (fails closed) — refused without
+   *      `force` when that would strand running sessions;
+   *   2. release the rows (accounts.json first — an interrupted release reverts to reserved);
+   *   3. write the snapshot LAST.
+   * So a leaving account is live nowhere by the time it is shared again: it can never end up live in
+   * two slots. Faults: `shrink:after-switch-off`, `shrink:after-release` (and `unbind:*` when the
+   * removal dissolves the group).
+   *
+   * Whatever the reason the slot would be left empty — no remaining member at all, or every
+   * remaining member failing to take it over (a transient refresh error) — the shrink is refused
+   * without `force` while sessions run in the group's scopes, and nothing changes. `opts.soleScope`
+   * is {@link addGroupMembers}'s precondition, for the same reason.
+   */
+  async removeGroupMembers(
+    groupId: string,
+    accountIds: readonly string[],
+    opts: { force?: boolean; soleScope?: GroupScopeRef } = {},
+  ): Promise<GroupShrinkResult> {
+    const removeIds = [...new Set(accountIds)];
+    if (removeIds.length === 0) {
+      throw new RefreshError(
+        'removing from a binding needs at least one account',
+        'bind_no_accounts',
+      );
+    }
+    return this.withCredentialLock(async () => {
+      // Which member is live in the slot decides whether a leaver must be switched off first, so the
+      // slot may not be left mid-switch.
+      await this.settlePendingSwitchesLocked();
+      const group = await this.mustGroupLocked(groupId);
+      if (opts.soleScope !== undefined) this.requireSoleScope(group, opts.soleScope, 'remove');
+      for (const id of removeIds) {
+        if (!group.members.some((m) => m.id === id)) {
+          const label = (await this.vault.getAccount(id))?.label ?? id;
+          throw new RefreshError(
+            `account "${label}" is not one of the accounts bound to ${describeFolders(group)}`,
+            'not_a_member',
+          );
+        }
+      }
+      const removeSet = new Set(removeIds);
+      const force = opts.force === true;
+
+      if (removeSet.size === group.members.length) {
+        const dissolved = await this.dissolveGroupLocked(group, force, describeFolders(group));
+        return {
+          removed: dissolved.releasedMembers,
+          dissolved: true,
+          adoptedRotation: dissolved.adoptedRotation,
+          runningSessions: dissolved.runningSessions,
+        };
       }
 
       const slotId = groupSlotId(group.id);
       const rt = this.slotRuntime(slotId);
-      // Adopt any CLI-side rotation of the profile's live token before it is discarded — the same
-      // reconcile-by-reading a switch does, so a token minted inside the profile is never lost.
-      const currentLive = await this.getActiveId(slotId);
-      const liveNow = await rt.credStore.readLiveCredentials();
-      const liveOauth = await rt.credStore.readOauthAccount();
-      const adoptedRotation = await this.adoptRotationIfNeeded(currentLive, liveNow, liveOauth);
-      this.fault('unbind:after-adopt');
+      const liveId = await this.getActiveId(slotId);
+      let switchedTo: string | null | undefined;
+      let adoptedRotation = false;
+      if (liveId !== null && removeSet.has(liveId)) {
+        // The candidates ensureGroupLive would try, over the members that STAY (the leaver is not
+        // treated as the recorded active member here, or it would be tried first).
+        const candidates = orderedGroupCandidates({
+          ...group,
+          members: group.members.filter((m) => !removeSet.has(m.id)),
+          activeId: null,
+        });
+        // Refuse (nothing changed) when the slot would be emptied under running sessions. Checked
+        // up front when no member could take over at all, and again below when every one tried
+        // failed: a failed activation writes nothing, so refusing after the attempts is still a
+        // refusal that changed nothing.
+        const refuseIfRunning = async (why: string): Promise<void> => {
+          if (force) return;
+          const running = await this.runningSessionsInScopes(group);
+          if (running.length > 0) {
+            throw new RefreshError(
+              `${why}, and ${running.length} session(s) are running on ${describeFolders(group)}` +
+                `${unidentifiedNote(running)}; exit them or rerun with --force`,
+              'sessions_running',
+            );
+          }
+        };
+        if (candidates.length === 0) {
+          await refuseIfRunning('no other account bound there can take the slot over');
+        }
+        switchedTo = null;
+        for (const member of candidates) {
+          try {
+            const res = await this.activateInSlot(rt, member.id, {
+              force: true,
+              origin: 'manual',
+              reason: 'switching the slot off an account leaving the binding',
+            });
+            switchedTo = member.id;
+            adoptedRotation = res.adoptedPreviousRotation;
+            break;
+          } catch (err) {
+            // A process that died mid-activation does not go on to the next member. Any other
+            // failure has already put the leaver's login back (activateInSlot undoes its own
+            // partial write), so the next candidate starts from the slot as it was.
+            if (this.isSimulatedDeath(err)) throw err;
+            this.log.warn(
+              { groupId: group.id, memberId: member.id, reason: errorReason(err) },
+              'group member failed to take the slot over; trying the next',
+            );
+          }
+        }
+        if (switchedTo === null && candidates.length > 0) {
+          await refuseIfRunning('no other account bound there could take the slot over right now');
+        }
+        if (switchedTo === null) {
+          // No remaining member could be seated: keep the leaver's rotated token, then fail the slot
+          // closed so the leaver is not left live in a slot it no longer belongs to.
+          const liveNow = await rt.credStore.readLiveCredentials().catch(() => undefined);
+          const liveOauth = await rt.credStore.readOauthAccount().catch(() => undefined);
+          adoptedRotation = await this.adoptRotationIfNeeded(liveId, liveNow, liveOauth);
+          await this.clearSlotLive(rt);
+        }
+      }
+      this.fault('shrink:after-switch-off');
 
-      // Clear the profile's live seat (fails the slot closed) and drop its crash-recovery state; the
-      // profile dir itself stays for history.
-      await this.clearSlotLive(rt);
-      await this.clearSlotState(rt);
-      this.fault('unbind:after-clear-live');
-
-      const releasedMembers = group.members.map((m) => m.id);
-      await this.vault.releaseAccounts(group.id, releasedMembers);
-      this.fault('unbind:after-release');
+      await this.vault.releaseAccounts(group.id, removeIds);
+      this.fault('shrink:after-release');
 
       await this.writeSnapshotLocked();
+      const after = await this.vault.getGroup(group.id);
       return {
-        folder: canonicalFolder,
-        dissolved: true,
-        releasedMembers,
+        ...(after !== undefined ? { group: after } : {}),
+        removed: removeIds,
+        dissolved: false,
+        ...(switchedTo !== undefined ? { switchedTo } : {}),
         adoptedRotation,
-        runningSessions,
+        runningSessions: [],
       };
     });
+  }
+
+  /**
+   * Dissolve a whole binding: every member back to the shared pool, whatever scopes the group holds
+   * — the way out for a binding left with no scope at all (which no folder or alias can name), and
+   * `cctl unbind --group`. The members released are the ones the group holds when this takes the
+   * lock, never a list a caller read before it: a concurrent grow is dissolved with the rest rather
+   * than left behind as a smaller binding. V1 unbind semantics otherwise: refused without `force`
+   * while sessions run in any of its scopes; adopt, clear, release, snapshot LAST
+   * ({@link dissolveGroupLocked}, same fault points).
+   */
+  async dissolveGroup(
+    groupId: string,
+    opts: { force?: boolean } = {},
+  ): Promise<GroupDissolveResult> {
+    return this.withCredentialLock(async () => {
+      // The dissolve adopts the live seat's rotation by who is live there; settle it first.
+      await this.settlePendingSwitchesLocked();
+      const group = await this.mustGroupLocked(groupId);
+      const dissolved = await this.dissolveGroupLocked(
+        group,
+        opts.force === true,
+        describeFolders(group),
+      );
+      return { group, ...dissolved };
+    });
+  }
+
+  /** Refuse (`binding_changed`) unless `scope` is `group`'s only scope — the precondition a caller
+   *  growing or shrinking ONE scope's accounts passes, checked under the lock. The scope is compared
+   *  by the same uniqueness keys the registry enforces. */
+  private requireSoleScope(group: StoredGroup, scope: GroupScopeRef, verb: 'add' | 'remove'): void {
+    const aliases = group.aliases ?? [];
+    const sole =
+      scope.kind === 'folder'
+        ? aliases.length === 0 &&
+          group.folders.length === 1 &&
+          folderUniquenessKey(group.folders[0]!, this.platform) ===
+            folderUniquenessKey(scope.folder, this.platform)
+        : group.folders.length === 0 &&
+          aliases.length === 1 &&
+          aliasScopeUniquenessKey(aliases[0]!.folder, aliases[0]!.alias, this.platform) ===
+            aliasScopeUniquenessKey(scope.folder, scope.alias, this.platform);
+    if (!sole) {
+      throw new RefreshError(
+        `${describeMembers(group)} is now bound to ${describeFolders(group)}; ` +
+          `${verb === 'add' ? 'adding accounts there would add them' : 'removing accounts there would remove them'} ` +
+          'for every one of those. Nothing changed; look again (cctl bindings) and rerun.',
+        'binding_changed',
+      );
+    }
+  }
+
+  /** A group by id, under the lock, or a `not_bound` refusal naming it. */
+  private async mustGroupLocked(groupId: string): Promise<StoredGroup> {
+    const group = await this.vault.getGroup(groupId);
+    if (!group) throw new RefreshError(`no binding group with id "${groupId}"`, 'not_bound');
+    return group;
+  }
+
+  /**
+   * Step 2 of a bind/grow, under the lock: when one of the accounts about to be reserved is the
+   * GLOBAL live account, switch global to the best remaining shared account first (adopting the
+   * outgoing account's rotation, which activateInSlot does for the previous live account), so the
+   * account is live nowhere at the instant its row moves into a group. Refuses — nothing changed —
+   * when no usable shared account would remain to hold the global slot. `verb` names the operation
+   * in that refusal.
+   */
+  private async moveGlobalOffLocked(
+    reserving: readonly StoredAccount[],
+    reservingIds: ReadonlySet<string>,
+    verb: 'bind' | 'add',
+  ): Promise<{ movedOffGlobal: string | null; globalSwitchedTo: string | null }> {
+    const globalLive = await this.getActiveId('global');
+    if (globalLive === null || !reservingIds.has(globalLive)) {
+      return { movedOffGlobal: null, globalSwitchedTo: null };
+    }
+    const replacement = this.pickGlobalReplacement(await this.vault.listAccounts(), reservingIds);
+    if (replacement === undefined) {
+      const label = reserving.find((r) => r.id === globalLive)?.label ?? globalLive;
+      throw new RefreshError(
+        `cannot ${verb}: "${label}" is the only usable shared account, so moving it into a ` +
+          'binding would leave the global slot with none',
+        'no_shared_account_remains',
+      );
+    }
+    // Deliberate operator move: force past the cadence guard (a bind should never be blocked by a
+    // recent hop).
+    const res = await this.activateInSlot(this.slotRuntime('global'), replacement.id, {
+      force: true,
+      origin: 'manual',
+      reason: 'freeing the global slot for a binding',
+    });
+    return { movedOffGlobal: globalLive, globalSwitchedTo: res.activeAccountId };
+  }
+
+  /** A group slot is a second config dir; macOS has no per-config-dir credential slot yet, so
+   *  creating or growing one there would silently share the global Keychain item. Refuse up front. */
+  private refuseGroupSlotsOnDarwin(): void {
+    if (this.platform === 'darwin') {
+      throw new RefreshError(
+        'folder-bound accounts are not supported on macOS yet (per-config-dir Keychain slots)',
+        'group_slot_unsupported',
+      );
+    }
+  }
+
+  /** Refuse an alias no session title could usefully carry here: blank (after the resume rule's
+   *  trim), longer than Claude Code keeps a session's title (it stores the first
+   *  {@link CLAUDE_CODE_TITLE_MAX_LENGTH} characters, so a longer alias would never match any
+   *  session — a binding that silently binds nothing), or holding a control/bidi character — the
+   *  alias is echoed into hook decisions and terminals, and a title that needs one is not worth the
+   *  risk. */
+  private checkAliasText(alias: string): void {
+    if (typeof alias !== 'string' || aliasKey(alias) === '') {
+      throw new RefreshError('a session alias cannot be empty', 'bind_refused');
+    }
+    if (alias.length > MAX_ALIAS_LENGTH || !aliasFitsSessionTitle(alias)) {
+      throw new RefreshError(
+        `a session alias cannot be longer than ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters: ` +
+          'Claude Code keeps only the first ' +
+          `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters of a session name, so no session could ` +
+          'match a longer one',
+        'bind_refused',
+      );
+    }
+    if (sanitizeTerminalText(alias) !== alias) {
+      throw new RefreshError(
+        'a session alias cannot contain control or bidirectional characters',
+        'bind_refused',
+      );
+    }
   }
 
   /**
@@ -1777,6 +2344,36 @@ export class SwitchEngine {
     return canon.path;
   }
 
+  /** Canonicalize the folder of an alias bind, refusing only what {@link checkAliasFolder} refuses
+   *  (a missing folder, or one inside cctl's state / the main config dir): an alias scope covers one
+   *  exact folder, so the home dir or a volume root — refused as FOLDER bindings because they would
+   *  capture everything beneath — is a legitimate place for a named session. */
+  private canonicalizeAliasFolder(folder: string): string {
+    const canon = canonicalizeFolder(folder, {
+      platform: this.platform,
+      cwd: this.bindFs.cwd(),
+      realpath: this.bindFs.realpath,
+    });
+    if (!canon.ok) {
+      throw new RefreshError(`cannot use folder "${folder}": ${canon.reason}`, 'bind_refused');
+    }
+    const check = checkAliasFolder(canon.path, {
+      platform: this.platform,
+      isDirectory: this.bindFs.isDirectory,
+      homeDir: this.canonReserved(this.bindFs.homedir()),
+      vaultDir: this.canonReserved(this.paths.vaultDir),
+      profilesRoot: this.canonReserved(profilesRoot(this.paths.vaultDir)),
+      mainConfigDir: this.canonReserved(this.paths.claudeDir),
+    });
+    if (!check.ok) {
+      throw new RefreshError(
+        `cannot bind a session in "${canon.path}": it ${check.reason}`,
+        'bind_refused',
+      );
+    }
+    return canon.path;
+  }
+
   /** Canonicalize a cctl-internal reserved path for containment checks — same rules as a bind target,
    *  but falling back to the raw path when it does not exist yet (the profiles root has no directory
    *  until the first bind). */
@@ -1817,10 +2414,74 @@ export class SwitchEngine {
     await rm(rt.stateDir, { recursive: true, force: true });
   }
 
-  /** Scan `<mainConfigDir>/sessions/*.json` for Claude Code sessions whose recorded pid is alive and
-   *  whose cwd is within one of `folders`. Defensive: a missing dir, an unreadable or malformed file,
-   *  or a session with no usable pid/cwd is simply skipped, never thrown — this only feeds a warning. */
+  /** Running sessions whose cwd is within one of `folders` — what a folder scope covers. */
   private async runningSessionsUnder(folders: readonly string[]): Promise<RunningSession[]> {
+    if (folders.length === 0) return [];
+    return this.scanRunningSessions((rec) =>
+      folders.some((f) => isWithin(rec.cwd, f, this.platform)),
+    );
+  }
+
+  /** Running sessions an alias scope covers: a custom title matching `alias` by alias key, in a
+   *  conversation RECORDED in exactly `folder` (the precedence rule's alias key — a session resumed
+   *  from a parent folder still belongs to the folder it was recorded in). An unnamed session is not
+   *  counted: it is outside the alias scope by definition. A session whose title could not be
+   *  learned IS counted — marked {@link RunningSession.unidentified} — when it runs in `folder`, or
+   *  its transcript's project directory can stand for `folder`: it may be that conversation, and a
+   *  dissolve must not strand it silently. */
+  private async runningAliasSessions(folder: string, alias: string): Promise<RunningSession[]> {
+    const here = folderUniquenessKey(folder, this.platform);
+    const key = aliasKey(alias);
+    return this.scanRunningSessions((rec) => {
+      if (!rec.titleKnown) {
+        return folderUniquenessKey(rec.cwd, this.platform) === here ||
+          (rec.recordedFolder !== null &&
+            folderUniquenessKey(rec.recordedFolder, this.platform) === here) ||
+          (rec.dirName !== undefined && projectDirMatches(rec.dirName, folder))
+          ? 'unidentified'
+          : false;
+      }
+      return (
+        rec.title !== null &&
+        aliasKey(rec.title) === key &&
+        rec.recordedFolder !== null &&
+        folderUniquenessKey(rec.recordedFolder, this.platform) === here
+      );
+    });
+  }
+
+  /** Running sessions in ANY of a group's scopes (folders and aliases), each reported once. What a
+   *  dissolve refuses on: every session that could be running on the group's slot. */
+  private async runningSessionsInScopes(group: StoredGroup): Promise<RunningSession[]> {
+    const found = await this.runningSessionsUnder(group.folders);
+    for (const a of group.aliases ?? []) {
+      for (const s of await this.runningAliasSessions(a.folder, a.alias)) {
+        if (!found.some((f) => f.sessionFile === s.sessionFile)) found.push(s);
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Scan `<mainConfigDir>/sessions/*.json` for Claude Code sessions whose recorded pid is alive and
+   * that `matches` accepts. Each file records `{pid, cwd, sessionId, name, nameSource}` (measured on
+   * Claude Code 2.1.283; it is removed on a clean exit and left stale by a hard kill, hence the pid
+   * check). The cwd is where the session runs. Its title and recorded folder come from its
+   * TRANSCRIPT when {@link sessionIdentity} is wired — the only source for a resumed session, whose
+   * `name` is derived (`nameSource: "derived"`), never its title — the recorded folder decided as
+   * everywhere else (recordedFolderFor over the shared reading, the session's cwd as the folder it
+   * runs in). A session the transcript does not know yet (a `--name` launch before its first turn)
+   * falls back to a `name` the operator set (`nameSource: "user"`, or no `nameSource` at all from an
+   * older Claude Code), recorded where it runs. Anything else — an unreadable transcript, a session
+   * with no transcript and no name of its own (a fork or a new session before its first prompt), a
+   * failed lookup — has an UNKNOWN title (`titleKnown` false), which the matcher decides about. A
+   * matcher answering 'unidentified' counts the session as possibly in scope. Defensive: a missing
+   * dir, an unreadable or malformed session file, or a session with no usable pid/cwd is skipped —
+   * this only feeds a warning or a refusal the operator can `--force`, never throws.
+   */
+  private async scanRunningSessions(
+    matches: (rec: SessionRecordView) => boolean | 'unidentified',
+  ): Promise<RunningSession[]> {
     const dir = join(this.paths.claudeDir, 'sessions');
     let names: string[];
     try {
@@ -1828,7 +2489,14 @@ export class SwitchEngine {
     } catch {
       return [];
     }
-    const out: RunningSession[] = [];
+    const live: {
+      pid: number;
+      rawCwd: string;
+      cwd: string;
+      file: string;
+      sessionId: string | undefined;
+      launchName: string | null;
+    }[] = [];
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       const file = join(dir, name);
@@ -1839,17 +2507,82 @@ export class SwitchEngine {
         continue;
       }
       if (typeof parsed !== 'object' || parsed === null) continue;
-      const rec = parsed as { pid?: unknown; cwd?: unknown };
+      const rec = parsed as {
+        pid?: unknown;
+        cwd?: unknown;
+        name?: unknown;
+        nameSource?: unknown;
+        sessionId?: unknown;
+      };
       const pid = typeof rec.pid === 'number' && Number.isInteger(rec.pid) ? rec.pid : undefined;
       const rawCwd = typeof rec.cwd === 'string' ? rec.cwd : undefined;
       if (pid === undefined || rawCwd === undefined) continue;
       if (!this.isProcessAlive(pid)) continue;
-      const canonCwd = this.canonReserved(rawCwd);
-      if (folders.some((f) => isWithin(canonCwd, f, this.platform))) {
-        out.push({ pid, cwd: canonCwd, sessionFile: file });
-      }
+      const userNamed = rec.nameSource === undefined || rec.nameSource === 'user';
+      live.push({
+        pid,
+        rawCwd,
+        cwd: this.canonReserved(rawCwd),
+        file,
+        sessionId:
+          typeof rec.sessionId === 'string' && rec.sessionId !== '' ? rec.sessionId : undefined,
+        launchName: userNamed && typeof rec.name === 'string' ? rec.name : null,
+      });
+    }
+    const identities = await this.lookupSessionIdentities(
+      live.flatMap((l) => (l.sessionId !== undefined ? [l.sessionId] : [])),
+    );
+    const out: RunningSession[] = [];
+    for (const l of live) {
+      const known: SessionIdentity | undefined =
+        l.sessionId !== undefined ? identities.get(l.sessionId.toLowerCase()) : undefined;
+      const readable = known !== undefined && known.unreadable !== true;
+      const titleKnown = readable || (known === undefined && l.launchName !== null);
+      const title = readable ? known.customTitle : titleKnown ? l.launchName : null;
+      // The folder the conversation belongs to, decided exactly as the guard decides it: a known
+      // transcript's trusted folder, else the folder it runs in when the transcript's project
+      // directory can stand for it; a named launch before its first turn belongs where it runs.
+      const recordedFolder =
+        known !== undefined
+          ? recordedFolderFor(
+              { folder: readable ? known.folder : null, dirName: known.dirName ?? '' },
+              { spelled: l.rawCwd, canonical: l.cwd },
+              (f) => this.canonReserved(f),
+            )
+          : l.cwd;
+      const verdict = matches({
+        cwd: l.cwd,
+        title,
+        titleKnown,
+        recordedFolder,
+        dirName: known?.dirName,
+      });
+      if (verdict === false) continue;
+      out.push({
+        pid: l.pid,
+        cwd: l.cwd,
+        sessionFile: l.file,
+        ...(verdict === 'unidentified' ? { unidentified: true as const } : {}),
+      });
     }
     return out;
+  }
+
+  /** {@link sessionIdentity} for these ids, or an empty map when it is not wired, there is nothing to
+   *  look up, or the lookup fails (the scan then falls back to what the session file records). */
+  private async lookupSessionIdentities(
+    sessionIds: readonly string[],
+  ): Promise<ReadonlyMap<string, SessionIdentity>> {
+    if (this.sessionIdentity === undefined || sessionIds.length === 0) return new Map();
+    try {
+      return await this.sessionIdentity(this.paths.claudeDir, sessionIds);
+    } catch (err) {
+      this.log.warn(
+        { reason: errorReason(err) },
+        "could not read running sessions' transcripts; using their session files only",
+      );
+      return new Map();
+    }
   }
 
   /** Build the guard snapshot object from the current registry (no IO beyond the vault reads). The
@@ -1862,6 +2595,7 @@ export class SwitchEngine {
     ]);
     return buildFolderBindingSnapshot({
       groups,
+      platform: this.platform,
       generation,
       enforce: this.resolveBindEnforce(),
       mainConfigDir: this.canonReserved(this.paths.claudeDir),
@@ -2066,8 +2800,31 @@ export class SwitchEngine {
         : { claudeAiOauth: live };
       const account = await this.vault.addAccount(label, bundle);
       // The just-captured account IS the live one; record that so the first switch reconciles.
-      await this.vault.setActive(account.id);
+      await this.adoptAsGlobalLiveLocked(account.id);
       return account;
+    });
+  }
+
+  /**
+   * Record that `accountId` is now the global slot's live account WITHOUT a switch — a login cctl
+   * captured in place (`accounts add` of the current login, a first login with nothing live before
+   * it). Sets the registry's active id AND appends the same `activated` audit entry a switch writes:
+   * the attribution journal derives its activation timeline from that log alone, so without it a box
+   * that never switched has no interval at all and every turn reads as unattributed. Caller holds the
+   * credential lock.
+   */
+  private async adoptAsGlobalLiveLocked(accountId: string): Promise<void> {
+    const previous = await this.vault.getActiveId();
+    await this.vault.setActive(accountId);
+    if (previous === accountId) return;
+    this.audit.append({
+      ts: this.clock(),
+      event: 'activated',
+      fromAccountId: previous,
+      toAccountId: accountId,
+      origin: 'manual',
+      slot: 'global',
+      detail: 'adopted the current login',
     });
   }
 
@@ -2157,7 +2914,7 @@ export class SwitchEngine {
         const account = await this.vault.addAccount(label, bundle);
         if (!prior) {
           // Nothing to restore: the captured login is now the live one — record that.
-          await this.vault.setActive(account.id);
+          await this.adoptAsGlobalLiveLocked(account.id);
         }
         return account;
       } finally {
@@ -2214,7 +2971,7 @@ export class SwitchEngine {
           : { claudeAiOauth: creds };
         await this.vault.writeBundle(accountId, bundle);
         await this.vault.clearQuarantine(accountId);
-        if (!prior) await this.vault.setActive(accountId);
+        if (!prior) await this.adoptAsGlobalLiveLocked(accountId);
         const refreshed = await this.vault.getAccount(accountId);
         if (!refreshed) throw new UnknownAccountError(accountId);
         return refreshed;

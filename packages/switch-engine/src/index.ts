@@ -76,6 +76,8 @@ export {
   MAX_GROUPS,
   MAX_GROUP_MEMBERS,
   MAX_GROUP_FOLDERS,
+  MAX_GROUP_ALIASES,
+  MAX_ALIAS_LENGTH,
   needsMetadataBackfill,
   type DedupeReport,
 } from './vault.js';
@@ -89,18 +91,47 @@ export {
   resolveBinding,
   exactBinding,
   checkBindTarget,
+  checkAliasFolder,
+  aliasKey,
+  aliasFitsSessionTitle,
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasScopeUniquenessKey,
+  exactAliasBinding,
+  resolveSessionBinding,
+  canonicalStoredFolder,
+  projectDirStem,
+  projectDirMatches,
+  shellQuoteArg,
   embeddableFolderPathSource,
+  embedFunctionAs,
+  type AliasScopeKey,
+  type ScopedGroup,
+  type SessionBinding,
   type CanonicalizeDeps,
   type CanonicalizeResult,
   type BindTargetDeps,
   type FolderBoundGroup,
 } from './folderPath.js';
+// Where a transcript's conversation belongs — the one reading the launcher, the guard (embedded),
+// the session catalog and the running-session scan all key alias bindings on (see recordedFolder.ts).
+export {
+  readRecordedFolder,
+  recordedFolderFor,
+  embeddableRecordedFolderSource,
+  RECORDED_FOLDER_HEAD_BYTES,
+  RECORDED_FOLDER_TAIL_BYTES,
+  type RecordedFolderFs,
+  type RecordedFolderRead,
+} from './recordedFolder.js';
 // Terminal-safe text stripping — shared verbatim between cctl-side renderers (the CLI re-exports
 // it) and the enforcement guard, which embeds the compiled source (see terminalSafe.ts).
 export { sanitizeTerminalText, embeddableSanitizeSource } from './terminalSafe.js';
 // The non-secret folder-bindings snapshot the guard reads.
 export {
   buildFolderBindingSnapshot,
+  describeGroupScopes,
+  groupScopeCount,
+  scopedGroupOf,
   readFolderBindingSnapshot,
   writeFolderBindingSnapshot,
   type BindEnforceMode,

@@ -1,3 +1,7 @@
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   isSupportedShell,
@@ -104,6 +108,25 @@ describe('renderShellInit', () => {
       // The exact wrapping differs between the two headers, so match the load-bearing tokens.
       expect(out).toContain('empty-string');
       expect(out).toContain('dropped');
+    }
+  });
+
+  it('powershell (both forms): warns that the function binder eats --, splits commas and -name:value', () => {
+    // Since the launcher routes by --resume / --name, a `--` the wrapper loses changes which session
+    // opens, so the header must say so and name the fix.
+    for (const out of [
+      renderShellInit('powershell', { nodePath: 'node.exe', cctlEntry: 'C:\\cctl\\bin.js' }),
+      renderShellInit('powershell'),
+    ]) {
+      expect(out).toContain('a bare -- is consumed');
+      expect(out).toContain('an unquoted comma splits one argument into several');
+      expect(out).toContain('-name:value splits at the colon');
+      expect(out).toContain("Quote such arguments ('--', '--resume=a,b',");
+      expect(out).toContain('run claude.exe directly');
+      // Still one well-formed wrapper: every header line is a comment.
+      const head = out.slice(0, out.indexOf('function claude {'));
+      for (const line of head.split('\n').filter((l) => l !== ''))
+        expect(line.startsWith('#')).toBe(true);
     }
   });
 
@@ -223,5 +246,63 @@ describe('isSupportedShell', () => {
     expect(isSupportedShell('fish')).toBe(true);
     expect(isSupportedShell('cmd')).toBe(false);
     expect(isSupportedShell('')).toBe(false);
+  });
+});
+
+// The binder caveat above, measured in a real Windows PowerShell: the wrapper's node target is
+// swapped for an argv printer, so the test sees exactly what the launcher would parse, next to what
+// a native command receives from the same text. It proves both halves of the header's claim — the
+// quirk is real, and the quoting it recommends fixes it. All calls share one PowerShell process.
+describe.runIf(process.platform === 'win32')('the PowerShell wrapper in a real PowerShell', () => {
+  it('drops a bare --, splits commas and -name:value, and quoting keeps each verbatim', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cctl-psw-'));
+    try {
+      // The wrapper runs `node <entry> claude @args`: print what follows "claude".
+      const printer = join(dir, 'argv.cjs');
+      writeFileSync(printer, 'console.log(JSON.stringify(process.argv.slice(3)))');
+      const native = join(dir, 'native.cjs');
+      writeFileSync(native, 'console.log(JSON.stringify(process.argv.slice(2)))');
+      const wrapper = join(dir, 'wrapper.ps1');
+      writeFileSync(
+        wrapper,
+        renderShellInit('powershell', { nodePath: process.execPath, cctlEntry: printer }),
+      );
+      const q = (p: string): string => `'${p.replace(/'/g, "''")}'`;
+      const calls = [
+        `-p -- --resume 'Auth Work'`,
+        `-p '--' --resume 'Auth Work'`,
+        `--resume=Auth,Work`,
+        `'--resume=Auth,Work'`,
+        `-r:x`,
+        `'-r:x'`,
+      ];
+      const script = [
+        `. ${q(wrapper)}`,
+        ...calls.flatMap((c) => [`claude ${c}`, `& ${q(process.execPath)} ${q(native)} ${c}`]),
+      ].join('\n');
+      const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
+        encoding: 'utf8',
+      });
+      const out = r.stdout
+        .split(/\r?\n/)
+        .filter((l) => l.startsWith('['))
+        .map((l) => JSON.parse(l) as string[]);
+      expect(out).toHaveLength(calls.length * 2);
+      const viaWrapper = (i: number) => out[2 * i];
+      const direct = (i: number) => out[2 * i + 1];
+      // Unquoted: the wrapper differs from a direct call.
+      expect(direct(0)).toEqual(['-p', '--', '--resume', 'Auth Work']);
+      expect(viaWrapper(0)).toEqual(['-p', '--resume', 'Auth Work']);
+      expect(direct(2)).toEqual(['--resume=Auth,Work']);
+      expect(viaWrapper(2)).toEqual(['--resume=Auth', 'Work']);
+      expect(direct(4)).toEqual(['-r:x']);
+      expect(viaWrapper(4)).toEqual(['-r:', 'x']);
+      // Quoted, as the header recommends: identical to the direct call.
+      expect(viaWrapper(1)).toEqual(['-p', '--', '--resume', 'Auth Work']);
+      expect(viaWrapper(3)).toEqual(['--resume=Auth,Work']);
+      expect(viaWrapper(5)).toEqual(['-r:x']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

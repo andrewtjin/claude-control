@@ -13,6 +13,47 @@
 import type { FolderBindingSnapshot, FolderBindingSnapshotGroup, StoredGroup } from './types.js';
 import { atomicWriteFile, readJsonIfExists } from './fsutil.js';
 import { VaultError } from './errors.js';
+import { aliasKey, canonicalStoredFolder, type ScopedGroup } from './folderPath.js';
+
+/** A vault group's scopes in the shape the precedence rule (`resolveSessionBinding`) reads: its
+ *  folders and alias folders in their canonical spelling ({@link canonicalStoredFolder}: a hand-edited
+ *  `C:/x` is the same folder as `C:\x`), and its alias scopes reduced to their comparison keys. The
+ *  one place a stored scope is turned into what matching compares, so the snapshot, the launcher and
+ *  `where` cannot key it differently. `platform` selects the path rules. Pure. */
+export function scopedGroupOf(
+  group: StoredGroup,
+  platform: NodeJS.Platform = process.platform,
+): ScopedGroup {
+  return {
+    id: group.id,
+    folders: group.folders.map((f) => canonicalStoredFolder(f, platform)),
+    aliases: (group.aliases ?? []).map((a) => ({
+      folder: canonicalStoredFolder(a.folder, platform),
+      aliasKey: aliasKey(a.alias),
+    })),
+  };
+}
+
+/** How many scopes (folders + alias scopes) a group holds — the count that decides whether removing
+ *  one dissolves it. */
+export function groupScopeCount(group: StoredGroup): number {
+  return group.folders.length + (group.aliases?.length ?? 0);
+}
+
+/**
+ * A group's scopes as one display list: its folders, then `session "<alias>" in <folder>` per alias
+ * scope. What refusals, alerts and the phone name a group by — a folder the operator acts on, not
+ * the group label (which defaults to the member labels). Falls back to the label for a group with no
+ * scope at all (the validator refuses one; this is only defensive). Unsanitized: every caller that
+ * prints it to a terminal passes it through its own sink sanitizer.
+ */
+export function describeGroupScopes(group: StoredGroup): string {
+  const parts = [
+    ...group.folders,
+    ...(group.aliases ?? []).map((a) => `session "${a.alias}" in ${a.folder}`),
+  ];
+  return parts.length > 0 ? parts.join(', ') : group.label;
+}
 
 /** Schema tag for `folder-bindings.json`. The guard treats an unknown value as "fail open"; this
  *  trusted reader treats it as a corrupt file and refuses it by name. */
@@ -26,6 +67,8 @@ export type BindEnforceMode = 'block' | 'warn' | 'off';
  *  vault directly) so the builder stays testable and the caller controls the profile-dir mapping. */
 export interface BuildSnapshotInput {
   groups: readonly StoredGroup[];
+  /** Selects the path rules the stored folders are canonicalized under (default: this host's). */
+  platform?: NodeJS.Platform;
   /** The `groups.json` generation these groups came from — carried so a stale snapshot is
    *  detectable against the live registry. */
   generation: number;
@@ -43,13 +86,24 @@ export interface BuildSnapshotInput {
  * {folders, profileDir, member LABELS} — no member ids, no tokens.
  */
 export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBindingSnapshot {
-  const groups: FolderBindingSnapshotGroup[] = input.groups.map((g) => ({
-    id: g.id,
-    label: g.label,
-    profileDir: input.profileDirOf(g.id),
-    folders: g.folders.slice(),
-    members: g.members.map((m) => m.label),
-  }));
+  const groups: FolderBindingSnapshotGroup[] = input.groups.map((g) => {
+    // Canonical folders (the guard compares them by case-folded equality and containment only); each
+    // alias scope as its comparison key plus the alias as bound, which the guard only ever shows.
+    const scoped = scopedGroupOf(g, input.platform);
+    const stored = g.aliases ?? [];
+    return {
+      id: g.id,
+      label: g.label,
+      profileDir: input.profileDirOf(g.id),
+      folders: scoped.folders.slice(),
+      aliases: (scoped.aliases ?? []).map((a, i) => ({
+        folder: a.folder,
+        aliasKey: a.aliasKey,
+        alias: stored[i]?.alias ?? a.aliasKey,
+      })),
+      members: g.members.map((m) => m.label),
+    };
+  });
   return {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
     generation: input.generation,
@@ -61,7 +115,7 @@ export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBin
 
 /**
  * Whether two snapshots are equal in the fields the guard actually reads — enforce mode, main config
- * dir, and every group's id/label/profileDir/folders/members. The `generation` is DELIBERATELY
+ * dir, and every group's id/label/profileDir/folders/aliases/members. The `generation` is DELIBERATELY
  * ignored: it bumps on registry writes the guard never sees (a group's active member, metadata), and
  * comparing it would report a snapshot as stale after a routine switch even though nothing the guard
  * enforces changed. Pure.
@@ -83,6 +137,8 @@ function guardRelevantKey(s: FolderBindingSnapshot): string {
       label: g.label,
       profileDir: g.profileDir,
       folders: g.folders,
+      // A snapshot written before alias scopes existed has no field; it means "none".
+      aliases: g.aliases ?? [],
       members: g.members,
     })),
   });

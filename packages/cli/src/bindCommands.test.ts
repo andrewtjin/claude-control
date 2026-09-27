@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { sandboxPaths, type Paths, type StoredGroup } from '@claude-control/switch-engine';
 import { BIND_GUARD_MARKER, bindGuardPath } from '@claude-control/daemon';
-import { reconcileBindGuard, relaxationBannerLine } from './bindCommands.js';
+import { describeSwitchedGroup, reconcileBindGuard, relaxationBannerLine } from './bindCommands.js';
 
 /** A minimal stand-in for the switch engine: `reconcileBindGuard` only asks it how many groups
  *  (folder bindings) exist. `count` is what `listGroups` reports — the one input that decides
@@ -103,6 +103,11 @@ describe('relaxationBannerLine', () => {
     expect(line).toContain('C:/somewhere');
   });
 
+  it('words an account bound to a session alias as reserved to its bindings, like the guard', () => {
+    const line = relaxationBannerLine('explicit', 'work@corp', 'C:/somewhere', 'bindings');
+    expect(line).toContain('work@corp is reserved to its bindings; running it in C:/somewhere');
+  });
+
   it('strips terminal control sequences from a crafted label and cwd', () => {
     const line = relaxationBannerLine('override', 'a\u001b[31mred\u0007', 'C:/x\r\nFAKE: injected');
     expect(line).not.toContain('\u001b');
@@ -110,5 +115,40 @@ describe('relaxationBannerLine', () => {
     // The CR/LF that would forge a new banner line is gone (only the single trailing newline remains).
     expect(line.indexOf('\n')).toBe(line.length - 1);
     expect(line).not.toContain('\r');
+  });
+});
+
+describe('describeSwitchedGroup', () => {
+  const member = { id: 'm1', label: 'm', quarantined: false, createdAtMs: 1, updatedAtMs: 1 };
+  const engineWith = (groups: StoredGroup[]) =>
+    ({ listGroups: () => Promise.resolve(groups) }) as unknown as Parameters<
+      typeof describeSwitchedGroup
+    >[0];
+  const group = (over: Partial<StoredGroup>): StoredGroup => ({
+    id: 'g1',
+    label: 'G',
+    members: [member],
+    activeId: 'm1',
+    folders: [],
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    ...over,
+  });
+
+  it('names a folder-only group by its folders, as before', async () => {
+    const d = await describeSwitchedGroup(engineWith([group({ folders: ['C:/w'] })]), 'm1');
+    expect(d?.where).toBe('the C:/w folder group');
+  });
+
+  it('names an alias-bound group by its scopes, never an empty folder list', async () => {
+    const d = await describeSwitchedGroup(
+      engineWith([group({ aliases: [{ folder: 'C:/r', alias: 'Auth Work' }] })]),
+      'm1',
+    );
+    expect(d?.where).toBe('the binding of session "Auth Work" in C:/r');
+  });
+
+  it('is null for a shared account', async () => {
+    expect(await describeSwitchedGroup(engineWith([group({ folders: ['C:/w'] })]), 'x')).toBeNull();
   });
 });

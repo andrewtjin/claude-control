@@ -50,6 +50,12 @@ const engine = vi.hoisted(() => ({
   unbindFolder: vi.fn((f: string): Promise<never> =>
     Promise.reject(new Error(`unbindFolder(${f}) not stubbed`)),
   ),
+  removeGroupMembers: vi.fn((id: string): Promise<never> =>
+    Promise.reject(new Error(`removeGroupMembers(${id}) not stubbed`)),
+  ),
+  dissolveGroup: vi.fn((id: string): Promise<never> =>
+    Promise.reject(new Error(`dissolveGroup(${id}) not stubbed`)),
+  ),
   ensureGroupLive: vi.fn((): Promise<never> =>
     Promise.reject(new Error('ensureGroupLive not stubbed')),
   ),
@@ -370,7 +376,17 @@ describe('buildProgram', () => {
   it('nests session subcommands', () => {
     const session = buildProgram().commands.find((c) => c.name() === 'session');
     const subs = session?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['aliases', 'label', 'register', 'show', 'status', 'unregister', 'watch']);
+    expect(subs).toEqual([
+      'aliases',
+      'bind',
+      'label',
+      'register',
+      'show',
+      'status',
+      'unbind',
+      'unregister',
+      'watch',
+    ]);
   });
 
   it('offers the alias lookup flags on session show and session aliases', () => {
@@ -381,6 +397,20 @@ describe('buildProgram', () => {
     expect(flags('aliases')).toEqual(
       expect.arrayContaining(['--cwd', '--all', '--auto', '--json']),
     );
+  });
+
+  it('offers the alias binding flags on session bind and session unbind', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const cmd = (name: string) => session?.commands.find((c) => c.name() === name);
+    expect(cmd('bind')?.options.map((o) => o.long)).toEqual(
+      expect.arrayContaining(['--cwd', '--label']),
+    );
+    expect(cmd('unbind')?.options.map((o) => o.long)).toEqual(
+      expect.arrayContaining(['--accounts', '--cwd', '--force']),
+    );
+    // Both positionals are optional: the alias and accounts default from the current session.
+    expect(cmd('bind')?.registeredArguments.map((a) => a.required)).toEqual([false, false]);
+    expect(cmd('unbind')?.registeredArguments.map((a) => a.required)).toEqual([false]);
   });
 
   it('offers --session on the register/label/watch/unregister session commands', () => {
@@ -1066,6 +1096,84 @@ describe('folder-bound account commands', () => {
   });
 });
 
+describe('cctl unbind --group', () => {
+  // A binding with no folder and no session left (what a cctl without session aliases leaves when
+  // it rewrites the file) can be named by no scope, so it is released by its id or label.
+  const member = { id: 'm-1', label: 'work', quarantined: false, createdAtMs: 1, updatedAtMs: 1 };
+  const scopeless = {
+    id: '11111111-2222-4333-8444-555555555555',
+    label: 'work',
+    members: [member],
+    activeId: 'm-1',
+    folders: [],
+  };
+  let dir: string;
+  beforeEach(async () => {
+    // The dissolve rewires the guard hook through defaultPaths(): keep it inside a temp dir.
+    dir = await mkdtemp(join(tmpdir(), 'cctl-unbind-group-'));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(dir, 'claude'));
+    vi.stubEnv('LOCALAPPDATA', dir);
+    vi.stubEnv('XDG_DATA_HOME', dir);
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    engine.listGroups.mockReset();
+    engine.listGroups.mockResolvedValue([]);
+    engine.dissolveGroup.mockReset();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const dissolved = (group: typeof scopeless) =>
+    ({
+      group,
+      releasedMembers: group.members.map((m) => m.id),
+      adoptedRotation: false,
+      runningSessions: [],
+    }) as never;
+
+  it('dissolves the binding with that id: every account back to the shared pool', async () => {
+    engine.listGroups.mockResolvedValue([scopeless]);
+    engine.dissolveGroup.mockResolvedValue(dissolved(scopeless));
+    const r = await runCli(['unbind', '--group', scopeless.id]);
+    expect(r.exited).toBe(false);
+    expect(engine.dissolveGroup).toHaveBeenCalledWith(scopeless.id, {});
+    expect(r.out).toContain(
+      'Dissolved the binding work: 1 account(s) returned to the shared pool (work)',
+    );
+  });
+
+  it('prints what the engine released under its lock, not the members it listed before', async () => {
+    // Another process grew the binding between the listing and the dissolve.
+    const extra = { ...member, id: 'm-2', label: 'extra' };
+    engine.listGroups.mockResolvedValue([scopeless]);
+    engine.dissolveGroup.mockResolvedValue(dissolved({ ...scopeless, members: [member, extra] }));
+    const r = await runCli(['unbind', '--group', scopeless.id]);
+    expect(r.out).toContain('2 account(s) returned to the shared pool (work, extra)');
+  });
+
+  it('accepts the exact label, and passes --force through', async () => {
+    engine.listGroups.mockResolvedValue([scopeless]);
+    engine.dissolveGroup.mockResolvedValue(dissolved(scopeless));
+    await runCli(['unbind', '--group', 'work', '--force']);
+    expect(engine.dissolveGroup).toHaveBeenCalledWith(scopeless.id, { force: true });
+  });
+
+  it('refuses an unknown or ambiguous ref, and a folder together with --group', async () => {
+    engine.listGroups.mockResolvedValue([scopeless, { ...scopeless, id: 'other-id' }]);
+    expect((await runCli(['unbind', '--group', 'nope'])).err).toContain(
+      'no binding with id or label "nope"',
+    );
+    expect((await runCli(['unbind', '--group', 'work'])).err).toContain(
+      '2 bindings are labelled "work"; pass the id',
+    );
+    expect((await runCli(['unbind', '.', '--group', 'work'])).err).toContain(
+      'pass a folder or --group, not both',
+    );
+    expect((await runCli(['unbind'])).err).toContain('pass the folder to unbind');
+    expect(engine.dissolveGroup).not.toHaveBeenCalled();
+  });
+});
+
 describe('doctor with a folder-bindings registry this build cannot read', () => {
   let root: string;
   beforeEach(async () => {
@@ -1086,7 +1194,7 @@ describe('doctor with a folder-bindings registry this build cannot read', () => 
     { timeout: 60_000 },
     async () => {
       const unreadable = new VaultError(
-        'groups.json has an unsupported schemaVersion (2); a newer build wrote it',
+        'groups.json has an unsupported schemaVersion (3); a newer build wrote it',
       );
       engine.listGroups.mockRejectedValueOnce(unreadable);
       engine.checkSlots.mockRejectedValueOnce(unreadable);

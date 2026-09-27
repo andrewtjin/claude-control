@@ -11,14 +11,22 @@ import type { Command } from 'commander';
 import {
   SwitchEngineError,
   canonicalizeFolder,
+  describeGroupScopes,
   folderBindingsPath,
   folderKey,
+  folderUniquenessKey,
   groupSlotId,
   profilesRoot,
+  recordedFolderFor,
   resolveAccountRef,
   resolveBinding,
+  resolveSessionBinding,
+  canonicalStoredFolder,
+  scopedGroupOf,
   type AccountView,
   type Paths,
+  type SessionBinding,
+  type SlotId,
   type StoredAccount,
   type StoredGroup,
 } from '@claude-control/switch-engine';
@@ -37,6 +45,7 @@ import {
   renderBindings,
   renderWhere,
   type BindingGroupView,
+  type WhereAliasView,
   type WhereView,
 } from './render.js';
 import type { Palette } from './ansi.js';
@@ -45,10 +54,16 @@ import {
   buildLaunchEnv,
   configDirPointsIntoProfiles,
   findClaudeOnPath,
+  parseClaudeSessionArgs,
+  resolveLaunchSessions,
   resolveLaunchTarget,
   spawnClaude,
+  type LaunchCandidate,
+  type LaunchSessionDeps,
   type LaunchSlot,
 } from './launcher.js';
+import { claudeCodeCwd, launchSessionStore } from './launchSessionStore.js';
+import { canonicalOrRaw } from './sessionAliases.js';
 import {
   isSupportedShell,
   renderShellInit,
@@ -110,8 +125,10 @@ async function buildGroupViews(engine: Engine): Promise<BindingGroupView[]> {
   return groups.map((g) => {
     const liveMemberId = live.get(groupSlotId(g.id)) ?? null;
     return {
+      id: g.id,
       label: g.label,
       folders: g.folders,
+      aliases: g.aliases ?? [],
       members: g.members.map((m) => ({
         label: m.label,
         live: m.id === liveMemberId,
@@ -131,6 +148,227 @@ export async function renderBindingsAppendix(engine: Engine, palette: Palette): 
   const groups = await buildGroupViews(engine);
   if (groups.length === 0) return '';
   return '\n\nFolder-bound accounts:\n' + renderBindingGroups(groups, palette);
+}
+
+/**
+ * The `cctl where` view of a folder: the binding an UNNAMED session there resolves to (the folder
+ * rule), plus every named session alias-bound in exactly this folder — those outrank the folder rule,
+ * so the operator has to see them to know where a resumed session will run. Pure over its inputs.
+ */
+export function buildWhereView(
+  folder: string,
+  groups: readonly StoredGroup[],
+  live: ReadonlyMap<SlotId, string | null>,
+  platform: NodeJS.Platform,
+  vaultDir: string = defaultPaths().vaultDir,
+): WhereView {
+  const liveLabel = (g: StoredGroup): string | null => {
+    const liveId = live.get(groupSlotId(g.id)) ?? null;
+    return liveId ? (g.members.find((m) => m.id === liveId)?.label ?? null) : null;
+  };
+  const binding = resolveBinding(folder, groups, platform);
+  const group =
+    binding === null ? undefined : (groups.find((g) => g.id === binding.groupId) ?? undefined);
+  const here = folderUniquenessKey(folder, platform);
+  const aliases: WhereAliasView[] = [];
+  for (const g of groups) {
+    for (const a of g.aliases ?? []) {
+      if (folderUniquenessKey(a.folder, platform) !== here) continue;
+      aliases.push({
+        alias: a.alias,
+        groupLabel: g.label,
+        members: g.members.map((m) => m.label),
+        liveMemberLabel: liveLabel(g),
+      });
+    }
+  }
+  return {
+    folder,
+    bound:
+      binding === null || group === undefined
+        ? null
+        : {
+            groupLabel: group.label,
+            matchedFolder: binding.folder,
+            members: group.members.map((m) => m.label),
+            profileDir: groupProfilePath(vaultDir, group.id),
+            liveMemberLabel: liveLabel(group),
+          },
+    ...(aliases.length > 0 ? { aliases } : {}),
+  };
+}
+
+/** Which binding a `cctl claude` launch belongs to, and the note (if any) to print about it. */
+export interface LaunchBindingDecision {
+  binding: SessionBinding | null;
+  /** The title a launch routed by alias opens under, for the banner; null otherwise. */
+  alias: string | null;
+  /** One stderr line when the launcher could not tell which session opens, else null. */
+  note: string | null;
+}
+
+/** The stderr note for a launch whose arguments do not say which session opens. The reason quotes
+ *  operator text, so it passes sanitizeForTerminal at this sink. */
+export function uncertainLaunchNote(reason: string): string {
+  return (
+    `cctl: could not tell which session these arguments open (${sanitizeForTerminal(reason)}); ` +
+    `launching by the folder rule — the enforcement guard checks the session Claude Code opens\n`
+  );
+}
+
+/**
+ * Which binding a `cctl claude` launch belongs to, by THE precedence rule applied to the session
+ * Claude Code's own arguments open (launcher.ts resolveLaunchSessions): its title, and the folder
+ * its conversation is RECORDED in — `claude --resume X` in a repository can reach sessions recorded
+ * in subfolders and worktrees, and a resumed session keeps its original folder, so that recorded
+ * folder is the one an alias scope is matched against (a fork is a new conversation of the launch
+ * folder); the folder rule always uses the launch folder. The recorded folder is decided exactly as
+ * the enforcement guard decides it (switch-engine recordedFolderFor over readRecordedFolder), so
+ * the two can never disagree about a session. When the arguments allow several sessions (a title
+ * several sessions share, a newest transcript from another folder), the launch routes to a binding
+ * only if EVERY candidate maps to the same one; otherwise, and whenever the arguments are uncertain,
+ * it launches by the folder rule and leaves the pick to the enforcement guard.
+ *
+ * Nothing is parsed or read when no binding has an alias scope — no title could change the answer.
+ */
+export async function resolveLaunchBinding(input: {
+  /** The canonical launch folder. */
+  folder: string;
+  /** The launch folder as Claude Code spells it (see launchSessionStore's claudeCodeCwd): what a
+   *  transcript's project-directory name is matched against when it records no folder of its own.
+   *  Default: {@link folder}. */
+  launchSpelling?: string;
+  /** Claude Code's argv, read and never modified. */
+  args: readonly string[];
+  groups: readonly StoredGroup[];
+  platform: NodeJS.Platform;
+  /** Claude Code's session store, searched from the launch folder. */
+  sessions: LaunchSessionDeps;
+  /** A recorded session folder in the form bindings store folders (default: string-only
+   *  canonicalization; the launcher passes the realpath-resolving one). */
+  canonicalFolder?: (folder: string) => string;
+}): Promise<LaunchBindingDecision> {
+  const scoped = input.groups.map((g) => scopedGroupOf(g, input.platform));
+  const folderRule: LaunchBindingDecision = {
+    binding: resolveSessionBinding(input.folder, null, scoped, input.platform),
+    alias: null,
+    note: null,
+  };
+  const boundAliasKeys = new Set(scoped.flatMap((g) => (g.aliases ?? []).map((a) => a.aliasKey)));
+  if (boundAliasKeys.size === 0) return folderRule;
+
+  const opened = await resolveLaunchSessions(parseClaudeSessionArgs(input.args), input.sessions, {
+    launchFolder: input.folder,
+    boundAliasKeys,
+    platform: input.platform,
+  });
+  if (opened.kind === 'uncertain') {
+    return { ...folderRule, note: uncertainLaunchNote(opened.reason) };
+  }
+
+  const canonical =
+    input.canonicalFolder ?? ((f: string) => canonicalStoredFolder(f, input.platform));
+  const running = { spelled: input.launchSpelling ?? input.folder, canonical: input.folder };
+  /** The folder the candidate's conversation belongs to, as the guard will judge it. */
+  const recordedFolder = (c: LaunchCandidate): string | null =>
+    c.dirName === undefined
+      ? c.folder === null
+        ? null
+        : canonical(c.folder)
+      : recordedFolderFor({ folder: c.folder, dirName: c.dirName }, running, canonical);
+  const targets = opened.candidates.map((c) => ({
+    title: c.title,
+    binding: resolveSessionBinding(
+      input.folder,
+      c.title,
+      scoped,
+      input.platform,
+      recordedFolder(c),
+    ),
+  }));
+  const first = targets[0];
+  if (first === undefined) return folderRule;
+  const groupOf = (b: SessionBinding | null): string | null => b?.groupId ?? null;
+  if (!targets.every((t) => groupOf(t.binding) === groupOf(first.binding))) return folderRule;
+  return {
+    binding: first.binding,
+    alias: first.binding?.via === 'alias' ? first.title : null,
+    note: null,
+  };
+}
+
+/**
+ * Where `cctl claude` run in `cwd` searches for the session it opens, and how it spells and
+ * canonicalizes folders: the launch folder (canonical, the folder rule's key), the launch folder as
+ * Claude Code spells it (it resolves a junction or symlink in its cwd before naming its project
+ * directory, so its session search runs from that spelling, not the one the shell reports), Claude
+ * Code's session store searched from there, and the canonicalizer for a recorded folder. The one
+ * wiring the launcher uses; its tests drive it with a sandbox config dir.
+ */
+export function launchSessionContext(opts: {
+  cwd: string;
+  claudeDir: string;
+  platform: NodeJS.Platform;
+  /** The git worktree list (default: `git worktree list`); injected by tests. */
+  gitWorktrees?: (cwd: string) => Promise<string[]>;
+}): {
+  folder: string;
+  launchSpelling: string;
+  sessions: LaunchSessionDeps;
+  canonicalFolder: (folder: string) => string;
+} {
+  const ccCwd = claudeCodeCwd(opts.cwd);
+  return {
+    folder: canonicalizeCliFolder(opts.cwd),
+    launchSpelling: ccCwd,
+    sessions: launchSessionStore({
+      claudeDir: opts.claudeDir,
+      cwd: ccCwd,
+      platform: opts.platform,
+      ...(opts.gitWorktrees !== undefined ? { gitWorktrees: opts.gitWorktrees } : {}),
+    }),
+    canonicalFolder: (folder) => canonicalOrRaw(folder, { platform: opts.platform, cwd: opts.cwd }),
+  };
+}
+
+/**
+ * `cctl unbind --group <id|label>`: dissolve a whole binding — every account back to the shared pool,
+ * V1 unbind semantics (refused while sessions run in its scopes, unless `force`). The way out for a
+ * binding left with no scope at all (which no folder or alias can name), and a shortcut for one with
+ * many. The ref is the group id (as `cctl bindings` / `cctl doctor` print it) or its exact label;
+ * only the id is taken from this unlocked read. The engine dissolves the group as it stands under
+ * its lock (a concurrent grow is dissolved with the rest), and what is printed is what it released.
+ */
+async function unbindGroup(engine: Engine, ref: string, force: boolean): Promise<void> {
+  const groups = await engine.listGroups();
+  const byId = groups.find((g) => g.id === ref.trim());
+  const byLabel = groups.filter((g) => g.label === ref);
+  if (byId === undefined && byLabel.length > 1) {
+    fail(
+      `${byLabel.length} bindings are labelled "${sanitizeForTerminal(ref)}"; pass the id ` +
+        '(cctl bindings lists them)',
+    );
+  }
+  const group = byId ?? byLabel[0];
+  if (group === undefined) {
+    fail(`no binding with id or label "${sanitizeForTerminal(ref)}" (cctl bindings lists them)`);
+  }
+  try {
+    const res = await engine.dissolveGroup(group.id, force ? { force: true } : {});
+    const released = res.group.members
+      .filter((m) => res.releasedMembers.includes(m.id))
+      .map((m) => sanitizeForTerminal(m.label));
+    process.stdout.write(
+      `Dissolved the binding ${sanitizeForTerminal(res.group.label)}: ${released.length} ` +
+        `account(s) returned to the shared pool (${released.join(', ')})` +
+        (res.adoptedRotation ? ', adopting the profile’s latest token first' : '') +
+        '.\n  the profile dir is kept for history; its live credentials were cleared.\n',
+    );
+    await reconcileBindGuard(engine, defaultPaths());
+  } catch (err) {
+    if (err instanceof SwitchEngineError) fail(err.message);
+    throw err;
+  }
 }
 
 /** Resolve one account ref against the full registry (shared pool + reserved members). */
@@ -170,9 +408,7 @@ export function buildBindCommands(program: Command): void {
         const palette = detectPalette();
         const lines: string[] = [];
         const groupLabel = sanitizeForTerminal(result.group.label);
-        const boundFolder = sanitizeForTerminal(
-          result.group.folders[result.group.folders.length - 1] ?? folder,
-        );
+        const boundFolder = sanitizeForTerminal(result.folder);
         lines.push(
           result.created
             ? `Bound ${boundFolder} to a new folder account: ${groupLabel}.`
@@ -232,17 +468,27 @@ export function buildBindCommands(program: Command): void {
   // unbind
   // -------------------------------------------------------------------------
   program
-    .command('unbind <folder>')
-    .description('remove a folder binding; the last folder of a group dissolves it')
+    .command('unbind [folder]')
+    .description(
+      'remove a folder binding; the last folder of a group dissolves it (--group <id|label>: ' +
+        'dissolve a whole binding, e.g. one left with no folder or session)',
+    )
     .option('--force', 'dissolve even when sessions are observed running under the folder')
-    .action(async (folder: string, opts: { force?: boolean }) => {
+    .option('--group <ref>', 'dissolve the binding with this id or label, whatever its scopes')
+    .action(async (folder: string | undefined, opts: { force?: boolean; group?: string }) => {
       const engine = buildEngine();
+      if (opts.group !== undefined) {
+        if (folder !== undefined) fail('pass a folder or --group, not both');
+        await unbindGroup(engine, opts.group, opts.force === true);
+        return;
+      }
+      if (folder === undefined) fail('pass the folder to unbind (or --group <id|label>)');
       try {
         const result = await engine.unbindFolder(folder, opts.force ? { force: true } : {});
         const folderText = sanitizeForTerminal(result.folder);
         if (!result.dissolved) {
           process.stdout.write(
-            `Unbound ${folderText}. The group keeps its other folders and stays live.\n`,
+            `Unbound ${folderText}. The group keeps its other bindings and stays live.\n`,
           );
           return;
         }
@@ -303,27 +549,10 @@ export function buildBindCommands(program: Command): void {
       const engine = buildEngine();
       const canonical = canonicalizeCliFolder(folderArg ?? process.cwd());
       const [groups, live] = await Promise.all([engine.listGroups(), engine.liveSlots()]);
-      const binding = resolveBinding(canonical, groups, process.platform);
-      let view: WhereView;
-      if (binding === null) {
-        view = { folder: canonical, bound: null };
-      } else {
-        const group = groups.find((g) => g.id === binding.groupId) as StoredGroup;
-        const liveId = live.get(groupSlotId(group.id)) ?? null;
-        view = {
-          folder: canonical,
-          bound: {
-            groupLabel: group.label,
-            matchedFolder: binding.folder,
-            members: group.members.map((m) => m.label),
-            profileDir: groupProfilePath(defaultPaths().vaultDir, group.id),
-            liveMemberLabel: liveId
-              ? (group.members.find((m) => m.id === liveId)?.label ?? null)
-              : null,
-          },
-        };
-      }
-      process.stdout.write(renderWhere(view, detectPalette()) + '\n');
+      process.stdout.write(
+        renderWhere(buildWhereView(canonical, groups, live, process.platform), detectPalette()) +
+          '\n',
+      );
     });
 
   // -------------------------------------------------------------------------
@@ -378,13 +607,16 @@ export function relaxationBannerLine(
   kind: 'override' | 'explicit',
   label: string,
   cwd: string,
+  reservedTo: 'folders' | 'bindings' = 'folders',
 ): string {
   const safeLabel = sanitizeForTerminal(label);
   const safeCwd = sanitizeForTerminal(cwd);
+  // An account whose binding holds a session alias is reserved to its bindings, one bound only to
+  // folders to its folders — the guard's own --account notice words it the same way.
   return kind === 'override'
     ? `cctl: --override in effect: allowing ${safeLabel} in ${safeCwd}, which is bound to a ` +
         `different account.\n`
-    : `cctl: --account in effect: ${safeLabel} is reserved to its folders; running it in ` +
+    : `cctl: --account in effect: ${safeLabel} is reserved to its ${reservedTo}; running it in ` +
         `${safeCwd} on purpose.\n`;
 }
 
@@ -402,6 +634,8 @@ async function runClaude(opts: {
 
   let slot: LaunchSlot;
   let explicit = false;
+  /** What an explicitly launched reserved account is reserved to, for its notice. */
+  let reservedTo: 'folders' | 'bindings' = 'folders';
 
   if (opts.account !== undefined) {
     explicit = true;
@@ -427,8 +661,9 @@ async function runClaude(opts: {
         kind: 'group',
         profileDir: groupProfilePath(paths.vaultDir, group.id),
         label: acct.label,
-        context: `explicit account, ${group.folders.join(', ')}`,
+        context: `explicit account, ${describeGroupScopes(group)}`,
       };
+      if ((group.aliases ?? []).length > 0) reservedTo = 'bindings';
     } else {
       // A shared account can only be live in the global slot, and only one at a time — so --account
       // of a shared account is honored ONLY when it is already the global live account.
@@ -443,12 +678,24 @@ async function runClaude(opts: {
       slot = { kind: 'global', label: acct.label, context: 'global (shared account)' };
     }
   } else {
-    // No explicit account: the cwd's folder binding decides.
-    const canonical = canonicalizeCliFolder(process.cwd());
+    // No explicit account: THE precedence rule decides — the alias binding of the session Claude
+    // Code's own arguments open (matched in the folder that session is recorded in), else the cwd's
+    // folder binding, else global. The argv is only read here; it is passed to the child untouched
+    // below.
     const groups = await engine.listGroups();
-    const binding = resolveBinding(canonical, groups, platform);
+    const { binding, alias, note } = await resolveLaunchBinding({
+      ...launchSessionContext({ cwd: process.cwd(), claudeDir: paths.claudeDir, platform }),
+      args: opts.args,
+      groups,
+      platform,
+    });
+    if (note !== null) process.stderr.write(note);
     if (binding !== null) {
       const group = groups.find((g) => g.id === binding.groupId) as StoredGroup;
+      const scope =
+        binding.via === 'alias'
+          ? `session "${alias ?? binding.aliasKey}" in ${binding.folder}`
+          : binding.folder;
       let live;
       try {
         live = await engine.ensureGroupLive(group.id);
@@ -458,8 +705,9 @@ async function runClaude(opts: {
       }
       if (live.noWorkingAccount) {
         fail(
-          `${binding.folder} is bound to ${group.members.map((m) => m.label).join(', ')}, but none ` +
-            `of its accounts are usable (all quarantined). Re-login one: cctl accounts relogin <ref>.`,
+          `${sanitizeForTerminal(scope)} is bound to ` +
+            `${sanitizeForTerminal(group.members.map((m) => m.label).join(', '))}, but none of its ` +
+            `accounts are usable (all quarantined). Re-login one: cctl accounts relogin <ref>.`,
         );
       }
       const liveLabel = group.members.find((m) => m.id === live.liveMember)?.label ?? group.label;
@@ -467,7 +715,7 @@ async function runClaude(opts: {
         kind: 'group',
         profileDir: groupProfilePath(paths.vaultDir, group.id),
         label: liveLabel,
-        context: `${binding.folder} binding`,
+        context: `${scope} binding`,
       };
     } else {
       const globalLive = await engine.getActiveId('global');
@@ -540,7 +788,7 @@ async function runClaude(opts: {
     process.stderr.write(relaxationBannerLine('override', slot.label, process.cwd()));
   }
   if (explicitToken !== undefined) {
-    process.stderr.write(relaxationBannerLine('explicit', slot.label, process.cwd()));
+    process.stderr.write(relaxationBannerLine('explicit', slot.label, process.cwd(), reservedTo));
   }
 
   try {
@@ -574,12 +822,19 @@ function slotProfileKey(slot: LaunchSlot, platform: NodeJS.Platform): string {
 }
 
 /** Also used by `cctl switch`: describe the group a just-switched member belongs to (or null when it
- *  is a shared account). Kept here beside the other group helpers. */
+ *  is a shared account). `where` is the phrase naming it: "the <folders> folder group" for a group
+ *  bound only by folders, else "the binding of <scopes>" so an alias-only group is still named.
+ *  Kept here beside the other group helpers. */
 export async function describeSwitchedGroup(
   engine: Engine,
   accountId: string,
-): Promise<{ label: string; folders: string[] } | null> {
+): Promise<{ label: string; folders: string[]; where: string } | null> {
   const groups = await engine.listGroups();
   const group = groups.find((g) => g.members.some((m) => m.id === accountId));
-  return group ? { label: group.label, folders: group.folders } : null;
+  if (!group) return null;
+  const where =
+    (group.aliases ?? []).length === 0 && group.folders.length > 0
+      ? `the ${group.folders.join(', ')} folder group`
+      : `the binding of ${describeGroupScopes(group)}`;
+  return { label: group.label, folders: group.folders, where };
 }

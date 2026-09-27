@@ -412,3 +412,216 @@ describe('an intent an older build left at phase "refreshed"', () => {
     });
   });
 });
+
+describe('alias binding operations: the same undo and settle as every other locked operation', () => {
+  const dieBetweenWrites = (checkpoint: string): void => {
+    if (checkpoint === 'activate:after-credentials-write') throw new Error('process died');
+  };
+
+  /** Seed P (live in global), T, R and Q, with R alone bound to the alias "feature" in `repo`. */
+  async function seedWithAlias(h: Harness) {
+    const ids = await seed(h);
+    const Q = await h.mk().addAccount('Q', bundle('Q', NOW + 8 * HOUR));
+    const repo = await h.folder('repo');
+    const bound = await h.mk().bindAlias(repo, 'feature', [ids.R.id]);
+    return { ...ids, Q, repo, groupId: bound.group.id };
+  }
+
+  /** The group an account is reserved to, or undefined when it is shared. */
+  async function groupOf(h: Harness, id: string): Promise<string | undefined> {
+    return (await h.vault.listAllAccounts()).find((r) => r.id === id)?.groupId;
+  }
+
+  /** A slot's two live files, by token and identity suffix. */
+  async function slotLive(store: CredentialStore): Promise<{ creds?: string; identity?: string }> {
+    const creds = (await store.readLiveCredentials())?.refreshToken;
+    const uuid = (await store.readOauthAccount())?.accountUuid;
+    return {
+      ...(creds !== undefined ? { creds: creds.replace(/^rt-/, '') } : {}),
+      ...(uuid !== undefined ? { identity: uuid.replace(/^uuid-/, '') } : {}),
+    };
+  }
+
+  it('an alias grow whose global hand-off fails after its credentials landed is undone, and grows nothing', async () => {
+    const h = await harness();
+    const { P, T, R, Q, groupId } = await seedWithAlias(h);
+    failWrites(h.paths.claudeJsonPath);
+
+    // P is live in the global slot, so reserving it first moves the global slot to another account.
+    await expect(h.mk().addGroupMembers(groupId, [P.id])).rejects.toMatchObject({ code: 'EPERM' });
+
+    expect(await globalLive(h)).toEqual({ creds: 'P', identity: 'P' });
+    expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
+    const e = h.mk();
+    expect((await e.getGroup(groupId))?.members.map((m) => m.id)).toEqual([R.id]);
+    expect(await groupOf(h, P.id)).toBeUndefined();
+    expect(await e.getActiveId('global')).toBe(P.id);
+    expect(await e.checkSlots()).toEqual([]);
+    expect(await storedTokens(h, { P: P.id, T: T.id, R: R.id, Q: Q.id })).toEqual({
+      P: 'rt-P',
+      T: 'rt-T',
+      R: 'rt-R',
+      Q: 'rt-Q',
+    });
+  });
+
+  it('an alias bind whose global hand-off fails after its credentials landed is undone, and binds nothing', async () => {
+    const h = await harness();
+    const { P, T, R } = await seed(h);
+    failWrites(h.paths.claudeJsonPath);
+
+    await expect(h.mk().bindAlias(await h.folder('repo'), 'feature', [P.id])).rejects.toMatchObject(
+      { code: 'EPERM' },
+    );
+
+    expect(await globalLive(h)).toEqual({ creds: 'P', identity: 'P' });
+    expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
+    const e = h.mk();
+    expect(await e.listGroups()).toEqual([]);
+    expect(await e.getActiveId('global')).toBe(P.id);
+    expect(await e.checkSlots()).toEqual([]);
+    expect(await storedTokens(h, { P: P.id, T: T.id, R: R.id })).toEqual({
+      P: 'rt-P',
+      T: 'rt-T',
+      R: 'rt-R',
+    });
+  });
+
+  it('a shrink whose takeover fails after its credentials landed puts the leaver back, then fails the slot closed', async () => {
+    const h = await harness();
+    const { T, R } = await seed(h);
+    const bound = await h.mk().bindAlias(await h.folder('repo'), 'feature', [T.id, R.id]);
+    const slot = groupSlotId(bound.group.id);
+    const gStore = groupStore(h.paths, bound.group.id);
+    const leaver = await h.mk().getActiveId(slot);
+    expect(leaver).not.toBeNull();
+    const stays = leaver === T.id ? R : T;
+    // The remaining member's takeover fails at its identity write, once.
+    failWrites(join(groupProfileDir(h.paths.vaultDir, bound.group.id), '.claude.json'));
+
+    const res = await h.mk().removeGroupMembers(bound.group.id, [leaver!]);
+
+    // Nothing else could take the slot, so it was emptied rather than left holding the leaver.
+    expect(res.switchedTo).toBeNull();
+    expect(await slotLive(gStore)).toEqual({});
+    expect(
+      await new IntentStore(join(h.paths.vaultDir, 'slots', bound.group.id)).read(),
+    ).toBeUndefined();
+    const e = h.mk();
+    expect((await e.getGroup(bound.group.id))?.members.map((m) => m.id)).toEqual([stays.id]);
+    expect(await groupOf(h, leaver!)).toBeUndefined();
+    expect(await e.checkSlots()).toEqual([]);
+    expect(await storedTokens(h, { T: T.id, R: R.id })).toEqual({ T: 'rt-T', R: 'rt-R' });
+  });
+
+  it('a shrink that dies mid-takeover goes no further, and the next operation completes it', async () => {
+    const h = await harness();
+    const { T, R } = await seed(h);
+    const bound = await h.mk().bindAlias(await h.folder('repo'), 'feature', [T.id, R.id]);
+    const slot = groupSlotId(bound.group.id);
+    const gStore = groupStore(h.paths, bound.group.id);
+    const leaver = (await h.mk().getActiveId(slot)) === T.id ? T : R;
+    const stays = leaver.id === T.id ? R : T;
+
+    await expect(
+      h.mk(dieBetweenWrites).removeGroupMembers(bound.group.id, [leaver.id]),
+    ).rejects.toThrow('process died');
+    // A dead process neither tried another member nor emptied the slot nor released the leaver.
+    expect(await slotLive(gStore)).toEqual({ creds: stays.label, identity: leaver.label });
+    expect(await groupOf(h, leaver.id)).toBe(bound.group.id);
+
+    const e = h.mk();
+    await e.removeGroupMembers(bound.group.id, [leaver.id]);
+
+    expect(await slotLive(gStore)).toEqual({ creds: stays.label, identity: stays.label });
+    expect(await groupOf(h, leaver.id)).toBeUndefined();
+    expect(await e.checkSlots()).toEqual([]);
+    expect(await storedTokens(h, { T: T.id, R: R.id })).toEqual({ T: 'rt-T', R: 'rt-R' });
+  });
+
+  it('a grow of the account a crashed switch left live in the global slot moves it off global first', async () => {
+    const h = await harness();
+    const { T, groupId } = await seedWithAlias(h);
+    await expect(h.mk(dieBetweenWrites).activate(T.id, { force: true })).rejects.toThrow(
+      'process died',
+    );
+    expect(await globalLive(h)).toEqual({ creds: 'T', identity: 'P' });
+
+    const e = h.mk();
+    await e.addGroupMembers(groupId, [T.id]);
+
+    expect((await h.global.readLiveCredentials())?.refreshToken).not.toBe('rt-T');
+    expect(await e.checkSlots()).toEqual([]);
+  });
+
+  it('a shrink of the member a crashed group switch was moving to switches the slot off it first', async () => {
+    const h = await harness();
+    const { T, R } = await seed(h);
+    const bound = await h.mk().bindAlias(await h.folder('repo'), 'feature', [T.id, R.id]);
+    const slot = groupSlotId(bound.group.id);
+    const gStore = groupStore(h.paths, bound.group.id);
+    const from = (await h.mk().getActiveId(slot)) === T.id ? T : R;
+    const to = from.id === T.id ? R : T;
+    await expect(h.mk(dieBetweenWrites).activate(to.id, { force: true, slot })).rejects.toThrow(
+      'process died',
+    );
+    // The profile holds the target's credentials under the previous member's identity.
+    expect(await slotLive(gStore)).toEqual({ creds: to.label, identity: from.label });
+
+    const e = h.mk();
+    const res = await e.removeGroupMembers(bound.group.id, [to.id]);
+
+    // Settled first (the switch to `to` completed), so the leaver was seen live and switched off.
+    expect(res.switchedTo).toBe(from.id);
+    expect(await slotLive(gStore)).toEqual({ creds: from.label, identity: from.label });
+    expect(await groupOf(h, to.id)).toBeUndefined();
+    expect(await e.checkSlots()).toEqual([]);
+    expect(await storedTokens(h, { T: T.id, R: R.id })).toEqual({ T: 'rt-T', R: 'rt-R' });
+  });
+
+  type Seeded = Awaited<ReturnType<typeof seedWithAlias>>;
+  type Step = (e: SwitchEngine, s: Seeded, h: Harness) => Promise<unknown>;
+  /** Each op, with the setup it needs done BEFORE the crash (so nothing but the op itself runs
+   *  between the crash and the assertions). */
+  const ops: { name: string; prepare?: Step; op: Step }[] = [
+    {
+      name: 'bindAlias',
+      op: async (e, s, h) => e.bindAlias(await h.folder('other'), 'other', [s.Q.id]),
+    },
+    { name: 'addGroupMembers', op: (e, s) => e.addGroupMembers(s.groupId, [s.Q.id]) },
+    {
+      name: 'removeGroupMembers',
+      prepare: (e, s) => e.addGroupMembers(s.groupId, [s.Q.id]),
+      op: (e, s) => e.removeGroupMembers(s.groupId, [s.Q.id]),
+    },
+    { name: 'dissolveGroup', op: (e, s) => e.dissolveGroup(s.groupId) },
+    { name: 'unbindAlias', op: (e, s) => e.unbindAlias(s.repo, 'feature') },
+  ];
+
+  for (const { name, prepare, op } of ops) {
+    it(`${name} settles a switch a crash left pending in the global slot before it reads any slot`, async () => {
+      const h = await harness();
+      const s = await seedWithAlias(h);
+      if (prepare !== undefined) await prepare(h.mk(), s, h);
+      await expect(h.mk(dieBetweenWrites).activate(s.T.id, { force: true })).rejects.toThrow(
+        'process died',
+      );
+      expect(await globalLive(h)).toEqual({ creds: 'T', identity: 'P' });
+      expect((await new IntentStore(h.paths.vaultDir).read())?.phase).toBe('writing');
+
+      const e = h.mk();
+      await op(e, s, h);
+
+      expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
+      const live = await globalLive(h);
+      expect(live.creds).toBe(live.identity);
+      expect(await e.checkSlots()).toEqual([]);
+      expect(await storedTokens(h, { P: s.P.id, T: s.T.id, R: s.R.id, Q: s.Q.id })).toEqual({
+        P: 'rt-P',
+        T: 'rt-T',
+        R: 'rt-R',
+        Q: 'rt-Q',
+      });
+    });
+  }
+});

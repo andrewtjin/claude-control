@@ -33,6 +33,15 @@ const bundle = (token: string): CredentialBundle => ({
   oauthAccount: { accountUuid: 'uuid-' + token, emailAddress: token + '@x.com' },
 });
 
+/** A fresh folder for a group the test does not care about the scope of: a group must hold at least
+ *  one scope (a folder or a session alias) to be written or loaded, and folders are unique across
+ *  groups, so each call hands out a distinct one. */
+let scopeSeq = 0;
+function scopeFolder(): string {
+  scopeSeq += 1;
+  return `C:\\scope-${scopeSeq}`;
+}
+
 /** Read a JSON file as an object. */
 async function readJson(path: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
@@ -80,7 +89,7 @@ describe('createGroup — reserving shared accounts', () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('work', bundle('a'));
     const b = await v.addAccount('client', bundle('b'));
-    const group = await v.createGroup({ memberIds: [a.id, b.id] });
+    const group = await v.createGroup({ memberIds: [a.id, b.id], folders: [scopeFolder()] });
     expect(group.label).toBe('work, client');
   });
 
@@ -89,20 +98,24 @@ describe('createGroup — reserving shared accounts', () => {
     const a = await v.addAccount('work', bundle('a'));
     await v.setActive(a.id);
     expect(await v.getActiveId()).toBe(a.id);
-    await v.createGroup({ memberIds: [a.id] });
+    await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     expect(await v.getActiveId()).toBeNull();
   });
 
   it('refuses an empty member set, an unknown id, and an already-reserved id', async () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('work', bundle('a'));
-    await expect(v.createGroup({ memberIds: [] })).rejects.toThrow(/at least one member/);
-    await expect(v.createGroup({ memberIds: ['nope'] })).rejects.toThrow(UnknownAccountError);
-    const group = await v.createGroup({ memberIds: [a.id] });
-    const b = await v.addAccount('other', bundle('b'));
-    await expect(v.createGroup({ memberIds: [a.id, b.id] })).rejects.toThrow(
-      new RegExp(`already reserved to group ${group.id}`),
+    await expect(v.createGroup({ memberIds: [], folders: [scopeFolder()] })).rejects.toThrow(
+      /at least one member/,
     );
+    await expect(v.createGroup({ memberIds: ['nope'], folders: [scopeFolder()] })).rejects.toThrow(
+      UnknownAccountError,
+    );
+    const group = await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
+    const b = await v.addAccount('other', bundle('b'));
+    await expect(
+      v.createGroup({ memberIds: [a.id, b.id], folders: [scopeFolder()] }),
+    ).rejects.toThrow(new RegExp(`already reserved to group ${group.id}`));
   });
 
   it('refuses a folder already bound to another group, but allows a nested subfolder', async () => {
@@ -125,7 +138,7 @@ describe('reserve / release — moving rows between the two files', () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
     const b = await v.addAccount('b', bundle('b'));
-    const group = await v.createGroup({ memberIds: [a.id] });
+    const group = await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     await v.reserveAccounts(group.id, [b.id]);
     const g = await v.getGroup(group.id);
     expect(g?.members.map((m) => m.id).sort()).toEqual([a.id, b.id].sort());
@@ -136,7 +149,7 @@ describe('reserve / release — moving rows between the two files', () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
     const b = await v.addAccount('b', bundle('b'));
-    const group = await v.createGroup({ memberIds: [a.id, b.id] });
+    const group = await v.createGroup({ memberIds: [a.id, b.id], folders: [scopeFolder()] });
     await v.releaseAccounts(group.id, [a.id]);
     expect((await v.listAccounts()).map((r) => r.id)).toEqual([a.id]);
     expect((await v.getGroup(group.id))?.members.map((m) => m.id)).toEqual([b.id]);
@@ -158,7 +171,7 @@ describe('reserve / release — moving rows between the two files', () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
     const b = await v.addAccount('b', bundle('b'));
-    const group = await v.createGroup({ memberIds: [a.id, b.id] });
+    const group = await v.createGroup({ memberIds: [a.id, b.id], folders: [scopeFolder()] });
     await v.setGroupActive(group.id, a.id);
     await v.releaseAccounts(group.id, [a.id]);
     expect((await v.getGroup(group.id))?.activeId).toBeNull();
@@ -168,7 +181,7 @@ describe('reserve / release — moving rows between the two files', () => {
     const { v, groupsPath } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
     const b = await v.addAccount('b', bundle('b'));
-    const group = await v.createGroup({ memberIds: [a.id] });
+    const group = await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     expect((await readJson(groupsPath)).generation).toBe(1);
     await v.reserveAccounts(group.id, [b.id]);
     expect((await readJson(groupsPath)).generation).toBe(2);
@@ -240,7 +253,7 @@ describe('folder + active mutations on a group', () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
     const shared = await v.addAccount('shared', bundle('s'));
-    const group = await v.createGroup({ memberIds: [a.id] });
+    const group = await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     await v.setGroupActive(group.id, a.id);
     expect((await v.getGroup(group.id))?.activeId).toBe(a.id);
     await expect(v.setGroupActive(group.id, shared.id)).rejects.toThrow(UnknownAccountError);
@@ -254,7 +267,7 @@ describe('row-level mutations route to the file that holds the row', () => {
     const { v, accountsPath, groupsPath } = await vaultAt();
     const a = await v.addAccount('reserved', bundle('a'));
     const shared = await v.addAccount('shared', bundle('s'));
-    const group = await v.createGroup({ memberIds: [a.id] });
+    const group = await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     const accountsBefore = await readFile(accountsPath, 'utf8');
 
     await v.quarantine(a.id, 'dead token');
@@ -277,14 +290,14 @@ describe('row-level mutations route to the file that holds the row', () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('alpha', bundle('a'));
     const shared = await v.addAccount('shared', bundle('s'));
-    await v.createGroup({ memberIds: [a.id] });
+    await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     await expect(v.renameAccount(shared.id, 'alpha')).rejects.toThrow(/already refers to account/);
   });
 
   it('addAccount refuses a login already reserved to a group', async () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('alpha', bundle('a'));
-    await v.createGroup({ memberIds: [a.id] });
+    await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     // Same accountUuid as the reserved account.
     await expect(v.addAccount('again', bundle('a'))).rejects.toThrow(/already stored/);
   });
@@ -293,7 +306,7 @@ describe('row-level mutations route to the file that holds the row', () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
     const b = await v.addAccount('b', bundle('b'));
-    const group = await v.createGroup({ memberIds: [a.id, b.id] });
+    const group = await v.createGroup({ memberIds: [a.id, b.id], folders: [scopeFolder()] });
     await v.removeAccount(a.id);
     expect((await v.getGroup(group.id))?.members.map((m) => m.id)).toEqual([b.id]);
     await expect(v.readBundle(a.id)).rejects.toThrow();
@@ -304,7 +317,7 @@ describe('row-level mutations route to the file that holds the row', () => {
   it('dedupes within a group using that group active id', async () => {
     const { v, groupsPath } = await vaultAt();
     const a = await v.addAccount('dup', bundle('a'));
-    const group = await v.createGroup({ memberIds: [a.id] });
+    const group = await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     await v.setGroupActive(group.id, a.id);
     // Smuggle a second row with the same login directly into the member list.
     const groups = await readJson(groupsPath);
@@ -327,7 +340,7 @@ describe('crash-mid-move healing (groups.json wins)', () => {
   it('a row lingering in BOTH files is treated as reserved and healed out of accounts.json', async () => {
     const { v, accountsPath, groupsPath } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
-    const group = await v.createGroup({ memberIds: [a.id] });
+    const group = await v.createGroup({ memberIds: [a.id], folders: [scopeFolder()] });
     // Simulate a crash after groups.json was written but before accounts.json lost the row: put the
     // reserved row back into accounts.json (and point the global active at it).
     const accounts = await readJson(accountsPath);
@@ -382,12 +395,15 @@ describe('strict validation of groups.json fails CLOSED, naming the field, leavi
     createdAtMs: 1,
     updatedAtMs: 1,
   };
+  // Each fixture group gets its own folder by default (named after its id): a scope-less group is
+  // itself refused on load, and two groups sharing one folder would be too — neither may mask the
+  // refusal a test is actually about.
   const group = (over: Record<string, unknown> = {}) => ({
     id: 'g1',
     label: 'g',
     members: [member],
     activeId: null,
-    folders: [],
+    folders: [`C:\\fixture-${typeof over.id === 'string' ? over.id : 'g1'}`],
     createdAtMs: 1,
     updatedAtMs: 1,
     ...over,
@@ -604,7 +620,7 @@ describe('downgrade fence — an older cctl cannot see or drop reserved accounts
     const { v, accountsPath } = await vaultAt();
     const reserved = await v.addAccount('reserved', bundle('a'));
     const shared = await v.addAccount('shared', bundle('s'));
-    const group = await v.createGroup({ memberIds: [reserved.id] });
+    const group = await v.createGroup({ memberIds: [reserved.id], folders: [scopeFolder()] });
 
     // Simulate an older cctl that knows only {activeId, accounts} and rewrites accounts.json — it
     // never touches groups.json, and it cannot mention the reserved account it never saw.
@@ -638,7 +654,7 @@ describe('downgrade fence — an older cctl cannot see or drop reserved accounts
   it('an older `accounts add` of a reserved login (fresh id, same accountUuid) is healed out of the shared pool', async () => {
     const { v, accountsPath } = await vaultAt();
     const reserved = await v.addAccount('work', bundle('a')); // accountUuid 'uuid-a'
-    await v.createGroup({ memberIds: [reserved.id] });
+    await v.createGroup({ memberIds: [reserved.id], folders: [scopeFolder()] });
 
     // An OLDER cctl predates groups.json, so it cannot see the reserved row. Running `accounts add`
     // of that same login writes a NEW shared row under a fresh id carrying the SAME accountUuid — the
@@ -705,6 +721,20 @@ describe('group labels are stored terminal-safe', () => {
 
     expect(group.label).toBe('work');
   });
+
+  it('strips an alias-only binding label the same way', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      aliases: [{ folder: 'C:\\repo', alias: 'feature' }],
+      label: 'x\u001b]0;owned\u0007y\u202e',
+    });
+
+    expect(group.label).toBe('x]0;ownedy');
+    expect((await v.getGroup(group.id))?.label).toBe('x]0;ownedy');
+  });
 });
 
 describe('groups.json keeps fields this build does not know', () => {
@@ -749,5 +779,80 @@ describe('groups.json keeps fields this build does not know', () => {
     const groups = after.groups as Record<string, unknown>[];
     expect(groups).toHaveLength(1);
     expect(groups[0]!.futureScopes).toEqual([groups[0]!.id]);
+  });
+});
+
+describe('alias scopes beside the groups.json fields this build does not know', () => {
+  it('writes aliases as its own field at schema 2, keeping the unknown ones beside them', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      aliases: [{ folder: 'C:\\repo', alias: 'Feature' }],
+    });
+    const file = await readJson(groupsPath);
+    file.futureTopLevel = 1;
+    (file.groups as Record<string, unknown>[])[0]!.futureScopes = ['kept'];
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    // An ordinary group write by this build.
+    await v.setGroupActive(group.id, a.id);
+
+    const after = await readJson(groupsPath);
+    expect(after.schemaVersion).toBe(2);
+    expect(after.futureTopLevel).toBe(1);
+    const g = (after.groups as Record<string, unknown>[])[0]!;
+    expect(g.aliases).toEqual([{ folder: 'C:\\repo', alias: 'Feature' }]);
+    expect(g.futureScopes).toEqual(['kept']);
+    // aliases is handed out (this build owns it); the unknown field is not.
+    const view = (await v.getGroup(group.id))!;
+    expect(view.aliases).toEqual([{ folder: 'C:\\repo', alias: 'Feature' }]);
+    expect(Object.keys(view)).not.toContain('futureScopes');
+  });
+
+  it('drops aliases when the last alias scope goes, never writing them back from the unknown fields', async () => {
+    const { v, vaultDir, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      folders: ['C:\\work'],
+      aliases: [{ folder: 'C:\\repo', alias: 'feature' }],
+    });
+    const file = await readJson(groupsPath);
+    (file.groups as Record<string, unknown>[])[0]!.futureScopes = ['kept'];
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    await v.removeAliasFromGroup(group.id, { folder: 'C:\\repo', alias: 'feature' });
+
+    const after = await readJson(groupsPath);
+    // No alias left: the older shape again, which a folder-only build reads.
+    expect(after.schemaVersion).toBe(1);
+    const g = (after.groups as Record<string, unknown>[])[0]!;
+    expect(Object.keys(g)).not.toContain('aliases');
+    expect(g.futureScopes).toEqual(['kept']);
+    // A fresh load (another process) sees the alias gone too.
+    const fresh = new Vault(
+      vaultDir,
+      new InsecurePassthroughProtector(),
+      () => 5000,
+      undefined,
+      'win32',
+    );
+    expect((await fresh.getGroup(group.id))?.aliases).toBeUndefined();
+    // And the next write by that process keeps it gone.
+    await fresh.setGroupActive(group.id, a.id);
+    const again = (await readJson(groupsPath)).groups as Record<string, unknown>[];
+    expect(Object.keys(again[0]!)).not.toContain('aliases');
+  });
+
+  it('refuses an unknown schema version still, whatever fields ride along', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    await v.createGroup({ memberIds: [a.id], aliases: [{ folder: 'C:\\repo', alias: 'x' }] });
+    const file = await readJson(groupsPath);
+    file.schemaVersion = 3;
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    await expect(v.listGroups()).rejects.toThrow(/unsupported schemaVersion \(3\)/);
   });
 });

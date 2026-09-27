@@ -186,6 +186,28 @@ describe('captureCurrentLogin', () => {
     const h = await harness();
     await expect(h.engine.captureCurrentLogin('work')).rejects.toBeInstanceOf(RefreshError);
   });
+
+  it('records the adoption as an activation, so usage is attributed before any switch', async () => {
+    // A box whose only account was captured in place and never switched to must still have a
+    // global activation timeline: attribution derives it from the audit log alone.
+    const h = await harness();
+    const a = bundleFor('A', NOW + HOUR);
+    await h.credStore.writeLiveCredentials(a.claudeAiOauth);
+    await h.credStore.writeOauthAccount(a.oauthAccount!);
+    const account = await h.engine.captureCurrentLogin('work');
+    const activations = (await readAuditLines(h.paths)).filter((l) => l.event === 'activated');
+    expect(activations).toEqual([
+      {
+        ts: NOW,
+        event: 'activated',
+        fromAccountId: null,
+        toAccountId: account.id,
+        origin: 'manual',
+        slot: 'global',
+        detail: 'adopted the current login',
+      },
+    ]);
+  });
 });
 
 describe('captureFromConfigDir', () => {
@@ -841,7 +863,9 @@ describe('activate — happy path', () => {
     await h.engine.activate(accountA.id, { origin: 'auto', reason: 'B is at 96% used' });
 
     const activations = (await readAuditLines(h.paths)).filter((l) => l.event === 'activated');
+    // The first entry is the capture adopting A as the live account (see captureCurrentLogin).
     expect(activations).toMatchObject([
+      { toAccountId: accountA.id, origin: 'manual', detail: 'adopted the current login' },
       { toAccountId: accountB.id, origin: 'manual' },
       { toAccountId: accountA.id, origin: 'auto', detail: 'B is at 96% used' },
     ]);

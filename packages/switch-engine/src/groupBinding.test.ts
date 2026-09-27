@@ -278,12 +278,13 @@ describe('bindFolder — the global-slot hand-off', () => {
     const h = await harness();
     const A = await h.engine.addAccount('A', bundleFor('A', NOW + 10 * HOUR));
     await h.engine.addAccount('R', bundleFor('R', NOW + 10 * HOUR));
+    const work = await h.folder('work');
     for (let i = 0; i < MAX_GROUPS; i += 1) {
       const x = await h.vault.addAccount(`X${i}`, bundleFor(`X${i}`, NOW + 10 * HOUR));
-      await h.vault.createGroup({ memberIds: [x.id] });
+      // Every group carries a scope (a scope-less group is refused at creation).
+      await h.vault.createGroup({ memberIds: [x.id], folders: [join(work, `g${i}`)] });
     }
     await h.engine.activate(A.id);
-    const work = await h.folder('work');
 
     await expect(h.engine.bindFolder(work, [A.id])).rejects.toThrow(
       `cannot create another group (max ${MAX_GROUPS})`,

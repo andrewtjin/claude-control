@@ -8,9 +8,11 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createLogger, type LogSink } from '@claude-control/shared-protocol';
+import { sessionIdentities } from '@claude-control/daemon';
 import {
   SwitchEngine,
   defaultPaths,
+  sanitizeTerminalText,
   type BindEnforceMode,
   type Logger,
   type Paths,
@@ -100,6 +102,9 @@ export function buildEngine(
     logger: adapter,
     // The enforcement mode baked into any guard snapshot this engine writes (see resolveBindEnforce).
     bindEnforce: resolveBindEnforce(env),
+    // How the running-session scan learns a session's title and recorded folder: its transcript,
+    // via the daemon's session catalog (a resumed session's session file carries no title).
+    sessionIdentity: sessionIdentities,
     refreshDeps: {
       overload: {
         // The status-page probe an overloaded (529) token endpoint triggers, passed explicitly
@@ -169,7 +174,14 @@ export function reportFatal(
   err: unknown,
   sink: { write(text: string): unknown } = process.stderr,
 ): void {
-  const line = `error: ${err instanceof Error ? err.message : String(err)}\n`;
+  // A message can echo operator- or file-supplied text (an account ref, a session alias or id, a
+  // folder), so what a terminal would interpret is stripped here, at the one sink — line by line, so
+  // a line break a message means to carry survives.
+  const message = (err instanceof Error ? err.message : String(err))
+    .split('\n')
+    .map((part) => sanitizeTerminalText(part))
+    .join('\n');
+  const line = `error: ${message}\n`;
   sink.write(paintErrorLine(line, detectPalette(process.stderr)));
   process.exitCode = 1;
 }

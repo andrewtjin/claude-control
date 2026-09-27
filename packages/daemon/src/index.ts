@@ -227,6 +227,7 @@ export {
 
 export {
   readSessionCatalog,
+  sessionIdentities,
   aliasOf,
   aliasKey,
   projectDirMatches,

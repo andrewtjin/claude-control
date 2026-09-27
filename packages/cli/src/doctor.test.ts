@@ -11,6 +11,7 @@ import {
   checkNodeVersion,
   checkSessionRuntime,
   checkSlots,
+  checkBindingScopes,
   checkGuardSnapshot,
   checkGuardHook,
   checkFolderBindings,
@@ -517,6 +518,64 @@ describe('checkPowerShellWrapper', () => {
   });
 });
 
+describe('checkBindingScopes', () => {
+  const member = (id: string) => ({
+    id,
+    label: id,
+    quarantined: false,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+  });
+  const group = (id: string, over: Record<string, unknown> = {}) => ({
+    id,
+    label: `L-${id}`,
+    members: [member(`m-${id}`)],
+    activeId: null,
+    folders: [] as string[],
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    ...over,
+  });
+
+  it('passes when every binding has a folder or a session', async () => {
+    const check = await checkBindingScopes({
+      listGroups: () =>
+        Promise.resolve([
+          group('a', { folders: ['C:\\work'] }),
+          group('b', { aliases: [{ folder: 'C:\\repo', alias: 'x' }] }),
+        ]),
+    });
+    expect(check).toMatchObject({ name: 'binding-scopes', ok: true });
+  });
+
+  it('flags a binding left with no scope, naming it and the release command', async () => {
+    const check = await checkBindingScopes({
+      listGroups: () => Promise.resolve([group('g1'), group('g2', { folders: ['C:\\x'] })]),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('1 binding(s) route nothing');
+    expect(check.detail).toContain('L-g1 (m-g1)');
+    expect(check.detail).toContain('cctl unbind --group g1');
+    expect(check.detail).not.toContain('g2');
+  });
+
+  it('flags a session alias longer than Claude Code keeps a session name: it never matches', async () => {
+    const long = 'x'.repeat(201);
+    const check = await checkBindingScopes({
+      listGroups: () =>
+        Promise.resolve([
+          group('a', { aliases: [{ folder: 'C:\\repo', alias: long }] }),
+          group('b', { aliases: [{ folder: 'C:\\repo', alias: 'y'.repeat(200) }] }),
+        ]),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('1 session alias(es) never match a session');
+    expect(check.detail).toContain('200 characters Claude Code keeps of a session name');
+    expect(check.detail).toContain(`cctl session unbind '${long}' --cwd`);
+    expect(check.detail).not.toContain('y'.repeat(200));
+  });
+});
+
 describe('checkFolderBindings', () => {
   let root: string;
   beforeEach(async () => {
@@ -548,7 +607,7 @@ describe('checkFolderBindings', () => {
     const out = await checkFolderBindings(sandboxEngine(), paths);
 
     // One failed check names the unreadable file; the rest still report instead of the whole doctor
-    // dying on the first read.
+    // dying on the first read. The scope check is left out: it would only repeat that reason.
     expect(out.map((c) => c.name)).toEqual(['bindings', 'slots', 'guard-snapshot', 'guard-hook']);
     const bindings = out.find((c) => c.name === 'bindings')!;
     expect(bindings.ok).toBe(false);
@@ -571,7 +630,41 @@ describe('checkFolderBindings', () => {
   it('adds no extra line when the bindings read fine', async () => {
     const out = await checkFolderBindings(sandboxEngine(), sandboxPaths(root));
 
-    expect(out.map((c) => c.name)).toEqual(['slots', 'guard-snapshot', 'guard-hook']);
+    expect(out.map((c) => c.name)).toEqual([
+      'slots',
+      'binding-scopes',
+      'guard-snapshot',
+      'guard-hook',
+    ]);
     expect(out.every((c) => c.ok)).toBe(true);
+  });
+
+  it('runs the binding-scopes check beside the others, flagging a binding that routes nothing', async () => {
+    const scopeless = {
+      id: 'g-1',
+      label: 'work',
+      members: [{ id: 'm-1', label: 'work', quarantined: false, createdAtMs: 1, updatedAtMs: 1 }],
+      activeId: null,
+      folders: [] as string[],
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
+    const engine = {
+      listGroups: () => Promise.resolve([scopeless]),
+      checkSlots: () => Promise.resolve([]),
+      getGuardSnapshotFreshness: () => sandboxEngine().getGuardSnapshotFreshness(),
+    };
+
+    const out = await checkFolderBindings(engine, sandboxPaths(root));
+
+    expect(out.map((c) => c.name)).toEqual([
+      'slots',
+      'binding-scopes',
+      'guard-snapshot',
+      'guard-hook',
+    ]);
+    const scopes = out.find((c) => c.name === 'binding-scopes')!;
+    expect(scopes.ok).toBe(false);
+    expect(scopes.detail).toContain('cctl unbind --group g-1');
   });
 });

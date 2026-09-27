@@ -5,7 +5,13 @@
 // TTY; see ansi.ts), and layout is always computed on plain text before painting, so
 // styled and plain output align identically.
 
-import type { DedupeReport, StoredAccount } from '@claude-control/switch-engine';
+import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  shellQuoteArg,
+  type DedupeReport,
+  type StoredAccount,
+} from '@claude-control/switch-engine';
 import type {
   AccountUsage,
   TokenBucketRow,
@@ -472,8 +478,12 @@ export interface BindingMemberView {
 
 /** One folder-bound group for display. */
 export interface BindingGroupView {
+  /** The group's id — what `cctl unbind --group` takes; shown only for a binding with no scope. */
+  id?: string;
   label: string;
   folders: string[];
+  /** Session-alias scopes (the alias as bound, in its exact folder); absent or empty when none. */
+  aliases?: { folder: string; alias: string }[];
   members: BindingMemberView[];
   profileDir: string;
   /** True when no member could be made live (all quarantined) — the folder has no working account. */
@@ -491,6 +501,20 @@ export function renderBindingGroups(
   const blocks = groups.map((g) => {
     const header = palette.bold(sanitizeForTerminal(g.label));
     const folderLines = g.folders.map((f) => `  folder:  ${sanitizeForTerminal(f)}`);
+    // An alias scope covers one named session in exactly that folder (not its subfolders). One
+    // longer than Claude Code keeps a session name (bound before cctl refused those) can never
+    // match a session: said so, since it silently binds nothing.
+    const aliasLines = (g.aliases ?? []).map(
+      (a) =>
+        `  session: "${sanitizeForTerminal(a.alias)}" in ${sanitizeForTerminal(a.folder)}` +
+        (aliasFitsSessionTitle(a.alias)
+          ? ''
+          : '  ' +
+            palette.yellow(
+              `(never matches: longer than the ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters Claude ` +
+                'Code keeps of a session name; unbind it)',
+            )),
+    );
     const memberLine =
       '  accounts: ' +
       g.members
@@ -508,9 +532,28 @@ export function renderBindingGroups(
       ? '  ' + palette.red('live:    none usable (re-login a member: cctl accounts relogin <ref>)')
       : null;
     const profileLine = '  profile: ' + palette.dim(sanitizeForTerminal(g.profileDir));
-    return [header, ...folderLines, memberLine, ...(liveLine ? [liveLine] : []), profileLine].join(
-      '\n',
-    );
+    // No folder and no session: the binding routes nothing (a cctl without session aliases rewrote
+    // its file), while its accounts stay reserved. Say so, with both ways out.
+    const scopeless = g.folders.length === 0 && (g.aliases ?? []).length === 0;
+    const scopeLines = scopeless
+      ? [
+          '  ' +
+            palette.yellow(
+              'scope:   none — this binding routes nothing; bind a session or folder to these ' +
+                'accounts again, or release them: ' +
+                `cctl unbind --group ${sanitizeForTerminal(g.id ?? '<id>')}`,
+            ),
+        ]
+      : [];
+    return [
+      header,
+      ...folderLines,
+      ...aliasLines,
+      ...scopeLines,
+      memberLine,
+      ...(liveLine ? [liveLine] : []),
+      profileLine,
+    ].join('\n');
   });
   return blocks.join('\n\n');
 }
@@ -555,13 +598,69 @@ export function renderBindings(
   palette: Palette = PLAIN_PALETTE,
 ): string {
   if (input.groups.length === 0) {
-    return 'No folder-bound accounts. Bind one with: cctl bind <folder> <account>[,<account>...]';
+    return (
+      'No folder-bound accounts. Bind one with: cctl bind <folder> <account>[,<account>...]\n' +
+      'or bind a named session with: cctl session bind <alias> <account>[,<account>...]'
+    );
   }
   return (
     renderBindingGroups(input.groups, palette) +
     '\n\n' +
     renderBindingsFooter(input.footer, palette)
   );
+}
+
+/** One named session bound in the queried folder, for `cctl where`. */
+export interface WhereAliasView {
+  /** The alias as bound. */
+  alias: string;
+  groupLabel: string;
+  members: string[];
+  liveMemberLabel: string | null;
+}
+
+/**
+ * The command that resumes a named session on its bound account, safe to paste: the FULL alias as one
+ * single-quoted literal for the operator's shell ({@link shellQuote}: PowerShell on Windows, POSIX
+ * elsewhere), trimmed the way `claude --resume` trims it. Display text around it may
+ * be shortened; this never is. An alias a terminal could not show verbatim (one carrying a control or
+ * bidi character — a title read from a transcript, never a bound alias, which bind refuses) cannot be
+ * printed as a working argument, so the session id is used instead when the caller has it, else
+ * the bare picker form.
+ */
+export function resumeCommand(
+  alias: string,
+  opts: { sessionId?: string; platform?: NodeJS.Platform } = {},
+): string {
+  const platform = opts.platform ?? process.platform;
+  const text = alias.trim();
+  if (text !== '' && sanitizeForTerminal(text) === text) {
+    return `cctl claude --resume ${shellQuote(text, platform)}`;
+  }
+  const id = opts.sessionId;
+  return id !== undefined && /^[0-9a-f-]{8,64}$/i.test(id)
+    ? `cctl claude --resume ${id}`
+    : 'cctl claude --resume';
+}
+
+/** A session id as Claude Code writes it (a UUID): paste-safe with no quoting at all. */
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The command that resumes ONE known session on its bound account: by its id, which names exactly
+ * that conversation — its alias may be shared by other sessions Claude Code's title search reaches,
+ * and then `--resume <alias>` reopens the picker and the launcher can route the pick only by the
+ * folder rule. The enforcement guard prints the same form. Falls back to {@link resumeCommand} when
+ * the id is not a well-formed session id.
+ */
+export function resumeSessionCommand(
+  sessionId: string,
+  alias: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return SESSION_UUID.test(sessionId)
+    ? `cctl claude --resume ${sessionId}`
+    : resumeCommand(alias, { platform });
 }
 
 /** The resolution `cctl where` explains for a folder. */
@@ -576,16 +675,35 @@ export interface WhereView {
     profileDir: string;
     liveMemberLabel: string | null;
   } | null;
+  /** Named sessions alias-bound in EXACTLY this folder: they outrank the folder rule above. */
+  aliases?: WhereAliasView[];
+}
+
+/** The `cctl where` section naming the sessions alias-bound in the folder, or [] when none. */
+function whereAliasLines(view: WhereView, palette: Palette, platform: NodeJS.Platform): string[] {
+  const aliases = view.aliases ?? [];
+  if (aliases.length === 0) return [];
+  const lines = ['', 'Named sessions bound here (they outrank the folder rule above):'];
+  for (const a of aliases) {
+    const alias = sanitizeForTerminal(a.alias);
+    const members = a.members.map((m) => sanitizeForTerminal(m)).join(', ');
+    const live = a.liveMemberLabel ? sanitizeForTerminal(a.liveMemberLabel) : 'none usable';
+    lines.push(
+      `  "${alias}" -> ${palette.bold(sanitizeForTerminal(a.groupLabel))} (${members}), live: ${live}`,
+    );
+    lines.push(`    start or resume it with: ${resumeCommand(a.alias, { platform })}`);
+  }
+  return lines;
 }
 
 /** Quote one argument so it pastes into the operator's shell as a single literal word: PowerShell
- *  single quotes (a `'` doubled) on Windows, POSIX single quotes (`'\''`) elsewhere. Single quotes
- *  because nothing inside them expands in either shell — a folder or label may hold `$`, a backtick
- *  or a double quote. */
+ *  single quotes (every single-quote character doubled) on Windows, POSIX single quotes (`'\''`)
+ *  elsewhere. Single quotes because nothing inside them expands in either shell — a folder, label or
+ *  session alias may hold `$`, a backtick or a double quote. The rule itself is switch-engine's
+ *  shellQuoteArg, the same function the enforcement guard embeds, so a command the CLI prints and
+ *  one the guard prints can never quote differently. */
 export function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string {
-  return platform === 'win32'
-    ? `'${value.replace(/'/g, "''")}'`
-    : `'${value.replace(/'/g, "'\\''")}'`;
+  return shellQuoteArg(value, platform);
 }
 
 /** The VS Code profile name `cctl where` suggests for a binding: `cctl-<label>`, reduced to
@@ -609,6 +727,7 @@ export function renderWhere(
       `${palette.bold(folder)}`,
       '  runs on: the global (shared) account — no folder binding applies here',
       '  env:     CLAUDE_CONFIG_DIR is not set (the global slot)',
+      ...whereAliasLines(view, palette, platform),
       '',
       'Bind this folder to an account with: cctl bind ' + folder + ' <account>[,<account>...]',
     ].join('\n');
@@ -634,6 +753,7 @@ export function renderWhere(
     `  live:    ${live}`,
     `  matched: ${sanitizeForTerminal(b.matchedFolder)}`,
     `  env:     CLAUDE_CONFIG_DIR=${profile}`,
+    ...whereAliasLines(view, palette, platform),
     '',
     'Start Claude Code here with the right account using: cctl claude',
     '(or install the wrapper once: cctl shell-init powershell)',
@@ -652,10 +772,36 @@ export function renderWhere(
 // Session aliases (`cctl session show` / `cctl session aliases`)
 // ---------------------------------------------------------------------------
 
+/** Which account a session is bound to by THE precedence rule, and whether it runs there. */
+export interface SessionBindingView {
+  /** How the rule matched: its alias in its folder, a folder binding, or nothing (global). */
+  via: 'alias' | 'folder' | null;
+  /** The bound folder (the alias's exact folder, or the folder binding that contains it). */
+  folder: string | null;
+  /** The alias as bound, when `via` is 'alias'. */
+  alias: string | null;
+  groupId: string | null;
+  groupLabel: string | null;
+  members: string[];
+  /** The slot the rule requires: 'global' or 'group:<id>'. */
+  requiredSlot: string;
+  /** The slot the session runs (or last ran) in, or null when it is unknown: nothing recorded it,
+   *  or (slotSource 'env') this session runs on a config dir cctl does not manage. */
+  slot: string | null;
+  /** Where `slot` came from: this process's own session env, or the daemon's record. */
+  slotSource: 'env' | 'recorded' | null;
+  /** A display name for `slot` (the shared account, or a binding's label). */
+  slotLabel: string | null;
+  /** slot === requiredSlot, or null when the slot is unknown. */
+  inScope: boolean | null;
+}
+
 /** One session with the accounts its turns were billed to. */
 export interface SessionView {
   meta: SessionMeta;
   accounts: SessionAccountUse[];
+  /** Present on `cctl session show`: the session's binding and whether it is in scope. */
+  binding?: SessionBindingView;
 }
 
 /** `YYYY-MM-DD HH:MM` in local time — the operator reads their own clock. */
@@ -703,7 +849,47 @@ export function sessionViewJson(view: SessionView): Record<string, unknown> {
       first: new Date(a.firstMs).toISOString(),
       last: new Date(a.lastMs).toISOString(),
     })),
+    ...(view.binding !== undefined ? { binding: { ...view.binding } } : {}),
   };
+}
+
+/** The `Bound to` / `Scope` lines of `cctl session show`. */
+function bindingLines(b: SessionBindingView, sessionId: string, palette: Palette): string[] {
+  const members = b.members.map((m) => sanitizeForTerminal(m)).join(', ');
+  const who =
+    b.groupLabel === null
+      ? ''
+      : `${palette.bold(sanitizeForTerminal(b.groupLabel))}${members !== '' ? ` (${members})` : ''}`;
+  const bound =
+    b.via === 'alias'
+      ? `${who}  by alias "${sanitizeForTerminal(b.alias ?? '')}" in ${sanitizeForTerminal(b.folder ?? '')}`
+      : b.via === 'folder'
+        ? `${who}  by folder ${sanitizeForTerminal(b.folder ?? '')}`
+        : 'nothing: it runs on the shared account';
+  const out = [`Bound to  ${bound}`];
+  if (b.inScope === null) {
+    out.push(
+      `Scope     ${palette.dim(
+        b.slotSource === 'env'
+          ? 'unknown (this session runs on a config dir cctl does not manage)'
+          : 'unknown (no slot recorded for this session yet)',
+      )}`,
+    );
+  } else if (b.inScope) {
+    out.push(`Scope     in scope`);
+  } else {
+    const on = sanitizeForTerminal(b.slotLabel ?? b.slot ?? '?');
+    const fix =
+      b.via === 'alias'
+        ? `resume it with: ${resumeSessionCommand(sessionId, b.alias ?? '')}`
+        : 'start it again with: cctl claude';
+    out.push(
+      palette.yellow(
+        `Scope     OUT of scope: it ${b.slotSource === 'env' ? 'runs' : 'last ran'} on ${on}; ${fix}`,
+      ),
+    );
+  }
+  return out;
 }
 
 /** One account's line: label, turns, tokens and when. */
@@ -774,6 +960,9 @@ export function renderSessionDetails(
       out.push(`          ${palette.dim('(started in ' + sanitizeForTerminal(m.launchCwd) + ')')}`);
     }
     out.push(`Session   ${sanitizeForTerminal(m.sessionId)}`);
+    if (view.binding !== undefined) {
+      out.push(...bindingLines(view.binding, view.meta.sessionId, palette));
+    }
     const since = m.firstActivityMs === null ? '?' : localStamp(m.firstActivityMs);
     out.push(`Active    ${since} -> ${localStamp(m.lastActivityMs)}`);
     if (view.accounts.length === 0) {

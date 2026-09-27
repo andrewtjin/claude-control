@@ -25,13 +25,14 @@
 //
 // The functions here are split so the decisions are unit-testable in isolation from the spawn:
 // findClaudeOnPath (PATH lookup), resolveLaunchTarget (how to invoke a candidate), buildLaunchEnv
-// (the child env), configDirPointsIntoProfiles (the one env deletion rule), and spawnClaude (the
-// process itself, with an injectable signal seam).
+// (the child env), configDirPointsIntoProfiles (the one env deletion rule), parseClaudeSessionArgs
+// and resolveLaunchSessions (which session Claude Code's own arguments open, over an injectable
+// session lookup), and spawnClaude (the process itself, with an injectable signal seam).
 
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from 'node:fs';
 import { extname, posix, win32 } from 'node:path';
-import { canonicalizeFolder, isWithin } from '@claude-control/switch-engine';
+import { aliasKey, canonicalizeFolder, isWithin } from '@claude-control/switch-engine';
 
 /** How to invoke a resolved claude candidate, or why we refuse to. */
 export type LaunchTarget =
@@ -280,6 +281,597 @@ export function configDirPointsIntoProfiles(
   const r = canonicalizeFolder(profilesRoot, deps);
   if (!c.ok || !r.ok) return false;
   return isWithin(c.path, r.path, deps.platform);
+}
+
+// ---------------------------------------------------------------------------
+// Which session a launch opens (Claude Code's own arguments)
+// ---------------------------------------------------------------------------
+//
+// An alias binding routes a NAMED session, so before spawning the launcher reads Claude Code's own
+// arguments for the session they open. It only READS the argv: the array handed to the child is the
+// caller's, untouched, byte for byte (see spawnClaude — no shell, no rewrite).
+//
+// The parse mirrors how Claude Code 2.1.283 consumes the same argv, because a misread is exactly how
+// a flag VALUE would be taken for a flag: `--append-system-prompt --resume` passes the text
+// "--resume" as a prompt, it does not resume anything. First come the paths Claude Code decides
+// before its option parser runs: a first word naming a fast path (`claude rc`, `claude logs`, ...),
+// `daemon`, and `--bg`/`--background` anywhere. Then its option parser's (commander's) rules: an
+// option with a REQUIRED value takes the next token whatever it looks like; an OPTIONAL value
+// (`--resume [value]`) takes the next token only when it does not look like an option; a VARIADIC
+// option keeps taking tokens that do not look like options; `--x=v` and short `-xVALUE` attach the
+// value; combined short booleans (`-pc`) expand; `--` ends option parsing; and a first operand naming
+// a subcommand (`claude mcp add --name x`) hands everything after it to that subcommand, which opens
+// no session.
+//
+// The tables are Claude Code 2.1.283's full top-level option set. An option they do not list may be
+// one a newer Claude Code added, and nothing says whether it takes a value — so when one appears
+// before a session option, the parse refuses to guess (`uncertain`). The launcher then routes by the
+// folder rule alone and says so on stderr, and the enforcement guard judges the session Claude Code
+// actually opens.
+
+/** How a top-level option consumes the tokens after it (commander's arities). */
+type OptionArity = 'boolean' | 'required' | 'variadic' | 'optional';
+
+/** Options whose value is REQUIRED: the next token is always consumed. Claude Code's own argv
+ *  pre-scan table, plus two value options only its option parser defines (`--project-config-root`,
+ *  `--attach-serve`). The variadic ones are listed separately below. */
+const REQUIRED_VALUE_OPTIONS = [
+  '--prefill',
+  '--prefill-b64',
+  '--deep-link-repo',
+  '--deep-link-last-fetch',
+  '--deep-link-cwd-b64',
+  '--handle-uri',
+  '--settings',
+  '--managed-settings',
+  '--setting-sources',
+  '--client-data-url',
+  '--watch-artifact',
+  '--watch-artifact-no-autoreact',
+  '--team-name',
+  '--agent-id',
+  '--agent-name',
+  '--agent-color',
+  '--parent-session-id',
+  '--agent-type',
+  '--model',
+  '--agent',
+  '--routine',
+  '--effort',
+  '--permission-mode',
+  '--inherit-permission-mode',
+  '--proactivity',
+  '--debug-file',
+  '--system-prompt',
+  '--system-prompt-file',
+  '--append-system-prompt',
+  '--append-system-prompt-file',
+  '--system-prompt-snapshot',
+  '--append-subagent-system-prompt',
+  '--append-subagent-system-prompt-file',
+  '--plan-mode-instructions',
+  '--permission-prompt-tool',
+  '--permission-prompts',
+  '--json-schema',
+  '--fallback-model',
+  '--advisor',
+  '--agents',
+  '--name',
+  '-n',
+  '--plugin-dir',
+  '--plugin-dir-no-mcp',
+  '--plugin-url',
+  '--remote-control-session-name-prefix',
+  '--sdk-url',
+  '--exec',
+  '-m',
+  '--thinking',
+  '--thinking-display',
+  '--max-thinking-tokens',
+  '--max-turns',
+  '--max-budget-usd',
+  '--task-budget',
+  '--autocompact',
+  '--rewind-files',
+  '--resume-session-at',
+  '--resume-drops-turn',
+  '--workload',
+  '--output-format',
+  '--input-format',
+  '--teammate-mode',
+  '--messaging-socket-path',
+  '--session-id',
+  '--environment',
+  '--pool',
+  '--ref',
+  '--on-branch',
+  '--correlation-id',
+  '--forward-home-settings',
+  '--project-config-root',
+  '--attach-serve',
+] as const;
+
+/** VARIADIC options: a required first value, then every further token that does not look like an
+ *  option is a value too. */
+const VARIADIC_OPTIONS = [
+  '--allowedTools',
+  '--allowed-tools',
+  '--disallowedTools',
+  '--disallowed-tools',
+  '--tools',
+  '--add-dir',
+  '--mcp-config',
+  '--betas',
+  '--file',
+  '--channels',
+  '--dangerously-load-development-channels',
+] as const;
+
+/** Options whose value is OPTIONAL: the next token is taken only when it does not look like an
+ *  option (commander: a token of length > 1 starting with '-'). */
+const OPTIONAL_VALUE_OPTIONS = [
+  '-d',
+  '--debug',
+  '-r',
+  '--resume',
+  '--from-pr',
+  '-w',
+  '--worktree',
+  '--teleport',
+  '--cloud',
+  '--remote',
+  '--project',
+  '--remote-control',
+  '--rc',
+  '--prompt-suggestions',
+] as const;
+
+/** Options that take no value. `-d2e` is one whole short flag, which is why exact tokens are
+ *  matched before a short token is split into combined flags. */
+const BOOLEAN_OPTIONS = [
+  '-d2e',
+  '--debug-to-stderr',
+  '--verbose',
+  '-p',
+  '--print',
+  '--bare',
+  '--safe-mode',
+  '--init',
+  '--init-only',
+  '--maintenance',
+  '--include-hook-events',
+  '--include-partial-messages',
+  '--forward-subagent-text',
+  '--session-mirror',
+  '--await-claim',
+  '--await-initialize',
+  '--dangerously-skip-permissions',
+  '--allow-dangerously-skip-permissions',
+  '--replay-user-messages',
+  '--enable-auth-status',
+  '--restricted',
+  '--exclude-dynamic-system-prompt-sections',
+  '-c',
+  '--continue',
+  '--fork-session',
+  '--deep-link-origin',
+  '--no-session-persistence',
+  '--reply-on-resume',
+  '--ide',
+  '--strict-mcp-config',
+  '--disable-slash-commands',
+  '--chrome',
+  '--no-chrome',
+  '--tmux',
+  '--enable-auto-mode',
+  '--bg',
+  '--background',
+  '--brief',
+  '--ax-screen-reader',
+  '--plan-mode-required',
+  '-h',
+  '--help',
+  '-v',
+  '--version',
+] as const;
+
+/**
+ * Every known top-level option with its arity, built once from the lists above. An option listed
+ * twice would make the parse depend on list order, so a duplicate is a programming error that fails
+ * the module load (and with it every test that imports it) rather than silently picking one.
+ */
+const OPTION_ARITY: ReadonlyMap<string, OptionArity> = (() => {
+  const table = new Map<string, OptionArity>();
+  const add = (names: readonly string[], arity: OptionArity): void => {
+    for (const name of names) {
+      if (table.has(name)) throw new Error(`launcher option table lists ${name} twice`);
+      table.set(name, arity);
+    }
+  };
+  add(REQUIRED_VALUE_OPTIONS, 'required');
+  add(VARIADIC_OPTIONS, 'variadic');
+  add(OPTIONAL_VALUE_OPTIONS, 'optional');
+  add(BOOLEAN_OPTIONS, 'boolean');
+  return table;
+})();
+
+/** Claude Code's root subcommands (with their aliases): a FIRST operand naming one hands every token
+ *  after it to that subcommand, which opens no session. Words like `login`, `config` or `eval` are
+ *  not commands in 2.1.283 — there they are prompt text, and the session still opens. */
+const ROOT_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'gateway',
+  'auth',
+  'project',
+  'setup-token',
+  'agents',
+  'ultrareview',
+  'auto-mode',
+  'remote-control',
+  'rc',
+  'doctor',
+  'sandbox',
+  'update',
+  'upgrade',
+  'install',
+  'import',
+  'import-conversations',
+  'mcp',
+  'plugin',
+  'plugins',
+]);
+
+/** First words Claude Code routes BEFORE its option parser runs — decided on the very first token
+ *  only, so the same word later in the argv is ordinary text. None of them opens a session here. */
+const FAST_PATH_COMMANDS: ReadonlySet<string> = new Set([
+  'remote-control',
+  'rc',
+  'remote',
+  'sync',
+  'bridge',
+  'logs',
+  'attach',
+  'stop',
+  'kill',
+  'respawn',
+  'rm',
+]);
+
+/** Leading flags Claude Code skips when it looks for the `daemon` fast path. */
+const DAEMON_LEADING_FLAGS: ReadonlySet<string> = new Set([
+  '--dangerously-skip-permissions',
+  '--allow-dangerously-skip-permissions',
+]);
+
+/** Flags that send the launch down Claude Code's background-session path, wherever they appear. */
+const BACKGROUND_FLAGS: ReadonlySet<string> = new Set(['--bg', '--background']);
+
+/** A token that can be (or, inside a combined short token, contain) one of the options that decide
+ *  which session opens. Used only to judge whether an unrecognized option could have swallowed one,
+ *  so it errs toward "yes": any short token carrying a c, r or n letter counts. */
+const SESSION_LONG_OPTION = /^--(?:resume|continue|name|session-id|fork-session)(?:=|$)/;
+function looksLikeSessionOption(token: string): boolean {
+  if (SESSION_LONG_OPTION.test(token)) return true;
+  return /^-[^-]/.test(token) && /[crn]/.test(token.slice(1));
+}
+
+/** The longest option name quoted back in the uncertainty note — enough to recognize it, never a
+ *  wall of operator text. */
+const NOTE_OPTION_MAX = 40;
+
+/** What Claude Code's arguments say about the session a launch opens. */
+export interface ClaudeSessionArgs {
+  /** `--resume/-r`: the value (a session id, a transcript path or a title), `null` for a bare
+   *  `--resume` (the picker), absent when not resuming. Last occurrence wins, as in commander. */
+  resume?: string | null;
+  /** `--continue/-c`: the most recent session in the folder. It beats `--resume` when both are
+   *  given — Claude Code checks it first. */
+  continue: boolean;
+  /** `--name/-n <name>`: the new session's (or the opened one's new) custom title. An empty name
+   *  names nothing, so `--name ""` leaves this absent. */
+  name?: string;
+  /** `--session-id <uuid>`. */
+  sessionId?: string;
+  /** `--fork-session`: the resumed or continued conversation is copied into a NEW session of the
+   *  launch folder (a new id, the same title; measured: a fork of a session recorded in `repo/sub`,
+   *  launched from `repo`, is written to repo's project directory with every cwd rewritten to
+   *  `repo`). So a fork belongs to the folder it is launched in, not to the one it came from. */
+  fork: boolean;
+  /** `-p` / `--print`: a non-interactive run. Its `--resume <title>` search also finds sessions
+   *  created by `-p` or the SDK, which the interactive search leaves out. */
+  print?: true;
+  /** Set when no session opens: the first operand names a subcommand, or the first word is one of
+   *  Claude Code's fast paths. */
+  subcommand?: string;
+  /** Set when the arguments do not say for certain which session opens (an unrecognized option
+   *  before a session option, or the background path): a short, human reason. */
+  uncertain?: string;
+}
+
+/** commander's `maybeOption`: a token that parses as an option rather than a value. */
+function looksLikeOption(token: string): boolean {
+  return token.length > 1 && token.startsWith('-');
+}
+
+/**
+ * Read which session Claude Code will open from its argv, the way Claude Code itself would (see the
+ * section header). Pure, and never mutates `args` — the launcher spawns the caller's array as is.
+ */
+export function parseClaudeSessionArgs(args: readonly string[]): ClaudeSessionArgs {
+  const out: ClaudeSessionArgs = { continue: false, fork: false };
+
+  // Paths Claude Code takes before its option parser ever sees the argv.
+  const first = args[0];
+  if (first !== undefined && FAST_PATH_COMMANDS.has(first)) return { ...out, subcommand: first };
+  const afterLeadingFlags = args.find((t) => !DAEMON_LEADING_FLAGS.has(t));
+  if (afterLeadingFlags === 'daemon') return { ...out, subcommand: 'daemon' };
+  const background = args.find((t) => BACKGROUND_FLAGS.has(t));
+  if (background !== undefined) {
+    return { ...out, uncertain: `"${background}" starts a background session` };
+  }
+
+  let sawOperand = false;
+  let variadic = false;
+  /** The first token no table recognizes, with its position in `args`. */
+  let unrecognized: { token: string; index: number } | undefined;
+  // Tokens still to read, front first, each with its position in `args`. A combined short token
+  // pushes its remainder back onto the front, the way commander unshifts `-${rest}`.
+  const queue = args.map((token, index) => ({ token, index }));
+  const next = (): { token: string; index: number } | undefined => queue.shift();
+
+  /** Apply one known option, with its attached value if it had one (`--x=v`, `-xv`). */
+  const apply = (name: string, arity: OptionArity, attached: string | undefined): void => {
+    let value: string | null = null;
+    if (arity === 'required' || arity === 'variadic') {
+      // A missing value is a Claude Code usage error (nothing opens); null records "no value".
+      value = attached ?? next()?.token ?? null;
+      // Only a value in its own token keeps a variadic option collecting: commander's `--x=v`
+      // branch never re-arms it.
+      variadic = arity === 'variadic' && attached === undefined;
+    } else if (arity === 'optional') {
+      if (attached !== undefined) value = attached;
+      else if (queue[0] !== undefined && !looksLikeOption(queue[0].token)) value = next()!.token;
+    }
+    if (name === '--resume' || name === '-r') out.resume = value;
+    else if (name === '--continue' || name === '-c') out.continue = true;
+    else if (name === '--fork-session') out.fork = true;
+    else if (name === '-p' || name === '--print') out.print = true;
+    else if ((name === '--name' || name === '-n') && value !== null) out.name = value;
+    else if (name === '--session-id' && value !== null) out.sessionId = value;
+  };
+
+  for (let item = next(); item !== undefined; item = next()) {
+    const { token, index } = item;
+    if (token === '--') {
+      // Everything after is an operand — and commander still dispatches a subcommand named by the
+      // first operand, even one that follows `--`.
+      const following = queue[0]?.token;
+      if (!sawOperand && following !== undefined && ROOT_SUBCOMMANDS.has(following)) {
+        out.subcommand = following;
+      }
+      break;
+    }
+    if (variadic && !looksLikeOption(token)) continue; // a further value of a variadic option
+    variadic = false;
+
+    if (!looksLikeOption(token)) {
+      // An operand. The FIRST one may name a subcommand, which owns every token after it.
+      if (!sawOperand && ROOT_SUBCOMMANDS.has(token)) {
+        out.subcommand = token;
+        break;
+      }
+      sawOperand = true;
+      continue;
+    }
+
+    // An exact known token first: that is how `-d2e` stays one flag rather than `-d` + "2e".
+    const exact = OPTION_ARITY.get(token);
+    if (exact !== undefined) {
+      apply(token, exact, undefined);
+      continue;
+    }
+    if (token.startsWith('--')) {
+      // `--x=v` attaches a value only to an option that takes one; `--bool=v` is not an option.
+      const eq = token.indexOf('=');
+      const arity = eq > 2 ? OPTION_ARITY.get(token.slice(0, eq)) : undefined;
+      if (arity !== undefined && arity !== 'boolean') {
+        apply(token.slice(0, eq), arity, token.slice(eq + 1));
+        continue;
+      }
+    } else {
+      // A combined short token: its first letter decides. A value-taking flag takes the rest
+      // verbatim (so `-r=x` resumes "=x"); a boolean flag hands the rest back as `-${rest}`.
+      const flag = token.slice(0, 2);
+      const arity = OPTION_ARITY.get(flag);
+      if (arity !== undefined) {
+        if (arity === 'boolean') {
+          apply(flag, arity, undefined);
+          queue.unshift({ token: `-${token.slice(2)}`, index });
+        } else {
+          apply(flag, arity, token.slice(2));
+        }
+        continue;
+      }
+    }
+    // Not an option these tables know. commander reads it as a boolean; remember the first one.
+    unrecognized ??= { token, index };
+  }
+
+  // An empty name names nothing (measured: `--name "" --resume X` keeps X's title).
+  if (out.name === '') delete out.name;
+
+  // An unrecognized option may take a value in the Claude Code actually installed; if a session
+  // option follows it (or hides in its own combined letters), that option may have been swallowed
+  // as the value, and the parse cannot tell which session opens.
+  if (unrecognized !== undefined) {
+    const { token, index } = unrecognized;
+    const ownLetters = !token.startsWith('--') && /[crn]/.test(token.slice(2));
+    if (ownLetters || args.slice(index + 1).some(looksLikeSessionOption)) {
+      const name = token.startsWith('--') ? token.split('=', 1)[0]! : token.slice(0, 2);
+      const shown = name.length > NOTE_OPTION_MAX ? `${name.slice(0, NOTE_OPTION_MAX)}...` : name;
+      out.uncertain = `unrecognized option "${shown}"`;
+    }
+  }
+  return out;
+}
+
+/** What the launcher knows about one Claude Code session: its titles, from Claude Code's own quick
+ *  read of its transcript, and the folder its conversation belongs to, from the one recorded-folder
+ *  reading every consumer of an alias binding uses (switch-engine readRecordedFolder; see
+ *  launchSessionStore.ts). */
+export interface LaunchSessionFacts {
+  /** The last custom title (`/rename`, `--name`); null when none is recorded. */
+  customTitle: string | null;
+  /** The last generated title; null when none is recorded. */
+  aiTitle: string | null;
+  /** The folder the conversation belongs to, as recorded and trusted (readRecordedFolder's
+   *  `folder`); null when none is. */
+  folder: string | null;
+  /** How the session was started, as its first line recording one says (`cli` interactively,
+   *  `sdk-cli` for `-p` or the SDK); absent when the quick read sees none. */
+  entrypoint?: string;
+  /** The project directory the transcript lives in: with no trusted folder, it stands for the launch
+   *  folder when it can (recordedFolderFor). Absent = unknown, so no fallback applies. */
+  dirName?: string;
+}
+
+/**
+ * The session lookups {@link resolveLaunchSessions} needs: Claude Code's own session search,
+ * reproduced over its transcripts. launchSessionStore.ts implements it; tests pass stand-ins. Every
+ * lookup is relative to the launch folder the implementation was built for.
+ */
+export interface LaunchSessionDeps {
+  /** `--resume <uuid>` / `--session-id <uuid>`: the session with this id, or null when none. */
+  sessionById(sessionId: string): Promise<LaunchSessionFacts | null>;
+  /** `--resume <absolute .jsonl path>`: that transcript, or null when it cannot be read. */
+  sessionAtPath(file: string): Promise<LaunchSessionFacts | null>;
+  /** `--resume <text>`: every session Claude Code's title search can match, from the launch folder
+   *  (any number: one resumes it, several open a picker, none opens the picker empty). */
+  sessionsTitled(text: string): Promise<LaunchSessionFacts[]>;
+  /** `--continue`: the session(s) it may open — more than one when the newest transcript belongs to
+   *  another folder, and none when the launcher cannot name it. */
+  continueSessions(): Promise<LaunchSessionFacts[]>;
+}
+
+/** One session a launch may open, as the precedence rule reads it. */
+export interface LaunchCandidate {
+  /** Its custom title once open (a `--name` renames it); null = unnamed. */
+  title: string | null;
+  /** The folder its conversation belongs to: the recorded one of an existing session, the launch
+   *  folder for a new session or a fork; null = none is recorded (see {@link dirName}). */
+  folder: string | null;
+  /** An existing session's project directory, the fallback when no folder is recorded (see
+   *  {@link LaunchSessionFacts.dirName}). */
+  dirName?: string;
+}
+
+/** Which session(s) a launch may open. `candidates` empty = no session opens, or the launcher
+ *  cannot name the one that will (a picker, an unknown id): either way the folder rule applies. */
+export type LaunchSessions =
+  { kind: 'candidates'; candidates: LaunchCandidate[] } | { kind: 'uncertain'; reason: string };
+
+/** What {@link resolveLaunchSessions} needs besides the lookups. */
+export interface LaunchSessionContext {
+  /** The folder the launch runs in: where a NEW session's conversation belongs. */
+  launchFolder: string;
+  /** Every alias key some binding holds. A title outside it cannot route by alias, which lets a
+   *  resume skip reading transcripts entirely. */
+  boundAliasKeys: ReadonlySet<string>;
+  platform: NodeJS.Platform;
+}
+
+/** A session id as Claude Code writes it (a UUID). */
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Whether `--resume <value>` names a transcript file: Claude Code's own rule, an absolute path
+ *  ending in `.jsonl` (resumed from that file, never matched as a title). */
+function isTranscriptPath(value: string, platform: NodeJS.Platform): boolean {
+  const path = platform === 'win32' ? win32 : posix;
+  return path.isAbsolute(value) && value.endsWith('.jsonl');
+}
+
+/** A custom title that names a session (non-blank), or null. */
+function namedTitle(title: string | null): string | null {
+  return title !== null && title.trim() !== '' ? title : null;
+}
+
+/** No session the launcher can name: the folder rule decides. */
+const FOLDER_RULE: LaunchSessions = { kind: 'candidates', candidates: [] };
+
+/** The entrypoint Claude Code records for a session started by `-p` or the SDK. */
+const SDK_ENTRYPOINT = 'sdk-cli';
+
+/**
+ * The session(s) a launch opens, as Claude Code will pick them — each with the title it will carry
+ * and the folder its conversation belongs to:
+ *   - a subcommand or fast path opens none; an uncertain parse is reported, never guessed;
+ *   - `--continue` wins over `--resume` (Claude Code checks it first): its session(s);
+ *   - `--resume <uuid>` / `<absolute .jsonl>`: that session; a bare `--resume`, or a title that is
+ *     blank, opens the picker (none nameable); `--resume <title>`: every session Claude Code's title
+ *     search matches — one resumes, several open a picker the enforcement guard then judges;
+ *   - `--session-id <uuid>` alone: that session if it exists, else a new one;
+ *   - otherwise a new session, recorded in the launch folder.
+ * `--name v` renames whatever opens to v. `--fork-session` copies what `--continue` / `--resume`
+ * opens into a NEW conversation of the launch folder under the same title, so a fork's folder is the
+ * launch folder, whatever folder it was forked from — exactly what the enforcement guard sees once
+ * the fork runs. A match found only by its GENERATED title opens as an unnamed session (only a custom
+ * title binds).
+ *
+ * Reads are skipped whenever no title the launch can end up with is bound: a `--name` bound nowhere
+ * settles every candidate before anything is read, and so does a resume title bound nowhere.
+ */
+export async function resolveLaunchSessions(
+  parsed: ClaudeSessionArgs,
+  deps: LaunchSessionDeps,
+  context: LaunchSessionContext,
+): Promise<LaunchSessions> {
+  if (parsed.uncertain !== undefined) return { kind: 'uncertain', reason: parsed.uncertain };
+  if (parsed.subcommand !== undefined) return FOLDER_RULE;
+  const name = parsed.name;
+  const isBound = (title: string): boolean => context.boundAliasKeys.has(aliasKey(title));
+  if (name !== undefined && !isBound(name)) return FOLDER_RULE;
+
+  /** An existing session as it will open: renamed by --name, else under its own custom title; in
+   *  its own recorded folder, or — forked — as a new conversation of the launch folder. */
+  const fork = parsed.fork && (parsed.continue || parsed.resume !== undefined);
+  const opened = (s: LaunchSessionFacts): LaunchCandidate => {
+    const title = name ?? namedTitle(s.customTitle);
+    if (fork) return { title, folder: context.launchFolder };
+    return { title, folder: s.folder, ...(s.dirName !== undefined ? { dirName: s.dirName } : {}) };
+  };
+  const found = (s: LaunchSessionFacts | null): LaunchSessions => ({
+    kind: 'candidates',
+    candidates: s === null ? [] : [opened(s)],
+  });
+
+  if (parsed.continue) {
+    return { kind: 'candidates', candidates: (await deps.continueSessions()).map(opened) };
+  }
+  if (parsed.resume !== undefined) {
+    if (parsed.resume === null) return FOLDER_RULE; // the picker
+    const value = parsed.resume;
+    if (SESSION_UUID.test(value.trim())) return found(await deps.sessionById(value.trim()));
+    if (isTranscriptPath(value, context.platform)) return found(await deps.sessionAtPath(value));
+    if (aliasKey(value) === '') return FOLDER_RULE; // a blank title matches nothing: the picker
+    // Every match opens under its own custom title, whose key IS the resume text's: unbound there,
+    // no match can route by alias, so none needs reading.
+    if (name === undefined && !isBound(value)) return FOLDER_RULE;
+    const matches = await deps.sessionsTitled(value);
+    // Interactively, Claude Code's title search leaves out sessions started by `-p` or the SDK
+    // (measured: its picker reports no match for them); a `-p` launch finds them.
+    const reachable =
+      parsed.print === true ? matches : matches.filter((s) => s.entrypoint !== SDK_ENTRYPOINT);
+    return { kind: 'candidates', candidates: reachable.map(opened) };
+  }
+  if (parsed.sessionId !== undefined) {
+    const id = parsed.sessionId.trim();
+    if (!SESSION_UUID.test(id)) return FOLDER_RULE; // Claude Code refuses a malformed id
+    const existing = await deps.sessionById(id);
+    if (existing !== null) return found(existing);
+  }
+  return {
+    kind: 'candidates',
+    candidates: [{ title: name ?? null, folder: context.launchFolder }],
+  };
 }
 
 // ---------------------------------------------------------------------------

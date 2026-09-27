@@ -45,6 +45,7 @@ import {
   hookSecretPath,
   installHooks,
   readHookEndpoint,
+  sessionIdentities,
   readTranscriptTurns,
   writeHookForwarder,
   loadOrCreateHookSecret,
@@ -568,6 +569,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),
+    // A resumed session's custom title and recorded folder, read from its one transcript under this
+    // config dir, so a phone spawn that resumes a NAMED session lands on that alias's binding (see
+    // resolveSpawnBinding).
+    sessionIdentityOf: async (sessionId) =>
+      (await sessionIdentities(paths.claudeDir, [sessionId])).get(sessionId.toLowerCase()) ?? null,
     // Present only when the operator hasn't opted out — the Daemon stamps it onto every
     // managed spawn/resume, and its absence IS the off switch (no policy, no retries).
     ...(config.values.autoContinue

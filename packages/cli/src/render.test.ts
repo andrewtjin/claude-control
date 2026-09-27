@@ -17,12 +17,13 @@ import {
   shellQuote,
   vscodeProfileName,
   type DaemonStatusView,
+  type SessionBindingView,
   type SessionView,
   type UsageRow,
 } from './render.js';
 import { ANSI_PALETTE, pacingStyle, PLAIN_PALETTE } from './ansi.js';
 import type { SessionAccountUse, SessionMeta } from '@claude-control/daemon';
-import type { StoredAccount } from '@claude-control/switch-engine';
+import { embeddableFolderPathSource, type StoredAccount } from '@claude-control/switch-engine';
 import type {
   AccountUsage,
   TokenStatsSnapshot,
@@ -808,6 +809,36 @@ describe('renderBindingGroups', () => {
     expect(renderBindingGroups([], PLAIN_PALETTE)).toBe('');
   });
 
+  it('flags a binding with no folder and no session, with the command that releases it', () => {
+    const out = renderBindingGroups(
+      [{ ...group, id: 'g-1', folders: [], aliases: [] }],
+      PLAIN_PALETTE,
+    );
+    expect(out).toContain('scope:   none — this binding routes nothing');
+    expect(out).toContain('cctl unbind --group g-1');
+    // A binding with a scope never carries the line.
+    expect(renderBindingGroups([group], PLAIN_PALETTE)).not.toContain('scope:');
+  });
+
+  it('marks a session alias longer than Claude Code keeps a session name as never matching', () => {
+    const out = renderBindingGroups(
+      [
+        {
+          ...group,
+          folders: [],
+          aliases: [
+            { folder: 'C:\\repo', alias: 'z'.repeat(201) },
+            { folder: 'C:\\repo', alias: 'fits' },
+          ],
+        },
+      ],
+      PLAIN_PALETTE,
+    );
+    const lines = out.split('\n');
+    expect(lines.find((l) => l.includes('z'.repeat(201)))).toContain('(never matches: longer than');
+    expect(lines.find((l) => l.includes('"fits"'))).not.toContain('never matches');
+  });
+
   it('flags a group with no working account', () => {
     const dead = { ...group, members: [], noWorkingAccount: true };
     expect(renderBindingGroups([dead], PLAIN_PALETTE)).toContain('none usable');
@@ -935,11 +966,112 @@ describe('renderWhere', () => {
     expect(vscodeProfileName('  ')).toBe('cctl-binding');
   });
 
+  it('quotes exactly like the copy the enforcement guard embeds', () => {
+    // The guard is a generated CommonJS script and carries its own copy of the quoting rule; the
+    // CLI and the guard must print the same command for the same alias.
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const factory = new Function(`${embeddableFolderPathSource()}\nreturn shellQuoteArg;`);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    const guardCopy = factory() as (text: string, platform: NodeJS.Platform) => string;
+    for (const text of ['Auth Work', "it's", 'don’t', 'Deploy $(calc) "now" `id`', '']) {
+      for (const platform of ['win32', 'linux', 'darwin'] as const) {
+        expect(shellQuote(text, platform)).toBe(guardCopy(text, platform));
+      }
+    }
+    // PowerShell also treats the typographic single quotes as quotes, so they are doubled too.
+    expect(shellQuote('don’t', 'win32')).toBe("'don’’t'");
+  });
+
   it('explains an unbound folder as the global account', () => {
     const out = renderWhere({ folder: 'C:\\tmp', bound: null }, PLAIN_PALETTE);
     expect(out).toContain('global (shared) account');
     expect(out).toContain('CLAUDE_CONFIG_DIR is not set');
     expect(out).toContain('cctl bind C:\\tmp');
+    expect(out).not.toContain('Named sessions');
+  });
+
+  it('lists the named sessions alias-bound in the folder, with how to start each', () => {
+    const view = {
+      folder: 'C:\\repos\\work',
+      bound: null,
+      aliases: [
+        {
+          alias: 'Auth Work',
+          groupLabel: 'Research',
+          members: ['research@x', 'spare@x'],
+          liveMemberLabel: 'research@x',
+        },
+      ],
+    };
+    const out = renderWhere(view, PLAIN_PALETTE);
+    expect(out).toContain('Named sessions bound here (they outrank the folder rule above):');
+    expect(out).toContain('"Auth Work" -> Research (research@x, spare@x), live: research@x');
+    // The resume command quotes the alias as ONE single-quoted literal (paste-safe in PowerShell and
+    // POSIX shells alike; a double-quoted "$(...)" would run a command).
+    expect(out).toContain("start or resume it with: cctl claude --resume 'Auth Work'");
+    // Alongside a folder binding too, and before the VS Code snippet (whose JSON must still parse).
+    const both = renderWhere(
+      {
+        ...view,
+        bound: {
+          groupLabel: 'work',
+          matchedFolder: 'C:\\repos\\work',
+          members: ['work@me.com'],
+          profileDir: 'C:\\p',
+          liveMemberLabel: null,
+        },
+      },
+      PLAIN_PALETTE,
+    );
+    expect(both).toContain('"Auth Work" -> Research');
+    // The VS Code snippet is followed by the profile steps now, so the JSON is the text between its
+    // first opening and last closing brace.
+    expect(
+      () => JSON.parse(both.slice(both.indexOf('{'), both.lastIndexOf('}') + 1)) as unknown,
+    ).not.toThrow();
+    // The alias lines come before the VS Code advice.
+    expect(both.indexOf('Named sessions bound here')).toBeLessThan(both.indexOf('For VS Code'));
+  });
+
+  it('strips terminal controls from an alias it prints', () => {
+    const out = renderWhere(
+      {
+        folder: 'C:\\r',
+        bound: null,
+        aliases: [
+          {
+            alias: `x${String.fromCharCode(27)}[31m\u202e`,
+            groupLabel: 'g',
+            members: ['m'],
+            liveMemberLabel: null,
+          },
+        ],
+      },
+      PLAIN_PALETTE,
+    );
+    expect(out).not.toContain(String.fromCharCode(27));
+    expect(out).not.toContain('\u202e');
+    expect(out).toContain('live: none usable');
+  });
+});
+
+describe('renderBindingGroups — alias scopes', () => {
+  it('lists each alias scope under its group, sanitized', () => {
+    const out = renderBindingGroups(
+      [
+        {
+          label: 'Research',
+          folders: [],
+          aliases: [{ folder: 'C:\\repo', alias: `Auth${String.fromCharCode(27)}[2K Work` }],
+          members: [{ label: 'r', live: true, quarantined: false, excluded: false }],
+          profileDir: 'C:\\p',
+          noWorkingAccount: false,
+        },
+      ],
+      PLAIN_PALETTE,
+    );
+    expect(out).toContain('  session: "Auth[2K Work" in C:\\repo');
+    expect(out).not.toContain(String.fromCharCode(27));
   });
 });
 
@@ -1162,6 +1294,120 @@ describe('renderSessionDetails', () => {
     expect(stripAnsi(renderSessionDetails(views, ctx, ANSI_PALETTE))).toBe(
       renderSessionDetails(views, ctx, PLAIN_PALETTE),
     );
+  });
+});
+
+describe('renderSessionDetails — Bound to', () => {
+  const binding = (over: Partial<SessionBindingView> = {}): SessionBindingView => ({
+    via: 'alias',
+    folder: 'C:\\work\\app',
+    alias: 'Auth Work',
+    groupId: 'g1',
+    groupLabel: 'Research',
+    members: ['research@x'],
+    requiredSlot: 'group:g1',
+    slot: 'group:g1',
+    slotSource: 'env',
+    slotLabel: 'the Research binding',
+    inScope: true,
+    ...over,
+  });
+  const render = (b: SessionBindingView): string[] =>
+    renderSessionDetails(
+      [
+        {
+          meta: sessionMeta({ sessionId: 's', customTitle: 'Auth Work' }),
+          accounts: [],
+          binding: b,
+        },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'id' },
+    ).split('\n');
+
+  it('an out-of-scope session with a real id is resumed by that id, not by its shareable alias', () => {
+    const id = 'aaaaaaaa-0000-4000-8000-00000000000a';
+    const lines = renderSessionDetails(
+      [
+        {
+          meta: sessionMeta({ sessionId: id, customTitle: 'Auth Work' }),
+          accounts: [],
+          binding: binding({ slot: 'global', slotLabel: 'the shared account', inScope: false }),
+        },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'id' },
+    ).split('\n');
+    expect(lines).toContain(
+      `Scope     OUT of scope: it runs on the shared account; resume it with: cctl claude --resume ${id}`,
+    );
+  });
+
+  it('names the binding and the rule that matched, and says in scope', () => {
+    const lines = render(binding());
+    expect(lines).toContain(
+      'Bound to  Research (research@x)  by alias "Auth Work" in C:\\work\\app',
+    );
+    expect(lines).toContain('Scope     in scope');
+  });
+
+  it('says OUT of scope with where it runs and how to resume it on the bound account', () => {
+    const lines = render(
+      binding({ slot: 'global', slotLabel: 'the shared account', inScope: false }),
+    );
+    expect(lines).toContain(
+      // Single-quoted: the paste-safe literal (see resumeCommand).
+      "Scope     OUT of scope: it runs on the shared account; resume it with: cctl claude --resume 'Auth Work'",
+    );
+    // A recorded (not live) slot is reported in the past tense.
+    const recorded = render(
+      binding({
+        slot: 'global',
+        slotLabel: 'the shared account',
+        slotSource: 'recorded',
+        inScope: false,
+      }),
+    );
+    expect(recorded.join('\n')).toContain('it last ran on the shared account');
+  });
+
+  it('a folder binding, an unbound session and an unknown slot', () => {
+    expect(
+      render(binding({ via: 'folder', alias: null, folder: 'C:\\work' })).join('\n'),
+    ).toContain('Bound to  Research (research@x)  by folder C:\\work');
+    expect(
+      render(
+        binding({
+          via: null,
+          groupId: null,
+          groupLabel: null,
+          members: [],
+          folder: null,
+          alias: null,
+        }),
+      ),
+    ).toContain('Bound to  nothing: it runs on the shared account');
+    expect(render(binding({ slot: null, slotSource: null, inScope: null })).join('\n')).toContain(
+      'unknown (no slot recorded for this session yet)',
+    );
+  });
+
+  it('strips terminal controls from the bound alias and labels', () => {
+    const out = render(binding({ alias: HOSTILE_TITLE, groupLabel: HOSTILE_TITLE })).join('\n');
+    expect(out).not.toContain(ESC_CHAR);
+    expect(out).not.toContain('\u202e');
+    expect(out).not.toContain('\u0007');
+  });
+
+  it('carries the binding in the --json shape', () => {
+    const json = sessionViewJson({
+      meta: sessionMeta({ sessionId: 's' }),
+      accounts: [],
+      binding: binding({ inScope: false }),
+    });
+    expect(json.binding).toMatchObject({ via: 'alias', inScope: false, requiredSlot: 'group:g1' });
+    // No binding computed (the alias listing) -> no field.
+    expect(
+      sessionViewJson({ meta: sessionMeta({ sessionId: 's' }), accounts: [] }),
+    ).not.toHaveProperty('binding');
   });
 });
 

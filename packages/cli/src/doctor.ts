@@ -15,7 +15,12 @@ import {
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { isBindGuardInSettingsText } from '@claude-control/daemon';
-import type { SwitchEngine } from '@claude-control/switch-engine';
+import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  shellQuoteArg,
+  type SwitchEngine,
+} from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
@@ -326,6 +331,63 @@ export async function checkSlots(engine: Pick<SwitchEngine, 'checkSlots'>): Prom
   }
 }
 
+/** A binding with no folder and no session alias routes nothing: it is what a cctl without session
+ *  aliases leaves behind when it rewrites a file holding an alias-only binding (it drops the alias
+ *  scopes it does not know). Its accounts stay reserved to it — usable nowhere but with an explicit
+ *  `--account` — until a scope is bound to them again or the binding is dissolved. Flagged by name
+ *  with the release command (by id: stable and paste-safe). Also flagged: a session alias longer
+ *  than Claude Code keeps a session's name (bound before cctl refused those), which no session can
+ *  ever match — with the command that unbinds it. */
+export async function checkBindingScopes(
+  engine: Pick<SwitchEngine, 'listGroups'>,
+): Promise<DoctorCheck> {
+  try {
+    const groups = await engine.listGroups();
+    const scopeless = groups.filter(
+      (g) => g.folders.length === 0 && (g.aliases ?? []).length === 0,
+    );
+    const tooLong = groups.flatMap((g) =>
+      (g.aliases ?? []).filter((a) => !aliasFitsSessionTitle(a.alias)),
+    );
+    if (scopeless.length === 0 && tooLong.length === 0) {
+      return { name: 'binding-scopes', ok: true, detail: 'every binding has a folder or session' };
+    }
+    const problems: string[] = [];
+    if (scopeless.length > 0) {
+      problems.push(
+        `${scopeless.length} binding(s) route nothing (no folder or session left): ` +
+          scopeless
+            .map((g) => `${g.label} (${g.members.map((m) => m.label).join(', ')})`)
+            .join('; ') +
+          ' — bind a session or folder to those accounts again (cctl session bind / cctl bind), ' +
+          'or release them: ' +
+          scopeless.map((g) => `cctl unbind --group ${g.id}`).join('; '),
+      );
+    }
+    if (tooLong.length > 0) {
+      problems.push(
+        `${tooLong.length} session alias(es) never match a session (longer than the ` +
+          `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters Claude Code keeps of a session name) — ` +
+          'unbind them: ' +
+          tooLong
+            .map(
+              (a) =>
+                `cctl session unbind ${shellQuoteArg(a.alias, process.platform)} --cwd ` +
+                shellQuoteArg(a.folder, process.platform),
+            )
+            .join('; '),
+      );
+    }
+    return { name: 'binding-scopes', ok: false, detail: problems.join('; and ') };
+  } catch (err) {
+    return {
+      name: 'binding-scopes',
+      ok: false,
+      detail: `could not read the bindings: ${(err as Error).message}`,
+    };
+  }
+}
+
 /** The guard reads a snapshot copy of the groups file, stamped with the generation it was built
  *  from. If that lags the live groups generation, the guard is enforcing a stale binding view until
  *  the daemon restarts or a `cctl settings` change rewrites it. No groups + no snapshot is a pass
@@ -374,12 +436,14 @@ export async function checkGuardSnapshot(
 }
 
 /**
- * The folder-binding checks `cctl doctor` appends: slot invariants, guard snapshot freshness, guard
- * hook presence. They all read `groups.json`, and a doctor exists precisely for the day that file
- * cannot be read (corrupt, or written by a newer build) — so an unreadable registry is reported as
- * ONE failed `bindings` check naming the reason, and every other check still runs and reports, instead
- * of the whole command dying on the first read with nothing but that error. With the bindings unknown,
- * the guard hook is judged as if bindings exist: a missing guard may then be a real gap.
+ * The binding checks `cctl doctor` appends: slot invariants, bindings that route nothing (see
+ * {@link checkBindingScopes}), guard snapshot freshness, guard hook presence. They all read
+ * `groups.json`, and a doctor exists precisely for the day that file cannot be read (corrupt, or
+ * written by a newer build) — so an unreadable registry is reported as ONE failed `bindings` check
+ * naming the reason, and every other check still runs and reports, instead of the whole command dying
+ * on the first read with nothing but that error. The scope check is the one left out then: it has
+ * nothing to look at beyond the registry, and would only repeat that reason. With the bindings
+ * unknown, the guard hook is judged as if bindings exist: a missing guard may then be a real gap.
  */
 export async function checkFolderBindings(
   engine: Pick<SwitchEngine, 'listGroups' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
@@ -387,21 +451,21 @@ export async function checkFolderBindings(
 ): Promise<DoctorCheck[]> {
   const out: DoctorCheck[] = [];
   let hasBindings: boolean;
+  let readable = true;
   try {
     hasBindings = (await engine.listGroups()).length > 0;
   } catch (err) {
     hasBindings = true;
+    readable = false;
     out.push({
       name: 'bindings',
       ok: false,
       detail: `could not read the folder bindings: ${(err as Error).message}`,
     });
   }
-  out.push(
-    await checkSlots(engine),
-    await checkGuardSnapshot(engine),
-    checkGuardHook(paths, hasBindings),
-  );
+  out.push(await checkSlots(engine));
+  if (readable) out.push(await checkBindingScopes(engine));
+  out.push(await checkGuardSnapshot(engine), checkGuardHook(paths, hasBindings));
   return out;
 }
 

@@ -65,14 +65,16 @@ only the login differs.
 cctl bind <folder> <account>[,<account>...]   # bind a folder to one account or a set
 cctl unbind <folder>                          # remove a binding (dissolves the group on its last folder)
 cctl unbind <folder> --force                  # dissolve even while a session runs in the profile
+cctl unbind --group <id|label>                # dissolve a whole binding (all its folders and sessions)
 cctl bindings                                 # list every binding, its accounts, and which is live
 ```
 
 `cctl bind` reports what it changed: if a to-be-bound account was the global live account
 it is moved out first (the global slot switches to the best remaining shared account, and
 `bind` refuses if none is left), the account's isolated profile is prepared, and any
-sessions already running under the folder are named — they keep their old account until
-they are relaunched.
+sessions already running under the folder are named — they stay on the slot they started on
+until they are relaunched (a running session follows whatever login is live in its slot, and
+picks up a switch there on its next request).
 
 A **set** of accounts (`cctl bind C:\work alice,bob`) rotates internally: auto-switch and
 the phone's `/switch` move only among the set's members, never out to a global account.
@@ -112,6 +114,13 @@ cctl shell-init bash         # (also: zsh, fish)
 For PowerShell, `cctl shell-init powershell` prints a function to add to your profile
 (`$PROFILE`); afterwards typing `claude` in any bound folder starts on the right account,
 and typing it anywhere else behaves exactly as before. The command prints where to put it.
+
+One PowerShell caveat: the wrapper is a PowerShell _function_, and PowerShell binds a
+function's arguments before it runs — a bare `--` is consumed, an unquoted comma splits one
+argument into several, and `-name:value` splits at the colon. So through the wrapper
+`claude -p -- --resume x` resumes the session `x`, where a direct `claude.exe` call sends the
+prompt "--resume x", and `claude --resume=a,b` resumes "a". Quote such arguments (`'--'`,
+`'--resume=a,b'`, `'-r:x'`) or call `claude.exe` directly. The generated wrapper says so too.
 
 In **VS Code**, the Claude Code extension takes its environment from the
 `claudeCode.environmentVariables` setting (a list of `{ "name", "value" }` pairs). That
@@ -173,6 +182,181 @@ with `cctl claude --override`; to run a bound account against a folder it is not
 launch with `cctl claude --account <that account>`. Both are honored by the guard for that
 session only.
 
+### Binding a named session
+
+A binding can also name ONE session instead of a whole folder: its alias (the title you give
+it with `/rename` or `claude --name`) in the folder it belongs to. That conversation runs on
+the bound accounts whenever it is resumed, while the rest of the folder keeps its own binding
+(or the global account).
+
+Alias binding needs **Claude Code 2.1.283 or newer**: the guard reads a session's name from
+the `session_title` field Claude Code sends with each prompt (measured on 2.1.283), and never
+from the transcript. An older Claude Code does not send it, so every session looks unnamed:
+alias bindings do not apply, and a session started on an alias's accounts is stopped as
+unnamed.
+
+```
+cctl session bind                         # this session's alias, on the account it runs on now
+cctl session bind <alias> <account>[,<account>...]   # an alias in this folder, on those accounts
+cctl session bind <alias> <accounts> --cwd <folder>  # an alias in another folder
+cctl session unbind [alias]               # drop the binding (dissolves it when it was the last)
+cctl session unbind [alias] --accounts <refs>        # remove accounts from the binding instead
+```
+
+Run inside a Claude Code session (from a Bash tool or a `!` command), both commands default to
+that session: the alias is its own name and the folder is its own folder. Only a name you set
+counts — a session with just a generated title is refused with `name it first: /rename <alias>`,
+because a generated title changes under you. An alias longer than 200 characters is refused too:
+Claude Code keeps only the first 200 characters of a session's name, so no session could ever
+carry it. (A longer alias bound by an older cctl still loads; `cctl bindings` marks it as never
+matching and `cctl doctor` prints the command that unbinds it.) The accounts default to the one the session runs
+on right now; when the session runs on a config dir cctl does not manage (a `CLAUDE_CONFIG_DIR`
+that is neither the main config dir nor a live binding's profile), that account is unknown, so
+`bind` refuses and asks you to name the accounts, and `session show` reports its slot as
+unknown. Run from inside a session on a binding's profile, the commands still act on the main
+config dir.
+
+Binding an alias that is already bound **adds** the accounts to it ("add this session's account
+to the ones that alias uses"), so running `cctl session bind` from sessions on different
+accounts builds up the alias's list. If the binding also covers other folders or aliases (it was
+created for the same set of accounts), growing it would grow those too, so `bind` refuses and
+asks you to unbind the alias and bind it to the full list — and it re-checks that under the
+credential lock, so a `cctl bind` elsewhere that joins the same accounts in the meantime is
+never grown along with it. `--accounts` on `unbind` shrinks the same way; removing a live
+account first moves the slot to another of the alias's accounts, and when none of them can
+take it over (none left, or each fails to refresh right now) while a session runs on the
+binding, it refuses unless you pass `--force`.
+
+A running session counts for an alias when its transcript names it. When a live session's name
+cannot be learned at all — its transcript cannot be read (a sync client or a scanner holding it),
+or it has none yet (a fork, or a new session, before its first prompt) — and it runs in the
+alias's folder, it may be that conversation: dissolving or shrinking the binding is refused
+without `--force`, and the refusal says how many sessions could not be identified.
+
+A folder that was moved and replaced by a link (a junction or symlink) to its new home can still
+be unbound by its old path: `cctl session unbind --cwd <old path>` and `cctl unbind <old path>`
+look the binding up by the folder as spelled when the resolved path is not bound.
+`cctl unbind --group` dissolves the binding as it stands when it takes the credential lock —
+accounts another command added in the meantime are released with the rest — and prints what it
+released.
+
+Which account a session belongs on is decided by one rule, used by `cctl claude`, the guard,
+the daemon's phone spawns, `cctl where` and `cctl session show` alike:
+
+1. its alias is bound for the folder the conversation was **recorded** in -> that binding;
+2. else the longest bound folder containing the folder it runs in -> that binding;
+3. else the global account.
+
+The recorded folder is where the session was started (its transcript's first working
+directory). It matters because `claude --resume <alias>` run in a git repo root can also resume
+a session recorded in one of the repo's subfolders or worktrees (or in a sibling folder whose
+name starts with the root's): the resumed conversation keeps belonging to its own folder, so it
+is routed and checked by that folder's alias binding, and a same-titled conversation of another
+folder never runs on an alias's reserved accounts. An alias binding covers the conversations of
+its exact folder, not of its subfolders, and aliases compare the way `claude --resume` compares
+them: case-insensitive, ignoring surrounding spaces.
+
+**A fork belongs to the folder it is launched in.** `claude --resume <alias> --fork-session`
+(or `--continue --fork-session`) copies the conversation into a NEW session of the folder you
+run it in — Claude Code writes the fork's transcript to that folder's project directory with
+every working directory rewritten to it, under the same name. So a fork made in the bound
+folder stays on the alias's accounts, and a fork made from another folder (say the repo root, of
+a conversation recorded in a subfolder) is a conversation of that folder: it runs by that
+folder's own bindings, and the subfolder's alias binding no longer applies to it.
+
+`cctl claude`, the guard, `cctl session show` and the running-session check all read a
+transcript's recorded folder the same way:
+
+- the first line with a working directory within the transcript's first 1 MiB (Claude Code
+  writes a long first prompt twice before that line, so a smaller window would miss it);
+- moved by the last `relocated` line within its last 64 KiB — Claude Code records one when a
+  session enters or leaves a `.claude/worktrees/<name>` checkout, and re-appends it with the
+  session's title;
+- each trusted only when it agrees with the project directory the transcript lives in (Claude
+  Code names that directory after the folder the session started in); a relocation must stay
+  within the same repository's `.claude/worktrees`;
+- otherwise — no working directory within the window, one that disagrees, a transcript that does
+  not exist yet or cannot be read — the session counts for the folder it runs in when the project
+  directory's name can stand for that folder, and for no alias binding otherwise. The name is
+  lossy (`C:\a_b` and `C:\a-b` share one), so it never picks a bound folder the session does not
+  run in.
+
+`cctl claude` reads Claude Code's own arguments to see which session it opens — `--resume
+<alias>`, `--resume <session id>`, `--resume <path to a .jsonl transcript>`, `--continue` (the
+folder's most recent session; it wins when given together with `--resume`, as in Claude Code),
+`--name <alias>` (an empty name names nothing), `--session-id`, with or without `--fork-session`
+(a fork keeps its title and belongs to the launch folder) — then finds that session the way
+Claude Code will (the folder's sessions, plus the repo's subfolders and worktrees when Claude
+Code would search them, searched from the folder as Claude Code sees it: a junction or symlink
+in the working directory resolved) and launches it on the binding of the session's own name and
+recorded folder:
+
+```
+cctl claude --resume 'auth work'    # resumes the session on the accounts bound to "auth work"
+```
+
+A resume by text that matches only a generated title is an unnamed session (the folder rule
+applies). An interactive `claude --resume <text>` does not find sessions started with `-p` or
+the SDK (their picker reports no match), so an interactive launch does not route by them; a
+`-p` launch does. Subcommands (`claude mcp ...`, `claude doctor`) and Claude Code's other entry
+points (`claude rc`, `claude logs`, ...) open no session, so they run by the folder rule too. When the text matches several sessions that belong to different bindings, Claude Code
+decides which one opens (its picker), so the launch uses the folder rule and the guard judges
+the pick. `cctl claude` carries Claude Code 2.1.283's own option table; when your arguments hold
+an option it does not know before the session flags (or `--bg`), it cannot tell which session
+opens, so it launches by the folder rule and says so in one line:
+
+```
+cctl: could not tell which session these arguments open (unrecognized option "--x"); launching
+by the folder rule — the enforcement guard checks the session Claude Code opens
+```
+
+`cctl claude` reads a transcript's first and last 64 KiB for its name, as Claude Code's own
+search does, reads the recorded folder (above) only for the sessions the launch may open, and
+reads nothing at all when no binding has a session alias or no title the launch can end up with
+is bound.
+
+A session resumed from your phone follows the same rule: the daemon looks up the resumed
+session's name and recorded folder and starts it on that binding.
+
+The guard checks each prompt with the same rule. A named session that is running on the wrong
+account is stopped with how to fix it: the command resumes THAT session by its id — a name
+several sessions share would reopen Claude Code's picker, and the launcher could route the pick
+only by the folder rule:
+
+```
+cctl: session "auth work" in C:\repo is bound to research, but this session runs on the shared
+account. Exit and resume it with: cctl claude --resume 0b1c2d3e-4f50-4617-8899-aabbccddeeff
+```
+
+Before the session's transcript exists (its very first prompt) there is nothing to resume by id,
+so the command carries the whole alias as bound instead, quoted for your shell (single quotes:
+PowerShell on Windows, POSIX shells elsewhere), so it pastes as one argument whatever the alias
+holds: `cctl claude --resume 'auth work'`. `cctl session show` and the note `cctl session bind`
+prints about the session it runs in resume a session by its id the same way.
+
+A session on an alias's accounts that carries another name (renamed away, or another
+conversation altogether) is stopped too — start it again normally with `cctl claude`, or, if it
+is the bound session, rename it back — and so is a same-titled session recorded in another
+folder. `cctl bindings` lists alias bindings beside folder ones, `cctl where` names the aliases
+bound in a folder, and `cctl session show` adds a `Bound to` line and whether the session is in
+scope (`--json`: a `binding` field). If `session bind` is run from a session that the change
+leaves outside its binding, it says so: that session stays on the slot it started on until it
+exits (following whatever account is live there — a running session picks up its slot's
+current login on its next request), and its next prompt is flagged.
+
+**Mixing cctl versions.** While any alias binding exists, `groups.json` is written as schema 2,
+which a cctl without session aliases refuses to read (every command fails there, naming the
+schema) instead of silently dropping the aliases it does not know. Update every cctl on the
+machine — the daemon's included — before binding a session; once the last alias binding is
+gone the file goes back to schema 1. A binding left with no folder and no session (what an
+older cctl leaves when it rewrote such a file) still loads: it routes nothing, its accounts stay
+reserved, and `cctl bindings` / `cctl doctor` flag it. Bind a session or folder to the same
+accounts again to reuse it, or release it:
+
+```
+cctl unbind --group <id|label>     # dissolve a whole binding, whatever its folders and sessions
+```
+
 ### macOS
 
 Folder-bound accounts are **not supported on macOS yet** — `cctl bind` refuses there. The
@@ -213,8 +397,11 @@ timestamp against the daemon's switch journal to decide which account was live a
 time. Input, output, cache-write and cache-read tokens are reported separately — cache
 reads usually dominate, so one combined number would hide everything interesting.
 
-No network call is made and no daemon needs to be running. The same numbers reach the
-phone as `/stats`, pushed by the daemon every 15 minutes.
+No network call is made, and no daemon needs to be running to read them — but which account
+was live when comes from the daemon's switch journal, so a turn is attributed only once the
+daemon has run and synced that journal at least once; before that (measured), every turn reads
+as `unattributed`. The same numbers reach the phone as `/stats`, pushed by the daemon every 15
+minutes.
 
 On the phone, `/stats` with no options renders that pushed snapshot — instant, and up to
 15 minutes old. `/stats days:30` (1–90) asks for a different window instead, which makes
@@ -350,9 +537,15 @@ The account list is billed the same way as `cctl stats`: each turn goes to the a
 was live in the session's slot at that moment (the global slot, or its folder-bound group),
 so a session that ran on several accounts over its life lists them all, in the order it first
 used them, with turns, tokens and dates. `--json` prints the same data for scripts. Like
-`stats`, it reads local files only and needs no running daemon; a session's slot is known
-from the hooks the daemon receives, so turns from before the daemon saw the session are
+`stats`, it reads local files only and needs no running daemon — once the daemon has synced its
+switch journal at least once; until then every turn reads as `unattributed`. A session's slot is
+known from the hooks the daemon receives, so turns from before the daemon saw the session are
 billed against the global slot.
+
+`cctl session show` also says which account the session is bound to (see
+[Binding a named session](#binding-a-named-session)) and whether it runs there: for the session
+you run it from, by the account that session is on now; for any other, by the slot the daemon
+last recorded for it.
 
 ## Prompts to idle sessions
 
