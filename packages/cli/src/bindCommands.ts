@@ -17,6 +17,7 @@ import {
   folderUniquenessKey,
   groupSlotId,
   profilesRoot,
+  recordedFolderFor,
   resolveAccountRef,
   resolveBinding,
   resolveSessionBinding,
@@ -57,10 +58,11 @@ import {
   resolveLaunchSessions,
   resolveLaunchTarget,
   spawnClaude,
+  type LaunchCandidate,
   type LaunchSessionDeps,
   type LaunchSlot,
 } from './launcher.js';
-import { launchSessionStore } from './launchSessionStore.js';
+import { claudeCodeCwd, launchSessionStore } from './launchSessionStore.js';
 import { canonicalOrRaw } from './sessionAliases.js';
 import {
   isSupportedShell,
@@ -219,17 +221,23 @@ export function uncertainLaunchNote(reason: string): string {
  * Claude Code's own arguments open (launcher.ts resolveLaunchSessions): its title, and the folder
  * its conversation is RECORDED in — `claude --resume X` in a repository can reach sessions recorded
  * in subfolders and worktrees, and a resumed session keeps its original folder, so that recorded
- * folder is the one an alias scope is matched against; the folder rule always uses the launch
- * folder. When the arguments allow several sessions (a title several sessions share, a newest
- * transcript from another folder), the launch routes to a binding only if EVERY candidate maps to
- * the same one; otherwise, and whenever the arguments are uncertain, it launches by the folder rule
- * and leaves the pick to the enforcement guard.
+ * folder is the one an alias scope is matched against (a fork is a new conversation of the launch
+ * folder); the folder rule always uses the launch folder. The recorded folder is decided exactly as
+ * the enforcement guard decides it (switch-engine recordedFolderFor over readRecordedFolder), so
+ * the two can never disagree about a session. When the arguments allow several sessions (a title
+ * several sessions share, a newest transcript from another folder), the launch routes to a binding
+ * only if EVERY candidate maps to the same one; otherwise, and whenever the arguments are uncertain,
+ * it launches by the folder rule and leaves the pick to the enforcement guard.
  *
  * Nothing is parsed or read when no binding has an alias scope — no title could change the answer.
  */
 export async function resolveLaunchBinding(input: {
   /** The canonical launch folder. */
   folder: string;
+  /** The launch folder as Claude Code spells it (see launchSessionStore's claudeCodeCwd): what a
+   *  transcript's project-directory name is matched against when it records no folder of its own.
+   *  Default: {@link folder}. */
+  launchSpelling?: string;
   /** Claude Code's argv, read and never modified. */
   args: readonly string[];
   groups: readonly StoredGroup[];
@@ -260,6 +268,14 @@ export async function resolveLaunchBinding(input: {
 
   const canonical =
     input.canonicalFolder ?? ((f: string) => canonicalStoredFolder(f, input.platform));
+  const running = { spelled: input.launchSpelling ?? input.folder, canonical: input.folder };
+  /** The folder the candidate's conversation belongs to, as the guard will judge it. */
+  const recordedFolder = (c: LaunchCandidate): string | null =>
+    c.dirName === undefined
+      ? c.folder === null
+        ? null
+        : canonical(c.folder)
+      : recordedFolderFor({ folder: c.folder, dirName: c.dirName }, running, canonical);
   const targets = opened.candidates.map((c) => ({
     title: c.title,
     binding: resolveSessionBinding(
@@ -267,7 +283,7 @@ export async function resolveLaunchBinding(input: {
       c.title,
       scoped,
       input.platform,
-      c.folder === null ? null : canonical(c.folder),
+      recordedFolder(c),
     ),
   }));
   const first = targets[0];
@@ -278,6 +294,40 @@ export async function resolveLaunchBinding(input: {
     binding: first.binding,
     alias: first.binding?.via === 'alias' ? first.title : null,
     note: null,
+  };
+}
+
+/**
+ * Where `cctl claude` run in `cwd` searches for the session it opens, and how it spells and
+ * canonicalizes folders: the launch folder (canonical, the folder rule's key), the launch folder as
+ * Claude Code spells it (it resolves a junction or symlink in its cwd before naming its project
+ * directory, so its session search runs from that spelling, not the one the shell reports), Claude
+ * Code's session store searched from there, and the canonicalizer for a recorded folder. The one
+ * wiring the launcher uses; its tests drive it with a sandbox config dir.
+ */
+export function launchSessionContext(opts: {
+  cwd: string;
+  claudeDir: string;
+  platform: NodeJS.Platform;
+  /** The git worktree list (default: `git worktree list`); injected by tests. */
+  gitWorktrees?: (cwd: string) => Promise<string[]>;
+}): {
+  folder: string;
+  launchSpelling: string;
+  sessions: LaunchSessionDeps;
+  canonicalFolder: (folder: string) => string;
+} {
+  const ccCwd = claudeCodeCwd(opts.cwd);
+  return {
+    folder: canonicalizeCliFolder(opts.cwd),
+    launchSpelling: ccCwd,
+    sessions: launchSessionStore({
+      claudeDir: opts.claudeDir,
+      cwd: ccCwd,
+      platform: opts.platform,
+      ...(opts.gitWorktrees !== undefined ? { gitWorktrees: opts.gitWorktrees } : {}),
+    }),
+    canonicalFolder: (folder) => canonicalOrRaw(folder, { platform: opts.platform, cwd: opts.cwd }),
   };
 }
 
@@ -553,13 +603,16 @@ export function relaxationBannerLine(
   kind: 'override' | 'explicit',
   label: string,
   cwd: string,
+  reservedTo: 'folders' | 'bindings' = 'folders',
 ): string {
   const safeLabel = sanitizeForTerminal(label);
   const safeCwd = sanitizeForTerminal(cwd);
+  // An account whose binding holds a session alias is reserved to its bindings, one bound only to
+  // folders to its folders — the guard's own --account notice words it the same way.
   return kind === 'override'
     ? `cctl: --override in effect: allowing ${safeLabel} in ${safeCwd}, which is bound to a ` +
         `different account.\n`
-    : `cctl: --account in effect: ${safeLabel} is reserved to its folders; running it in ` +
+    : `cctl: --account in effect: ${safeLabel} is reserved to its ${reservedTo}; running it in ` +
         `${safeCwd} on purpose.\n`;
 }
 
@@ -577,6 +630,8 @@ async function runClaude(opts: {
 
   let slot: LaunchSlot;
   let explicit = false;
+  /** What an explicitly launched reserved account is reserved to, for its notice. */
+  let reservedTo: 'folders' | 'bindings' = 'folders';
 
   if (opts.account !== undefined) {
     explicit = true;
@@ -604,6 +659,7 @@ async function runClaude(opts: {
         label: acct.label,
         context: `explicit account, ${describeGroupScopes(group)}`,
       };
+      if ((group.aliases ?? []).length > 0) reservedTo = 'bindings';
     } else {
       // A shared account can only be live in the global slot, and only one at a time — so --account
       // of a shared account is honored ONLY when it is already the global live account.
@@ -622,15 +678,12 @@ async function runClaude(opts: {
     // Code's own arguments open (matched in the folder that session is recorded in), else the cwd's
     // folder binding, else global. The argv is only read here; it is passed to the child untouched
     // below.
-    const canonical = canonicalizeCliFolder(process.cwd());
     const groups = await engine.listGroups();
     const { binding, alias, note } = await resolveLaunchBinding({
-      folder: canonical,
+      ...launchSessionContext({ cwd: process.cwd(), claudeDir: paths.claudeDir, platform }),
       args: opts.args,
       groups,
       platform,
-      sessions: launchSessionStore({ claudeDir: paths.claudeDir, cwd: process.cwd(), platform }),
-      canonicalFolder: (folder) => canonicalOrRaw(folder, { platform, cwd: process.cwd() }),
     });
     if (note !== null) process.stderr.write(note);
     if (binding !== null) {
@@ -731,7 +784,7 @@ async function runClaude(opts: {
     process.stderr.write(relaxationBannerLine('override', slot.label, process.cwd()));
   }
   if (explicitToken !== undefined) {
-    process.stderr.write(relaxationBannerLine('explicit', slot.label, process.cwd()));
+    process.stderr.write(relaxationBannerLine('explicit', slot.label, process.cwd(), reservedTo));
   }
 
   try {

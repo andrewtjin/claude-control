@@ -5,7 +5,15 @@
 // launch.
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -13,6 +21,7 @@ import { projectDirStem } from '@claude-control/switch-engine';
 import type { LaunchSessionFacts } from './launcher.js';
 import {
   TRANSCRIPT_WINDOW_BYTES,
+  claudeCodeCwd,
   firstLineValue,
   gitWorktreeList,
   hasLossyProjectName,
@@ -309,13 +318,25 @@ describe('launchSessionStore', () => {
   function session(
     dirOf: string,
     id: string,
-    opts: { cwd?: string | null; title?: string; ai?: string; relocated?: string } = {},
+    opts: {
+      cwd?: string | null;
+      title?: string;
+      ai?: string;
+      relocated?: string;
+      prompt?: string;
+    } = {},
   ): string {
     const dir = join(claudeDir, 'projects', projectDirStem(dirOf));
     mkdirSync(dir, { recursive: true });
     const file = join(dir, `${id}.jsonl`);
     const lines: string[] = [];
     const cwd = opts.cwd === undefined ? dirOf : opts.cwd;
+    if (opts.prompt !== undefined) {
+      // Claude Code writes a first prompt twice before the first cwd: a queue-operation line, then
+      // the user line, whose cwd FOLLOWS the message.
+      lines.push(line({ type: 'queue-operation', operation: 'enqueue', content: opts.prompt }));
+      lines.push(line({ type: 'user', message: { role: 'user', content: opts.prompt }, cwd }));
+    }
     lines.push(cwd === null ? line({ type: 'summary', summary: 's' }) : user(cwd));
     if (opts.ai !== undefined) lines.push(line({ type: 'ai-title', aiTitle: opts.ai }));
     if (opts.title !== undefined)
@@ -408,7 +429,11 @@ describe('launchSessionStore', () => {
       });
       session(join(base, 'unrelated'), 'aaaaaaaa-0000-4000-8000-000000000002', { title: 'Moved' });
       const { s } = counted(lossy);
-      expect((await s.sessionsTitled('Moved')).map((f) => f.folder)).toEqual([lossy]);
+      const found = await s.sessionsTitled('Moved');
+      expect(titles(found)).toEqual(['Moved']);
+      // Found by Claude Code's own search; its conversation still belongs to the folder it was
+      // launched in, because a relocation outside that folder's worktree root is not trusted.
+      expect(found.map((f) => f.folder)).toEqual([join(base, 'origin')]);
     });
 
     it('does not widen when the folder has a session of its own', async () => {
@@ -423,13 +448,24 @@ describe('launchSessionStore', () => {
       expect(reads).toHaveLength(1); // only the folder's own transcript
     });
 
+    it('reads the recorded folder behind a long first prompt, past Claude Code’s quick-read window', async () => {
+      const w = join(base, 'w');
+      session(w, 'aaaaaaaa-0000-4000-8000-000000000001', {
+        title: 'Big',
+        prompt: 'x'.repeat(70 * 1024),
+      });
+      const { s } = counted(w);
+      expect((await s.sessionsTitled('Big')).map((f) => f.folder)).toEqual([w]);
+    });
+
     it('keeps one entry per session id, the newest copy winning', async () => {
       const w = join(base, 'w');
       const id = 'aaaaaaaa-0000-4000-8000-000000000001';
+      const worktree = join(w, '.claude', 'worktrees', 'x');
       session(w, id, { title: 'Dup', cwd: w });
-      session(join(base, 'w--claude-worktrees-x'), id, { title: 'Dup', cwd: join(base, 'newer') });
+      session(worktree, id, { title: 'Dup' });
       const { s } = counted(w);
-      expect((await s.sessionsTitled('Dup')).map((f) => f.folder)).toEqual([join(base, 'newer')]);
+      expect((await s.sessionsTitled('Dup')).map((f) => f.folder)).toEqual([worktree]);
     });
   });
 
@@ -451,6 +487,50 @@ describe('launchSessionStore', () => {
       const { s, reads } = counted(here);
       expect(titles(await s.continueSessions())).toEqual(['Mine', 'Theirs']);
       expect(reads).toHaveLength(2);
+    });
+
+    it('continues a session whose first cwd lies past Claude Code’s quick-read window', async () => {
+      // Measured: Claude Code's --continue opened the newest session although its first cwd sat at
+      // ~144 KB; routing by the older one would put the session on the wrong account.
+      const w = join(base, 'w');
+      session(w, 'aaaaaaaa-0000-4000-8000-000000000001', { title: 'Older' });
+      session(w, 'aaaaaaaa-0000-4000-8000-000000000002', {
+        title: 'Big',
+        prompt: 'x'.repeat(70 * 1024),
+      });
+      const { s } = counted(w);
+      const found = await s.continueSessions();
+      expect(found.map((f) => [f.customTitle, f.folder])).toEqual([['Big', w]]);
+    });
+
+    it('a transcript whose first cwd lies past even the shared window counts for this folder', async () => {
+      const w = join(base, 'w');
+      session(w, 'aaaaaaaa-0000-4000-8000-000000000001', { title: 'Older' });
+      session(w, 'aaaaaaaa-0000-4000-8000-000000000002', {
+        title: 'Huge',
+        prompt: 'x'.repeat(1_200_000),
+      });
+      const { s } = counted(w);
+      const found = await s.continueSessions();
+      expect(found.map((f) => [f.customTitle, f.folder, f.dirName])).toEqual([
+        ['Huge', null, projectDirStem(w)],
+      ]);
+    });
+
+    it('names nothing when the newest transcript cannot be read', async () => {
+      const w = join(base, 'w');
+      session(w, 'aaaaaaaa-0000-4000-8000-000000000001', { title: 'Older' });
+      session(w, 'aaaaaaaa-0000-4000-8000-000000000002', { title: 'Locked' });
+      const { s } = counted(w, {
+        readFolder: (file) => ({
+          status: file.endsWith('2.jsonl') ? 'unreadable' : 'read',
+          dirName: projectDirStem(w),
+          launchFolder: w,
+          folder: w,
+          sawCwd: true,
+        }),
+      });
+      expect(await s.continueSessions()).toEqual([]);
     });
 
     it('skips a transcript that records no folder (nothing to continue)', async () => {
@@ -498,6 +578,15 @@ describe('launchSessionStore', () => {
     expect(await s.sessionAtPath(join(base, 'missing.jsonl'))).toBeNull();
   });
 
+  it('sessionById and sessionAtPath carry the recorded folder and the project directory', async () => {
+    const w = join(base, 'w');
+    const file = session(w, 'aaaaaaaa-0000-4000-8000-00000000000d', { title: 'P' });
+    const { s } = counted(base);
+    const expected = { customTitle: 'P', aiTitle: null, folder: w, dirName: projectDirStem(w) };
+    expect(await s.sessionById('aaaaaaaa-0000-4000-8000-00000000000d')).toEqual(expected);
+    expect(await s.sessionAtPath(file)).toEqual(expected);
+  });
+
   it('a missing projects directory is an empty store', async () => {
     const s = launchSessionStore({
       claudeDir: join(base, 'no-such-config'),
@@ -508,5 +597,21 @@ describe('launchSessionStore', () => {
     expect(await s.sessionsTitled('x')).toEqual([]);
     expect(await s.continueSessions()).toEqual([]);
     expect(await s.sessionById('aaaaaaaa-0000-4000-8000-000000000000')).toBeNull();
+  });
+});
+
+describe('claudeCodeCwd', () => {
+  it('resolves a link in the launch folder the way Claude Code does, and keeps an unresolvable one', () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'cctl-lss-link-')));
+    try {
+      const real = join(base, 'real');
+      mkdirSync(real);
+      const link = join(base, 'link');
+      symlinkSync(real, link, process.platform === 'win32' ? 'junction' : 'dir');
+      expect(claudeCodeCwd(link)).toBe(real);
+      expect(claudeCodeCwd(join(base, 'missing'))).toBe(join(base, 'missing'));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });

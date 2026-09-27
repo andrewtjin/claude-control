@@ -525,12 +525,18 @@ describe('subcommands and paths that open no session', () => {
   });
 });
 
-/** Facts for a session a stand-in store returns. */
+/** Facts for a session a stand-in store returns (with its project directory when given). */
 const facts = (
   customTitle: string | null,
   folder: string | null = 'C:\\work',
   aiTitle: string | null = null,
-): LaunchSessionFacts => ({ customTitle, aiTitle, folder });
+  dirName?: string,
+): LaunchSessionFacts => ({
+  customTitle,
+  aiTitle,
+  folder,
+  ...(dirName !== undefined ? { dirName } : {}),
+});
 
 /** A stand-in session store that records every lookup it is asked. */
 function store(answers: {
@@ -706,11 +712,41 @@ describe('resolveLaunchSessions', () => {
     ]);
   });
 
-  it('a fork keeps the resumed title', async () => {
-    const { deps } = store({ titled: [facts('Auth Work')] });
+  it('a fork keeps the resumed title but is a new conversation of the LAUNCH folder', async () => {
+    // Measured: a fork of a session recorded in repo/sub, launched from repo, is written to repo's
+    // project directory with every cwd rewritten to repo.
+    const { deps } = store({ titled: [facts('Auth Work', 'C:\\work\\sub')] });
     expect(await candidates(['-r', 'Auth Work', '--fork-session'], deps, ctx('auth work'))).toEqual(
       [{ title: 'Auth Work', folder: 'C:\\work' }],
     );
+    const byId = store({ byId: { [ID]: facts('Auth Work', 'C:\\elsewhere') } });
+    expect(await candidates(['--fork-session', '-r', ID], byId.deps, ctx('auth work'))).toEqual([
+      { title: 'Auth Work', folder: 'C:\\work' },
+    ]);
+  });
+
+  it('-c --fork-session: every session --continue may open becomes a conversation of the launch folder', async () => {
+    const { deps } = store({
+      continued: [facts('Other', 'C:\\a-b'), facts('Auth Work', 'C:\\a_b', null, 'C--a-b')],
+    });
+    expect(await candidates(['-c', '--fork-session'], deps, ctx('auth work'))).toEqual([
+      { title: 'Other', folder: 'C:\\work' },
+      { title: 'Auth Work', folder: 'C:\\work' },
+    ]);
+  });
+
+  it('--fork-session without --resume or --continue changes nothing', async () => {
+    const { deps } = store({ byId: { [ID]: facts('Existing', 'C:\\old') } });
+    expect(await candidates(['--session-id', ID, '--fork-session'], deps, ctx('existing'))).toEqual(
+      [{ title: 'Existing', folder: 'C:\\old' }],
+    );
+  });
+
+  it('an existing session carries its project directory for the fallback', async () => {
+    const { deps } = store({ titled: [facts('Auth Work', null, null, 'C--work')] });
+    expect(await candidates(['-r', 'Auth Work'], deps, ctx('auth work'))).toEqual([
+      { title: 'Auth Work', folder: null, dirName: 'C--work' },
+    ]);
   });
 
   it('--session-id alone names an existing session, else a new one; a malformed id none', async () => {
@@ -938,6 +974,60 @@ describe('resolveLaunchBinding', () => {
       sessions: store({ titled: [facts('Auth Work', null)] }).deps,
     });
     expect(res.binding).toMatchObject({ groupId: 'folder', via: 'folder' });
+  });
+
+  it('with no trusted folder, its project directory stands for the launch folder only when it can', async () => {
+    // The guard's fallback exactly (switch-engine recordedFolderFor): the directory named after the
+    // launch folder as Claude Code spells it (here a link to the launch folder) counts as the launch
+    // folder's; a directory the launch folder's name cannot produce counts for no folder.
+    const here = await resolveLaunchBinding({
+      folder: 'C:\\work',
+      launchSpelling: 'C:\\link',
+      args: ['-r', 'Auth Work'],
+      groups: GROUPS,
+      platform: 'win32',
+      sessions: store({ titled: [facts('Auth Work', null, null, 'C--link')] }).deps,
+    });
+    expect(here.binding).toMatchObject({ groupId: 'alias', via: 'alias', folder: 'C:\\work' });
+    const elsewhere = await resolveLaunchBinding({
+      folder: 'C:\\work',
+      launchSpelling: 'C:\\link',
+      args: ['-r', 'Auth Work'],
+      groups: GROUPS,
+      platform: 'win32',
+      sessions: store({ titled: [facts('Auth Work', null, null, 'C--work-sub')] }).deps,
+    });
+    expect(elsewhere.binding).toMatchObject({ groupId: 'folder', via: 'folder' });
+  });
+
+  it('a fork of a bound conversation launched from ANOTHER folder follows that folder', async () => {
+    const groups = [group('sub', [], [{ folder: 'C:\\repo\\sub', alias: 'X' }])];
+    const sessions = store({ titled: [facts('X', 'C:\\repo\\sub')] }).deps;
+    const resumed = await resolveLaunchBinding({
+      folder: 'C:\\repo',
+      args: ['-r', 'X'],
+      groups,
+      platform: 'win32',
+      sessions,
+    });
+    expect(resumed.binding).toMatchObject({ groupId: 'sub', via: 'alias' });
+    const forked = await resolveLaunchBinding({
+      folder: 'C:\\repo',
+      args: ['-r', 'X', '--fork-session'],
+      groups,
+      platform: 'win32',
+      sessions,
+    });
+    expect(forked.binding).toBeNull();
+    // Forked in its own folder it stays bound.
+    const here = await resolveLaunchBinding({
+      folder: 'C:\\repo\\sub',
+      args: ['-r', 'X', '--fork-session'],
+      groups,
+      platform: 'win32',
+      sessions,
+    });
+    expect(here.binding).toMatchObject({ groupId: 'sub', via: 'alias' });
   });
 
   it('several candidates that map to DIFFERENT targets launch by the folder rule', async () => {

@@ -571,7 +571,10 @@ export interface ClaudeSessionArgs {
   name?: string;
   /** `--session-id <uuid>`. */
   sessionId?: string;
-  /** `--fork-session`: a new id, but the SAME title — so it never changes which alias applies. */
+  /** `--fork-session`: the resumed or continued conversation is copied into a NEW session of the
+   *  launch folder (a new id, the same title; measured: a fork of a session recorded in `repo/sub`,
+   *  launched from `repo`, is written to repo's project directory with every cwd rewritten to
+   *  `repo`). So a fork belongs to the folder it is launched in, not to the one it came from. */
   fork: boolean;
   /** Set when no session opens: the first operand names a subcommand, or the first word is one of
    *  Claude Code's fast paths. */
@@ -707,16 +710,21 @@ export function parseClaudeSessionArgs(args: readonly string[]): ClaudeSessionAr
   return out;
 }
 
-/** What the launcher knows about one Claude Code session: Claude Code's own quick read of its
- *  transcript (see launchSessionStore.ts). */
+/** What the launcher knows about one Claude Code session: its titles, from Claude Code's own quick
+ *  read of its transcript, and the folder its conversation belongs to, from the one recorded-folder
+ *  reading every consumer of an alias binding uses (switch-engine readRecordedFolder; see
+ *  launchSessionStore.ts). */
 export interface LaunchSessionFacts {
   /** The last custom title (`/rename`, `--name`); null when none is recorded. */
   customTitle: string | null;
   /** The last generated title; null when none is recorded. */
   aiTitle: string | null;
-  /** The folder the conversation belongs to: its last relocation, else the first cwd it records;
-   *  null when it records neither. */
+  /** The folder the conversation belongs to, as recorded and trusted (readRecordedFolder's
+   *  `folder`); null when none is. */
   folder: string | null;
+  /** The project directory the transcript lives in: with no trusted folder, it stands for the launch
+   *  folder when it can (recordedFolderFor). Absent = unknown, so no fallback applies. */
+  dirName?: string;
 }
 
 /**
@@ -741,9 +749,12 @@ export interface LaunchSessionDeps {
 export interface LaunchCandidate {
   /** Its custom title once open (a `--name` renames it); null = unnamed. */
   title: string | null;
-  /** The folder its conversation belongs to (a new session: the launch folder); null = none is
-   *  recorded, so no alias scope can apply to it. */
+  /** The folder its conversation belongs to: the recorded one of an existing session, the launch
+   *  folder for a new session or a fork; null = none is recorded (see {@link dirName}). */
   folder: string | null;
+  /** An existing session's project directory, the fallback when no folder is recorded (see
+   *  {@link LaunchSessionFacts.dirName}). */
+  dirName?: string;
 }
 
 /** Which session(s) a launch may open. `candidates` empty = no session opens, or the launcher
@@ -789,8 +800,11 @@ const FOLDER_RULE: LaunchSessions = { kind: 'candidates', candidates: [] };
  *     search matches — one resumes, several open a picker the enforcement guard then judges;
  *   - `--session-id <uuid>` alone: that session if it exists, else a new one;
  *   - otherwise a new session, recorded in the launch folder.
- * `--name v` renames whatever opens to v; `--fork-session` keeps the forked session's title. A match
- * found only by its GENERATED title opens as an unnamed session (only a custom title binds).
+ * `--name v` renames whatever opens to v. `--fork-session` copies what `--continue` / `--resume`
+ * opens into a NEW conversation of the launch folder under the same title, so a fork's folder is the
+ * launch folder, whatever folder it was forked from — exactly what the enforcement guard sees once
+ * the fork runs. A match found only by its GENERATED title opens as an unnamed session (only a custom
+ * title binds).
  *
  * Reads are skipped whenever no title the launch can end up with is bound: a `--name` bound nowhere
  * settles every candidate before anything is read, and so does a resume title bound nowhere.
@@ -806,11 +820,14 @@ export async function resolveLaunchSessions(
   const isBound = (title: string): boolean => context.boundAliasKeys.has(aliasKey(title));
   if (name !== undefined && !isBound(name)) return FOLDER_RULE;
 
-  /** An existing session as it will open: renamed by --name, else under its own custom title. */
-  const opened = (s: LaunchSessionFacts): LaunchCandidate => ({
-    title: name ?? namedTitle(s.customTitle),
-    folder: s.folder,
-  });
+  /** An existing session as it will open: renamed by --name, else under its own custom title; in
+   *  its own recorded folder, or — forked — as a new conversation of the launch folder. */
+  const fork = parsed.fork && (parsed.continue || parsed.resume !== undefined);
+  const opened = (s: LaunchSessionFacts): LaunchCandidate => {
+    const title = name ?? namedTitle(s.customTitle);
+    if (fork) return { title, folder: context.launchFolder };
+    return { title, folder: s.folder, ...(s.dirName !== undefined ? { dirName: s.dirName } : {}) };
+  };
   const found = (s: LaunchSessionFacts | null): LaunchSessions => ({
     kind: 'candidates',
     candidates: s === null ? [] : [opened(s)],

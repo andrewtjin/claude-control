@@ -4,15 +4,23 @@
 // launcher.ts resolveLaunchSessions for how the answers are used). Read-only, offline, and never
 // fatal: an unreadable directory or transcript is simply not a candidate.
 //
-// HOW A TRANSCRIPT IS READ. Claude Code's session listings never parse a whole transcript: they read
-// its first and last 64 KiB and take the last custom / generated title in the tail (else in the
-// head), the last relocation in the tail, and the first recorded cwd in the head. This module reads
-// exactly those windows with exactly those rules, so it sees what Claude Code's search sees — and
-// shares its one blind spot: a title written only in the middle of a transcript longer than 128 KiB
-// (a /rename deep into a long session that has not exited since; titles are re-appended at exit) is
-// invisible to both. The payoff is a bounded cost of two small reads per transcript however long it
-// grows. When the session that opens carries a title this read missed, the enforcement guard, which
-// checks every prompt against the live title, still has the last word.
+// HOW A TRANSCRIPT IS READ. Two readings, for two different questions.
+//   - WHICH SESSIONS CLAUDE CODE CAN OPEN (its titles, and the folders its widened search keys
+//     directories by): Claude Code's own quick read. Its session listings never parse a whole
+//     transcript: they read its first and last 64 KiB and take the last custom / generated title in
+//     the tail (else in the head), the last relocation in the tail, and the first recorded cwd in the
+//     head. This module reads exactly those windows with exactly those rules, so it sees what Claude
+//     Code's search sees — and shares its one blind spot: a title written only in the middle of a
+//     transcript longer than 128 KiB (a /rename deep into a long session that has not exited since;
+//     titles are re-appended at exit) is invisible to both. When the session that opens carries a
+//     title this read missed, the enforcement guard, which checks every prompt against the live
+//     title, still has the last word.
+//   - WHICH FOLDER A SESSION'S CONVERSATION BELONGS TO (the key of an alias binding): switch-engine's
+//     readRecordedFolder, the reading the enforcement guard, the session catalog and the
+//     running-session scan use too — a larger head window (a long first prompt pushes the first cwd
+//     past 64 KiB), relocations, and a consistency check against the project-directory name. It is
+//     read only for the sessions the launch may open, never for every transcript searched.
+// Both are bounded reads, whatever a transcript's length.
 //
 // WHERE IT LOOKS (`--resume <text>`). Claude Code searches from the launch folder with the git
 // worktrees of its repository: with at most one worktree, the folder's own project directory plus
@@ -31,10 +39,17 @@
 // would change the pick, the launcher's pick can differ, and the guard judges the session that opens.
 
 import { execFile } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import * as nodeFs from 'node:fs';
 import { open, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { aliasKey, projectDirMatches, projectDirStem } from '@claude-control/switch-engine';
+import {
+  RECORDED_FOLDER_HEAD_BYTES,
+  aliasKey,
+  projectDirMatches,
+  projectDirStem,
+  readRecordedFolder,
+  type RecordedFolderRead,
+} from '@claude-control/switch-engine';
 import { sameFolder } from '@claude-control/daemon';
 import type { LaunchSessionDeps, LaunchSessionFacts } from './launcher.js';
 
@@ -53,8 +68,20 @@ const IO_CONCURRENCY = 16;
  *  has a lossy name, which is what lets its search widen (see the file header). */
 const LOSSY_NAME_CHAR = /[^a-zA-Z0-9/\\:-]/;
 
+/** Claude Code's quick read of one transcript: its titles, and the folder its own search keys the
+ *  transcript's directory by (the last relocation in the tail, else the first cwd in the head). */
+export interface TranscriptQuickRead {
+  /** The last custom title (`/rename`, `--name`); null when none is recorded. */
+  customTitle: string | null;
+  /** The last generated title; null when none is recorded. */
+  aiTitle: string | null;
+  /** The folder as Claude Code's quick read sees it; null when its windows record none. Used only to
+   *  predict Claude Code's search — never as a binding key (see the file header). */
+  folder: string | null;
+}
+
 /** No title, no folder: an empty transcript, or one whose windows record neither. */
-const NOTHING_RECORDED: LaunchSessionFacts = { customTitle: null, aiTitle: null, folder: null };
+const NOTHING_RECORDED: TranscriptQuickRead = { customTitle: null, aiTitle: null, folder: null };
 
 // ---------------------------------------------------------------------------
 // Reading one transcript (Claude Code's quick read)
@@ -157,9 +184,10 @@ function parseRecord(line: string): Record<string, unknown> | null {
   }
 }
 
-/** A session's titles and folder from its transcript's head and tail windows (see the file header).
- *  Pure: the IO is {@link readTranscriptFacts}. A blank recorded folder counts as none. */
-export function transcriptFacts(head: string, tail: string): LaunchSessionFacts {
+/** A session's titles and folder from its transcript's head and tail windows — Claude Code's quick
+ *  read (see the file header). Pure: the IO is {@link readTranscriptFacts}. A blank recorded folder
+ *  counts as none. */
+export function transcriptFacts(head: string, tail: string): TranscriptQuickRead {
   if (head === '') return NOTHING_RECORDED;
   const folder =
     lastTypedLineValue(tail, 'relocatedCwd', 'relocated') ?? firstLineValue(head, 'cwd');
@@ -173,7 +201,7 @@ export function transcriptFacts(head: string, tail: string): LaunchSessionFacts 
 
 /** Read a transcript's head and tail windows (one read when the file fits in one) and extract its
  *  facts. Null when the file cannot be opened or read — never a throw. */
-export async function readTranscriptFacts(file: string): Promise<LaunchSessionFacts | null> {
+export async function readTranscriptFacts(file: string): Promise<TranscriptQuickRead | null> {
   let handle;
   try {
     handle = await open(file, 'r');
@@ -318,11 +346,12 @@ interface SessionFile {
   sessionId: string;
   file: string;
   mtimeMs: number;
+  size: number;
 }
 
-/** A transcript file with its facts (null when it could not be read). */
+/** A transcript file with Claude Code's quick read of it (null when it could not be read). */
 interface ReadSession extends SessionFile {
-  facts: LaunchSessionFacts | null;
+  facts: TranscriptQuickRead | null;
 }
 
 /** Run `fn` over `items` with at most `limit` in flight, keeping order. */
@@ -365,8 +394,8 @@ async function listSessionFiles(dir: string): Promise<SessionFile[]> {
   const files = await mapBounded(names, IO_CONCURRENCY, async (name) => {
     const file = join(dir, name);
     try {
-      const { mtimeMs } = await stat(file);
-      return { sessionId: name.slice(0, -'.jsonl'.length), file, mtimeMs };
+      const { mtimeMs, size } = await stat(file);
+      return { sessionId: name.slice(0, -'.jsonl'.length), file, mtimeMs, size };
     } catch {
       return null;
     }
@@ -378,14 +407,17 @@ async function listSessionFiles(dir: string): Promise<SessionFile[]> {
 export interface LaunchSessionStoreOptions {
   /** The main Claude Code config dir; transcripts live under `<claudeDir>/projects`. */
   claudeDir: string;
-  /** The launch cwd EXACTLY as Claude Code will see it: its project directory is named from this
-   *  spelling, not from the canonical path. */
+  /** The launch cwd EXACTLY as Claude Code will see it — `fs.realpathSync` of the process cwd
+   *  (measured: Claude Code resolves a junction or symlink in its cwd, but keeps the spelling's
+   *  case): its project directory is named from this spelling, not from the canonical path. */
   cwd: string;
   platform: NodeJS.Platform;
   /** The git worktree list for a folder (default: `git worktree list --porcelain`). */
   gitWorktrees?: (cwd: string) => Promise<string[]>;
-  /** One transcript's facts (default: {@link readTranscriptFacts}). */
-  readTranscript?: (file: string) => Promise<LaunchSessionFacts | null>;
+  /** One transcript's quick read (default: {@link readTranscriptFacts}). */
+  readTranscript?: (file: string) => Promise<TranscriptQuickRead | null>;
+  /** One transcript's recorded folder (default: switch-engine's readRecordedFolder). */
+  readFolder?: (file: string) => RecordedFolderRead;
   /** A folder's real path, or the folder itself when it has none (default: fs realpath). */
   realpath?: (folder: string) => string;
 }
@@ -393,9 +425,20 @@ export interface LaunchSessionStoreOptions {
 /** The real path of `folder`, or `folder` itself when it cannot be resolved. */
 function realpathOrSelf(folder: string): string {
   try {
-    return realpathSync.native(folder);
+    return nodeFs.realpathSync.native(folder);
   } catch {
     return folder;
+  }
+}
+
+/** The launch cwd as Claude Code spells it: the JS `fs.realpathSync` of `cwd` (junctions and
+ *  symlinks resolved, the typed case kept — unlike the `.native` form, which also rewrites case and
+ *  8.3 names), or `cwd` itself when it cannot be resolved. */
+export function claudeCodeCwd(cwd: string): string {
+  try {
+    return nodeFs.realpathSync(cwd);
+  } catch {
+    return cwd;
   }
 }
 
@@ -410,9 +453,28 @@ export function launchSessionStore(options: LaunchSessionStoreOptions): LaunchSe
   const platform = options.platform;
   const gitWorktrees = options.gitWorktrees ?? gitWorktreeList;
   const readTranscript = options.readTranscript ?? readTranscriptFacts;
+  const readFolder =
+    options.readFolder ?? ((file: string) => readRecordedFolder(file, nodeFs, platform));
   const realpath = options.realpath ?? realpathOrSelf;
   const recordedHere = (folder: string, target: string): boolean =>
     sameFolder(folder, target, platform);
+
+  /** A session the launch may open: its titles (quick read) and its recorded folder (the shared
+   *  reading), with the project directory as the fallback. */
+  const factsOf = (file: string, quick: TranscriptQuickRead): LaunchSessionFacts => {
+    const recorded = readFolder(file);
+    return {
+      customTitle: quick.customTitle,
+      aiTitle: quick.aiTitle,
+      folder: recorded.folder,
+      dirName: recorded.dirName,
+    };
+  };
+  /** Read one transcript as a session the launch opens, or null when it cannot be read. */
+  const sessionAt = async (file: string): Promise<LaunchSessionFacts | null> => {
+    const quick = await readTranscript(file);
+    return quick === null ? null : factsOf(file, quick);
+  };
 
   /** Every transcript of one project directory, read. */
   const readDir = async (name: string): Promise<ReadSession[]> => {
@@ -463,11 +525,11 @@ export function launchSessionStore(options: LaunchSessionStoreOptions): LaunchSe
       const newest = hits
         .filter((h): h is { file: string; mtimeMs: number } => h !== null)
         .sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
-      return newest === undefined ? null : readTranscript(newest.file);
+      return newest === undefined ? null : sessionAt(newest.file);
     },
 
     sessionAtPath(file) {
-      return readTranscript(file);
+      return sessionAt(file);
     },
 
     async sessionsTitled(text) {
@@ -517,24 +579,37 @@ export function launchSessionStore(options: LaunchSessionStoreOptions): LaunchSe
           if (known === undefined || s.mtimeMs > known.mtimeMs) byId.set(id, s);
         }
       }
-      return [...byId.values()].map((s) => s.facts!);
+      return [...byId.values()].map((s) => factsOf(s.file, s.facts!));
     },
 
     async continueSessions() {
       // The launch folder's own project directory, newest transcript first, read one at a time:
-      // `--continue` opens the newest session recorded HERE. Anything newer that belongs to another
-      // folder is kept as a candidate too (Claude Code's own filter of those is finer than this
-      // read can tell), and a transcript that records no folder holds no conversation to continue.
+      // `--continue` opens the newest session recorded HERE — measured, even one whose first cwd
+      // lies far past Claude Code's 64 KiB quick-read window, so this uses the shared reading, whose
+      // fallback counts a transcript with no trusted folder as this folder's (it sits in this
+      // folder's own project directory). Anything newer that belongs to another folder is kept as a
+      // candidate too (Claude Code's own filter of those is finer than this read can tell). A
+      // transcript read whole that records no cwd at all holds no conversation to continue; one that
+      // cannot be read at all leaves what `--continue` opens unnameable.
       const own = (await listDirNames(root)).filter((name) => projectDirMatches(name, cwd));
       const files = (await Promise.all(own.map((name) => listSessionFiles(join(root, name)))))
         .flat()
         .sort((a, b) => b.mtimeMs - a.mtimeMs);
       const candidates: LaunchSessionFacts[] = [];
       for (const f of files) {
-        const facts = await readTranscript(f.file);
-        if (facts === null || facts.folder === null) continue;
-        candidates.push(facts);
-        if (recordedHere(facts.folder, cwd)) return candidates;
+        const recorded = readFolder(f.file);
+        if (recorded.status === 'missing') continue; // gone since it was listed
+        if (recorded.status === 'unreadable') return [];
+        if (!recorded.sawCwd && f.size <= RECORDED_FOLDER_HEAD_BYTES) continue;
+        const quick = await readTranscript(f.file);
+        if (quick === null) return [];
+        candidates.push({
+          customTitle: quick.customTitle,
+          aiTitle: quick.aiTitle,
+          folder: recorded.folder,
+          dirName: recorded.dirName,
+        });
+        if (recorded.folder === null || recordedHere(recorded.folder, cwd)) return candidates;
       }
       // No session recorded here: what `--continue` opens (if anything) cannot be named.
       return [];
