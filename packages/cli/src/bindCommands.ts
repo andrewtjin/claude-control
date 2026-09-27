@@ -20,6 +20,7 @@ import {
   resolveAccountRef,
   resolveBinding,
   resolveSessionBinding,
+  canonicalStoredFolder,
   scopedGroupOf,
   type AccountView,
   type Paths,
@@ -53,13 +54,14 @@ import {
   configDirPointsIntoProfiles,
   findClaudeOnPath,
   parseClaudeSessionArgs,
-  resolveLaunchAlias,
+  resolveLaunchSessions,
   resolveLaunchTarget,
   spawnClaude,
-  type LaunchAliasDeps,
+  type LaunchSessionDeps,
   type LaunchSlot,
 } from './launcher.js';
-import { catalogLaunchAliasDeps } from './sessionAliases.js';
+import { launchSessionStore } from './launchSessionStore.js';
+import { canonicalOrRaw } from './sessionAliases.js';
 import {
   isSupportedShell,
   renderShellInit,
@@ -194,11 +196,36 @@ export function buildWhereView(
   };
 }
 
+/** Which binding a `cctl claude` launch belongs to, and the note (if any) to print about it. */
+export interface LaunchBindingDecision {
+  binding: SessionBinding | null;
+  /** The title a launch routed by alias opens under, for the banner; null otherwise. */
+  alias: string | null;
+  /** One stderr line when the launcher could not tell which session opens, else null. */
+  note: string | null;
+}
+
+/** The stderr note for a launch whose arguments do not say which session opens. The reason quotes
+ *  operator text, so it passes sanitizeForTerminal at this sink. */
+export function uncertainLaunchNote(reason: string): string {
+  return (
+    `cctl: could not tell which session these arguments open (${sanitizeForTerminal(reason)}); ` +
+    `launching by the folder rule — the enforcement guard checks the session Claude Code opens\n`
+  );
+}
+
 /**
- * Which binding a `cctl claude` launch belongs to, by THE precedence rule: the alias of the session
- * Claude Code's own arguments open (`--name`, `--resume`, `--continue`, `--session-id`; see
- * launcher.ts) in this exact folder, else the folder rule. The session catalog is read only when
- * some alias is bound in this folder — otherwise no title could change the answer.
+ * Which binding a `cctl claude` launch belongs to, by THE precedence rule applied to the session
+ * Claude Code's own arguments open (launcher.ts resolveLaunchSessions): its title, and the folder
+ * its conversation is RECORDED in — `claude --resume X` in a repository can reach sessions recorded
+ * in subfolders and worktrees, and a resumed session keeps its original folder, so that recorded
+ * folder is the one an alias scope is matched against; the folder rule always uses the launch
+ * folder. When the arguments allow several sessions (a title several sessions share, a newest
+ * transcript from another folder), the launch routes to a binding only if EVERY candidate maps to
+ * the same one; otherwise, and whenever the arguments are uncertain, it launches by the folder rule
+ * and leaves the pick to the enforcement guard.
+ *
+ * Nothing is parsed or read when no binding has an alias scope — no title could change the answer.
  */
 export async function resolveLaunchBinding(input: {
   /** The canonical launch folder. */
@@ -207,22 +234,51 @@ export async function resolveLaunchBinding(input: {
   args: readonly string[];
   groups: readonly StoredGroup[];
   platform: NodeJS.Platform;
-  aliasDeps: LaunchAliasDeps;
-}): Promise<{ binding: SessionBinding | null; alias: string | null }> {
-  const here = folderUniquenessKey(input.folder, input.platform);
-  const aliasBoundHere = input.groups.some((g) =>
-    (g.aliases ?? []).some((a) => folderUniquenessKey(a.folder, input.platform) === here),
-  );
-  const alias = aliasBoundHere
-    ? await resolveLaunchAlias(parseClaudeSessionArgs(input.args), input.aliasDeps)
-    : null;
-  const binding = resolveSessionBinding(
-    input.folder,
-    alias,
-    input.groups.map((g) => scopedGroupOf(g, input.platform)),
-    input.platform,
-  );
-  return { binding, alias };
+  /** Claude Code's session store, searched from the launch folder. */
+  sessions: LaunchSessionDeps;
+  /** A recorded session folder in the form bindings store folders (default: string-only
+   *  canonicalization; the launcher passes the realpath-resolving one). */
+  canonicalFolder?: (folder: string) => string;
+}): Promise<LaunchBindingDecision> {
+  const scoped = input.groups.map((g) => scopedGroupOf(g, input.platform));
+  const folderRule: LaunchBindingDecision = {
+    binding: resolveSessionBinding(input.folder, null, scoped, input.platform),
+    alias: null,
+    note: null,
+  };
+  const boundAliasKeys = new Set(scoped.flatMap((g) => (g.aliases ?? []).map((a) => a.aliasKey)));
+  if (boundAliasKeys.size === 0) return folderRule;
+
+  const opened = await resolveLaunchSessions(parseClaudeSessionArgs(input.args), input.sessions, {
+    launchFolder: input.folder,
+    boundAliasKeys,
+    platform: input.platform,
+  });
+  if (opened.kind === 'uncertain') {
+    return { ...folderRule, note: uncertainLaunchNote(opened.reason) };
+  }
+
+  const canonical =
+    input.canonicalFolder ?? ((f: string) => canonicalStoredFolder(f, input.platform));
+  const targets = opened.candidates.map((c) => ({
+    title: c.title,
+    binding: resolveSessionBinding(
+      input.folder,
+      c.title,
+      scoped,
+      input.platform,
+      c.folder === null ? null : canonical(c.folder),
+    ),
+  }));
+  const first = targets[0];
+  if (first === undefined) return folderRule;
+  const groupOf = (b: SessionBinding | null): string | null => b?.groupId ?? null;
+  if (!targets.every((t) => groupOf(t.binding) === groupOf(first.binding))) return folderRule;
+  return {
+    binding: first.binding,
+    alias: first.binding?.via === 'alias' ? first.title : null,
+    note: null,
+  };
 }
 
 /**
@@ -562,18 +618,21 @@ async function runClaude(opts: {
       slot = { kind: 'global', label: acct.label, context: 'global (shared account)' };
     }
   } else {
-    // No explicit account: THE precedence rule decides — the alias of the session Claude Code's own
-    // arguments open, in this exact folder, else the cwd's folder binding, else global. The argv is
-    // only read here; it is passed to the child untouched below.
+    // No explicit account: THE precedence rule decides — the alias binding of the session Claude
+    // Code's own arguments open (matched in the folder that session is recorded in), else the cwd's
+    // folder binding, else global. The argv is only read here; it is passed to the child untouched
+    // below.
     const canonical = canonicalizeCliFolder(process.cwd());
     const groups = await engine.listGroups();
-    const { binding, alias } = await resolveLaunchBinding({
+    const { binding, alias, note } = await resolveLaunchBinding({
       folder: canonical,
       args: opts.args,
       groups,
       platform,
-      aliasDeps: catalogLaunchAliasDeps(paths.claudeDir, process.cwd(), platform),
+      sessions: launchSessionStore({ claudeDir: paths.claudeDir, cwd: process.cwd(), platform }),
+      canonicalFolder: (folder) => canonicalOrRaw(folder, { platform, cwd: process.cwd() }),
     });
+    if (note !== null) process.stderr.write(note);
     if (binding !== null) {
       const group = groups.find((g) => g.id === binding.groupId) as StoredGroup;
       const scope =

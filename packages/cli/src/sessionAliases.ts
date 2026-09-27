@@ -17,7 +17,6 @@ import {
   readSessionCatalog,
   readTranscriptTurns,
   resolveSessionRef,
-  sameFolder,
   slotBySessionMap,
   type SessionAccountUse,
   type SessionMeta,
@@ -36,7 +35,6 @@ import {
 } from '@claude-control/switch-engine';
 import { detectPalette, sanitizeForTerminal } from './ansi.js';
 import { buildEngine, daemonDbPath, fail } from './context.js';
-import type { LaunchAliasDeps } from './launcher.js';
 import {
   renderAmbiguousAlias,
   renderSessionAliasList,
@@ -211,47 +209,19 @@ async function withBindings(deps: SessionAliasDeps, read: AccountsRead): Promise
 }
 
 /** Canonicalize a recorded session folder the way a binding stores folders (realpath when it
- *  exists), falling back to the recorded text for a path that cannot be canonicalized. */
-function canonicalOrRaw(folder: string, deps: SessionAliasDeps): string {
+ *  exists), falling back to the recorded text for a path that cannot be canonicalized. A recorded
+ *  folder is data, not operator input, so this never fails. Shared with the launcher, which matches
+ *  a resumed session's recorded folder against alias scopes the same way. */
+export function canonicalOrRaw(
+  folder: string,
+  deps: { platform: NodeJS.Platform; cwd: string },
+): string {
   const r = canonicalizeFolder(folder, {
     platform: deps.platform,
     cwd: deps.cwd,
     realpath: (p) => realpathSync.native(p),
   });
   return r.ok ? r.path : folder;
-}
-
-/**
- * The session-catalog lookups the launcher needs to learn which ALIAS a `cctl claude` launch opens
- * (see launcher.ts resolveLaunchAlias). Only custom titles count. `rawCwd` is the launch cwd exactly
- * as Claude Code will see it — the project directory it records sessions under is derived from that
- * spelling, not from the canonical path.
- */
-export function catalogLaunchAliasDeps(
-  claudeDir: string,
-  rawCwd: string,
-  platform: NodeJS.Platform,
-): LaunchAliasDeps {
-  return {
-    customTitleById: async (sessionId) => {
-      const catalog = await readSessionCatalog({ claudeDir, sessionIds: new Set([sessionId]) });
-      const meta = catalog.sessions.find(
-        (s) => s.sessionId.toLowerCase() === sessionId.toLowerCase(),
-      );
-      return meta === undefined ? null : customTitleOf(meta);
-    },
-    latestCustomTitleInFolder: async () => {
-      const catalog = await readSessionCatalog({
-        claudeDir,
-        projectDirFilter: (name) => projectDirMatches(name, rawCwd),
-      });
-      const here = catalog.sessions
-        .filter((s) => s.folder !== null && sameFolder(s.folder, rawCwd, platform))
-        .sort((a, b) => b.lastActivityMs - a.lastActivityMs);
-      const latest = here[0];
-      return latest === undefined ? null : customTitleOf(latest);
-    },
-  };
 }
 
 /** `cctl session show [ref]`. */
