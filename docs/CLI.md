@@ -184,7 +184,8 @@ the Keychain. See `docs/PLATFORM.md`.
 ```
 cctl switch <id|label>       # activate an account (a bound account switches ITS group's slot)
 cctl switch <id|label> --force   # bypass the switch-cadence guard
-cctl recover                 # recover from an interrupted switch (safe to run anytime)
+cctl recover                 # recover from an interrupted switch (safe to run anytime);
+                             # exits 1 with the reason when it cannot be settled yet
 ```
 
 ## Usage and timeline

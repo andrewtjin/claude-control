@@ -90,11 +90,19 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   snapshot the current live creds → reconcile (adopt the previous account's token if
   the CLI rotated it under us) → refresh the target if near expiry and persist the
   rotated single-use token immediately → atomically write both `.credentials.json` and
-  the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. A
-  write-ahead intent makes every step crash-recoverable (`recover()` rolls forward if
-  the new creds are already live and the target still belongs to that slot, else back to an
-  encrypted snapshot). Which slot a switch targets is decided under the same lock, so a bind or
-  unbind that lands first can never have a switch write an account into a slot it just left.
+  the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. Any
+  failure after the first live write undoes the switch before the error surfaces: the
+  previous login goes back (identity, then credentials), unless another writer's token
+  landed meanwhile, which stays live and is stored in no bundle. A write-ahead intent per
+  slot, recorded before the first live write, makes every step crash-recoverable: `recover()`
+  at startup, and every locked operation on a slot, looks at its live files and completes or
+  undoes the switch (undoing it when completing needs a write that cannot be made, or when the
+  target no longer belongs to that slot). A switch that can be neither is reported, refuses
+  writes to its slot and operations on the two accounts it was between, and is retried until it
+  settles; everything else still runs. Which slot a switch targets is decided under the same
+  lock, so a bind or unbind that lands first can never have a switch write an account into a
+  slot it just left. Rotation adoption never stores a live token that another account's bundle
+  already holds, and a token two accounts store is never seated in any slot.
 - **Usage.** Tier-0 reads each profile's cached `cachedUsageUtilization` for free;
   tier-1 hits the OAuth usage endpoint. Cross-account visibility never requires
   switching, and the poller degrades to cached data (labelled stale) rather than
