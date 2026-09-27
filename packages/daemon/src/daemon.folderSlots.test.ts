@@ -25,6 +25,7 @@ import {
 import {
   groupSlotId,
   type AccountView,
+  type ActivateOptions,
   type ActivateResult,
   type GroupLiveResult,
   type Logger,
@@ -141,7 +142,7 @@ function view(id: string, label: string, groupId?: string): AccountView {
  *  liveSlots() read; checkSlots/repairSlots are stubbable per case. */
 interface FakeEngineControls {
   engine: SwitchEngineLike;
-  activateCalls: Array<{ id: string }>;
+  activateCalls: Array<{ id: string; options: ActivateOptions | undefined }>;
   ensureGroupLiveCalls: string[];
   refreshSnapshotCalls: number;
   refreshSnapshotIfStaleCalls: number;
@@ -180,8 +181,8 @@ function fakeEngine(opts: {
   const memberIds = new Set(opts.groups.flatMap((g) => g.members.map((m) => m.id)));
   controls.engine = {
     recover: (): Promise<RecoverResult> => Promise.resolve({ recovered: false, action: 'none' }),
-    activate: (id: string): Promise<ActivateResult> => {
-      controls.activateCalls.push({ id });
+    activate: (id: string, options?: ActivateOptions): Promise<ActivateResult> => {
+      controls.activateCalls.push({ id, options });
       return Promise.resolve({
         ok: true,
         activeAccountId: id,
@@ -553,6 +554,11 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     // Global hopped to the healthy SHARED account (never a group member); the group hopped to its
     // own healthy member (never the shared pool).
     expect(hopped).toEqual(['m2', 's2']);
+    // Each hop names the slot it was decided for, so a membership change that lands before the
+    // switch reaches the engine lock refuses the hop instead of re-routing it to another slot.
+    const slotOf = new Map(controls.activateCalls.map((c) => [c.id, c.options?.slot]));
+    expect(slotOf.get('s2')).toBe('global');
+    expect(slotOf.get('m2')).toBe(groupSlotId('g1'));
   });
 
   it('names the folder group on the phone notice for a GROUP hop (not a global switch)', async () => {
@@ -941,6 +947,31 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
 
     const exhaustion = slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'));
     expect(exhaustion[0]?.body).toContain('C:/ai-research, C:/experiments');
+  });
+});
+
+describe('daemon folder-bound slots — a phone switch asserts the slot it resolved', () => {
+  it('switches a reserved member in its group slot and names that slot to the engine', async () => {
+    const { accounts, groups, live } = twoAccountGroup();
+    const controls = fakeEngine({ accounts, groups, live });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    await rig.start();
+
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'switch.command',
+      payload: {
+        requestId: 'rq-member',
+        targetAccountId: 'Member Two',
+        reason: 'manual',
+        idempotencyKey: 'ik-member',
+      },
+    });
+    await waitFor(() => switchResults(rig.relay).some((r) => r.requestId === 'rq-member'));
+
+    expect(controls.activateCalls).toEqual([
+      { id: 'm2', options: { origin: 'phone', slot: groupSlotId('g1') } },
+    ]);
   });
 });
 

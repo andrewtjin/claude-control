@@ -412,7 +412,13 @@ async function runClaude(opts: {
       const group = await engine.getGroup(acct.groupId);
       if (!group) fail(`account ${acct.label} is reserved to a group that no longer exists.`);
       try {
-        await engine.activate(acct.id, { force: true, origin: 'manual' });
+        // Asserting the group slot: if the account was released between the lookup above and this
+        // switch, it must fail here rather than switch the GLOBAL slot and then launch into a profile.
+        await engine.activate(acct.id, {
+          force: true,
+          origin: 'manual',
+          slot: groupSlotId(group.id),
+        });
       } catch (err) {
         if (err instanceof SwitchEngineError) fail(err.message);
         throw err;

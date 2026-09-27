@@ -153,7 +153,7 @@ export interface SwitchEngineLike {
 export interface AutoSwitcherLike {
   evaluate(
     accounts: AccountUsageInput[],
-    opts?: { slotKey?: string; candidateIds?: ReadonlySet<string>; slotLabel?: string },
+    opts?: { slotKey?: SlotId; candidateIds?: ReadonlySet<string>; slotLabel?: string },
   ): Promise<string | undefined>;
 }
 
@@ -1866,8 +1866,13 @@ export class Daemon {
       const targetGroupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
       if (targetGroupId !== undefined) targetSlot = groupSlotId(targetGroupId);
       // Phone-initiated: stamped 'phone' so the audit trail (and activation_intervals) can tell
-      // this apart from the CLI's own 'manual' /switch and from a policy-driven 'auto' hop.
-      const result = await this.switchEngine.activate(resolved.account.id, { origin: 'phone' });
+      // this apart from the CLI's own 'manual' /switch and from a policy-driven 'auto' hop. The slot
+      // resolved above is asserted: if a bind or unbind moved the account between that read and the
+      // switch, the engine refuses rather than switching a slot the operator was not told about.
+      const result = await this.switchEngine.activate(resolved.account.id, {
+        origin: 'phone',
+        slot: targetSlot,
+      });
       // Named by LABEL, which is how the operator addressed the account and how the auto-switch
       // card already reports one. A `/switch spare` answered with "switched to 6f2a-…" tells the
       // user something they did not ask about, in the one vocabulary they never use — and the
