@@ -339,6 +339,9 @@ function describeRepairedViolation(v: SlotViolation): string {
     case 'account_in_multiple_slots':
       // One account was live in more than one slot; each slot was re-seated on its rightful account.
       return `${v.detail}; cctl re-seated each slot on its own account.`;
+    case 'live_identity_mismatch':
+      // A slot's token and identity named different accounts; the slot was re-seated so both agree.
+      return `${v.detail}; cctl re-seated the slot so its credentials and identity name one account.`;
     default:
       // broken_profile_link is not repaired by repairSlots (ensureGroupProfile owns it); a future
       // repairable kind lands here with an honest generic corrective clause rather than silence.
