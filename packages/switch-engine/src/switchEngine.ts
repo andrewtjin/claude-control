@@ -1167,18 +1167,31 @@ export class SwitchEngine {
 
   /** The shared body of {@link unbindFolder} and {@link unbindAlias}. */
   private async unbindScope(scope: BindScope, opts: { force?: boolean }): Promise<UnbindResult> {
-    const canonicalFolder = this.canonicalizeBindFolder(scope.folder, { mustExist: false });
+    const resolvedFolder = this.canonicalizeBindFolder(scope.folder, { mustExist: false });
+    // The folder as spelled, canonicalized WITHOUT resolving links. A bound folder that was moved
+    // and replaced by a link to its new home resolves to the new home, where nothing is bound, while
+    // the binding still names the old path: this spelling is how that binding can still be removed.
+    const spelled = canonicalizeFolder(scope.folder, {
+      platform: this.platform,
+      cwd: this.bindFs.cwd(),
+    });
     return this.withCredentialLock(async () => {
       const groups = await this.vault.listGroups();
-      const ownerId =
+      const ownerOf = (folder: string): string | null =>
         scope.kind === 'folder'
-          ? exactBinding(canonicalFolder, groups, this.platform)
-          : exactAliasBinding(canonicalFolder, scope.alias, groups, this.platform);
+          ? exactBinding(folder, groups, this.platform)
+          : exactAliasBinding(folder, scope.alias, groups, this.platform);
+      let canonicalFolder = resolvedFolder;
+      let ownerId = ownerOf(resolvedFolder);
+      if (ownerId === null && spelled.ok && spelled.path !== resolvedFolder) {
+        ownerId = ownerOf(spelled.path);
+        if (ownerId !== null) canonicalFolder = spelled.path;
+      }
       if (ownerId === null) {
         throw new RefreshError(
           scope.kind === 'folder'
-            ? `"${canonicalFolder}" is not bound to any folder-bound account`
-            : `${describeScope(scope, canonicalFolder)} is not bound to any account`,
+            ? `"${resolvedFolder}" is not bound to any folder-bound account`
+            : `${describeScope(scope, resolvedFolder)} is not bound to any account`,
           'not_bound',
         );
       }

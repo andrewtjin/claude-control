@@ -63,6 +63,9 @@ interface AliasTarget {
   alias: string;
   /** Canonical. */
   folder: string;
+  /** The folder as spelled, canonicalized without resolving links (null when it has no canonical
+   *  form): what a binding of a folder since moved and replaced by a link still names. */
+  folderAsSpelled: string | null;
   current: SessionMeta | null;
 }
 
@@ -140,7 +143,8 @@ async function resolveAliasTarget(
   if (!canon.ok) {
     fail(`cannot use folder "${sanitizeForTerminal(folderInput)}": ${canon.reason}`);
   }
-  return { alias, folder: canon.path, current };
+  const spelled = canonicalizeFolder(folderInput, { platform: deps.platform, cwd: deps.cwd });
+  return { alias, folder: canon.path, folderAsSpelled: spelled.ok ? spelled.path : null, current };
 }
 
 /** Resolve comma-separated account refs across the whole registry (shared + reserved), de-duped. */
@@ -414,10 +418,17 @@ export async function runSessionUnbind(
 ): Promise<void> {
   const engine = deps.engine ?? buildEngine(deps.paths);
   const palette = detectPalette();
-  const target = await resolveAliasTarget(aliasArg, options.cwd, 'unbind', deps);
-  const scope = scopeText(target.alias, target.folder);
+  const resolved = await resolveAliasTarget(aliasArg, options.cwd, 'unbind', deps);
   const groups = await engine.listGroups();
-  const ownerId = exactAliasBinding(target.folder, target.alias, groups, deps.platform);
+  // A binding of a folder since moved and replaced by a link names the old path, which now resolves
+  // to the new home: look it up by the folder as spelled too, and act on the one that is bound.
+  let target = resolved;
+  let ownerId = exactAliasBinding(resolved.folder, resolved.alias, groups, deps.platform);
+  if (ownerId === null && resolved.folderAsSpelled !== null) {
+    ownerId = exactAliasBinding(resolved.folderAsSpelled, resolved.alias, groups, deps.platform);
+    if (ownerId !== null) target = { ...resolved, folder: resolved.folderAsSpelled };
+  }
+  const scope = scopeText(target.alias, target.folder);
   if (ownerId === null) {
     fail(`${scope} is not bound to any account (cctl bindings lists the bindings)`);
   }
