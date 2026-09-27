@@ -92,7 +92,9 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   rotated single-use token immediately → atomically write both `.credentials.json` and
   the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. A
   write-ahead intent makes every step crash-recoverable (`recover()` rolls forward if
-  the new creds are already live, else back to an encrypted snapshot).
+  the new creds are already live and the target still belongs to that slot, else back to an
+  encrypted snapshot). Which slot a switch targets is decided under the same lock, so a bind or
+  unbind that lands first can never have a switch write an account into a slot it just left.
 - **Usage.** Tier-0 reads each profile's cached `cachedUsageUtilization` for free;
   tier-1 hits the OAuth usage endpoint. Cross-account visibility never requires
   switching, and the poller degrades to cached data (labelled stale) rather than
