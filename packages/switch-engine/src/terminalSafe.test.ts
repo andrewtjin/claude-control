@@ -49,6 +49,26 @@ const CASES: Array<{ name: string; input: string; expected: string }> = [
     expected: 'abcd',
   },
   {
+    name: 'strips the line and paragraph separators (U+2028/U+2029) that forge a line break',
+    input: 'work [system] fake line done',
+    expected: 'work[system] fake linedone',
+  },
+  {
+    name: 'strips the Arabic letter mark (U+061C), a bidi control',
+    input: 'a؜b',
+    expected: 'ab',
+  },
+  {
+    name: 'strips zero-width and invisible format characters (U+200B-200D, U+2060-2064, U+206A-206F)',
+    input: 'a​b‌c‍d⁠e⁤f⁪g⁯h',
+    expected: 'abcdefgh',
+  },
+  {
+    name: 'strips tag characters (U+E0000-E007F) that carry hidden text',
+    input: 'a\u{e0000}\u{e0041}\u{e0042}\u{e007f}b',
+    expected: 'ab',
+  },
+  {
     name: 'leaves ordinary labels and Windows drive paths untouched',
     input: 'C:\\Users\\me\\repos\\research',
     expected: 'C:\\Users\\me\\repos\\research',

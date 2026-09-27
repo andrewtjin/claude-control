@@ -7,9 +7,14 @@
 //   - C0/C1/DEL controls, including ESC (the CSI/OSC lead-in) — an SGR escape could recolor or
 //     retitle a window or hide text, and a newline/carriage-return could forge extra output lines
 //     (a fabricated "[system] ..." directive on its own line);
-//   - the Unicode bidirectional/format controls (LRM/RLM, the embeddings/overrides U+202A-202E,
-//     the isolates U+2066-2069, and the BOM U+FEFF) that let a right-to-left run reorder a
-//     displayed path so what the eye reads is not what was matched.
+//   - the Unicode bidirectional/format controls (LRM/RLM and the Arabic letter mark U+061C, the
+//     embeddings/overrides U+202A-202E, the isolates U+2066-2069, and the BOM U+FEFF) that let a
+//     right-to-left run reorder a displayed path so what the eye reads is not what was matched;
+//   - the line and paragraph separators U+2028/U+2029, which many renderers break a line on (the
+//     same forged-line hazard as a newline);
+//   - the invisible characters that hide text: zero-width space/non-joiner/joiner U+200B-200D, the
+//     word joiner and invisible operators U+2060-2064, the deprecated format controls U+206A-206F,
+//     and the tag characters U+E0000-E007F (which can spell out a hidden ASCII message).
 //
 // This strips all of it to plain, left-to-right, printable text. Removals are zero-width or
 // interpreted bytes, never visible columns, so a kept value's width is unchanged and it still
@@ -27,10 +32,12 @@
 
 /**
  * Strip every terminal-interpreted control from a label or folder path: C0/C1/DEL (which includes
- * the ESC that begins an SGR/OSC sequence and the newline/CR that would forge a line) and the
- * Unicode bidi/format controls (U+200E/F, U+202A-202E, U+2066-2069, U+FEFF). The result is plain,
- * left-to-right, printable text safe to color, pad, and write to any terminal surface, and safe to
- * interpolate into a hook decision string a terminal or model will read. Idempotent.
+ * the ESC that begins an SGR/OSC sequence and the newline/CR that would forge a line), the line and
+ * paragraph separators (U+2028/U+2029), the Unicode bidi/format controls (U+061C, U+200E/F,
+ * U+202A-202E, U+2066-2069, U+FEFF), and the invisible characters that hide text (U+200B-200D,
+ * U+2060-2064, U+206A-206F, the tag block U+E0000-E007F). The result is plain, left-to-right,
+ * printable text safe to color, pad, and write to any terminal surface, and safe to interpolate
+ * into a hook decision string a terminal or model will read. Idempotent.
  *
  * SELF-CONTAINED BY CONTRACT (see file header): references only its parameter and a pattern
  * declared in its own body, so `sanitizeTerminalText.toString()` is a complete, embeddable program.
@@ -44,10 +51,15 @@ export function sanitizeTerminalText(value: string): string {
   const unsafe = new RegExp(
     [
       '[\\u0000-\\u001f\\u007f-\\u009f]', // C0 controls + DEL + C1 controls (incl. ESC, CR, LF)
-      '[\\u200e\\u200f]', // LRM / RLM
+      '[\\u2028\\u2029]', // LINE SEPARATOR / PARAGRAPH SEPARATOR
+      '[\\u061c\\u200e\\u200f]', // ALM / LRM / RLM
+      '[\\u200b-\\u200d]', // ZERO WIDTH SPACE / NON-JOINER / JOINER
+      '[\\u2060-\\u2064]', // WORD JOINER + the invisible operators
       '[\\u202a-\\u202e]', // LRE RLE PDF LRO RLO
       '[\\u2066-\\u2069]', // LRI RLI FSI PDI
+      '[\\u206a-\\u206f]', // the deprecated format controls
       '\\ufeff', // ZERO WIDTH NO-BREAK SPACE / BOM
+      '[\\u{e0000}-\\u{e007f}]', // the tag characters
     ].join('|'),
     'gu',
   );
