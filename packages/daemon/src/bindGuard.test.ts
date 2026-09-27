@@ -170,6 +170,36 @@ describe('bind guard script', () => {
     expect(JSON.parse(result.stdout)).toEqual({ systemMessage: expectedReasonA() });
   });
 
+  it('(A) --override is honored when CLAUDE_CONFIG_DIR names the main config dir explicitly', async () => {
+    // A shell that exports CLAUDE_CONFIG_DIR to the main config dir is on the global slot, just
+    // spelled out. The launcher keeps that value and mints the override for the global slot (key
+    // ''); the guard must key the session the same way or the override can never match.
+    await writeSnapshot();
+    const token = mintToken('override', slotKey(undefined));
+    for (const spelling of [root, root + (process.platform === 'win32' ? '\\' : '/')]) {
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: boundFolder,
+        CLAUDE_CONFIG_DIR: spelling,
+        CCTL_BIND_OVERRIDE: token,
+      });
+      expect({ spelling, out: JSON.parse(result.stdout) as unknown }).toEqual({
+        spelling,
+        out: { systemMessage: expectedReasonA() },
+      });
+    }
+  });
+
+  it('(A) the main config dir spelled out is still the shared account without a token → block', async () => {
+    await writeSnapshot();
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+      CLAUDE_CONFIG_DIR: root,
+    });
+    expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
+  });
+
   it('(A) an inherited CCTL_BIND_OVERRIDE=1 (no token) is NOT honored → still blocks', async () => {
     // The core of the ambient-bypass defect: a plain "1" carried in from the shell must not relax the
     // binding, because it has no per-launch token record behind it.
@@ -449,6 +479,66 @@ describe('bind guard script', () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('');
     expect(result.stderr).toContain('cctl bind-guard:');
+  });
+
+  describe('a project folder whose name carries a format or bidi control', () => {
+    // Such a folder is legal on disk but has no canonical form, so no binding can name it. The
+    // decision is still computable from its nearest clean ancestor: a binding covers the folder
+    // exactly when it covers that ancestor. Failing open instead would let a reserved account run
+    // outside its folders.
+    const ODD = 'x‎y';
+
+    it('on a group slot, outside its folders → block (case B), no fail-open line', async () => {
+      await writeSnapshot();
+      const odd = join(outsideFolder, ODD);
+      await mkdir(odd, { recursive: true });
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: odd,
+        CLAUDE_CONFIG_DIR: profileDir,
+      });
+      expect(result.stderr).toBe('');
+      const parsed = JSON.parse(result.stdout) as { decision?: string; reason?: string };
+      expect(parsed.decision).toBe('block');
+      expect(parsed.reason).toContain('cctl claude --account');
+      // The reason shows the folder with the control stripped, never the raw control.
+      expect(parsed.reason).not.toContain('‎');
+    });
+
+    it('on the global slot, outside every binding → silent allow', async () => {
+      await writeSnapshot();
+      const odd = join(outsideFolder, ODD);
+      await mkdir(odd, { recursive: true });
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: odd,
+      });
+      expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+    });
+
+    it('on the global slot, INSIDE a bound folder → block (case A)', async () => {
+      await writeSnapshot();
+      const odd = join(boundFolder, ODD);
+      await mkdir(odd, { recursive: true });
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: odd,
+      });
+      expect(result.stderr).toBe('');
+      expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
+    });
+
+    it("on its group's slot, inside the bound folder → silent allow", async () => {
+      await writeSnapshot();
+      const odd = join(boundFolder, 'deeper', ODD, 'leaf');
+      await mkdir(odd, { recursive: true });
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: odd,
+        CLAUDE_CONFIG_DIR: profileDir,
+      });
+      expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+    });
   });
 
   it('falls back to the payload cwd when CLAUDE_PROJECT_DIR is unset', async () => {
