@@ -578,9 +578,31 @@ export interface WhereView {
   } | null;
 }
 
-/** Explain which account a folder runs on, print the env line a session needs, and a VS Code
- *  `.vscode/settings.json` snippet (claudeCode.environmentVariables) for that folder. */
-export function renderWhere(view: WhereView, palette: Palette = PLAIN_PALETTE): string {
+/** Quote one argument so it pastes into the operator's shell as a single literal word: PowerShell
+ *  single quotes (a `'` doubled) on Windows, POSIX single quotes (`'\''`) elsewhere. Single quotes
+ *  because nothing inside them expands in either shell — a folder or label may hold `$`, a backtick
+ *  or a double quote. */
+export function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32'
+    ? `'${value.replace(/'/g, "''")}'`
+    : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/** The VS Code profile name `cctl where` suggests for a binding: `cctl-<label>`, reduced to
+ *  letters, digits, `.`, `_` and `-` so it is one plain word in any shell and in VS Code's UI. */
+export function vscodeProfileName(groupLabel: string): string {
+  const slug = groupLabel.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return `cctl-${slug === '' ? 'binding' : slug}`;
+}
+
+/** Explain which account a folder runs on, print the env line a session needs, and how to point
+ *  the VS Code Claude Code extension at that account (a VS Code profile holding the
+ *  claudeCode.environmentVariables setting). */
+export function renderWhere(
+  view: WhereView,
+  palette: Palette = PLAIN_PALETTE,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const folder = sanitizeForTerminal(view.folder);
   if (view.bound === null) {
     return [
@@ -595,14 +617,17 @@ export function renderWhere(view: WhereView, palette: Palette = PLAIN_PALETTE): 
   const members = b.members.map((m) => sanitizeForTerminal(m)).join(', ');
   const live = b.liveMemberLabel ? sanitizeForTerminal(b.liveMemberLabel) : 'none usable';
   const profile = sanitizeForTerminal(b.profileDir);
-  // The Claude Code extension's setting is an ARRAY of {name, value} pairs (its default is []),
-  // not an object map; an object here would be ignored and the extension would launch on the
-  // global account.
+  // The extension's setting is declared as a list of {name, value} pairs (its default is []), so
+  // that is the shape printed. The setting is MACHINE-scoped: VS Code ignores it in a folder's or
+  // workspace's .vscode/settings.json (it only greys the line out), and reads it from user settings
+  // only. Per-folder routing therefore needs a VS Code profile whose user settings carry it — one
+  // profile per binding, opened on the bound folder.
   const vscodeSnippet = JSON.stringify(
     { 'claudeCode.environmentVariables': [{ name: 'CLAUDE_CONFIG_DIR', value: b.profileDir }] },
     null,
     2,
   );
+  const openCommand = `code --profile ${shellQuote(vscodeProfileName(b.groupLabel), platform)} ${shellQuote(folder, platform)}`;
   return [
     `${palette.bold(folder)}`,
     `  runs on: ${palette.bold(sanitizeForTerminal(b.groupLabel))} (${members})`,
@@ -613,7 +638,12 @@ export function renderWhere(view: WhereView, palette: Palette = PLAIN_PALETTE): 
     'Start Claude Code here with the right account using: cctl claude',
     '(or install the wrapper once: cctl shell-init powershell)',
     '',
-    'For VS Code, put this in ' + folder + '\\.vscode\\settings.json:',
+    'For VS Code: the Claude Code extension reads its environment from USER settings only (a',
+    "folder's .vscode/settings.json is ignored), so give this binding its own VS Code profile:",
+    `  1. ${openCommand}`,
+    '     (creates the profile the first time; install or enable Claude Code in it)',
+    '  2. in that window run "Preferences: Open User Settings (JSON)" and add:',
     vscodeSnippet,
+    `  3. open this folder with the same command from then on. Other windows keep the shared account.`,
   ].join('\n');
 }
