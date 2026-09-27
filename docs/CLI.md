@@ -154,6 +154,69 @@ with `cctl claude --override`; to run a bound account against a folder it is not
 launch with `cctl claude --account <that account>`. Both are honored by the guard for that
 session only.
 
+### Binding a named session
+
+A binding can also name ONE session instead of a whole folder: its alias (the title you give
+it with `/rename` or `claude --name`) in the folder it lives in. That session runs on the
+bound accounts whenever it is resumed from that folder, while the rest of the folder keeps
+its own binding (or the global account).
+
+```
+cctl session bind                         # this session's alias, on the account it runs on now
+cctl session bind <alias> <account>[,<account>...]   # an alias in this folder, on those accounts
+cctl session bind <alias> <accounts> --cwd <folder>  # an alias in another folder
+cctl session unbind [alias]               # drop the binding (dissolves it when it was the last)
+cctl session unbind [alias] --accounts <refs>        # remove accounts from the binding instead
+```
+
+Run inside a Claude Code session (from a Bash tool or a `!` command), both commands default to
+that session: the alias is its own name and the folder is its own folder. Only a name you set
+counts — a session with just a generated title is refused with `name it first: /rename <alias>`,
+because a generated title changes under you. The accounts default to the one the session runs
+on right now.
+
+Binding an alias that is already bound **adds** the accounts to it ("add this session's account
+to the ones that alias uses"), so running `cctl session bind` from sessions on different
+accounts builds up the alias's list. If the binding also covers other folders or aliases (it was
+created for the same set of accounts), growing it would grow those too, so `bind` refuses and
+asks you to unbind the alias and bind it to the full list. `--accounts` on `unbind` shrinks the
+same way; removing a live account first moves the slot to another of the alias's accounts.
+
+Which account a session belongs on is decided by one rule, used by `cctl claude`, the guard,
+`cctl where` and `cctl session show` alike:
+
+1. its alias, in exactly its folder, is bound -> that binding;
+2. else the longest bound folder containing it -> that binding;
+3. else the global account.
+
+An alias binding covers its exact folder only, never subfolders — `claude --resume <alias>`
+searches just the folder you run it in — and aliases compare the way `claude --resume` compares
+them: case-insensitive, ignoring surrounding spaces.
+
+`cctl claude` reads Claude Code's own arguments to see which session it opens: `--resume <alias>`
+(or `--resume <session id>`), `--continue` (the folder's most recent session), `--name <alias>`,
+`--session-id`, with or without `--fork-session` (a fork keeps its title). When that alias is
+bound here, the launch goes to its binding:
+
+```
+cctl claude --resume "auth work"    # resumes the session on the accounts bound to "auth work"
+```
+
+The guard checks each prompt with the same rule, using the session's name as Claude Code
+reports it. A named session that is running on the wrong account is stopped with how to fix it:
+
+```
+cctl: session "auth work" in C:\repo is bound to research, but this session runs on the shared
+account. Exit and resume it with: cctl claude --resume "auth work"
+```
+
+and a session on an alias's accounts that is renamed to something else is stopped too (rename
+it back, or start it again normally). `cctl bindings` lists alias bindings beside folder ones,
+`cctl where` names the aliases bound in a folder, and `cctl session show` adds a `Bound to` line
+and whether the session is in scope (`--json`: a `binding` field). If `session bind` is run from
+a session that the change leaves outside its binding, it says so: that session keeps its current
+account until it exits, and its next prompt is flagged.
+
 ### macOS
 
 Folder-bound accounts are **not supported on macOS yet** — `cctl bind` refuses there. The
@@ -334,6 +397,11 @@ used them, with turns, tokens and dates. `--json` prints the same data for scrip
 `stats`, it reads local files only and needs no running daemon; a session's slot is known
 from the hooks the daemon receives, so turns from before the daemon saw the session are
 billed against the global slot.
+
+`cctl session show` also says which account the session is bound to (see
+[Binding a named session](#binding-a-named-session)) and whether it runs there: for the session
+you run it from, by the account that session is on now; for any other, by the slot the daemon
+last recorded for it.
 
 ## Prompts to idle sessions
 

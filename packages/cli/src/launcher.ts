@@ -283,6 +283,268 @@ export function configDirPointsIntoProfiles(
 }
 
 // ---------------------------------------------------------------------------
+// Which session a launch opens (Claude Code's own arguments)
+// ---------------------------------------------------------------------------
+//
+// An alias binding routes a NAMED session, so before spawning the launcher reads Claude Code's own
+// arguments for the session they open. It only READS the argv: the array handed to the child is the
+// caller's, untouched, byte for byte (see spawnClaude — no shell, no rewrite).
+//
+// The parse mirrors how Claude Code's option parser (commander) consumes the same argv, because a
+// misread is exactly how a flag VALUE would be taken for a flag: `--append-system-prompt --resume`
+// passes the text "--resume" as a prompt, it does not resume anything. The commander rules that
+// matter: an option with a REQUIRED value takes the next token whatever it looks like; an OPTIONAL
+// value (`--resume [value]`) takes the next token only when it does not start with '-'; a VARIADIC
+// option keeps taking non-dash tokens; `--x=v` and short `-xVALUE` attach the value; combined short
+// booleans (`-pc`) expand; `--` ends option parsing; and a first operand naming a subcommand
+// (`claude mcp add --name x`) hands everything after it to that subcommand, which opens no session.
+// The tables list Claude Code 2.1.x's value-taking top-level options; an option not listed is read
+// as a boolean, which can only mis-attribute a token when that unknown option's value is itself one
+// of the session flags — and even then the enforcement guard, not this parse, has the last word.
+
+/** Top-level options whose value is REQUIRED (the next token is always consumed). */
+const REQUIRED_VALUE_OPTIONS = new Set([
+  '--name',
+  '-n',
+  '--session-id',
+  '--model',
+  '--fallback-model',
+  '--agent',
+  '--agents',
+  '--settings',
+  '--setting-sources',
+  '--permission-mode',
+  '--permission-prompt-tool',
+  '--append-system-prompt',
+  '--append-system-prompt-file',
+  '--system-prompt',
+  '--system-prompt-file',
+  '--output-format',
+  '--input-format',
+  '--max-turns',
+  '--max-budget-usd',
+  '--max-thinking-tokens',
+  '--json-schema',
+  '--debug-file',
+  '--plugin-dir',
+  '--effort',
+  '--thinking',
+  '--resume-session-at',
+  '--rewind-files',
+  '--parent-session-id',
+  '--sdk-url',
+  '--advisor',
+  '--agent-id',
+  '--agent-name',
+  '--agent-type',
+  '--agent-color',
+  '--team-name',
+  '--teammate-mode',
+  '--autocompact',
+  '--task-budget',
+  '--workload',
+]);
+
+/** Top-level VARIADIC options (the first value is required; further non-dash tokens are values). */
+const VARIADIC_OPTIONS = new Set([
+  '--add-dir',
+  '--allowedTools',
+  '--allowed-tools',
+  '--disallowedTools',
+  '--disallowed-tools',
+  '--tools',
+  '--mcp-config',
+  '--betas',
+  '--channels',
+  '--dangerously-load-development-channels',
+  '--file',
+]);
+
+/** Top-level options whose value is OPTIONAL (taken only when the next token is not dash-led). */
+const OPTIONAL_VALUE_OPTIONS = new Set([
+  '--resume',
+  '-r',
+  '--debug',
+  '-d',
+  '--worktree',
+  '-w',
+  '--remote',
+  '--teleport',
+  '--rc',
+  '--remote-control',
+  '--from-pr',
+  '--prompt-suggestions',
+  '--cloud',
+]);
+
+/** Claude Code subcommands: a first operand naming one opens no interactive session. */
+const CLAUDE_SUBCOMMANDS = new Set([
+  'mcp',
+  'plugin',
+  'plugins',
+  'auth',
+  'login',
+  'logout',
+  'doctor',
+  'update',
+  'upgrade',
+  'install',
+  'setup-token',
+  'agents',
+  'config',
+  'migrate-installer',
+  'remote-control',
+  'sandbox',
+  'gateway',
+  'project',
+  'import-conversations',
+  'ultrareview',
+  'auto-mode',
+  'eval',
+]);
+
+/** What Claude Code's arguments say about the session a launch opens. */
+export interface ClaudeSessionArgs {
+  /** `--resume/-r`: the value (a session id or a title), `null` for a bare `--resume` (the picker),
+   *  absent when not resuming. Last occurrence wins, as in commander. */
+  resume?: string | null;
+  /** `--continue/-c`: the most recent session in the folder. */
+  continue: boolean;
+  /** `--name/-n <name>`: the new session's (or the resumed one's) custom title. */
+  name?: string;
+  /** `--session-id <uuid>`. */
+  sessionId?: string;
+  /** `--fork-session`: a new id, but the SAME title — so it never changes which alias applies. */
+  fork: boolean;
+  /** Set when the first operand names a subcommand: nothing after it is a session option. */
+  subcommand?: string;
+}
+
+/** commander's `maybeOption`: a token that parses as an option rather than a value. */
+function looksLikeOption(token: string): boolean {
+  return token.length > 1 && token.startsWith('-');
+}
+
+/**
+ * Read which session Claude Code will open from its argv, the way its option parser would (see the
+ * section header). Pure, and never mutates `args` — the launcher spawns the caller's array as is.
+ */
+export function parseClaudeSessionArgs(args: readonly string[]): ClaudeSessionArgs {
+  const out: ClaudeSessionArgs = { continue: false, fork: false };
+  let sawOperand = false;
+  let variadic = false;
+  // Tokens still to read, front first. Combined short flags push their expansion back onto it, the
+  // way commander unshifts `-${rest}`.
+  const queue = [...args];
+  const next = (): string | undefined => queue.shift();
+
+  /** Apply one option by name, with its attached value if it had one (`--x=v`, `-xv`). */
+  const apply = (name: string, attached: string | undefined): void => {
+    const takeRequired = (): string | undefined => attached ?? next();
+    const takeOptional = (): string | undefined => {
+      if (attached !== undefined) return attached;
+      const peek = queue[0];
+      return peek !== undefined && !looksLikeOption(peek) ? next() : undefined;
+    };
+    if (name === '--resume' || name === '-r') {
+      out.resume = takeOptional() ?? null;
+    } else if (name === '--continue' || name === '-c') {
+      out.continue = true;
+    } else if (name === '--fork-session') {
+      out.fork = true;
+    } else if (name === '--name' || name === '-n') {
+      const v = takeRequired();
+      if (v !== undefined) out.name = v;
+    } else if (name === '--session-id') {
+      const v = takeRequired();
+      if (v !== undefined) out.sessionId = v;
+    } else if (REQUIRED_VALUE_OPTIONS.has(name)) {
+      takeRequired();
+    } else if (VARIADIC_OPTIONS.has(name)) {
+      takeRequired();
+      variadic = true;
+    } else if (OPTIONAL_VALUE_OPTIONS.has(name)) {
+      takeOptional();
+    }
+    // Anything else is read as a boolean flag.
+  };
+
+  for (let token = next(); token !== undefined; token = next()) {
+    if (token === '--') break; // everything after is an operand (the prompt)
+    if (variadic && !looksLikeOption(token)) continue; // a further value of a variadic option
+    variadic = false;
+    if (token.startsWith('--')) {
+      const eq = token.indexOf('=');
+      apply(eq === -1 ? token : token.slice(0, eq), eq === -1 ? undefined : token.slice(eq + 1));
+    } else if (looksLikeOption(token)) {
+      const flag = token.slice(0, 2);
+      const rest = token.slice(2);
+      const takesValue =
+        REQUIRED_VALUE_OPTIONS.has(flag) ||
+        VARIADIC_OPTIONS.has(flag) ||
+        OPTIONAL_VALUE_OPTIONS.has(flag);
+      if (rest === '') {
+        apply(flag, undefined);
+      } else if (takesValue) {
+        apply(flag, rest); // -rVALUE: the rest is the value, verbatim (so -r=v is the value "=v")
+      } else {
+        apply(flag, undefined);
+        queue.unshift(`-${rest}`); // -pc: -p, then -c
+      }
+    } else {
+      // An operand. The FIRST one may name a subcommand, which owns every token after it.
+      if (!sawOperand && CLAUDE_SUBCOMMANDS.has(token)) {
+        out.subcommand = token;
+        break;
+      }
+      sawOperand = true;
+    }
+  }
+  return out;
+}
+
+/** What {@link resolveLaunchAlias} needs to look sessions up (the daemon's session catalog). */
+export interface LaunchAliasDeps {
+  /** The CUSTOM title of the session with this id, or null (unknown session, or unnamed). */
+  customTitleById: (sessionId: string) => Promise<string | null>;
+  /** The CUSTOM title of the most recently active session in the launch folder, or null. */
+  latestCustomTitleInFolder: () => Promise<string | null>;
+}
+
+/** A session id as Claude Code writes it (a UUID). */
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The custom title the launched session will carry — the alias the precedence rule is asked about —
+ * or null for an unnamed / unknown target:
+ *   - a subcommand opens no session: null;
+ *   - `--name v` names it v (also on a resume or a fork: the name is what its prompts will report);
+ *   - `--resume <uuid>` -> that session's custom title (the catalog); `--resume <v>` -> v itself
+ *     (Claude Code resumes the session whose title matches v; a picker opens when none or several
+ *     do, and the guard judges whatever is picked); a bare `--resume` (the picker) -> null;
+ *   - `--continue` -> the most recent session in the folder's custom title;
+ *   - `--session-id <uuid>` alone -> that session's title if it exists (else a new, unnamed one).
+ * `--fork-session` changes nothing: a fork keeps its parent's title.
+ */
+export async function resolveLaunchAlias(
+  parsed: ClaudeSessionArgs,
+  deps: LaunchAliasDeps,
+): Promise<string | null> {
+  if (parsed.subcommand !== undefined) return null;
+  if (parsed.name !== undefined) return parsed.name;
+  if (parsed.resume !== undefined) {
+    if (parsed.resume === null) return null;
+    const value = parsed.resume.trim();
+    return SESSION_UUID.test(value) ? deps.customTitleById(value) : parsed.resume;
+  }
+  if (parsed.continue) return deps.latestCustomTitleInFolder();
+  if (parsed.sessionId !== undefined && SESSION_UUID.test(parsed.sessionId.trim())) {
+    return deps.customTitleById(parsed.sessionId.trim());
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Spawning
 // ---------------------------------------------------------------------------
 

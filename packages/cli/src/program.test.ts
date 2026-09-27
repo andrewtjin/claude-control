@@ -370,7 +370,17 @@ describe('buildProgram', () => {
   it('nests session subcommands', () => {
     const session = buildProgram().commands.find((c) => c.name() === 'session');
     const subs = session?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['aliases', 'label', 'register', 'show', 'status', 'unregister', 'watch']);
+    expect(subs).toEqual([
+      'aliases',
+      'bind',
+      'label',
+      'register',
+      'show',
+      'status',
+      'unbind',
+      'unregister',
+      'watch',
+    ]);
   });
 
   it('offers the alias lookup flags on session show and session aliases', () => {
@@ -381,6 +391,20 @@ describe('buildProgram', () => {
     expect(flags('aliases')).toEqual(
       expect.arrayContaining(['--cwd', '--all', '--auto', '--json']),
     );
+  });
+
+  it('offers the alias binding flags on session bind and session unbind', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const cmd = (name: string) => session?.commands.find((c) => c.name() === name);
+    expect(cmd('bind')?.options.map((o) => o.long)).toEqual(
+      expect.arrayContaining(['--cwd', '--label']),
+    );
+    expect(cmd('unbind')?.options.map((o) => o.long)).toEqual(
+      expect.arrayContaining(['--accounts', '--cwd', '--force']),
+    );
+    // Both positionals are optional: the alias and accounts default from the current session.
+    expect(cmd('bind')?.registeredArguments.map((a) => a.required)).toEqual([false, false]);
+    expect(cmd('unbind')?.registeredArguments.map((a) => a.required)).toEqual([false]);
   });
 
   it('offers --session on the register/label/watch/unregister session commands', () => {

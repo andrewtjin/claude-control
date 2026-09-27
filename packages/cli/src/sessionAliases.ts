@@ -7,6 +7,7 @@
 // the network. Per-turn attribution is the SAME function `cctl stats` uses, so the two can never
 // name different accounts for one turn.
 
+import { realpathSync } from 'node:fs';
 import {
   Store,
   aliasedSessions,
@@ -16,19 +17,32 @@ import {
   readSessionCatalog,
   readTranscriptTurns,
   resolveSessionRef,
+  sameFolder,
   slotBySessionMap,
   type SessionAccountUse,
   type SessionMeta,
   type SessionRefResolution,
+  type SessionSlotSpanRow,
 } from '@claude-control/daemon';
-import type { Paths } from '@claude-control/switch-engine';
+import {
+  aliasKey,
+  canonicalizeFolder,
+  groupSlotId,
+  resolveSessionBinding,
+  scopedGroupOf,
+  type Paths,
+  type StoredGroup,
+  type SwitchEngine,
+} from '@claude-control/switch-engine';
 import { detectPalette } from './ansi.js';
 import { buildEngine, daemonDbPath, fail } from './context.js';
+import type { LaunchAliasDeps } from './launcher.js';
 import {
   renderAmbiguousAlias,
   renderSessionAliasList,
   renderSessionDetails,
   sessionViewJson,
+  type SessionBindingView,
   type SessionView,
 } from './render.js';
 
@@ -62,6 +76,29 @@ export interface SessionAliasDeps {
   write: (text: string) => void;
   /** Progress notes for a slow scan; only shown on a terminal. */
   note: (text: string) => void;
+  /** The engine to read (and, for bind/unbind, write) through; default = one over `paths`. Tests
+   *  pass one built over a sandbox vault. */
+  engine?: SwitchEngine;
+}
+
+/** Sessions' per-account use, plus the slot each was last RECORDED in (a slot span from a hook
+ *  event, else its registered slot) — what `session show` judges "in scope" by for a session that
+ *  is not the one running this command. */
+interface AccountsRead {
+  views: SessionView[];
+  recordedSlot: Map<string, string>;
+}
+
+/** The latest recorded slot per session id (lower-cased): its last span, else its registered slot.
+ *  Spans come ordered by session, then time, so the last one seen per session is its latest. */
+function lastRecordedSlots(
+  spans: readonly SessionSlotSpanRow[],
+  registered: ReadonlyMap<string, string>,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [id, slot] of registered) out.set(id.toLowerCase(), slot);
+  for (const span of spans) out.set(span.sessionId.toLowerCase(), span.slot);
+  return out;
 }
 
 /** Attach each session's per-account use (the expensive half: only these sessions' turns are
@@ -69,12 +106,12 @@ export interface SessionAliasDeps {
 async function withAccounts(
   deps: SessionAliasDeps,
   sessions: SessionMeta[],
-): Promise<SessionView[]> {
-  if (sessions.length === 0) return [];
+): Promise<AccountsRead> {
+  if (sessions.length === 0) return { views: [], recordedSlot: new Map() };
   const sessionIds = new Set(sessions.map((s) => s.sessionId));
   const [accounts, scan] = await Promise.all([
     // Reserved group members included: a bound account must show its name, not its id.
-    buildEngine(deps.paths).listAllAccounts(),
+    (deps.engine ?? buildEngine(deps.paths)).listAllAccounts(),
     // Per-session de-dup: a forked session's inherited turns belong to its history too.
     readTranscriptTurns({
       claudeDir: deps.paths.claudeDir,
@@ -85,12 +122,16 @@ async function withAccounts(
   ]);
   const store = new Store(daemonDbPath(deps.paths));
   let accountFor;
+  let recordedSlot: Map<string, string>;
   try {
+    const slotBySession = slotBySessionMap(store.listSessions());
+    const slotSpans = store.listSessionSlotSpans();
     accountFor = buildTurnAttributor({
       intervals: store.listActivationIntervals(),
-      slotBySession: slotBySessionMap(store.listSessions()),
-      slotSpans: store.listSessionSlotSpans(),
+      slotBySession,
+      slotSpans,
     });
+    recordedSlot = lastRecordedSlots(slotSpans, slotBySession);
   } finally {
     store.close();
   }
@@ -100,7 +141,114 @@ async function withAccounts(
     new Map(accounts.map((a) => [a.id, a.label] as const)),
   );
   const none: SessionAccountUse[] = [];
-  return sessions.map((meta) => ({ meta, accounts: uses.get(meta.sessionId) ?? none }));
+  return {
+    views: sessions.map((meta) => ({ meta, accounts: uses.get(meta.sessionId) ?? none })),
+    recordedSlot,
+  };
+}
+
+/** A custom title that names the session (non-blank), or null. */
+function customTitleOf(meta: SessionMeta): string | null {
+  return meta.customTitle !== null && meta.customTitle.trim() !== '' ? meta.customTitle : null;
+}
+
+/**
+ * Attach each session's binding by THE precedence rule (the same pure function the guard embeds):
+ * its folder and custom title -> the required slot; and whether it runs there. The current session's
+ * slot is read from this process's own CLAUDE_CONFIG_DIR (it runs inside it); any other session's
+ * is the slot the daemon last recorded for it, or unknown.
+ */
+async function withBindings(deps: SessionAliasDeps, read: AccountsRead): Promise<SessionView[]> {
+  if (read.views.length === 0) return read.views;
+  const engine = deps.engine ?? buildEngine(deps.paths);
+  const groups = await engine.listGroups();
+  const scoped = groups.map(scopedGroupOf);
+  const currentId = deps.env[SESSION_ID_ENV]?.trim().toLowerCase();
+  const currentSlot =
+    currentId !== undefined && currentId !== ''
+      ? await engine.slotForConfigDir(deps.env.CLAUDE_CONFIG_DIR ?? null)
+      : null;
+  const slotLabel = (slot: string): string => {
+    if (slot === 'global') return 'the shared account';
+    const g = groups.find((x) => groupSlotId(x.id) === slot);
+    return g === undefined ? 'a binding that no longer exists' : `the ${g.label} binding`;
+  };
+  return read.views.map((view) => {
+    const m = view.meta;
+    const title = customTitleOf(m);
+    const folder = m.folder === null ? null : canonicalOrRaw(m.folder, deps);
+    const required =
+      folder === null ? null : resolveSessionBinding(folder, title, scoped, deps.platform);
+    const group: StoredGroup | undefined =
+      required === null ? undefined : groups.find((g) => g.id === required.groupId);
+    const requiredSlot = required === null ? 'global' : groupSlotId(required.groupId);
+    const isCurrent = currentId !== undefined && m.sessionId.toLowerCase() === currentId;
+    const slot = isCurrent
+      ? currentSlot
+      : (read.recordedSlot.get(m.sessionId.toLowerCase()) ?? null);
+    const binding: SessionBindingView = {
+      via: required?.via ?? null,
+      folder: required?.folder ?? null,
+      alias:
+        required?.via === 'alias'
+          ? ((group?.aliases ?? []).find((a) => aliasKey(a.alias) === required.aliasKey)?.alias ??
+            title)
+          : null,
+      groupId: required?.groupId ?? null,
+      groupLabel: group?.label ?? null,
+      members: group?.members.map((mm) => mm.label) ?? [],
+      requiredSlot,
+      slot,
+      slotSource: slot === null ? null : isCurrent ? 'env' : 'recorded',
+      slotLabel: slot === null ? null : slotLabel(slot),
+      inScope: slot === null ? null : slot === requiredSlot,
+    };
+    return { ...view, binding };
+  });
+}
+
+/** Canonicalize a recorded session folder the way a binding stores folders (realpath when it
+ *  exists), falling back to the recorded text for a path that cannot be canonicalized. */
+function canonicalOrRaw(folder: string, deps: SessionAliasDeps): string {
+  const r = canonicalizeFolder(folder, {
+    platform: deps.platform,
+    cwd: deps.cwd,
+    realpath: (p) => realpathSync.native(p),
+  });
+  return r.ok ? r.path : folder;
+}
+
+/**
+ * The session-catalog lookups the launcher needs to learn which ALIAS a `cctl claude` launch opens
+ * (see launcher.ts resolveLaunchAlias). Only custom titles count. `rawCwd` is the launch cwd exactly
+ * as Claude Code will see it — the project directory it records sessions under is derived from that
+ * spelling, not from the canonical path.
+ */
+export function catalogLaunchAliasDeps(
+  claudeDir: string,
+  rawCwd: string,
+  platform: NodeJS.Platform,
+): LaunchAliasDeps {
+  return {
+    customTitleById: async (sessionId) => {
+      const catalog = await readSessionCatalog({ claudeDir, sessionIds: new Set([sessionId]) });
+      const meta = catalog.sessions.find(
+        (s) => s.sessionId.toLowerCase() === sessionId.toLowerCase(),
+      );
+      return meta === undefined ? null : customTitleOf(meta);
+    },
+    latestCustomTitleInFolder: async () => {
+      const catalog = await readSessionCatalog({
+        claudeDir,
+        projectDirFilter: (name) => projectDirMatches(name, rawCwd),
+      });
+      const here = catalog.sessions
+        .filter((s) => s.folder !== null && sameFolder(s.folder, rawCwd, platform))
+        .sort((a, b) => b.lastActivityMs - a.lastActivityMs);
+      const latest = here[0];
+      return latest === undefined ? null : customTitleOf(latest);
+    },
+  };
 }
 
 /** `cctl session show [ref]`. */
@@ -170,7 +318,7 @@ export async function runSessionShow(
   }
 
   const sessions = resolution.kind === 'id' ? [resolution.session] : resolution.sessions;
-  const views = await withAccounts(deps, sessions);
+  const views = await withBindings(deps, await withAccounts(deps, sessions));
   const context = {
     matchedBy: resolution.kind,
     ...(resolution.kind === 'alias' ? { inScope: resolution.inScope } : {}),
@@ -201,7 +349,7 @@ export async function runSessionAliases(
   const sessions = aliasedSessions(catalog.sessions, folder, deps.platform).filter(
     (s) => options.auto === true || (s.customTitle !== null && s.customTitle.trim() !== ''),
   );
-  const views = await withAccounts(deps, sessions);
+  const { views } = await withAccounts(deps, sessions);
   if (options.json === true) {
     deps.write(JSON.stringify({ folder, sessions: views.map(sessionViewJson) }, null, 2) + '\n');
     return;
