@@ -820,7 +820,12 @@ export class Vault {
     const st = await this.loadState();
     const { folders, moved } = this.validateNewGroup(st, opts);
     const now = this.clock();
-    const label = opts.label?.trim() || moved.map((m) => m.label).join(', ');
+    // Stored terminal-safe, exactly as an account label is (see addAccount): the group label is
+    // rendered on the CLI, in the doctor, in the guard's decision text and in phone alerts, and an
+    // operator types it freely. A label with nothing printable left falls back to the default.
+    const label =
+      sanitizeTerminalText(opts.label ?? '').trim() ||
+      sanitizeTerminalText(moved.map((m) => m.label).join(', '));
     const group: StoredGroup = {
       id: randomUUID(),
       label,

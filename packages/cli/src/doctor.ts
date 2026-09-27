@@ -16,7 +16,7 @@ import {
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { isBindGuardInSettingsText } from '@claude-control/daemon';
 import type { SwitchEngine } from '@claude-control/switch-engine';
-import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
 
@@ -141,10 +141,18 @@ export async function probeRelay(
   }
 }
 
-/** Render checks as `[ok]/[!!]` lines (green/red when a color palette is injected). Pure. */
+/** Render checks as `[ok]/[!!]` lines (green/red when a color palette is injected). Pure.
+ *
+ *  A detail quotes account labels, group labels and folder paths straight out of the registry files,
+ *  which an older build or a hand edit may have left carrying terminal controls, so each line of it
+ *  is made terminal-safe here — the one place every check's text reaches the terminal. */
 export function renderDoctor(checks: DoctorCheck[], palette: Palette = PLAIN_PALETTE): string {
+  const safe = (text: string): string => text.split('\n').map(sanitizeForTerminal).join('\n');
   return checks
-    .map((c) => `${c.ok ? palette.green('[ok]') : palette.red('[!!]')} ${c.name}: ${c.detail}`)
+    .map(
+      (c) =>
+        `${c.ok ? palette.green('[ok]') : palette.red('[!!]')} ${safe(c.name)}: ${safe(c.detail)}`,
+    )
     .join('\n');
 }
 

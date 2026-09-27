@@ -676,3 +676,33 @@ describe('downgrade fence — an older cctl cannot see or drop reserved accounts
     expect(await v.heal()).toBe(false);
   });
 });
+
+describe('group labels are stored terminal-safe', () => {
+  it('strips escape sequences, controls and bidi overrides from a given label, as account labels are', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      folders: ['C:\\work'],
+      label: 'x\u001b[2Jy\u202eevil\u0007',
+    });
+
+    // The same stripping addAccount applies: the controls go, the now-inert printable text stays.
+    expect(group.label).toBe('x[2Jyevil');
+    expect((await v.getGroup(group.id))?.label).toBe('x[2Jyevil');
+  });
+
+  it('falls back to the member labels when nothing printable is left', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      folders: ['C:\\w'],
+      label: ' \u001b\u0007\u202e\n ',
+    });
+
+    expect(group.label).toBe('work');
+  });
+});

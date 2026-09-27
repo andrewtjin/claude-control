@@ -41,6 +41,21 @@ describe('renderDoctor', () => {
     expect(out).toContain('[ok] dpapi: works');
     expect(out).toContain('[!!] login: no credentials');
   });
+
+  it('prints a detail carrying a stored label or path without its terminal controls', () => {
+    // A check detail quotes labels and folders straight out of the registry files, which an older
+    // build or a hand edit may have left carrying escape sequences.
+    const out = renderDoctor([
+      {
+        name: 'slots',
+        ok: false,
+        detail: 'non-member "work\u001b]0;pwned\u0007\u001b[2J\u001b[31mALL CHECKS OK" is live',
+      },
+    ]);
+    expect(out).not.toContain('\u001b');
+    expect(out).not.toContain('\u0007');
+    expect(out).toContain('ALL CHECKS OK');
+  });
 });
 
 describe('summarize', () => {
