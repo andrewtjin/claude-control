@@ -373,6 +373,38 @@ export async function checkGuardSnapshot(
   }
 }
 
+/**
+ * The folder-binding checks `cctl doctor` appends: slot invariants, guard snapshot freshness, guard
+ * hook presence. They all read `groups.json`, and a doctor exists precisely for the day that file
+ * cannot be read (corrupt, or written by a newer build) — so an unreadable registry is reported as
+ * ONE failed `bindings` check naming the reason, and every other check still runs and reports, instead
+ * of the whole command dying on the first read with nothing but that error. With the bindings unknown,
+ * the guard hook is judged as if bindings exist: a missing guard may then be a real gap.
+ */
+export async function checkFolderBindings(
+  engine: Pick<SwitchEngine, 'listGroups' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
+  paths: Paths,
+): Promise<DoctorCheck[]> {
+  const out: DoctorCheck[] = [];
+  let hasBindings: boolean;
+  try {
+    hasBindings = (await engine.listGroups()).length > 0;
+  } catch (err) {
+    hasBindings = true;
+    out.push({
+      name: 'bindings',
+      ok: false,
+      detail: `could not read the folder bindings: ${(err as Error).message}`,
+    });
+  }
+  out.push(
+    await checkSlots(engine),
+    await checkGuardSnapshot(engine),
+    checkGuardHook(paths, hasBindings),
+  );
+  return out;
+}
+
 /** Whether the enforcement guard hook is installed in the main config dir's settings.json. When
  *  bindings exist but the guard is absent, nothing enforces them — a failure. With no bindings, its
  *  presence is optional and reported without failing. */

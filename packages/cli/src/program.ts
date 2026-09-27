@@ -132,11 +132,9 @@ import {
   type SessionVerb,
 } from './sessionClient.js';
 import {
-  checkGuardHook,
-  checkGuardSnapshot,
+  checkFolderBindings,
   checkLiveLogin,
   checkPowerShellWrapper,
-  checkSlots,
   checkVersionSkew,
   probeRelay,
   readPowerShellWrapperProfile,
@@ -564,16 +562,14 @@ export function buildProgram(): Command {
       const paths = defaultPaths();
       const engine = buildEngine(paths);
       const checks = await runDoctor(paths);
-      // Folder-bound-account checks: slot invariants, guard snapshot freshness, guard hook presence,
-      // and CLI/daemon build skew — appended so the base environment report stays unchanged.
-      const groups = await engine.listGroups();
+      // Folder-bound-account checks (slot invariants, guard snapshot freshness, guard hook presence)
+      // and CLI/daemon build skew — appended so the base environment report stays unchanged. The
+      // binding checks report an unreadable groups.json as one failed check rather than throwing.
       const report = await readSettingsReport(daemonSettingsPath());
       const heartbeat = await readHeartbeat(daemonHeartbeatPath());
       const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
       checks.push(
-        await checkSlots(engine),
-        await checkGuardSnapshot(engine),
-        checkGuardHook(paths, groups.length > 0),
+        ...(await checkFolderBindings(engine, paths)),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
       );
       // Windows only: flag a PowerShell `claude` wrapper whose embedded node/cctl paths have gone
