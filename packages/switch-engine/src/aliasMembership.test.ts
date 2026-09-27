@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { SwitchEngine, type BindFs } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
-import { Vault } from './vault.js';
+import { MAX_GROUPS, MAX_GROUP_MEMBERS, Vault } from './vault.js';
 import { folderBindingsPath, groupProfileDir, sandboxPaths, type Paths } from './paths.js';
 import { readFolderBindingSnapshot } from './folderBindings.js';
 import type {
@@ -488,6 +488,55 @@ describe('a hand-edited alias folder spelling', () => {
     await h.engine.refreshSnapshot();
     const snap = await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir));
     expect(snap?.groups[0]?.aliases?.[0]?.folder).toBe(repo);
+  });
+});
+
+describe('refusals come before the global slot moves', () => {
+  it('an alias bind past the group cap refuses without moving global off the account', async () => {
+    const h = await harness();
+    const A = await h.engine.addAccount('A', bundleFor('A'));
+    await h.engine.addAccount('R', bundleFor('R'));
+    const repo = await h.folder('repo');
+    for (let i = 0; i < MAX_GROUPS; i += 1) {
+      const x = await h.vault.addAccount(`X${i}`, bundleFor(`X${i}`));
+      await h.vault.createGroup({ memberIds: [x.id], aliases: [{ folder: repo, alias: `a${i}` }] });
+    }
+    await h.engine.activate(A.id, { force: true });
+    await expect(h.engine.bindAlias(repo, 'new one', [A.id])).rejects.toThrow(
+      `cannot create another group (max ${MAX_GROUPS})`,
+    );
+    expect(await h.engine.getActiveId('global')).toBe(A.id);
+  });
+
+  it('growing past the member cap refuses without moving global off the account', async () => {
+    const h = await harness();
+    const A = await h.engine.addAccount('A', bundleFor('A'));
+    await h.engine.addAccount('R', bundleFor('R'));
+    const repo = await h.folder('repo');
+    const members: string[] = [];
+    for (let i = 0; i < MAX_GROUP_MEMBERS; i += 1) {
+      members.push((await h.engine.addAccount(`M${i}`, bundleFor(`M${i}`))).id);
+    }
+    await h.engine.activate(A.id, { force: true });
+    const bound = await h.engine.bindAlias(repo, 'full', members);
+    await expect(h.engine.addGroupMembers(bound.group.id, [A.id])).rejects.toThrow(
+      `more than ${MAX_GROUP_MEMBERS} members`,
+    );
+    expect(await h.engine.getActiveId('global')).toBe(A.id);
+  });
+
+  it('an alias in a folder another binding holds as a FOLDER is not refused as a folder conflict', async () => {
+    // The pre-check validates the scope being created — an alias scope, not the folder itself.
+    const h = await harness();
+    const A = await h.engine.addAccount('A', bundleFor('A'));
+    const W = await h.engine.addAccount('W', bundleFor('W'));
+    await h.engine.addAccount('C', bundleFor('C'));
+    const repo = await h.folder('repo');
+    await h.engine.activate(A.id, { force: true });
+    await h.engine.bindFolder(repo, [W.id]);
+    const res = await h.engine.bindAlias(repo, 'auth', [A.id]);
+    expect(res.created).toBe(true);
+    expect(res.movedOffGlobal).toBe(A.id);
   });
 });
 
