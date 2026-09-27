@@ -546,6 +546,85 @@ describe('bindFolder — crash safety (fault after each step converges)', () => 
     expect(snap.groups.length).toBe(1);
     expect(await fresh.checkSlots()).toEqual([]);
   });
+
+  it('after ensure-live, before the snapshot: a routine repair with no slot breach writes it', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    const faulted = h.restart((cp) => {
+      if (cp === 'bind:after-ensure-live') throw new Error('boom');
+    });
+    await expect(faulted.bindFolder(work, [A.id, B.id])).rejects.toThrow('boom');
+
+    // Every slot is legal, so the repair has nothing to move — but the guard would otherwise keep
+    // reading a snapshot that does not know the folder is bound.
+    const fresh = h.restart();
+    expect(await fresh.checkSlots()).toEqual([]);
+    await fresh.repairSlots();
+
+    const freshness = await fresh.getGuardSnapshotFreshness();
+    expect(freshness).toMatchObject({ present: true, fresh: true });
+    const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(snap.groups.flatMap((g) => g.folders)).toEqual([work]);
+  });
+});
+
+describe('the guard snapshot follows every change to a bound member', () => {
+  it('removing the last member drops the dissolved group from the snapshot and empties its slot', async () => {
+    const h = await harness();
+    const { A } = await seed(h);
+    const work = await h.folder('work');
+    const bound = await h.engine.bindFolder(work, [A.id]);
+
+    await h.engine.removeAccount(A.id);
+
+    const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(snap.groups).toEqual([]);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+    expect(await groupStore(h.paths, bound.group.id).readLiveCredentials()).toBeUndefined();
+    expect(existsSync(join(h.paths.vaultDir, 'slots', bound.group.id))).toBe(false);
+  });
+
+  it('removing one member rewrites the member labels the guard names', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.bindFolder(work, [A.id, B.id]);
+
+    await h.engine.removeAccount(B.id);
+
+    const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(snap.groups.map((g) => g.members)).toEqual([['A']]);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+  });
+
+  it('renaming a reserved member rewrites the member labels the guard names', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.bindFolder(work, [A.id, B.id]);
+
+    await h.engine.renameAccount(B.id, 'Research');
+
+    const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(snap.groups[0]!.members.sort()).toEqual(['A', 'Research']);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+  });
+
+  it('refreshSnapshotIfStale rewrites a stale snapshot once and leaves a fresh one alone', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    const faulted = h.restart((cp) => {
+      if (cp === 'bind:after-ensure-live') throw new Error('boom');
+    });
+    await expect(faulted.bindFolder(work, [A.id, B.id])).rejects.toThrow('boom');
+
+    const fresh = h.restart();
+    expect(await fresh.refreshSnapshotIfStale()).toBe(true);
+    expect((await fresh.getGuardSnapshotFreshness()).fresh).toBe(true);
+    expect(await fresh.refreshSnapshotIfStale()).toBe(false);
+  });
 });
 
 describe('unbindFolder — crash safety', () => {

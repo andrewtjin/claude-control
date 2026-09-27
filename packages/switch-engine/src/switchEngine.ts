@@ -489,20 +489,35 @@ export class SwitchEngine {
    * the reservation fence exists to prevent. So its live files are cleared, failing that slot closed
    * (an empty config dir = not logged in — measured). The global slot is deliberately NOT cleared
    * this way: removing the global active account leaves its live files for the historical reasons the
-   * vault's own active-id clearing already encodes.
+   * vault's own active-id clearing already encodes. Removing a member rewrites the guard snapshot,
+   * which names members and — when the removal dissolves the group — enforces its folders.
    */
   removeAccount(id: string): Promise<void> {
     return this.withCredentialLock(async () => {
       // Decide BEFORE the row is gone: only a member that is currently live in its own group slot
-      // needs its profile seat cleared.
+      // needs its profile seat cleared — or every seat of a group this removal dissolves.
       const { slotId, group } = await this.slotForAccount(id);
       const liveInGroup = group !== undefined && (await this.getActiveId(slotId)) === id;
+      const dissolves = group !== undefined && group.members.length === 1;
       await this.vault.removeAccount(id);
-      if (liveInGroup) await this.clearSlotLive(this.slotRuntime(slotId));
+      if (group === undefined) return;
+      const rt = this.slotRuntime(slotId);
+      if (liveInGroup || dissolves) await this.clearSlotLive(rt);
+      // A dissolved group's slot no longer exists: drop its recovery state too, so no intent is left
+      // behind for a slot nothing will ever walk again (the same cleanup an unbind's dissolve does).
+      if (dissolves) await this.clearSlotState(rt);
+      // The guard names a group's members and enforces its folders; a removal changed one or both.
+      // Written LAST, like every other group mutation.
+      await this.writeSnapshotLocked();
     });
   }
   renameAccount(id: string, label: string): Promise<StoredAccount> {
-    return this.withCredentialLock(() => this.vault.renameAccount(id, label));
+    return this.withCredentialLock(async () => {
+      const renamed = await this.vault.renameAccount(id, label);
+      // A reserved member's label is part of what the guard's block reason shows.
+      if ((await this.slotForAccount(id)).group !== undefined) await this.writeSnapshotLocked();
+      return renamed;
+    });
   }
   clearQuarantine(id: string): Promise<void> {
     return this.withCredentialLock(() => this.vault.clearQuarantine(id));
@@ -590,7 +605,13 @@ export class SwitchEngine {
   async dedupeAccounts(): Promise<DedupeReport> {
     const nothing: DedupeReport = { merged: [], relabelled: [] };
     try {
-      const report = await this.withCredentialLockIfFree(() => this.vault.dedupeAccounts());
+      const report = await this.withCredentialLockIfFree(async () => {
+        const r = await this.vault.dedupeAccounts();
+        // A merge or a relabel can change a reserved member's label, which the guard names.
+        if (r.merged.length > 0 || r.relabelled.length > 0)
+          await this.refreshSnapshotIfStaleLocked();
+        return r;
+      });
       if (report && (report.merged.length > 0 || report.relabelled.length > 0)) {
         this.log.info(
           { merged: report.merged, relabelled: report.relabelled },
@@ -1189,7 +1210,17 @@ export class SwitchEngine {
   async repairSlots(): Promise<RepairResult> {
     return this.withCredentialLock(async () => {
       const before = await this.computeViolations();
-      if (before.length === 0) return { repaired: [], remaining: [], actions: [] };
+      if (before.length === 0) {
+        // No slot to move — but the snapshot can still lag the registry (a crash between a group
+        // write and its snapshot write leaves every slot legal). Converge that too, or the guard
+        // keeps enforcing a binding set that no longer exists until something else rewrites it.
+        const rewrote = await this.refreshSnapshotIfStaleLocked();
+        return {
+          repaired: [],
+          remaining: [],
+          actions: rewrote ? ['rewrote the stale folder-bindings snapshot'] : [],
+        };
+      }
 
       const actions: string[] = [];
       const allRows = await this.vault.listAllAccounts();
@@ -1546,6 +1577,36 @@ export class SwitchEngine {
    *  always reads a snapshot consistent with the live registry. */
   async refreshSnapshot(): Promise<void> {
     await this.withCredentialLock(() => this.writeSnapshotLocked());
+  }
+
+  /**
+   * Rewrite the guard snapshot only when it no longer matches the registry (see
+   * {@link getGuardSnapshotFreshness}); returns whether it rewrote. What the daemon's periodic
+   * maintenance calls, so a snapshot left stale — a crash between a group write and its snapshot
+   * write, an offline registry edit — is healed within one cycle rather than at the next restart or
+   * the next group mutation. The steady-state check is lock-free; the lock is taken only to rewrite,
+   * and the check is repeated under it so a concurrent writer's fresh snapshot is not rewritten.
+   */
+  async refreshSnapshotIfStale(): Promise<boolean> {
+    if (await this.snapshotIsFresh()) return false;
+    return this.withCredentialLock(() => this.refreshSnapshotIfStaleLocked());
+  }
+
+  /** {@link refreshSnapshotIfStale} for a caller that already holds the credential lock. */
+  private async refreshSnapshotIfStaleLocked(): Promise<boolean> {
+    if (await this.snapshotIsFresh()) return false;
+    await this.writeSnapshotLocked();
+    return true;
+  }
+
+  /** Whether the on-disk snapshot matches the registry. A missing or unreadable (corrupt) snapshot
+   *  is simply not fresh — the rewrite is exactly what heals it. */
+  private async snapshotIsFresh(): Promise<boolean> {
+    try {
+      return (await this.getGuardSnapshotFreshness()).fresh;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -2170,7 +2231,15 @@ export class SwitchEngine {
    * profile dir first ({@link ensureGroupProfile}) and commits by moving the group's live member,
    * leaving the global slot untouched. `options.slot`, when given, may only AGREE with the derived
    * slot — a disagreement is the "reserved account can't be global / non-member can't be a group"
-   * refusal, made explicit rather than silently overridden.
+   * refusal ({@link SlotError} `slot_mismatch`), made explicit rather than silently overridden.
+   *
+   * Everything that decides WHERE the target goes is read UNDER the lock. Membership is a fact another
+   * process changes (a bind reserves an account, an unbind dissolves a group); a slot derived before
+   * the lock can name a slot the target no longer belongs to by the time it is written — putting one
+   * account live in two slots, or seeding a dissolved group's profile nothing checks any more. A
+   * caller that decided against an older picture (the daemon's per-slot auto-switch, a phone
+   * `/switch`) passes the slot it decided for, so a changed picture fails the switch rather than
+   * landing it somewhere the caller never meant.
    */
   async activate(targetId: string, options: ActivateOptions = {}): Promise<ActivateResult> {
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);

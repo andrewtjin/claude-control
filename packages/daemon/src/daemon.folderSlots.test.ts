@@ -144,6 +144,7 @@ interface FakeEngineControls {
   activateCalls: Array<{ id: string }>;
   ensureGroupLiveCalls: string[];
   refreshSnapshotCalls: number;
+  refreshSnapshotIfStaleCalls: number;
   checkSlotsCalls: number;
   repairSlotsCalls: number;
   liveSlots: Map<SlotId, string | null>;
@@ -163,11 +164,14 @@ function fakeEngine(opts: {
   ensureGroupLiveImpl?: (groupId: string) => Promise<GroupLiveResult>;
   /** Override checkSlots, e.g. to model a breach that the per-group self-heal clears. */
   checkSlotsImpl?: () => Promise<SlotViolation[]>;
+  /** What refreshSnapshotIfStale reports (default: the snapshot was already fresh). */
+  snapshotStale?: boolean;
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
     ensureGroupLiveCalls: [],
     refreshSnapshotCalls: 0,
+    refreshSnapshotIfStaleCalls: 0,
     checkSlotsCalls: 0,
     repairSlotsCalls: 0,
     liveSlots: opts.live,
@@ -229,6 +233,10 @@ function fakeEngine(opts: {
     refreshSnapshot: (): Promise<void> => {
       controls.refreshSnapshotCalls++;
       return Promise.resolve();
+    },
+    refreshSnapshotIfStale: (): Promise<boolean> => {
+      controls.refreshSnapshotIfStaleCalls++;
+      return Promise.resolve(opts.snapshotStale === true);
     },
     reauthenticate: () => Promise.reject(new Error('unused')),
   };
@@ -422,6 +430,25 @@ describe('daemon folder-bound slots — startup and maintenance', () => {
     expect(controls.refreshSnapshotCalls).toBe(1);
     expect(controls.ensureGroupLiveCalls).toContain('g1');
     expect(controls.checkSlotsCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it('checks the guard snapshot for staleness every cycle, even with no slot breach', async () => {
+    // A crash between a group write and its snapshot write leaves every slot legal, so the
+    // check/repair path never runs; the per-cycle staleness check is what converges the snapshot.
+    const { accounts, groups, live } = twoAccountGroup();
+    const controls = fakeEngine({ accounts, groups, live, snapshotStale: true });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({
+        limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }],
+      }),
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 2);
+
+    expect(controls.refreshSnapshotIfStaleCalls).toBeGreaterThanOrEqual(2);
+    expect(controls.repairSlotsCalls).toBe(0);
   });
 
   it('repairs a slot invariant breach and alerts once per window on what survives', async () => {

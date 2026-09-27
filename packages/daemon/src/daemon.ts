@@ -128,6 +128,9 @@ export interface SwitchEngineLike {
   repairSlots?(): Promise<RepairResult>;
   /** Rewrite the guard snapshot from the current registry + configured enforce mode. */
   refreshSnapshot?(): Promise<void>;
+  /** Rewrite the guard snapshot only when it no longer matches the registry; resolves whether it
+   *  rewrote. Lock-free when the snapshot is fresh, so it is cheap enough to run every cycle. */
+  refreshSnapshotIfStale?(): Promise<boolean>;
   /** The config dir a managed spawn runs in for an account (a reserved member's profile dir, or
    *  undefined for a shared account) — the seam wired into the SDK client. */
   configDirForAccount?(accountId: string): Promise<string | undefined>;
@@ -1386,7 +1389,8 @@ export class Daemon {
   }
 
   /**
-   * Self-heal every group slot and repair illegal slot occupancy, once per cycle. For each group:
+   * Self-heal every group slot and repair illegal slot occupancy, once per cycle. First a stale guard
+   * snapshot is rewritten (see the body for why nothing else would). Then, for each group:
    * `ensureGroupLive` materializes its profile and makes a usable member live (a no-op steady-state),
    * and a group left with no working account is alerted on. Then `checkSlots` finds any invariant
    * breach and `repairSlots` fixes the (a)-(d) ones under the engine lock; whatever a repair could
@@ -1395,6 +1399,23 @@ export class Daemon {
    * same way as one repairSlots fixes.
    */
   private async maintainSlots(groups: StoredGroup[]): Promise<void> {
+    // Every group mutation writes the guard snapshot LAST, so a crash between the registry write and
+    // the snapshot write leaves the snapshot stale while every slot is legal — nothing below would
+    // notice, and the guard would keep enforcing the old binding set (fail-open for a new binding,
+    // a stray block for a dissolved one) until a restart. Converge it here, once per cycle.
+    const refreshSnapshotIfStale = this.switchEngine.refreshSnapshotIfStale?.bind(
+      this.switchEngine,
+    );
+    if (refreshSnapshotIfStale) {
+      try {
+        if (await refreshSnapshotIfStale()) {
+          this.logger.info('rewrote a stale folder-bindings snapshot');
+        }
+      } catch (err) {
+        this.logger.warn({ err }, 'could not refresh a stale folder-bindings snapshot');
+      }
+    }
+
     const checkSlots = this.switchEngine.checkSlots?.bind(this.switchEngine);
     // Take the breach snapshot BEFORE the per-group self-heal. ensureGroupLive re-seats a group's
     // rightful member over a stranger it finds in the profile as a side effect, so a check taken
