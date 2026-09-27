@@ -80,3 +80,96 @@ describe('groupProfileDir', () => {
     expect(indexGroupProfileDir.length).toBe(2);
   });
 });
+
+// Inside a folder-bound session CLAUDE_CONFIG_DIR is the group's profile. A cctl command run from
+// that session's tools must still act on the MAIN config dir, or it writes the global account into
+// the profile (one account live in two slots) and points the guard snapshot at the profile.
+describe('defaultPaths from inside a group profile', () => {
+  const lad = join('C:', 'Users', 'me', 'AppData', 'Local');
+  const home = join('C:', 'Users', 'me');
+  const vaultDir = join(lad, 'claude-control', 'vault');
+  const profile = join(lad, 'claude-control', 'profiles', 'g-123');
+  // The logic resolves with win32 path rules; compare separator-blind so this runs on any host.
+  const norm = (s: string): string => s.replace(/[\\/]+/g, '/').replace(/\/$/, '');
+  const noSnapshot = (): string => {
+    throw new Error('ENOENT');
+  };
+
+  it('sees through to the main dir the profile links its projects to (explicit main dir)', () => {
+    const main = join('D:', 'claude-main');
+    const paths = defaultPaths({ LOCALAPPDATA: lad, CLAUDE_CONFIG_DIR: profile }, 'win32', {
+      home,
+      readlink: (p) => {
+        expect(norm(p)).toBe(norm(join(profile, 'projects')));
+        // How Windows reports a junction target: long-path prefix and a trailing separator.
+        return '\\\\?\\' + join(main, 'projects') + '\\';
+      },
+      readFile: noSnapshot,
+    });
+    expect(norm(paths.claudeDir)).toBe(norm(main));
+    expect(norm(paths.credentialsPath)).toBe(norm(join(main, '.credentials.json')));
+    expect(norm(paths.claudeJsonPath)).toBe(norm(join(main, '.claude.json')));
+    expect(norm(paths.vaultDir)).toBe(norm(vaultDir));
+  });
+
+  it('maps a profile of the default layout back to ~/.claude and ~/.claude.json', () => {
+    const paths = defaultPaths(
+      { LOCALAPPDATA: lad, CLAUDE_CONFIG_DIR: profile.toUpperCase() + '\\' },
+      'win32',
+      { home, readlink: () => join(home, '.claude', 'projects'), readFile: noSnapshot },
+    );
+    expect(norm(paths.claudeDir)).toBe(norm(join(home, '.claude')));
+    expect(norm(paths.claudeJsonPath)).toBe(norm(join(home, '.claude.json')));
+  });
+
+  it('falls back to the guard snapshot when the projects link cannot be read', () => {
+    const main = join('E:', 'cfg');
+    const paths = defaultPaths({ LOCALAPPDATA: lad, CLAUDE_CONFIG_DIR: profile }, 'win32', {
+      home,
+      readlink: () => {
+        throw new Error('EINVAL');
+      },
+      readFile: (p) => {
+        expect(norm(p)).toBe(norm(join(lad, 'claude-control', 'folder-bindings.json')));
+        return JSON.stringify({ schemaVersion: 1, mainConfigDir: main });
+      },
+    });
+    expect(norm(paths.claudeDir)).toBe(norm(main));
+  });
+
+  it('falls back to the default layout, never the profile, when nothing names the main dir', () => {
+    const paths = defaultPaths({ LOCALAPPDATA: lad, CLAUDE_CONFIG_DIR: profile }, 'win32', {
+      home,
+      readlink: () => {
+        throw new Error('EINVAL');
+      },
+      readFile: () => '{not json',
+    });
+    expect(norm(paths.claudeDir)).toBe(norm(join(home, '.claude')));
+  });
+
+  it('leaves a CLAUDE_CONFIG_DIR outside the profiles root untouched, with no filesystem read', () => {
+    const touch = (): string => {
+      throw new Error('must not read');
+    };
+    const dir = join(lad, 'claude-control', 'profiles-not');
+    const paths = defaultPaths({ LOCALAPPDATA: lad, CLAUDE_CONFIG_DIR: dir }, 'win32', {
+      home,
+      readlink: touch,
+      readFile: touch,
+    });
+    expect(norm(paths.claudeDir)).toBe(norm(dir));
+  });
+
+  it('treats the profiles root itself as outside any profile', () => {
+    const root = join(lad, 'claude-control', 'profiles');
+    const paths = defaultPaths({ LOCALAPPDATA: lad, CLAUDE_CONFIG_DIR: root }, 'win32', {
+      home,
+      readlink: () => {
+        throw new Error('must not read');
+      },
+      readFile: noSnapshot,
+    });
+    expect(norm(paths.claudeDir)).toBe(norm(root));
+  });
+});
