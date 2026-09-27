@@ -361,6 +361,23 @@ describe('bindAlias — refusals name the offender', () => {
     expect(fits.alias).toBe(`  ${'y'.repeat(200)}  `);
   });
 
+  it('counts that length in code points, as Claude Code does: an alias of emoji it stores whole binds', async () => {
+    // Measured: 195 ASCII characters and 5 emoji (200 code points, 205 UTF-16 units) are stored
+    // whole; 201 code points are stored as the first 200 code points.
+    const h = await harness();
+    const { A } = await seed(h);
+    const repo = await h.folder('repo');
+    const whole = `${'a'.repeat(195)}${'\u{1F600}'.repeat(5)}`;
+    expect(whole.length).toBe(205);
+    await expect(h.engine.bindAlias(repo, whole, [A.id])).resolves.toMatchObject({
+      alias: whole,
+    });
+    const cut = `${'b'.repeat(196)}${'\u{1F600}'.repeat(5)}`;
+    await expect(h.engine.bindAlias(repo, cut, [A.id])).rejects.toThrow(
+      /cannot be longer than 200 characters/,
+    );
+  });
+
   it('refuses a nonexistent folder and one inside cctl state; unknown/empty accounts; macOS', async () => {
     const h = await harness();
     const { A } = await seed(h);

@@ -839,6 +839,27 @@ describe('renderBindingGroups', () => {
     expect(lines.find((l) => l.includes('"fits"'))).not.toContain('never matches');
   });
 
+  it('counts that length in code points, as Claude Code does', () => {
+    const whole = `${'q'.repeat(195)}${'\u{1F600}'.repeat(5)}`; // 200 code points, 205 units
+    const cut = `${'r'.repeat(196)}${'\u{1F600}'.repeat(5)}`; // 201 code points
+    const out = renderBindingGroups(
+      [
+        {
+          ...group,
+          folders: [],
+          aliases: [
+            { folder: 'C:\\repo', alias: whole },
+            { folder: 'C:\\repo', alias: cut },
+          ],
+        },
+      ],
+      PLAIN_PALETTE,
+    );
+    const lines = out.split('\n');
+    expect(lines.find((l) => l.includes('q'.repeat(195)))).not.toContain('never matches');
+    expect(lines.find((l) => l.includes('r'.repeat(196)))).toContain('(never matches: longer than');
+  });
+
   it('flags a group with no working account', () => {
     const dead = { ...group, members: [], noWorkingAccount: true };
     expect(renderBindingGroups([dead], PLAIN_PALETTE)).toContain('none usable');

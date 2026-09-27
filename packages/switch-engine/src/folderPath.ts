@@ -365,15 +365,19 @@ export function aliasKey(alias: string): string {
   return alias.toLowerCase().trim();
 }
 
-/** The longest custom title Claude Code keeps: it stores the first 200 characters of a name (measured
- *  on 2.1.283: `claude --name "<278 characters>"` records a 200-character customTitle). */
+/** The longest custom title Claude Code keeps, in CODE POINTS: it stores the first 200 characters of a
+ *  name (measured on 2.1.283: `claude --name "<278 characters>"` records a 200-character customTitle;
+ *  195 ASCII characters and 5 emoji — 200 code points, 205 UTF-16 units — are stored whole, and 201
+ *  code points are stored as the first 200 code points, not the first 200 units). */
 export const CLAUDE_CODE_TITLE_MAX_LENGTH = 200;
 
 /** Whether a session could carry `alias` as its title: its trimmed text fits Claude Code's title
- *  length. A longer alias is cut when stored, so no session's title ever matches it — a binding of
- *  it would bind nothing, and `claude --resume <alias>` would reject it. */
+ *  length, counted in code points as Claude Code counts it (a UTF-16 count would refuse an alias of
+ *  emoji or other astral characters that Claude Code stores whole). A longer alias is cut when
+ *  stored, so no session's title ever matches it — a binding of it would bind nothing, and
+ *  `claude --resume <alias>` would reject it. */
 export function aliasFitsSessionTitle(alias: string): boolean {
-  return alias.trim().length <= CLAUDE_CODE_TITLE_MAX_LENGTH;
+  return [...alias.trim()].length <= CLAUDE_CODE_TITLE_MAX_LENGTH;
 }
 
 /**

@@ -207,8 +207,8 @@ Run inside a Claude Code session (from a Bash tool or a `!` command), both comma
 that session: the alias is its own name and the folder is its own folder. Only a name you set
 counts — a session with just a generated title is refused with `name it first: /rename <alias>`,
 because a generated title changes under you. An alias longer than 200 characters is refused too:
-Claude Code keeps only the first 200 characters of a session's name, so no session could ever
-carry it. (A longer alias bound by an older cctl still loads; `cctl bindings` marks it as never
+Claude Code keeps only the first 200 characters of a session's name (an emoji counts as one), so
+no session could ever carry it. (A longer alias bound by an older cctl still loads; `cctl bindings` marks it as never
 matching and `cctl doctor` prints the command that unbinds it.) The accounts default to the one the session runs
 on right now; when the session runs on a config dir cctl does not manage (a `CLAUDE_CONFIG_DIR`
 that is neither the main config dir nor a live binding's profile), that account is unknown, so

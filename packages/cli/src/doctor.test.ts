@@ -574,6 +574,15 @@ describe('checkBindingScopes', () => {
     expect(check.detail).toContain(`cctl session unbind '${long}' --cwd`);
     expect(check.detail).not.toContain('y'.repeat(200));
   });
+
+  it('counts that length in code points, as Claude Code does', async () => {
+    const whole = `${'q'.repeat(195)}${'\u{1F600}'.repeat(5)}`; // 200 code points, 205 units
+    const check = await checkBindingScopes({
+      listGroups: () =>
+        Promise.resolve([group('a', { aliases: [{ folder: 'C:\\repo', alias: whole }] })]),
+    });
+    expect(check.ok).toBe(true);
+  });
 });
 
 describe('checkFolderBindings', () => {
