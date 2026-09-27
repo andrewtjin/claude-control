@@ -23,7 +23,13 @@ import type {
 } from './types.js';
 import type { FolderBindingSnapshot } from './types.js';
 import type { Protector } from './dpapi.js';
-import { aliasKey, aliasScopeUniquenessKey, folderUniquenessKey } from './folderPath.js';
+import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  aliasKey,
+  aliasScopeUniquenessKey,
+  folderUniquenessKey,
+} from './folderPath.js';
 import { sanitizeTerminalText } from './terminalSafe.js';
 import {
   buildFolderBindingSnapshot,
@@ -182,9 +188,12 @@ export const MAX_GROUP_MEMBERS = 32;
 export const MAX_GROUP_FOLDERS = 256;
 /** Alias scopes per group — same order of magnitude as folders, same reasoning. */
 export const MAX_GROUP_ALIASES = 256;
-/** Longest alias a binding may carry. A session title is free text, and every bound alias is copied
- *  into the guard snapshot the hook reads on each prompt, so an unbounded one would let a single
- *  pasted blob bloat every prompt's read. Far above any title a person types. */
+/** Longest alias a registry file may carry when LOADED. A session title is free text, and every
+ *  bound alias is copied into the guard snapshot the hook reads on each prompt, so an unbounded one
+ *  would let a single pasted blob bloat every prompt's read. A NEW binding is held to Claude Code's
+ *  own title length (CLAUDE_CODE_TITLE_MAX_LENGTH), since a longer alias can never match a session;
+ *  this larger cap only keeps a file written before that rule loadable, so its binding can be seen
+ *  (flagged as never matching) and released. */
 export const MAX_ALIAS_LENGTH = 512;
 
 /** Property names that, if copied onto an object literal or used as a plain-object map key, reach
@@ -1167,8 +1176,9 @@ export class Vault {
   }
 
   /** Validate NEW alias scopes against the current bindings, mirroring {@link checkNewFolders}: each
-   *  needs a non-empty folder and an alias with a non-empty {@link aliasKey}, within
-   *  {@link MAX_ALIAS_LENGTH}, no NUL, unique within the set, and not already held by any group
+   *  needs a non-empty folder and an alias with a non-empty {@link aliasKey}, whose trimmed text fits
+   *  Claude Code's title length (a longer one never matches a session), no NUL, unique within the
+   *  set, and not already held by any group
    *  (`ignoreGroupId` only changes which message names the collision). Keys on
    *  {@link aliasScopeUniquenessKey}, the SAME key {@link validateGroupsFile} enforces at load.
    *  Returns copies of the scopes. */
@@ -1194,9 +1204,10 @@ export class Vault {
       if (typeof scope.alias !== 'string' || aliasKey(scope.alias) === '') {
         throw new VaultError('a session alias cannot be empty');
       }
-      if (scope.alias.length > MAX_ALIAS_LENGTH) {
+      if (scope.alias.length > MAX_ALIAS_LENGTH || !aliasFitsSessionTitle(scope.alias)) {
         throw new VaultError(
-          `a session alias cannot be longer than ${MAX_ALIAS_LENGTH} characters`,
+          `a session alias cannot be longer than ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters ` +
+            '(Claude Code keeps only that much of a session name)',
         );
       }
       if (scope.folder.includes('\u0000') || scope.alias.includes('\u0000')) {

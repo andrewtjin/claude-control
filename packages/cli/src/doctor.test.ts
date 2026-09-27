@@ -536,4 +536,20 @@ describe('checkBindingScopes', () => {
     expect(check.detail).toContain('cctl unbind --group g1');
     expect(check.detail).not.toContain('g2');
   });
+
+  it('flags a session alias longer than Claude Code keeps a session name: it never matches', async () => {
+    const long = 'x'.repeat(201);
+    const check = await checkBindingScopes({
+      listGroups: () =>
+        Promise.resolve([
+          group('a', { aliases: [{ folder: 'C:\\repo', alias: long }] }),
+          group('b', { aliases: [{ folder: 'C:\\repo', alias: 'y'.repeat(200) }] }),
+        ]),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('1 session alias(es) never match a session');
+    expect(check.detail).toContain('200 characters Claude Code keeps of a session name');
+    expect(check.detail).toContain(`cctl session unbind '${long}' --cwd`);
+    expect(check.detail).not.toContain('y'.repeat(200));
+  });
 });

@@ -365,6 +365,17 @@ export function aliasKey(alias: string): string {
   return alias.toLowerCase().trim();
 }
 
+/** The longest custom title Claude Code keeps: it stores the first 200 characters of a name (measured
+ *  on 2.1.283: `claude --name "<278 characters>"` records a 200-character customTitle). */
+export const CLAUDE_CODE_TITLE_MAX_LENGTH = 200;
+
+/** Whether a session could carry `alias` as its title: its trimmed text fits Claude Code's title
+ *  length. A longer alias is cut when stored, so no session's title ever matches it — a binding of
+ *  it would bind nothing, and `claude --resume <alias>` would reject it. */
+export function aliasFitsSessionTitle(alias: string): boolean {
+  return alias.trim().length <= CLAUDE_CODE_TITLE_MAX_LENGTH;
+}
+
 /**
  * Quote `text` as ONE literal argument for the shell an operator pastes a printed command into:
  * PowerShell on Windows (the documented shell there), a POSIX shell elsewhere. Single quotes in

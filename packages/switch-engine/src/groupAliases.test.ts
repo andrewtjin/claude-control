@@ -80,6 +80,44 @@ async function expectLoadRefusal(content: unknown, pattern: RegExp): Promise<voi
   expect(await readFile(groupsPath, 'utf8')).toBe(before);
 }
 
+describe('the length of a session alias', () => {
+  it('a NEW alias is held to the 200 characters Claude Code keeps of a session name', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('a', bundle('a'));
+    const b = await v.addAccount('b', bundle('b'));
+    await expect(
+      v.createGroup({ memberIds: [a.id], aliases: [{ folder: 'C:\\b', alias: 'x'.repeat(201) }] }),
+    ).rejects.toThrow(/cannot be longer than 200 characters/);
+    const g = await v.createGroup({
+      memberIds: [b.id],
+      aliases: [{ folder: 'C:\\repo', alias: 'auth work' }],
+    });
+    await expect(
+      v.addAliasToGroup(g.id, { folder: 'C:\\repo', alias: 'x'.repeat(201) }),
+    ).rejects.toThrow(/cannot be longer than 200 characters/);
+    // The trimmed text is what counts (the resume rule trims): 200 characters fit.
+    await v.addAliasToGroup(g.id, { folder: 'C:\\repo', alias: ` ${'x'.repeat(200)} ` });
+  });
+
+  it('an existing longer alias (bound before the rule) still loads, so it can be seen and released', async () => {
+    const long = 'x'.repeat(300);
+    const { v } = await withGroupsFile(
+      file([
+        aliasGroup('g1', [
+          { folder: 'C:\\repo', alias: long },
+          { folder: 'C:\\repo', alias: 'short' },
+        ]),
+      ]),
+    );
+    expect((await v.listGroups())[0]!.aliases).toEqual([
+      { folder: 'C:\\repo', alias: long },
+      { folder: 'C:\\repo', alias: 'short' },
+    ]);
+    const updated = await v.removeAliasFromGroup('g1', { folder: 'C:\\repo', alias: long });
+    expect(updated.aliases).toEqual([{ folder: 'C:\\repo', alias: 'short' }]);
+  });
+});
+
 describe('loading alias scopes', () => {
   it('loads a file written before alias scopes existed (no aliases field anywhere)', async () => {
     const { v } = await withGroupsFile(

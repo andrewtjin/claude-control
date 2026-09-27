@@ -345,6 +345,22 @@ describe('bindAlias — refusals name the offender', () => {
     expect((await h.vault.listGroups()).length).toBe(0);
   });
 
+  it('refuses an alias longer than Claude Code keeps a session name, which no session could match', async () => {
+    // Measured: `claude --name "<278 characters>"` records only the first 200 characters.
+    const h = await harness();
+    const { A } = await seed(h);
+    const repo = await h.folder('repo');
+    const attempt = h.engine.bindAlias(repo, 'x'.repeat(201), [A.id]);
+    await expect(attempt).rejects.toMatchObject({ code: 'bind_refused' });
+    await expect(h.engine.bindAlias(repo, 'x'.repeat(201), [A.id])).rejects.toThrow(
+      /cannot be longer than 200 characters: Claude Code keeps only the first 200/,
+    );
+    expect((await h.vault.listGroups()).length).toBe(0);
+    // 200 characters fit, whatever surrounds them (the resume rule trims).
+    const fits = await h.engine.bindAlias(repo, `  ${'y'.repeat(200)}  `, [A.id]);
+    expect(fits.alias).toBe(`  ${'y'.repeat(200)}  `);
+  });
+
   it('refuses a nonexistent folder and one inside cctl state; unknown/empty accounts; macOS', async () => {
     const h = await harness();
     const { A } = await seed(h);

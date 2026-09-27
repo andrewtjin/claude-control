@@ -15,7 +15,12 @@ import {
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { isBindGuardInSettingsText } from '@claude-control/daemon';
-import type { SwitchEngine } from '@claude-control/switch-engine';
+import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  shellQuoteArg,
+  type SwitchEngine,
+} from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
@@ -322,29 +327,50 @@ export async function checkSlots(engine: Pick<SwitchEngine, 'checkSlots'>): Prom
  *  aliases leaves behind when it rewrites a file holding an alias-only binding (it drops the alias
  *  scopes it does not know). Its accounts stay reserved to it — usable nowhere but with an explicit
  *  `--account` — until a scope is bound to them again or the binding is dissolved. Flagged by name
- *  with the release command (by id: stable and paste-safe). */
+ *  with the release command (by id: stable and paste-safe). Also flagged: a session alias longer
+ *  than Claude Code keeps a session's name (bound before cctl refused those), which no session can
+ *  ever match — with the command that unbinds it. */
 export async function checkBindingScopes(
   engine: Pick<SwitchEngine, 'listGroups'>,
 ): Promise<DoctorCheck> {
   try {
-    const scopeless = (await engine.listGroups()).filter(
+    const groups = await engine.listGroups();
+    const scopeless = groups.filter(
       (g) => g.folders.length === 0 && (g.aliases ?? []).length === 0,
     );
-    if (scopeless.length === 0) {
+    const tooLong = groups.flatMap((g) =>
+      (g.aliases ?? []).filter((a) => !aliasFitsSessionTitle(a.alias)),
+    );
+    if (scopeless.length === 0 && tooLong.length === 0) {
       return { name: 'binding-scopes', ok: true, detail: 'every binding has a folder or session' };
     }
-    return {
-      name: 'binding-scopes',
-      ok: false,
-      detail:
+    const problems: string[] = [];
+    if (scopeless.length > 0) {
+      problems.push(
         `${scopeless.length} binding(s) route nothing (no folder or session left): ` +
-        scopeless
-          .map((g) => `${g.label} (${g.members.map((m) => m.label).join(', ')})`)
-          .join('; ') +
-        ' — bind a session or folder to those accounts again (cctl session bind / cctl bind), or ' +
-        'release them: ' +
-        scopeless.map((g) => `cctl unbind --group ${g.id}`).join('; '),
-    };
+          scopeless
+            .map((g) => `${g.label} (${g.members.map((m) => m.label).join(', ')})`)
+            .join('; ') +
+          ' — bind a session or folder to those accounts again (cctl session bind / cctl bind), ' +
+          'or release them: ' +
+          scopeless.map((g) => `cctl unbind --group ${g.id}`).join('; '),
+      );
+    }
+    if (tooLong.length > 0) {
+      problems.push(
+        `${tooLong.length} session alias(es) never match a session (longer than the ` +
+          `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters Claude Code keeps of a session name) — ` +
+          'unbind them: ' +
+          tooLong
+            .map(
+              (a) =>
+                `cctl session unbind ${shellQuoteArg(a.alias, process.platform)} --cwd ` +
+                shellQuoteArg(a.folder, process.platform),
+            )
+            .join('; '),
+      );
+    }
+    return { name: 'binding-scopes', ok: false, detail: problems.join('; and ') };
   } catch (err) {
     return {
       name: 'binding-scopes',

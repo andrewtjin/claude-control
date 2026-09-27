@@ -41,6 +41,8 @@ import {
 import { folderBindingsPath, groupProfileDir, profilesRoot, type Paths } from './paths.js';
 import { atomicWriteFile, removeIfExists } from './fsutil.js';
 import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
   aliasKey,
   aliasScopeUniquenessKey,
   canonicalizeFolder,
@@ -1615,15 +1617,21 @@ export class SwitchEngine {
   }
 
   /** Refuse an alias no session title could usefully carry here: blank (after the resume rule's
-   *  trim), longer than {@link MAX_ALIAS_LENGTH}, or holding a control/bidi character — the alias is
-   *  echoed into hook decisions and terminals, and a title that needs one is not worth the risk. */
+   *  trim), longer than Claude Code keeps a session's title (it stores the first
+   *  {@link CLAUDE_CODE_TITLE_MAX_LENGTH} characters, so a longer alias would never match any
+   *  session — a binding that silently binds nothing), or holding a control/bidi character — the
+   *  alias is echoed into hook decisions and terminals, and a title that needs one is not worth the
+   *  risk. */
   private checkAliasText(alias: string): void {
     if (typeof alias !== 'string' || aliasKey(alias) === '') {
       throw new RefreshError('a session alias cannot be empty', 'bind_refused');
     }
-    if (alias.length > MAX_ALIAS_LENGTH) {
+    if (alias.length > MAX_ALIAS_LENGTH || !aliasFitsSessionTitle(alias)) {
       throw new RefreshError(
-        `a session alias cannot be longer than ${MAX_ALIAS_LENGTH} characters`,
+        `a session alias cannot be longer than ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters: ` +
+          'Claude Code keeps only the first ' +
+          `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters of a session name, so no session could ` +
+          'match a longer one',
         'bind_refused',
       );
     }

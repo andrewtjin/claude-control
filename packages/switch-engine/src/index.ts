@@ -93,6 +93,8 @@ export {
   checkBindTarget,
   checkAliasFolder,
   aliasKey,
+  aliasFitsSessionTitle,
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
   aliasScopeUniquenessKey,
   exactAliasBinding,
   resolveSessionBinding,

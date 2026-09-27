@@ -6,6 +6,8 @@
 // styled and plain output align identically.
 
 import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
   shellQuoteArg,
   type DedupeReport,
   type StoredAccount,
@@ -499,9 +501,19 @@ export function renderBindingGroups(
   const blocks = groups.map((g) => {
     const header = palette.bold(sanitizeForTerminal(g.label));
     const folderLines = g.folders.map((f) => `  folder:  ${sanitizeForTerminal(f)}`);
-    // An alias scope covers one named session in exactly that folder (not its subfolders).
+    // An alias scope covers one named session in exactly that folder (not its subfolders). One
+    // longer than Claude Code keeps a session name (bound before cctl refused those) can never
+    // match a session: said so, since it silently binds nothing.
     const aliasLines = (g.aliases ?? []).map(
-      (a) => `  session: "${sanitizeForTerminal(a.alias)}" in ${sanitizeForTerminal(a.folder)}`,
+      (a) =>
+        `  session: "${sanitizeForTerminal(a.alias)}" in ${sanitizeForTerminal(a.folder)}` +
+        (aliasFitsSessionTitle(a.alias)
+          ? ''
+          : '  ' +
+            palette.yellow(
+              `(never matches: longer than the ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters Claude ` +
+                'Code keeps of a session name; unbind it)',
+            )),
     );
     const memberLine =
       '  accounts: ' +

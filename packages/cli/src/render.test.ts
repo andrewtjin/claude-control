@@ -820,6 +820,25 @@ describe('renderBindingGroups', () => {
     expect(renderBindingGroups([group], PLAIN_PALETTE)).not.toContain('scope:');
   });
 
+  it('marks a session alias longer than Claude Code keeps a session name as never matching', () => {
+    const out = renderBindingGroups(
+      [
+        {
+          ...group,
+          folders: [],
+          aliases: [
+            { folder: 'C:\\repo', alias: 'z'.repeat(201) },
+            { folder: 'C:\\repo', alias: 'fits' },
+          ],
+        },
+      ],
+      PLAIN_PALETTE,
+    );
+    const lines = out.split('\n');
+    expect(lines.find((l) => l.includes('z'.repeat(201)))).toContain('(never matches: longer than');
+    expect(lines.find((l) => l.includes('"fits"'))).not.toContain('never matches');
+  });
+
   it('flags a group with no working account', () => {
     const dead = { ...group, members: [], noWorkingAccount: true };
     expect(renderBindingGroups([dead], PLAIN_PALETTE)).toContain('none usable');
