@@ -22,7 +22,6 @@ import {
   groupScopeCount,
   groupSlotId,
   resolveAccountRef,
-  shellQuoteArg,
   type AccountView,
   type StoredAccount,
   type StoredGroup,
@@ -32,7 +31,7 @@ import { readSessionCatalog, type SessionMeta } from '@claude-control/daemon';
 import { detectPalette, sanitizeForTerminal, type Palette } from './ansi.js';
 import { buildEngine, fail } from './context.js';
 import { reconcileBindGuard } from './bindCommands.js';
-import { resumeCommand } from './render.js';
+import { resumeCommand, shellQuote } from './render.js';
 import { SESSION_ID_ENV, type SessionAliasDeps } from './sessionAliases.js';
 
 export interface SessionBindOptions {
@@ -364,7 +363,7 @@ export async function runSessionBind(
         `${scope} is bound to ${membersOf(owner)} together with ` +
           `${otherScopes(owner, target.alias, target.folder, deps.platform)}; adding accounts there would add ` +
           `them to those too. Unbind it first (cctl session unbind ` +
-          `${shellQuoteArg(sanitizeForTerminal(target.alias), deps.platform)}` +
+          `${shellQuote(sanitizeForTerminal(target.alias), deps.platform)}` +
           `${options.cwd !== undefined ? ' --cwd <folder>' : ''}), then bind it to the full list.`,
       );
     }

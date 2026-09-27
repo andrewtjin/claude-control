@@ -14,6 +14,8 @@ import {
   renderUsage,
   renderWhere,
   sessionViewJson,
+  shellQuote,
+  vscodeProfileName,
   type DaemonStatusView,
   type SessionBindingView,
   type SessionView,
@@ -21,7 +23,7 @@ import {
 } from './render.js';
 import { ANSI_PALETTE, pacingStyle, PLAIN_PALETTE } from './ansi.js';
 import type { SessionAccountUse, SessionMeta } from '@claude-control/daemon';
-import type { StoredAccount } from '@claude-control/switch-engine';
+import { embeddableFolderPathSource, type StoredAccount } from '@claude-control/switch-engine';
 import type {
   AccountUsage,
   TokenStatsSnapshot,
@@ -907,14 +909,58 @@ describe('renderWhere', () => {
     );
     expect(out).toContain('runs on: work (work@me.com)');
     expect(out).toContain('CLAUDE_CONFIG_DIR=C:\\data\\profiles\\g1');
-    expect(out).toContain('claudeCode.environmentVariables');
-    expect(out).toContain('.vscode\\settings.json');
+    // The extension's setting is machine-scoped: a folder's .vscode/settings.json is ignored, so the
+    // advice is a VS Code profile whose USER settings carry it, never the workspace file.
+    expect(out).toContain('USER settings only');
+    expect(out).toContain("code --profile 'cctl-work' 'C:\\repos\\work'");
+    expect(out).toContain('Open User Settings (JSON)');
     // The printed snippet must parse and carry the extension's array-of-{name,value} shape.
-    const json = out.slice(out.indexOf('{'));
+    const json = out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1);
     const parsed = JSON.parse(json) as Record<string, unknown>;
     expect(parsed['claudeCode.environmentVariables']).toEqual([
       { name: 'CLAUDE_CONFIG_DIR', value: 'C:\\data\\profiles\\g1' },
     ]);
+  });
+
+  it('quotes the VS Code command for the shell, whatever the folder or label holds', () => {
+    const out = renderWhere(
+      {
+        folder: "C:\\it's $HOME",
+        bound: {
+          groupLabel: 'Work "Main"',
+          matchedFolder: "C:\\it's $HOME",
+          members: ['w'],
+          profileDir: 'C:\\p',
+          liveMemberLabel: 'w',
+        },
+      },
+      PLAIN_PALETTE,
+      'win32',
+    );
+    // PowerShell single quotes: nothing expands inside, a quote is doubled.
+    expect(out).toContain("code --profile 'cctl-Work-Main' 'C:\\it''s $HOME'");
+  });
+
+  it('uses POSIX quoting off Windows', () => {
+    expect(shellQuote("a'b $c", 'linux')).toBe("'a'\\''b $c'");
+    expect(shellQuote("a'b $c", 'win32')).toBe("'a''b $c'");
+    expect(vscodeProfileName('  ')).toBe('cctl-binding');
+  });
+
+  it('quotes exactly like the copy the enforcement guard embeds', () => {
+    // The guard is a generated CommonJS script and carries its own copy of the quoting rule; the
+    // CLI and the guard must print the same command for the same alias.
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const factory = new Function(`${embeddableFolderPathSource()}\nreturn shellQuoteArg;`);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    const guardCopy = factory() as (text: string, platform: NodeJS.Platform) => string;
+    for (const text of ['Auth Work', "it's", 'don’t', 'Deploy $(calc) "now" `id`', '']) {
+      for (const platform of ['win32', 'linux', 'darwin'] as const) {
+        expect(shellQuote(text, platform)).toBe(guardCopy(text, platform));
+      }
+    }
+    // PowerShell also treats the typographic single quotes as quotes, so they are doubled too.
+    expect(shellQuote('don’t', 'win32')).toBe("'don’’t'");
   });
 
   it('explains an unbound folder as the global account', () => {
@@ -959,7 +1005,13 @@ describe('renderWhere', () => {
       PLAIN_PALETTE,
     );
     expect(both).toContain('"Auth Work" -> Research');
-    expect(() => JSON.parse(both.slice(both.indexOf('{'))) as unknown).not.toThrow();
+    // The VS Code snippet is followed by the profile steps now, so the JSON is the text between its
+    // first opening and last closing brace.
+    expect(
+      () => JSON.parse(both.slice(both.indexOf('{'), both.lastIndexOf('}') + 1)) as unknown,
+    ).not.toThrow();
+    // The alias lines come before the VS Code advice.
+    expect(both.indexOf('Named sessions bound here')).toBeLessThan(both.indexOf('For VS Code'));
   });
 
   it('strips terminal controls from an alias it prints', () => {

@@ -609,8 +609,8 @@ export interface WhereAliasView {
 
 /**
  * The command that resumes a named session on its bound account, safe to paste: the FULL alias as one
- * single-quoted literal for the operator's shell (see switch-engine's shellQuoteArg — PowerShell on
- * Windows, POSIX elsewhere), trimmed the way `claude --resume` trims it. Display text around it may
+ * single-quoted literal for the operator's shell ({@link shellQuote}: PowerShell on Windows, POSIX
+ * elsewhere), trimmed the way `claude --resume` trims it. Display text around it may
  * be shortened; this never is. An alias a terminal could not show verbatim (one carrying a control or
  * bidi character — a title read from a transcript, never a bound alias, which bind refuses) cannot be
  * printed as a working argument, so the session id is used instead when the caller has it, else
@@ -623,7 +623,7 @@ export function resumeCommand(
   const platform = opts.platform ?? process.platform;
   const text = alias.trim();
   if (text !== '' && sanitizeForTerminal(text) === text) {
-    return `cctl claude --resume ${shellQuoteArg(text, platform)}`;
+    return `cctl claude --resume ${shellQuote(text, platform)}`;
   }
   const id = opts.sessionId;
   return id !== undefined && /^[0-9a-f-]{8,64}$/i.test(id)
@@ -648,7 +648,7 @@ export interface WhereView {
 }
 
 /** The `cctl where` section naming the sessions alias-bound in the folder, or [] when none. */
-function whereAliasLines(view: WhereView, palette: Palette): string[] {
+function whereAliasLines(view: WhereView, palette: Palette, platform: NodeJS.Platform): string[] {
   const aliases = view.aliases ?? [];
   if (aliases.length === 0) return [];
   const lines = ['', 'Named sessions bound here (they outrank the folder rule above):'];
@@ -659,22 +659,43 @@ function whereAliasLines(view: WhereView, palette: Palette): string[] {
     lines.push(
       `  "${alias}" -> ${palette.bold(sanitizeForTerminal(a.groupLabel))} (${members}), live: ${live}`,
     );
-    lines.push(`    start or resume it with: ${resumeCommand(a.alias)}`);
+    lines.push(`    start or resume it with: ${resumeCommand(a.alias, { platform })}`);
   }
   return lines;
 }
 
-/** Explain which account a folder runs on, print the env line a session needs, and a VS Code
- *  `.vscode/settings.json` snippet (claudeCode.environmentVariables) for that folder. Named sessions
- *  alias-bound in the folder are listed after, since they run elsewhere than the folder rule says. */
-export function renderWhere(view: WhereView, palette: Palette = PLAIN_PALETTE): string {
+/** Quote one argument so it pastes into the operator's shell as a single literal word: PowerShell
+ *  single quotes (every single-quote character doubled) on Windows, POSIX single quotes (`'\''`)
+ *  elsewhere. Single quotes because nothing inside them expands in either shell — a folder, label or
+ *  session alias may hold `$`, a backtick or a double quote. The rule itself is switch-engine's
+ *  shellQuoteArg, the same function the enforcement guard embeds, so a command the CLI prints and
+ *  one the guard prints can never quote differently. */
+export function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string {
+  return shellQuoteArg(value, platform);
+}
+
+/** The VS Code profile name `cctl where` suggests for a binding: `cctl-<label>`, reduced to
+ *  letters, digits, `.`, `_` and `-` so it is one plain word in any shell and in VS Code's UI. */
+export function vscodeProfileName(groupLabel: string): string {
+  const slug = groupLabel.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return `cctl-${slug === '' ? 'binding' : slug}`;
+}
+
+/** Explain which account a folder runs on, print the env line a session needs, and how to point
+ *  the VS Code Claude Code extension at that account (a VS Code profile holding the
+ *  claudeCode.environmentVariables setting). */
+export function renderWhere(
+  view: WhereView,
+  palette: Palette = PLAIN_PALETTE,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const folder = sanitizeForTerminal(view.folder);
   if (view.bound === null) {
     return [
       `${palette.bold(folder)}`,
       '  runs on: the global (shared) account — no folder binding applies here',
       '  env:     CLAUDE_CONFIG_DIR is not set (the global slot)',
-      ...whereAliasLines(view, palette),
+      ...whereAliasLines(view, palette, platform),
       '',
       'Bind this folder to an account with: cctl bind ' + folder + ' <account>[,<account>...]',
     ].join('\n');
@@ -683,27 +704,35 @@ export function renderWhere(view: WhereView, palette: Palette = PLAIN_PALETTE): 
   const members = b.members.map((m) => sanitizeForTerminal(m)).join(', ');
   const live = b.liveMemberLabel ? sanitizeForTerminal(b.liveMemberLabel) : 'none usable';
   const profile = sanitizeForTerminal(b.profileDir);
-  // The Claude Code extension's setting is an ARRAY of {name, value} pairs (its default is []),
-  // not an object map; an object here would be ignored and the extension would launch on the
-  // global account.
+  // The extension's setting is declared as a list of {name, value} pairs (its default is []), so
+  // that is the shape printed. The setting is MACHINE-scoped: VS Code ignores it in a folder's or
+  // workspace's .vscode/settings.json (it only greys the line out), and reads it from user settings
+  // only. Per-folder routing therefore needs a VS Code profile whose user settings carry it — one
+  // profile per binding, opened on the bound folder.
   const vscodeSnippet = JSON.stringify(
     { 'claudeCode.environmentVariables': [{ name: 'CLAUDE_CONFIG_DIR', value: b.profileDir }] },
     null,
     2,
   );
+  const openCommand = `code --profile ${shellQuote(vscodeProfileName(b.groupLabel), platform)} ${shellQuote(folder, platform)}`;
   return [
     `${palette.bold(folder)}`,
     `  runs on: ${palette.bold(sanitizeForTerminal(b.groupLabel))} (${members})`,
     `  live:    ${live}`,
     `  matched: ${sanitizeForTerminal(b.matchedFolder)}`,
     `  env:     CLAUDE_CONFIG_DIR=${profile}`,
-    ...whereAliasLines(view, palette),
+    ...whereAliasLines(view, palette, platform),
     '',
     'Start Claude Code here with the right account using: cctl claude',
     '(or install the wrapper once: cctl shell-init powershell)',
     '',
-    'For VS Code, put this in ' + folder + '\\.vscode\\settings.json:',
+    'For VS Code: the Claude Code extension reads its environment from USER settings only (a',
+    "folder's .vscode/settings.json is ignored), so give this binding its own VS Code profile:",
+    `  1. ${openCommand}`,
+    '     (creates the profile the first time; install or enable Claude Code in it)',
+    '  2. in that window run "Preferences: Open User Settings (JSON)" and add:',
     vscodeSnippet,
+    `  3. open this folder with the same command from then on. Other windows keep the shared account.`,
   ].join('\n');
 }
 

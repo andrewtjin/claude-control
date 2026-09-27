@@ -551,10 +551,16 @@ extension. Green tests are not a bound account.
   account (no wrapper) and confirm the `UserPromptSubmit` guard blocks the prompt with the
   documented message; confirm `--override` and `bind-enforce warn`/`off` behave as documented;
   confirm the guard fails open when the snapshot is absent.
-- **VS Code extension route.** With the `cctl where` snippet in a folder's
-  `.vscode/settings.json`, confirm the VS Code Claude Code extension launches on the bound
-  account (this is a different launch path from a terminal `claude` and must be confirmed
-  separately).
+- **VS Code extension route.** Driven headless against the real VS Code 1.121 and Claude Code
+  extension 2.1.283 (fake API, bearer recorded per request): the extension declares
+  `claudeCode.environmentVariables` machine-scoped, so the snippet in a folder's
+  `.vscode/settings.json` is IGNORED (the session ran on the shared account and was blocked). The
+  snippet in a VS Code profile's user settings, opened with `code --profile <name> <folder>`,
+  routed the session to the bound account — also with VS Code already running. `cctl where`
+  now prints that route. Also measured: the extension sends a session-title request carrying
+  the prompt text in parallel with the first prompt, so a prompt the guard blocks in a wrongly
+  routed window still reaches that window's account once; a multi-root window judges only its
+  first folder. On a real account, confirm the profile route once.
 - **Remote Control in a bound session.** Confirm a first-party `/rc`-style remote session
   started in a bound folder stays on the bound account (Remote Control is account-bound; this
   is exactly the interaction most likely to strand it — see the RC note in the repo memory).
