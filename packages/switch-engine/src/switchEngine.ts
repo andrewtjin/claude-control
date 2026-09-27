@@ -2562,6 +2562,13 @@ export class SwitchEngine {
    * landing it somewhere the caller never meant.
    */
   async activate(targetId: string, options: ActivateOptions = {}): Promise<ActivateResult> {
+    // Fingerprint the stored bundles BEFORE taking the lock. Rotation adoption, under the lock, checks
+    // the live token against every stored one; with a cold fingerprint cache (a process that has not
+    // seen the current bundles, the first run after an upgrade) that is a decrypt per bundle — a
+    // PowerShell spawn each on Windows. Paid here it delays only this caller; paid under the lock it
+    // eats into the time every holder must finish within (see LOCK_STALE_MS). Best-effort: the check
+    // under the lock stays authoritative, and a failure here only means it does the work itself.
+    await this.vault.readStoredTokens().catch(() => undefined);
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
       const target = await this.vault.getAccount(targetId);

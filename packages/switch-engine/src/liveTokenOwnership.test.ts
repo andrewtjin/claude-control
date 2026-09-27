@@ -13,11 +13,11 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { realpathSync, statSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SwitchEngine, type BindFs, type RefreshFn } from './switchEngine.js';
-import { InsecurePassthroughProtector } from './dpapi.js';
+import { InsecurePassthroughProtector, type Protector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { IntentStore } from './intent.js';
 import { Vault } from './vault.js';
@@ -288,5 +288,51 @@ describe('capturing the current login', () => {
     await expect(h.mk().captureCurrentLogin('N')).rejects.toThrow(/already stored/);
 
     expect((await h.vault.listAllAccounts()).map((a) => a.label).sort()).toEqual(['P', 'R', 'T']);
+  });
+});
+
+describe('the stored-token check under the lock', () => {
+  it('costs no per-bundle decrypt there when the fingerprint cache is cold', async () => {
+    const h = await harness();
+    const e = h.mk();
+    const P = await e.addAccount('P', bundle('P', NOW + 2 * HOUR));
+    const R = await e.addAccount('R', bundle('R', NOW + 8 * HOUR));
+    for (const t of ['A', 'B', 'C', 'D']) await e.addAccount(t, bundle(t, NOW + 8 * HOUR));
+    await e.activate(P.id, { force: true });
+    // P's token rotated while live, so the next switch adopts it — and checks it against every bundle.
+    await h.global.writeLiveCredentials({
+      accessToken: 'at-P2',
+      refreshToken: 'rt-P2',
+      expiresAt: NOW + 9 * HOUR,
+    });
+    // A process that has never seen these bundles, with no fingerprint file to start from.
+    await rm(join(h.paths.vaultDir, 'token-prints.json'), { force: true });
+    const lockDir = join(h.paths.vaultDir, '.lock');
+    const inner = new InsecurePassthroughProtector();
+    let decryptsUnderLock = 0;
+    const counting: Protector = {
+      protect: (plain) => inner.protect(plain),
+      unprotect: (blob) => {
+        if (existsSync(lockDir)) decryptsUnderLock += 1;
+        return inner.unprotect(blob);
+      },
+    };
+    const cold = new SwitchEngine({
+      paths: h.paths,
+      protector: counting,
+      liveCredentialChannel: new FileCredentialChannel(h.paths.credentialsPath),
+      refresh: (c: ClaudeOauth) => Promise.resolve(c),
+      clock: () => NOW,
+      minSwitchIntervalMs: 0,
+      lockOptions: { timeoutMs: 5000, pollMs: 5 },
+      platform: process.platform,
+      isProcessAlive: () => false,
+    });
+
+    const res = await cold.activate(R.id, { force: true });
+
+    expect(res.adoptedPreviousRotation).toBe(true);
+    // Under the lock: the previous account's bundle (adoption) and the target's — never all six.
+    expect(decryptsUnderLock).toBeLessThanOrEqual(2);
   });
 });
