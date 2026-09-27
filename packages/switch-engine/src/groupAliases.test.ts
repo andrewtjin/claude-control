@@ -383,6 +383,39 @@ describe('writing alias scopes', () => {
     expect((await v.getGroup(g.id))?.aliases).toEqual([{ folder: 'C:\\repo', alias: 'x' }]);
   });
 
+  it('fields a newer build added to an alias scope entry survive this build rewriting the file', async () => {
+    const { v, groupsPath } = await withGroupsFile({
+      schemaVersion: 2,
+      generation: 3,
+      groups: [
+        aliasGroup('g1', [
+          { folder: 'C:\\repo', alias: 'Auth Work', matchMode: 'prefix', note: { by: 'next' } },
+          { folder: 'C:\\repo', alias: 'plain' },
+        ]),
+      ],
+    });
+    // What this build hands out never carries them.
+    expect((await v.getGroup('g1'))?.aliases).toEqual([
+      { folder: 'C:\\repo', alias: 'Auth Work' },
+      { folder: 'C:\\repo', alias: 'plain' },
+    ]);
+    // Ordinary writes of the group: an in-group switch, a scope added, another removed.
+    await v.setGroupActive('g1', 'm-g1');
+    await v.addAliasToGroup('g1', { folder: 'C:\\other', alias: 'new' });
+    await v.removeAliasFromGroup('g1', { folder: 'C:\\repo', alias: 'plain' });
+    const written = (await readJson(groupsPath)) as { groups: { aliases: unknown[] }[] };
+    expect(written.groups[0]!.aliases).toEqual([
+      { folder: 'C:\\repo', alias: 'Auth Work', matchMode: 'prefix', note: { by: 'next' } },
+      { folder: 'C:\\other', alias: 'new' },
+    ]);
+    // An entry this build removes takes its fields with it; binding it again starts clean.
+    await v.addAliasToGroup('g1', { folder: 'C:\\x', alias: 'keep' });
+    await v.removeAliasFromGroup('g1', { folder: 'C:\\repo', alias: 'AUTH WORK' });
+    await v.addAliasToGroup('g1', { folder: 'C:\\repo', alias: 'Auth Work' });
+    const again = (await readJson(groupsPath)) as { groups: { aliases: unknown[] }[] };
+    expect(again.groups[0]!.aliases).toContainEqual({ folder: 'C:\\repo', alias: 'Auth Work' });
+  });
+
   it('dissolving via the last member removes the group and its alias scopes together', async () => {
     const { v, groupsPath } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));

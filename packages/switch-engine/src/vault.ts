@@ -299,7 +299,11 @@ function validateGroupsFile(
   const seenFolderKeys = new Set<string>();
   const seenAliasKeys = new Set<string>();
   const groups: StoredGroup[] = [];
-  const extras: GroupsExtras = { top: unownedFields(value, GROUPS_FILE_KEYS), byGroup: new Map() };
+  const extras: GroupsExtras = {
+    top: unownedFields(value, GROUPS_FILE_KEYS),
+    byGroup: new Map(),
+    byAliasScope: new Map(),
+  };
   for (let i = 0; i < rawGroups.length; i += 1) {
     const g: unknown = rawGroups[i];
     const where = `groups[${i}]`;
@@ -373,7 +377,13 @@ function validateGroupsFile(
       seenFolderKeys.add(key);
       folders.push(folder);
     }
-    const aliases = validateAliasScopes(g.aliases, `${where} (${g.id})`, platform, seenAliasKeys);
+    const aliases = validateAliasScopes(
+      g.aliases,
+      `${where} (${g.id})`,
+      platform,
+      seenAliasKeys,
+      extras.byAliasScope,
+    );
     // A group with no scope LOADS: it is what a folder-only build leaves behind when it rewrites a
     // file holding an alias-only group (it drops the `aliases` it does not know). Refusing it here
     // would fail every command on the machine; loaded, it routes nothing (no rule can name it), its
@@ -412,13 +422,15 @@ function groupsSchemaVersionFor(groups: readonly StoredGroup[]): GroupsFile['sch
  * non-empty and which is no longer than {@link MAX_ALIAS_LENGTH}; its (folder, alias key) pair must
  * not already be claimed by any group — `seen` carries the pairs across the whole file, keyed by
  * {@link aliasScopeUniquenessKey}, the SAME key the write guards use (so a write can never persist
- * a file the next load rejects).
+ * a file the next load rejects). An entry's fields this build does not own go into `extras` under
+ * that key (see {@link GroupsExtras}).
  */
 function validateAliasScopes(
   raw: unknown,
   where: string,
   platform: NodeJS.Platform,
   seen: Set<string>,
+  extras: Map<string, Record<string, unknown>>,
 ): StoredAliasScope[] {
   if (raw === undefined) return [];
   if (!Array.isArray(raw)) throw new VaultError(`${where} aliases is not an array`);
@@ -452,6 +464,8 @@ function validateAliasScopes(
       throw new VaultError(`session alias "${alias}" in ${folder} is bound more than once`);
     }
     seen.add(key);
+    const entryExtras = unownedFields(entry, ALIAS_SCOPE_KEYS);
+    if (Object.keys(entryExtras).length > 0) extras.set(key, entryExtras);
     out.push({ folder, alias });
   }
   return out;
@@ -467,12 +481,19 @@ function validateAliasScopes(
  *
  * Kept beside the typed groups rather than on them, so nothing this build hands out (the CLI views,
  * the guard snapshot, the wire) ever carries a field it does not understand. A group this build
- * removes takes its unknown fields with it; member rows keep theirs on the row, as shared rows do.
+ * removes takes its unknown fields with it, and so does an alias scope it unbinds; member rows keep
+ * theirs on the row, as shared rows do.
  */
 interface GroupsExtras {
   top: Record<string, unknown>;
   byGroup: Map<string, Record<string, unknown>>;
+  /** By the scope's {@link aliasScopeUniquenessKey} (unique across the file), so an entry's fields
+   *  follow the scope wherever this build writes it. */
+  byAliasScope: Map<string, Record<string, unknown>>;
 }
+
+/** The keys of one alias scope entry this build writes itself (see {@link StoredAliasScope}). */
+const ALIAS_SCOPE_KEYS: ReadonlySet<string> = new Set(['folder', 'alias']);
 
 /** The top-level keys of `groups.json` this build writes itself. */
 const GROUPS_FILE_KEYS: ReadonlySet<string> = new Set(['schemaVersion', 'generation', 'groups']);
@@ -809,7 +830,7 @@ export class Vault {
       rawGroups === undefined
         ? {
             file: { schemaVersion: GROUPS_SCHEMA_VERSION, generation: 0, groups: [] },
-            extras: { top: {}, byGroup: new Map() },
+            extras: { top: {}, byGroup: new Map(), byAliasScope: new Map() },
           }
         : validateGroupsFile(rawGroups, this.platform);
 
@@ -896,7 +917,20 @@ export class Vault {
     const out = {
       ...st.groupsExtras.top,
       ...file,
-      groups: st.groups.map((g) => ({ ...st.groupsExtras.byGroup.get(g.id), ...g })),
+      groups: st.groups.map((g) => ({
+        ...st.groupsExtras.byGroup.get(g.id),
+        ...g,
+        ...(g.aliases !== undefined
+          ? {
+              aliases: g.aliases.map((a) => ({
+                ...st.groupsExtras.byAliasScope.get(
+                  aliasScopeUniquenessKey(a.folder, a.alias, this.platform),
+                ),
+                ...a,
+              })),
+            }
+          : {}),
+      })),
     };
     await atomicWriteFile(this.groupsPath(), JSON.stringify(out, null, 2));
   }
