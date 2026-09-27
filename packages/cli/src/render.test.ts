@@ -14,6 +14,8 @@ import {
   renderUsage,
   renderWhere,
   sessionViewJson,
+  shellQuote,
+  vscodeProfileName,
   type DaemonStatusView,
   type SessionView,
   type UsageRow,
@@ -895,14 +897,42 @@ describe('renderWhere', () => {
     );
     expect(out).toContain('runs on: work (work@me.com)');
     expect(out).toContain('CLAUDE_CONFIG_DIR=C:\\data\\profiles\\g1');
-    expect(out).toContain('claudeCode.environmentVariables');
-    expect(out).toContain('.vscode\\settings.json');
+    // The extension's setting is machine-scoped: a folder's .vscode/settings.json is ignored, so the
+    // advice is a VS Code profile whose USER settings carry it, never the workspace file.
+    expect(out).toContain('USER settings only');
+    expect(out).toContain("code --profile 'cctl-work' 'C:\\repos\\work'");
+    expect(out).toContain('Open User Settings (JSON)');
     // The printed snippet must parse and carry the extension's array-of-{name,value} shape.
-    const json = out.slice(out.indexOf('{'));
+    const json = out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1);
     const parsed = JSON.parse(json) as Record<string, unknown>;
     expect(parsed['claudeCode.environmentVariables']).toEqual([
       { name: 'CLAUDE_CONFIG_DIR', value: 'C:\\data\\profiles\\g1' },
     ]);
+  });
+
+  it('quotes the VS Code command for the shell, whatever the folder or label holds', () => {
+    const out = renderWhere(
+      {
+        folder: "C:\\it's $HOME",
+        bound: {
+          groupLabel: 'Work "Main"',
+          matchedFolder: "C:\\it's $HOME",
+          members: ['w'],
+          profileDir: 'C:\\p',
+          liveMemberLabel: 'w',
+        },
+      },
+      PLAIN_PALETTE,
+      'win32',
+    );
+    // PowerShell single quotes: nothing expands inside, a quote is doubled.
+    expect(out).toContain("code --profile 'cctl-Work-Main' 'C:\\it''s $HOME'");
+  });
+
+  it('uses POSIX quoting off Windows', () => {
+    expect(shellQuote("a'b $c", 'linux')).toBe("'a'\\''b $c'");
+    expect(shellQuote("a'b $c", 'win32')).toBe("'a''b $c'");
+    expect(vscodeProfileName('  ')).toBe('cctl-binding');
   });
 
   it('explains an unbound folder as the global account', () => {
