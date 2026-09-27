@@ -64,7 +64,8 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   account and never spend the one you keep for everything else, while memories, skills,
   plugins and settings stay shared. A guard catches a session launched on the wrong
   account before it runs. A single named session can be bound too
-  (`cctl session bind <alias> <account>`). Windows and Linux; see `docs/CLI.md`.
+  (`cctl session bind <alias> <account>`; needs Claude Code 2.1.283 or newer). Windows and
+  Linux; see `docs/CLI.md`.
 
 ## Local-only (no Discord)
 
