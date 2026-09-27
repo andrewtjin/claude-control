@@ -309,6 +309,56 @@ describe('shrinking an alias binding under running sessions', () => {
   });
 });
 
+describe('dissolveGroup', () => {
+  it('releases every member the group holds when it takes the lock, whatever its scopes', async () => {
+    const h = await harness();
+    const A = await h.engine.addAccount('A', bundleFor('A'));
+    const B = await h.engine.addAccount('B', bundleFor('B'));
+    const C = await h.engine.addAccount('C', bundleFor('C'));
+    await h.engine.activate(A.id, { force: true });
+    const repo = await h.folder('repo');
+    const work = await h.folder('work');
+    const bound = await h.engine.bindAlias(repo, 'auth', [B.id]);
+    await h.engine.bindFolder(work, [B.id]);
+    await h.engine.addGroupMembers(bound.group.id, [C.id]);
+
+    const res = await h.engine.dissolveGroup(bound.group.id);
+    expect(res.releasedMembers.sort()).toEqual([B.id, C.id].sort());
+    expect(res.group.members.map((m) => m.label).sort()).toEqual(['B', 'C']);
+    expect(await h.engine.listGroups()).toEqual([]);
+    expect((await h.engine.listAccounts()).map((a) => a.label).sort()).toEqual(['A', 'B', 'C']);
+    expect(await groupStore(h.paths, bound.group.id).readLiveCredentials()).toBeUndefined();
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+
+  it('refuses while a session runs in one of its scopes, unless forced; an unknown id is not bound', async () => {
+    const h = await harness({ withIdentity: true });
+    const A = await h.engine.addAccount('A', bundleFor('A'));
+    const B = await h.engine.addAccount('B', bundleFor('B'));
+    await h.engine.activate(A.id, { force: true });
+    const repo = await h.folder('repo');
+    const bound = await h.engine.bindAlias(repo, 'auth', [B.id]);
+    await runningSession(h, 8101, {
+      cwd: repo,
+      sessionId: 's-9',
+      name: 'x',
+      nameSource: 'derived',
+    });
+    h.transcripts.set('s-9', { customTitle: 'Auth', folder: repo });
+
+    await expect(h.engine.dissolveGroup(bound.group.id)).rejects.toMatchObject({
+      code: 'sessions_running',
+    });
+    expect(await h.engine.listGroups()).toHaveLength(1);
+    expect((await h.engine.dissolveGroup(bound.group.id, { force: true })).releasedMembers).toEqual(
+      [B.id],
+    );
+    await expect(h.engine.dissolveGroup(bound.group.id)).rejects.toMatchObject({
+      code: 'not_bound',
+    });
+  });
+});
+
 describe('growing or shrinking ONE scope of a binding another process changed', () => {
   it('addGroupMembers with a sole-scope precondition refuses once a folder was bound to the same group', async () => {
     const h = await harness();

@@ -53,6 +53,9 @@ const engine = vi.hoisted(() => ({
   removeGroupMembers: vi.fn((id: string): Promise<never> =>
     Promise.reject(new Error(`removeGroupMembers(${id}) not stubbed`)),
   ),
+  dissolveGroup: vi.fn((id: string): Promise<never> =>
+    Promise.reject(new Error(`dissolveGroup(${id}) not stubbed`)),
+  ),
   ensureGroupLive: vi.fn((): Promise<never> =>
     Promise.reject(new Error('ensureGroupLive not stubbed')),
   ),
@@ -1116,34 +1119,43 @@ describe('cctl unbind --group', () => {
     vi.unstubAllEnvs();
     engine.listGroups.mockReset();
     engine.listGroups.mockResolvedValue([]);
-    engine.removeGroupMembers.mockReset();
+    engine.dissolveGroup.mockReset();
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('dissolves the binding with that id: every account back to the shared pool', async () => {
-    engine.listGroups.mockResolvedValue([scopeless]);
-    engine.removeGroupMembers.mockResolvedValue({
-      removed: ['m-1'],
-      dissolved: true,
+  const dissolved = (group: typeof scopeless) =>
+    ({
+      group,
+      releasedMembers: group.members.map((m) => m.id),
       adoptedRotation: false,
       runningSessions: [],
-    } as never);
+    }) as never;
+
+  it('dissolves the binding with that id: every account back to the shared pool', async () => {
+    engine.listGroups.mockResolvedValue([scopeless]);
+    engine.dissolveGroup.mockResolvedValue(dissolved(scopeless));
     const r = await runCli(['unbind', '--group', scopeless.id]);
     expect(r.exited).toBe(false);
-    expect(engine.removeGroupMembers).toHaveBeenCalledWith(scopeless.id, ['m-1'], {});
-    expect(r.out).toContain('Dissolved the binding work: 1 account(s) returned to the shared pool');
+    expect(engine.dissolveGroup).toHaveBeenCalledWith(scopeless.id, {});
+    expect(r.out).toContain(
+      'Dissolved the binding work: 1 account(s) returned to the shared pool (work)',
+    );
+  });
+
+  it('prints what the engine released under its lock, not the members it listed before', async () => {
+    // Another process grew the binding between the listing and the dissolve.
+    const extra = { ...member, id: 'm-2', label: 'extra' };
+    engine.listGroups.mockResolvedValue([scopeless]);
+    engine.dissolveGroup.mockResolvedValue(dissolved({ ...scopeless, members: [member, extra] }));
+    const r = await runCli(['unbind', '--group', scopeless.id]);
+    expect(r.out).toContain('2 account(s) returned to the shared pool (work, extra)');
   });
 
   it('accepts the exact label, and passes --force through', async () => {
     engine.listGroups.mockResolvedValue([scopeless]);
-    engine.removeGroupMembers.mockResolvedValue({
-      removed: ['m-1'],
-      dissolved: true,
-      adoptedRotation: false,
-      runningSessions: [],
-    } as never);
+    engine.dissolveGroup.mockResolvedValue(dissolved(scopeless));
     await runCli(['unbind', '--group', 'work', '--force']);
-    expect(engine.removeGroupMembers).toHaveBeenCalledWith(scopeless.id, ['m-1'], { force: true });
+    expect(engine.dissolveGroup).toHaveBeenCalledWith(scopeless.id, { force: true });
   });
 
   it('refuses an unknown or ambiguous ref, and a folder together with --group', async () => {
@@ -1158,6 +1170,6 @@ describe('cctl unbind --group', () => {
       'pass a folder or --group, not both',
     );
     expect((await runCli(['unbind'])).err).toContain('pass the folder to unbind');
-    expect(engine.removeGroupMembers).not.toHaveBeenCalled();
+    expect(engine.dissolveGroup).not.toHaveBeenCalled();
   });
 });

@@ -79,6 +79,7 @@ import type {
   ClaudeOauth,
   CredentialBundle,
   FolderBindingSnapshot,
+  GroupDissolveResult,
   GroupGrowResult,
   GroupLiveResult,
   GroupScopeRef,
@@ -1494,6 +1495,30 @@ export class SwitchEngine {
         adoptedRotation,
         runningSessions: [],
       };
+    });
+  }
+
+  /**
+   * Dissolve a whole binding: every member back to the shared pool, whatever scopes the group holds
+   * — the way out for a binding left with no scope at all (which no folder or alias can name), and
+   * `cctl unbind --group`. The members released are the ones the group holds when this takes the
+   * lock, never a list a caller read before it: a concurrent grow is dissolved with the rest rather
+   * than left behind as a smaller binding. V1 unbind semantics otherwise: refused without `force`
+   * while sessions run in any of its scopes; adopt, clear, release, snapshot LAST
+   * ({@link dissolveGroupLocked}, same fault points).
+   */
+  async dissolveGroup(
+    groupId: string,
+    opts: { force?: boolean } = {},
+  ): Promise<GroupDissolveResult> {
+    return this.withCredentialLock(async () => {
+      const group = await this.mustGroupLocked(groupId);
+      const dissolved = await this.dissolveGroupLocked(
+        group,
+        opts.force === true,
+        describeFolders(group),
+      );
+      return { group, ...dissolved };
     });
   }
 

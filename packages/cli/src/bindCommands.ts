@@ -335,7 +335,9 @@ export function launchSessionContext(opts: {
  * `cctl unbind --group <id|label>`: dissolve a whole binding — every account back to the shared pool,
  * V1 unbind semantics (refused while sessions run in its scopes, unless `force`). The way out for a
  * binding left with no scope at all (which no folder or alias can name), and a shortcut for one with
- * many. The ref is the group id (as `cctl bindings` / `cctl doctor` print it) or its exact label.
+ * many. The ref is the group id (as `cctl bindings` / `cctl doctor` print it) or its exact label;
+ * only the id is taken from this unlocked read. The engine dissolves the group as it stands under
+ * its lock (a concurrent grow is dissolved with the rest), and what is printed is what it released.
  */
 async function unbindGroup(engine: Engine, ref: string, force: boolean): Promise<void> {
   const groups = await engine.listGroups();
@@ -343,21 +345,23 @@ async function unbindGroup(engine: Engine, ref: string, force: boolean): Promise
   const byLabel = groups.filter((g) => g.label === ref);
   if (byId === undefined && byLabel.length > 1) {
     fail(
-      `${byLabel.length} bindings are labelled "${ref}"; pass the id (cctl bindings lists them)`,
+      `${byLabel.length} bindings are labelled "${sanitizeForTerminal(ref)}"; pass the id ` +
+        '(cctl bindings lists them)',
     );
   }
   const group = byId ?? byLabel[0];
-  if (group === undefined) fail(`no binding with id or label "${ref}" (cctl bindings lists them)`);
+  if (group === undefined) {
+    fail(`no binding with id or label "${sanitizeForTerminal(ref)}" (cctl bindings lists them)`);
+  }
   try {
-    const res = await engine.removeGroupMembers(
-      group.id,
-      group.members.map((m) => m.id),
-      force ? { force: true } : {},
-    );
+    const res = await engine.dissolveGroup(group.id, force ? { force: true } : {});
+    const released = res.group.members
+      .filter((m) => res.releasedMembers.includes(m.id))
+      .map((m) => sanitizeForTerminal(m.label));
     process.stdout.write(
-      `Dissolved the binding ${sanitizeForTerminal(group.label)}: ${res.removed.length} account(s) ` +
-        'returned to the shared pool' +
-        (res.adoptedRotation ? ' (adopted the profile’s latest token first)' : '') +
+      `Dissolved the binding ${sanitizeForTerminal(res.group.label)}: ${released.length} ` +
+        `account(s) returned to the shared pool (${released.join(', ')})` +
+        (res.adoptedRotation ? ', adopting the profile’s latest token first' : '') +
         '.\n  the profile dir is kept for history; its live credentials were cleared.\n',
     );
     await reconcileBindGuard(engine, defaultPaths());

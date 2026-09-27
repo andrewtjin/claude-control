@@ -446,6 +446,19 @@ export interface GroupShrinkResult {
   runningSessions: RunningSession[];
 }
 
+/** What {@link SwitchEngine.dissolveGroup} did. */
+export interface GroupDissolveResult {
+  /** The group as it stood when the dissolve took the lock — its label, members and scopes are the
+   *  ones actually released, whatever a caller listed before. */
+  group: StoredGroup;
+  /** Account ids returned to the shared pool (every member the group held at that moment). */
+  releasedMembers: string[];
+  /** True when the profile's rotated token was adopted into the vault before its seat was cleared. */
+  adoptedRotation: boolean;
+  /** Sessions observed in the group's scopes (what a non-forced dissolve refuses on). */
+  runningSessions: RunningSession[];
+}
+
 /** The invariant {@link SwitchEngine.checkSlots} found broken. The kinds mirror §7's (a)-(e):
  *  - `account_in_multiple_slots` (a): one account's credentials are live in more than one slot —
  *    the single invariant the whole reservation fence exists to protect (a rotating refresh token
