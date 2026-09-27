@@ -310,6 +310,31 @@ receiver; `status` reads the local database and works offline. The group is also
 exposed in-session as the `/cctl:*` slash commands shipped in `plugins/cctl/` — a
 self-contained Claude Code plugin that holds no secrets and only wraps the CLI.
 
+## Session aliases
+
+```
+cctl session show                # this session: its alias, folder, and every account it ran on
+cctl session show <id|alias>     # any session, by id or by alias
+cctl session show <alias> --cwd <folder>   # look the alias up in another folder
+cctl session aliases             # the named sessions in this folder and their accounts
+cctl session aliases --all       # every folder (--auto adds sessions with only a generated title)
+```
+
+A session's alias is its title: the name you give it with `/rename` (or `claude --name`),
+else the title Claude Code generates. It is exactly what `claude --resume <alias>` matches —
+case-insensitive, per folder — so two folders can each have a session called `pptx`. An
+alias is looked up in the current folder first; when only one other folder uses it, that
+session is shown with a note, and when several do, they are listed and `--cwd` picks one.
+An id always wins over an alias.
+
+The account list is billed the same way as `cctl stats`: each turn goes to the account that
+was live in the session's slot at that moment (the global slot, or its folder-bound group),
+so a session that ran on several accounts over its life lists them all, in the order it first
+used them, with turns, tokens and dates. `--json` prints the same data for scripts. Like
+`stats`, it reads local files only and needs no running daemon; a session's slot is known
+from the hooks the daemon receives, so turns from before the daemon saw the session are
+billed against the global slot.
+
 ## Prompts to idle sessions
 
 ```

@@ -114,6 +114,14 @@ export interface PendingQuestionRow {
   resolvedAtMs: number | null;
 }
 
+/** One span of {@link Store.recordSessionSlot}: from `startedAtMs` on (until the session's next
+ *  span, if any) the session ran in `slot` (`'global'` / `'group:<id>'`). */
+export interface SessionSlotSpanRow {
+  sessionId: string;
+  slot: string;
+  startedAtMs: number;
+}
+
 export interface SessionRow {
   id: string;
   kind: string;
@@ -304,6 +312,17 @@ export class Store {
         accountId TEXT,
         json TEXT NOT NULL,
         updatedAtMs INTEGER NOT NULL
+      );
+
+      -- Which slot each session ran in, and from when: one row per slot CHANGE, never per event.
+      -- Recorded for every session the hooks report (not only registered ones), so attribution
+      -- can bill a folder-bound session's turns to its group's live member. See
+      -- recordSessionSlot for why a session can have more than one span.
+      CREATE TABLE IF NOT EXISTS session_slot_spans (
+        sessionId TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        startedAtMs INTEGER NOT NULL,
+        PRIMARY KEY (sessionId, startedAtMs)
       );
 
       CREATE TABLE IF NOT EXISTS outbox (
@@ -848,6 +867,50 @@ export class Store {
       .prepare(`SELECT * FROM sessions ORDER BY updatedAtMs ASC`)
       .all()
       .map((r) => this.toSessionRow(r));
+  }
+
+  // ---- session slot spans ----
+  //
+  // A session's slot is fixed for one run (its CLAUDE_CONFIG_DIR is set at launch), but the SAME
+  // session id can run again later under a different config dir — `claude --resume` from another
+  // profile keeps the id. So the record is a list of spans rather than one value per session, and
+  // a turn is billed to the span in force at its timestamp. Like the sessions mirror this is
+  // observability only: a missing span degrades attribution, never behavior.
+
+  /**
+   * Record that `sessionId` runs in `slot` as of `atMs`. Writes a row only when the slot differs
+   * from the session's latest recorded span, so a hook storm costs one indexed read per event and
+   * the table grows by slot changes, not by events. Returns whether a row was written.
+   */
+  recordSessionSlot(sessionId: string, slot: string, atMs: number): boolean {
+    const latest = this.db
+      .prepare(
+        `SELECT slot FROM session_slot_spans WHERE sessionId = ?
+         ORDER BY startedAtMs DESC LIMIT 1`,
+      )
+      .get(sessionId);
+    if (latest !== undefined && latest['slot'] === slot) return false;
+    // OR IGNORE: two events of one session in the same millisecond with different slots cannot
+    // both be true, and the first one recorded is as good a record as the second.
+    return (
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO session_slot_spans (sessionId, slot, startedAtMs) VALUES (?, ?, ?)`,
+        )
+        .run(sessionId, slot, atMs).changes > 0
+    );
+  }
+
+  /** Every recorded span, grouped by session and oldest first within each. */
+  listSessionSlotSpans(): SessionSlotSpanRow[] {
+    return this.db
+      .prepare(`SELECT * FROM session_slot_spans ORDER BY sessionId ASC, startedAtMs ASC`)
+      .all()
+      .map((r) => ({
+        sessionId: requireString(r, 'sessionId'),
+        slot: requireString(r, 'slot'),
+        startedAtMs: requireNumber(r, 'startedAtMs'),
+      }));
   }
 
   // ---- outbox ----

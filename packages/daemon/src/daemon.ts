@@ -1772,8 +1772,9 @@ export class Daemon {
       windowEndMs: this.clock(),
       labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
       // A folder-bound session's turns join against the member live in its group's slot, not the
-      // global account — so map each recorded session to its slot for the aggregator.
+      // global account — so map each recorded session to its slot (spans first, then the mirror).
       slotBySession: slotBySessionMap(this.store.listSessions()),
+      slotSpans: this.store.listSessionSlotSpans(),
     });
   }
 

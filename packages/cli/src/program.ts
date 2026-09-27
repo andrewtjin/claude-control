@@ -52,6 +52,7 @@ import {
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
+import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
@@ -408,7 +409,9 @@ export function buildProgram(): Command {
         process.stderr.write(`Reading transcripts under ${paths.claudeDir} ...\n`);
       }
       const [accounts, scan] = await Promise.all([
-        buildEngine(paths).listAccounts(),
+        // Every account, reserved group members included: a bound account's turns must be labeled
+        // with its name, not its raw id.
+        buildEngine(paths).listAllAccounts(),
         readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs: windowStartMs }),
       ]);
 
@@ -418,10 +421,12 @@ export function buildProgram(): Command {
       const store = new Store(daemonDbPath(paths));
       let intervals;
       let slotBySession;
+      let slotSpans;
       try {
         intervals = store.listActivationIntervals();
         // Folder-bound sessions attribute against their group slot's timeline, not the global one.
         slotBySession = slotBySessionMap(store.listSessions());
+        slotSpans = store.listSessionSlotSpans();
       } finally {
         store.close();
       }
@@ -433,6 +438,7 @@ export function buildProgram(): Command {
         windowEndMs,
         labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
         slotBySession,
+        slotSpans,
       });
       process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });
@@ -1789,6 +1795,29 @@ function buildSessionCommands(program: Command): void {
     });
 
   session
+    .command('show [ref]')
+    .description(
+      "a session's alias (its title) and every account it has run on; ref = session id or alias, " +
+        'default = this session',
+    )
+    .option('--cwd <folder>', 'the folder an alias is looked up in (default: the current folder)')
+    .option('--json', 'machine-readable output')
+    .action(async (ref: string | undefined, opts: { cwd?: string; json?: boolean }) => {
+      await runSessionShow(ref, opts, sessionAliasDeps());
+    });
+
+  session
+    .command('aliases')
+    .description('named sessions in this folder (or --all) and the accounts each has run on')
+    .option('--cwd <folder>', 'list this folder instead of the current one')
+    .option('--all', 'every folder on this machine')
+    .option('--auto', 'include sessions that only have a generated title')
+    .option('--json', 'machine-readable output')
+    .action(async (opts: { cwd?: string; all?: boolean; auto?: boolean; json?: boolean }) => {
+      await runSessionAliases(opts, sessionAliasDeps());
+    });
+
+  session
     .command('status')
     .description('show tracked sessions and the active account (reads the daemon db offline)')
     .action(async () => {
@@ -1820,6 +1849,21 @@ function buildSessionCommands(program: Command): void {
       };
       process.stdout.write(renderSessionStatus(rows, header, detectPalette()) + '\n');
     });
+}
+
+/** The real edges for the session alias commands: this machine's paths, env and cwd; progress
+ *  notes only when stderr is a terminal, so piped output stays clean. */
+function sessionAliasDeps(): SessionAliasDeps {
+  return {
+    paths: defaultPaths(),
+    env: process.env,
+    cwd: process.cwd(),
+    platform: process.platform,
+    write: (text) => process.stdout.write(text),
+    note: (text) => {
+      if (process.stderr.isTTY) process.stderr.write(text + '\n');
+    },
+  };
 }
 
 /** Turn one Store `sessions` row into a display row, resolving the account id to a label and

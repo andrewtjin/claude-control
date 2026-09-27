@@ -12,7 +12,7 @@ import type {
   TokenStatsSnapshot,
   TokenTotals,
 } from '@claude-control/shared-protocol';
-import type { HeartbeatReading } from '@claude-control/daemon';
+import type { HeartbeatReading, SessionAccountUse, SessionMeta } from '@claude-control/daemon';
 import { localDayKey, totalTokens } from '@claude-control/daemon';
 import {
   billingLabel,
@@ -616,4 +616,229 @@ export function renderWhere(view: WhereView, palette: Palette = PLAIN_PALETTE): 
     'For VS Code, put this in ' + folder + '\\.vscode\\settings.json:',
     vscodeSnippet,
   ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Session aliases (`cctl session show` / `cctl session aliases`)
+// ---------------------------------------------------------------------------
+
+/** One session with the accounts its turns were billed to. */
+export interface SessionView {
+  meta: SessionMeta;
+  accounts: SessionAccountUse[];
+}
+
+/** `YYYY-MM-DD HH:MM` in local time — the operator reads their own clock. */
+function localStamp(ms: number): string {
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${localDayKey(ms)} ${hh}:${mm}`;
+}
+
+/** Where a session's alias came from: `custom` (`/rename`, `--name`) or `auto` (generated). Mirrors
+ *  `aliasOf`: a custom title that is present but blank hides the generated one, as it does for
+ *  `claude --resume`. */
+function aliasSource(meta: SessionMeta): 'custom' | 'auto' | null {
+  if (meta.customTitle !== null) return meta.customTitle.trim() === '' ? null : 'custom';
+  return meta.aiTitle !== null && meta.aiTitle.trim() !== '' ? 'auto' : null;
+}
+
+/** The session's alias as `claude --resume` sees it (`customTitle ?? aiTitle`), or null. */
+function aliasText(meta: SessionMeta): string | null {
+  const source = aliasSource(meta);
+  return source === 'custom' ? meta.customTitle : source === 'auto' ? meta.aiTitle : null;
+}
+
+/** The `--json` shape of one session. Stable field names; timestamps as ISO strings. Titles and
+ *  paths go out verbatim — JSON escapes control characters itself. */
+export function sessionViewJson(view: SessionView): Record<string, unknown> {
+  const m = view.meta;
+  return {
+    sessionId: m.sessionId,
+    alias: aliasText(m),
+    aliasSource: aliasSource(m),
+    customTitle: m.customTitle,
+    aiTitle: m.aiTitle,
+    folder: m.folder,
+    launchCwd: m.launchCwd,
+    firstActivity: m.firstActivityMs === null ? null : new Date(m.firstActivityMs).toISOString(),
+    lastActivity: new Date(m.lastActivityMs).toISOString(),
+    transcript: m.file,
+    accounts: view.accounts.map((a) => ({
+      accountId: a.accountId,
+      label: a.label,
+      turns: a.turns,
+      tokens: a.tokens,
+      first: new Date(a.firstMs).toISOString(),
+      last: new Date(a.lastMs).toISOString(),
+    })),
+  };
+}
+
+/** One account's line: label, turns, tokens and when. */
+function accountUseLine(use: SessionAccountUse, palette: Palette): string {
+  const label = sanitizeForTerminal(use.label);
+  const when =
+    localDayKey(use.firstMs) === localDayKey(use.lastMs)
+      ? localStamp(use.lastMs)
+      : `${localStamp(use.firstMs)} -> ${localStamp(use.lastMs)}`;
+  const turns = `${use.turns} turn${use.turns === 1 ? '' : 's'}`;
+  const name = use.accountId === null ? palette.dim(label) : palette.bold(label);
+  return `${name}  ${turns}, ${formatTokens(use.tokens)} tokens  ${palette.dim(when)}`;
+}
+
+/** Whether `meta` is the session this command runs inside. */
+function isCurrentSession(meta: SessionMeta, currentSessionId: string | undefined): boolean {
+  return (
+    currentSessionId !== undefined &&
+    currentSessionId.toLowerCase() === meta.sessionId.toLowerCase()
+  );
+}
+
+export interface SessionDetailsContext {
+  folder: string;
+  matchedBy: 'id' | 'alias';
+  /** For an alias match: whether it was found in `folder` (false = in the one other folder). */
+  inScope?: boolean;
+  currentSessionId?: string | undefined;
+}
+
+/** `cctl session show`: one block per session. */
+export function renderSessionDetails(
+  views: SessionView[],
+  ctx: SessionDetailsContext,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  const out: string[] = [];
+  const first = views[0];
+  if (ctx.matchedBy === 'alias' && ctx.inScope === false && first?.meta.folder != null) {
+    out.push(
+      palette.yellow(
+        `No session with that alias in ${sanitizeForTerminal(ctx.folder)}; ` +
+          `showing the one in ${sanitizeForTerminal(first.meta.folder)}.`,
+      ),
+      '',
+    );
+  }
+  if (views.length > 1) {
+    out.push(
+      `${views.length} sessions share this alias in this folder; "claude --resume <alias>" opens ` +
+        'a picker for them instead of resuming one.',
+      '',
+    );
+  }
+  views.forEach((view, i) => {
+    if (i > 0) out.push('');
+    const m = view.meta;
+    const alias = aliasText(m);
+    out.push(
+      `Alias     ${alias === null ? palette.dim('(none)') : palette.bold(sanitizeForTerminal(alias))}` +
+        (aliasSource(m) === 'auto' ? palette.dim('  (generated title; /rename sets one)') : '') +
+        (isCurrentSession(m, ctx.currentSessionId) ? palette.cyan('  <- this session') : ''),
+    );
+    out.push(
+      `Folder    ${m.folder === null ? palette.dim('(unknown)') : sanitizeForTerminal(m.folder)}`,
+    );
+    if (m.launchCwd !== null && m.folder !== null && m.launchCwd !== m.folder) {
+      out.push(`          ${palette.dim('(started in ' + sanitizeForTerminal(m.launchCwd) + ')')}`);
+    }
+    out.push(`Session   ${sanitizeForTerminal(m.sessionId)}`);
+    const since = m.firstActivityMs === null ? '?' : localStamp(m.firstActivityMs);
+    out.push(`Active    ${since} -> ${localStamp(m.lastActivityMs)}`);
+    if (view.accounts.length === 0) {
+      out.push(`Accounts  ${palette.dim('(no turns recorded yet)')}`);
+    } else {
+      view.accounts.forEach((use, j) => {
+        out.push(`${j === 0 ? 'Accounts  ' : '          '}${accountUseLine(use, palette)}`);
+      });
+    }
+  });
+  return out.join('\n');
+}
+
+export interface SessionAliasListContext {
+  /** The folder listed, or null for every folder. */
+  folder: string | null;
+  currentSessionId?: string | undefined;
+}
+
+/** `cctl session aliases`: one row per named session. */
+export function renderSessionAliasList(
+  views: SessionView[],
+  ctx: SessionAliasListContext,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (views.length === 0) {
+    const where = ctx.folder === null ? 'on this machine' : `in ${sanitizeForTerminal(ctx.folder)}`;
+    return `No named sessions ${where}. Name one with /rename <alias> (or claude --name <alias>).`;
+  }
+  let anyAuto = false;
+  let anyCurrent = false;
+  const rows = views.map((v) => {
+    const auto = aliasSource(v.meta) === 'auto';
+    const current = isCurrentSession(v.meta, ctx.currentSessionId);
+    anyAuto ||= auto;
+    anyCurrent ||= current;
+    return {
+      alias:
+        sanitizeForTerminal(aliasText(v.meta) ?? '') + (auto ? ' ~' : '') + (current ? ' *' : ''),
+      last: localStamp(v.meta.lastActivityMs),
+      accounts:
+        v.accounts.length === 0
+          ? '-'
+          : v.accounts.map((a) => sanitizeForTerminal(a.label)).join(', '),
+      session: sanitizeForTerminal(v.meta.sessionId.slice(0, 8)),
+      folder: v.meta.folder === null ? '' : sanitizeForTerminal(v.meta.folder),
+    };
+  });
+  type Col = keyof (typeof rows)[number];
+  const headers: Record<Col, string> = {
+    alias: 'ALIAS',
+    last: 'LAST ACTIVE',
+    accounts: 'ACCOUNTS',
+    session: 'SESSION',
+    folder: 'FOLDER',
+  };
+  const cols: Col[] =
+    ctx.folder === null
+      ? ['alias', 'last', 'accounts', 'session', 'folder']
+      : ['alias', 'last', 'accounts', 'session'];
+  const widths = new Map(
+    cols.map((c) => [c, Math.max(headers[c].length, ...rows.map((r) => r[c].length))] as const),
+  );
+  const line = (r: Record<Col, string>): string =>
+    cols
+      .map((c, i) => (i === cols.length - 1 ? r[c] : r[c].padEnd(widths.get(c) ?? 0)))
+      .join('  ')
+      .trimEnd();
+  const out = [palette.bold(line(headers)), ...rows.map(line)];
+  if (ctx.folder !== null) out.unshift(palette.dim(sanitizeForTerminal(ctx.folder)), '');
+  const notes: string[] = [];
+  if (anyAuto) notes.push('~ generated title');
+  if (anyCurrent) notes.push('* this session');
+  if (notes.length > 0) out.push('', palette.dim(notes.join('   ')));
+  return out.join('\n');
+}
+
+/** An alias found in several other folders: list them, and say how to pick. */
+export function renderAmbiguousAlias(
+  alias: string,
+  folders: { folder: string; sessions: SessionMeta[] }[],
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  const out = [
+    palette.yellow(
+      `"${sanitizeForTerminal(alias)}" is not a session in this folder, and ${folders.length} ` +
+        'other folders use it:',
+    ),
+  ];
+  for (const f of folders) {
+    const n = f.sessions.length;
+    const latest = f.sessions[0];
+    const last = latest === undefined ? '' : `  last active ${localStamp(latest.lastActivityMs)}`;
+    out.push(`  ${sanitizeForTerminal(f.folder)}  (${n} session${n === 1 ? '' : 's'})${last}`);
+  }
+  out.push('', 'Run it from one of those folders, or pass --cwd <folder>.');
+  return out.join('\n');
 }

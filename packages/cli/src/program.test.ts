@@ -370,7 +370,17 @@ describe('buildProgram', () => {
   it('nests session subcommands', () => {
     const session = buildProgram().commands.find((c) => c.name() === 'session');
     const subs = session?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['label', 'register', 'status', 'unregister', 'watch']);
+    expect(subs).toEqual(['aliases', 'label', 'register', 'show', 'status', 'unregister', 'watch']);
+  });
+
+  it('offers the alias lookup flags on session show and session aliases', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const flags = (name: string) =>
+      session?.commands.find((c) => c.name() === name)?.options.map((o) => o.long);
+    expect(flags('show')).toEqual(expect.arrayContaining(['--cwd', '--json']));
+    expect(flags('aliases')).toEqual(
+      expect.arrayContaining(['--cwd', '--all', '--auto', '--json']),
+    );
   });
 
   it('offers --session on the register/label/watch/unregister session commands', () => {
