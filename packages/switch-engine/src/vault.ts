@@ -244,7 +244,10 @@ function validateMember(value: unknown, where: string): StoredAccount {
  * canonicalization) with one already claimed by any group. The caller separately heals a member id
  * that ALSO lingers in `accounts.json`.
  */
-function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFile {
+function validateGroupsFile(
+  value: unknown,
+  platform: NodeJS.Platform,
+): { file: GroupsFile; extras: GroupsExtras } {
   if (!isPlainObject(value)) throw new VaultError('groups.json is not an object');
   assertNoForbiddenKeys(value, 'groups.json');
   if (value.schemaVersion !== GROUPS_SCHEMA_VERSION) {
@@ -266,12 +269,15 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
   const seenAccountUuids = new Set<string>();
   const seenFolderKeys = new Set<string>();
   const groups: StoredGroup[] = [];
+  const extras: GroupsExtras = { top: unownedFields(value, GROUPS_FILE_KEYS), byGroup: new Map() };
   for (let i = 0; i < rawGroups.length; i += 1) {
     const g: unknown = rawGroups[i];
     const where = `groups[${i}]`;
     if (!isPlainObject(g)) throw new VaultError(`${where} is not an object`);
     assertNoForbiddenKeys(g, where);
     if (typeof g.id !== 'string' || g.id === '') throw new VaultError(`${where} has no string id`);
+    const groupExtras = unownedFields(g, GROUP_KEYS);
+    if (Object.keys(groupExtras).length > 0) extras.byGroup.set(g.id, groupExtras);
     if (typeof g.label !== 'string') throw new VaultError(`${where} (${g.id}) has no string label`);
     if (typeof g.createdAtMs !== 'number' || typeof g.updatedAtMs !== 'number') {
       throw new VaultError(`${where} (${g.id}) has non-numeric timestamps`);
@@ -347,7 +353,50 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
       updatedAtMs: g.updatedAtMs,
     });
   }
-  return { schemaVersion: GROUPS_SCHEMA_VERSION, generation: value.generation, groups };
+  return {
+    file: { schemaVersion: GROUPS_SCHEMA_VERSION, generation: value.generation, groups },
+    extras,
+  };
+}
+
+/**
+ * The fields of `groups.json` this build does not own, carried forward on every rewrite — the same
+ * forward-compatibility `accounts.json` already has for its top-level keys and rows. A build of the
+ * same schema version that adds an optional field must not lose it the moment an older build touches
+ * a group (an ordinary switch rewrites the file). A change older builds must NOT carry forward blindly
+ * bumps the schema version instead, which this build refuses to read at all.
+ *
+ * Kept beside the typed groups rather than on them, so nothing this build hands out (the CLI views,
+ * the guard snapshot, the wire) ever carries a field it does not understand. A group this build
+ * removes takes its unknown fields with it; member rows keep theirs on the row, as shared rows do.
+ */
+interface GroupsExtras {
+  top: Record<string, unknown>;
+  byGroup: Map<string, Record<string, unknown>>;
+}
+
+/** The top-level keys of `groups.json` this build writes itself. */
+const GROUPS_FILE_KEYS: ReadonlySet<string> = new Set(['schemaVersion', 'generation', 'groups']);
+/** The keys of one group this build writes itself (see {@link StoredGroup}). */
+const GROUP_KEYS: ReadonlySet<string> = new Set([
+  'id',
+  'label',
+  'members',
+  'activeId',
+  'folders',
+  'createdAtMs',
+  'updatedAtMs',
+]);
+
+/** Every own field of `obj` whose key is not in `owned`, copied. (Forbidden prototype keys never
+ *  reach here: the file is refused on them before this runs.) */
+function unownedFields(
+  obj: Record<string, unknown>,
+  owned: ReadonlySet<string>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(obj)) if (!owned.has(key)) out[key] = obj[key];
+  return out;
 }
 
 /**
@@ -562,6 +611,8 @@ interface RegistryState {
   groups: StoredGroup[];
   /** `groups.json`'s generation; the next groups write is `generation + 1`. */
   generation: number;
+  /** The fields of `groups.json` this build does not own, re-emitted on every groups write. */
+  groupsExtras: GroupsExtras;
   /** True when a member id (or a reserved active id) still lingered in `accounts.json` and the next
    *  shared write must drop it. See {@link Vault.heal}. */
   needsSharedRewrite: boolean;
@@ -652,9 +703,12 @@ export class Vault {
     }
 
     const rawGroups = await readJsonIfExists<unknown>(this.groupsPath());
-    const groupsFile: GroupsFile =
+    const { file: groupsFile, extras: groupsExtras } =
       rawGroups === undefined
-        ? { schemaVersion: GROUPS_SCHEMA_VERSION, generation: 0, groups: [] }
+        ? {
+            file: { schemaVersion: GROUPS_SCHEMA_VERSION, generation: 0, groups: [] },
+            extras: { top: {}, byGroup: new Map() },
+          }
         : validateGroupsFile(rawGroups, this.platform);
 
     // Heal: no shared row may duplicate a reserved account (groups.json wins), and the global active
@@ -699,6 +753,7 @@ export class Vault {
       unknownKeys,
       groups: groupsFile.groups,
       generation: groupsFile.generation,
+      groupsExtras,
       needsSharedRewrite,
     };
   }
@@ -726,7 +781,9 @@ export class Vault {
 
   /** Persist the reserved side, incrementing `generation` (the guard snapshot carries it, so a
    *  bump is what lets a stale snapshot be detected). Mutates `st.generation` to the value written
-   *  so a caller that then writes the snapshot reports the right number. */
+   *  so a caller that then writes the snapshot reports the right number. Fields this build does not
+   *  own are written back where they were read (see {@link GroupsExtras}); this build's own fields
+   *  are spread last, so an unknown field can never shadow one of them. */
   private async saveGroups(st: RegistryState): Promise<void> {
     st.generation += 1;
     const file: GroupsFile = {
@@ -734,7 +791,12 @@ export class Vault {
       generation: st.generation,
       groups: st.groups,
     };
-    await atomicWriteFile(this.groupsPath(), JSON.stringify(file, null, 2));
+    const out = {
+      ...st.groupsExtras.top,
+      ...file,
+      groups: st.groups.map((g) => ({ ...st.groupsExtras.byGroup.get(g.id), ...g })),
+    };
+    await atomicWriteFile(this.groupsPath(), JSON.stringify(out, null, 2));
   }
 
   /**

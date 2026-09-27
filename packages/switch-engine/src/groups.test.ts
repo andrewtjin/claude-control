@@ -706,3 +706,48 @@ describe('group labels are stored terminal-safe', () => {
     expect(group.label).toBe('work');
   });
 });
+
+describe('groups.json keeps fields this build does not know', () => {
+  it('carries unknown top-level and group-level fields through a rewrite', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    const b = await v.addAccount('client', bundle('b'));
+    const group = await v.createGroup({ memberIds: [a.id, b.id], folders: ['C:\\work'] });
+    // A later build of the same schema adds a field at each level.
+    const file = await readJson(groupsPath);
+    file.futureTopLevel = { keep: true };
+    (file.groups as Record<string, unknown>[])[0]!.futureScopes = [
+      { kind: 'branch', name: 'main' },
+    ];
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    // An ordinary group write by this build.
+    await v.setGroupActive(group.id, a.id);
+
+    const after = await readJson(groupsPath);
+    expect(after.futureTopLevel).toEqual({ keep: true });
+    const g = (after.groups as Record<string, unknown>[])[0]!;
+    expect(g.futureScopes).toEqual([{ kind: 'branch', name: 'main' }]);
+    expect(g.activeId).toBe(a.id);
+    // This build's own fields still win, and the unknown ones never leak into what it hands out.
+    expect(Object.keys((await v.getGroup(group.id))!)).not.toContain('futureScopes');
+  });
+
+  it('drops the unknown fields of a group that no longer exists', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    const b = await v.addAccount('client', bundle('b'));
+    const g1 = await v.createGroup({ memberIds: [a.id], folders: ['C:\\one'] });
+    await v.createGroup({ memberIds: [b.id], folders: ['C:\\two'] });
+    const file = await readJson(groupsPath);
+    for (const g of file.groups as Record<string, unknown>[]) g.futureScopes = [g.id];
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    await v.releaseAccounts(g1.id, [a.id]);
+
+    const after = await readJson(groupsPath);
+    const groups = after.groups as Record<string, unknown>[];
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.futureScopes).toEqual([groups[0]!.id]);
+  });
+});
