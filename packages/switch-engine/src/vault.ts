@@ -803,15 +803,7 @@ export class Vault {
     label?: string;
   }): Promise<StoredGroup> {
     const st = await this.loadState();
-    if (st.groups.length >= MAX_GROUPS) {
-      throw new VaultError(`cannot create another group (max ${MAX_GROUPS})`);
-    }
-    if (opts.memberIds.length === 0) throw new VaultError('a group needs at least one member');
-    if (opts.memberIds.length > MAX_GROUP_MEMBERS) {
-      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
-    }
-    const folders = this.checkNewFolders(st, opts.folders ?? [], null);
-    const moved = this.takeSharedRows(st, opts.memberIds);
+    const { folders, moved } = this.validateNewGroup(st, opts);
     const now = this.clock();
     const label = opts.label?.trim() || moved.map((m) => m.label).join(', ');
     const group: StoredGroup = {
@@ -828,6 +820,38 @@ export class Vault {
     this.removeSharedRows(st, opts.memberIds);
     await this.saveShared(st); // accounts.json SECOND
     return group;
+  }
+
+  /**
+   * Run every refusal {@link createGroup} would make — group count, member count, folder conflicts,
+   * members that are unknown or already reserved — WITHOUT writing anything. For a caller whose
+   * group creation is preceded by its own side effects (a bind moves the global slot off a
+   * to-be-member first): checking here first means a request that was always going to be refused
+   * is refused before anything moved, not after.
+   */
+  async checkCreateGroup(opts: {
+    memberIds: readonly string[];
+    folders?: readonly string[];
+  }): Promise<void> {
+    this.validateNewGroup(await this.loadState(), opts);
+  }
+
+  /** The shared validation behind {@link createGroup} and {@link checkCreateGroup}: throws the named
+   *  refusal, else returns the checked folders and the shared rows that would move. Pure over `st`. */
+  private validateNewGroup(
+    st: RegistryState,
+    opts: { memberIds: readonly string[]; folders?: readonly string[] },
+  ): { folders: string[]; moved: StoredAccount[] } {
+    if (st.groups.length >= MAX_GROUPS) {
+      throw new VaultError(`cannot create another group (max ${MAX_GROUPS})`);
+    }
+    if (opts.memberIds.length === 0) throw new VaultError('a group needs at least one member');
+    if (opts.memberIds.length > MAX_GROUP_MEMBERS) {
+      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
+    }
+    const folders = this.checkNewFolders(st, opts.folders ?? [], null);
+    const moved = this.takeSharedRows(st, opts.memberIds);
+    return { folders, moved };
   }
 
   /**

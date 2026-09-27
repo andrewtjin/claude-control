@@ -852,7 +852,8 @@ export class SwitchEngine {
    * Bind a folder to a set of accounts, creating (or reusing) their group. The exact §7 order:
    *   1. canonicalize + validate the folder; resolve the members; refuse a member reserved to a
    *      DIFFERENT group (named), and refuse the folder if it is already bound to a group whose
-   *      member set differs (unbind first).
+   *      member set differs (unbind first); refuse a new group the registry caps would reject. Every
+   *      refusal happens here, before step 2 has moved anything.
    *   2. if a to-be-member is live in the GLOBAL slot, move global OFF it first (adopting its
    *      rotation), refusing when no shared account remains to hold the global slot.
    *   3. move the member rows out of `accounts.json` into the group (groups.json first — the vault's
@@ -933,6 +934,10 @@ export class SwitchEngine {
             : await this.vault.addFolderToGroup(matching.id, canonicalFolder);
         created = false;
       } else {
+        // Every refusal the group creation below can make (group count, member count, folder
+        // conflicts) is checked NOW, before the global hand-off: a bind that was always going to be
+        // refused must not first move the global slot off an account and then leave it moved.
+        await this.vault.checkCreateGroup({ memberIds: requestedIds, folders: [canonicalFolder] });
         // New group: a requested member may be the GLOBAL live account. Move global off it FIRST
         // (while it is still a shared account activate() can route to global), so it is live nowhere
         // at the instant its row moves into the group.
