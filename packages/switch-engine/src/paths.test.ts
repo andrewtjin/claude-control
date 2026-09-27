@@ -110,6 +110,16 @@ describe('defaultPaths from inside a group profile', () => {
     expect(norm(paths.credentialsPath)).toBe(norm(join(main, '.credentials.json')));
     expect(norm(paths.claudeJsonPath)).toBe(norm(join(main, '.claude.json')));
     expect(norm(paths.vaultDir)).toBe(norm(vaultDir));
+    // The profile the session really runs in is kept, for the capture that must refuse there.
+    expect(paths.profileConfigDir).toBe(profile);
+  });
+
+  it('records no profile when CLAUDE_CONFIG_DIR is not one', () => {
+    const dir = join('D:', 'claude-main');
+    expect(
+      defaultPaths({ LOCALAPPDATA: lad, CLAUDE_CONFIG_DIR: dir }, 'win32').profileConfigDir,
+    ).toBe(undefined);
+    expect(defaultPaths({ LOCALAPPDATA: lad }, 'win32').profileConfigDir).toBe(undefined);
   });
 
   it('maps a profile of the default layout back to ~/.claude and ~/.claude.json', () => {
@@ -146,6 +156,7 @@ describe('defaultPaths from inside a group profile', () => {
       readFile: () => '{not json',
     });
     expect(norm(paths.claudeDir)).toBe(norm(join(home, '.claude')));
+    expect(paths.profileConfigDir).toBe(profile);
   });
 
   it('leaves a CLAUDE_CONFIG_DIR outside the profiles root untouched, with no filesystem read', () => {

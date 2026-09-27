@@ -265,6 +265,16 @@ interface OrphanLogin {
   occupant: PhysicalOccupant;
 }
 
+/** The refusal of a capture whose config dir is a group profile: a {@link RefreshError} with a stable
+ *  code, so the CLI can render guidance ("onboard in a throwaway dir") rather than a raw message. */
+function captureInProfileError(configDir: string): RefreshError {
+  return new RefreshError(
+    `"${configDir}" is inside the folder-bound profiles area; onboard a new account in a ` +
+      'throwaway config dir instead of a group profile',
+    'capture_in_profile',
+  );
+}
+
 /** Set equality by membership — the two account-id sets compare identical. */
 function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a.size !== b.size) return false;
@@ -1940,13 +1950,7 @@ export class SwitchEngine {
    *  {@link isInsideProfilesRoot}). A {@link RefreshError} with a stable code so the CLI can render
    *  guidance ("onboard in a throwaway dir, not a group profile") rather than a raw message. */
   private refuseCaptureInProfile(configDir: string): void {
-    if (this.isInsideProfilesRoot(configDir)) {
-      throw new RefreshError(
-        `"${configDir}" is inside the folder-bound profiles area; onboard a new account in a ` +
-          'throwaway config dir instead of a group profile',
-        'capture_in_profile',
-      );
-    }
+    if (this.isInsideProfilesRoot(configDir)) throw captureInProfileError(configDir);
   }
 
   // ---- active account (live-login reconciled) ----
@@ -2024,8 +2028,16 @@ export class SwitchEngine {
   async captureCurrentLogin(label: string): Promise<StoredAccount> {
     // A capture reads whoever is live in THIS config dir. Run inside a group profile, that seat is a
     // group's live credentials — onboarding always uses a throwaway dir, so a config dir pointing
-    // into the profiles root is a mistake to refuse, not a login to capture.
+    // into the profiles root is a mistake to refuse, not a login to capture. The session's OWN config
+    // dir is checked too: inside a bound session the paths are seen through to the main dir, so
+    // `claudeDir` alone would capture the main dir's login instead of the one just made in the
+    // profile — and report it as if it were the new one.
     this.refuseCaptureInProfile(this.paths.claudeDir);
+    // Set only when the environment's config dir IS a group profile (defaultPaths decided that by
+    // the same profiles-root rule), so it is refused outright rather than re-derived here.
+    if (this.paths.profileConfigDir !== undefined) {
+      throw captureInProfileError(this.paths.profileConfigDir);
+    }
     // Locked for the whole capture: the add + setActive pair below are two registry writes that
     // must land as one atomic unit, and reading the live login while a switch is mid-flight would
     // otherwise see a torn set of credential files.
