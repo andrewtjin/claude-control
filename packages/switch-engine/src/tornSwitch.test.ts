@@ -26,6 +26,7 @@ import { Vault } from './vault.js';
 import { groupProfileDir, sandboxPaths, type Paths } from './paths.js';
 import { groupSlotId } from './types.js';
 import type { ClaudeOauth, CredentialBundle, OauthAccount } from './types.js';
+import type { Logger } from './logger.js';
 
 // ---- write faults: fail chosen atomic writes by target path ---------------------------------------
 interface WriteFault {
@@ -75,7 +76,7 @@ afterEach(async () => {
 interface Harness {
   paths: Paths;
   /** A fresh engine over the same on-disk state — the daemon, another CLI, or a restart. */
-  mk: (faultAt?: (checkpoint: string) => void, now?: number) => SwitchEngine;
+  mk: (faultAt?: (checkpoint: string) => void, now?: number, logger?: Logger) => SwitchEngine;
   vault: Vault;
   /** The GLOBAL slot's live files. */
   global: CredentialStore;
@@ -110,7 +111,7 @@ async function harness(): Promise<Harness> {
       expiresAt: NOW + 9 * HOUR,
     });
   const refresh = vi.fn(refreshImpl);
-  const mk = (faultAt?: (checkpoint: string) => void, now = NOW): SwitchEngine =>
+  const mk = (faultAt?: (checkpoint: string) => void, now = NOW, logger?: Logger): SwitchEngine =>
     new SwitchEngine({
       paths,
       protector,
@@ -124,6 +125,7 @@ async function harness(): Promise<Harness> {
       bindFs,
       isProcessAlive: () => false,
       bindEnforce: 'block',
+      ...(logger ? { logger } : {}),
       ...(faultAt ? { faultAt } : {}),
     });
   return {
@@ -201,13 +203,61 @@ describe('a switch whose identity write fails after its credentials landed', () 
     const { P, T } = await seed(h);
     failWrites(h.paths.claudeJsonPath);
 
-    await expect(h.mk().activate(T.id, { force: true })).rejects.toMatchObject({ code: 'EPERM' });
+    await expect(h.mk().activate(T.id, { force: true })).rejects.toMatchObject({
+      code: 'switch_failed',
+      outcome: 'restored',
+      cause: { code: 'EPERM' },
+    });
 
     expect(await globalLive(h)).toEqual({ creds: 'P', identity: 'P' });
     expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
     const e = h.mk();
     expect(await e.getActiveId('global')).toBe(P.id);
     expect(await e.checkSlots()).toEqual([]);
+  });
+
+  it('says so in plain words, and logs nothing a one-shot command would print', async () => {
+    const h = await harness();
+    const { T } = await seed(h);
+    failWrites(h.paths.claudeJsonPath);
+    const loud: string[] = [];
+    const logger: Logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: (_obj, msg) => loud.push(`warn: ${msg ?? ''}`),
+      error: (_obj, msg) => loud.push(`error: ${msg ?? ''}`),
+    };
+
+    const err = await h
+      .mk(undefined, NOW, logger)
+      .activate(T.id, { force: true })
+      .catch((e: unknown) => e);
+
+    expect((err as Error).message).toBe(
+      `could not write ${h.paths.claudeJsonPath} (EPERM): another program probably has it open ` +
+        '(an editor, a backup or sync tool, antivirus), or it is read-only. The switch to "T" was ' +
+        'undone and the previous login was kept - nothing changed. Close that program (or wait ' +
+        'for it to finish) and try again.',
+    );
+    expect(loud).toEqual([]);
+  });
+
+  it('names the pending state when the undo fails too', async () => {
+    const h = await harness();
+    const { T } = await seed(h);
+    failWrites(h.paths.claudeJsonPath);
+    failWrites(h.paths.credentialsPath, { skip: 1 });
+
+    const err = await h
+      .mk()
+      .activate(T.id, { force: true })
+      .catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ code: 'switch_failed', outcome: 'pending' });
+    expect((err as Error).message).toContain(
+      'could not be undone either, so it is still pending: the next operation on the global slot ' +
+        'finishes or undoes it, and `cctl recover` retries it now. Close that program first.',
+    );
   });
 
   it('never lets the next switch store the target token in the previous account bundle', async () => {
@@ -286,7 +336,13 @@ describe('a switch undone because its read-back found another writer', () => {
       }
     });
 
-    await expect(racing.activate(T.id, { force: true })).rejects.toThrow(/read-back/);
+    const err = await racing.activate(T.id, { force: true }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'switch_failed', outcome: 'kept_other_login' });
+    expect((err as Error).message).toBe(
+      'another program wrote the live login of the global slot while the switch to "T" was being ' +
+        'written. The switch to "T" did not happen: the login written meanwhile was left in place, ' +
+        'and nothing was stored from it. Try again.',
+    );
 
     // Nothing says whose rotation it is but the block the switch itself wrote: no bundle takes it,
     // nothing overwrites it, and that block is gone.

@@ -31,8 +31,10 @@ import {
   RefreshError,
   SharedTokenError,
   SlotError,
+  SwitchFailedError,
   UnknownAccountError,
   UnsettledSwitchError,
+  type FailedSwitchOutcome,
   VaultError,
   VerifyError,
 } from './errors.js';
@@ -264,6 +266,55 @@ const SHARED_TOKEN_REMEDY =
 /** Labels of `ids` as a quoted list for a message, falling back to the id for an unknown row. */
 function quotedLabels(ids: readonly string[], rows: readonly StoredAccount[]): string {
   return ids.map((id) => `"${rows.find((a) => a.id === id)?.label ?? id}"`).join(' and ');
+}
+
+/** Error codes of a write another program refused: on Windows a file some process holds open
+ *  (EPERM/EBUSY, see fsutil's isTransientRenameError) or one marked read-only (EPERM/EACCES). */
+const REFUSED_WRITE_CODES: ReadonlySet<string> = new Set(['EPERM', 'EBUSY', 'EACCES']);
+
+/**
+ * The message of a {@link SwitchFailedError}, for the person who asked for the switch: what could
+ * not be done (which file could not be written, or that another program wrote the live login
+ * meanwhile), what the slot holds now, the likely cause and the next step. Nothing in it needs the
+ * log to be understood — the underlying error stays on the error as its `cause`.
+ */
+function describeFailedSwitch(failure: {
+  target: string;
+  where: string;
+  cause: unknown;
+  file: string | undefined;
+  outcome: FailedSwitchOutcome;
+}): string {
+  const { target, where, cause, file, outcome } = failure;
+  const code = (cause as NodeJS.ErrnoException | undefined)?.code;
+  const refused = code !== undefined && REFUSED_WRITE_CODES.has(code);
+  const what =
+    cause instanceof VerifyError
+      ? `another program wrote the live login of ${where} while the switch to "${target}" was being written`
+      : file !== undefined
+        ? `could not write ${file}${code !== undefined ? ` (${code})` : ''}` +
+          (refused
+            ? ': another program probably has it open (an editor, a backup or sync tool, ' +
+              'antivirus), or it is read-only'
+            : `: ${errorReason(cause)}`)
+        : `the switch to "${target}" failed: ${errorReason(cause)}`;
+  const now: Record<FailedSwitchOutcome, string> = {
+    restored: `The switch to "${target}" was undone and the previous login was kept - nothing changed.`,
+    kept_other_login:
+      `The switch to "${target}" did not happen: the login written meanwhile was left in place, ` +
+      'and nothing was stored from it.',
+    pending:
+      `The switch to "${target}" could not be undone either, so it is still pending: the next ` +
+      `operation on ${where} finishes or undoes it, and \`cctl recover\` retries it now.`,
+  };
+  const next = refused
+    ? outcome === 'pending'
+      ? ' Close that program first.'
+      : ' Close that program (or wait for it to finish) and try again.'
+    : outcome === 'pending'
+      ? ''
+      : ' Try again.';
+  return `${what}. ${now[outcome]}${next}`;
 }
 
 /** Whether a pending switch was between `accountId` and another account — the two accounts whose
@@ -3067,15 +3118,20 @@ export class SwitchEngine {
     // The live files are about to change: say so before the first write, never after it.
     await rt.intent.write(intentAt('writing'));
     let recorded: SwitchIntent['phase'] = 'writing';
+    // Which file each step writes, so a failure can say which one could not be written.
+    let writing: string | undefined = this.liveFileOf(rt, 'credentials');
     try {
       await rt.credStore.writeLiveCredentials(bundle.claudeAiOauth);
       this.fault('activate:after-credentials-write');
+      writing = this.liveFileOf(rt, 'identity');
       await this.writeLiveIdentity(bundle.oauthAccount, rt.credStore);
+      writing = join(rt.stateDir, '.switch-intent.json');
       await rt.intent.write(intentAt('written'));
       recorded = 'written';
       this.fault('activate:after-live-write');
 
       // Verify the write actually landed; a mismatch is undone like any other failure here.
+      writing = undefined;
       const check = await rt.credStore.readLiveCredentials();
       if (!check || check.accessToken !== bundle.claudeAiOauth.accessToken) {
         throw new VerifyError(
@@ -3084,13 +3140,25 @@ export class SwitchEngine {
       }
 
       // Commit into the slot's own registry side — the last step that can still be undone.
+      writing = join(this.paths.vaultDir, group !== undefined ? 'groups.json' : 'accounts.json');
       if (group !== undefined) await this.vault.setGroupActive(group.id, targetId);
       else await this.vault.setActive(targetId);
     } catch (err) {
       // A process that died here runs nothing more; its intent is what recovers it.
-      if (!this.isSimulatedDeath(err))
-        await this.undoFailedSwitch(rt, intentAt(recorded), prior, err);
-      throw err;
+      if (this.isSimulatedDeath(err)) throw err;
+      const outcome = await this.undoFailedSwitch(rt, intentAt(recorded), prior, err);
+      const failedFile = (err as NodeJS.ErrnoException & { dest?: unknown }).dest;
+      throw new SwitchFailedError(
+        describeFailedSwitch({
+          target: (await this.vault.getAccount(targetId))?.label ?? targetId,
+          where: await this.slotLabelOf(rt.id),
+          cause: err,
+          file: typeof failedFile === 'string' ? failedFile : writing,
+          outcome,
+        }),
+        outcome,
+        { cause: err },
+      );
     }
 
     // A real account hop (not a same-account heal) restarts THIS slot's cadence clock — forced
@@ -3138,19 +3206,26 @@ export class SwitchEngine {
     pending: SwitchIntent,
     prior: PriorLive,
     cause: unknown,
-  ): Promise<void> {
+  ): Promise<FailedSwitchOutcome> {
+    // Logged at info: the caller is handed the whole story as a SwitchFailedError, and a one-shot
+    // command's stderr is for that plain line, not a structured copy of it. The daemon's log, at
+    // info, keeps every one.
     const undoing: SwitchIntent = { ...pending, undo: true };
     await rt.intent
       .write(undoing)
       .catch((err: unknown) =>
-        this.log.warn(
+        this.log.info(
           { slot: rt.id, targetId: pending.targetId, reason: errorReason(err) },
           'could not record that a failed switch is being undone',
         ),
       );
     try {
       const result = await this.settleSwitch(rt, undoing, 'undo', prior);
-      this.log.warn(
+      const live = await rt.credStore.readLiveCredentials().catch(() => undefined);
+      const outcome: FailedSwitchOutcome = sameGrant(live, prior.creds)
+        ? 'restored'
+        : 'kept_other_login';
+      this.log.info(
         {
           slot: rt.id,
           targetId: pending.targetId,
@@ -3160,8 +3235,9 @@ export class SwitchEngine {
         },
         'switch failed after its live write and was undone',
       );
+      return outcome;
     } catch (undoErr) {
-      this.log.error(
+      this.log.info(
         {
           slot: rt.id,
           targetId: pending.targetId,
@@ -3171,6 +3247,7 @@ export class SwitchEngine {
         'switch failed after its live write and could not be undone; it stays pending until the ' +
           'next operation on this slot settles it',
       );
+      return 'pending';
     }
   }
 
@@ -3404,7 +3481,7 @@ export class SwitchEngine {
       const error = await this.unsettledError(slotId, pending, err);
       if (this.unsettledLogged.get(slotId) !== error.message) {
         this.unsettledLogged.set(slotId, error.message);
-        this.log.error(
+        this.log.info(
           {
             slot: slotId,
             targetId: pending?.targetId,
@@ -3443,6 +3520,19 @@ export class SwitchEngine {
         '.credentials.json open, closing it lets it finish',
       { cause },
     );
+  }
+
+  /** Where a slot's live credentials or identity block is written, as a message names it: the
+   *  file, or on macOS the Keychain item that holds the global slot's credentials. */
+  private liveFileOf(rt: SlotRuntime, which: 'credentials' | 'identity'): string {
+    const dir = rt.profileDir;
+    if (which === 'identity') {
+      return dir === undefined ? this.paths.claudeJsonPath : join(dir, '.claude.json');
+    }
+    if (dir !== undefined) return join(dir, '.credentials.json');
+    return this.platform === 'darwin'
+      ? "Claude Code's login Keychain item"
+      : this.paths.credentialsPath;
   }
 
   /** A slot as a message names it: "the global slot", or the folder slot of a group's members. */
@@ -3529,7 +3619,7 @@ export class SwitchEngine {
         const identityLanded = await this.writeLiveIdentity(target.oauthAccount, rt.credStore).then(
           () => true,
           (err: unknown) => {
-            this.log.warn(
+            this.log.info(
               { slot: rt.id, targetId: pending.targetId, reason: errorReason(err) },
               'could not finish an interrupted switch; undoing it instead',
             );
@@ -3586,7 +3676,9 @@ export class SwitchEngine {
       ? 'the slot holds a login written after an unfinished switch; it was left in place'
       : 'the live login after an unfinished switch could not be attributed; its identity block ' +
         'was removed so Claude Code re-derives it, and no bundle was changed';
-    this.log.warn(fields, message);
+    // An undo's caller is told this in its SwitchFailedError; only a recovery has no one to tell.
+    if (mode === 'undo') this.log.info(fields, message);
+    else this.log.warn(fields, message);
     this.auditRecovery(
       pending.prevActiveId,
       null,

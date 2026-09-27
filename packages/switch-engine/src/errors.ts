@@ -55,6 +55,28 @@ export class VerifyError extends SwitchEngineError {
   }
 }
 
+/** What a switch that failed after its first live write left in its slot (see {@link SwitchFailedError}):
+ *  - `restored`: the switch was undone and the previous login is live again — nothing changed;
+ *  - `kept_other_login`: another program wrote the live login while the switch ran; that login was
+ *    left in place and nothing was stored from it;
+ *  - `pending`: the undo failed too, so the switch stays pending until the next operation on the
+ *    slot (or `cctl recover`) finishes or undoes it. */
+export type FailedSwitchOutcome = 'restored' | 'kept_other_login' | 'pending';
+
+/** A switch failed after it had begun writing the live login. Its message is the whole story in
+ *  plain language — what could not be done, what the live login is now, the likely cause and the
+ *  next step — because a person reads it (a CLI error line, a phone reply); the underlying failure is
+ *  its `cause`, and `outcome` says the same about the slot for code. */
+export class SwitchFailedError extends SwitchEngineError {
+  constructor(
+    message: string,
+    readonly outcome: FailedSwitchOutcome,
+    options?: { cause?: unknown },
+  ) {
+    super(message, 'switch_failed', options);
+  }
+}
+
 /** A switch that was interrupted (a crash, or an undo that itself failed) could not be finished or
  *  undone yet — typically because another process keeps a live file open — so that slot's live
  *  login may be one account's credentials under another's identity. What writes that slot, or

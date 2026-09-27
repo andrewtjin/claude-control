@@ -79,8 +79,8 @@ describe.skipIf(process.platform !== 'win32')('an identity write refused by a sh
 
     holder = await holdOpenForReading(paths.claudeJsonPath);
     const hop = await engine.activate(T.id, { force: true, origin: 'auto' }).then(
-      () => 'ok',
-      (err: NodeJS.ErrnoException) => err.code ?? err.message,
+      () => undefined,
+      (err: unknown) => err,
     );
     const store = new CredentialStore(paths);
     const creds = (await store.readLiveCredentials())?.refreshToken;
@@ -90,7 +90,15 @@ describe.skipIf(process.platform !== 'win32')('an identity write refused by a sh
     await closed;
     holder = undefined;
 
-    expect(hop).toBe('EPERM');
+    // The real rename error underneath, said the way a person reads it: which file, why, what now.
+    expect(hop).toMatchObject({
+      code: 'switch_failed',
+      outcome: 'restored',
+      cause: { code: 'EPERM', dest: paths.claudeJsonPath },
+    });
+    expect((hop as Error).message).toMatch(
+      /^could not write .*\.claude\.json \(EPERM\): another program probably has it open .* nothing changed\. Close that program/,
+    );
     expect({ creds, ident }).toEqual({ creds: 'rt-P', ident: 'uuid-P' });
     expect(await new IntentStore(paths.vaultDir).read()).toBeUndefined();
 

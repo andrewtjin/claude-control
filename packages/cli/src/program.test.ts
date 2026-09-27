@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   RefreshError,
+  SwitchFailedError,
   VaultError,
   type ActivateResult,
   type DedupeReport,
@@ -695,6 +696,25 @@ describe('switch', () => {
     expect(r.out).toBe('');
   });
 
+  it('prints a switch another program kept from writing as one plain line, not the raw error', async () => {
+    const said =
+      'could not write C:\\Users\\me\\.claude.json (EPERM): another program probably has it open ' +
+      '(an editor, a backup or sync tool, antivirus), or it is read-only. The switch to "Work" was ' +
+      'undone and the previous login was kept - nothing changed. Close that program (or wait for ' +
+      'it to finish) and try again.';
+    engine.listAccounts.mockResolvedValueOnce([account]);
+    engine.activate.mockRejectedValueOnce(
+      new SwitchFailedError(said, 'restored', {
+        cause: Object.assign(new Error("EPERM: operation not permitted, rename '.tmp-1'"), {
+          code: 'EPERM',
+        }),
+      }),
+    );
+
+    const r = await runCli(['switch', 'Work']);
+
+    expect(r).toEqual({ out: '', err: `error: ${said}\n`, exited: true });
+  });
 });
 
 describe('recover', () => {

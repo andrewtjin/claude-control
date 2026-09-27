@@ -15,9 +15,12 @@ import { dirname, join } from 'node:path';
 import {
   CadenceError,
   QuarantineError,
+  SharedTokenError,
   SlotError,
   SwitchEngineError,
+  SwitchFailedError,
   UnknownAccountError,
+  UnsettledSwitchError,
   VaultError,
   buildAuthorizeUrl,
   defaultPaths,
@@ -300,6 +303,16 @@ export function buildProgram(): Command {
         if (err instanceof UnknownAccountError) fail(err.message);
         if (err instanceof SlotError) {
           fail(`${err.message}. Nothing was changed - check \`cctl bindings\`.`);
+        }
+        // A switch that failed after it began writing the live login, one an earlier switch still
+        // blocks, or a login stored under two accounts: the engine's message already says what the
+        // live login is now and what to do, in words — it is the whole error line.
+        if (
+          err instanceof SwitchFailedError ||
+          err instanceof UnsettledSwitchError ||
+          err instanceof SharedTokenError
+        ) {
+          fail(err.message);
         }
         // The token endpoint shedding load is an outage, not a broken account: the engine has
         // already spent its retry budget and checked the status page, so its message is the
