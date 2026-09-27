@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -14,6 +14,7 @@ import {
   checkBindingScopes,
   checkGuardSnapshot,
   checkGuardHook,
+  checkFolderBindings,
   checkVersionSkew,
   checkPowerShellWrapper,
   powerShellProfilePaths,
@@ -25,7 +26,13 @@ import {
   type ProbeFetch,
 } from './doctor.js';
 import { renderShellInit } from './shellInit.js';
-import { sandboxPaths, type LiveCredentialChannel } from '@claude-control/switch-engine';
+import {
+  FileCredentialChannel,
+  InsecurePassthroughProtector,
+  SwitchEngine,
+  sandboxPaths,
+  type LiveCredentialChannel,
+} from '@claude-control/switch-engine';
 
 // This file lives at packages/cli/src/, so two levels up is packages/, where the publishable
 // bundle lives at cctl-publish/package.json (see dependencyClosure.test.ts for the same idiom).
@@ -41,6 +48,21 @@ describe('renderDoctor', () => {
     const out = renderDoctor(checks);
     expect(out).toContain('[ok] dpapi: works');
     expect(out).toContain('[!!] login: no credentials');
+  });
+
+  it('prints a detail carrying a stored label or path without its terminal controls', () => {
+    // A check detail quotes labels and folders straight out of the registry files, which an older
+    // build or a hand edit may have left carrying escape sequences.
+    const out = renderDoctor([
+      {
+        name: 'slots',
+        ok: false,
+        detail: 'non-member "work\u001b]0;pwned\u0007\u001b[2J\u001b[31mALL CHECKS OK" is live',
+      },
+    ]);
+    expect(out).not.toContain('\u001b');
+    expect(out).not.toContain('\u0007');
+    expect(out).toContain('ALL CHECKS OK');
   });
 });
 
@@ -551,5 +573,98 @@ describe('checkBindingScopes', () => {
     expect(check.detail).toContain('200 characters Claude Code keeps of a session name');
     expect(check.detail).toContain(`cctl session unbind '${long}' --cwd`);
     expect(check.detail).not.toContain('y'.repeat(200));
+  });
+});
+
+describe('checkFolderBindings', () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'cctl-doctor-bindings-'));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  function sandboxEngine(): SwitchEngine {
+    const paths = sandboxPaths(root);
+    return new SwitchEngine({
+      paths,
+      protector: new InsecurePassthroughProtector(),
+      liveCredentialChannel: new FileCredentialChannel(paths.credentialsPath),
+      minSwitchIntervalMs: 0,
+      lockOptions: { timeoutMs: 2000, pollMs: 10 },
+    });
+  }
+
+  it('still runs every binding check when groups.json was written by a newer build', async () => {
+    const paths = sandboxPaths(root);
+    await mkdir(paths.vaultDir, { recursive: true });
+    await writeFile(
+      join(paths.vaultDir, 'groups.json'),
+      JSON.stringify({ schemaVersion: 99, generation: 1, groups: [] }),
+    );
+
+    const out = await checkFolderBindings(sandboxEngine(), paths);
+
+    // One failed check names the unreadable file; the rest still report instead of the whole doctor
+    // dying on the first read. The scope check is left out: it would only repeat that reason.
+    expect(out.map((c) => c.name)).toEqual(['bindings', 'slots', 'guard-snapshot', 'guard-hook']);
+    const bindings = out.find((c) => c.name === 'bindings')!;
+    expect(bindings.ok).toBe(false);
+    expect(bindings.detail).toContain('schemaVersion');
+    // With the bindings unknown, a missing guard is reported as the failure it may be.
+    expect(out.find((c) => c.name === 'guard-hook')!.ok).toBe(false);
+  });
+
+  it('reports a corrupt groups.json the same way', async () => {
+    const paths = sandboxPaths(root);
+    await mkdir(paths.vaultDir, { recursive: true });
+    await writeFile(join(paths.vaultDir, 'groups.json'), '{ not json');
+
+    const out = await checkFolderBindings(sandboxEngine(), paths);
+
+    expect(out[0]).toMatchObject({ name: 'bindings', ok: false });
+    expect(out).toHaveLength(4);
+  });
+
+  it('adds no extra line when the bindings read fine', async () => {
+    const out = await checkFolderBindings(sandboxEngine(), sandboxPaths(root));
+
+    expect(out.map((c) => c.name)).toEqual([
+      'slots',
+      'binding-scopes',
+      'guard-snapshot',
+      'guard-hook',
+    ]);
+    expect(out.every((c) => c.ok)).toBe(true);
+  });
+
+  it('runs the binding-scopes check beside the others, flagging a binding that routes nothing', async () => {
+    const scopeless = {
+      id: 'g-1',
+      label: 'work',
+      members: [{ id: 'm-1', label: 'work', quarantined: false, createdAtMs: 1, updatedAtMs: 1 }],
+      activeId: null,
+      folders: [] as string[],
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
+    const engine = {
+      listGroups: () => Promise.resolve([scopeless]),
+      checkSlots: () => Promise.resolve([]),
+      getGuardSnapshotFreshness: () => sandboxEngine().getGuardSnapshotFreshness(),
+    };
+
+    const out = await checkFolderBindings(engine, sandboxPaths(root));
+
+    expect(out.map((c) => c.name)).toEqual([
+      'slots',
+      'binding-scopes',
+      'guard-snapshot',
+      'guard-hook',
+    ]);
+    const scopes = out.find((c) => c.name === 'binding-scopes')!;
+    expect(scopes.ok).toBe(false);
+    expect(scopes.detail).toContain('cctl unbind --group g-1');
   });
 });

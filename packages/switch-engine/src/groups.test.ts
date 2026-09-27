@@ -692,3 +692,167 @@ describe('downgrade fence — an older cctl cannot see or drop reserved accounts
     expect(await v.heal()).toBe(false);
   });
 });
+
+describe('group labels are stored terminal-safe', () => {
+  it('strips escape sequences, controls and bidi overrides from a given label, as account labels are', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      folders: ['C:\\work'],
+      label: 'x\u001b[2Jy\u202eevil\u0007',
+    });
+
+    // The same stripping addAccount applies: the controls go, the now-inert printable text stays.
+    expect(group.label).toBe('x[2Jyevil');
+    expect((await v.getGroup(group.id))?.label).toBe('x[2Jyevil');
+  });
+
+  it('falls back to the member labels when nothing printable is left', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      folders: ['C:\\w'],
+      label: ' \u001b\u0007\u202e\n ',
+    });
+
+    expect(group.label).toBe('work');
+  });
+
+  it('strips an alias-only binding label the same way', async () => {
+    const { v } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      aliases: [{ folder: 'C:\\repo', alias: 'feature' }],
+      label: 'x\u001b]0;owned\u0007y\u202e',
+    });
+
+    expect(group.label).toBe('x]0;ownedy');
+    expect((await v.getGroup(group.id))?.label).toBe('x]0;ownedy');
+  });
+});
+
+describe('groups.json keeps fields this build does not know', () => {
+  it('carries unknown top-level and group-level fields through a rewrite', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    const b = await v.addAccount('client', bundle('b'));
+    const group = await v.createGroup({ memberIds: [a.id, b.id], folders: ['C:\\work'] });
+    // A later build of the same schema adds a field at each level.
+    const file = await readJson(groupsPath);
+    file.futureTopLevel = { keep: true };
+    (file.groups as Record<string, unknown>[])[0]!.futureScopes = [
+      { kind: 'branch', name: 'main' },
+    ];
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    // An ordinary group write by this build.
+    await v.setGroupActive(group.id, a.id);
+
+    const after = await readJson(groupsPath);
+    expect(after.futureTopLevel).toEqual({ keep: true });
+    const g = (after.groups as Record<string, unknown>[])[0]!;
+    expect(g.futureScopes).toEqual([{ kind: 'branch', name: 'main' }]);
+    expect(g.activeId).toBe(a.id);
+    // This build's own fields still win, and the unknown ones never leak into what it hands out.
+    expect(Object.keys((await v.getGroup(group.id))!)).not.toContain('futureScopes');
+  });
+
+  it('drops the unknown fields of a group that no longer exists', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    const b = await v.addAccount('client', bundle('b'));
+    const g1 = await v.createGroup({ memberIds: [a.id], folders: ['C:\\one'] });
+    await v.createGroup({ memberIds: [b.id], folders: ['C:\\two'] });
+    const file = await readJson(groupsPath);
+    for (const g of file.groups as Record<string, unknown>[]) g.futureScopes = [g.id];
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    await v.releaseAccounts(g1.id, [a.id]);
+
+    const after = await readJson(groupsPath);
+    const groups = after.groups as Record<string, unknown>[];
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.futureScopes).toEqual([groups[0]!.id]);
+  });
+});
+
+describe('alias scopes beside the groups.json fields this build does not know', () => {
+  it('writes aliases as its own field at schema 2, keeping the unknown ones beside them', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      aliases: [{ folder: 'C:\\repo', alias: 'Feature' }],
+    });
+    const file = await readJson(groupsPath);
+    file.futureTopLevel = 1;
+    (file.groups as Record<string, unknown>[])[0]!.futureScopes = ['kept'];
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    // An ordinary group write by this build.
+    await v.setGroupActive(group.id, a.id);
+
+    const after = await readJson(groupsPath);
+    expect(after.schemaVersion).toBe(2);
+    expect(after.futureTopLevel).toBe(1);
+    const g = (after.groups as Record<string, unknown>[])[0]!;
+    expect(g.aliases).toEqual([{ folder: 'C:\\repo', alias: 'Feature' }]);
+    expect(g.futureScopes).toEqual(['kept']);
+    // aliases is handed out (this build owns it); the unknown field is not.
+    const view = (await v.getGroup(group.id))!;
+    expect(view.aliases).toEqual([{ folder: 'C:\\repo', alias: 'Feature' }]);
+    expect(Object.keys(view)).not.toContain('futureScopes');
+  });
+
+  it('drops aliases when the last alias scope goes, never writing them back from the unknown fields', async () => {
+    const { v, vaultDir, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    const group = await v.createGroup({
+      memberIds: [a.id],
+      folders: ['C:\\work'],
+      aliases: [{ folder: 'C:\\repo', alias: 'feature' }],
+    });
+    const file = await readJson(groupsPath);
+    (file.groups as Record<string, unknown>[])[0]!.futureScopes = ['kept'];
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    await v.removeAliasFromGroup(group.id, { folder: 'C:\\repo', alias: 'feature' });
+
+    const after = await readJson(groupsPath);
+    // No alias left: the older shape again, which a folder-only build reads.
+    expect(after.schemaVersion).toBe(1);
+    const g = (after.groups as Record<string, unknown>[])[0]!;
+    expect(Object.keys(g)).not.toContain('aliases');
+    expect(g.futureScopes).toEqual(['kept']);
+    // A fresh load (another process) sees the alias gone too.
+    const fresh = new Vault(
+      vaultDir,
+      new InsecurePassthroughProtector(),
+      () => 5000,
+      undefined,
+      'win32',
+    );
+    expect((await fresh.getGroup(group.id))?.aliases).toBeUndefined();
+    // And the next write by that process keeps it gone.
+    await fresh.setGroupActive(group.id, a.id);
+    const again = (await readJson(groupsPath)).groups as Record<string, unknown>[];
+    expect(Object.keys(again[0]!)).not.toContain('aliases');
+  });
+
+  it('refuses an unknown schema version still, whatever fields ride along', async () => {
+    const { v, groupsPath } = await vaultAt();
+    const a = await v.addAccount('work', bundle('a'));
+    await v.createGroup({ memberIds: [a.id], aliases: [{ folder: 'C:\\repo', alias: 'x' }] });
+    const file = await readJson(groupsPath);
+    file.schemaVersion = 3;
+    await writeFile(groupsPath, JSON.stringify(file), 'utf8');
+
+    await expect(v.listGroups()).rejects.toThrow(/unsupported schemaVersion \(3\)/);
+  });
+});

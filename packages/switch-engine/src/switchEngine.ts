@@ -3,12 +3,14 @@
 // `activate(id)` makes an account's credentials the live ones, with these guarantees:
 //   1. Mutual exclusion with our other processes (file lock).
 //   2. The previous account's live token, if the CLI rotated it under us, is ADOPTED into
-//      the vault before we overwrite anything (reconcile-by-reading) — never lost.
+//      the vault before we overwrite anything (reconcile-by-reading) — never lost, and never
+//      stored under an account the live files cannot prove it belongs to.
 //   3. The target's token is refreshed if near expiry, and the rotated (single-use) token is
 //      persisted to the vault IMMEDIATELY, before it can be lost.
-//   4. Live files are written atomically, then read back and verified; a mismatch rolls back
-//      to an encrypted snapshot of the prior live credentials.
-//   5. A write-ahead intent makes every step crash-recoverable via `recover()`.
+//   4. Live files are written atomically, then read back and verified; any failure between the
+//      first live write and the commit puts the prior live login (credentials AND identity) back.
+//   5. A write-ahead intent makes every step crash-recoverable: `recover()` at startup, and every
+//      locked operation settles a slot's pending switch before it reads that slot.
 //
 // What it deliberately does NOT do: claim that a *running* interactive session picked up the
 // new credentials. That is an empirical, per-platform fact (see docs/VERIFICATION.md); this
@@ -70,9 +72,10 @@ import {
   type BindEnforceMode,
 } from './folderBindings.js';
 import { readdir, readFile, rm } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { groupSlotId } from './types.js';
 import type {
   AccountView,
@@ -99,9 +102,11 @@ import type {
   SlotViolation,
   StoredAccount,
   StoredGroup,
+  SwitchIntent,
   UnbindResult,
 } from './types.js';
 import { MAX_ALIAS_LENGTH, needsMetadataBackfill, Vault, type DedupeReport } from './vault.js';
+import type { StoredTokens } from './tokenPrints.js';
 
 /** What a bind/unbind acts on (see {@link GroupScopeRef}). */
 type BindScope = GroupScopeRef;
@@ -276,6 +281,53 @@ export const DEFAULT_MIN_SWITCH_INTERVAL_MS = 60_000;
  *  as something rather than `[object Object]`. */
 function errorReason(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** A slot's live login as it was before a switch wrote over it: what undoing that switch puts back. */
+interface PriorLive {
+  /** The credentials the slot held (`undefined`: it held none). */
+  creds: ClaudeOauth | undefined;
+  /** The identity block it held. `null` when it was not recorded — a slot that held no credentials
+   *  leaves no snapshot to record it in — which an undo treats as "remove whatever is there now":
+   *  with no credentials beside it, an absent block is the one statement that cannot be wrong. */
+  identity: OauthAccount | undefined | null;
+}
+
+/** Whether two credential blocks are the same grant: both absent, or the same pair of tokens. */
+function sameGrant(a: ClaudeOauth | undefined, b: ClaudeOauth | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.accessToken === b.accessToken && a.refreshToken === b.refreshToken;
+}
+
+/** What a slot's live files physically hold (see {@link SwitchEngine}'s `physicalLiveId`). */
+interface PhysicalOccupant {
+  /** The stored account the live login belongs to, or null (nobody, or a login not stored here). */
+  id: string | null;
+  hasCreds: boolean;
+  /** The identity's uuid when it names no stored account. */
+  foreignUuid?: string;
+  /** Set when the credentials are provably `id`'s stored token while the identity block names a
+   *  different account (`identityId`, or null for a login this vault does not know). */
+  mismatch?: { identityId: string | null; identityUuid: string };
+}
+
+/** A profile dir no group owns that still holds a live login (see `orphanProfileLogins`). */
+interface OrphanLogin {
+  /** The dir's name — the id of the group that once owned it. */
+  name: string;
+  dir: string;
+  store: CredentialStore;
+  occupant: PhysicalOccupant;
+}
+
+/** The refusal of a capture whose config dir is a group profile: a {@link RefreshError} with a stable
+ *  code, so the CLI can render guidance ("onboard in a throwaway dir") rather than a raw message. */
+function captureInProfileError(configDir: string): RefreshError {
+  return new RefreshError(
+    `"${configDir}" is inside the folder-bound profiles area; onboard a new account in a ` +
+      'throwaway config dir instead of a group profile',
+    'capture_in_profile',
+  );
 }
 
 /** Set equality by membership — the two account-id sets compare identical. */
@@ -496,9 +548,29 @@ export class SwitchEngine {
     this.faultAt = options.faultAt;
   }
 
-  /** Fire the fault-injection seam at a labeled checkpoint (a no-op in production). */
+  /** Errors thrown by the fault-injection seam. See {@link fault}. */
+  private readonly simulatedDeaths = new WeakSet<object>();
+
+  /**
+   * Fire the fault-injection seam at a labeled checkpoint (a no-op in production).
+   *
+   * A checkpoint stands for the process dying at that point, so nothing a dead process could not
+   * have run may run after it: the thrown error is remembered, and every in-process undo lets such an
+   * error through untouched (see {@link isSimulatedDeath}). Without that, a crash test would exercise
+   * the undo instead of the crash recovery it exists to prove.
+   */
   private fault(checkpoint: string): void {
-    this.faultAt?.(checkpoint);
+    try {
+      this.faultAt?.(checkpoint);
+    } catch (err) {
+      if (typeof err === 'object' && err !== null) this.simulatedDeaths.add(err);
+      throw err;
+    }
+  }
+
+  /** Whether `err` came from the fault-injection seam, i.e. stands for the process having died. */
+  private isSimulatedDeath(err: unknown): boolean {
+    return typeof err === 'object' && err !== null && this.simulatedDeaths.has(err);
   }
 
   // ---- registry mutators (lock-guarded) ----
@@ -556,18 +628,37 @@ export class SwitchEngine {
    * this way: removing the global active account leaves its live files for the historical reasons the
    * vault's own active-id clearing already encodes. Removing a member rewrites the guard snapshot,
    * which names members and — when the removal dissolves the group — enforces its folders.
+   *
+   * ORDER is the crash-safety contract, and it is the one an unbind's dissolve uses: adopt the seat's
+   * rotation, clear the seat, THEN drop the row. Dying after the clear leaves the account whole (row,
+   * bundle holding its latest token) with an empty seat the group re-fills, and a rerun completes the
+   * removal. The reverse order leaves the removed login live in the profile — and when the removal
+   * dissolved the group, in a profile no slot owns, which nothing else would ever clear.
    */
   removeAccount(id: string): Promise<void> {
     return this.withCredentialLock(async () => {
-      // Decide BEFORE the row is gone: only a member that is currently live in its own group slot
-      // needs its profile seat cleared — or every seat of a group this removal dissolves.
+      await this.settlePendingSwitchesLocked();
       const { slotId, group } = await this.slotForAccount(id);
-      const liveInGroup = group !== undefined && (await this.getActiveId(slotId)) === id;
-      const dissolves = group !== undefined && group.members.length === 1;
-      await this.vault.removeAccount(id);
-      if (group === undefined) return;
+      if (group === undefined) {
+        await this.vault.removeAccount(id);
+        return;
+      }
       const rt = this.slotRuntime(slotId);
-      if (liveInGroup || dissolves) await this.clearSlotLive(rt);
+      // Only a member live in its own group slot has a seat to clear — or every seat of a group this
+      // removal dissolves.
+      const liveMember = await this.getActiveId(slotId);
+      const dissolves = group.members.length === 1;
+      if (liveMember === id || dissolves) {
+        // Whatever rotation the seat holds reaches the vault first, so dying between here and the row
+        // drop never costs the account its latest token.
+        const liveNow = await rt.credStore.readLiveCredentials().catch(() => undefined);
+        const liveOauth = await rt.credStore.readOauthAccount().catch(() => undefined);
+        await this.adoptRotationIfNeeded(liveMember, liveNow, liveOauth);
+        await this.clearSlotLive(rt);
+        this.fault('remove:after-clear-live');
+      }
+      await this.vault.removeAccount(id);
+      this.fault('remove:after-registry-drop');
       // A dissolved group's slot no longer exists: drop its recovery state too, so no intent is left
       // behind for a slot nothing will ever walk again (the same cleanup an unbind's dissolve does).
       if (dissolves) await this.clearSlotState(rt);
@@ -747,12 +838,7 @@ export class SwitchEngine {
     const profileDir = groupProfileDir(this.paths.vaultDir, groupId);
     // A group slot is always FILE-based: it never uses the darwin Keychain channel (group slots are
     // refused on macOS), so a plain CredentialStore over the profile dir is the whole story.
-    const credStore = new CredentialStore({
-      claudeDir: profileDir,
-      credentialsPath: join(profileDir, '.credentials.json'),
-      claudeJsonPath: join(profileDir, '.claude.json'),
-      vaultDir: this.paths.vaultDir,
-    });
+    const credStore = this.configDirStore(profileDir);
     const stateDir = join(this.paths.vaultDir, 'slots', groupId);
     return {
       id: slotId,
@@ -819,6 +905,18 @@ export class SwitchEngine {
     return undefined;
   }
 
+  /** The slot whose live credentials hold exactly this refresh token, whoever its identity block
+   *  names, or undefined. A plain read of each slot's credentials file — no decrypt. */
+  private async slotHoldingRefreshToken(refreshToken: string): Promise<SlotId | undefined> {
+    for (const slotId of await this.allSlotIds()) {
+      const live = await this.slotRuntime(slotId)
+        .credStore.readLiveCredentials()
+        .catch(() => undefined);
+      if (live?.refreshToken === refreshToken) return slotId;
+    }
+    return undefined;
+  }
+
   /**
    * Clear a GROUP slot's live seat: remove its `.credentials.json` and drop the `oauthAccount`
    * block, so the slot fails closed (an empty config dir is "not logged in" — measured). A no-op for
@@ -829,14 +927,6 @@ export class SwitchEngine {
     if (rt.profileDir === undefined) return;
     await removeIfExists(join(rt.profileDir, '.credentials.json'));
     await rt.credStore.clearOauthAccount();
-  }
-
-  /** Empty ANY slot's live seat, the global one included — for the few paths whose job is to take a
-   *  login out of a slot it must not occupy (recovery of a switch whose target lost its right to the
-   *  slot). Every other path clears a group seat only; see {@link clearSlotLive}. */
-  private async clearLiveSeat(rt: SlotRuntime): Promise<void> {
-    if (rt.groupId === undefined) await this.clearGlobalLive();
-    else await this.clearSlotLive(rt);
   }
 
   /** The reconciled live account of every slot — the doctor/daemon view of "who is where". */
@@ -1032,6 +1122,8 @@ export class SwitchEngine {
       throw new RefreshError('bind needs at least one account', 'bind_no_accounts');
 
     return this.withCredentialLock(async () => {
+      // Who is live where decides the global hand-off below, so no slot may be left mid-switch.
+      await this.settlePendingSwitchesLocked();
       const requested: StoredAccount[] = [];
       for (const id of requestedIds) {
         const row = await this.vault.getAccount(id);
@@ -1178,6 +1270,7 @@ export class SwitchEngine {
       cwd: this.bindFs.cwd(),
     });
     return this.withCredentialLock(async () => {
+      await this.settlePendingSwitchesLocked();
       const groups = await this.vault.listGroups();
       const ownerOf = (folder: string): string | null =>
         scope.kind === 'folder'
@@ -1332,6 +1425,9 @@ export class SwitchEngine {
       throw new RefreshError('adding to a binding needs at least one account', 'bind_no_accounts');
     }
     return this.withCredentialLock(async () => {
+      // Who is live where decides the global hand-off and the group's seat below, so no slot may be
+      // left mid-switch.
+      await this.settlePendingSwitchesLocked();
       const group = await this.mustGroupLocked(groupId);
       if (opts.soleScope !== undefined) this.requireSoleScope(group, opts.soleScope, 'add');
       const groups = await this.vault.listGroups();
@@ -1410,6 +1506,9 @@ export class SwitchEngine {
       );
     }
     return this.withCredentialLock(async () => {
+      // Which member is live in the slot decides whether a leaver must be switched off first, so the
+      // slot may not be left mid-switch.
+      await this.settlePendingSwitchesLocked();
       const group = await this.mustGroupLocked(groupId);
       if (opts.soleScope !== undefined) this.requireSoleScope(group, opts.soleScope, 'remove');
       for (const id of removeIds) {
@@ -1477,6 +1576,10 @@ export class SwitchEngine {
             adoptedRotation = res.adoptedPreviousRotation;
             break;
           } catch (err) {
+            // A process that died mid-activation does not go on to the next member. Any other
+            // failure has already put the leaver's login back (activateInSlot undoes its own
+            // partial write), so the next candidate starts from the slot as it was.
+            if (this.isSimulatedDeath(err)) throw err;
             this.log.warn(
               { groupId: group.id, memberId: member.id, reason: errorReason(err) },
               'group member failed to take the slot over; trying the next',
@@ -1527,6 +1630,8 @@ export class SwitchEngine {
     opts: { force?: boolean } = {},
   ): Promise<GroupDissolveResult> {
     return this.withCredentialLock(async () => {
+      // The dissolve adopts the live seat's rotation by who is live there; settle it first.
+      await this.settlePendingSwitchesLocked();
       const group = await this.mustGroupLocked(groupId);
       const dissolved = await this.dissolveGroupLocked(
         group,
@@ -1676,6 +1781,8 @@ export class SwitchEngine {
         mainClaudeJsonPath: this.paths.claudeJsonPath,
       });
     }
+    // A switch left unfinished in this slot is settled before the slot is read (a no-op when none).
+    await this.recoverSlot(rt);
 
     const liveMember = await this.getActiveId(slotId);
     const liveCreds = await rt.credStore.readLiveCredentials().catch(() => undefined);
@@ -1707,6 +1814,8 @@ export class SwitchEngine {
           noWorkingAccount: false,
         };
       } catch (err) {
+        // A process that died mid-activation does not go on to the next member.
+        if (this.isSimulatedDeath(err)) throw err;
         // A dead token (quarantine) or a transient failure on one member must not stop the others.
         this.log.warn(
           { groupId: group.id, memberId: member.id, reason: errorReason(err) },
@@ -1741,12 +1850,17 @@ export class SwitchEngine {
 
   /**
    * The single authority for "is any slot in an illegal state", read by both `cctl doctor` and the
-   * daemon watchdog. Read-only. Reports the §7 (a)-(e) violations; {@link repairSlots} fixes (a)-(d).
+   * daemon watchdog. Read-only, apart from keeping the token-fingerprint cache current (see
+   * tokenPrints.ts). Reports the §7 (a)-(e) violations, a slot whose live token and
+   * identity name different accounts, a profile no group owns that is still logged in, and a token
+   * stored under two accounts; {@link repairSlots} fixes all but (e) and the last.
    *
-   * Slot occupancy is read PHYSICALLY here (the live identity block matched against the WHOLE
-   * registry), not through {@link getActiveId} — because getActiveId only recognizes an account that
-   * is a candidate for the slot, and the whole point of the check is to catch an account living where
-   * it is NOT a candidate (a reserved account squatting in global, a non-member in a group profile).
+   * Slot occupancy is read PHYSICALLY here (the live token, then the live identity block, matched
+   * against the WHOLE registry — see {@link physicalLiveId}), not through {@link getActiveId} —
+   * because getActiveId only recognizes an account that is a candidate for the slot and goes by the
+   * identity block alone, and the whole point of the check is to catch an account living where it is
+   * NOT a candidate (a reserved account squatting in global, a non-member in a group profile) or
+   * where the identity block misnames it.
    */
   async checkSlots(): Promise<SlotViolation[]> {
     return this.computeViolations();
@@ -1757,13 +1871,18 @@ export class SwitchEngine {
    *   - adopt the freshest live token (identity-guarded) for every KNOWN account that is live
    *     anywhere, so a rotation is preserved before any slot is overwritten;
    *   - move the global slot off a reserved account onto a shared one (or clear it if none remains);
-   *   - re-activate each group slot's rightful member, evicting a non-member.
-   * Unrecognized logins are never adopted (alert only), and broken profile links (e) are left to
-   * `ensureGroupProfile`; both are reported in `remaining`. A hostile registry cannot widen access:
-   * every write only ever makes a slot hold an account that is RIGHTFULLY its own.
+   *   - re-seat a slot whose live token and identity name different accounts;
+   *   - re-activate each group slot's rightful member, evicting a non-member;
+   *   - clear the live login of a profile no group owns (after adopting its rotation).
+   * Unrecognized logins are never adopted (alert only), broken profile links (e) are left to
+   * `ensureGroupProfile`, and a token stored under two accounts cannot be told apart from the files;
+   * all three are reported in `remaining`. A hostile registry cannot widen access: every write only
+   * ever makes a slot hold an account that is RIGHTFULLY its own.
    */
   async repairSlots(): Promise<RepairResult> {
     return this.withCredentialLock(async () => {
+      // An unfinished switch is settled by its own intent, which knows more than any repair below.
+      await this.settlePendingSwitchesLocked();
       const before = await this.computeViolations();
       if (before.length === 0) {
         // No slot to move — but the snapshot can still lag the registry (a crash between a group
@@ -1780,13 +1899,14 @@ export class SwitchEngine {
       const actions: string[] = [];
       const allRows = await this.vault.listAllAccounts();
       const groups = await this.vault.listGroups();
+      const stored = await this.vault.readStoredTokens();
 
       // Step 1: adopt the freshest rotation for every known account that is live in any slot. Applied
       // per (account, slot); adoption only replaces the vault copy when the live token is newer, so
       // running it across all slots lands the freshest regardless of order.
       for (const slotId of await this.allSlotIds()) {
         const rt = this.slotRuntime(slotId);
-        const phys = await this.physicalLiveId(rt, allRows);
+        const phys = await this.physicalLiveId(rt.credStore, allRows, stored);
         if (phys.id !== null) {
           const liveNow = await rt.credStore.readLiveCredentials().catch(() => undefined);
           const liveOauth = await rt.credStore.readOauthAccount().catch(() => undefined);
@@ -1797,16 +1917,29 @@ export class SwitchEngine {
         }
       }
 
-      // Step 2: reconcile the global slot to a SHARED account (evict any reserved squatter).
-      await this.repairGlobalSlot(allRows, actions);
+      // Step 2: a slot whose token and identity name different accounts is re-seated before anything
+      // below reads it, because everything below goes by the identity block.
+      for (const slotId of await this.allSlotIds()) {
+        const rt = this.slotRuntime(slotId);
+        const phys = await this.physicalLiveId(rt.credStore, allRows, stored);
+        if (phys.mismatch !== undefined && phys.id !== null) {
+          await this.reseatMismatchedSlot(rt, phys.id, allRows, groups, actions);
+        }
+      }
 
-      // Step 3: reconcile each group slot to its rightful member (evicting a non-member).
+      // Step 3: reconcile the global slot to a SHARED account (evict any reserved squatter).
+      await this.repairGlobalSlot(allRows, stored, actions);
+
+      // Step 4: reconcile each group slot to its rightful member (evicting a non-member).
       for (const group of groups) {
         const res = await this.ensureGroupLiveLocked(group);
         if (res.activated) actions.push(`re-activated a member in ${describeMembers(group)}`);
         else if (res.clearedSquatter)
           actions.push(`cleared a non-member login from ${describeMembers(group)}`);
       }
+
+      // Step 5: a profile no group owns may not keep a login live.
+      await this.clearOrphanProfileLogins(allRows, groups, stored, actions);
 
       // Snapshot LAST — an activeId may have moved (its generation is what freshness checks read).
       await this.writeSnapshotLocked();
@@ -1824,16 +1957,65 @@ export class SwitchEngine {
     const violations: SlotViolation[] = [];
     const allRows = await this.vault.listAllAccounts();
     const groups = await this.vault.listGroups();
+    const stored = await this.vault.readStoredTokens();
     const labelOf = (id: string): string => allRows.find((r) => r.id === id)?.label ?? id;
     const groupIdOf = (id: string): string | undefined => allRows.find((r) => r.id === id)?.groupId;
+    const slotLabel = (slotId: SlotId): string => {
+      const group = groups.find((g) => groupSlotId(g.id) === slotId);
+      return group === undefined ? 'the global slot' : describeMembers(group);
+    };
 
     // Physical occupancy of every slot.
-    const physical = new Map<
-      SlotId,
-      { id: string | null; hasCreds: boolean; foreignUuid?: string }
-    >();
+    const physical = new Map<SlotId, PhysicalOccupant>();
     for (const slotId of await this.allSlotIds()) {
-      physical.set(slotId, await this.physicalLiveId(this.slotRuntime(slotId), allRows));
+      physical.set(
+        slotId,
+        await this.physicalLiveId(this.slotRuntime(slotId).credStore, allRows, stored),
+      );
+    }
+
+    // Checks added after (a)-(e) are reported after them, so the long-standing order is kept.
+    const trailing: SlotViolation[] = [];
+
+    // A slot holding one account's token under another account's identity: everything that goes by
+    // the identity block (who is live, whose rotation to adopt) is wrong about it.
+    for (const [slotId, phys] of physical) {
+      if (phys.mismatch === undefined || phys.id === null) continue;
+      const named =
+        phys.mismatch.identityId !== null
+          ? `"${labelOf(phys.mismatch.identityId)}"`
+          : `an unrecognized login (${phys.mismatch.identityUuid})`;
+      trailing.push({
+        kind: 'live_identity_mismatch',
+        accountId: phys.id,
+        slot: slotId,
+        ...(slotId !== 'global' ? { groupId: slotId.slice('group:'.length) } : {}),
+        detail: `${slotLabel(slotId)} holds the credentials of "${labelOf(phys.id)}" but its identity names ${named}`,
+      });
+    }
+
+    // One token stored under two accounts: the state a mis-attributed adoption leaves behind.
+    for (const ids of stored.sharedTokens()) {
+      trailing.push({
+        kind: 'duplicate_stored_token',
+        accountId: ids[0]!,
+        detail:
+          `accounts ${ids.map((id) => `"${labelOf(id)}"`).join(' and ')} store the same login ` +
+          'token: either one login was stored twice (remove the extra account) or one of them holds ' +
+          "the other's token (re-login that one: cctl accounts relogin <label>)",
+      });
+    }
+
+    // A profile no group owns that is still logged in.
+    for (const orphan of await this.orphanProfileLogins(allRows, groups, stored)) {
+      trailing.push({
+        kind: 'orphan_profile_login',
+        ...(orphan.occupant.id !== null ? { accountId: orphan.occupant.id } : {}),
+        groupId: orphan.name,
+        detail:
+          `${orphan.dir}, a profile no binding owns any more, still holds a live login` +
+          (orphan.occupant.id !== null ? ` of "${labelOf(orphan.occupant.id)}"` : ''),
+      });
     }
 
     // (a) one account live in more than one slot — the core invariant.
@@ -1909,6 +2091,7 @@ export class SwitchEngine {
       for (const v of this.brokenLinkViolations(group)) violations.push(v);
     }
 
+    violations.push(...trailing);
     return violations;
   }
 
@@ -1945,9 +2128,13 @@ export class SwitchEngine {
    *  (repairSlots step 1), so the squatter's rotation is safe; here we only re-seat global onto a
    *  shared account, or clear it (fail closed) when none remains. A shared account in global, an
    *  empty global, or an unrecognized login in global are all left alone — none breaches the fence. */
-  private async repairGlobalSlot(allRows: AccountView[], actions: string[]): Promise<void> {
+  private async repairGlobalSlot(
+    allRows: AccountView[],
+    stored: StoredTokens,
+    actions: string[],
+  ): Promise<void> {
     const rt = this.slotRuntime('global');
-    const phys = await this.physicalLiveId(rt, allRows);
+    const phys = await this.physicalLiveId(rt.credStore, allRows, stored);
     if (phys.id === null) return; // empty or unrecognized login — not a fence breach.
     const squatter = allRows.find((r) => r.id === phys.id);
     if (squatter?.groupId === undefined) return; // a shared account belongs in global.
@@ -1975,25 +2162,153 @@ export class SwitchEngine {
     }
   }
 
-  /** The physical live account of a slot: the live identity block matched by uuid against the WHOLE
-   *  registry (so a reserved/non-member login is recognized), or a foreign-uuid marker when the login
-   *  belongs to no known account. Cheap (no bundle decryption) — a login always writes its identity
-   *  block, so uuid matching is the whole story on the check/repair path. */
+  /**
+   * The physical live account of a set of live files (a slot's, or an orphaned profile's), matched
+   * against the WHOLE registry so a reserved/non-member login is recognized.
+   *
+   * The token decides first: a live token equal to a stored account's token IS that account's login,
+   * whatever the identity block beside it says — the token is the one artifact that cannot be stale.
+   * When it also contradicts the identity block, provably (the block names a different stored
+   * account, or the owner's recorded uuid differs from the one named), the result carries a
+   * `mismatch`: a switch torn between its two writes that no intent describes. An owner with no
+   * recorded uuid beside an unknown one is not treated as a contradiction: that is most likely Claude
+   * Code's own re-derived block for that very login.
+   *
+   * A token no bundle stores (rotated since it was stored, or never captured) falls back to the
+   * identity block: the uuid matched against the registry, or a foreign-uuid marker when it names no
+   * known account. Token matching reads fingerprints and does not decrypt in the steady state (see
+   * tokenPrints.ts), so this stays cheap on the doctor's and the daemon's read paths.
+   */
   private async physicalLiveId(
-    rt: SlotRuntime,
+    credStore: CredentialStore,
     allRows: AccountView[],
-  ): Promise<{ id: string | null; hasCreds: boolean; foreignUuid?: string }> {
-    const live = await rt.credStore.readLiveCredentials().catch(() => undefined);
+    stored: StoredTokens,
+  ): Promise<PhysicalOccupant> {
+    const live = await credStore.readLiveCredentials().catch(() => undefined);
     if (!live) return { id: null, hasCreds: false };
-    const oauth = await rt.credStore.readOauthAccount().catch(() => undefined);
-    const uuid = oauth?.accountUuid;
-    if (uuid !== undefined) {
-      const row = allRows.find((r) => r.accountUuid === uuid);
-      if (row) return { id: row.id, hasCreds: true };
-      return { id: null, hasCreds: true, foreignUuid: uuid };
+    const oauth = await credStore.readOauthAccount().catch(() => undefined);
+    const uuid = anchorValue(oauth?.accountUuid);
+    const named = uuid !== undefined ? allRows.find((r) => r.accountUuid === uuid) : undefined;
+    const holders = stored.holdersOf(live);
+    if (holders.length > 0) {
+      const owner = named !== undefined && holders.includes(named.id) ? named.id : holders[0]!;
+      const ownerUuid = allRows.find((r) => r.id === owner)?.accountUuid;
+      const contradicted =
+        uuid !== undefined && (named !== undefined ? named.id !== owner : ownerUuid !== undefined);
+      if (!contradicted) return { id: owner, hasCreds: true };
+      return {
+        id: owner,
+        hasCreds: true,
+        mismatch: { identityId: named?.id ?? null, identityUuid: uuid },
+      };
     }
+    if (named !== undefined) return { id: named.id, hasCreds: true };
+    if (uuid !== undefined) return { id: null, hasCreds: true, foreignUuid: uuid };
     // Credentials with no identity block name nobody we can attribute — not a violation we can act on.
     return { id: null, hasCreds: true };
+  }
+
+  /**
+   * Re-seat a slot whose live token belongs to `ownerId` while its identity block names someone else
+   * (see {@link physicalLiveId}). When the owner may hold this slot it is activated there: its own
+   * token is what is live, so this rewrites the identity to match and commits it — nothing is
+   * adopted, because adoption refuses a token another account stores. When it may not, the slot's
+   * rightful account is put back: for a group, a member here (the per-group step that follows goes by
+   * the identity block and would take the member it names for live); for the global slot the reserved
+   * owner is evicted by {@link repairGlobalSlot}, which reads the token the same way.
+   */
+  private async reseatMismatchedSlot(
+    rt: SlotRuntime,
+    ownerId: string,
+    allRows: AccountView[],
+    groups: StoredGroup[],
+    actions: string[],
+  ): Promise<void> {
+    const owner = allRows.find((r) => r.id === ownerId);
+    const group = rt.groupId === undefined ? undefined : groups.find((g) => g.id === rt.groupId);
+    const where = group === undefined ? 'the global slot' : describeMembers(group);
+    const reason = "re-seating a slot whose credentials were under another account's identity";
+    if (owner !== undefined && owner.groupId === rt.groupId) {
+      await this.activateInSlot(rt, owner.id, { force: true, origin: 'recovery', reason });
+      actions.push(
+        `re-seated "${owner.label}" in ${where}; its credentials were under another identity`,
+      );
+      return;
+    }
+    if (group === undefined) return; // a reserved owner in global: repairGlobalSlot evicts it
+    for (const member of orderedGroupCandidates(group)) {
+      try {
+        await this.activateInSlot(rt, member.id, { force: true, origin: 'recovery', reason });
+        actions.push(`restored "${member.label}" in ${where} over another account's credentials`);
+        return;
+      } catch (err) {
+        if (this.isSimulatedDeath(err)) throw err;
+        this.log.warn(
+          { groupId: group.id, memberId: member.id, reason: errorReason(err) },
+          'group member failed to activate over a mismatched login; trying the next',
+        );
+      }
+    }
+    await this.clearSlotLive(rt);
+    actions.push(`cleared another account's credentials from ${where} (no member could take it)`);
+  }
+
+  /**
+   * Profile dirs no group owns that still hold a live login (`orphan_profile_login`). A dissolved
+   * group's profile is kept for its history with its live seat cleared; one still logged in is what
+   * an interrupted removal by an older build leaves, and it is no slot — nothing else reads it, so the
+   * login would sit there, a second live copy of an account's token, for good. Cheap: one directory
+   * listing, and one read of a missing file per dissolved profile.
+   */
+  private async orphanProfileLogins(
+    allRows: AccountView[],
+    groups: StoredGroup[],
+    stored: StoredTokens,
+  ): Promise<OrphanLogin[]> {
+    const root = profilesRoot(this.paths.vaultDir);
+    let names: string[];
+    try {
+      names = await readdir(root);
+    } catch {
+      return []; // no profiles root yet: nothing was ever bound
+    }
+    const fold = (name: string): string => (this.platform === 'win32' ? name.toLowerCase() : name);
+    const owned = new Set(
+      groups.map((g) => fold(basename(groupProfileDir(this.paths.vaultDir, g.id)))),
+    );
+    const out: OrphanLogin[] = [];
+    for (const name of names) {
+      if (owned.has(fold(name))) continue;
+      const dir = join(root, name);
+      const store = this.configDirStore(dir);
+      const occupant = await this.physicalLiveId(store, allRows, stored);
+      if (occupant.hasCreds) out.push({ name, dir, store, occupant });
+    }
+    return out;
+  }
+
+  /** Clear the live login of every orphaned profile (see {@link orphanProfileLogins}), adopting its
+   *  rotation first when it provably belongs to a stored account — the adopt-then-clear order a
+   *  dissolve uses, so clearing never costs an account its latest token. */
+  private async clearOrphanProfileLogins(
+    allRows: AccountView[],
+    groups: StoredGroup[],
+    stored: StoredTokens,
+    actions: string[],
+  ): Promise<void> {
+    for (const orphan of await this.orphanProfileLogins(allRows, groups, stored)) {
+      if (orphan.occupant.id !== null && orphan.occupant.mismatch === undefined) {
+        const liveNow = await orphan.store.readLiveCredentials().catch(() => undefined);
+        const liveOauth = await orphan.store.readOauthAccount().catch(() => undefined);
+        await this.adoptRotationIfNeeded(orphan.occupant.id, liveNow, liveOauth);
+      }
+      await orphan.store.clearLiveCredentials();
+      await orphan.store.clearOauthAccount();
+      const who = allRows.find((r) => r.id === orphan.occupant.id)?.label;
+      actions.push(
+        `cleared ${who !== undefined ? `"${who}"'s` : 'a'} login from ${orphan.dir}, a profile no binding owns`,
+      );
+    }
   }
 
   // ---- group-lifecycle helpers ----
@@ -2369,13 +2684,7 @@ export class SwitchEngine {
    *  {@link isInsideProfilesRoot}). A {@link RefreshError} with a stable code so the CLI can render
    *  guidance ("onboard in a throwaway dir, not a group profile") rather than a raw message. */
   private refuseCaptureInProfile(configDir: string): void {
-    if (this.isInsideProfilesRoot(configDir)) {
-      throw new RefreshError(
-        `"${configDir}" is inside the folder-bound profiles area; onboard a new account in a ` +
-          'throwaway config dir instead of a group profile',
-        'capture_in_profile',
-      );
-    }
+    if (this.isInsideProfilesRoot(configDir)) throw captureInProfileError(configDir);
   }
 
   // ---- active account (live-login reconciled) ----
@@ -2453,15 +2762,38 @@ export class SwitchEngine {
   async captureCurrentLogin(label: string): Promise<StoredAccount> {
     // A capture reads whoever is live in THIS config dir. Run inside a group profile, that seat is a
     // group's live credentials — onboarding always uses a throwaway dir, so a config dir pointing
-    // into the profiles root is a mistake to refuse, not a login to capture.
+    // into the profiles root is a mistake to refuse, not a login to capture. The session's OWN config
+    // dir is checked too: inside a bound session the paths are seen through to the main dir, so
+    // `claudeDir` alone would capture the main dir's login instead of the one just made in the
+    // profile — and report it as if it were the new one.
     this.refuseCaptureInProfile(this.paths.claudeDir);
+    // Set only when the environment's config dir IS a group profile (defaultPaths decided that by
+    // the same profiles-root rule), so it is refused outright rather than re-derived here.
+    if (this.paths.profileConfigDir !== undefined) {
+      throw captureInProfileError(this.paths.profileConfigDir);
+    }
     // Locked for the whole capture: the add + setActive pair below are two registry writes that
     // must land as one atomic unit, and reading the live login while a switch is mid-flight would
     // otherwise see a torn set of credential files.
     return this.withCredentialLock(async () => {
+      // A switch left between its two live writes would be captured as one account's token under
+      // another's identity; it is settled first.
+      await this.settlePendingSwitchesLocked(['global']);
       const live = await this.credStore.readLiveCredentials();
       if (!live)
         throw new RefreshError('no live credentials to capture; log in first', 'no_live_login');
+      // A live token an account already stores IS that account's login, whatever identity block sits
+      // beside it — refused like a login stored twice, since storing it again would put one
+      // single-use token in two bundles. (The identity-based duplicate check in the vault cannot see
+      // this when the block beside the token names someone else.)
+      const [holder] = (await this.vault.readStoredTokens()).holdersOf(live);
+      if (holder !== undefined) {
+        const row = await this.vault.getAccount(holder);
+        throw new VaultError(
+          `this login is account ${holder} ("${row?.label ?? holder}"), which is already stored; ` +
+            `switch to it with \`cctl switch ${row?.label ?? holder}\` instead of adding it again`,
+        );
+      }
       const oauthAccount = await this.credStore.readOauthAccount();
       const bundle: CredentialBundle = oauthAccount
         ? { claudeAiOauth: live, oauthAccount }
@@ -2510,12 +2842,7 @@ export class SwitchEngine {
     // Deliberately FILE-based on every platform: the transient dir's contents are what we
     // capture. Whether the mac CLI honors CLAUDE_CONFIG_DIR with files (or still writes its
     // Keychain item, which would make this flow read nothing) is unverified on a real Mac.
-    const store = new CredentialStore({
-      claudeDir: configDir,
-      credentialsPath: join(configDir, '.credentials.json'),
-      claudeJsonPath: join(configDir, '.claude.json'),
-      vaultDir: this.paths.vaultDir,
-    });
+    const store = this.configDirStore(configDir);
     const creds = await store.readLiveCredentials();
     if (!creds) {
       throw new RefreshError(
@@ -2573,10 +2900,15 @@ export class SwitchEngine {
         'no_capture_login',
       );
     }
-    const oauthAccount = await this.transientStore(configDir).readOauthAccount();
+    const oauthAccount = await this.configDirStore(configDir).readOauthAccount();
     const bundle: CredentialBundle = oauthAccount
       ? { claudeAiOauth: creds, oauthAccount }
       : { claudeAiOauth: creds };
+    // A switch left pending in the global slot is deliberately NOT settled here (nor in
+    // reloginFromKeychainDelta): `prior` was read before the window opened, and settling in between
+    // could change the live login that the restore below then overwrites with `prior` again. The
+    // restore puts the live credentials back exactly as this flow found them, the state the pending
+    // intent describes, so the next operation on the slot settles it as if this flow had never run.
     return this.withCredentialLock(async () => {
       try {
         const account = await this.vault.addAccount(label, bundle);
@@ -2619,7 +2951,7 @@ export class SwitchEngine {
         const existing = await this.vault.getAccount(accountId);
         if (!existing) throw new UnknownAccountError(accountId);
 
-        const oauthAccount = await this.transientStore(configDir).readOauthAccount();
+        const oauthAccount = await this.configDirStore(configDir).readOauthAccount();
 
         // Attribution guard — see reloginFromConfigDir for why a mismatch is fatal, not a warning.
         if (
@@ -2649,9 +2981,11 @@ export class SwitchEngine {
     });
   }
 
-  /** A file-based CredentialStore over a transient `CLAUDE_CONFIG_DIR` — the darwin flows read
-   *  only its `.claude.json` (identity); its `.credentials.json` never exists there. */
-  private transientStore(configDir: string): CredentialStore {
+  /** A file-based CredentialStore over one config dir — a group profile, an orphaned profile, or a
+   *  transient `CLAUDE_CONFIG_DIR` a login was performed in (the darwin flows read only the latter's
+   *  `.claude.json`; its `.credentials.json` never exists there). Always file-based: only the global
+   *  slot ever uses the platform's live-credential channel. */
+  private configDirStore(configDir: string): CredentialStore {
     return new CredentialStore({
       claudeDir: configDir,
       credentialsPath: join(configDir, '.credentials.json'),
@@ -2705,9 +3039,11 @@ export class SwitchEngine {
     // Locked end-to-end so the existence check, the in-place bundle overwrite, and the quarantine
     // clear cannot interleave with a concurrent registry writer — which could remove the account
     // between the check and the write, orphaning its freshly written bundle.
-    return this.withCredentialLock(() =>
-      this.reloginFromConfigDirLocked(accountId, configDir, expectedRefreshToken),
-    );
+    return this.withCredentialLock(async () => {
+      // Which slot the account is live in is read below; no slot may be left mid-switch for it.
+      await this.settlePendingSwitchesLocked();
+      return this.reloginFromConfigDirLocked(accountId, configDir, expectedRefreshToken);
+    });
   }
 
   /** The unlocked core of {@link reloginFromConfigDir}; the public wrapper holds the lock. */
@@ -2743,12 +3079,7 @@ export class SwitchEngine {
     // File-based capture on every platform (the mac Keychain caveat above applies here too):
     // the transient dir is a plain CLAUDE_CONFIG_DIR the CLI populated with
     // `.credentials.json` + `.claude.json`. Same seam add --fresh reads from.
-    const store = new CredentialStore({
-      claudeDir: configDir,
-      credentialsPath: join(configDir, '.credentials.json'),
-      claudeJsonPath: join(configDir, '.claude.json'),
-      vaultDir: this.paths.vaultDir,
-    });
+    const store = this.configDirStore(configDir);
     const creds = await store.readLiveCredentials();
     if (!creds) {
       throw new RefreshError(
@@ -2933,6 +3264,7 @@ export class SwitchEngine {
     // Locked end-to-end for the same reason as relogin: the existence check, the overwrite,
     // and the quarantine clear must not interleave with a concurrent registry writer.
     return this.withCredentialLock(async () => {
+      await this.settlePendingSwitchesLocked();
       const existing = await this.vault.getAccount(accountId);
       if (!existing) throw new UnknownAccountError(accountId);
       // Read BEFORE the overwrite, for the same reason reloginFromConfigDirLocked does.
@@ -2987,6 +3319,13 @@ export class SwitchEngine {
    * landing it somewhere the caller never meant.
    */
   async activate(targetId: string, options: ActivateOptions = {}): Promise<ActivateResult> {
+    // Fingerprint the stored bundles BEFORE taking the lock. Rotation adoption, under the lock, checks
+    // the live token against every stored one; with a cold fingerprint cache (a process that has not
+    // seen the current bundles, the first run after an upgrade) that is a decrypt per bundle — a
+    // PowerShell spawn each on Windows. Paid here it delays only this caller; paid under the lock it
+    // eats into the time every holder must finish within (see LOCK_STALE_MS). Best-effort: the check
+    // under the lock stays authoritative, and a failure here only means it does the work itself.
+    await this.vault.readStoredTokens().catch(() => undefined);
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
       const target = await this.vault.getAccount(targetId);
@@ -3083,17 +3422,31 @@ export class SwitchEngine {
    * cadence clock are the SLOT's; the commit is `setActive` for global and `setGroupActive` for a
    * group. The single credential lock (held by the caller) still serialises all slots.
    *
-   * The target's right to the slot is checked FIRST, against the registry as it stands under the
+   * A switch this slot was left in the middle of (a crash, or an undo that failed) is settled FIRST,
+   * before anything here reads the slot: every read below — who is live, whose rotation to adopt —
+   * goes by the live identity block, which such a switch may have left naming the wrong account.
+   *
+   * The target's right to the slot is checked next, against the registry as it stands under the
    * lock ({@link slotCandidacy}), before the cadence clock, the rollback snapshot, the intent, or any
    * live write. The commit at the end refuses an illegitimate target too, but only after the live
    * files already hold it; refusing here is what keeps a refused switch from leaving an account live
    * where it does not belong.
+   *
+   * The live login is two files, written credentials first and identity second, and the intent says
+   * `writing` BEFORE the first of them. Anything that fails from there to the registry commit — the
+   * identity write (another process holding `.claude.json` open is enough), the `written` record, the
+   * read-back, the commit itself — puts the previous login back, identity and credentials, before
+   * the error surfaces ({@link settleSwitch} in undo mode). A slot must never be left holding the
+   * target's credentials under the previous account's identity: every reader would take the target's
+   * token for the previous account's, and the next switch would store it in that account's bundle.
+   * When the undo itself fails, the intent stays, and the next operation on this slot settles it.
    */
   private async activateInSlot(
     rt: SlotRuntime,
     targetId: string,
     options: ActivateOptions,
   ): Promise<ActivateResult> {
+    await this.recoverSlot(rt);
     const candidacy = await this.slotCandidacy(rt, targetId);
     if (!candidacy.ok) throw candidacy.error;
     const group = candidacy.group;
@@ -3119,9 +3472,12 @@ export class SwitchEngine {
       }
     }
 
-    // Snapshot this slot's current live credentials so a failed write can be rolled back.
+    // Snapshot this slot's current live login so a failed write can be rolled back — to disk for a
+    // crash, and in memory for this process's own undo (which then needs no decrypt, and knows the
+    // identity block even of a slot that held no credentials).
     const liveNow = await rt.credStore.readLiveCredentials();
     const liveOauthAccount = await rt.credStore.readOauthAccount();
+    const prior: PriorLive = { creds: liveNow, identity: liveOauthAccount };
     let hasRollback = false;
     if (liveNow) {
       await this.writeSlotRollback(
@@ -3133,13 +3489,14 @@ export class SwitchEngine {
       hasRollback = true;
     }
 
-    await rt.intent.write({
-      phase: 'begin',
+    const intentAt = (phase: SwitchIntent['phase']): SwitchIntent => ({
+      phase,
       targetId,
       prevActiveId,
       hasRollback,
       startedAtMs: this.clock(),
     });
+    await rt.intent.write(intentAt('begin'));
 
     // Reconcile-by-reading: if the CLI rotated the previous account's refresh token while it was
     // live in THIS slot, the vault's copy is now stale. Adopt the live token before overwriting.
@@ -3164,37 +3521,34 @@ export class SwitchEngine {
       bundle = await this.refreshTarget(rt, targetId, bundle, hasRollback);
       refreshed = true;
     }
-    await rt.intent.write({
-      phase: 'refreshed',
-      targetId,
-      prevActiveId,
-      hasRollback,
-      startedAtMs: this.clock(),
-    });
 
-    // Write this slot's live files atomically, then record that the point of no easy return passed.
-    await rt.credStore.writeLiveCredentials(bundle.claudeAiOauth);
-    await this.writeLiveIdentity(bundle.oauthAccount, rt.credStore);
-    await rt.intent.write({
-      phase: 'written',
-      targetId,
-      prevActiveId,
-      hasRollback,
-      startedAtMs: this.clock(),
-    });
-    this.fault('activate:after-live-write');
+    // The live files are about to change: say so before the first write, never after it.
+    await rt.intent.write(intentAt('writing'));
+    let recorded: SwitchIntent['phase'] = 'writing';
+    try {
+      await rt.credStore.writeLiveCredentials(bundle.claudeAiOauth);
+      this.fault('activate:after-credentials-write');
+      await this.writeLiveIdentity(bundle.oauthAccount, rt.credStore);
+      await rt.intent.write(intentAt('written'));
+      recorded = 'written';
+      this.fault('activate:after-live-write');
 
-    // Verify the write actually landed; a mismatch rolls back to the snapshot.
-    const check = await rt.credStore.readLiveCredentials();
-    if (!check || check.accessToken !== bundle.claudeAiOauth.accessToken) {
-      await this.restoreRollback(rt);
-      await this.finishIntent(rt);
-      throw new VerifyError('credential read-back did not match after write; rolled back');
+      // Verify the write actually landed; a mismatch is undone like any other failure here.
+      const check = await rt.credStore.readLiveCredentials();
+      if (!check || check.accessToken !== bundle.claudeAiOauth.accessToken) {
+        throw new VerifyError('credential read-back did not match after write; rolled back');
+      }
+
+      // Commit into the slot's own registry side — the last step that can still be undone.
+      if (group !== undefined) await this.vault.setGroupActive(group.id, targetId);
+      else await this.vault.setActive(targetId);
+    } catch (err) {
+      // A process that died here runs nothing more; its intent is what recovers it.
+      if (!this.isSimulatedDeath(err))
+        await this.undoFailedSwitch(rt, intentAt(recorded), prior, err);
+      throw err;
     }
 
-    // Commit into the slot's own registry side.
-    if (group !== undefined) await this.vault.setGroupActive(group.id, targetId);
-    else await this.vault.setActive(targetId);
     // A real account hop (not a same-account heal) restarts THIS slot's cadence clock — forced
     // switches too, so an override doesn't grant a free follow-up switch.
     if (targetId !== prevActiveId) await this.writeLastSwitchAtMs(rt, this.clock());
@@ -3224,6 +3578,43 @@ export class SwitchEngine {
   }
 
   /**
+   * Put a slot back after a switch failed between its first live write and its commit, then let the
+   * caller rethrow the original error. Uses the in-memory snapshot, so the undo needs no decrypt. An
+   * undo that fails too is logged and leaves the intent in place — the next locked operation on this
+   * slot settles it ({@link recoverSlot}) — rather than replacing the error the caller must see.
+   */
+  private async undoFailedSwitch(
+    rt: SlotRuntime,
+    pending: SwitchIntent,
+    prior: PriorLive,
+    cause: unknown,
+  ): Promise<void> {
+    try {
+      const result = await this.settleSwitch(rt, pending, 'undo', prior);
+      this.log.warn(
+        {
+          slot: rt.id,
+          targetId: pending.targetId,
+          reason: errorReason(cause),
+          undo: result.action,
+        },
+        'switch failed after its live write; the previous login was put back',
+      );
+    } catch (undoErr) {
+      this.log.error(
+        {
+          slot: rt.id,
+          targetId: pending.targetId,
+          reason: errorReason(cause),
+          undoReason: errorReason(undoErr),
+        },
+        'switch failed after its live write and could not be undone; it stays pending until the ' +
+          'next operation on this slot settles it',
+      );
+    }
+  }
+
+  /**
    * Refresh an account's access token in the VAULT without changing the active account or
    * touching the live credential files. Built for the daemon's usage poller, whose peek-only
    * vault reads go blind once an idle account's access token expires.
@@ -3249,6 +3640,8 @@ export class SwitchEngine {
 
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
+      // Who is live where is read across every slot below; none may be left mid-switch.
+      await this.settlePendingSwitchesLocked();
       // Live-reconciled for the same reason as `activate()`, and across EVERY slot: the adopt-only
       // protection below must shield the account whose token is ACTUALLY live wherever it is live —
       // network-refreshing a token some session (global OR a group profile) is holding would strand
@@ -3278,6 +3671,20 @@ export class SwitchEngine {
           accountId: targetId,
           refreshed: false,
           skippedReason: 'token_fresh',
+          expiresAt: bundle.claudeAiOauth.expiresAt,
+        };
+      }
+
+      // The last word before spending the token: whatever the identity blocks say, a slot whose live
+      // refresh token IS this stored one has sessions holding it, and a network refresh would strand
+      // them. (A slot left holding one account's token under another's identity, with nothing
+      // recorded that could settle it, is how the reconciled reading above can miss it.)
+      if ((await this.slotHoldingRefreshToken(bundle.claudeAiOauth.refreshToken)) !== undefined) {
+        return {
+          accountId: targetId,
+          refreshed: false,
+          skippedReason: 'active_account',
+          adoptedLiveRotation: false,
           expiresAt: bundle.claudeAiOauth.expiresAt,
         };
       }
@@ -3337,107 +3744,238 @@ export class SwitchEngine {
   }
 
   /**
-   * Recover one slot from its own intent WAL, or `undefined` when it has none pending. The commit is
-   * the slot's: `setActive` for global, `setGroupActive` for a group.
-   *
-   * A switch interrupted after its live write rolls FORWARD only when its target still belongs to
-   * the slot ({@link slotCandidacy}). Membership can change between the crash and the recovery (a
-   * bind reserved the target, a member was released), and rolling forward then would either throw on
-   * the commit — failing every start that awaits this — or leave an account live in a slot it does
-   * not belong to. Such a switch is rolled BACK instead: the previous login is restored from the
-   * slot's snapshot, or, when the slot held nothing before the switch, the target's credentials are
-   * removed so the slot is back to the empty state it started from.
+   * Settle every pending switch in these slots (every slot by default), for a caller that holds the
+   * credential lock and is about to read or write slots. A switch left between its live writes and
+   * its commit — by a crash, or by an undo that failed — must not wait for a restart: until it is
+   * settled, the slot's identity block may name the wrong account, and everything that reads a slot
+   * goes by that block. Cheap when nothing is pending, which is nearly every call: one read of an
+   * absent intent file per slot. See {@link settleSwitch}.
    */
+  private async settlePendingSwitchesLocked(slotIds?: readonly SlotId[]): Promise<void> {
+    for (const slotId of slotIds ?? (await this.allSlotIds())) {
+      await this.recoverSlot(this.slotRuntime(slotId));
+    }
+  }
+
+  /** Recover one slot from its own intent WAL ({@link settleSwitch}), or `undefined` when it has
+   *  none pending. */
   private async recoverSlot(rt: SlotRuntime): Promise<RecoverResult | undefined> {
     const pending = await rt.intent.read();
     if (!pending) return undefined;
+    return this.settleSwitch(rt, pending, 'recover');
+  }
 
-    // Before the live files were touched, nothing to undo — just clear. Any token refresh that
-    // reached the vault in the 'refreshed' phase is desirable and kept.
-    if (pending.phase === 'begin' || pending.phase === 'refreshed') {
+  /**
+   * Bring a slot whose switch did not finish to a state where both live files name one account, and
+   * clear its intent. Two callers: recovery of a switch a crash (or a failed undo) left pending
+   * (`recover`), and a switch undoing its own failure (`undo`, handed the in-memory snapshot).
+   *
+   * Nothing is assumed from the phase beyond `begin` (nothing live written — cleared; a refresh or an
+   * adoption that reached the vault is kept). From `writing` on — and at an older build's `refreshed`,
+   * recorded just before its first live write — the files are LOOKED AT, because the credentials may
+   * be the target's while the identity block still names the previous account. In order:
+   *
+   *   1. The target's credentials are live. Recovery rolls FORWARD when the target may still hold the
+   *      slot: the credentials are provably complete (one atomically written file), so writing the
+   *      target's identity completes the switch, which is then committed. An undo — or a target that
+   *      has lost its right to the slot since ({@link slotCandidacy}) — rolls BACK to the previous
+   *      login instead (a slot that held none before is emptied).
+   *   2. The previous credentials are live: the credentials write never landed, or has been undone.
+   *      Only the identity can still be off, and it is put back.
+   *   3. Neither, but the identity names the target: both writes landed and a running session has
+   *      since rotated the target's token, so the live token is the target's. Recovery rolls forward
+   *      (nothing to rewrite); an undo, or a target that lost the slot, first adopts it into the
+   *      target's own bundle, then rolls back.
+   *   4. Neither, and the identity does not name the target: the live token moved on after the
+   *      switch touched it. It is left live — overwriting it would destroy whichever login it is — and
+   *      no bundle is changed. At `written` the switch had already written its identity block, so the
+   *      one there now was written later, by whoever wrote the live login (a `/login`), and is left
+   *      standing. Before that, the block may be the previous account's, left over from before the
+   *      switch, beside a token that may be the previous account's rotation or the target's: the files
+   *      cannot say which, so the block, the one statement that may be false, is removed. Claude Code
+   *      re-derives it from the token itself, and until it does, rotation adoption refuses to credit
+   *      the token to anyone (see adoptRotationIfNeeded).
+   */
+  private async settleSwitch(
+    rt: SlotRuntime,
+    pending: SwitchIntent,
+    mode: 'recover' | 'undo',
+    knownPrior?: PriorLive,
+  ): Promise<RecoverResult> {
+    if (pending.phase === 'begin') {
       await this.finishIntent(rt);
-      this.audit.append({
-        ts: this.clock(),
-        event: 'recovered',
-        fromAccountId: pending.prevActiveId,
-        toAccountId: null,
-        detail: `cleared at phase ${pending.phase} (${rt.id})`,
-        origin: 'recovery',
-      });
+      this.auditRecovery(pending.prevActiveId, null, `cleared at phase begin (${rt.id})`);
       return {
         recovered: true,
         action: 'cleared',
-        detail: `no live write had occurred (phase ${pending.phase})`,
+        detail: 'no live write had occurred (phase begin)',
       };
     }
 
-    // phase 'written': this slot's live files were changed but the switch never committed.
     const candidacy = await this.slotCandidacy(rt, pending.targetId);
     const target = await this.vault.readBundle(pending.targetId).catch(() => undefined);
+    const prior = knownPrior ?? (await this.readPriorLive(rt, pending));
     const live = await rt.credStore.readLiveCredentials();
-    const targetIsLive =
-      target !== undefined &&
-      live !== undefined &&
-      live.accessToken === target.claudeAiOauth.accessToken;
-    if (candidacy.ok && target !== undefined && targetIsLive) {
-      // The target creds are already live and valid — roll forward and commit. Finish the
-      // interrupted live write first: activateInSlot lands the identity block AFTER the
-      // credentials, so a crash between the two leaves a live identity that still names the previous
-      // account (which would also mislead the live-login reconciliation).
-      await this.writeLiveIdentity(target.oauthAccount, rt.credStore);
-      if (candidacy.group !== undefined) {
-        await this.vault.setGroupActive(candidacy.group.id, pending.targetId);
-      } else {
-        await this.vault.setActive(pending.targetId);
-      }
-      this.audit.append({
-        ts: this.clock(),
-        event: 'recovered',
-        fromAccountId: pending.prevActiveId,
-        toAccountId: pending.targetId,
-        detail: `rolled forward (${rt.id})`,
-        origin: 'recovery',
-      });
-      await this.finishIntent(rt);
-      return { recovered: true, action: 'rolled_forward', detail: `committed ${pending.targetId}` };
-    }
-
+    const liveIdentity = await rt.credStore.readOauthAccount();
+    const targetUuid = target?.oauthAccount?.accountUuid;
+    const mayForward = mode === 'recover' && candidacy.ok;
     if (!candidacy.ok) {
       this.log.warn(
         { slot: rt.id, targetId: pending.targetId, reason: candidacy.error.message },
         'interrupted switch target no longer belongs to its slot; rolling back instead of forward',
       );
     }
-    const restored = await this.restoreRollback(rt);
-    // No snapshot means the slot held no login before the switch. When the target has no right to
-    // the slot, "back to how it was" is empty: remove the target's credentials rather than leave it
-    // live where it does not belong. (A legitimate target's leftover write is left as it always was.)
-    const clearedTarget = !restored && !candidacy.ok && targetIsLive;
-    if (clearedTarget) await this.clearLiveSeat(rt);
+
+    // 1. The target's credentials are live.
+    if (target !== undefined && live !== undefined && sameGrant(live, target.claudeAiOauth)) {
+      if (mayForward) return this.rollForward(rt, pending, target, candidacy.group, true);
+      return this.rollBack(rt, pending, prior, mode);
+    }
+
+    // 2. The previous credentials are live: at most the identity is left to put back.
+    if (prior !== undefined && sameGrant(live, prior.creds)) {
+      let changed = false;
+      if (prior.identity !== null) {
+        changed = !isDeepStrictEqual(liveIdentity, prior.identity);
+        if (changed) await this.writeLiveIdentity(prior.identity, rt.credStore);
+      } else if (targetUuid !== undefined && liveIdentity?.accountUuid === targetUuid) {
+        // Unrecorded prior identity, no credentials then or now: the target's block is removed.
+        await rt.credStore.clearOauthAccount();
+        changed = true;
+      }
+      await this.finishIntent(rt);
+      this.auditRecovery(
+        pending.targetId,
+        pending.prevActiveId,
+        `${mode === 'undo' ? 'undid' : 'recovered'} a switch whose live write had not landed (${rt.id})`,
+      );
+      return changed
+        ? { recovered: true, action: 'rolled_back', detail: 'restored the previous live identity' }
+        : { recovered: true, action: 'cleared', detail: 'the live write had not landed' };
+    }
+
+    // 3. The identity names the target: the live token is the target's, rotated since.
+    if (
+      target !== undefined &&
+      targetUuid !== undefined &&
+      liveIdentity?.accountUuid === targetUuid
+    ) {
+      if (mayForward) return this.rollForward(rt, pending, target, candidacy.group, false);
+      await this.adoptRotationIfNeeded(pending.targetId, live, liveIdentity);
+      return this.rollBack(rt, pending, prior, mode);
+    }
+
+    // 4. A login written after the switch touched the slot: keep it, change no bundle, and withdraw
+    //    the identity block unless it too post-dates the switch's own identity write.
+    const identityPostdates = pending.phase === 'written';
+    if (!identityPostdates) await rt.credStore.clearOauthAccount();
+    await this.finishIntent(rt);
+    this.log.warn(
+      { slot: rt.id, targetId: pending.targetId, prevActiveId: pending.prevActiveId },
+      identityPostdates
+        ? 'the slot holds a login written after an unfinished switch; it was left in place'
+        : 'the live login after an unfinished switch could not be attributed; its identity block ' +
+            'was removed so Claude Code re-derives it, and no bundle was changed',
+    );
+    this.auditRecovery(
+      pending.prevActiveId,
+      null,
+      `left a later live login in place${identityPostdates ? '' : ' and removed its identity block'} (${rt.id})`,
+    );
+    return {
+      recovered: true,
+      action: 'cleared',
+      detail: identityPostdates
+        ? 'a login written after the switch was left in place'
+        : 'the live login could not be attributed; its identity block was removed',
+    };
+  }
+
+  /** The previous live login a pending switch recorded in its snapshot. A switch that found no
+   *  credentials recorded none: the slot held no credentials, identity unknown. A snapshot that should
+   *  exist but is missing or cannot be decrypted is `undefined` — nothing is known — and is logged:
+   *  settling must not fail every later operation on a snapshot it can never read. */
+  private async readPriorLive(
+    rt: SlotRuntime,
+    pending: SwitchIntent,
+  ): Promise<PriorLive | undefined> {
+    if (!pending.hasRollback) return { creds: undefined, identity: null };
+    try {
+      const snapshot = await this.readSlotRollback(rt);
+      if (snapshot === undefined) return undefined;
+      return { creds: snapshot.claudeAiOauth, identity: snapshot.oauthAccount };
+    } catch (err) {
+      this.log.error(
+        { slot: rt.id, reason: errorReason(err) },
+        'the rollback snapshot of an unfinished switch could not be read',
+      );
+      return undefined;
+    }
+  }
+
+  /** Complete a pending switch whose target's credentials are live: its identity (unless the live
+   *  one already names it), then the registry commit — what the switch itself would have done next. */
+  private async rollForward(
+    rt: SlotRuntime,
+    pending: SwitchIntent,
+    target: CredentialBundle,
+    group: StoredGroup | undefined,
+    writeIdentity: boolean,
+  ): Promise<RecoverResult> {
+    if (writeIdentity) await this.writeLiveIdentity(target.oauthAccount, rt.credStore);
+    if (group !== undefined) await this.vault.setGroupActive(group.id, pending.targetId);
+    else await this.vault.setActive(pending.targetId);
+    this.auditRecovery(pending.prevActiveId, pending.targetId, `rolled forward (${rt.id})`);
+    await this.finishIntent(rt);
+    return { recovered: true, action: 'rolled_forward', detail: `committed ${pending.targetId}` };
+  }
+
+  /**
+   * Put a slot's previous login back and clear the intent. Identity FIRST, then credentials — the
+   * reverse of the switch's own order, so failing part way leaves the half-state the switch itself
+   * passes through (the target's credentials under the previous identity), which the still-pending
+   * intent settles next time. The other order could leave the previous account's token under the
+   * TARGET's identity, a state nothing recorded describes. A previous login that is not known (its
+   * snapshot missing or unreadable) is treated as an empty slot: the target is taken out, which loses
+   * nothing, since both accounts' vault copies are current.
+   */
+  private async rollBack(
+    rt: SlotRuntime,
+    pending: SwitchIntent,
+    prior: PriorLive | undefined,
+    mode: 'recover' | 'undo',
+  ): Promise<RecoverResult> {
+    const identity = prior === undefined || prior.identity === null ? undefined : prior.identity;
+    await this.writeLiveIdentity(identity, rt.credStore);
+    if (prior?.creds !== undefined) await rt.credStore.writeLiveCredentials(prior.creds);
+    else await rt.credStore.clearLiveCredentials();
+    await this.finishIntent(rt);
+    const what = prior?.creds !== undefined ? 'rolled back' : 'removed the target login';
+    this.auditRecovery(
+      pending.targetId,
+      pending.prevActiveId,
+      `${mode === 'undo' ? 'undid a failed switch: ' : ''}${what} (${rt.id})`,
+    );
+    return prior?.creds !== undefined
+      ? { recovered: true, action: 'rolled_back', detail: 'restored previous live credentials' }
+      : {
+          recovered: true,
+          action: 'rolled_back',
+          detail: 'removed the target credentials from a slot that held no login before',
+        };
+  }
+
+  /** Append a recovery entry to the audit trail — always origin `recovery`, never the origin the
+   *  interrupted switch was asked with, since nothing here was a deliberate switch request. */
+  private auditRecovery(from: string | null, to: string | null, detail: string): void {
     this.audit.append({
       ts: this.clock(),
       event: 'recovered',
-      fromAccountId: pending.targetId,
-      toAccountId: pending.prevActiveId,
-      detail: `${restored ? 'rolled back' : clearedTarget ? 'removed the target login' : 'no snapshot'} (${rt.id})`,
+      fromAccountId: from,
+      toAccountId: to,
+      detail,
       origin: 'recovery',
     });
-    await this.finishIntent(rt);
-    if (restored) {
-      return {
-        recovered: true,
-        action: 'rolled_back',
-        detail: 'restored previous live credentials',
-      };
-    }
-    if (clearedTarget) {
-      return {
-        recovered: true,
-        action: 'rolled_back',
-        detail: 'removed the credentials of a target that no longer belongs to the slot',
-      };
-    }
-    return { recovered: true, action: 'cleared', detail: 'no rollback snapshot was available' };
   }
 
   /** Collapse per-slot recovery outcomes into one {@link RecoverResult}. A single recovery (the
@@ -3485,6 +4023,20 @@ export class SwitchEngine {
     // cannot be a later rotation, and is left alone rather than adopted.
     if (liveNow.expiresAt <= prevBundle.claudeAiOauth.expiresAt) return false;
 
+    // Ownership guards, run only now that a write is otherwise decided (they are the expensive part).
+    const refusal = await this.adoptionRefusal(prevActiveId, prevUuid, liveNow, liveOauthAccount);
+    if (refusal !== undefined) {
+      this.log.warn({ prevActiveId, reason: refusal }, 'refused to adopt the live token');
+      this.audit.append({
+        ts: this.clock(),
+        event: 'adoption_refused',
+        fromAccountId: prevActiveId,
+        toAccountId: prevActiveId,
+        detail: refusal,
+      });
+      return false;
+    }
+
     // Identity precedence: the live block goes into this account's bundle only when it PROVABLY
     // belongs to it — both sides report a uuid and they agree. Otherwise the bundle keeps its own
     // block, because an unprovable live block (partial, or belonging to whoever the CLI logged in
@@ -3508,6 +4060,44 @@ export class SwitchEngine {
     });
     this.log.info({ prevActiveId }, 'adopted CLI-rotated token into vault');
     return true;
+  }
+
+  /**
+   * Why the live token must NOT be stored under `prevActiveId`, or `undefined` when nothing forbids
+   * it. Adoption trusts the live identity block to say whose token is live; these are the cases where
+   * the files themselves show that block cannot be trusted with it, and each refusal leaves every
+   * bundle exactly as it was:
+   *
+   *   - The live token is another stored account's own token (either of its two tokens). A token is
+   *     issued to one account, so it is that account's login, whatever the identity block says — the
+   *     signature of a switch torn between its two live writes. Storing it here would put one
+   *     single-use token in two bundles and destroy this account's own.
+   *   - The live identity block is missing while this account's bundle carries an identity. Nothing
+   *     then says whose token is live except the registry's record, and cctl removes the block
+   *     precisely when it cannot tell (an unfinished switch it could not attribute) — Claude Code
+   *     re-derives it from the token, after which adoption proceeds on the evidence. A block that is
+   *     present but names no uuid is still a statement by the login and is judged as before.
+   *
+   * A rotation the refusal holds back is not lost for good: it stays live until the next switch
+   * overwrites it, and a re-login recovers the account if that happens first. Crediting it to the
+   * wrong account could never be undone.
+   */
+  private async adoptionRefusal(
+    prevActiveId: string,
+    prevUuid: string | undefined,
+    liveNow: ClaudeOauth,
+    liveOauthAccount: OauthAccount | undefined,
+  ): Promise<string | undefined> {
+    if (prevUuid !== undefined && liveOauthAccount === undefined) {
+      return "the live login names no account, so its token cannot be shown to be this account's";
+    }
+    const others = (await this.vault.readStoredTokens())
+      .holdersOf(liveNow)
+      .filter((id) => id !== prevActiveId);
+    if (others.length > 0) {
+      return `the live token is stored for another account (${others.join(', ')})`;
+    }
+    return undefined;
   }
 
   /** Refresh the target's token for an in-flight `activate()` — the shared refresh core plus
@@ -3581,18 +4171,6 @@ export class SwitchEngine {
   ): Promise<void> {
     if (oauthAccount) await credStore.writeOauthAccount(oauthAccount);
     else await credStore.clearOauthAccount();
-  }
-
-  /** Restore a slot's previous live credentials from its encrypted rollback snapshot. */
-  private async restoreRollback(rt: SlotRuntime): Promise<boolean> {
-    const snapshot = await this.readSlotRollback(rt);
-    if (!snapshot) return false;
-    await rt.credStore.writeLiveCredentials(snapshot.claudeAiOauth);
-    // The snapshot omits the block exactly when the live file had none, so restoring it means
-    // removing whatever the failed switch wrote — not leaving the target's identity behind on
-    // the previous account's credentials.
-    await this.writeLiveIdentity(snapshot.oauthAccount, rt.credStore);
-    return true;
   }
 
   /** Clear a slot's intent and rollback snapshot together — the switch is finished either way. */

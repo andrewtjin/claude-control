@@ -1530,10 +1530,36 @@ describe('recover', () => {
     const h = await harness();
     const { accountA, accountB } = await seedAActiveWithB(h);
     // The live files had no identity block when the switch began, so the snapshot has none
-    // either; the switch then wrote B's identity before its credential write went wrong.
+    // either; the switch then wrote B's credentials and identity. B has since been reserved to a
+    // folder group, so it may not stay in the global slot and the switch is rolled back.
     const a = await h.vault.readBundle(accountA.id);
     await h.vault.writeRollback({ claudeAiOauth: a.claudeAiOauth });
-    await h.credStore.writeLiveCredentials(oauth('CORRUPT', NOW + HOUR));
+    const b = await h.vault.readBundle(accountB.id);
+    await h.credStore.writeLiveCredentials(b.claudeAiOauth);
+    await h.credStore.writeOauthAccount(b.oauthAccount!);
+    await h.intent.write({
+      phase: 'written',
+      targetId: accountB.id,
+      prevActiveId: accountA.id,
+      hasRollback: true,
+      startedAtMs: NOW,
+    });
+    await h.vault.createGroup({ memberIds: [accountB.id], folders: [join(h.paths.vaultDir, 'w')] });
+
+    expect((await h.engine.recover()).action).toBe('rolled_back');
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    // Restoring A's credentials under B's identity would recreate the exact mismatch the
+    // forward path refuses to create.
+    expect(await h.credStore.readOauthAccount()).toBeUndefined();
+  });
+
+  it('rolls forward when the identity names the target and its token has rotated since', async () => {
+    // Both live writes landed (the identity names B) and a running session has since rotated B's
+    // token. The live token is B's; restoring the snapshot would throw away B's only valid token.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeRollback(await h.vault.readBundle(accountA.id));
+    await h.credStore.writeLiveCredentials(oauth('B-rotated', NOW + 11 * HOUR));
     await h.credStore.writeOauthAccount({ accountUuid: 'uuid-B', emailAddress: 'B@x.com' });
     await h.intent.write({
       phase: 'written',
@@ -1543,20 +1569,21 @@ describe('recover', () => {
       startedAtMs: NOW,
     });
 
-    expect((await h.engine.recover()).action).toBe('rolled_back');
-    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
-    // Restoring A's credentials under B's identity would recreate the exact mismatch the
-    // forward path refuses to create.
-    expect(await h.credStore.readOauthAccount()).toBeUndefined();
+    expect((await h.engine.recover()).action).toBe('rolled_forward');
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('B-rotated');
+    expect(await h.vault.getActiveId()).toBe(accountB.id);
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.accessToken).toBe('A');
   });
 
-  it('rolls back to the snapshot when the live write is inconsistent', async () => {
+  it('leaves a login written after the switch in place rather than restoring over it', async () => {
+    // At `written` the switch had written B's identity, so the block naming A now — beside a token
+    // that is neither B's nor the snapshot's — was written later, with that token: a login made after
+    // the switch. Restoring the snapshot over it would destroy it; nothing is written instead.
     const h = await harness();
     const { accountA, accountB } = await seedAActiveWithB(h);
-    // Snapshot A as the rollback target, corrupt the live files, and leave a 'written' intent.
     const a = await h.vault.readBundle(accountA.id);
     await h.vault.writeRollback(a);
-    await h.credStore.writeLiveCredentials(oauth('CORRUPT', NOW + HOUR));
+    await h.credStore.writeLiveCredentials(oauth('A-relogged', NOW + HOUR));
     await h.intent.write({
       phase: 'written',
       targetId: accountB.id,
@@ -1567,11 +1594,33 @@ describe('recover', () => {
 
     const result = await h.engine.recover();
 
-    expect(result.action).toBe('rolled_back');
-    // Live restored to A from the encrypted snapshot.
-    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect(result.action).toBe('cleared');
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A-relogged');
+    expect((await h.credStore.readOauthAccount())?.accountUuid).toBe('uuid-A');
+    expect((await h.vault.readBundle(accountA.id)).claudeAiOauth.accessToken).toBe('A');
+    expect((await h.vault.readBundle(accountB.id)).claudeAiOauth.accessToken).toBe('B');
     expect(await h.intent.read()).toBeUndefined();
     expect(await h.vault.readRollback()).toBeUndefined();
+  });
+
+  it('restores the snapshot when the credentials write never landed', async () => {
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeRollback(await h.vault.readBundle(accountA.id));
+    await h.intent.write({
+      phase: 'writing',
+      targetId: accountB.id,
+      prevActiveId: accountA.id,
+      hasRollback: true,
+      startedAtMs: NOW,
+    });
+
+    const result = await h.engine.recover();
+
+    expect(result.recovered).toBe(true);
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect((await h.credStore.readOauthAccount())?.accountUuid).toBe('uuid-A');
+    expect(await h.intent.read()).toBeUndefined();
   });
 });
 
