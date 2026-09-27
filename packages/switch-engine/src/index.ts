@@ -97,6 +97,7 @@ export {
   exactAliasBinding,
   resolveSessionBinding,
   embeddableFolderPathSource,
+  embedFunctionAs,
   type AliasScopeKey,
   type ScopedGroup,
   type SessionBinding,

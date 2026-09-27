@@ -12,6 +12,7 @@ import {
   exactBinding,
   checkBindTarget,
   embeddableFolderPathSource,
+  embedFunctionAs,
   type CanonicalizeDeps,
   type CanonicalizeResult,
   type ScopedGroup,
@@ -452,6 +453,28 @@ describe('embeddableFolderPathSource', () => {
     expect(embedded.folderKey('C:\\Foo', 'win32')).toBe('c:\\foo');
     expect(embedded.isWithin('C:\\a\\b', 'C:\\a', 'win32')).toBe(true);
     expect(embedded.isWithin('C:\\ab', 'C:\\a', 'win32')).toBe(false);
+  });
+
+  it('survives a bundler renaming a function and its sibling calls (binds both names)', () => {
+    // What esbuild does on a top-level name collision: the declaration AND every call site are
+    // renamed (helper -> helper2). Embedding under the source name alone would leave `user`
+    // calling an undefined helper2.
+    function helper2(x: number): number {
+      return x + 1;
+    }
+    function user(x: number): number {
+      return helper2(x) * 10;
+    }
+    const src = [embedFunctionAs(helper2, 'helper'), embedFunctionAs(user, 'user')].join('\n');
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const factory = new Function(`${src}\nreturn { helper, user };`);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    const embedded = factory() as { helper: (x: number) => number; user: (x: number) => number };
+    expect(embedded.helper(1)).toBe(2);
+    expect(embedded.user(1)).toBe(20);
+    // An un-renamed function is emitted once, under its own name.
+    expect(embedFunctionAs(aliasKey, 'aliasKey').startsWith('const aliasKey = ')).toBe(true);
+    expect(embedFunctionAs(aliasKey, 'aliasKey').split('const ')).toHaveLength(2);
   });
 
   it('embeds aliasKey and resolveSessionBinding, agreeing with the live ones on the whole table', () => {

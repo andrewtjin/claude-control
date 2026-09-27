@@ -284,9 +284,7 @@ export function buildProgram(): Command {
         ].filter(Boolean);
         // A reserved account's switch moves its FOLDER group's slot, not the global one — say which.
         const group = await describeSwitchedGroup(engine, resolved.account.id);
-        const where = group
-          ? ` in the ${sanitizeForTerminal(group.folders.join(', '))} folder group`
-          : '';
+        const where = group ? ` in ${sanitizeForTerminal(group.where)}` : '';
         process.stdout.write(
           `Activated ${sanitizeForTerminal(resolved.account.label)}${where} (${bits.join(', ')}).\n`,
         );

@@ -549,13 +549,28 @@ export function checkAliasFolder(
  * is what stops the two copies drifting.
  */
 export function embeddableFolderPathSource(): string {
-  // `folderKey` must precede `isWithin` (which calls it), and both plus `aliasKey` must precede
-  // `resolveSessionBinding` (which calls all three), so every name resolves in the emitted scope.
+  // Every function is bound under the name the guard glue calls it by; see embedFunctionAs for why
+  // each is ALSO bound under its own (possibly bundler-renamed) name.
   return [
-    `const folderKey = ${folderKey.toString()};`,
-    `const isWithin = ${isWithin.toString()};`,
-    `const aliasKey = ${aliasKey.toString()};`,
-    `const canonicalizeFolder = ${canonicalizeFolder.toString()};`,
-    `const resolveSessionBinding = ${resolveSessionBinding.toString()};`,
+    embedFunctionAs(folderKey, 'folderKey'),
+    embedFunctionAs(isWithin, 'isWithin'),
+    embedFunctionAs(aliasKey, 'aliasKey'),
+    embedFunctionAs(canonicalizeFolder, 'canonicalizeFolder'),
+    embedFunctionAs(resolveSessionBinding, 'resolveSessionBinding'),
   ].join('\n');
+}
+
+/**
+ * Emit `fn`'s source bound to `as` in the embedding scope — and ALSO to the function's own name
+ * when that differs. A bundler that meets two top-level functions of one name renames one (esbuild
+ * makes it `aliasKey2`), and renames the CALLS to it inside sibling functions too: the embedded
+ * `resolveSessionBinding` would then call `aliasKey2`, which a plain `const aliasKey = ...` never
+ * defines, and the guard would throw on every prompt (failing open — enforcement silently off). So
+ * the emitted scope defines both names; the guard glue keeps calling the source name `as`. Order is
+ * free: the functions only call each other at run time, after every `const` is initialized.
+ */
+export function embedFunctionAs(fn: (...args: never[]) => unknown, as: string): string {
+  const own = fn.name;
+  if (own === as || !/^[A-Za-z_$][\w$]*$/.test(own)) return `const ${as} = ${fn.toString()};`;
+  return `const ${own} = ${fn.toString()};\nconst ${as} = ${own};`;
 }

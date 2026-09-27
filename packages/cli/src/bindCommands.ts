@@ -11,6 +11,7 @@ import type { Command } from 'commander';
 import {
   SwitchEngineError,
   canonicalizeFolder,
+  describeGroupScopes,
   folderBindingsPath,
   folderKey,
   folderUniquenessKey,
@@ -330,7 +331,7 @@ export function buildBindCommands(program: Command): void {
         const folderText = sanitizeForTerminal(result.folder);
         if (!result.dissolved) {
           process.stdout.write(
-            `Unbound ${folderText}. The group keeps its other folders and stays live.\n`,
+            `Unbound ${folderText}. The group keeps its other bindings and stays live.\n`,
           );
           return;
         }
@@ -492,7 +493,7 @@ async function runClaude(opts: {
         kind: 'group',
         profileDir: groupProfilePath(paths.vaultDir, group.id),
         label: acct.label,
-        context: `explicit account, ${group.folders.join(', ')}`,
+        context: `explicit account, ${describeGroupScopes(group)}`,
       };
     } else {
       // A shared account can only be live in the global slot, and only one at a time — so --account
@@ -652,12 +653,19 @@ function slotProfileKey(slot: LaunchSlot, platform: NodeJS.Platform): string {
 }
 
 /** Also used by `cctl switch`: describe the group a just-switched member belongs to (or null when it
- *  is a shared account). Kept here beside the other group helpers. */
+ *  is a shared account). `where` is the phrase naming it: "the <folders> folder group" for a group
+ *  bound only by folders, else "the binding of <scopes>" so an alias-only group is still named.
+ *  Kept here beside the other group helpers. */
 export async function describeSwitchedGroup(
   engine: Engine,
   accountId: string,
-): Promise<{ label: string; folders: string[] } | null> {
+): Promise<{ label: string; folders: string[]; where: string } | null> {
   const groups = await engine.listGroups();
   const group = groups.find((g) => g.members.some((m) => m.id === accountId));
-  return group ? { label: group.label, folders: group.folders } : null;
+  if (!group) return null;
+  const where =
+    (group.aliases ?? []).length === 0 && group.folders.length > 0
+      ? `the ${group.folders.join(', ')} folder group`
+      : `the binding of ${describeGroupScopes(group)}`;
+  return { label: group.label, folders: group.folders, where };
 }
