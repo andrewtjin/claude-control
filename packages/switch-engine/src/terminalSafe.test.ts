@@ -59,9 +59,14 @@ const CASES: Array<{ name: string; input: string; expected: string }> = [
     expected: 'ab',
   },
   {
-    name: 'strips zero-width and invisible format characters (U+200B-200D, U+2060-2064, U+206A-206F)',
-    input: 'a​b‌c‍d⁠e⁤f⁪g⁯h',
+    name: 'strips zero-width space and invisible format characters (U+200B, U+2060-2064, U+206A-206F)',
+    input: 'a​bcd⁠e⁤f⁪g⁯h',
     expected: 'abcdefgh',
+  },
+  {
+    name: 'keeps the zero-width non-joiner and joiner, which shape Persian text and emoji',
+    input: '\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645 \u{1f468}\u200d\u{1f4bb}',
+    expected: '\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645 \u{1f468}\u200d\u{1f4bb}',
   },
   {
     name: 'strips tag characters (U+E0000-E007F) that carry hidden text',

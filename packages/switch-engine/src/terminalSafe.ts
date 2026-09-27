@@ -12,9 +12,11 @@
 //     right-to-left run reorder a displayed path so what the eye reads is not what was matched;
 //   - the line and paragraph separators U+2028/U+2029, which many renderers break a line on (the
 //     same forged-line hazard as a newline);
-//   - the invisible characters that hide text: zero-width space/non-joiner/joiner U+200B-200D, the
-//     word joiner and invisible operators U+2060-2064, the deprecated format controls U+206A-206F,
-//     and the tag characters U+E0000-E007F (which can spell out a hidden ASCII message).
+//   - the invisible characters that hide text: zero-width space U+200B, the word joiner and
+//     invisible operators U+2060-2064, the deprecated format controls U+206A-206F, and the tag
+//     characters U+E0000-E007F (which can spell out a hidden ASCII message). The zero-width
+//     non-joiner/joiner U+200C/U+200D are KEPT: they shape Persian and Indic text and join emoji
+//     sequences, move nothing and forge nothing, and stripping them would mangle real labels.
 //
 // This strips all of it to plain, left-to-right, printable text. Removals are zero-width or
 // interpreted bytes, never visible columns, so a kept value's width is unchanged and it still
@@ -34,7 +36,7 @@
  * Strip every terminal-interpreted control from a label or folder path: C0/C1/DEL (which includes
  * the ESC that begins an SGR/OSC sequence and the newline/CR that would forge a line), the line and
  * paragraph separators (U+2028/U+2029), the Unicode bidi/format controls (U+061C, U+200E/F,
- * U+202A-202E, U+2066-2069, U+FEFF), and the invisible characters that hide text (U+200B-200D,
+ * U+202A-202E, U+2066-2069, U+FEFF), and the invisible characters that hide text (U+200B,
  * U+2060-2064, U+206A-206F, the tag block U+E0000-E007F). The result is plain, left-to-right,
  * printable text safe to color, pad, and write to any terminal surface, and safe to interpolate
  * into a hook decision string a terminal or model will read. Idempotent.
@@ -53,7 +55,7 @@ export function sanitizeTerminalText(value: string): string {
       '[\\u0000-\\u001f\\u007f-\\u009f]', // C0 controls + DEL + C1 controls (incl. ESC, CR, LF)
       '[\\u2028\\u2029]', // LINE SEPARATOR / PARAGRAPH SEPARATOR
       '[\\u061c\\u200e\\u200f]', // ALM / LRM / RLM
-      '[\\u200b-\\u200d]', // ZERO WIDTH SPACE / NON-JOINER / JOINER
+      '\\u200b', // ZERO WIDTH SPACE (ZWNJ/ZWJ U+200C/D are kept: they shape text and emoji)
       '[\\u2060-\\u2064]', // WORD JOINER + the invisible operators
       '[\\u202a-\\u202e]', // LRE RLE PDF LRO RLO
       '[\\u2066-\\u2069]', // LRI RLI FSI PDI
