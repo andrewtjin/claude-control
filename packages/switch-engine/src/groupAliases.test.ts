@@ -1,7 +1,8 @@
 // Alias scopes in groups.json: a group may be bound by session aliases (one title in one exact
-// folder) beside or instead of folders. The file stays schemaVersion 1 — the field is additive and
-// optional — so the load rules pinned here are what keep an old file readable, a corrupt one refused
-// (closed, file untouched), and every write loadable by the next read.
+// folder) beside or instead of folders. A file holding any alias scope is written as schemaVersion
+// 2, which a folder-only build refuses (rather than dropping the aliases on its next write); a file
+// without one stays schemaVersion 1. The load rules pinned here are what keep an old file readable,
+// a corrupt one refused (closed, file untouched), and every write loadable by the next read.
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -114,12 +115,19 @@ describe('loading alias scopes', () => {
     expect(g2!.aliases).toBeUndefined();
   });
 
-  it('refuses a group with no scope at all (no folder, no alias)', async () => {
-    await expectLoadRefusal(file([aliasGroup('g1', [])]), /has no folder or session alias bound/);
-    await expectLoadRefusal(
-      file([aliasGroup('g1', undefined)]),
-      /has no folder or session alias bound/,
-    );
+  // A scope-less group is what a folder-only build leaves when it rewrites a file holding an
+  // alias-only group. It used to be refused, which failed EVERY command on the machine; it now loads
+  // (routing nothing, its members still reserved) so it can be seen and released.
+  it('loads a group with no scope at all (no folder, no alias), keeping its members reserved', async () => {
+    for (const aliases of [[], undefined]) {
+      const { v } = await withGroupsFile(file([aliasGroup('g1', aliases)]));
+      const [g] = await v.listGroups();
+      expect(g!.folders).toEqual([]);
+      expect(g!.aliases).toBeUndefined();
+      expect(g!.members.map((m) => m.id)).toEqual(['m-g1']);
+      expect((await v.listAllAccounts()).find((a) => a.id === 'm-g1')?.groupId).toBe('g1');
+      expect(await v.listAccounts()).toEqual([]);
+    }
   });
 
   it('refuses the same (folder, alias) pair in two groups, by alias key and folder key', () =>

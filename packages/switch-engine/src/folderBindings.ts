@@ -13,17 +13,24 @@
 import type { FolderBindingSnapshot, FolderBindingSnapshotGroup, StoredGroup } from './types.js';
 import { atomicWriteFile, readJsonIfExists } from './fsutil.js';
 import { VaultError } from './errors.js';
-import { aliasKey, type ScopedGroup } from './folderPath.js';
+import { aliasKey, canonicalStoredFolder, type ScopedGroup } from './folderPath.js';
 
 /** A vault group's scopes in the shape the precedence rule (`resolveSessionBinding`) reads: its
- *  folders, and its alias scopes reduced to their comparison keys. The one place a stored alias is
- *  turned into a key for matching, so the snapshot, the launcher and `where` cannot key it
- *  differently. Pure. */
-export function scopedGroupOf(group: StoredGroup): ScopedGroup {
+ *  folders and alias folders in their canonical spelling ({@link canonicalStoredFolder}: a hand-edited
+ *  `C:/x` is the same folder as `C:\x`), and its alias scopes reduced to their comparison keys. The
+ *  one place a stored scope is turned into what matching compares, so the snapshot, the launcher and
+ *  `where` cannot key it differently. `platform` selects the path rules. Pure. */
+export function scopedGroupOf(
+  group: StoredGroup,
+  platform: NodeJS.Platform = process.platform,
+): ScopedGroup {
   return {
     id: group.id,
-    folders: group.folders,
-    aliases: (group.aliases ?? []).map((a) => ({ folder: a.folder, aliasKey: aliasKey(a.alias) })),
+    folders: group.folders.map((f) => canonicalStoredFolder(f, platform)),
+    aliases: (group.aliases ?? []).map((a) => ({
+      folder: canonicalStoredFolder(a.folder, platform),
+      aliasKey: aliasKey(a.alias),
+    })),
   };
 }
 
@@ -60,6 +67,8 @@ export type BindEnforceMode = 'block' | 'warn' | 'off';
  *  vault directly) so the builder stays testable and the caller controls the profile-dir mapping. */
 export interface BuildSnapshotInput {
   groups: readonly StoredGroup[];
+  /** Selects the path rules the stored folders are canonicalized under (default: this host's). */
+  platform?: NodeJS.Platform;
   /** The `groups.json` generation these groups came from — carried so a stale snapshot is
    *  detectable against the live registry. */
   generation: number;
@@ -77,18 +86,19 @@ export interface BuildSnapshotInput {
  * {folders, profileDir, member LABELS} — no member ids, no tokens.
  */
 export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBindingSnapshot {
-  const groups: FolderBindingSnapshotGroup[] = input.groups.map((g) => ({
-    id: g.id,
-    label: g.label,
-    profileDir: input.profileDirOf(g.id),
-    folders: g.folders.slice(),
-    // Keys only: the guard compares a lower-cased, trimmed title and never shows the typed alias.
-    aliases: (scopedGroupOf(g).aliases ?? []).map((a) => ({
-      folder: a.folder,
-      aliasKey: a.aliasKey,
-    })),
-    members: g.members.map((m) => m.label),
-  }));
+  const groups: FolderBindingSnapshotGroup[] = input.groups.map((g) => {
+    // Canonical folders (the guard compares them by case-folded equality and containment only), and
+    // alias keys only: the guard compares a lower-cased, trimmed title and never shows the typed alias.
+    const scoped = scopedGroupOf(g, input.platform);
+    return {
+      id: g.id,
+      label: g.label,
+      profileDir: input.profileDirOf(g.id),
+      folders: scoped.folders.slice(),
+      aliases: (scoped.aliases ?? []).map((a) => ({ folder: a.folder, aliasKey: a.aliasKey })),
+      members: g.members.map((m) => m.label),
+    };
+  });
   return {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
     generation: input.generation,

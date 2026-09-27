@@ -8,6 +8,7 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createLogger, type LogSink } from '@claude-control/shared-protocol';
+import { sessionIdentities } from '@claude-control/daemon';
 import {
   SwitchEngine,
   defaultPaths,
@@ -100,6 +101,9 @@ export function buildEngine(
     logger: adapter,
     // The enforcement mode baked into any guard snapshot this engine writes (see resolveBindEnforce).
     bindEnforce: resolveBindEnforce(env),
+    // How the running-session scan learns a session's title and recorded folder: its transcript,
+    // via the daemon's session catalog (a resumed session's session file carries no title).
+    sessionIdentity: sessionIdentities,
     refreshDeps: {
       overload: {
         // The status-page probe an overloaded (529) token endpoint triggers, passed explicitly

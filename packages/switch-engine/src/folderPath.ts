@@ -19,8 +19,9 @@ export interface CanonicalizeDeps {
   /** Absolute base directory a relative input is resolved against (e.g. `process.cwd()`). */
   cwd: string;
   /** `fs.realpathSync.native` equivalent: returns the true on-disk path (resolving junctions,
-   *  symlinks, 8.3 short names and true case) or THROWS when the path does not exist. */
-  realpath: (path: string) => string;
+   *  symlinks, 8.3 short names and true case) or THROWS when the path does not exist. Absent =
+   *  string-only canonicalization (no filesystem access at all), for keying a STORED folder. */
+  realpath?: (path: string) => string;
 }
 
 /** Success carries the canonical path; failure carries a human reason (surfaced by the CLI and,
@@ -163,6 +164,9 @@ export function canonicalizeFolder(input: string, deps: CanonicalizeDeps): Canon
   // ancestor still resolves to the same key as an existing one (enforcement must not be existence-
   // dependent). Only when nothing up to the root resolves do we fall back to the unresolved string.
   function resolvePreferReal(p: string): { path: string; real: boolean } {
+    // String-only mode: nothing to resolve against. Skipping the probe loop (rather than handing it
+    // a realpath that always throws) keeps keying thousands of stored folders cheap.
+    if (realpath === undefined) return { path: p, real: false };
     const tail: string[] = []; // stripped leaf segments, deepest first
     let head = p;
     for (;;) {
@@ -277,9 +281,9 @@ export function folderKey(path: string, platform: NodeJS.Platform): string {
  * (a `C:/x` vs `C:\x` separator difference, a trailing separator, an embedded `.`/`..`) would slip
  * past it and let two groups silently "own" the same folder — with only one reachable.
  *
- * So the folder is run through {@link canonicalizeFolder} FIRST (string-only: `realpath` always
- * throws, since this must not touch the filesystem — the load validator keys stored folders with it
- * and load must not stat per-folder), then keyed. A folder that bind stored is already canonical, so
+ * So the folder is run through {@link canonicalizeFolder} FIRST (string-only, via
+ * {@link canonicalStoredFolder}: this must not touch the filesystem — the load validator keys stored
+ * folders with it and load must not stat per-folder), then keyed. A folder that bind stored is already canonical, so
  * this is a no-op for it; it only additionally collapses a NON-canonical spelling that reached the
  * operator-editable file some other way (a hand-edit, a vault copied under a different separator
  * convention). A path canonicalization rejects (device/ADS/drive-relative/control chars) has no
@@ -291,14 +295,36 @@ export function folderKey(path: string, platform: NodeJS.Platform): string {
  * brick). It is NOT part of the embeddable trio, so it may reference the module's other functions.
  */
 export function folderUniquenessKey(folder: string, platform: NodeJS.Platform): string {
-  const canon = canonicalizeFolder(folder, {
-    platform,
-    cwd: platform === 'win32' ? 'C:\\' : '/',
-    realpath: () => {
-      throw new Error('no filesystem access when keying a stored folder');
-    },
-  });
-  return folderKey(canon.ok ? canon.path : folder, platform);
+  return folderKey(canonicalStoredFolder(folder, platform), platform);
+}
+
+/** Memo for {@link canonicalStoredFolder}, keyed by platform + NUL + folder. The same folders are
+ *  keyed on every registry load (each load validates every stored folder and alias scope), so the
+ *  cache turns the per-load cost at the registry caps into map lookups. Bounded at twice the most
+ *  scopes a registry can hold (64 groups x (256 folders + 256 aliases)), so a full registry stays
+ *  cached; dropped when full, so a stream of distinct inputs can never grow it without limit. */
+const storedFolderMemo = new Map<string, string>();
+const STORED_FOLDER_MEMO_MAX = 65_536;
+
+/**
+ * The canonical spelling of a STORED folder (a binding's folder as `groups.json` holds it), with no
+ * filesystem access: {@link canonicalizeFolder} in string-only mode, falling back to the raw text for
+ * a path with no canonical form. A folder bind wrote is already canonical, so this is the identity
+ * for it; it only collapses a spelling that reached the operator-editable file another way (a hand
+ * edit, a POSIX-style separator on Windows). The one normalization every consumer that COMPARES a
+ * stored folder applies — {@link folderUniquenessKey}, the precedence rule's inputs
+ * (`scopedGroupOf`) and the guard snapshot — so none of them can disagree about which folder a
+ * binding names. Memoized (see {@link storedFolderMemo}).
+ */
+export function canonicalStoredFolder(folder: string, platform: NodeJS.Platform): string {
+  const memoKey = platform + '\u0000' + folder;
+  const hit = storedFolderMemo.get(memoKey);
+  if (hit !== undefined) return hit;
+  const canon = canonicalizeFolder(folder, { platform, cwd: platform === 'win32' ? 'C:\\' : '/' });
+  const out = canon.ok ? canon.path : folder;
+  if (storedFolderMemo.size >= STORED_FOLDER_MEMO_MAX) storedFolderMemo.clear();
+  storedFolderMemo.set(memoKey, out);
+  return out;
 }
 
 /** Whether `child` is `parent` itself or lives beneath it. Compares on {@link folderKey} and only
@@ -331,6 +357,55 @@ export function aliasKey(alias: string): string {
   return alias.toLowerCase().trim();
 }
 
+/**
+ * Claude Code's project-directory name for a session launched in `cwd` (its transcripts live in
+ * `<config dir>/projects/<name>/`): every character that is not an ASCII letter or digit becomes
+ * `-`, per UTF-16 code unit, exactly as Claude Code's own sanitizer does. Past 200 characters
+ * Claude Code truncates and appends a hash cctl does not reproduce, so this returns the truncated
+ * STEM; {@link projectDirMatches} accounts for the suffix. Lossy by construction (`C:\a_b` and
+ * `C:\a-b` share one name), so a name only narrows where a session can live — its recorded cwd
+ * decides.
+ *
+ * SELF-CONTAINED BY CONTRACT (the guard embeds it): references nothing at module scope.
+ */
+export function projectDirStem(cwd: string): string {
+  const max = 200;
+  const name = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+  return name.length <= max ? name : name.slice(0, max);
+}
+
+/**
+ * Whether project directory `name` can hold sessions launched in `cwd`: its exact encoding, or, for
+ * a long cwd, the truncated stem plus Claude Code's hash suffix. Case-insensitive, because Windows
+ * drive letters and folders reach Claude Code in whatever case the shell used (and Claude Code
+ * compares these names case-insensitively itself). A true answer is only a candidate.
+ *
+ * SELF-CONTAINED BY CONTRACT: calls only {@link projectDirStem}, which the embedding places in the
+ * same scope.
+ */
+export function projectDirMatches(name: string, cwd: string): boolean {
+  const stem = projectDirStem(cwd).toLowerCase();
+  const n = name.toLowerCase();
+  if (stem.length < 200) return n === stem;
+  return n === stem || n.startsWith(stem + '-');
+}
+
+/**
+ * Quote `text` as ONE literal argument for the shell an operator pastes a printed command into:
+ * PowerShell on Windows (the documented shell there), a POSIX shell elsewhere. Single quotes in
+ * both, because only they make every other character inert (`$(...)`, `$HOME`, backticks, `"`, `&`
+ * all stay literal): PowerShell doubles each single-quote character inside — including the
+ * typographic ones U+2018-U+201B, which PowerShell also treats as quotes — and POSIX closes, escapes
+ * and reopens (`'\''`). A hint may shorten its DISPLAY text, never the argument it tells the
+ * operator to run.
+ *
+ * SELF-CONTAINED BY CONTRACT (the guard embeds it): references nothing at module scope.
+ */
+export function shellQuoteArg(text: string, platform: NodeJS.Platform): string {
+  if (platform === 'win32') return "'" + text.replace(/['\u2018\u2019\u201a\u201b]/g, '$&$&') + "'";
+  return "'" + text.replace(/'/g, "'\\''") + "'";
+}
+
 /** One alias scope as the precedence rule reads it: the EXACT folder (canonical) the alias lives in
  *  and the alias's {@link aliasKey}. The snapshot carries only these keys, never the typed text. */
 export interface AliasScopeKey {
@@ -353,13 +428,19 @@ export type SessionBinding =
 /**
  * THE precedence rule for a session, shared by the launcher, the guard, `cctl where` and
  * `cctl session show` so none of them can disagree about which account a session belongs on:
- *   1. the session's folder F and custom title X are alias-bound as (F, X) -> that group;
- *   2. else the longest bound folder containing F -> that group;
+ *   1. the session's RECORDED folder R and custom title X are alias-bound as (R, X) -> that group;
+ *   2. else the longest bound folder containing F (the folder the session runs in) -> that group;
  *   3. else `null`, the global slot.
- * An alias scope is EXACT-folder (canonical key equality, never a subfolder): `claude --resume X`
- * only searches the launch folder's project, so the alias namespace is per folder. `title` is the
- * session's CUSTOM title (null/undefined/blank = unnamed, rule 1 never applies) — a generated title
- * changes under the operator and never binds.
+ * R is the folder the conversation belongs to (its transcript's recorded cwd): `claude --resume X`
+ * run in a repo root also reaches sessions recorded in the repo's subfolders and worktrees, and the
+ * resumed conversation keeps its original folder, so an alias binding (R, X) means "the
+ * conversations titled X that belong to R". `aliasFolder` is R; absent, R = F (a session that runs
+ * where it was recorded); `null`, no recorded folder (rule 1 is skipped). An alias scope is
+ * EXACT-folder (canonical key equality, never a subfolder). Folders are compared by
+ * {@link folderKey}, so callers pass canonical folders on both sides (`scopedGroupOf` canonicalizes
+ * the stored ones). `title` is the session's CUSTOM title
+ * (null/undefined/blank = unnamed, rule 1 never applies) — a generated title changes under the
+ * operator and never binds.
  *
  * SELF-CONTAINED BY CONTRACT, like {@link canonicalizeFolder}: it calls only {@link aliasKey},
  * {@link folderKey} and {@link isWithin}, which the embedding places in the same scope, and it reads
@@ -370,10 +451,14 @@ export function resolveSessionBinding(
   title: string | null | undefined,
   groups: readonly ScopedGroup[],
   platform: NodeJS.Platform,
+  aliasFolder?: string | null,
 ): SessionBinding | null {
   const key = typeof title === 'string' ? aliasKey(title) : '';
-  if (key !== '') {
-    const here = folderKey(folder, platform);
+  // R: the explicit recorded folder, else F; null = the conversation belongs to no folder rule 1
+  // could name (rule 1 is skipped).
+  const recorded = aliasFolder === undefined ? folder : aliasFolder;
+  if (key !== '' && typeof recorded === 'string') {
+    const here = folderKey(recorded, platform);
     for (const g of groups) {
       // Typed explicitly: Array.isArray widens a readonly array to any[] (the guard's snapshot rows
       // are untrusted, so the check itself must stay).
@@ -531,7 +616,7 @@ export function checkAliasFolder(
   deps: BindTargetDeps,
 ): { ok: true } | { ok: false; reason: string } {
   if (!deps.isDirectory(folder)) {
-    return { ok: false, reason: 'not an existing directory' };
+    return { ok: false, reason: 'is not an existing directory' };
   }
   const reserved: Array<{ path: string; name: string }> = [
     { path: deps.vaultDir, name: 'the cctl vault directory' },
@@ -550,7 +635,8 @@ export function checkAliasFolder(
  * The embeddable source of the canonicalizer and the precedence rule, for the enforcement hook.
  *
  * Returns a program string that, when run in an empty scope (e.g. via `new Function`), defines
- * `canonicalizeFolder`, `folderKey`, `isWithin`, `aliasKey` and `resolveSessionBinding` as locals.
+ * `canonicalizeFolder`, `folderKey`, `isWithin`, `aliasKey`, `resolveSessionBinding`,
+ * `projectDirStem`, `projectDirMatches` and `shellQuoteArg` as locals.
  * The hook appends its own `return {...}` (or the caller does). Because each function is
  * self-contained (or calls only the others emitted here), the text carries everything it needs; the
  * colocated test proves the embedded copies agree with the live ones across the case tables, which
@@ -565,6 +651,9 @@ export function embeddableFolderPathSource(): string {
     embedFunctionAs(aliasKey, 'aliasKey'),
     embedFunctionAs(canonicalizeFolder, 'canonicalizeFolder'),
     embedFunctionAs(resolveSessionBinding, 'resolveSessionBinding'),
+    embedFunctionAs(projectDirStem, 'projectDirStem'),
+    embedFunctionAs(projectDirMatches, 'projectDirMatches'),
+    embedFunctionAs(shellQuoteArg, 'shellQuoteArg'),
   ].join('\n');
 }
 

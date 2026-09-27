@@ -218,7 +218,7 @@ export async function resolveLaunchBinding(input: {
   const binding = resolveSessionBinding(
     input.folder,
     alias,
-    input.groups.map(scopedGroupOf),
+    input.groups.map((g) => scopedGroupOf(g, input.platform)),
     input.platform,
   );
   return { binding, alias };

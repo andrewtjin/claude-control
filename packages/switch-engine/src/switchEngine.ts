@@ -42,12 +42,14 @@ import { folderBindingsPath, groupProfileDir, profilesRoot, type Paths } from '.
 import { atomicWriteFile, removeIfExists } from './fsutil.js';
 import {
   aliasKey,
+  aliasScopeUniquenessKey,
   canonicalizeFolder,
   checkAliasFolder,
   checkBindTarget,
   exactAliasBinding,
   exactBinding,
   folderKey,
+  folderUniquenessKey,
   isWithin,
   resolveBinding,
   resolveSessionBinding,
@@ -78,6 +80,7 @@ import type {
   FolderBindingSnapshot,
   GroupGrowResult,
   GroupLiveResult,
+  GroupScopeRef,
   GroupShrinkResult,
   OauthAccount,
   RecoverResult,
@@ -85,6 +88,8 @@ import type {
   ReloginResult,
   RepairResult,
   RunningSession,
+  SessionIdentity,
+  SessionIdentityLookup,
   SlotId,
   SlotLiveToken,
   SlotViolation,
@@ -94,16 +99,17 @@ import type {
 } from './types.js';
 import { MAX_ALIAS_LENGTH, needsMetadataBackfill, Vault, type DedupeReport } from './vault.js';
 
-/** What a bind/unbind acts on: a folder (the folder and every subfolder), or one session alias in
- *  one exact folder. Both are scopes of a group; the lifecycle around them is identical. */
-type BindScope =
-  { kind: 'folder'; folder: string } | { kind: 'alias'; folder: string; alias: string };
+/** What a bind/unbind acts on (see {@link GroupScopeRef}). */
+type BindScope = GroupScopeRef;
 
-/** A running Claude Code session as `<mainConfigDir>/sessions/<pid>.json` records it, reduced to
- *  what the scope matchers read: the canonical cwd and the operator-set session name, if any. */
+/** A running Claude Code session as the scope matchers see it: the canonical cwd it runs in (what
+ *  a FOLDER scope covers), and — for an ALIAS scope — its custom title and the canonical folder its
+ *  conversation was recorded in (see {@link SwitchEngine.scanRunningSessions} for where each comes
+ *  from). `title` null = unnamed. */
 interface SessionRecordView {
   cwd: string;
-  name: string | undefined;
+  title: string | null;
+  recordedFolder: string;
 }
 
 /** The filesystem seam {@link SwitchEngine.bindFolder} / {@link SwitchEngine.unbindFolder} use to
@@ -201,6 +207,12 @@ export interface SwitchEngineOptions {
   /** Process-liveness probe for the running-session scan. Defaults to a signal-0 check; tests inject
    *  a deterministic one. */
   isProcessAlive?: (pid: number) => boolean;
+  /** Reads a running session's custom title and recorded folder from its transcript, for the alias
+   *  half of the running-session scan. Claude Code's `sessions/<pid>.json` does not carry the title
+   *  of a RESUMED session (it records a derived name), so without this seam the scan can only use a
+   *  name the operator set at launch (`nameSource: "user"`). The CLI wires the daemon's session
+   *  catalog here; absent, only that launch-time name is used. */
+  sessionIdentity?: SessionIdentityLookup;
   /** The enforcement mode stamped into the guard snapshot written after every group mutation.
    *  Defaults to `'block'`. Pass a plain mode for a one-shot CLI process; pass a RESOLVER for a
    *  long-lived process (the daemon), which is called at each snapshot write so a live
@@ -417,6 +429,8 @@ export class SwitchEngine {
   private readonly bindFs: BindFs;
   /** See {@link SwitchEngineOptions.isProcessAlive}. */
   private readonly isProcessAlive: (pid: number) => boolean;
+  /** See {@link SwitchEngineOptions.sessionIdentity}. */
+  private readonly sessionIdentity: SessionIdentityLookup | undefined;
   /** Resolves the enforcement mode at snapshot-write time. See {@link SwitchEngineOptions.bindEnforce}
    *  — a plain mode is wrapped in a constant function; a resolver is read on every write so a live
    *  settings change is honored by daemon-side writers too. */
@@ -451,6 +465,7 @@ export class SwitchEngine {
     this.lockOptions = options.lockOptions ?? {};
     this.bindFs = options.bindFs ?? defaultBindFs();
     this.isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+    this.sessionIdentity = options.sessionIdentity;
     this.resolveBindEnforce =
       typeof options.bindEnforce === 'function'
         ? options.bindEnforce
@@ -861,8 +876,19 @@ export class SwitchEngine {
    * to global. Canonicalized so a case difference or trailing separator still matches on Windows.
    */
   async slotForConfigDir(configDir: string | null | undefined): Promise<SlotId> {
+    return (await this.recognizedSlotForConfigDir(configDir)) ?? 'global';
+  }
+
+  /**
+   * {@link slotForConfigDir} without the guess: the global slot for an absent config dir or the main
+   * one, a group's slot for its live profile, and `null` for anything else — a config dir cctl does
+   * not manage (a dissolved group's profile, a hand-made store), whose account is unknown. What a
+   * caller must use before acting on "the account this session runs on".
+   */
+  async recognizedSlotForConfigDir(configDir: string | null | undefined): Promise<SlotId | null> {
     if (configDir === undefined || configDir === null || configDir === '') return 'global';
     const key = folderKey(this.canonReserved(configDir), this.platform);
+    if (key === folderKey(this.canonReserved(this.paths.claudeDir), this.platform)) return 'global';
     for (const g of await this.vault.listGroups()) {
       const profileKey = folderKey(
         this.canonReserved(groupProfileDir(this.paths.vaultDir, g.id)),
@@ -870,7 +896,7 @@ export class SwitchEngine {
       );
       if (key === profileKey) return groupSlotId(g.id);
     }
-    return 'global';
+    return null;
   }
 
   /**
@@ -904,7 +930,7 @@ export class SwitchEngine {
     return resolveSessionBinding(
       this.canonReserved(folder),
       title,
-      groups.map(scopedGroupOf),
+      groups.map((g) => scopedGroupOf(g, this.platform)),
       this.platform,
     );
   }
@@ -1133,13 +1159,31 @@ export class SwitchEngine {
         );
       }
       const group = groups.find((g) => g.id === ownerId)!;
-      // Report the alias as it was STORED (the operator may have typed another case/spacing).
-      const storedAlias =
+      // Report the scope as it was STORED — the operator may have typed another case, spacing or
+      // separator spelling — matched by the same uniqueness key that found the owner (folder AND
+      // alias: one group may hold one alias in several folders).
+      const wanted =
+        scope.kind === 'folder'
+          ? folderUniquenessKey(canonicalFolder, this.platform)
+          : aliasScopeUniquenessKey(canonicalFolder, scope.alias, this.platform);
+      const storedAliasScope =
         scope.kind === 'alias'
-          ? ((group.aliases ?? []).find((a) => aliasKey(a.alias) === aliasKey(scope.alias))
-              ?.alias ?? scope.alias)
+          ? (group.aliases ?? []).find(
+              (a) => aliasScopeUniquenessKey(a.folder, a.alias, this.platform) === wanted,
+            )
           : undefined;
+      const storedFolder =
+        scope.kind === 'folder'
+          ? group.folders.find((f) => folderUniquenessKey(f, this.platform) === wanted)
+          : storedAliasScope?.folder;
+      const shownFolder = storedFolder ?? canonicalFolder;
+      const storedAlias =
+        scope.kind === 'alias' ? (storedAliasScope?.alias ?? scope.alias) : undefined;
       const aliasField = storedAlias !== undefined ? { alias: storedAlias } : {};
+      const shownScope: BindScope =
+        scope.kind === 'folder'
+          ? { kind: 'folder', folder: shownFolder }
+          : { kind: 'alias', folder: shownFolder, alias: storedAlias ?? scope.alias };
 
       // Removing one of several scopes keeps the group (and its live slot) intact — no session
       // concern, no member move.
@@ -1153,7 +1197,7 @@ export class SwitchEngine {
               });
         await this.writeSnapshotLocked();
         return {
-          folder: canonicalFolder,
+          folder: shownFolder,
           ...aliasField,
           dissolved: false,
           group: updated,
@@ -1166,9 +1210,9 @@ export class SwitchEngine {
       const dissolved = await this.dissolveGroupLocked(
         group,
         opts.force === true,
-        describeScope(scope, canonicalFolder),
+        describeScope(shownScope, shownFolder),
       );
-      return { folder: canonicalFolder, ...aliasField, dissolved: true, ...dissolved };
+      return { folder: shownFolder, ...aliasField, dissolved: true, ...dissolved };
     });
   }
 
@@ -1233,8 +1277,16 @@ export class SwitchEngine {
    *   3. ensure the group's slot is live (normally a no-op: the live member keeps the slot);
    *   4. write the snapshot LAST (member labels are guard-relevant).
    * Faults: `grow:after-global-switch`, `grow:after-row-move`, `grow:after-ensure-live`.
+   *
+   * `opts.soleScope`: the scope the caller means to grow, which must be the group's ONLY scope —
+   * checked under the lock, so a scope another process bound to the same group after the caller
+   * looked (a bind with the same member set reuses the group) can never be grown by accident.
    */
-  async addGroupMembers(groupId: string, accountIds: readonly string[]): Promise<GroupGrowResult> {
+  async addGroupMembers(
+    groupId: string,
+    accountIds: readonly string[],
+    opts: { soleScope?: GroupScopeRef } = {},
+  ): Promise<GroupGrowResult> {
     this.refuseGroupSlotsOnDarwin();
     const requestedIds = [...new Set(accountIds)];
     if (requestedIds.length === 0) {
@@ -1242,6 +1294,7 @@ export class SwitchEngine {
     }
     return this.withCredentialLock(async () => {
       const group = await this.mustGroupLocked(groupId);
+      if (opts.soleScope !== undefined) this.requireSoleScope(group, opts.soleScope, 'add');
       const groups = await this.vault.listGroups();
       const toAdd: StoredAccount[] = [];
       for (const id of requestedIds) {
@@ -1299,11 +1352,16 @@ export class SwitchEngine {
    * So a leaving account is live nowhere by the time it is shared again: it can never end up live in
    * two slots. Faults: `shrink:after-switch-off`, `shrink:after-release` (and `unbind:*` when the
    * removal dissolves the group).
+   *
+   * Whatever the reason the slot would be left empty — no remaining member at all, or every
+   * remaining member failing to take it over (a transient refresh error) — the shrink is refused
+   * without `force` while sessions run in the group's scopes, and nothing changes. `opts.soleScope`
+   * is {@link addGroupMembers}'s precondition, for the same reason.
    */
   async removeGroupMembers(
     groupId: string,
     accountIds: readonly string[],
-    opts: { force?: boolean } = {},
+    opts: { force?: boolean; soleScope?: GroupScopeRef } = {},
   ): Promise<GroupShrinkResult> {
     const removeIds = [...new Set(accountIds)];
     if (removeIds.length === 0) {
@@ -1314,6 +1372,7 @@ export class SwitchEngine {
     }
     return this.withCredentialLock(async () => {
       const group = await this.mustGroupLocked(groupId);
+      if (opts.soleScope !== undefined) this.requireSoleScope(group, opts.soleScope, 'remove');
       for (const id of removeIds) {
         if (!group.members.some((m) => m.id === id)) {
           const label = (await this.vault.getAccount(id))?.label ?? id;
@@ -1349,15 +1408,23 @@ export class SwitchEngine {
           members: group.members.filter((m) => !removeSet.has(m.id)),
           activeId: null,
         });
-        if (candidates.length === 0 && !force) {
+        // Refuse (nothing changed) when the slot would be emptied under running sessions. Checked
+        // up front when no member could take over at all, and again below when every one tried
+        // failed: a failed activation writes nothing, so refusing after the attempts is still a
+        // refusal that changed nothing.
+        const refuseIfRunning = async (why: string): Promise<void> => {
+          if (force) return;
           const running = await this.runningSessionsInScopes(group);
           if (running.length > 0) {
             throw new RefreshError(
-              `no other account bound to ${describeFolders(group)} can take the slot over, and ` +
-                `${running.length} session(s) are running on it; exit them or rerun with --force`,
+              `${why}, and ${running.length} session(s) are running on ${describeFolders(group)}; ` +
+                'exit them or rerun with --force',
               'sessions_running',
             );
           }
+        };
+        if (candidates.length === 0) {
+          await refuseIfRunning('no other account bound there can take the slot over');
         }
         switchedTo = null;
         for (const member of candidates) {
@@ -1376,6 +1443,9 @@ export class SwitchEngine {
               'group member failed to take the slot over; trying the next',
             );
           }
+        }
+        if (switchedTo === null && candidates.length > 0) {
+          await refuseIfRunning('no other account bound there could take the slot over right now');
         }
         if (switchedTo === null) {
           // No remaining member could be seated: keep the leaver's rotated token, then fail the slot
@@ -1402,6 +1472,31 @@ export class SwitchEngine {
         runningSessions: [],
       };
     });
+  }
+
+  /** Refuse (`binding_changed`) unless `scope` is `group`'s only scope — the precondition a caller
+   *  growing or shrinking ONE scope's accounts passes, checked under the lock. The scope is compared
+   *  by the same uniqueness keys the registry enforces. */
+  private requireSoleScope(group: StoredGroup, scope: GroupScopeRef, verb: 'add' | 'remove'): void {
+    const aliases = group.aliases ?? [];
+    const sole =
+      scope.kind === 'folder'
+        ? aliases.length === 0 &&
+          group.folders.length === 1 &&
+          folderUniquenessKey(group.folders[0]!, this.platform) ===
+            folderUniquenessKey(scope.folder, this.platform)
+        : group.folders.length === 0 &&
+          aliases.length === 1 &&
+          aliasScopeUniquenessKey(aliases[0]!.folder, aliases[0]!.alias, this.platform) ===
+            aliasScopeUniquenessKey(scope.folder, scope.alias, this.platform);
+    if (!sole) {
+      throw new RefreshError(
+        `${describeMembers(group)} is now bound to ${describeFolders(group)}; ` +
+          `${verb === 'add' ? 'adding accounts there would add them' : 'removing accounts there would remove them'} ` +
+          'for every one of those. Nothing changed; look again (cctl bindings) and rerun.',
+        'binding_changed',
+      );
+    }
   }
 
   /** A group by id, under the lock, or a `not_bound` refusal naming it. */
@@ -1943,17 +2038,18 @@ export class SwitchEngine {
     );
   }
 
-  /** Running sessions an alias scope covers: cwd EXACTLY `folder` and a session name (Claude Code
-   *  records the operator-set title as `name` in its session file) matching `alias` by alias key.
-   *  An unnamed session is not counted: it is outside the alias scope by definition. */
+  /** Running sessions an alias scope covers: a custom title matching `alias` by alias key, in a
+   *  conversation RECORDED in exactly `folder` (the precedence rule's alias key — a session resumed
+   *  from a parent folder still belongs to the folder it was recorded in). An unnamed session is not
+   *  counted: it is outside the alias scope by definition. */
   private async runningAliasSessions(folder: string, alias: string): Promise<RunningSession[]> {
-    const here = folderKey(folder, this.platform);
+    const here = folderUniquenessKey(folder, this.platform);
     const key = aliasKey(alias);
     return this.scanRunningSessions(
       (rec) =>
-        rec.name !== undefined &&
-        aliasKey(rec.name) === key &&
-        folderKey(rec.cwd, this.platform) === here,
+        rec.title !== null &&
+        aliasKey(rec.title) === key &&
+        folderUniquenessKey(rec.recordedFolder, this.platform) === here,
     );
   }
 
@@ -1969,10 +2065,19 @@ export class SwitchEngine {
     return found;
   }
 
-  /** Scan `<mainConfigDir>/sessions/*.json` for Claude Code sessions whose recorded pid is alive and
-   *  that `matches` accepts (given the canonical cwd and the optional session name). Defensive: a
-   *  missing dir, an unreadable or malformed file, or a session with no usable pid/cwd is simply
-   *  skipped, never thrown — this only feeds a warning or a refusal the operator can `--force`. */
+  /**
+   * Scan `<mainConfigDir>/sessions/*.json` for Claude Code sessions whose recorded pid is alive and
+   * that `matches` accepts. Each file records `{pid, cwd, sessionId, name, nameSource}` (measured on
+   * Claude Code 2.1.283; it is removed on a clean exit and left stale by a hard kill, hence the pid
+   * check). The cwd is where the session runs. Its title and recorded folder come from its
+   * TRANSCRIPT when {@link sessionIdentity} is wired — the only source for a resumed session, whose
+   * `name` is derived (`nameSource: "derived"`), never its title. A session the transcript does not
+   * know yet (a `--name` launch before its first turn) falls back to a `name` the operator set
+   * (`nameSource: "user"`, or no `nameSource` at all from an older Claude Code) and its cwd.
+   * Defensive: a missing dir, an unreadable or malformed file, or a session with no usable pid/cwd is
+   * skipped, and a failed transcript lookup falls back as above — this only feeds a warning or a
+   * refusal the operator can `--force`, never throws.
+   */
   private async scanRunningSessions(
     matches: (rec: SessionRecordView) => boolean,
   ): Promise<RunningSession[]> {
@@ -1983,7 +2088,13 @@ export class SwitchEngine {
     } catch {
       return [];
     }
-    const out: RunningSession[] = [];
+    const live: {
+      pid: number;
+      cwd: string;
+      file: string;
+      sessionId: string | undefined;
+      launchName: string | null;
+    }[] = [];
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       const file = join(dir, name);
@@ -1994,18 +2105,59 @@ export class SwitchEngine {
         continue;
       }
       if (typeof parsed !== 'object' || parsed === null) continue;
-      const rec = parsed as { pid?: unknown; cwd?: unknown; name?: unknown };
+      const rec = parsed as {
+        pid?: unknown;
+        cwd?: unknown;
+        name?: unknown;
+        nameSource?: unknown;
+        sessionId?: unknown;
+      };
       const pid = typeof rec.pid === 'number' && Number.isInteger(rec.pid) ? rec.pid : undefined;
       const rawCwd = typeof rec.cwd === 'string' ? rec.cwd : undefined;
       if (pid === undefined || rawCwd === undefined) continue;
       if (!this.isProcessAlive(pid)) continue;
-      const canonCwd = this.canonReserved(rawCwd);
-      const sessionName = typeof rec.name === 'string' ? rec.name : undefined;
-      if (matches({ cwd: canonCwd, name: sessionName })) {
-        out.push({ pid, cwd: canonCwd, sessionFile: file });
+      const userNamed = rec.nameSource === undefined || rec.nameSource === 'user';
+      live.push({
+        pid,
+        cwd: this.canonReserved(rawCwd),
+        file,
+        sessionId:
+          typeof rec.sessionId === 'string' && rec.sessionId !== '' ? rec.sessionId : undefined,
+        launchName: userNamed && typeof rec.name === 'string' ? rec.name : null,
+      });
+    }
+    const identities = await this.lookupSessionIdentities(
+      live.flatMap((l) => (l.sessionId !== undefined ? [l.sessionId] : [])),
+    );
+    const out: RunningSession[] = [];
+    for (const l of live) {
+      const known: SessionIdentity | undefined =
+        l.sessionId !== undefined ? identities.get(l.sessionId.toLowerCase()) : undefined;
+      const title = known !== undefined ? known.customTitle : l.launchName;
+      const recordedFolder =
+        known !== undefined && known.folder !== null ? this.canonReserved(known.folder) : l.cwd;
+      if (matches({ cwd: l.cwd, title, recordedFolder })) {
+        out.push({ pid: l.pid, cwd: l.cwd, sessionFile: l.file });
       }
     }
     return out;
+  }
+
+  /** {@link sessionIdentity} for these ids, or an empty map when it is not wired, there is nothing to
+   *  look up, or the lookup fails (the scan then falls back to what the session file records). */
+  private async lookupSessionIdentities(
+    sessionIds: readonly string[],
+  ): Promise<ReadonlyMap<string, SessionIdentity>> {
+    if (this.sessionIdentity === undefined || sessionIds.length === 0) return new Map();
+    try {
+      return await this.sessionIdentity(this.paths.claudeDir, sessionIds);
+    } catch (err) {
+      this.log.warn(
+        { reason: errorReason(err) },
+        "could not read running sessions' transcripts; using their session files only",
+      );
+      return new Map();
+    }
   }
 
   /** Build the guard snapshot object from the current registry (no IO beyond the vault reads). The
@@ -2018,6 +2170,7 @@ export class SwitchEngine {
     ]);
     return buildFolderBindingSnapshot({
       groups,
+      platform: this.platform,
       generation,
       enforce: this.resolveBindEnforce(),
       mainConfigDir: this.canonReserved(this.paths.claudeDir),

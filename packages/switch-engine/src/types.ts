@@ -185,9 +185,11 @@ export interface StoredGroup {
   updatedAtMs: number;
 }
 
-/** The `groups.json` file: the reserved side of the one logical registry. */
+/** The `groups.json` file: the reserved side of the one logical registry. `schemaVersion` is 2
+ *  exactly when some group carries an alias scope (so a folder-only build refuses the file rather
+ *  than dropping the aliases on its next write), else 1. */
 export interface GroupsFile {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   /** Bumped on every write; the guard snapshot (see {@link FolderBindingSnapshot}) carries it so a
    *  stale snapshot can be detected. */
   generation: number;
@@ -307,6 +309,29 @@ export interface RunningSession {
   /** The session file it was read from, for diagnostics. */
   sessionFile: string;
 }
+
+/** One scope of a group, as an operator names it: a folder (the folder and every subfolder), or one
+ *  session alias in one exact folder. Both are scopes of a group; the lifecycle around them is
+ *  identical. */
+export type GroupScopeRef =
+  { kind: 'folder'; folder: string } | { kind: 'alias'; folder: string; alias: string };
+
+/** What Claude Code's transcript says about one session: its custom title (`/rename`, `--name`;
+ *  null = unnamed — a generated title never counts) and the folder it was recorded in (its first
+ *  recorded cwd, or a later relocation; null = unknown). */
+export interface SessionIdentity {
+  customTitle: string | null;
+  folder: string | null;
+}
+
+/** Look sessions up by id in Claude Code's transcripts under `claudeDir` (the main config dir): a
+ *  map from the LOWER-CASED session id to what its transcript records. An id with no transcript yet
+ *  is simply absent. Injected into the engine because the transcript reader lives with the daemon's
+ *  session catalog; see {@link SwitchEngineOptions.sessionIdentity}. */
+export type SessionIdentityLookup = (
+  claudeDir: string,
+  sessionIds: readonly string[],
+) => Promise<ReadonlyMap<string, SessionIdentity>>;
 
 /** What {@link SwitchEngine.ensureGroupLive} settled a group's slot to — reported at the mechanism
  *  level like {@link ActivateResult}: `liveMember` is the member whose credentials are now written to

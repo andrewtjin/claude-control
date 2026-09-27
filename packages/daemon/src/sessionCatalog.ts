@@ -18,7 +18,12 @@
 
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { aliasKey } from '@claude-control/switch-engine';
+import {
+  aliasKey,
+  projectDirMatches,
+  projectDirStem,
+  type SessionIdentity,
+} from '@claude-control/switch-engine';
 import { forEachLine } from './transcriptTokens.js';
 
 /** One session, as its transcript describes it. */
@@ -73,26 +78,10 @@ export function aliasOf(meta: Pick<SessionMeta, 'customTitle' | 'aiTitle'>): str
  *  guard embeds it), so the lookup here and the binding there can never compare titles differently. */
 export { aliasKey };
 
-/** The length past which Claude Code truncates a project directory name and appends a hash. */
-const PROJECT_DIR_MAX = 200;
-
-/** Claude Code's project-directory name for `cwd`, without the hash suffix it adds past 200
- *  characters (the hash is an implementation detail cctl does not reproduce). */
-export function projectDirStem(cwd: string): string {
-  const name = cwd.replace(/[^a-zA-Z0-9]/g, '-');
-  return name.length <= PROJECT_DIR_MAX ? name : name.slice(0, PROJECT_DIR_MAX);
-}
-
-/** Whether project directory `name` can hold sessions launched in `cwd`: its exact encoding, or,
- *  for a long cwd, the truncated stem plus Claude Code's hash. Case-insensitive, because Windows
- *  drive letters and folders reach Claude Code in whatever case the shell used. A true answer is
- *  only a candidate — the transcript's recorded cwd decides. */
-export function projectDirMatches(name: string, cwd: string): boolean {
-  const stem = projectDirStem(cwd).toLowerCase();
-  const n = name.toLowerCase();
-  if (stem.length < PROJECT_DIR_MAX) return n === stem;
-  return n === stem || n.startsWith(stem + '-');
-}
+/** Claude Code's project-directory naming (`projectDirStem`, `projectDirMatches`). Owned by
+ *  switch-engine, because the enforcement guard embeds the same functions to tell which folder a
+ *  prompt's transcript belongs to; re-exported here for the catalog's callers. */
+export { projectDirMatches, projectDirStem };
 
 // Byte needles. A needle containing quotes can only match STRUCTURE: inside a JSON string value
 // the same characters are escaped (`\"type\":\"custom-title\"`), so a message that merely quotes
@@ -174,6 +163,29 @@ async function readMeta(
   });
   meta.folder = relocatedCwd ?? meta.launchCwd;
   return meta;
+}
+
+/**
+ * What the transcripts under `claudeDir` record about these sessions: each one's custom title (a
+ * blank one names nothing) and its folder, keyed by LOWER-CASED id; an id with no transcript is
+ * absent. The engine's `SessionIdentityLookup` — how the running-session scan learns the title of a
+ * session whose `sessions/<pid>.json` only carries a derived name (every `--resume` launch). Reads
+ * only these sessions' transcripts.
+ */
+export async function sessionIdentities(
+  claudeDir: string,
+  sessionIds: readonly string[],
+): Promise<Map<string, SessionIdentity>> {
+  const catalog = await readSessionCatalog({ claudeDir, sessionIds: new Set(sessionIds) });
+  const out = new Map<string, SessionIdentity>();
+  for (const meta of catalog.sessions) {
+    const custom = meta.customTitle;
+    out.set(meta.sessionId.toLowerCase(), {
+      customTitle: custom !== null && custom.trim() !== '' ? custom : null,
+      folder: meta.folder,
+    });
+  }
+  return out;
 }
 
 /**

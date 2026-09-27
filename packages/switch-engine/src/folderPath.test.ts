@@ -3,6 +3,10 @@ import {
   aliasKey,
   aliasScopeUniquenessKey,
   canonicalizeFolder,
+  canonicalStoredFolder,
+  projectDirMatches,
+  projectDirStem,
+  shellQuoteArg,
   checkAliasFolder,
   exactAliasBinding,
   folderKey,
@@ -504,11 +508,37 @@ describe('embeddableFolderPathSource', () => {
       resolveSessionBinding: typeof resolveSessionBinding;
     };
     for (const c of PRECEDENCE_CASES) {
-      expect(embedded.resolveSessionBinding(c.folder, c.title, c.groups, c.platform)).toEqual(
-        resolveSessionBinding(c.folder, c.title, c.groups, c.platform),
-      );
+      expect(
+        embedded.resolveSessionBinding(c.folder, c.title, c.groups, c.platform, c.aliasFolder),
+      ).toEqual(resolveSessionBinding(c.folder, c.title, c.groups, c.platform, c.aliasFolder));
     }
     expect(embedded.aliasKey('  Auth WORK ')).toBe(aliasKey('  Auth WORK '));
+  });
+
+  it('embeds the project-dir naming and the shell quoting, agreeing with the live ones', () => {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const factory = new Function(
+      `${embeddableFolderPathSource()}\nreturn { projectDirStem, projectDirMatches, shellQuoteArg };`,
+    );
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    const embedded = factory() as {
+      projectDirStem: typeof projectDirStem;
+      projectDirMatches: typeof projectDirMatches;
+      shellQuoteArg: typeof shellQuoteArg;
+    };
+    const long = 'C:\\' + 'deep\\'.repeat(50) + 'x';
+    for (const cwd of ['C:\\Users\\me\\proj', '/home/me/a_b', 'C:\\émoji😀', long]) {
+      expect(embedded.projectDirStem(cwd)).toBe(projectDirStem(cwd));
+      expect(embedded.projectDirMatches(projectDirStem(cwd), cwd)).toBe(true);
+      expect(embedded.projectDirMatches(projectDirStem(cwd) + '-abc', cwd)).toBe(
+        projectDirMatches(projectDirStem(cwd) + '-abc', cwd),
+      );
+    }
+    for (const text of QUOTE_CASES) {
+      for (const platform of ['win32', 'linux'] as const) {
+        expect(embedded.shellQuoteArg(text, platform)).toBe(shellQuoteArg(text, platform));
+      }
+    }
   });
 });
 
@@ -523,6 +553,8 @@ interface PrecedenceCase {
   name: string;
   folder: string;
   title: string | null | undefined;
+  /** The session's RECORDED folder, when it differs from where it runs (absent = the same). */
+  aliasFolder?: string | null;
   groups: ScopedGroup[];
   platform: NodeJS.Platform;
   want: SessionBinding | null;
@@ -661,6 +693,33 @@ const PRECEDENCE_CASES: PrecedenceCase[] = [
     want: { groupId: 'both', via: 'folder', folder: 'C:\\research' },
   },
   {
+    name: 'the alias rule keys on the RECORDED folder: a subfolder session resumed from its parent',
+    folder: 'C:\\work',
+    aliasFolder: 'C:\\work\\client',
+    title: 'OPS',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'alias', via: 'alias', folder: 'C:\\work\\client', aliasKey: 'ops' },
+  },
+  {
+    name: 'a same-titled session recorded in another folder does not take the launch folder’s alias',
+    folder: 'C:\\work',
+    aliasFolder: 'C:\\work-other',
+    title: 'Auth Work',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'outer', via: 'folder', folder: 'C:\\work' },
+  },
+  {
+    name: 'no recorded folder (null) skips the alias rule; the folder rule still applies',
+    folder: 'C:\\elsewhere',
+    aliasFolder: null,
+    title: 'Notes',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: null,
+  },
+  {
     name: 'posix: alias in the exact folder',
     folder: '/home/me/work',
     title: 'auth WORK',
@@ -701,7 +760,9 @@ const PRECEDENCE_CASES: PrecedenceCase[] = [
 
 describe('resolveSessionBinding (the precedence table)', () => {
   it.each(PRECEDENCE_CASES.map((c) => [c.name, c] as const))('%s', (_name, c) => {
-    expect(resolveSessionBinding(c.folder, c.title, c.groups, c.platform)).toEqual(c.want);
+    expect(resolveSessionBinding(c.folder, c.title, c.groups, c.platform, c.aliasFolder)).toEqual(
+      c.want,
+    );
   });
 
   it('resolveBinding is its folder half (no title)', () => {
@@ -759,5 +820,68 @@ describe('checkAliasFolder', () => {
     expect(checkAliasFolder(base.vaultDir, base).ok).toBe(false);
     expect(checkAliasFolder(base.profilesRoot + '\\g1', base).ok).toBe(false);
     expect(checkAliasFolder(base.mainConfigDir + '\\projects', base).ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Claude Code's project-dir naming, stored-folder canonicalization, shell quoting
+// ---------------------------------------------------------------------------
+
+/** Texts a printed command must carry through a shell unchanged. */
+const QUOTE_CASES = [
+  'Auth Work',
+  "it's here",
+  'don\u2019t \u2018x\u2019 \u201ay\u201b',
+  'Deploy $(calc) "now" `id` $HOME %PATH% & | ;',
+  '',
+];
+
+describe('projectDirStem / projectDirMatches (Claude Code’s project-dir naming)', () => {
+  it('replaces every non-alphanumeric UTF-16 unit with a dash', () => {
+    expect(projectDirStem('C:\\Users\\me\\a_b.c')).toBe('C--Users-me-a-b-c');
+    expect(projectDirStem('/home/me/proj')).toBe('-home-me-proj');
+    // A surrogate pair is two units: two dashes, as Claude Code's own regex yields.
+    expect(projectDirStem('C:\\x😀')).toBe('C--x--');
+  });
+
+  it('matches its own name case-insensitively, and a long name with the hash suffix', () => {
+    expect(projectDirMatches('c--users-ME-proj', 'C:\\Users\\me\\proj')).toBe(true);
+    expect(projectDirMatches('C--Users-me-proj-other', 'C:\\Users\\me\\proj')).toBe(false);
+    const long = '/' + 'a'.repeat(300);
+    const stem = projectDirStem(long);
+    expect(stem).toHaveLength(200);
+    expect(projectDirMatches(stem + '-1abcd', long)).toBe(true);
+    expect(projectDirMatches(stem, long)).toBe(true);
+  });
+});
+
+describe('canonicalStoredFolder', () => {
+  it('collapses another spelling of a stored folder with no filesystem access', () => {
+    expect(canonicalStoredFolder('c:/Repo/sub/', 'win32')).toBe('C:\\Repo\\sub');
+    expect(canonicalStoredFolder('/home//me/./work/', 'linux')).toBe('/home/me/work');
+    // A path with no canonical form is kept as spelled (still compared, never thrown).
+    expect(canonicalStoredFolder('C:\\a:b', 'win32')).toBe('C:\\a:b');
+    // Memoized: the same answer on a second call.
+    expect(canonicalStoredFolder('c:/Repo/sub/', 'win32')).toBe('C:\\Repo\\sub');
+  });
+
+  it('canonicalizeFolder without a realpath never resolves against the filesystem', () => {
+    const r = canonicalizeFolder('relative/x', { platform: 'linux', cwd: '/base' });
+    expect(r).toEqual({ ok: true, path: '/base/relative/x' });
+  });
+});
+
+describe('shellQuoteArg', () => {
+  it('PowerShell: one single-quoted literal, every single-quote character doubled', () => {
+    expect(shellQuoteArg('Auth Work', 'win32')).toBe("'Auth Work'");
+    expect(shellQuoteArg("it's", 'win32')).toBe("'it''s'");
+    expect(shellQuoteArg('don\u2019t', 'win32')).toBe("'don\u2019\u2019t'");
+    expect(shellQuoteArg('$(calc) "x"', 'win32')).toBe(`'$(calc) "x"'`);
+  });
+
+  it('POSIX: one single-quoted literal, a single quote closed, escaped and reopened', () => {
+    expect(shellQuoteArg('Auth Work', 'linux')).toBe("'Auth Work'");
+    expect(shellQuoteArg("it's", 'darwin')).toBe("'it'\\''s'");
+    expect(shellQuoteArg('$(calc) `id` "x"', 'linux')).toBe(`'$(calc) \`id\` "x"'`);
   });
 });

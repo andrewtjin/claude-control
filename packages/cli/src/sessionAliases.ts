@@ -162,7 +162,7 @@ async function withBindings(deps: SessionAliasDeps, read: AccountsRead): Promise
   if (read.views.length === 0) return read.views;
   const engine = deps.engine ?? buildEngine(deps.paths);
   const groups = await engine.listGroups();
-  const scoped = groups.map(scopedGroupOf);
+  const scoped = groups.map((g) => scopedGroupOf(g, deps.platform));
   const currentId = deps.env[SESSION_ID_ENV]?.trim().toLowerCase();
   const currentSlot =
     currentId !== undefined && currentId !== ''

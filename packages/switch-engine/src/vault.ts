@@ -158,9 +158,16 @@ function emptyRegistry(): Registry {
 /** Registry schema tag written into `accounts.json` from this build on. Its presence marks a file
  *  the group split is aware of; its ABSENCE is the legacy pre-split shape (see {@link Registry}). */
 const ACCOUNTS_SCHEMA_VERSION = 2;
-/** Schema tag for `groups.json`. Only value ever accepted on load — an unknown one fails closed
- *  rather than being read as a shape this build does not understand. */
+/** Schema tag for a `groups.json` whose groups carry folder scopes only — the shape every build
+ *  with folder bindings reads. */
 const GROUPS_SCHEMA_VERSION = 1;
+/** Schema tag for a `groups.json` in which any group carries an alias scope. A folder-only build
+ *  refuses any tag but 1 (failing closed on every command) — which is the point: such a build would
+ *  otherwise load the file, drop the `aliases` it does not know on its next write, and leave an
+ *  alias-only group with no scope at all (and a folder+alias group silently without its alias). So a
+ *  file is stamped 2 exactly when dropping aliases would lose something, and 1 again once none are
+ *  left, which older builds read as before. This build reads both. */
+const GROUPS_SCHEMA_VERSION_ALIASES = 2;
 
 /**
  * Upper bounds on the group registry, enforced on every load and every mutation.
@@ -239,15 +246,18 @@ function validateMember(value: unknown, where: string): StoredAccount {
  * resolution ambiguous); an `activeId` that is neither null nor one of the group's own members; an
  * over-cap folder list; a folder that collides (by {@link folderUniquenessKey}, i.e. after
  * canonicalization) with one already claimed by any group; a malformed or over-cap `aliases` list
- * (optional: a file written before alias scopes existed has none and loads as before); an alias
- * scope whose (folder, alias key) pair any group already claims; or a group with NO scope at all
- * (neither a folder nor an alias — it could never be used and nothing could address it to dissolve
- * it). The caller separately heals a member id that ALSO lingers in `accounts.json`.
+ * (optional: a file written before alias scopes existed has none and loads as before); or an alias
+ * scope whose (folder, alias key) pair any group already claims. A group with NO scope at all loads
+ * (see the loop below). Both schema tags load (see {@link GROUPS_SCHEMA_VERSION_ALIASES}). The
+ * caller separately heals a member id that ALSO lingers in `accounts.json`.
  */
 function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFile {
   if (!isPlainObject(value)) throw new VaultError('groups.json is not an object');
   assertNoForbiddenKeys(value, 'groups.json');
-  if (value.schemaVersion !== GROUPS_SCHEMA_VERSION) {
+  if (
+    value.schemaVersion !== GROUPS_SCHEMA_VERSION &&
+    value.schemaVersion !== GROUPS_SCHEMA_VERSION_ALIASES
+  ) {
     throw new VaultError(
       `groups.json has an unsupported schemaVersion (${JSON.stringify(value.schemaVersion)}); ` +
         'a newer build wrote it — this one refuses to read it rather than drop the bindings it holds',
@@ -339,9 +349,11 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
       folders.push(folder);
     }
     const aliases = validateAliasScopes(g.aliases, `${where} (${g.id})`, platform, seenAliasKeys);
-    if (folders.length === 0 && aliases.length === 0) {
-      throw new VaultError(`${where} (${g.id}) has no folder or session alias bound`);
-    }
+    // A group with no scope LOADS: it is what a folder-only build leaves behind when it rewrites a
+    // file holding an alias-only group (it drops the `aliases` it does not know). Refusing it here
+    // would fail every command on the machine; loaded, it routes nothing (no rule can name it), its
+    // members stay reserved (never live in global), and `cctl bindings` / `cctl doctor` flag it
+    // until a scope is bound to it again or it is dissolved (`cctl unbind --group`).
     groups.push({
       id: g.id,
       label: g.label,
@@ -354,7 +366,15 @@ function validateGroupsFile(value: unknown, platform: NodeJS.Platform): GroupsFi
       updatedAtMs: g.updatedAtMs,
     });
   }
-  return { schemaVersion: GROUPS_SCHEMA_VERSION, generation: value.generation, groups };
+  return { schemaVersion: groupsSchemaVersionFor(groups), generation: value.generation, groups };
+}
+
+/** The schema tag a `groups.json` holding `groups` is written with (see
+ *  {@link GROUPS_SCHEMA_VERSION_ALIASES}). */
+function groupsSchemaVersionFor(groups: readonly StoredGroup[]): GroupsFile['schemaVersion'] {
+  return groups.some((g) => (g.aliases?.length ?? 0) > 0)
+    ? GROUPS_SCHEMA_VERSION_ALIASES
+    : GROUPS_SCHEMA_VERSION;
 }
 
 /**
@@ -784,7 +804,7 @@ export class Vault {
   private async saveGroups(st: RegistryState): Promise<void> {
     st.generation += 1;
     const file: GroupsFile = {
-      schemaVersion: GROUPS_SCHEMA_VERSION,
+      schemaVersion: groupsSchemaVersionFor(st.groups),
       generation: st.generation,
       groups: st.groups,
     };
@@ -1568,6 +1588,7 @@ export class Vault {
     const st = await this.loadState();
     const snapshot = buildFolderBindingSnapshot({
       groups: st.groups,
+      platform: this.platform,
       generation: st.generation,
       enforce: opts.enforce,
       mainConfigDir: opts.mainConfigDir,
