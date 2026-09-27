@@ -916,14 +916,16 @@ export class SwitchEngine {
   }
 
   /**
-   * Resolve a session in `folder` with custom title `title` to its binding by THE precedence rule
-   * (alias scope in that exact folder, else the longest folder binding, else null = global). The
-   * folder is canonicalized leniently like {@link resolveCwdBinding}; `title` null/blank means an
-   * unnamed session, for which only folder bindings apply.
+   * Resolve a session running in `folder` with custom title `title` to its binding by THE precedence
+   * rule (the alias scope of the folder the session was recorded in — `recordedFolder`, default
+   * `folder` — else the longest folder binding of `folder`, else null = global). Folders are
+   * canonicalized leniently like {@link resolveCwdBinding}; `title` null/blank means an unnamed
+   * session, for which only folder bindings apply.
    */
   async resolveSessionBinding(
     folder: string,
     title: string | null | undefined,
+    recordedFolder?: string,
   ): Promise<SessionBinding | null> {
     const groups = await this.vault.listGroups();
     if (groups.length === 0) return null;
@@ -932,6 +934,7 @@ export class SwitchEngine {
       title,
       groups.map((g) => scopedGroupOf(g, this.platform)),
       this.platform,
+      recordedFolder === undefined ? undefined : this.canonReserved(recordedFolder),
     );
   }
 

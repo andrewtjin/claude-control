@@ -17,6 +17,7 @@ import {
   type GroupLiveResult,
   type RecoverResult,
   type ReauthResult,
+  type SessionIdentity,
   type SlotId,
   type StoredAccount,
 } from '@claude-control/switch-engine';
@@ -293,7 +294,7 @@ const ALIAS_PROFILE_DIR = 'C:/profiles/g2';
 /**
  * {@link groupEngine} plus a second group `g2` (one member m3, live) bound by the ALIAS "auth work"
  * in `boundFolder` — the same folder `g1` is folder-bound to. `resolveSessionBinding` answers by the
- * precedence rule: that alias in that folder -> g2, anything else in the folder -> g1.
+ * precedence rule: that alias recorded in that folder -> g2, anything else run in the folder -> g1.
  */
 function aliasAwareEngine(boundFolder: string): GroupEngine {
   const base = groupEngine(boundFolder);
@@ -331,23 +332,27 @@ function aliasAwareEngine(boundFolder: string): GroupEngine {
     resolveSessionBinding: (
       folder: string,
       title: string | null,
+      recordedFolder?: string,
     ): Promise<{ groupId: string } | null> =>
       Promise.resolve(
-        folder !== boundFolder
-          ? null
-          : title !== null && title.trim().toLowerCase() === 'auth work'
-            ? { groupId: 'g2' }
-            : { groupId: 'g1' },
+        (recordedFolder ?? folder) === boundFolder &&
+          title !== null &&
+          title.trim().toLowerCase() === 'auth work'
+          ? { groupId: 'g2' }
+          : folder === boundFolder
+            ? { groupId: 'g1' }
+            : null,
       ),
   };
 }
 
 describe('Daemon: a managed spawn that resumes a NAMED session follows its alias binding', () => {
   async function spawnResuming(opts: {
-    titleOf?: (sessionId: string) => Promise<string | null>;
+    identityOf?: (sessionId: string, boundFolder: string) => Promise<SessionIdentity | null>;
     resumeSessionId?: string;
   }): Promise<{ captured: Array<string | undefined>; engine: GroupEngine; accountId?: string }> {
     const boundFolder = await sandbox();
+    const identityOf = opts.identityOf;
     const engine = aliasAwareEngine(boundFolder);
     const captured: Array<string | undefined> = [];
     harness = await createHarness({
@@ -356,7 +361,9 @@ describe('Daemon: a managed spawn that resumes a NAMED session follows its alias
         captured.push(configDir);
         return scriptedAgentSdkClient([]);
       },
-      ...(opts.titleOf !== undefined ? { sessionTitleOf: opts.titleOf } : {}),
+      ...(identityOf !== undefined
+        ? { sessionIdentityOf: (id: string) => identityOf(id, boundFolder) }
+        : {}),
     });
     await harness.daemon.start();
     harness.relay.push({
@@ -389,9 +396,9 @@ describe('Daemon: a managed spawn that resumes a NAMED session follows its alias
     const asked: string[] = [];
     const res = await spawnResuming({
       resumeSessionId: SDK_ID,
-      titleOf: (id) => {
+      identityOf: (id, boundFolder) => {
         asked.push(id);
-        return Promise.resolve('Auth Work');
+        return Promise.resolve({ customTitle: 'Auth Work', folder: boundFolder });
       },
     });
     // The title was looked up by the resume anchor (a raw SDK id passes through unchanged).
@@ -405,16 +412,27 @@ describe('Daemon: a managed spawn that resumes a NAMED session follows its alias
   it('resuming an unnamed session (or another title) keeps the folder binding', async () => {
     const unnamed = await spawnResuming({
       resumeSessionId: SDK_ID,
-      titleOf: () => Promise.resolve(null),
+      identityOf: (_id, boundFolder) => Promise.resolve({ customTitle: null, folder: boundFolder }),
     });
     expect(unnamed.captured).toEqual([PROFILE_DIR]);
     expect(unnamed.accountId).toBe('m1');
   });
 
+  it('a same-titled session RECORDED in another folder keeps the folder binding of the spawn folder', async () => {
+    // The alias binding covers the conversations recorded in the bound folder; a session titled the
+    // same but recorded elsewhere (resumed into this folder) is not one of them.
+    const res = await spawnResuming({
+      resumeSessionId: SDK_ID,
+      identityOf: () => Promise.resolve({ customTitle: 'Auth Work', folder: 'C:/elsewhere' }),
+    });
+    expect(res.captured).toEqual([PROFILE_DIR]);
+    expect(res.accountId).toBe('m1');
+  });
+
   it('a title lookup that fails falls back to the folder binding (the guard judges the real title)', async () => {
     const res = await spawnResuming({
       resumeSessionId: SDK_ID,
-      titleOf: () => Promise.reject(new Error('transcript unreadable')),
+      identityOf: () => Promise.reject(new Error('transcript unreadable')),
     });
     expect(res.captured).toEqual([PROFILE_DIR]);
   });
@@ -422,9 +440,9 @@ describe('Daemon: a managed spawn that resumes a NAMED session follows its alias
   it('a fresh spawn (nothing resumed) never asks for a title', async () => {
     const asked: string[] = [];
     const res = await spawnResuming({
-      titleOf: (id) => {
+      identityOf: (id, boundFolder) => {
         asked.push(id);
-        return Promise.resolve('Auth Work');
+        return Promise.resolve({ customTitle: 'Auth Work', folder: boundFolder });
       },
     });
     expect(asked).toEqual([]);

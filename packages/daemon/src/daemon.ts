@@ -21,6 +21,7 @@ import type {
   SlotViolation,
   RepairResult,
   GroupLiveResult,
+  SessionIdentity,
 } from '@claude-control/switch-engine';
 import { describeGroupScopes, groupSlotId } from '@claude-control/switch-engine';
 import {
@@ -138,9 +139,14 @@ export interface SwitchEngineLike {
   slotForConfigDir?(configDir: string | null | undefined): Promise<SlotId>;
   /** The group a working directory is bound to, or null for an unbound cwd. */
   resolveCwdBinding?(cwd: string): Promise<{ groupId: string } | null>;
-  /** The group a session in `folder` with custom title `title` belongs to by the precedence rule
-   *  (that alias bound in exactly this folder, else the longest folder binding), or null = global. */
-  resolveSessionBinding?(folder: string, title: string | null): Promise<{ groupId: string } | null>;
+  /** The group a session running in `folder` with custom title `title`, recorded in
+   *  `recordedFolder` (default: `folder`), belongs to by the precedence rule (that alias bound for
+   *  the recorded folder, else the longest folder binding of `folder`), or null = global. */
+  resolveSessionBinding?(
+    folder: string,
+    title: string | null,
+    recordedFolder?: string,
+  ): Promise<{ groupId: string } | null>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
   reauthenticate(
     id: string,
@@ -199,11 +205,12 @@ export interface DaemonOptions {
    *  `scrubInheritedConfigDir` (global spawns only) drops an inherited `CLAUDE_CONFIG_DIR` that names
    *  a group profile, so a global session is never silently redirected onto a group's account. */
   createAgentSdkClient?: (configDir?: string, scrubInheritedConfigDir?: boolean) => AgentSdkClient;
-  /** The CUSTOM title of a Claude Code session by id (read from its transcript), or null when it
-   *  has none or is unknown. A managed spawn that RESUMES a named session routes by it: an alias
-   *  binding of that title in the spawn's folder outranks the folder binding, exactly as the
-   *  launcher and the guard decide. Absent = spawns route by folder only. */
-  sessionTitleOf?: (sessionId: string) => Promise<string | null>;
+  /** What a Claude Code session's transcript records about it, by id: its CUSTOM title (null =
+   *  unnamed) and the folder it was recorded in; null when the session is unknown. A managed spawn
+   *  that RESUMES a named session routes by it: an alias binding of that title for the session's
+   *  recorded folder outranks the folder binding, exactly as the launcher and the guard decide.
+   *  Absent = spawns route by folder only. */
+  sessionIdentityOf?: (sessionId: string) => Promise<SessionIdentity | null>;
   /** Auto-continue policy stamped onto every managed session this daemon spawns or resumes
    *  (see session-runtime's AutoContinuePolicy): transient API failures retry with backoff
    *  instead of stamping the session `failed`, and usage-limit failures PARK the session for
@@ -685,7 +692,8 @@ export class Daemon {
     scrubInheritedConfigDir?: boolean,
   ) => AgentSdkClient;
   private readonly autoContinue: AutoContinuePolicy | undefined;
-  private readonly sessionTitleOf: ((sessionId: string) => Promise<string | null>) | undefined;
+  private readonly sessionIdentityOf:
+    ((sessionId: string) => Promise<SessionIdentity | null>) | undefined;
   private readonly installHooks: ((port: number) => Promise<void>) | undefined;
   private readonly publishHookEndpoint: ((port: number) => Promise<void>) | undefined;
   private readonly endpointRepublishMs: number;
@@ -875,7 +883,7 @@ export class Daemon {
           ...(scrubInheritedConfigDir ? { scrubInheritedConfigDir: true } : {}),
         }));
     this.autoContinue = options.autoContinue;
-    this.sessionTitleOf = options.sessionTitleOf;
+    this.sessionIdentityOf = options.sessionIdentityOf;
     this.installHooks = options.installHooks;
     this.publishHookEndpoint = options.publishHookEndpoint;
     this.endpointRepublishMs = options.endpointRepublishMs ?? DEFAULT_ENDPOINT_REPUBLISH_MS;
@@ -3544,11 +3552,12 @@ export class Daemon {
 
   /**
    * The binding an account-less managed spawn in `cwd` belongs to. A spawn that resumes a session
-   * with a CUSTOM title is judged by the precedence rule — that alias bound in exactly this folder
-   * outranks the folder binding — so it lands on the slot the guard will require of it (a resumed
-   * session reports its title on its first prompt). Otherwise, and whenever the title cannot be
-   * learned (no catalog seam, an unknown or never-started resume ref, a read failure), the folder
-   * rule decides, as before; the guard still judges the real title.
+   * with a CUSTOM title is judged by the precedence rule — that alias bound for the folder the
+   * session was RECORDED in outranks the folder binding of `cwd` — so it lands on the slot the guard
+   * will require of it (a resumed session reports its title on its first prompt, and the guard keys
+   * the alias on the same recorded folder). Otherwise, and whenever the title cannot be learned (no
+   * catalog seam, an unknown or never-started resume ref, a read failure), the folder rule decides,
+   * as before; the guard still judges the real title.
    */
   private async resolveSpawnBinding(
     cwd: string,
@@ -3557,7 +3566,7 @@ export class Daemon {
     const engine = this.switchEngine;
     if (
       resumeRef !== undefined &&
-      this.sessionTitleOf !== undefined &&
+      this.sessionIdentityOf !== undefined &&
       engine.resolveSessionBinding !== undefined
     ) {
       let anchor: string | undefined;
@@ -3566,10 +3575,11 @@ export class Daemon {
       } catch {
         anchor = undefined; // the spawn path reports an unresumable ref itself
       }
-      const title =
-        anchor === undefined ? null : await this.sessionTitleOf(anchor).catch(() => null);
+      const identity =
+        anchor === undefined ? null : await this.sessionIdentityOf(anchor).catch(() => null);
+      const title = identity?.customTitle ?? null;
       if (title !== null && title.trim() !== '') {
-        return engine.resolveSessionBinding(cwd, title);
+        return engine.resolveSessionBinding(cwd, title, identity?.folder ?? undefined);
       }
     }
     return engine.resolveCwdBinding ? engine.resolveCwdBinding(cwd) : null;
