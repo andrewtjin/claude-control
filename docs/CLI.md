@@ -55,7 +55,8 @@ Each repair is printed above the listing it precedes.
 ```
 cctl switch <id|label>       # activate an account
 cctl switch <id|label> --force   # bypass the switch-cadence guard
-cctl recover                 # recover from an interrupted switch (safe to run anytime)
+cctl recover                 # recover from an interrupted switch (safe to run anytime);
+                             # exits 1 with the reason when it cannot be settled yet
 ```
 
 ## Usage and timeline

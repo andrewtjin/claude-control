@@ -48,10 +48,29 @@ export class LockTimeoutError extends SwitchEngineError {
   }
 }
 
-/** Wrote the live credentials but read-back verification did not match — a rollback was attempted. */
+/** Wrote the live credentials but read-back verification did not match — the switch was undone. */
 export class VerifyError extends SwitchEngineError {
   constructor(message: string) {
     super(message, 'verify_failed');
+  }
+}
+
+/** A switch that was interrupted (a crash, or an undo that itself failed) could not be finished or
+ *  undone yet — typically because another process keeps a live file open — so the live login may be
+ *  one account's credentials under another's identity. What reads or writes the live login is
+ *  refused until it is settled, and every such operation retries the settle first. */
+export class UnsettledSwitchError extends SwitchEngineError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, 'switch_unsettled', options);
+  }
+}
+
+/** The account's stored refresh token is also stored under another account. A refresh token is
+ *  single-use, so whichever copy is refreshed first kills the other; seating it live (where every
+ *  session refreshes it) is refused until one of the two accounts is re-logged. */
+export class SharedTokenError extends SwitchEngineError {
+  constructor(message: string) {
+    super(message, 'shared_token');
   }
 }
 

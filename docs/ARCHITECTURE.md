@@ -91,12 +91,16 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   the CLI rotated it under us) → refresh the target if near expiry and persist the
   rotated single-use token immediately → atomically write both `.credentials.json` and
   the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. Any
-  failure after the first live write puts the previous login back (identity, then
-  credentials) before the error surfaces. A write-ahead intent, recorded before the first
-  live write, makes every step crash-recoverable: `recover()` at startup, and every locked
-  operation that reads the live login first, looks at the live files and completes or
-  undoes the switch. Rotation adoption never stores a live token that another account's
-  bundle already holds.
+  failure after the first live write undoes the switch before the error surfaces: the
+  previous login goes back (identity, then credentials), unless another writer's token
+  landed meanwhile, which stays live and is stored in no bundle. A write-ahead intent,
+  recorded before the first live write, makes every step crash-recoverable: `recover()` at
+  startup, and every locked operation that reads the live login first, looks at the live
+  files and completes or undoes the switch (undoing it when completing needs a write that
+  cannot be made). A switch that can be neither is reported, refuses whatever reads the
+  live login, and is retried until it settles; other accounts' refreshes and re-logins
+  still run. Rotation adoption never stores a live token that another account's bundle
+  already holds, and a token two accounts store is never switched to.
 - **Usage.** Tier-0 reads each profile's cached `cachedUsageUtilization` for free;
   tier-1 hits the OAuth usage endpoint. Cross-account visibility never requires
   switching, and the poller degrades to cached data (labelled stale) rather than

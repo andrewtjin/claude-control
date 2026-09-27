@@ -43,7 +43,24 @@ function sha256(text: string): string {
 /** Which stored account holds which token, as fingerprints — the answer {@link Vault.readStoredTokens}
  *  builds for one moment of the registry. */
 export class StoredTokens {
-  constructor(private readonly byAccount: ReadonlyMap<string, TokenPrints>) {}
+  constructor(
+    private readonly byAccount: ReadonlyMap<string, TokenPrints>,
+    /** Accounts whose bundle exists but could not be read or decrypted, with why. They hold nothing
+     *  as far as these answers go, so a caller that reports on the whole vault must say they were
+     *  left out rather than vouch for them. */
+    readonly unreadable: ReadonlyMap<string, string> = new Map(),
+  ) {}
+
+  /** Ids of the OTHER stored accounts whose bundle holds the same refresh token as `accountId`'s. */
+  refreshSharers(accountId: string): string[] {
+    const own = this.byAccount.get(accountId);
+    if (own === undefined) return [];
+    const out: string[] = [];
+    for (const [id, stored] of this.byAccount) {
+      if (id !== accountId && stored.refresh === own.refresh) out.push(id);
+    }
+    return out;
+  }
 
   /** Ids of the stored accounts whose bundle holds `oauth`'s refresh token or its access token. A
    *  token is issued to one account, so more than one id here is itself a contamination. */

@@ -9,17 +9,21 @@
 //   - refreshToken never spends a stored token that sits live, whatever the identity says;
 //   - `accounts add` never stores a live token another account already holds;
 //   - findTokenConflicts reports live files whose token and identity disagree, and a token stored
-//     under two accounts (what the adoption defect leaves behind in a vault).
+//     under two accounts (what the adoption defect leaves behind in a vault);
+//   - a token two accounts store is never seated live, and never credited to one of the two;
+//   - a bundle the check cannot read is skipped and reported, never thrown, and never decrypted
+//     again until it changes.
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SwitchEngine, type RefreshFn } from './switchEngine.js';
 import { InsecurePassthroughProtector, type Protector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { IntentStore } from './intent.js';
+import { LOCK_STALE_MS } from './lock.js';
 import { Vault } from './vault.js';
 import { sandboxPaths, type Paths } from './paths.js';
 import type { ClaudeOauth, CredentialBundle, OauthAccount, SwitchIntent } from './types.js';
@@ -111,6 +115,41 @@ async function storedTokens(
     out[name] = (await h.vault.readBundle(id)).claudeAiOauth.refreshToken;
   }
   return out;
+}
+
+/** What an older build's mis-attributed adoption leaves in a vault: `holder`'s bundle holding
+ *  `owner`'s token, under `holder`'s own identity. */
+async function contaminate(h: Harness, holderId: string, holder: string, ownerId: string) {
+  await h.vault.writeBundle(holderId, {
+    claudeAiOauth: (await h.vault.readBundle(ownerId)).claudeAiOauth,
+    oauthAccount: identity(holder),
+  });
+}
+
+/** A throwaway config dir holding a fresh login of `name`, as `cctl accounts relogin` captures it. */
+async function loginDir(h: Harness, name: string): Promise<string> {
+  const dir = join(h.paths.vaultDir, '..', `login-${name}`);
+  await mkdir(dir, { recursive: true });
+  writeFileSync(
+    join(dir, '.credentials.json'),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: `at-${name}9`,
+        refreshToken: `rt-${name}9`,
+        expiresAt: NOW + 9 * HOUR,
+      },
+    }),
+  );
+  writeFileSync(join(dir, '.claude.json'), JSON.stringify({ oauthAccount: identity(name) }));
+  return dir;
+}
+
+/** Make an account's bundle file unreadable as a file (a directory in its place: EISDIR). Any
+ *  read failure other than a missing file takes the same path. */
+async function breakBundleFile(h: Harness, id: string): Promise<void> {
+  const path = join(h.paths.vaultDir, id, 'cred.enc');
+  await rm(path, { force: true });
+  await mkdir(join(path, 'x'), { recursive: true });
 }
 
 describe.each<{ phase: SwitchIntent['phase'] }>([{ phase: 'writing' }, { phase: 'refreshed' }])(
@@ -289,6 +328,37 @@ describe('findTokenConflicts', () => {
     expect(await h.mk().findTokenConflicts()).toEqual([]);
     expect((await new IntentStore(h.paths.vaultDir).read())?.phase).toBe('writing');
   });
+
+  it('reports a switch interrupted longer ago than any switch can still be running', async () => {
+    const h = await harness();
+    const { P, T } = await seed(h);
+    await h.live.writeLiveCredentials((await h.vault.readBundle(T.id)).claudeAiOauth);
+    await new IntentStore(h.paths.vaultDir).write({
+      phase: 'writing',
+      targetId: T.id,
+      prevActiveId: P.id,
+      hasRollback: false,
+      startedAtMs: NOW - LOCK_STALE_MS - 1,
+    });
+
+    const found = await h.mk().findTokenConflicts();
+
+    expect(found).toEqual([
+      expect.objectContaining({ kind: 'unsettled_switch', accountIds: [T.id, P.id] }),
+    ]);
+    expect(found[0]?.detail).toContain('"T"');
+    expect(found[0]?.detail).toContain('cctl recover');
+  });
+
+  it('reports a switch record that cannot be read, instead of throwing', async () => {
+    const h = await harness();
+    await seed(h);
+    await writeFile(join(h.paths.vaultDir, '.switch-intent.json'), '{"phase":');
+
+    const found = await h.mk().findTokenConflicts();
+
+    expect(found).toEqual([expect.objectContaining({ kind: 'unsettled_switch', accountIds: [] })]);
+  });
 });
 
 describe('the stored-token check under the lock', () => {
@@ -332,5 +402,150 @@ describe('the stored-token check under the lock', () => {
     expect(res.adoptedPreviousRotation).toBe(true);
     // Under the lock: the previous account's bundle (adoption) and the target's — never all six.
     expect(decryptsUnderLock).toBeLessThanOrEqual(2);
+  });
+});
+
+// A vault an older build already contaminated: one refresh token stored under two accounts. Whichever
+// copy is refreshed first kills the other, so it must not be put live, where a session refreshes it.
+describe('an account whose stored token another account also stores', () => {
+  it('is never seated live: the switch is refused, naming both accounts and the fix', async () => {
+    const h = await harness();
+    const { P, T, R } = await seed(h);
+    await contaminate(h, P.id, 'P', T.id);
+    await h.mk().activate(R.id, { force: true });
+
+    for (const id of [P.id, T.id]) {
+      const refusal = h.mk().activate(id, { force: true });
+      await expect(refusal).rejects.toMatchObject({ code: 'shared_token' });
+      await expect(refusal).rejects.toThrow(/"P".*"T"|"T".*"P"/);
+      await expect(refusal).rejects.toThrow(/relogin/);
+    }
+
+    expect((await h.live.readLiveCredentials())?.refreshToken).toBe('rt-R');
+    expect((await h.live.readOauthAccount())?.accountUuid).toBe('uuid-R');
+    expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
+    expect(await storedTokens(h, { P: P.id, T: T.id })).toEqual({ P: 'rt-T', T: 'rt-T' });
+  });
+
+  it('is seated again once one of the two is re-logged', async () => {
+    const h = await harness();
+    const { P, T } = await seed(h);
+    await contaminate(h, P.id, 'P', T.id);
+
+    await h.mk().reloginFromConfigDir(P.id, await loginDir(h, 'P'));
+    await h.mk().activate(T.id, { force: true });
+
+    expect((await h.live.readLiveCredentials())?.refreshToken).toBe('rt-T');
+    expect(await storedTokens(h, { P: P.id, T: T.id })).toEqual({ P: 'rt-P9', T: 'rt-T' });
+  });
+});
+
+// The files cannot say which of two holders a token really belongs to. Picking one by registry order
+// (or by "the registry's account holds it") can hand the token, and everything keyed on it, to the
+// account whose copy is the contamination.
+describe('a live token that two stored accounts hold', () => {
+  it('is reported with both holders, and with no switch that would seat one of them', async () => {
+    const h = await harness();
+    const { P, T, R } = await seed(h);
+    await contaminate(h, P.id, 'P', T.id); // P is first in registry order
+    await h.mk().activate(R.id, { force: true });
+    // An older build's torn switch R -> T left T's credentials under R's identity.
+    await h.live.writeLiveCredentials((await h.vault.readBundle(T.id)).claudeAiOauth);
+
+    const found = await h.mk().findTokenConflicts();
+
+    const mismatch = found.find((c) => c.kind === 'live_identity_mismatch');
+    expect(mismatch?.accountIds.slice().sort()).toEqual([P.id, T.id, R.id].sort());
+    expect(mismatch?.detail).toContain('"P"');
+    expect(mismatch?.detail).toContain('"T"');
+    expect(mismatch?.detail).not.toContain('cctl switch');
+  });
+
+  it("does not make the registry's account the live one because it is one of the holders", async () => {
+    const h = await harness();
+    const { P, T } = await seed(h);
+    // The registry names P, P's bundle holds T's token, and T's login is live under T's identity.
+    await contaminate(h, P.id, 'P', T.id);
+    await h.live.writeLiveCredentials((await h.vault.readBundle(T.id)).claudeAiOauth);
+    await h.live.writeOauthAccount(identity('T'));
+
+    expect(await h.mk().getActiveId()).toBe(T.id);
+  });
+
+  it('is refused by a capture that names every holder, not one', async () => {
+    const h = await harness();
+    const { P, T } = await seed(h);
+    await contaminate(h, P.id, 'P', T.id);
+    await h.live.writeLiveCredentials((await h.vault.readBundle(T.id)).claudeAiOauth);
+    await h.live.writeOauthAccount(identity('N'));
+
+    const capture = h.mk().captureCurrentLogin('N');
+    await expect(capture).rejects.toThrow(/"P"/);
+    await expect(capture).rejects.toThrow(/"T"/);
+  });
+});
+
+describe('a stored bundle the check cannot read', () => {
+  it('is skipped and reported, and does not stop the doctor or a switch that must adopt', async () => {
+    const h = await harness();
+    const { P, T } = await seed(h);
+    const Z = await h.mk().addAccount('Z', bundle('Z', NOW + 8 * HOUR));
+    await breakBundleFile(h, Z.id);
+
+    const found = await h.mk().findTokenConflicts();
+    expect(found).toEqual([
+      expect.objectContaining({ kind: 'unreadable_bundle', accountIds: [Z.id] }),
+    ]);
+    expect(found[0]?.detail).toContain('"Z"');
+
+    // P's token rotated while live: the next switch adopts it, which checks every stored token.
+    await h.live.writeLiveCredentials({
+      accessToken: 'at-P2',
+      refreshToken: 'rt-P2',
+      expiresAt: NOW + 9 * HOUR,
+    });
+    await expect(h.mk().activate(T.id, { force: true })).resolves.toMatchObject({
+      ok: true,
+      adoptedPreviousRotation: true,
+    });
+    expect((await h.vault.readBundle(P.id)).claudeAiOauth.refreshToken).toBe('rt-P2');
+  });
+
+  it('is decrypted once per version when it cannot be decrypted, not on every check', async () => {
+    const h = await harness();
+    await seed(h);
+    const Z = await h.mk().addAccount('Z', bundle('Z', NOW + 8 * HOUR));
+    // A bundle this machine can no longer decrypt (a DPAPI master-key change, a restored backup).
+    await writeFile(join(h.paths.vaultDir, Z.id, 'cred.enc'), 'dpapi:unreadable-on-this-machine');
+    const inner = new InsecurePassthroughProtector();
+    let decrypts = 0;
+    const counting: Protector = {
+      protect: (plain) => inner.protect(plain),
+      unprotect: (blob) => {
+        decrypts += 1;
+        return inner.unprotect(blob);
+      },
+    };
+    const daemon = new SwitchEngine({
+      paths: h.paths,
+      protector: counting,
+      liveCredentialChannel: new FileCredentialChannel(h.paths.credentialsPath),
+      refresh: (c: ClaudeOauth) => Promise.resolve(c),
+      clock: () => NOW,
+      minSwitchIntervalMs: 0,
+      lockOptions: { timeoutMs: 5000, pollMs: 5 },
+    });
+
+    const first = await daemon.findTokenConflicts();
+    const afterFirst = decrypts;
+    for (let i = 0; i < 5; i += 1) await daemon.findTokenConflicts();
+
+    expect(decrypts - afterFirst).toBe(0);
+    expect(first).toEqual([
+      expect.objectContaining({ kind: 'unreadable_bundle', accountIds: [Z.id] }),
+    ]);
+    // A new version of the bundle is a new blob, and is decrypted again.
+    await h.vault.writeBundle(Z.id, bundle('Z', NOW + 8 * HOUR));
+    expect(await daemon.findTokenConflicts()).toEqual([]);
   });
 });

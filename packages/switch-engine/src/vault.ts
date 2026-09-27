@@ -272,6 +272,15 @@ export class Vault {
    *  every full read. */
   private readonly printsByBlob = new Map<string, TokenPrints>();
 
+  /** Why each bundle blob that could not be decrypted failed, by the blob's digest, pruned the same
+   *  way. A bundle this machine cannot decrypt (a DPAPI master-key change, a restored backup) would
+   *  otherwise be retried on every check, a PowerShell spawn each on Windows, and fail the same way
+   *  every time. Keyed by digest, a bundle that is rewritten is simply tried again, and a decrypt
+   *  that later succeeds elsewhere (readBundle) lands in printsByBlob, which is consulted first. In
+   *  memory only, so a failure that was transient costs a new process one more attempt, never a
+   *  bundle left out for good. */
+  private readonly undecryptable = new Map<string, string>();
+
   constructor(
     private readonly vaultDir: string,
     private readonly protector: Protector,
@@ -537,35 +546,47 @@ export class Vault {
    * Each bundle blob is read (cheap) and looked up by its digest: first in memory, then in the index
    * file; only a blob neither has seen is decrypted. The index is rewritten when what is current
    * differs from what it holds, so it follows every rotation and only ever describes bundles that
-   * exist. An account with no bundle holds nothing; one whose bundle cannot be decrypted is left
-   * out, with a warning — it can then not be recognized as a holder, which is the behavior a check
-   * over it had before it existed.
+   * exist. An account with no bundle holds nothing.
+   *
+   * One bundle that cannot be read (a directory or a file this user may not open in its place) or
+   * decrypted never fails the whole answer: every caller — the doctor, rotation adoption inside a
+   * switch — needs the other accounts' tokens, and one broken bundle must not block a switch that
+   * has nothing to do with it. It is left out, with a warning, and listed in the answer's
+   * `unreadable` so a report on the whole vault can say so. Left out, it cannot be recognized as a
+   * holder — the behavior a check over it had before it existed. A blob that failed to decrypt is
+   * not tried again until it changes (see {@link undecryptable}).
    */
   async readStoredTokens(): Promise<StoredTokens> {
     const accounts = await this.listAccounts();
     const persisted = await readPrintIndex(this.printsPath());
     const current = new Map<string, TokenPrints>();
+    const failed = new Map<string, string>();
     const byAccount = new Map<string, TokenPrints>();
+    const unreadable = new Map<string, string>();
     for (const row of accounts) {
       let blob: string;
       try {
         blob = await readFile(this.bundlePath(row.id), 'utf8');
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw err;
+        const reason = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          { accountId: row.id, reason },
+          'could not read a stored bundle to fingerprint its token; it is left out of the check',
+        );
+        unreadable.set(row.id, reason);
+        continue;
       }
       const digest = blobDigest(blob);
       let prints = this.printsByBlob.get(digest) ?? persisted.get(digest);
       if (prints === undefined) {
-        try {
-          prints = tokenPrints((await this.decodeBundle(blob)).claudeAiOauth);
-        } catch (err) {
-          this.log.warn(
-            { accountId: row.id, reason: err instanceof Error ? err.message : String(err) },
-            'could not decrypt a stored bundle to fingerprint its token; it is left out of the check',
-          );
+        const decoded = await this.printsOrFailure(row.id, digest, blob);
+        if (typeof decoded === 'string') {
+          failed.set(digest, decoded);
+          unreadable.set(row.id, decoded);
           continue;
         }
+        prints = decoded;
       }
       current.set(digest, prints);
       byAccount.set(row.id, prints);
@@ -573,6 +594,8 @@ export class Vault {
     // Only what describes a bundle that exists now is kept, in memory and on disk.
     this.printsByBlob.clear();
     for (const [digest, prints] of current) this.printsByBlob.set(digest, prints);
+    this.undecryptable.clear();
+    for (const [digest, reason] of failed) this.undecryptable.set(digest, reason);
     const stale =
       persisted.size !== current.size || [...current.keys()].some((d) => !persisted.has(d));
     if (stale) {
@@ -585,7 +608,30 @@ export class Vault {
         ),
       );
     }
-    return new StoredTokens(byAccount);
+    return new StoredTokens(byAccount, unreadable);
+  }
+
+  /** Decrypt `blob` for its token fingerprints, or say why it cannot be — without trying again a
+   *  blob that already failed (see {@link undecryptable}). */
+  private async printsOrFailure(
+    accountId: string,
+    digest: string,
+    blob: string,
+  ): Promise<TokenPrints | string> {
+    const known = this.undecryptable.get(digest);
+    if (known !== undefined) return known;
+    try {
+      return tokenPrints((await this.decodeBundle(blob)).claudeAiOauth);
+    } catch (err) {
+      // The wrapper's message only: its cause can be a JSON parse error quoting the plaintext.
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(
+        { accountId, reason },
+        'could not decrypt a stored bundle to fingerprint its token; it is left out of the check ' +
+          'until it changes',
+      );
+      return reason;
+    }
   }
 
   /** Encrypt and persist an account's credential bundle, then refresh its metadata row via

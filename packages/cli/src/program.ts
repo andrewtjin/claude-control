@@ -258,6 +258,9 @@ export function buildProgram(): Command {
     .description('recover from an interrupted switch (run at startup)')
     .action(async () => {
       const result = await buildEngine().recover();
+      // Still pending: the engine says why and what clears it, so it is the whole error.
+      if (result.action === 'unsettled')
+        fail(result.detail ?? 'an interrupted switch is unsettled');
       process.stdout.write(
         result.recovered
           ? `Recovered: ${result.action}${result.detail ? ` - ${result.detail}` : ''}.\n`
