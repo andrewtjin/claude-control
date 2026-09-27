@@ -165,7 +165,10 @@ describe('cctl session bind', () => {
     const snap = JSON.parse(await readFile(folderBindingsPath(paths.vaultDir), 'utf8')) as {
       groups: { aliases: unknown }[];
     };
-    expect(snap.groups[0]?.aliases).toEqual([{ folder: repo, aliasKey: 'auth work' }]);
+    // The key the guard compares, plus the alias as bound for its messages.
+    expect(snap.groups[0]?.aliases).toEqual([
+      { folder: repo, aliasKey: 'auth work', alias: 'Auth Work' },
+    ]);
   });
 
   it('uses the session’s own folder for its own alias, even from a subfolder cwd', async () => {
