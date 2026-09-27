@@ -25,6 +25,7 @@ import {
 import {
   groupSlotId,
   type AccountView,
+  type ActivateOptions,
   type ActivateResult,
   type GroupLiveResult,
   type Logger,
@@ -141,9 +142,10 @@ function view(id: string, label: string, groupId?: string): AccountView {
  *  liveSlots() read; checkSlots/repairSlots are stubbable per case. */
 interface FakeEngineControls {
   engine: SwitchEngineLike;
-  activateCalls: Array<{ id: string }>;
+  activateCalls: Array<{ id: string; options: ActivateOptions | undefined }>;
   ensureGroupLiveCalls: string[];
   refreshSnapshotCalls: number;
+  refreshSnapshotIfStaleCalls: number;
   checkSlotsCalls: number;
   repairSlotsCalls: number;
   liveSlots: Map<SlotId, string | null>;
@@ -163,11 +165,14 @@ function fakeEngine(opts: {
   ensureGroupLiveImpl?: (groupId: string) => Promise<GroupLiveResult>;
   /** Override checkSlots, e.g. to model a breach that the per-group self-heal clears. */
   checkSlotsImpl?: () => Promise<SlotViolation[]>;
+  /** What refreshSnapshotIfStale reports (default: the snapshot was already fresh). */
+  snapshotStale?: boolean;
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
     ensureGroupLiveCalls: [],
     refreshSnapshotCalls: 0,
+    refreshSnapshotIfStaleCalls: 0,
     checkSlotsCalls: 0,
     repairSlotsCalls: 0,
     liveSlots: opts.live,
@@ -176,8 +181,8 @@ function fakeEngine(opts: {
   const memberIds = new Set(opts.groups.flatMap((g) => g.members.map((m) => m.id)));
   controls.engine = {
     recover: (): Promise<RecoverResult> => Promise.resolve({ recovered: false, action: 'none' }),
-    activate: (id: string): Promise<ActivateResult> => {
-      controls.activateCalls.push({ id });
+    activate: (id: string, options?: ActivateOptions): Promise<ActivateResult> => {
+      controls.activateCalls.push({ id, options });
       return Promise.resolve({
         ok: true,
         activeAccountId: id,
@@ -229,6 +234,10 @@ function fakeEngine(opts: {
     refreshSnapshot: (): Promise<void> => {
       controls.refreshSnapshotCalls++;
       return Promise.resolve();
+    },
+    refreshSnapshotIfStale: (): Promise<boolean> => {
+      controls.refreshSnapshotIfStaleCalls++;
+      return Promise.resolve(opts.snapshotStale === true);
     },
     reauthenticate: () => Promise.reject(new Error('unused')),
   };
@@ -424,6 +433,25 @@ describe('daemon folder-bound slots — startup and maintenance', () => {
     expect(controls.checkSlotsCalls).toBeGreaterThanOrEqual(1);
   });
 
+  it('checks the guard snapshot for staleness every cycle, even with no slot breach', async () => {
+    // A crash between a group write and its snapshot write leaves every slot legal, so the
+    // check/repair path never runs; the per-cycle staleness check is what converges the snapshot.
+    const { accounts, groups, live } = twoAccountGroup();
+    const controls = fakeEngine({ accounts, groups, live, snapshotStale: true });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({
+        limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }],
+      }),
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 2);
+
+    expect(controls.refreshSnapshotIfStaleCalls).toBeGreaterThanOrEqual(2);
+    expect(controls.repairSlotsCalls).toBe(0);
+  });
+
   it('repairs a slot invariant breach and alerts once per window on what survives', async () => {
     const { accounts, groups, live } = twoAccountGroup();
     const remaining: SlotViolation = {
@@ -526,6 +554,11 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     // Global hopped to the healthy SHARED account (never a group member); the group hopped to its
     // own healthy member (never the shared pool).
     expect(hopped).toEqual(['m2', 's2']);
+    // Each hop names the slot it was decided for, so a membership change that lands before the
+    // switch reaches the engine lock refuses the hop instead of re-routing it to another slot.
+    const slotOf = new Map(controls.activateCalls.map((c) => [c.id, c.options?.slot]));
+    expect(slotOf.get('s2')).toBe('global');
+    expect(slotOf.get('m2')).toBe(groupSlotId('g1'));
   });
 
   it('names the folder group on the phone notice for a GROUP hop (not a global switch)', async () => {
@@ -914,6 +947,31 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
 
     const exhaustion = slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'));
     expect(exhaustion[0]?.body).toContain('C:/ai-research, C:/experiments');
+  });
+});
+
+describe('daemon folder-bound slots — a phone switch asserts the slot it resolved', () => {
+  it('switches a reserved member in its group slot and names that slot to the engine', async () => {
+    const { accounts, groups, live } = twoAccountGroup();
+    const controls = fakeEngine({ accounts, groups, live });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    await rig.start();
+
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'switch.command',
+      payload: {
+        requestId: 'rq-member',
+        targetAccountId: 'Member Two',
+        reason: 'manual',
+        idempotencyKey: 'ik-member',
+      },
+    });
+    await waitFor(() => switchResults(rig.relay).some((r) => r.requestId === 'rq-member'));
+
+    expect(controls.activateCalls).toEqual([
+      { id: 'm2', options: { origin: 'phone', slot: groupSlotId('g1') } },
+    ]);
   });
 });
 
