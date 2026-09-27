@@ -4,6 +4,7 @@
 //   accounts.json        registry: active id + StoredAccount[] (non-secret metadata)
 //   <id>/cred.enc        DPAPI-encrypted CredentialBundle for one account
 //   .rollback.enc        DPAPI-encrypted snapshot of the previous live creds (mid-switch only)
+//   token-prints.json    one-way fingerprints of each bundle's tokens, a cache (see tokenPrints.ts)
 //
 // The registry is plaintext by design so the CLI can list accounts cheaply; it never holds
 // a token. Secrets exist only inside the .enc blobs, which are useless off this machine/user.
@@ -14,6 +15,14 @@ import { join } from 'node:path';
 import type { CredentialBundle, OauthAccount, Registry, StoredAccount } from './types.js';
 import type { Protector } from './dpapi.js';
 import { atomicWriteFile, ensureDir, readJsonIfExists, removeIfExists } from './fsutil.js';
+import {
+  StoredTokens,
+  blobDigest,
+  readPrintIndex,
+  tokenPrints,
+  writePrintIndex,
+  type TokenPrints,
+} from './tokenPrints.js';
 import { UnknownAccountError, VaultError } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
 
@@ -258,6 +267,20 @@ function applyBundleMetadata(
 }
 
 export class Vault {
+  /** Token fingerprints by the digest of the blob they were read from (see {@link readStoredTokens}).
+   *  Filled for free wherever a bundle is decrypted or written, pruned to the current bundles on
+   *  every full read. */
+  private readonly printsByBlob = new Map<string, TokenPrints>();
+
+  /** Why each bundle blob that could not be decrypted failed, by the blob's digest, pruned the same
+   *  way. A bundle this machine cannot decrypt (a DPAPI master-key change, a restored backup) would
+   *  otherwise be retried on every check, a PowerShell spawn each on Windows, and fail the same way
+   *  every time. Keyed by digest, a bundle that is rewritten is simply tried again, and a decrypt
+   *  that later succeeds elsewhere (readBundle) lands in printsByBlob, which is consulted first. In
+   *  memory only, so a failure that was transient costs a new process one more attempt, never a
+   *  bundle left out for good. */
+  private readonly undecryptable = new Map<string, string>();
+
   constructor(
     private readonly vaultDir: string,
     private readonly protector: Protector,
@@ -498,7 +521,8 @@ export class Vault {
 
   // ---- secret bundles (DPAPI) ----
 
-  /** Decrypt and return an account's credential bundle. */
+  /** Decrypt and return an account's credential bundle. The token fingerprints of the blob it read
+   *  are remembered on the way (see {@link readStoredTokens}), since the decrypt is already paid. */
   async readBundle(id: string): Promise<CredentialBundle> {
     let blob: string;
     try {
@@ -509,7 +533,105 @@ export class Vault {
       }
       throw err;
     }
-    return this.decodeBundle(blob);
+    const bundle = await this.decodeBundle(blob);
+    this.printsByBlob.set(blobDigest(blob), tokenPrints(bundle.claudeAiOauth));
+    return bundle;
+  }
+
+  /**
+   * Fingerprints of the tokens every stored account's bundle holds right now — the one place that
+   * can say whether a live token is some OTHER account's (see tokenPrints.ts for why this is not a
+   * plain decrypt of every bundle).
+   *
+   * Each bundle blob is read (cheap) and looked up by its digest: first in memory, then in the index
+   * file; only a blob neither has seen is decrypted. The index is rewritten when what is current
+   * differs from what it holds, so it follows every rotation and only ever describes bundles that
+   * exist. An account with no bundle holds nothing.
+   *
+   * One bundle that cannot be read (a directory or a file this user may not open in its place) or
+   * decrypted never fails the whole answer: every caller — the doctor, rotation adoption inside a
+   * switch — needs the other accounts' tokens, and one broken bundle must not block a switch that
+   * has nothing to do with it. It is left out, with a warning, and listed in the answer's
+   * `unreadable` so a report on the whole vault can say so. Left out, it cannot be recognized as a
+   * holder — the behavior a check over it had before it existed. A blob that failed to decrypt is
+   * not tried again until it changes (see {@link undecryptable}).
+   */
+  async readStoredTokens(): Promise<StoredTokens> {
+    const accounts = await this.listAccounts();
+    const persisted = await readPrintIndex(this.printsPath());
+    const current = new Map<string, TokenPrints>();
+    const failed = new Map<string, string>();
+    const byAccount = new Map<string, TokenPrints>();
+    const unreadable = new Map<string, string>();
+    for (const row of accounts) {
+      let blob: string;
+      try {
+        blob = await readFile(this.bundlePath(row.id), 'utf8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        const reason = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          { accountId: row.id, reason },
+          'could not read a stored bundle to fingerprint its token; it is left out of the check',
+        );
+        unreadable.set(row.id, reason);
+        continue;
+      }
+      const digest = blobDigest(blob);
+      let prints = this.printsByBlob.get(digest) ?? persisted.get(digest);
+      if (prints === undefined) {
+        const decoded = await this.printsOrFailure(row.id, digest, blob);
+        if (typeof decoded === 'string') {
+          failed.set(digest, decoded);
+          unreadable.set(row.id, decoded);
+          continue;
+        }
+        prints = decoded;
+      }
+      current.set(digest, prints);
+      byAccount.set(row.id, prints);
+    }
+    // Only what describes a bundle that exists now is kept, in memory and on disk.
+    this.printsByBlob.clear();
+    for (const [digest, prints] of current) this.printsByBlob.set(digest, prints);
+    this.undecryptable.clear();
+    for (const [digest, reason] of failed) this.undecryptable.set(digest, reason);
+    const stale =
+      persisted.size !== current.size || [...current.keys()].some((d) => !persisted.has(d));
+    if (stale) {
+      // A cache write that fails (another process replacing the same file this instant) costs a
+      // decrypt next time, never a wrong answer — so it is not allowed to fail the caller.
+      await writePrintIndex(this.printsPath(), current).catch((err: unknown) =>
+        this.log.debug(
+          { reason: err instanceof Error ? err.message : String(err) },
+          'could not update the token fingerprint index',
+        ),
+      );
+    }
+    return new StoredTokens(byAccount, unreadable);
+  }
+
+  /** Decrypt `blob` for its token fingerprints, or say why it cannot be — without trying again a
+   *  blob that already failed (see {@link undecryptable}). */
+  private async printsOrFailure(
+    accountId: string,
+    digest: string,
+    blob: string,
+  ): Promise<TokenPrints | string> {
+    const known = this.undecryptable.get(digest);
+    if (known !== undefined) return known;
+    try {
+      return tokenPrints((await this.decodeBundle(blob)).claudeAiOauth);
+    } catch (err) {
+      // The wrapper's message only: its cause can be a JSON parse error quoting the plaintext.
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(
+        { accountId, reason },
+        'could not decrypt a stored bundle to fingerprint its token; it is left out of the check ' +
+          'until it changes',
+      );
+      return reason;
+    }
   }
 
   /** Encrypt and persist an account's credential bundle, then refresh its metadata row via
@@ -528,6 +650,7 @@ export class Vault {
     ensureDir(join(this.vaultDir, id));
     const blob = await this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
     await atomicWriteFile(this.bundlePath(id), blob);
+    this.printsByBlob.set(blobDigest(blob), tokenPrints(bundle.claudeAiOauth));
     await this.syncMetadata(id, bundle);
   }
 
@@ -618,5 +741,8 @@ export class Vault {
   }
   private rollbackPath(): string {
     return join(this.vaultDir, '.rollback.enc');
+  }
+  private printsPath(): string {
+    return join(this.vaultDir, 'token-prints.json');
   }
 }

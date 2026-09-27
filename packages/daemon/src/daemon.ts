@@ -791,6 +791,13 @@ export class Daemon {
     const recovery = await this.switchEngine.recover();
     if (recovery.recovered) {
       this.logger.info({ recovery }, 'switch engine recovery ran on daemon startup');
+    } else if (recovery.action === 'unsettled') {
+      // Not fatal: switching is refused until it settles (every switch retries it), and the
+      // daemon's other work (usage polling, sessions, the relay) does not depend on it.
+      this.logger.warn(
+        { recovery },
+        'an interrupted switch could not be settled on daemon startup; switching is refused until it is',
+      );
     }
 
     // Install the CLI session-command logic BEFORE binding, so a `cctl session` request that

@@ -110,14 +110,54 @@ export interface Registry {
   accounts: StoredAccount[];
 }
 
-/** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets. */
+/** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets.
+ *
+ *  `phase` says how far the switch got, and so what the live files may hold:
+ *  - `begin`: nothing live has been written (the previous account's rotation may have been adopted
+ *    into the vault, and the target refreshed there — both are kept).
+ *  - `writing`: recorded BEFORE the first live write, so the credentials, the identity block, both
+ *    or neither may be the target's. Recovery must look at the files; it can never assume either.
+ *  - `written`: both live files were written; the registry commit had not happened.
+ *  - `refreshed`: written only by older builds, immediately before their first live write — so it
+ *    means exactly what `writing` means and is recovered the same way. This build never writes it. */
 export interface SwitchIntent {
-  phase: 'begin' | 'refreshed' | 'written';
+  phase: 'begin' | 'refreshed' | 'writing' | 'written';
   targetId: string;
   prevActiveId: string | null;
   /** Whether a DPAPI rollback snapshot of the prior live credentials exists on disk. */
   hasRollback: boolean;
   startedAtMs: number;
+  /** Set when the switch failed and is being undone. Whoever settles it later (after that undo
+   *  failed too) must finish the undo, never complete the switch: the caller was told it failed, and
+   *  the target's identity block in the live files is then the switch's own write, not evidence of
+   *  whose token sits beside it. */
+  undo?: boolean;
+}
+
+/**
+ * A login token the files show is attributed to the wrong account, or a reason the files could not
+ * be checked — what `SwitchEngine.findTokenConflicts` reports. Report-only: nothing repairs these
+ * automatically, because the files cannot say which side is wrong.
+ *  - `live_identity_mismatch`: the live credentials are a stored token while the live identity block
+ *    names an account that does not hold it. Everything that goes by the identity block (who is
+ *    live, whose rotation to adopt) is wrong about it. `accountIds` is every stored account holding
+ *    the token, then the account named (when the block names a stored account). More than one
+ *    holder means the token's owner cannot be told, and none is named as the owner.
+ *  - `duplicate_stored_token`: two or more accounts' bundles store the same refresh token — the same
+ *    login stored twice, or one account holding another's token (what a mis-attributed rotation
+ *    adoption leaves behind). `accountIds` lists every account storing it.
+ *  - `unreadable_bundle`: an account's stored bundle could not be read or decrypted, so none of the
+ *    checks above could include it. `accountIds` is that account.
+ *  - `unsettled_switch`: a switch was interrupted longer ago than any switch can still be running,
+ *    and nothing has been able to finish or undo it; the live files are not checked meanwhile.
+ *    `accountIds` is the switch's target and previous account (empty when its record is unreadable).
+ */
+export interface TokenConflict {
+  kind:
+    'live_identity_mismatch' | 'duplicate_stored_token' | 'unreadable_bundle' | 'unsettled_switch';
+  accountIds: string[];
+  /** One sentence naming the accounts by label and what to do about it. */
+  detail: string;
 }
 
 /** What `activate()` actually did — reported honestly at the mechanism level.
@@ -146,10 +186,12 @@ export interface ReloginResult {
   healedLiveLogin: boolean;
 }
 
-/** Outcome of a startup recovery sweep. */
+/** Outcome of a startup recovery sweep. `unsettled` (with `recovered: false`): a switch is pending
+ *  that could not be finished or undone yet; `detail` says why. It stays pending, and every
+ *  operation that reads the live login retries it (see `UnsettledSwitchError`). */
 export interface RecoverResult {
   recovered: boolean;
-  action: 'none' | 'rolled_forward' | 'rolled_back' | 'cleared';
+  action: 'none' | 'rolled_forward' | 'rolled_back' | 'cleared' | 'unsettled';
   detail?: string;
 }
 
