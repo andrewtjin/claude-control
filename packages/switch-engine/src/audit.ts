@@ -22,6 +22,7 @@ export interface AuditEntry {
     | 'quarantined'
     | 'recovered'
     | 'refresh_adopted'
+    | 'adoption_refused'
     | 'refreshed'
     | 'relogin_live_heal';
   fromAccountId: string | null;

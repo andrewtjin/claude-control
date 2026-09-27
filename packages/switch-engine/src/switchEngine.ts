@@ -3,12 +3,14 @@
 // `activate(id)` makes an account's credentials the live ones, with these guarantees:
 //   1. Mutual exclusion with our other processes (file lock).
 //   2. The previous account's live token, if the CLI rotated it under us, is ADOPTED into
-//      the vault before we overwrite anything (reconcile-by-reading) — never lost.
+//      the vault before we overwrite anything (reconcile-by-reading) — never lost, and never
+//      stored under an account the live files cannot prove it belongs to.
 //   3. The target's token is refreshed if near expiry, and the rotated (single-use) token is
 //      persisted to the vault IMMEDIATELY, before it can be lost.
-//   4. Live files are written atomically, then read back and verified; a mismatch rolls back
-//      to an encrypted snapshot of the prior live credentials.
-//   5. A write-ahead intent makes every step crash-recoverable via `recover()`.
+//   4. Live files are written atomically, then read back and verified; any failure between the
+//      first live write and the commit puts the prior live login (credentials AND identity) back.
+//   5. A write-ahead intent makes every step crash-recoverable: `recover()` at startup, and every
+//      locked operation that reads or writes the live login settles a pending switch first.
 //
 // What it deliberately does NOT do: claim that a *running* interactive session picked up the
 // new credentials. That is an empirical, per-platform fact (see docs/VERIFICATION.md); this
@@ -24,6 +26,7 @@ import {
   QuarantineError,
   RefreshError,
   UnknownAccountError,
+  VaultError,
   VerifyError,
 } from './errors.js';
 import { IntentStore } from './intent.js';
@@ -40,6 +43,7 @@ import type { Paths } from './paths.js';
 import { atomicWriteFile } from './fsutil.js';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import type {
   ActivateResult,
   ClaudeOauth,
@@ -49,8 +53,11 @@ import type {
   RefreshTokenResult,
   ReloginResult,
   StoredAccount,
+  SwitchIntent,
+  TokenConflict,
 } from './types.js';
 import { needsMetadataBackfill, Vault, type DedupeReport } from './vault.js';
+import type { StoredTokens } from './tokenPrints.js';
 
 /** Signature of the refresh function, so tests can inject a fake. */
 export type RefreshFn = (current: ClaudeOauth, deps?: RefreshDeps) => Promise<ClaudeOauth>;
@@ -118,6 +125,23 @@ export const DEFAULT_MIN_SWITCH_INTERVAL_MS = 60_000;
  *  as something rather than `[object Object]`. */
 function errorReason(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** The live login as it was before a switch wrote over it: what undoing that switch puts back. */
+interface PriorLive {
+  /** The credentials that were live (`undefined`: nobody was logged in). */
+  creds: ClaudeOauth | undefined;
+  /** The identity block that was live. `null` when it was not recorded — a switch that found no
+   *  credentials leaves no snapshot to record it in — which an undo treats as "remove whatever is
+   *  there now": with no credentials beside it, an absent block is the one statement that cannot be
+   *  wrong. */
+  identity: OauthAccount | undefined | null;
+}
+
+/** Whether two credential blocks are the same grant: both absent, or the same pair of tokens. */
+function sameGrant(a: ClaudeOauth | undefined, b: ClaudeOauth | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.accessToken === b.accessToken && a.refreshToken === b.refreshToken;
 }
 
 /** The identity fields a registry row and a login's identity block BOTH carry — the only ones a
@@ -249,7 +273,11 @@ export class SwitchEngine {
     return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
   }
   removeAccount(id: string): Promise<void> {
-    return this.withCredentialLock(() => this.vault.removeAccount(id));
+    return this.withCredentialLock(async () => {
+      // A pending switch to or from this account needs its bundle to be settled correctly.
+      await this.settlePendingSwitchLocked();
+      await this.vault.removeAccount(id);
+    });
   }
   renameAccount(id: string, label: string): Promise<StoredAccount> {
     return this.withCredentialLock(() => this.vault.renameAccount(id, label));
@@ -455,13 +483,31 @@ export class SwitchEngine {
    * `cctl accounts add` right after an interactive login populated the live files.
    */
   async captureCurrentLogin(label: string): Promise<StoredAccount> {
+    // Fingerprint the stored bundles before taking the lock, for the same reason activate() does:
+    // the check below compares the live token against every stored one.
+    await this.vault.readStoredTokens().catch(() => undefined);
     // Locked for the whole capture: the add + setActive pair below are two registry writes that
     // must land as one atomic unit, and reading the live login while a switch is mid-flight would
     // otherwise see a torn set of credential files.
     return this.withCredentialLock(async () => {
+      // A switch left between its two live writes would be captured as one account's token under
+      // another's identity; it is settled first.
+      await this.settlePendingSwitchLocked();
       const live = await this.credStore.readLiveCredentials();
       if (!live)
         throw new RefreshError('no live credentials to capture; log in first', 'no_live_login');
+      // A live token an account already stores IS that account's login, whatever identity block sits
+      // beside it — refused like a login stored twice, since storing it again would put one
+      // single-use token in two bundles. (The identity-based duplicate check in the vault cannot see
+      // this when the block beside the token names someone else.)
+      const [holder] = (await this.vault.readStoredTokens()).holdersOf(live);
+      if (holder !== undefined) {
+        const row = await this.vault.getAccount(holder);
+        throw new VaultError(
+          `this login is account ${holder} ("${row?.label ?? holder}"), which is already stored; ` +
+            `switch to it with \`cctl switch ${row?.label ?? holder}\` instead of adding it again`,
+        );
+      }
       const oauthAccount = await this.credStore.readOauthAccount();
       const bundle: CredentialBundle = oauthAccount
         ? { claudeAiOauth: live, oauthAccount }
@@ -551,6 +597,11 @@ export class SwitchEngine {
     const bundle: CredentialBundle = oauthAccount
       ? { claudeAiOauth: creds, oauthAccount }
       : { claudeAiOauth: creds };
+    // A pending switch is deliberately NOT settled here (nor in reloginFromKeychainDelta): `prior`
+    // was read before the window opened, and settling in between could change the live login that
+    // the restore below then overwrites with `prior` again. The restore puts the live credentials
+    // back exactly as this flow found them, the state the pending intent describes, so the next
+    // operation settles it as if this flow had never run.
     return this.withCredentialLock(async () => {
       try {
         const account = await this.vault.addAccount(label, bundle);
@@ -679,9 +730,11 @@ export class SwitchEngine {
     // Locked end-to-end so the existence check, the in-place bundle overwrite, and the quarantine
     // clear cannot interleave with a concurrent registry writer — which could remove the account
     // between the check and the write, orphaning its freshly written bundle.
-    return this.withCredentialLock(() =>
-      this.reloginFromConfigDirLocked(accountId, configDir, expectedRefreshToken),
-    );
+    return this.withCredentialLock(async () => {
+      // Whether the account is the live one is read below; no switch may be left mid-flight.
+      await this.settlePendingSwitchLocked();
+      return this.reloginFromConfigDirLocked(accountId, configDir, expectedRefreshToken);
+    });
   }
 
   /** The unlocked core of {@link reloginFromConfigDir}; the public wrapper holds the lock. */
@@ -902,6 +955,8 @@ export class SwitchEngine {
     // Locked end-to-end for the same reason as relogin: the existence check, the overwrite,
     // and the quarantine clear must not interleave with a concurrent registry writer.
     return this.withCredentialLock(async () => {
+      // Whether the account is the live one is read below; no switch may be left mid-flight.
+      await this.settlePendingSwitchLocked();
       const existing = await this.vault.getAccount(accountId);
       if (!existing) throw new UnknownAccountError(accountId);
       // Read BEFORE the overwrite, for the same reason reloginFromConfigDirLocked does.
@@ -937,7 +992,22 @@ export class SwitchEngine {
 
   // ---- the state machine ----
 
-  /** Make `targetId` the live account. See the class comment for the guarantees. */
+  /**
+   * Make `targetId` the live account. See the file comment for the guarantees.
+   *
+   * A switch left in the middle (a crash, or an undo that failed) is settled FIRST, before anything
+   * here reads the live login: every read below — who is live, whose rotation to adopt — goes by the
+   * live identity block, which such a switch may have left naming the wrong account.
+   *
+   * The live login is two files, written credentials first and identity second, and the intent says
+   * `writing` BEFORE the first of them. Anything that fails from there to the registry commit — the
+   * identity write (another process holding `.claude.json` open is enough), the `written` record, the
+   * read-back, the commit itself — puts the previous login back, identity and credentials, before
+   * the error surfaces ({@link settleSwitch} in undo mode). The live files must never be left holding
+   * the target's credentials under the previous account's identity: every reader would take the
+   * target's token for the previous account's, and the next switch would store it in that account's
+   * bundle. When the undo itself fails, the intent stays, and the next locked operation settles it.
+   */
   async activate(targetId: string, options: ActivateOptions = {}): Promise<ActivateResult> {
     const target = await this.vault.getAccount(targetId);
     if (!target) throw new UnknownAccountError(targetId);
@@ -945,8 +1015,17 @@ export class SwitchEngine {
       throw new QuarantineError(`account "${target.label}" is quarantined; re-login required`);
     }
 
+    // Fingerprint the stored bundles BEFORE taking the lock. Rotation adoption, under the lock,
+    // checks the live token against every stored one; with a cold fingerprint cache (a process that
+    // has not seen the current bundles, the first run after an upgrade) that is a decrypt per bundle
+    // — a PowerShell spawn each on Windows. Paid here it delays only this caller; paid under the lock
+    // it eats into the time every holder must finish within (see LOCK_STALE_MS). Best-effort: the
+    // check under the lock stays authoritative, and a failure here only means it does the work itself.
+    await this.vault.readStoredTokens().catch(() => undefined);
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
+      await this.settlePendingSwitchLocked();
+
       // Live-reconciled, not the raw registry: `prevActiveId` names who OWNS the live token
       // below (rotation adoption, audit), and after an external `/login` the registry's
       // record points at an account whose credentials are no longer the live ones.
@@ -967,9 +1046,12 @@ export class SwitchEngine {
         }
       }
 
-      // Snapshot the current live credentials so a failed write can be rolled back.
+      // Snapshot the current live login so a failed write can be rolled back — to disk for a crash,
+      // and in memory for this process's own undo (which then needs no decrypt, and knows the
+      // identity block even when no credentials were live).
       const liveNow = await this.credStore.readLiveCredentials();
       const liveOauthAccount = await this.credStore.readOauthAccount();
+      const prior: PriorLive = { creds: liveNow, identity: liveOauthAccount };
       let hasRollback = false;
       if (liveNow) {
         await this.vault.writeRollback(
@@ -980,13 +1062,14 @@ export class SwitchEngine {
         hasRollback = true;
       }
 
-      await this.intent.write({
-        phase: 'begin',
+      const intentAt = (phase: SwitchIntent['phase']): SwitchIntent => ({
+        phase,
         targetId,
         prevActiveId,
         hasRollback,
         startedAtMs: this.clock(),
       });
+      await this.intent.write(intentAt('begin'));
 
       // Reconcile-by-reading: if the CLI rotated the previous account's refresh token while
       // it was live, the vault's copy is now stale. Adopt the live token before overwriting.
@@ -1011,35 +1094,29 @@ export class SwitchEngine {
         bundle = await this.refreshTarget(targetId, bundle, hasRollback);
         refreshed = true;
       }
-      await this.intent.write({
-        phase: 'refreshed',
-        targetId,
-        prevActiveId,
-        hasRollback,
-        startedAtMs: this.clock(),
-      });
 
-      // Write the live files atomically, then record that the point of no easy return passed.
-      await this.credStore.writeLiveCredentials(bundle.claudeAiOauth);
-      await this.writeLiveIdentity(bundle.oauthAccount);
-      await this.intent.write({
-        phase: 'written',
-        targetId,
-        prevActiveId,
-        hasRollback,
-        startedAtMs: this.clock(),
-      });
+      // The live files are about to change: say so before the first write, never after it.
+      await this.intent.write(intentAt('writing'));
+      let recorded: SwitchIntent['phase'] = 'writing';
+      try {
+        await this.credStore.writeLiveCredentials(bundle.claudeAiOauth);
+        await this.writeLiveIdentity(bundle.oauthAccount);
+        await this.intent.write(intentAt('written'));
+        recorded = 'written';
 
-      // Verify the write actually landed; a mismatch rolls back to the snapshot.
-      const check = await this.credStore.readLiveCredentials();
-      if (!check || check.accessToken !== bundle.claudeAiOauth.accessToken) {
-        await this.restoreRollback();
-        await this.finishIntent();
-        throw new VerifyError('credential read-back did not match after write; rolled back');
+        // Verify the write actually landed; a mismatch is undone like any other failure here.
+        const check = await this.credStore.readLiveCredentials();
+        if (!check || check.accessToken !== bundle.claudeAiOauth.accessToken) {
+          throw new VerifyError('credential read-back did not match after write; rolled back');
+        }
+
+        // Commit — the last step that can still be undone.
+        await this.vault.setActive(targetId);
+      } catch (err) {
+        await this.undoFailedSwitch(intentAt(recorded), prior, err);
+        throw err;
       }
 
-      // Commit.
-      await this.vault.setActive(targetId);
       // A real account hop (not a same-account heal) restarts the cadence clock — forced
       // switches too, so an override doesn't grant a free follow-up switch.
       if (targetId !== prevActiveId) await this.writeLastSwitchAtMs(this.clock());
@@ -1091,6 +1168,8 @@ export class SwitchEngine {
 
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
+      // Who is live is read below; no switch may be left mid-flight.
+      await this.settlePendingSwitchLocked();
       // Live-reconciled for the same reason as `activate()`: the adopt-only protection below
       // must shield the account whose token is ACTUALLY live, not whichever one the registry
       // last recorded — network-refreshing the live account's token would strand its session.
@@ -1121,6 +1200,22 @@ export class SwitchEngine {
         };
       }
 
+      // The last word before spending the token: whatever the identity block says, live
+      // credentials holding this very refresh token have sessions using it, and a network refresh
+      // would strand them. (Live files left holding one account's token under another's identity,
+      // with nothing recorded that could settle them, are how the reconciled reading above can
+      // miss it.) A plain read of the live credentials — no decrypt.
+      const live = await this.credStore.readLiveCredentials().catch(() => undefined);
+      if (live?.refreshToken === bundle.claudeAiOauth.refreshToken) {
+        return {
+          accountId: targetId,
+          refreshed: false,
+          skippedReason: 'active_account',
+          adoptedLiveRotation: false,
+          expiresAt: bundle.claudeAiOauth.expiresAt,
+        };
+      }
+
       const updated = await this.refreshAndPersist(targetId, bundle);
       this.audit.append({
         ts: this.clock(),
@@ -1137,79 +1232,350 @@ export class SwitchEngine {
   }
 
   /**
-   * Recover from a switch that crashed mid-flight. Called on daemon/CLI startup. Rolls the
-   * operation forward if the new credentials are already live and valid, otherwise restores
-   * the previous account from the encrypted snapshot.
+   * Recover from a switch that did not finish (a crash, or an undo that failed). Called on
+   * daemon/CLI startup; every locked operation that reads the live login also does this first (see
+   * {@link settlePendingSwitchLocked}). See {@link settleSwitch} for what it does.
    */
   async recover(): Promise<RecoverResult> {
     if (!(await this.intent.read())) return { recovered: false, action: 'none' };
 
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
     try {
-      const pending = await this.intent.read();
-      if (!pending) return { recovered: false, action: 'none' };
-
-      // Before the live files were touched, nothing to undo — just clear. Any token refresh
-      // that reached the vault in the 'refreshed' phase is desirable and kept.
-      if (pending.phase === 'begin' || pending.phase === 'refreshed') {
-        await this.finishIntent();
-        this.audit.append({
-          ts: this.clock(),
-          event: 'recovered',
-          fromAccountId: pending.prevActiveId,
-          toAccountId: null,
-          detail: `cleared at phase ${pending.phase}`,
-          origin: 'recovery',
-        });
-        return {
-          recovered: true,
-          action: 'cleared',
-          detail: `no live write had occurred (phase ${pending.phase})`,
-        };
-      }
-
-      // phase 'written': the live files were changed but the switch never committed.
-      const target = await this.vault.readBundle(pending.targetId).catch(() => undefined);
-      const live = await this.credStore.readLiveCredentials();
-      if (target && live && live.accessToken === target.claudeAiOauth.accessToken) {
-        // The target creds are already live and valid — roll forward and commit. Finish the
-        // interrupted live write first: activate() lands the identity block AFTER the
-        // credentials, so a crash between the two leaves a live identity that still names the
-        // previous account (which would also mislead the live-login reconciliation).
-        await this.writeLiveIdentity(target.oauthAccount);
-        await this.vault.setActive(pending.targetId);
-        this.audit.append({
-          ts: this.clock(),
-          event: 'recovered',
-          fromAccountId: pending.prevActiveId,
-          toAccountId: pending.targetId,
-          detail: 'rolled forward',
-          origin: 'recovery',
-        });
-        await this.finishIntent();
-        return {
-          recovered: true,
-          action: 'rolled_forward',
-          detail: `committed ${pending.targetId}`,
-        };
-      }
-
-      const restored = await this.restoreRollback();
-      this.audit.append({
-        ts: this.clock(),
-        event: 'recovered',
-        fromAccountId: pending.targetId,
-        toAccountId: pending.prevActiveId,
-        detail: restored ? 'rolled back' : 'no snapshot',
-        origin: 'recovery',
-      });
-      await this.finishIntent();
-      return restored
-        ? { recovered: true, action: 'rolled_back', detail: 'restored previous live credentials' }
-        : { recovered: true, action: 'cleared', detail: 'no rollback snapshot was available' };
+      return (await this.settlePendingSwitchLocked()) ?? { recovered: false, action: 'none' };
     } finally {
       lock.release();
     }
+  }
+
+  /**
+   * Settle a pending switch, for a caller that holds the credential lock and is about to read or
+   * write the live login, or the bundles a pending switch involves. A switch left between its live
+   * writes and its commit must not wait for a restart: until it is settled, the live identity block
+   * may name the wrong account, and everything that reads the live login goes by that block. Cheap
+   * when nothing is pending, which is nearly every call: one read of an absent intent file. Returns
+   * what it did, or `undefined` when nothing was pending.
+   */
+  private async settlePendingSwitchLocked(): Promise<RecoverResult | undefined> {
+    const pending = await this.intent.read();
+    if (!pending) return undefined;
+    return this.settleSwitch(pending, 'recover');
+  }
+
+  /**
+   * Bring live files whose switch did not finish to a state where both name one account, and clear
+   * the intent. Two callers: recovery of a switch a crash (or a failed undo) left pending
+   * (`recover`), and a switch undoing its own failure (`undo`, handed the in-memory snapshot).
+   *
+   * Nothing is assumed from the phase beyond `begin` (nothing live written — cleared; a refresh or an
+   * adoption that reached the vault is kept). From `writing` on — and at an older build's `refreshed`,
+   * recorded just before its first live write — the files are LOOKED AT, because the credentials may
+   * be the target's while the identity block still names the previous account. In order:
+   *
+   *   1. The target's credentials are live. Recovery rolls FORWARD when the target is still a stored
+   *      account: the credentials are provably complete (one atomically written file), so writing the
+   *      target's identity completes the switch, which is then committed. An undo — or a target that
+   *      is no longer stored — rolls BACK to the previous login instead (emptied if there was none).
+   *   2. The previous credentials are live: the credentials write never landed, or has been undone.
+   *      Only the identity can still be off, and it is put back.
+   *   3. Neither, but the identity names the target: both writes landed and a running session has
+   *      since rotated the target's token, so the live token is the target's. Recovery rolls forward
+   *      (nothing to rewrite); an undo, or a target that is no longer stored, first adopts it into
+   *      the target's own bundle, then rolls back.
+   *   4. Neither, and the identity does not name the target: the live token moved on after the
+   *      switch touched it. It is left live — overwriting it would destroy whichever login it is — and
+   *      no bundle is changed. At `written` the switch had already written its identity block, so the
+   *      one there now was written later, by whoever wrote the live login (a `/login`), and is left
+   *      standing. Before that, the block may be the previous account's, left over from before the
+   *      switch, beside a token that may be the previous account's rotation or the target's: the files
+   *      cannot say which, so the block, the one statement that may be false, is removed. Claude Code
+   *      re-derives it from the token itself, and until it does, rotation adoption refuses to credit
+   *      the token to anyone (see adoptionRefusal).
+   */
+  private async settleSwitch(
+    pending: SwitchIntent,
+    mode: 'recover' | 'undo',
+    knownPrior?: PriorLive,
+  ): Promise<RecoverResult> {
+    if (pending.phase === 'begin') {
+      await this.finishIntent();
+      this.auditRecovery(pending.prevActiveId, null, 'cleared at phase begin');
+      return {
+        recovered: true,
+        action: 'cleared',
+        detail: 'no live write had occurred (phase begin)',
+      };
+    }
+
+    const target = await this.vault.readBundle(pending.targetId).catch(() => undefined);
+    const prior = knownPrior ?? (await this.readPriorLive(pending));
+    const live = await this.credStore.readLiveCredentials();
+    const liveIdentity = await this.credStore.readOauthAccount();
+    const targetUuid = anchorValue(target?.oauthAccount?.accountUuid);
+    const namesTarget =
+      targetUuid !== undefined && anchorValue(liveIdentity?.accountUuid) === targetUuid;
+    // Committing needs the target's registry row (setActive refuses an unknown id); a target whose
+    // row is gone is rolled back rather than failing every later settle on the commit.
+    const targetStored = (await this.vault.getAccount(pending.targetId)) !== undefined;
+    const mayForward = mode === 'recover' && targetStored;
+    if (mode === 'recover' && !targetStored) {
+      this.log.warn(
+        { targetId: pending.targetId },
+        'unfinished switch target is no longer a stored account; rolling back instead of forward',
+      );
+    }
+
+    // 1. The target's credentials are live.
+    if (target !== undefined && live !== undefined && sameGrant(live, target.claudeAiOauth)) {
+      if (mayForward) return this.rollForward(pending, target, true);
+      return this.rollBack(pending, prior, mode);
+    }
+
+    // 2. The previous credentials are live: at most the identity is left to put back.
+    if (prior !== undefined && sameGrant(live, prior.creds)) {
+      let changed = false;
+      if (prior.identity !== null) {
+        changed = !isDeepStrictEqual(liveIdentity, prior.identity);
+        if (changed) await this.writeLiveIdentity(prior.identity);
+      } else if (namesTarget) {
+        // Unrecorded prior identity, no credentials then or now: the target's block is removed.
+        await this.credStore.clearOauthAccount();
+        changed = true;
+      }
+      await this.finishIntent();
+      this.auditRecovery(
+        pending.targetId,
+        pending.prevActiveId,
+        `${mode === 'undo' ? 'undid' : 'recovered'} a switch whose live write had not landed`,
+      );
+      return changed
+        ? { recovered: true, action: 'rolled_back', detail: 'restored the previous live identity' }
+        : { recovered: true, action: 'cleared', detail: 'the live write had not landed' };
+    }
+
+    // 3. The identity names the target: the live token is the target's, rotated since.
+    if (target !== undefined && namesTarget) {
+      if (mayForward) return this.rollForward(pending, target, false);
+      await this.adoptRotationIfNeeded(pending.targetId, live, liveIdentity);
+      return this.rollBack(pending, prior, mode);
+    }
+
+    // 4. A login written after the switch touched the live files: keep it, change no bundle, and
+    //    withdraw the identity block unless it too post-dates the switch's own identity write.
+    const identityPostdates = pending.phase === 'written';
+    if (!identityPostdates) await this.credStore.clearOauthAccount();
+    await this.finishIntent();
+    this.log.warn(
+      { targetId: pending.targetId, prevActiveId: pending.prevActiveId },
+      identityPostdates
+        ? 'the live login was written after an unfinished switch; it was left in place'
+        : 'the live login after an unfinished switch could not be attributed; its identity block ' +
+            'was removed so Claude Code re-derives it, and no bundle was changed',
+    );
+    this.auditRecovery(
+      pending.prevActiveId,
+      null,
+      `left a later live login in place${identityPostdates ? '' : ' and removed its identity block'}`,
+    );
+    return {
+      recovered: true,
+      action: 'cleared',
+      detail: identityPostdates
+        ? 'a login written after the switch was left in place'
+        : 'the live login could not be attributed; its identity block was removed',
+    };
+  }
+
+  /** The previous live login a pending switch recorded in its snapshot. A switch that found no
+   *  credentials recorded none: no credentials, identity unknown. A snapshot that should exist but
+   *  is missing or cannot be decrypted is `undefined` — nothing is known — and is logged: settling
+   *  must not fail every later operation on a snapshot it can never read. */
+  private async readPriorLive(pending: SwitchIntent): Promise<PriorLive | undefined> {
+    if (!pending.hasRollback) return { creds: undefined, identity: null };
+    try {
+      const snapshot = await this.vault.readRollback();
+      if (snapshot === undefined) return undefined;
+      return { creds: snapshot.claudeAiOauth, identity: snapshot.oauthAccount };
+    } catch (err) {
+      this.log.error(
+        { reason: errorReason(err) },
+        'the rollback snapshot of an unfinished switch could not be read',
+      );
+      return undefined;
+    }
+  }
+
+  /** Complete a pending switch whose target's credentials are live: its identity (unless the live
+   *  one already names it), then the registry commit — what the switch itself would have done next. */
+  private async rollForward(
+    pending: SwitchIntent,
+    target: CredentialBundle,
+    writeIdentity: boolean,
+  ): Promise<RecoverResult> {
+    if (writeIdentity) await this.writeLiveIdentity(target.oauthAccount);
+    await this.vault.setActive(pending.targetId);
+    this.auditRecovery(pending.prevActiveId, pending.targetId, 'rolled forward');
+    await this.finishIntent();
+    return { recovered: true, action: 'rolled_forward', detail: `committed ${pending.targetId}` };
+  }
+
+  /**
+   * Put the previous login back and clear the intent. Identity FIRST, then credentials — the reverse
+   * of the switch's own order, so failing part way leaves the half-state the switch itself passes
+   * through (the target's credentials under the previous identity), which the still-pending intent
+   * settles next time. The other order could leave the previous account's token under the TARGET's
+   * identity, a state nothing recorded describes. A previous login that is not known (its snapshot
+   * missing or unreadable) is treated as nobody logged in: the target is taken out, which loses
+   * nothing, since both accounts' vault copies are current.
+   */
+  private async rollBack(
+    pending: SwitchIntent,
+    prior: PriorLive | undefined,
+    mode: 'recover' | 'undo',
+  ): Promise<RecoverResult> {
+    const identity = prior === undefined || prior.identity === null ? undefined : prior.identity;
+    await this.writeLiveIdentity(identity);
+    if (prior?.creds !== undefined) await this.credStore.writeLiveCredentials(prior.creds);
+    else await this.credStore.clearLiveCredentials();
+    await this.finishIntent();
+    const what = prior?.creds !== undefined ? 'rolled back' : 'removed the target login';
+    this.auditRecovery(
+      pending.targetId,
+      pending.prevActiveId,
+      `${mode === 'undo' ? 'undid a failed switch: ' : ''}${what}`,
+    );
+    return prior?.creds !== undefined
+      ? { recovered: true, action: 'rolled_back', detail: 'restored previous live credentials' }
+      : {
+          recovered: true,
+          action: 'rolled_back',
+          detail: 'removed the target credentials; no login was live before the switch',
+        };
+  }
+
+  /**
+   * Put the live login back after a switch failed between its first live write and its commit, then
+   * let the caller rethrow the original error. Uses the in-memory snapshot, so the undo needs no
+   * decrypt. An undo that fails too is logged and leaves the intent in place — the next locked
+   * operation settles it ({@link settlePendingSwitchLocked}) — rather than replacing the error the
+   * caller must see.
+   */
+  private async undoFailedSwitch(
+    pending: SwitchIntent,
+    prior: PriorLive,
+    cause: unknown,
+  ): Promise<void> {
+    try {
+      const result = await this.settleSwitch(pending, 'undo', prior);
+      this.log.warn(
+        { targetId: pending.targetId, reason: errorReason(cause), undo: result.action },
+        'switch failed after its live write; the previous login was put back',
+      );
+    } catch (undoErr) {
+      this.log.error(
+        {
+          targetId: pending.targetId,
+          reason: errorReason(cause),
+          undoReason: errorReason(undoErr),
+        },
+        'switch failed after its live write and could not be undone; it stays pending until the ' +
+          'next locked operation settles it',
+      );
+    }
+  }
+
+  /** Append a recovery entry to the audit trail — always origin `recovery`, never the origin the
+   *  interrupted switch was asked with, since nothing here was a deliberate switch request. */
+  private auditRecovery(from: string | null, to: string | null, detail: string): void {
+    this.audit.append({
+      ts: this.clock(),
+      event: 'recovered',
+      fromAccountId: from,
+      toAccountId: to,
+      detail,
+      origin: 'recovery',
+    });
+  }
+
+  /**
+   * Login tokens the files show are attributed to the wrong account — report-only, for `cctl doctor`.
+   *
+   *   - The live credentials are one stored account's token while the live identity block names
+   *     another: everything that goes by the identity block misjudges who is live. The next switch
+   *     rewrites both live files (and rotation adoption refuses the token meanwhile). Not reported
+   *     while a switch is pending — the next locked operation settles that on its own.
+   *   - A refresh token stored under two accounts: the state a mis-attributed rotation adoption
+   *     leaves behind. The files cannot say which bundle is wrong, so the fix is a re-login of the one
+   *     that is (or removing a login stored twice).
+   *
+   * Read-only apart from keeping the token-fingerprint cache current (see tokenPrints.ts), and
+   * unlocked like the other reads: a switch landing mid-check can at worst produce a stale answer.
+   */
+  async findTokenConflicts(): Promise<TokenConflict[]> {
+    const accounts = await this.vault.listAccounts();
+    const stored = await this.vault.readStoredTokens();
+    const labelOf = (id: string): string => accounts.find((a) => a.id === id)?.label ?? id;
+    const out: TokenConflict[] = [];
+
+    if ((await this.intent.read()) === undefined) {
+      const mismatch = await this.liveTokenMismatch(accounts, stored);
+      if (mismatch !== undefined) {
+        const named =
+          mismatch.namedId !== undefined
+            ? `"${labelOf(mismatch.namedId)}"`
+            : `an account that is not stored here (${mismatch.namedUuid})`;
+        const owner = labelOf(mismatch.ownerId);
+        out.push({
+          kind: 'live_identity_mismatch',
+          accountIds:
+            mismatch.namedId !== undefined
+              ? [mismatch.ownerId, mismatch.namedId]
+              : [mismatch.ownerId],
+          detail:
+            `the live login is "${owner}"'s token under the identity of ${named}; ` +
+            `\`cctl switch ${owner}\` rewrites both live files`,
+        });
+      }
+    }
+
+    for (const ids of stored.sharedTokens()) {
+      out.push({
+        kind: 'duplicate_stored_token',
+        accountIds: ids,
+        detail:
+          `accounts ${ids.map((id) => `"${labelOf(id)}"`).join(' and ')} store the same login ` +
+          'token: either one login was stored twice (remove the extra account) or one of them holds ' +
+          "the other's token (re-login that one: cctl accounts relogin <label>)",
+      });
+    }
+    return out;
+  }
+
+  /**
+   * The stored account whose token is live, when the live identity block provably contradicts it:
+   * the token decides, since it is the one artifact that cannot be stale. `undefined` when the live
+   * token is no stored account's, or the identity agrees with it (or names no uuid). An owner with no
+   * recorded uuid beside a block naming an account that is not stored is not treated as a
+   * contradiction: that is most likely Claude Code's own re-derived block for that very login.
+   */
+  private async liveTokenMismatch(
+    accounts: StoredAccount[],
+    stored: StoredTokens,
+  ): Promise<{ ownerId: string; namedId?: string; namedUuid: string } | undefined> {
+    const live = await this.credStore.readLiveCredentials().catch(() => undefined);
+    if (!live) return undefined;
+    const holders = stored.holdersOf(live);
+    if (holders.length === 0) return undefined;
+    const identity = await this.credStore.readOauthAccount().catch(() => undefined);
+    const uuid = anchorValue(identity?.accountUuid);
+    if (uuid === undefined) return undefined;
+    const named = accounts.find((a) => a.accountUuid === uuid);
+    const ownerId = named !== undefined && holders.includes(named.id) ? named.id : holders[0]!;
+    const ownerUuid = accounts.find((a) => a.id === ownerId)?.accountUuid;
+    const contradicted = named !== undefined ? named.id !== ownerId : ownerUuid !== undefined;
+    if (!contradicted) return undefined;
+    return named !== undefined
+      ? { ownerId, namedId: named.id, namedUuid: uuid }
+      : { ownerId, namedUuid: uuid };
   }
 
   // ---- internals ----
@@ -1242,6 +1608,20 @@ export class SwitchEngine {
     // cannot be a later rotation, and is left alone rather than adopted.
     if (liveNow.expiresAt <= prevBundle.claudeAiOauth.expiresAt) return false;
 
+    // Ownership guards, run only now that a write is otherwise decided (they are the expensive part).
+    const refusal = await this.adoptionRefusal(prevActiveId, prevUuid, liveNow, liveOauthAccount);
+    if (refusal !== undefined) {
+      this.log.warn({ prevActiveId, reason: refusal }, 'refused to adopt the live token');
+      this.audit.append({
+        ts: this.clock(),
+        event: 'adoption_refused',
+        fromAccountId: prevActiveId,
+        toAccountId: prevActiveId,
+        detail: refusal,
+      });
+      return false;
+    }
+
     // Identity precedence: the live block goes into this account's bundle only when it PROVABLY
     // belongs to it — both sides report a uuid and they agree. Otherwise the bundle keeps its own
     // block, because an unprovable live block (partial, or belonging to whoever the CLI logged in
@@ -1265,6 +1645,44 @@ export class SwitchEngine {
     });
     this.log.info({ prevActiveId }, 'adopted CLI-rotated token into vault');
     return true;
+  }
+
+  /**
+   * Why the live token must NOT be stored under `prevActiveId`, or `undefined` when nothing forbids
+   * it. Adoption trusts the live identity block to say whose token is live; these are the cases where
+   * the files themselves show that block cannot be trusted with it, and each refusal leaves every
+   * bundle exactly as it was:
+   *
+   *   - The live token is another stored account's own token (either of its two tokens). A token is
+   *     issued to one account, so it is that account's login, whatever the identity block says — the
+   *     signature of a switch torn between its two live writes. Storing it here would put one
+   *     single-use token in two bundles and destroy this account's own.
+   *   - The live identity block is missing while this account's bundle carries an identity. Nothing
+   *     then says whose token is live except the registry's record, and cctl removes the block
+   *     precisely when it cannot tell (an unfinished switch it could not attribute) — Claude Code
+   *     re-derives it from the token, after which adoption proceeds on the evidence. A block that is
+   *     present but names no uuid is still a statement by the login and is judged as before.
+   *
+   * A rotation the refusal holds back is not lost for good: it stays live until the next switch
+   * overwrites it, and a re-login recovers the account if that happens first. Crediting it to the
+   * wrong account could never be undone.
+   */
+  private async adoptionRefusal(
+    prevActiveId: string,
+    prevUuid: string | undefined,
+    liveNow: ClaudeOauth,
+    liveOauthAccount: OauthAccount | undefined,
+  ): Promise<string | undefined> {
+    if (prevUuid !== undefined && liveOauthAccount === undefined) {
+      return "the live login names no account, so its token cannot be shown to be this account's";
+    }
+    const others = (await this.vault.readStoredTokens())
+      .holdersOf(liveNow)
+      .filter((id) => id !== prevActiveId);
+    if (others.length > 0) {
+      return `the live token is stored for another account (${others.join(', ')})`;
+    }
+    return undefined;
   }
 
   /** Refresh the target's token for an in-flight `activate()` — the shared refresh core plus
@@ -1334,18 +1752,6 @@ export class SwitchEngine {
   private async writeLiveIdentity(oauthAccount: OauthAccount | undefined): Promise<void> {
     if (oauthAccount) await this.credStore.writeOauthAccount(oauthAccount);
     else await this.credStore.clearOauthAccount();
-  }
-
-  /** Restore the previous live credentials from the encrypted rollback snapshot. */
-  private async restoreRollback(): Promise<boolean> {
-    const snapshot = await this.vault.readRollback();
-    if (!snapshot) return false;
-    await this.credStore.writeLiveCredentials(snapshot.claudeAiOauth);
-    // The snapshot omits the block exactly when the live file had none, so restoring it means
-    // removing whatever the failed switch wrote — not leaving the target's identity behind on
-    // the previous account's credentials.
-    await this.writeLiveIdentity(snapshot.oauthAccount);
-    return true;
   }
 
   /** Clear the intent and rollback snapshot together — the switch is finished either way. */

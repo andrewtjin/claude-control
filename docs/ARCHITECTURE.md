@@ -90,9 +90,13 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   snapshot the current live creds → reconcile (adopt the previous account's token if
   the CLI rotated it under us) → refresh the target if near expiry and persist the
   rotated single-use token immediately → atomically write both `.credentials.json` and
-  the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. A
-  write-ahead intent makes every step crash-recoverable (`recover()` rolls forward if
-  the new creds are already live, else back to an encrypted snapshot).
+  the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. Any
+  failure after the first live write puts the previous login back (identity, then
+  credentials) before the error surfaces. A write-ahead intent, recorded before the first
+  live write, makes every step crash-recoverable: `recover()` at startup, and every locked
+  operation that reads the live login first, looks at the live files and completes or
+  undoes the switch. Rotation adoption never stores a live token that another account's
+  bundle already holds.
 - **Usage.** Tier-0 reads each profile's cached `cachedUsageUtilization` for free;
   tier-1 hits the OAuth usage endpoint. Cross-account visibility never requires
   switching, and the poller degrades to cached data (labelled stale) rather than
