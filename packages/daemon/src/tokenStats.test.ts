@@ -5,8 +5,15 @@
 // what a reader sees first.
 
 import { describe, it, expect } from 'vitest';
-import { aggregateTokenStats, localDayKey, totalTokens, UNATTRIBUTED_LABEL } from './tokenStats.js';
-import type { ActivationWindow } from './tokenStats.js';
+import {
+  aggregateTokenStats,
+  buildSlotAt,
+  buildTurnAttributor,
+  localDayKey,
+  totalTokens,
+  UNATTRIBUTED_LABEL,
+} from './tokenStats.js';
+import type { ActivationWindow, SessionSlotSpan } from './tokenStats.js';
 import type { TranscriptScan, TranscriptTurn } from './transcriptTokens.js';
 
 function turn(overrides: Partial<TranscriptTurn> & { tsMs: number }): TranscriptTurn {
@@ -278,6 +285,152 @@ describe('aggregateTokenStats', () => {
       const row = stats.byAccount.find((r) => r.label === 'main');
       expect(row && totalTokens(row.totals)).toBe(5 + 2 + 4 + 8);
     });
+
+    it('bills an UNREGISTERED session to its group member from a recorded span alone', () => {
+      // The hand-started case: the session was never registered (absent from slotBySession), and
+      // the only record of its slot is the span the hooks wrote. Without the span it would be billed
+      // to the global account live at the same instant.
+      const intervals: ActivationWindow[] = [
+        { accountId: 'acct-a', startedAtMs: T0 - HOUR, endedAtMs: null, slot: 'global' },
+        { accountId: 'acct-b', startedAtMs: T0 - HOUR, endedAtMs: null, slot: 'group:g1' },
+      ];
+      const stats = aggregateTokenStats({
+        scan: scanOf([turn({ tsMs: T0, sessionId: 'hand-started', inputTokens: 100 })]),
+        intervals,
+        windowStartMs: T0 - 7 * 24 * HOUR,
+        windowEndMs: T0 + 24 * HOUR,
+        labelById: new Map([
+          ['acct-a', 'main'],
+          ['acct-b', 'spare'],
+        ]),
+        slotSpans: [{ sessionId: 'hand-started', slot: 'group:g1', startedAtMs: T0 - HOUR }],
+      });
+      expect(tokensFor(stats, 'spare')).toBe(114);
+      expect(tokensFor(stats, 'main')).toBeUndefined();
+    });
+
+    it('splits a session resumed from global into a group at the span boundary', () => {
+      // One session id, two runs: before the span it ran on the global profile, after it under the
+      // group's. Each turn is billed to the account live in the slot it ran in at that moment.
+      const intervals: ActivationWindow[] = [
+        { accountId: 'acct-a', startedAtMs: T0 - 5 * HOUR, endedAtMs: null, slot: 'global' },
+        { accountId: 'acct-b', startedAtMs: T0 - 5 * HOUR, endedAtMs: null, slot: 'group:g1' },
+      ];
+      const stats = aggregateTokenStats({
+        scan: scanOf([
+          turn({ tsMs: T0 - 2 * HOUR, sessionId: 'resumed', inputTokens: 10 }),
+          turn({ tsMs: T0 + HOUR, sessionId: 'resumed', inputTokens: 1000 }),
+        ]),
+        intervals,
+        windowStartMs: T0 - 7 * 24 * HOUR,
+        windowEndMs: T0 + 24 * HOUR,
+        labelById: new Map([
+          ['acct-a', 'main'],
+          ['acct-b', 'spare'],
+        ]),
+        slotSpans: [{ sessionId: 'resumed', slot: 'group:g1', startedAtMs: T0 }],
+      });
+      expect(tokensFor(stats, 'main')).toBe(10 + 2 + 4 + 8);
+      expect(tokensFor(stats, 'spare')).toBe(1000 + 2 + 4 + 8);
+    });
+  });
+});
+
+describe('buildSlotAt', () => {
+  const spans: SessionSlotSpan[] = [
+    // Deliberately unsorted: the resolver must order each session's spans itself.
+    { sessionId: 's1', slot: 'global', startedAtMs: 3000 },
+    { sessionId: 's1', slot: 'group:g1', startedAtMs: 1000 },
+    { sessionId: 's2', slot: 'group:g2', startedAtMs: 500 },
+  ];
+
+  it('answers the global slot for a turn with no session', () => {
+    const slotAt = buildSlotAt(spans, new Map([['s1', 'group:mirror']]));
+    expect(slotAt(null, 2000)).toBe('global');
+    expect(slotAt(undefined, 2000)).toBe('global');
+  });
+
+  it('answers the span in force at the turn time, the span start itself included', () => {
+    const slotAt = buildSlotAt(spans);
+    expect(slotAt('s1', 1000)).toBe('group:g1');
+    expect(slotAt('s1', 2999)).toBe('group:g1');
+    expect(slotAt('s1', 3000)).toBe('global');
+    expect(slotAt('s1', 9999)).toBe('global');
+  });
+
+  it("never lets one session's spans answer for another", () => {
+    const slotAt = buildSlotAt(spans);
+    expect(slotAt('s2', 2000)).toBe('group:g2');
+    expect(slotAt('s3', 2000)).toBe('global');
+  });
+
+  it('falls back to the sessions mirror before the first span, else to global', () => {
+    // Before its first span the earlier run's slot is unknown: the first span must NOT be borrowed
+    // backwards, or a resumed session's whole pre-binding history would bill to the group.
+    expect(buildSlotAt(spans)('s1', 999)).toBe('global');
+    expect(buildSlotAt(spans, new Map([['s1', 'group:mirror']]))('s1', 999)).toBe('group:mirror');
+  });
+
+  it('answers from the sessions mirror alone when no spans were recorded', () => {
+    const slotAt = buildSlotAt([], new Map([['registered', 'group:g1']]));
+    expect(slotAt('registered', 0)).toBe('group:g1');
+    expect(slotAt('other', 0)).toBe('global');
+  });
+
+  it('lets a recorded span override the mirror once it is in force', () => {
+    // The mirror holds one slot per session; a later span (a resume elsewhere) is more precise.
+    const slotAt = buildSlotAt(
+      [{ sessionId: 's1', slot: 'global', startedAtMs: 1000 }],
+      new Map([['s1', 'group:g1']]),
+    );
+    expect(slotAt('s1', 500)).toBe('group:g1');
+    expect(slotAt('s1', 1500)).toBe('global');
+  });
+});
+
+describe('buildTurnAttributor', () => {
+  const intervals: ActivationWindow[] = [
+    { accountId: 'acct-global', startedAtMs: 0, endedAtMs: null, slot: 'global' },
+    // A member hop inside the group slot, listed out of order: acct-g1a until 2000, acct-g1b after.
+    { accountId: 'acct-g1b', startedAtMs: 2000, endedAtMs: null, slot: 'group:g1' },
+    { accountId: 'acct-g1a', startedAtMs: 0, endedAtMs: 2000, slot: 'group:g1' },
+  ];
+
+  it("bills a span-only session against its group slot's timeline, member hops included", () => {
+    const accountFor = buildTurnAttributor({
+      intervals,
+      slotSpans: [{ sessionId: 'hand', slot: 'group:g1', startedAtMs: 0 }],
+    });
+    expect(accountFor({ sessionId: 'hand', tsMs: 1000 })).toBe('acct-g1a');
+    expect(accountFor({ sessionId: 'hand', tsMs: 2500 })).toBe('acct-g1b');
+    // A session nobody recorded stays on the global timeline.
+    expect(accountFor({ sessionId: 'other', tsMs: 2500 })).toBe('acct-global');
+  });
+
+  it('bills a resumed session to global before its span and to the group after', () => {
+    const accountFor = buildTurnAttributor({
+      intervals,
+      slotSpans: [{ sessionId: 'resumed', slot: 'group:g1', startedAtMs: 2500 }],
+    });
+    expect(accountFor({ sessionId: 'resumed', tsMs: 1000 })).toBe('acct-global');
+    expect(accountFor({ sessionId: 'resumed', tsMs: 3000 })).toBe('acct-g1b');
+  });
+
+  it('claims no account for a slot with no interval covering the turn', () => {
+    const accountFor = buildTurnAttributor({
+      intervals,
+      slotSpans: [{ sessionId: 's', slot: 'group:unknown', startedAtMs: 0 }],
+    });
+    // Never the global account: a group turn with no live member is unattributed, not misbilled.
+    expect(accountFor({ sessionId: 's', tsMs: 1000 })).toBeNull();
+  });
+
+  it('reads an interval with no slot as a global one', () => {
+    const accountFor = buildTurnAttributor({
+      intervals: [{ accountId: 'legacy', startedAtMs: 0, endedAtMs: null }],
+    });
+    expect(accountFor({ sessionId: null, tsMs: 10 })).toBe('legacy');
+    expect(accountFor({ sessionId: 'any', tsMs: 10 })).toBe('legacy');
   });
 });
 

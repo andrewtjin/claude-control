@@ -113,18 +113,37 @@ For PowerShell, `cctl shell-init powershell` prints a function to add to your pr
 (`$PROFILE`); afterwards typing `claude` in any bound folder starts on the right account,
 and typing it anywhere else behaves exactly as before. The command prints where to put it.
 
-In **VS Code**, point the Claude Code extension at the folder's account by adding the snippet
-`cctl where` prints to the folder's `.vscode/settings.json` (the extension's
-`claudeCode.environmentVariables` setting is a list of `{ "name", "value" }` pairs). A
-`claude` typed in VS Code's integrated terminal is covered by the shell wrapper above:
+In **VS Code**, the Claude Code extension takes its environment from the
+`claudeCode.environmentVariables` setting (a list of `{ "name", "value" }` pairs). That
+setting is machine-scoped: VS Code reads it from **user** settings only and silently ignores
+it in a folder's `.vscode/settings.json`. So give each binding its own VS Code profile, and
+open the bound folder in it:
 
-```json
-{
-  "claudeCode.environmentVariables": [
-    { "name": "CLAUDE_CONFIG_DIR", "value": "<the profile dir cctl where prints>" }
-  ]
-}
-```
+1. `code --profile cctl-<label> <folder>` — creates the profile the first time; install or
+   enable the Claude Code extension in it.
+2. In that window, run **Preferences: Open User Settings (JSON)** and add the snippet
+   `cctl where` prints:
+
+   ```json
+   {
+     "claudeCode.environmentVariables": [
+       { "name": "CLAUDE_CONFIG_DIR", "value": "<the profile dir cctl where prints>" }
+     ]
+   }
+   ```
+
+3. Open the folder with the same `code --profile ...` command from then on. Windows in any
+   other profile keep the shared account.
+
+`cctl where` prints the exact command, quoted for your shell. A `claude` typed in VS Code's
+integrated terminal is covered by the shell wrapper above.
+
+Two VS Code specifics. The extension asks the model for a session title **in parallel with**
+your first prompt, so a prompt the guard blocks in a wrongly configured window has already
+sent its text, for that title, to the window's account; the guard cannot stop that request —
+routing the window correctly does. And a multi-root workspace runs its session in the FIRST
+folder; the other folders are added working directories that the guard does not judge, so
+keep a bound folder in its own window.
 
 ```
 cctl where              # explain how THIS folder resolves, with the env line and a
@@ -165,7 +184,8 @@ the Keychain. See `docs/PLATFORM.md`.
 ```
 cctl switch <id|label>       # activate an account (a bound account switches ITS group's slot)
 cctl switch <id|label> --force   # bypass the switch-cadence guard
-cctl recover                 # recover from an interrupted switch (safe to run anytime)
+cctl recover                 # recover from an interrupted switch (safe to run anytime);
+                             # exits 1 with the reason when it cannot be settled yet
 ```
 
 ## Usage and timeline
@@ -309,6 +329,31 @@ cctl session status         # show tracked sessions + active account (reads the 
 receiver; `status` reads the local database and works offline. The group is also
 exposed in-session as the `/cctl:*` slash commands shipped in `plugins/cctl/` — a
 self-contained Claude Code plugin that holds no secrets and only wraps the CLI.
+
+## Session aliases
+
+```
+cctl session show                # this session: its alias, folder, and every account it ran on
+cctl session show <id|alias>     # any session, by id or by alias
+cctl session show <alias> --cwd <folder>   # look the alias up in another folder
+cctl session aliases             # the named sessions in this folder and their accounts
+cctl session aliases --all       # every folder (--auto adds sessions with only a generated title)
+```
+
+A session's alias is its title: the name you give it with `/rename` (or `claude --name`),
+else the title Claude Code generates. It is exactly what `claude --resume <alias>` matches —
+case-insensitive, per folder — so two folders can each have a session called `pptx`. An
+alias is looked up in the current folder first; when only one other folder uses it, that
+session is shown with a note, and when several do, they are listed and `--cwd` picks one.
+An id always wins over an alias.
+
+The account list is billed the same way as `cctl stats`: each turn goes to the account that
+was live in the session's slot at that moment (the global slot, or its folder-bound group),
+so a session that ran on several accounts over its life lists them all, in the order it first
+used them, with turns, tokens and dates. `--json` prints the same data for scripts. Like
+`stats`, it reads local files only and needs no running daemon; a session's slot is known
+from the hooks the daemon receives, so turns from before the daemon saw the session are
+billed against the global slot.
 
 ## Prompts to idle sessions
 

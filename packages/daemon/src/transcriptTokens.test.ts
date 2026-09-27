@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readTranscriptTurns, sessionIdForFile } from './transcriptTokens.js';
+import { forEachLine, readTranscriptTurns, sessionIdForFile } from './transcriptTokens.js';
 
 // A directory listing failure has to be simulated rather than triggered with real OS
 // permissions: chmod does not reliably deny a folder's own owner on every platform CI runs on,
@@ -286,6 +286,133 @@ describe('readTranscriptTurns', () => {
     // Not the file base name ('agent-9'): a sub-agent's spend belongs to the session that launched
     // it, so it attributes against that session's slot.
     expect(scan.turns[0]?.sessionId).toBe('sess-1');
+  });
+});
+
+describe('readTranscriptTurns: per-session reads', () => {
+  it('reads only the named sessions, sub-agent files included, and never opens the rest', async () => {
+    await writeTranscript('proj/wanted.jsonl', [turnLine({ id: 'msg_w', ts: IN_WINDOW })]);
+    await writeTranscript('proj/wanted/subagents/agent-1.jsonl', [
+      turnLine({ id: 'msg_w_sub', ts: IN_WINDOW }),
+    ]);
+    await writeTranscript('other/unwanted.jsonl', [turnLine({ id: 'msg_u', ts: IN_WINDOW })]);
+    await writeTranscript('proj/unwanted/subagents/agent-2.jsonl', [
+      turnLine({ id: 'msg_u_sub', ts: IN_WINDOW }),
+    ]);
+    // An old unwanted file is passed over before the mtime check, so it counts as nothing at all.
+    const stale = await writeTranscript('other/stale.jsonl', [
+      turnLine({ id: 'msg_s', ts: IN_WINDOW }),
+    ]);
+    const staleSeconds = (SINCE - 86_400_000) / 1000;
+    await utimes(stale, staleSeconds, staleSeconds);
+
+    const scan = await readTranscriptTurns({
+      claudeDir,
+      sinceMs: SINCE,
+      sessionIds: new Set(['wanted']),
+    });
+    expect(scan.turns.map((t) => t.sessionId)).toEqual(['wanted', 'wanted']);
+    expect(scan.filesScanned).toBe(2);
+    expect(scan.filesSkippedByMtime).toBe(0);
+  });
+
+  it('reads nothing for an empty session set', async () => {
+    await writeTranscript('proj/s.jsonl', [turnLine({ id: 'msg_1', ts: IN_WINDOW })]);
+    const scan = await readTranscriptTurns({ claudeDir, sinceMs: SINCE, sessionIds: new Set() });
+    expect(scan.turns).toEqual([]);
+    expect(scan.filesScanned).toBe(0);
+  });
+
+  it("global de-dup (the default) drops a fork's inherited turns", async () => {
+    const inherited = turnLine({ id: 'msg_shared', ts: IN_WINDOW, output: 42 });
+    await writeTranscript('proj/parent.jsonl', [inherited]);
+    await writeTranscript('proj/fork.jsonl', [
+      inherited,
+      turnLine({ id: 'msg_fork', ts: IN_WINDOW }),
+    ]);
+    const scan = await readTranscriptTurns({ claudeDir, sinceMs: SINCE });
+    // Machine-wide the shared response was spent once, whichever file owns it.
+    expect(scan.turns).toHaveLength(2);
+    expect(scan.duplicateTurns).toBe(1);
+  });
+
+  it("per-session de-dup keeps a fork's inherited turns in the fork's history", async () => {
+    const inherited = turnLine({ id: 'msg_shared', ts: IN_WINDOW, output: 42 });
+    await writeTranscript('proj/parent.jsonl', [inherited]);
+    await writeTranscript('proj/fork.jsonl', [
+      inherited,
+      turnLine({ id: 'msg_fork', ts: IN_WINDOW }),
+    ]);
+    const scan = await readTranscriptTurns({ claudeDir, sinceMs: SINCE, dedupe: 'session' });
+    const bySession = (id: string) => scan.turns.filter((t) => t.sessionId === id).length;
+    // Scan order must not matter: each session keeps every response it holds.
+    expect(bySession('parent')).toBe(1);
+    expect(bySession('fork')).toBe(2);
+    expect(scan.duplicateTurns).toBe(0);
+  });
+
+  it('per-session de-dup still collapses repeats WITHIN one session, sub-agent files included', async () => {
+    const line = turnLine({ id: 'msg_multi', ts: IN_WINDOW });
+    // Several content-block lines of one response, plus a sub-agent file that repeats the id.
+    await writeTranscript('proj/s1.jsonl', [line, line]);
+    await writeTranscript('proj/s1/subagents/agent-1.jsonl', [line]);
+    const scan = await readTranscriptTurns({ claudeDir, sinceMs: SINCE, dedupe: 'session' });
+    expect(scan.turns).toHaveLength(1);
+    expect(scan.duplicateTurns).toBe(2);
+  });
+});
+
+describe('forEachLine', () => {
+  /** Collect every line a file yields, decoded, in order. */
+  async function linesOf(path: string): Promise<string[]> {
+    const out: string[] = [];
+    await forEachLine(path, (bytes) => out.push(bytes.toString('utf8')));
+    return out;
+  }
+
+  it('yields each line without its newline, and a final unterminated line too', async () => {
+    const path = join(root, 'lines.txt');
+    await writeFile(path, 'one\ntwo\n\nthree', 'utf8');
+    // The empty line is delivered as an empty buffer: skipping it is the handler's call.
+    expect(await linesOf(path)).toEqual(['one', 'two', '', 'three']);
+  });
+
+  it('yields nothing extra for a file ending in a newline, and nothing at all for an empty file', async () => {
+    const terminated = join(root, 'terminated.txt');
+    await writeFile(terminated, 'a\nb\n', 'utf8');
+    expect(await linesOf(terminated)).toEqual(['a', 'b']);
+    const empty = join(root, 'empty.txt');
+    await writeFile(empty, '', 'utf8');
+    expect(await linesOf(empty)).toEqual([]);
+  });
+
+  it('hands over raw bytes: a CRLF line keeps its carriage return', async () => {
+    const path = join(root, 'crlf.txt');
+    await writeFile(path, 'a\r\nb', 'utf8');
+    expect(await linesOf(path)).toEqual(['a\r', 'b']);
+  });
+
+  it('reassembles a line that spans several read chunks', async () => {
+    const path = join(root, 'big.txt');
+    const big = 'y'.repeat(2_500_000);
+    await writeFile(path, `head\n${big}\ntail`, 'utf8');
+    const lines = await linesOf(path);
+    expect(lines.map((l) => l.length)).toEqual([4, big.length, 4]);
+  });
+
+  it('keeps a multi-byte character split across chunks intact', async () => {
+    const path = join(root, 'utf8.txt');
+    // Push a 3-byte character across the 1 MiB chunk boundary: splitting on bytes then decoding
+    // per line must not corrupt it the way per-chunk decoding would.
+    const prefix = 'x'.repeat((1 << 20) - 1);
+    await writeFile(path, `${prefix}€\nnext`, 'utf8');
+    const lines = await linesOf(path);
+    expect(lines[0]?.endsWith('€')).toBe(true);
+    expect(lines[1]).toBe('next');
+  });
+
+  it('rejects for a file that cannot be opened', async () => {
+    await expect(forEachLine(join(root, 'missing.txt'), () => {})).rejects.toThrow();
   });
 });
 

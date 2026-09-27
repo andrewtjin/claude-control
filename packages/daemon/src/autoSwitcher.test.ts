@@ -1,7 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { PayloadOf } from '@claude-control/shared-protocol';
 import type { AccountUsageInput } from '@claude-control/usage-advisor';
-import { AutoSwitcher, DEFAULT_AUTOSWITCH_COOLDOWN_MS } from './autoSwitcher.js';
+import {
+  AutoSwitcher,
+  DEFAULT_AUTOSWITCH_COOLDOWN_MS,
+  type AutoSwitchActivateOptions,
+} from './autoSwitcher.js';
 
 const NOW = 1_000_000_000;
 const H = 60 * 60 * 1000;
@@ -32,7 +36,7 @@ function healthySnapshot(): AccountUsageInput[] {
 }
 
 function makeSwitcher(overrides: Partial<ConstructorParameters<typeof AutoSwitcher>[0]> = {}) {
-  const activate = vi.fn((id: string, _options: { origin: 'auto'; reason: string }) =>
+  const activate = vi.fn((id: string, _options: AutoSwitchActivateOptions) =>
     Promise.resolve({ ok: true, activeAccountId: id }),
   );
   const notify = vi.fn((payload: PayloadOf<'switch.result'>) => {
@@ -191,6 +195,21 @@ describe('AutoSwitcher — per-slot restriction and cooldown', () => {
       'm2',
       expect.objectContaining({ origin: 'auto' }),
     );
+  });
+
+  it('hands the engine the slot each hop was decided for, and none when no slot was named', async () => {
+    const { switcher, activate } = makeSwitcher();
+    await switcher.evaluate(groupSnapshot(), {
+      slotKey: 'group:g1',
+      candidateIds: new Set(['m1', 'm2']),
+    });
+    await switcher.evaluate(lowSnapshot(), { slotKey: 'global' });
+    expect(activate.mock.calls.map(([, options]) => options.slot)).toEqual(['group:g1', 'global']);
+
+    // No slot named: the pre-slot contract, where the engine routes the target by membership.
+    const legacy = makeSwitcher();
+    await legacy.switcher.evaluate(lowSnapshot());
+    expect(legacy.activate.mock.calls[0]?.[1]).not.toHaveProperty('slot');
   });
 
   it('names the slot on the phone notice when a slotLabel is given (a group hop)', async () => {

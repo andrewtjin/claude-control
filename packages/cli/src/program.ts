@@ -15,14 +15,19 @@ import { dirname, join } from 'node:path';
 import {
   CadenceError,
   QuarantineError,
+  SharedTokenError,
+  SlotError,
   SwitchEngineError,
+  SwitchFailedError,
   UnknownAccountError,
+  UnsettledSwitchError,
   VaultError,
   buildAuthorizeUrl,
   defaultPaths,
   defaultProtector,
   generatePkce,
   generateState,
+  groupSlotId,
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
@@ -52,6 +57,7 @@ import {
   type AccountUsageInput,
 } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
+import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
@@ -130,11 +136,9 @@ import {
   type SessionVerb,
 } from './sessionClient.js';
 import {
-  checkGuardHook,
-  checkGuardSnapshot,
+  checkFolderBindings,
   checkLiveLogin,
   checkPowerShellWrapper,
-  checkSlots,
   checkVersionSkew,
   probeRelay,
   readPowerShellWrapperProfile,
@@ -268,12 +272,17 @@ export function buildProgram(): Command {
       const engine = buildEngine();
       // Resolve across the WHOLE registry (shared pool + reserved members) so `cctl switch <member>`
       // reaches a folder-bound account; activate() routes it to its group slot by membership.
-      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
+      const fleet = await engine.listAllAccounts();
+      const resolved = resolveAccountRef(fleet, ref);
       if (!resolved.ok) fail(resolved.message);
+      // The slot the account belonged to when it was resolved. Asserted on the switch, so a bind or
+      // unbind landing in between fails this command instead of switching a slot it never named.
+      const groupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
       try {
         const result = await engine.activate(resolved.account.id, {
           force: Boolean(opts.force),
           origin: 'manual',
+          slot: groupId !== undefined ? groupSlotId(groupId) : 'global',
         });
         const bits = [
           result.wroteCredentials ? 'credentials written' : 'no change',
@@ -293,6 +302,19 @@ export function buildProgram(): Command {
           fail(`${resolved.account.label} is quarantined; re-login required.`);
         if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
         if (err instanceof UnknownAccountError) fail(err.message);
+        if (err instanceof SlotError) {
+          fail(`${err.message}. Nothing was changed - check \`cctl bindings\`.`);
+        }
+        // A switch that failed after it began writing the live login, one an earlier switch still
+        // blocks, or a login stored under two accounts: the engine's message already says what the
+        // live login is now and what to do, in words — it is the whole error line.
+        if (
+          err instanceof SwitchFailedError ||
+          err instanceof UnsettledSwitchError ||
+          err instanceof SharedTokenError
+        ) {
+          fail(err.message);
+        }
         // The token endpoint shedding load is an outage, not a broken account: the engine has
         // already spent its retry budget and checked the status page, so its message is the
         // whole story and this switch simply did not happen. Printed as the CLI's own refusal
@@ -310,6 +332,9 @@ export function buildProgram(): Command {
     .description('recover from an interrupted switch (run at startup)')
     .action(async () => {
       const result = await buildEngine().recover();
+      // Still pending: the engine says where, why and what clears it, so it is the whole error.
+      if (result.action === 'unsettled')
+        fail(result.detail ?? 'an interrupted switch is unsettled');
       process.stdout.write(
         result.recovered
           ? `Recovered: ${result.action}${result.detail ? ` - ${result.detail}` : ''}.\n`
@@ -408,7 +433,9 @@ export function buildProgram(): Command {
         process.stderr.write(`Reading transcripts under ${paths.claudeDir} ...\n`);
       }
       const [accounts, scan] = await Promise.all([
-        buildEngine(paths).listAccounts(),
+        // Every account, reserved group members included: a bound account's turns must be labeled
+        // with its name, not its raw id.
+        buildEngine(paths).listAllAccounts(),
         readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs: windowStartMs }),
       ]);
 
@@ -418,10 +445,12 @@ export function buildProgram(): Command {
       const store = new Store(daemonDbPath(paths));
       let intervals;
       let slotBySession;
+      let slotSpans;
       try {
         intervals = store.listActivationIntervals();
         // Folder-bound sessions attribute against their group slot's timeline, not the global one.
         slotBySession = slotBySessionMap(store.listSessions());
+        slotSpans = store.listSessionSlotSpans();
       } finally {
         store.close();
       }
@@ -433,6 +462,7 @@ export function buildProgram(): Command {
         windowEndMs,
         labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
         slotBySession,
+        slotSpans,
       });
       process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });
@@ -554,16 +584,14 @@ export function buildProgram(): Command {
       const paths = defaultPaths();
       const engine = buildEngine(paths);
       const checks = await runDoctor(paths);
-      // Folder-bound-account checks: slot invariants, guard snapshot freshness, guard hook presence,
-      // and CLI/daemon build skew — appended so the base environment report stays unchanged.
-      const groups = await engine.listGroups();
+      // Folder-bound-account checks (slot invariants, guard snapshot freshness, guard hook presence)
+      // and CLI/daemon build skew — appended so the base environment report stays unchanged. The
+      // binding checks report an unreadable groups.json as one failed check rather than throwing.
       const report = await readSettingsReport(daemonSettingsPath());
       const heartbeat = await readHeartbeat(daemonHeartbeatPath());
       const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
       checks.push(
-        await checkSlots(engine),
-        await checkGuardSnapshot(engine),
-        checkGuardHook(paths, groups.length > 0),
+        ...(await checkFolderBindings(engine, paths)),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
       );
       // Windows only: flag a PowerShell `claude` wrapper whose embedded node/cctl paths have gone
@@ -1789,6 +1817,29 @@ function buildSessionCommands(program: Command): void {
     });
 
   session
+    .command('show [ref]')
+    .description(
+      "a session's alias (its title) and every account it has run on; ref = session id or alias, " +
+        'default = this session',
+    )
+    .option('--cwd <folder>', 'the folder an alias is looked up in (default: the current folder)')
+    .option('--json', 'machine-readable output')
+    .action(async (ref: string | undefined, opts: { cwd?: string; json?: boolean }) => {
+      await runSessionShow(ref, opts, sessionAliasDeps());
+    });
+
+  session
+    .command('aliases')
+    .description('named sessions in this folder (or --all) and the accounts each has run on')
+    .option('--cwd <folder>', 'list this folder instead of the current one')
+    .option('--all', 'every folder on this machine')
+    .option('--auto', 'include sessions that only have a generated title')
+    .option('--json', 'machine-readable output')
+    .action(async (opts: { cwd?: string; all?: boolean; auto?: boolean; json?: boolean }) => {
+      await runSessionAliases(opts, sessionAliasDeps());
+    });
+
+  session
     .command('status')
     .description('show tracked sessions and the active account (reads the daemon db offline)')
     .action(async () => {
@@ -1820,6 +1871,21 @@ function buildSessionCommands(program: Command): void {
       };
       process.stdout.write(renderSessionStatus(rows, header, detectPalette()) + '\n');
     });
+}
+
+/** The real edges for the session alias commands: this machine's paths, env and cwd; progress
+ *  notes only when stderr is a terminal, so piped output stays clean. */
+function sessionAliasDeps(): SessionAliasDeps {
+  return {
+    paths: defaultPaths(),
+    env: process.env,
+    cwd: process.cwd(),
+    platform: process.platform,
+    write: (text) => process.stdout.write(text),
+    note: (text) => {
+      if (process.stderr.isTTY) process.stderr.write(text + '\n');
+    },
+  };
 }
 
 /** Turn one Store `sessions` row into a display row, resolving the account id to a label and

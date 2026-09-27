@@ -6,14 +6,22 @@ import {
   renderBindings,
   renderBindingsFooter,
   renderDaemonStatus,
+  renderAmbiguousAlias,
   renderPacingLine,
+  renderSessionAliasList,
+  renderSessionDetails,
   renderTokenStats,
   renderUsage,
   renderWhere,
+  sessionViewJson,
+  shellQuote,
+  vscodeProfileName,
   type DaemonStatusView,
+  type SessionView,
   type UsageRow,
 } from './render.js';
 import { ANSI_PALETTE, pacingStyle, PLAIN_PALETTE } from './ansi.js';
+import type { SessionAccountUse, SessionMeta } from '@claude-control/daemon';
 import type { StoredAccount } from '@claude-control/switch-engine';
 import type {
   AccountUsage,
@@ -889,14 +897,42 @@ describe('renderWhere', () => {
     );
     expect(out).toContain('runs on: work (work@me.com)');
     expect(out).toContain('CLAUDE_CONFIG_DIR=C:\\data\\profiles\\g1');
-    expect(out).toContain('claudeCode.environmentVariables');
-    expect(out).toContain('.vscode\\settings.json');
+    // The extension's setting is machine-scoped: a folder's .vscode/settings.json is ignored, so the
+    // advice is a VS Code profile whose USER settings carry it, never the workspace file.
+    expect(out).toContain('USER settings only');
+    expect(out).toContain("code --profile 'cctl-work' 'C:\\repos\\work'");
+    expect(out).toContain('Open User Settings (JSON)');
     // The printed snippet must parse and carry the extension's array-of-{name,value} shape.
-    const json = out.slice(out.indexOf('{'));
+    const json = out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1);
     const parsed = JSON.parse(json) as Record<string, unknown>;
     expect(parsed['claudeCode.environmentVariables']).toEqual([
       { name: 'CLAUDE_CONFIG_DIR', value: 'C:\\data\\profiles\\g1' },
     ]);
+  });
+
+  it('quotes the VS Code command for the shell, whatever the folder or label holds', () => {
+    const out = renderWhere(
+      {
+        folder: "C:\\it's $HOME",
+        bound: {
+          groupLabel: 'Work "Main"',
+          matchedFolder: "C:\\it's $HOME",
+          members: ['w'],
+          profileDir: 'C:\\p',
+          liveMemberLabel: 'w',
+        },
+      },
+      PLAIN_PALETTE,
+      'win32',
+    );
+    // PowerShell single quotes: nothing expands inside, a quote is doubled.
+    expect(out).toContain("code --profile 'cctl-Work-Main' 'C:\\it''s $HOME'");
+  });
+
+  it('uses POSIX quoting off Windows', () => {
+    expect(shellQuote("a'b $c", 'linux')).toBe("'a'\\''b $c'");
+    expect(shellQuote("a'b $c", 'win32')).toBe("'a''b $c'");
+    expect(vscodeProfileName('  ')).toBe('cctl-binding');
   });
 
   it('explains an unbound folder as the global account', () => {
@@ -904,5 +940,409 @@ describe('renderWhere', () => {
     expect(out).toContain('global (shared) account');
     expect(out).toContain('CLAUDE_CONFIG_DIR is not set');
     expect(out).toContain('cctl bind C:\\tmp');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session aliases (`cctl session show` / `cctl session aliases`)
+// ---------------------------------------------------------------------------
+
+/** An instant built from LOCAL wall-clock fields: the renderers print local time, so a stamp
+ *  built this way renders as the same text in every time zone the suite runs in. */
+const localMs = (y: number, mo: number, d: number, h: number, mi: number): number =>
+  new Date(y, mo - 1, d, h, mi).getTime();
+
+function sessionMeta(over: Partial<SessionMeta> & { sessionId: string }): SessionMeta {
+  return {
+    file: `C:\\claude\\projects\\p\\${over.sessionId}.jsonl`,
+    projectDir: 'p',
+    launchCwd: 'C:\\work\\app',
+    folder: 'C:\\work\\app',
+    customTitle: null,
+    aiTitle: null,
+    firstActivityMs: localMs(2026, 9, 1, 9, 5),
+    lastActivityMs: localMs(2026, 9, 1, 17, 30),
+    ...over,
+  };
+}
+
+function accountUse(over: Partial<SessionAccountUse> = {}): SessionAccountUse {
+  return {
+    accountId: 'acct-a',
+    label: 'main',
+    turns: 3,
+    tokens: 1500,
+    firstMs: localMs(2026, 9, 1, 9, 5),
+    lastMs: localMs(2026, 9, 1, 12, 0),
+    ...over,
+  };
+}
+
+const ESC_CHAR = String.fromCharCode(27);
+/** A title a hostile transcript could carry: an SGR recolor, an OSC window retitle, a forged
+ *  newline and a bidi override. */
+const HOSTILE_TITLE = `${ESC_CHAR}[31mpwn${ESC_CHAR}]0;owned\u0007\nfake line\u202e`;
+
+describe('renderSessionDetails', () => {
+  it('renders alias, folder, session, active window and per-account use', () => {
+    const out = renderSessionDetails(
+      [
+        {
+          meta: sessionMeta({ sessionId: 'aaaa-1111', customTitle: 'auth-work' }),
+          accounts: [
+            accountUse(),
+            accountUse({
+              accountId: null,
+              label: 'unattributed',
+              turns: 1,
+              tokens: 10,
+              firstMs: localMs(2026, 8, 30, 8, 0),
+              lastMs: localMs(2026, 9, 1, 8, 0),
+            }),
+          ],
+        },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'alias', inScope: true },
+    );
+    expect(out.split('\n')).toEqual([
+      'Alias     auth-work',
+      'Folder    C:\\work\\app',
+      'Session   aaaa-1111',
+      'Active    2026-09-01 09:05 -> 2026-09-01 17:30',
+      // Same-day use shows one stamp; use spanning days shows the range.
+      'Accounts  main  3 turns, 1.5k tokens  2026-09-01 12:00',
+      '          unattributed  1 turn, 10 tokens  2026-08-30 08:00 -> 2026-09-01 08:00',
+    ]);
+  });
+
+  it('marks a generated title and says how to set a real one', () => {
+    const out = renderSessionDetails(
+      [{ meta: sessionMeta({ sessionId: 's', aiTitle: 'Fix login' }), accounts: [] }],
+      { folder: 'C:\\work\\app', matchedBy: 'alias', inScope: true },
+    );
+    expect(out).toContain('Alias     Fix login  (generated title; /rename sets one)');
+  });
+
+  it('does not mark a custom title as generated', () => {
+    const out = renderSessionDetails(
+      [{ meta: sessionMeta({ sessionId: 's', customTitle: 'mine', aiTitle: 'ai' }), accounts: [] }],
+      { folder: 'C:\\work\\app', matchedBy: 'id' },
+    );
+    expect(out).toContain('Alias     mine');
+    expect(out).not.toContain('generated title');
+  });
+
+  it('marks the session the command runs inside, matching its id case-insensitively', () => {
+    const out = renderSessionDetails(
+      [{ meta: sessionMeta({ sessionId: 'abcd-ef', customTitle: 'me' }), accounts: [] }],
+      { folder: 'C:\\work\\app', matchedBy: 'id', currentSessionId: 'ABCD-EF' },
+    );
+    expect(out).toContain('Alias     me  <- this session');
+  });
+
+  it('does not mark another session as the current one', () => {
+    const out = renderSessionDetails(
+      [{ meta: sessionMeta({ sessionId: 'abcd-ef', customTitle: 'me' }), accounts: [] }],
+      { folder: 'C:\\work\\app', matchedBy: 'id', currentSessionId: 'other' },
+    );
+    expect(out).not.toContain('this session');
+  });
+
+  it('says so when the alias was found only in another folder', () => {
+    const out = renderSessionDetails(
+      [
+        {
+          meta: sessionMeta({ sessionId: 's', customTitle: 'api', folder: 'D:\\elsewhere' }),
+          accounts: [],
+        },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'alias', inScope: false },
+    );
+    expect(out.split('\n')[0]).toBe(
+      'No session with that alias in C:\\work\\app; showing the one in D:\\elsewhere.',
+    );
+  });
+
+  it('shows no out-of-folder notice for an in-folder alias or an id match', () => {
+    const views: SessionView[] = [
+      { meta: sessionMeta({ sessionId: 's', customTitle: 'api', folder: 'D:\\x' }), accounts: [] },
+    ];
+    expect(
+      renderSessionDetails(views, { folder: 'C:\\work\\app', matchedBy: 'alias', inScope: true }),
+    ).not.toContain('No session with that alias');
+    expect(renderSessionDetails(views, { folder: 'C:\\work\\app', matchedBy: 'id' })).not.toContain(
+      'No session with that alias',
+    );
+  });
+
+  it('explains the resume picker when several sessions share the alias', () => {
+    const out = renderSessionDetails(
+      [
+        { meta: sessionMeta({ sessionId: 'one', customTitle: 'api' }), accounts: [] },
+        { meta: sessionMeta({ sessionId: 'two', customTitle: 'api' }), accounts: [] },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'alias', inScope: true },
+    );
+    expect(out).toContain('2 sessions share this alias in this folder');
+    expect(out).toContain('opens a picker');
+    // One block per session, separated by a blank line.
+    expect(out).toContain('Session   one\n');
+    expect(out).toContain('\n\nAlias     api\n');
+    expect(out).toContain('Session   two');
+  });
+
+  it('spells out the missing pieces instead of printing blanks', () => {
+    const out = renderSessionDetails(
+      [
+        {
+          meta: sessionMeta({
+            sessionId: 's',
+            folder: null,
+            launchCwd: null,
+            firstActivityMs: null,
+          }),
+          accounts: [],
+        },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'id' },
+    );
+    expect(out).toContain('Alias     (none)');
+    expect(out).toContain('Folder    (unknown)');
+    expect(out).toContain('Active    ? -> 2026-09-01 17:30');
+    expect(out).toContain('Accounts  (no turns recorded yet)');
+  });
+
+  it('shows where a relocated session was started', () => {
+    const out = renderSessionDetails(
+      [
+        {
+          meta: sessionMeta({ sessionId: 's', launchCwd: 'C:\\old', folder: 'C:\\work\\app' }),
+          accounts: [],
+        },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'id' },
+    );
+    expect(out).toContain('Folder    C:\\work\\app\n          (started in C:\\old)');
+  });
+
+  it('strips terminal control sequences from titles, folders and labels', () => {
+    const out = renderSessionDetails(
+      [
+        {
+          meta: sessionMeta({
+            sessionId: 's',
+            customTitle: HOSTILE_TITLE,
+            folder: `C:\\work\\${ESC_CHAR}[2Jwiped`,
+          }),
+          accounts: [accountUse({ label: `${ESC_CHAR}[31mred-label` })],
+        },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'id' },
+    );
+    expect(out).not.toContain(ESC_CHAR);
+    expect(out).not.toContain('\u0007');
+    expect(out).not.toContain('\u202e');
+    // The forged newline is gone: the title stays on the Alias line.
+    expect(out.split('\n')[0]).toBe('Alias     [31mpwn]0;ownedfake line');
+  });
+
+  it('never lets color change the visible text', () => {
+    const views: SessionView[] = [
+      {
+        meta: sessionMeta({ sessionId: 's', aiTitle: 'gen', folder: 'D:\\x' }),
+        accounts: [accountUse(), accountUse({ accountId: null, label: 'unattributed' })],
+      },
+    ];
+    const ctx = {
+      folder: 'C:\\work\\app',
+      matchedBy: 'alias' as const,
+      inScope: false,
+      currentSessionId: 's',
+    };
+    expect(stripAnsi(renderSessionDetails(views, ctx, ANSI_PALETTE))).toBe(
+      renderSessionDetails(views, ctx, PLAIN_PALETTE),
+    );
+  });
+});
+
+describe('renderSessionAliasList', () => {
+  const views: SessionView[] = [
+    {
+      meta: sessionMeta({
+        sessionId: '11111111-aaaa',
+        customTitle: 'auth-work',
+        lastActivityMs: localMs(2026, 9, 2, 8, 15),
+      }),
+      accounts: [accountUse(), accountUse({ accountId: 'acct-b', label: 'spare' })],
+    },
+    {
+      meta: sessionMeta({ sessionId: '22222222-bbbb', aiTitle: 'Fix login' }),
+      accounts: [],
+    },
+  ];
+
+  it('lists one row per session under aligned headers, with the folder above', () => {
+    const out = renderSessionAliasList(views, { folder: 'C:\\work\\app' });
+    const lines = out.split('\n');
+    expect(lines[0]).toBe('C:\\work\\app');
+    expect(lines[1]).toBe('');
+    expect(lines[2]).toMatch(/^ALIAS\s+LAST ACTIVE\s+ACCOUNTS\s+SESSION$/);
+    // Columns line up: each value starts where its header does.
+    const col = (header: string) => lines[2]!.indexOf(header);
+    expect(lines[3]!.indexOf('2026-09-02 08:15')).toBe(col('LAST ACTIVE'));
+    expect(lines[3]!.indexOf('main, spare')).toBe(col('ACCOUNTS'));
+    // Only the short session id is shown.
+    expect(lines[3]!.endsWith('11111111')).toBe(true);
+    expect(out).not.toContain('11111111-aaaa');
+    // A session with no turns shows a dash, not an empty cell.
+    expect(lines[4]!.slice(col('ACCOUNTS'), col('ACCOUNTS') + 1)).toBe('-');
+  });
+
+  it('marks generated titles and the current session, and explains both marks', () => {
+    const out = renderSessionAliasList(views, {
+      folder: 'C:\\work\\app',
+      currentSessionId: '11111111-AAAA',
+    });
+    expect(out).toMatch(/^auth-work \* /m);
+    expect(out).toMatch(/^Fix login ~ /m);
+    expect(out.split('\n').at(-1)).toBe('~ generated title   * this session');
+  });
+
+  it('omits the legend when there is nothing to explain', () => {
+    const out = renderSessionAliasList([views[0]!], { folder: 'C:\\work\\app' });
+    expect(out).not.toContain('generated title');
+    expect(out).not.toContain('this session');
+  });
+
+  it('adds a FOLDER column, and no folder heading, when listing every folder', () => {
+    const out = renderSessionAliasList(views, { folder: null });
+    const lines = out.split('\n');
+    expect(lines[0]).toMatch(/^ALIAS\s+LAST ACTIVE\s+ACCOUNTS\s+SESSION\s+FOLDER$/);
+    expect(lines[1]!.endsWith('C:\\work\\app')).toBe(true);
+  });
+
+  it('says how to name a session when there are none', () => {
+    expect(renderSessionAliasList([], { folder: 'C:\\work\\app' })).toBe(
+      'No named sessions in C:\\work\\app. Name one with /rename <alias> (or claude --name <alias>).',
+    );
+    expect(renderSessionAliasList([], { folder: null })).toMatch(
+      /^No named sessions on this machine\./,
+    );
+  });
+
+  it('strips terminal control sequences from aliases, labels and folders', () => {
+    const out = renderSessionAliasList(
+      [
+        {
+          meta: sessionMeta({
+            sessionId: 's',
+            customTitle: HOSTILE_TITLE,
+            folder: `C:\\${ESC_CHAR}[2Jx`,
+          }),
+          accounts: [accountUse({ label: `${ESC_CHAR}[31mred` })],
+        },
+      ],
+      { folder: null },
+    );
+    expect(out).not.toContain(ESC_CHAR);
+    expect(out).not.toContain('\u0007');
+    // The forged newline cannot add a row: header + one data row.
+    expect(out.split('\n')).toHaveLength(2);
+  });
+});
+
+describe('renderAmbiguousAlias', () => {
+  it('lists each folder using the alias with its session count and last activity', () => {
+    const out = renderAmbiguousAlias('api', [
+      {
+        folder: 'D:\\one',
+        sessions: [
+          sessionMeta({ sessionId: 'a', lastActivityMs: localMs(2026, 9, 3, 14, 0) }),
+          sessionMeta({ sessionId: 'b', lastActivityMs: localMs(2026, 9, 1, 9, 0) }),
+        ],
+      },
+      { folder: 'E:\\two', sessions: [sessionMeta({ sessionId: 'c' })] },
+    ]);
+    expect(out.split('\n')).toEqual([
+      '"api" is not a session in this folder, and 2 other folders use it:',
+      '  D:\\one  (2 sessions)  last active 2026-09-03 14:00',
+      '  E:\\two  (1 session)  last active 2026-09-01 17:30',
+      '',
+      'Run it from one of those folders, or pass --cwd <folder>.',
+    ]);
+  });
+
+  it('strips terminal control sequences from the alias and the folders', () => {
+    const out = renderAmbiguousAlias(HOSTILE_TITLE, [
+      { folder: `D:\\${ESC_CHAR}[2Jone`, sessions: [sessionMeta({ sessionId: 'a' })] },
+    ]);
+    expect(out).not.toContain(ESC_CHAR);
+    expect(out).not.toContain('\u202e');
+  });
+});
+
+describe('sessionViewJson', () => {
+  it('emits stable fields with ISO timestamps and the per-account breakdown', () => {
+    const view: SessionView = {
+      meta: sessionMeta({ sessionId: 's1', customTitle: 'auth-work', aiTitle: 'Generated' }),
+      accounts: [accountUse()],
+    };
+    expect(sessionViewJson(view)).toEqual({
+      sessionId: 's1',
+      alias: 'auth-work',
+      aliasSource: 'custom',
+      customTitle: 'auth-work',
+      aiTitle: 'Generated',
+      folder: 'C:\\work\\app',
+      launchCwd: 'C:\\work\\app',
+      firstActivity: new Date(localMs(2026, 9, 1, 9, 5)).toISOString(),
+      lastActivity: new Date(localMs(2026, 9, 1, 17, 30)).toISOString(),
+      transcript: 'C:\\claude\\projects\\p\\s1.jsonl',
+      accounts: [
+        {
+          accountId: 'acct-a',
+          label: 'main',
+          turns: 3,
+          tokens: 1500,
+          first: new Date(localMs(2026, 9, 1, 9, 5)).toISOString(),
+          last: new Date(localMs(2026, 9, 1, 12, 0)).toISOString(),
+        },
+      ],
+    });
+  });
+
+  it('names the alias source: auto for a generated title, none for a blank custom title', () => {
+    const auto = sessionViewJson({
+      meta: sessionMeta({ sessionId: 's', aiTitle: 'gen' }),
+      accounts: [],
+    });
+    expect(auto).toMatchObject({ alias: 'gen', aliasSource: 'auto' });
+    // A blank custom title hides the generated one, exactly as claude --resume reads it.
+    const blank = sessionViewJson({
+      meta: sessionMeta({ sessionId: 's', customTitle: ' ', aiTitle: 'gen' }),
+      accounts: [],
+    });
+    expect(blank).toMatchObject({
+      alias: null,
+      aliasSource: null,
+      customTitle: ' ',
+      aiTitle: 'gen',
+    });
+    const none = sessionViewJson({
+      meta: sessionMeta({ sessionId: 's', firstActivityMs: null }),
+      accounts: [],
+    });
+    expect(none).toMatchObject({ alias: null, aliasSource: null, firstActivity: null });
+  });
+
+  it('keeps a hostile title verbatim: JSON escapes it, the terminal renderers strip it', () => {
+    const json = sessionViewJson({
+      meta: sessionMeta({ sessionId: 's', customTitle: HOSTILE_TITLE }),
+      accounts: [],
+    });
+    expect(json['alias']).toBe(HOSTILE_TITLE);
+    const text = JSON.stringify(json);
+    expect(text).not.toContain(ESC_CHAR);
+    expect((JSON.parse(text) as Record<string, unknown>)['customTitle']).toBe(HOSTILE_TITLE);
   });
 });

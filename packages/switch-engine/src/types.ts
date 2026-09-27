@@ -214,14 +214,28 @@ export interface FolderBindingSnapshotGroup {
   members: string[];
 }
 
-/** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets. */
+/** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets.
+ *
+ *  `phase` says how far the switch got, and so what the slot's live files may hold:
+ *  - `begin`: nothing live has been written (the previous account's rotation may have been adopted
+ *    into the vault, and the target refreshed there — both are kept).
+ *  - `writing`: recorded BEFORE the first live write, so the credentials, the identity block, both
+ *    or neither may be the target's. Recovery must look at the files; it can never assume either.
+ *  - `written`: both live files were written; the registry commit had not happened.
+ *  - `refreshed`: written only by older builds, immediately before their first live write — so it
+ *    means exactly what `writing` means and is recovered the same way. This build never writes it. */
 export interface SwitchIntent {
-  phase: 'begin' | 'refreshed' | 'written';
+  phase: 'begin' | 'refreshed' | 'writing' | 'written';
   targetId: string;
   prevActiveId: string | null;
   /** Whether a DPAPI rollback snapshot of the prior live credentials exists on disk. */
   hasRollback: boolean;
   startedAtMs: number;
+  /** Set when the switch failed and is being undone. Whoever settles it later (after that undo
+   *  failed too) must finish the undo, never complete the switch: the caller was told it failed, and
+   *  the target's identity block in the live files is then the switch's own write, not evidence of
+   *  whose token sits beside it. */
+  undo?: boolean;
 }
 
 /** What `activate()` actually did — reported honestly at the mechanism level.
@@ -250,10 +264,13 @@ export interface ReloginResult {
   healedLiveLogin: boolean;
 }
 
-/** Outcome of a startup recovery sweep. */
+/** Outcome of a startup recovery sweep. `unsettled` (with `recovered: false`): a switch is pending
+ *  in some slot that could not be finished or undone yet; `detail` says which and why (every other
+ *  slot was recovered regardless). It stays pending, and every operation on that slot retries it
+ *  (see `UnsettledSwitchError`). */
 export interface RecoverResult {
   recovered: boolean;
-  action: 'none' | 'rolled_forward' | 'rolled_back' | 'cleared';
+  action: 'none' | 'rolled_forward' | 'rolled_back' | 'cleared' | 'unsettled';
   detail?: string;
 }
 
@@ -356,13 +373,38 @@ export interface UnbindResult {
  *  - `group_active_mismatch` (d): a group's recorded `activeId` names a different member than the
  *    one whose identity is actually live in the profile.
  *  - `broken_profile_link` (e): a shared file/dir in a profile is no longer correctly linked to
- *    main (repaired by `ensureGroupProfile`, not by `repairSlots`). */
+ *    main (repaired by `ensureGroupProfile`, not by `repairSlots`).
+ *  - `live_identity_mismatch`: a slot's live credentials are one stored account's token while its
+ *    identity block names a different account — a switch torn between its two live writes that no
+ *    pending intent describes. Every reader that goes by the identity block misjudges who is live, so
+ *    it is repaired by re-seating the account the token belongs to (or the slot's rightful one).
+ *  - `orphan_profile_login`: a profile dir no group owns still holds a live login. It is no slot, so
+ *    nothing else would ever notice or clear it; `repairSlots` clears it (after adopting its rotation).
+ *  - `duplicate_stored_token`: two accounts' bundles store the same token — either the same login
+ *    stored twice, or one account holding another's token. Nothing can tell which bundle is wrong
+ *    from the files, so it is only alerted on (a re-login of the wrong one fixes it).
+ *  - `unreadable_bundle`: an account's stored bundle could not be read or decrypted, so none of the
+ *    token checks could include it. Alert only.
+ *  - `unsettled_switch`: a slot's switch was interrupted longer ago than any switch can still be
+ *    running and nothing has been able to finish or undo it (another program holding the slot's
+ *    live files open), or its record cannot be read. Every operation on that slot retries it; until
+ *    one succeeds, writes to that slot are refused. Alert only.
+ *  - `token_in_multiple_slots`: one refresh token is live in two or more slots whose live logins
+ *    name different accounts (or none) — a token stored under two accounts, each seated somewhere.
+ *    The same breach as (a), which is keyed by account and cannot see it; nothing can tell which
+ *    slot is wrong, so it is alerted on (a re-login of the wrong account fixes it). */
 export type SlotViolationKind =
   | 'account_in_multiple_slots'
   | 'reserved_live_in_global'
   | 'nonmember_live_in_group'
   | 'group_active_mismatch'
-  | 'broken_profile_link';
+  | 'broken_profile_link'
+  | 'live_identity_mismatch'
+  | 'orphan_profile_login'
+  | 'duplicate_stored_token'
+  | 'unreadable_bundle'
+  | 'unsettled_switch'
+  | 'token_in_multiple_slots';
 
 /** One invariant breach, with enough context to alert on and to repair. Every message names the
  *  offending account and/or folder (a hard requirement of the verb). */
@@ -376,7 +418,8 @@ export interface SlotViolation {
   slot?: SlotId;
   /** For `account_in_multiple_slots`: every slot the account is live in. */
   slots?: SlotId[];
-  /** The group the breach concerns, when it is a group slot. */
+  /** The group the breach concerns, when it is a group slot. For `orphan_profile_login`, the name of
+   *  the profile dir (the id of the group that once owned it). */
   groupId?: string;
 }
 

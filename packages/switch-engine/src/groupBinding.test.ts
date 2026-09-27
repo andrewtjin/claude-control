@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { SwitchEngine, type BindFs } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
-import { Vault } from './vault.js';
+import { MAX_GROUP_MEMBERS, MAX_GROUPS, Vault } from './vault.js';
 import { groupProfileDir, sandboxPaths, folderBindingsPath, type Paths } from './paths.js';
 import {
   readFolderBindingSnapshot,
@@ -251,6 +251,46 @@ describe('bindFolder — the global-slot hand-off', () => {
     // Unchanged: A still shared and globally live, no group.
     expect((await h.vault.listGroups()).length).toBe(0);
     expect(await h.engine.getActiveId('global')).toBe(A.id);
+  });
+
+  it('refuses a bind over the member cap before moving the global slot off anyone', async () => {
+    const h = await harness();
+    const A = await h.engine.addAccount('A', bundleFor('A', NOW + 10 * HOUR));
+    await h.engine.addAccount('R', bundleFor('R', NOW + 10 * HOUR)); // a ready global replacement
+    const extra: string[] = [];
+    for (let i = 0; i < MAX_GROUP_MEMBERS; i += 1) {
+      extra.push((await h.vault.addAccount(`M${i}`, bundleFor(`M${i}`, NOW + 10 * HOUR))).id);
+    }
+    await h.engine.activate(A.id);
+    const work = await h.folder('work');
+
+    // A plus 32 others is one member too many for a group.
+    await expect(h.engine.bindFolder(work, [A.id, ...extra])).rejects.toThrow(
+      `more than ${MAX_GROUP_MEMBERS} members`,
+    );
+    // Nothing moved: A is still the global live account and no group exists.
+    expect(await h.engine.getActiveId('global')).toBe(A.id);
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect((await h.vault.listGroups()).length).toBe(0);
+  });
+
+  it('refuses a bind past the group cap before moving the global slot off anyone', async () => {
+    const h = await harness();
+    const A = await h.engine.addAccount('A', bundleFor('A', NOW + 10 * HOUR));
+    await h.engine.addAccount('R', bundleFor('R', NOW + 10 * HOUR));
+    for (let i = 0; i < MAX_GROUPS; i += 1) {
+      const x = await h.vault.addAccount(`X${i}`, bundleFor(`X${i}`, NOW + 10 * HOUR));
+      await h.vault.createGroup({ memberIds: [x.id] });
+    }
+    await h.engine.activate(A.id);
+    const work = await h.folder('work');
+
+    await expect(h.engine.bindFolder(work, [A.id])).rejects.toThrow(
+      `cannot create another group (max ${MAX_GROUPS})`,
+    );
+    expect(await h.engine.getActiveId('global')).toBe(A.id);
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect((await h.vault.listGroups()).length).toBe(MAX_GROUPS);
   });
 });
 
@@ -505,6 +545,85 @@ describe('bindFolder — crash safety (fault after each step converges)', () => 
     const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
     expect(snap.groups.length).toBe(1);
     expect(await fresh.checkSlots()).toEqual([]);
+  });
+
+  it('after ensure-live, before the snapshot: a routine repair with no slot breach writes it', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    const faulted = h.restart((cp) => {
+      if (cp === 'bind:after-ensure-live') throw new Error('boom');
+    });
+    await expect(faulted.bindFolder(work, [A.id, B.id])).rejects.toThrow('boom');
+
+    // Every slot is legal, so the repair has nothing to move — but the guard would otherwise keep
+    // reading a snapshot that does not know the folder is bound.
+    const fresh = h.restart();
+    expect(await fresh.checkSlots()).toEqual([]);
+    await fresh.repairSlots();
+
+    const freshness = await fresh.getGuardSnapshotFreshness();
+    expect(freshness).toMatchObject({ present: true, fresh: true });
+    const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(snap.groups.flatMap((g) => g.folders)).toEqual([work]);
+  });
+});
+
+describe('the guard snapshot follows every change to a bound member', () => {
+  it('removing the last member drops the dissolved group from the snapshot and empties its slot', async () => {
+    const h = await harness();
+    const { A } = await seed(h);
+    const work = await h.folder('work');
+    const bound = await h.engine.bindFolder(work, [A.id]);
+
+    await h.engine.removeAccount(A.id);
+
+    const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(snap.groups).toEqual([]);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+    expect(await groupStore(h.paths, bound.group.id).readLiveCredentials()).toBeUndefined();
+    expect(existsSync(join(h.paths.vaultDir, 'slots', bound.group.id))).toBe(false);
+  });
+
+  it('removing one member rewrites the member labels the guard names', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.bindFolder(work, [A.id, B.id]);
+
+    await h.engine.removeAccount(B.id);
+
+    const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(snap.groups.map((g) => g.members)).toEqual([['A']]);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+  });
+
+  it('renaming a reserved member rewrites the member labels the guard names', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.bindFolder(work, [A.id, B.id]);
+
+    await h.engine.renameAccount(B.id, 'Research');
+
+    const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
+    expect(snap.groups[0]!.members.sort()).toEqual(['A', 'Research']);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+  });
+
+  it('refreshSnapshotIfStale rewrites a stale snapshot once and leaves a fresh one alone', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    const faulted = h.restart((cp) => {
+      if (cp === 'bind:after-ensure-live') throw new Error('boom');
+    });
+    await expect(faulted.bindFolder(work, [A.id, B.id])).rejects.toThrow('boom');
+
+    const fresh = h.restart();
+    expect(await fresh.refreshSnapshotIfStale()).toBe(true);
+    expect((await fresh.getGuardSnapshotFreshness()).fresh).toBe(true);
+    expect(await fresh.refreshSnapshotIfStale()).toBe(false);
   });
 });
 

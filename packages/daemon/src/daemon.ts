@@ -128,6 +128,9 @@ export interface SwitchEngineLike {
   repairSlots?(): Promise<RepairResult>;
   /** Rewrite the guard snapshot from the current registry + configured enforce mode. */
   refreshSnapshot?(): Promise<void>;
+  /** Rewrite the guard snapshot only when it no longer matches the registry; resolves whether it
+   *  rewrote. Lock-free when the snapshot is fresh, so it is cheap enough to run every cycle. */
+  refreshSnapshotIfStale?(): Promise<boolean>;
   /** The config dir a managed spawn runs in for an account (a reserved member's profile dir, or
    *  undefined for a shared account) — the seam wired into the SDK client. */
   configDirForAccount?(accountId: string): Promise<string | undefined>;
@@ -150,7 +153,7 @@ export interface SwitchEngineLike {
 export interface AutoSwitcherLike {
   evaluate(
     accounts: AccountUsageInput[],
-    opts?: { slotKey?: string; candidateIds?: ReadonlySet<string>; slotLabel?: string },
+    opts?: { slotKey?: SlotId; candidateIds?: ReadonlySet<string>; slotLabel?: string },
   ): Promise<string | undefined>;
 }
 
@@ -336,6 +339,12 @@ function describeRepairedViolation(v: SlotViolation): string {
     case 'account_in_multiple_slots':
       // One account was live in more than one slot; each slot was re-seated on its rightful account.
       return `${v.detail}; cctl re-seated each slot on its own account.`;
+    case 'live_identity_mismatch':
+      // A slot's token and identity named different accounts; the slot was re-seated so both agree.
+      return `${v.detail}; cctl re-seated the slot so its credentials and identity name one account.`;
+    case 'orphan_profile_login':
+      // A dissolved binding's profile was still logged in; its login was cleared.
+      return `${v.detail}; cctl cleared that login from the unused profile.`;
     default:
       // broken_profile_link is not repaired by repairSlots (ensureGroupProfile owns it); a future
       // repairable kind lands here with an honest generic corrective clause rather than silence.
@@ -919,6 +928,13 @@ export class Daemon {
     const recovery = await this.switchEngine.recover();
     if (recovery.recovered) {
       this.logger.info({ recovery }, 'switch engine recovery ran on daemon startup');
+    } else if (recovery.action === 'unsettled') {
+      // Not fatal: writes to that slot are refused until it settles (every operation on it retries
+      // it), the other slots were recovered, and the slot watchdog alerts on it (unsettled_switch).
+      this.logger.warn(
+        { recovery },
+        'an interrupted switch could not be settled on daemon startup; its slot is not switched until it is',
+      );
     }
 
     // Rewrite the folder-bindings guard snapshot once at startup, so it reflects the current
@@ -1386,7 +1402,8 @@ export class Daemon {
   }
 
   /**
-   * Self-heal every group slot and repair illegal slot occupancy, once per cycle. For each group:
+   * Self-heal every group slot and repair illegal slot occupancy, once per cycle. First a stale guard
+   * snapshot is rewritten (see the body for why nothing else would). Then, for each group:
    * `ensureGroupLive` materializes its profile and makes a usable member live (a no-op steady-state),
    * and a group left with no working account is alerted on. Then `checkSlots` finds any invariant
    * breach and `repairSlots` fixes the (a)-(d) ones under the engine lock; whatever a repair could
@@ -1395,6 +1412,23 @@ export class Daemon {
    * same way as one repairSlots fixes.
    */
   private async maintainSlots(groups: StoredGroup[]): Promise<void> {
+    // Every group mutation writes the guard snapshot LAST, so a crash between the registry write and
+    // the snapshot write leaves the snapshot stale while every slot is legal — nothing below would
+    // notice, and the guard would keep enforcing the old binding set (fail-open for a new binding,
+    // a stray block for a dissolved one) until a restart. Converge it here, once per cycle.
+    const refreshSnapshotIfStale = this.switchEngine.refreshSnapshotIfStale?.bind(
+      this.switchEngine,
+    );
+    if (refreshSnapshotIfStale) {
+      try {
+        if (await refreshSnapshotIfStale()) {
+          this.logger.info('rewrote a stale folder-bindings snapshot');
+        }
+      } catch (err) {
+        this.logger.warn({ err }, 'could not refresh a stale folder-bindings snapshot');
+      }
+    }
+
     const checkSlots = this.switchEngine.checkSlots?.bind(this.switchEngine);
     // Take the breach snapshot BEFORE the per-group self-heal. ensureGroupLive re-seats a group's
     // rightful member over a stranger it finds in the profile as a side effect, so a check taken
@@ -1772,8 +1806,9 @@ export class Daemon {
       windowEndMs: this.clock(),
       labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
       // A folder-bound session's turns join against the member live in its group's slot, not the
-      // global account — so map each recorded session to its slot for the aggregator.
+      // global account — so map each recorded session to its slot (spans first, then the mirror).
       slotBySession: slotBySessionMap(this.store.listSessions()),
+      slotSpans: this.store.listSessionSlotSpans(),
     });
   }
 
@@ -1845,8 +1880,13 @@ export class Daemon {
       const targetGroupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
       if (targetGroupId !== undefined) targetSlot = groupSlotId(targetGroupId);
       // Phone-initiated: stamped 'phone' so the audit trail (and activation_intervals) can tell
-      // this apart from the CLI's own 'manual' /switch and from a policy-driven 'auto' hop.
-      const result = await this.switchEngine.activate(resolved.account.id, { origin: 'phone' });
+      // this apart from the CLI's own 'manual' /switch and from a policy-driven 'auto' hop. The slot
+      // resolved above is asserted: if a bind or unbind moved the account between that read and the
+      // switch, the engine refuses rather than switching a slot the operator was not told about.
+      const result = await this.switchEngine.activate(resolved.account.id, {
+        origin: 'phone',
+        slot: targetSlot,
+      });
       // Named by LABEL, which is how the operator addressed the account and how the auto-switch
       // card already reports one. A `/switch spare` answered with "switched to 6f2a-…" tells the
       // user something they did not ask about, in the one vocabulary they never use — and the

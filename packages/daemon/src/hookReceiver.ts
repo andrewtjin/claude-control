@@ -111,6 +111,11 @@ export interface HookReceiverOptions {
    *  the CLI falls through to the SDK gate and the phone sees exactly ONE card). Default:
    *  nothing is managed (interactive CLI windows keep every card). */
   isManagedSession?: (sessionId: string) => boolean;
+  /** Told about every hook event that names a session and carries the forwarder's `configDir`
+   *  stamp (`null` = the shared config dir), whatever the event. The daemon records the session's
+   *  slot from it for attribution (see sessionSlotRecorder.ts). Must return fast and never throw
+   *  into the hook path; a throw is caught and logged. Default: nothing is recorded. */
+  onSessionSeen?: (sighting: { sessionId: string; configDir: string | null }) => void;
   /** How long a channel long-poll is held before answering empty. See
    *  {@link DEFAULT_CHANNEL_POLL_MS}; tests shorten it so a bound can be exercised in
    *  milliseconds rather than half a minute. */
@@ -496,6 +501,8 @@ export class HookReceiver {
    *  insert, so it stays bounded by the number of RECENTLY-failing sessions. */
   private readonly apiErrorCardLastAt = new Map<string, number>();
   private readonly isManagedSession: (sessionId: string) => boolean;
+  private readonly onSessionSeen:
+    ((sighting: { sessionId: string; configDir: string | null }) => void) | undefined;
   private readonly channelPollMs: number;
   private readonly requestStop: (() => void) | undefined;
   private server: Server | undefined;
@@ -600,6 +607,7 @@ export class HookReceiver {
     this.fullToolOutput = options.fullToolOutput ?? false;
     this.apiErrorCards = options.apiErrorCards ?? true;
     this.isManagedSession = options.isManagedSession ?? (() => false);
+    this.onSessionSeen = options.onSessionSeen;
     this.channelPollMs = options.channelPollMs ?? DEFAULT_CHANNEL_POLL_MS;
     this.requestStop = options.requestStop;
   }
@@ -1404,6 +1412,7 @@ export class HookReceiver {
       this.respond(res, 400, { ok: false, error: 'missing event name' });
       return;
     }
+    this.noteSessionSighting(body);
 
     if (event === this.eventNames.permissionRequest) {
       this.handlePermissionRequest(body, res, event);
@@ -1436,6 +1445,25 @@ export class HookReceiver {
       'hook POST with unrecognized event name - not an event we handle',
     );
     this.respond(res, 400, { ok: false, error: `unrecognized event "${event}"` });
+  }
+
+  /** Pass a hook event's session + config dir stamp to {@link HookReceiverOptions.onSessionSeen}.
+   *  Only a payload the forwarder stamped counts: an absent `configDir` (an older forwarder, an
+   *  internal sender) says nothing about the slot, whereas `null` positively means the shared dir.
+   *  A non-string, non-null stamp is not the forwarder's and is ignored. */
+  private noteSessionSighting(body: Record<string, unknown>): void {
+    if (this.onSessionSeen === undefined) return;
+    if (!Object.prototype.hasOwnProperty.call(body, 'configDir')) return;
+    const sessionId = str(body.session_id) ?? str(body.sessionId);
+    const raw = body.configDir;
+    // An empty id names no session (no transcript turn carries one), so it records nothing.
+    if (sessionId === undefined || sessionId === '') return;
+    if (raw !== null && typeof raw !== 'string') return;
+    try {
+      this.onSessionSeen({ sessionId, configDir: raw === '' ? null : raw });
+    } catch (err) {
+      this.logger.warn({ err, sessionId }, 'session sighting handler threw (attribution only)');
+    }
   }
 
   private handlePermissionRequest(

@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   RefreshError,
+  SwitchFailedError,
   VaultError,
   type ActivateResult,
   type DedupeReport,
+  type RecoverResult,
   type StoredAccount,
 } from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
@@ -62,6 +64,9 @@ const engine = vi.hoisted(() => ({
     Promise.reject(new Error(`renameAccount(${id}, ${label}) not stubbed`)),
   ),
   removeAccount: vi.fn((): Promise<void> => Promise.resolve()),
+  recover: vi.fn((): Promise<RecoverResult> =>
+    Promise.resolve({ recovered: false, action: 'none' }),
+  ),
 }));
 // `cctl switch` resolves across the whole registry; keep the mock's whole-registry view in sync with
 // whatever a test stubbed on listAccounts (the shared pool) so the existing switch tests still drive it.
@@ -370,7 +375,17 @@ describe('buildProgram', () => {
   it('nests session subcommands', () => {
     const session = buildProgram().commands.find((c) => c.name() === 'session');
     const subs = session?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['label', 'register', 'status', 'unregister', 'watch']);
+    expect(subs).toEqual(['aliases', 'label', 'register', 'show', 'status', 'unregister', 'watch']);
+  });
+
+  it('offers the alias lookup flags on session show and session aliases', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const flags = (name: string) =>
+      session?.commands.find((c) => c.name() === name)?.options.map((o) => o.long);
+    expect(flags('show')).toEqual(expect.arrayContaining(['--cwd', '--json']));
+    expect(flags('aliases')).toEqual(
+      expect.arrayContaining(['--cwd', '--all', '--auto', '--json']),
+    );
   });
 
   it('offers --session on the register/label/watch/unregister session commands', () => {
@@ -689,6 +704,60 @@ describe('switch', () => {
         'Nothing was changed - try again shortly.\n',
     );
     expect(r.out).toBe('');
+  });
+
+  it('prints a switch another program kept from writing as one plain line, not the raw error', async () => {
+    const said =
+      'could not write C:\\Users\\me\\.claude.json (EPERM): another program probably has it open ' +
+      '(an editor, a backup or sync tool, antivirus), or it is read-only. The switch to "Work" was ' +
+      'undone and the previous login was kept - nothing changed. Close that program (or wait for ' +
+      'it to finish) and try again.';
+    engine.listAccounts.mockResolvedValueOnce([account]);
+    engine.activate.mockRejectedValueOnce(
+      new SwitchFailedError(said, 'restored', {
+        cause: Object.assign(new Error("EPERM: operation not permitted, rename '.tmp-1'"), {
+          code: 'EPERM',
+        }),
+      }),
+    );
+
+    const r = await runCli(['switch', 'Work']);
+
+    expect(r).toEqual({ out: '', err: `error: ${said}\n`, exited: true });
+  });
+});
+
+describe('recover', () => {
+  it('says what it recovered', async () => {
+    engine.recover.mockResolvedValueOnce({
+      recovered: true,
+      action: 'rolled_back',
+      detail: 'restored previous live credentials',
+    });
+
+    const r = await runCli(['recover']);
+
+    expect(r).toEqual({
+      out: 'Recovered: rolled_back - restored previous live credentials.\n',
+      err: '',
+      exited: false,
+    });
+  });
+
+  it('exits non-zero with the reason when a switch could not be settled', async () => {
+    engine.recover.mockResolvedValueOnce({
+      recovered: false,
+      action: 'unsettled',
+      detail: 'a switch of the global slot to "Work" was interrupted and could not be finished',
+    });
+
+    const r = await runCli(['recover']);
+
+    expect(r.exited).toBe(true);
+    expect(r.out).toBe('');
+    expect(r.err).toContain(
+      'a switch of the global slot to "Work" was interrupted and could not be finished',
+    );
   });
 });
 
@@ -1054,4 +1123,41 @@ describe('folder-bound account commands', () => {
     expect(r.err).toContain('cannot capture inside a folder profile');
     expect(r.err).toContain('--fresh');
   });
+});
+
+describe('doctor with a folder-bindings registry this build cannot read', () => {
+  let root: string;
+  beforeEach(async () => {
+    // Every path doctor reads resolves inside a sandbox, never near the operator's real files.
+    root = await mkdtemp(join(tmpdir(), 'cctl-doctor-groups-'));
+    vi.stubEnv('LOCALAPPDATA', root);
+    vi.stubEnv('XDG_DATA_HOME', root);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'claude'));
+    vi.stubEnv('NO_COLOR', '1');
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it(
+    'still prints every check, with the unreadable file as one failed check',
+    { timeout: 60_000 },
+    async () => {
+      const unreadable = new VaultError(
+        'groups.json has an unsupported schemaVersion (2); a newer build wrote it',
+      );
+      engine.listGroups.mockRejectedValueOnce(unreadable);
+      engine.checkSlots.mockRejectedValueOnce(unreadable);
+      engine.getGuardSnapshotFreshness.mockRejectedValueOnce(unreadable);
+
+      const r = await runCli(['doctor']);
+
+      expect(r.exited).toBe(false);
+      expect(r.out).toMatch(/\[!!\] bindings: .*schemaVersion/);
+      expect(r.out).toContain('[!!] slots:');
+      expect(r.out).toContain('guard-hook:');
+      expect(r.out).toMatch(/\d+ ok, \d+ to look at\./);
+    },
+  );
 });

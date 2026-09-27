@@ -540,6 +540,81 @@ describe('Store', () => {
       }
     });
   });
+
+  describe('session_slot_spans', () => {
+    it('writes the first sighting of a session and reports that it did', () => {
+      expect(store.recordSessionSlot('s1', 'group:g1', 1000)).toBe(true);
+      expect(store.listSessionSlotSpans()).toEqual([
+        { sessionId: 's1', slot: 'group:g1', startedAtMs: 1000 },
+      ]);
+    });
+
+    it('ignores a repeat of the slot already in force, so a hook storm adds no rows', () => {
+      store.recordSessionSlot('s1', 'global', 1000);
+      // Every later event of the same run reports the same slot: no write, whatever the time.
+      expect(store.recordSessionSlot('s1', 'global', 2000)).toBe(false);
+      expect(store.recordSessionSlot('s1', 'global', 3000)).toBe(false);
+      expect(store.listSessionSlotSpans()).toHaveLength(1);
+    });
+
+    it('opens a new span on every slot CHANGE, including a change back to an earlier slot', () => {
+      // A session resumed from the global profile into a group, then back out again: three runs,
+      // three spans. Deduping against "any earlier span" instead of "the latest" would lose the third.
+      expect(store.recordSessionSlot('s1', 'global', 1000)).toBe(true);
+      expect(store.recordSessionSlot('s1', 'group:g1', 2000)).toBe(true);
+      expect(store.recordSessionSlot('s1', 'global', 3000)).toBe(true);
+      expect(store.listSessionSlotSpans().map((r) => [r.slot, r.startedAtMs])).toEqual([
+        ['global', 1000],
+        ['group:g1', 2000],
+        ['global', 3000],
+      ]);
+    });
+
+    it('keeps the first of two different slots recorded in the same millisecond', () => {
+      store.recordSessionSlot('s1', 'global', 1000);
+      store.recordSessionSlot('s1', 'group:g1', 2000);
+      // Same (session, instant) as the group span: the primary key refuses it rather than throwing.
+      expect(store.recordSessionSlot('s1', 'group:g2', 2000)).toBe(false);
+      expect(store.listSessionSlotSpans().map((r) => r.slot)).toEqual(['global', 'group:g1']);
+    });
+
+    it('dedupes against the LATEST span by time, not by insertion order', () => {
+      store.recordSessionSlot('s1', 'group:g1', 5000);
+      // An earlier sighting that lands late is still a distinct span...
+      expect(store.recordSessionSlot('s1', 'global', 1000)).toBe(true);
+      // ...and the latest span by time is still the group one, so a repeat of it is a no-op.
+      expect(store.recordSessionSlot('s1', 'group:g1', 6000)).toBe(false);
+      expect(store.listSessionSlotSpans().map((r) => [r.slot, r.startedAtMs])).toEqual([
+        ['global', 1000],
+        ['group:g1', 5000],
+      ]);
+    });
+
+    it('tracks each session independently', () => {
+      store.recordSessionSlot('s1', 'group:g1', 1000);
+      // Another session in the same slot is its own first sighting, not a repeat of s1's.
+      expect(store.recordSessionSlot('s2', 'group:g1', 1000)).toBe(true);
+      expect(store.recordSessionSlot('s2', 'global', 1500)).toBe(true);
+      expect(store.recordSessionSlot('s1', 'group:g1', 2000)).toBe(false);
+    });
+
+    it('lists spans grouped by session and oldest first within each', () => {
+      store.recordSessionSlot('s2', 'group:g1', 300);
+      store.recordSessionSlot('s1', 'group:g1', 200);
+      store.recordSessionSlot('s2', 'global', 100);
+      store.recordSessionSlot('s1', 'global', 100);
+      expect(store.listSessionSlotSpans()).toEqual([
+        { sessionId: 's1', slot: 'global', startedAtMs: 100 },
+        { sessionId: 's1', slot: 'group:g1', startedAtMs: 200 },
+        { sessionId: 's2', slot: 'global', startedAtMs: 100 },
+        { sessionId: 's2', slot: 'group:g1', startedAtMs: 300 },
+      ]);
+    });
+
+    it('lists nothing on a fresh database', () => {
+      expect(store.listSessionSlotSpans()).toEqual([]);
+    });
+  });
 });
 
 // Retention has to stay cheap on the table it exists to bound, so this checks the PLAN, not just
@@ -652,6 +727,52 @@ describe('Store migration', () => {
       expect(store.getPendingPermission('new-1')?.origin).toBe('managed');
     } finally {
       store.close();
+    }
+  });
+
+  it('adds the session_slot_spans table to a database written before it existed, keeping old rows', () => {
+    const dbPath = join(dir, 'daemon.db');
+    // Build the current schema, write an ordinary row, then remove the spans table: exactly the
+    // file a daemon from before slot spans leaves behind.
+    const first = new Store(dbPath);
+    first.replaceActivationIntervals([
+      { accountId: 'a', startedAtMs: 1000, endedAtMs: null, origin: null, slot: 'group:g1' },
+    ]);
+    first.close();
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec('DROP TABLE session_slot_spans');
+    legacy.close();
+
+    const store = new Store(dbPath);
+    try {
+      // The pre-existing data survives the reopen untouched...
+      expect(store.listActivationIntervals().map((r) => [r.accountId, r.slot])).toEqual([
+        ['a', 'group:g1'],
+      ]);
+      // ...and the new table is there, empty, and writable.
+      expect(store.listSessionSlotSpans()).toEqual([]);
+      expect(store.recordSessionSlot('s1', 'group:g1', 2000)).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('keeps recorded slot spans across a reopen', () => {
+    const dbPath = join(dir, 'daemon.db');
+    const first = new Store(dbPath);
+    first.recordSessionSlot('s1', 'group:g1', 1000);
+    first.close();
+
+    // The daemon writes spans and `cctl session show` reads them from another process later.
+    const second = new Store(dbPath);
+    try {
+      expect(second.listSessionSlotSpans()).toEqual([
+        { sessionId: 's1', slot: 'group:g1', startedAtMs: 1000 },
+      ]);
+      // The dedupe survives the reopen too: the same slot is still a no-op.
+      expect(second.recordSessionSlot('s1', 'group:g1', 5000)).toBe(false);
+    } finally {
+      second.close();
     }
   });
 
