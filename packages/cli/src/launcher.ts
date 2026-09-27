@@ -576,6 +576,9 @@ export interface ClaudeSessionArgs {
    *  launched from `repo`, is written to repo's project directory with every cwd rewritten to
    *  `repo`). So a fork belongs to the folder it is launched in, not to the one it came from. */
   fork: boolean;
+  /** `-p` / `--print`: a non-interactive run. Its `--resume <title>` search also finds sessions
+   *  created by `-p` or the SDK, which the interactive search leaves out. */
+  print?: true;
   /** Set when no session opens: the first operand names a subcommand, or the first word is one of
    *  Claude Code's fast paths. */
   subcommand?: string;
@@ -631,6 +634,7 @@ export function parseClaudeSessionArgs(args: readonly string[]): ClaudeSessionAr
     if (name === '--resume' || name === '-r') out.resume = value;
     else if (name === '--continue' || name === '-c') out.continue = true;
     else if (name === '--fork-session') out.fork = true;
+    else if (name === '-p' || name === '--print') out.print = true;
     else if ((name === '--name' || name === '-n') && value !== null) out.name = value;
     else if (name === '--session-id' && value !== null) out.sessionId = value;
   };
@@ -722,6 +726,9 @@ export interface LaunchSessionFacts {
   /** The folder the conversation belongs to, as recorded and trusted (readRecordedFolder's
    *  `folder`); null when none is. */
   folder: string | null;
+  /** How the session was started, as its first line recording one says (`cli` interactively,
+   *  `sdk-cli` for `-p` or the SDK); absent when the quick read sees none. */
+  entrypoint?: string;
   /** The project directory the transcript lives in: with no trusted folder, it stands for the launch
    *  folder when it can (recordedFolderFor). Absent = unknown, so no fallback applies. */
   dirName?: string;
@@ -790,6 +797,9 @@ function namedTitle(title: string | null): string | null {
 /** No session the launcher can name: the folder rule decides. */
 const FOLDER_RULE: LaunchSessions = { kind: 'candidates', candidates: [] };
 
+/** The entrypoint Claude Code records for a session started by `-p` or the SDK. */
+const SDK_ENTRYPOINT = 'sdk-cli';
+
 /**
  * The session(s) a launch opens, as Claude Code will pick them — each with the title it will carry
  * and the folder its conversation belongs to:
@@ -845,7 +855,12 @@ export async function resolveLaunchSessions(
     // Every match opens under its own custom title, whose key IS the resume text's: unbound there,
     // no match can route by alias, so none needs reading.
     if (name === undefined && !isBound(value)) return FOLDER_RULE;
-    return { kind: 'candidates', candidates: (await deps.sessionsTitled(value)).map(opened) };
+    const matches = await deps.sessionsTitled(value);
+    // Interactively, Claude Code's title search leaves out sessions started by `-p` or the SDK
+    // (measured: its picker reports no match for them); a `-p` launch finds them.
+    const reachable =
+      parsed.print === true ? matches : matches.filter((s) => s.entrypoint !== SDK_ENTRYPOINT);
+    return { kind: 'candidates', candidates: reachable.map(opened) };
   }
   if (parsed.sessionId !== undefined) {
     const id = parsed.sessionId.trim();

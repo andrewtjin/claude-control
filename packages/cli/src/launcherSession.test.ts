@@ -53,7 +53,7 @@ const TABLE: Array<[string, string[], ClaudeSessionArgs]> = [
   [
     'an OPTIONAL value is not taken when dash-led (-p after -r)',
     ['-r', '-p', 'hello'],
-    parsed({ resume: null }),
+    parsed({ resume: null, print: true }),
   ],
   [
     'a REQUIRED value is taken even when it looks like a flag',
@@ -72,17 +72,21 @@ const TABLE: Array<[string, string[], ClaudeSessionArgs]> = [
   ],
   ['--continue', ['--continue'], parsed({ continue: true })],
   ['-c', ['-c'], parsed({ continue: true })],
-  ['combined short booleans -pc expand', ['-pc', 'hi'], parsed({ continue: true })],
+  ['combined short booleans -pc expand', ['-pc', 'hi'], parsed({ continue: true, print: true })],
   [
     'combined -cr: -c then -r taking the next token',
     ['-cr', 'Auth Work'],
     parsed({ continue: true, resume: 'Auth Work' }),
   ],
-  ['combined -pn: -p then -n taking the next token', ['-pn', 'x'], parsed({ name: 'x' })],
+  [
+    'combined -pn: -p then -n taking the next token',
+    ['-pn', 'x'],
+    parsed({ name: 'x', print: true }),
+  ],
   [
     'combined -pcrX: -p, -c, then -r with the rest attached',
     ['-pcrX'],
-    parsed({ continue: true, resume: 'X' }),
+    parsed({ continue: true, resume: 'X', print: true }),
   ],
   ['-nX attaches the name', ['-nX'], parsed({ name: 'X' })],
   ['-d2e is one flag, not -d with the value "2e"', ['-d2e', '-c'], parsed({ continue: true })],
@@ -179,7 +183,7 @@ const TABLE: Array<[string, string[], ClaudeSessionArgs]> = [
   [
     'an unrecognized short flag inside a combined token: its remaining letters may be session flags',
     ['-pzc'],
-    parsed({ uncertain: 'unrecognized option "-z"' }),
+    parsed({ uncertain: 'unrecognized option "-z"', print: true }),
   ],
   [
     'an unrecognized short flag with no session letters and nothing after is certain',
@@ -429,8 +433,9 @@ describe('the option table matches Claude Code 2.1.283', () => {
     },
   );
   it.each(BOOLEAN)('%s is a known boolean: never uncertain, never takes a value', (opt) => {
+    const print = opt === '-p' || opt === '--print' ? { print: true as const } : {};
     expect(parseClaudeSessionArgs([opt, 'mcp', '--name', 'n'])).toEqual(
-      parsed({ subcommand: 'mcp' }),
+      parsed({ subcommand: 'mcp', ...print }),
     );
   });
 });
@@ -497,7 +502,7 @@ describe('subcommands and paths that open no session', () => {
     'the fast-path word %s later in the argv is prompt text',
     (word) => {
       expect(parseClaudeSessionArgs(['-p', word, '--name', 'Auth Work'])).toEqual(
-        parsed({ name: 'Auth Work' }),
+        parsed({ name: 'Auth Work', print: true }),
       );
     },
   );
@@ -511,7 +516,9 @@ describe('subcommands and paths that open no session', () => {
   });
 
   it('daemon after any other option is prompt text', () => {
-    expect(parseClaudeSessionArgs(['-p', 'daemon', '--name', 'x'])).toEqual(parsed({ name: 'x' }));
+    expect(parseClaudeSessionArgs(['-p', 'daemon', '--name', 'x'])).toEqual(
+      parsed({ name: 'x', print: true }),
+    );
   });
 
   it.each([
@@ -709,6 +716,21 @@ describe('resolveLaunchSessions', () => {
     ]);
     expect(await candidates(['-r', ID, '--fork-session', '-n', 'n'], deps, ctx('n'))).toEqual([
       { title: 'n', folder: 'C:\\work' },
+    ]);
+  });
+
+  it('an interactive title search leaves out sessions started by -p or the SDK; a -p launch keeps them', async () => {
+    // Measured: interactive `claude --resume "<title>"` reports no match for a session whose
+    // transcript records entrypoint "sdk-cli".
+    const sdk = { ...facts('Auth Work'), entrypoint: 'sdk-cli' };
+    const tui = { ...facts('Auth Work', 'C:\\tui'), entrypoint: 'cli' };
+    const { deps } = store({ titled: [sdk, tui] });
+    expect(await candidates(['-r', 'Auth Work'], deps, ctx('auth work'))).toEqual([
+      { title: 'Auth Work', folder: 'C:\\tui' },
+    ]);
+    expect(await candidates(['-p', '-r', 'Auth Work'], deps, ctx('auth work'))).toEqual([
+      { title: 'Auth Work', folder: 'C:\\work' },
+      { title: 'Auth Work', folder: 'C:\\tui' },
     ]);
   });
 

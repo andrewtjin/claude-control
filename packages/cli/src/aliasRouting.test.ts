@@ -109,7 +109,7 @@ const transcriptPath = (dirOf: string, id: string): string =>
 function ccTranscript(
   cwd: string,
   id: string,
-  opts: { title: string; prompt?: string; tail?: object[]; dirOf?: string },
+  opts: { title: string; prompt?: string; tail?: object[]; dirOf?: string; entrypoint?: string },
 ): string {
   const prompt = opts.prompt ?? 'hi';
   const file = transcriptPath(opts.dirOf ?? cwd, id);
@@ -119,7 +119,14 @@ function ccTranscript(
     { type: 'agent-name', agentName: opts.title, sessionId: id },
     { type: 'queue-operation', operation: 'enqueue', sessionId: id, content: prompt },
     { type: 'queue-operation', operation: 'dequeue', sessionId: id },
-    { type: 'user', message: { role: 'user', content: prompt }, cwd, sessionId: id },
+    {
+      type: 'user',
+      message: { role: 'user', content: prompt },
+      // `cli` for an interactive session, `sdk-cli` for one started by `-p` or the SDK.
+      entrypoint: opts.entrypoint ?? 'cli',
+      cwd,
+      sessionId: id,
+    },
     { type: 'assistant', message: { role: 'assistant', content: 'OK' }, cwd, sessionId: id },
     { type: 'custom-title', customTitle: opts.title, sessionId: id },
     ...(opts.tail ?? []),
@@ -444,6 +451,23 @@ describe('a transcript whose head claims a folder its project directory does not
     // ...and on the reserved account it is blocked, not silently allowed.
     const onA = guard({ slot: 'A', projectDir: elsewhere, title: 'X', transcript: file });
     expect(onA.decision).toBe('block');
+  });
+});
+
+describe('a bound session started by -p or the SDK', () => {
+  // Measured: interactive `claude --resume "<title>"` does not list a session whose transcript
+  // records entrypoint "sdk-cli" (its picker reports no match); `claude -p --resume` resumes it.
+  it('an interactive launch does not route by it; a -p launch does, and the guard agrees', async () => {
+    const repo = dir('repo');
+    const groups = bindAlias(repo, 'Batch');
+    const file = ccTranscript(repo, `${SID}0`, { title: 'Batch', entrypoint: 'sdk-cli' });
+
+    expect(await launch(repo, ['--resume', 'Batch'], groups)).toBe('global');
+    const slot = await launch(repo, ['-p', 'go on', '--resume', 'Batch'], groups);
+    expect({
+      slot,
+      verdict: guard({ slot, projectDir: repo, title: 'Batch', transcript: file }),
+    }).toEqual({ slot: 'A', verdict: {} });
   });
 });
 

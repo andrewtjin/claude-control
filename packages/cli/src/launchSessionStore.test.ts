@@ -88,6 +88,16 @@ describe('transcriptFacts (Claude Code’s quick read)', () => {
     expect(transcriptFacts('', '')).toEqual({ customTitle: null, aiTitle: null, folder: null });
     expect(transcriptFacts(line({ type: 'user', cwd: '' }), '').folder).toBeNull();
   });
+
+  it('reads how the session was started from the first head line recording it', () => {
+    const head = [
+      line({ type: 'custom-title', customTitle: 'T' }),
+      line({ type: 'user', entrypoint: 'sdk-cli', cwd: 'C:\\w' }),
+      line({ type: 'user', entrypoint: 'cli', cwd: 'C:\\w' }),
+    ].join('\n');
+    expect(transcriptFacts(head, head).entrypoint).toBe('sdk-cli');
+    expect(transcriptFacts(user('C:\\w'), '')).not.toHaveProperty('entrypoint');
+  });
 });
 
 describe('the field readers', () => {

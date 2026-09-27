@@ -78,6 +78,8 @@ export interface TranscriptQuickRead {
   /** The folder as Claude Code's quick read sees it; null when its windows record none. Used only to
    *  predict Claude Code's search — never as a binding key (see the file header). */
   folder: string | null;
+  /** The entrypoint of the first head line recording one (`cli`, `sdk-cli`); absent when none. */
+  entrypoint?: string;
 }
 
 /** No title, no folder: an empty transcript, or one whose windows record neither. */
@@ -191,11 +193,13 @@ export function transcriptFacts(head: string, tail: string): TranscriptQuickRead
   if (head === '') return NOTHING_RECORDED;
   const folder =
     lastTypedLineValue(tail, 'relocatedCwd', 'relocated') ?? firstLineValue(head, 'cwd');
+  const entrypoint = firstLineValue(head, 'entrypoint');
   return {
     customTitle:
       lastStringValue(tail, 'customTitle') ?? lastStringValue(head, 'customTitle') ?? null,
     aiTitle: lastStringValue(tail, 'aiTitle') ?? lastStringValue(head, 'aiTitle') ?? null,
     folder: folder === undefined || folder === '' ? null : folder,
+    ...(entrypoint !== undefined ? { entrypoint } : {}),
   };
 }
 
@@ -468,6 +472,7 @@ export function launchSessionStore(options: LaunchSessionStoreOptions): LaunchSe
       aiTitle: quick.aiTitle,
       folder: recorded.folder,
       dirName: recorded.dirName,
+      ...(quick.entrypoint !== undefined ? { entrypoint: quick.entrypoint } : {}),
     };
   };
   /** Read one transcript as a session the launch opens, or null when it cannot be read. */
