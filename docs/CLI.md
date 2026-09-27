@@ -119,7 +119,7 @@ cctl settings set <name> <value>    # persist a daemon setting by alias or env v
                                     # aliases listed below)
 cctl settings unset <name>          # remove a persisted daemon setting
 cctl doctor     # environment checks: Node version, vault crypto round-trip, vault dir,
-                # live login, ~/.claude.json
+                # live login, ~/.claude.json, and that every login token has one owner
 ```
 
 ## The daemon

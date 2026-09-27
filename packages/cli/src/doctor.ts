@@ -10,8 +10,10 @@ import {
   defaultLiveCredentialChannel,
   defaultProtector,
   quoteSecurityArg,
+  SwitchEngine,
   type LiveCredentialChannel,
   type Paths,
+  type TokenConflict,
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
@@ -288,6 +290,34 @@ export async function checkChannelAllowlist(
   };
 }
 
+/**
+ * Whether every login token belongs to exactly one account: no stored token under two accounts, and
+ * no live token under another account's identity. Either is what a switch torn between its two live
+ * writes led to in earlier builds (the next switch stored the target's token in the previous
+ * account's bundle), and nothing else surfaces it until a refresh fails with a dead token or usage
+ * is attributed to the wrong account. Report-only: the detail names the accounts and the fix.
+ *
+ * `find` is the engine's {@link SwitchEngine.findTokenConflicts}, injected so the verdict and its
+ * wording are tested without a vault. A check that cannot run (an unreadable registry) is reported
+ * rather than thrown, so the checks after it still run.
+ */
+export async function checkStoredTokens(
+  find: () => Promise<TokenConflict[]>,
+): Promise<DoctorCheck> {
+  try {
+    const conflicts = await find();
+    return conflicts.length === 0
+      ? { name: 'tokens', ok: true, detail: 'every stored and live login token has one owner' }
+      : { name: 'tokens', ok: false, detail: conflicts.map((c) => c.detail).join('; ') };
+  } catch (err) {
+    return {
+      name: 'tokens',
+      ok: false,
+      detail: `could not check the stored login tokens: ${(err as Error).message}`,
+    };
+  }
+}
+
 /** Run every check for the given paths. */
 export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
   return [
@@ -296,6 +326,7 @@ export async function runDoctor(paths: Paths): Promise<DoctorCheck[]> {
     checkVault(paths),
     await checkLiveLogin(paths),
     checkClaudeJson(paths),
+    await checkStoredTokens(() => new SwitchEngine({ paths }).findTokenConflicts()),
     checkSessionRuntime(),
     await checkChannelAllowlist(),
     { name: 'lock', ok: true, detail: join(paths.vaultDir, '.lock') },

@@ -13,11 +13,16 @@ import {
   healthUrlFromRelay,
   probeRelay,
   checkLiveLogin,
+  checkStoredTokens,
   MIN_NODE_VERSION,
   type DoctorCheck,
   type ProbeFetch,
 } from './doctor.js';
-import { sandboxPaths, type LiveCredentialChannel } from '@claude-control/switch-engine';
+import {
+  sandboxPaths,
+  type LiveCredentialChannel,
+  type TokenConflict,
+} from '@claude-control/switch-engine';
 
 // This file lives at packages/cli/src/, so two levels up is packages/, where the publishable
 // bundle lives at cctl-publish/package.json (see dependencyClosure.test.ts for the same idiom).
@@ -245,5 +250,29 @@ describe('checkLiveLogin (darwin)', () => {
     expect(res.detail).toContain('service="Custom-Item"');
     expect(res.detail).toContain('account="alt-user"');
     expect(res.detail).not.toContain('Claude Code-credentials');
+  });
+});
+
+describe('checkStoredTokens', () => {
+  it('passes when every stored and live token belongs to one account', async () => {
+    const res = await checkStoredTokens(() => Promise.resolve([]));
+    expect(res).toMatchObject({ name: 'tokens', ok: true });
+  });
+
+  it('fails with every conflict spelled out, so the operator knows which account to re-login', async () => {
+    const conflicts: TokenConflict[] = [
+      { kind: 'duplicate_stored_token', accountIds: ['p', 't'], detail: 'P and T share a token' },
+      { kind: 'live_identity_mismatch', accountIds: ['t', 'p'], detail: 'T is live as P' },
+    ];
+    const res = await checkStoredTokens(() => Promise.resolve(conflicts));
+    expect(res.ok).toBe(false);
+    expect(res.detail).toContain('P and T share a token');
+    expect(res.detail).toContain('T is live as P');
+  });
+
+  it('reports a check that could not run instead of throwing past the other checks', async () => {
+    const res = await checkStoredTokens(() => Promise.reject(new Error('registry is malformed')));
+    expect(res.ok).toBe(false);
+    expect(res.detail).toContain('registry is malformed');
   });
 });
