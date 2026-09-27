@@ -16,7 +16,7 @@ import {
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { isBindGuardInSettingsText } from '@claude-control/daemon';
 import type { SwitchEngine } from '@claude-control/switch-engine';
-import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
 
@@ -141,10 +141,18 @@ export async function probeRelay(
   }
 }
 
-/** Render checks as `[ok]/[!!]` lines (green/red when a color palette is injected). Pure. */
+/** Render checks as `[ok]/[!!]` lines (green/red when a color palette is injected). Pure.
+ *
+ *  A detail quotes account labels, group labels and folder paths straight out of the registry files,
+ *  which an older build or a hand edit may have left carrying terminal controls, so each line of it
+ *  is made terminal-safe here — the one place every check's text reaches the terminal. */
 export function renderDoctor(checks: DoctorCheck[], palette: Palette = PLAIN_PALETTE): string {
+  const safe = (text: string): string => text.split('\n').map(sanitizeForTerminal).join('\n');
   return checks
-    .map((c) => `${c.ok ? palette.green('[ok]') : palette.red('[!!]')} ${c.name}: ${c.detail}`)
+    .map(
+      (c) =>
+        `${c.ok ? palette.green('[ok]') : palette.red('[!!]')} ${safe(c.name)}: ${safe(c.detail)}`,
+    )
     .join('\n');
 }
 
@@ -363,6 +371,38 @@ export async function checkGuardSnapshot(
       detail: `could not read the guard snapshot: ${(err as Error).message}`,
     };
   }
+}
+
+/**
+ * The folder-binding checks `cctl doctor` appends: slot invariants, guard snapshot freshness, guard
+ * hook presence. They all read `groups.json`, and a doctor exists precisely for the day that file
+ * cannot be read (corrupt, or written by a newer build) — so an unreadable registry is reported as
+ * ONE failed `bindings` check naming the reason, and every other check still runs and reports, instead
+ * of the whole command dying on the first read with nothing but that error. With the bindings unknown,
+ * the guard hook is judged as if bindings exist: a missing guard may then be a real gap.
+ */
+export async function checkFolderBindings(
+  engine: Pick<SwitchEngine, 'listGroups' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
+  paths: Paths,
+): Promise<DoctorCheck[]> {
+  const out: DoctorCheck[] = [];
+  let hasBindings: boolean;
+  try {
+    hasBindings = (await engine.listGroups()).length > 0;
+  } catch (err) {
+    hasBindings = true;
+    out.push({
+      name: 'bindings',
+      ok: false,
+      detail: `could not read the folder bindings: ${(err as Error).message}`,
+    });
+  }
+  out.push(
+    await checkSlots(engine),
+    await checkGuardSnapshot(engine),
+    checkGuardHook(paths, hasBindings),
+  );
+  return out;
 }
 
 /** Whether the enforcement guard hook is installed in the main config dir's settings.json. When

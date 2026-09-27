@@ -18,6 +18,12 @@ export interface Paths {
   claudeJsonPath: string;
   /** Root of our encrypted vault + registry + audit trail. */
   vaultDir: string;
+  /** Set only when `CLAUDE_CONFIG_DIR` named a folder-bound group's profile and
+   *  {@link defaultPaths} saw it through to the main dir: the profile the calling session really
+   *  runs in, as the environment named it. Every other field describes the main dir; this is kept
+   *  for the one caller that must refuse rather than follow the see-through — capturing "the current
+   *  login", which inside a bound session is the profile's, never the main dir's. */
+  profileConfigDir?: string;
 }
 
 /** The platform's convention for machine-local app state (the vault must NOT roam or sync:
@@ -71,9 +77,11 @@ export function defaultPaths(
   // AND .claude.json both live inside it. Only the default (unset) case uses ~/.claude.json.
   // (Platform-independent per the CLI's docs; re-verify on macOS.)
   let configDir = env.CLAUDE_CONFIG_DIR?.trim() || undefined;
+  let profileConfigDir: string | undefined;
   if (configDir !== undefined) {
     const profileDir = profileDirContaining(configDir, profilesRoot(vaultDir), platform);
     if (profileDir !== undefined) {
+      profileConfigDir = configDir;
       const main = mainConfigDirForProfile(profileDir, vaultDir, platform, deps);
       // The default layout's main dir is ~/.claude with ~/.claude.json beside it — the same shape
       // an unset CLAUDE_CONFIG_DIR gives. A main dir that cannot be found (a profile missing its
@@ -88,6 +96,7 @@ export function defaultPaths(
     credentialsPath: join(claudeDir, '.credentials.json'),
     claudeJsonPath: configDir ? join(configDir, '.claude.json') : join(home, '.claude.json'),
     vaultDir,
+    ...(profileConfigDir !== undefined ? { profileConfigDir } : {}),
   };
 }
 

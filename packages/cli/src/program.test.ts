@@ -1065,3 +1065,40 @@ describe('folder-bound account commands', () => {
     expect(r.err).toContain('--fresh');
   });
 });
+
+describe('doctor with a folder-bindings registry this build cannot read', () => {
+  let root: string;
+  beforeEach(async () => {
+    // Every path doctor reads resolves inside a sandbox, never near the operator's real files.
+    root = await mkdtemp(join(tmpdir(), 'cctl-doctor-groups-'));
+    vi.stubEnv('LOCALAPPDATA', root);
+    vi.stubEnv('XDG_DATA_HOME', root);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'claude'));
+    vi.stubEnv('NO_COLOR', '1');
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it(
+    'still prints every check, with the unreadable file as one failed check',
+    { timeout: 60_000 },
+    async () => {
+      const unreadable = new VaultError(
+        'groups.json has an unsupported schemaVersion (2); a newer build wrote it',
+      );
+      engine.listGroups.mockRejectedValueOnce(unreadable);
+      engine.checkSlots.mockRejectedValueOnce(unreadable);
+      engine.getGuardSnapshotFreshness.mockRejectedValueOnce(unreadable);
+
+      const r = await runCli(['doctor']);
+
+      expect(r.exited).toBe(false);
+      expect(r.out).toMatch(/\[!!\] bindings: .*schemaVersion/);
+      expect(r.out).toContain('[!!] slots:');
+      expect(r.out).toContain('guard-hook:');
+      expect(r.out).toMatch(/\d+ ok, \d+ to look at\./);
+    },
+  );
+});
