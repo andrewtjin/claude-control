@@ -87,15 +87,20 @@ export interface BuildSnapshotInput {
  */
 export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBindingSnapshot {
   const groups: FolderBindingSnapshotGroup[] = input.groups.map((g) => {
-    // Canonical folders (the guard compares them by case-folded equality and containment only), and
-    // alias keys only: the guard compares a lower-cased, trimmed title and never shows the typed alias.
+    // Canonical folders (the guard compares them by case-folded equality and containment only); each
+    // alias scope as its comparison key plus the alias as bound, which the guard only ever shows.
     const scoped = scopedGroupOf(g, input.platform);
+    const stored = g.aliases ?? [];
     return {
       id: g.id,
       label: g.label,
       profileDir: input.profileDirOf(g.id),
       folders: scoped.folders.slice(),
-      aliases: (scoped.aliases ?? []).map((a) => ({ folder: a.folder, aliasKey: a.aliasKey })),
+      aliases: (scoped.aliases ?? []).map((a, i) => ({
+        folder: a.folder,
+        aliasKey: a.aliasKey,
+        alias: stored[i]?.alias ?? a.aliasKey,
+      })),
       members: g.members.map((m) => m.label),
     };
   });

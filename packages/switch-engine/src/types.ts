@@ -229,10 +229,12 @@ export interface FolderBindingSnapshotGroup {
   /** The group's profile dir; the guard matches a session's canonical config dir against it. */
   profileDir: string;
   folders: string[];
-  /** Alias scopes as KEYS only (the folder and the lower-cased, trimmed alias): the guard compares
-   *  a prompt's session title against them and never needs the typed text. Always present (possibly
-   *  empty) in a snapshot this build writes; a guard reading an older snapshot treats it as empty. */
-  aliases: { folder: string; aliasKey: string }[];
+  /** Alias scopes: the canonical folder, the key the guard compares a prompt's session title
+   *  against (lower-cased, trimmed), and the alias as bound, for the guard's messages and the
+   *  resume command it prints (a bound alias is printable text: bind refuses control and bidi
+   *  characters). Always present (possibly empty) in a snapshot this build writes; a guard reading
+   *  an older snapshot treats a missing list as empty and a missing `alias` as unknown. */
+  aliases: { folder: string; aliasKey: string; alias?: string }[];
   /** Member display labels, for the "bound to <members>" message. */
   members: string[];
 }

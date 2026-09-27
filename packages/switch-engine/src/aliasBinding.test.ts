@@ -196,7 +196,10 @@ describe('bindAlias — creating and reusing a group', () => {
     expect((await h.vault.listAccounts()).map((a) => a.id).sort()).toEqual([C.id, D.id].sort());
     expect((await groupStore(h.paths, res.group.id).readLiveCredentials())?.accessToken).toBe('A');
     const snap = (await readFolderBindingSnapshot(folderBindingsPath(h.paths.vaultDir)))!;
-    expect(snap.groups[0]?.aliases).toEqual([{ folder: repo, aliasKey: 'auth work' }]);
+    // The key the guard compares, plus the alias as bound for its messages.
+    expect(snap.groups[0]?.aliases).toEqual([
+      { folder: repo, aliasKey: 'auth work', alias: 'Auth Work' },
+    ]);
     expect(snap.groups[0]?.folders).toEqual([]);
     expect(await h.engine.checkSlots()).toEqual([]);
   });

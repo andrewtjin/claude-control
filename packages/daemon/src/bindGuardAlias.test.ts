@@ -4,18 +4,26 @@
 // embedded canonicalizer's realpath step behaves as in production.
 //
 // What is proved here: the session's alias comes from the payload's session_title (the custom
-// title), with a bounded transcript fallback ONLY when that key is absent; the precedence rule
-// (alias in the exact folder > longest folder binding > global) decides the required slot; the block
-// reasons name the right accounts and tell the operator how to resume; untrusted title text is inert
-// in the output; and the V1 enforce modes and relaxation tokens behave exactly as for folders.
+// title) and nowhere else — an absent key is an unnamed session, the transcript is never read for a
+// title; the alias rule keys on the folder the conversation was RECORDED in (its transcript's first
+// cwd), so a session Claude Code resumed across folders is judged by its own folder; the precedence
+// rule (alias of the recorded folder > longest folder binding > global) decides the required slot;
+// the block reasons name the right accounts and print a paste-safe resume command carrying the whole
+// alias; untrusted title text is inert in the output; and the V1 enforce modes and relaxation tokens
+// behave exactly as for folders.
 
-import { spawn } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { closeSync, ftruncateSync, openSync, realpathSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { canonicalizeFolder, folderKey } from '@claude-control/switch-engine';
+import {
+  canonicalizeFolder,
+  folderKey,
+  projectDirStem,
+  shellQuoteArg,
+} from '@claude-control/switch-engine';
 import { bindGuardPath, writeBindGuard } from './bindGuard.js';
 import { bindTokensDir, mintBindToken, type BindTokenKind } from './bindToken.js';
 
@@ -80,8 +88,17 @@ function payload(opts: { title?: unknown; transcript?: string; omitTitle?: boole
 
 const customTitleLine = (t: string): string =>
   JSON.stringify({ type: 'custom-title', customTitle: t });
-const userLine = (text: string): string =>
-  JSON.stringify({ type: 'user', message: { role: 'user', content: text } });
+const userLine = (text: string, cwd?: string): string =>
+  JSON.stringify({
+    type: 'user',
+    ...(cwd !== undefined ? { cwd } : {}),
+    message: { role: 'user', content: text },
+  });
+
+/** The `cctl claude --resume <alias>` a block reason prints, quoted for this host's shell. */
+const resumeHint = (alias: string): string =>
+  `cctl claude --resume ${shellQuoteArg(alias, process.platform)}`;
+const WIN = process.platform === 'win32';
 
 describe('bind guard — session alias rules', () => {
   let root: string;
@@ -177,9 +194,10 @@ describe('bind guard — session alias rules', () => {
       expect(r.code).toBe(0);
       expect(decision(r)).toEqual({
         decision: 'block',
+        // The whole alias, as one single-quoted literal (paste-safe in PowerShell and POSIX shells).
         reason:
           `cctl: session "Auth Work" in ${repo} is bound to research@x, but this session runs on ` +
-          'the shared account. Exit and resume it with: cctl claude --resume "Auth Work"',
+          `the shared account. Exit and resume it with: ${resumeHint('Auth Work')}`,
       });
     });
 
@@ -190,7 +208,7 @@ describe('bind guard — session alias rules', () => {
       expect(d.decision).toBe('block');
       expect(d.reason).toContain(`session "auth work" in ${repo} is bound to research@x`);
       expect(d.reason).toContain(`this session runs on work@x (bound to ${repo})`);
-      expect(d.reason).toContain('cctl claude --resume "auth work"');
+      expect(d.reason).toContain(resumeHint('auth work'));
       expect(d.reason).not.toContain('the shared account');
     });
 
@@ -201,16 +219,18 @@ describe('bind guard — session alias rules', () => {
         payload({ title: 'Something Else' }),
         onSlot(aliasProfile),
       );
+      // It may have been renamed away, or be another conversation altogether: the advice covers
+      // both, leading with the one that cannot hijack the alias.
       expect(decision(r)).toEqual({
         decision: 'block',
         reason:
           `cctl: this session runs on the account bound to session "auth work" in ${repo}, but it ` +
-          'is named "Something Else". That account is reserved to its bindings. Rename it back ' +
-          'with /rename auth work, or exit and run Claude Code here normally: cctl claude',
+          'is named "Something Else". That account is reserved to its bindings. Exit and start it ' +
+          'here with: cctl claude — or, if this is that session, rename it back: /rename auth work',
       });
     });
 
-    it('a non-string session_title means "no custom title" (and never triggers the transcript read)', async () => {
+    it('a non-string session_title means "no custom title" (the transcript is not read for one)', async () => {
       await writeSnapshot([aliasGroup()]);
       const transcript = join(root, 't.jsonl');
       // The transcript WOULD name the session correctly; the key is present, so it must not be read.
@@ -307,95 +327,300 @@ describe('bind guard — session alias rules', () => {
     });
   });
 
-  describe('transcript fallback (session_title key absent)', () => {
-    async function transcript(lines: string[], trailingNewline = true): Promise<string> {
+  describe('an absent session_title is an unnamed session', () => {
+    async function transcript(lines: string[]): Promise<string> {
       const file = join(root, `t-${Math.random().toString(16).slice(2)}.jsonl`);
-      await writeFile(file, lines.join('\n') + (trailingNewline ? '\n' : ''), 'utf8');
+      await writeFile(file, lines.join('\n') + '\n', 'utf8');
       return file;
     }
 
-    it('uses the LAST custom-title line (titles are last-wins)', async () => {
+    it('even when the transcript records a custom title (older Claude Code cannot use aliases)', async () => {
       await writeSnapshot([aliasGroup()]);
-      const t = await transcript([
-        userLine('a'),
-        customTitleLine('old name'),
-        userLine('b'),
-        customTitleLine('Auth Work'),
-        userLine('c'),
-      ]);
+      const t = await transcript([userLine('a', repo), customTitleLine('Auth Work')]);
+      // On the alias slot: unnamed, so outside the alias scope.
       const r = await runGuard(scriptPath, payload({ transcript: t }), onSlot(aliasProfile));
-      expect(r).toMatchObject({ code: 0, stdout: '', stderr: '' });
-      // The same transcript on the shared account → blocked as the bound alias.
-      const g = await runGuard(scriptPath, payload({ transcript: t }), onSlot(undefined));
-      expect(decision(g).reason).toContain('cctl claude --resume "Auth Work"');
-    });
-
-    it('a torn (half-written) last line is skipped in favour of the previous title', async () => {
-      await writeSnapshot([aliasGroup()]);
-      const t = await transcript(
-        [customTitleLine('Auth Work'), userLine('x'), '{"type":"custom-title","customTitle":"hal'],
-        false,
-      );
-      const r = await runGuard(scriptPath, payload({ transcript: t }), onSlot(aliasProfile));
-      expect(r).toMatchObject({ code: 0, stdout: '', stderr: '' });
-    });
-
-    it('a quoted "type":"custom-title" inside a message is not a title line', async () => {
-      await writeSnapshot([aliasGroup()]);
-      const t = await transcript([
-        customTitleLine('Auth Work'),
-        userLine('please write {"type":"custom-title","customTitle":"evil"}'),
-      ]);
-      const r = await runGuard(scriptPath, payload({ transcript: t }), onSlot(aliasProfile));
-      expect(r).toMatchObject({ code: 0, stdout: '', stderr: '' });
-    });
-
-    it('a missing transcript (first prompt, or a bad path) reads as unnamed', async () => {
-      await writeSnapshot([aliasGroup()]);
-      const missing = join(root, 'nope.jsonl');
-      const r = await runGuard(scriptPath, payload({ transcript: missing }), onSlot(aliasProfile));
       expect(decision(r).reason).toContain('but it is unnamed');
-      const dir = await runGuard(scriptPath, payload({ transcript: root }), onSlot(undefined));
-      expect(dir).toMatchObject({ code: 0, stdout: '', stderr: '' });
+      // On the shared account: unnamed sessions are not the alias's, so allowed.
+      const g = await runGuard(scriptPath, payload({ transcript: t }), onSlot(undefined));
+      expect(g).toMatchObject({ code: 0, stdout: '', stderr: '' });
     });
 
-    it('is bounded: a title only in the head of a huge transcript is not found; one near the end is', async () => {
+    it('the payload title decides when both exist', async () => {
       await writeSnapshot([aliasGroup()]);
-      // ~12 MiB of turns after the only title: past the 8 MiB scan bound, so the session reads as
-      // unnamed rather than the whole file being read on a prompt.
-      const filler = userLine('x'.repeat(1000));
-      const bulk = Array.from({ length: 12 * 1024 }, () => filler);
-      const headOnly = await transcript([customTitleLine('Auth Work'), ...bulk]);
-      const r1 = await runGuard(
-        scriptPath,
-        payload({ transcript: headOnly }),
-        onSlot(aliasProfile),
-      );
-      expect(decision(r1).reason).toContain('but it is unnamed');
-      // The same bulk with the title near the end is found.
-      const nearEnd = await transcript([...bulk, customTitleLine('Auth Work'), userLine('y')]);
-      const r2 = await runGuard(scriptPath, payload({ transcript: nearEnd }), onSlot(aliasProfile));
-      expect(r2).toMatchObject({ code: 0, stdout: '', stderr: '' });
-    });
-
-    it('a title line straddling a chunk boundary is read whole', async () => {
-      await writeSnapshot([aliasGroup()]);
-      // Pad so the title line crosses the 256 KiB read boundary counted from the end of the file.
-      const tail = userLine('z'.repeat(256 * 1024 - 40));
-      const t = await transcript([userLine('a'), customTitleLine('Auth Work'), tail]);
-      const r = await runGuard(scriptPath, payload({ transcript: t }), onSlot(aliasProfile));
-      expect(r).toMatchObject({ code: 0, stdout: '', stderr: '' });
-    });
-
-    it('the payload title wins over the transcript when both exist', async () => {
-      await writeSnapshot([aliasGroup()]);
-      const t = await transcript([customTitleLine('Auth Work')]);
+      const t = await transcript([userLine('a', repo), customTitleLine('Auth Work')]);
       const r = await runGuard(
         scriptPath,
         payload({ title: 'renamed', transcript: t }),
         onSlot(aliasProfile),
       );
       expect(decision(r).reason).toContain('is named "renamed"');
+    });
+
+    it('an unnamed session never opens its transcript (a locked or missing one cannot matter)', async () => {
+      await writeSnapshot([aliasGroup()]);
+      for (const t of [join(root, 'missing.jsonl'), root, 'a\u0000b', WIN ? 'NUL' : '/dev/zero']) {
+        const r = await runGuard(
+          scriptPath,
+          payload({ transcript: t }),
+          onSlot(aliasProfile, other),
+        );
+        expect({ t, err: r.stderr, d: decision(r).decision }).toEqual({
+          t,
+          err: '',
+          d: 'block',
+        });
+      }
+    });
+  });
+
+  describe('the alias rule keys on the folder the conversation was recorded in', () => {
+    // Measured on Claude Code 2.1.283: from a git repo root with worktrees, `claude --resume "<title>"`
+    // resumes (same id) a session recorded in a subfolder, a worktree or a prefix-sibling project
+    // ("proj-other" from "proj"). The hook then gets CLAUDE_PROJECT_DIR = the launch folder and the
+    // session's title, while the transcript stays in the ORIGINAL project dir, whose first line
+    // records the original cwd.
+    let sub: string;
+    let sibling: string;
+
+    beforeEach(async () => {
+      await mkdir(join(root, 'repo', 'sub'), { recursive: true });
+      await mkdir(join(root, 'repo-other'), { recursive: true });
+      sub = canon(join(root, 'repo', 'sub'));
+      sibling = canon(join(root, 'repo-other'));
+    });
+
+    /** A transcript where Claude Code keeps it: `<projects>/<encoded recorded folder>/<id>.jsonl`. */
+    async function recordedIn(folder: string, title: string | null): Promise<string> {
+      const dir = join(root, 'projects', projectDirStem(folder));
+      await mkdir(dir, { recursive: true });
+      const file = join(dir, `${Math.random().toString(16).slice(2)}.jsonl`);
+      const lines = [userLine('a', folder), ...(title !== null ? [customTitleLine(title)] : [])];
+      await writeFile(file, lines.join('\n') + '\n', 'utf8');
+      return file;
+    }
+
+    const bound = (folder: string) => ({ ...aliasGroup(), aliases: [{ folder, aliasKey: 'x' }] });
+
+    it('a subfolder’s bound session resumed from the repo root on the shared account → block', async () => {
+      await writeSnapshot([bound(sub)]);
+      const t = await recordedIn(sub, 'X');
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(undefined),
+      );
+      const d = decision(r);
+      expect(d.decision).toBe('block');
+      expect(d.reason).toContain(`session "X" in ${sub} is bound to research@x`);
+      expect(d.reason).toContain(resumeHint('X'));
+    });
+
+    it('…and on its own slot it is in scope, though it runs in the root', async () => {
+      await writeSnapshot([bound(sub)]);
+      const t = await recordedIn(sub, 'X');
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(aliasProfile),
+      );
+      expect(r).toMatchObject({ code: 0, stdout: '', stderr: '' });
+    });
+
+    it('a prefix-sibling project’s same-titled session never rides the bound folder’s slot', async () => {
+      await writeSnapshot([bound(repo)]);
+      const t = await recordedIn(sibling, 'X');
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(aliasProfile),
+      );
+      const d = decision(r);
+      expect(d.decision).toBe('block');
+      expect(d.reason).toContain(
+        `this session was recorded in ${sibling}, so it is not that conversation`,
+      );
+      // ...and on the shared account the foreign conversation is simply allowed.
+      const g = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(undefined),
+      );
+      expect(g).toMatchObject({ code: 0, stdout: '', stderr: '' });
+    });
+
+    it('before the transcript exists (the first prompt of a named launch) the folder it runs in counts', async () => {
+      await writeSnapshot([bound(repo)]);
+      const t = join(root, 'projects', projectDirStem(repo), 'not-yet.jsonl');
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(undefined),
+      );
+      expect(decision(r).decision).toBe('block');
+      const ok = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: t }),
+        onSlot(aliasProfile),
+      );
+      expect(ok).toMatchObject({ code: 0, stdout: '', stderr: '' });
+    });
+
+    it('a first line longer than the head window still yields its cwd', async () => {
+      await writeSnapshot([bound(sub)]);
+      const dir = join(root, 'projects', projectDirStem(sub));
+      await mkdir(dir, { recursive: true });
+      const file = join(dir, 'big.jsonl');
+      // cwd first, then a 3 MB pasted prompt on the same line: the line is never complete in the
+      // bounded read, so the value is taken from the raw head.
+      await writeFile(
+        file,
+        `{"type":"user","cwd":${JSON.stringify(sub)},"message":{"content":"${'y'.repeat(3 * 1024 * 1024)}"}}\n`,
+        'utf8',
+      );
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'x', transcript: file }),
+        onSlot(undefined),
+      );
+      expect(decision(r).decision).toBe('block');
+    });
+
+    it('an unreadable transcript falls back to its project-dir name, never failing open', async () => {
+      await writeSnapshot([bound(sub)]);
+      // A DIRECTORY at the transcript path: stat works, it is not a file, so no cwd is read; the
+      // project-dir name (the sub folder's) decides.
+      const dir = join(root, 'projects', projectDirStem(sub), 'as-dir.jsonl');
+      await mkdir(dir, { recursive: true });
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'X', transcript: dir }),
+        onSlot(undefined),
+      );
+      expect(r.stderr).toBe('');
+      expect(decision(r).decision).toBe('block');
+    });
+
+    describe.skipIf(!WIN)('a transcript locked by another process', () => {
+      let holder: ChildProcess | null = null;
+      afterEach(() => {
+        holder?.kill();
+        holder = null;
+      });
+
+      it('is judged by its project-dir name: the reserved slot outside its scope still blocks', async () => {
+        await writeSnapshot([bound(repo)]);
+        const t = await recordedIn(sibling, 'X');
+        const script = join(root, 'hold.ps1');
+        await writeFile(
+          script,
+          "param([string]$Path)\n$fs=[System.IO.File]::Open($Path,'Open','ReadWrite','ReadWrite')\n" +
+            "$fs.Lock(0,$fs.Length)\nWrite-Output 'locked'\nStart-Sleep -Seconds 30\n",
+          'utf8',
+        );
+        holder = spawn('powershell.exe', ['-NoProfile', '-File', script, '-Path', t]);
+        await new Promise<void>((resolve, reject) => {
+          const to = setTimeout(() => reject(new Error('the lock holder never locked')), 15000);
+          holder!.stdout!.on('data', (c: Buffer) => {
+            if (c.toString().includes('locked')) {
+              clearTimeout(to);
+              resolve();
+            }
+          });
+        });
+        const r = await runGuard(
+          scriptPath,
+          payload({ title: 'X', transcript: t }),
+          onSlot(aliasProfile),
+        );
+        expect(r.stderr).toBe('');
+        expect(decision(r).decision).toBe('block');
+      });
+    });
+  });
+
+  describe('printed commands survive the operator’s shell', () => {
+    it('a long bound alias is printed whole in the resume command', async () => {
+      const alias = 'Auth Work '.repeat(20).trim(); // 199 characters, bindable up to 512
+      const key = alias.toLowerCase();
+      await writeSnapshot([{ ...aliasGroup(), aliases: [{ folder: repo, aliasKey: key, alias }] }]);
+      const r = await runGuard(scriptPath, payload({ title: alias }), onSlot(undefined));
+      expect(decision(r).reason).toContain(resumeHint(alias));
+    });
+
+    it('the alias as bound is shown and resumed (not the lower-cased key)', async () => {
+      await writeSnapshot([
+        {
+          ...aliasGroup(),
+          aliases: [{ folder: repo, aliasKey: 'paper draft', alias: 'Paper Draft' }],
+        },
+      ]);
+      const renamed = await runGuard(scriptPath, payload({ title: 'other' }), onSlot(aliasProfile));
+      expect(decision(renamed).reason).toContain('/rename Paper Draft');
+      const shared = await runGuard(
+        scriptPath,
+        payload({ title: 'paper DRAFT' }),
+        onSlot(undefined),
+      );
+      expect(decision(shared).reason).toContain(resumeHint('Paper Draft'));
+    });
+
+    it.skipIf(!WIN)(
+      'PowerShell hands the printed alias to cctl as ONE unchanged argument',
+      async () => {
+        for (const alias of ['cost $HOME', 'say "hi" now', "it's `here`", 'Deploy $(calc)']) {
+          const key = alias.toLowerCase();
+          await writeSnapshot([
+            { ...aliasGroup(), aliases: [{ folder: repo, aliasKey: key, alias }] },
+          ]);
+          const r = await runGuard(scriptPath, payload({ title: alias }), onSlot(undefined));
+          const reason = decision(r).reason ?? '';
+          const cmd = reason.slice(reason.indexOf('cctl claude --resume'));
+          // A stub `cctl` function reports the argv PowerShell passes it.
+          const ps = spawnSync(
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-Command',
+              `function cctl { ConvertTo-Json -Compress -InputObject @($args) }; ${cmd}`,
+            ],
+            { encoding: 'utf8' },
+          );
+          const argv = JSON.parse(ps.stdout.trim() || '[]') as string[];
+          expect({ alias, got: argv[2] }).toEqual({ alias, got: alias });
+        }
+      },
+    );
+
+    it('a group with many long scopes and members still yields a small decision', async () => {
+      const aliases = Array.from({ length: 256 }, (_, i) => ({
+        folder: i === 0 ? repo : join(root, `f${i}-${'d'.repeat(200)}`),
+        aliasKey: `a${i}`,
+        alias: `A${i}`,
+      }));
+      const members = Array.from({ length: 32 }, (_, i) => `member-${i}-${'m'.repeat(300)}`);
+      await writeSnapshot([{ ...aliasGroup(), aliases, members }]);
+      // Case B names the binding's scopes: the first few, then a count.
+      const b = await runGuard(scriptPath, payload({ title: 'nope' }), onSlot(aliasProfile, other));
+      const reasonB = decision(b).reason ?? '';
+      expect(reasonB).toContain('and 253 more');
+      expect(reasonB.length).toBeLessThan(2500);
+      // Case A names its members the same way (the session is in the first alias's folder, on the
+      // shared account).
+      const a = await runGuard(scriptPath, payload({ title: 'A0' }), onSlot(undefined, repo));
+      const reasonA = decision(a).reason ?? '';
+      expect(reasonA).toContain('and 29 more');
+      expect(reasonA).toContain(resumeHint('A0'));
+      expect(reasonA.length).toBeLessThan(2500);
+    });
+
+    it('the --account notice of an alias-only binding says it is reserved to its bindings', async () => {
+      await writeSnapshot([aliasGroup()]);
+      const token = mintToken('explicit', aliasProfile);
+      const r = await runGuard(scriptPath, payload({ title: 'else' }), {
+        ...onSlot(aliasProfile, other),
+        CCTL_LAUNCH_EXPLICIT: token,
+      });
+      expect(decision(r).systemMessage).toContain('This account is reserved to its bindings.');
     });
   });
 
@@ -423,7 +648,7 @@ describe('bind guard — session alias rules', () => {
     it('warn → the block text rides a systemMessage; off → silent', async () => {
       await writeSnapshot([aliasGroup()], 'warn');
       const w = await runGuard(scriptPath, payload({ title: 'auth work' }), onSlot(undefined));
-      expect(decision(w).systemMessage).toContain('cctl claude --resume "auth work"');
+      expect(decision(w).systemMessage).toContain(resumeHint('auth work'));
       expect(decision(w).decision).toBeUndefined();
       await writeSnapshot([aliasGroup()], 'off');
       const o = await runGuard(scriptPath, payload({ title: 'auth work' }), onSlot(undefined));
@@ -469,6 +694,61 @@ describe('bind guard — session alias rules', () => {
         CCTL_LAUNCH_EXPLICIT: token,
       });
       expect(decision(r).decision).toBe('block');
+    });
+  });
+
+  describe('title shapes and cost', () => {
+    it('a title matches exactly when claude --resume would match it (lower-case + trim, no normalizing)', async () => {
+      const bound = 'Café İstanbul';
+      await writeSnapshot([
+        {
+          ...aliasGroup(),
+          aliases: [{ folder: repo, aliasKey: bound.toLowerCase().trim(), alias: bound }],
+        },
+      ]);
+      const cases: Array<[string, boolean]> = [
+        ['  CAFÉ İSTANBUL \u3000', true],
+        ['\ufeffcafé i̇stanbul', true],
+        ['Cafe\u0301 İstanbul', false], // NFD: claude --resume does not normalize either
+        ['Café\u200bIstanbul', false],
+        ['Café Istanbul', false],
+      ];
+      for (const [title, match] of cases) {
+        const r = await runGuard(scriptPath, payload({ title }), onSlot(aliasProfile));
+        expect({ title, allowed: r.stdout === '' }).toEqual({ title, allowed: match });
+      }
+    });
+
+    it('the registry at its caps and a 600 MB transcript cost a prompt a bounded read', async () => {
+      const groups = Array.from({ length: 64 }, (_, i) => ({
+        id: `g${i}`,
+        label: `L${i}`,
+        profileDir: i === 0 ? aliasProfile : join(root, `p${i}`),
+        folders: [],
+        aliases: Array.from({ length: 256 }, (_, k) => ({
+          folder: i === 0 && k === 0 ? repo : join(root, `f${i}-${k}`),
+          aliasKey: i === 0 && k === 0 ? 'bound' : `a${i}-${k}`,
+        })),
+        members: [`m${i}`],
+      }));
+      await writeSnapshot(groups);
+      // A newline-free 600 MB transcript whose title names the bound alias: only its head is read.
+      const dir = join(root, 'projects', projectDirStem(repo));
+      await mkdir(dir, { recursive: true });
+      const big = join(dir, 'big.jsonl');
+      const fd = openSync(big, 'w');
+      ftruncateSync(fd, 600 * 1024 * 1024);
+      closeSync(fd);
+      const t0 = Date.now();
+      const r = await runGuard(
+        scriptPath,
+        payload({ title: 'Bound', transcript: big }),
+        onSlot(undefined),
+      );
+      const ms = Date.now() - t0;
+      expect(decision(r).decision).toBe('block'); // no cwd in the head: the project-dir name decides
+      expect(ms).toBeLessThan(5000);
+      await rm(big, { force: true });
     });
   });
 

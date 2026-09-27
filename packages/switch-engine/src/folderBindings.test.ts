@@ -62,6 +62,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       },
     ];
     const snapshot = buildFolderBindingSnapshot({
+      platform: 'win32',
       groups,
       generation: 7,
       enforce: 'block',
@@ -88,7 +89,10 @@ describe('buildFolderBindingSnapshot (pure)', () => {
     });
   });
 
-  it('carries alias scopes as KEYS only (lower-cased, trimmed), never the typed alias', () => {
+  // The alias as bound rides beside its key: the guard shows it (sanitized) and prints it in the
+  // resume command, where the lower-cased key would read wrong. Titles are not secret, and a bound
+  // alias is printable text by construction (bind refuses control and bidi characters).
+  it('carries each alias scope as its key (lower-cased, trimmed) plus the alias as bound', () => {
     const groups: StoredGroup[] = [
       {
         id: 'g1',
@@ -102,14 +106,16 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       },
     ];
     const snapshot = buildFolderBindingSnapshot({
+      platform: 'win32',
       groups,
       generation: 1,
       enforce: 'block',
       mainConfigDir: 'C:\\m',
       profileDirOf: (id) => id,
     });
-    expect(snapshot.groups[0]?.aliases).toEqual([{ folder: 'C:\\repo', aliasKey: 'auth work' }]);
-    expect(JSON.stringify(snapshot)).not.toContain('Auth Work');
+    expect(snapshot.groups[0]?.aliases).toEqual([
+      { folder: 'C:\\repo', aliasKey: 'auth work', alias: '  Auth Work ' },
+    ]);
   });
 
   it('carries no member ids and no token material', () => {
@@ -135,6 +141,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
     ];
     const text = JSON.stringify(
       buildFolderBindingSnapshot({
+        platform: 'win32',
         groups,
         generation: 1,
         enforce: 'warn',
@@ -151,6 +158,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
 describe('folderBindingSnapshotContentEqual (pure)', () => {
   const base = () =>
     buildFolderBindingSnapshot({
+      platform: 'win32',
       groups: [
         {
           id: 'g1',
@@ -227,8 +235,23 @@ describe('scope helpers', () => {
 
   it('scopedGroupOf keys aliases and keeps folders', () => {
     expect(
-      scopedGroupOf(g({ folders: ['C:\\a'], aliases: [{ folder: 'C:\\b', alias: ' X ' }] })),
+      scopedGroupOf(
+        g({ folders: ['C:\\a'], aliases: [{ folder: 'C:\\b', alias: ' X ' }] }),
+        'win32',
+      ),
     ).toEqual({ id: 'g1', folders: ['C:\\a'], aliases: [{ folder: 'C:\\b', aliasKey: 'x' }] });
+  });
+
+  it('scopedGroupOf spells stored folders canonically (a hand-edited spelling still matches)', () => {
+    expect(
+      scopedGroupOf(
+        g({ folders: ['c:/a/'], aliases: [{ folder: 'C:/b/./c/', alias: 'x' }] }),
+        'win32',
+      ),
+    ).toEqual({ id: 'g1', folders: ['C:\\a'], aliases: [{ folder: 'C:\\b\\c', aliasKey: 'x' }] });
+    expect(scopedGroupOf(g({ folders: ['/home//me/w/'] }), 'linux').folders).toEqual([
+      '/home/me/w',
+    ]);
   });
 
   it('groupScopeCount counts folders and aliases together', () => {
