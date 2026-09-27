@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   groupSlotId,
+  projectDirStem,
   type AccountView,
   type ActivateResult,
   type GroupLiveResult,
@@ -332,10 +333,11 @@ function aliasAwareEngine(boundFolder: string): GroupEngine {
     resolveSessionBinding: (
       folder: string,
       title: string | null,
-      recordedFolder?: string,
+      recordedFolder?: string | null,
     ): Promise<{ groupId: string } | null> =>
       Promise.resolve(
-        (recordedFolder ?? folder) === boundFolder &&
+        // undefined = recorded where it runs; null = recorded in no folder an alias can name.
+        (recordedFolder === undefined ? folder : recordedFolder) === boundFolder &&
           title !== null &&
           title.trim().toLowerCase() === 'auth work'
           ? { groupId: 'g2' }
@@ -427,6 +429,42 @@ describe('Daemon: a managed spawn that resumes a NAMED session follows its alias
     });
     expect(res.captured).toEqual([PROFILE_DIR]);
     expect(res.accountId).toBe('m1');
+  });
+
+  it('a transcript that exists but cannot be read has an unknown title: the folder binding decides', async () => {
+    const res = await spawnResuming({
+      resumeSessionId: SDK_ID,
+      identityOf: (_id, boundFolder) =>
+        Promise.resolve({
+          customTitle: null,
+          folder: null,
+          dirName: projectDirStem(boundFolder),
+          unreadable: true,
+        }),
+    });
+    expect(res.captured).toEqual([PROFILE_DIR]);
+  });
+
+  it('with no trusted recorded folder, the transcript counts for the spawn folder only when its project directory can stand for it', async () => {
+    // The same fallback every reader applies (switch-engine recordedFolderFor).
+    const here = await spawnResuming({
+      resumeSessionId: SDK_ID,
+      identityOf: (_id, boundFolder) =>
+        Promise.resolve({
+          customTitle: 'Auth Work',
+          folder: null,
+          dirName: projectDirStem(boundFolder),
+        }),
+    });
+    expect(here.captured).toEqual([ALIAS_PROFILE_DIR]);
+    await harness?.dispose();
+    harness = undefined;
+    const elsewhere = await spawnResuming({
+      resumeSessionId: SDK_ID,
+      identityOf: () =>
+        Promise.resolve({ customTitle: 'Auth Work', folder: null, dirName: 'C--elsewhere' }),
+    });
+    expect(elsewhere.captured).toEqual([PROFILE_DIR]);
   });
 
   it('a title lookup that fails falls back to the folder binding (the guard judges the real title)', async () => {

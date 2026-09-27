@@ -310,6 +310,10 @@ export interface RunningSession {
   cwd: string;
   /** The session file it was read from, for diagnostics. */
   sessionFile: string;
+  /** Set when the session was counted for an alias scope although its title could not be learned
+   *  (its transcript cannot be read, or it has none yet — a fork or a new session before its first
+   *  prompt), because it runs in that scope's folder: it MAY be that conversation. */
+  unidentified?: true;
 }
 
 /** One scope of a group, as an operator names it: a folder (the folder and every subfolder), or one
@@ -319,17 +323,25 @@ export type GroupScopeRef =
   { kind: 'folder'; folder: string } | { kind: 'alias'; folder: string; alias: string };
 
 /** What Claude Code's transcript says about one session: its custom title (`/rename`, `--name`;
- *  null = unnamed — a generated title never counts) and the folder it was recorded in (its first
- *  recorded cwd, or a later relocation; null = unknown). */
+ *  null = unnamed — a generated title never counts) and the folder it was recorded in, as the one
+ *  shared reading decides it (recordedFolder.ts readRecordedFolder: its first recorded cwd, or a
+ *  later relocation, each trusted only when consistent with the transcript's project directory;
+ *  null = none trusted, when `dirName` is the fallback — see recordedFolderFor). */
 export interface SessionIdentity {
   customTitle: string | null;
   folder: string | null;
+  /** The name of the project directory the transcript lives in. */
+  dirName?: string;
+  /** Set when the transcript exists but could not be read (locked, an IO error): its title is then
+   *  UNKNOWN, not absent — `customTitle` null does not mean unnamed. */
+  unreadable?: boolean;
 }
 
 /** Look sessions up by id in Claude Code's transcripts under `claudeDir` (the main config dir): a
- *  map from the LOWER-CASED session id to what its transcript records. An id with no transcript yet
- *  is simply absent. Injected into the engine because the transcript reader lives with the daemon's
- *  session catalog; see {@link SwitchEngineOptions.sessionIdentity}. */
+ *  map from the LOWER-CASED session id to what its transcript records — or, for a transcript that
+ *  exists but cannot be read, an entry marked `unreadable`. An id with no transcript yet is simply
+ *  absent. Injected into the engine because the transcript reader lives with the daemon's session
+ *  catalog; see {@link SwitchEngineOptions.sessionIdentity}. */
 export type SessionIdentityLookup = (
   claudeDir: string,
   sessionIds: readonly string[],

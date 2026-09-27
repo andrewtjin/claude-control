@@ -55,6 +55,7 @@ import {
   resolveSessionBinding,
   type SessionBinding,
 } from './folderPath.js';
+import { projectDirMatches, recordedFolderFor } from './recordedFolder.js';
 import { sanitizeTerminalText } from './terminalSafe.js';
 import { createNodeProfileFs, ensureGroupProfile, planGroupProfile } from './profile.js';
 import {
@@ -105,11 +106,27 @@ type BindScope = GroupScopeRef;
 /** A running Claude Code session as the scope matchers see it: the canonical cwd it runs in (what
  *  a FOLDER scope covers), and — for an ALIAS scope — its custom title and the canonical folder its
  *  conversation was recorded in (see {@link SwitchEngine.scanRunningSessions} for where each comes
- *  from). `title` null = unnamed. */
+ *  from). `title` null = unnamed; `titleKnown` false = the title could not be learned at all, so the
+ *  session may carry any title. `recordedFolder` null = none an alias scope can name; `dirName` = the
+ *  project directory its transcript lives in, when known. */
 interface SessionRecordView {
   cwd: string;
   title: string | null;
-  recordedFolder: string;
+  titleKnown: boolean;
+  recordedFolder: string | null;
+  dirName: string | undefined;
+}
+
+/** The clause a running-session refusal adds for sessions counted only because they MAY be the
+ *  conversation (see {@link RunningSession.unidentified}), so the operator knows why. */
+function unidentifiedNote(sessions: readonly RunningSession[]): string {
+  const n = sessions.filter((s) => s.unidentified === true).length;
+  if (n === 0) return '';
+  return (
+    ` (${n} of them could not be identified — a transcript that cannot be read, or a session ` +
+    "that has not sent its first prompt yet, such as a fork — and run in the binding's folder, so " +
+    'they may be its conversation)'
+  );
 }
 
 /** The filesystem seam {@link SwitchEngine.bindFolder} / {@link SwitchEngine.unbindFolder} use to
@@ -918,14 +935,15 @@ export class SwitchEngine {
   /**
    * Resolve a session running in `folder` with custom title `title` to its binding by THE precedence
    * rule (the alias scope of the folder the session was recorded in — `recordedFolder`, default
-   * `folder` — else the longest folder binding of `folder`, else null = global). Folders are
-   * canonicalized leniently like {@link resolveCwdBinding}; `title` null/blank means an unnamed
-   * session, for which only folder bindings apply.
+   * `folder`, null = recorded in no folder an alias scope can name — else the longest folder binding
+   * of `folder`, else null = global). Folders are canonicalized leniently like
+   * {@link resolveCwdBinding}; `title` null/blank means an unnamed session, for which only folder
+   * bindings apply.
    */
   async resolveSessionBinding(
     folder: string,
     title: string | null | undefined,
-    recordedFolder?: string,
+    recordedFolder?: string | null,
   ): Promise<SessionBinding | null> {
     const groups = await this.vault.listGroups();
     if (groups.length === 0) return null;
@@ -934,7 +952,9 @@ export class SwitchEngine {
       title,
       groups.map((g) => scopedGroupOf(g, this.platform)),
       this.platform,
-      recordedFolder === undefined ? undefined : this.canonReserved(recordedFolder),
+      recordedFolder === undefined || recordedFolder === null
+        ? recordedFolder
+        : this.canonReserved(recordedFolder),
     );
   }
 
@@ -1241,7 +1261,7 @@ export class SwitchEngine {
     if (runningSessions.length > 0 && !force) {
       throw new RefreshError(
         `${what} (${describeMembers(group)}) has ${runningSessions.length} running ` +
-          'session(s) under it; exit them or rerun with --force',
+          `session(s) under it${unidentifiedNote(runningSessions)}; exit them or rerun with --force`,
         'sessions_running',
       );
     }
@@ -1420,8 +1440,8 @@ export class SwitchEngine {
           const running = await this.runningSessionsInScopes(group);
           if (running.length > 0) {
             throw new RefreshError(
-              `${why}, and ${running.length} session(s) are running on ${describeFolders(group)}; ` +
-                'exit them or rerun with --force',
+              `${why}, and ${running.length} session(s) are running on ${describeFolders(group)}` +
+                `${unidentifiedNote(running)}; exit them or rerun with --force`,
               'sessions_running',
             );
           }
@@ -2044,16 +2064,29 @@ export class SwitchEngine {
   /** Running sessions an alias scope covers: a custom title matching `alias` by alias key, in a
    *  conversation RECORDED in exactly `folder` (the precedence rule's alias key — a session resumed
    *  from a parent folder still belongs to the folder it was recorded in). An unnamed session is not
-   *  counted: it is outside the alias scope by definition. */
+   *  counted: it is outside the alias scope by definition. A session whose title could not be
+   *  learned IS counted — marked {@link RunningSession.unidentified} — when it runs in `folder`, or
+   *  its transcript's project directory can stand for `folder`: it may be that conversation, and a
+   *  dissolve must not strand it silently. */
   private async runningAliasSessions(folder: string, alias: string): Promise<RunningSession[]> {
     const here = folderUniquenessKey(folder, this.platform);
     const key = aliasKey(alias);
-    return this.scanRunningSessions(
-      (rec) =>
+    return this.scanRunningSessions((rec) => {
+      if (!rec.titleKnown) {
+        return folderUniquenessKey(rec.cwd, this.platform) === here ||
+          (rec.recordedFolder !== null &&
+            folderUniquenessKey(rec.recordedFolder, this.platform) === here) ||
+          (rec.dirName !== undefined && projectDirMatches(rec.dirName, folder))
+          ? 'unidentified'
+          : false;
+      }
+      return (
         rec.title !== null &&
         aliasKey(rec.title) === key &&
-        folderUniquenessKey(rec.recordedFolder, this.platform) === here,
-    );
+        rec.recordedFolder !== null &&
+        folderUniquenessKey(rec.recordedFolder, this.platform) === here
+      );
+    });
   }
 
   /** Running sessions in ANY of a group's scopes (folders and aliases), each reported once. What a
@@ -2074,15 +2107,19 @@ export class SwitchEngine {
    * Claude Code 2.1.283; it is removed on a clean exit and left stale by a hard kill, hence the pid
    * check). The cwd is where the session runs. Its title and recorded folder come from its
    * TRANSCRIPT when {@link sessionIdentity} is wired — the only source for a resumed session, whose
-   * `name` is derived (`nameSource: "derived"`), never its title. A session the transcript does not
-   * know yet (a `--name` launch before its first turn) falls back to a `name` the operator set
-   * (`nameSource: "user"`, or no `nameSource` at all from an older Claude Code) and its cwd.
-   * Defensive: a missing dir, an unreadable or malformed file, or a session with no usable pid/cwd is
-   * skipped, and a failed transcript lookup falls back as above — this only feeds a warning or a
-   * refusal the operator can `--force`, never throws.
+   * `name` is derived (`nameSource: "derived"`), never its title — the recorded folder decided as
+   * everywhere else (recordedFolderFor over the shared reading, the session's cwd as the folder it
+   * runs in). A session the transcript does not know yet (a `--name` launch before its first turn)
+   * falls back to a `name` the operator set (`nameSource: "user"`, or no `nameSource` at all from an
+   * older Claude Code), recorded where it runs. Anything else — an unreadable transcript, a session
+   * with no transcript and no name of its own (a fork or a new session before its first prompt), a
+   * failed lookup — has an UNKNOWN title (`titleKnown` false), which the matcher decides about. A
+   * matcher answering 'unidentified' counts the session as possibly in scope. Defensive: a missing
+   * dir, an unreadable or malformed session file, or a session with no usable pid/cwd is skipped —
+   * this only feeds a warning or a refusal the operator can `--force`, never throws.
    */
   private async scanRunningSessions(
-    matches: (rec: SessionRecordView) => boolean,
+    matches: (rec: SessionRecordView) => boolean | 'unidentified',
   ): Promise<RunningSession[]> {
     const dir = join(this.paths.claudeDir, 'sessions');
     let names: string[];
@@ -2093,6 +2130,7 @@ export class SwitchEngine {
     }
     const live: {
       pid: number;
+      rawCwd: string;
       cwd: string;
       file: string;
       sessionId: string | undefined;
@@ -2122,6 +2160,7 @@ export class SwitchEngine {
       const userNamed = rec.nameSource === undefined || rec.nameSource === 'user';
       live.push({
         pid,
+        rawCwd,
         cwd: this.canonReserved(rawCwd),
         file,
         sessionId:
@@ -2136,12 +2175,34 @@ export class SwitchEngine {
     for (const l of live) {
       const known: SessionIdentity | undefined =
         l.sessionId !== undefined ? identities.get(l.sessionId.toLowerCase()) : undefined;
-      const title = known !== undefined ? known.customTitle : l.launchName;
+      const readable = known !== undefined && known.unreadable !== true;
+      const titleKnown = readable || (known === undefined && l.launchName !== null);
+      const title = readable ? known.customTitle : titleKnown ? l.launchName : null;
+      // The folder the conversation belongs to, decided exactly as the guard decides it: a known
+      // transcript's trusted folder, else the folder it runs in when the transcript's project
+      // directory can stand for it; a named launch before its first turn belongs where it runs.
       const recordedFolder =
-        known !== undefined && known.folder !== null ? this.canonReserved(known.folder) : l.cwd;
-      if (matches({ cwd: l.cwd, title, recordedFolder })) {
-        out.push({ pid: l.pid, cwd: l.cwd, sessionFile: l.file });
-      }
+        known !== undefined
+          ? recordedFolderFor(
+              { folder: readable ? known.folder : null, dirName: known.dirName ?? '' },
+              { spelled: l.rawCwd, canonical: l.cwd },
+              (f) => this.canonReserved(f),
+            )
+          : l.cwd;
+      const verdict = matches({
+        cwd: l.cwd,
+        title,
+        titleKnown,
+        recordedFolder,
+        dirName: known?.dirName,
+      });
+      if (verdict === false) continue;
+      out.push({
+        pid: l.pid,
+        cwd: l.cwd,
+        sessionFile: l.file,
+        ...(verdict === 'unidentified' ? { unidentified: true as const } : {}),
+      });
     }
     return out;
   }

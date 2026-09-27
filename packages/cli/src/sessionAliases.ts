@@ -27,6 +27,7 @@ import {
   aliasKey,
   canonicalizeFolder,
   groupSlotId,
+  recordedFolderFor,
   resolveSessionBinding,
   scopedGroupOf,
   type Paths,
@@ -152,11 +153,17 @@ function customTitleOf(meta: SessionMeta): string | null {
 
 /**
  * Attach each session's binding by THE precedence rule (the same pure function the guard embeds):
- * its folder and custom title -> the required slot; and whether it runs there. The current session's
- * slot is read from this process's own CLAUDE_CONFIG_DIR (it runs inside it); any other session's
- * is the slot the daemon last recorded for it, or unknown.
+ * its folder and custom title -> the required slot; and whether it runs there. Its folder is the
+ * one the shared recorded-folder reading trusts, else — the same fallback the guard and the
+ * launcher apply — `folder` (the one this lookup runs in) when its project directory can stand for
+ * it. The current session's slot is read from this process's own CLAUDE_CONFIG_DIR (it runs inside
+ * it); any other session's is the slot the daemon last recorded for it, or unknown.
  */
-async function withBindings(deps: SessionAliasDeps, read: AccountsRead): Promise<SessionView[]> {
+async function withBindings(
+  deps: SessionAliasDeps,
+  read: AccountsRead,
+  folder: string,
+): Promise<SessionView[]> {
   if (read.views.length === 0) return read.views;
   const engine = deps.engine ?? buildEngine(deps.paths);
   const groups = await engine.listGroups();
@@ -177,9 +184,14 @@ async function withBindings(deps: SessionAliasDeps, read: AccountsRead): Promise
   return read.views.map((view) => {
     const m = view.meta;
     const title = customTitleOf(m);
-    const folder = m.folder === null ? null : canonicalOrRaw(m.folder, deps);
+    const lookupFolder = canonicalOrRaw(folder, deps);
+    const recorded = recordedFolderFor(
+      { folder: m.folder, dirName: m.projectDir },
+      { spelled: folder, canonical: lookupFolder },
+      (f) => canonicalOrRaw(f, deps),
+    );
     const required =
-      folder === null ? null : resolveSessionBinding(folder, title, scoped, deps.platform);
+      recorded === null ? null : resolveSessionBinding(recorded, title, scoped, deps.platform);
     const group: StoredGroup | undefined =
       required === null ? undefined : groups.find((g) => g.id === required.groupId);
     const requiredSlot = required === null ? 'global' : groupSlotId(required.groupId);
@@ -294,7 +306,7 @@ export async function runSessionShow(
   }
 
   const sessions = resolution.kind === 'id' ? [resolution.session] : resolution.sessions;
-  const views = await withBindings(deps, await withAccounts(deps, sessions));
+  const views = await withBindings(deps, await withAccounts(deps, sessions), folder);
   const context = {
     matchedBy: resolution.kind,
     ...(resolution.kind === 'alias' ? { inScope: resolution.inScope } : {}),

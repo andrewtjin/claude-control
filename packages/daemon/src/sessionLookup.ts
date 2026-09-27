@@ -2,7 +2,7 @@
 // ties between folders that reuse one alias), and total which accounts each session's turns were
 // billed to. No IO — the catalog, the turns and the attribution function are all passed in.
 
-import { folderUniquenessKey } from '@claude-control/switch-engine';
+import { folderUniquenessKey, recordedFolderFor } from '@claude-control/switch-engine';
 import { aliasKey, aliasOf, type SessionMeta } from './sessionCatalog.js';
 import type { TranscriptTurn } from './transcriptTokens.js';
 
@@ -21,6 +21,18 @@ export function sameFolder(a: string, b: string, platform: NodeJS.Platform): boo
   return folderUniquenessKey(a, platform) === folderUniquenessKey(b, platform);
 }
 
+/** The folder a session's conversation belongs to, looked at from `folder` (the one a lookup runs
+ *  in): its trusted recorded folder, else `folder` when the session's project directory can stand
+ *  for it, else null — the fallback every reader of an alias binding's folder applies
+ *  (switch-engine recordedFolderFor). */
+function folderSeenFrom(s: SessionMeta, folder: string): string | null {
+  return recordedFolderFor(
+    { folder: s.folder, dirName: s.projectDir },
+    { spelled: folder, canonical: folder },
+    (f) => f,
+  );
+}
+
 /**
  * Resolve `ref` against the catalog from `folder` (normally the cwd).
  *
@@ -31,7 +43,8 @@ export function sameFolder(a: string, b: string, platform: NodeJS.Platform): boo
  *    answer (flagged `inScope: false` so the caller says where they are); matches spread over
  *    several folders are ambiguous, and the working directory is what picks between them.
  *
- * Sessions whose folder is unknown (no recorded cwd) can match by id only.
+ * A session with no trusted folder counts for `folder` when its project directory can stand for
+ * it (the shared fallback); otherwise it can match by id only.
  */
 export function resolveSessionRef(
   catalog: readonly SessionMeta[],
@@ -48,11 +61,11 @@ export function resolveSessionRef(
   const key = aliasKey(trimmed);
   const matches = catalog.filter((s) => {
     const alias = aliasOf(s);
-    return alias !== null && s.folder !== null && aliasKey(alias) === key;
+    return alias !== null && folderSeenFrom(s, folder) !== null && aliasKey(alias) === key;
   });
   if (matches.length === 0) return { kind: 'none' };
 
-  const here = matches.filter((s) => s.folder !== null && sameFolder(s.folder, folder, platform));
+  const here = matches.filter((s) => sameFolder(folderSeenFrom(s, folder)!, folder, platform));
   if (here.length > 0)
     return { kind: 'alias', folder, sessions: sortByRecent(here), inScope: true };
 
@@ -72,12 +85,12 @@ export function aliasedSessions(
   platform: NodeJS.Platform,
 ): SessionMeta[] {
   return sortByRecent(
-    catalog.filter(
-      (s) =>
-        aliasOf(s) !== null &&
-        s.folder !== null &&
-        (folder === null || sameFolder(s.folder, folder, platform)),
-    ),
+    catalog.filter((s) => {
+      if (aliasOf(s) === null) return false;
+      if (folder === null) return s.folder !== null;
+      const seen = folderSeenFrom(s, folder);
+      return seen !== null && sameFolder(seen, folder, platform);
+    }),
   );
 }
 

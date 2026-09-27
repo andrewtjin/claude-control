@@ -189,21 +189,24 @@ describe('running sessions of an alias binding', () => {
     expect(res.dissolved).toBe(true);
   });
 
-  it('without a transcript lookup, only a name the operator set counts (never a derived one)', async () => {
+  it('without a transcript lookup, a derived name is never a title: the session may be any conversation', async () => {
     const h = await harness();
     const A = await h.engine.addAccount('A', bundleFor('A'));
     const B = await h.engine.addAccount('B', bundleFor('B'));
     await h.engine.activate(A.id, { force: true });
     const repo = await h.folder('repo');
     await h.engine.bindAlias(repo, 'repo-4f', [B.id]);
+    // The derived name is not its title, and nothing else says what its title is: it runs in the
+    // alias folder, so it is counted, and the refusal says why.
     await runningSession(h, 5151, { cwd: repo, name: 'repo-4f', nameSource: 'derived' });
-    expect((await h.engine.unbindAlias(repo, 'repo-4f')).dissolved).toBe(true);
+    await expect(h.engine.unbindAlias(repo, 'repo-4f')).rejects.toThrow(/could not be identified/);
+    expect((await h.engine.unbindAlias(repo, 'repo-4f', { force: true })).dissolved).toBe(true);
 
+    // A name the operator set IS its title.
     await h.engine.bindAlias(repo, 'Named', [B.id]);
     await runningSession(h, 5152, { cwd: repo, name: 'Named', nameSource: 'user' });
-    await expect(h.engine.unbindAlias(repo, 'Named')).rejects.toMatchObject({
-      code: 'sessions_running',
-    });
+    const refused = h.engine.unbindAlias(repo, 'Named');
+    await expect(refused).rejects.toMatchObject({ code: 'sessions_running' });
   });
 
   it('a session keys on its RECORDED folder: resumed from the repo root, it still belongs to its subfolder', async () => {

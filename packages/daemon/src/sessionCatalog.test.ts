@@ -101,6 +101,7 @@ describe('readSessionCatalog', () => {
     const catalog = await readSessionCatalog({ claudeDir: join(root, 'never-ran') });
     expect(catalog).toEqual({
       sessions: [],
+      unreadable: [],
       filesUnreadable: 0,
       dirsUnreadable: 0,
       malformedLines: 0,
@@ -128,7 +129,7 @@ describe('readSessionCatalog', () => {
   });
 
   it('keeps the FIRST cwd as the launch folder, skipping an empty one', async () => {
-    await writeSession('p', 's', [
+    await writeSession(projectDirStem('/home/me/first'), 's', [
       JSON.stringify({ type: 'system', cwd: '', timestamp: TS1 }),
       userLine('/home/me/first', TS1),
       userLine('/home/me/later', TS2),
@@ -244,26 +245,48 @@ describe('readSessionCatalog', () => {
   });
 
   describe('folder', () => {
+    // Claude Code relocates a session when it enters or leaves a `.claude/worktrees/<name>`
+    // checkout of its folder; the transcript itself never moves.
     it('follows the LAST relocation, keeping the launch cwd as it was', async () => {
-      await writeSession('p', 's', [
+      await writeSession(projectDirStem('/old'), 's', [
         userLine('/old', TS1),
-        relocated('/moved-once'),
-        relocated('/moved-twice'),
-        userLine('/moved-twice', TS2),
+        relocated('/old/.claude/worktrees/once'),
+        relocated('/old/.claude/worktrees/twice'),
+        userLine('/old/.claude/worktrees/twice', TS2),
       ]);
       const meta = await only();
       expect(meta.launchCwd).toBe('/old');
-      expect(meta.folder).toBe('/moved-twice');
+      expect(meta.folder).toBe('/old/.claude/worktrees/twice');
     });
 
     it('ignores a relocation with an empty or missing target', async () => {
-      await writeSession('p', 's', [
+      await writeSession(projectDirStem('/old'), 's', [
         userLine('/old', TS1),
-        relocated('/real-move'),
+        relocated('/old/.claude/worktrees/real'),
         relocated(''),
         JSON.stringify({ type: 'relocated' }),
       ]);
-      expect((await only()).folder).toBe('/real-move');
+      expect((await only()).folder).toBe('/old/.claude/worktrees/real');
+    });
+
+    it('ignores a relocation outside the launch folder’s worktree root', async () => {
+      await writeSession(projectDirStem('/old'), 's', [userLine('/old', TS1), relocated('/else')]);
+      expect((await only()).folder).toBe('/old');
+    });
+
+    it('does not trust a launch folder its project directory does not encode (an edit)', async () => {
+      await writeSession(projectDirStem('/elsewhere'), 's', [userLine('/bound', TS1)]);
+      const meta = await only();
+      expect(meta).toMatchObject({ projectDir: '-elsewhere', launchCwd: null, folder: null });
+    });
+
+    it('finds the launch folder behind a long first prompt, as every reader does', async () => {
+      const big = 'x'.repeat(70 * 1024);
+      await writeSession(projectDirStem('/w'), 's', [
+        JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: big }),
+        JSON.stringify({ type: 'user', message: { role: 'user', content: big }, cwd: '/w' }),
+      ]);
+      expect((await only()).folder).toBe('/w');
     });
 
     it('is null when the transcript records no cwd at all', async () => {
@@ -304,10 +327,10 @@ describe('readSessionCatalog', () => {
   it('keeps the most recently written transcript when one session id is in two project dirs', async () => {
     // Two ids, the newer copy in the first directory for one and the last for the other, so the
     // outcome cannot depend on the order the directories are listed in.
-    const olderA = await writeSession('aaa', 'id-1', [userLine('/a', TS1), customTitle('stale')]);
-    const newerZ = await writeSession('zzz', 'id-1', [userLine('/z', TS1), customTitle('fresh')]);
-    const newerA = await writeSession('aaa', 'id-2', [userLine('/a', TS1), customTitle('fresh')]);
-    const olderZ = await writeSession('zzz', 'id-2', [userLine('/z', TS1), customTitle('stale')]);
+    const olderA = await writeSession('-a', 'id-1', [userLine('/a', TS1), customTitle('stale')]);
+    const newerZ = await writeSession('-z', 'id-1', [userLine('/z', TS1), customTitle('fresh')]);
+    const newerA = await writeSession('-a', 'id-2', [userLine('/a', TS1), customTitle('fresh')]);
+    const olderZ = await writeSession('-z', 'id-2', [userLine('/z', TS1), customTitle('stale')]);
     const old = Date.parse('2026-09-01T00:00:00.000Z');
     const recent = Date.parse('2026-09-05T00:00:00.000Z');
     await setMtime(olderA, old);
@@ -320,12 +343,12 @@ describe('readSessionCatalog', () => {
     expect(catalog.sessions).toHaveLength(2);
     expect(byId.get('id-1')).toMatchObject({
       customTitle: 'fresh',
-      projectDir: 'zzz',
+      projectDir: '-z',
       folder: '/z',
     });
     expect(byId.get('id-2')).toMatchObject({
       customTitle: 'fresh',
-      projectDir: 'aaa',
+      projectDir: '-a',
       folder: '/a',
     });
   });
@@ -370,6 +393,8 @@ describe('readSessionCatalog', () => {
     const catalog = await readSessionCatalog({ claudeDir });
     expect(catalog.sessions.map((s) => s.sessionId)).toEqual(['s1']);
     expect(catalog.filesUnreadable).toBe(1);
+    // ...and names it: what an unreadable transcript records is unknown, not absent.
+    expect(catalog.unreadable).toEqual([{ sessionId: VANISHED_MARKER, projectDir: 'p' }]);
   });
 });
 

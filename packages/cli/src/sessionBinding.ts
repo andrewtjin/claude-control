@@ -342,12 +342,25 @@ export async function runSessionBind(
             `${otherScopes(res.group, target.alias, target.folder, deps.platform)}.`,
     );
     lines.push(...(await slotLines(engine, deps, palette, res.group, res, res.live)));
-    if (res.runningSessions.length > 0) {
+    const named = res.runningSessions.filter((s) => s.unidentified !== true).length;
+    const unknown = res.runningSessions.length - named;
+    if (named > 0) {
       lines.push(
         palette.yellow(
-          `  ${res.runningSessions.length} running session(s) named "${sanitizeForTerminal(target.alias)}" ` +
+          `  ${named} running session(s) named "${sanitizeForTerminal(target.alias)}" ` +
             'here stay on the slot they started on (following whatever account is live there) ' +
             `until relaunched with: ${resumeCommand(target.alias)}`,
+        ),
+      );
+    }
+    if (unknown > 0) {
+      // Their titles could not be learned (an unreadable transcript, or no prompt sent yet): any of
+      // them may be this alias's conversation, and would stay on its slot the same way.
+      lines.push(
+        palette.yellow(
+          `  ${unknown} running session(s) here could not be identified (a transcript that cannot ` +
+            'be read, or no prompt sent yet); if one of them is this conversation, it stays on the ' +
+            `slot it started on until relaunched with: ${resumeCommand(target.alias)}`,
         ),
       );
     }

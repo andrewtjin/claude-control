@@ -23,7 +23,7 @@ import type {
   GroupLiveResult,
   SessionIdentity,
 } from '@claude-control/switch-engine';
-import { describeGroupScopes, groupSlotId } from '@claude-control/switch-engine';
+import { describeGroupScopes, groupSlotId, recordedFolderFor } from '@claude-control/switch-engine';
 import {
   buildAuthorizeUrl,
   generatePkce,
@@ -145,7 +145,7 @@ export interface SwitchEngineLike {
   resolveSessionBinding?(
     folder: string,
     title: string | null,
-    recordedFolder?: string,
+    recordedFolder?: string | null,
   ): Promise<{ groupId: string } | null>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
   reauthenticate(
@@ -3577,9 +3577,17 @@ export class Daemon {
       }
       const identity =
         anchor === undefined ? null : await this.sessionIdentityOf(anchor).catch(() => null);
-      const title = identity?.customTitle ?? null;
-      if (title !== null && title.trim() !== '') {
-        return engine.resolveSessionBinding(cwd, title, identity?.folder ?? undefined);
+      const title = identity?.unreadable === true ? null : (identity?.customTitle ?? null);
+      if (identity !== null && title !== null && title.trim() !== '') {
+        // The recorded folder as every other reader decides it: the trusted one, else the spawn's
+        // cwd when the transcript's project directory can stand for it, else none (null: no alias
+        // rule applies).
+        const recorded = recordedFolderFor(
+          { folder: identity.folder, dirName: identity.dirName ?? '' },
+          { spelled: cwd, canonical: cwd },
+          (f) => f,
+        );
+        return engine.resolveSessionBinding(cwd, title, recorded);
       }
     }
     return engine.resolveCwdBinding ? engine.resolveCwdBinding(cwd) : null;

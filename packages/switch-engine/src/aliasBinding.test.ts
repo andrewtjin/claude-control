@@ -376,11 +376,17 @@ describe('bindAlias — running sessions in the scope', () => {
     const repo = await h.folder('repo');
     await session(h, 101, repo, 'AUTH work'); // in scope (alias key match)
     await session(h, 102, repo, 'other'); // another title
-    await session(h, 103, repo); // unnamed
+    await session(h, 103, repo); // no name of its own, no transcript lookup: its title is unknown
     await session(h, 104, join(repo, 'sub'), 'auth work'); // a subfolder is not the alias scope
     await session(h, 105, repo, 'auth work', false); // dead
+    await session(h, 106, join(repo, 'sub')); // unknown title, but not in the alias folder
     const res = await h.engine.bindAlias(repo, 'Auth Work', [A.id]);
-    expect(res.runningSessions.map((s) => s.pid)).toEqual([101]);
+    // The unknown one in the alias folder MAY be the conversation: reported, and marked as such.
+    const seen = [...res.runningSessions].sort((x, y) => x.pid - y.pid);
+    expect(seen.map((s) => [s.pid, s.unidentified ?? false])).toEqual([
+      [101, false],
+      [103, true],
+    ]);
   });
 });
 
