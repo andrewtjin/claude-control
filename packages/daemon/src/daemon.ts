@@ -22,7 +22,7 @@ import type {
   RepairResult,
   GroupLiveResult,
 } from '@claude-control/switch-engine';
-import { groupSlotId } from '@claude-control/switch-engine';
+import { describeGroupScopes, groupSlotId } from '@claude-control/switch-engine';
 import {
   buildAuthorizeUrl,
   generatePkce,
@@ -1555,7 +1555,7 @@ export class Daemon {
 
       // Name the folder(s) on the group hop's phone notice so it reads as a group rotation, not a
       // global switch — the same folder choice the exhaustion alert makes.
-      const slotLabel = group.folders.length > 0 ? group.folders.join(', ') : group.label;
+      const slotLabel = describeGroupScopes(group);
       const hop = await autoSwitcher
         .evaluate(memberInputs, { slotKey: slot, candidateIds: memberIds, slotLabel })
         .catch((err: unknown) => {
@@ -1587,11 +1587,11 @@ export class Daemon {
       budget?.resetsAt !== undefined
         ? `until it resets in ${humanizeDuration(budget.resetsAt - now)}`
         : 'until it resets';
-    // Name the bound folder, not the group label: the label defaults to the joined member labels,
-    // so a single-account group would read "<label> account <label> ..." and never say which folder
-    // stalled. The folder is what the operator acts on. Join when a group holds several folders, and
-    // fall back to the label only if a group somehow has no folder recorded.
-    const folder = group.folders.length > 0 ? group.folders.join(', ') : group.label;
+    // Name the bound scopes, not the group label: the label defaults to the joined member labels,
+    // so a single-account group would read "<label> account <label> ..." and never say which
+    // folder (or session alias) stalled. The scope is what the operator acts on; describeGroupScopes
+    // joins several and falls back to the label only if a group somehow has no scope recorded.
+    const folder = describeGroupScopes(group);
     this.emitSlotAlert(
       `exhausted:${group.id}`,
       `${folder} account ${live.label} is out of quota ${resetText}`,

@@ -18,6 +18,7 @@
 
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { aliasKey } from '@claude-control/switch-engine';
 import { forEachLine } from './transcriptTokens.js';
 
 /** One session, as its transcript describes it. */
@@ -67,10 +68,10 @@ export function aliasOf(meta: Pick<SessionMeta, 'customTitle' | 'aiTitle'>): str
   return alias === null || alias.trim() === '' ? null : alias;
 }
 
-/** The comparison form of an alias: the resume search's `toLowerCase().trim()`. */
-export function aliasKey(alias: string): string {
-  return alias.toLowerCase().trim();
-}
+/** The comparison form of an alias: the resume search's `toLowerCase().trim()`. Re-exported from
+ *  switch-engine, which owns it: an alias BINDING keys on the same function (and the enforcement
+ *  guard embeds it), so the lookup here and the binding there can never compare titles differently. */
+export { aliasKey };
 
 /** The length past which Claude Code truncates a project directory name and appends a hash. */
 const PROJECT_DIR_MAX = 200;

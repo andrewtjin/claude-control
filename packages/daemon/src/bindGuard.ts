@@ -9,11 +9,11 @@
 //     mixing them would put a blocking decision on the path that must never stall a tool call;
 //   - the guard needs the folder canonicalizer, and the forwarder does not.
 //
-// The canonicalizer is not re-implemented here. It is EMBEDDED verbatim from switch-engine's
-// `embeddableFolderPathSource()` (canonicalizeFolder / folderKey / isWithin), whose colocated test
-// proves the embedded copy still agrees with the live TS function across the whole case table.
-// Only the small amount of glue below — reading the snapshot, resolving the binding, and shaping
-// the decision per spec §9 — is written here, and it calls into that embedded trio.
+// The canonicalizer and the precedence rule are not re-implemented here. They are EMBEDDED verbatim
+// from switch-engine's `embeddableFolderPathSource()` (canonicalizeFolder / folderKey / isWithin /
+// aliasKey / resolveSessionBinding), whose colocated test proves the embedded copies still agree
+// with the live TS functions across the case tables. Only the glue below — reading the snapshot and
+// the session title, and shaping the decision per spec §9 — is written here.
 //
 // Fail-open by construction: any thrown error, a missing/unparseable snapshot, or an unrecognized
 // schema exits 0 (never blocks) with a single stderr line. A guard that crashed closed would lock
@@ -61,13 +61,21 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  * The script implements the enforcement rules:
  *   - session slot = the group whose canonical profileDir equals the session's canonical
  *     CLAUDE_CONFIG_DIR, else the global slot (outside every group).
- *   - (A) the project dir is bound to a group the session is NOT running on -> block. The block
- *     reason names the account the session is actually on (a different group, or the shared account).
- *     A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a visible
- *     systemMessage warning instead.
- *   - (B) the session runs on a group's slot but the project dir is not within that group's folders
- *     -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT) allows it, with a visible
- *     systemMessage so the bypass is never silent.
+ *   - required slot = THE precedence rule (switch-engine's resolveSessionBinding, embedded): the
+ *     session's folder F and custom title X alias-bound as (F, X) -> that group; else the longest
+ *     bound folder containing F -> that group; else the global slot. X is the payload's
+ *     `session_title` (Claude Code's custom title, absent for an unnamed session); only when that key
+ *     is absent and an alias rule could matter is the transcript's last custom-title read (bounded).
+ *   - (A) the rule names a group the session is NOT running on -> block. The block reason names the
+ *     account the session is actually on (a different group, or the shared account); for an alias
+ *     binding it says to resume the session with `cctl claude --resume "<title>"`. A valid --override
+ *     relaxation token (CCTL_BIND_OVERRIDE) allows the session with a visible systemMessage instead.
+ *   - (B) the session runs on a group's slot but the rule names no group here (a folder outside the
+ *     group's folders, or a session renamed away from the group's alias) -> block. A valid --account
+ *     relaxation token (CCTL_LAUNCH_EXPLICIT) allows it, with a visible systemMessage so the bypass
+ *     is never silent.
+ *   - every interpolated string (folders, labels, the untrusted session title) is sanitized at the
+ *     output sinks, and a title is truncated for display.
  *   - The relaxation env vars are NOT plain switches: each must name a token file the launcher minted
  *     for THIS launch's slot (see bindToken.ts) whose launching process is still alive. An inherited
  *     or persisted value (e.g. a stray "1"), or a token left behind by a dead launch, has no honored
@@ -181,7 +189,8 @@ function run(input) {
     },
   };
 
-  // The hook payload is only needed for its \`cwd\` fallback when CLAUDE_PROJECT_DIR is unset.
+  // The hook payload supplies the session's custom title (session_title, or the transcript_path
+  // fallback) and the \`cwd\` fallback when CLAUDE_PROJECT_DIR is unset.
   var payload = {};
   try {
     var parsed = JSON.parse(input);
@@ -248,53 +257,72 @@ function run(input) {
     }
   }
 
-  // Resolve the project dir's binding: the longest bound folder that contains it wins (a nested
-  // binding overrides its ancestor). Uses the embedded isWithin, so the boundary + case rules match
-  // the TS canonicalizer exactly (C:\\research never contains C:\\research2).
-  var projectBinding = null;
-  for (var j = 0; j < snapshot.groups.length; j++) {
-    var grp = snapshot.groups[j];
-    if (!grp || !Array.isArray(grp.folders)) continue;
-    for (var k = 0; k < grp.folders.length; k++) {
-      var f = grp.folders[k];
-      if (typeof f === 'string' && isWithin(projectDir, f, platform)) {
-        if (projectBinding === null || f.length > projectBinding.folder.length) {
-          projectBinding = { group: grp, folder: f };
-        }
-      }
-    }
+  var groups = snapshot.groups;
+
+  // The session's alias: the prompt payload's session_title, which Claude Code sets to the session's
+  // CUSTOM title (/rename, --name) — present from the very first prompt of a named launch, absent for
+  // an unnamed session, never the generated title. Any non-string value means "no custom title".
+  // Only when the key is ABSENT (an older Claude Code that does not send it) AND an alias rule could
+  // change the answer here is the transcript read for its last custom-title line; the scan is bounded.
+  var title = typeof payload.session_title === 'string' ? payload.session_title : null;
+  if (
+    !Object.prototype.hasOwnProperty.call(payload, 'session_title') &&
+    aliasRuleRelevant(projectDir, sessionGroup, groups, platform)
+  ) {
+    title = lastCustomTitle(payload.transcript_path);
   }
+
+  // THE precedence rule, embedded verbatim from switch-engine (the launcher, cctl where and cctl
+  // session show run the same function): an alias scope in exactly this folder, else the longest
+  // bound folder containing it (a nested binding overrides its ancestor; the embedded isWithin keeps
+  // C:\\research from containing C:\\research2), else null = the global slot.
+  var required = resolveSessionBinding(projectDir, title, groups, platform);
+  var requiredGroup = required ? findGroup(groups, required.groupId) : null;
+  if (required && !requiredGroup) required = null;
 
   var sessionGroupId = sessionGroup ? sessionGroup.id : null;
 
-  // Case A: the project dir is bound to a group, and the session is not on that group's slot.
-  if (projectBinding && projectBinding.group.id !== sessionGroupId) {
-    var members = Array.isArray(projectBinding.group.members)
-      ? projectBinding.group.members.join(', ')
-      : '';
+  // Case A: the rule names a group, and the session is not on that group's slot.
+  if (required && required.groupId !== sessionGroupId) {
+    var members = membersOf(requiredGroup);
     // The reason must name the account this session is ACTUALLY on. A session on the global slot runs
     // on the shared account; a session on another group's slot runs on that group's reserved account,
-    // so telling it to "cctl claude" (which would put it on the bound folder's account) is right, but
-    // "runs on the shared account" would be false. Branch on sessionGroup accordingly.
+    // so telling it to "cctl claude" (which would put it on the bound account) is right, but "runs on
+    // the shared account" would be false. Branch on sessionGroup accordingly.
     var reasonA;
-    if (sessionGroup) {
-      var sMembers = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
-      var sFolders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
+    if (required.via === 'alias') {
+      var shown = displayTitle(title);
+      var current = sessionGroup
+        ? membersOf(sessionGroup) + ' (bound to ' + scopesOf(sessionGroup) + ')'
+        : 'the shared account';
       reasonA =
-        'cctl: ' +
-        projectBinding.folder +
+        'cctl: session "' +
+        shown +
+        '" in ' +
+        projectDir +
         ' is bound to ' +
         members +
         ', but this session runs on ' +
-        sMembers +
+        current +
+        '. Exit and resume it with: cctl claude --resume "' +
+        shown +
+        '"';
+    } else if (sessionGroup) {
+      reasonA =
+        'cctl: ' +
+        required.folder +
+        ' is bound to ' +
+        members +
+        ', but this session runs on ' +
+        membersOf(sessionGroup) +
         ' (bound to ' +
-        sFolders +
+        scopesOf(sessionGroup) +
         '). Exit and start it here with: cctl claude' +
         '   (or add --override to use this account here anyway)';
     } else {
       reasonA =
         'cctl: ' +
-        projectBinding.folder +
+        required.folder +
         ' is bound to ' +
         members +
         ', but this session runs on the shared account. Exit and start it with: cctl claude' +
@@ -308,49 +336,212 @@ function run(input) {
     return emitBlock(reasonA, enforce);
   }
 
-  // Case B: the session runs on a group's slot, but the project dir is outside that group's folders.
-  if (sessionGroup) {
-    var within = false;
-    if (Array.isArray(sessionGroup.folders)) {
-      for (var m = 0; m < sessionGroup.folders.length; m++) {
-        var sf = sessionGroup.folders[m];
-        if (typeof sf === 'string' && isWithin(projectDir, sf, platform)) {
-          within = true;
-          break;
-        }
-      }
+  // Case B: the session runs on a group's slot, but the rule names no group here (a group-named
+  // required slot that differs was case A above). The reserved account is outside its scopes: a
+  // folder it is not bound to, or — for an alias scope — a session renamed away from its alias.
+  if (sessionGroup && !required) {
+    var scopes = scopesOf(sessionGroup);
+    // --account relaxes case B, but only via a token minted for this session's slot whose launch is
+    // still alive; an inherited env value is not honored. A honored relaxation emits a systemMessage
+    // (surfaced in interactive sessions; the launcher banner is the headless signal) so it is clear
+    // the reserved account is being used outside its scopes on purpose.
+    if (honorRelaxation(process.env.CCTL_LAUNCH_EXPLICIT, 'explicit', sessionConfigKey)) {
+      return emitSystemMessage(
+        'cctl: running ' +
+          membersOf(sessionGroup) +
+          ' (bound to ' +
+          scopes +
+          ') in ' +
+          projectDir +
+          ' — launched explicitly with --account. This account is reserved to its folders.',
+      );
     }
-    if (!within) {
-      var folders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
-      // --account relaxes case B, but only via a token minted for this session's slot whose launch is
-      // still alive; an inherited env value is not honored. A honored relaxation emits a systemMessage
-      // (surfaced in interactive sessions; the launcher banner is the headless signal) so it is clear
-      // the reserved account is being used outside its folders on purpose.
-      if (honorRelaxation(process.env.CCTL_LAUNCH_EXPLICIT, 'explicit', sessionConfigKey)) {
-        var membersB = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
-        return emitSystemMessage(
-          'cctl: running ' +
-            membersB +
-            ' (bound to ' +
-            folders +
-            ') in ' +
-            projectDir +
-            ' — launched explicitly with --account. This account is reserved to its folders.',
-        );
-      }
-      var reasonB =
+    var aliasHere = aliasScopeIn(sessionGroup, projectDir, platform);
+    var reasonB;
+    if (aliasHere !== null) {
+      // The session is in the folder of one of its group's alias scopes but no longer carries that
+      // title: it was renamed away (or never had it). Say so, and how to put it back.
+      reasonB =
+        'cctl: this session runs on the account bound to session "' +
+        aliasHere +
+        '" in ' +
+        projectDir +
+        ', but it is ' +
+        (title !== null && aliasKey(title) !== '' ? 'named "' + displayTitle(title) + '"' : 'unnamed') +
+        '. That account is reserved to its bindings. Rename it back with /rename ' +
+        aliasHere +
+        ', or exit and run Claude Code here normally: cctl claude';
+    } else if (hasAliasScopes(sessionGroup)) {
+      reasonB =
         'cctl: this session runs on the account bound to ' +
-        folders +
+        scopes +
+        ', but this session in ' +
+        projectDir +
+        ' is not one of its bindings. That account is reserved to its bindings. Run Claude Code ' +
+        'here normally, or launch it explicitly with: cctl claude --account <account>';
+    } else {
+      reasonB =
+        'cctl: this session runs on the account bound to ' +
+        scopes +
         ', but ' +
         projectDir +
         ' is not one of its folders. That account is reserved to its folders. Run Claude Code ' +
         'here normally, or launch it explicitly with: cctl claude --account <account>';
-      return emitBlock(reasonB, enforce);
     }
+    return emitBlock(reasonB, enforce);
   }
 
   // No conflict.
   process.exit(0);
+}
+
+// ---- snapshot row helpers (every field is read defensively: the snapshot is operator-editable) ----
+
+function findGroup(groups, id) {
+  for (var i = 0; i < groups.length; i++) {
+    if (groups[i] && groups[i].id === id) return groups[i];
+  }
+  return null;
+}
+
+function membersOf(group) {
+  return group && Array.isArray(group.members) ? group.members.join(', ') : '';
+}
+
+function aliasesOf(group) {
+  return group && Array.isArray(group.aliases) ? group.aliases : [];
+}
+
+function hasAliasScopes(group) {
+  return aliasesOf(group).length > 0;
+}
+
+// A group's scopes for a message: its folders, then each alias scope as session "<key>" in <folder>
+// (only the key is in the snapshot). For a group with no alias scope this is exactly the folder list.
+function scopesOf(group) {
+  var parts = [];
+  if (group && Array.isArray(group.folders)) {
+    for (var i = 0; i < group.folders.length; i++) {
+      if (typeof group.folders[i] === 'string') parts.push(group.folders[i]);
+    }
+  }
+  var aliases = aliasesOf(group);
+  for (var j = 0; j < aliases.length; j++) {
+    var a = aliases[j];
+    if (a && typeof a.folder === 'string' && typeof a.aliasKey === 'string') {
+      parts.push('session "' + a.aliasKey + '" in ' + a.folder);
+    }
+  }
+  return parts.join(', ');
+}
+
+// The key of the group's alias scope in exactly this folder, or null.
+function aliasScopeIn(group, projectDir, platform) {
+  var here = folderKey(projectDir, platform);
+  var aliases = aliasesOf(group);
+  for (var i = 0; i < aliases.length; i++) {
+    var a = aliases[i];
+    if (
+      a &&
+      typeof a.folder === 'string' &&
+      typeof a.aliasKey === 'string' &&
+      folderKey(a.folder, platform) === here
+    ) {
+      return a.aliasKey;
+    }
+  }
+  return null;
+}
+
+// Whether the session's title could change the decision here: some group binds an alias in exactly
+// this folder, or the session runs on a slot that has alias scopes (then whether it still carries the
+// alias decides case B). Otherwise the rule is folder-only and no title is needed.
+function aliasRuleRelevant(projectDir, sessionGroup, groups, platform) {
+  if (hasAliasScopes(sessionGroup)) return true;
+  for (var i = 0; i < groups.length; i++) {
+    if (aliasScopeIn(groups[i], projectDir, platform) !== null) return true;
+  }
+  return false;
+}
+
+// A title for display in a decision: long enough to recognize, never a megabyte of hook output.
+// Control characters are stripped at the output sinks (emitBlock / emitSystemMessage).
+var TITLE_DISPLAY_MAX = 120;
+function displayTitle(title) {
+  var t = typeof title === 'string' ? title : '';
+  return t.length > TITLE_DISPLAY_MAX ? t.slice(0, TITLE_DISPLAY_MAX) + '...' : t;
+}
+
+// The fallback title read, for a Claude Code that does not put session_title in the payload: the
+// LAST {"type":"custom-title"} line of the transcript (titles are last-wins). Read BACKWARDS in chunks
+// so the common case (a title near the end) costs one chunk, and bounded so a multi-gigabyte
+// transcript can never stall a prompt: past TITLE_SCAN_MAX_BYTES the session is treated as unnamed.
+// A torn (half-written) line simply fails to parse and the scan moves on to the previous one. Only a
+// regular file is opened (a FIFO would block the open).
+var TITLE_SCAN_MAX_BYTES = 8 * 1024 * 1024;
+var TITLE_SCAN_CHUNK = 256 * 1024;
+var CUSTOM_TITLE_NEEDLE = Buffer.from('"type":"custom-title"');
+
+function lastCustomTitle(file) {
+  if (typeof file !== 'string' || file.length === 0) return null;
+  var st;
+  try {
+    st = fs.statSync(file);
+  } catch (e) {
+    return null;
+  }
+  if (!st.isFile()) return null;
+  var fd;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch (e) {
+    return null;
+  }
+  try {
+    var pos = st.size;
+    var scanned = 0;
+    var carry = Buffer.alloc(0);
+    while (pos > 0 && scanned < TITLE_SCAN_MAX_BYTES) {
+      var len = Math.min(TITLE_SCAN_CHUNK, pos, TITLE_SCAN_MAX_BYTES - scanned);
+      pos -= len;
+      scanned += len;
+      var chunk = Buffer.alloc(len);
+      var got = fs.readSync(fd, chunk, 0, len, pos);
+      var data = Buffer.concat([chunk.subarray(0, got), carry]);
+      // Every segment after a newline is a complete line; the head before the first newline may
+      // continue in the previous chunk, so it is carried to the next (earlier) read.
+      var end = data.length;
+      while (end > 0) {
+        var nl = data.lastIndexOf(0x0a, end - 1);
+        if (nl === -1) break;
+        var found = customTitleOfLine(data.subarray(nl + 1, end));
+        if (found !== null) return found;
+        end = nl;
+      }
+      carry = data.subarray(0, end);
+    }
+    // Reached the start of the file: the carried head is the (complete) first line.
+    if (pos === 0 && carry.length > 0) return customTitleOfLine(carry);
+    return null;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch (e) {}
+  }
+}
+
+function customTitleOfLine(line) {
+  if (line.length === 0 || line.indexOf(CUSTOM_TITLE_NEEDLE) === -1) return null;
+  var obj;
+  try {
+    obj = JSON.parse(line.toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+  if (obj && obj.type === 'custom-title' && typeof obj.customTitle === 'string') {
+    return obj.customTitle;
+  }
+  return null;
 }
 
 var input = '';
