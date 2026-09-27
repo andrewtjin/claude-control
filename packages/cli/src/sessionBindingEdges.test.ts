@@ -263,14 +263,14 @@ describe('a session on a config dir cctl does not manage', () => {
 });
 
 describe('printed resume commands are paste-safe', () => {
-  it('the out-of-binding note quotes the whole alias as one single-quoted literal', async () => {
+  it('the out-of-binding note resumes this session by its id, never by an unquoted alias', async () => {
     const engine = sandboxEngine();
     const h = harness(engine, { env: { [SESSION_ID_ENV]: S_DOLLAR } });
     await runSessionBind(undefined, 'work', {}, h.deps);
     const out = h.text();
-    // A double-quoted "$(calc)" would RUN calc in PowerShell and POSIX shells; single quotes are
-    // inert in both (and "now" keeps its inner double quotes).
-    expect(out).toContain(`cctl claude --resume 'Deploy $(calc) "now"'`);
+    // THIS session is named by its id (a UUID: nothing for a shell to expand); a double-quoted
+    // "$(calc)" would RUN calc in PowerShell and POSIX shells.
+    expect(out).toContain(`cctl claude --resume ${S_DOLLAR}`);
     expect(out).not.toContain('--resume "Deploy');
   });
 

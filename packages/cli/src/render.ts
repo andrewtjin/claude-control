@@ -631,6 +631,26 @@ export function resumeCommand(
     : 'cctl claude --resume';
 }
 
+/** A session id as Claude Code writes it (a UUID): paste-safe with no quoting at all. */
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The command that resumes ONE known session on its bound account: by its id, which names exactly
+ * that conversation — its alias may be shared by other sessions Claude Code's title search reaches,
+ * and then `--resume <alias>` reopens the picker and the launcher can route the pick only by the
+ * folder rule. The enforcement guard prints the same form. Falls back to {@link resumeCommand} when
+ * the id is not a well-formed session id.
+ */
+export function resumeSessionCommand(
+  sessionId: string,
+  alias: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return SESSION_UUID.test(sessionId)
+    ? `cctl claude --resume ${sessionId}`
+    : resumeCommand(alias, { platform });
+}
+
 /** The resolution `cctl where` explains for a folder. */
 export interface WhereView {
   /** The canonical folder queried. */
@@ -822,7 +842,7 @@ export function sessionViewJson(view: SessionView): Record<string, unknown> {
 }
 
 /** The `Bound to` / `Scope` lines of `cctl session show`. */
-function bindingLines(b: SessionBindingView, palette: Palette): string[] {
+function bindingLines(b: SessionBindingView, sessionId: string, palette: Palette): string[] {
   const members = b.members.map((m) => sanitizeForTerminal(m)).join(', ');
   const who =
     b.groupLabel === null
@@ -849,7 +869,7 @@ function bindingLines(b: SessionBindingView, palette: Palette): string[] {
     const on = sanitizeForTerminal(b.slotLabel ?? b.slot ?? '?');
     const fix =
       b.via === 'alias'
-        ? `resume it with: ${resumeCommand(b.alias ?? '')}`
+        ? `resume it with: ${resumeSessionCommand(sessionId, b.alias ?? '')}`
         : 'start it again with: cctl claude';
     out.push(
       palette.yellow(
@@ -928,7 +948,9 @@ export function renderSessionDetails(
       out.push(`          ${palette.dim('(started in ' + sanitizeForTerminal(m.launchCwd) + ')')}`);
     }
     out.push(`Session   ${sanitizeForTerminal(m.sessionId)}`);
-    if (view.binding !== undefined) out.push(...bindingLines(view.binding, palette));
+    if (view.binding !== undefined) {
+      out.push(...bindingLines(view.binding, view.meta.sessionId, palette));
+    }
     const since = m.firstActivityMs === null ? '?' : localStamp(m.firstActivityMs);
     out.push(`Active    ${since} -> ${localStamp(m.lastActivityMs)}`);
     if (view.accounts.length === 0) {

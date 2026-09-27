@@ -31,7 +31,7 @@ import { readSessionCatalog, type SessionMeta } from '@claude-control/daemon';
 import { detectPalette, sanitizeForTerminal, type Palette } from './ansi.js';
 import { buildEngine, fail } from './context.js';
 import { reconcileBindGuard } from './bindCommands.js';
-import { resumeCommand, shellQuote } from './render.js';
+import { resumeCommand, resumeSessionCommand, shellQuote } from './render.js';
 import { SESSION_ID_ENV, type SessionAliasDeps } from './sessionAliases.js';
 
 export interface SessionBindOptions {
@@ -282,7 +282,7 @@ async function currentSessionNote(
   const resume =
     title === null
       ? 'start it again here with: cctl claude'
-      : `resume it on the bound account with: ${resumeCommand(title, { sessionId: current.sessionId })}`;
+      : `resume it on the bound account with: ${resumeSessionCommand(current.sessionId, title)}`;
   return palette.yellow(
     `This session is now outside its binding: it stays on ${on} until it exits, and the guard ` +
       `will flag its next prompt. Exit and ${resume}`,

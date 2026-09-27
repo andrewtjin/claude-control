@@ -1305,6 +1305,23 @@ describe('renderSessionDetails — Bound to', () => {
       { folder: 'C:\\work\\app', matchedBy: 'id' },
     ).split('\n');
 
+  it('an out-of-scope session with a real id is resumed by that id, not by its shareable alias', () => {
+    const id = 'aaaaaaaa-0000-4000-8000-00000000000a';
+    const lines = renderSessionDetails(
+      [
+        {
+          meta: sessionMeta({ sessionId: id, customTitle: 'Auth Work' }),
+          accounts: [],
+          binding: binding({ slot: 'global', slotLabel: 'the shared account', inScope: false }),
+        },
+      ],
+      { folder: 'C:\\work\\app', matchedBy: 'id' },
+    ).split('\n');
+    expect(lines).toContain(
+      `Scope     OUT of scope: it runs on the shared account; resume it with: cctl claude --resume ${id}`,
+    );
+  });
+
   it('names the binding and the rule that matched, and says in scope', () => {
     const lines = render(binding());
     expect(lines).toContain(

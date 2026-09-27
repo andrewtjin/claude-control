@@ -154,8 +154,8 @@ describe('cctl session bind', () => {
     expect(out).toContain(`profile ready on main: ${groupProfileDir(paths.vaultDir, group.id)}`);
     // This session runs in the global slot, the binding now names the alias group: say so plainly.
     expect(out).toContain('This session is now outside its binding');
-    // Paste-safe: the alias as one single-quoted literal.
-    expect(out).toContain("cctl claude --resume 'Auth Work'");
+    // THIS session is resumed by its id: its alias may be shared by other sessions.
+    expect(out).toContain(`cctl claude --resume ${S_CUR}`);
 
     // The FIRST alias bind installed the guard (the first-bind gap must not reopen for aliases)...
     const settings = await readFile(join(paths.claudeDir, 'settings.json'), 'utf8');
@@ -350,7 +350,7 @@ describe('cctl session show — Bound to', () => {
     await runSessionShow(undefined, {}, text.deps);
     expect(text.text()).toContain(`by alias "Auth Work" in ${repo}`);
     expect(text.text()).toContain('OUT of scope: it runs on the shared account');
-    expect(text.text()).toContain("cctl claude --resume 'Auth Work'");
+    expect(text.text()).toContain(`cctl claude --resume ${S_CUR}`);
   });
 
   it('the current session on its bound profile is in scope', async () => {
