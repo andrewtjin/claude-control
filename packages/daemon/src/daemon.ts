@@ -928,6 +928,13 @@ export class Daemon {
     const recovery = await this.switchEngine.recover();
     if (recovery.recovered) {
       this.logger.info({ recovery }, 'switch engine recovery ran on daemon startup');
+    } else if (recovery.action === 'unsettled') {
+      // Not fatal: writes to that slot are refused until it settles (every operation on it retries
+      // it), the other slots were recovered, and the slot watchdog alerts on it (unsettled_switch).
+      this.logger.warn(
+        { recovery },
+        'an interrupted switch could not be settled on daemon startup; its slot is not switched until it is',
+      );
     }
 
     // Rewrite the folder-bindings guard snapshot once at startup, so it reflects the current

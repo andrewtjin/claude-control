@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   RefreshError,
+  SwitchFailedError,
   VaultError,
   type ActivateResult,
   type DedupeReport,
+  type RecoverResult,
   type StoredAccount,
 } from '@claude-control/switch-engine';
 import { buildProgram } from './program.js';
@@ -62,6 +64,9 @@ const engine = vi.hoisted(() => ({
     Promise.reject(new Error(`renameAccount(${id}, ${label}) not stubbed`)),
   ),
   removeAccount: vi.fn((): Promise<void> => Promise.resolve()),
+  recover: vi.fn((): Promise<RecoverResult> =>
+    Promise.resolve({ recovered: false, action: 'none' }),
+  ),
 }));
 // `cctl switch` resolves across the whole registry; keep the mock's whole-registry view in sync with
 // whatever a test stubbed on listAccounts (the shared pool) so the existing switch tests still drive it.
@@ -699,6 +704,60 @@ describe('switch', () => {
         'Nothing was changed - try again shortly.\n',
     );
     expect(r.out).toBe('');
+  });
+
+  it('prints a switch another program kept from writing as one plain line, not the raw error', async () => {
+    const said =
+      'could not write C:\\Users\\me\\.claude.json (EPERM): another program probably has it open ' +
+      '(an editor, a backup or sync tool, antivirus), or it is read-only. The switch to "Work" was ' +
+      'undone and the previous login was kept - nothing changed. Close that program (or wait for ' +
+      'it to finish) and try again.';
+    engine.listAccounts.mockResolvedValueOnce([account]);
+    engine.activate.mockRejectedValueOnce(
+      new SwitchFailedError(said, 'restored', {
+        cause: Object.assign(new Error("EPERM: operation not permitted, rename '.tmp-1'"), {
+          code: 'EPERM',
+        }),
+      }),
+    );
+
+    const r = await runCli(['switch', 'Work']);
+
+    expect(r).toEqual({ out: '', err: `error: ${said}\n`, exited: true });
+  });
+});
+
+describe('recover', () => {
+  it('says what it recovered', async () => {
+    engine.recover.mockResolvedValueOnce({
+      recovered: true,
+      action: 'rolled_back',
+      detail: 'restored previous live credentials',
+    });
+
+    const r = await runCli(['recover']);
+
+    expect(r).toEqual({
+      out: 'Recovered: rolled_back - restored previous live credentials.\n',
+      err: '',
+      exited: false,
+    });
+  });
+
+  it('exits non-zero with the reason when a switch could not be settled', async () => {
+    engine.recover.mockResolvedValueOnce({
+      recovered: false,
+      action: 'unsettled',
+      detail: 'a switch of the global slot to "Work" was interrupted and could not be finished',
+    });
+
+    const r = await runCli(['recover']);
+
+    expect(r.exited).toBe(true);
+    expect(r.out).toBe('');
+    expect(r.err).toContain(
+      'a switch of the global slot to "Work" was interrupted and could not be finished',
+    );
   });
 });
 

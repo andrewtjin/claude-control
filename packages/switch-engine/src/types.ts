@@ -231,6 +231,11 @@ export interface SwitchIntent {
   /** Whether a DPAPI rollback snapshot of the prior live credentials exists on disk. */
   hasRollback: boolean;
   startedAtMs: number;
+  /** Set when the switch failed and is being undone. Whoever settles it later (after that undo
+   *  failed too) must finish the undo, never complete the switch: the caller was told it failed, and
+   *  the target's identity block in the live files is then the switch's own write, not evidence of
+   *  whose token sits beside it. */
+  undo?: boolean;
 }
 
 /** What `activate()` actually did — reported honestly at the mechanism level.
@@ -259,10 +264,13 @@ export interface ReloginResult {
   healedLiveLogin: boolean;
 }
 
-/** Outcome of a startup recovery sweep. */
+/** Outcome of a startup recovery sweep. `unsettled` (with `recovered: false`): a switch is pending
+ *  in some slot that could not be finished or undone yet; `detail` says which and why (every other
+ *  slot was recovered regardless). It stays pending, and every operation on that slot retries it
+ *  (see `UnsettledSwitchError`). */
 export interface RecoverResult {
   recovered: boolean;
-  action: 'none' | 'rolled_forward' | 'rolled_back' | 'cleared';
+  action: 'none' | 'rolled_forward' | 'rolled_back' | 'cleared' | 'unsettled';
   detail?: string;
 }
 
@@ -374,7 +382,17 @@ export interface UnbindResult {
  *    nothing else would ever notice or clear it; `repairSlots` clears it (after adopting its rotation).
  *  - `duplicate_stored_token`: two accounts' bundles store the same token — either the same login
  *    stored twice, or one account holding another's token. Nothing can tell which bundle is wrong
- *    from the files, so it is only alerted on (a re-login of the wrong one fixes it). */
+ *    from the files, so it is only alerted on (a re-login of the wrong one fixes it).
+ *  - `unreadable_bundle`: an account's stored bundle could not be read or decrypted, so none of the
+ *    token checks could include it. Alert only.
+ *  - `unsettled_switch`: a slot's switch was interrupted longer ago than any switch can still be
+ *    running and nothing has been able to finish or undo it (another program holding the slot's
+ *    live files open), or its record cannot be read. Every operation on that slot retries it; until
+ *    one succeeds, writes to that slot are refused. Alert only.
+ *  - `token_in_multiple_slots`: one refresh token is live in two or more slots whose live logins
+ *    name different accounts (or none) — a token stored under two accounts, each seated somewhere.
+ *    The same breach as (a), which is keyed by account and cannot see it; nothing can tell which
+ *    slot is wrong, so it is alerted on (a re-login of the wrong account fixes it). */
 export type SlotViolationKind =
   | 'account_in_multiple_slots'
   | 'reserved_live_in_global'
@@ -383,7 +401,10 @@ export type SlotViolationKind =
   | 'broken_profile_link'
   | 'live_identity_mismatch'
   | 'orphan_profile_login'
-  | 'duplicate_stored_token';
+  | 'duplicate_stored_token'
+  | 'unreadable_bundle'
+  | 'unsettled_switch'
+  | 'token_in_multiple_slots';
 
 /** One invariant breach, with enough context to alert on and to repair. Every message names the
  *  offending account and/or folder (a hard requirement of the verb). */

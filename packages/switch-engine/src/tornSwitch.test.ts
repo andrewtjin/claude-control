@@ -15,7 +15,7 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
-import { realpathSync, statSync } from 'node:fs';
+import { realpathSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SwitchEngine, type BindFs, type RefreshFn } from './switchEngine.js';
@@ -26,6 +26,7 @@ import { Vault } from './vault.js';
 import { groupProfileDir, sandboxPaths, type Paths } from './paths.js';
 import { groupSlotId } from './types.js';
 import type { ClaudeOauth, CredentialBundle, OauthAccount } from './types.js';
+import type { Logger } from './logger.js';
 
 // ---- write faults: fail chosen atomic writes by target path ---------------------------------------
 interface WriteFault {
@@ -75,7 +76,7 @@ afterEach(async () => {
 interface Harness {
   paths: Paths;
   /** A fresh engine over the same on-disk state — the daemon, another CLI, or a restart. */
-  mk: (faultAt?: (checkpoint: string) => void) => SwitchEngine;
+  mk: (faultAt?: (checkpoint: string) => void, now?: number, logger?: Logger) => SwitchEngine;
   vault: Vault;
   /** The GLOBAL slot's live files. */
   global: CredentialStore;
@@ -110,13 +111,13 @@ async function harness(): Promise<Harness> {
       expiresAt: NOW + 9 * HOUR,
     });
   const refresh = vi.fn(refreshImpl);
-  const mk = (faultAt?: (checkpoint: string) => void): SwitchEngine =>
+  const mk = (faultAt?: (checkpoint: string) => void, now = NOW, logger?: Logger): SwitchEngine =>
     new SwitchEngine({
       paths,
       protector,
       liveCredentialChannel: new FileCredentialChannel(paths.credentialsPath),
       refresh,
-      clock: () => NOW,
+      clock: () => now,
       refreshSkewMs: 5 * 60_000,
       minSwitchIntervalMs: 0,
       lockOptions: { timeoutMs: 5000, pollMs: 5 },
@@ -124,6 +125,7 @@ async function harness(): Promise<Harness> {
       bindFs,
       isProcessAlive: () => false,
       bindEnforce: 'block',
+      ...(logger ? { logger } : {}),
       ...(faultAt ? { faultAt } : {}),
     });
   return {
@@ -201,13 +203,61 @@ describe('a switch whose identity write fails after its credentials landed', () 
     const { P, T } = await seed(h);
     failWrites(h.paths.claudeJsonPath);
 
-    await expect(h.mk().activate(T.id, { force: true })).rejects.toMatchObject({ code: 'EPERM' });
+    await expect(h.mk().activate(T.id, { force: true })).rejects.toMatchObject({
+      code: 'switch_failed',
+      outcome: 'restored',
+      cause: { code: 'EPERM' },
+    });
 
     expect(await globalLive(h)).toEqual({ creds: 'P', identity: 'P' });
     expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
     const e = h.mk();
     expect(await e.getActiveId('global')).toBe(P.id);
     expect(await e.checkSlots()).toEqual([]);
+  });
+
+  it('says so in plain words, and logs nothing a one-shot command would print', async () => {
+    const h = await harness();
+    const { T } = await seed(h);
+    failWrites(h.paths.claudeJsonPath);
+    const loud: string[] = [];
+    const logger: Logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: (_obj, msg) => loud.push(`warn: ${msg ?? ''}`),
+      error: (_obj, msg) => loud.push(`error: ${msg ?? ''}`),
+    };
+
+    const err = await h
+      .mk(undefined, NOW, logger)
+      .activate(T.id, { force: true })
+      .catch((e: unknown) => e);
+
+    expect((err as Error).message).toBe(
+      `could not write ${h.paths.claudeJsonPath} (EPERM): another program probably has it open ` +
+        '(an editor, a backup or sync tool, antivirus), or it is read-only. The switch to "T" was ' +
+        'undone and the previous login was kept - nothing changed. Close that program (or wait ' +
+        'for it to finish) and try again.',
+    );
+    expect(loud).toEqual([]);
+  });
+
+  it('names the pending state when the undo fails too', async () => {
+    const h = await harness();
+    const { T } = await seed(h);
+    failWrites(h.paths.claudeJsonPath);
+    failWrites(h.paths.credentialsPath, { skip: 1 });
+
+    const err = await h
+      .mk()
+      .activate(T.id, { force: true })
+      .catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ code: 'switch_failed', outcome: 'pending' });
+    expect((err as Error).message).toContain(
+      'could not be undone either, so it is still pending: the next operation on the global slot ' +
+        'finishes or undoes it, and `cctl recover` retries it now. Close that program first.',
+    );
   });
 
   it('never lets the next switch store the target token in the previous account bundle', async () => {
@@ -270,6 +320,45 @@ describe('a switch whose identity write fails after its credentials landed', () 
       undefined,
     );
     expect(await h.mk().checkSlots()).toEqual([]);
+  });
+});
+
+describe('a switch undone because its read-back found another writer', () => {
+  it('keeps that token live, stores it in no bundle, and withdraws the identity the switch wrote', async () => {
+    const h = await harness();
+    const { P, T, R } = await seed(h);
+    // A session running on P started refreshing P's token just before the switch; its rotation lands
+    // after the switch wrote T's credentials and identity, and before the read-back.
+    const pRotation = { accessToken: 'at-P2', refreshToken: 'rt-P2', expiresAt: NOW + 9 * HOUR };
+    const racing = h.mk((checkpoint) => {
+      if (checkpoint === 'activate:after-live-write') {
+        writeFileSync(h.paths.credentialsPath, JSON.stringify({ claudeAiOauth: pRotation }));
+      }
+    });
+
+    const err = await racing.activate(T.id, { force: true }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'switch_failed', outcome: 'kept_other_login' });
+    expect((err as Error).message).toBe(
+      'another program wrote the live login of the global slot while the switch to "T" was being ' +
+        'written. The switch to "T" did not happen: the login written meanwhile was left in place, ' +
+        'and nothing was stored from it. Try again.',
+    );
+
+    // Nothing says whose rotation it is but the block the switch itself wrote: no bundle takes it,
+    // nothing overwrites it, and that block is gone.
+    expect(await storedTokens(h, { P: P.id, T: T.id, R: R.id })).toEqual({
+      P: 'rt-P',
+      T: 'rt-T',
+      R: 'rt-R',
+    });
+    expect(await globalLive(h)).toEqual({ creds: 'P2' });
+    expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
+    expect(await h.vault.getActiveId()).toBe(P.id);
+
+    // Claude Code re-derives the block from the token; the next switch then saves P's rotation.
+    await h.global.writeOauthAccount(identity('P'));
+    await h.mk().activate(R.id, { force: true, origin: 'auto' });
+    expect(await storedTokens(h, { P: P.id, T: T.id })).toEqual({ P: 'rt-P2', T: 'rt-T' });
   });
 });
 
@@ -368,6 +457,159 @@ describe('a process that dies between the credentials and identity writes', () =
   });
 });
 
+describe('a pending switch whose live .claude.json stays unwritable', () => {
+  const dieBetweenWrites = (checkpoint: string): void => {
+    if (checkpoint === 'activate:after-credentials-write') throw new Error('process died');
+  };
+
+  /** A switch to T dies between its writes (T's credentials under P's identity, intent `writing`),
+   *  and from then on another program keeps the global `.claude.json` open. Q is idle and inside the
+   *  refresh window, so the daemon's usage poll refreshes it. */
+  async function pendingWhileIdentityLocked(h: Harness) {
+    const ids = await seed(h);
+    const Q = await h.mk().addAccount('Q', bundle('Q', NOW + 60_000));
+    await expect(h.mk(dieBetweenWrites).activate(ids.T.id, { force: true })).rejects.toThrow(
+      'process died',
+    );
+    expect((await new IntentStore(h.paths.vaultDir).read())?.phase).toBe('writing');
+    failWrites(h.paths.claudeJsonPath, { times: 1_000 });
+    return { ...ids, Q };
+  }
+
+  it('recover() puts the previous login back, which needs no identity write', async () => {
+    const h = await harness();
+    const { P, T } = await pendingWhileIdentityLocked(h);
+
+    const res = await h.mk().recover();
+
+    expect(res).toMatchObject({ recovered: true, action: 'rolled_back' });
+    expect(await globalLive(h)).toEqual({ creds: 'P', identity: 'P' });
+    expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
+    expect(await h.vault.getActiveId()).toBe(P.id);
+    expect(await storedTokens(h, { P: P.id, T: T.id })).toEqual({ P: 'rt-P', T: 'rt-T' });
+  });
+
+  it('an idle-account refresh and a relogin of an account that is not live both go through', async () => {
+    const h = await harness();
+    const { R, Q } = await pendingWhileIdentityLocked(h);
+
+    await expect(h.mk().refreshToken(Q.id)).resolves.toMatchObject({ refreshed: true });
+
+    const dir = join(h.paths.vaultDir, '..', 'relogin-tmp');
+    await mkdir(dir, { recursive: true });
+    writeFileSync(
+      join(dir, '.credentials.json'),
+      JSON.stringify({
+        claudeAiOauth: { accessToken: 'at-R9', refreshToken: 'rt-R9', expiresAt: NOW + 9 * HOUR },
+      }),
+    );
+    writeFileSync(join(dir, '.claude.json'), JSON.stringify({ oauthAccount: identity('R') }));
+    await expect(h.mk().reloginFromConfigDir(R.id, dir)).resolves.toMatchObject({
+      healedLiveLogin: false,
+    });
+    expect((await h.vault.readBundle(R.id)).claudeAiOauth.refreshToken).toBe('rt-R9');
+  });
+});
+
+describe('a pending switch whose slot cannot be settled at all', () => {
+  const dieBetweenWrites = (checkpoint: string): void => {
+    if (checkpoint === 'activate:after-credentials-write') throw new Error('process died');
+  };
+
+  it('refuses only what depends on it, is reported, and settles once its files are free', async () => {
+    const h = await harness();
+    const { P, T, R } = await seed(h);
+    const Q = await h.mk().addAccount('Q', bundle('Q', NOW + 60_000));
+    const G1 = await h.mk().addAccount('G1', bundle('G1', NOW + 8 * HOUR));
+    const G2 = await h.mk().addAccount('G2', bundle('G2', NOW + 8 * HOUR));
+    const bound = await h.mk().bindFolder(await h.folder('repo'), [G1.id, G2.id]);
+    const slot = groupSlotId(bound.group.id);
+    await expect(h.mk(dieBetweenWrites).activate(T.id, { force: true })).rejects.toThrow(
+      'process died',
+    );
+    // Neither of the global slot's live files can be replaced: nothing can finish or undo it.
+    failWrites(h.paths.claudeJsonPath, { times: 1_000 });
+    failWrites(h.paths.credentialsPath, { times: 1_000 });
+    const unsettledError = { code: 'switch_unsettled' };
+
+    // The daemon still starts, and says where and why.
+    const rec = await h.mk().recover();
+    expect(rec).toMatchObject({ recovered: false, action: 'unsettled' });
+    expect(rec.detail).toContain('a switch of the global slot to "T"');
+    expect(rec.detail).toContain('EPERM');
+    expect((await new IntentStore(h.paths.vaultDir).read())?.phase).toBe('writing');
+
+    // What writes that slot, or depends on the two accounts the switch was between, is refused.
+    await expect(h.mk().activate(R.id, { force: true })).rejects.toMatchObject(unsettledError);
+    await expect(h.mk().captureCurrentLogin('N')).rejects.toMatchObject(unsettledError);
+    await expect(h.mk().refreshToken(P.id)).rejects.toMatchObject(unsettledError);
+    await expect(h.mk().removeAccount(T.id)).rejects.toMatchObject(unsettledError);
+    // Anything else goes on: another account's refresh, a switch inside a folder's own slot.
+    await expect(h.mk().refreshToken(Q.id)).resolves.toMatchObject({ refreshed: true });
+    const inGroup = (await h.mk().getActiveId(slot)) === G1.id ? G2 : G1;
+    await expect(h.mk().activate(inGroup.id, { force: true, slot })).resolves.toMatchObject({
+      ok: true,
+    });
+
+    // Reported by the repair (under the lock), and by an unlocked check once no switch that could
+    // still be running is that old — never while one may be in flight.
+    const reported: unknown = expect.objectContaining({
+      kind: 'unsettled_switch',
+      slot: 'global',
+      accountId: T.id,
+    });
+    expect((await h.mk().repairSlots()).remaining).toContainEqual(reported);
+    expect(await h.mk(undefined, NOW + 10 * 60_000).checkSlots()).toContainEqual(reported);
+    expect(await h.mk().checkSlots()).not.toContainEqual(reported);
+
+    // The other program lets go; the next operation on the slot settles it.
+    faults.rules = [];
+    await h.mk().activate(R.id, { force: true, origin: 'auto' });
+    expect(await globalLive(h)).toEqual({ creds: 'R', identity: 'R' });
+    expect(await storedTokens(h, { P: P.id, T: T.id, R: R.id })).toEqual({
+      P: 'rt-P',
+      T: 'rt-T',
+      R: 'rt-R',
+    });
+    expect(await h.mk().checkSlots()).toEqual([]);
+  });
+
+  it('a record of one that cannot be read blocks that slot and is reported', async () => {
+    const h = await harness();
+    const { R } = await seed(h);
+    writeFileSync(join(h.paths.vaultDir, '.switch-intent.json'), '{"phase":');
+
+    const rec = await h.mk().recover();
+    expect(rec).toMatchObject({ recovered: false, action: 'unsettled' });
+    expect(rec.detail).toContain('could not be read');
+    await expect(h.mk().activate(R.id, { force: true })).rejects.toMatchObject({
+      code: 'switch_unsettled',
+    });
+    expect(await h.mk().checkSlots()).toContainEqual(
+      expect.objectContaining({ kind: 'unsettled_switch', slot: 'global' }),
+    );
+  });
+});
+
+describe('a failed switch whose undo fails too, settled later', () => {
+  it('is finished as an undo: the switch its caller was told failed is never completed', async () => {
+    const h = await harness();
+    const { P, T } = await seed(h);
+    // The identity write fails, and so does the undo's restore of the credentials.
+    failWrites(h.paths.claudeJsonPath);
+    failWrites(h.paths.credentialsPath, { skip: 1 });
+    await expect(h.mk().activate(T.id, { force: true })).rejects.toThrow();
+    expect(await globalLive(h)).toEqual({ creds: 'T', identity: 'P' });
+    expect(await new IntentStore(h.paths.vaultDir).read()).toMatchObject({ undo: true });
+
+    const rec = await h.mk().recover();
+
+    expect(rec).toMatchObject({ recovered: true, action: 'rolled_back' });
+    expect(await globalLive(h)).toEqual({ creds: 'P', identity: 'P' });
+    expect(await h.vault.getActiveId()).toBe(P.id);
+    expect(await storedTokens(h, { P: P.id, T: T.id })).toEqual({ P: 'rt-P', T: 'rt-T' });
+  });
+});
 describe('an intent an older build left at phase "refreshed"', () => {
   /** What an older build leaves when it dies between the two live writes: the target's credentials
    *  live under the previous identity, the intent still at "refreshed", the rollback snapshot kept. */
