@@ -285,6 +285,8 @@ describe('a group switch decided before its target left the alias binding', () =
     const repo = await h.folder('repo');
     const bound = await h.engine.bindAlias(repo, 'auth', [B.id, C.id]);
     expect(bound.live.liveMember).toBe(B.id);
+    // Past the cadence guard for the group slot too (the bind just seated B there).
+    h.setNow(NOW + 15 * 60_000);
 
     // The daemon's per-slot auto-switch hops the alias group's slot B -> C...
     const p = pauseNextLock();
@@ -304,6 +306,29 @@ describe('a group switch decided before its target left the alias binding', () =
     expect(await h.engine.checkSlots()).toEqual([]);
 
     // C is shared now, so a later global hop may legitimately pick it: still one slot only.
+    h.setNow(NOW + 20 * 60_000);
+    await h.engine.activate(C.id, { origin: 'auto' });
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+
+  it('a hop that names no slot follows the departed account out, never into the group', async () => {
+    const h = await harness();
+    const { B, C } = await seed(h);
+    const repo = await h.folder('repo');
+    const bound = await h.engine.bindAlias(repo, 'auth', [B.id, C.id]);
+    h.setNow(NOW + 15 * 60_000); // past the cadence guard for the group slot too
+
+    const p = pauseNextLock();
+    const hop = settle(h.other().activate(C.id, { origin: 'auto' }));
+    await p.arrived;
+    await h.engine.removeGroupMembers(bound.group.id, [C.id]);
+    p.release();
+    await hop;
+
+    expect((await groupStore(h.paths, bound.group.id).readLiveCredentials())?.refreshToken).toBe(
+      'r-B',
+    );
+    expect(await h.engine.checkSlots()).toEqual([]);
     h.setNow(NOW + 20 * 60_000);
     await h.engine.activate(C.id, { origin: 'auto' });
     expect(await h.engine.checkSlots()).toEqual([]);
