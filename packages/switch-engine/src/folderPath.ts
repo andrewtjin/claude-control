@@ -371,13 +371,36 @@ export function aliasKey(alias: string): string {
  *  code points are stored as the first 200 code points, not the first 200 units). */
 export const CLAUDE_CODE_TITLE_MAX_LENGTH = 200;
 
-/** Whether a session could carry `alias` as its title: its trimmed text fits Claude Code's title
- *  length, counted in code points as Claude Code counts it (a UTF-16 count would refuse an alias of
- *  emoji or other astral characters that Claude Code stores whole). A longer alias is cut when
- *  stored, so no session's title ever matches it — a binding of it would bind nothing, and
- *  `claude --resume <alias>` would reject it. */
+/** Whether `text` is well-formed UTF-16 — carries no unpaired (lone) surrogate. Claude Code stores a
+ *  lone surrogate in a session name as the Unicode replacement character U+FFFD (measured on 2.1.283:
+ *  `ab\uD800cd` is recorded with the title `ab�cd`), so an alias holding one can never equal any
+ *  session's stored title. Written as an explicit scan (not `String.prototype.isWellFormed`) so it
+ *  carries no runtime-version floor. */
+export function isWellFormedText(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      // A high surrogate is well-formed only when a low surrogate follows it; consume the pair.
+      const next = text.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      i += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false; // a low surrogate with no high surrogate before it
+    }
+  }
+  return true;
+}
+
+/** Whether a session could carry `alias` as its title, so a binding of it could ever match: its
+ *  trimmed text fits Claude Code's title length, counted in code points as Claude Code counts it (a
+ *  UTF-16 count would refuse an alias of emoji or other astral characters that Claude Code stores
+ *  whole), AND it is well-formed UTF-16 ({@link isWellFormedText}: Claude Code substitutes U+FFFD for
+ *  a lone surrogate, so a title carrying one is never recorded verbatim). A longer or ill-formed alias
+ *  never matches any session's title — a binding of it would bind nothing, and `claude --resume
+ *  <alias>` would reject it. */
 export function aliasFitsSessionTitle(alias: string): boolean {
-  return [...alias.trim()].length <= CLAUDE_CODE_TITLE_MAX_LENGTH;
+  const trimmed = alias.trim();
+  return isWellFormedText(trimmed) && [...trimmed].length <= CLAUDE_CODE_TITLE_MAX_LENGTH;
 }
 
 /**

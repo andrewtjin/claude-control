@@ -568,17 +568,43 @@ describe('launchSessionStore', () => {
       session(join(base, 'x'), 'aaaaaaaa-0000-4000-8000-00000000000b', { title: 'Other' });
       session(join(base, 'y'), id, { title: 'Target' });
       const { s, reads } = counted(join(base, 'somewhere-else'));
-      expect((await s.sessionById(id.toUpperCase()))?.customTitle).toBe('Target');
+      expect((await s.sessionById(id.toUpperCase()))[0]?.customTitle).toBe('Target');
       expect(reads).toHaveLength(1);
     });
 
-    it('prefers the newest copy of an id; a missing id is null', async () => {
+    it('with no copy of the id in the launch scope, falls back to the newest copy anywhere; a missing id is empty', async () => {
       const id = 'aaaaaaaa-0000-4000-8000-00000000000a';
       session(join(base, 'x'), id, { title: 'Older' });
       session(join(base, 'y'), id, { title: 'Newer' });
       const { s } = counted(base);
-      expect((await s.sessionById(id))?.customTitle).toBe('Newer');
-      expect(await s.sessionById('bbbbbbbb-0000-4000-8000-000000000000')).toBeNull();
+      expect((await s.sessionById(id)).map((f) => f.customTitle)).toEqual(['Newer']);
+      expect(await s.sessionById('bbbbbbbb-0000-4000-8000-000000000000')).toEqual([]);
+    });
+
+    it('prefers the id’s copy inside the launch folder’s resume scope over a newer one outside it', async () => {
+      // The bound folder is the launch folder; a newer copy of the same id sits in an unrelated folder
+      // out of Claude Code’s resume scope. Following `--resume <id>` from the launch folder must land
+      // on the in-scope copy, not the newer out-of-scope one.
+      const id = 'aaaaaaaa-0000-4000-8000-00000000000a';
+      const here = join(base, 'repo');
+      const older = session(here, id, { title: 'Bound' });
+      const newer = session(join(base, 'other'), id, { title: 'Unbound' });
+      utimesSync(older, new Date(1_000_000_000_000), new Date(1_000_000_000_000));
+      utimesSync(newer, new Date(), new Date());
+      const { s } = counted(here);
+      expect((await s.sessionById(id)).map((f) => f.folder)).toEqual([here]);
+    });
+
+    it('returns every in-scope copy of an id (two worktrees reach a subfolder copy)', async () => {
+      const id = 'aaaaaaaa-0000-4000-8000-00000000000a';
+      const repo = join(base, 'repo');
+      const sub = join(repo, 'sub');
+      session(repo, id, { title: 'X' });
+      session(sub, id, { title: 'X' });
+      const { s } = counted(repo, {
+        gitWorktrees: () => Promise.resolve([repo, join(base, 'repo-wt')]),
+      });
+      expect((await s.sessionById(id)).map((f) => f.folder).sort()).toEqual([repo, sub].sort());
     });
   });
 
@@ -595,7 +621,7 @@ describe('launchSessionStore', () => {
     const file = session(w, 'aaaaaaaa-0000-4000-8000-00000000000d', { title: 'P' });
     const { s } = counted(base);
     const expected = { customTitle: 'P', aiTitle: null, folder: w, dirName: projectDirStem(w) };
-    expect(await s.sessionById('aaaaaaaa-0000-4000-8000-00000000000d')).toEqual(expected);
+    expect(await s.sessionById('aaaaaaaa-0000-4000-8000-00000000000d')).toEqual([expected]);
     expect(await s.sessionAtPath(file)).toEqual(expected);
   });
 
@@ -608,7 +634,7 @@ describe('launchSessionStore', () => {
     });
     expect(await s.sessionsTitled('x')).toEqual([]);
     expect(await s.continueSessions()).toEqual([]);
-    expect(await s.sessionById('aaaaaaaa-0000-4000-8000-000000000000')).toBeNull();
+    expect(await s.sessionById('aaaaaaaa-0000-4000-8000-000000000000')).toEqual([]);
   });
 });
 

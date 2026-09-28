@@ -520,26 +520,41 @@ export function launchSessionStore(options: LaunchSessionStoreOptions): LaunchSe
 
   return {
     async sessionById(sessionId) {
-      // Every project directory, newest copy wins (a relocation can leave the id in two places).
-      // Machine-wide is at least as wide as Claude Code's own lookup: an id it cannot open opens
-      // nothing, so locating it here anyway cannot misroute a session.
+      // An id can sit in more than one project directory (a relocation leaves a copy behind). Claude
+      // Code's `--resume <id>` opens the copy inside its OWN resume search scope, so the launcher must
+      // route by that copy — routing by the newest copy machine-wide would send `cctl claude --resume
+      // <id>` (the very command a block prints) to whichever unbound folder holds a newer copy, and
+      // the guard would block it again. So prefer the id's copies within the launch folder's resume
+      // scope (the same scope sessionsTitled searches); only when the id sits nowhere in scope fall
+      // back to the single newest copy anywhere (an id Claude Code cannot open here opens nothing, so
+      // naming it still cannot misroute, and the guard has the last word). Every in-scope copy is
+      // returned, so the precedence rule routes only when they agree on a binding target.
       const spellings = [...new Set([sessionId, sessionId.toLowerCase()])];
-      const hits = await mapBounded(await listDirNames(root), IO_CONCURRENCY, async (name) => {
-        for (const id of spellings) {
-          const file = join(root, name, `${id}.jsonl`);
-          try {
-            const info = await stat(file);
-            if (info.isFile()) return { file, mtimeMs: info.mtimeMs };
-          } catch {
-            // Not in this directory.
+      const names = await listDirNames(root);
+      const hits = (
+        await mapBounded(names, IO_CONCURRENCY, async (name) => {
+          for (const id of spellings) {
+            const file = join(root, name, `${id}.jsonl`);
+            try {
+              const info = await stat(file);
+              if (info.isFile()) return { name, file, mtimeMs: info.mtimeMs };
+            } catch {
+              // Not in this directory.
+            }
           }
-        }
-        return null;
-      });
-      const newest = hits
-        .filter((h): h is { file: string; mtimeMs: number } => h !== null)
-        .sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
-      return newest === undefined ? null : sessionAt(newest.file);
+          return null;
+        })
+      ).filter((h): h is { name: string; file: string; mtimeMs: number } => h !== null);
+      if (hits.length === 0) return [];
+      // The launch folder's resume search scope, decided by directory NAMES only (no transcript read).
+      const worktrees = await gitWorktrees(cwd).catch((): string[] => []);
+      const inScope = new Set(
+        resumeSearchPlan(names, cwd, worktrees).dirs.map((d) => d.name.toLowerCase()),
+      );
+      const scoped = hits.filter((h) => inScope.has(h.name.toLowerCase()));
+      const chosen = scoped.length > 0 ? scoped : [hits.sort((a, b) => b.mtimeMs - a.mtimeMs)[0]!];
+      const read = await mapBounded(chosen, IO_CONCURRENCY, (h) => sessionAt(h.file));
+      return read.filter((f): f is LaunchSessionFacts => f !== null);
     },
 
     sessionAtPath(file) {

@@ -501,9 +501,10 @@ export function renderBindingGroups(
   const blocks = groups.map((g) => {
     const header = palette.bold(sanitizeForTerminal(g.label));
     const folderLines = g.folders.map((f) => `  folder:  ${sanitizeForTerminal(f)}`);
-    // An alias scope covers one named session in exactly that folder (not its subfolders). One
-    // longer than Claude Code keeps a session name (bound before cctl refused those) can never
-    // match a session: said so, since it silently binds nothing.
+    // An alias scope covers one named session in exactly that folder (not its subfolders). One no
+    // session title can carry — longer than Claude Code keeps a session name, or not well-formed
+    // text (both bound before cctl refused those) — can never match a session: said so, since it
+    // silently binds nothing.
     const aliasLines = (g.aliases ?? []).map(
       (a) =>
         `  session: "${sanitizeForTerminal(a.alias)}" in ${sanitizeForTerminal(a.folder)}` +
@@ -511,8 +512,8 @@ export function renderBindingGroups(
           ? ''
           : '  ' +
             palette.yellow(
-              `(never matches: longer than the ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters Claude ` +
-                'Code keeps of a session name; unbind it)',
+              `(never matches: no session title can carry it — longer than ` +
+                `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters, or not well-formed text; unbind it)`,
             )),
     );
     const memberLine =

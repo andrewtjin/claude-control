@@ -346,10 +346,10 @@ export async function checkBindingScopes(
     const scopeless = groups.filter(
       (g) => g.folders.length === 0 && (g.aliases ?? []).length === 0,
     );
-    const tooLong = groups.flatMap((g) =>
+    const unmatchable = groups.flatMap((g) =>
       (g.aliases ?? []).filter((a) => !aliasFitsSessionTitle(a.alias)),
     );
-    if (scopeless.length === 0 && tooLong.length === 0) {
+    if (scopeless.length === 0 && unmatchable.length === 0) {
       return { name: 'binding-scopes', ok: true, detail: 'every binding has a folder or session' };
     }
     const problems: string[] = [];
@@ -364,12 +364,12 @@ export async function checkBindingScopes(
           scopeless.map((g) => `cctl unbind --group ${g.id}`).join('; '),
       );
     }
-    if (tooLong.length > 0) {
+    if (unmatchable.length > 0) {
       problems.push(
-        `${tooLong.length} session alias(es) never match a session (longer than the ` +
-          `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters Claude Code keeps of a session name) — ` +
-          'unbind them: ' +
-          tooLong
+        `${unmatchable.length} session alias(es) never match a session (no session title can carry ` +
+          `them: longer than the ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters Claude Code keeps of a ` +
+          'session name, or not well-formed text) — unbind them: ' +
+          unmatchable
             .map(
               (a) =>
                 `cctl session unbind ${shellQuoteArg(a.alias, process.platform)} --cwd ` +

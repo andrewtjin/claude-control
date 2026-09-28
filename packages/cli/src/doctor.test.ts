@@ -583,6 +583,17 @@ describe('checkBindingScopes', () => {
     });
     expect(check.ok).toBe(true);
   });
+
+  it('flags a session alias with a lone surrogate: it never matches (Claude Code stores U+FFFD)', async () => {
+    const lone = 'ab\uD800cd';
+    const check = await checkBindingScopes({
+      listGroups: () =>
+        Promise.resolve([group('a', { aliases: [{ folder: 'C:\\repo', alias: lone }] })]),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('1 session alias(es) never match a session');
+    expect(check.detail).toContain(`cctl session unbind '${lone}' --cwd`);
+  });
 });
 
 describe('checkFolderBindings', () => {

@@ -744,8 +744,13 @@ export interface LaunchSessionFacts {
  * lookup is relative to the launch folder the implementation was built for.
  */
 export interface LaunchSessionDeps {
-  /** `--resume <uuid>` / `--session-id <uuid>`: the session with this id, or null when none. */
-  sessionById(sessionId: string): Promise<LaunchSessionFacts | null>;
+  /** `--resume <uuid>` / `--session-id <uuid>`: the session(s) with this id Claude Code could open
+   *  from the launch folder. Claude Code opens the copy inside its own resume search scope, so this
+   *  returns the id's copies in that scope; only when none is in scope does it fall back to the single
+   *  newest copy anywhere (an id Claude Code cannot open here opens nothing). More than one is returned
+   *  only when in-scope copies disagree, and the precedence rule then routes only if they agree.
+   *  Empty when no copy of the id exists. */
+  sessionById(sessionId: string): Promise<LaunchSessionFacts[]>;
   /** `--resume <absolute .jsonl path>`: that transcript, or null when it cannot be read. */
   sessionAtPath(file: string): Promise<LaunchSessionFacts | null>;
   /** `--resume <text>`: every session Claude Code's title search can match, from the launch folder
@@ -861,7 +866,9 @@ export async function resolveLaunchSessions(
   if (parsed.resume !== undefined) {
     if (parsed.resume === null) return FOLDER_RULE; // the picker
     const value = parsed.resume;
-    if (SESSION_UUID.test(value.trim())) return found(await deps.sessionById(value.trim()));
+    if (SESSION_UUID.test(value.trim())) {
+      return { kind: 'candidates', candidates: (await deps.sessionById(value.trim())).map(opened) };
+    }
     if (isTranscriptPath(value, context.platform)) return found(await deps.sessionAtPath(value));
     if (aliasKey(value) === '') return FOLDER_RULE; // a blank title matches nothing: the picker
     // Every match opens under its own custom title, whose key IS the resume text's: unbound there,
@@ -878,7 +885,7 @@ export async function resolveLaunchSessions(
     const id = parsed.sessionId.trim();
     if (!SESSION_UUID.test(id)) return FOLDER_RULE; // Claude Code refuses a malformed id
     const existing = await deps.sessionById(id);
-    if (existing !== null) return found(existing);
+    if (existing.length > 0) return { kind: 'candidates', candidates: existing.map(opened) };
   }
   return {
     kind: 'candidates',

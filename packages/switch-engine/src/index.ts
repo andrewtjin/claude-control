@@ -94,6 +94,7 @@ export {
   checkAliasFolder,
   aliasKey,
   aliasFitsSessionTitle,
+  isWellFormedText,
   CLAUDE_CODE_TITLE_MAX_LENGTH,
   aliasScopeUniquenessKey,
   exactAliasBinding,

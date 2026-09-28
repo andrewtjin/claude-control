@@ -835,8 +835,18 @@ describe('renderBindingGroups', () => {
       PLAIN_PALETTE,
     );
     const lines = out.split('\n');
-    expect(lines.find((l) => l.includes('z'.repeat(201)))).toContain('(never matches: longer than');
+    expect(lines.find((l) => l.includes('z'.repeat(201)))).toContain('(never matches:');
     expect(lines.find((l) => l.includes('"fits"'))).not.toContain('never matches');
+  });
+
+  it('marks a session alias with a lone surrogate as never matching', () => {
+    const lone = 'ab\uD800cd';
+    const out = renderBindingGroups(
+      [{ ...group, folders: [], aliases: [{ folder: 'C:\\repo', alias: lone }] }],
+      PLAIN_PALETTE,
+    );
+    const lines = out.split('\n');
+    expect(lines.find((l) => l.includes('in C:\\repo'))).toContain('(never matches:');
   });
 
   it('counts that length in code points, as Claude Code does', () => {
@@ -857,7 +867,7 @@ describe('renderBindingGroups', () => {
     );
     const lines = out.split('\n');
     expect(lines.find((l) => l.includes('q'.repeat(195)))).not.toContain('never matches');
-    expect(lines.find((l) => l.includes('r'.repeat(196)))).toContain('(never matches: longer than');
+    expect(lines.find((l) => l.includes('r'.repeat(196)))).toContain('(never matches:');
   });
 
   it('flags a group with no working account', () => {

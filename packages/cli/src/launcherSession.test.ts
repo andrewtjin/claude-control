@@ -556,7 +556,8 @@ function store(answers: {
   const deps: LaunchSessionDeps = {
     sessionById: (id) => {
       asked.push(`id:${id}`);
-      return Promise.resolve(answers.byId?.[id] ?? null);
+      const f = answers.byId?.[id];
+      return Promise.resolve(f !== undefined ? [f] : []);
     },
     sessionAtPath: (file) => {
       asked.push(`path:${file}`);

@@ -54,6 +54,7 @@ import {
   exactBinding,
   folderKey,
   folderUniquenessKey,
+  isWellFormedText,
   isWithin,
   resolveBinding,
   resolveSessionBinding,
@@ -1724,12 +1725,20 @@ export class SwitchEngine {
   /** Refuse an alias no session title could usefully carry here: blank (after the resume rule's
    *  trim), longer than Claude Code keeps a session's title (it stores the first
    *  {@link CLAUDE_CODE_TITLE_MAX_LENGTH} characters, so a longer alias would never match any
-   *  session — a binding that silently binds nothing), or holding a control/bidi character — the
-   *  alias is echoed into hook decisions and terminals, and a title that needs one is not worth the
-   *  risk. */
+   *  session — a binding that silently binds nothing), carrying an unpaired surrogate (which Claude
+   *  Code stores as U+FFFD, so again no session could match it), or holding a control/bidi character
+   *  — the alias is echoed into hook decisions and terminals, and a title that needs one is not worth
+   *  the risk. */
   private checkAliasText(alias: string): void {
     if (typeof alias !== 'string' || aliasKey(alias) === '') {
       throw new RefreshError('a session alias cannot be empty', 'bind_refused');
+    }
+    if (!isWellFormedText(alias)) {
+      throw new RefreshError(
+        'a session alias cannot contain an unpaired surrogate: Claude Code stores it as the ' +
+          'Unicode replacement character in a session name, so no session could match this alias',
+        'bind_refused',
+      );
     }
     if (alias.length > MAX_ALIAS_LENGTH || !aliasFitsSessionTitle(alias)) {
       throw new RefreshError(
