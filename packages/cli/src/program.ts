@@ -37,6 +37,7 @@ import {
   episodesOf,
   exhaustionLogPath,
   openEpisodeOf,
+  outageStatus,
   readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
@@ -57,7 +58,12 @@ import {
   type AccountUsageInput,
   type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
-import { episodesInWindow, renderExhaustionBanner, renderExhaustionLog } from './exhaustedView.js';
+import {
+  episodesInWindow,
+  renderExhaustionBanner,
+  renderExhaustionLog,
+  type OpenOutage,
+} from './exhaustedView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
@@ -157,6 +163,7 @@ import {
   renderSettings,
   renderVersionInfo,
   reportSaysGreedyActive,
+  reportedFableCapTrigger,
   resolveCliSettings,
   resolveDaemonConfig,
   settableSettingsSummary,
@@ -333,7 +340,12 @@ export function buildProgram(): Command {
         text +=
           '\n\n' +
           renderPlanSummary(
-            computePlan(inputs, greedy ? { greedyAutoSwitch: true, autoSwitchPolicy } : {}),
+            // The policy goes in either way: whether the Fable cap counts against headroom has to
+            // match the banner above, or the plan could say "No usable account" beside no banner.
+            computePlan(inputs, {
+              autoSwitchPolicy,
+              ...(greedy ? { greedyAutoSwitch: true } : {}),
+            }),
           );
         text +=
           '\n\n' +
@@ -343,8 +355,9 @@ export function buildProgram(): Command {
     });
 
   // The history of the fleet's worst failure: every time no account could take work, written by
-  // the daemon (see the daemon's exhaustionLog.ts). Reads the file only, so it works with the
-  // daemon stopped.
+  // the daemon (see the daemon's exhaustionLog.ts). Works with the daemon stopped: the file is
+  // the history, and an outage still open in it is checked against the latest numbers in
+  // daemon.db, so one that is over but that no running daemon has closed says so.
   program
     .command('exhausted')
     .description(
@@ -360,11 +373,23 @@ export function buildProgram(): Command {
       }
       const nowMs = Date.now();
       const log = exhaustionLog();
-      const episodes = episodesInWindow(episodesOf(await log.read()), nowMs, days);
+      const records = await log.read();
+      const openRecord = openEpisodeOf(records);
+      let open: OpenOutage | undefined;
+      if (openRecord !== undefined) {
+        const state = await readUsageState(nowMs);
+        const fleet = assessFleet(buildAdvisorInputs(state), nowMs, {
+          countFableCap: (await cliAutoSwitchPolicy()).fableCapTriggers ?? true,
+        });
+        const { recovery } = outageStatus(openRecord, fleet, nowMs);
+        open = { id: openRecord.id, ...(recovery !== undefined ? { overBy: recovery } : {}) };
+      }
+      const episodes = episodesInWindow(episodesOf(records), nowMs, days, open?.id);
       if (opts.json === true) {
         const newestFirst = [...episodes].reverse();
         process.stdout.write(
-          JSON.stringify({ log: log.path, episodes: newestFirst }, null, 2) + '\n',
+          JSON.stringify({ log: log.path, open: open ?? null, episodes: newestFirst }, null, 2) +
+            '\n',
         );
         return;
       }
@@ -373,6 +398,7 @@ export function buildProgram(): Command {
           now: nowMs,
           logPath: log.path,
           ...(days !== undefined ? { days } : {}),
+          ...(open !== undefined ? { open } : {}),
           palette: detectPalette(),
         }) + '\n',
       );
@@ -1167,11 +1193,16 @@ function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
   );
 }
 
-/** The auto-switch policy a daemon started from this shell would run under: this shell's
- *  environment over config.json, the way `cctl settings` previews it. */
+/** The auto-switch policy to judge usage by: the thresholds a daemon started from this shell
+ *  would run under (this shell's environment over config.json, the way `cctl settings` previews
+ *  them), except whether the Fable cap counts, which comes from the RUNNING daemon's report when
+ *  there is one. The banner and the plan say whether that daemon counts an outage, and a setting
+ *  saved since it started only reaches it on its next start. */
 async function cliAutoSwitchPolicy(): Promise<AutoSwitchPolicy> {
   const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
-  return autoSwitchPolicyOf(resolveDaemonConfig(process.env, {}, fileConfig).values);
+  const policy = autoSwitchPolicyOf(resolveDaemonConfig(process.env, {}, fileConfig).values);
+  const reported = reportedFableCapTrigger(await readSettingsReport(daemonSettingsPath()));
+  return reported === undefined ? policy : { ...policy, fableCapTriggers: reported };
 }
 
 /** The exhaustion log this machine's daemon writes, beside its database. */
@@ -1179,22 +1210,24 @@ function exhaustionLog(): ExhaustionLog {
   return new ExhaustionLog(exhaustionLogPath(dirname(defaultPaths().vaultDir)));
 }
 
-/** The banner `usage` and `timeline` lead with while no account can take work. Judged from the
- *  numbers the view itself prints, with the Fable cap counted exactly as auto-switch counts it;
- *  the daemon's log only supplies since when, and a log that cannot be read just drops that. */
+/** The banner `usage` and `timeline` lead with while no account can take work, judged the way
+ *  the daemon judges it (`outageStatus`): an outage open in the log stays on until the numbers
+ *  the view prints prove an account is back, so a poll that came back empty does not hide it;
+ *  with none open, it is on when no account can take work. A log that cannot be read is treated
+ *  as having none open. */
 async function exhaustionBanner(
   inputs: AccountUsageInput[],
   policy: AutoSwitchPolicy,
   nowMs: number,
 ): Promise<string | undefined> {
   const fleet = assessFleet(inputs, nowMs, { countFableCap: policy.fableCapTriggers ?? true });
-  if (!fleet.exhausted) return undefined;
   let open: ExhaustedRecord | undefined;
   try {
     open = openEpisodeOf(await exhaustionLog().read());
   } catch {
     open = undefined;
   }
+  if (!outageStatus(open, fleet, nowMs).on) return undefined;
   return renderExhaustionBanner(fleet, open, nowMs, detectPalette());
 }
 

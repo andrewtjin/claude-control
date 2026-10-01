@@ -51,7 +51,7 @@
 // still rotates windows across equal accounts once the active one genuinely nears the wall.
 
 import { humanizeDuration, roundPct } from './format.js';
-import { effectiveLimits, LIMIT_NOUN, worstLimit } from './limits.js';
+import { effectiveLimits, LIMIT_NOUN, policyLimits, worstLimit } from './limits.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
@@ -152,7 +152,7 @@ function candidateGate(now: number, policy: AutoSwitchPolicy) {
   // told to ignore. An account that reports nothing but the cap then reports nothing at all.
   const countFableCap = policy.fableCapTriggers ?? true;
   const visibleLimits = (a: AccountUsageInput): LimitInput[] =>
-    countFableCap ? a.limits : a.limits.filter((l) => l.kind !== 'weekly_scoped');
+    policyLimits(a.limits, countFableCap);
   const weeklyResetAt = (a: AccountUsageInput) => weeklyBudget(visibleLimits(a), a, now)?.resetsAt;
   const isCandidate = (a: AccountUsageInput): boolean =>
     !a.active &&

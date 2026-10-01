@@ -51,6 +51,7 @@ import {
   type IdentityStore,
 } from '@claude-control/daemon';
 import { createAgentSdkClient, createSessionManager } from '@claude-control/session-runtime';
+import type { AdvisorOptions, AutoSwitchPolicy } from '@claude-control/usage-advisor';
 import type { AgentSdkClient } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
@@ -194,6 +195,25 @@ export interface ShutdownSequence {
  * Every step is best-effort: a failure in any one of them must not strand the process before the
  * marker is written, which is precisely the state that would be misreported afterwards.
  */
+/**
+ * What the poller's plan (the one the phone renders) is computed under. The policy always goes
+ * in: it decides whether the Fable cap counts against an account's headroom, which has to match
+ * what auto-switch and the exhaustion log count, or the plan could say "No usable account" while
+ * the daemon logs no outage. Greedy auto-switch additionally makes the plan describe the hops the
+ * daemon itself will make and gate its targets by the same policy, so it never announces a hop
+ * the executor would refuse.
+ */
+export function pollerAdvisorOptions(args: {
+  autoSwitch: boolean;
+  greedy: boolean;
+  policy: AutoSwitchPolicy;
+}): AdvisorOptions {
+  return {
+    autoSwitchPolicy: args.policy,
+    ...(args.autoSwitch && args.greedy ? { greedyAutoSwitch: true } : {}),
+  };
+}
+
 export async function runShutdownSequence(steps: ShutdownSequence): Promise<void> {
   await steps.stopDaemon().catch(() => undefined);
   await steps.removeEndpoint().catch(() => undefined);
@@ -356,13 +376,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       },
       claudeJsonPath: paths.claudeJsonPath,
     }),
-    // Greedy-aware advice: when the daemon itself executes the burn plan, the plan's
-    // wording turns descriptive instead of telling the user to do it by hand — and its
-    // targets are gated by the executor's own policy, so it never announces a hop the
-    // executor would refuse.
-    ...(autoSwitch && greedy
-      ? { advisorOptions: { greedyAutoSwitch: true, autoSwitchPolicy } }
-      : {}),
+    // The plan is computed under the executor's policy (see pollerAdvisorOptions).
+    advisorOptions: pollerAdvisorOptions({ autoSwitch, greedy, policy: autoSwitchPolicy }),
   });
 
   const attributionJournal = new AttributionJournal({ store, vaultDir: paths.vaultDir });

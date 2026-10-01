@@ -13,8 +13,11 @@ import {
   exhaustedCardBody,
   exhaustedRecord,
   ExhaustionLog,
+  openEpisodeFrom,
   exhaustionLogPath,
   openEpisodeOf,
+  outageStatus,
+  trackOpenEpisode,
   recoveredRecord,
   recoveryText,
   type ExhaustedRecord,
@@ -77,7 +80,7 @@ describe('decideExhaustion — starting', () => {
       [acct('a', [session(100, T0 + H)]), acct('b', [weekly(100, T0 + 30 * H)])],
       T0 + 10 * M,
     );
-    expect(decideExhaustion(open, still, T0 + 10 * M)).toEqual({ kind: 'none' });
+    expect(decideExhaustion(openEpisodeFrom(open), still, T0 + 10 * M)).toEqual({ kind: 'none' });
   });
 });
 
@@ -92,7 +95,7 @@ describe('decideExhaustion — ending needs positive evidence', () => {
       ],
       at,
     );
-    expect(decideExhaustion(open, fleet, at)).toEqual({
+    expect(decideExhaustion(openEpisodeFrom(open), fleet, at)).toEqual({
       kind: 'end',
       recovery: { accountId: 'a', label: 'a', how: 'reset', backSince: T0 + H, limit: 'session' },
     });
@@ -104,14 +107,14 @@ describe('decideExhaustion — ending needs positive evidence', () => {
     // a's poll came back empty: usable by "unknown is not exhausted", but nothing proves it.
     const fleet = assessFleet([acct('a'), acct('b', [weekly(100, T0 + 30 * H)])], at);
     expect(fleet.exhausted).toBe(false);
-    expect(decideExhaustion(open, fleet, at)).toEqual({ kind: 'none' });
+    expect(decideExhaustion(openEpisodeFrom(open), fleet, at)).toEqual({ kind: 'none' });
   });
 
   it('no numbers, but the recorded reset has passed: the clock is the evidence', () => {
     const open = exhaustedAtT0();
     const at = T0 + 2 * H;
     const fleet = assessFleet([acct('a'), acct('b', [weekly(100, T0 + 30 * H)])], at);
-    expect(decideExhaustion(open, fleet, at)).toMatchObject({
+    expect(decideExhaustion(openEpisodeFrom(open), fleet, at)).toMatchObject({
       kind: 'end',
       recovery: { label: 'a', how: 'reset', backSince: T0 + H },
     });
@@ -125,7 +128,7 @@ describe('decideExhaustion — ending needs positive evidence', () => {
       [acct('a', [session(100, T0 + 6 * H)]), acct('b', [weekly(100, T0 + 30 * H)])],
       at,
     );
-    expect(decideExhaustion(open, fleet, at)).toEqual({ kind: 'none' });
+    expect(decideExhaustion(openEpisodeFrom(open), fleet, at)).toEqual({ kind: 'none' });
   });
 
   it('headroom before the recorded reset is still a return (the endpoint said so)', () => {
@@ -135,26 +138,43 @@ describe('decideExhaustion — ending needs positive evidence', () => {
       [acct('a', [session(60, T0 + H)]), acct('b', [weekly(100, T0 + 30 * H)])],
       at,
     );
-    expect(decideExhaustion(open, fleet, at)).toMatchObject({
+    expect(decideExhaustion(openEpisodeFrom(open), fleet, at)).toMatchObject({
       kind: 'end',
       recovery: { label: 'a', how: 'headroom', backSince: at },
     });
   });
 
-  it('an account added during the episode ends it', () => {
+  it('an account added during the episode ends it once its numbers show headroom', () => {
+    const open = exhaustedAtT0();
+    const at = T0 + 5 * M;
+    const fleetWith = (added: AccountUsageInput) =>
+      assessFleet(
+        [acct('a', [session(100, T0 + H)]), acct('b', [weekly(100, T0 + 30 * H)]), added],
+        at,
+      );
+    expect(
+      decideExhaustion(
+        openEpisodeFrom(open),
+        fleetWith(acct('new', [session(10, T0 + 4 * H)])),
+        at,
+      ),
+    ).toMatchObject({
+      kind: 'end',
+      recovery: { label: 'new', how: 'new_account', backSince: at },
+    });
+  });
+
+  it('an added account with no numbers yet (its first poll failed) does not end it', () => {
     const open = exhaustedAtT0();
     const at = T0 + 5 * M;
     const fleet = assessFleet(
       [acct('a', [session(100, T0 + H)]), acct('b', [weekly(100, T0 + 30 * H)]), acct('new')],
       at,
     );
-    expect(decideExhaustion(open, fleet, at)).toMatchObject({
-      kind: 'end',
-      recovery: { label: 'new', how: 'new_account', backSince: at },
-    });
+    expect(decideExhaustion(openEpisodeFrom(open), fleet, at)).toEqual({ kind: 'none' });
   });
 
-  it('a restored login ends it once the quota is fine; a still-dead one does not', () => {
+  it('a restored login ends it once its numbers show headroom; a still-dead one does not', () => {
     const fleetAt = (quarantined: boolean, limits: LimitInput[]) =>
       assessFleet([acct('q', limits, { quarantined })], T0 + 10 * M);
     const open = exhaustedRecord({
@@ -163,11 +183,16 @@ describe('decideExhaustion — ending needs positive evidence', () => {
       active: null,
       switches: [],
     });
-    expect(decideExhaustion(open, fleetAt(true, []), T0 + 10 * M)).toEqual({ kind: 'none' });
-    expect(decideExhaustion(open, fleetAt(false, []), T0 + 10 * M)).toMatchObject({
-      kind: 'end',
-      recovery: { how: 'relogin' },
+    expect(decideExhaustion(openEpisodeFrom(open), fleetAt(true, []), T0 + 10 * M)).toEqual({
+      kind: 'none',
     });
+    // Restored, but no numbers yet: nothing proves it has usage.
+    expect(decideExhaustion(openEpisodeFrom(open), fleetAt(false, []), T0 + 10 * M)).toEqual({
+      kind: 'none',
+    });
+    expect(
+      decideExhaustion(openEpisodeFrom(open), fleetAt(false, [session(20, T0 + H)]), T0 + 10 * M),
+    ).toMatchObject({ kind: 'end', recovery: { how: 'relogin' } });
   });
 
   it('a restored login whose quota was also spent waits for that reset when there are no numbers', () => {
@@ -178,9 +203,9 @@ describe('decideExhaustion — ending needs positive evidence', () => {
       switches: [],
     });
     const early = assessFleet([acct('q')], T0 + 10 * M);
-    expect(decideExhaustion(open, early, T0 + 10 * M)).toEqual({ kind: 'none' });
+    expect(decideExhaustion(openEpisodeFrom(open), early, T0 + 10 * M)).toEqual({ kind: 'none' });
     const late = assessFleet([acct('q')], T0 + 2 * H);
-    expect(decideExhaustion(open, late, T0 + 2 * H)).toMatchObject({
+    expect(decideExhaustion(openEpisodeFrom(open), late, T0 + 2 * H)).toMatchObject({
       kind: 'end',
       recovery: { how: 'relogin' },
     });
@@ -193,7 +218,7 @@ describe('decideExhaustion — ending needs positive evidence', () => {
       [acct('a', [session(0, T0 + 45 * H)]), acct('b', [weekly(0, T0 + 200 * H)])],
       at,
     );
-    expect(decideExhaustion(open, fleet, at)).toMatchObject({
+    expect(decideExhaustion(openEpisodeFrom(open), fleet, at)).toMatchObject({
       kind: 'end',
       recovery: { label: 'a', backSince: T0 + H },
     });
@@ -332,5 +357,144 @@ describe('episodes', () => {
   it('an end with no start is dropped', () => {
     const orphan = end(start(T0), T0 + H);
     expect(episodesOf([orphan])).toEqual([]);
+  });
+});
+
+describe('reading the file back', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('a record appended after a torn last line (a crash mid-append) starts its own line', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'exhaustion-log-'));
+    const log = new ExhaustionLog(join(dir, 'x.jsonl'));
+    await writeFile(log.path, '{"v":1,"event":"recovered","id":"ep-1","at":1790');
+    const record = exhaustedAtT0();
+    await log.append(record);
+    expect(await log.read()).toEqual([record]);
+  });
+
+  it('skips a version-1 line whose inner shape is broken, keeps the good ones', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'exhaustion-log-'));
+    const log = new ExhaustionLog(join(dir, 'x.jsonl'));
+    const good = exhaustedAtT0();
+    const broken = [
+      { ...good, accounts: [null] },
+      { ...good, accounts: good.accounts.map(({ spent: _spent, ...rest }) => rest) },
+      { ...good, accounts: [{ ...good.accounts[0], reason: 'tired' }] },
+      { ...good, switches: [{ at: 'yesterday', to: 'a' }] },
+      { ...good, at: 'noon' },
+      { v: 1, event: 'recovered', id: good.id, at: T0, account: null, backSince: T0 },
+    ];
+    await writeFile(log.path, [...broken, good].map((r) => JSON.stringify(r)).join('\n') + '\n');
+    expect(await log.read()).toEqual([good]);
+  });
+});
+
+describe('an open episode, tracked', () => {
+  it('a wall an account hits mid-outage replaces the walls it was recorded with', () => {
+    const open = openEpisodeFrom(exhaustedAtT0());
+    // At the start a was out on its 5-hour window; now its week is at the wall too.
+    const later = assessFleet(
+      [
+        acct('a', [session(100, T0 + H), weekly(99, T0 + 90 * H)]),
+        acct('b', [weekly(100, T0 + 30 * H)]),
+      ],
+      T0 + 30 * M,
+    );
+    const tracked = trackOpenEpisode(open, later, T0 + 30 * M);
+    expect(tracked.accounts.get('a')).toMatchObject({
+      lastOutAt: T0 + 30 * M,
+      spent: [
+        { kind: 'session', percent: 100 },
+        { kind: 'weekly_all', percent: 99 },
+      ],
+    });
+    // After the window's reset, a poll with no numbers is no proof: the week is still ahead.
+    const empty = assessFleet([acct('a'), acct('b', [weekly(100, T0 + 30 * H)])], T0 + 2 * H);
+    expect(
+      decideExhaustion(trackOpenEpisode(tracked, empty, T0 + 2 * H), empty, T0 + 2 * H),
+    ).toEqual({
+      kind: 'none',
+    });
+  });
+
+  it('an account first seen out mid-outage joins it, so its return needs the same proof', () => {
+    const open = openEpisodeFrom(exhaustedAtT0());
+    const withC = assessFleet(
+      [
+        acct('a', [session(100, T0 + H)]),
+        acct('b', [weekly(100, T0 + 30 * H)]),
+        acct('c', [session(100, T0 + 2 * H)]),
+      ],
+      T0 + 10 * M,
+    );
+    const tracked = trackOpenEpisode(open, withC, T0 + 10 * M);
+    expect(tracked.accounts.get('c')?.reason).toBe('session');
+    const cEmpty = assessFleet(
+      [acct('a', [session(100, T0 + H)]), acct('b', [weekly(100, T0 + 30 * H)]), acct('c')],
+      T0 + 20 * M,
+    );
+    expect(decideExhaustion(tracked, cEmpty, T0 + 20 * M)).toEqual({ kind: 'none' });
+  });
+
+  it('a dead login with no numbers keeps the walls it had', () => {
+    const open = openEpisodeFrom(
+      exhaustedRecord({
+        fleet: assessFleet([acct('q', [session(100, T0 + H)], { quarantined: true })], T0),
+        now: T0,
+        active: null,
+        switches: [],
+      }),
+    );
+    const blind = assessFleet([acct('q', [], { quarantined: true })], T0 + 10 * M);
+    expect(trackOpenEpisode(open, blind, T0 + 10 * M).accounts.get('q')?.spent).toEqual([
+      session(100, T0 + H),
+    ]);
+  });
+});
+
+describe('outageStatus (what the CLI shows)', () => {
+  it('with nothing open, the outage is on exactly when no account can take work', () => {
+    const out = assessFleet([acct('a', [session(100, T0 + H)])], T0);
+    const fine = assessFleet([acct('a', [session(10, T0 + H)])], T0);
+    expect(outageStatus(undefined, out, T0)).toEqual({ on: true });
+    expect(outageStatus(undefined, fine, T0)).toEqual({ on: false });
+  });
+
+  it('an open outage stays on through a reading with no numbers, and ends on proof', () => {
+    const open = exhaustedAtT0();
+    const blind = assessFleet([acct('a'), acct('b', [weekly(100, T0 + 30 * H)])], T0 + 10 * M);
+    expect(outageStatus(open, blind, T0 + 10 * M)).toEqual({ on: true });
+    const back = assessFleet(
+      [acct('a', [session(5, T0 + 6 * H)]), acct('b', [weekly(100, T0 + 30 * H)])],
+      T0 + 2 * H,
+    );
+    expect(outageStatus(open, back, T0 + 2 * H)).toMatchObject({
+      on: false,
+      recovery: { label: 'a', how: 'reset', backSince: T0 + H },
+    });
+  });
+});
+
+describe('a clock that stepped back', () => {
+  it('never dates the end before the start, and a zero-length outage reads "<1m"', () => {
+    const open = exhaustedRecord({
+      fleet: assessFleet([acct('a', [session(100, T0 + 2 * H)])], T0 + H),
+      now: T0 + H,
+      active: 'a',
+      switches: [],
+    });
+    const r = recoveredRecord(
+      open,
+      { accountId: 'a', label: 'a', how: 'headroom', backSince: T0 + 10 * M },
+      T0 + 10 * M,
+    );
+    expect(r).toMatchObject({ backSince: open.at, durationMs: 0 });
+    expect(r.summary).toBe(
+      'Usage is back: a (it has usage left again). No account could take work for <1m.',
+    );
   });
 });

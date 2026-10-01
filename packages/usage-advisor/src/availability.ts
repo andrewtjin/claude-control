@@ -1,19 +1,27 @@
 // Which accounts can take work right now and, when none can, why each one is out and when the
 // first one comes back.
 //
-// "Can take work" is ONE rule shared by every surface that asks: the advisor's exhausted bar,
-// the daemon's post-switch resume of stalled sessions, and the exhaustion log the daemon keeps
-// of the times no account could take work at all. Two definitions would let the log say "every
-// account is out" while the resume kicked a session onto one of them. Pure, like the rest of
+// "Can take work" is ONE rule shared by every surface that asks: the advisor's usable verdict
+// (its plan's "No usable account"), the daemon's post-switch resume of stalled sessions, and the
+// exhaustion log the daemon keeps of the times no account could take work at all. All of them
+// read the same live limits (a limit whose reset has passed no longer counts), drop the Fable
+// cap exactly when the auto-switch policy does, and apply the same bar. Two definitions would let
+// the log say "every account is out" while the plan or the resume found one with usage left.
+//
+// It is NOT auto-switch's target rule: auto-switch stops hopping to an account well before this
+// bar (at its 94% trigger, or with too little of a 5-hour window left), so auto-switch can run
+// out of places to go while some account can still, strictly, take work. Pure, like the rest of
 // this package: the caller supplies the snapshot and the moment.
 
 import { humanizeDuration, roundPct } from './format.js';
-import { effectiveLimits, LIMIT_NOUN, worstLimit } from './limits.js';
+import { effectiveLimits, LIMIT_NOUN, policyLimits, worstLimit } from './limits.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
-/** Headroom at/below this is "effectively exhausted" — the one definition shared by the
- *  advisor's scoring (its `minUsableHeadroomPct` default) and the daemon's post-switch
- *  stalled-session kick, so "has usage left" can never mean two different things. */
+/** Headroom BELOW this is "effectively exhausted": a limit more than 98% used is a wall, and
+ *  one at exactly 98% is not (the endpoint reports whole percents, so in practice the wall is
+ *  99%). The one bar shared by the advisor (its `minUsableHeadroomPct` default), the daemon's
+ *  post-switch stalled-session kick and the exhaustion log, so "has usage left" can never mean
+ *  two different things. */
 export const MIN_USABLE_HEADROOM_PCT = 2;
 
 /** Why an account cannot take work: a dead login, or the kind of limit it hit. */
@@ -56,8 +64,8 @@ export interface FleetAvailability {
 
 export interface AvailabilityOptions {
   /** Whether the Fable weekly cap counts as a wall. Pass the auto-switch policy's
-   *  `fableCapTriggers`, so "out of usage" means exactly what auto-switch treats as out.
-   *  Default true, as there. */
+   *  `fableCapTriggers`, so the cap counts exactly when auto-switch counts it. Default true,
+   *  as there. */
   countFableCap?: boolean;
 }
 
@@ -72,10 +80,7 @@ export function assessAccount(
   now: number,
   options: AvailabilityOptions = {},
 ): AccountAvailability {
-  const visible =
-    (options.countFableCap ?? true)
-      ? account.limits
-      : account.limits.filter((l) => l.kind !== 'weekly_scoped');
+  const visible = policyLimits(account.limits, options.countFableCap ?? true);
   const live = effectiveLimits(visible, now);
   const binding = worstLimit(visible, now);
   const spent = live.filter((l) => 100 - l.percent < MIN_USABLE_HEADROOM_PCT);
@@ -160,14 +165,21 @@ export function hasUsableHeadroom(account: AccountUsageInput, now = Date.now()):
   return assessAccount(account, now).usable;
 }
 
+/** The limits holding an account out, in words: "5-hour window 100% and weekly budget 99%".
+ *  Every wall is named, because the account is back only when the LAST of them resets: naming
+ *  the worst one alone would pair "5-hour window" with a return three days out. Shared by the
+ *  log, the phone card and `cctl exhausted`. */
+export function describeWalls(spent: LimitInput[]): string {
+  return spent.length === 0
+    ? 'out of usage'
+    : spent.map((l) => `${LIMIT_NOUN[l.kind]} ${roundPct(l.percent)}%`).join(' and ');
+}
+
 /** One unavailable account in words, shared by the log, the phone card and the CLI so they
  *  never describe the same account differently: "work2 (5-hour window 99%, back in 2h 13m)". */
 export function describeUnavailable(a: AccountAvailability, now: number): string {
   if (a.reason === 'quarantined') return `${a.label} (login expired)`;
-  const limit =
-    a.reason !== undefined && a.percent !== undefined
-      ? `${LIMIT_NOUN[a.reason]} ${roundPct(a.percent)}%`
-      : 'out of usage';
+  const limit = describeWalls(a.spent);
   const back =
     a.backAt === undefined
       ? 'reset time unknown'

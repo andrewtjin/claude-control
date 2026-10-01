@@ -7,6 +7,7 @@ import {
   hasUsableHeadroom,
   MIN_USABLE_HEADROOM_PCT,
 } from './availability.js';
+import { computePlan } from './advisor.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 const NOW = Date.parse('2026-10-01T12:00:00.000Z');
@@ -195,5 +196,54 @@ describe('describing an exhausted fleet', () => {
         NOW,
       ),
     ).toBe('No reset time is known for any of them.');
+  });
+});
+
+describe('an account out on more than one limit', () => {
+  it('is described by every wall, so the reason and the return time never name different limits', () => {
+    const a = assessAccount(
+      acct('work1', {}, [
+        { kind: 'session', percent: 100, resetsAt: NOW + H },
+        { kind: 'weekly_all', percent: 99, resetsAt: NOW + 72 * H },
+      ]),
+      NOW,
+    );
+    expect(describeUnavailable(a, NOW)).toBe(
+      'work1 (5-hour window 100% and weekly budget 99%, back in 3d)',
+    );
+  });
+});
+
+describe('the advisor reads the same rule', () => {
+  it('with the Fable cap opted out, a Fable-capped fleet is usable to the plan too', () => {
+    const capped = (id: string, active = false) =>
+      acct('', { accountId: id, label: id, active }, [
+        { kind: 'session', percent: 20, resetsAt: NOW + 3 * H },
+        { kind: 'weekly_all', percent: 40, resetsAt: NOW + 72 * H },
+        { kind: 'weekly_scoped', percent: 100, resetsAt: NOW + 30 * H },
+      ]);
+    const inputs = [capped('work1', true), capped('work2')];
+    const plan = computePlan(inputs, {
+      now: () => NOW,
+      autoSwitchPolicy: { fableCapTriggers: false },
+    });
+    expect(assessFleet(inputs, NOW, { countFableCap: false }).exhausted).toBe(false);
+    expect(plan.reason).not.toMatch(/^No usable account/);
+    // And with the cap counted, both say every account is out.
+    const counted = computePlan(inputs, { now: () => NOW });
+    expect(assessFleet(inputs, NOW).exhausted).toBe(true);
+    expect(counted.reason).toMatch(/^No usable account/);
+  });
+
+  it('a limit whose reset has passed holds nothing back, in the plan as in the rule', () => {
+    const rested = (id: string, active = false) =>
+      acct('', { accountId: id, label: id, active }, [
+        { kind: 'session', percent: 100, resetsAt: NOW - 5 * 60_000 },
+      ]);
+    const inputs = [rested('work1', true), rested('work2')];
+    const plan = computePlan(inputs, { now: () => NOW });
+    expect(inputs.map((i) => assessAccount(i, NOW).usable)).toEqual([true, true]);
+    expect(plan.ranking.every((r) => r.score > Number.MIN_SAFE_INTEGER)).toBe(true);
+    expect(plan.reason).not.toMatch(/^No usable account/);
   });
 });

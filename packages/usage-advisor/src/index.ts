@@ -19,6 +19,7 @@ export {
   assessFleet,
   describeFirstBack,
   describeUnavailable,
+  describeWalls,
   type AccountAvailability,
   type AvailabilityOptions,
   type FleetAvailability,

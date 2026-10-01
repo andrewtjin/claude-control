@@ -64,18 +64,23 @@ export {
   EXHAUSTION_LOG_FILE,
   ExhaustionLog,
   exhaustionLogPath,
+  openEpisodeFrom,
   openEpisodeOf,
+  outageStatus,
   recoveryText,
   SWITCH_CHAIN_WINDOW_MS,
+  trackOpenEpisode,
   type ExhaustedAccount,
   type ExhaustedRecord,
   type ExhaustionEpisode,
   type ExhaustionRecord,
   type ExhaustionSwitch,
   type ExhaustionTransition,
+  type OpenEpisode,
   type RecoveredRecord,
   type Recovery,
   type RecoveryHow,
+  type TrackedAccount,
 } from './exhaustionLog.js';
 
 export {

@@ -2,7 +2,8 @@
 // AttributionJournal and ControlPlaneClient talking to a minimal in-process relay, with the
 // usage endpoint scripted per account and a clock the test moves. What is under test is that the
 // pieces agree: the file gets exactly one start and one end per outage, the phone gets exactly
-// one card each time, and nothing in between (a failed poll, a restart) adds a second outage.
+// one card each time, and nothing in between (a failed poll, a restart, an account added mid-way,
+// a write that failed) adds a second outage or a false end.
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
@@ -35,6 +36,7 @@ import {
   exhaustedRecord,
   ExhaustionLog,
   type ExhaustedRecord,
+  type ExhaustionRecord,
   type RecoveredRecord,
 } from './exhaustionLog.js';
 
@@ -102,6 +104,14 @@ class SteadyRelay {
     );
   }
 
+  /** The plan line of the last usage snapshot: what the phone's /usage shows. */
+  lastPlanReason(): string | undefined {
+    const last = this.received.filter((e) => e.type === 'usage.snapshot').at(-1);
+    return last !== undefined && isType(last, 'usage.snapshot')
+      ? last.payload.plan?.reason
+      : undefined;
+  }
+
   async close(): Promise<void> {
     await new Promise<void>((resolve, reject) =>
       this.wss.close((err) => (err ? reject(err) : resolve())),
@@ -126,18 +136,35 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
 /** Let anything a cycle sent cross the real socket before asserting that nothing more came. */
 const settle = () => new Promise((r) => setTimeout(r, 60));
 
-const ACCOUNTS: StoredAccount[] = [
-  { id: 'acct-1', label: 'work1', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
-  { id: 'acct-2', label: 'work2', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
-];
+const account = (id: string, label: string): StoredAccount => ({
+  id,
+  label,
+  quarantined: false,
+  createdAtMs: 0,
+  updatedAtMs: 0,
+});
 
-/** An endpoint body: the 5-hour window at `percent`, resetting at `resetsAt`, a quiet week. */
-const sessionBody = (percent: number, resetsAt: number) => ({
+/** An endpoint body: the 5-hour window at `percent`, resetting at `resetsAt`, the week at
+ *  `weeklyPercent` (quiet by default). */
+const sessionBody = (percent: number, resetsAt: number, weeklyPercent = 50) => ({
   limits: [
     { kind: 'session', percent, resets_at: iso(resetsAt) },
-    { kind: 'weekly_all', percent: 50, resets_at: iso(T0 + 90 * H) },
+    { kind: 'weekly_all', percent: weeklyPercent, resets_at: iso(T0 + 90 * H) },
   ],
 });
+
+/** A body the fake endpoint answers with that HTTP status instead of usage (429, 500). */
+const httpStatus = (status: number) => ({ __status: status });
+
+/** A log whose appends fail while `failing` says so: a file briefly held by a scanner, a disk
+ *  briefly full. */
+class FlakyLog extends ExhaustionLog {
+  failing: (record: ExhaustionRecord) => boolean = () => false;
+  override async append(record: ExhaustionRecord): Promise<void> {
+    if (this.failing(record)) throw new Error('EBUSY: resource busy or locked');
+    return super.append(record);
+  }
+}
 
 interface Rig {
   daemon: Daemon;
@@ -146,8 +173,12 @@ interface Rig {
   lines: string[];
   /** The usage endpoint's answer per account id; mutate between cycles. */
   bodies: Map<string, unknown>;
+  /** The registry the daemon lists each cycle; push to add an account mid-run. */
+  accounts: StoredAccount[];
   /** Run one poll cycle at `at`, after any cycle already running has finished. */
   cycle: (at: number) => Promise<void>;
+  /** Stop this daemon (a restart test starts another on the same log). */
+  stop: () => Promise<void>;
   vaultDir: string;
 }
 
@@ -162,21 +193,30 @@ async function createRig(
     seedLog?: unknown[];
     /** Lines already in the switch audit log. */
     seedAudit?: unknown[];
+    /** The daemon's auto-switch policy, also handed to the poller's plan as the composition
+     *  root does. */
     autoSwitchPolicy?: AutoSwitchPolicy;
     /** Where the log lives; default a file in the rig's temp folder. */
     logPath?: (dir: string) => string;
+    /** A log of the test's own (a flaky one); overrides `logPath`. */
+    log?: ExhaustionLog;
+    accounts?: StoredAccount[];
+    activeId?: string;
+    /** The clock when the daemon starts (its first cycle runs then). */
+    startAt?: number;
   } = {},
 ): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
   const store = new Store(':memory:');
   const vaultDir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-'));
-  const clock = { now: T0 };
+  const clock = { now: options.startAt ?? T0 };
   const bodies = new Map<string, unknown>();
+  const accounts = options.accounts ?? [account('acct-1', 'work1'), account('acct-2', 'work2')];
 
-  const log = new ExhaustionLog(
-    options.logPath?.(vaultDir) ?? join(vaultDir, 'exhaustion-log.jsonl'),
-  );
+  const log =
+    options.log ??
+    new ExhaustionLog(options.logPath?.(vaultDir) ?? join(vaultDir, 'exhaustion-log.jsonl'));
   if (options.seedLog !== undefined) {
     await writeFile(log.path, options.seedLog.map((r) => JSON.stringify(r) + '\n').join(''));
   }
@@ -187,21 +227,26 @@ async function createRig(
     );
   }
 
-  const json = (body: unknown): FetchLikeResponse => ({
-    ok: true,
-    status: 200,
-    json: () => Promise.resolve(body),
-  });
+  const respond = (body: unknown): FetchLikeResponse => {
+    const status =
+      typeof body === 'object' && body !== null && '__status' in body
+        ? (body as { __status: number }).__status
+        : 200;
+    return { ok: status === 200, status, json: () => Promise.resolve(body) };
+  };
   const poller = new UsagePoller({
     // The token names the account, so one fetch answers per account.
     fetch: (_url, init) =>
       Promise.resolve(
-        json(bodies.get((init.headers.authorization ?? '').replace('Bearer tok-', '')) ?? {}),
+        respond(bodies.get((init.headers.authorization ?? '').replace('Bearer tok-', '')) ?? {}),
       ),
     getToken: (accountId: string) => Promise.resolve(`tok-${accountId}`),
     getCachedUsage: () => Promise.resolve(undefined),
     clock: () => clock.now,
     random: () => 0,
+    ...(options.autoSwitchPolicy !== undefined
+      ? { advisorOptions: { autoSwitchPolicy: options.autoSwitchPolicy } }
+      : {}),
   });
 
   const switchEngine: SwitchEngineLike = {
@@ -214,8 +259,8 @@ async function createRig(
         adoptedPreviousRotation: false,
         wroteCredentials: true,
       }),
-    listAccounts: (): Promise<StoredAccount[]> => Promise.resolve(ACCOUNTS),
-    getActiveId: (): Promise<string | null> => Promise.resolve('acct-2'),
+    listAccounts: (): Promise<StoredAccount[]> => Promise.resolve([...accounts]),
+    getActiveId: (): Promise<string | null> => Promise.resolve(options.activeId ?? 'acct-2'),
     reauthenticate: () => Promise.reject(new Error('not used in this test')),
   };
   const records: SessionRecord[] = [];
@@ -266,9 +311,15 @@ async function createRig(
     // Effectively off: every cycle is driven by the test.
     pollIntervalMs: 100_000,
   });
-  cleanups.push(async () => {
+  let stopped = false;
+  const stop = async (): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
     await daemon.stop().catch(() => {});
     await relay.close();
+  };
+  cleanups.push(async () => {
+    await stop();
     await rm(vaultDir, { recursive: true, force: true });
   });
 
@@ -283,14 +334,15 @@ async function createRig(
     clock.now = at;
     await internals.runPollCycle();
   };
-  return { daemon, relay, log, lines, bodies, cycle, vaultDir };
+  return { daemon, relay, log, lines, bodies, accounts, cycle, stop, vaultDir };
 }
 
-/** Start the daemon with its first (immediate) cycle at T0, and wait for that cycle to finish. */
-async function startAtT0(rig: Rig): Promise<void> {
+/** Start the daemon with its first (immediate) cycle at `at` (default T0), and wait for that
+ *  cycle to finish. */
+async function startAtT0(rig: Rig, at = T0): Promise<void> {
   await rig.daemon.start();
   await waitFor(() => rig.relay.received.some((e) => e.type === 'usage.snapshot'));
-  await rig.cycle(T0 + 1); // waits out the start cycle; a second reading at the same numbers
+  await rig.cycle(at + 1); // waits out the start cycle; a second reading at the same numbers
 }
 
 describe('exhaustion log through the poll cycle', () => {
@@ -475,11 +527,370 @@ describe('exhaustion log through the poll cycle', () => {
     rig.bodies.set('acct-2', sessionBody(100, T0 + 2 * H));
     await startAtT0(rig);
     await waitFor(() => rig.relay.cards().length === 1);
-    expect(rig.lines).toContain('could not write the exhaustion log');
+    expect(rig.lines).toContain('could not write the exhaustion log; retrying every cycle');
     await expect(readFile(rig.log.path, 'utf8')).rejects.toThrow();
     // And the cycle after it still runs and does not announce the outage again.
     await rig.cycle(T0 + 10 * M);
     await settle();
     expect(rig.relay.cards()).toHaveLength(1);
+  });
+});
+
+describe('an account that joins an open outage', () => {
+  it('added at the wall, then one empty poll of it: the outage stays open', async () => {
+    const rig = await createRig();
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 4 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 5 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+
+    // A third login during the outage, just as spent (used elsewhere).
+    rig.accounts.push(account('acct-3', 'work3'));
+    rig.bodies.set('acct-3', sessionBody(100, T0 + 3 * H));
+    await rig.cycle(T0 + 10 * M);
+    // One empty reading of it, then it reads at the wall again.
+    rig.bodies.set('acct-3', {});
+    await rig.cycle(T0 + 20 * M);
+    rig.bodies.set('acct-3', sessionBody(100, T0 + 3 * H));
+    await rig.cycle(T0 + 30 * M);
+    await settle();
+
+    expect(rig.relay.cards().map((c) => c.type)).toEqual(['usage_exhausted']);
+    expect(await rig.log.read()).toHaveLength(1);
+  });
+
+  it('added at the wall, it comes back by its own reset, dated to that reset', async () => {
+    const rig = await createRig();
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 4 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 5 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    rig.accounts.push(account('acct-3', 'work3'));
+    rig.bodies.set('acct-3', sessionBody(100, T0 + 2 * H));
+    await rig.cycle(T0 + 10 * M);
+    rig.bodies.set('acct-3', sessionBody(3, T0 + 7 * H));
+    await rig.cycle(T0 + 2 * H + 5 * M);
+    await waitFor(() => rig.relay.cards().length === 2);
+    const end = (await rig.log.read())[1] as RecoveredRecord;
+    expect(end).toMatchObject({ how: 'reset', limit: 'session', backSince: T0 + 2 * H });
+  });
+
+  it('added mid-outage, its first poll failing (500): no false end, no second start', async () => {
+    const rig = await createRig();
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 2 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 3 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    rig.accounts.push(account('acct-3', 'work3'));
+    rig.bodies.set('acct-3', httpStatus(500));
+    await rig.cycle(T0 + 10 * M);
+    rig.bodies.set('acct-3', sessionBody(100, T0 + 4 * H));
+    await rig.cycle(T0 + 15 * M);
+    await settle();
+    expect(rig.relay.cards().map((c) => c.type)).toEqual(['usage_exhausted']);
+    expect((await rig.log.read()).map((r) => r.event)).toEqual(['exhausted']);
+  });
+
+  it('added while the daemon was stopped and rate-limited on its first poll: not back', async () => {
+    const before = exhaustedRecord({
+      fleet: assessFleet(
+        [
+          {
+            accountId: 'acct-1',
+            label: 'work1',
+            active: false,
+            quarantined: false,
+            limits: [{ kind: 'session', percent: 100, resetsAt: T0 + 3 * H }],
+          },
+          {
+            accountId: 'acct-2',
+            label: 'work2',
+            active: true,
+            quarantined: false,
+            limits: [{ kind: 'session', percent: 100, resetsAt: T0 + 4 * H }],
+          },
+        ],
+        T0 - 30 * M,
+      ),
+      now: T0 - 30 * M,
+      active: 'work2',
+      switches: [],
+    });
+    const rig = await createRig({
+      seedLog: [before],
+      accounts: [
+        account('acct-1', 'work1'),
+        account('acct-2', 'work2'),
+        account('acct-3', 'work3'),
+      ],
+    });
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    rig.bodies.set('acct-3', httpStatus(429));
+    await startAtT0(rig);
+    rig.bodies.set('acct-3', sessionBody(100, T0 + 2 * H));
+    await rig.cycle(T0 + 40 * M); // past the 429 backoff: work3 reads at the wall
+    await settle();
+    expect(rig.relay.cards()).toEqual([]);
+  });
+});
+
+describe('a write that failed for a while', () => {
+  /** An outage at T0 that ends at T0+1h05 while the end cannot be written. */
+  async function outageWhoseEndFailsToWrite(path: string): Promise<{ rig: Rig; log: FlakyLog }> {
+    const log = new FlakyLog(path);
+    log.failing = (r) => r.event === 'recovered';
+    const rig = await createRig({ log });
+    rig.bodies.set('acct-1', sessionBody(100, T0 + H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 2 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    rig.bodies.set('acct-1', sessionBody(3, T0 + 6 * H));
+    await rig.cycle(T0 + H + 5 * M);
+    await waitFor(() => rig.relay.cards().length === 2); // the phone heard: usage is back
+    expect(rig.lines).toContain('could not write the exhaustion log; retrying every cycle');
+    expect((await log.read()).map((r) => r.event)).toEqual(['exhausted']);
+    return { rig, log };
+  }
+
+  it('an end that could not be written lands on the next cycle once the file is writable', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const { rig, log } = await outageWhoseEndFailsToWrite(join(dir, 'exhaustion-log.jsonl'));
+    log.failing = () => false;
+    await rig.cycle(T0 + H + 10 * M);
+    expect((await log.read()).map((r) => r.event)).toEqual(['exhausted', 'recovered']);
+    expect(rig.relay.cards()).toHaveLength(2);
+  });
+
+  it('an end written on shutdown is not announced again by the next daemon', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const path = join(dir, 'exhaustion-log.jsonl');
+    const { rig, log } = await outageWhoseEndFailsToWrite(path);
+    log.failing = () => false;
+    await rig.stop(); // the queued end is written on the way down
+    expect((await log.read()).map((r) => r.event)).toEqual(['exhausted', 'recovered']);
+
+    // Days later the daemon starts again; usage has been fine all along.
+    const later = T0 + 72 * H;
+    const second = await createRig({ logPath: () => path, startAt: later });
+    second.bodies.set('acct-1', sessionBody(3, later + 3 * H));
+    second.bodies.set('acct-2', sessionBody(3, later + 3 * H));
+    await startAtT0(second, later);
+    await settle();
+    expect(second.relay.cards()).toEqual([]);
+  });
+
+  it('after an end written late, the next outage after a restart still gets its start card', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const path = join(dir, 'exhaustion-log.jsonl');
+    const { rig, log } = await outageWhoseEndFailsToWrite(path);
+    log.failing = () => false;
+    await rig.stop();
+
+    const later = T0 + 72 * H;
+    const second = await createRig({ logPath: () => path, startAt: later });
+    second.bodies.set('acct-1', sessionBody(100, later + H));
+    second.bodies.set('acct-2', sessionBody(100, later + 2 * H));
+    await startAtT0(second, later);
+    await settle();
+    expect(second.relay.cards().map((c) => c.type)).toEqual(['usage_exhausted']);
+  });
+
+  it('a start written late is not announced again by a restart mid-outage', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const path = join(dir, 'exhaustion-log.jsonl');
+    const log = new FlakyLog(path);
+    log.failing = (r) => r.event === 'exhausted';
+    const first = await createRig({ log });
+    first.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    first.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(first);
+    await waitFor(() => first.relay.cards().length === 1);
+    log.failing = () => false;
+    await first.stop();
+
+    const second = await createRig({ logPath: () => path, startAt: T0 + 30 * M });
+    second.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    second.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(second, T0 + 30 * M);
+    await settle();
+    expect(second.relay.cards()).toEqual([]);
+  });
+
+  it('a torn last line left by a crash does not swallow the next entry', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const path = join(dir, 'exhaustion-log.jsonl');
+    await writeFile(path, '{"v":1,"event":"exhausted","id":"ep-1","at":17');
+    const first = await createRig({ logPath: () => path });
+    first.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    first.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(first);
+    await waitFor(() => first.relay.cards().length === 1);
+    expect((await first.log.read()).map((r) => r.event)).toEqual(['exhausted']);
+    await first.stop();
+
+    // So a restart mid-outage resumes it instead of announcing it again.
+    const second = await createRig({ logPath: () => path, startAt: T0 + 30 * M });
+    second.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    second.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(second, T0 + 30 * M);
+    await settle();
+    expect(second.relay.cards()).toEqual([]);
+  });
+});
+
+describe('walls kept current through the outage', () => {
+  it('a wall hit during the outage keeps it open through an empty poll after the first reset', async () => {
+    const rig = await createRig();
+    // work1: 99% of its 5-hour window (resets T0+1h), week at 97%. work2: out for the week.
+    rig.bodies.set('acct-1', sessionBody(99, T0 + H, 97));
+    rig.bodies.set('acct-2', {
+      limits: [
+        { kind: 'session', percent: 10, resets_at: iso(T0 + 3 * H) },
+        { kind: 'weekly_all', percent: 100, resets_at: iso(T0 + 50 * H) },
+      ],
+    });
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    // The last of the window burns the week to 99%.
+    rig.bodies.set('acct-1', sessionBody(100, T0 + H, 99));
+    await rig.cycle(T0 + 30 * M);
+    // After the window's reset, one empty reading...
+    rig.bodies.set('acct-1', {});
+    await rig.cycle(T0 + H + 5 * M);
+    // ...then a fresh window, but the week is still at the wall.
+    rig.bodies.set('acct-1', sessionBody(0, T0 + 6 * H, 99));
+    await rig.cycle(T0 + H + 10 * M);
+    await settle();
+    expect(rig.relay.cards().map((c) => c.type)).toEqual(['usage_exhausted']);
+  });
+
+  it('a reset the endpoint moves later dates the end to the later reset', async () => {
+    const rig = await createRig();
+    const weekly = (percent: number, resetsAt: number) => ({
+      limits: [
+        { kind: 'session', percent: 0, resets_at: iso(T0 + 4 * H) },
+        { kind: 'weekly_all', percent, resets_at: iso(resetsAt) },
+      ],
+    });
+    rig.bodies.set('acct-1', weekly(100, T0 + H));
+    rig.bodies.set('acct-2', weekly(100, T0 + 50 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    // Past the reset recorded at the start, work1 still reads at the wall, now until T0+3h.
+    rig.bodies.set('acct-1', weekly(100, T0 + 3 * H));
+    await rig.cycle(T0 + H + 5 * M);
+    await rig.cycle(T0 + 2 * H);
+    rig.bodies.set('acct-1', weekly(0, T0 + 171 * H));
+    await rig.cycle(T0 + 3 * H + 5 * M);
+    await waitFor(() => rig.relay.cards().length === 2);
+    const end = (await rig.log.read())[1] as RecoveredRecord;
+    expect(end).toMatchObject({ how: 'reset', backSince: T0 + 3 * H, durationMs: 3 * H });
+  });
+});
+
+describe('a log line this build cannot use', () => {
+  it('a structurally broken start is skipped, not resumed, and tracking keeps working', async () => {
+    const good = exhaustedRecord({
+      fleet: assessFleet(
+        [
+          {
+            accountId: 'acct-1',
+            label: 'work1',
+            active: false,
+            quarantined: false,
+            limits: [{ kind: 'session', percent: 100, resetsAt: T0 + H }],
+          },
+        ],
+        T0 - 30 * M,
+      ),
+      now: T0 - 30 * M,
+      active: 'work1',
+      switches: [],
+    });
+    // The same entry with an account's walls cut out by hand.
+    const broken = { ...good, accounts: good.accounts.map(({ spent: _spent, ...rest }) => rest) };
+    const rig = await createRig({ seedLog: [broken] });
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 2 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 3 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    expect(rig.lines).not.toContain('exhaustion tracking failed');
+    // Nothing was resumed from the unusable line, so this outage is announced as its own.
+    expect(rig.relay.cards().map((c) => c.type)).toEqual(['usage_exhausted']);
+  });
+});
+
+describe('the phone hears one story', () => {
+  it('Fable cap opted out: the plan does not say "No usable account" while no card is sent', async () => {
+    const rig = await createRig({ autoSwitchPolicy: { fableCapTriggers: false } });
+    const fableCapped = {
+      limits: [
+        { kind: 'session', percent: 20, resets_at: iso(T0 + 3 * H) },
+        { kind: 'weekly_all', percent: 40, resets_at: iso(T0 + 72 * H) },
+        { kind: 'weekly_scoped', percent: 100, resets_at: iso(T0 + 30 * H) },
+      ],
+    };
+    rig.bodies.set('acct-1', fableCapped);
+    rig.bodies.set('acct-2', fableCapped);
+    await startAtT0(rig);
+    await settle();
+    expect(rig.relay.cards()).toEqual([]);
+    expect(rig.relay.lastPlanReason() ?? '').not.toMatch(/^No usable account/);
+  });
+
+  it('a crash recovery that rolled a switch forward is part of the walk', async () => {
+    const rig = await createRig({
+      accounts: [
+        account('acct-1', 'work1'),
+        account('acct-2', 'work2'),
+        account('acct-3', 'work3'),
+      ],
+      activeId: 'acct-3',
+      seedAudit: [
+        {
+          ts: T0 - 3 * H,
+          event: 'activated',
+          fromAccountId: 'acct-1',
+          toAccountId: 'acct-2',
+          origin: 'auto',
+          detail: 'work1 at 95% of its 5-hour window',
+        },
+        // A switch to work3 was torn after its first write; recovery finished it.
+        {
+          ts: T0 - H,
+          event: 'recovered',
+          fromAccountId: 'acct-2',
+          toAccountId: 'acct-3',
+          detail: 'rolled forward',
+          origin: 'recovery',
+        },
+        // A recovery that only cleared a record moved nothing.
+        {
+          ts: T0 - 30 * M,
+          event: 'recovered',
+          fromAccountId: 'acct-3',
+          toAccountId: null,
+          detail: 'cleared at phase writing',
+          origin: 'recovery',
+        },
+      ],
+    });
+    rig.bodies.set('acct-1', sessionBody(100, T0 + H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 2 * H));
+    rig.bodies.set('acct-3', sessionBody(100, T0 + 3 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    const [start] = (await rig.log.read()) as ExhaustedRecord[];
+    expect(start?.active).toBe('work3');
+    expect(start?.switches.map((sw) => `${sw.from}->${sw.to} ${sw.origin}`)).toEqual([
+      'work1->work2 auto',
+      'work2->work3 recovery',
+    ]);
   });
 });

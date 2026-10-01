@@ -127,6 +127,19 @@ export interface AttributionJournalOptions {
   vaultDir: string;
 }
 
+/** Whether an audit entry moved the live account to another account: every activation, and the
+ *  two crash-recovery outcomes that finish or undo a torn switch ("rolled forward", "rolled
+ *  back"). A recovery that only cleared a record, or found nothing to restore, moved nothing. */
+function movedLiveAccount(e: AuditEntry): e is AuditEntry & { toAccountId: string } {
+  if (e.toAccountId === null) return false;
+  if (e.event === 'activated') return true;
+  return (
+    e.event === 'recovered' &&
+    (e.detail === 'rolled forward' || e.detail === 'rolled back') &&
+    e.toAccountId !== e.fromAccountId
+  );
+}
+
 /** One switch of the live account, as the audit log recorded it. */
 export interface SwitchStep {
   at: number;
@@ -179,13 +192,13 @@ export class AttributionJournal {
   async switchesBetween(fromMs: number, toMs: number): Promise<SwitchStep[]> {
     const entries = await readAuditLog(this.vaultDir);
     return entries
-      .filter((e) => e.event === 'activated' && e.toAccountId !== null)
+      .filter(movedLiveAccount)
       .filter((e) => e.ts >= fromMs && e.ts <= toMs)
       .sort((a, b) => a.ts - b.ts)
       .map((e) => ({
         at: e.ts,
         fromAccountId: e.fromAccountId,
-        toAccountId: e.toAccountId as string,
+        toAccountId: e.toAccountId,
         ...(e.origin !== undefined ? { origin: e.origin } : {}),
         ...(e.detail !== undefined ? { reason: e.detail } : {}),
       }));

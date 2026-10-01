@@ -17,8 +17,10 @@
 // weekly budget first) and who to hold in reserve — so frontends render ONE compact line,
 // not a recommendation heading plus a per-account advisory list.
 
-import { isAutoSwitchCandidate, MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
+import { isAutoSwitchCandidate } from './autoswitch.js';
+import { MIN_USABLE_HEADROOM_PCT } from './availability.js';
 import { humanizeDuration, roundPct } from './format.js';
+import { effectiveLimits, policyLimits } from './limits.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type {
   AccountScore,
@@ -91,6 +93,9 @@ export function computePlan(
     significantUnusedPct: options.significantUnusedPct ?? DEFAULTS.significantUnusedPct,
     riskHeadroomPct: options.riskHeadroomPct ?? DEFAULTS.riskHeadroomPct,
     minUsableHeadroomPct: options.minUsableHeadroomPct ?? DEFAULTS.minUsableHeadroomPct,
+    // The Fable cap binds headroom exactly when the auto-switch policy counts it, so the plan's
+    // "No usable account" and the exhaustion log can never disagree about it.
+    countFableCap: options.autoSwitchPolicy?.fableCapTriggers ?? true,
   };
 
   const greedy = options.greedyAutoSwitch === true;
@@ -145,16 +150,18 @@ export function computePlan(
   };
 }
 
-type Config = typeof DEFAULTS;
+type Config = typeof DEFAULTS & { countFableCap: boolean };
 
 /** Score one account: headroom, minus a near-cap risk penalty, plus a burn-urgency bonus. */
 function analyze(input: AccountUsageInput, now: number, cfg: Config): Analysis {
-  // Headroom is set by the MOST-constrained limit — the one closest to its cap binds the
-  // account. With no limits reported we optimistically assume full capacity.
+  // Headroom is set by the MOST-constrained live limit — the one closest to its cap binds the
+  // account. A limit whose reset has passed binds nothing (the window is rested; the snapshot is
+  // just older than the reset), and the Fable cap binds only while the policy counts it: the
+  // same limits the shared availability rule reads, so `usable` below is that rule's verdict.
+  // With no live limits we optimistically assume full capacity.
+  const live = effectiveLimits(policyLimits(input.limits, cfg.countFableCap), now);
   const headroomPct =
-    input.limits.length === 0
-      ? 100
-      : Math.min(...input.limits.map((l) => 100 - clampPct(l.percent)));
+    live.length === 0 ? 100 : Math.min(...live.map((l) => 100 - clampPct(l.percent)));
 
   // The weekly budget — percent used AND the clock it resets on — comes from the one
   // fleet-wide rule (see weekly.ts) so the Plan line and the Pacing line in the same view can

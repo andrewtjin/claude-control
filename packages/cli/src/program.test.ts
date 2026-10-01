@@ -1074,3 +1074,208 @@ describe('exhausted, and the banner usage and timeline lead with', () => {
     expect(r.out).not.toContain('No account can take work');
   });
 });
+
+describe('the banner and the plan agree with the running daemon', () => {
+  const H = 60 * 60 * 1000;
+  const BANNER = 'No account can take work';
+  let dir = '';
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-exhausted-daemon-'));
+    pathsIo.dataRoot = dir;
+    settingsIo.configPath = join(dir, 'config.json');
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([
+        { id: 'a1', label: 'work1', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
+        { id: 'a2', label: 'work2', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
+      ]),
+    );
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    pathsIo.dataRoot = '';
+    settingsIo.configPath = '';
+    settingsIo.readSettingsReport.mockImplementation(() => Promise.resolve(undefined));
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const dataDir = () => join(dir, 'claude-control');
+  type Limit = { kind: string; percent: number; resetsAt: number };
+  /** Snapshots in daemon.db, as the daemon's polls left them. */
+  async function seedUsage(rows: Array<{ id: string; label: string; limits: Limit[] }>) {
+    await mkdir(dataDir(), { recursive: true });
+    const store = new Store(join(dataDir(), 'daemon.db'));
+    try {
+      for (const r of rows) {
+        store.insertUsageSnapshot({
+          accountId: r.id,
+          fetchedAtMs: Date.now(),
+          source: 'live',
+          json: JSON.stringify({
+            accountId: r.id,
+            label: r.label,
+            active: r.id === 'a1',
+            source: 'live',
+            fetchedAtMs: Date.now(),
+            limits: r.limits.map((l) => ({
+              kind: l.kind,
+              percent: l.percent,
+              resetsAt: new Date(l.resetsAt).toISOString(),
+              isActive: true,
+            })),
+          }),
+        });
+      }
+    } finally {
+      store.close();
+    }
+  }
+  /** An open outage as the running daemon wrote it. */
+  async function seedOpenOutage(at: number, reason: string, spent: Limit[]) {
+    await mkdir(dataDir(), { recursive: true });
+    const line = {
+      v: 1,
+      event: 'exhausted',
+      id: `ep-${at}`,
+      at,
+      time: new Date(at).toISOString(),
+      summary: 'No account can take work: ...',
+      active: 'work1',
+      accounts: ['a1', 'a2'].map((id, i) => ({
+        accountId: id,
+        label: `work${i + 1}`,
+        reason,
+        percent: 100,
+        spent,
+      })),
+      firstBack: { accountId: 'a1', label: 'work1', at: at + 3 * H, predicted: false },
+      switches: [],
+    };
+    await writeFile(join(dataDir(), 'exhaustion-log.jsonl'), JSON.stringify(line) + '\n');
+  }
+  /** The running daemon's settings report, naming whether it counts the Fable cap. */
+  const reportWithFableCap = (value: 'on' | 'off'): SettingsReport => ({
+    startedAtMs: Date.now() - 2 * H,
+    settings: [
+      { name: 'auto-switch', value: 'on', source: 'default' },
+      { name: 'greedy burn-back', value: 'on', source: 'default' },
+      { name: 'fable cap trigger', value, source: value === 'on' ? 'default' : 'env' },
+    ],
+  });
+  /** Both accounts with plenty of 5-hour window and week, Fable weekly cap full. */
+  const fableCapped = () => {
+    const now = Date.now();
+    const limits: Limit[] = [
+      { kind: 'session', percent: 10, resetsAt: now + 3 * H },
+      { kind: 'weekly_all', percent: 50, resetsAt: now + 72 * H },
+      { kind: 'weekly_scoped', percent: 100, resetsAt: now + 48 * H },
+    ];
+    return [
+      { id: 'a1', label: 'work1', limits },
+      { id: 'a2', label: 'work2', limits },
+    ];
+  };
+
+  it('a Fable-cap opt-out saved since the daemon started does not hide its outage', async () => {
+    // The running daemon counts the cap (its report), and has an outage open on it.
+    settingsIo.readSettingsReport.mockImplementation(() =>
+      Promise.resolve(reportWithFableCap('on')),
+    );
+    // The opt-out was saved since; it reaches the daemon only on its next start.
+    await writeFile(
+      settingsIo.configPath,
+      JSON.stringify({ env: { CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' } }),
+    );
+    await seedUsage(fableCapped());
+    await seedOpenOutage(Date.now() - 20 * 60_000, 'weekly_scoped', [
+      { kind: 'weekly_scoped', percent: 100, resetsAt: Date.now() + 48 * H },
+    ]);
+    expect((await runCli(['exhausted'])).out).toContain('ongoing');
+    expect((await runCli(['usage'])).out).toContain(BANNER);
+  });
+
+  it('a daemon running with the Fable cap off logs no outage, so there is no banner', async () => {
+    settingsIo.readSettingsReport.mockImplementation(() =>
+      Promise.resolve(reportWithFableCap('off')),
+    );
+    await seedUsage(fableCapped());
+    expect((await runCli(['usage'])).out).not.toContain(BANNER);
+  });
+
+  it('timeline: with the Fable cap off the plan does not say "No usable account" beside no banner', async () => {
+    vi.stubEnv('CCTL_AUTOSWITCH_ON_FABLE_CAP', '0');
+    settingsIo.readSettingsReport.mockImplementation(() =>
+      Promise.resolve(reportWithFableCap('off')),
+    );
+    await seedUsage(fableCapped());
+    const r = await runCli(['timeline']);
+    expect(r.out).not.toContain(BANNER);
+    expect(r.out).not.toMatch(/Plan: No usable account/);
+  });
+
+  it('timeline: windows that reset since the last snapshot are not out, in the plan or the banner', async () => {
+    const now = Date.now();
+    await seedUsage([
+      {
+        id: 'a1',
+        label: 'work1',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now - 10 * 60_000 }],
+      },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now - 5 * 60_000 }],
+      },
+    ]);
+    const r = await runCli(['timeline']);
+    expect(r.out).not.toContain(BANNER);
+    expect(r.out).not.toMatch(/Plan: No usable account/);
+  });
+
+  it('an account whose last poll came back empty does not hide an open outage', async () => {
+    const now = Date.now();
+    await seedOpenOutage(now - 20 * 60_000, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now + 3 * H },
+    ]);
+    await seedUsage([
+      { id: 'a1', label: 'work1', limits: [] },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now + 4 * H }],
+      },
+    ]);
+    const r = await runCli(['usage']);
+    expect(r.out).toMatch(
+      /^No account can take work since .+ \(20m\)\. First back expected: work1 at /,
+    );
+  });
+
+  it('an open outage the latest numbers show is over says so in cctl exhausted', async () => {
+    const now = Date.now();
+    await seedOpenOutage(now - 4 * H, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now - H },
+    ]);
+    await seedUsage([
+      {
+        id: 'a1',
+        label: 'work1',
+        limits: [{ kind: 'session', percent: 5, resetsAt: now + 4 * H }],
+      },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now + 4 * H }],
+      },
+    ]);
+    const text = (await runCli(['exhausted'])).out;
+    expect(text).toMatch(
+      /-> over by the latest numbers: work1 back since .+ \(its 5-hour window reset\)/,
+    );
+    const json = JSON.parse((await runCli(['exhausted', '--json'])).out) as {
+      open: { id: string; overBy?: { label: string; how: string } } | null;
+    };
+    expect(json.open).toMatchObject({ overBy: { label: 'work1', how: 'reset' } });
+    expect((await runCli(['usage'])).out).not.toContain(BANNER);
+  });
+});

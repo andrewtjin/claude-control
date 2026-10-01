@@ -9,6 +9,13 @@ export function effectiveLimits(limits: LimitInput[], now: number): LimitInput[]
   return limits.filter((l) => l.resetsAt === undefined || l.resetsAt > now);
 }
 
+/** The limits a policy can see: all of them, or all but the Fable weekly cap when that cap is
+ *  opted out of auto-switch (`fableCapTriggers: false`). One helper, so auto-switch, the advisor
+ *  and the availability rule can never filter the cap differently. */
+export function policyLimits(limits: LimitInput[], countFableCap: boolean): LimitInput[] {
+  return countFableCap ? limits : limits.filter((l) => l.kind !== 'weekly_scoped');
+}
+
 /** How a tie on percent is broken: the widest budget first. Only reached when two live limits
  *  report the SAME percent, and only the NAME the reason quotes is at stake (the percent is
  *  identical either way). Input order is the wrong answer there because the endpoint lists the
