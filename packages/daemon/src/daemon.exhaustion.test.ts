@@ -51,7 +51,7 @@ class SteadyRelay {
   constructor() {
     this.wss.on('connection', (socket: WebSocket) => {
       socket.on('message', (raw: RawData) => {
-        const decoded = decode(Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw));
+        const decoded = decode(rawToString(raw));
         if (!decoded.ok) return;
         this.received.push(decoded.envelope);
         if (isType(decoded.envelope, 'hello')) {
@@ -107,6 +107,12 @@ class SteadyRelay {
       this.wss.close((err) => (err ? reject(err) : resolve())),
     );
   }
+}
+
+function rawToString(raw: RawData): string {
+  if (Array.isArray(raw)) return Buffer.concat(raw).toString('utf8');
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString('utf8');
+  return raw.toString('utf8');
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
