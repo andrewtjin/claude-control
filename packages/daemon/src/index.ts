@@ -52,7 +52,31 @@ export {
   type WeeklyObservation,
 } from './usageHistory.js';
 
-export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
+export {
+  AttributionJournal,
+  type AttributionJournalOptions,
+  type SwitchStep,
+} from './attributionJournal.js';
+
+export {
+  decideExhaustion,
+  episodesOf,
+  EXHAUSTION_LOG_FILE,
+  ExhaustionLog,
+  exhaustionLogPath,
+  openEpisodeOf,
+  recoveryText,
+  SWITCH_CHAIN_WINDOW_MS,
+  type ExhaustedAccount,
+  type ExhaustedRecord,
+  type ExhaustionEpisode,
+  type ExhaustionRecord,
+  type ExhaustionSwitch,
+  type ExhaustionTransition,
+  type RecoveredRecord,
+  type Recovery,
+  type RecoveryHow,
+} from './exhaustionLog.js';
 
 export {
   readTranscriptTurns,

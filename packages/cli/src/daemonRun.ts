@@ -31,6 +31,8 @@ import {
   ControlPlaneRejectionError,
   DEFAULT_SECRET_HEADER,
   Daemon,
+  ExhaustionLog,
+  exhaustionLogPath,
   HeartbeatWriter,
   HookReceiver,
   Store,
@@ -487,6 +489,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     attributionJournal,
     hookReceiver,
     controlPlaneClient,
+    // Every time no account can take work, beside daemon.log; `cctl exhausted` reads the same
+    // path through the same helper.
+    exhaustionLog: new ExhaustionLog(exhaustionLogPath(dataDir)),
     installHooks: async () => {
       // The forwarder script is (re)written before the hook entries that point at it, so the
       // installed command always has a current script behind it. The command itself is

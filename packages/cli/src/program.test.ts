@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -9,9 +9,28 @@ import {
   type DedupeReport,
   type StoredAccount,
 } from '@claude-control/switch-engine';
+import { Store } from '@claude-control/daemon';
 import { buildProgram } from './program.js';
 import { CliFailure, reportFatal } from './context.js';
 import { VERSION, type SettingsReport } from './settings.js';
+
+// Where the CLI finds its data directory (daemon.db, the exhaustion log). Redirected to a temp
+// folder by the tests that read those files; left alone (the real resolution) everywhere else.
+// Overridden at the function rather than through LOCALAPPDATA/XDG_DATA_HOME because on macOS
+// the data root comes from the home folder alone, and a test must never land in the real one.
+const pathsIo = vi.hoisted(() => ({ dataRoot: '' }));
+vi.mock('@claude-control/switch-engine', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@claude-control/switch-engine')>();
+  return {
+    ...real,
+    defaultPaths: (...args: Parameters<typeof real.defaultPaths>) => {
+      const paths = real.defaultPaths(...args);
+      return pathsIo.dataRoot === ''
+        ? paths
+        : { ...paths, vaultDir: join(pathsIo.dataRoot, 'claude-control', 'vault') };
+    },
+  };
+});
 
 // `buildEngine` is the CLI's single seam onto the switch engine, so stubbing it lets an action
 // body run for real — commander dispatch, the action, the render — with nothing near a real
@@ -134,6 +153,7 @@ describe('buildProgram', () => {
     expect(names).toContain('usage');
     expect(names).toContain('timeline');
     expect(names).toContain('stats');
+    expect(names).toContain('exhausted');
     expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
@@ -872,5 +892,185 @@ describe('color on a terminal', () => {
     const r = await onTerminal(process.stderr, () => runCli(['settings', 'unset']));
     expect(r.exited).toBe(true);
     expect(r.err).toBe(`${ESC}[31merror: missing required argument 'name'${ESC}[0m\n`);
+  });
+});
+
+describe('exhausted, and the banner usage and timeline lead with', () => {
+  const H = 60 * 60 * 1000;
+  let dir = '';
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-exhausted-'));
+    pathsIo.dataRoot = dir;
+    // An empty config: the Fable cap counts, as by default.
+    settingsIo.configPath = join(dir, 'config.json');
+  });
+  afterEach(async () => {
+    pathsIo.dataRoot = '';
+    settingsIo.configPath = '';
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    engine.getActiveId.mockImplementation(() => Promise.resolve(null));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const dataDir = () => join(dir, 'claude-control');
+  const logPath = () => join(dataDir(), 'exhaustion-log.jsonl');
+  const account = (id: string, label: string): StoredAccount => ({
+    id,
+    label,
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  });
+  /** One `exhausted` line as the daemon writes it. */
+  const started = (at: number, id = `ep-${at}`) => ({
+    v: 1,
+    event: 'exhausted',
+    id,
+    at,
+    time: new Date(at).toISOString(),
+    summary: 'No account can take work: ...',
+    active: 'work1',
+    accounts: [
+      {
+        accountId: 'a1',
+        label: 'work1',
+        reason: 'session',
+        percent: 100,
+        backAt: at + H,
+        spent: [],
+      },
+    ],
+    firstBack: { accountId: 'a1', label: 'work1', at: at + H, predicted: false },
+    switches: [],
+  });
+  const recovered = (start: ReturnType<typeof started>, backSince: number) => ({
+    v: 1,
+    event: 'recovered',
+    id: start.id,
+    at: backSince,
+    time: new Date(backSince).toISOString(),
+    summary: 'Usage is back: ...',
+    backSince,
+    durationMs: backSince - start.at,
+    account: { accountId: 'a1', label: 'work1' },
+    how: 'reset',
+    limit: 'session',
+  });
+  const seedLog = async (lines: unknown[]) => {
+    await mkdir(dataDir(), { recursive: true });
+    await writeFile(logPath(), lines.map((l) => JSON.stringify(l) + '\n').join(''));
+  };
+  /** Snapshots in daemon.db, as the daemon's poll would have left them. */
+  const seedUsage = async (
+    rows: Array<{ id: string; label: string; percent: number; resetsAt: number }>,
+  ) => {
+    await mkdir(dataDir(), { recursive: true });
+    const store = new Store(join(dataDir(), 'daemon.db'));
+    try {
+      for (const r of rows) {
+        store.insertUsageSnapshot({
+          accountId: r.id,
+          fetchedAtMs: Date.now(),
+          source: 'live',
+          json: JSON.stringify({
+            accountId: r.id,
+            label: r.label,
+            active: false,
+            source: 'live',
+            fetchedAtMs: Date.now(),
+            limits: [
+              {
+                kind: 'session',
+                percent: r.percent,
+                resetsAt: new Date(r.resetsAt).toISOString(),
+                isActive: true,
+              },
+            ],
+          }),
+        });
+      }
+    } finally {
+      store.close();
+    }
+  };
+
+  it('offers --days and --json', () => {
+    const cmd = buildProgram().commands.find((c) => c.name() === 'exhausted');
+    expect(cmd?.options.map((o) => o.long).sort()).toEqual(['--days', '--json']);
+  });
+
+  it('lists every time, newest first, and says where the log is', async () => {
+    const now = Date.now();
+    const old = started(now - 50 * H);
+    await seedLog([old, recovered(old, now - 49 * H), started(now - 2 * H)]);
+    const r = await runCli(['exhausted']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toMatch(/^2 times no account could take work \(newest first\):/);
+    expect(r.out.indexOf('ongoing')).toBeLessThan(
+      r.out.indexOf('back: work1 (its 5-hour window reset)'),
+    );
+    expect(r.out).toContain(`Log: ${logPath()}`);
+  });
+
+  it('--json prints the episodes newest first with the log path; --days narrows to recent ones', async () => {
+    const now = Date.now();
+    const old = started(now - 20 * 24 * H);
+    const recent = started(now - 2 * H);
+    await seedLog([old, recovered(old, old.at + H), recent]);
+    const all = JSON.parse((await runCli(['exhausted', '--json'])).out) as {
+      log: string;
+      episodes: Array<{ start: { id: string }; end?: unknown }>;
+    };
+    expect(all.log).toBe(logPath());
+    expect(all.episodes.map((e) => e.start.id)).toEqual([recent.id, old.id]);
+    const week = JSON.parse((await runCli(['exhausted', '--json', '--days', '7'])).out) as {
+      episodes: Array<{ start: { id: string } }>;
+    };
+    expect(week.episodes.map((e) => e.start.id)).toEqual([recent.id]);
+  });
+
+  it('with no log yet it says nothing is on record', async () => {
+    const r = await runCli(['exhausted']);
+    expect(r.out).toBe(
+      `No time on record when every account was out of usage.\nLog: ${logPath()}\n`,
+    );
+  });
+
+  it('refuses a --days that is not a positive number', async () => {
+    const r = await runCli(['exhausted', '--days', '0']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('--days must be a positive number.');
+  });
+
+  it('usage and timeline lead with the banner while no account can take work', async () => {
+    const now = Date.now();
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([account('a1', 'work1'), account('a2', 'work2')]),
+    );
+    await seedUsage([
+      { id: 'a1', label: 'work1', percent: 100, resetsAt: now + 2 * H },
+      { id: 'a2', label: 'work2', percent: 100, resetsAt: now + 4 * H },
+    ]);
+    await seedLog([started(now - 30 * 60_000)]);
+    for (const command of ['usage', 'timeline']) {
+      const r = await runCli([command]);
+      expect(r.exited).toBe(false);
+      expect(r.out).toMatch(
+        /^No account can take work since .+ \(30m\)\. First back: work1 in 1h 59m\./,
+      );
+    }
+  });
+
+  it('no banner while some account has usage left', async () => {
+    const now = Date.now();
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([account('a1', 'work1'), account('a2', 'work2')]),
+    );
+    await seedUsage([
+      { id: 'a1', label: 'work1', percent: 100, resetsAt: now + 2 * H },
+      { id: 'a2', label: 'work2', percent: 40, resetsAt: now + 4 * H },
+    ]);
+    const r = await runCli(['usage']);
+    expect(r.out).not.toContain('No account can take work');
   });
 });

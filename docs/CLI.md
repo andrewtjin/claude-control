@@ -67,7 +67,34 @@ cctl timeline   # 5h-session budget per account + when every limit resets, with 
 ```
 
 Both read the daemon's last-persisted snapshot, so they work whether or not the daemon
-is currently running.
+is currently running. While no account can take work, both lead with a line saying since
+when and which account is back first.
+
+## When every account is out of usage
+
+```
+cctl exhausted             # every time no account could take work, newest first
+cctl exhausted --days 30   # only the times that started in the last 30 days
+cctl exhausted --json      # the same, as JSON
+```
+
+When auto-switch has walked every account and all of them are spent, the daemon records it.
+"Spent" is the rule auto-switch itself uses: an account is out when it is within 2% of a
+limit (its 5-hour window, its weekly budget, or the Fable weekly cap unless
+`CCTL_AUTOSWITCH_ON_FABLE_CAP` is off) or its login has expired. An account you excluded
+from auto-switch still counts as available while it has quota, and an account cctl has no
+numbers for yet counts as available too.
+
+Each time is one entry with when it started, why each account was out and when each was
+due back, and the switches of the five hours before it (who made each and why). When an
+account comes back, the entry is closed with how long nothing could run and how it ended
+(a limit reset, a login restored, a new account). The outage is measured to the reset that
+ended it, so a daemon that was stopped through the reset still records the right length. A
+usage poll that fails during an outage does not count as an account coming back.
+
+The phone gets a card when it starts and when it ends. The log is
+`exhaustion-log.jsonl` in the daemon's data folder (beside `daemon.db`), one JSON line per
+start and per end, each with a plain-English `summary`; `cctl exhausted` prints its path.
 
 ## Token stats
 

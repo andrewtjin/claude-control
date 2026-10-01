@@ -1,0 +1,336 @@
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  assessFleet,
+  type AccountUsageInput,
+  type LimitInput,
+} from '@claude-control/usage-advisor';
+import {
+  decideExhaustion,
+  episodesOf,
+  exhaustedCardBody,
+  exhaustedRecord,
+  ExhaustionLog,
+  exhaustionLogPath,
+  openEpisodeOf,
+  recoveredRecord,
+  recoveryText,
+  type ExhaustedRecord,
+  type ExhaustionRecord,
+} from './exhaustionLog.js';
+
+const T0 = Date.parse('2026-10-01T12:00:00.000Z');
+const H = 60 * 60 * 1000;
+const M = 60 * 1000;
+
+function acct(
+  id: string,
+  limits: LimitInput[] = [],
+  overrides: Partial<AccountUsageInput> = {},
+): AccountUsageInput {
+  return { accountId: id, label: id, active: false, quarantined: false, limits, ...overrides };
+}
+
+const session = (percent: number, resetsAt: number): LimitInput => ({
+  kind: 'session',
+  percent,
+  resetsAt,
+});
+const weekly = (percent: number, resetsAt?: number): LimitInput => ({
+  kind: 'weekly_all',
+  percent,
+  ...(resetsAt !== undefined ? { resetsAt } : {}),
+});
+
+/** A two-account fleet out of usage at T0: a back at T0+1h (5-hour window), b at T0+30h (week). */
+function exhaustedAtT0(): ExhaustedRecord {
+  const fleet = assessFleet(
+    [
+      acct('a', [session(100, T0 + H), weekly(40, T0 + 90 * H)]),
+      acct('b', [weekly(100, T0 + 30 * H)]),
+    ],
+    T0,
+  );
+  expect(fleet.exhausted).toBe(true);
+  return exhaustedRecord({ fleet, now: T0, active: 'a', switches: [] });
+}
+
+describe('decideExhaustion — starting', () => {
+  it('starts when no account can take work and nothing is open', () => {
+    const fleet = assessFleet([acct('a', [session(100, T0 + H)])], T0);
+    expect(decideExhaustion(undefined, fleet, T0)).toEqual({ kind: 'start' });
+  });
+
+  it('does nothing while any account can take work', () => {
+    const fleet = assessFleet(
+      [acct('a', [session(100, T0 + H)]), acct('b', [session(10, T0 + H)])],
+      T0,
+    );
+    expect(decideExhaustion(undefined, fleet, T0)).toEqual({ kind: 'none' });
+  });
+
+  it('never starts a second episode while one is open', () => {
+    const open = exhaustedAtT0();
+    const still = assessFleet(
+      [acct('a', [session(100, T0 + H)]), acct('b', [weekly(100, T0 + 30 * H)])],
+      T0 + 10 * M,
+    );
+    expect(decideExhaustion(open, still, T0 + 10 * M)).toEqual({ kind: 'none' });
+  });
+});
+
+describe('decideExhaustion — ending needs positive evidence', () => {
+  it('ends when fresh numbers show headroom, dated to the reset that brought it back', () => {
+    const open = exhaustedAtT0();
+    const at = T0 + H + 3 * M;
+    const fleet = assessFleet(
+      [
+        acct('a', [session(4, T0 + 6 * H), weekly(41, T0 + 90 * H)]),
+        acct('b', [weekly(100, T0 + 30 * H)]),
+      ],
+      at,
+    );
+    expect(decideExhaustion(open, fleet, at)).toEqual({
+      kind: 'end',
+      recovery: { accountId: 'a', label: 'a', how: 'reset', backSince: T0 + H, limit: 'session' },
+    });
+  });
+
+  it('a failed poll (no numbers at all) does NOT end it while the recorded reset is ahead', () => {
+    const open = exhaustedAtT0();
+    const at = T0 + 20 * M;
+    // a's poll came back empty: usable by "unknown is not exhausted", but nothing proves it.
+    const fleet = assessFleet([acct('a'), acct('b', [weekly(100, T0 + 30 * H)])], at);
+    expect(fleet.exhausted).toBe(false);
+    expect(decideExhaustion(open, fleet, at)).toEqual({ kind: 'none' });
+  });
+
+  it('no numbers, but the recorded reset has passed: the clock is the evidence', () => {
+    const open = exhaustedAtT0();
+    const at = T0 + 2 * H;
+    const fleet = assessFleet([acct('a'), acct('b', [weekly(100, T0 + 30 * H)])], at);
+    expect(decideExhaustion(open, fleet, at)).toMatchObject({
+      kind: 'end',
+      recovery: { label: 'a', how: 'reset', backSince: T0 + H },
+    });
+  });
+
+  it('numbers that still show the wall keep it open even after the recorded reset', () => {
+    const open = exhaustedAtT0();
+    const at = T0 + 2 * H;
+    // The endpoint moved a's window: a fresh 5-hour window already at 100%.
+    const fleet = assessFleet(
+      [acct('a', [session(100, T0 + 6 * H)]), acct('b', [weekly(100, T0 + 30 * H)])],
+      at,
+    );
+    expect(decideExhaustion(open, fleet, at)).toEqual({ kind: 'none' });
+  });
+
+  it('headroom before the recorded reset is still a return (the endpoint said so)', () => {
+    const open = exhaustedAtT0();
+    const at = T0 + 30 * M;
+    const fleet = assessFleet(
+      [acct('a', [session(60, T0 + H)]), acct('b', [weekly(100, T0 + 30 * H)])],
+      at,
+    );
+    expect(decideExhaustion(open, fleet, at)).toMatchObject({
+      kind: 'end',
+      recovery: { label: 'a', how: 'headroom', backSince: at },
+    });
+  });
+
+  it('an account added during the episode ends it', () => {
+    const open = exhaustedAtT0();
+    const at = T0 + 5 * M;
+    const fleet = assessFleet(
+      [acct('a', [session(100, T0 + H)]), acct('b', [weekly(100, T0 + 30 * H)]), acct('new')],
+      at,
+    );
+    expect(decideExhaustion(open, fleet, at)).toMatchObject({
+      kind: 'end',
+      recovery: { label: 'new', how: 'new_account', backSince: at },
+    });
+  });
+
+  it('a restored login ends it once the quota is fine; a still-dead one does not', () => {
+    const fleetAt = (quarantined: boolean, limits: LimitInput[]) =>
+      assessFleet([acct('q', limits, { quarantined })], T0 + 10 * M);
+    const open = exhaustedRecord({
+      fleet: assessFleet([acct('q', [], { quarantined: true })], T0),
+      now: T0,
+      active: null,
+      switches: [],
+    });
+    expect(decideExhaustion(open, fleetAt(true, []), T0 + 10 * M)).toEqual({ kind: 'none' });
+    expect(decideExhaustion(open, fleetAt(false, []), T0 + 10 * M)).toMatchObject({
+      kind: 'end',
+      recovery: { how: 'relogin' },
+    });
+  });
+
+  it('a restored login whose quota was also spent waits for that reset when there are no numbers', () => {
+    const open = exhaustedRecord({
+      fleet: assessFleet([acct('q', [session(100, T0 + H)], { quarantined: true })], T0),
+      now: T0,
+      active: null,
+      switches: [],
+    });
+    const early = assessFleet([acct('q')], T0 + 10 * M);
+    expect(decideExhaustion(open, early, T0 + 10 * M)).toEqual({ kind: 'none' });
+    const late = assessFleet([acct('q')], T0 + 2 * H);
+    expect(decideExhaustion(open, late, T0 + 2 * H)).toMatchObject({
+      kind: 'end',
+      recovery: { how: 'relogin' },
+    });
+  });
+
+  it('two accounts back at once: the earlier return names the end', () => {
+    const open = exhaustedAtT0();
+    const at = T0 + 40 * H;
+    const fleet = assessFleet(
+      [acct('a', [session(0, T0 + 45 * H)]), acct('b', [weekly(0, T0 + 200 * H)])],
+      at,
+    );
+    expect(decideExhaustion(open, fleet, at)).toMatchObject({
+      kind: 'end',
+      recovery: { label: 'a', backSince: T0 + H },
+    });
+  });
+});
+
+describe('records', () => {
+  it('the exhausted entry carries every account, the first back, the walk and a readable summary', () => {
+    const fleet = assessFleet(
+      [acct('a', [session(100, T0 + H)]), acct('q', [], { quarantined: true })],
+      T0,
+    );
+    const r = exhaustedRecord({
+      fleet,
+      now: T0,
+      active: 'a',
+      switches: [{ at: T0 - H, from: 'q', to: 'a', origin: 'auto', reason: 'q at 95%' }],
+    });
+    expect(r).toMatchObject({
+      v: 1,
+      event: 'exhausted',
+      id: `ep-${T0}`,
+      time: '2026-10-01T12:00:00.000Z',
+      active: 'a',
+      firstBack: { label: 'a', at: T0 + H, predicted: false },
+    });
+    expect(r.accounts.map((a) => a.reason)).toEqual(['session', 'quarantined']);
+    expect(r.summary).toBe(
+      'No account can take work: a (5-hour window 100%, back in 1h), q (login expired). First back: a in 1h.',
+    );
+    expect(exhaustedCardBody(fleet, r)).toBe(
+      [
+        'No account can take work.',
+        '• a (5-hour window 100%, back in 1h)',
+        '• q (login expired)',
+        'First back: a in 1h.',
+        '1 switch in the last 5 hours; cctl exhausted lists them.',
+      ].join('\n'),
+    );
+  });
+
+  it('refuses to record a fleet that still has an account able to work', () => {
+    const fleet = assessFleet([acct('a', [session(10, T0 + H)])], T0);
+    expect(() => exhaustedRecord({ fleet, now: T0, active: null, switches: [] })).toThrow(
+      /can still take work/,
+    );
+  });
+
+  it('the recovered entry measures the outage to the reset, not to when the daemon noticed', () => {
+    const open = exhaustedAtT0();
+    const noticed = T0 + 9 * H; // say the daemon was stopped through the reset
+    const r = recoveredRecord(
+      open,
+      { accountId: 'a', label: 'a', how: 'reset', backSince: T0 + H, limit: 'session' },
+      noticed,
+    );
+    expect(r).toMatchObject({ id: open.id, at: noticed, backSince: T0 + H, durationMs: H });
+    expect(r.summary).toBe(
+      'Usage is back: a (its 5-hour window reset). No account could take work for 1h.',
+    );
+  });
+
+  it('words every way back', () => {
+    expect(recoveryText({ how: 'reset', limit: 'weekly_all' })).toBe('its weekly budget reset');
+    expect(recoveryText({ how: 'relogin' })).toBe('its login was restored');
+    expect(recoveryText({ how: 'new_account' })).toBe('a newly added account');
+    expect(recoveryText({ how: 'headroom' })).toBe('it has usage left again');
+  });
+});
+
+describe('the log file', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('appends one line per record, creating the folder, and reads them back', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'exhaustion-log-'));
+    const log = new ExhaustionLog(exhaustionLogPath(join(dir, 'nested')));
+    expect(await log.read()).toEqual([]);
+    const start = exhaustedAtT0();
+    await log.append(start);
+    const end = recoveredRecord(
+      start,
+      { accountId: 'a', label: 'a', how: 'headroom', backSince: T0 + H },
+      T0 + H,
+    );
+    await log.append(end);
+    const raw = await readFile(log.path, 'utf8');
+    expect(raw.split('\n').filter(Boolean)).toHaveLength(2);
+    expect(await log.read()).toEqual([start, end]);
+    expect(log.path.endsWith('exhaustion-log.jsonl')).toBe(true);
+  });
+
+  it('skips torn lines and records from another version, keeps the rest', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'exhaustion-log-'));
+    const log = new ExhaustionLog(join(dir, 'x.jsonl'));
+    const start = exhaustedAtT0();
+    await writeFile(
+      log.path,
+      [
+        JSON.stringify(start),
+        '{"v":1,"event":"exhaus',
+        JSON.stringify({ ...start, v: 2 }),
+        '',
+      ].join('\n'),
+    );
+    expect(await log.read()).toEqual([start]);
+  });
+});
+
+describe('episodes', () => {
+  const start = (at: number): ExhaustedRecord => ({ ...exhaustedAtT0(), id: `ep-${at}`, at });
+  const end = (s: ExhaustedRecord, at: number): ExhaustionRecord =>
+    recoveredRecord(s, { accountId: 'a', label: 'a', how: 'headroom', backSince: at }, at);
+
+  it('pairs starts with ends; the last start without an end is the open one', () => {
+    const s1 = start(T0);
+    const s2 = start(T0 + 10 * H);
+    const records = [s1, end(s1, T0 + H), s2];
+    expect(episodesOf(records).map((e) => [e.start.id, e.end?.id])).toEqual([
+      [s1.id, s1.id],
+      [s2.id, undefined],
+    ]);
+    expect(openEpisodeOf(records)).toBe(s2);
+    expect(openEpisodeOf([...records, end(s2, T0 + 11 * H)])).toBeUndefined();
+  });
+
+  it('an older start left without an end is history, not an open episode', () => {
+    const s1 = start(T0);
+    const s2 = start(T0 + 10 * H);
+    expect(openEpisodeOf([s1, s2, end(s2, T0 + 11 * H)])).toBeUndefined();
+  });
+
+  it('an end with no start is dropped', () => {
+    const orphan = end(start(T0), T0 + H);
+    expect(episodesOf([orphan])).toEqual([]);
+  });
+});

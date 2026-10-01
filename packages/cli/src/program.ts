@@ -30,18 +30,24 @@ import {
 } from '@claude-control/switch-engine';
 import {
   ControlPlaneClient,
+  ExhaustionLog,
   Store,
   aggregateTokenStats,
   buildDaemonHookSpecs,
+  episodesOf,
+  exhaustionLogPath,
+  openEpisodeOf,
   readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
   uninstallHooks,
+  type ExhaustedRecord,
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import { DEFAULT_STATS_DAYS } from '@claude-control/shared-protocol';
 import {
+  assessFleet,
   computeOutlook,
   computePlan,
   planWeight,
@@ -49,7 +55,9 @@ import {
   renderPlanSummary,
   timelineInputFromWire,
   type AccountUsageInput,
+  type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
+import { episodesInWindow, renderExhaustionBanner, renderExhaustionLog } from './exhaustedView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
@@ -295,7 +303,8 @@ export function buildProgram(): Command {
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
-      process.stdout.write(text + '\n');
+      const banner = await exhaustionBanner(inputs, await cliAutoSwitchPolicy(), nowMs);
+      process.stdout.write((banner !== undefined ? `${banner}\n\n` : '') + text + '\n');
     });
 
   program
@@ -307,7 +316,11 @@ export function buildProgram(): Command {
       const state = await readUsageState(nowMs);
       const inputs = buildAdvisorInputs(state);
       const outlook = computeOutlook(inputs, nowMs);
-      let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
+      const autoSwitchPolicy = await cliAutoSwitchPolicy();
+      const banner = await exhaustionBanner(inputs, autoSwitchPolicy, nowMs);
+      let text =
+        (banner !== undefined ? `${banner}\n\n` : '') +
+        renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to burn first and what to
       // hold. When the last-started daemon runs greedy auto-switch, the advice matches its
       // descriptive phrasing (the daemon executes the plan; the user doesn't have to) and its
@@ -317,10 +330,6 @@ export function buildProgram(): Command {
       // live solely in some other shell's environment could judge differently.
       if (inputs.length > 0) {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
-        const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
-        const autoSwitchPolicy = autoSwitchPolicyOf(
-          resolveDaemonConfig(process.env, {}, fileConfig).values,
-        );
         text +=
           '\n\n' +
           renderPlanSummary(
@@ -331,6 +340,42 @@ export function buildProgram(): Command {
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       process.stdout.write(text + '\n');
+    });
+
+  // The history of the fleet's worst failure: every time no account could take work, written by
+  // the daemon (see the daemon's exhaustionLog.ts). Reads the file only, so it works with the
+  // daemon stopped.
+  program
+    .command('exhausted')
+    .description(
+      'every time no account could take work: when, for how long, why, and the switches before it',
+    )
+    .option('--days <n>', 'only the times that started in the last <n> days')
+    .option('--json', 'print the times as JSON, newest first')
+    .action(async (opts: { days?: string; json?: boolean }) => {
+      let days: number | undefined;
+      if (opts.days !== undefined) {
+        days = Number(opts.days);
+        if (!Number.isFinite(days) || days <= 0) fail('--days must be a positive number.');
+      }
+      const nowMs = Date.now();
+      const log = exhaustionLog();
+      const episodes = episodesInWindow(episodesOf(await log.read()), nowMs, days);
+      if (opts.json === true) {
+        const newestFirst = [...episodes].reverse();
+        process.stdout.write(
+          JSON.stringify({ log: log.path, episodes: newestFirst }, null, 2) + '\n',
+        );
+        return;
+      }
+      process.stdout.write(
+        renderExhaustionLog(episodes, {
+          now: nowMs,
+          logPath: log.path,
+          ...(days !== undefined ? { days } : {}),
+          palette: detectPalette(),
+        }) + '\n',
+      );
     });
 
   // `usage`/`timeline` answer "how much of my LIMIT is gone" (a percent from Anthropic's
@@ -1120,6 +1165,37 @@ function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
       ...resolvedWeight(a),
     })),
   );
+}
+
+/** The auto-switch policy a daemon started from this shell would run under: this shell's
+ *  environment over config.json, the way `cctl settings` previews it. */
+async function cliAutoSwitchPolicy(): Promise<AutoSwitchPolicy> {
+  const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
+  return autoSwitchPolicyOf(resolveDaemonConfig(process.env, {}, fileConfig).values);
+}
+
+/** The exhaustion log this machine's daemon writes, beside its database. */
+function exhaustionLog(): ExhaustionLog {
+  return new ExhaustionLog(exhaustionLogPath(dirname(defaultPaths().vaultDir)));
+}
+
+/** The banner `usage` and `timeline` lead with while no account can take work. Judged from the
+ *  numbers the view itself prints, with the Fable cap counted exactly as auto-switch counts it;
+ *  the daemon's log only supplies since when, and a log that cannot be read just drops that. */
+async function exhaustionBanner(
+  inputs: AccountUsageInput[],
+  policy: AutoSwitchPolicy,
+  nowMs: number,
+): Promise<string | undefined> {
+  const fleet = assessFleet(inputs, nowMs, { countFableCap: policy.fableCapTriggers ?? true });
+  if (!fleet.exhausted) return undefined;
+  let open: ExhaustedRecord | undefined;
+  try {
+    open = openEpisodeOf(await exhaustionLog().read());
+  } catch {
+    open = undefined;
+  }
+  return renderExhaustionBanner(fleet, open, nowMs, detectPalette());
 }
 
 /** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same

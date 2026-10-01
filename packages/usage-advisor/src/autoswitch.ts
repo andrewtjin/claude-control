@@ -51,8 +51,13 @@
 // still rotates windows across equal accounts once the active one genuinely nears the wall.
 
 import { humanizeDuration, roundPct } from './format.js';
+import { effectiveLimits, LIMIT_NOUN, worstLimit } from './limits.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
+
+// The "has usage left" rule moved to availability.ts with the fleet-wide check built on it;
+// re-exported here because callers have always found it beside the policy it gates.
+export { hasUsableHeadroom, MIN_USABLE_HEADROOM_PCT } from './availability.js';
 
 /** Knobs governing the auto-switch decision. Defaults live in this module. */
 export interface AutoSwitchPolicy {
@@ -280,68 +285,12 @@ export function decideAutoSwitch(
   return null;
 }
 
-/** Headroom at/below this is "effectively exhausted" — the one definition shared by the
- *  advisor's scoring (its `minUsableHeadroomPct` default) and the daemon's post-switch
- *  stalled-session kick, so "has usage left" can never mean two different things. */
-export const MIN_USABLE_HEADROOM_PCT = 2;
-
-/**
- * Does this account have usage left to run work on right now? Quarantined = no (dead
- * refresh token, unusable regardless of quota). No live limit data = YES: unknown is not
- * exhausted, and the account with no snapshot at all (dormant, never polled) is exactly the
- * one holding a full untouched allowance. Otherwise the binding (worst) live limit must
- * clear the exhausted bar. Same pure-function posture as `decideAutoSwitch`: the caller
- * supplies the snapshot and the moment.
- */
-export function hasUsableHeadroom(account: AccountUsageInput, now = Date.now()): boolean {
-  if (account.quarantined) return false;
-  const worst = worstPercent(account.limits, now);
-  return worst === undefined || 100 - worst >= MIN_USABLE_HEADROOM_PCT;
-}
-
-/** Limits that still describe a live window: reset time unknown, or still in the future. */
-function effectiveLimits(limits: LimitInput[], now: number): LimitInput[] {
-  return limits.filter((l) => l.resetsAt === undefined || l.resetsAt > now);
-}
-
-/** The binding constraint among `limits` — max percent used across the live ones. `undefined`
+/** The binding constraint's percent — max percent used across the live limits. `undefined`
  *  when nothing usable was reported: for the trigger that means "never act on ignorance", for
- *  a candidate "nothing known to be low". The caller decides which limits the policy may see
- *  (the Fable cap is dropped up front when opted out), so a snapshot carrying only an ignored
- *  limit honestly reports no data. */
+ *  a candidate "nothing known to be low". */
 function worstPercent(limits: LimitInput[], now: number): number | undefined {
   return worstLimit(limits, now)?.percent;
 }
-
-/** How a tie on percent is broken: the widest budget first. Only reached when two live limits
- *  report the SAME percent, and only the NAME the reason quotes is at stake (the percent is
- *  identical either way). Input order is the wrong answer there because the endpoint lists the
- *  5h window before the weekly ones: an account simultaneously out of its 5-hour window and out
- *  of its week would be reported as "at 100% of its 5-hour window", which reads as "back in a
- *  few hours" when in fact the week is gone. Naming the longest-lived constraint is the honest
- *  answer, and a total order keeps the pick deterministic. */
-const LIMIT_TIE_RANK: Record<LimitInput['kind'], number> = {
-  weekly_all: 3,
-  weekly_scoped: 2,
-  session: 1,
-};
-
-/** The limit behind `worstPercent`, so a reason can name it. */
-function worstLimit(limits: LimitInput[], now: number): LimitInput | undefined {
-  const live = effectiveLimits(limits, now);
-  if (live.length === 0) return undefined;
-  return live.reduce((worst, l) => {
-    if (l.percent !== worst.percent) return l.percent > worst.percent ? l : worst;
-    return LIMIT_TIE_RANK[l.kind] > LIMIT_TIE_RANK[worst.kind] ? l : worst;
-  });
-}
-
-/** How a reason names each limit kind — the words the usage table already uses for them. */
-const LIMIT_NOUN: Record<LimitInput['kind'], string> = {
-  session: '5-hour window',
-  weekly_all: 'weekly budget',
-  weekly_scoped: 'Fable weekly cap',
-};
 
 /** Percent of the 5h session window used. No live session limit = no open window = 0. */
 function sessionUsedPct(account: AccountUsageInput, now: number): number {

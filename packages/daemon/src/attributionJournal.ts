@@ -127,6 +127,18 @@ export interface AttributionJournalOptions {
   vaultDir: string;
 }
 
+/** One switch of the live account, as the audit log recorded it. */
+export interface SwitchStep {
+  at: number;
+  fromAccountId: string | null;
+  toAccountId: string;
+  /** Who made it: auto-switch, a CLI or phone switch, or crash recovery. Absent on entries
+   *  written before the audit log carried it. */
+  origin?: string;
+  /** Why, when the caller said (auto-switch always does: which limit fired). */
+  reason?: string;
+}
+
 /**
  * Rebuilds `activation_intervals` from the switch-audit log. `sync()` is safe to call
  * repeatedly (e.g. once per poll cycle): it re-derives EVERY interval from the whole,
@@ -158,6 +170,25 @@ export class AttributionJournal {
     const existing = this.store.listActivationIntervals();
     if (intervalsEqual(existing, target)) return; // nothing changed — don't rewrite/churn rows
     this.store.replaceActivationIntervals(target);
+  }
+
+  /** The switches that changed the live account between two moments (inclusive), oldest first,
+   *  with who made each and why — the walk the exhaustion log shows leading up to the moment no
+   *  account was left. Read fresh from the audit log, like {@link sync}: it runs once per
+   *  exhaustion episode, never per cycle. */
+  async switchesBetween(fromMs: number, toMs: number): Promise<SwitchStep[]> {
+    const entries = await readAuditLog(this.vaultDir);
+    return entries
+      .filter((e) => e.event === 'activated' && e.toAccountId !== null)
+      .filter((e) => e.ts >= fromMs && e.ts <= toMs)
+      .sort((a, b) => a.ts - b.ts)
+      .map((e) => ({
+        at: e.ts,
+        fromAccountId: e.fromAccountId,
+        toAccountId: e.toAccountId as string,
+        ...(e.origin !== undefined ? { origin: e.origin } : {}),
+        ...(e.detail !== undefined ? { reason: e.detail } : {}),
+      }));
   }
 
   /** Which account was live at a given moment, or `null` if none was (before the first

@@ -133,6 +133,13 @@ outbox by row count, usage snapshots by a 90-day cutoff trimmed on each poll cyc
 switch engine keeps its own file-based vault, intent, and audit trail so it works even when
 the daemon isn't running (e.g. from `cctl`).
 
+Beside `daemon.db`, `exhaustion-log.jsonl` records every time no account could take work:
+an append-only line when the last account runs out and one when the first comes back. The
+file is the only store for it (the daemon reads it back on start to resume an outage that
+spans a restart), so it is plain JSON lines a person can read without cctl. Whether an
+account can take work is the advisor's one shared rule (`assessFleet`), the same one
+auto-switch and the post-switch session resume use.
+
 **`pending_steering` holds prompt bodies in plaintext**, and it is the one table here whose
 contents are the operator's own words rather than metadata about them. A prompt gets a row
 the moment cctl accepts it and keeps it until the session receives it or cctl gives up —

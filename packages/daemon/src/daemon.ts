@@ -51,6 +51,7 @@ import {
   MIN_STATS_DAYS,
 } from '@claude-control/shared-protocol';
 import {
+  assessFleet,
   hasUsableHeadroom,
   planWeight,
   selectWeeklyBudget,
@@ -58,6 +59,17 @@ import {
   type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
 import type { ProbeCandidate } from './accountProbe.js';
+import {
+  decideExhaustion,
+  exhaustedCardBody,
+  exhaustedRecord,
+  openEpisodeOf,
+  recoveredRecord,
+  SWITCH_CHAIN_WINDOW_MS,
+  type ExhaustedRecord,
+  type ExhaustionLog,
+  type ExhaustionRecord,
+} from './exhaustionLog.js';
 import type { Store } from './store.js';
 import {
   UsagePoller,
@@ -209,6 +221,10 @@ export interface DaemonOptions {
    *  interval: the numbers move slowly, the scan is seconds of disk IO, and `/stats` renders the
    *  last pushed snapshot rather than triggering a fresh one. */
   statsIntervalMs?: number;
+  /** Where each time no account can take work is recorded (see exhaustionLog.ts). Injected —
+   *  the composition root owns where the data directory is — and optional so tests that are not
+   *  about it never write a file; absent = nothing is tracked. */
+  exhaustionLog?: ExhaustionLog;
   logger?: Logger;
 }
 
@@ -692,6 +708,12 @@ export class Daemon {
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
    *  not re-pushed on every restart). */
   private quarantineState = new Map<string, QuarantineNoticeState>();
+  private readonly exhaustionLog: ExhaustionLog | undefined;
+  /** The exhaustion episode open right now (no account can take work), or `undefined`. Read
+   *  back from the log on the first cycle, so an outage that spans a daemon restart stays one
+   *  episode with one pair of cards; {@link exhaustionLoaded} says whether that read happened. */
+  private openExhaustion: ExhaustedRecord | undefined;
+  private exhaustionLoaded = false;
   /** The account each LIVE managed session is currently running its turns against — the value
    *  stamped on its `session.status`/`session.output` frames. Mutable because a session outlives
    *  the account it was spawned on: a usage-limit park resumed after a switch runs everything
@@ -748,6 +770,7 @@ export class Daemon {
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.scanTranscripts = options.scanTranscripts;
     this.statsIntervalMs = options.statsIntervalMs ?? DEFAULT_STATS_INTERVAL_MS;
+    this.exhaustionLog = options.exhaustionLog;
     this.logger = options.logger ?? noopLogger;
     this.isProcessAlive = options.isProcessAlive ?? pidIsAlive;
     // Waking the receiver's held poll on enqueue is what makes injection feel immediate rather
@@ -1167,6 +1190,16 @@ export class Daemon {
       this.sendEnvelope({ type: 'settings.snapshot', payload: this.settingsReport });
     }
 
+    // Record the times no account can take work: after the snapshot ships, so the phone has the
+    // numbers before the card that sums them up, and judged on the same merged inputs the plan
+    // and auto-switch read. Its own catch, like auto-switch's below: a bug in the bookkeeping
+    // must never take down the poll loop.
+    await this.timePhase('exhaustion', () =>
+      this.trackExhaustion(snapshot.inputs, accounts, activeId).catch((err: unknown) => {
+        this.logger.error({ err }, 'exhaustion tracking failed');
+      }),
+    );
+
     // Auto-switch runs AFTER the snapshot ships, so the phone always sees the usage state
     // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
     // engine failures itself; this catch only guards against bugs in the evaluator so a
@@ -1396,6 +1429,100 @@ export class Daemon {
           notificationType: 'quarantine',
         },
       });
+    }
+  }
+
+  /**
+   * Keep the exhaustion log: open an episode the cycle no account can take work, close it the
+   * cycle one provably can, and send the phone a card both times. When each happens is decided
+   * by the pure {@link decideExhaustion}; this method owns the IO around it.
+   */
+  private async trackExhaustion(
+    inputs: AccountUsageInput[],
+    accounts: ReadonlyArray<{ id: string; label: string }>,
+    activeId: string | null,
+  ): Promise<void> {
+    const log = this.exhaustionLog;
+    if (log === undefined) return;
+    if (!this.exhaustionLoaded) {
+      this.exhaustionLoaded = true;
+      try {
+        this.openExhaustion = openEpisodeOf(await log.read());
+      } catch (err) {
+        // Unreadable: start with no episode open. The cost is at most one second "out of usage"
+        // entry for an outage that began before this daemon started.
+        this.logger.warn({ err, path: log.path }, 'exhaustion log unreadable; no episode resumed');
+      }
+    }
+    const now = this.clock();
+    // The Fable cap counts exactly when auto-switch counts it, so "out of usage" here means what
+    // the executor treats as out.
+    const fleet = assessFleet(inputs, now, {
+      countFableCap: this.autoSwitchPolicy.fableCapTriggers ?? true,
+    });
+    const transition = decideExhaustion(this.openExhaustion, fleet, now);
+    if (transition.kind === 'none') return;
+    const labelOf = (id: string): string => accounts.find((a) => a.id === id)?.label ?? id;
+
+    if (transition.kind === 'start') {
+      const steps = await this.attributionJournal.switchesBetween(
+        now - SWITCH_CHAIN_WINDOW_MS,
+        now,
+      );
+      const record = exhaustedRecord({
+        fleet,
+        now,
+        active: activeId === null ? null : labelOf(activeId),
+        switches: steps.map((s) => ({
+          at: s.at,
+          from: s.fromAccountId === null ? null : labelOf(s.fromAccountId),
+          to: labelOf(s.toAccountId),
+          ...(s.origin !== undefined ? { origin: s.origin } : {}),
+          ...(s.reason !== undefined ? { reason: s.reason } : {}),
+        })),
+      });
+      this.openExhaustion = record;
+      await this.appendExhaustion(log, record);
+      this.logger.warn({ episode: record.id, summary: record.summary }, 'no account can take work');
+      this.sendEnvelope({
+        type: 'hook.notification',
+        payload: {
+          event: 'notification',
+          title: 'All accounts are out of usage',
+          body: exhaustedCardBody(fleet, record),
+          level: 'warn',
+          notificationType: 'usage_exhausted',
+        },
+      });
+      return;
+    }
+
+    // `decideExhaustion` only ends an episode that is open.
+    const open = this.openExhaustion as ExhaustedRecord;
+    const record = recoveredRecord(open, transition.recovery, now);
+    this.openExhaustion = undefined;
+    await this.appendExhaustion(log, record);
+    this.logger.info({ episode: record.id, summary: record.summary }, 'usage is back');
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        title: 'Usage is back',
+        body: record.summary,
+        level: 'success',
+        notificationType: 'usage_restored',
+      },
+    });
+  }
+
+  /** Append one exhaustion entry. A failed write is logged WITH the entry, so daemon.log still
+   *  holds it, and never stops the card: the phone hearing about the outage matters more than
+   *  the file. */
+  private async appendExhaustion(log: ExhaustionLog, record: ExhaustionRecord): Promise<void> {
+    try {
+      await log.append(record);
+    } catch (err) {
+      this.logger.error({ err, path: log.path, record }, 'could not write the exhaustion log');
     }
   }
 
