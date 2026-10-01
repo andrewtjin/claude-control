@@ -137,10 +137,13 @@ Beside `daemon.db`, `exhaustion-log.jsonl` records every time no account could t
 an append-only line when the last account runs out and one when the first comes back. The
 file is the only store for it (the daemon reads it back on start to resume an outage that
 spans a restart), so it is plain JSON lines a person can read without cctl. Whether an
-account can take work is one shared rule (`assessAccount` in the usage advisor): the
-advisor's plan, the post-switch session resume and the exhaustion log all read it, so the plan
-can never say "No usable account" while the log records no outage. Auto-switch's target rule
-is deliberately stricter (it stops at its 94% trigger).
+account can take work is one shared rule (`assessAccount` in the usage advisor), read by the
+advisor's plan, the post-switch session resume and the exhaustion log, so the plan can never say
+"No usable account" while the log records no outage (the resume always counts the Fable cap; the
+plan and the log follow the auto-switch policy on it). Auto-switch's target rule is
+deliberately stricter (it stops at its 94% trigger). While an outage is open, a `walls` line is
+added whenever what keeps an account out changes (a new limit at the wall, a reset that moved),
+so a restarted daemon judges each account's return by what it last saw.
 
 **`pending_steering` holds prompt bodies in plaintext**, and it is the one table here whose
 contents are the operator's own words rather than metadata about them. A prompt gets a row

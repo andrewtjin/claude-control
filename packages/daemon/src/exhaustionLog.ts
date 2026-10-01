@@ -104,7 +104,31 @@ export interface RecoveredRecord {
   limit?: LimitInput['kind'];
 }
 
-export type ExhaustionRecord = ExhaustedRecord | RecoveredRecord;
+/**
+ * Written while an episode is open, when what keeps an account out changes materially: it hits a
+ * new limit, its login dies, a reset it waits on moves by more than {@link WALL_MOVE_MS}, or it
+ * joins the episode (added mid-outage). A restarted daemon, and the CLI, fold these into the
+ * start entry's accounts, so a return is judged against what was last seen, not only against what
+ * was true at the start.
+ */
+export interface WallsRecord {
+  v: 1;
+  event: 'walls';
+  /** The open episode it belongs to. */
+  id: string;
+  at: number;
+  time: string;
+  accountId: string;
+  label: string;
+  reason: UnavailableReason;
+  spent: LimitInput[];
+}
+
+export type ExhaustionRecord = ExhaustedRecord | RecoveredRecord | WallsRecord;
+
+/** How far a reset must move before it is worth a `walls` line: the endpoint recomputes every
+ *  reset per response with about a second of jitter, and a line per poll would bury the history. */
+export const WALL_MOVE_MS = 5 * 60_000;
 
 /** An episode as the CLI lists it: its start and, once over, its end. */
 export interface ExhaustionEpisode {
@@ -180,6 +204,9 @@ function isRecord(value: unknown): value is ExhaustionRecord {
       optional(value.firstBack, (f) => isObject(f) && isString(f.label) && isNumber(f.at))
     );
   }
+  if (value.event === 'walls') {
+    return isExhaustedAccount(value);
+  }
   if (value.event === 'recovered') {
     const account = value.account;
     return (
@@ -197,16 +224,19 @@ function isRecord(value: unknown): value is ExhaustionRecord {
 }
 
 /** Pair starts with their ends, oldest first. An end with no start (a hand-edited file) is
- *  dropped; a start with no end is the episode still open. */
+ *  dropped; a start with no end is the episode still open. `walls` lines are tracking, not
+ *  history, and are left to {@link resumeOpenEpisode}. A start written twice (a write retried
+ *  after it had in fact landed) is one episode. */
 export function episodesOf(records: ExhaustionRecord[]): ExhaustionEpisode[] {
   const episodes: ExhaustionEpisode[] = [];
   const byId = new Map<string, ExhaustionEpisode>();
   for (const r of records) {
     if (r.event === 'exhausted') {
+      if (byId.has(r.id)) continue;
       const episode: ExhaustionEpisode = { start: r };
       episodes.push(episode);
       byId.set(r.id, episode);
-    } else {
+    } else if (r.event === 'recovered') {
       const episode = byId.get(r.id);
       if (episode !== undefined && episode.end === undefined) episode.end = r;
     }
@@ -291,31 +321,108 @@ export interface TrackedAccount {
   spent: LimitInput[];
   /** The last moment a reading showed it out: its return is never dated earlier. */
   lastOutAt: number;
+  /** What the log file holds for it (the start entry or its last `walls` line), or `undefined`
+   *  when the file has nothing yet: what a change is measured against before it is written. */
+  filed?: { reason: UnavailableReason; spent: LimitInput[] };
 }
 
 /**
  * An open episode: the start entry as the file holds it, plus every account's latest known
- * state. The start entry never changes; the tracking lives in memory and is rebuilt from the
- * start entry after a restart. It is what a return is judged against, so a wall an account hits
- * mid-outage, or a reset the endpoint moves later, cannot be mistaken for the account coming
- * back once the reset recorded at the start has passed.
+ * state. It is what a return is judged against, so a wall an account hits mid-outage, or a reset
+ * the endpoint moves later, cannot be mistaken for the account coming back once the reset
+ * recorded at the start has passed. The tracking lives in memory; its material changes are filed
+ * as `walls` lines (see {@link fileWallChanges}), which is what a restart rebuilds it from.
  */
 export interface OpenEpisode {
   record: ExhaustedRecord;
   accounts: ReadonlyMap<string, TrackedAccount>;
 }
 
-/** The open episode as its start entry describes it. */
-export function openEpisodeFrom(record: ExhaustedRecord): OpenEpisode {
-  return {
-    record,
-    accounts: new Map(
-      record.accounts.map((a) => [
-        a.accountId,
-        { label: a.label, reason: a.reason, spent: a.spent, lastOutAt: record.at },
-      ]),
-    ),
-  };
+/** The open episode as its start entry describes it, with any `walls` lines filed since folded
+ *  in, oldest first. */
+export function openEpisodeFrom(record: ExhaustedRecord, walls: WallsRecord[] = []): OpenEpisode {
+  const accounts = new Map<string, TrackedAccount>(
+    record.accounts.map((a) => [
+      a.accountId,
+      {
+        label: a.label,
+        reason: a.reason,
+        spent: a.spent,
+        lastOutAt: record.at,
+        filed: { reason: a.reason, spent: a.spent },
+      },
+    ]),
+  );
+  for (const w of walls) {
+    if (w.id !== record.id) continue;
+    accounts.set(w.accountId, {
+      label: w.label,
+      reason: w.reason,
+      spent: w.spent,
+      lastOutAt: Math.max(w.at, accounts.get(w.accountId)?.lastOutAt ?? w.at),
+      filed: { reason: w.reason, spent: w.spent },
+    });
+  }
+  return { record, accounts };
+}
+
+/** The open episode as the log holds it: the last start without an end, and its `walls` lines.
+ *  What a restarted daemon resumes, and what the CLI judges an outage by. */
+export function resumeOpenEpisode(records: ExhaustionRecord[]): OpenEpisode | undefined {
+  const open = openEpisodeOf(records);
+  if (open === undefined) return undefined;
+  const walls = records.filter((r): r is WallsRecord => r.event === 'walls' && r.id === open.id);
+  return openEpisodeFrom(open, walls);
+}
+
+/** Whether two sets of walls differ in a way that changes a return: a limit added or gone, or a
+ *  reset moved by more than {@link WALL_MOVE_MS} (or becoming known or unknown). A percent that
+ *  moves at the wall changes nothing. */
+function wallsDiffer(a: LimitInput[], b: LimitInput[]): boolean {
+  if (a.length !== b.length) return true;
+  return a.some((limit) => {
+    const other = b.find((l) => l.kind === limit.kind);
+    if (other === undefined) return true;
+    if ((limit.resetsAt === undefined) !== (other.resetsAt === undefined)) return true;
+    return (
+      limit.resetsAt !== undefined &&
+      other.resetsAt !== undefined &&
+      Math.abs(limit.resetsAt - other.resetsAt) > WALL_MOVE_MS
+    );
+  });
+}
+
+/**
+ * The `walls` lines this cycle's tracking calls for: one per account whose reason or walls
+ * changed materially since the file last described it, or that the file has never described.
+ * Returns the episode with those accounts marked as filed, so the same change is not written
+ * twice.
+ */
+export function fileWallChanges(
+  open: OpenEpisode,
+  now: number,
+): { open: OpenEpisode; records: WallsRecord[] } {
+  const records: WallsRecord[] = [];
+  const accounts = new Map(open.accounts);
+  for (const [accountId, a] of open.accounts) {
+    const filed = a.filed;
+    if (filed !== undefined && filed.reason === a.reason && !wallsDiffer(filed.spent, a.spent)) {
+      continue;
+    }
+    records.push({
+      v: 1,
+      event: 'walls',
+      id: open.record.id,
+      at: now,
+      time: new Date(now).toISOString(),
+      accountId,
+      label: a.label,
+      reason: a.reason,
+      spent: a.spent,
+    });
+    accounts.set(accountId, { ...a, filed: { reason: a.reason, spent: a.spent } });
+  }
+  return { open: { record: open.record, accounts }, records };
 }
 
 /**
@@ -339,6 +446,7 @@ export function trackOpenEpisode(
       reason: a.reason,
       spent: a.measured ? a.spent : (before?.spent ?? []),
       lastOutAt: now,
+      ...(before?.filed !== undefined ? { filed: before.filed } : {}),
     });
   }
   return { record: open.record, accounts };
@@ -346,15 +454,15 @@ export function trackOpenEpisode(
 
 /** Whether an outage is on, judged from the log and one reading the way the daemon judges it: an
  *  open episode stays on until an account is provably back, and with none open it is on when no
- *  account can take work. For the CLI, which has the start entry and the current numbers but not
- *  the daemon's tracking between them. */
+ *  account can take work. For the CLI, which has the log (see {@link resumeOpenEpisode}) and the
+ *  current numbers. */
 export function outageStatus(
-  open: ExhaustedRecord | undefined,
+  open: OpenEpisode | undefined,
   fleet: FleetAvailability,
   now: number,
 ): { on: boolean; recovery?: Recovery } {
   if (open === undefined) return { on: fleet.exhausted };
-  const tracked = trackOpenEpisode(openEpisodeFrom(open), fleet, now);
+  const tracked = trackOpenEpisode(open, fleet, now);
   const transition = decideExhaustion(tracked, fleet, now);
   return transition.kind === 'end' ? { on: false, recovery: transition.recovery } : { on: true };
 }

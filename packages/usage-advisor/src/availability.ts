@@ -4,9 +4,10 @@
 // "Can take work" is ONE rule shared by every surface that asks: the advisor's usable verdict
 // (its plan's "No usable account"), the daemon's post-switch resume of stalled sessions, and the
 // exhaustion log the daemon keeps of the times no account could take work at all. All of them
-// read the same live limits (a limit whose reset has passed no longer counts), drop the Fable
-// cap exactly when the auto-switch policy does, and apply the same bar. Two definitions would let
-// the log say "every account is out" while the plan or the resume found one with usage left.
+// read the same live limits (a limit whose reset has passed no longer counts) against the same
+// bar. The plan and the log drop the Fable cap exactly when the auto-switch policy does; the
+// post-switch resume always counts it (see `hasUsableHeadroom`). Two definitions would let the
+// log say "every account is out" while the plan found one with usage left.
 //
 // It is NOT auto-switch's target rule: auto-switch stops hopping to an account well before this
 // bar (at its 94% trigger, or with too little of a 5-hour window left), so auto-switch can run
@@ -157,9 +158,10 @@ export function assessFleet(
 
 /**
  * Does this account have usage left to run work on right now? The fleet rule above for one
- * account, with every limit counted (the post-switch resume has no auto-switch policy to
- * defer to). Same pure-function posture as `decideAutoSwitch`: the caller supplies the
- * snapshot and the moment.
+ * account, with every limit counted, the Fable cap included whatever the auto-switch policy says:
+ * its caller, the post-switch resume, kicks sessions that died on a usage limit, and those mostly
+ * run on Fable, so an account whose Fable cap is full would only park them again. Same
+ * pure-function posture as `decideAutoSwitch`: the caller supplies the snapshot and the moment.
  */
 export function hasUsableHeadroom(account: AccountUsageInput, now = Date.now()): boolean {
   return assessAccount(account, now).usable;

@@ -17,6 +17,10 @@ import {
   exhaustionLogPath,
   openEpisodeOf,
   outageStatus,
+  fileWallChanges,
+  resumeOpenEpisode,
+  WALL_MOVE_MS,
+  type WallsRecord,
   trackOpenEpisode,
   recoveredRecord,
   recoveryText,
@@ -467,12 +471,12 @@ describe('outageStatus (what the CLI shows)', () => {
   it('an open outage stays on through a reading with no numbers, and ends on proof', () => {
     const open = exhaustedAtT0();
     const blind = assessFleet([acct('a'), acct('b', [weekly(100, T0 + 30 * H)])], T0 + 10 * M);
-    expect(outageStatus(open, blind, T0 + 10 * M)).toEqual({ on: true });
+    expect(outageStatus(openEpisodeFrom(open), blind, T0 + 10 * M)).toEqual({ on: true });
     const back = assessFleet(
       [acct('a', [session(5, T0 + 6 * H)]), acct('b', [weekly(100, T0 + 30 * H)])],
       T0 + 2 * H,
     );
-    expect(outageStatus(open, back, T0 + 2 * H)).toMatchObject({
+    expect(outageStatus(openEpisodeFrom(open), back, T0 + 2 * H)).toMatchObject({
       on: false,
       recovery: { label: 'a', how: 'reset', backSince: T0 + H },
     });
@@ -496,5 +500,115 @@ describe('a clock that stepped back', () => {
     expect(r.summary).toBe(
       'Usage is back: a (it has usage left again). No account could take work for <1m.',
     );
+  });
+});
+
+describe('walls lines: what an open outage learned, on file', () => {
+  /** A walls line for `a`, filed at `at`. */
+  const walls = (open: ExhaustedRecord, at: number, spent: LimitInput[]): WallsRecord => ({
+    v: 1,
+    event: 'walls',
+    id: open.id,
+    at,
+    time: new Date(at).toISOString(),
+    accountId: 'a',
+    label: 'a',
+    reason: 'session',
+    spent,
+  });
+
+  it('files a new wall once, and nothing while the walls hold still', () => {
+    let open = openEpisodeFrom(exhaustedAtT0());
+    expect(fileWallChanges(open, T0).records).toEqual([]);
+    const later = assessFleet(
+      [
+        acct('a', [session(100, T0 + H), weekly(99, T0 + 90 * H)]),
+        acct('b', [weekly(100, T0 + 30 * H)]),
+      ],
+      T0 + 30 * M,
+    );
+    open = trackOpenEpisode(open, later, T0 + 30 * M);
+    const first = fileWallChanges(open, T0 + 30 * M);
+    expect(first.records.map((r) => [r.accountId, r.spent.map((l) => l.kind)])).toEqual([
+      ['a', ['session', 'weekly_all']],
+    ]);
+    const again = trackOpenEpisode(first.open, later, T0 + 40 * M);
+    expect(fileWallChanges(again, T0 + 40 * M).records).toEqual([]);
+  });
+
+  it('a reset that jitters by seconds is not a change; one that moves past the margin is', () => {
+    const open = openEpisodeFrom(exhaustedAtT0());
+    const at = (resetsAt: number) =>
+      trackOpenEpisode(
+        open,
+        assessFleet(
+          [acct('a', [session(100, resetsAt)]), acct('b', [weekly(100, T0 + 30 * H)])],
+          T0 + 5 * M,
+        ),
+        T0 + 5 * M,
+      );
+    expect(fileWallChanges(at(T0 + H + 2_000), T0 + 5 * M).records).toEqual([]);
+    expect(fileWallChanges(at(T0 + H + WALL_MOVE_MS + 1), T0 + 5 * M).records).toHaveLength(1);
+  });
+
+  it('an account first seen mid-outage is filed', () => {
+    const open = openEpisodeFrom(exhaustedAtT0());
+    const withC = trackOpenEpisode(
+      open,
+      assessFleet(
+        [
+          acct('a', [session(100, T0 + H)]),
+          acct('b', [weekly(100, T0 + 30 * H)]),
+          acct('c', [session(100, T0 + 2 * H)]),
+        ],
+        T0 + 10 * M,
+      ),
+      T0 + 10 * M,
+    );
+    expect(fileWallChanges(withC, T0 + 10 * M).records.map((r) => r.accountId)).toEqual(['c']);
+  });
+
+  it('a resumed outage folds its walls lines in, the last one winning', () => {
+    const start = exhaustedAtT0();
+    const records = [
+      start,
+      walls(start, T0 + 20 * M, [session(100, T0 + H), weekly(99, T0 + 90 * H)]),
+      walls(start, T0 + 40 * M, [weekly(99, T0 + 95 * H)]),
+    ];
+    const resumed = resumeOpenEpisode(records);
+    expect(resumed?.record).toBe(start);
+    expect(resumed?.accounts.get('a')).toMatchObject({
+      lastOutAt: T0 + 40 * M,
+      spent: [weekly(99, T0 + 95 * H)],
+    });
+    // Walls lines of an episode that has ended belong to nobody.
+    const ended = recoveredRecord(
+      start,
+      { accountId: 'b', label: 'b', how: 'headroom', backSince: T0 + H },
+      T0 + H,
+    );
+    expect(resumeOpenEpisode([...records, ended])).toBeUndefined();
+  });
+
+  it('walls lines are tracking, not history, and a start written twice is one episode', () => {
+    const start = exhaustedAtT0();
+    const w = walls(start, T0 + 20 * M, [session(100, T0 + H)]);
+    expect(episodesOf([start, w, start]).map((e) => e.start.id)).toEqual([start.id]);
+  });
+
+  it('a walls line with a broken shape is skipped on read', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'exhaustion-log-'));
+    try {
+      const log = new ExhaustionLog(join(dir, 'x.jsonl'));
+      const start = exhaustedAtT0();
+      const good = walls(start, T0 + M, [session(100, T0 + H)]);
+      await writeFile(
+        log.path,
+        [start, { ...good, spent: 'none' }, good].map((r) => JSON.stringify(r)).join('\n') + '\n',
+      );
+      expect(await log.read()).toEqual([start, good]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

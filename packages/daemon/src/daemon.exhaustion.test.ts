@@ -156,6 +156,10 @@ const sessionBody = (percent: number, resetsAt: number, weeklyPercent = 50) => (
 /** A body the fake endpoint answers with that HTTP status instead of usage (429, 500). */
 const httpStatus = (status: number) => ({ __status: status });
 
+/** The episode's own lines, without the tracking (`walls`) lines. */
+const startsAndEnds = (records: ExhaustionRecord[]) =>
+  records.filter((r) => r.event !== 'walls').map((r) => r.event);
+
 /** A log whose appends fail while `failing` says so: a file briefly held by a scanner, a disk
  *  briefly full. */
 class FlakyLog extends ExhaustionLog {
@@ -556,7 +560,8 @@ describe('an account that joins an open outage', () => {
     await settle();
 
     expect(rig.relay.cards().map((c) => c.type)).toEqual(['usage_exhausted']);
-    expect(await rig.log.read()).toHaveLength(1);
+    // work3 joining is tracking (a walls line), not a second start.
+    expect(startsAndEnds(await rig.log.read())).toEqual(['exhausted']);
   });
 
   it('added at the wall, it comes back by its own reset, dated to that reset', async () => {
@@ -571,7 +576,7 @@ describe('an account that joins an open outage', () => {
     rig.bodies.set('acct-3', sessionBody(3, T0 + 7 * H));
     await rig.cycle(T0 + 2 * H + 5 * M);
     await waitFor(() => rig.relay.cards().length === 2);
-    const end = (await rig.log.read())[1] as RecoveredRecord;
+    const end = (await rig.log.read()).find((r) => r.event === 'recovered') as RecoveredRecord;
     expect(end).toMatchObject({ how: 'reset', limit: 'session', backSince: T0 + 2 * H });
   });
 
@@ -588,7 +593,7 @@ describe('an account that joins an open outage', () => {
     await rig.cycle(T0 + 15 * M);
     await settle();
     expect(rig.relay.cards().map((c) => c.type)).toEqual(['usage_exhausted']);
-    expect((await rig.log.read()).map((r) => r.event)).toEqual(['exhausted']);
+    expect(startsAndEnds(await rig.log.read())).toEqual(['exhausted']);
   });
 
   it('added while the daemon was stopped and rate-limited on its first poll: not back', async () => {
@@ -789,7 +794,10 @@ describe('walls kept current through the outage', () => {
     rig.bodies.set('acct-1', weekly(0, T0 + 171 * H));
     await rig.cycle(T0 + 3 * H + 5 * M);
     await waitFor(() => rig.relay.cards().length === 2);
-    const end = (await rig.log.read())[1] as RecoveredRecord;
+    // The moved reset was filed as a walls line on the way.
+    const records = await rig.log.read();
+    expect(records.map((r) => r.event)).toEqual(['exhausted', 'walls', 'recovered']);
+    const end = records.find((r) => r.event === 'recovered') as RecoveredRecord;
     expect(end).toMatchObject({ how: 'reset', backSince: T0 + 3 * H, durationMs: 3 * H });
   });
 });
@@ -892,5 +900,164 @@ describe('the phone hears one story', () => {
       'work1->work2 auto',
       'work2->work3 recovery',
     ]);
+  });
+});
+
+/** work2 is out for the week; its 5-hour window is fine. */
+const weekOut = () => ({
+  limits: [
+    { kind: 'session', percent: 10, resets_at: iso(T0 + 3 * H) },
+    { kind: 'weekly_all', percent: 100, resets_at: iso(T0 + 50 * H) },
+  ],
+});
+
+describe('what the open outage learned, across a restart', () => {
+  it('a wall hit mid-outage is filed, so a restart whose first poll is rate-limited keeps it open', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const path = join(dir, 'exhaustion-log.jsonl');
+    const first = await createRig({ logPath: () => path });
+    first.bodies.set('acct-1', sessionBody(99, T0 + H, 97));
+    first.bodies.set('acct-2', weekOut());
+    await startAtT0(first);
+    await waitFor(() => first.relay.cards().length === 1);
+    // The last of work1's window burns its week to 99%: a new wall, filed as a walls line.
+    first.bodies.set('acct-1', sessionBody(100, T0 + H, 99));
+    await first.cycle(T0 + 30 * M);
+    expect((await first.log.read()).map((r) => r.event)).toEqual(['exhausted', 'walls']);
+    await first.stop();
+
+    // Restarted after work1's 5-hour reset; the restart's first poll of work1 is rate-limited.
+    const second = await createRig({ logPath: () => path, startAt: T0 + H + 5 * M });
+    second.bodies.set('acct-1', httpStatus(429));
+    second.bodies.set('acct-2', weekOut());
+    await startAtT0(second, T0 + H + 5 * M);
+    // Past the backoff work1 reads: a fresh window, the week still at the wall.
+    second.bodies.set('acct-1', sessionBody(0, T0 + 6 * H, 99));
+    await second.cycle(T0 + H + 40 * M);
+    await settle();
+    expect(second.relay.cards()).toEqual([]);
+    expect(startsAndEnds(await second.log.read())).toEqual(['exhausted']);
+  });
+
+  it('a reset moved later, with the daemon stopped through it, still dates the end to it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const path = join(dir, 'exhaustion-log.jsonl');
+    const weekly = (percent: number, resetsAt: number) => ({
+      limits: [
+        { kind: 'session', percent: 0, resets_at: iso(T0 + 4 * H) },
+        { kind: 'weekly_all', percent, resets_at: iso(resetsAt) },
+      ],
+    });
+    const first = await createRig({ logPath: () => path });
+    first.bodies.set('acct-1', weekly(100, T0 + H));
+    first.bodies.set('acct-2', weekly(100, T0 + 50 * H));
+    await startAtT0(first);
+    await waitFor(() => first.relay.cards().length === 1);
+    // Past the reset recorded at the start, work1 still reads at the wall, now until T0+3h.
+    first.bodies.set('acct-1', weekly(100, T0 + 3 * H));
+    await first.cycle(T0 + H + 5 * M);
+    await first.cycle(T0 + 2 * H);
+    await first.stop();
+
+    const second = await createRig({ logPath: () => path, startAt: T0 + 5 * H });
+    second.bodies.set('acct-1', weekly(0, T0 + 171 * H));
+    second.bodies.set('acct-2', weekly(100, T0 + 50 * H));
+    await startAtT0(second, T0 + 5 * H);
+    await waitFor(() => second.relay.cards().length === 1);
+    const end = (await second.log.read()).find((r) => r.event === 'recovered') as RecoveredRecord;
+    expect(end).toMatchObject({ how: 'reset', backSince: T0 + 3 * H, durationMs: 3 * H });
+  });
+
+  it('a jittering reset (seconds) is not filed again and again', async () => {
+    const rig = await createRig();
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 2 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 3 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    for (let i = 1; i <= 5; i++) {
+      rig.bodies.set('acct-1', sessionBody(100, T0 + 2 * H + (i % 2 === 0 ? 900 : -700)));
+      await rig.cycle(T0 + i * 10 * M);
+    }
+    expect((await rig.log.read()).map((r) => r.event)).toEqual(['exhausted']);
+  });
+});
+
+/** A log whose next append can be held mid-write, and whose appends can fail. */
+class HeldLog extends ExhaustionLog {
+  failing = false;
+  hold: Promise<void> | undefined;
+  entered = 0;
+  override async append(record: ExhaustionRecord): Promise<void> {
+    if (this.failing) throw new Error('EBUSY: resource busy or locked');
+    this.entered++;
+    const hold = this.hold;
+    this.hold = undefined;
+    if (hold !== undefined) await hold;
+    return super.append(record);
+  }
+}
+
+/** A log whose next read fails once, as a file briefly held by a scanner does. */
+class ReadFlakyLog extends ExhaustionLog {
+  readFailing = false;
+  override async read(): Promise<ExhaustionRecord[]> {
+    if (this.readFailing) {
+      this.readFailing = false;
+      throw Object.assign(new Error('EBUSY: resource busy or locked, open'), { code: 'EBUSY' });
+    }
+    return super.read();
+  }
+}
+
+describe('the write queue, shutdown and resume', () => {
+  it('a shutdown while a cycle is mid-write writes the queued entry once', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const log = new HeldLog(join(dir, 'exhaustion-log.jsonl'));
+    log.failing = true; // the start cannot be written for now
+    const rig = await createRig({ log });
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+
+    // The file frees up; the next cycle starts writing the queued start, slowly...
+    log.failing = false;
+    let release: () => void = () => {};
+    log.hold = new Promise<void>((r) => (release = r));
+    const internals = rig.daemon as unknown as { runPollCycle(): Promise<void> };
+    const inFlight = internals.runPollCycle().catch(() => {});
+    await waitFor(() => log.entered === 1);
+    // ...and the daemon is stopped meanwhile; the slow write then completes.
+    const stopping = rig.daemon.stop();
+    release();
+    await stopping;
+    await inFlight;
+    expect((await log.read()).map((r) => r.event)).toEqual(['exhausted']);
+  });
+
+  it('a restart whose first read of the log fails resumes on the next cycle, announcing nothing', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const path = join(dir, 'exhaustion-log.jsonl');
+    const first = await createRig({ logPath: () => path });
+    first.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    first.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(first);
+    await waitFor(() => first.relay.cards().length === 1);
+    await first.stop();
+
+    const log = new ReadFlakyLog(path);
+    log.readFailing = true;
+    const second = await createRig({ log, startAt: T0 + 30 * M });
+    second.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    second.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(second, T0 + 30 * M);
+    await settle();
+    expect(second.relay.cards()).toEqual([]);
+    expect((await log.read()).map((r) => r.event)).toEqual(['exhausted']);
+    expect(second.lines).toContain('exhaustion log unreadable; retrying next cycle');
   });
 });

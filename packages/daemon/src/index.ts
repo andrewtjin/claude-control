@@ -64,10 +64,12 @@ export {
   EXHAUSTION_LOG_FILE,
   ExhaustionLog,
   exhaustionLogPath,
+  fileWallChanges,
   openEpisodeFrom,
   openEpisodeOf,
   outageStatus,
   recoveryText,
+  resumeOpenEpisode,
   SWITCH_CHAIN_WINDOW_MS,
   trackOpenEpisode,
   type ExhaustedAccount,
@@ -81,6 +83,8 @@ export {
   type Recovery,
   type RecoveryHow,
   type TrackedAccount,
+  type WallsRecord,
+  WALL_MOVE_MS,
 } from './exhaustionLog.js';
 
 export {

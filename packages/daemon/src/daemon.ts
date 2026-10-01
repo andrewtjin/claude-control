@@ -63,8 +63,9 @@ import {
   decideExhaustion,
   exhaustedCardBody,
   exhaustedRecord,
+  fileWallChanges,
   openEpisodeFrom,
-  openEpisodeOf,
+  resumeOpenEpisode,
   recoveredRecord,
   SWITCH_CHAIN_WINDOW_MS,
   trackOpenEpisode,
@@ -231,6 +232,9 @@ export interface DaemonOptions {
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
+/** How many poll cycles the exhaustion log may fail to read on resume before tracking goes on
+ *  without it. */
+const EXHAUSTION_READ_ATTEMPTS = 3;
 /** A poll-cycle phase slower than this is logged at warn rather than debug. Deliberately the
  *  loop-lag monitor's own threshold: a phase that outlasts it is, by that monitor's definition,
  *  long enough to be a stall worth naming, so the two never disagree about what counts as slow. */
@@ -716,6 +720,10 @@ export class Daemon {
    *  episode with one pair of cards; {@link exhaustionLoaded} says whether that read happened. */
   private openExhaustion: OpenEpisode | undefined;
   private exhaustionLoaded = false;
+  /** Consecutive failed reads of the log on resume (see {@link EXHAUSTION_READ_ATTEMPTS}). */
+  private exhaustionReadFailures = 0;
+  /** The write queue's flushes, chained so a shutdown's flush never runs beside a cycle's. */
+  private exhaustionFlush: Promise<void> = Promise.resolve();
   /** Exhaustion entries not yet on disk, oldest first (see {@link writeExhaustion}). */
   private readonly pendingExhaustionWrites: ExhaustionRecord[] = [];
   private exhaustionWriteFailureLogged = false;
@@ -1452,14 +1460,23 @@ export class Daemon {
     const log = this.exhaustionLog;
     if (log === undefined) return;
     if (!this.exhaustionLoaded) {
-      this.exhaustionLoaded = true;
       try {
-        const open = openEpisodeOf(await log.read());
-        this.openExhaustion = open === undefined ? undefined : openEpisodeFrom(open);
+        this.openExhaustion = resumeOpenEpisode(await log.read());
+        this.exhaustionLoaded = true;
       } catch (err) {
-        // Unreadable: start with no episode open. The cost is at most one second "out of usage"
-        // entry for an outage that began before this daemon started.
+        // Judging before the log is read could announce an outage it already holds. A read that
+        // fails (the file briefly held by a scanner) is retried next cycle; only after several
+        // does tracking go on without it, at the cost of at most one repeated "out of usage".
+        this.exhaustionReadFailures += 1;
+        if (this.exhaustionReadFailures < EXHAUSTION_READ_ATTEMPTS) {
+          this.logger.warn(
+            { err, path: log.path },
+            'exhaustion log unreadable; retrying next cycle',
+          );
+          return;
+        }
         this.logger.warn({ err, path: log.path }, 'exhaustion log unreadable; no episode resumed');
+        this.exhaustionLoaded = true;
       }
     }
     // Entries an earlier cycle could not write go first, so the file keeps their order.
@@ -1475,7 +1492,16 @@ export class Daemon {
       this.openExhaustion = trackOpenEpisode(this.openExhaustion, fleet, now);
     }
     const transition = decideExhaustion(this.openExhaustion, fleet, now);
-    if (transition.kind === 'none') return;
+    if (transition.kind === 'none') {
+      // Still out: file what this cycle changed about any account, so a restart judges its
+      // return by what was last seen rather than by the start entry alone.
+      if (this.openExhaustion !== undefined) {
+        const filed = fileWallChanges(this.openExhaustion, now);
+        this.openExhaustion = filed.open;
+        for (const record of filed.records) await this.writeExhaustion(log, record);
+      }
+      return;
+    }
     const labelOf = (id: string): string => accounts.find((a) => a.id === id)?.label ?? id;
 
     if (transition.kind === 'start') {
@@ -1543,15 +1569,24 @@ export class Daemon {
     await this.flushExhaustionWrites(log);
   }
 
+  /** Write the queued exhaustion entries. Flushes run one after another, never side by side: a
+   *  shutdown arriving while a cycle is mid-write would otherwise append the same entry twice. */
+  private flushExhaustionWrites(log: ExhaustionLog): Promise<void> {
+    const run = this.exhaustionFlush.then(() => this.flushExhaustionQueue(log));
+    this.exhaustionFlush = run.catch(() => {});
+    return run;
+  }
+
   /** Write the queued exhaustion entries in order, stopping at the first that fails. Each failure
    *  is logged once at error WITH the entry, so daemon.log holds it even if the file never does;
    *  retries of the same entry log quietly. */
-  private async flushExhaustionWrites(log: ExhaustionLog): Promise<void> {
+  private async flushExhaustionQueue(log: ExhaustionLog): Promise<void> {
     while (this.pendingExhaustionWrites.length > 0) {
       const next = this.pendingExhaustionWrites[0] as ExhaustionRecord;
       try {
         await log.append(next);
-        this.pendingExhaustionWrites.shift();
+        const written = this.pendingExhaustionWrites.indexOf(next);
+        if (written >= 0) this.pendingExhaustionWrites.splice(written, 1);
         this.exhaustionWriteFailureLogged = false;
       } catch (err) {
         if (!this.exhaustionWriteFailureLogged) {

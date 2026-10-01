@@ -100,6 +100,11 @@ resets of every limit it was last seen out on having passed. A usage poll that f
 comes back empty during an outage is not evidence, and neither is a login added mid-outage
 before its first successful poll, so neither ends it (or starts a second one).
 
+While an outage is open the daemon also adds a short `walls` line whenever what keeps an
+account out changes (it hits another limit, its login expires, a reset moves by more than five
+minutes, or an account joins), so a daemon restarted mid-outage judges every account by what was
+last seen, not only by what was true at the start.
+
 The phone gets a card when it starts and when it ends. The log is
 `exhaustion-log.jsonl` in the daemon's data folder (beside `daemon.db`), one JSON line per
 start and per end, each with a plain-English `summary`; `cctl exhausted` prints its path. A

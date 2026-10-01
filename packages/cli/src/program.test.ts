@@ -1083,6 +1083,7 @@ describe('the banner and the plan agree with the running daemon', () => {
     dir = await mkdtemp(join(tmpdir(), 'cctl-exhausted-daemon-'));
     pathsIo.dataRoot = dir;
     settingsIo.configPath = join(dir, 'config.json');
+    settingsIo.heartbeatPath = join(dir, 'claude-control', 'daemon-heartbeat.json');
     engine.listAccounts.mockImplementation(() =>
       Promise.resolve([
         { id: 'a1', label: 'work1', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
@@ -1094,6 +1095,7 @@ describe('the banner and the plan agree with the running daemon', () => {
     vi.unstubAllEnvs();
     pathsIo.dataRoot = '';
     settingsIo.configPath = '';
+    settingsIo.heartbeatPath = '';
     settingsIo.readSettingsReport.mockImplementation(() => Promise.resolve(undefined));
     engine.listAccounts.mockImplementation(() => Promise.resolve([]));
     await rm(dir, { recursive: true, force: true });
@@ -1153,6 +1155,19 @@ describe('the banner and the plan agree with the running daemon', () => {
     };
     await writeFile(join(dataDir(), 'exhaustion-log.jsonl'), JSON.stringify(line) + '\n');
   }
+  /** A daemon heartbeat: written just now (alive), or written and then stopped days ago. */
+  async function seedHeartbeat(state: 'alive' | 'stopped') {
+    await mkdir(dataDir(), { recursive: true });
+    const now = Date.now();
+    await writeFile(
+      settingsIo.heartbeatPath,
+      JSON.stringify(
+        state === 'alive'
+          ? { writtenAtMs: now }
+          : { writtenAtMs: now - 6 * 24 * H, stoppedAtMs: now - 6 * 24 * H },
+      ),
+    );
+  }
   /** The running daemon's settings report, naming whether it counts the Fable cap. */
   const reportWithFableCap = (value: 'on' | 'off'): SettingsReport => ({
     startedAtMs: Date.now() - 2 * H,
@@ -1178,6 +1193,7 @@ describe('the banner and the plan agree with the running daemon', () => {
 
   it('a Fable-cap opt-out saved since the daemon started does not hide its outage', async () => {
     // The running daemon counts the cap (its report), and has an outage open on it.
+    await seedHeartbeat('alive');
     settingsIo.readSettingsReport.mockImplementation(() =>
       Promise.resolve(reportWithFableCap('on')),
     );
@@ -1195,6 +1211,7 @@ describe('the banner and the plan agree with the running daemon', () => {
   });
 
   it('a daemon running with the Fable cap off logs no outage, so there is no banner', async () => {
+    await seedHeartbeat('alive');
     settingsIo.readSettingsReport.mockImplementation(() =>
       Promise.resolve(reportWithFableCap('off')),
     );
@@ -1277,5 +1294,44 @@ describe('the banner and the plan agree with the running daemon', () => {
     };
     expect(json.open).toMatchObject({ overBy: { label: 'work1', how: 'reset' } });
     expect((await runCli(['usage'])).out).not.toContain(BANNER);
+  });
+
+  it('a report left by a daemon stopped days ago does not overrule the saved Fable-cap opt-out', async () => {
+    await seedHeartbeat('stopped');
+    settingsIo.readSettingsReport.mockImplementation(() =>
+      Promise.resolve(reportWithFableCap('on')),
+    );
+    await writeFile(
+      settingsIo.configPath,
+      JSON.stringify({ env: { CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' } }),
+    );
+    await seedUsage(fableCapped());
+    const r = await runCli(['timeline']);
+    expect(r.out).not.toContain(BANNER);
+    expect(r.out).not.toMatch(/Plan: No usable account/);
+  });
+
+  it('cctl exhausted still prints the history when daemon.db cannot be opened', async () => {
+    const now = Date.now();
+    await seedOpenOutage(now - 20 * 60_000, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now + 3 * H },
+    ]);
+    await writeFile(join(dataDir(), 'daemon.db'), 'not a database '.repeat(50));
+    const r = await runCli(['exhausted']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toContain('ongoing');
+  });
+
+  it('cctl exhausted still prints the history when the vault cannot be listed', async () => {
+    const now = Date.now();
+    await seedOpenOutage(now - 20 * 60_000, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now + 3 * H },
+    ]);
+    engine.listAccounts.mockImplementation(() =>
+      Promise.reject(new Error('vault metadata unreadable')),
+    );
+    const r = await runCli(['exhausted']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toContain('ongoing');
   });
 });

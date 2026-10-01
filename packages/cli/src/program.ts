@@ -36,13 +36,13 @@ import {
   buildDaemonHookSpecs,
   episodesOf,
   exhaustionLogPath,
-  openEpisodeOf,
   outageStatus,
+  resumeOpenEpisode,
   readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
   uninstallHooks,
-  type ExhaustedRecord,
+  type OpenEpisode,
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
@@ -374,15 +374,22 @@ export function buildProgram(): Command {
       const nowMs = Date.now();
       const log = exhaustionLog();
       const records = await log.read();
-      const openRecord = openEpisodeOf(records);
+      const openEpisode = resumeOpenEpisode(records);
       let open: OpenOutage | undefined;
-      if (openRecord !== undefined) {
-        const state = await readUsageState(nowMs);
-        const fleet = assessFleet(buildAdvisorInputs(state), nowMs, {
-          countFableCap: (await cliAutoSwitchPolicy()).fableCapTriggers ?? true,
-        });
-        const { recovery } = outageStatus(openRecord, fleet, nowMs);
-        open = { id: openRecord.id, ...(recovery !== undefined ? { overBy: recovery } : {}) };
+      if (openEpisode !== undefined) {
+        open = { id: openEpisode.record.id };
+        // Whether the latest numbers already show it over. Best effort: the history is the
+        // command's job, and an unreadable daemon.db or vault must not stop it from printing.
+        try {
+          const state = await readUsageState(nowMs);
+          const fleet = assessFleet(buildAdvisorInputs(state), nowMs, {
+            countFableCap: (await cliAutoSwitchPolicy()).fableCapTriggers ?? true,
+          });
+          const { recovery } = outageStatus(openEpisode, fleet, nowMs);
+          if (recovery !== undefined) open = { ...open, overBy: recovery };
+        } catch {
+          // Shown as plain "ongoing", which is what the log itself says.
+        }
       }
       const episodes = episodesInWindow(episodesOf(records), nowMs, days, open?.id);
       if (opts.json === true) {
@@ -1195,12 +1202,14 @@ function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
 
 /** The auto-switch policy to judge usage by: the thresholds a daemon started from this shell
  *  would run under (this shell's environment over config.json, the way `cctl settings` previews
- *  them), except whether the Fable cap counts, which comes from the RUNNING daemon's report when
- *  there is one. The banner and the plan say whether that daemon counts an outage, and a setting
- *  saved since it started only reaches it on its next start. */
+ *  them), except whether the Fable cap counts, which comes from the running daemon's report while
+ *  its heartbeat says it is alive. The banner and the plan say whether that daemon counts an
+ *  outage, and a setting saved since it started only reaches it on its next start; a report left
+ *  by a daemon that is no longer running says nothing about the next one. */
 async function cliAutoSwitchPolicy(): Promise<AutoSwitchPolicy> {
   const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
   const policy = autoSwitchPolicyOf(resolveDaemonConfig(process.env, {}, fileConfig).values);
+  if ((await readHeartbeat(daemonHeartbeatPath())).state !== 'alive') return policy;
   const reported = reportedFableCapTrigger(await readSettingsReport(daemonSettingsPath()));
   return reported === undefined ? policy : { ...policy, fableCapTriggers: reported };
 }
@@ -1221,14 +1230,14 @@ async function exhaustionBanner(
   nowMs: number,
 ): Promise<string | undefined> {
   const fleet = assessFleet(inputs, nowMs, { countFableCap: policy.fableCapTriggers ?? true });
-  let open: ExhaustedRecord | undefined;
+  let open: OpenEpisode | undefined;
   try {
-    open = openEpisodeOf(await exhaustionLog().read());
+    open = resumeOpenEpisode(await exhaustionLog().read());
   } catch {
     open = undefined;
   }
   if (!outageStatus(open, fleet, nowMs).on) return undefined;
-  return renderExhaustionBanner(fleet, open, nowMs, detectPalette());
+  return renderExhaustionBanner(fleet, open?.record, nowMs, detectPalette());
 }
 
 /** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same
