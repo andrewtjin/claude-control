@@ -158,6 +158,14 @@ describe('renderSetupSummary', () => {
     expect(out).toContain('[--] discord: local-only');
   });
 
+  it('warns about a running daemon with no autostart registered', () => {
+    // Shown as [ok] before: the daemon was up, but nothing would bring it back after a stop.
+    const out = renderSetupSummary({ ...base, autostart: 'unregistered' });
+    expect(out).toContain('[--] daemon: running, but no autostart registered');
+    expect(out).toContain('cctl daemon install');
+    expect(out).not.toContain('[ok] daemon');
+  });
+
   it('never points at cctl daemon install on a platform without autostart', () => {
     const stopped = renderSetupSummary({ ...base, autostart: 'unsupported', daemonAlive: false });
     expect(stopped).toContain('[--] daemon: not running — start it: cctl daemon supervise');

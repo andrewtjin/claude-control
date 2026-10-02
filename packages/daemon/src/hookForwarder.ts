@@ -30,6 +30,13 @@
 //     unrecognized or unparsable event rides the response — correctness over speed for
 //     anything unknown.
 //
+// A daemon that is down must not stay invisible: every hook silently becoming a no-op is how a
+// dead daemon (and auto-switch with it) went unnoticed for days. So on the two daemon-down
+// paths above, a UserPromptSubmit — the moment a person is looking at the session — prints one
+// `systemMessage` naming the outage and the command that ends it, at most once per
+// DOWN_NOTICE_EVERY_MS across every session (a marker file's mtime is the shared clock). No
+// other event carries it: they fire per tool call, and nobody is reading them as they go.
+//
 // Reading the receiver's CURRENT port from the endpoint file at fire time also makes the
 // installed command port-independent: a running session's hook snapshot keeps working across
 // daemon restarts instead of pointing at a dead port forever. Events that fire while the
@@ -41,7 +48,7 @@
 // the surrounding repo) and must NEVER exit non-zero or write to stderr: a hook failure is
 // the daemon's problem, never the session's.
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 /** Stable on-disk location beside `hook-endpoint.json` — the script finds the endpoint file
@@ -59,7 +66,8 @@ export const HOOK_FORWARDER_SOURCE = `'use strict';
 // to the local daemon's loopback receiver. PermissionRequest/Stop/UserPromptSubmit
 // responses are awaited and printed (decisions and steering ride them); everything
 // else is fire-and-forget once the body reaches the socket. No daemon (no endpoint
-// file, or nothing listening) => exit 0 quickly.
+// file, or nothing listening) => exit 0 quickly, with a rate-limited notice on
+// UserPromptSubmit so the outage is seen.
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -75,8 +83,37 @@ const RESPONSE_EVENTS = ['PermissionRequest', 'Stop', 'UserPromptSubmit'];
 
 const endpointFile = path.join(__dirname, 'hook-endpoint.json');
 
+// The daemon-down notice: shared marker (its mtime is the last time any session showed it),
+// the minimum gap between two showings, and the line itself.
+const DOWN_NOTICE_FILE = path.join(__dirname, 'daemon-down-notice');
+const DOWN_NOTICE_EVERY_MS = 15 * 60 * 1000;
+const DOWN_NOTICE =
+  'cctl: the daemon is not running, so auto-switch and every cctl hook are off. ' +
+  'Start it: cctl daemon start (or remove the hooks: cctl daemon uninstall)';
+
 function bail() {
   process.exit(0);
+}
+
+// The daemon is not there. Say so on a UserPromptSubmit unless a session already did within
+// the window; otherwise (or if the marker cannot be written, which would turn the rate limit
+// into a notice on every prompt) exit quietly as before.
+function daemonDown(event) {
+  if (event !== 'UserPromptSubmit') bail();
+  try {
+    // A marker dated in the future (the clock was set back) does not count as a recent
+    // showing; otherwise the notice would stay silent until the clock caught up.
+    const age = Date.now() - fs.statSync(DOWN_NOTICE_FILE).mtimeMs;
+    if (age >= 0 && age < DOWN_NOTICE_EVERY_MS) bail();
+  } catch {}
+  try {
+    fs.writeFileSync(DOWN_NOTICE_FILE, new Date().toISOString() + '\\n');
+  } catch {
+    bail();
+  }
+  // Exit from the write callback: stdout to a pipe can be asynchronous (Windows), and an
+  // immediate exit could drop the line.
+  process.stdout.write(JSON.stringify({ systemMessage: DOWN_NOTICE }) + '\\n', bail);
 }
 
 let port;
@@ -84,12 +121,13 @@ try {
   const parsed = JSON.parse(fs.readFileSync(endpointFile, 'utf8'));
   if (Number.isInteger(parsed.port) && parsed.port > 0) port = parsed.port;
 } catch {
-  bail(); // no endpoint file (daemon stopped cleanly) or unreadable: no network, done
+  // No endpoint file (daemon stopped cleanly, or never started) or unreadable: no network.
+  // The payload is still read below, only to learn whether this event carries the notice.
 }
 const flagIndex = process.argv.indexOf('--secret-header');
 const headerArg = flagIndex >= 0 ? process.argv[flagIndex + 1] : undefined;
 const sep = typeof headerArg === 'string' ? headerArg.indexOf(':') : -1;
-if (port === undefined || sep <= 0) bail();
+if (sep <= 0) bail();
 
 const headers = {
   'content-type': 'application/json',
@@ -109,6 +147,10 @@ process.stdin.on('end', () => {
   try {
     event = JSON.parse(body).hook_event_name;
   } catch {}
+  if (port === undefined) {
+    daemonDown(event);
+    return;
+  }
   // Unknown/unparsable events ride the response: never guess that an answer is ignorable.
   const awaitResponse = typeof event !== 'string' || RESPONSE_EVENTS.indexOf(event) >= 0;
 
@@ -148,6 +190,8 @@ process.stdin.on('end', () => {
         const current = JSON.parse(fs.readFileSync(endpointFile, 'utf8'));
         if (current.port === port) fs.unlinkSync(endpointFile);
       } catch {}
+      daemonDown(event);
+      return;
     }
     bail();
   });
@@ -162,9 +206,18 @@ process.stdin.on('end', () => {
 });
 `;
 
+/** Where the forwarder records its last daemon-down notice; a sibling of the script, which
+ *  finds it by its own directory. */
+export function daemonDownNoticePath(dataDir: string): string {
+  return join(dataDir, 'daemon-down-notice');
+}
+
 /** Write (or refresh) the forwarder script. Called on daemon start, before hook install, so
- *  the command `buildDaemonHookSpecs` points at always has a current script behind it. */
+ *  the command `buildDaemonHookSpecs` points at always has a current script behind it. Also
+ *  clears the daemon-down marker: the outage it recorded is over, so the next one gets its
+ *  notice at once instead of waiting out the window a restart's brief gap may have used. */
 export async function writeHookForwarder(filePath: string): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, HOOK_FORWARDER_SOURCE, 'utf8');
+  await rm(daemonDownNoticePath(dirname(filePath)), { force: true });
 }

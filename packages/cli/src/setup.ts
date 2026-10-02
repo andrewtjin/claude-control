@@ -243,10 +243,17 @@ export function renderSetupSummary(
 
   // On a platform with no autostart backend, `cctl daemon install` would only restate that and
   // exit, so the line hands over the manual start instead.
+  // A running daemon with no autostart is a warning, not an ok: it stays down silently after
+  // the first reboot or stopped supervisor, and nothing else on a local-only box says so.
   const daemonLine = s.daemonAlive
     ? s.autostart === 'unsupported'
       ? ok('daemon: running (started by hand — no autostart on this platform)')
-      : ok('daemon: running')
+      : s.autostart === 'unregistered'
+        ? warn(
+            'daemon: running, but no autostart registered — it stays down after a reboot ' +
+              'or stop (run: cctl daemon install)',
+          )
+        : ok('daemon: running')
     : s.autostart === 'registered'
       ? warn('daemon: not running yet — starts at logon (or: cctl daemon install)')
       : s.autostart === 'unsupported'
