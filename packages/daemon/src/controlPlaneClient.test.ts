@@ -435,6 +435,55 @@ describe('ControlPlaneClient', () => {
     expect(client.getState()).toBe('open');
   });
 
+  describe('sending while connected', () => {
+    const note = (title: string): EnvelopeDraft => ({
+      daemonId: 'assigned-daemon-1',
+      type: 'hook.notification',
+      payload: { event: 'notification', title, body: '', level: 'info' },
+    });
+    const receivedTitles = () =>
+      relay.received.flatMap((e) => (e.type === 'hook.notification' ? [e.payload.title] : []));
+
+    async function connected(): Promise<ControlPlaneClient> {
+      const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
+      relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+      const c = new ControlPlaneClient({
+        url: relay.url(),
+        identityStore: memoryIdentityStore(identity),
+        store,
+        hostLabel: 'h',
+        heartbeatMs: 100_000,
+      });
+      await c.connect();
+      return c;
+    }
+
+    it('goes straight to the socket without writing the outbox', async () => {
+      // Every command-output card takes this path; queueing and deleting each one cost two
+      // synchronous SQLite writes on the main thread for no added safety.
+      client = await connected();
+      const enqueue = vi.spyOn(store, 'enqueueOutbox');
+      const remove = vi.spyOn(store, 'deleteOutbox');
+      for (let i = 0; i < 50; i++) client.send(note(`n${i}`));
+      await waitFor(() => receivedTitles().length === 50);
+      expect(receivedTitles()).toEqual(Array.from({ length: 50 }, (_, i) => `n${i}`));
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(store.countOutbox()).toBe(0);
+    });
+
+    it('never overtakes a row already queued: the backlog drains first, in order', async () => {
+      client = await connected();
+      // A row left queued while the link is up (it can happen when the socket closes before the
+      // client's state catches up); a fresh send must go out behind it, not ahead.
+      store.enqueueOutbox(encode(stamp(note('queued-first'))), 1);
+      client.send(note('sent-second'));
+      await waitFor(() => receivedTitles().length === 2);
+      expect(receivedTitles()).toEqual(['queued-first', 'sent-second']);
+      expect(store.countOutbox()).toBe(0);
+    });
+  });
+
   it('buffers sends while disconnected and flushes exactly once (in order, no dupes) on reconnect', async () => {
     const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
     relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
@@ -504,6 +553,110 @@ describe('ControlPlaneClient', () => {
       e.type === 'hook.notification' ? e.payload.title : undefined,
     );
     expect(titles).toEqual(['n2', 'n3', 'n4']); // oldest (n0, n1) dropped
+  });
+
+  describe('an outbox nothing can deliver', () => {
+    const note = (title: string): EnvelopeDraft => ({
+      daemonId: 'x',
+      type: 'hook.notification',
+      payload: { event: 'notification', title, body: '', level: 'info' },
+    });
+    const titles = () =>
+      store
+        .listOutbox()
+        .map((r) => JSON.parse(r.envelopeJson) as Envelope)
+        .map((e) => (e.type === 'hook.notification' ? e.payload.title : undefined));
+
+    it('unpaired with no code: queues nothing after the verdict, and keeps rows already queued', async () => {
+      // Every command-output card on an unpaired box used to cost an outbox insert and trim.
+      // A previous run's backlog is kept: "unpaired" can be a transient identity-read failure,
+      // and a healthy restart should still deliver what the paired run queued.
+      store.enqueueOutbox(encode(stamp(note('from-last-run'))), 1);
+      const infoLogs: unknown[] = [];
+      client = new ControlPlaneClient({
+        url: relay.url(),
+        identityStore: memoryIdentityStore(),
+        store,
+        hostLabel: 'h',
+        logger: {
+          debug: () => {},
+          info: (obj: unknown) => infoLogs.push(obj),
+          warn: () => {},
+          error: () => {},
+        },
+      });
+      await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
+      expect(infoLogs).toContainEqual({ reason: 'not paired' });
+      for (let i = 0; i < 20; i++) client.send(note(`after-${i}`));
+      expect(titles()).toEqual(['from-last-run']);
+    });
+
+    it('a terminally rejected hello stops queueing and keeps rows already queued', async () => {
+      const badRelay = new FakeRelay({ rejectHello: true });
+      await badRelay.listen();
+      try {
+        store.enqueueOutbox(encode(stamp(note('queued'))), 1);
+        client = new ControlPlaneClient({
+          url: badRelay.url(),
+          identityStore: memoryIdentityStore({ daemonId: 'd1', daemonToken: 't1' }),
+          store,
+          hostLabel: 'h',
+          reconnectBaseMs: 10,
+        });
+        await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
+        client.send(note('after-rejection'));
+        // A protocol-version rejection clears once either side upgrades, and the same identity
+        // then delivers what it had queued; only new sends are pointless now.
+        expect(titles()).toEqual(['queued']);
+      } finally {
+        await badRelay.close();
+      }
+    });
+
+    it('a paired client that is merely disconnected still queues (delivery is still possible)', async () => {
+      const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
+      relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+      client = new ControlPlaneClient({
+        url: relay.url(),
+        identityStore: memoryIdentityStore(identity),
+        store,
+        hostLabel: 'h',
+        heartbeatMs: 100_000,
+        reconnectBaseMs: 60_000, // stay disconnected for the assertion
+        reconnectCapMs: 60_000,
+      });
+      await client.connect();
+      relay.disconnectAll();
+      await waitFor(() => client!.getState() === 'reconnecting');
+      client.send(note('kept'));
+      expect(titles()).toEqual(['kept']);
+    });
+
+    it('a later connect() that can deliver queues again', async () => {
+      // The flag belongs to one connect() attempt, not to the client forever: a later connect()
+      // that finds an identity queues normally. (The daemon calls connect() once per process;
+      // this pins the reset for any caller that retries.)
+      const identityStore = memoryIdentityStore();
+      client = new ControlPlaneClient({
+        url: relay.url(),
+        identityStore,
+        store,
+        hostLabel: 'h',
+        reconnectBaseMs: 10,
+      });
+      await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
+      client.send(note('dropped'));
+      await identityStore.save({ daemonId: 'assigned-daemon-1', daemonToken: 'tok' });
+      relay.tokensByDaemonId.set('assigned-daemon-1', 'tok');
+      await client.connect();
+      relay.disconnectAll();
+      await waitFor(
+        () => client!.getState() === 'reconnecting' || client!.getState() === 'connecting',
+      );
+      client.send(note('queued-again'));
+      expect(titles()).toContain('queued-again');
+      expect(titles()).not.toContain('dropped');
+    });
   });
 
   it('dispatches every inbound command type to its handler', async () => {

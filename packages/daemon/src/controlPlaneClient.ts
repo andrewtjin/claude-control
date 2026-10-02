@@ -22,7 +22,6 @@ import {
   stamp,
   isType,
   PROTOCOL_VERSION,
-  type Envelope,
   type EnvelopeDraft,
   type MessageOf,
 } from '@claude-control/shared-protocol';
@@ -167,6 +166,15 @@ export class ControlPlaneClient {
    *  but it is NOT caused by our own `close()`, so the end state is `'rejected'`, not
    *  `'closed'`, to distinguish "the bot refused us" from "we shut ourselves down". */
   private terminalRejection = false;
+  /** Set once this process can never deliver anything: unpaired with no code to pair with, or
+   *  a hello the bot rejected terminally (bad credentials or an unsupported protocol version;
+   *  only a later process, re-paired or upgraded, can connect). From then on `send()` queues
+   *  nothing: queueing anyway cost two synchronous SQLite writes per envelope on the main thread
+   *  (every command-output card on an unpaired box) for rows only a later process could send.
+   *  Rows already queued are left alone. "Unpaired" can be a transient failure to read the
+   *  identity, and the rows may be a previous paired run's backlog that a healthy restart
+   *  should still deliver. */
+  private undeliverable = false;
   /** Resolves the in-flight `connect()` promise once hello succeeds (or pairing completes and
    *  the follow-up hello succeeds) — lets tests/daemon.ts `await client.connect()`. */
   private connectedResolvers: { resolve: () => void; reject: (err: Error) => void }[] = [];
@@ -215,12 +223,14 @@ export class ControlPlaneClient {
     this.stopped = false;
     // A fresh connect() (e.g. after re-pairing) clears any prior terminal rejection.
     this.terminalRejection = false;
+    this.undeliverable = false;
     this.identity = await this.opts.identityStore.load();
     // Unpaired with nothing to pair with: fail HERE, before touching the network. Without this
     // guard the socket's open handler would encode a pair.claim with an empty pairingCode,
     // which the wire schema rejects — a synchronous throw inside a ws event handler, i.e. a
     // process crash instead of the clean rejection this method's contract promises.
     if (!this.identity && !hasPairingCode(this.opts.pairingCode)) {
+      this.stopQueueing('not paired');
       throw new ControlPlaneRejectionError(NOT_PAIRED_MESSAGE);
     }
     return new Promise((resolve, reject) => {
@@ -240,15 +250,30 @@ export class ControlPlaneClient {
   }
 
   /**
-   * Send an envelope. If connected, it goes out immediately; either way it is first durably
-   * queued in the outbox and only removed once actually written to the socket — so a send
-   * that races a disconnect is never silently lost.
+   * Send an envelope. Connected with nothing queued ahead of it, it goes straight to the socket.
+   * Otherwise it is durably queued in the outbox and flushed in order: right away behind the
+   * queued rows when connected, or once the connection is up. Once the client knows nothing can
+   * ever be delivered from this process (see {@link undeliverable}), the envelope is dropped.
+   *
+   * The direct path skips the outbox on purpose: a row was deleted the moment `socket.send()`
+   * buffered it, so queueing first and deleting after gave a connected send no protection a
+   * direct send lacks, at the price of two synchronous SQLite writes on the main thread per
+   * envelope, one per command-output card. The empty-outbox check keeps a fresh envelope from
+   * overtaking queued ones.
    */
   send(draft: EnvelopeDraft): void {
-    const envelope = stamp(draft);
-    const id = this.opts.store.enqueueOutbox(encode(envelope), this.opts.clock());
+    if (this.undeliverable) return;
+    const json = encode(stamp(draft));
+    const socket = this.liveSocket();
+    if (socket && this.opts.store.countOutbox() === 0) {
+      socket.send(json);
+      return;
+    }
+    this.opts.store.enqueueOutbox(json, this.opts.clock());
     this.opts.store.trimOutboxOldest(this.opts.outboxBound);
-    this.trySendRow(id, envelope);
+    // Connected but with rows already queued: drain them all, oldest first, so this envelope
+    // goes out behind them rather than ahead.
+    if (socket) this.flushOutbox();
   }
 
   // ---- connection setup ----
@@ -296,6 +321,7 @@ export class ControlPlaneClient {
       // reconnecting cannot help when there is nothing to pair with.
       this.opts.logger.error({}, NOT_PAIRED_MESSAGE);
       this.stopped = true;
+      this.stopQueueing('not paired');
       this.failConnect(new ControlPlaneRejectionError(NOT_PAIRED_MESSAGE));
       this.socket.close(1000, 'no pairing code');
       return;
@@ -396,6 +422,7 @@ export class ControlPlaneClient {
       const reason = envelope.payload.error ?? 'hello rejected';
       this.terminalRejection = true;
       this.state = 'rejected';
+      this.stopQueueing('hello rejected');
       this.opts.logger.error(
         { reason },
         'control-plane rejected hello - stopping; re-pairing required',
@@ -452,20 +479,34 @@ export class ControlPlaneClient {
       if (rows.length === 0) break;
       const remainingBefore = this.opts.store.countOutbox();
       for (const row of rows) {
-        this.trySendRow(row.id, undefined, row.envelopeJson);
+        this.trySendRow(row.id, row.envelopeJson);
       }
       if (this.opts.store.countOutbox() >= remainingBefore) break; // no progress — stop
     }
   }
 
-  /** Send one outbox row over the live socket (if open) and delete it once written. Accepts
-   *  either an already-stamped `envelope` (a fresh `send()`) or a pre-serialized
-   *  `envelopeJson` (a flush replay) — never both are needed at once. */
-  private trySendRow(id: number, envelope?: Envelope, envelopeJson?: string): void {
-    if (this.state !== 'open' || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    const json = envelopeJson ?? (envelope ? encode(envelope) : undefined);
-    if (json === undefined) return;
-    this.socket.send(json);
+  /** Stop queueing for good (see {@link undeliverable}). Logged once, so a box whose phone
+   *  stopped hearing from it can tell why from the log. Already-queued rows stay for a later
+   *  process to deliver. */
+  private stopQueueing(reason: string): void {
+    if (this.undeliverable) return;
+    this.undeliverable = true;
+    this.opts.logger.info({ reason }, 'control-plane messages will not be queued by this process');
+  }
+
+  /** The socket, if an envelope handed to it now would be written: the handshake is done and
+   *  the socket itself is open (it can close before `state` catches up). */
+  private liveSocket(): WebSocket | undefined {
+    return this.state === 'open' && this.socket?.readyState === WebSocket.OPEN
+      ? this.socket
+      : undefined;
+  }
+
+  /** Send one outbox row over the live socket (if open) and delete it once written. */
+  private trySendRow(id: number, envelopeJson: string): void {
+    const socket = this.liveSocket();
+    if (!socket) return;
+    socket.send(envelopeJson);
     this.opts.store.deleteOutbox(id);
   }
 
