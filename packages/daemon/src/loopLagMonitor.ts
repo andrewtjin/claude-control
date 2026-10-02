@@ -31,7 +31,7 @@ export interface LoopLagMonitorOptions {
  * well below the multi-second stalls that tax hook latency.
  *
  * Exported because the poll cycle's own per-phase timing warns at the same bar (see
- * `POLL_PHASE_SLOW_MS` in daemon.ts). One number, so a phase can never be "slow" by one
+ * `POLL_PHASE_BLOCK_MS` in daemon.ts). One number, so a phase can never be "slow" by one
  * definition and fine by the other — which is exactly the confusion that makes an attributed
  * stall hard to read.
  */
