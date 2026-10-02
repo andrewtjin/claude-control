@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -758,6 +758,21 @@ describe('Store migration', () => {
       ]);
     } finally {
       second.close();
+    }
+  });
+});
+
+describe('Store on a file that is not a database', () => {
+  it('throws, and lets go of the file so it can be replaced or deleted', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'store-garbage-'));
+    try {
+      const path = join(dir, 'daemon.db');
+      writeFileSync(path, 'not a database '.repeat(50));
+      expect(() => new Store(path)).toThrow();
+      // On Windows an open handle makes this fail with EBUSY.
+      expect(() => rmSync(path)).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

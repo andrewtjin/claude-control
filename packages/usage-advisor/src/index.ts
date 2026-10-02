@@ -14,6 +14,18 @@ export {
   type AutoSwitchDecision,
   type AutoSwitchPolicy,
 } from './autoswitch.js';
+export {
+  assessAccount,
+  assessFleet,
+  describeFirstBack,
+  describeUnavailable,
+  describeWalls,
+  type AccountAvailability,
+  type AvailabilityOptions,
+  type FleetAvailability,
+  type UnavailableReason,
+} from './availability.js';
+export { LIMIT_NOUN } from './limits.js';
 export { formatTokens, humanizeDaysUntil, humanizeDuration, roundPct } from './format.js';
 export {
   planWeight,
