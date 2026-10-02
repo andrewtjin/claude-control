@@ -15,7 +15,7 @@ import {
   formatLocalTime,
   renderExhaustionBanner,
   renderExhaustionLog,
-} from './exhaustedView.js';
+} from './outagesView.js';
 
 // Built from LOCAL components, so the expected strings hold in whatever zone the suite runs.
 const local = (month: number, day: number, hour: number, minute: number, year = 2026): number =>
@@ -256,13 +256,13 @@ describe('renderExhaustionBanner', () => {
   it('says since when (from the open outage) and when the first account is back', () => {
     expect(renderExhaustionBanner(out, openEpisodeFrom(start(local(10, 1, 14, 20))), NOW)).toBe(
       'No account can take work since Oct 1 14:20 (40m). First back: a in 2h. ' +
-        'cctl exhausted lists every time this happened.',
+        'cctl outages lists every time this happened.',
     );
   });
 
   it('without an open outage in the log it still says so, without a since', () => {
     expect(renderExhaustionBanner(out, undefined, NOW)).toBe(
-      'No account can take work. First back: a in 2h. cctl exhausted lists every time this happened.',
+      'No account can take work. First back: a in 2h. cctl outages lists every time this happened.',
     );
   });
 
@@ -273,7 +273,7 @@ describe('renderExhaustionBanner', () => {
       renderExhaustionBanner(unmeasured, openEpisodeFrom(start(local(10, 1, 14, 20))), NOW),
     ).toBe(
       'No account can take work since Oct 1 14:20 (40m). First back expected: w2 at Oct 1 16:20. ' +
-        'cctl exhausted lists every time this happened.',
+        'cctl outages lists every time this happened.',
     );
   });
 

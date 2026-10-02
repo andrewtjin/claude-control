@@ -5,7 +5,7 @@
 //
 // The file IS the log, the only store: append-only JSON lines at
 // `<dataDir>/exhaustion-log.jsonl`, each carrying a plain-English `summary` so the file reads on
-// its own, rendered by `cctl exhausted`. The daemon reads it back on start to resume an episode
+// its own, rendered by `cctl outages`. The daemon reads it back on start to resume an episode
 // that was open when it stopped, so a restart never announces the same outage twice.
 //
 // Deciding WHEN an episode starts and ends is pure (see {@link decideExhaustion}) and leans on
@@ -141,7 +141,7 @@ export interface ExhaustionEpisode {
 // Every field the daemon or the CLI reads is checked before a line is accepted, down to each
 // account and limit: a line from a newer build (another `v`), a torn write, or a hand edit that
 // left a field out is skipped whole, never half-used. Half-used, it would throw on every poll
-// cycle that judged the episode it describes, and stop `cctl exhausted` from printing anything.
+// cycle that judged the episode it describes, and stop `cctl outages` from printing anything.
 
 const LIMIT_KINDS = new Set<string>(['session', 'weekly_all', 'weekly_scoped']);
 const REASONS = new Set<string>([...LIMIT_KINDS, 'quarantined']);
@@ -639,7 +639,7 @@ function reasonOf(a: AccountAvailability): UnavailableReason {
   return a.reason;
 }
 
-/** What brought an account back, in words. Shared with `cctl exhausted`, so the file's summary
+/** What brought an account back, in words. Shared with `cctl outages`, so the file's summary
  *  and the CLI never word the same recovery differently. */
 export function recoveryText(recovery: Pick<Recovery, 'how' | 'limit'>): string {
   switch (recovery.how) {
@@ -689,7 +689,7 @@ export function exhaustedCardBody(fleet: FleetAvailability, record: ExhaustedRec
   const walk =
     record.switches.length > 0
       ? [
-          `${record.switches.length} switch${record.switches.length === 1 ? '' : 'es'} in the last 5 hours; cctl exhausted lists them.`,
+          `${record.switches.length} switch${record.switches.length === 1 ? '' : 'es'} in the last 5 hours; cctl outages lists them.`,
         ]
       : [];
   return ['No account can take work.', ...lines, describeFirstBack(fleet, record.at), ...walk].join(

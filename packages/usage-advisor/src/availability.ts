@@ -170,7 +170,7 @@ export function hasUsableHeadroom(account: AccountUsageInput, now = Date.now()):
 /** The limits holding an account out, in words: "5-hour window 100% and weekly budget 99%".
  *  Every wall is named, because the account is back only when the LAST of them resets: naming
  *  the worst one alone would pair "5-hour window" with a return three days out. Shared by the
- *  log, the phone card and `cctl exhausted`. */
+ *  log, the phone card and `cctl outages`. */
 export function describeWalls(spent: LimitInput[]): string {
   return spent.length === 0
     ? 'out of usage'

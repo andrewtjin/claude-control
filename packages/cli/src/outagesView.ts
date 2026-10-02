@@ -1,5 +1,5 @@
 // The CLI's two views of the exhaustion log (see the daemon's exhaustionLog.ts): the history
-// `cctl exhausted` prints, and the one-line banner `cctl usage` and `cctl timeline` lead with
+// `cctl outages` prints, and the one-line banner `cctl usage` and `cctl timeline` lead with
 // while no account can take work. Pure renderers; program.ts does the reading and the judging.
 
 import {
@@ -105,7 +105,7 @@ export function episodesInWindow(
   return episodes.filter((e) => e.start.at >= since || e.start.id === openId);
 }
 
-/** `cctl exhausted`: every episode, newest first, each with its accounts and the switches
+/** `cctl outages`: every episode, newest first, each with its accounts and the switches
  *  that led there, then where the log lives. */
 export function renderExhaustionLog(
   episodes: ExhaustionEpisode[],
@@ -177,6 +177,6 @@ export function renderExhaustionBanner(
   return (
     palette.red(palette.bold(`No account can take work${since}.`)) +
     (firstBack !== '' ? ` ${firstBack}` : '') +
-    ' cctl exhausted lists every time this happened.'
+    ' cctl outages lists every time this happened.'
   );
 }

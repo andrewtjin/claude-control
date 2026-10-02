@@ -153,7 +153,7 @@ describe('buildProgram', () => {
     expect(names).toContain('usage');
     expect(names).toContain('timeline');
     expect(names).toContain('stats');
-    expect(names).toContain('exhausted');
+    expect(names).toContain('outages');
     expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
@@ -895,11 +895,11 @@ describe('color on a terminal', () => {
   });
 });
 
-describe('exhausted, and the banner usage and timeline lead with', () => {
+describe('outages, and the banner usage and timeline lead with', () => {
   const H = 60 * 60 * 1000;
   let dir = '';
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'cctl-exhausted-'));
+    dir = await mkdtemp(join(tmpdir(), 'cctl-outages-'));
     pathsIo.dataRoot = dir;
     // An empty config: the Fable cap counts, as by default.
     settingsIo.configPath = join(dir, 'config.json');
@@ -995,7 +995,7 @@ describe('exhausted, and the banner usage and timeline lead with', () => {
   };
 
   it('offers --days and --json', () => {
-    const cmd = buildProgram().commands.find((c) => c.name() === 'exhausted');
+    const cmd = buildProgram().commands.find((c) => c.name() === 'outages');
     expect(cmd?.options.map((o) => o.long).sort()).toEqual(['--days', '--json']);
   });
 
@@ -1003,7 +1003,7 @@ describe('exhausted, and the banner usage and timeline lead with', () => {
     const now = Date.now();
     const old = started(now - 50 * H);
     await seedLog([old, recovered(old, now - 49 * H), started(now - 2 * H)]);
-    const r = await runCli(['exhausted']);
+    const r = await runCli(['outages']);
     expect(r.exited).toBe(false);
     expect(r.out).toMatch(/^2 times no account could take work \(newest first\):/);
     expect(r.out.indexOf('ongoing')).toBeLessThan(
@@ -1017,27 +1017,27 @@ describe('exhausted, and the banner usage and timeline lead with', () => {
     const old = started(now - 20 * 24 * H);
     const recent = started(now - 2 * H);
     await seedLog([old, recovered(old, old.at + H), recent]);
-    const all = JSON.parse((await runCli(['exhausted', '--json'])).out) as {
+    const all = JSON.parse((await runCli(['outages', '--json'])).out) as {
       log: string;
       episodes: Array<{ start: { id: string }; end?: unknown }>;
     };
     expect(all.log).toBe(logPath());
     expect(all.episodes.map((e) => e.start.id)).toEqual([recent.id, old.id]);
-    const week = JSON.parse((await runCli(['exhausted', '--json', '--days', '7'])).out) as {
+    const week = JSON.parse((await runCli(['outages', '--json', '--days', '7'])).out) as {
       episodes: Array<{ start: { id: string } }>;
     };
     expect(week.episodes.map((e) => e.start.id)).toEqual([recent.id]);
   });
 
   it('with no log yet it says nothing is on record', async () => {
-    const r = await runCli(['exhausted']);
+    const r = await runCli(['outages']);
     expect(r.out).toBe(
       `No time on record when every account was out of usage.\nLog: ${logPath()}\n`,
     );
   });
 
   it('refuses a --days that is not a positive number', async () => {
-    const r = await runCli(['exhausted', '--days', '0']);
+    const r = await runCli(['outages', '--days', '0']);
     expect(r.exited).toBe(true);
     expect(r.err).toContain('--days must be a positive number.');
   });
@@ -1080,7 +1080,7 @@ describe('the banner and the plan agree with the running daemon', () => {
   const BANNER = 'No account can take work';
   let dir = '';
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'cctl-exhausted-daemon-'));
+    dir = await mkdtemp(join(tmpdir(), 'cctl-outages-daemon-'));
     pathsIo.dataRoot = dir;
     settingsIo.configPath = join(dir, 'config.json');
     settingsIo.heartbeatPath = join(dir, 'claude-control', 'daemon-heartbeat.json');
@@ -1206,7 +1206,7 @@ describe('the banner and the plan agree with the running daemon', () => {
     await seedOpenOutage(Date.now() - 20 * 60_000, 'weekly_scoped', [
       { kind: 'weekly_scoped', percent: 100, resetsAt: Date.now() + 48 * H },
     ]);
-    expect((await runCli(['exhausted'])).out).toContain('ongoing');
+    expect((await runCli(['outages'])).out).toContain('ongoing');
     expect((await runCli(['usage'])).out).toContain(BANNER);
   });
 
@@ -1268,7 +1268,7 @@ describe('the banner and the plan agree with the running daemon', () => {
     );
   });
 
-  it('an open outage the latest numbers show is over says so in cctl exhausted', async () => {
+  it('an open outage the latest numbers show is over says so in cctl outages', async () => {
     const now = Date.now();
     await seedOpenOutage(now - 4 * H, 'session', [
       { kind: 'session', percent: 100, resetsAt: now - H },
@@ -1285,11 +1285,11 @@ describe('the banner and the plan agree with the running daemon', () => {
         limits: [{ kind: 'session', percent: 100, resetsAt: now + 4 * H }],
       },
     ]);
-    const text = (await runCli(['exhausted'])).out;
+    const text = (await runCli(['outages'])).out;
     expect(text).toMatch(
       /-> over by the latest numbers: work1 back since .+ \(its 5-hour window reset\)/,
     );
-    const json = JSON.parse((await runCli(['exhausted', '--json'])).out) as {
+    const json = JSON.parse((await runCli(['outages', '--json'])).out) as {
       open: { id: string; overBy?: { label: string; how: string } } | null;
     };
     expect(json.open).toMatchObject({ overBy: { label: 'work1', how: 'reset' } });
@@ -1311,18 +1311,18 @@ describe('the banner and the plan agree with the running daemon', () => {
     expect(r.out).not.toMatch(/Plan: No usable account/);
   });
 
-  it('cctl exhausted still prints the history when daemon.db cannot be opened', async () => {
+  it('cctl outages still prints the history when daemon.db cannot be opened', async () => {
     const now = Date.now();
     await seedOpenOutage(now - 20 * 60_000, 'session', [
       { kind: 'session', percent: 100, resetsAt: now + 3 * H },
     ]);
     await writeFile(join(dataDir(), 'daemon.db'), 'not a database '.repeat(50));
-    const r = await runCli(['exhausted']);
+    const r = await runCli(['outages']);
     expect(r.exited).toBe(false);
     expect(r.out).toContain('ongoing');
   });
 
-  it('cctl exhausted still prints the history when the vault cannot be listed', async () => {
+  it('cctl outages still prints the history when the vault cannot be listed', async () => {
     const now = Date.now();
     await seedOpenOutage(now - 20 * 60_000, 'session', [
       { kind: 'session', percent: 100, resetsAt: now + 3 * H },
@@ -1330,7 +1330,7 @@ describe('the banner and the plan agree with the running daemon', () => {
     engine.listAccounts.mockImplementation(() =>
       Promise.reject(new Error('vault metadata unreadable')),
     );
-    const r = await runCli(['exhausted']);
+    const r = await runCli(['outages']);
     expect(r.exited).toBe(false);
     expect(r.out).toContain('ongoing');
   });

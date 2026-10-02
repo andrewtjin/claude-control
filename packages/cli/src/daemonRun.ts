@@ -504,7 +504,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     attributionJournal,
     hookReceiver,
     controlPlaneClient,
-    // Every time no account can take work, beside daemon.log; `cctl exhausted` reads the same
+    // Every time no account can take work, beside daemon.log; `cctl outages` reads the same
     // path through the same helper.
     exhaustionLog: new ExhaustionLog(exhaustionLogPath(dataDir)),
     installHooks: async () => {

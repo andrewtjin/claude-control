@@ -259,7 +259,7 @@ describe('records', () => {
         '• a (5-hour window 100%, back in 1h)',
         '• q (login expired)',
         'First back: a in 1h.',
-        '1 switch in the last 5 hours; cctl exhausted lists them.',
+        '1 switch in the last 5 hours; cctl outages lists them.',
       ].join('\n'),
     );
   });

@@ -63,7 +63,7 @@ import {
   renderExhaustionBanner,
   renderExhaustionLog,
   type OpenOutage,
-} from './exhaustedView.js';
+} from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
@@ -359,7 +359,7 @@ export function buildProgram(): Command {
   // the history, and an outage still open in it is checked against the latest numbers in
   // daemon.db, so one that is over but that no running daemon has closed says so.
   program
-    .command('exhausted')
+    .command('outages')
     .description(
       'every time no account could take work: when, for how long, why, and the switches before it',
     )

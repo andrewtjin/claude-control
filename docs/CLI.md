@@ -73,9 +73,9 @@ when and which account is back first.
 ## When every account is out of usage
 
 ```
-cctl exhausted             # every time no account could take work, newest first
-cctl exhausted --days 30   # only the times that started in the last 30 days
-cctl exhausted --json      # the same, as JSON
+cctl outages             # every time no account could take work, newest first
+cctl outages --days 30   # only the times that started in the last 30 days
+cctl outages --json      # the same, as JSON
 ```
 
 When auto-switch has walked every account and all of them are spent, the daemon records it.
@@ -107,11 +107,11 @@ last seen, not only by what was true at the start.
 
 The phone gets a card when it starts and when it ends. The log is
 `exhaustion-log.jsonl` in the daemon's data folder (beside `daemon.db`), one JSON line per
-start and per end, each with a plain-English `summary`; `cctl exhausted` prints its path. A
+start and per end, each with a plain-English `summary`; `cctl outages` prints its path. A
 write that fails (the file held open by a scanner, a full disk) is retried every cycle and on
 shutdown, and the entry is in `daemon.log` either way.
 
-`cctl exhausted` marks the outage still open as `ongoing`. If the latest numbers already show
+`cctl outages` marks the outage still open as `ongoing`. If the latest numbers already show
 an account back but no running daemon has recorded the end, it says so (`over by the latest
 numbers`) instead. A start whose end was never written is shown as `end not recorded`.
 
