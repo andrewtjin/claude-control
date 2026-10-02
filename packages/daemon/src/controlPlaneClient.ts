@@ -167,11 +167,13 @@ export class ControlPlaneClient {
    *  `'closed'`, to distinguish "the bot refused us" from "we shut ourselves down". */
   private terminalRejection = false;
   /** Set once this process can never deliver anything: unpaired with no code to pair with, or
-   *  a hello the bot rejected terminally (re-pairing, i.e. a new process, is required). From
-   *  then on `send()` queues nothing, and what was already queued is discarded. Queueing anyway
-   *  cost two synchronous SQLite writes per envelope on the main thread (every command-output
-   *  card on an unpaired box), and the rows would flush to the phone, stale and stamped with
-   *  the old daemon id, the first time a later process paired. */
+   *  a hello the bot rejected terminally (bad credentials or an unsupported protocol version;
+   *  only a later process, re-paired or upgraded, can connect). From then on `send()` queues
+   *  nothing: queueing anyway cost two synchronous SQLite writes per envelope on the main thread
+   *  (every command-output card on an unpaired box) for rows only a later process could send.
+   *  Rows already queued are left alone. "Unpaired" can be a transient failure to read the
+   *  identity, and the rows may be a previous paired run's backlog that a healthy restart
+   *  should still deliver. */
   private undeliverable = false;
   /** Resolves the in-flight `connect()` promise once hello succeeds (or pairing completes and
    *  the follow-up hello succeeds) — lets tests/daemon.ts `await client.connect()`. */
@@ -228,7 +230,7 @@ export class ControlPlaneClient {
     // which the wire schema rejects — a synchronous throw inside a ws event handler, i.e. a
     // process crash instead of the clean rejection this method's contract promises.
     if (!this.identity && !hasPairingCode(this.opts.pairingCode)) {
-      this.abandonOutbox('not paired');
+      this.stopQueueing('not paired');
       throw new ControlPlaneRejectionError(NOT_PAIRED_MESSAGE);
     }
     return new Promise((resolve, reject) => {
@@ -250,8 +252,8 @@ export class ControlPlaneClient {
   /**
    * Send an envelope. Connected with nothing queued ahead of it, it goes straight to the socket.
    * Otherwise it is durably queued in the outbox and flushed in order: right away behind the
-   * queued rows when connected, or once the connection is up. Once the client knows nothing can ever be delivered from this process (see
-   * {@link undeliverable}), the envelope is dropped instead.
+   * queued rows when connected, or once the connection is up. Once the client knows nothing can
+   * ever be delivered from this process (see {@link undeliverable}), the envelope is dropped.
    *
    * The direct path skips the outbox on purpose: a row was deleted the moment `socket.send()`
    * buffered it, so queueing first and deleting after gave a connected send no protection a
@@ -319,7 +321,7 @@ export class ControlPlaneClient {
       // reconnecting cannot help when there is nothing to pair with.
       this.opts.logger.error({}, NOT_PAIRED_MESSAGE);
       this.stopped = true;
-      this.abandonOutbox('not paired');
+      this.stopQueueing('not paired');
       this.failConnect(new ControlPlaneRejectionError(NOT_PAIRED_MESSAGE));
       this.socket.close(1000, 'no pairing code');
       return;
@@ -420,7 +422,7 @@ export class ControlPlaneClient {
       const reason = envelope.payload.error ?? 'hello rejected';
       this.terminalRejection = true;
       this.state = 'rejected';
-      this.abandonOutbox('hello rejected');
+      this.stopQueueing('hello rejected');
       this.opts.logger.error(
         { reason },
         'control-plane rejected hello - stopping; re-pairing required',
@@ -483,17 +485,13 @@ export class ControlPlaneClient {
     }
   }
 
-  /** Stop queueing for good and drop what is queued: nothing in this process can deliver it
-   *  (see {@link undeliverable}). Logged once with the count, so a dropped backlog is visible. */
-  private abandonOutbox(reason: string): void {
+  /** Stop queueing for good (see {@link undeliverable}). Logged once, so a box whose phone
+   *  stopped hearing from it can tell why from the log. Already-queued rows stay for a later
+   *  process to deliver. */
+  private stopQueueing(reason: string): void {
+    if (this.undeliverable) return;
     this.undeliverable = true;
-    const dropped = this.opts.store.clearOutbox();
-    if (dropped > 0) {
-      this.opts.logger.info(
-        { dropped, reason },
-        'dropped queued control-plane messages that can no longer be delivered',
-      );
-    }
+    this.opts.logger.info({ reason }, 'control-plane messages will not be queued by this process');
   }
 
   /** The socket, if an envelope handed to it now would be written: the handshake is done and

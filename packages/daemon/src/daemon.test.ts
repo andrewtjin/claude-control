@@ -2509,7 +2509,7 @@ describe('Daemon lifecycle', () => {
     expect((finished?.obj as { rung?: string }).rung).toBe('hard_stopped');
   });
 
-  it('attributes each poll-cycle phase in the log, and warns on one that keeps the loop busy', async () => {
+  it('attributes each poll-cycle phase in the log, and warns on one that blocks the loop', async () => {
     // The loop-lag monitor can say THAT the loop stalled but never WHERE — which is why the
     // multi-second stall that motivated this instrumentation was never attributed to a phase.
     // A phase during which the loop was busy past that monitor's threshold has to name itself.
@@ -2539,11 +2539,11 @@ describe('Daemon lifecycle', () => {
     });
     await daemon.start();
 
-    const busyMsg = 'poll cycle phase kept the event loop busy';
-    await waitFor(() => entries.some((e) => e.msg === busyMsg));
-    const slow = entries.find((e) => e.msg === busyMsg);
+    const blockedMsg = 'poll cycle phase blocked the event loop';
+    await waitFor(() => entries.some((e) => e.msg === blockedMsg));
+    const slow = entries.find((e) => e.msg === blockedMsg);
     expect((slow?.obj as { phase?: string }).phase).toBe('attributionJournal.sync');
-    expect((slow?.obj as { loopBusyMs?: number }).loopBusyMs).toBeGreaterThanOrEqual(
+    expect((slow?.obj as { blockedMs?: number }).blockedMs).toBeGreaterThanOrEqual(
       LOOP_LAG_THRESHOLD_MS,
     );
 
@@ -2594,15 +2594,62 @@ describe('Daemon lifecycle', () => {
         e.msg === 'poll cycle phase' &&
         (e.obj as { phase?: string }).phase === 'attributionJournal.sync',
     );
-    const fields = journal?.obj as { elapsedMs: number; loopBusyMs: number };
+    const fields = journal?.obj as { elapsedMs: number; blockedMs: number };
     expect(fields.elapsedMs).toBeGreaterThanOrEqual(LOOP_LAG_THRESHOLD_MS + 100);
-    expect(fields.loopBusyMs).toBeLessThan(LOOP_LAG_THRESHOLD_MS);
+    expect(fields.blockedMs).toBeLessThan(LOOP_LAG_THRESHOLD_MS);
     expect(
       entries.some(
         (e) =>
-          e.msg === 'poll cycle phase kept the event loop busy' &&
+          e.msg === 'poll cycle phase blocked the event loop' &&
           (e.obj as { phase?: string }).phase === 'attributionJournal.sync',
       ),
+    ).toBe(false);
+  });
+
+  it('a waiting phase is not blamed for unrelated work that keeps the loop busy meanwhile', async () => {
+    // Hook handling runs while a poll phase awaits the network; whole-loop busy time would pin
+    // that work on the phase. Here a timer burns the loop in short slices (none a stall on its
+    // own) while the journal phase only waits.
+    const { logger, entries } = capturingLogger();
+    const waitingJournal = {
+      sync: async () => {
+        const burner = setInterval(() => {
+          const until = Date.now() + 8;
+          while (Date.now() < until) {
+            // spin
+          }
+        }, 20);
+        await new Promise((r) => setTimeout(r, 600));
+        clearInterval(burner);
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal: waitingJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+      logger,
+    });
+    await daemon.start();
+    const isJournal = (e: { obj: unknown }) =>
+      (e.obj as { phase?: string }).phase === 'attributionJournal.sync';
+    await waitFor(() => entries.some((e) => isJournal(e) && e.msg === 'poll cycle phase'));
+    const fields = entries.find((e) => isJournal(e) && e.msg === 'poll cycle phase')?.obj as {
+      loopBusyMs: number;
+      blockedMs: number;
+    };
+    // The loop really was busy past the bar during the phase...
+    expect(fields.loopBusyMs).toBeGreaterThanOrEqual(LOOP_LAG_THRESHOLD_MS);
+    // ...but not because of it.
+    expect(fields.blockedMs).toBeLessThan(LOOP_LAG_THRESHOLD_MS);
+    expect(
+      entries.some((e) => isJournal(e) && e.msg === 'poll cycle phase blocked the event loop'),
     ).toBe(false);
   });
 

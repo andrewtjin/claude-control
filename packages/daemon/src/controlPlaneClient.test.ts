@@ -567,10 +567,10 @@ describe('ControlPlaneClient', () => {
         .map((r) => JSON.parse(r.envelopeJson) as Envelope)
         .map((e) => (e.type === 'hook.notification' ? e.payload.title : undefined));
 
-    it('unpaired with no code: drops what was queued before connect() and queues nothing after', async () => {
-      // The daemon sends before connect() has loaded the identity (restored prompt queues,
-      // early hook events), so rows can already be there when the not-paired verdict lands.
-      // A row from a previous run is there too, and would otherwise flush on a later pairing.
+    it('unpaired with no code: queues nothing after the verdict, and keeps rows already queued', async () => {
+      // Every command-output card on an unpaired box used to cost an outbox insert and trim.
+      // A previous run's backlog is kept: "unpaired" can be a transient identity-read failure,
+      // and a healthy restart should still deliver what the paired run queued.
       store.enqueueOutbox(encode(stamp(note('from-last-run'))), 1);
       const infoLogs: unknown[] = [];
       client = new ControlPlaneClient({
@@ -585,15 +585,13 @@ describe('ControlPlaneClient', () => {
           error: () => {},
         },
       });
-      client.send(note('before-verdict'));
       await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
-      expect(store.countOutbox()).toBe(0);
-      expect(infoLogs).toContainEqual({ dropped: 2, reason: 'not paired' });
+      expect(infoLogs).toContainEqual({ reason: 'not paired' });
       for (let i = 0; i < 20; i++) client.send(note(`after-${i}`));
-      expect(store.countOutbox()).toBe(0);
+      expect(titles()).toEqual(['from-last-run']);
     });
 
-    it('a terminally rejected hello drops the queue and stops queueing', async () => {
+    it('a terminally rejected hello stops queueing and keeps rows already queued', async () => {
       const badRelay = new FakeRelay({ rejectHello: true });
       await badRelay.listen();
       try {
@@ -606,9 +604,10 @@ describe('ControlPlaneClient', () => {
           reconnectBaseMs: 10,
         });
         await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
-        expect(store.countOutbox()).toBe(0);
         client.send(note('after-rejection'));
-        expect(store.countOutbox()).toBe(0);
+        // A protocol-version rejection clears once either side upgrades, and the same identity
+        // then delivers what it had queued; only new sends are pointless now.
+        expect(titles()).toEqual(['queued']);
       } finally {
         await badRelay.close();
       }
@@ -634,7 +633,9 @@ describe('ControlPlaneClient', () => {
     });
 
     it('a later connect() that can deliver queues again', async () => {
-      // Unpaired first, then a pairing code arrives (the re-pair path builds a fresh connect()).
+      // The flag belongs to one connect() attempt, not to the client forever: a later connect()
+      // that finds an identity queues normally. (The daemon calls connect() once per process;
+      // this pins the reset for any caller that retries.)
       const identityStore = memoryIdentityStore();
       client = new ControlPlaneClient({
         url: relay.url(),
