@@ -377,12 +377,18 @@ export function resumeOpenEpisode(records: ExhaustionRecord[]): OpenEpisode | un
 
 /** Whether two sets of walls differ in a way that changes a return: a limit added or gone, or a
  *  reset moved by more than {@link WALL_MOVE_MS} (or becoming known or unknown). A percent that
- *  moves at the wall changes nothing. */
+ *  moves at the wall changes nothing. Compared as sorted lists, not by looking each kind up: one
+ *  reading can carry two limits of the same kind (an Opus and a Fable weekly cap both normalize
+ *  to `weekly_scoped`), and a lookup would pair them crosswise and see a change every cycle. */
 function wallsDiffer(a: LimitInput[], b: LimitInput[]): boolean {
   if (a.length !== b.length) return true;
-  return a.some((limit) => {
-    const other = b.find((l) => l.kind === limit.kind);
-    if (other === undefined) return true;
+  const order = (l: LimitInput) =>
+    `${l.kind}:${String(l.resetsAt ?? Number.MAX_SAFE_INTEGER).padStart(16, '0')}`;
+  const sortedA = [...a].sort((x, y) => order(x).localeCompare(order(y)));
+  const sortedB = [...b].sort((x, y) => order(x).localeCompare(order(y)));
+  return sortedA.some((limit, i) => {
+    const other = sortedB[i] as LimitInput;
+    if (other.kind !== limit.kind) return true;
     if ((limit.resetsAt === undefined) !== (other.resetsAt === undefined)) return true;
     return (
       limit.resetsAt !== undefined &&
@@ -390,6 +396,19 @@ function wallsDiffer(a: LimitInput[], b: LimitInput[]): boolean {
       Math.abs(limit.resetsAt - other.resetsAt) > WALL_MOVE_MS
     );
   });
+}
+
+/** When an account tracked by an open episode is expected back: the last reset among the walls
+ *  it was last seen out on, or `undefined` when one of them has no known reset, or it is out on a
+ *  dead login with nothing else to wait for. */
+export function trackedBackAt(account: TrackedAccount): number | undefined {
+  if (account.spent.length === 0) return undefined;
+  let backAt = Number.NEGATIVE_INFINITY;
+  for (const limit of account.spent) {
+    if (limit.resetsAt === undefined) return undefined;
+    backAt = Math.max(backAt, limit.resetsAt);
+  }
+  return backAt;
 }
 
 /**

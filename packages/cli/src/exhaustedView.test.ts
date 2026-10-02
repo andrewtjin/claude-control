@@ -4,7 +4,12 @@ import {
   type AccountUsageInput,
   type LimitInput,
 } from '@claude-control/usage-advisor';
-import type { ExhaustedRecord, ExhaustionEpisode, RecoveredRecord } from '@claude-control/daemon';
+import {
+  openEpisodeFrom,
+  type ExhaustedRecord,
+  type ExhaustionEpisode,
+  type RecoveredRecord,
+} from '@claude-control/daemon';
 import {
   episodesInWindow,
   formatLocalTime,
@@ -249,7 +254,7 @@ describe('renderExhaustionBanner', () => {
   );
 
   it('says since when (from the open outage) and when the first account is back', () => {
-    expect(renderExhaustionBanner(out, start(local(10, 1, 14, 20)), NOW)).toBe(
+    expect(renderExhaustionBanner(out, openEpisodeFrom(start(local(10, 1, 14, 20))), NOW)).toBe(
       'No account can take work since Oct 1 14:20 (40m). First back: a in 2h. ' +
         'cctl exhausted lists every time this happened.',
     );
@@ -264,9 +269,37 @@ describe('renderExhaustionBanner', () => {
   it('when an account has no numbers right now, the first-back time comes from the outage record', () => {
     const unmeasured = assessFleet([acct('a', []), acct('q', [], true)], NOW);
     expect(unmeasured.exhausted).toBe(false);
-    expect(renderExhaustionBanner(unmeasured, start(local(10, 1, 14, 20)), NOW)).toBe(
+    expect(
+      renderExhaustionBanner(unmeasured, openEpisodeFrom(start(local(10, 1, 14, 20))), NOW),
+    ).toBe(
       'No account can take work since Oct 1 14:20 (40m). First back expected: w2 at Oct 1 16:20. ' +
         'cctl exhausted lists every time this happened.',
+    );
+  });
+
+  it('a later walls line moves the expected first-back time with it', () => {
+    const s0 = start(local(10, 1, 14, 20));
+    const unmeasured = assessFleet([acct('a', []), acct('q', [], true)], NOW);
+    // w2's 5-hour window was due at 16:20; a walls line since says it is out for the week too.
+    const open = openEpisodeFrom(s0, [
+      {
+        v: 1,
+        event: 'walls',
+        id: s0.id,
+        at: local(10, 1, 14, 50),
+        time: '',
+        accountId: 'a2',
+        label: 'w2',
+        reason: 'session',
+        spent: [
+          { kind: 'session', percent: 100, resetsAt: local(10, 1, 16, 20) },
+          { kind: 'weekly_all', percent: 99, resetsAt: local(10, 3, 9, 0) },
+        ],
+      },
+    ]);
+    // work1 (week, back Oct 2 20:20) is now the first back, not w2.
+    expect(renderExhaustionBanner(unmeasured, open, NOW)).toContain(
+      'First back expected: work1 at Oct 2 20:20.',
     );
   });
 });

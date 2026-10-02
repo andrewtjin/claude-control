@@ -1237,7 +1237,7 @@ async function exhaustionBanner(
     open = undefined;
   }
   if (!outageStatus(open, fleet, nowMs).on) return undefined;
-  return renderExhaustionBanner(fleet, open?.record, nowMs, detectPalette());
+  return renderExhaustionBanner(fleet, open, nowMs, detectPalette());
 }
 
 /** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same

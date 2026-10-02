@@ -1024,7 +1024,15 @@ export class Daemon {
     // to the next daemon run (whose recover() only stamps the registry rows 'orphaned').
     await this.stopLiveSessions();
     // A last try at exhaustion entries a failed write left queued: the next run reads the file.
-    if (this.exhaustionLog !== undefined) await this.flushExhaustionWrites(this.exhaustionLog);
+    // Bounded like the session teardown above, so a write that never settles cannot hold the
+    // process open.
+    if (this.exhaustionLog !== undefined) {
+      const bound = new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, this.sessionStopOnShutdownMs);
+        timer.unref();
+      });
+      await Promise.race([this.flushExhaustionWrites(this.exhaustionLog), bound]);
+    }
     this.controlPlaneClient.close();
     await this.hookReceiver.close();
     this.store.close();

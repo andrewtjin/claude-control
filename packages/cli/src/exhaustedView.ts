@@ -10,10 +10,11 @@ import {
 } from '@claude-control/usage-advisor';
 import {
   recoveryText,
+  trackedBackAt,
   type ExhaustedAccount,
-  type ExhaustedRecord,
   type ExhaustionEpisode,
   type ExhaustionSwitch,
+  type OpenEpisode,
   type Recovery,
 } from '@claude-control/daemon';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
@@ -135,26 +136,43 @@ export function renderExhaustionLog(
   return [count, '', blocks.join('\n\n'), '', footer].join('\n');
 }
 
+/** The tracked account expected back soonest, by the walls the log last recorded for it. */
+function expectedFirstBack(
+  open: OpenEpisode,
+  now: number,
+): { label: string; at: number } | undefined {
+  let first: { label: string; at: number } | undefined;
+  for (const a of open.accounts.values()) {
+    const at = trackedBackAt(a);
+    if (at === undefined || at <= now) continue;
+    if (first === undefined || at < first.at || (at === first.at && a.label < first.label)) {
+      first = { label: a.label, at };
+    }
+  }
+  return first;
+}
+
 /** The banner `cctl usage` and `cctl timeline` lead with while an outage is on (the caller has
  *  judged that, the daemon's way). Since when comes from the open episode in the log; when the
  *  first account is back comes from the numbers when they show every account out, else from what
- *  the episode recorded at its start (an account whose poll came back empty has no numbers to
- *  say). */
+ *  the log last recorded for each account (an account whose poll came back empty has no numbers
+ *  to say). */
 export function renderExhaustionBanner(
   fleet: FleetAvailability,
-  open: ExhaustedRecord | undefined,
+  open: OpenEpisode | undefined,
   now: number,
   palette: Palette = PLAIN_PALETTE,
 ): string {
+  const start = open?.record;
   const since =
-    open !== undefined
-      ? ` since ${formatLocalTime(open.at, now)} (${humanizeDuration(Math.max(now - open.at, 1))})`
+    start !== undefined
+      ? ` since ${formatLocalTime(start.at, now)} (${humanizeDuration(Math.max(now - start.at, 1))})`
       : '';
-  const recorded = open?.firstBack;
+  const expected = open !== undefined ? expectedFirstBack(open, now) : undefined;
   const firstBack = fleet.exhausted
     ? describeFirstBack(fleet, now)
-    : recorded !== undefined && recorded.at > now
-      ? `First back expected: ${recorded.label} at ${formatLocalTime(recorded.at, now)}.`
+    : expected !== undefined
+      ? `First back expected: ${expected.label} at ${formatLocalTime(expected.at, now)}.`
       : '';
   return (
     palette.red(palette.bold(`No account can take work${since}.`)) +

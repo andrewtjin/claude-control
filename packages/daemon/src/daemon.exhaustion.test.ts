@@ -208,6 +208,8 @@ async function createRig(
     activeId?: string;
     /** The clock when the daemon starts (its first cycle runs then). */
     startAt?: number;
+    /** The daemon's bound on each shutdown step (default its own 5 s). */
+    sessionStopOnShutdownMs?: number;
   } = {},
 ): Promise<Rig> {
   const relay = new SteadyRelay();
@@ -311,6 +313,9 @@ async function createRig(
     clock: () => clock.now,
     ...(options.autoSwitchPolicy !== undefined
       ? { autoSwitchPolicy: options.autoSwitchPolicy }
+      : {}),
+    ...(options.sessionStopOnShutdownMs !== undefined
+      ? { sessionStopOnShutdownMs: options.sessionStopOnShutdownMs }
       : {}),
     // Effectively off: every cycle is driven by the test.
     pollIntervalMs: 100_000,
@@ -1059,5 +1064,25 @@ describe('the write queue, shutdown and resume', () => {
     expect(second.relay.cards()).toEqual([]);
     expect((await log.read()).map((r) => r.event)).toEqual(['exhausted']);
     expect(second.lines).toContain('exhaustion log unreadable; retrying next cycle');
+  });
+});
+
+describe('shutdown with a write that never settles', () => {
+  it('stop() gives up on the queued entry after its bound instead of hanging', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const log = new HeldLog(join(dir, 'exhaustion-log.jsonl'));
+    log.failing = true; // the start is queued, not written
+    const rig = await createRig({ log, sessionStopOnShutdownMs: 200 });
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(rig);
+    await waitFor(() => rig.relay.cards().length === 1);
+    // The file is "free" again, but the write never comes back (a hung network share).
+    log.failing = false;
+    log.hold = new Promise<void>(() => {});
+    const started = Date.now();
+    await rig.daemon.stop();
+    expect(Date.now() - started).toBeLessThan(3000);
   });
 });

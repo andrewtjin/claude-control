@@ -612,3 +612,32 @@ describe('walls lines: what an open outage learned, on file', () => {
     }
   });
 });
+
+describe('walls with two limits of the same kind', () => {
+  it('an account out on an Opus and a Fable weekly cap is not filed again and again', () => {
+    // Both caps normalize to weekly_scoped; they reset at different times.
+    const twoCaps = [
+      { kind: 'weekly_scoped' as const, percent: 100, resetsAt: T0 + 30 * H },
+      { kind: 'weekly_scoped' as const, percent: 100, resetsAt: T0 + 50 * H },
+    ];
+    let open = openEpisodeFrom(
+      exhaustedRecord({
+        fleet: assessFleet([acct('a', twoCaps)], T0),
+        now: T0,
+        active: 'a',
+        switches: [],
+      }),
+    );
+    let filed = 0;
+    for (let i = 1; i <= 10; i++) {
+      const at = T0 + i * 10 * M;
+      // The endpoint may list them in either order.
+      const reading = i % 2 === 0 ? [...twoCaps].reverse() : twoCaps;
+      open = trackOpenEpisode(open, assessFleet([acct('a', reading)], at), at);
+      const step = fileWallChanges(open, at);
+      filed += step.records.length;
+      open = step.open;
+    }
+    expect(filed).toBe(0);
+  });
+});

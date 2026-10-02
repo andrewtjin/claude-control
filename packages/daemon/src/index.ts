@@ -71,6 +71,7 @@ export {
   recoveryText,
   resumeOpenEpisode,
   SWITCH_CHAIN_WINDOW_MS,
+  trackedBackAt,
   trackOpenEpisode,
   type ExhaustedAccount,
   type ExhaustedRecord,
