@@ -117,7 +117,14 @@ import {
   type SessionCommandSuccess,
   type SessionVerb,
 } from './sessionClient.js';
-import { checkLiveLogin, probeRelay, renderDoctor, runDoctor, summarize } from './doctor.js';
+import {
+  checkAutostart,
+  checkLiveLogin,
+  probeRelay,
+  renderDoctor,
+  runDoctor,
+  summarize,
+} from './doctor.js';
 import {
   connectWithTimeout,
   normalizePairingCode,
@@ -486,7 +493,7 @@ export function buildProgram(): Command {
     .command('doctor')
     .description('check the local environment')
     .action(async () => {
-      const checks = await runDoctor(defaultPaths());
+      const checks = [...(await runDoctor(defaultPaths())), checkAutostart(readAutostartState())];
       process.stdout.write(renderDoctor(checks, detectPalette()) + '\n');
       const { passed, failed } = summarize(checks);
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);

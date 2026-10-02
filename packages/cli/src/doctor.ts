@@ -15,6 +15,7 @@ import {
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import type { AutostartState } from './autostart.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 
 export interface DoctorCheck {
@@ -285,6 +286,29 @@ export async function checkChannelAllowlist(
       ? `${status.detail} — re-run \`cctl channel enable\` to restore it`
       : 'idle-session prompts not enabled; /say delivers at the next turn boundary instead. ' +
         '`cctl channel enable` changes that.',
+  };
+}
+
+/** Whether the daemon comes back on its own. A daemon started by hand (a terminal, or
+ *  `cctl daemon supervise`) runs fine until the first thing that ends it — a reboot, or a
+ *  supervisor that stops — and then stays down silently, with every hook a no-op. Kept OUT of
+ *  runDoctor: the setup wizard runs those checks before its own autostart step, so this one
+ *  would flag every first run. The `cctl doctor` command appends it. */
+export function checkAutostart(state: AutostartState): DoctorCheck {
+  if (state === 'registered')
+    return { name: 'autostart', ok: true, detail: 'the daemon starts at logon' };
+  if (state === 'unsupported')
+    return {
+      name: 'autostart',
+      ok: true,
+      detail: 'no autostart on this platform; keep `cctl daemon supervise` running',
+    };
+  return {
+    name: 'autostart',
+    ok: false,
+    detail:
+      'none registered: a stopped or rebooted daemon stays down until started by hand. ' +
+      'Run: cctl daemon install',
   };
 }
 

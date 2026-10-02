@@ -20,9 +20,20 @@ import {
  *  schedules the scripted emit via setImmediate, so the listener is guaranteed to be there. */
 class FakeChild extends EventEmitter implements SupervisedChild {
   killed = false;
-  kill(): void {
+  /** Every signal sent, in order (an argument-less kill() is recorded as SIGTERM). */
+  signals: string[] = [];
+  /** How the child answers SIGTERM: 'signal' dies by it (the default, a child with no
+   *  handler); 'graceful' runs a shutdown handler and exits 0, as the real daemon does;
+   *  'ignore' never answers (a wedged event loop), so only SIGKILL ends it. */
+  constructor(private readonly onTerm: 'signal' | 'graceful' | 'ignore' = 'signal') {
+    super();
+  }
+  kill(signal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM'): void {
     this.killed = true;
-    this.emit('exit', null, 'SIGTERM');
+    this.signals.push(signal);
+    if (signal === 'SIGKILL') this.emit('exit', null, 'SIGKILL');
+    else if (this.onTerm === 'signal') this.emit('exit', null, 'SIGTERM');
+    else if (this.onTerm === 'graceful') setImmediate(() => this.emit('exit', 0, null));
   }
 }
 
@@ -32,7 +43,10 @@ class FakeChild extends EventEmitter implements SupervisedChild {
  *   - an Error fires 'error' instead of 'exit' (simulated spawn failure)
  *   - undefined — including running past the end of the array — fires nothing: the child
  *     "runs forever" until killed via signal or the health probe. */
-function harness(exits: Array<number | null | Error | undefined>) {
+function harness(
+  exits: Array<number | null | Error | undefined>,
+  onTerm: Array<'signal' | 'graceful' | 'ignore'> = [],
+) {
   const children: FakeChild[] = [];
   const logs: string[] = [];
   const crashLines: string[] = [];
@@ -45,7 +59,7 @@ function harness(exits: Array<number | null | Error | undefined>) {
     run: (overrides?: { signal?: AbortSignal; probe?: ProbeOptions }) =>
       superviseDaemon({
         spawnChild: () => {
-          const child = new FakeChild();
+          const child = new FakeChild(onTerm[children.length]);
           children.push(child);
           const scripted = pendingExits.shift();
           if (scripted instanceof Error) {
@@ -235,6 +249,93 @@ describe('health probe (hang detection)', () => {
     expect(h.children).toHaveLength(1);
     expect(h.children[0]?.killed).toBe(true);
   });
+});
+
+describe('health kill of a daemon that shuts down gracefully', () => {
+  /** Probe results that fail forever: the probe never sees a healthy daemon again. */
+  const alwaysFailing = (): Promise<boolean> => Promise.resolve(false);
+
+  it('respawns when the health-killed child exits 0 from its own SIGTERM handler', async () => {
+    // The live incident: the real daemon answers SIGTERM with a graceful shutdown and exit
+    // code 0, which the exit path used to read as a deliberate stop, ending supervision.
+    const h = harness([undefined, 0], ['graceful']);
+    await h.run({ probe: { probeFn: alwaysFailing } });
+    expect(h.children).toHaveLength(2);
+    expect(h.children[0]?.signals).toEqual(['SIGTERM']);
+    expect(h.crashLines.some((l) => l.includes('code=0 signal=none after the health kill'))).toBe(
+      true,
+    );
+    // Only the SECOND child's own (unordered) clean exit ends supervision.
+    expect(h.logs.filter((l) => l.includes('exited cleanly'))).toHaveLength(1);
+    expect(h.logs.at(-1)).toContain('exited cleanly');
+  });
+
+  it('sends SIGKILL when the child is still alive after the grace period, then respawns', async () => {
+    const h = harness([undefined, 0], ['ignore']);
+    await h.run({ probe: { probeFn: alwaysFailing, killGraceMs: 10_000 } });
+    expect(h.children).toHaveLength(2);
+    expect(h.children[0]?.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(h.crashLines.some((l) => l.includes('10s after the health kill; sending SIGKILL'))).toBe(
+      true,
+    );
+    expect(h.crashLines.some((l) => l.includes('signal=SIGKILL after the health kill'))).toBe(true);
+  });
+
+  it('never sends SIGKILL to a child that exited within the grace period', async () => {
+    const h = harness([undefined, 0], ['graceful']);
+    await h.run({ probe: { probeFn: alwaysFailing } });
+    // Let any grace timer that wrongly survived the exit run out before asserting.
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.children[0]?.signals).toEqual(['SIGTERM']);
+    expect(h.crashLines.some((l) => l.includes('sending SIGKILL'))).toBe(false);
+  });
+
+  it('a clean exit the probe did NOT order still ends supervision', async () => {
+    // Deliberate stops (cctl daemon stop, Ctrl+C) must keep ending supervision with the
+    // probe enabled: the respawn is tied to the supervisor's own kill, not to the probe.
+    const h = harness([0]);
+    await h.run({ probe: { probeFn: () => Promise.resolve(true) } });
+    expect(h.children).toHaveLength(1);
+    expect(h.children[0]?.killed).toBe(false);
+    expect(h.crashLines).toEqual([]);
+    expect(h.logs.at(-1)).toContain('exited cleanly');
+  });
+
+  it('repeated health kills count toward the crash-loop backoff', async () => {
+    // Three children in a row hang and are health-killed (each exiting 0 gracefully); the
+    // third exit reaches the threshold of 3 and must back off rather than respawn at 2s.
+    const h = harness([undefined, undefined, undefined, 0], ['graceful', 'graceful', 'graceful']);
+    await h.run({ probe: { probeFn: alwaysFailing, intervalMs: 1_000 } });
+    expect(h.children).toHaveLength(4);
+    const restarts = h.crashLines.filter((l) => l.includes('restarting in'));
+    expect(restarts).toHaveLength(3);
+    expect(restarts[0]).toContain('restarting in 2000ms');
+    expect(restarts[2]).toContain('restarting in 30000ms');
+  });
+
+  it('escalates on real timers with the production sleeps (no injected sleep)', async () => {
+    // Exercises the production grace delay, which must neither race the abort signal nor
+    // need a test seam to fire. The respawned child exits 0 so supervision ends by itself.
+    const children: FakeChild[] = [];
+    const logs: string[] = [];
+    const crashLines: string[] = [];
+    await superviseDaemon({
+      spawnChild: () => {
+        const child = new FakeChild(children.length === 0 ? 'ignore' : 'signal');
+        if (children.length > 0) setImmediate(() => child.emit('exit', 0, null));
+        children.push(child);
+        return child;
+      },
+      log: (line) => logs.push(line),
+      logCrash: (line) => crashLines.push(line),
+      restartDelayMs: 1,
+      probe: { probeFn: alwaysFailing, intervalMs: 1, failuresToKill: 1, killGraceMs: 20 },
+    });
+    expect(children).toHaveLength(2);
+    expect(children[0]?.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(logs.at(-1)).toContain('exited cleanly');
+  }, 2_000);
 });
 
 describe('buildDefaultProbeFn (production health probe)', () => {

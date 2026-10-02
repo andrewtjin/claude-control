@@ -119,7 +119,7 @@ cctl settings set <name> <value>    # persist a daemon setting by alias or env v
                                     # aliases listed below)
 cctl settings unset <name>          # remove a persisted daemon setting
 cctl doctor     # environment checks: Node version, vault crypto round-trip, vault dir,
-                # live login, ~/.claude.json
+                # live login, ~/.claude.json, and whether the daemon has autostart
 ```
 
 ## The daemon
@@ -143,7 +143,8 @@ cctl daemon run --no-auto-switch       # never hop accounts automatically; for a
                                         # `cctl settings set fable-cap off`
 
 cctl daemon supervise                  # run + auto-restart on crash or hang (same flags
-                                        # as `daemon run`; a clean exit ends supervision)
+                                        # as `daemon run`; a clean exit you asked for ends
+                                        # supervision)
 
 cctl daemon start       # start the daemon in the background: through the logon task /
                         # LaunchAgent / systemd unit when one is registered, else as a
@@ -177,8 +178,16 @@ to stick.
 
 `cctl daemon supervise` respawns the daemon a couple of seconds after a crash (with a
 cooldown if it crash-loops), probes its local health endpoint, and kills + respawns a
-daemon that is alive but unresponsive. Crashes leave a line in `daemon-crash.log`
-beside the vault.
+daemon that is alive but unresponsive: SIGTERM first, SIGKILL if it is still running 10
+seconds later. A daemon it killed this way is always respawned, even when it shut down
+cleanly; only a stop you asked for (`cctl daemon stop`, Ctrl+C) ends supervision. Crashes
+and health kills leave a line in `daemon-crash.log` beside the vault.
+
+While the daemon is down, its hooks do nothing, and auto-switch is off with them. So that
+an outage is never silent, the first prompt you send in any session (at most once every 15
+minutes) shows a one-line notice naming `cctl daemon start`. `cctl status` and
+`cctl doctor` also flag a daemon with no autostart registered, since one started by hand
+stays down after a reboot or a stopped supervisor.
 
 A running daemon writes a heartbeat roughly every 30 seconds; `cctl daemon status` and
 `cctl status` read it to tell "connected 12s ago" from "dead since 3h" apart from

@@ -13,6 +13,8 @@ import {
   healthUrlFromRelay,
   probeRelay,
   checkLiveLogin,
+  checkAutostart,
+  runDoctor,
   MIN_NODE_VERSION,
   type DoctorCheck,
   type ProbeFetch,
@@ -40,6 +42,34 @@ describe('summarize', () => {
   it('counts passed and failed', () => {
     expect(summarize(checks)).toEqual({ passed: 1, failed: 1 });
   });
+});
+
+describe('checkAutostart', () => {
+  it('fails when no autostart is registered, naming the command that fixes it', () => {
+    // A hand-started daemon with no registration stays down silently after its first stop.
+    const check = checkAutostart('unregistered');
+    expect(check.ok).toBe(false);
+    expect(check.name).toBe('autostart');
+    expect(check.detail).toContain('cctl daemon install');
+  });
+
+  it('passes when registered, and on a platform with no autostart at all', () => {
+    expect(checkAutostart('registered').ok).toBe(true);
+    const unsupported = checkAutostart('unsupported');
+    expect(unsupported.ok).toBe(true);
+    // `cctl daemon install` only restates "unsupported" there, so it must not be suggested.
+    expect(unsupported.detail).not.toContain('cctl daemon install');
+  });
+
+  it("is not one of runDoctor's checks, which the setup wizard runs before registering autostart", async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-doctor-'));
+    try {
+      const names = (await runDoctor(sandboxPaths(dir))).map((c) => c.name);
+      expect(names).not.toContain('autostart');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe('checkVaultProtection', () => {
