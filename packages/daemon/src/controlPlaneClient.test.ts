@@ -506,6 +506,109 @@ describe('ControlPlaneClient', () => {
     expect(titles).toEqual(['n2', 'n3', 'n4']); // oldest (n0, n1) dropped
   });
 
+  describe('an outbox nothing can deliver', () => {
+    const note = (title: string): EnvelopeDraft => ({
+      daemonId: 'x',
+      type: 'hook.notification',
+      payload: { event: 'notification', title, body: '', level: 'info' },
+    });
+    const titles = () =>
+      store
+        .listOutbox()
+        .map((r) => JSON.parse(r.envelopeJson) as Envelope)
+        .map((e) => (e.type === 'hook.notification' ? e.payload.title : undefined));
+
+    it('unpaired with no code: drops what was queued before connect() and queues nothing after', async () => {
+      // The daemon sends before connect() has loaded the identity (restored prompt queues,
+      // early hook events), so rows can already be there when the not-paired verdict lands.
+      // A row from a previous run is there too, and would otherwise flush on a later pairing.
+      store.enqueueOutbox(encode(stamp(note('from-last-run'))), 1);
+      const infoLogs: unknown[] = [];
+      client = new ControlPlaneClient({
+        url: relay.url(),
+        identityStore: memoryIdentityStore(),
+        store,
+        hostLabel: 'h',
+        logger: {
+          debug: () => {},
+          info: (obj: unknown) => infoLogs.push(obj),
+          warn: () => {},
+          error: () => {},
+        },
+      });
+      client.send(note('before-verdict'));
+      await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
+      expect(store.countOutbox()).toBe(0);
+      expect(infoLogs).toContainEqual({ dropped: 2, reason: 'not paired' });
+      for (let i = 0; i < 20; i++) client.send(note(`after-${i}`));
+      expect(store.countOutbox()).toBe(0);
+    });
+
+    it('a terminally rejected hello drops the queue and stops queueing', async () => {
+      const badRelay = new FakeRelay({ rejectHello: true });
+      await badRelay.listen();
+      try {
+        store.enqueueOutbox(encode(stamp(note('queued'))), 1);
+        client = new ControlPlaneClient({
+          url: badRelay.url(),
+          identityStore: memoryIdentityStore({ daemonId: 'd1', daemonToken: 't1' }),
+          store,
+          hostLabel: 'h',
+          reconnectBaseMs: 10,
+        });
+        await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
+        expect(store.countOutbox()).toBe(0);
+        client.send(note('after-rejection'));
+        expect(store.countOutbox()).toBe(0);
+      } finally {
+        await badRelay.close();
+      }
+    });
+
+    it('a paired client that is merely disconnected still queues (delivery is still possible)', async () => {
+      const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
+      relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+      client = new ControlPlaneClient({
+        url: relay.url(),
+        identityStore: memoryIdentityStore(identity),
+        store,
+        hostLabel: 'h',
+        heartbeatMs: 100_000,
+        reconnectBaseMs: 60_000, // stay disconnected for the assertion
+        reconnectCapMs: 60_000,
+      });
+      await client.connect();
+      relay.disconnectAll();
+      await waitFor(() => client!.getState() === 'reconnecting');
+      client.send(note('kept'));
+      expect(titles()).toEqual(['kept']);
+    });
+
+    it('a later connect() that can deliver queues again', async () => {
+      // Unpaired first, then a pairing code arrives (the re-pair path builds a fresh connect()).
+      const identityStore = memoryIdentityStore();
+      client = new ControlPlaneClient({
+        url: relay.url(),
+        identityStore,
+        store,
+        hostLabel: 'h',
+        reconnectBaseMs: 10,
+      });
+      await expect(client.connect()).rejects.toBeInstanceOf(ControlPlaneRejectionError);
+      client.send(note('dropped'));
+      await identityStore.save({ daemonId: 'assigned-daemon-1', daemonToken: 'tok' });
+      relay.tokensByDaemonId.set('assigned-daemon-1', 'tok');
+      await client.connect();
+      relay.disconnectAll();
+      await waitFor(
+        () => client!.getState() === 'reconnecting' || client!.getState() === 'connecting',
+      );
+      client.send(note('queued-again'));
+      expect(titles()).toContain('queued-again');
+      expect(titles()).not.toContain('dropped');
+    });
+  });
+
   it('dispatches every inbound command type to its handler', async () => {
     const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
     relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);

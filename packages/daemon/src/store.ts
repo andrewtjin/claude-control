@@ -825,6 +825,12 @@ export class Store {
     return row ? requireNumber(row, 'n') : 0;
   }
 
+  /** Drop every queued envelope; returns how many there were. For a client that knows nothing
+   *  queued can ever be delivered (unpaired, or rejected until re-paired). */
+  clearOutbox(): number {
+    return Number(this.db.prepare(`DELETE FROM outbox`).run().changes);
+  }
+
   /** Enforce a bounded outbox by dropping the OLDEST rows first — a disconnected daemon
    *  should keep its most recent state, not the state from before a long outage. */
   trimOutboxOldest(maxRows: number): void {
