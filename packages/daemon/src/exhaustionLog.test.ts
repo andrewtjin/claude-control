@@ -318,6 +318,14 @@ describe('the log file', () => {
     expect(log.path.endsWith('exhaustion-log.jsonl')).toBe(true);
   });
 
+  it('a log whose folder is a file reads as empty, on every platform', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'exhaustion-log-'));
+    // Linux reports ENOTDIR here where Windows reports ENOENT: either way there is no log.
+    await writeFile(join(dir, 'blocker'), 'not a folder');
+    const log = new ExhaustionLog(join(dir, 'blocker', 'exhaustion-log.jsonl'));
+    expect(await log.read()).toEqual([]);
+  });
+
   it('skips torn lines and records from another version, keeps the rest', async () => {
     dir = await mkdtemp(join(tmpdir(), 'exhaustion-log-'));
     const log = new ExhaustionLog(join(dir, 'x.jsonl'));

@@ -270,7 +270,7 @@ export class ExhaustionLog {
     try {
       raw = await readFile(this.path, 'utf8');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      if (isNoSuchFile(err)) return [];
       throw err;
     }
     const records: ExhaustionRecord[] = [];
@@ -289,6 +289,14 @@ export class ExhaustionLog {
   }
 }
 
+/** Whether an error says no file exists at the path: ENOENT, or ENOTDIR when a parent in the path
+ *  is a file, which Linux reports where Windows says ENOENT. Either way there is no log to read,
+ *  which is not the same as one that cannot be read right now. */
+function isNoSuchFile(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
 /** Whether a file's last byte is something other than a newline. A missing or empty file ends
  *  on a line boundary. Reads one byte, however long the log grows. */
 async function endsMidLine(path: string): Promise<boolean> {
@@ -296,7 +304,7 @@ async function endsMidLine(path: string): Promise<boolean> {
   try {
     handle = await open(path, 'r');
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    if (isNoSuchFile(err)) return false;
     throw err;
   }
   try {
