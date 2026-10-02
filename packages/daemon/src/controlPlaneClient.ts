@@ -22,7 +22,6 @@ import {
   stamp,
   isType,
   PROTOCOL_VERSION,
-  type Envelope,
   type EnvelopeDraft,
   type MessageOf,
 } from '@claude-control/shared-protocol';
@@ -249,17 +248,30 @@ export class ControlPlaneClient {
   }
 
   /**
-   * Send an envelope. If connected, it goes out immediately; either way it is first durably
-   * queued in the outbox and only removed once actually written to the socket — so a send
-   * that races a disconnect is never silently lost. Once the client knows nothing can ever be
-   * delivered from this process (see {@link undeliverable}), the envelope is dropped instead.
+   * Send an envelope. Connected with nothing queued ahead of it, it goes straight to the socket.
+   * Otherwise it is durably queued in the outbox and flushed in order: right away behind the
+   * queued rows when connected, or once the connection is up. Once the client knows nothing can ever be delivered from this process (see
+   * {@link undeliverable}), the envelope is dropped instead.
+   *
+   * The direct path skips the outbox on purpose: a row was deleted the moment `socket.send()`
+   * buffered it, so queueing first and deleting after gave a connected send no protection a
+   * direct send lacks, at the price of two synchronous SQLite writes on the main thread per
+   * envelope, one per command-output card. The empty-outbox check keeps a fresh envelope from
+   * overtaking queued ones.
    */
   send(draft: EnvelopeDraft): void {
     if (this.undeliverable) return;
-    const envelope = stamp(draft);
-    const id = this.opts.store.enqueueOutbox(encode(envelope), this.opts.clock());
+    const json = encode(stamp(draft));
+    const socket = this.liveSocket();
+    if (socket && this.opts.store.countOutbox() === 0) {
+      socket.send(json);
+      return;
+    }
+    this.opts.store.enqueueOutbox(json, this.opts.clock());
     this.opts.store.trimOutboxOldest(this.opts.outboxBound);
-    this.trySendRow(id, envelope);
+    // Connected but with rows already queued: drain them all, oldest first, so this envelope
+    // goes out behind them rather than ahead.
+    if (socket) this.flushOutbox();
   }
 
   // ---- connection setup ----
@@ -465,7 +477,7 @@ export class ControlPlaneClient {
       if (rows.length === 0) break;
       const remainingBefore = this.opts.store.countOutbox();
       for (const row of rows) {
-        this.trySendRow(row.id, undefined, row.envelopeJson);
+        this.trySendRow(row.id, row.envelopeJson);
       }
       if (this.opts.store.countOutbox() >= remainingBefore) break; // no progress — stop
     }
@@ -484,14 +496,19 @@ export class ControlPlaneClient {
     }
   }
 
-  /** Send one outbox row over the live socket (if open) and delete it once written. Accepts
-   *  either an already-stamped `envelope` (a fresh `send()`) or a pre-serialized
-   *  `envelopeJson` (a flush replay) — never both are needed at once. */
-  private trySendRow(id: number, envelope?: Envelope, envelopeJson?: string): void {
-    if (this.state !== 'open' || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    const json = envelopeJson ?? (envelope ? encode(envelope) : undefined);
-    if (json === undefined) return;
-    this.socket.send(json);
+  /** The socket, if an envelope handed to it now would be written: the handshake is done and
+   *  the socket itself is open (it can close before `state` catches up). */
+  private liveSocket(): WebSocket | undefined {
+    return this.state === 'open' && this.socket?.readyState === WebSocket.OPEN
+      ? this.socket
+      : undefined;
+  }
+
+  /** Send one outbox row over the live socket (if open) and delete it once written. */
+  private trySendRow(id: number, envelopeJson: string): void {
+    const socket = this.liveSocket();
+    if (!socket) return;
+    socket.send(envelopeJson);
     this.opts.store.deleteOutbox(id);
   }
 

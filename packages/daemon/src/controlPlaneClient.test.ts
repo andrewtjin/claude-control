@@ -435,6 +435,55 @@ describe('ControlPlaneClient', () => {
     expect(client.getState()).toBe('open');
   });
 
+  describe('sending while connected', () => {
+    const note = (title: string): EnvelopeDraft => ({
+      daemonId: 'assigned-daemon-1',
+      type: 'hook.notification',
+      payload: { event: 'notification', title, body: '', level: 'info' },
+    });
+    const receivedTitles = () =>
+      relay.received.flatMap((e) => (e.type === 'hook.notification' ? [e.payload.title] : []));
+
+    async function connected(): Promise<ControlPlaneClient> {
+      const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
+      relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+      const c = new ControlPlaneClient({
+        url: relay.url(),
+        identityStore: memoryIdentityStore(identity),
+        store,
+        hostLabel: 'h',
+        heartbeatMs: 100_000,
+      });
+      await c.connect();
+      return c;
+    }
+
+    it('goes straight to the socket without writing the outbox', async () => {
+      // Every command-output card takes this path; queueing and deleting each one cost two
+      // synchronous SQLite writes on the main thread for no added safety.
+      client = await connected();
+      const enqueue = vi.spyOn(store, 'enqueueOutbox');
+      const remove = vi.spyOn(store, 'deleteOutbox');
+      for (let i = 0; i < 50; i++) client.send(note(`n${i}`));
+      await waitFor(() => receivedTitles().length === 50);
+      expect(receivedTitles()).toEqual(Array.from({ length: 50 }, (_, i) => `n${i}`));
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(store.countOutbox()).toBe(0);
+    });
+
+    it('never overtakes a row already queued: the backlog drains first, in order', async () => {
+      client = await connected();
+      // A row left queued while the link is up (it can happen when the socket closes before the
+      // client's state catches up); a fresh send must go out behind it, not ahead.
+      store.enqueueOutbox(encode(stamp(note('queued-first'))), 1);
+      client.send(note('sent-second'));
+      await waitFor(() => receivedTitles().length === 2);
+      expect(receivedTitles()).toEqual(['queued-first', 'sent-second']);
+      expect(store.countOutbox()).toBe(0);
+    });
+  });
+
   it('buffers sends while disconnected and flushes exactly once (in order, no dupes) on reconnect', async () => {
     const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
     relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
