@@ -9,6 +9,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { stat } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import type {
   ActivateOptions,
   RecoverResult,
@@ -213,10 +214,14 @@ export interface DaemonOptions {
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
-/** A poll-cycle phase slower than this is logged at warn rather than debug. Deliberately the
- *  loop-lag monitor's own threshold: a phase that outlasts it is, by that monitor's definition,
- *  long enough to be a stall worth naming, so the two never disagree about what counts as slow. */
-const POLL_PHASE_SLOW_MS = LOOP_LAG_THRESHOLD_MS;
+/** A poll-cycle phase during which the event loop was busy this long is logged at warn.
+ *  Deliberately the loop-lag monitor's own threshold: busy time past it is, by that monitor's
+ *  definition, a stall worth naming, so the two never disagree about what counts as one. */
+const POLL_PHASE_BUSY_MS = LOOP_LAG_THRESHOLD_MS;
+/** A phase that only WAITED (the loop was free to serve hooks) is still worth an info line past
+ *  this: a network fetch or file read this slow says something about the host. Well above an
+ *  ordinary usage poll (about half a second), well below anything an operator would miss. */
+const POLL_PHASE_WAIT_MS = 10_000;
 /** One day, the unit every window below is counted in. */
 const DAY_MS = 24 * 60 * 60_000;
 /** How long a usage snapshot is kept before the poll cycle trims it. The poller appends one row
@@ -1018,7 +1023,8 @@ export class Daemon {
   // ---- poll cycle ----
 
   /**
-   * Time one phase of the poll cycle and warn if it alone blocked past the lag threshold.
+   * Time one phase of the poll cycle and warn if the event loop was busy past the lag threshold
+   * while it ran.
    *
    * The loop-lag monitor can only say THAT the loop stalled, never WHERE — which is why the
    * regression it was built for still took a forensic hunt to attribute, and why one multi-second
@@ -1026,20 +1032,29 @@ export class Daemon {
    * long enough to matter: every phase reports its own duration, so the next anomaly names the
    * phase in the log instead of being re-derived from cadence arithmetic after the fact.
    *
-   * Costs two `clock()` reads per phase. Deliberately measures the phase's whole span — awaits
-   * included — rather than only its synchronous part: a phase that is slow for either reason is
-   * worth seeing, and the lag monitor beside it is what distinguishes the two.
+   * Two numbers per phase: `elapsedMs`, its whole span with awaits, and `loopBusyMs`, how much
+   * of that span the event loop spent running code or blocked in a synchronous call rather than
+   * idle waiting for I/O (from `performance.eventLoopUtilization`). Only the second one starves
+   * hooks and /healthz, so only it warns: a phase that merely waited on the network for a second
+   * left the loop free the whole time, and warning on elapsed time alone buried the real stalls
+   * under thousands of those. Busy time is the whole loop's, so a hook burst running during an
+   * awaited phase counts too; that is still a span in which hooks were made to wait.
    */
   private async timePhase<T>(phase: string, run: () => Promise<T> | T): Promise<T> {
     const startedAt = this.clock();
+    const utilizationAtStart = performance.eventLoopUtilization();
     try {
       return await run();
     } finally {
       const elapsedMs = this.clock() - startedAt;
-      if (elapsedMs >= POLL_PHASE_SLOW_MS) {
-        this.logger.warn({ phase, elapsedMs }, 'poll cycle phase ran long');
+      const loopBusyMs = Math.round(performance.eventLoopUtilization(utilizationAtStart).active);
+      const fields = { phase, elapsedMs, loopBusyMs };
+      if (loopBusyMs >= POLL_PHASE_BUSY_MS) {
+        this.logger.warn(fields, 'poll cycle phase kept the event loop busy');
+      } else if (elapsedMs >= POLL_PHASE_WAIT_MS) {
+        this.logger.info(fields, 'poll cycle phase waited long');
       } else {
-        this.logger.debug({ phase, elapsedMs }, 'poll cycle phase');
+        this.logger.debug(fields, 'poll cycle phase');
       }
     }
   }
