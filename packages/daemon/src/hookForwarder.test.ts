@@ -272,6 +272,8 @@ describe('hook forwarder script', () => {
       expect(Object.keys(parsed)).toEqual(['systemMessage']);
       expect(parsed.systemMessage).toContain('daemon is not running');
       expect(parsed.systemMessage).toContain('cctl daemon start');
+      // Names the off switch too, for a daemon stopped on purpose with its hooks left behind.
+      expect(parsed.systemMessage).toContain('cctl daemon uninstall');
     };
     const silent = { code: 0, stdout: '', stderr: '' };
 
@@ -290,6 +292,20 @@ describe('hook forwarder script', () => {
       await writeFile(noticePath(), 'old\n', 'utf8');
       const sixteenMinutesAgo = (Date.now() - 16 * 60 * 1000) / 1000;
       await utimes(noticePath(), sixteenMinutesAgo, sixteenMinutesAgo);
+      expectNotice(await runForwarder(scriptPath, PROMPT));
+    });
+
+    it('a marker dated in the future (clock set back) does not suppress the notice', async () => {
+      await writeFile(noticePath(), 'future\n', 'utf8');
+      const tomorrow = (Date.now() + 24 * 60 * 60 * 1000) / 1000;
+      await utimes(noticePath(), tomorrow, tomorrow);
+      expectNotice(await runForwarder(scriptPath, PROMPT));
+    });
+
+    it('a daemon start (writeHookForwarder) clears the marker, so the next outage is told at once', async () => {
+      expectNotice(await runForwarder(scriptPath, PROMPT));
+      await writeHookForwarder(scriptPath);
+      expect(existsSync(noticePath())).toBe(false);
       expectNotice(await runForwarder(scriptPath, PROMPT));
     });
 

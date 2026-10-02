@@ -184,8 +184,10 @@ cleanly; only a stop you asked for (`cctl daemon stop`, Ctrl+C) ends supervision
 and health kills leave a line in `daemon-crash.log` beside the vault.
 
 While the daemon is down, its hooks do nothing, and auto-switch is off with them. So that
-an outage is never silent, the first prompt you send in any session (at most once every 15
-minutes) shows a one-line notice naming `cctl daemon start`. `cctl status` and
+an outage is never silent, a prompt you send while it is down shows a one-line notice naming
+`cctl daemon start` (and `cctl daemon uninstall`, to remove the hooks instead). The notice
+appears at most once every 15 minutes across all sessions, and again right away for a new
+outage after the daemon has run in between. `cctl status` and
 `cctl doctor` also flag a daemon with no autostart registered, since one started by hand
 stays down after a reboot or a stopped supervisor.
 

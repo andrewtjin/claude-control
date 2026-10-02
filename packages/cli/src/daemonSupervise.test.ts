@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -313,6 +313,97 @@ describe('health kill of a daemon that shuts down gracefully', () => {
     expect(restarts[0]).toContain('restarting in 2000ms');
     expect(restarts[2]).toContain('restarting in 30000ms');
   });
+
+  it('an operator interrupt during the grace period neither cuts it short nor respawns', async () => {
+    // Production timers: the grace must run its full length even though the abort-aware
+    // sleeps all return at once, and the wedged child must still get its SIGKILL.
+    const controller = new AbortController();
+    const children: FakeChild[] = [];
+    const logs: string[] = [];
+    const startedAt = Date.now();
+    const done = superviseDaemon({
+      spawnChild: () => {
+        const child = new FakeChild('ignore');
+        children.push(child);
+        return child;
+      },
+      log: (line) => logs.push(line),
+      logCrash: () => {},
+      signal: controller.signal,
+      restartDelayMs: 1,
+      probe: { probeFn: alwaysFailing, intervalMs: 5, failuresToKill: 1, killGraceMs: 200 },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(children[0]?.signals).toEqual(['SIGTERM']);
+    controller.abort();
+    await done;
+    expect(children).toHaveLength(1);
+    // The probe's SIGTERM, the interrupt's SIGTERM, then the grace's SIGKILL.
+    expect(children[0]?.signals).toEqual(['SIGTERM', 'SIGTERM', 'SIGKILL']);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(190);
+    expect(logs.at(-1)).toContain('operator interrupt');
+  }, 2_000);
+
+  it('a grace timer left from one child never signals the respawned one', async () => {
+    // Child A exits gracefully well inside a long grace; child B is spawned before A's timer
+    // would fire. B must see only its own probe's signals.
+    const children: FakeChild[] = [];
+    let probes = 0;
+    await superviseDaemon({
+      spawnChild: () => {
+        const n = children.length;
+        const child = new FakeChild(n === 0 ? 'graceful' : n === 1 ? 'ignore' : 'signal');
+        if (n === 2) setImmediate(() => child.emit('exit', 0, null));
+        children.push(child);
+        return child;
+      },
+      log: () => {},
+      logCrash: () => {},
+      restartDelayMs: 1,
+      probe: {
+        // A fails at once; B stays healthy past A's grace window, then fails.
+        probeFn: () => {
+          probes += 1;
+          return Promise.resolve(children.length === 2 && probes < 40);
+        },
+        intervalMs: 10,
+        failuresToKill: 1,
+        killGraceMs: 300,
+      },
+    });
+    expect(children).toHaveLength(3);
+    expect(children[0]?.signals).toEqual(['SIGTERM']);
+    expect(children[1]?.signals).toEqual(['SIGTERM', 'SIGKILL']);
+  }, 5_000);
+
+  it('returns promptly after a clean exit instead of waiting out the probe interval', async () => {
+    // Production sleeps with a long interval: the pending probe sleep must end with the child,
+    // or its timer holds a real supervisor process open for up to an interval after the stop.
+    const setSpy = vi.spyOn(globalThis, 'setTimeout');
+    const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      await superviseDaemon({
+        spawnChild: () => {
+          const child = new FakeChild();
+          setTimeout(() => child.emit('exit', 0, null), 20);
+          return child;
+        },
+        log: () => {},
+        logCrash: () => {},
+        probe: { probeFn: () => Promise.resolve(true), intervalMs: 5_000 },
+      });
+      const intervalTimers = setSpy.mock.calls
+        .map((call, i) => ({ ms: call[1], handle: setSpy.mock.results[i]?.value as unknown }))
+        .filter((t) => t.ms === 5_000);
+      expect(intervalTimers.length).toBeGreaterThan(0);
+      for (const t of intervalTimers) {
+        expect(clearSpy.mock.calls.some((call) => call[0] === t.handle)).toBe(true);
+      }
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  }, 3_000);
 
   it('escalates on real timers with the production sleeps (no injected sleep)', async () => {
     // Exercises the production grace delay, which must neither race the abort signal nor

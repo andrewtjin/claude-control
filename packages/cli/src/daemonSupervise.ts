@@ -253,6 +253,9 @@ function startProbeLoop(args: {
       if (consecutiveFailures < failuresToKill) continue;
 
       cancelled = true;
+      // Set before the exit is seen, so a deliberate stop that lands in this very tick is
+      // respawned too. That takes a daemon unresponsive for every probe in the streak, and
+      // erring toward a running daemon is the safe side.
       killed = true;
       const detail = `supervise: daemon unresponsive (${consecutiveFailures} consecutive health probes failed); killing for respawn`;
       logCrash(detail);
@@ -306,11 +309,17 @@ export async function superviseDaemon(options: SuperviseOptions): Promise<void> 
     const abortListener = () => child.kill();
     options.signal?.addEventListener('abort', abortListener, { once: true });
 
+    // The probe loop's interval sleep must end with its child, not only with the supervisor:
+    // left to run, a pending 15s delay holds the process open after a deliberate stop.
+    const childGone = new AbortController();
+    const probeSignal = options.signal
+      ? AbortSignal.any([options.signal, childGone.signal])
+      : childGone.signal;
     const probing = options.probe
       ? startProbeLoop({
           child,
           probe: options.probe,
-          sleep,
+          sleep: options.sleep ?? ((ms: number) => abortAwareDelay(ms, probeSignal)),
           graceSleep,
           signal: options.signal,
           log: options.log,
@@ -323,6 +332,7 @@ export async function superviseDaemon(options: SuperviseOptions): Promise<void> 
       child.once('error', (err) => resolve({ code: null, signal: null, error: err }));
     });
     probing?.stop();
+    childGone.abort();
     options.signal?.removeEventListener('abort', abortListener);
     const healthKilled = probing?.killedByProbe() ?? false;
 

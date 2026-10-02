@@ -48,7 +48,7 @@
 // the surrounding repo) and must NEVER exit non-zero or write to stderr: a hook failure is
 // the daemon's problem, never the session's.
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 /** Stable on-disk location beside `hook-endpoint.json` — the script finds the endpoint file
@@ -89,7 +89,7 @@ const DOWN_NOTICE_FILE = path.join(__dirname, 'daemon-down-notice');
 const DOWN_NOTICE_EVERY_MS = 15 * 60 * 1000;
 const DOWN_NOTICE =
   'cctl: the daemon is not running, so auto-switch and every cctl hook are off. ' +
-  'Start it: cctl daemon start';
+  'Start it: cctl daemon start (or remove the hooks: cctl daemon uninstall)';
 
 function bail() {
   process.exit(0);
@@ -101,7 +101,10 @@ function bail() {
 function daemonDown(event) {
   if (event !== 'UserPromptSubmit') bail();
   try {
-    if (Date.now() - fs.statSync(DOWN_NOTICE_FILE).mtimeMs < DOWN_NOTICE_EVERY_MS) bail();
+    // A marker dated in the future (the clock was set back) does not count as a recent
+    // showing; otherwise the notice would stay silent until the clock caught up.
+    const age = Date.now() - fs.statSync(DOWN_NOTICE_FILE).mtimeMs;
+    if (age >= 0 && age < DOWN_NOTICE_EVERY_MS) bail();
   } catch {}
   try {
     fs.writeFileSync(DOWN_NOTICE_FILE, new Date().toISOString() + '\\n');
@@ -203,9 +206,18 @@ process.stdin.on('end', () => {
 });
 `;
 
+/** Where the forwarder records its last daemon-down notice; a sibling of the script, which
+ *  finds it by its own directory. */
+export function daemonDownNoticePath(dataDir: string): string {
+  return join(dataDir, 'daemon-down-notice');
+}
+
 /** Write (or refresh) the forwarder script. Called on daemon start, before hook install, so
- *  the command `buildDaemonHookSpecs` points at always has a current script behind it. */
+ *  the command `buildDaemonHookSpecs` points at always has a current script behind it. Also
+ *  clears the daemon-down marker: the outage it recorded is over, so the next one gets its
+ *  notice at once instead of waiting out the window a restart's brief gap may have used. */
 export async function writeHookForwarder(filePath: string): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, HOOK_FORWARDER_SOURCE, 'utf8');
+  await rm(daemonDownNoticePath(dirname(filePath)), { force: true });
 }
