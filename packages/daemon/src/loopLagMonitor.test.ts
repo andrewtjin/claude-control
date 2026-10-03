@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { startLoopLagMonitor } from './loopLagMonitor.js';
 
 /** Block the event loop synchronously for ~ms — the exact pathology the monitor exists to
@@ -26,6 +26,53 @@ describe('startLoopLagMonitor', () => {
       expect(stalls.length).toBeGreaterThanOrEqual(1);
       // Drift ≈ block duration (minus up to one interval); assert the right magnitude.
       expect(Math.max(...stalls)).toBeGreaterThanOrEqual(150);
+    } finally {
+      stop();
+    }
+  });
+
+  it('ignores wall-clock steps: an idle loop whose clock jumps forward is not a stall', async () => {
+    // Live on WSL2: two time services corrected the VM clock, which stepped about +2s every
+    // ~34s while the daemon sat idle in epoll_wait, and every step was logged as a 2s stall.
+    const stalls: number[] = [];
+    let offsetMs = 0;
+    const realNow = Date.now.bind(Date);
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offsetMs);
+    const stop = startLoopLagMonitor({
+      onStall: (lagMs) => stalls.push(lagMs),
+      intervalMs: 50,
+      thresholdMs: 100,
+    });
+    try {
+      for (let i = 0; i < 4; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        offsetMs += 2_000;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(stalls).toEqual([]);
+    } finally {
+      stop();
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('reports a stall in the first moments of the process (monotonic clock starts near 0)', async () => {
+    const stalls: number[] = [];
+    const stop = startLoopLagMonitor({
+      onStall: (lagMs) => stalls.push(lagMs),
+      intervalMs: 50,
+      thresholdMs: 100,
+      // A clock that has only just started, as performance.now() has in a fresh daemon.
+      clock: (() => {
+        const base = performance.now();
+        return () => performance.now() - base;
+      })(),
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      blockLoop(300);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(stalls.length).toBeGreaterThanOrEqual(1);
     } finally {
       stop();
     }
