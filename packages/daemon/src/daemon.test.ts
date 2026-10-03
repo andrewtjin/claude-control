@@ -2608,16 +2608,22 @@ describe('Daemon lifecycle', () => {
 
   it('a wall-clock step during a phase is not counted as phase time', async () => {
     // Phase durations used the wall clock, so a clock correction mid-phase (about +2s every
-    // ~34s on one WSL2 box) inflated whatever phase it landed in.
+    // ~34s on one WSL2 box) inflated whatever phase it landed in. The step must still be in
+    // force when the phase is measured, but the test must not wait on anything clock-based
+    // while it is (its waiting helpers time out by the wall clock), so it waits by event-loop
+    // turns and restores the clock before any clock-based wait.
     const { logger, entries } = capturingLogger();
     const realNow = Date.now.bind(Date);
     let offsetMs = 0;
     const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offsetMs);
+    let phaseDone!: () => void;
+    const done = new Promise<void>((resolve) => (phaseDone = resolve));
     const steppingJournal = {
       sync: async () => {
         await new Promise((r) => setTimeout(r, 20));
         offsetMs += 60_000;
         await new Promise((r) => setTimeout(r, 20));
+        phaseDone();
       },
       accountActiveAt: () => null,
     } as unknown as AttributionJournal;
@@ -2635,16 +2641,18 @@ describe('Daemon lifecycle', () => {
         logger,
       });
       await daemon.start();
+      await done;
+      // timePhase's finally runs in the microtasks right after the phase resolves; a few
+      // macrotask turns is ample, and none of them reads the clock.
+      for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+      nowSpy.mockRestore();
       const isJournal = (e: { obj: unknown }) =>
         (e.obj as { phase?: string }).phase === 'attributionJournal.sync';
-      await waitFor(() => entries.some((e) => isJournal(e) && e.msg === 'poll cycle phase'));
-      const fields = entries.find((e) => isJournal(e) && e.msg === 'poll cycle phase')?.obj as {
-        elapsedMs: number;
-      };
-      expect(fields.elapsedMs).toBeLessThan(5_000);
-      expect(entries.some((e) => isJournal(e) && e.msg === 'poll cycle phase waited long')).toBe(
-        false,
-      );
+      // Whichever line the phase logged (debug, or "waited long" if the step leaked in).
+      await waitFor(() => entries.some(isJournal));
+      const line = entries.find(isJournal);
+      expect((line?.obj as { elapsedMs: number }).elapsedMs).toBeLessThan(5_000);
+      expect(line?.msg).toBe('poll cycle phase');
     } finally {
       nowSpy.mockRestore();
     }
