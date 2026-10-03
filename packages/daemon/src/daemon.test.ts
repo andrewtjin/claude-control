@@ -2606,6 +2606,58 @@ describe('Daemon lifecycle', () => {
     ).toBe(false);
   });
 
+  it('a wall-clock step during a phase is not counted as phase time', async () => {
+    // Phase durations used the wall clock, so a clock correction mid-phase (about +2s every
+    // ~34s on one WSL2 box) inflated whatever phase it landed in. The step must still be in
+    // force when the phase is measured, but the test must not wait on anything clock-based
+    // while it is (its waiting helpers time out by the wall clock), so it waits by event-loop
+    // turns and restores the clock before any clock-based wait.
+    const { logger, entries } = capturingLogger();
+    const realNow = Date.now.bind(Date);
+    let offsetMs = 0;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offsetMs);
+    let phaseDone!: () => void;
+    const done = new Promise<void>((resolve) => (phaseDone = resolve));
+    const steppingJournal = {
+      sync: async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        offsetMs += 60_000;
+        await new Promise((r) => setTimeout(r, 20));
+        phaseDone();
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    try {
+      daemon = new Daemon({
+        store,
+        switchEngine,
+        sessionManager,
+        poller,
+        attributionJournal: steppingJournal,
+        hookReceiver,
+        controlPlaneClient,
+        createAgentSdkClient: () => fakeAgentSdkClient,
+        pollIntervalMs: 100_000,
+        logger,
+      });
+      await daemon.start();
+      await done;
+      // timePhase's finally runs in the microtasks right after the phase resolves; a few
+      // macrotask turns is ample, and none of them reads the clock.
+      for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+      nowSpy.mockRestore();
+      const isJournal = (e: { obj: unknown }) =>
+        (e.obj as { phase?: string }).phase === 'attributionJournal.sync';
+      // Whichever line the phase logged (debug, or "waited long" if the step leaked in).
+      await waitFor(() => entries.some(isJournal));
+      const line = entries.find(isJournal);
+      expect((line?.obj as { elapsedMs: number }).elapsedMs).toBeLessThan(5_000);
+      expect(line?.msg).toBe('poll cycle phase');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   it('a waiting phase is not blamed for unrelated work that keeps the loop busy meanwhile', async () => {
     // Hook handling runs while a poll phase awaits the network; whole-loop busy time would pin
     // that work on the phase. Here a timer burns the loop in short slices (none a stall on its
