@@ -1044,18 +1044,20 @@ export class Daemon {
    *     (`performance.eventLoopUtilization`), whoever kept it busy. Context, not attribution.
    */
   private async timePhase<T>(phase: string, run: () => Promise<T> | T): Promise<T> {
-    const startedAt = this.clock();
+    // Durations come from the monotonic clock, never `this.clock` (wall time, for timestamps):
+    // a wall-clock correction landing mid-phase would otherwise show up as phase time.
+    const startedAt = performance.now();
     const utilizationAtStart = performance.eventLoopUtilization();
     let returnedAt: number | undefined;
     try {
       const pending = run();
-      returnedAt = this.clock();
+      returnedAt = performance.now();
       return await pending;
     } finally {
-      const endedAt = this.clock();
+      const endedAt = performance.now();
       // A phase that threw synchronously ran entirely inside the block.
-      const blockedMs = (returnedAt ?? endedAt) - startedAt;
-      const elapsedMs = endedAt - startedAt;
+      const blockedMs = Math.round((returnedAt ?? endedAt) - startedAt);
+      const elapsedMs = Math.round(endedAt - startedAt);
       const loopBusyMs = Math.round(performance.eventLoopUtilization(utilizationAtStart).active);
       const fields = { phase, elapsedMs, blockedMs, loopBusyMs };
       if (blockedMs >= POLL_PHASE_BLOCK_MS) {

@@ -2606,6 +2606,50 @@ describe('Daemon lifecycle', () => {
     ).toBe(false);
   });
 
+  it('a wall-clock step during a phase is not counted as phase time', async () => {
+    // Phase durations used the wall clock, so a clock correction mid-phase (about +2s every
+    // ~34s on one WSL2 box) inflated whatever phase it landed in.
+    const { logger, entries } = capturingLogger();
+    const realNow = Date.now.bind(Date);
+    let offsetMs = 0;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offsetMs);
+    const steppingJournal = {
+      sync: async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        offsetMs += 60_000;
+        await new Promise((r) => setTimeout(r, 20));
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    try {
+      daemon = new Daemon({
+        store,
+        switchEngine,
+        sessionManager,
+        poller,
+        attributionJournal: steppingJournal,
+        hookReceiver,
+        controlPlaneClient,
+        createAgentSdkClient: () => fakeAgentSdkClient,
+        pollIntervalMs: 100_000,
+        logger,
+      });
+      await daemon.start();
+      const isJournal = (e: { obj: unknown }) =>
+        (e.obj as { phase?: string }).phase === 'attributionJournal.sync';
+      await waitFor(() => entries.some((e) => isJournal(e) && e.msg === 'poll cycle phase'));
+      const fields = entries.find((e) => isJournal(e) && e.msg === 'poll cycle phase')?.obj as {
+        elapsedMs: number;
+      };
+      expect(fields.elapsedMs).toBeLessThan(5_000);
+      expect(entries.some((e) => isJournal(e) && e.msg === 'poll cycle phase waited long')).toBe(
+        false,
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   it('a waiting phase is not blamed for unrelated work that keeps the loop busy meanwhile', async () => {
     // Hook handling runs while a poll phase awaits the network; whole-loop busy time would pin
     // that work on the phase. Here a timer burns the loop in short slices (none a stall on its
