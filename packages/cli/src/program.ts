@@ -30,13 +30,20 @@ import {
 } from '@claude-control/switch-engine';
 import {
   ControlPlaneClient,
+  ExhaustionLog,
   Store,
   aggregateTokenStats,
   buildDaemonHookSpecs,
+  episodesOf,
+  exhaustionLogPath,
+  judgeOutage,
+  resumeOpenEpisode,
   readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
   uninstallHooks,
+  type OpenEpisode,
+  type OutageJudgement,
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
@@ -49,7 +56,15 @@ import {
   renderPlanSummary,
   timelineInputFromWire,
   type AccountUsageInput,
+  type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
+import {
+  episodesInWindow,
+  expectedFirstBack,
+  renderOutageBanner,
+  renderOutages,
+  type OutageStatus,
+} from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
@@ -156,6 +171,7 @@ import {
   renderSettings,
   renderVersionInfo,
   reportSaysGreedyActive,
+  reportedFableCapTrigger,
   resolveCliSettings,
   resolveDaemonConfig,
   settableSettingsSummary,
@@ -302,7 +318,8 @@ export function buildProgram(): Command {
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
-      process.stdout.write(text + '\n');
+      const banner = await exhaustionBanner(inputs, await cliAutoSwitchPolicy(), nowMs);
+      process.stdout.write((banner !== undefined ? `${banner}\n\n` : '') + text + '\n');
     });
 
   program
@@ -314,7 +331,11 @@ export function buildProgram(): Command {
       const state = await readUsageState(nowMs);
       const inputs = buildAdvisorInputs(state);
       const outlook = computeOutlook(inputs, nowMs);
-      let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
+      const autoSwitchPolicy = await cliAutoSwitchPolicy();
+      const banner = await exhaustionBanner(inputs, autoSwitchPolicy, nowMs);
+      let text =
+        (banner !== undefined ? `${banner}\n\n` : '') +
+        renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to burn first and what to
       // hold. When the last-started daemon runs greedy auto-switch, the advice matches its
       // descriptive phrasing (the daemon executes the plan; the user doesn't have to) and its
@@ -324,20 +345,74 @@ export function buildProgram(): Command {
       // live solely in some other shell's environment could judge differently.
       if (inputs.length > 0) {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
-        const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
-        const autoSwitchPolicy = autoSwitchPolicyOf(
-          resolveDaemonConfig(process.env, {}, fileConfig).values,
-        );
         text +=
           '\n\n' +
           renderPlanSummary(
-            computePlan(inputs, greedy ? { greedyAutoSwitch: true, autoSwitchPolicy } : {}),
+            // The policy goes in either way: whether the Fable cap counts against headroom has to
+            // match the banner above, or the plan could say "No usable account" beside no banner.
+            computePlan(inputs, {
+              autoSwitchPolicy,
+              ...(greedy ? { greedyAutoSwitch: true } : {}),
+            }),
           );
         text +=
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       process.stdout.write(text + '\n');
+    });
+
+  // The history of the fleet's worst failure: every time no account could take work, written by
+  // the daemon (see the daemon's exhaustionLog.ts). Works with the daemon stopped: the file is
+  // the history, and an outage still open in it is checked against the latest numbers in
+  // daemon.db, so one that is over but that no running daemon has closed says so.
+  program
+    .command('outages')
+    .description(
+      'every time no account could take work: when, for how long, why, and the switches before it',
+    )
+    .option('--days <n>', 'only the times that started in the last <n> days')
+    .option('--json', 'print the times as JSON, newest first')
+    .action(async (opts: { days?: string; json?: boolean }) => {
+      let days: number | undefined;
+      if (opts.days !== undefined) {
+        days = Number(opts.days);
+        if (!Number.isFinite(days) || days <= 0) fail('--days must be a positive number.');
+      }
+      const nowMs = Date.now();
+      const log = exhaustionLog();
+      const records = await log.read();
+      const resumed = resumeOpenEpisode(records);
+      let open: OutageStatus | undefined;
+      if (resumed !== undefined) {
+        // Where it stands by the latest numbers: over, or who is expected back first.
+        const judged = await judgeLatestNumbers(resumed, nowMs);
+        const transition = judged?.transition;
+        const expected = expectedFirstBack(judged?.open ?? resumed, nowMs, judged?.fleet);
+        open = {
+          id: resumed.record.id,
+          ...(transition?.kind === 'end' ? { overBy: transition.recovery } : {}),
+          ...(expected !== undefined ? { expected } : {}),
+        };
+      }
+      const episodes = episodesInWindow(episodesOf(records), nowMs, days, open?.id);
+      if (opts.json === true) {
+        const newestFirst = [...episodes].reverse();
+        process.stdout.write(
+          JSON.stringify({ log: log.path, open: open ?? null, episodes: newestFirst }, null, 2) +
+            '\n',
+        );
+        return;
+      }
+      process.stdout.write(
+        renderOutages(episodes, {
+          now: nowMs,
+          logPath: log.path,
+          ...(days !== undefined ? { days } : {}),
+          ...(open !== undefined ? { open } : {}),
+          palette: detectPalette(),
+        }) + '\n',
+      );
     });
 
   // `usage`/`timeline` answer "how much of my LIMIT is gone" (a percent from Anthropic's
@@ -1127,6 +1202,73 @@ function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
       ...resolvedWeight(a),
     })),
   );
+}
+
+/** The auto-switch policy to judge usage by: the thresholds a daemon started from this shell
+ *  would run under (this shell's environment over config.json, the way `cctl settings` previews
+ *  them), except whether the Fable cap counts, which comes from the running daemon's report while
+ *  its heartbeat says it is alive. The banner and the plan say whether that daemon counts an
+ *  outage, and a setting saved since it started only reaches it on its next start; a report left
+ *  by a daemon that is no longer running says nothing about the next one. */
+async function cliAutoSwitchPolicy(): Promise<AutoSwitchPolicy> {
+  const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
+  const policy = autoSwitchPolicyOf(resolveDaemonConfig(process.env, {}, fileConfig).values);
+  try {
+    if ((await readHeartbeat(daemonHeartbeatPath())).state !== 'alive') return policy;
+    const reported = reportedFableCapTrigger(await readSettingsReport(daemonSettingsPath()));
+    return reported === undefined ? policy : { ...policy, fableCapTriggers: reported };
+  } catch {
+    // The running daemon's report only refines the policy; a heartbeat or report that cannot be
+    // read must not stop `usage` or `timeline` from printing.
+    return policy;
+  }
+}
+
+/** The exhaustion log this machine's daemon writes, beside its database. */
+function exhaustionLog(): ExhaustionLog {
+  return new ExhaustionLog(exhaustionLogPath(dirname(defaultPaths().vaultDir)));
+}
+
+/** The log's open outage judged against the latest numbers the way the daemon judges it
+ *  (`judgeOutage`), or `undefined` when they cannot be read: `cctl outages` prints the history
+ *  either way, and an unreadable daemon.db or vault must not stop it. */
+async function judgeLatestNumbers(
+  open: OpenEpisode,
+  nowMs: number,
+): Promise<OutageJudgement | undefined> {
+  try {
+    const inputs = buildAdvisorInputs(await readUsageState(nowMs));
+    return judgeOutage(inputs, open, nowMs, await cliAutoSwitchPolicy());
+  } catch {
+    return undefined;
+  }
+}
+
+/** The banner `usage` and `timeline` lead with while no account can take work, judged the way
+ *  the daemon judges it (`judgeOutage`): an outage open in the log stays on until the numbers
+ *  the view prints prove an account is back, so a poll that came back empty does not hide it;
+ *  with none open, it is on when no account can take work. A log that cannot be read is treated
+ *  as having none open, and a banner that cannot be worked out is left off: it leads the view,
+ *  it must never replace it. */
+async function exhaustionBanner(
+  inputs: AccountUsageInput[],
+  policy: AutoSwitchPolicy,
+  nowMs: number,
+): Promise<string | undefined> {
+  let open: OpenEpisode | undefined;
+  try {
+    open = resumeOpenEpisode(await exhaustionLog().read());
+  } catch {
+    open = undefined;
+  }
+  try {
+    const judged = judgeOutage(inputs, open, nowMs, policy);
+    return judged.on
+      ? renderOutageBanner(judged.fleet, judged.open, nowMs, detectPalette())
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same

@@ -67,7 +67,56 @@ cctl timeline   # 5h-session budget per account + when every limit resets, with 
 ```
 
 Both read the daemon's last-persisted snapshot, so they work whether or not the daemon
-is currently running.
+is currently running. While no account can take work, both lead with a line saying so, with
+since when once the daemon has recorded it and which account is expected back first when a
+reset time is known.
+
+## When every account is out of usage
+
+```
+cctl outages             # every time no account could take work, newest first
+cctl outages --days 30   # only the times that started in the last 30 days (plus one still on)
+cctl outages --json      # the same, as JSON
+```
+
+When auto-switch has walked every account and all of them are spent, the daemon records it.
+An account counts as out when one of its limits is more than 98% used (the endpoint reports
+whole percents, so in practice 99% or more): its 5-hour window, its weekly budget, or the
+Fable weekly cap unless `CCTL_AUTOSWITCH_ON_FABLE_CAP` is off. An account whose login has
+expired counts as out too. An account you excluded from auto-switch still counts as available
+while it has quota, and so does an account cctl has no numbers for yet. This bar is stricter
+than auto-switch's own: auto-switch stops hopping to an account at its 94% trigger, so it can
+run out of places to go a little before every account counts as out.
+
+Each time is one entry with when it started, why each account was out (every limit holding
+it out) and when each was due back, and the switches of the five hours before it (who made
+each and why). When an account comes back, the entry is closed with how long nothing could
+run and how it ended (a limit reset, a login restored, a new account, or numbers showing
+usage left again). The outage is measured to the reset that ended it, so a daemon that was
+stopped through the reset still records the right length; a reset the usage endpoint moves
+later while the outage is on moves the end with it.
+
+An account only counts as back on evidence: numbers showing it has usage left, or the
+resets of every limit it was last seen out on having passed. A usage poll that fails or
+comes back empty during an outage is not evidence, and neither is a login added mid-outage
+before its first successful poll, so neither ends it (or starts a second one).
+
+While an outage is open the daemon also adds a short `walls` line whenever what keeps an
+account out changes (it hits another limit, its login expires, a reset moves by more than five
+minutes, or an account joins), so a daemon restarted mid-outage judges every account by what was
+last seen, not only by what was true at the start.
+
+The phone gets a card when it starts and when it ends. The log is
+`exhaustion-log.jsonl` in the daemon's data folder (beside `daemon.db`), one JSON line per
+start, per end and per `walls` change, starts and ends each with a plain-English `summary`;
+`cctl outages` prints its path. A
+write that fails (the file held open by a scanner, a full disk) is retried every cycle and on
+shutdown, and the entry is in `daemon.log` either way.
+
+`cctl outages` marks the outage still open as `ongoing`, with the account expected back first
+by what was last seen. If the latest numbers already show
+an account back but no running daemon has recorded the end, it says so (`over by the latest
+numbers`) instead. A start whose end was never written is shown as `end not recorded`.
 
 ## Token stats
 

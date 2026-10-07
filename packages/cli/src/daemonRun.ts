@@ -31,6 +31,8 @@ import {
   ControlPlaneRejectionError,
   DEFAULT_SECRET_HEADER,
   Daemon,
+  ExhaustionLog,
+  exhaustionLogPath,
   HeartbeatWriter,
   HookReceiver,
   Store,
@@ -49,6 +51,7 @@ import {
   type IdentityStore,
 } from '@claude-control/daemon';
 import { createAgentSdkClient, createSessionManager } from '@claude-control/session-runtime';
+import type { AdvisorOptions, AutoSwitchPolicy } from '@claude-control/usage-advisor';
 import type { AgentSdkClient } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
@@ -175,6 +178,25 @@ export interface ShutdownSequence {
   markStopped: () => void;
   /** Wait for every queued heartbeat write, marker included, to reach the disk. */
   flushHeartbeat: () => Promise<void>;
+}
+
+/**
+ * What the poller's plan (the one the phone renders) is computed under. The policy always goes
+ * in: it decides whether the Fable cap counts against an account's headroom, which has to match
+ * what auto-switch and the exhaustion log count, or the plan could say "No usable account" while
+ * the daemon logs no outage. Greedy auto-switch additionally makes the plan describe the hops the
+ * daemon itself will make and gate its targets by the same policy, so it never announces a hop
+ * the executor would refuse.
+ */
+export function pollerAdvisorOptions(args: {
+  autoSwitch: boolean;
+  greedy: boolean;
+  policy: AutoSwitchPolicy;
+}): AdvisorOptions {
+  return {
+    autoSwitchPolicy: args.policy,
+    ...(args.autoSwitch && args.greedy ? { greedyAutoSwitch: true } : {}),
+  };
 }
 
 /**
@@ -354,13 +376,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       },
       claudeJsonPath: paths.claudeJsonPath,
     }),
-    // Greedy-aware advice: when the daemon itself executes the burn plan, the plan's
-    // wording turns descriptive instead of telling the user to do it by hand — and its
-    // targets are gated by the executor's own policy, so it never announces a hop the
-    // executor would refuse.
-    ...(autoSwitch && greedy
-      ? { advisorOptions: { greedyAutoSwitch: true, autoSwitchPolicy } }
-      : {}),
+    // The plan is computed under the executor's policy (see pollerAdvisorOptions).
+    advisorOptions: pollerAdvisorOptions({ autoSwitch, greedy, policy: autoSwitchPolicy }),
   });
 
   const attributionJournal = new AttributionJournal({ store, vaultDir: paths.vaultDir });
@@ -487,6 +504,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     attributionJournal,
     hookReceiver,
     controlPlaneClient,
+    // Every time no account can take work, beside daemon.log; `cctl outages` reads the same
+    // path through the same helper.
+    exhaustionLog: new ExhaustionLog(exhaustionLogPath(dataDir)),
     installHooks: async () => {
       // The forwarder script is (re)written before the hook entries that point at it, so the
       // installed command always has a current script behind it. The command itself is

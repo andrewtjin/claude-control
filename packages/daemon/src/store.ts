@@ -208,7 +208,15 @@ export class Store {
   /** `path` is injectable so tests use `:memory:`; production passes a real file path. */
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    this.migrate();
+    try {
+      this.migrate();
+    } catch (err) {
+      // A file that is not a database (or not one this build can migrate) fails here; the handle
+      // must not outlive the failure, or on Windows the file can be neither replaced nor deleted
+      // until the process exits.
+      this.db.close();
+      throw err;
+    }
   }
 
   close(): void {
