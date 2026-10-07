@@ -103,7 +103,7 @@ describe('assessAccount', () => {
       { kind: 'weekly_scoped', percent: 100, resetsAt: NOW + 20 * H },
     ]);
     expect(assessAccount(capped, NOW)).toMatchObject({ usable: false, reason: 'weekly_scoped' });
-    expect(assessAccount(capped, NOW, { countFableCap: false })).toMatchObject({
+    expect(assessAccount(capped, NOW, { fableCapTriggers: false })).toMatchObject({
       usable: true,
       percent: 40,
     });
@@ -227,7 +227,7 @@ describe('the advisor reads the same rule', () => {
       now: () => NOW,
       autoSwitchPolicy: { fableCapTriggers: false },
     });
-    expect(assessFleet(inputs, NOW, { countFableCap: false }).exhausted).toBe(false);
+    expect(assessFleet(inputs, NOW, { fableCapTriggers: false }).exhausted).toBe(false);
     expect(plan.reason).not.toMatch(/^No usable account/);
     // And with the cap counted, both say every account is out.
     const counted = computePlan(inputs, { now: () => NOW });

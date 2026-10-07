@@ -5,11 +5,12 @@
 import {
   describeFirstBack,
   describeWalls,
-  humanizeDuration,
+  humanizeElapsed,
   type FleetAvailability,
 } from '@claude-control/usage-advisor';
 import {
   recoveryText,
+  SWITCH_CHAIN_WINDOW_WORDS,
   trackedBackAt,
   type ExhaustedAccount,
   type ExhaustionEpisode,
@@ -21,11 +22,19 @@ import { PLAIN_PALETTE, type Palette } from './ansi.js';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-/** The outage the log has open (the daemon's open episode), and, when the latest numbers already
- *  show an account back, how: the end a running daemon would record on its next cycle. */
-export interface OpenOutage {
+/** An account expected back, and when. */
+export interface ExpectedBack {
+  label: string;
+  at: number;
+}
+
+/** Where the outage the log has open (the daemon's open episode) stands by the latest numbers:
+ *  over, and how (the end a running daemon would record on its next cycle), or the account
+ *  expected back first. */
+export interface OutageStatus {
   id: string;
   overBy?: Recovery;
+  expected?: ExpectedBack;
 }
 
 /** A moment in this machine's local time, "Oct 1 14:02" — with the year when it is not this
@@ -63,13 +72,13 @@ function switchLine(s: ExhaustionSwitch, now: number, palette: Palette): string 
 function episodeHeading(
   e: ExhaustionEpisode,
   now: number,
-  open: OpenOutage | undefined,
+  open: OutageStatus | undefined,
   palette: Palette,
 ): string {
   const start = palette.bold(formatLocalTime(e.start.at, now));
   if (e.end !== undefined) {
     return (
-      `${start} -> ${formatLocalTime(e.end.backSince, now)}  ${palette.bold(humanizeDuration(Math.max(e.end.durationMs, 1)))}` +
+      `${start} -> ${formatLocalTime(e.end.backSince, now)}  ${palette.bold(humanizeElapsed(e.end.durationMs))}` +
       `  back: ${e.end.account.label} (${recoveryText(e.end)})`
     );
   }
@@ -83,13 +92,13 @@ function episodeHeading(
       'no running daemon has recorded the end yet'
     );
   }
-  const first = e.start.firstBack;
+  // By the walls last seen, as the banner says it: the start entry's own guess may have passed.
+  const first = open.expected;
   const expected =
     first !== undefined
-      ? `; first back expected: ${first.label} at ${formatLocalTime(first.at, now)}` +
-        `${first.predicted ? ' (predicted)' : ''}`
+      ? `; first back expected: ${first.label} at ${formatLocalTime(first.at, now)}`
       : '';
-  return `${start} -> ${palette.red('ongoing')}, ${humanizeDuration(Math.max(now - e.start.at, 1))} so far${expected}`;
+  return `${start} -> ${palette.red('ongoing')}, ${humanizeElapsed(now - e.start.at)} so far${expected}`;
 }
 
 /** Which episodes a `--days` window shows: those that started inside it, plus the open outage
@@ -107,13 +116,13 @@ export function episodesInWindow(
 
 /** `cctl outages`: every episode, newest first, each with its accounts and the switches
  *  that led there, then where the log lives. */
-export function renderExhaustionLog(
+export function renderOutages(
   episodes: ExhaustionEpisode[],
-  options: { now: number; logPath: string; days?: number; open?: OpenOutage; palette?: Palette },
+  options: { now: number; logPath: string; days?: number; open?: OutageStatus; palette?: Palette },
 ): string {
-  const { now, logPath } = options;
+  const { now, logPath, days } = options;
   const palette = options.palette ?? PLAIN_PALETTE;
-  const scope = options.days !== undefined ? ` in the last ${options.days} days` : '';
+  const scope = days !== undefined ? ` in the last ${days} day${days === 1 ? '' : 's'}` : '';
   const footer = palette.dim(`Log: ${logPath}`);
   if (episodes.length === 0) {
     return `No time on record${scope} when every account was out of usage.\n${footer}`;
@@ -126,23 +135,27 @@ export function renderExhaustionLog(
     const walk =
       e.start.switches.length > 0
         ? [
-            '  Switches in the 5 hours before:',
+            `  Switches in the ${SWITCH_CHAIN_WINDOW_WORDS} before:`,
             ...e.start.switches.map((s) => switchLine(s, now, palette)),
           ]
-        : ['  No switches in the 5 hours before.'];
+        : [`  No switches in the ${SWITCH_CHAIN_WINDOW_WORDS} before.`];
     return [episodeHeading(e, now, options.open, palette), ...accounts, ...walk].join('\n');
   });
   const count = `${episodes.length} time${episodes.length === 1 ? '' : 's'}${scope} no account could take work (newest first):`;
   return [count, '', blocks.join('\n\n'), '', footer].join('\n');
 }
 
-/** The tracked account expected back soonest, by the walls the log last recorded for it. */
-function expectedFirstBack(
+/** The tracked account expected back soonest, by the walls last seen for it, among those still
+ *  ahead. With `fleet`, only accounts that still exist count: one removed since the outage began
+ *  coming back changes nothing. */
+export function expectedFirstBack(
   open: OpenEpisode,
   now: number,
-): { label: string; at: number } | undefined {
-  let first: { label: string; at: number } | undefined;
-  for (const a of open.accounts.values()) {
+  fleet?: FleetAvailability,
+): ExpectedBack | undefined {
+  let first: ExpectedBack | undefined;
+  for (const [accountId, a] of open.accounts) {
+    if (fleet !== undefined && !fleet.accounts.some((f) => f.accountId === accountId)) continue;
     const at = trackedBackAt(a);
     if (at === undefined || at <= now) continue;
     if (first === undefined || at < first.at || (at === first.at && a.label < first.label)) {
@@ -157,7 +170,7 @@ function expectedFirstBack(
  *  first account is back comes from the numbers when they show every account out, else from what
  *  the log last recorded for each account (an account whose poll came back empty has no numbers
  *  to say). */
-export function renderExhaustionBanner(
+export function renderOutageBanner(
   fleet: FleetAvailability,
   open: OpenEpisode | undefined,
   now: number,
@@ -166,9 +179,9 @@ export function renderExhaustionBanner(
   const start = open?.record;
   const since =
     start !== undefined
-      ? ` since ${formatLocalTime(start.at, now)} (${humanizeDuration(Math.max(now - start.at, 1))})`
+      ? ` since ${formatLocalTime(start.at, now)} (${humanizeElapsed(now - start.at)})`
       : '';
-  const expected = open !== undefined ? expectedFirstBack(open, now) : undefined;
+  const expected = open !== undefined ? expectedFirstBack(open, now, fleet) : undefined;
   const firstBack = fleet.exhausted
     ? describeFirstBack(fleet, now)
     : expected !== undefined

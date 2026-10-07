@@ -12,9 +12,10 @@ import {
 } from '@claude-control/daemon';
 import {
   episodesInWindow,
+  expectedFirstBack,
   formatLocalTime,
-  renderExhaustionBanner,
-  renderExhaustionLog,
+  renderOutageBanner,
+  renderOutages,
 } from './outagesView.js';
 
 // Built from LOCAL components, so the expected strings hold in whatever zone the suite runs.
@@ -80,7 +81,7 @@ describe('formatLocalTime', () => {
   });
 });
 
-describe('renderExhaustionLog', () => {
+describe('renderOutages', () => {
   const closed = start(local(9, 29, 9, 44), {
     switches: [
       {
@@ -101,10 +102,10 @@ describe('renderExhaustionLog', () => {
 
   it('lists newest first: the open outage, then closed ones with how long and how they ended', () => {
     expect(
-      renderExhaustionLog(episodes, {
+      renderOutages(episodes, {
         now: NOW,
         logPath: 'C:\\data\\exhaustion-log.jsonl',
-        open: { id: ongoing.id },
+        open: { id: ongoing.id, expected: { label: 'w2', at: local(10, 1, 16, 20) } },
       }),
     ).toBe(
       [
@@ -145,7 +146,7 @@ describe('renderExhaustionLog', () => {
         },
       ],
     });
-    const text = renderExhaustionLog([{ start: s }], {
+    const text = renderOutages([{ start: s }], {
       now: NOW,
       logPath: 'x',
       open: { id: s.id },
@@ -174,7 +175,7 @@ describe('renderExhaustionLog', () => {
         },
       ],
     });
-    const text = renderExhaustionLog([{ start: s }], {
+    const text = renderOutages([{ start: s }], {
       now: NOW,
       logPath: 'x',
       open: { id: s.id },
@@ -185,13 +186,13 @@ describe('renderExhaustionLog', () => {
 
   it('a start whose end was never written is not "ongoing" when it is not the open outage', () => {
     const orphan = start(local(9, 20, 10, 0));
-    const text = renderExhaustionLog([{ start: orphan }], { now: NOW, logPath: 'x' });
+    const text = renderOutages([{ start: orphan }], { now: NOW, logPath: 'x' });
     expect(text).toContain('Sep 20 10:00 -> end not recorded');
     expect(text).not.toContain('ongoing');
   });
 
   it('an open outage the latest numbers show is over says so, and who is back since when', () => {
-    const text = renderExhaustionLog([{ start: ongoing }], {
+    const text = renderOutages([{ start: ongoing }], {
       now: NOW,
       logPath: 'x',
       open: {
@@ -211,11 +212,14 @@ describe('renderExhaustionLog', () => {
   });
 
   it('says so when nothing is on record, naming the window when one was asked for', () => {
-    expect(renderExhaustionLog([], { now: NOW, logPath: 'x.jsonl' })).toBe(
+    expect(renderOutages([], { now: NOW, logPath: 'x.jsonl' })).toBe(
       'No time on record when every account was out of usage.\nLog: x.jsonl',
     );
-    expect(renderExhaustionLog([], { now: NOW, logPath: 'x.jsonl', days: 7 })).toBe(
+    expect(renderOutages([], { now: NOW, logPath: 'x.jsonl', days: 7 })).toBe(
       'No time on record in the last 7 days when every account was out of usage.\nLog: x.jsonl',
+    );
+    expect(renderOutages([], { now: NOW, logPath: 'x.jsonl', days: 1 })).toContain(
+      'in the last 1 day when',
     );
   });
 });
@@ -240,7 +244,7 @@ describe('episodesInWindow', () => {
   });
 });
 
-describe('renderExhaustionBanner', () => {
+describe('renderOutageBanner', () => {
   const acct = (id: string, limits: LimitInput[], quarantined = false): AccountUsageInput => ({
     accountId: id,
     label: id,
@@ -254,24 +258,24 @@ describe('renderExhaustionBanner', () => {
   );
 
   it('says since when (from the open outage) and when the first account is back', () => {
-    expect(renderExhaustionBanner(out, openEpisodeFrom(start(local(10, 1, 14, 20))), NOW)).toBe(
+    expect(renderOutageBanner(out, openEpisodeFrom(start(local(10, 1, 14, 20))), NOW)).toBe(
       'No account can take work since Oct 1 14:20 (40m). First back: a in 2h. ' +
         'cctl outages lists every time this happened.',
     );
   });
 
   it('without an open outage in the log it still says so, without a since', () => {
-    expect(renderExhaustionBanner(out, undefined, NOW)).toBe(
+    expect(renderOutageBanner(out, undefined, NOW)).toBe(
       'No account can take work. First back: a in 2h. cctl outages lists every time this happened.',
     );
   });
 
+  // The outage's own accounts, with no numbers right now (a poll that came back empty).
+  const unmeasured = assessFleet([acct('a1', []), acct('a2', []), acct('a3', [], true)], NOW);
+
   it('when an account has no numbers right now, the first-back time comes from the outage record', () => {
-    const unmeasured = assessFleet([acct('a', []), acct('q', [], true)], NOW);
     expect(unmeasured.exhausted).toBe(false);
-    expect(
-      renderExhaustionBanner(unmeasured, openEpisodeFrom(start(local(10, 1, 14, 20))), NOW),
-    ).toBe(
+    expect(renderOutageBanner(unmeasured, openEpisodeFrom(start(local(10, 1, 14, 20))), NOW)).toBe(
       'No account can take work since Oct 1 14:20 (40m). First back expected: w2 at Oct 1 16:20. ' +
         'cctl outages lists every time this happened.',
     );
@@ -279,7 +283,6 @@ describe('renderExhaustionBanner', () => {
 
   it('a later walls line moves the expected first-back time with it', () => {
     const s0 = start(local(10, 1, 14, 20));
-    const unmeasured = assessFleet([acct('a', []), acct('q', [], true)], NOW);
     // w2's 5-hour window was due at 16:20; a walls line since says it is out for the week too.
     const open = openEpisodeFrom(s0, [
       {
@@ -298,8 +301,37 @@ describe('renderExhaustionBanner', () => {
       },
     ]);
     // work1 (week, back Oct 2 20:20) is now the first back, not w2.
-    expect(renderExhaustionBanner(unmeasured, open, NOW)).toContain(
+    expect(renderOutageBanner(unmeasured, open, NOW)).toContain(
       'First back expected: work1 at Oct 2 20:20.',
     );
+  });
+});
+
+describe('expectedFirstBack', () => {
+  const s0 = start(local(10, 1, 14, 20));
+  const acct = (id: string): AccountUsageInput => ({
+    accountId: id,
+    label: id,
+    active: false,
+    quarantined: false,
+    limits: [],
+  });
+
+  it('skips a time that has already passed: the next account still ahead is named', () => {
+    // w2 was due back at 16:20 and the outage is still on at 17:00 (its reset moved, or the
+    // numbers say nothing): work1, due Oct 2 20:20, is the one still expected.
+    expect(expectedFirstBack(openEpisodeFrom(s0), local(10, 1, 17, 0))).toEqual({
+      label: 'work1',
+      at: local(10, 2, 20, 20),
+    });
+  });
+
+  it('with the current fleet, an account removed since the outage began is not named', () => {
+    const withoutW2 = assessFleet([acct('a1'), acct('a3')], NOW);
+    expect(expectedFirstBack(openEpisodeFrom(s0), NOW, withoutW2)).toEqual({
+      label: 'work1',
+      at: local(10, 2, 20, 20),
+    });
+    expect(expectedFirstBack(openEpisodeFrom(s0), NOW, assessFleet([], NOW))).toBeUndefined();
   });
 });

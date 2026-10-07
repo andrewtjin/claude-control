@@ -36,19 +36,19 @@ import {
   buildDaemonHookSpecs,
   episodesOf,
   exhaustionLogPath,
-  outageStatus,
+  judgeOutage,
   resumeOpenEpisode,
   readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
   uninstallHooks,
   type OpenEpisode,
+  type OutageJudgement,
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import { DEFAULT_STATS_DAYS } from '@claude-control/shared-protocol';
 import {
-  assessFleet,
   computeOutlook,
   computePlan,
   planWeight,
@@ -60,9 +60,10 @@ import {
 } from '@claude-control/usage-advisor';
 import {
   episodesInWindow,
-  renderExhaustionBanner,
-  renderExhaustionLog,
-  type OpenOutage,
+  expectedFirstBack,
+  renderOutageBanner,
+  renderOutages,
+  type OutageStatus,
 } from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { withCaptureDir } from './captureDir.js';
@@ -381,22 +382,18 @@ export function buildProgram(): Command {
       const nowMs = Date.now();
       const log = exhaustionLog();
       const records = await log.read();
-      const openEpisode = resumeOpenEpisode(records);
-      let open: OpenOutage | undefined;
-      if (openEpisode !== undefined) {
-        open = { id: openEpisode.record.id };
-        // Whether the latest numbers already show it over. Best effort: the history is the
-        // command's job, and an unreadable daemon.db or vault must not stop it from printing.
-        try {
-          const state = await readUsageState(nowMs);
-          const fleet = assessFleet(buildAdvisorInputs(state), nowMs, {
-            countFableCap: (await cliAutoSwitchPolicy()).fableCapTriggers ?? true,
-          });
-          const { recovery } = outageStatus(openEpisode, fleet, nowMs);
-          if (recovery !== undefined) open = { ...open, overBy: recovery };
-        } catch {
-          // Shown as plain "ongoing", which is what the log itself says.
-        }
+      const resumed = resumeOpenEpisode(records);
+      let open: OutageStatus | undefined;
+      if (resumed !== undefined) {
+        // Where it stands by the latest numbers: over, or who is expected back first.
+        const judged = await judgeLatestNumbers(resumed, nowMs);
+        const transition = judged?.transition;
+        const expected = expectedFirstBack(judged?.open ?? resumed, nowMs, judged?.fleet);
+        open = {
+          id: resumed.record.id,
+          ...(transition?.kind === 'end' ? { overBy: transition.recovery } : {}),
+          ...(expected !== undefined ? { expected } : {}),
+        };
       }
       const episodes = episodesInWindow(episodesOf(records), nowMs, days, open?.id);
       if (opts.json === true) {
@@ -408,7 +405,7 @@ export function buildProgram(): Command {
         return;
       }
       process.stdout.write(
-        renderExhaustionLog(episodes, {
+        renderOutages(episodes, {
           now: nowMs,
           logPath: log.path,
           ...(days !== undefined ? { days } : {}),
@@ -1216,9 +1213,15 @@ function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
 async function cliAutoSwitchPolicy(): Promise<AutoSwitchPolicy> {
   const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
   const policy = autoSwitchPolicyOf(resolveDaemonConfig(process.env, {}, fileConfig).values);
-  if ((await readHeartbeat(daemonHeartbeatPath())).state !== 'alive') return policy;
-  const reported = reportedFableCapTrigger(await readSettingsReport(daemonSettingsPath()));
-  return reported === undefined ? policy : { ...policy, fableCapTriggers: reported };
+  try {
+    if ((await readHeartbeat(daemonHeartbeatPath())).state !== 'alive') return policy;
+    const reported = reportedFableCapTrigger(await readSettingsReport(daemonSettingsPath()));
+    return reported === undefined ? policy : { ...policy, fableCapTriggers: reported };
+  } catch {
+    // The running daemon's report only refines the policy; a heartbeat or report that cannot be
+    // read must not stop `usage` or `timeline` from printing.
+    return policy;
+  }
 }
 
 /** The exhaustion log this machine's daemon writes, beside its database. */
@@ -1226,25 +1229,46 @@ function exhaustionLog(): ExhaustionLog {
   return new ExhaustionLog(exhaustionLogPath(dirname(defaultPaths().vaultDir)));
 }
 
+/** The log's open outage judged against the latest numbers the way the daemon judges it
+ *  (`judgeOutage`), or `undefined` when they cannot be read: `cctl outages` prints the history
+ *  either way, and an unreadable daemon.db or vault must not stop it. */
+async function judgeLatestNumbers(
+  open: OpenEpisode,
+  nowMs: number,
+): Promise<OutageJudgement | undefined> {
+  try {
+    const inputs = buildAdvisorInputs(await readUsageState(nowMs));
+    return judgeOutage(inputs, open, nowMs, await cliAutoSwitchPolicy());
+  } catch {
+    return undefined;
+  }
+}
+
 /** The banner `usage` and `timeline` lead with while no account can take work, judged the way
- *  the daemon judges it (`outageStatus`): an outage open in the log stays on until the numbers
+ *  the daemon judges it (`judgeOutage`): an outage open in the log stays on until the numbers
  *  the view prints prove an account is back, so a poll that came back empty does not hide it;
  *  with none open, it is on when no account can take work. A log that cannot be read is treated
- *  as having none open. */
+ *  as having none open, and a banner that cannot be worked out is left off: it leads the view,
+ *  it must never replace it. */
 async function exhaustionBanner(
   inputs: AccountUsageInput[],
   policy: AutoSwitchPolicy,
   nowMs: number,
 ): Promise<string | undefined> {
-  const fleet = assessFleet(inputs, nowMs, { countFableCap: policy.fableCapTriggers ?? true });
   let open: OpenEpisode | undefined;
   try {
     open = resumeOpenEpisode(await exhaustionLog().read());
   } catch {
     open = undefined;
   }
-  if (!outageStatus(open, fleet, nowMs).on) return undefined;
-  return renderExhaustionBanner(fleet, open, nowMs, detectPalette());
+  try {
+    const judged = judgeOutage(inputs, open, nowMs, policy);
+    return judged.on
+      ? renderOutageBanner(judged.fleet, judged.open, nowMs, detectPalette())
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same

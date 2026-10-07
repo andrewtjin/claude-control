@@ -52,40 +52,26 @@ export {
   type WeeklyObservation,
 } from './usageHistory.js';
 
-export {
-  AttributionJournal,
-  type AttributionJournalOptions,
-  type SwitchStep,
-} from './attributionJournal.js';
+export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
 
 export {
-  decideExhaustion,
   episodesOf,
-  EXHAUSTION_LOG_FILE,
   ExhaustionLog,
   exhaustionLogPath,
-  fileWallChanges,
+  judgeOutage,
   openEpisodeFrom,
-  openEpisodeOf,
-  outageStatus,
   recoveryText,
   resumeOpenEpisode,
-  SWITCH_CHAIN_WINDOW_MS,
+  SWITCH_CHAIN_WINDOW_WORDS,
   trackedBackAt,
-  trackOpenEpisode,
   type ExhaustedAccount,
   type ExhaustedRecord,
   type ExhaustionEpisode,
-  type ExhaustionRecord,
   type ExhaustionSwitch,
-  type ExhaustionTransition,
   type OpenEpisode,
+  type OutageJudgement,
   type RecoveredRecord,
   type Recovery,
-  type RecoveryHow,
-  type TrackedAccount,
-  type WallsRecord,
-  WALL_MOVE_MS,
 } from './exhaustionLog.js';
 
 export {

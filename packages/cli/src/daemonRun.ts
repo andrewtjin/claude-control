@@ -181,21 +181,6 @@ export interface ShutdownSequence {
 }
 
 /**
- * Run a clean stop, in the one order that keeps the heartbeat honest.
- *
- * The stop marker is written LAST, after the teardown work and immediately before the flush
- * that puts it on disk. Written first — the obvious place, since the heartbeat is the first
- * thing you want to stop beating — it is a claim about a process that is still very much alive:
- * `daemon.stop()` can take as long as its session-stop bound, and if it hangs outright (a wedged
- * handle, a stuck close) the marker sits there telling `cctl daemon status` the daemon stopped
- * cleanly while this process still holds the instance lock and the receiver's port. Beating a
- * few seconds longer costs nothing; claiming a stop that has not happened sends the next start
- * into a lock fight it was told nothing about.
- *
- * Every step is best-effort: a failure in any one of them must not strand the process before the
- * marker is written, which is precisely the state that would be misreported afterwards.
- */
-/**
  * What the poller's plan (the one the phone renders) is computed under. The policy always goes
  * in: it decides whether the Fable cap counts against an account's headroom, which has to match
  * what auto-switch and the exhaustion log count, or the plan could say "No usable account" while
@@ -214,6 +199,21 @@ export function pollerAdvisorOptions(args: {
   };
 }
 
+/**
+ * Run a clean stop, in the one order that keeps the heartbeat honest.
+ *
+ * The stop marker is written LAST, after the teardown work and immediately before the flush
+ * that puts it on disk. Written first — the obvious place, since the heartbeat is the first
+ * thing you want to stop beating — it is a claim about a process that is still very much alive:
+ * `daemon.stop()` can take as long as its session-stop bound, and if it hangs outright (a wedged
+ * handle, a stuck close) the marker sits there telling `cctl daemon status` the daemon stopped
+ * cleanly while this process still holds the instance lock and the receiver's port. Beating a
+ * few seconds longer costs nothing; claiming a stop that has not happened sends the next start
+ * into a lock fight it was told nothing about.
+ *
+ * Every step is best-effort: a failure in any one of them must not strand the process before the
+ * marker is written, which is precisely the state that would be misreported afterwards.
+ */
 export async function runShutdownSequence(steps: ShutdownSequence): Promise<void> {
   await steps.stopDaemon().catch(() => undefined);
   await steps.removeEndpoint().catch(() => undefined);

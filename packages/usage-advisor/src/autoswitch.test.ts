@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { decideAutoSwitch, hasUsableHeadroom, MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
+import { decideAutoSwitch } from './autoswitch.js';
+import { hasUsableHeadroom, MIN_USABLE_HEADROOM_PCT } from './availability.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 const NOW = Date.parse('2026-07-16T12:00:00.000Z');

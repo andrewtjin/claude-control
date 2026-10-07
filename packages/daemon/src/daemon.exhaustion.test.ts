@@ -6,18 +6,10 @@
 // a write that failed) adds a second outage or a false end.
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import {
-  decode,
-  encode,
-  isType,
-  negotiateVersion,
-  stamp,
-  type Envelope,
-} from '@claude-control/shared-protocol';
+import { isType } from '@claude-control/shared-protocol';
 import { assessFleet, type AutoSwitchPolicy } from '@claude-control/usage-advisor';
 import type {
   ActivateResult,
@@ -32,6 +24,7 @@ import { AttributionJournal } from './attributionJournal.js';
 import { HookReceiver } from './hookReceiver.js';
 import { ControlPlaneClient, type DaemonIdentity } from './controlPlaneClient.js';
 import { Daemon, type SwitchEngineLike } from './daemon.js';
+import { TestRelay, waitFor as waitForWithin } from './testing/sessionDaemonHarness.js';
 import {
   exhaustedRecord,
   ExhaustionLog,
@@ -45,47 +38,9 @@ const H = 60 * 60 * 1000;
 const M = 60 * 1000;
 const iso = (ms: number): string => new Date(ms).toISOString();
 
-/** Collects everything the daemon pushes; answers just enough protocol to come all the way up. */
-class SteadyRelay {
-  private readonly wss = new WebSocketServer({ port: 0 });
-  readonly received: Envelope[] = [];
-
-  constructor() {
-    this.wss.on('connection', (socket: WebSocket) => {
-      socket.on('message', (raw: RawData) => {
-        const decoded = decode(rawToString(raw));
-        if (!decoded.ok) return;
-        this.received.push(decoded.envelope);
-        if (isType(decoded.envelope, 'hello')) {
-          const negotiated = negotiateVersion(decoded.envelope.payload.protocolVersion);
-          socket.send(
-            encode(
-              stamp({
-                daemonId: decoded.envelope.daemonId,
-                type: 'hello.result',
-                payload: {
-                  ok: negotiated !== null,
-                  ...(negotiated !== null ? { negotiatedVersion: negotiated } : {}),
-                },
-              }),
-            ),
-          );
-        } else if (isType(decoded.envelope, 'ping')) {
-          socket.send(
-            encode(stamp({ daemonId: decoded.envelope.daemonId, type: 'pong', payload: {} })),
-          );
-        }
-      });
-    });
-  }
-
-  async listen(): Promise<number> {
-    await new Promise<void>((resolve) => this.wss.once('listening', resolve));
-    const addr = this.wss.address();
-    if (addr === null || typeof addr === 'string') throw new Error('no address');
-    return addr.port;
-  }
-
+/** The shared test relay, read the way these tests need it: the exhaustion cards and the plan
+ *  line the phone received. */
+class CardRelay extends TestRelay {
   /** The exhaustion cards the phone received, in order. */
   cards(): Array<{ type: string; title: string; body: string; level: string }> {
     return this.received.flatMap((e) =>
@@ -111,27 +66,11 @@ class SteadyRelay {
       ? last.payload.plan?.reason
       : undefined;
   }
-
-  async close(): Promise<void> {
-    await new Promise<void>((resolve, reject) =>
-      this.wss.close((err) => (err ? reject(err) : resolve())),
-    );
-  }
 }
 
-function rawToString(raw: RawData): string {
-  if (Array.isArray(raw)) return Buffer.concat(raw).toString('utf8');
-  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString('utf8');
-  return raw.toString('utf8');
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error('timed out waiting for condition');
-    await new Promise((r) => setTimeout(r, 5));
-  }
-}
+/** Wait on work a poll cycle does off a timer or behind a socket round-trip; longer than the
+ *  harness default, as these cycles also read and write the log file. */
+const waitFor = (predicate: () => boolean): Promise<void> => waitForWithin(predicate, 5000);
 
 /** Let anything a cycle sent cross the real socket before asserting that nothing more came. */
 const settle = () => new Promise((r) => setTimeout(r, 60));
@@ -172,7 +111,7 @@ class FlakyLog extends ExhaustionLog {
 
 interface Rig {
   daemon: Daemon;
-  relay: SteadyRelay;
+  relay: CardRelay;
   log: ExhaustionLog;
   lines: string[];
   /** The usage endpoint's answer per account id; mutate between cycles. */
@@ -212,7 +151,7 @@ async function createRig(
     sessionStopOnShutdownMs?: number;
   } = {},
 ): Promise<Rig> {
-  const relay = new SteadyRelay();
+  const relay = new CardRelay();
   const relayPort = await relay.listen();
   const store = new Store(':memory:');
   const vaultDir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-'));
@@ -1084,5 +1023,38 @@ describe('shutdown with a write that never settles', () => {
     const started = Date.now();
     await rig.daemon.stop();
     expect(Date.now() - started).toBeLessThan(3000);
+  });
+});
+
+describe('a shutdown racing a cycle that starts an outage', () => {
+  it('the outage is announced once, however the start write and the shutdown interleave', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'daemon-exhaustion-shared-'));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    const path = join(dir, 'exhaustion-log.jsonl');
+    const log = new HeldLog(path);
+    const rig = await createRig({ log, sessionStopOnShutdownMs: 50 });
+    rig.bodies.set('acct-1', sessionBody(10, T0 + H));
+    rig.bodies.set('acct-2', sessionBody(10, T0 + 2 * H));
+    await startAtT0(rig);
+    // Every account runs out; the start's write is slow, past the shutdown's bound.
+    rig.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    rig.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    let release: () => void = () => {};
+    log.hold = new Promise<void>((r) => (release = r));
+    const inFlight = rig.cycle(T0 + 5 * M).catch(() => {});
+    await waitFor(() => log.entered === 1);
+    await rig.daemon.stop();
+    release();
+    await inFlight;
+    await settle();
+    expect((await log.read()).map((r) => r.event)).toEqual(['exhausted']);
+
+    // The next daemon resumes the filed outage without announcing it again.
+    const second = await createRig({ logPath: () => path, startAt: T0 + 10 * M });
+    second.bodies.set('acct-1', sessionBody(100, T0 + 3 * H));
+    second.bodies.set('acct-2', sessionBody(100, T0 + 4 * H));
+    await startAtT0(second, T0 + 10 * M);
+    await settle();
+    expect(rig.relay.cards().length + second.relay.cards().length).toBe(1);
   });
 });

@@ -20,7 +20,7 @@
 import { isAutoSwitchCandidate } from './autoswitch.js';
 import { MIN_USABLE_HEADROOM_PCT } from './availability.js';
 import { humanizeDuration, roundPct } from './format.js';
-import { effectiveLimits, policyLimits } from './limits.js';
+import { effectiveLimits, policyLimits, type FableCapPolicy } from './limits.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type {
   AccountScore,
@@ -95,7 +95,7 @@ export function computePlan(
     minUsableHeadroomPct: options.minUsableHeadroomPct ?? DEFAULTS.minUsableHeadroomPct,
     // The Fable cap binds headroom exactly when the auto-switch policy counts it, so the plan's
     // "No usable account" and the exhaustion log can never disagree about it.
-    countFableCap: options.autoSwitchPolicy?.fableCapTriggers ?? true,
+    fableCap: options.autoSwitchPolicy ?? {},
   };
 
   const greedy = options.greedyAutoSwitch === true;
@@ -150,7 +150,7 @@ export function computePlan(
   };
 }
 
-type Config = typeof DEFAULTS & { countFableCap: boolean };
+type Config = typeof DEFAULTS & { fableCap: FableCapPolicy };
 
 /** Score one account: headroom, minus a near-cap risk penalty, plus a burn-urgency bonus. */
 function analyze(input: AccountUsageInput, now: number, cfg: Config): Analysis {
@@ -159,7 +159,7 @@ function analyze(input: AccountUsageInput, now: number, cfg: Config): Analysis {
   // just older than the reset), and the Fable cap binds only while the policy counts it: the
   // same limits the shared availability rule reads, so `usable` below is that rule's verdict.
   // With no live limits we optimistically assume full capacity.
-  const live = effectiveLimits(policyLimits(input.limits, cfg.countFableCap), now);
+  const live = effectiveLimits(policyLimits(input.limits, cfg.fableCap), now);
   const headroomPct =
     live.length === 0 ? 100 : Math.min(...live.map((l) => 100 - clampPct(l.percent)));
 

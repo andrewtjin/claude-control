@@ -55,10 +55,6 @@ import { effectiveLimits, LIMIT_NOUN, policyLimits, worstLimit } from './limits.
 import { selectWeeklyBudget } from './weekly.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
-// The "has usage left" rule moved to availability.ts with the fleet-wide check built on it;
-// re-exported here because callers have always found it beside the policy it gates.
-export { hasUsableHeadroom, MIN_USABLE_HEADROOM_PCT } from './availability.js';
-
 /** Knobs governing the auto-switch decision. Defaults live in this module. */
 export interface AutoSwitchPolicy {
   /** The active account is "low" when its worst limit is at/above this percent used. */
@@ -150,9 +146,7 @@ function candidateGate(now: number, policy: AutoSwitchPolicy) {
   // the reason text — never on one side only, or the daemon would hop away from a Fable-capped
   // account and refuse to hop toward an identical one, or justify a hop by a budget it was
   // told to ignore. An account that reports nothing but the cap then reports nothing at all.
-  const countFableCap = policy.fableCapTriggers ?? true;
-  const visibleLimits = (a: AccountUsageInput): LimitInput[] =>
-    policyLimits(a.limits, countFableCap);
+  const visibleLimits = (a: AccountUsageInput): LimitInput[] => policyLimits(a.limits, policy);
   const weeklyResetAt = (a: AccountUsageInput) => weeklyBudget(visibleLimits(a), a, now)?.resetsAt;
   const isCandidate = (a: AccountUsageInput): boolean =>
     !a.active &&

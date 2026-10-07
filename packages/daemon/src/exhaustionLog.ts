@@ -15,22 +15,28 @@
 import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
+  assessFleet,
   describeFirstBack,
   describeUnavailable,
-  humanizeDuration,
+  humanizeElapsed,
   LIMIT_NOUN,
   type AccountAvailability,
+  type AccountUsageInput,
+  type AutoSwitchPolicy,
   type FleetAvailability,
   type LimitInput,
   type UnavailableReason,
 } from '@claude-control/usage-advisor';
 
 /** The log's file name inside the daemon's data directory. */
-export const EXHAUSTION_LOG_FILE = 'exhaustion-log.jsonl';
+const EXHAUSTION_LOG_FILE = 'exhaustion-log.jsonl';
 
 /** How far back the switch chain in an `exhausted` entry reaches: one 5-hour window, the
  *  span over which auto-switch could have walked every account's window. */
 export const SWITCH_CHAIN_WINDOW_MS = 5 * 60 * 60_000;
+
+/** {@link SWITCH_CHAIN_WINDOW_MS} in words, for the card and the CLI. */
+export const SWITCH_CHAIN_WINDOW_WORDS = '5 hours';
 
 /** Where the log lives for a given data directory. Shared by the daemon (writer) and the CLI
  *  (reader), so the two can never look in different places. */
@@ -81,8 +87,11 @@ export interface ExhaustedRecord {
   switches: ExhaustionSwitch[];
 }
 
+/** Every way an account can come back; the reader accepts exactly these. */
+const RECOVERY_HOWS = ['reset', 'headroom', 'relogin', 'new_account'] as const;
+
 /** How the first account came back. */
-export type RecoveryHow = 'reset' | 'headroom' | 'relogin' | 'new_account';
+export type RecoveryHow = (typeof RECOVERY_HOWS)[number];
 
 /** Written when some account can take work again. */
 export interface RecoveredRecord {
@@ -143,13 +152,19 @@ export interface ExhaustionEpisode {
 // left a field out is skipped whole, never half-used. Half-used, it would throw on every poll
 // cycle that judged the episode it describes, and stop `cctl outages` from printing anything.
 
-const LIMIT_KINDS = new Set<string>(['session', 'weekly_all', 'weekly_scoped']);
+// Taken from the exhaustive per-kind table, so a limit kind added there is read here too rather
+// than dropping every line that carries it.
+const LIMIT_KINDS = new Set<string>(Object.keys(LIMIT_NOUN));
 const REASONS = new Set<string>([...LIMIT_KINDS, 'quarantined']);
-const HOWS = new Set<string>(['reset', 'headroom', 'relogin', 'new_account']);
+const HOWS = new Set<string>(RECOVERY_HOWS);
+
+/** The largest magnitude a `Date` can hold: a timestamp past it renders as "NaN". */
+const MAX_TIME_MS = 8.64e15;
 
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 const isNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isTime = (v: unknown): v is number => isNumber(v) && Math.abs(v) <= MAX_TIME_MS;
 const isString = (v: unknown): v is string => typeof v === 'string';
 const optional = (v: unknown, check: (v: unknown) => boolean): boolean =>
   v === undefined || check(v);
@@ -160,7 +175,7 @@ function isLimit(v: unknown): boolean {
     isString(v.kind) &&
     LIMIT_KINDS.has(v.kind) &&
     isNumber(v.percent) &&
-    optional(v.resetsAt, isNumber)
+    optional(v.resetsAt, isTime)
   );
 }
 
@@ -174,14 +189,14 @@ function isExhaustedAccount(v: unknown): boolean {
     Array.isArray(v.spent) &&
     v.spent.every(isLimit) &&
     optional(v.percent, isNumber) &&
-    optional(v.backAt, isNumber)
+    optional(v.backAt, isTime)
   );
 }
 
 function isSwitch(v: unknown): boolean {
   return (
     isObject(v) &&
-    isNumber(v.at) &&
+    isTime(v.at) &&
     (v.from === null || isString(v.from)) &&
     isString(v.to) &&
     optional(v.origin, isString) &&
@@ -191,7 +206,7 @@ function isSwitch(v: unknown): boolean {
 
 /** Narrow one parsed line to a record this build understands (see above). */
 function isRecord(value: unknown): value is ExhaustionRecord {
-  if (!isObject(value) || value.v !== 1 || !isString(value.id) || !isNumber(value.at)) {
+  if (!isObject(value) || value.v !== 1 || !isString(value.id) || !isTime(value.at)) {
     return false;
   }
   if (value.event === 'exhausted') {
@@ -201,7 +216,7 @@ function isRecord(value: unknown): value is ExhaustionRecord {
       Array.isArray(value.switches) &&
       value.switches.every(isSwitch) &&
       (value.active === null || isString(value.active)) &&
-      optional(value.firstBack, (f) => isObject(f) && isString(f.label) && isNumber(f.at))
+      optional(value.firstBack, (f) => isObject(f) && isString(f.label) && isTime(f.at))
     );
   }
   if (value.event === 'walls') {
@@ -213,7 +228,7 @@ function isRecord(value: unknown): value is ExhaustionRecord {
       isObject(account) &&
       isString(account.accountId) &&
       isString(account.label) &&
-      isNumber(value.backSince) &&
+      isTime(value.backSince) &&
       isNumber(value.durationMs) &&
       isString(value.how) &&
       HOWS.has(value.how) &&
@@ -479,19 +494,47 @@ export function trackOpenEpisode(
   return { record: open.record, accounts };
 }
 
-/** Whether an outage is on, judged from the log and one reading the way the daemon judges it: an
- *  open episode stays on until an account is provably back, and with none open it is on when no
- *  account can take work. For the CLI, which has the log (see {@link resumeOpenEpisode}) and the
- *  current numbers. */
-export function outageStatus(
+/** One cycle's verdict on the outage. */
+export interface OutageJudgement {
+  /** The fleet as this reading stands now. */
+  fleet: FleetAvailability;
+  /** The open episode with this reading folded in (see {@link trackOpenEpisode}); `undefined`
+   *  when none was open. */
+  open: OpenEpisode | undefined;
+  transition: ExhaustionTransition;
+  /** Whether an outage is on once the transition is applied. */
+  on: boolean;
+}
+
+/**
+ * Judge the outage from the log's open episode and one reading: whether one starts, the open
+ * one ends, or nothing changes. The daemon acts on it every poll cycle; the CLI judges the same
+ * way from the file and the latest numbers, so the banner and `cctl outages` can never disagree
+ * with what the daemon would record. Whether the Fable cap counts comes from `policy`, exactly
+ * as for auto-switch.
+ *
+ * Resets are the endpoint's times, compared against this machine's clock. A clock stepped ahead
+ * across a reset therefore ends an outage early, and a step back can then start a second one.
+ * No margin is held against that: the poller re-polls an account only every few minutes, so any
+ * margin would delay every real "usage is back" by up to its length, to guard against a step
+ * that has to land within minutes of a reset to matter.
+ */
+export function judgeOutage(
+  inputs: AccountUsageInput[],
   open: OpenEpisode | undefined,
-  fleet: FleetAvailability,
   now: number,
-): { on: boolean; recovery?: Recovery } {
-  if (open === undefined) return { on: fleet.exhausted };
+  policy: Pick<AutoSwitchPolicy, 'fableCapTriggers'>,
+): OutageJudgement {
+  const fleet = assessFleet(inputs, now, policy);
+  if (open === undefined) {
+    const transition = decideExhaustion(undefined, fleet, now);
+    return { fleet, open, transition, on: transition.kind === 'start' };
+  }
+  // This reading refreshes what the episode knows about every account still out before judging
+  // whether any is back.
   const tracked = trackOpenEpisode(open, fleet, now);
   const transition = decideExhaustion(tracked, fleet, now);
-  return transition.kind === 'end' ? { on: false, recovery: transition.recovery } : { on: true };
+  return { fleet, open: tracked, transition, on: transition.kind !== 'end' };
 }
 
 // ---- deciding transitions ----------------------------------------------------------------------
@@ -510,7 +553,8 @@ export type ExhaustionTransition =
   { kind: 'none' } | { kind: 'start' } | { kind: 'end'; recovery: Recovery };
 
 /**
- * Decide whether this cycle starts an episode, ends the open one, or changes nothing.
+ * Decide whether this cycle starts an episode, ends the open one, or changes nothing (the pure
+ * core of {@link judgeOutage}).
  *
  * Starting needs the shared rule to say no account can take work. Ending needs POSITIVE
  * evidence that one can, because the shared rule counts an account with no live numbers as
@@ -578,21 +622,17 @@ function recoveryOf(
   return now.measured ? { ...who, how: 'headroom', backSince: at } : undefined;
 }
 
-/** When every limit the account was last seen out on has reset, and which reset came last;
- *  undefined while any is still ahead or was never known. */
+/** When every limit the account was last seen out on has reset by `now`, and which reset came
+ *  last; undefined while any is still ahead or was never known. */
 function wallResetOf(
   before: TrackedAccount,
   now: number,
 ): { at: number; kind: LimitInput['kind'] } | undefined {
-  if (before.spent.length === 0) return undefined;
-  let last: { at: number; kind: LimitInput['kind'] } | undefined;
-  for (const limit of before.spent) {
-    if (limit.resetsAt === undefined || limit.resetsAt > now) return undefined;
-    if (last === undefined || limit.resetsAt > last.at) {
-      last = { at: limit.resetsAt, kind: limit.kind };
-    }
-  }
-  return last;
+  const at = trackedBackAt(before);
+  if (at === undefined || at > now) return undefined;
+  // trackedBackAt is the latest reset among the walls, so one of them carries it.
+  const last = before.spent.find((l) => l.resetsAt === at) as LimitInput;
+  return { at, kind: last.kind };
 }
 
 // ---- building records ----------------------------------------------------------------------------
@@ -663,7 +703,7 @@ export function recoveredRecord(
   now: number,
 ): RecoveredRecord {
   // Never before the start: a clock stepped back between the two must not yield a negative
-  // outage, and a zero-length one reads "<1m", not "for now".
+  // outage.
   const backSince = Math.max(recovery.backSince, open.at);
   const durationMs = backSince - open.at;
   return {
@@ -674,7 +714,7 @@ export function recoveredRecord(
     time: new Date(now).toISOString(),
     summary:
       `Usage is back: ${recovery.label} (${recoveryText(recovery)}). ` +
-      `No account could take work for ${humanizeDuration(Math.max(durationMs, 1))}.`,
+      `No account could take work for ${humanizeElapsed(durationMs)}.`,
     backSince,
     durationMs,
     account: { accountId: recovery.accountId, label: recovery.label },
@@ -689,7 +729,7 @@ export function exhaustedCardBody(fleet: FleetAvailability, record: ExhaustedRec
   const walk =
     record.switches.length > 0
       ? [
-          `${record.switches.length} switch${record.switches.length === 1 ? '' : 'es'} in the last 5 hours; cctl outages lists them.`,
+          `${record.switches.length} switch${record.switches.length === 1 ? '' : 'es'} in the last ${SWITCH_CHAIN_WINDOW_WORDS}; cctl outages lists them.`,
         ]
       : [];
   return ['No account can take work.', ...lines, describeFirstBack(fleet, record.at), ...walk].join(

@@ -9,11 +9,20 @@ export function effectiveLimits(limits: LimitInput[], now: number): LimitInput[]
   return limits.filter((l) => l.resetsAt === undefined || l.resetsAt > now);
 }
 
+/** The one auto-switch setting that changes which limits count: whether the Fable weekly cap
+ *  does. The auto-switch policy itself satisfies it, so callers pass the policy they run under. */
+export interface FableCapPolicy {
+  /** Whether the Fable weekly cap counts as a limit. Default true. */
+  fableCapTriggers?: boolean;
+}
+
 /** The limits a policy can see: all of them, or all but the Fable weekly cap when that cap is
- *  opted out of auto-switch (`fableCapTriggers: false`). One helper, so auto-switch, the advisor
- *  and the availability rule can never filter the cap differently. */
-export function policyLimits(limits: LimitInput[], countFableCap: boolean): LimitInput[] {
-  return countFableCap ? limits : limits.filter((l) => l.kind !== 'weekly_scoped');
+ *  opted out of auto-switch (`fableCapTriggers: false`). One helper, holding the one default, so
+ *  auto-switch, the advisor and the availability rule can never filter the cap differently. */
+export function policyLimits(limits: LimitInput[], policy: FableCapPolicy = {}): LimitInput[] {
+  return (policy.fableCapTriggers ?? true)
+    ? limits
+    : limits.filter((l) => l.kind !== 'weekly_scoped');
 }
 
 /** How a tie on percent is broken: the widest budget first. Only reached when two live limits

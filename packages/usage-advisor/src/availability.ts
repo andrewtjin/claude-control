@@ -15,7 +15,13 @@
 // this package: the caller supplies the snapshot and the moment.
 
 import { humanizeDuration, roundPct } from './format.js';
-import { effectiveLimits, LIMIT_NOUN, policyLimits, worstLimit } from './limits.js';
+import {
+  effectiveLimits,
+  LIMIT_NOUN,
+  policyLimits,
+  worstLimit,
+  type FableCapPolicy,
+} from './limits.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 /** Headroom BELOW this is "effectively exhausted": a limit more than 98% used is a wall, and
@@ -63,12 +69,9 @@ export interface FleetAvailability {
   firstBack?: { accountId: string; label: string; at: number; predicted: boolean };
 }
 
-export interface AvailabilityOptions {
-  /** Whether the Fable weekly cap counts as a wall. Pass the auto-switch policy's
-   *  `fableCapTriggers`, so the cap counts exactly when auto-switch counts it. Default true,
-   *  as there. */
-  countFableCap?: boolean;
-}
+/** What changes the rule: only whether the Fable weekly cap counts as a wall. Pass the
+ *  auto-switch policy, so the cap counts exactly when auto-switch counts it. */
+export type AvailabilityOptions = FableCapPolicy;
 
 /**
  * Judge one account. Quarantined = out (dead refresh token, unusable regardless of quota). No
@@ -81,7 +84,7 @@ export function assessAccount(
   now: number,
   options: AvailabilityOptions = {},
 ): AccountAvailability {
-  const visible = policyLimits(account.limits, options.countFableCap ?? true);
+  const visible = policyLimits(account.limits, options);
   const live = effectiveLimits(visible, now);
   const binding = worstLimit(visible, now);
   const spent = live.filter((l) => 100 - l.percent < MIN_USABLE_HEADROOM_PCT);

@@ -16,7 +16,7 @@ import {
   openEpisodeFrom,
   exhaustionLogPath,
   openEpisodeOf,
-  outageStatus,
+  judgeOutage,
   fileWallChanges,
   resumeOpenEpisode,
   WALL_MOVE_MS,
@@ -398,6 +398,9 @@ describe('reading the file back', () => {
       { ...good, accounts: [{ ...good.accounts[0], reason: 'tired' }] },
       { ...good, switches: [{ at: 'yesterday', to: 'a' }] },
       { ...good, at: 'noon' },
+      // A number no Date can hold would print as "NaN NaN".
+      { ...good, at: 1e20 },
+      { ...good, firstBack: { ...good.firstBack, at: -1e20 } },
       { v: 1, event: 'recovered', id: good.id, at: T0, account: null, backSince: T0 },
     ];
     await writeFile(log.path, [...broken, good].map((r) => JSON.stringify(r)).join('\n') + '\n');
@@ -468,26 +471,31 @@ describe('an open episode, tracked', () => {
   });
 });
 
-describe('outageStatus (what the CLI shows)', () => {
+describe('judgeOutage (what the daemon acts on and the CLI shows)', () => {
+  const policy = {};
+
   it('with nothing open, the outage is on exactly when no account can take work', () => {
-    const out = assessFleet([acct('a', [session(100, T0 + H)])], T0);
-    const fine = assessFleet([acct('a', [session(10, T0 + H)])], T0);
-    expect(outageStatus(undefined, out, T0)).toEqual({ on: true });
-    expect(outageStatus(undefined, fine, T0)).toEqual({ on: false });
+    const out = judgeOutage([acct('a', [session(100, T0 + H)])], undefined, T0, policy);
+    const fine = judgeOutage([acct('a', [session(10, T0 + H)])], undefined, T0, policy);
+    expect(out).toMatchObject({ on: true, transition: { kind: 'start' } });
+    expect(fine).toMatchObject({ on: false, transition: { kind: 'none' } });
   });
 
   it('an open outage stays on through a reading with no numbers, and ends on proof', () => {
-    const open = exhaustedAtT0();
-    const blind = assessFleet([acct('a'), acct('b', [weekly(100, T0 + 30 * H)])], T0 + 10 * M);
-    expect(outageStatus(openEpisodeFrom(open), blind, T0 + 10 * M)).toEqual({ on: true });
-    const back = assessFleet(
-      [acct('a', [session(5, T0 + 6 * H)]), acct('b', [weekly(100, T0 + 30 * H)])],
-      T0 + 2 * H,
-    );
-    expect(outageStatus(openEpisodeFrom(open), back, T0 + 2 * H)).toMatchObject({
+    const open = openEpisodeFrom(exhaustedAtT0());
+    const blind = [acct('a'), acct('b', [weekly(100, T0 + 30 * H)])];
+    expect(judgeOutage(blind, open, T0 + 10 * M, policy)).toMatchObject({ on: true });
+    const back = [acct('a', [session(5, T0 + 6 * H)]), acct('b', [weekly(100, T0 + 30 * H)])];
+    expect(judgeOutage(back, open, T0 + 2 * H, policy)).toMatchObject({
       on: false,
-      recovery: { label: 'a', how: 'reset', backSince: T0 + H },
+      transition: { kind: 'end', recovery: { label: 'a', how: 'reset', backSince: T0 + H } },
     });
+  });
+
+  it('the Fable cap counts only while the policy counts it', () => {
+    const capped = [acct('a', [{ kind: 'weekly_scoped', percent: 100, resetsAt: T0 + H }])];
+    expect(judgeOutage(capped, undefined, T0, {}).on).toBe(true);
+    expect(judgeOutage(capped, undefined, T0, { fableCapTriggers: false }).on).toBe(false);
   });
 });
 

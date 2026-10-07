@@ -10,6 +10,7 @@ import {
   type StoredAccount,
 } from '@claude-control/switch-engine';
 import { Store } from '@claude-control/daemon';
+import { formatLocalTime } from './outagesView.js';
 import { buildProgram } from './program.js';
 import { CliFailure, reportFatal } from './context.js';
 import { VERSION, type SettingsReport } from './settings.js';
@@ -1294,6 +1295,53 @@ describe('the banner and the plan agree with the running daemon', () => {
     };
     expect(json.open).toMatchObject({ overBy: { label: 'work1', how: 'reset' } });
     expect((await runCli(['usage'])).out).not.toContain(BANNER);
+  });
+
+  it('cctl outages names who is still expected back, not a time that has already passed', async () => {
+    const now = Date.now();
+    // The start expected work1 back 7 hours ago; its window has since been reset and spent again.
+    await seedOpenOutage(now - 10 * H, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now - 8 * H },
+    ]);
+    await seedUsage([
+      {
+        id: 'a1',
+        label: 'work1',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now + 3 * H }],
+      },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now + 4 * H }],
+      },
+    ]);
+    const text = (await runCli(['outages'])).out;
+    expect(text).toContain(
+      `ongoing, 10h so far; first back expected: work1 at ${formatLocalTime(now + 3 * H, now)}`,
+    );
+    expect(text).not.toContain(formatLocalTime(now - 7 * H, now));
+  });
+
+  it('a heartbeat file that holds no object does not stop usage or timeline', async () => {
+    const now = Date.now();
+    await seedUsage([
+      {
+        id: 'a1',
+        label: 'work1',
+        limits: [{ kind: 'session', percent: 10, resetsAt: now + 3 * H }],
+      },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 20, resetsAt: now + 4 * H }],
+      },
+    ]);
+    await writeFile(settingsIo.heartbeatPath, 'null');
+    for (const command of ['usage', 'timeline']) {
+      const r = await runCli([command]);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain('work1');
+    }
   });
 
   it('a report left by a daemon stopped days ago does not overrule the saved Fable-cap opt-out', async () => {
