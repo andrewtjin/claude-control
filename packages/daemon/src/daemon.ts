@@ -9,6 +9,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { stat } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import type {
   ActivateOptions,
   RecoverResult,
@@ -235,10 +236,14 @@ const DEFAULT_POLL_INTERVAL_MS = 60_000;
 /** How many poll cycles the exhaustion log may fail to read on resume before tracking goes on
  *  without it. */
 const EXHAUSTION_READ_ATTEMPTS = 3;
-/** A poll-cycle phase slower than this is logged at warn rather than debug. Deliberately the
- *  loop-lag monitor's own threshold: a phase that outlasts it is, by that monitor's definition,
- *  long enough to be a stall worth naming, so the two never disagree about what counts as slow. */
-const POLL_PHASE_SLOW_MS = LOOP_LAG_THRESHOLD_MS;
+/** A poll-cycle phase whose own synchronous run blocks the event loop this long is logged at
+ *  warn. Deliberately the loop-lag monitor's own threshold: one block past it is, by that
+ *  monitor's definition, a stall, so a phase that warns here is one the monitor also saw. */
+const POLL_PHASE_BLOCK_MS = LOOP_LAG_THRESHOLD_MS;
+/** A phase that only WAITED (the loop was free to serve hooks) is still worth an info line past
+ *  this: a network fetch or file read this slow says something about the host. Well above an
+ *  ordinary usage poll (about half a second), well below anything an operator would miss. */
+const POLL_PHASE_WAIT_MS = 10_000;
 /** One day, the unit every window below is counted in. */
 const DAY_MS = 24 * 60 * 60_000;
 /** How long a usage snapshot is kept before the poll cycle trims it. The poller appends one row
@@ -1064,7 +1069,8 @@ export class Daemon {
   // ---- poll cycle ----
 
   /**
-   * Time one phase of the poll cycle and warn if it alone blocked past the lag threshold.
+   * Time one phase of the poll cycle and warn if its own synchronous run blocked the event loop
+   * past the lag threshold.
    *
    * The loop-lag monitor can only say THAT the loop stalled, never WHERE — which is why the
    * regression it was built for still took a forensic hunt to attribute, and why one multi-second
@@ -1072,20 +1078,40 @@ export class Daemon {
    * long enough to matter: every phase reports its own duration, so the next anomaly names the
    * phase in the log instead of being re-derived from cadence arithmetic after the fact.
    *
-   * Costs two `clock()` reads per phase. Deliberately measures the phase's whole span — awaits
-   * included — rather than only its synchronous part: a phase that is slow for either reason is
-   * worth seeing, and the lag monitor beside it is what distinguishes the two.
+   * Three numbers per phase:
+   *   - `blockedMs`: how long `run()` took to return, i.e. the phase's synchronous part, during
+   *     which nothing else (no hook, no /healthz) could run. The fully synchronous phases (the
+   *     SQLite writes) are all here. Only this one warns: it is the phase's own stall, never a
+   *     neighbor's. Synchronous stretches AFTER the phase's first await are not counted; the
+   *     loop-lag monitor still reports those, unattributed.
+   *   - `elapsedMs`: the whole span, awaits included. A phase that merely waited left the loop
+   *     free; warning on this buried the real stalls under thousands of slow network polls.
+   *   - `loopBusyMs`: how much of the span the whole event loop was busy rather than idle
+   *     (`performance.eventLoopUtilization`), whoever kept it busy. Context, not attribution.
    */
   private async timePhase<T>(phase: string, run: () => Promise<T> | T): Promise<T> {
-    const startedAt = this.clock();
+    // Durations come from the monotonic clock, never `this.clock` (wall time, for timestamps):
+    // a wall-clock correction landing mid-phase would otherwise show up as phase time.
+    const startedAt = performance.now();
+    const utilizationAtStart = performance.eventLoopUtilization();
+    let returnedAt: number | undefined;
     try {
-      return await run();
+      const pending = run();
+      returnedAt = performance.now();
+      return await pending;
     } finally {
-      const elapsedMs = this.clock() - startedAt;
-      if (elapsedMs >= POLL_PHASE_SLOW_MS) {
-        this.logger.warn({ phase, elapsedMs }, 'poll cycle phase ran long');
+      const endedAt = performance.now();
+      // A phase that threw synchronously ran entirely inside the block.
+      const blockedMs = Math.round((returnedAt ?? endedAt) - startedAt);
+      const elapsedMs = Math.round(endedAt - startedAt);
+      const loopBusyMs = Math.round(performance.eventLoopUtilization(utilizationAtStart).active);
+      const fields = { phase, elapsedMs, blockedMs, loopBusyMs };
+      if (blockedMs >= POLL_PHASE_BLOCK_MS) {
+        this.logger.warn(fields, 'poll cycle phase blocked the event loop');
+      } else if (elapsedMs >= POLL_PHASE_WAIT_MS) {
+        this.logger.info(fields, 'poll cycle phase waited long');
       } else {
-        this.logger.debug({ phase, elapsedMs }, 'poll cycle phase');
+        this.logger.debug(fields, 'poll cycle phase');
       }
     }
   }

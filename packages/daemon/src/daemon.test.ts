@@ -2509,14 +2509,19 @@ describe('Daemon lifecycle', () => {
     expect((finished?.obj as { rung?: string }).rung).toBe('hard_stopped');
   });
 
-  it('attributes each poll-cycle phase in the log, and warns on one that runs long', async () => {
+  it('attributes each poll-cycle phase in the log, and warns on one that blocks the loop', async () => {
     // The loop-lag monitor can say THAT the loop stalled but never WHERE — which is why the
     // multi-second stall that motivated this instrumentation was never attributed to a phase.
-    // A phase slower than that monitor's own threshold has to name itself, at warn level.
+    // A phase during which the loop was busy past that monitor's threshold has to name itself.
     const { logger, entries } = capturingLogger();
     const slowJournal = {
-      sync: async () => {
-        await new Promise((r) => setTimeout(r, LOOP_LAG_THRESHOLD_MS + 40));
+      // Synchronous work, as a blocking SQLite commit or sync file write would be.
+      sync: () => {
+        const until = Date.now() + LOOP_LAG_THRESHOLD_MS + 40;
+        while (Date.now() < until) {
+          // spin
+        }
+        return Promise.resolve();
       },
       accountActiveAt: () => null,
     } as unknown as AttributionJournal;
@@ -2534,10 +2539,11 @@ describe('Daemon lifecycle', () => {
     });
     await daemon.start();
 
-    await waitFor(() => entries.some((e) => e.msg === 'poll cycle phase ran long'));
-    const slow = entries.find((e) => e.msg === 'poll cycle phase ran long');
+    const blockedMsg = 'poll cycle phase blocked the event loop';
+    await waitFor(() => entries.some((e) => e.msg === blockedMsg));
+    const slow = entries.find((e) => e.msg === blockedMsg);
     expect((slow?.obj as { phase?: string }).phase).toBe('attributionJournal.sync');
-    expect((slow?.obj as { elapsedMs?: number }).elapsedMs).toBeGreaterThanOrEqual(
+    expect((slow?.obj as { blockedMs?: number }).blockedMs).toBeGreaterThanOrEqual(
       LOOP_LAG_THRESHOLD_MS,
     );
 
@@ -2551,6 +2557,152 @@ describe('Daemon lifecycle', () => {
     );
     expect(timed).toContain('pollAll');
     expect(timed).toContain('readFleetHistory');
+  });
+
+  it('a phase that only waits on I/O does not warn: the loop stayed free to serve hooks', async () => {
+    // The live log had thousands of warnings for phases that were merely awaiting the network,
+    // which buried the stalls that mattered. Waiting is not stalling.
+    const { logger, entries } = capturingLogger();
+    const waitingJournal = {
+      sync: async () => {
+        await new Promise((r) => setTimeout(r, LOOP_LAG_THRESHOLD_MS + 100));
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal: waitingJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+      logger,
+    });
+    await daemon.start();
+    await waitFor(() =>
+      entries.some(
+        (e) =>
+          e.msg === 'poll cycle phase' &&
+          (e.obj as { phase?: string }).phase === 'attributionJournal.sync',
+      ),
+    );
+    const journal = entries.find(
+      (e) =>
+        e.msg === 'poll cycle phase' &&
+        (e.obj as { phase?: string }).phase === 'attributionJournal.sync',
+    );
+    const fields = journal?.obj as { elapsedMs: number; blockedMs: number };
+    expect(fields.elapsedMs).toBeGreaterThanOrEqual(LOOP_LAG_THRESHOLD_MS + 100);
+    expect(fields.blockedMs).toBeLessThan(LOOP_LAG_THRESHOLD_MS);
+    expect(
+      entries.some(
+        (e) =>
+          e.msg === 'poll cycle phase blocked the event loop' &&
+          (e.obj as { phase?: string }).phase === 'attributionJournal.sync',
+      ),
+    ).toBe(false);
+  });
+
+  it('a wall-clock step during a phase is not counted as phase time', async () => {
+    // Phase durations used the wall clock, so a clock correction mid-phase (about +2s every
+    // ~34s on one WSL2 box) inflated whatever phase it landed in. The step must still be in
+    // force when the phase is measured, but the test must not wait on anything clock-based
+    // while it is (its waiting helpers time out by the wall clock), so it waits by event-loop
+    // turns and restores the clock before any clock-based wait.
+    const { logger, entries } = capturingLogger();
+    const realNow = Date.now.bind(Date);
+    let offsetMs = 0;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offsetMs);
+    let phaseDone!: () => void;
+    const done = new Promise<void>((resolve) => (phaseDone = resolve));
+    const steppingJournal = {
+      sync: async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        offsetMs += 60_000;
+        await new Promise((r) => setTimeout(r, 20));
+        phaseDone();
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    try {
+      daemon = new Daemon({
+        store,
+        switchEngine,
+        sessionManager,
+        poller,
+        attributionJournal: steppingJournal,
+        hookReceiver,
+        controlPlaneClient,
+        createAgentSdkClient: () => fakeAgentSdkClient,
+        pollIntervalMs: 100_000,
+        logger,
+      });
+      await daemon.start();
+      await done;
+      // timePhase's finally runs in the microtasks right after the phase resolves; a few
+      // macrotask turns is ample, and none of them reads the clock.
+      for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+      nowSpy.mockRestore();
+      const isJournal = (e: { obj: unknown }) =>
+        (e.obj as { phase?: string }).phase === 'attributionJournal.sync';
+      // Whichever line the phase logged (debug, or "waited long" if the step leaked in).
+      await waitFor(() => entries.some(isJournal));
+      const line = entries.find(isJournal);
+      expect((line?.obj as { elapsedMs: number }).elapsedMs).toBeLessThan(5_000);
+      expect(line?.msg).toBe('poll cycle phase');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('a waiting phase is not blamed for unrelated work that keeps the loop busy meanwhile', async () => {
+    // Hook handling runs while a poll phase awaits the network; whole-loop busy time would pin
+    // that work on the phase. Here a timer burns the loop in short slices (none a stall on its
+    // own) while the journal phase only waits.
+    const { logger, entries } = capturingLogger();
+    const waitingJournal = {
+      sync: async () => {
+        const burner = setInterval(() => {
+          const until = Date.now() + 8;
+          while (Date.now() < until) {
+            // spin
+          }
+        }, 20);
+        await new Promise((r) => setTimeout(r, 600));
+        clearInterval(burner);
+      },
+      accountActiveAt: () => null,
+    } as unknown as AttributionJournal;
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal: waitingJournal,
+      hookReceiver,
+      controlPlaneClient,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+      logger,
+    });
+    await daemon.start();
+    const isJournal = (e: { obj: unknown }) =>
+      (e.obj as { phase?: string }).phase === 'attributionJournal.sync';
+    await waitFor(() => entries.some((e) => isJournal(e) && e.msg === 'poll cycle phase'));
+    const fields = entries.find((e) => isJournal(e) && e.msg === 'poll cycle phase')?.obj as {
+      loopBusyMs: number;
+      blockedMs: number;
+    };
+    // The loop really was busy past the bar during the phase...
+    expect(fields.loopBusyMs).toBeGreaterThanOrEqual(LOOP_LAG_THRESHOLD_MS);
+    // ...but not because of it.
+    expect(fields.blockedMs).toBeLessThan(LOOP_LAG_THRESHOLD_MS);
+    expect(
+      entries.some((e) => isJournal(e) && e.msg === 'poll cycle phase blocked the event loop'),
+    ).toBe(false);
   });
 
   it('session.stop for an unknown session emits an error envelope correlated via relatesTo', async () => {

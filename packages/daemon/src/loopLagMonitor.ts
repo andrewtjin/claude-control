@@ -11,6 +11,11 @@
 // Detection is timer drift: a repeating interval that should fire every `intervalMs` fires
 // late by exactly however long the loop was blocked. Cheap (one timer, no sampling
 // machinery), and the drift measurement IS the stall duration.
+//
+// Drift is measured on a MONOTONIC clock. The wall clock can step: on WSL2 the Hyper-V time
+// sync and systemd-timesyncd both correct the VM clock, and every forward step read as a
+// stall of the step's size (about 2s every ~34s on one box, thousands of phantom stalls a day
+// while the loop sat idle).
 
 /** Options for {@link startLoopLagMonitor}. All injectable for tests. */
 export interface LoopLagMonitorOptions {
@@ -23,6 +28,8 @@ export interface LoopLagMonitorOptions {
   intervalMs?: number;
   /** Floor between reports so a sustained stall logs a heartbeat, not a flood. Default 10s. */
   reportFloorMs?: number;
+  /** Must be monotonic (never steps); a wall clock turns every clock correction into a
+   *  reported stall. Default `performance.now()`. */
   clock?: () => number;
 }
 
@@ -31,7 +38,7 @@ export interface LoopLagMonitorOptions {
  * well below the multi-second stalls that tax hook latency.
  *
  * Exported because the poll cycle's own per-phase timing warns at the same bar (see
- * `POLL_PHASE_SLOW_MS` in daemon.ts). One number, so a phase can never be "slow" by one
+ * `POLL_PHASE_BLOCK_MS` in daemon.ts). One number, so a phase can never be "slow" by one
  * definition and fine by the other — which is exactly the confusion that makes an attributed
  * stall hard to read.
  */
@@ -47,10 +54,12 @@ export function startLoopLagMonitor(options: LoopLagMonitorOptions): () => void 
   const thresholdMs = options.thresholdMs ?? LOOP_LAG_THRESHOLD_MS;
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
   const reportFloorMs = options.reportFloorMs ?? DEFAULT_REPORT_FLOOR_MS;
-  const clock = options.clock ?? Date.now;
+  const clock = options.clock ?? (() => performance.now());
 
   let lastTickAt = clock();
-  let lastReportAt = 0;
+  // Not 0: a monotonic clock counts from process start, and a stall in the first
+  // `reportFloorMs` of the process must still be reported.
+  let lastReportAt = Number.NEGATIVE_INFINITY;
   const timer = setInterval(() => {
     const now = clock();
     const lagMs = now - lastTickAt - intervalMs;
