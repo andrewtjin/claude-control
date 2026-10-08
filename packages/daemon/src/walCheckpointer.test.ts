@@ -188,6 +188,71 @@ describe('Store background checkpoints', () => {
     }
   });
 
+  it('falls back when the worker cannot even be started', () => {
+    const onFailure = vi.fn();
+    const store = new Store(dbPath, {
+      backgroundCheckpoints: {
+        onFailure,
+        start: () => {
+          throw new Error('no threads');
+        },
+      },
+    });
+    try {
+      expect(store.autoCheckpointPages()).toBe(1000);
+      expect(onFailure).toHaveBeenCalledTimes(1);
+      expect((onFailure.mock.calls[0]?.[0] as Error).message).toBe('no threads');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a second failure report is ignored', () => {
+    let failWorker: ((err: Error) => void) | undefined;
+    const onFailure = vi.fn();
+    const store = new Store(dbPath, {
+      backgroundCheckpoints: {
+        onFailure,
+        start: (options: WalCheckpointerOptions) => {
+          failWorker = options.onFailure;
+          return { stop: () => Promise.resolve() };
+        },
+      },
+    });
+    try {
+      failWorker?.(new Error('first'));
+      failWorker?.(new Error('second'));
+      expect(onFailure).toHaveBeenCalledTimes(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('truncates a grown WAL back to 4 MB when it next resets', () => {
+    // A burst between two worker runs can grow the WAL past the 4 MB the automatic checkpoint
+    // used to hold it to; the file must not stay that size.
+    const store = new Store(dbPath, {
+      backgroundCheckpoints: {
+        onFailure: vi.fn(),
+        start: () => ({ stop: () => Promise.resolve() }),
+      },
+    });
+    const checkpointer = new DatabaseSync(dbPath);
+    try {
+      for (let i = 0; i < 1_500; i++) {
+        store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: i, source: 'live', json: ROW });
+      }
+      expect(statSync(`${dbPath}-wal`).size).toBeGreaterThan(8 * 1024 * 1024);
+      // What the worker does, from another connection.
+      checkpointer.prepare('PRAGMA wal_checkpoint(PASSIVE)').get();
+      store.insertUsageSnapshot({ accountId: 'a', fetchedAtMs: 0, source: 'live', json: '{}' });
+      expect(statSync(`${dbPath}-wal`).size).toBeLessThanOrEqual(4 * 1024 * 1024);
+    } finally {
+      checkpointer.close();
+      store.close();
+    }
+  });
+
   it('stops the worker on close, and a failure reported after close is harmless', () => {
     let failWorker: ((err: Error) => void) | undefined;
     const stop = vi.fn(() => Promise.resolve());

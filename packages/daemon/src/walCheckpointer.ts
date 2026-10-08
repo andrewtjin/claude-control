@@ -10,7 +10,10 @@
 // `intervalMs`. PASSIVE never waits for readers or writers, and a WAL writer does not wait for
 // a checkpointer, so main-thread commits keep appending while the copy runs. The owner turns
 // off its own connection's automatic checkpoint while this runs, and turns it back on if the
-// worker fails (see `Store`), so a dead worker can never let the WAL grow without bound.
+// worker dies or fails to start (see `Store`). That covers a worker that ends, not one that
+// hangs: a checkpoint stuck in the kernel goes unnoticed, though a disk stall that long would
+// stop the main thread's own commits too. A failed worker is not restarted; checkpoints stay
+// on the main thread, as before this file, until the daemon restarts.
 //
 // The worker source is inline (`eval`) so the bundle needs no separate file, the same way the
 // DPAPI worker is built.
