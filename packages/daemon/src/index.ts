@@ -7,6 +7,7 @@
 export {
   Store,
   slotBySessionMap,
+  type StoreOptions,
   type UsageSnapshotRow,
   type ActivationIntervalRow,
   type PendingPermissionRow,
