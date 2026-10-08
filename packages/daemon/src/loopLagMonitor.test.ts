@@ -31,6 +31,26 @@ describe('startLoopLagMonitor', () => {
     }
   });
 
+  it('by default, reports a block shorter than half a second', async () => {
+    // With a 500ms tick, a block that started just after a tick and ended before the next one
+    // never delayed it; a 589ms WAL checkpoint went unreported that way.
+    const stalls: number[] = [];
+    // No floor, so a scheduling stall on a loaded box before the block can't use up the one
+    // report and hide it; only the default interval is under test.
+    const stop = startLoopLagMonitor({ onStall: (lagMs) => stalls.push(lagMs), reportFloorMs: 0 });
+    try {
+      // Block soon after a tick, ending well before a 500ms tick would be due.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      blockLoop(400);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      // At least the block minus one default interval (100ms), with a margin for the
+      // millisecond clock the block spins on.
+      expect(Math.max(0, ...stalls)).toBeGreaterThanOrEqual(290);
+    } finally {
+      stop();
+    }
+  });
+
   it('ignores wall-clock steps: an idle loop whose clock jumps forward is not a stall', async () => {
     // Live on WSL2: two time services corrected the VM clock, which stepped about +2s every
     // ~34s while the daemon sat idle in epoll_wait, and every step was logged as a 2s stall.
@@ -92,6 +112,28 @@ describe('startLoopLagMonitor', () => {
     try {
       await new Promise((resolve) => setTimeout(resolve, 300));
       expect(stalls).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
+
+  it('inside the floor, still reports a stall at least twice the largest one so far', async () => {
+    // A short stall used to spend the floor and hide a multi-second one right behind it.
+    const stalls: number[] = [];
+    const stop = startLoopLagMonitor({
+      onStall: (lagMs) => stalls.push(lagMs),
+      intervalMs: 25,
+      thresholdMs: 60,
+      reportFloorMs: 60_000,
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      blockLoop(120);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      blockLoop(600);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(stalls.length).toBe(2);
+      expect(stalls[1]).toBeGreaterThanOrEqual(500);
     } finally {
       stop();
     }

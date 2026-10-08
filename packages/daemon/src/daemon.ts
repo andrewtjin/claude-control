@@ -216,7 +216,8 @@ export interface DaemonOptions {
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
 /** A poll-cycle phase whose own synchronous run blocks the event loop this long is logged at
  *  warn. Deliberately the loop-lag monitor's own threshold: one block past it is, by that
- *  monitor's definition, a stall, so a phase that warns here is one the monitor also saw. */
+ *  monitor's definition, a stall. The monitor can read a block as up to one tick shorter, so a
+ *  phase that only just passes this may warn here without a matching stall line. */
 const POLL_PHASE_BLOCK_MS = LOOP_LAG_THRESHOLD_MS;
 /** A phase that only WAITED (the loop was free to serve hooks) is still worth an info line past
  *  this: a network fetch or file read this slow says something about the host. Well above an
