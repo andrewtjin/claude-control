@@ -9,8 +9,12 @@
 // stall's duration, so "hooks feel slow" becomes a grep instead of a forensic hunt.
 //
 // Detection is timer drift: a repeating interval that should fire every `intervalMs` fires
-// late by exactly however long the loop was blocked. Cheap (one timer, no sampling
-// machinery), and the drift measurement IS the stall duration.
+// late by however much of the block fell after it was due. A block that starts just after a
+// tick shows up as its length minus one interval, so a block shorter than
+// `thresholdMs + intervalMs` can go unreported, and the interval is kept short for that reason:
+// at 500ms, a 589ms WAL checkpoint went unreported. (`monitorEventLoopDelay` is no better:
+// resetting its histogram also forgets its last sample, so a block right after each read is
+// lost.)
 //
 // Drift is measured on a MONOTONIC clock. The wall clock can step: on WSL2 the Hyper-V time
 // sync and systemd-timesyncd both correct the VM clock, and every forward step read as a
@@ -23,8 +27,9 @@ export interface LoopLagMonitorOptions {
   onStall: (lagMs: number) => void;
   /** Drift above this is a stall worth reporting. Defaults to {@link LOOP_LAG_THRESHOLD_MS}. */
   thresholdMs?: number;
-  /** Probe cadence. Default 500ms — a stall shorter than this can still be caught (drift is
-   *  measured against the wall clock), and the idle cost is one timer tick per interval. */
+  /** Probe cadence. Default 50ms: every block longer than `thresholdMs + intervalMs` is
+   *  reported, as at least its length minus one interval. The idle cost is one timer tick per
+   *  interval. */
   intervalMs?: number;
   /** Floor between reports so a sustained stall logs a heartbeat, not a flood. Default 10s. */
   reportFloorMs?: number;
@@ -43,7 +48,7 @@ export interface LoopLagMonitorOptions {
  * stall hard to read.
  */
 export const LOOP_LAG_THRESHOLD_MS = 150;
-const DEFAULT_INTERVAL_MS = 500;
+const DEFAULT_INTERVAL_MS = 50;
 const DEFAULT_REPORT_FLOOR_MS = 10_000;
 
 /**

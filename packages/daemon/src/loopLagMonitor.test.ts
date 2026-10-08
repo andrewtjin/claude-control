@@ -31,6 +31,24 @@ describe('startLoopLagMonitor', () => {
     }
   });
 
+  it('by default, reports a block shorter than half a second', async () => {
+    // With a 500ms tick, a block that started just after a tick and ended before the next one
+    // never delayed it; a 589ms WAL checkpoint went unreported that way.
+    const stalls: number[] = [];
+    const stop = startLoopLagMonitor({ onStall: (lagMs) => stalls.push(lagMs) });
+    try {
+      // Block soon after a tick, ending well before a 500ms tick would be due.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      blockLoop(350);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      expect(stalls.length).toBe(1);
+      // At least the block minus one default interval.
+      expect(stalls[0]).toBeGreaterThanOrEqual(250);
+    } finally {
+      stop();
+    }
+  });
+
   it('ignores wall-clock steps: an idle loop whose clock jumps forward is not a stall', async () => {
     // Live on WSL2: two time services corrected the VM clock, which stepped about +2s every
     // ~34s while the daemon sat idle in epoll_wait, and every step was logged as a 2s stall.

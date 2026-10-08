@@ -6,6 +6,7 @@
 
 export {
   Store,
+  type StoreOptions,
   type UsageSnapshotRow,
   type ActivationIntervalRow,
   type PendingPermissionRow,
