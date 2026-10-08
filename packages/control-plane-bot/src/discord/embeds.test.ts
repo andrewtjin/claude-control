@@ -592,6 +592,78 @@ describe('buildSessionListEmbed', () => {
     const embed = buildSessionListEmbed([]).toJSON();
     expect(embed.description).toMatch(/no sessions/i);
   });
+
+  it('shows the account and folder binding of a group-slot session', () => {
+    const embed = buildSessionListEmbed([
+      { sessionId: 's1', state: 'running', accountId: 'acct-9', slot: 'group:abc' },
+    ]).toJSON();
+    expect(embed.fields?.[0]?.value).toContain('account: acct-9');
+    expect(embed.fields?.[0]?.value).toContain('folder-bound group');
+  });
+
+  it('adds no slot tag for a global session or an older daemon', () => {
+    const global = buildSessionListEmbed([
+      { sessionId: 's1', state: 'running', accountId: 'acct-1', slot: 'global' },
+    ]).toJSON();
+    expect(global.fields?.[0]?.value).not.toContain('folder-bound');
+    // A daemon predating the field renders exactly as before: state (+ summary) only.
+    const old = buildSessionListEmbed([
+      { sessionId: 's1', state: 'running', summary: 'x' },
+    ]).toJSON();
+    expect(old.fields?.[0]?.value).toBe('running — x');
+  });
+});
+
+describe('folder-bound account rendering', () => {
+  it('/usage marks the live member of a folder group and a merely-reserved one', () => {
+    const live = buildUsageEmbed({
+      accounts: [account({ groupId: 'g1', groupLabel: 'C:/research', groupActive: true })],
+    }).toJSON();
+    expect(live.fields?.[0]?.value).toContain('live in C:/research group');
+    const reserved = buildUsageEmbed({
+      accounts: [account({ groupId: 'g1', groupLabel: 'C:/research', groupActive: false })],
+    }).toJSON();
+    expect(reserved.fields?.[0]?.value).toContain('bound: C:/research');
+    expect(reserved.fields?.[0]?.value).not.toContain('live in');
+  });
+
+  it('/accounts shows the binding and renders exactly as before without the fields', () => {
+    const bound = buildAccountsEmbed([
+      account({ groupId: 'g1', groupLabel: 'C:/research', groupActive: true }),
+    ]).toJSON();
+    expect(bound.fields?.[0]?.value).toContain('live in C:/research group');
+    // An older daemon omits the group fields: no binding line at all.
+    const shared = buildAccountsEmbed([account()]).toJSON();
+    expect(shared.fields?.[0]?.value).not.toContain('bound');
+    expect(shared.fields?.[0]?.value).not.toContain('folder');
+  });
+
+  it('escapes an injection label and folder in a field name and value', () => {
+    const embed = buildAccountsEmbed([
+      account({
+        label: '**x** @everyone <@123>',
+        groupId: 'g1',
+        groupLabel: '](https://evil)',
+        groupActive: false,
+      }),
+    ]).toJSON();
+    const name = embed.fields?.[0]?.name ?? '';
+    const value = embed.fields?.[0]?.value ?? '';
+    // The label as a field name is inert: no bold, no live mention.
+    expect(name).not.toContain('**x**');
+    expect(name).not.toContain('@everyone');
+    expect(name).not.toContain('<@123>');
+    // The folder label as a field value cannot splice a link.
+    expect(value).not.toContain('](');
+  });
+
+  it('renders a folder with backticks inert', () => {
+    const embed = buildAccountsEmbed([
+      account({ groupId: 'g1', groupLabel: 'C:/x/`ls`', groupActive: true }),
+    ]).toJSON();
+    // The backticks are escaped, so the folder cannot open a code span in the value.
+    expect(embed.fields?.[0]?.value).toContain('\\`ls\\`');
+  });
 });
 
 describe('buildPermissionRequestEmbed', () => {
@@ -1166,6 +1238,37 @@ describe('session card / summary embeds — table re-rendering', () => {
     const boxLines = description.split('\n').filter((l) => /^[┌│├└]/.test(l));
     expect(boxLines.length).toBeGreaterThan(0);
     for (const line of boxLines) expect(line.length).toBeLessThanOrEqual(40);
+  });
+});
+
+describe('session card slot tag', () => {
+  const base: SessionCardModel = {
+    sessionId: 's1',
+    state: 'running',
+    stopping: false,
+    totalOutputChars: 0,
+    attached: false,
+    hasGap: false,
+    sourceTruncated: false,
+    hadError: false,
+  };
+
+  it('adds a Slot field for a group-slot session on the live and summary cards', () => {
+    const live = buildSessionCardEmbed({ ...base, slot: 'group:abc' }).toJSON();
+    expect(live.fields?.find((f) => f.name === 'Slot')?.value).toBe('folder-bound group');
+    const summary = buildSessionSummaryEmbed({
+      ...base,
+      state: 'done',
+      slot: 'group:abc',
+    }).toJSON();
+    expect(summary.fields?.find((f) => f.name === 'Slot')?.value).toBe('folder-bound group');
+  });
+
+  it('omits the Slot field for a global session or an older daemon', () => {
+    const global = buildSessionCardEmbed({ ...base, slot: 'global' }).toJSON();
+    expect(global.fields?.some((f) => f.name === 'Slot')).toBe(false);
+    const old = buildSessionCardEmbed(base).toJSON();
+    expect(old.fields?.some((f) => f.name === 'Slot')).toBe(false);
   });
 });
 

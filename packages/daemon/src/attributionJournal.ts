@@ -47,9 +47,13 @@ function isAuditEntry(value: unknown): value is AuditEntry {
     typeof v.event === 'string' &&
     (v.fromAccountId === null || typeof v.fromAccountId === 'string') &&
     (v.toAccountId === null || typeof v.toAccountId === 'string') &&
-    (v.origin === undefined || typeof v.origin === 'string')
+    (v.origin === undefined || typeof v.origin === 'string') &&
+    (v.slot === undefined || typeof v.slot === 'string')
   );
 }
+
+/** The slot an activation names, defaulting to the global slot for a pre-slot audit line. */
+const GLOBAL_SLOT = 'global';
 
 /** The subset of the audit log that actually changes which account is live: an `activated`
  *  event with a real target. (`quarantined`/`recovered`/`refresh_adopted` never flip the live
@@ -60,13 +64,20 @@ interface ActivationEvent {
   /** `null` for an entry written before the audit trail carried `origin` — see
    *  `ActivationIntervalRow.origin` (store.ts) for why that stays null rather than a guess. */
   origin: string | null;
+  /** The slot this activation was for; a pre-slot audit line is the global slot. */
+  slot: string;
 }
 
 function toActivationEvents(entries: AuditEntry[]): ActivationEvent[] {
   const events: ActivationEvent[] = [];
   for (const e of entries) {
     if (e.event === 'activated' && e.toAccountId !== null) {
-      events.push({ ts: e.ts, toAccountId: e.toAccountId, origin: e.origin ?? null });
+      events.push({
+        ts: e.ts,
+        toAccountId: e.toAccountId,
+        origin: e.origin ?? null,
+        slot: e.slot ?? GLOBAL_SLOT,
+      });
     }
   }
   // Oldest-first — the order intervals must be derived in.
@@ -80,25 +91,50 @@ interface DerivedInterval {
   startedAtMs: number;
   endedAtMs: number | null;
   origin: string | null;
+  slot: string;
 }
 
-/** Turn the ts-sorted activation list into contiguous, non-overlapping intervals: each
- *  activation opens an interval that the NEXT activation closes. Because `activations` is
- *  sorted ascending, every `endedAtMs` is >= its `startedAtMs`, so intervals never overlap
- *  even if the raw audit log had an out-of-order (clock-skewed) timestamp. */
+/**
+ * Turn the ts-sorted activation list into contiguous, non-overlapping intervals — PER SLOT. Each
+ * slot has its own live account at any instant (the global slot and each group slot switch
+ * independently), so an activation closes only the previous activation OF THE SAME SLOT: a group
+ * hop must not truncate the global account's interval, and vice versa. Within a slot, because the
+ * activations are ts-sorted, every `endedAtMs` is >= its `startedAtMs`, so intervals never overlap
+ * even if the raw audit log had an out-of-order (clock-skewed) timestamp. The combined result is
+ * sorted by (startedAtMs, slot, accountId) so it compares positionally against the store's ordering.
+ */
 function deriveIntervals(activations: ActivationEvent[]): DerivedInterval[] {
-  const intervals: DerivedInterval[] = [];
-  for (let i = 0; i < activations.length; i++) {
-    const activation = activations[i];
-    if (!activation) continue;
-    const next = activations[i + 1];
-    intervals.push({
-      accountId: activation.toAccountId,
-      startedAtMs: activation.ts,
-      endedAtMs: next ? next.ts : null,
-      origin: activation.origin,
-    });
+  // Group the ts-sorted activations by slot, preserving order within each slot.
+  const bySlot = new Map<string, ActivationEvent[]>();
+  for (const activation of activations) {
+    let list = bySlot.get(activation.slot);
+    if (list === undefined) {
+      list = [];
+      bySlot.set(activation.slot, list);
+    }
+    list.push(activation);
   }
+  const intervals: DerivedInterval[] = [];
+  for (const [slot, slotActivations] of bySlot) {
+    for (let i = 0; i < slotActivations.length; i++) {
+      const activation = slotActivations[i];
+      if (!activation) continue;
+      const next = slotActivations[i + 1];
+      intervals.push({
+        accountId: activation.toAccountId,
+        startedAtMs: activation.ts,
+        endedAtMs: next ? next.ts : null,
+        origin: activation.origin,
+        slot,
+      });
+    }
+  }
+  intervals.sort(
+    (a, b) =>
+      a.startedAtMs - b.startedAtMs ||
+      a.slot.localeCompare(b.slot) ||
+      a.accountId.localeCompare(b.accountId),
+  );
   return intervals;
 }
 
@@ -115,7 +151,9 @@ function intervalsEqual(existing: ActivationIntervalRow[], target: DerivedInterv
       e.accountId !== t.accountId ||
       e.startedAtMs !== t.startedAtMs ||
       e.endedAtMs !== t.endedAtMs ||
-      e.origin !== t.origin
+      e.origin !== t.origin ||
+      // A legacy row's NULL slot reads as the global slot, matching the target derived for it.
+      (e.slot ?? GLOBAL_SLOT) !== t.slot
     )
       return false;
   }
@@ -125,6 +163,31 @@ function intervalsEqual(existing: ActivationIntervalRow[], target: DerivedInterv
 export interface AttributionJournalOptions {
   store: Store;
   vaultDir: string;
+}
+
+/** Whether an audit entry moved the live account to another account: every activation, and the
+ *  two crash-recovery outcomes that finish or undo a torn switch ("rolled forward", "rolled
+ *  back"). A recovery that only cleared a record, or found nothing to restore, moved nothing. */
+function movedLiveAccount(e: AuditEntry): e is AuditEntry & { toAccountId: string } {
+  if (e.toAccountId === null) return false;
+  if (e.event === 'activated') return true;
+  return (
+    e.event === 'recovered' &&
+    (e.detail === 'rolled forward' || e.detail === 'rolled back') &&
+    e.toAccountId !== e.fromAccountId
+  );
+}
+
+/** One switch of the live account, as the audit log recorded it. */
+export interface SwitchStep {
+  at: number;
+  fromAccountId: string | null;
+  toAccountId: string;
+  /** Who made it: auto-switch, a CLI or phone switch, or crash recovery. Absent on entries
+   *  written before the audit log carried it. */
+  origin?: string;
+  /** Why, when the caller said (auto-switch always does: which limit fired). */
+  reason?: string;
 }
 
 /**
@@ -158,6 +221,25 @@ export class AttributionJournal {
     const existing = this.store.listActivationIntervals();
     if (intervalsEqual(existing, target)) return; // nothing changed — don't rewrite/churn rows
     this.store.replaceActivationIntervals(target);
+  }
+
+  /** The switches that changed the live account between two moments (inclusive), oldest first,
+   *  with who made each and why — the walk the exhaustion log shows leading up to the moment no
+   *  account was left. Read fresh from the audit log, like {@link sync}: it runs once per
+   *  exhaustion episode, never per cycle. */
+  async switchesBetween(fromMs: number, toMs: number): Promise<SwitchStep[]> {
+    const entries = await readAuditLog(this.vaultDir);
+    return entries
+      .filter(movedLiveAccount)
+      .filter((e) => e.ts >= fromMs && e.ts <= toMs)
+      .sort((a, b) => a.ts - b.ts)
+      .map((e) => ({
+        at: e.ts,
+        fromAccountId: e.fromAccountId,
+        toAccountId: e.toAccountId,
+        ...(e.origin !== undefined ? { origin: e.origin } : {}),
+        ...(e.detail !== undefined ? { reason: e.detail } : {}),
+      }));
   }
 
   /** Which account was live at a given moment, or `null` if none was (before the first

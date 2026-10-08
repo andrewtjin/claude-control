@@ -52,6 +52,9 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   session or the phone connection.
 - **Every limit in one view.** 5-hour, weekly, and per-model limits across all
   accounts at once, with the reset clocks that make them actionable.
+- **A record of every time you ran out.** When every account is spent, the daemon logs
+  when, why each account was out, and the switches that led there, then how long it
+  lasted. `cctl outages` lists them; the phone gets a card at the start and the end.
 - **Approve from anywhere.** Permission prompts, questions, and "done / waiting" notices reach
   your phone; approve or deny from Discord. Send live prompts or start a fresh
   session and watch milestones stream back.
@@ -59,6 +62,11 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   session to finish a turn — which never happens while you're away. Turn on
   `cctl channel enable` and it lands immediately instead, on a session nobody is
   watching. One consent prompt at setup, none afterwards.
+- **Bind a folder to an account.** `cctl bind <folder> <account>` ties a project (and
+  everything under it) to one account or a set — sessions started there run on that
+  account and never spend the one you keep for everything else, while memories, skills,
+  plugins and settings stay shared. A guard catches a session launched on the wrong
+  account before it runs. Windows and Linux; see `docs/CLI.md`.
 
 ## Local-only (no Discord)
 

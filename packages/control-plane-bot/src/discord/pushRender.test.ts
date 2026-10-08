@@ -163,6 +163,35 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(fix?.value).toContain(RELOGIN_COMMAND);
   });
 
+  it('a slot_alert escapes the folder path and account label so they render literally', () => {
+    // The daemon composes the body with a bound folder path and an account label the operator
+    // chose. Both are identifiers, so any markdown they carry is at best noise and at worst an
+    // injection. This body packs the three attack shapes: an underscore-laden path (would
+    // italicize), a masked link (would become a clickable phishing link), and a backtick (would
+    // open a code span). All must survive as literal text.
+    const body =
+      'C:\\ai_research\\my_proj account [click me](https://evil.example) `x` is out of quota until it resets in 3h';
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        title: 'Folder-bound account alert',
+        body,
+        level: 'warn',
+        notificationType: 'slot_alert',
+      }),
+    );
+    const content = push?.content ?? '';
+    // The masked link is defused: its brackets and parens are escaped, so no `[text](url)` remains.
+    expect(content).not.toMatch(/\[[^\]]*\]\([^)]*\)/);
+    expect(content).toContain('\\[click me\\]\\(https://evil.example\\)');
+    // Underscores in the path are escaped, so the path does not italicize.
+    expect(content).toContain('C:\\\\ai\\_research\\\\my\\_proj');
+    // The backtick is escaped, so it cannot open a code span.
+    expect(content).toContain('\\`x\\`');
+    // The title still renders as the bold heading.
+    expect(content.startsWith('**Folder-bound account alert**\n')).toBe(true);
+  });
+
   it('a tool_output notification renders a compact embed with a fenced preview', () => {
     const push = renderPush(
       env('hook.notification', {

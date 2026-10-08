@@ -15,14 +15,19 @@ import { dirname, join } from 'node:path';
 import {
   CadenceError,
   QuarantineError,
+  SharedTokenError,
+  SlotError,
   SwitchEngineError,
+  SwitchFailedError,
   UnknownAccountError,
+  UnsettledSwitchError,
   VaultError,
   buildAuthorizeUrl,
   defaultPaths,
   defaultProtector,
   generatePkce,
   generateState,
+  groupSlotId,
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
@@ -30,13 +35,21 @@ import {
 } from '@claude-control/switch-engine';
 import {
   ControlPlaneClient,
+  ExhaustionLog,
   Store,
   aggregateTokenStats,
   buildDaemonHookSpecs,
+  episodesOf,
+  exhaustionLogPath,
+  judgeOutage,
+  resumeOpenEpisode,
   readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
+  slotBySessionMap,
   uninstallHooks,
+  type OpenEpisode,
+  type OutageJudgement,
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
@@ -49,7 +62,15 @@ import {
   renderPlanSummary,
   timelineInputFromWire,
   type AccountUsageInput,
+  type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
+import {
+  episodesInWindow,
+  expectedFirstBack,
+  renderOutageBanner,
+  renderOutages,
+  type OutageStatus,
+} from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
@@ -94,7 +115,18 @@ import {
   uninstallAutostart,
   type AutostartResult,
 } from './autostart.js';
-import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
+import {
+  colorEnabled,
+  detectPalette,
+  outlookStyle,
+  pacingStyle,
+  sanitizeForTerminal,
+} from './ansi.js';
+import {
+  buildBindCommands,
+  describeSwitchedGroup,
+  renderBindingsAppendix,
+} from './bindCommands.js';
 import {
   renderAccountHeal,
   renderAccountsTable,
@@ -119,8 +151,12 @@ import {
 } from './sessionClient.js';
 import {
   checkAutostart,
+  checkFolderBindings,
   checkLiveLogin,
+  checkPowerShellWrapper,
+  checkVersionSkew,
   probeRelay,
+  readPowerShellWrapperProfile,
   renderDoctor,
   runDoctor,
   summarize,
@@ -156,6 +192,7 @@ import {
   renderSettings,
   renderVersionInfo,
   reportSaysGreedyActive,
+  reportedFableCapTrigger,
   resolveCliSettings,
   resolveDaemonConfig,
   settableSettingsSummary,
@@ -174,6 +211,20 @@ import {
  *  relabelled here, so no listing can show two accounts answering to one name. */
 async function healAccounts(engine: ReturnType<typeof buildEngine>): Promise<void> {
   process.stdout.write(renderAccountHeal(await engine.dedupeAccounts(), detectPalette()));
+}
+
+/** After a `cctl settings set/unset` of CCTL_BIND_ENFORCE, rewrite the guard snapshot so the new
+ *  mode takes effect without waiting for a daemon restart. A no-op (best-effort, never fatal to the
+ *  settings write that already succeeded) for any other setting. buildEngine() resolves the
+ *  just-persisted value, so the rewritten snapshot carries it. */
+async function refreshSnapshotIfBindEnforce(settingName: string): Promise<void> {
+  if (settingName !== 'CCTL_BIND_ENFORCE') return;
+  try {
+    await buildEngine().refreshSnapshot();
+  } catch {
+    // The setting is already persisted; a failed snapshot rewrite heals on the next daemon poll or
+    // bind. Never turn a successful settings change into a command failure over it.
+  }
 }
 
 export function buildProgram(): Command {
@@ -220,9 +271,14 @@ export function buildProgram(): Command {
     outputError: (str, write) => write(paintErrorLine(str, detectPalette(process.stderr))),
   });
 
+  // passThroughOptions on `cctl claude` (see bindCommands.ts) needs positional-options mode on the
+  // program so our --account/--override are parsed before Claude Code's own flags pass through.
+  program.enablePositionalOptions();
+
   buildAccountCommands(program);
   buildSessionCommands(program);
   buildChannelCommands(program);
+  buildBindCommands(program);
 
   program
     .command('switch <ref>')
@@ -230,24 +286,51 @@ export function buildProgram(): Command {
     .option('--force', 'bypass the switch-cadence guard (deliberate override)')
     .action(async (ref: string, opts: { force?: boolean }) => {
       const engine = buildEngine();
-      const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+      // Resolve across the WHOLE registry (shared pool + reserved members) so `cctl switch <member>`
+      // reaches a folder-bound account; activate() routes it to its group slot by membership.
+      const fleet = await engine.listAllAccounts();
+      const resolved = resolveAccountRef(fleet, ref);
       if (!resolved.ok) fail(resolved.message);
+      // The slot the account belonged to when it was resolved. Asserted on the switch, so a bind or
+      // unbind landing in between fails this command instead of switching a slot it never named.
+      const groupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
       try {
         const result = await engine.activate(resolved.account.id, {
           force: Boolean(opts.force),
           origin: 'manual',
+          slot: groupId !== undefined ? groupSlotId(groupId) : 'global',
         });
         const bits = [
           result.wroteCredentials ? 'credentials written' : 'no change',
           result.refreshed ? 'token refreshed' : null,
           result.adoptedPreviousRotation ? 'adopted previous rotation' : null,
         ].filter(Boolean);
-        process.stdout.write(`Activated ${resolved.account.label} (${bits.join(', ')}).\n`);
+        // A reserved account's switch moves its FOLDER group's slot, not the global one — say which.
+        const group = await describeSwitchedGroup(engine, resolved.account.id);
+        const where = group
+          ? ` in the ${sanitizeForTerminal(group.folders.join(', '))} folder group`
+          : '';
+        process.stdout.write(
+          `Activated ${sanitizeForTerminal(resolved.account.label)}${where} (${bits.join(', ')}).\n`,
+        );
       } catch (err) {
         if (err instanceof QuarantineError)
           fail(`${resolved.account.label} is quarantined; re-login required.`);
         if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
         if (err instanceof UnknownAccountError) fail(err.message);
+        if (err instanceof SlotError) {
+          fail(`${err.message}. Nothing was changed - check \`cctl bindings\`.`);
+        }
+        // A switch that failed after it began writing the live login, one an earlier switch still
+        // blocks, or a login stored under two accounts: the engine's message already says what the
+        // live login is now and what to do, in words — it is the whole error line.
+        if (
+          err instanceof SwitchFailedError ||
+          err instanceof UnsettledSwitchError ||
+          err instanceof SharedTokenError
+        ) {
+          fail(err.message);
+        }
         // The token endpoint shedding load is an outage, not a broken account: the engine has
         // already spent its retry budget and checked the status page, so its message is the
         // whole story and this switch simply did not happen. Printed as the CLI's own refusal
@@ -265,6 +348,9 @@ export function buildProgram(): Command {
     .description('recover from an interrupted switch (run at startup)')
     .action(async () => {
       const result = await buildEngine().recover();
+      // Still pending: the engine says where, why and what clears it, so it is the whole error.
+      if (result.action === 'unsettled')
+        fail(result.detail ?? 'an interrupted switch is unsettled');
       process.stdout.write(
         result.recovered
           ? `Recovered: ${result.action}${result.detail ? ` - ${result.detail}` : ''}.\n`
@@ -302,7 +388,9 @@ export function buildProgram(): Command {
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
-      process.stdout.write(text + '\n');
+      text += await renderBindingsAppendix(buildEngine(), detectPalette());
+      const banner = await exhaustionBanner(inputs, await cliAutoSwitchPolicy(), nowMs);
+      process.stdout.write((banner !== undefined ? `${banner}\n\n` : '') + text + '\n');
     });
 
   program
@@ -314,7 +402,11 @@ export function buildProgram(): Command {
       const state = await readUsageState(nowMs);
       const inputs = buildAdvisorInputs(state);
       const outlook = computeOutlook(inputs, nowMs);
-      let text = renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
+      const autoSwitchPolicy = await cliAutoSwitchPolicy();
+      const banner = await exhaustionBanner(inputs, autoSwitchPolicy, nowMs);
+      let text =
+        (banner !== undefined ? `${banner}\n\n` : '') +
+        renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
       // The burn-down plan turns the timeline into advice: what to burn first and what to
       // hold. When the last-started daemon runs greedy auto-switch, the advice matches its
       // descriptive phrasing (the daemon executes the plan; the user doesn't have to) and its
@@ -324,20 +416,74 @@ export function buildProgram(): Command {
       // live solely in some other shell's environment could judge differently.
       if (inputs.length > 0) {
         const greedy = reportSaysGreedyActive(await readSettingsReport(daemonSettingsPath()));
-        const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
-        const autoSwitchPolicy = autoSwitchPolicyOf(
-          resolveDaemonConfig(process.env, {}, fileConfig).values,
-        );
         text +=
           '\n\n' +
           renderPlanSummary(
-            computePlan(inputs, greedy ? { greedyAutoSwitch: true, autoSwitchPolicy } : {}),
+            // The policy goes in either way: whether the Fable cap counts against headroom has to
+            // match the banner above, or the plan could say "No usable account" beside no banner.
+            computePlan(inputs, {
+              autoSwitchPolicy,
+              ...(greedy ? { greedyAutoSwitch: true } : {}),
+            }),
           );
         text +=
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       process.stdout.write(text + '\n');
+    });
+
+  // The history of the fleet's worst failure: every time no account could take work, written by
+  // the daemon (see the daemon's exhaustionLog.ts). Works with the daemon stopped: the file is
+  // the history, and an outage still open in it is checked against the latest numbers in
+  // daemon.db, so one that is over but that no running daemon has closed says so.
+  program
+    .command('outages')
+    .description(
+      'every time no account could take work: when, for how long, why, and the switches before it',
+    )
+    .option('--days <n>', 'only the times that started in the last <n> days')
+    .option('--json', 'print the times as JSON, newest first')
+    .action(async (opts: { days?: string; json?: boolean }) => {
+      let days: number | undefined;
+      if (opts.days !== undefined) {
+        days = Number(opts.days);
+        if (!Number.isFinite(days) || days <= 0) fail('--days must be a positive number.');
+      }
+      const nowMs = Date.now();
+      const log = exhaustionLog();
+      const records = await log.read();
+      const resumed = resumeOpenEpisode(records);
+      let open: OutageStatus | undefined;
+      if (resumed !== undefined) {
+        // Where it stands by the latest numbers: over, or who is expected back first.
+        const judged = await judgeLatestNumbers(resumed, nowMs);
+        const transition = judged?.transition;
+        const expected = expectedFirstBack(judged?.open ?? resumed, nowMs, judged?.fleet);
+        open = {
+          id: resumed.record.id,
+          ...(transition?.kind === 'end' ? { overBy: transition.recovery } : {}),
+          ...(expected !== undefined ? { expected } : {}),
+        };
+      }
+      const episodes = episodesInWindow(episodesOf(records), nowMs, days, open?.id);
+      if (opts.json === true) {
+        const newestFirst = [...episodes].reverse();
+        process.stdout.write(
+          JSON.stringify({ log: log.path, open: open ?? null, episodes: newestFirst }, null, 2) +
+            '\n',
+        );
+        return;
+      }
+      process.stdout.write(
+        renderOutages(episodes, {
+          now: nowMs,
+          logPath: log.path,
+          ...(days !== undefined ? { days } : {}),
+          ...(open !== undefined ? { open } : {}),
+          palette: detectPalette(),
+        }) + '\n',
+      );
     });
 
   // `usage`/`timeline` answer "how much of my LIMIT is gone" (a percent from Anthropic's
@@ -371,8 +517,11 @@ export function buildProgram(): Command {
       // unattributed bucket (which the renderer shows rather than hides).
       const store = new Store(daemonDbPath(paths));
       let intervals;
+      let slotBySession;
       try {
         intervals = store.listActivationIntervals();
+        // Folder-bound sessions attribute against their group slot's timeline, not the global one.
+        slotBySession = slotBySessionMap(store.listSessions());
       } finally {
         store.close();
       }
@@ -383,6 +532,7 @@ export function buildProgram(): Command {
         windowStartMs,
         windowEndMs,
         labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
+        slotBySession,
       });
       process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });
@@ -458,6 +608,11 @@ export function buildProgram(): Command {
       } catch (err) {
         fail(err instanceof Error ? err.message : String(err));
       }
+      // The guard reads its enforce mode from a snapshot, not config.json — so a change to
+      // CCTL_BIND_ENFORCE only takes effect once the snapshot is rewritten. Do it now (the engine
+      // resolves the just-persisted value) so a running session sees the new mode without waiting
+      // for a daemon restart.
+      await refreshSnapshotIfBindEnforce(setting.name);
       process.stdout.write(renderSettingSaved(setting, checked.value, filePath, detectPalette()));
     });
 
@@ -474,6 +629,9 @@ export function buildProgram(): Command {
       } catch (err) {
         fail(err instanceof Error ? err.message : String(err));
       }
+      // Unsetting CCTL_BIND_ENFORCE returns the guard to its default mode — rewrite the snapshot so
+      // that takes effect immediately (see the `set` path).
+      await refreshSnapshotIfBindEnforce(setting.name);
       process.stdout.write(renderSettingForgotten(setting, filePath, removed, detectPalette()));
     });
 
@@ -493,7 +651,24 @@ export function buildProgram(): Command {
     .command('doctor')
     .description('check the local environment')
     .action(async () => {
-      const checks = [...(await runDoctor(defaultPaths())), checkAutostart(readAutostartState())];
+      const paths = defaultPaths();
+      const engine = buildEngine(paths);
+      const checks = [...(await runDoctor(paths)), checkAutostart(readAutostartState())];
+      // Folder-bound-account checks (slot invariants, guard snapshot freshness, guard hook presence)
+      // and CLI/daemon build skew — appended so the base environment report stays unchanged. The
+      // binding checks report an unreadable groups.json as one failed check rather than throwing.
+      const report = await readSettingsReport(daemonSettingsPath());
+      const heartbeat = await readHeartbeat(daemonHeartbeatPath());
+      const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
+      checks.push(
+        ...(await checkFolderBindings(engine, paths)),
+        checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
+      );
+      // Windows only: flag a PowerShell `claude` wrapper whose embedded node/cctl paths have gone
+      // stale (a node upgrade/move or cctl reinstall), which otherwise fails with a cryptic error.
+      if (process.platform === 'win32') {
+        checks.push(checkPowerShellWrapper(readPowerShellWrapperProfile()));
+      }
       process.stdout.write(renderDoctor(checks, detectPalette()) + '\n');
       const { passed, failed } = summarize(checks);
       process.stdout.write(`\n${passed} ok, ${failed} to look at.\n`);
@@ -1129,6 +1304,73 @@ function buildAdvisorInputs(state: UsageState): AccountUsageInput[] {
   );
 }
 
+/** The auto-switch policy to judge usage by: the thresholds a daemon started from this shell
+ *  would run under (this shell's environment over config.json, the way `cctl settings` previews
+ *  them), except whether the Fable cap counts, which comes from the running daemon's report while
+ *  its heartbeat says it is alive. The banner and the plan say whether that daemon counts an
+ *  outage, and a setting saved since it started only reaches it on its next start; a report left
+ *  by a daemon that is no longer running says nothing about the next one. */
+async function cliAutoSwitchPolicy(): Promise<AutoSwitchPolicy> {
+  const fileConfig = (await readDaemonConfigFile(daemonConfigPath())) ?? {};
+  const policy = autoSwitchPolicyOf(resolveDaemonConfig(process.env, {}, fileConfig).values);
+  try {
+    if ((await readHeartbeat(daemonHeartbeatPath())).state !== 'alive') return policy;
+    const reported = reportedFableCapTrigger(await readSettingsReport(daemonSettingsPath()));
+    return reported === undefined ? policy : { ...policy, fableCapTriggers: reported };
+  } catch {
+    // The running daemon's report only refines the policy; a heartbeat or report that cannot be
+    // read must not stop `usage` or `timeline` from printing.
+    return policy;
+  }
+}
+
+/** The exhaustion log this machine's daemon writes, beside its database. */
+function exhaustionLog(): ExhaustionLog {
+  return new ExhaustionLog(exhaustionLogPath(dirname(defaultPaths().vaultDir)));
+}
+
+/** The log's open outage judged against the latest numbers the way the daemon judges it
+ *  (`judgeOutage`), or `undefined` when they cannot be read: `cctl outages` prints the history
+ *  either way, and an unreadable daemon.db or vault must not stop it. */
+async function judgeLatestNumbers(
+  open: OpenEpisode,
+  nowMs: number,
+): Promise<OutageJudgement | undefined> {
+  try {
+    const inputs = buildAdvisorInputs(await readUsageState(nowMs));
+    return judgeOutage(inputs, open, nowMs, await cliAutoSwitchPolicy());
+  } catch {
+    return undefined;
+  }
+}
+
+/** The banner `usage` and `timeline` lead with while no account can take work, judged the way
+ *  the daemon judges it (`judgeOutage`): an outage open in the log stays on until the numbers
+ *  the view prints prove an account is back, so a poll that came back empty does not hide it;
+ *  with none open, it is on when no account can take work. A log that cannot be read is treated
+ *  as having none open, and a banner that cannot be worked out is left off: it leads the view,
+ *  it must never replace it. */
+async function exhaustionBanner(
+  inputs: AccountUsageInput[],
+  policy: AutoSwitchPolicy,
+  nowMs: number,
+): Promise<string | undefined> {
+  let open: OpenEpisode | undefined;
+  try {
+    open = resumeOpenEpisode(await exhaustionLog().read());
+  } catch {
+    open = undefined;
+  }
+  try {
+    const judged = judgeOutage(inputs, open, nowMs, policy);
+    return judged.on
+      ? renderOutageBanner(judged.fleet, judged.open, nowMs, detectPalette())
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same
  *  present-or-absent contract `timelineInputFromWire` relies on to tell a real 1x Pro account
  *  from one whose tier nothing could read. */
@@ -1200,7 +1442,10 @@ async function addFreshAccount(label: string): Promise<void> {
  */
 async function reloginAccount(ref: string): Promise<void> {
   const engine = buildEngine();
-  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  // Resolve against the WHOLE fleet, reserved (folder-bound) members included: a re-login must reach
+  // exactly the accounts binding reserves, whose ids/labels live in the group registry, not the
+  // shared-only account list. The engine then heals the slot the account is actually live in.
+  const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
   if (!resolved.ok) fail(resolved.message);
   const account = resolved.account;
 
@@ -1269,7 +1514,10 @@ async function reloginAccount(ref: string): Promise<void> {
  */
 async function reauthAccount(ref: string): Promise<void> {
   const engine = buildEngine();
-  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  // Resolve against the WHOLE fleet, reserved (folder-bound) members included: the headless reauth
+  // path must reach exactly the accounts binding reserves, whose ids/labels live in the group
+  // registry, not the shared-only account list. The engine then heals the slot the account is live in.
+  const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
   if (!resolved.ok) fail(resolved.message);
   const account = resolved.account;
 
@@ -1339,7 +1587,11 @@ async function reauthAccount(ref: string): Promise<void> {
  */
 async function setExclusion(ref: string, excluded: boolean): Promise<void> {
   const engine = buildEngine();
-  const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+  // Resolve against the WHOLE fleet, reserved (folder-bound) members included: a row-level mutation
+  // must reach exactly the accounts binding reserves, whose ids/labels live in the group registry, not
+  // the shared-only pool. The engine routes the write to the file that holds the row (groups.json for a
+  // reserved member). Same resolution as relogin/reauth.
+  const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
   if (!resolved.ok) fail(resolved.message);
   const already = resolved.account.autoSwitchExcluded === true;
   if (already === excluded) {
@@ -1380,7 +1632,12 @@ function buildAccountCommands(program: Command): void {
       await healAccounts(engine);
       await engine.backfillAccountMetadata();
       const [list, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
-      process.stdout.write(renderAccountsTable(list, activeId, detectPalette()) + '\n');
+      const palette = detectPalette();
+      process.stdout.write(
+        renderAccountsTable(list, activeId, palette) +
+          (await renderBindingsAppendix(engine, palette)) +
+          '\n',
+      );
     });
 
   accounts
@@ -1399,9 +1656,17 @@ function buildAccountCommands(program: Command): void {
         const account = await buildEngine().captureCurrentLogin(label);
         process.stdout.write(`Added ${account.label} (${account.id}) and set it active.\n`);
       } catch (err) {
-        // A refused duplicate (label or login already stored) is the vault's own message;
-        // anything else is the capture finding no login to store.
+        // A refused duplicate (label or login already stored) is the vault's own message.
         if (err instanceof VaultError) fail(err.message);
+        // Run inside a group profile, capture reads a folder-bound account's live seat — never a
+        // fresh login to store. Surface the engine's own guidance instead of the no-login message.
+        if (err instanceof SwitchEngineError && err.code === 'capture_in_profile') {
+          fail(
+            `${err.message}. Onboard a new account from a normal (non-folder-bound) shell, ` +
+              `or use: cctl accounts add <label> --fresh.`,
+          );
+        }
+        // Anything else is the capture finding no login to store.
         fail('no live login to capture. Run `claude` and log in first, then retry.');
       }
     });
@@ -1443,7 +1708,9 @@ function buildAccountCommands(program: Command): void {
     .description('remove a stored account by id or label')
     .action(async (ref: string) => {
       const engine = buildEngine();
-      const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+      // Resolve across the WHOLE fleet so a reserved (folder-bound) member is reachable by id or
+      // label; removeAccount drops it from its group (dissolving a group left memberless).
+      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
       await engine.removeAccount(resolved.account.id);
       process.stdout.write(`Removed ${resolved.account.label}.\n`);
@@ -1455,7 +1722,9 @@ function buildAccountCommands(program: Command): void {
     .description('give a stored account a new label (its id and usage history are unchanged)')
     .action(async (ref: string, newLabel: string) => {
       const engine = buildEngine();
-      const resolved = resolveAccountRef(await engine.listAccounts(), ref);
+      // Resolve across the WHOLE fleet so a reserved (folder-bound) member is reachable by id or
+      // label; renameAccount asserts label uniqueness across all rows and writes the file holding it.
+      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
       // Answered here rather than written: nothing would change, so nothing should be saved or
       // reported as a rename.

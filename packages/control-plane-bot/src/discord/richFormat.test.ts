@@ -3,6 +3,7 @@ import {
   accountMarker,
   discordRelative,
   emojiTrack,
+  escapeDiscordMarkdown,
   EMBED_DESCRIPTION_LIMIT,
   layeredBar,
   NOTIFICATION_COLOR,
@@ -226,5 +227,55 @@ describe('truncateLabeled', () => {
   it('stays within the real embed description ceiling for a huge message', () => {
     const out = truncateLabeled('x'.repeat(10_000), EMBED_DESCRIPTION_LIMIT);
     expect(out.length).toBeLessThanOrEqual(EMBED_DESCRIPTION_LIMIT);
+  });
+});
+
+describe('escapeDiscordMarkdown', () => {
+  it('leaves an ordinary label untouched', () => {
+    expect(escapeDiscordMarkdown('Work')).toBe('Work');
+    expect(escapeDiscordMarkdown('jina25')).toBe('jina25');
+  });
+
+  it('keeps a mid-word hyphen clean (no stray backslash)', () => {
+    // `-` is only markup at the start of a line, so a hyphenated label or a Max tier reads as
+    // typed — escaping every `-` would leave a visible backslash on the phone.
+    expect(escapeDiscordMarkdown('max-20x')).toBe('max-20x');
+    expect(escapeDiscordMarkdown('team-alpha-2')).toBe('team-alpha-2');
+  });
+
+  it('escapes a leading heading or bullet marker only at the start', () => {
+    expect(escapeDiscordMarkdown('# top')).toBe('\\# top');
+    expect(escapeDiscordMarkdown('- item')).toBe('\\- item');
+    // Not mid-string.
+    expect(escapeDiscordMarkdown('a # b')).toBe('a # b');
+  });
+
+  it('renders a link-injection label inert', () => {
+    const out = escapeDiscordMarkdown('](https://evil)');
+    expect(out).not.toContain('](');
+    expect(out).toBe('\\]\\(https://evil\\)');
+  });
+
+  it('renders bold/emphasis markers inert', () => {
+    expect(escapeDiscordMarkdown('**x**')).toBe('\\*\\*x\\*\\*');
+    expect(escapeDiscordMarkdown('_u_ ~s~ |sp|')).toBe('\\_u\\_ \\~s\\~ \\|sp\\|');
+  });
+
+  it('neutralizes every mention form without pinging', () => {
+    const out = escapeDiscordMarkdown('**x** @everyone <@123>');
+    // The visible text is preserved but the mention triggers are broken by a zero-width space.
+    expect(out).not.toContain('@everyone');
+    expect(out).not.toContain('<@123>');
+    expect(out).toContain('@\u200beveryone');
+    expect(out).toContain('@\u200b123');
+  });
+
+  it('escapes backticks so a folder cannot break out of a code fence', () => {
+    expect(escapeDiscordMarkdown('C:\\code\\`ls`')).toBe('C:\\\\code\\\\\\`ls\\`');
+  });
+
+  it('collapses newlines so a label cannot inject its own lines', () => {
+    expect(escapeDiscordMarkdown('a\nb')).toBe('a b');
+    expect(escapeDiscordMarkdown('a\r\nb')).toBe('a b');
   });
 });

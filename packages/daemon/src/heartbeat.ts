@@ -145,6 +145,8 @@ export async function readHeartbeat(
   } catch {
     return { state: 'never' };
   }
+  // Valid JSON is not necessarily an object: a file holding `null` would throw below.
+  if (typeof parsed !== 'object' || parsed === null) return { state: 'never' };
   const { writtenAtMs, stoppedAtMs } = parsed as Partial<HeartbeatFile>;
   if (typeof writtenAtMs !== 'number') return { state: 'never' };
   if (typeof stoppedAtMs === 'number') {

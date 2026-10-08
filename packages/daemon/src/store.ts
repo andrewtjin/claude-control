@@ -14,6 +14,11 @@ import { DatabaseSync } from 'node:sqlite';
 // reverse import does not exist — `usageHistory` reaches the store through a structural interface
 // — so there is no cycle.
 import { extractWeeklyReading } from './usageHistory.js';
+import {
+  startWalCheckpointer,
+  type WalCheckpointer,
+  type WalCheckpointerOptions,
+} from './walCheckpointer.js';
 
 // ---------------------------------------------------------------------------
 // Row shapes
@@ -70,6 +75,11 @@ export interface ActivationIntervalRow {
    *  from an audit line written before the field existed. Denormalized from the audit log by
    *  {@link AttributionJournal.sync}, same as every other column here. */
   origin: string | null;
+  /** The slot this interval belongs to — `'global'` or `'group:<id>'`. `null` for a row derived from
+   *  an audit line written before the slot field existed, which reads as the global slot. Attribution
+   *  keys one timeline per slot off this so a folder-bound group's turns join against the member live
+   *  in THAT slot. Denormalized from the audit log by {@link AttributionJournal.sync}. */
+  slot: string | null;
 }
 
 export interface PendingPermissionRow {
@@ -114,9 +124,25 @@ export interface SessionRow {
   kind: string;
   state: string;
   accountId: string | null;
+  /** The slot the session runs in: `'global'` or `'group:<id>'` for a folder-bound group. NULL for
+   *  a row written before slots existed, which reads the same as global. Optional on write (an
+   *  omitted value persists as NULL, i.e. global); always populated on read. Display-only, like the
+   *  rest of this table. */
+  slot?: string | null;
   /** Serialized `SessionRecord` — the store never parses it, callers own that shape. */
   json: string;
   updatedAtMs: number;
+}
+
+/** Map recorded sessions to their slot for attribution — only the folder-bound ones. A `'global'`
+ *  or NULL slot is omitted: it is the default an absent entry already means, so the map stays small
+ *  and the aggregator's "unknown session → global" fallback covers it. Pure. */
+export function slotBySessionMap(rows: readonly SessionRow[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const row of rows) {
+    if (row.slot != null && row.slot !== 'global') map.set(row.id, row.slot);
+  }
+  return map;
 }
 
 export interface OutboxRow {
@@ -202,17 +228,101 @@ function optionalNumber(row: Record<string, unknown>, col: string): number | nul
 // Store
 // ---------------------------------------------------------------------------
 
+/** Options for {@link Store}. */
+export interface StoreOptions {
+  /**
+   * Run WAL checkpoints on a worker thread instead of inside whichever main-thread commit
+   * crosses the automatic threshold (see `walCheckpointer.ts`). The daemon sets this; a
+   * one-shot CLI reader has no event loop worth protecting and doesn't. Ignored for
+   * `:memory:`, which has no WAL.
+   */
+  backgroundCheckpoints?: {
+    /** Told once when the worker fails; checkpoints are back on this connection by then. */
+    onFailure: (err: Error) => void;
+    /** Checkpoint cadence; see {@link WalCheckpointerOptions.intervalMs}. */
+    intervalMs?: number;
+    /** Starts the checkpointer. Injectable so tests can fail it. */
+    start?: (options: WalCheckpointerOptions) => WalCheckpointer;
+  };
+}
+
+/**
+ * The WAL file's size after it resets, in bytes. With the automatic checkpoint on, the commit
+ * that crossed 1000 pages checkpointed at once, so the file stopped near 4 MB. A checkpoint
+ * on another thread can't promise that (a burst between two runs, or a commit landing during
+ * one, lets the WAL keep growing), so the main connection truncates it back to the same size
+ * when it next resets. SQLite applies this on the connection that resets the WAL, which is
+ * the writer here, never the checkpointer.
+ */
+const WAL_SIZE_LIMIT_BYTES = 4 * 1024 * 1024;
+
 export class Store {
   private readonly db: DatabaseSync;
+  private checkpointer: WalCheckpointer | undefined;
+  private closed = false;
 
   /** `path` is injectable so tests use `:memory:`; production passes a real file path. */
-  constructor(path: string) {
+  constructor(path: string, options: StoreOptions = {}) {
     this.db = new DatabaseSync(path);
-    this.migrate();
+    try {
+      this.migrate();
+    } catch (err) {
+      // A file that is not a database (or not one this build can migrate) fails here; the handle
+      // must not outlive the failure, or on Windows the file can be neither replaced nor deleted
+      // until the process exits.
+      this.db.close();
+      throw err;
+    }
+    const background = options.backgroundCheckpoints;
+    if (background && path !== ':memory:') this.startBackgroundCheckpoints(path, background);
+  }
+
+  /**
+   * Hand checkpoints to the worker. The automatic checkpoint goes off before the worker
+   * starts, so no main-thread commit checkpoints from here on, and every failure, including
+   * one in starting the worker, turns it back on before anyone is told, so the WAL never
+   * grows with no checkpointer at all.
+   */
+  private startBackgroundCheckpoints(
+    path: string,
+    background: NonNullable<StoreOptions['backgroundCheckpoints']>,
+  ): void {
+    const restorePages = this.autoCheckpointPages();
+    this.db.exec(`PRAGMA journal_size_limit = ${WAL_SIZE_LIMIT_BYTES}`);
+    this.db.exec('PRAGMA wal_autocheckpoint = 0');
+    let reported = false;
+    const fallBack = (err: Error): void => {
+      if (reported) return;
+      reported = true;
+      this.checkpointer = undefined;
+      if (!this.closed) this.db.exec(`PRAGMA wal_autocheckpoint = ${restorePages}`);
+      background.onFailure(err);
+    };
+    const start = background.start ?? startWalCheckpointer;
+    try {
+      this.checkpointer = start({
+        dbPath: path,
+        ...(background.intervalMs !== undefined ? { intervalMs: background.intervalMs } : {}),
+        onFailure: fallBack,
+      });
+    } catch (err) {
+      fallBack(err instanceof Error ? err : new Error(String(err)));
+    }
   }
 
   close(): void {
+    this.closed = true;
+    // Not awaited: the worker closes its own connection, and the WAL is valid whenever it does.
+    void this.checkpointer?.stop();
+    this.checkpointer = undefined;
     this.db.close();
+  }
+
+  /** This connection's automatic checkpoint threshold in pages; 0 while checkpoints run on
+   *  the background worker. */
+  autoCheckpointPages(): number {
+    const row = this.db.prepare('PRAGMA wal_autocheckpoint').get() as Record<string, unknown>;
+    return requireNumber(row, 'wal_autocheckpoint');
   }
 
   private migrate(): void {
@@ -252,7 +362,8 @@ export class Store {
         accountId TEXT NOT NULL,
         startedAtMs INTEGER NOT NULL,
         endedAtMs INTEGER,
-        origin TEXT
+        origin TEXT,
+        slot TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_activation_intervals_account
         ON activation_intervals (accountId, startedAtMs);
@@ -333,11 +444,22 @@ export class Store {
     // activation_intervals row predates this column exactly when its source audit line predates
     // the `origin` field on `activated` entries, and "unknown who initiated this" is honestly
     // `NULL`, not a fabricated 'manual' — the row's actual initiator (or lack of one) is gone.
+    // Additive `slot` column on the display mirror: a database created before folder-bound slots
+    // has session rows that predate the concept, and NULL is the honest value (read as global).
+    const sessionColumns = this.db.prepare(`PRAGMA table_info(sessions)`).all();
+    if (!sessionColumns.some((col) => col['name'] === 'slot')) {
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN slot TEXT`);
+    }
     const activationIntervalColumns = this.db
       .prepare(`PRAGMA table_info(activation_intervals)`)
       .all();
     if (!activationIntervalColumns.some((col) => col['name'] === 'origin')) {
       this.db.exec(`ALTER TABLE activation_intervals ADD COLUMN origin TEXT`);
+    }
+    // The slot an interval belongs to (`'global'` / `'group:<id>'`). A row predating this column —
+    // like its source audit line predating the slot field — is NULL, which reads as the global slot.
+    if (!activationIntervalColumns.some((col) => col['name'] === 'slot')) {
+      this.db.exec(`ALTER TABLE activation_intervals ADD COLUMN slot TEXT`);
     }
     this.migrateWeeklyColumns();
   }
@@ -537,6 +659,7 @@ export class Store {
       startedAtMs: requireNumber(row, 'startedAtMs'),
       endedAtMs: optionalNumber(row, 'endedAtMs'),
       origin: optionalString(row, 'origin'),
+      slot: optionalString(row, 'slot'),
     };
   }
 
@@ -574,45 +697,68 @@ export class Store {
       startedAtMs: number;
       endedAtMs: number | null;
       origin: string | null;
+      /** The interval's slot; an omitted value persists as NULL (read as the global slot), so a
+       *  caller that predates slots keeps writing global-only intervals unchanged. */
+      slot?: string | null;
     }[],
   ): void {
     this.db.exec(`DELETE FROM activation_intervals`);
     const insert = this.db.prepare(
-      `INSERT INTO activation_intervals (accountId, startedAtMs, endedAtMs, origin) VALUES (?, ?, ?, ?)`,
+      `INSERT INTO activation_intervals (accountId, startedAtMs, endedAtMs, origin, slot) VALUES (?, ?, ?, ?, ?)`,
     );
     for (const interval of intervals) {
-      insert.run(interval.accountId, interval.startedAtMs, interval.endedAtMs, interval.origin);
+      insert.run(
+        interval.accountId,
+        interval.startedAtMs,
+        interval.endedAtMs,
+        interval.origin,
+        interval.slot ?? null,
+      );
     }
   }
 
+  /** The open GLOBAL interval, if any. Scoped to the global slot (NULL reads as global) so a group
+   *  slot's open interval never masquerades as "the live global account" for the global-only readers
+   *  (`accountActiveAt`, the cached-usage lane). Per-slot attribution uses {@link listActivationIntervals}. */
   getOpenActivationInterval(): ActivationIntervalRow | undefined {
     const row = this.db
       .prepare(
-        `SELECT * FROM activation_intervals WHERE endedAtMs IS NULL ORDER BY id DESC LIMIT 1`,
+        `SELECT * FROM activation_intervals
+         WHERE endedAtMs IS NULL AND (slot = 'global' OR slot IS NULL)
+         ORDER BY id DESC LIMIT 1`,
       )
       .get();
     return row ? this.toActivationIntervalRow(row) : undefined;
   }
 
   listActivationIntervals(accountId?: string): ActivationIntervalRow[] {
+    // Tiebroken by (slot, accountId) after startedAtMs so the order is deterministic across slots —
+    // the attribution journal compares the stored set positionally against its freshly derived one.
     const rows =
       accountId === undefined
-        ? this.db.prepare(`SELECT * FROM activation_intervals ORDER BY startedAtMs ASC`).all()
+        ? this.db
+            .prepare(
+              `SELECT * FROM activation_intervals ORDER BY startedAtMs ASC, slot ASC, accountId ASC`,
+            )
+            .all()
         : this.db
             .prepare(
-              `SELECT * FROM activation_intervals WHERE accountId = ? ORDER BY startedAtMs ASC`,
+              `SELECT * FROM activation_intervals WHERE accountId = ? ORDER BY startedAtMs ASC, slot ASC, accountId ASC`,
             )
             .all(accountId);
     return rows.map((r) => this.toActivationIntervalRow(r));
   }
 
-  /** The interval covering `tsMs`, if any — an open interval (`endedAtMs IS NULL`) covers
-   *  every timestamp from its start onward. */
+  /** The GLOBAL interval covering `tsMs`, if any — an open interval (`endedAtMs IS NULL`) covers
+   *  every timestamp from its start onward. Scoped to the global slot (NULL reads as global): this
+   *  feeds `accountActiveAt`, whose one caller is the global timeline. Slot-aware attribution
+   *  (tokenStats) reads the full set via {@link listActivationIntervals} and groups by slot itself. */
   findActivationIntervalAt(tsMs: number): ActivationIntervalRow | undefined {
     const row = this.db
       .prepare(
         `SELECT * FROM activation_intervals
          WHERE startedAtMs <= ? AND (endedAtMs IS NULL OR endedAtMs > ?)
+           AND (slot = 'global' OR slot IS NULL)
          ORDER BY startedAtMs DESC LIMIT 1`,
       )
       .get(tsMs, tsMs);
@@ -749,6 +895,7 @@ export class Store {
       kind: requireString(row, 'kind'),
       state: requireString(row, 'state'),
       accountId: optionalString(row, 'accountId'),
+      slot: optionalString(row, 'slot'),
       json: requireString(row, 'json'),
       updatedAtMs: requireNumber(row, 'updatedAtMs'),
     };
@@ -760,16 +907,17 @@ export class Store {
   upsertSession(row: SessionRow): void {
     this.db
       .prepare(
-        `INSERT INTO sessions (id, kind, state, accountId, json, updatedAtMs)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO sessions (id, kind, state, accountId, slot, json, updatedAtMs)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            kind = excluded.kind,
            state = excluded.state,
            accountId = excluded.accountId,
+           slot = excluded.slot,
            json = excluded.json,
            updatedAtMs = excluded.updatedAtMs`,
       )
-      .run(row.id, row.kind, row.state, row.accountId, row.json, row.updatedAtMs);
+      .run(row.id, row.kind, row.state, row.accountId, row.slot ?? null, row.json, row.updatedAtMs);
   }
 
   getSession(id: string): SessionRow | undefined {

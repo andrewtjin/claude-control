@@ -9,8 +9,18 @@
 // stall's duration, so "hooks feel slow" becomes a grep instead of a forensic hunt.
 //
 // Detection is timer drift: a repeating interval that should fire every `intervalMs` fires
-// late by exactly however long the loop was blocked. Cheap (one timer, no sampling
-// machinery), and the drift measurement IS the stall duration.
+// late by however much of the block fell after it was due. A block that starts just after a
+// tick shows up as its length minus one interval, so a block shorter than
+// `thresholdMs + intervalMs` can go unreported, and the interval is kept short for that reason:
+// at 500ms, a 589ms WAL checkpoint went unreported. 100ms catches every block over 250ms for
+// about 2ms of CPU a second while idle; 50ms cost twice that for 50ms more reach. (`monitorEventLoopDelay` is no better:
+// resetting its histogram also forgets its last sample, so a block right after each read is
+// lost.)
+//
+// Drift is measured on a MONOTONIC clock. The wall clock can step: on WSL2 the Hyper-V time
+// sync and systemd-timesyncd both correct the VM clock, and every forward step read as a
+// stall of the step's size (about 2s every ~34s on one box, thousands of phantom stalls a day
+// while the loop sat idle).
 
 /** Options for {@link startLoopLagMonitor}. All injectable for tests. */
 export interface LoopLagMonitorOptions {
@@ -18,11 +28,16 @@ export interface LoopLagMonitorOptions {
   onStall: (lagMs: number) => void;
   /** Drift above this is a stall worth reporting. Defaults to {@link LOOP_LAG_THRESHOLD_MS}. */
   thresholdMs?: number;
-  /** Probe cadence. Default 500ms — a stall shorter than this can still be caught (drift is
-   *  measured against the wall clock), and the idle cost is one timer tick per interval. */
+  /** Probe cadence. Default 100ms: every block longer than `thresholdMs + intervalMs` is
+   *  detected, as at least its length minus one interval. The idle cost is one timer tick per
+   *  interval. */
   intervalMs?: number;
-  /** Floor between reports so a sustained stall logs a heartbeat, not a flood. Default 10s. */
+  /** Floor between reports so a sustained stall logs a heartbeat, not a flood. Default 10s.
+   *  Inside it, a stall at least twice the largest one reported so far is still reported, so
+   *  a short stall can never hide a far worse one right behind it. */
   reportFloorMs?: number;
+  /** Must be monotonic (never steps); a wall clock turns every clock correction into a
+   *  reported stall. Default `performance.now()`. */
   clock?: () => number;
 }
 
@@ -31,12 +46,12 @@ export interface LoopLagMonitorOptions {
  * well below the multi-second stalls that tax hook latency.
  *
  * Exported because the poll cycle's own per-phase timing warns at the same bar (see
- * `POLL_PHASE_SLOW_MS` in daemon.ts). One number, so a phase can never be "slow" by one
+ * `POLL_PHASE_BLOCK_MS` in daemon.ts). One number, so a phase can never be "slow" by one
  * definition and fine by the other — which is exactly the confusion that makes an attributed
  * stall hard to read.
  */
 export const LOOP_LAG_THRESHOLD_MS = 150;
-const DEFAULT_INTERVAL_MS = 500;
+const DEFAULT_INTERVAL_MS = 100;
 const DEFAULT_REPORT_FLOOR_MS = 10_000;
 
 /**
@@ -47,16 +62,26 @@ export function startLoopLagMonitor(options: LoopLagMonitorOptions): () => void 
   const thresholdMs = options.thresholdMs ?? LOOP_LAG_THRESHOLD_MS;
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
   const reportFloorMs = options.reportFloorMs ?? DEFAULT_REPORT_FLOOR_MS;
-  const clock = options.clock ?? Date.now;
+  const clock = options.clock ?? (() => performance.now());
 
   let lastTickAt = clock();
-  let lastReportAt = 0;
+  // Not 0: a monotonic clock counts from process start, and a stall in the first
+  // `reportFloorMs` of the process must still be reported.
+  let lastReportAt = Number.NEGATIVE_INFINITY;
+  // The largest stall reported since the floor last opened. Doubling to get past the floor
+  // bounds the reports in one window to a handful, however the stalls grow.
+  let largestInWindowMs = 0;
   const timer = setInterval(() => {
     const now = clock();
     const lagMs = now - lastTickAt - intervalMs;
     lastTickAt = now;
-    if (lagMs > thresholdMs && now - lastReportAt >= reportFloorMs) {
+    if (lagMs <= thresholdMs) return;
+    if (now - lastReportAt >= reportFloorMs) {
       lastReportAt = now;
+      largestInWindowMs = lagMs;
+      options.onStall(lagMs);
+    } else if (lagMs >= 2 * largestInWindowMs) {
+      largestInWindowMs = lagMs;
       options.onStall(lagMs);
     }
   }, intervalMs);

@@ -152,6 +152,73 @@ describe('AttributionJournal', () => {
     expect(journal.accountActiveAt(3500)).toBe('c');
   });
 
+  describe('per-slot timelines', () => {
+    it('derives one independent timeline per slot: a group hop never closes the global interval', async () => {
+      // Interleaved global and group activations. Each slot's live account switches on its own; a
+      // group activation must NOT truncate the global account's interval (they are different logins).
+      await writeAuditLog(vaultDir, [
+        { ts: 1000, event: 'activated', fromAccountId: null, toAccountId: 'g1', slot: 'global' },
+        { ts: 1500, event: 'activated', fromAccountId: null, toAccountId: 'm1', slot: 'group:x' },
+        { ts: 2500, event: 'activated', fromAccountId: 'm1', toAccountId: 'm2', slot: 'group:x' },
+        { ts: 3000, event: 'activated', fromAccountId: 'g1', toAccountId: 'g2', slot: 'global' },
+      ]);
+      const journal = new AttributionJournal({ store, vaultDir });
+      await journal.sync();
+
+      const global = store
+        .listActivationIntervals()
+        .filter((i) => (i.slot ?? 'global') === 'global');
+      const group = store.listActivationIntervals().filter((i) => i.slot === 'group:x');
+      // Global timeline: g1 held from 1000 until the global hop at 3000 (the group hops in between
+      // did not touch it), then g2 open-ended.
+      expect(global).toHaveLength(2);
+      expect(global[0]).toMatchObject({ accountId: 'g1', startedAtMs: 1000, endedAtMs: 3000 });
+      expect(global[1]).toMatchObject({ accountId: 'g2', startedAtMs: 3000, endedAtMs: null });
+      // Group timeline: m1 from 1500 to 2500, then m2 open-ended.
+      expect(group).toHaveLength(2);
+      expect(group[0]).toMatchObject({ accountId: 'm1', startedAtMs: 1500, endedAtMs: 2500 });
+      expect(group[1]).toMatchObject({ accountId: 'm2', startedAtMs: 2500, endedAtMs: null });
+    });
+
+    it('stamps the slot on every derived interval, defaulting a pre-slot line to global', async () => {
+      await writeAuditLog(vaultDir, [
+        { ts: 1000, event: 'activated', fromAccountId: null, toAccountId: 'a' }, // pre-slot line
+        { ts: 2000, event: 'activated', fromAccountId: null, toAccountId: 'm', slot: 'group:x' },
+      ]);
+      const journal = new AttributionJournal({ store, vaultDir });
+      await journal.sync();
+      const bySlot = new Map(store.listActivationIntervals().map((i) => [i.accountId, i.slot]));
+      // A pre-slot line is derived as the global slot and written explicitly as 'global' (the journal
+      // always stamps a slot on the rows it writes); a group line keeps its own slot.
+      expect(bySlot.get('a')).toBe('global');
+      expect(bySlot.get('m')).toBe('group:x');
+    });
+
+    it('accountActiveAt is global-only: a group activation is invisible to it', async () => {
+      await writeAuditLog(vaultDir, [
+        { ts: 1000, event: 'activated', fromAccountId: null, toAccountId: 'g', slot: 'global' },
+        { ts: 1500, event: 'activated', fromAccountId: null, toAccountId: 'm', slot: 'group:x' },
+      ]);
+      const journal = new AttributionJournal({ store, vaultDir });
+      await journal.sync();
+      // At any instant after 1500 the global account is still 'g' — the group's live member never
+      // shadows the global timeline.
+      expect(journal.accountActiveAt(2000)).toBe('g');
+    });
+
+    it('a second sync is idempotent across mixed-slot activations', async () => {
+      await writeAuditLog(vaultDir, [
+        { ts: 1000, event: 'activated', fromAccountId: null, toAccountId: 'g', slot: 'global' },
+        { ts: 1500, event: 'activated', fromAccountId: null, toAccountId: 'm', slot: 'group:x' },
+      ]);
+      const journal = new AttributionJournal({ store, vaultDir });
+      await journal.sync();
+      const first = store.listActivationIntervals();
+      await journal.sync();
+      expect(store.listActivationIntervals()).toEqual(first);
+    });
+  });
+
   describe('accountActiveAt', () => {
     it('finds the account active at a point in time, including the open-ended final interval', async () => {
       await writeAuditLog(vaultDir, [
@@ -170,6 +237,37 @@ describe('AttributionJournal', () => {
       const journal = new AttributionJournal({ store, vaultDir });
       await journal.sync();
       expect(journal.accountActiveAt(Date.now())).toBeNull();
+    });
+  });
+
+  describe('switchesBetween', () => {
+    it('returns the live-account switches inside the window, oldest first, with who and why', async () => {
+      await writeAuditLog(vaultDir, [
+        {
+          ts: 3000,
+          event: 'activated',
+          fromAccountId: 'a',
+          toAccountId: 'b',
+          origin: 'auto',
+          detail: 'a at 95%',
+        },
+        { ts: 500, event: 'activated', fromAccountId: null, toAccountId: 'a', origin: 'manual' },
+        { ts: 1000, event: 'activated', fromAccountId: 'x', toAccountId: 'a' },
+        { ts: 2000, event: 'refreshed', fromAccountId: null, toAccountId: 'a' },
+        { ts: 2500, event: 'activated', fromAccountId: 'a', toAccountId: null },
+        { ts: 4001, event: 'activated', fromAccountId: 'b', toAccountId: 'a' },
+      ]);
+      const journal = new AttributionJournal({ store, vaultDir });
+      // Both ends inclusive; a refresh, a target-less entry and anything outside are not switches.
+      expect(await journal.switchesBetween(1000, 4000)).toEqual([
+        { at: 1000, fromAccountId: 'x', toAccountId: 'a' },
+        { at: 3000, fromAccountId: 'a', toAccountId: 'b', origin: 'auto', reason: 'a at 95%' },
+      ]);
+    });
+
+    it('is empty when nothing was ever switched', async () => {
+      const journal = new AttributionJournal({ store, vaultDir });
+      expect(await journal.switchesBetween(0, Date.now())).toEqual([]);
     });
   });
 });

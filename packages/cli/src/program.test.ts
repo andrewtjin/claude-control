@@ -1,17 +1,40 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   RefreshError,
+  SwitchFailedError,
   VaultError,
+  type ActivateResult,
   type DedupeReport,
+  type RecoverResult,
   type StoredAccount,
 } from '@claude-control/switch-engine';
+import { Store } from '@claude-control/daemon';
+import { formatLocalTime } from './outagesView.js';
 import { buildProgram } from './program.js';
 import { CliFailure, reportFatal } from './context.js';
 import { VERSION, type SettingsReport } from './settings.js';
+
+// Where the CLI finds its data directory (daemon.db, the exhaustion log). Redirected to a temp
+// folder by the tests that read those files; left alone (the real resolution) everywhere else.
+// Overridden at the function rather than through LOCALAPPDATA/XDG_DATA_HOME because on macOS
+// the data root comes from the home folder alone, and a test must never land in the real one.
+const pathsIo = vi.hoisted(() => ({ dataRoot: '' }));
+vi.mock('@claude-control/switch-engine', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@claude-control/switch-engine')>();
+  return {
+    ...real,
+    defaultPaths: (...args: Parameters<typeof real.defaultPaths>) => {
+      const paths = real.defaultPaths(...args);
+      return pathsIo.dataRoot === ''
+        ? paths
+        : { ...paths, vaultDir: join(pathsIo.dataRoot, 'claude-control', 'vault') };
+    },
+  };
+});
 
 // `buildEngine` is the CLI's single seam onto the switch engine, so stubbing it lets an action
 // body run for real — commander dispatch, the action, the render — with nothing near a real
@@ -25,15 +48,49 @@ const engine = vi.hoisted(() => ({
     Promise.reject(new Error(`captureCurrentLogin(${label}) not stubbed`)),
   ),
   listAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
+  // The folder-bound registry view: defaults to the shared pool (set below to delegate to
+  // listAccounts) so switch/where/accounts tests that stub listAccounts drive it too.
+  listAllAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
+  listGroups: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
+  liveSlots: vi.fn((): Promise<Map<string, string | null>> => Promise.resolve(new Map())),
+  getGroup: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
+  getGroupsGeneration: vi.fn((): Promise<number> => Promise.resolve(0)),
+  readSnapshot: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
+  getGuardSnapshotFreshness: vi.fn(
+    (): Promise<{
+      present: boolean;
+      fresh: boolean;
+      enforce: 'block' | 'warn' | 'off';
+      generation: number | null;
+    }> => Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
+  ),
+  checkSlots: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
+  refreshSnapshot: vi.fn((): Promise<void> => Promise.resolve()),
+  bindFolder: vi.fn((f: string): Promise<never> =>
+    Promise.reject(new Error(`bindFolder(${f}) not stubbed`)),
+  ),
+  unbindFolder: vi.fn((f: string): Promise<never> =>
+    Promise.reject(new Error(`unbindFolder(${f}) not stubbed`)),
+  ),
+  ensureGroupLive: vi.fn((): Promise<never> =>
+    Promise.reject(new Error('ensureGroupLive not stubbed')),
+  ),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
-  activate: vi.fn((id: string): Promise<never> =>
+  activate: vi.fn((id: string): Promise<ActivateResult> =>
     Promise.reject(new Error(`activate(${id}) not stubbed`)),
   ),
   setAutoSwitchExcluded: vi.fn(() => Promise.resolve()),
   renameAccount: vi.fn((id: string, label: string): Promise<StoredAccount> =>
     Promise.reject(new Error(`renameAccount(${id}, ${label}) not stubbed`)),
   ),
+  removeAccount: vi.fn((): Promise<void> => Promise.resolve()),
+  recover: vi.fn((): Promise<RecoverResult> =>
+    Promise.resolve({ recovered: false, action: 'none' }),
+  ),
 }));
+// `cctl switch` resolves across the whole registry; keep the mock's whole-registry view in sync with
+// whatever a test stubbed on listAccounts (the shared pool) so the existing switch tests still drive it.
+engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
 vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
   buildEngine: () => engine,
@@ -134,6 +191,7 @@ describe('buildProgram', () => {
     expect(names).toContain('usage');
     expect(names).toContain('timeline');
     expect(names).toContain('stats');
+    expect(names).toContain('outages');
     expect(names).toContain('settings');
     expect(names).toContain('pair');
     expect(names).toContain('session');
@@ -658,6 +716,60 @@ describe('switch', () => {
     );
     expect(r.out).toBe('');
   });
+
+  it('prints a switch another program kept from writing as one plain line, not the raw error', async () => {
+    const said =
+      'could not write C:\\Users\\me\\.claude.json (EPERM): another program probably has it open ' +
+      '(an editor, a backup or sync tool, antivirus), or it is read-only. The switch to "Work" was ' +
+      'undone and the previous login was kept - nothing changed. Close that program (or wait for ' +
+      'it to finish) and try again.';
+    engine.listAccounts.mockResolvedValueOnce([account]);
+    engine.activate.mockRejectedValueOnce(
+      new SwitchFailedError(said, 'restored', {
+        cause: Object.assign(new Error("EPERM: operation not permitted, rename '.tmp-1'"), {
+          code: 'EPERM',
+        }),
+      }),
+    );
+
+    const r = await runCli(['switch', 'Work']);
+
+    expect(r).toEqual({ out: '', err: `error: ${said}\n`, exited: true });
+  });
+});
+
+describe('recover', () => {
+  it('says what it recovered', async () => {
+    engine.recover.mockResolvedValueOnce({
+      recovered: true,
+      action: 'rolled_back',
+      detail: 'restored previous live credentials',
+    });
+
+    const r = await runCli(['recover']);
+
+    expect(r).toEqual({
+      out: 'Recovered: rolled_back - restored previous live credentials.\n',
+      err: '',
+      exited: false,
+    });
+  });
+
+  it('exits non-zero with the reason when a switch could not be settled', async () => {
+    engine.recover.mockResolvedValueOnce({
+      recovered: false,
+      action: 'unsettled',
+      detail: 'a switch of the global slot to "Work" was interrupted and could not be finished',
+    });
+
+    const r = await runCli(['recover']);
+
+    expect(r.exited).toBe(true);
+    expect(r.out).toBe('');
+    expect(r.err).toContain(
+      'a switch of the global slot to "Work" was interrupted and could not be finished',
+    );
+  });
 });
 
 describe('version command', () => {
@@ -811,6 +923,62 @@ describe('accounts exclude / include', () => {
   });
 });
 
+describe('reserved (folder-bound) members are reachable by row-level account mutations', () => {
+  // A reserved member lives in groups.json, so it appears in the whole-registry view
+  // (listAllAccounts) but NOT in the shared-only global pool (listAccounts). Row-level mutations must
+  // resolve against the whole registry — exactly as relogin/reauth do — or a folder-bound account is
+  // unreachable by exclude/include/rename/remove even though `accounts list` shows it.
+  const reserved: StoredAccount = {
+    id: 'res-1',
+    label: 'workacct',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  };
+
+  beforeEach(() => {
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    engine.listAllAccounts.mockImplementation(() => Promise.resolve([reserved]));
+    engine.setAutoSwitchExcluded.mockClear();
+    engine.renameAccount.mockClear();
+    engine.removeAccount.mockClear();
+    engine.backfillAccountMetadata.mockImplementation(() => Promise.resolve(0));
+  });
+
+  afterEach(() => {
+    // Restore the module-level delegation the other suites rely on.
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
+  });
+
+  it('excludes a reserved member by label though it is absent from the shared pool', async () => {
+    const out = await run(['accounts', 'exclude', 'workacct']);
+    expect(engine.setAutoSwitchExcluded).toHaveBeenCalledWith('res-1', true);
+    expect(out).toMatch(/Excluded workacct from auto-switch/);
+  });
+
+  it('renames a reserved member by label', async () => {
+    engine.renameAccount.mockResolvedValueOnce({ ...reserved, label: 'newname' });
+    const r = await runCli(['accounts', 'rename', 'workacct', 'newname']);
+    expect(r.exited).toBe(false);
+    expect(engine.renameAccount).toHaveBeenCalledWith('res-1', 'newname');
+    expect(r.out).toBe('Renamed workacct to newname (res-1).\n');
+  });
+
+  it('removes a reserved member by id', async () => {
+    const out = await run(['accounts', 'remove', 'res-1']);
+    expect(engine.removeAccount).toHaveBeenCalledWith('res-1');
+    expect(out).toMatch(/Removed workacct/);
+  });
+
+  it('still reports an unknown ref (not in the whole registry) as no match', async () => {
+    const r = await runCli(['accounts', 'exclude', 'ghost']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toMatch(/No account matches "ghost"/);
+    expect(engine.setAutoSwitchExcluded).not.toHaveBeenCalled();
+  });
+});
+
 /** Run `body` with the named stream pretending to be a terminal and NO_COLOR unset — the one
  *  condition under which the CLI paints — restoring both afterwards. */
 async function onTerminal<T>(stream: NodeJS.WriteStream, body: () => Promise<T>): Promise<T> {
@@ -872,5 +1040,623 @@ describe('color on a terminal', () => {
     const r = await onTerminal(process.stderr, () => runCli(['settings', 'unset']));
     expect(r.exited).toBe(true);
     expect(r.err).toBe(`${ESC}[31merror: missing required argument 'name'${ESC}[0m\n`);
+  });
+});
+
+describe('folder-bound account commands', () => {
+  const acct = (over: Partial<StoredAccount> = {}): StoredAccount => ({
+    id: 'a-1',
+    label: 'work@me.com',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    ...over,
+  });
+
+  it('shell-init powershell prints a claude wrapper function', async () => {
+    const r = await runCli(['shell-init', 'powershell']);
+    expect(r.out).toContain('function claude {');
+    // Forwards all args whether it invokes node directly (node-direct form) or the cctl shim
+    // (fallback form); both end the body with `claude @args`.
+    expect(r.out).toContain('claude @args');
+  });
+
+  it('shell-init rejects an unsupported shell', async () => {
+    const r = await runCli(['shell-init', 'cmd']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('unsupported shell');
+  });
+
+  it('bindings with nothing bound prints the empty-state message', async () => {
+    engine.listGroups.mockResolvedValueOnce([]);
+    engine.liveSlots.mockResolvedValueOnce(new Map());
+    engine.getGuardSnapshotFreshness.mockResolvedValueOnce({
+      present: false,
+      fresh: false,
+      enforce: 'block',
+      generation: null,
+    });
+    const r = await runCli(['bindings']);
+    expect(r.out).toContain('No folder-bound accounts');
+  });
+
+  it('where on an unbound folder explains the global account', async () => {
+    engine.listGroups.mockResolvedValue([]);
+    engine.liveSlots.mockResolvedValue(new Map());
+    const r = await runCli(['where', '.']);
+    expect(r.out).toContain('global (shared) account');
+  });
+
+  it('bind surfaces an engine refusal as a single error line', async () => {
+    engine.listAccounts.mockResolvedValue([acct()]);
+    engine.bindFolder.mockRejectedValueOnce(
+      new RefreshError(
+        'already bound to something else; unbind it first',
+        'folder_bound_elsewhere',
+      ),
+    );
+    const r = await runCli(['bind', '.', 'work@me.com']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('already bound to something else');
+  });
+
+  it('switch of a folder-bound member names its folder group', async () => {
+    const member = acct({ id: 'm-1', label: 'client@me.com' });
+    engine.listAccounts.mockResolvedValue([member]);
+    engine.activate.mockResolvedValueOnce({
+      ok: true,
+      activeAccountId: 'm-1',
+      wroteCredentials: true,
+      refreshed: false,
+      adoptedPreviousRotation: false,
+    });
+    engine.listGroups.mockResolvedValue([
+      {
+        id: 'g1',
+        label: 'client',
+        members: [member],
+        activeId: 'm-1',
+        folders: ['C:\\repos\\client'],
+      },
+    ]);
+    const r = await runCli(['switch', 'client@me.com']);
+    expect(r.out).toContain('client@me.com');
+    expect(r.out).toContain('folder group');
+    expect(r.out).toContain('C:\\repos\\client');
+  });
+
+  it('accounts add inside a profile renders the capture-in-profile guidance', async () => {
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new RefreshError('cannot capture inside a folder profile', 'capture_in_profile'),
+    );
+    const r = await runCli(['accounts', 'add', 'newlabel']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('cannot capture inside a folder profile');
+    expect(r.err).toContain('--fresh');
+  });
+});
+
+describe('doctor with a folder-bindings registry this build cannot read', () => {
+  let root: string;
+  beforeEach(async () => {
+    // Every path doctor reads resolves inside a sandbox, never near the operator's real files.
+    root = await mkdtemp(join(tmpdir(), 'cctl-doctor-groups-'));
+    vi.stubEnv('LOCALAPPDATA', root);
+    vi.stubEnv('XDG_DATA_HOME', root);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'claude'));
+    vi.stubEnv('NO_COLOR', '1');
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it(
+    'still prints every check, with the unreadable file as one failed check',
+    { timeout: 60_000 },
+    async () => {
+      const unreadable = new VaultError(
+        'groups.json has an unsupported schemaVersion (2); a newer build wrote it',
+      );
+      engine.listGroups.mockRejectedValueOnce(unreadable);
+      engine.checkSlots.mockRejectedValueOnce(unreadable);
+      engine.getGuardSnapshotFreshness.mockRejectedValueOnce(unreadable);
+
+      const r = await runCli(['doctor']);
+
+      expect(r.exited).toBe(false);
+      expect(r.out).toMatch(/\[!!\] bindings: .*schemaVersion/);
+      expect(r.out).toContain('[!!] slots:');
+      expect(r.out).toContain('guard-hook:');
+      expect(r.out).toMatch(/\d+ ok, \d+ to look at\./);
+    },
+  );
+});
+
+describe('outages, and the banner usage and timeline lead with', () => {
+  const H = 60 * 60 * 1000;
+  let dir = '';
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-outages-'));
+    pathsIo.dataRoot = dir;
+    // An empty config: the Fable cap counts, as by default.
+    settingsIo.configPath = join(dir, 'config.json');
+  });
+  afterEach(async () => {
+    pathsIo.dataRoot = '';
+    settingsIo.configPath = '';
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    engine.getActiveId.mockImplementation(() => Promise.resolve(null));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const dataDir = () => join(dir, 'claude-control');
+  const logPath = () => join(dataDir(), 'exhaustion-log.jsonl');
+  const account = (id: string, label: string): StoredAccount => ({
+    id,
+    label,
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  });
+  /** One `exhausted` line as the daemon writes it. */
+  const started = (at: number, id = `ep-${at}`) => ({
+    v: 1,
+    event: 'exhausted',
+    id,
+    at,
+    time: new Date(at).toISOString(),
+    summary: 'No account can take work: ...',
+    active: 'work1',
+    accounts: [
+      {
+        accountId: 'a1',
+        label: 'work1',
+        reason: 'session',
+        percent: 100,
+        backAt: at + H,
+        spent: [],
+      },
+    ],
+    firstBack: { accountId: 'a1', label: 'work1', at: at + H, predicted: false },
+    switches: [],
+  });
+  const recovered = (start: ReturnType<typeof started>, backSince: number) => ({
+    v: 1,
+    event: 'recovered',
+    id: start.id,
+    at: backSince,
+    time: new Date(backSince).toISOString(),
+    summary: 'Usage is back: ...',
+    backSince,
+    durationMs: backSince - start.at,
+    account: { accountId: 'a1', label: 'work1' },
+    how: 'reset',
+    limit: 'session',
+  });
+  const seedLog = async (lines: unknown[]) => {
+    await mkdir(dataDir(), { recursive: true });
+    await writeFile(logPath(), lines.map((l) => JSON.stringify(l) + '\n').join(''));
+  };
+  /** Snapshots in daemon.db, as the daemon's poll would have left them. */
+  const seedUsage = async (
+    rows: Array<{ id: string; label: string; percent: number; resetsAt: number }>,
+  ) => {
+    await mkdir(dataDir(), { recursive: true });
+    const store = new Store(join(dataDir(), 'daemon.db'));
+    try {
+      for (const r of rows) {
+        store.insertUsageSnapshot({
+          accountId: r.id,
+          fetchedAtMs: Date.now(),
+          source: 'live',
+          json: JSON.stringify({
+            accountId: r.id,
+            label: r.label,
+            active: false,
+            source: 'live',
+            fetchedAtMs: Date.now(),
+            limits: [
+              {
+                kind: 'session',
+                percent: r.percent,
+                resetsAt: new Date(r.resetsAt).toISOString(),
+                isActive: true,
+              },
+            ],
+          }),
+        });
+      }
+    } finally {
+      store.close();
+    }
+  };
+
+  it('offers --days and --json', () => {
+    const cmd = buildProgram().commands.find((c) => c.name() === 'outages');
+    expect(cmd?.options.map((o) => o.long).sort()).toEqual(['--days', '--json']);
+  });
+
+  it('lists every time, newest first, and says where the log is', async () => {
+    const now = Date.now();
+    const old = started(now - 50 * H);
+    await seedLog([old, recovered(old, now - 49 * H), started(now - 2 * H)]);
+    const r = await runCli(['outages']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toMatch(/^2 times no account could take work \(newest first\):/);
+    expect(r.out.indexOf('ongoing')).toBeLessThan(
+      r.out.indexOf('back: work1 (its 5-hour window reset)'),
+    );
+    expect(r.out).toContain(`Log: ${logPath()}`);
+  });
+
+  it('--json prints the episodes newest first with the log path; --days narrows to recent ones', async () => {
+    const now = Date.now();
+    const old = started(now - 20 * 24 * H);
+    const recent = started(now - 2 * H);
+    await seedLog([old, recovered(old, old.at + H), recent]);
+    const all = JSON.parse((await runCli(['outages', '--json'])).out) as {
+      log: string;
+      episodes: Array<{ start: { id: string }; end?: unknown }>;
+    };
+    expect(all.log).toBe(logPath());
+    expect(all.episodes.map((e) => e.start.id)).toEqual([recent.id, old.id]);
+    const week = JSON.parse((await runCli(['outages', '--json', '--days', '7'])).out) as {
+      episodes: Array<{ start: { id: string } }>;
+    };
+    expect(week.episodes.map((e) => e.start.id)).toEqual([recent.id]);
+  });
+
+  it('with no log yet it says nothing is on record', async () => {
+    const r = await runCli(['outages']);
+    expect(r.out).toBe(
+      `No time on record when every account was out of usage.\nLog: ${logPath()}\n`,
+    );
+  });
+
+  it('refuses a --days that is not a positive number', async () => {
+    const r = await runCli(['outages', '--days', '0']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('--days must be a positive number.');
+  });
+
+  it('usage and timeline lead with the banner while no account can take work', async () => {
+    const now = Date.now();
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([account('a1', 'work1'), account('a2', 'work2')]),
+    );
+    await seedUsage([
+      { id: 'a1', label: 'work1', percent: 100, resetsAt: now + 2 * H },
+      { id: 'a2', label: 'work2', percent: 100, resetsAt: now + 4 * H },
+    ]);
+    await seedLog([started(now - 30 * 60_000)]);
+    for (const command of ['usage', 'timeline']) {
+      const r = await runCli([command]);
+      expect(r.exited).toBe(false);
+      expect(r.out).toMatch(
+        /^No account can take work since .+ \(30m\)\. First back: work1 in 1h 59m\./,
+      );
+    }
+  });
+
+  it('no banner while some account has usage left', async () => {
+    const now = Date.now();
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([account('a1', 'work1'), account('a2', 'work2')]),
+    );
+    await seedUsage([
+      { id: 'a1', label: 'work1', percent: 100, resetsAt: now + 2 * H },
+      { id: 'a2', label: 'work2', percent: 40, resetsAt: now + 4 * H },
+    ]);
+    const r = await runCli(['usage']);
+    expect(r.out).not.toContain('No account can take work');
+  });
+});
+
+describe('the banner and the plan agree with the running daemon', () => {
+  const H = 60 * 60 * 1000;
+  const BANNER = 'No account can take work';
+  let dir = '';
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-outages-daemon-'));
+    pathsIo.dataRoot = dir;
+    settingsIo.configPath = join(dir, 'config.json');
+    settingsIo.heartbeatPath = join(dir, 'claude-control', 'daemon-heartbeat.json');
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([
+        { id: 'a1', label: 'work1', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
+        { id: 'a2', label: 'work2', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
+      ]),
+    );
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    pathsIo.dataRoot = '';
+    settingsIo.configPath = '';
+    settingsIo.heartbeatPath = '';
+    settingsIo.readSettingsReport.mockImplementation(() => Promise.resolve(undefined));
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const dataDir = () => join(dir, 'claude-control');
+  type Limit = { kind: string; percent: number; resetsAt: number };
+  /** Snapshots in daemon.db, as the daemon's polls left them. */
+  async function seedUsage(rows: Array<{ id: string; label: string; limits: Limit[] }>) {
+    await mkdir(dataDir(), { recursive: true });
+    const store = new Store(join(dataDir(), 'daemon.db'));
+    try {
+      for (const r of rows) {
+        store.insertUsageSnapshot({
+          accountId: r.id,
+          fetchedAtMs: Date.now(),
+          source: 'live',
+          json: JSON.stringify({
+            accountId: r.id,
+            label: r.label,
+            active: r.id === 'a1',
+            source: 'live',
+            fetchedAtMs: Date.now(),
+            limits: r.limits.map((l) => ({
+              kind: l.kind,
+              percent: l.percent,
+              resetsAt: new Date(l.resetsAt).toISOString(),
+              isActive: true,
+            })),
+          }),
+        });
+      }
+    } finally {
+      store.close();
+    }
+  }
+  /** An open outage as the running daemon wrote it. */
+  async function seedOpenOutage(at: number, reason: string, spent: Limit[]) {
+    await mkdir(dataDir(), { recursive: true });
+    const line = {
+      v: 1,
+      event: 'exhausted',
+      id: `ep-${at}`,
+      at,
+      time: new Date(at).toISOString(),
+      summary: 'No account can take work: ...',
+      active: 'work1',
+      accounts: ['a1', 'a2'].map((id, i) => ({
+        accountId: id,
+        label: `work${i + 1}`,
+        reason,
+        percent: 100,
+        spent,
+      })),
+      firstBack: { accountId: 'a1', label: 'work1', at: at + 3 * H, predicted: false },
+      switches: [],
+    };
+    await writeFile(join(dataDir(), 'exhaustion-log.jsonl'), JSON.stringify(line) + '\n');
+  }
+  /** A daemon heartbeat: written just now (alive), or written and then stopped days ago. */
+  async function seedHeartbeat(state: 'alive' | 'stopped') {
+    await mkdir(dataDir(), { recursive: true });
+    const now = Date.now();
+    await writeFile(
+      settingsIo.heartbeatPath,
+      JSON.stringify(
+        state === 'alive'
+          ? { writtenAtMs: now }
+          : { writtenAtMs: now - 6 * 24 * H, stoppedAtMs: now - 6 * 24 * H },
+      ),
+    );
+  }
+  /** The running daemon's settings report, naming whether it counts the Fable cap. */
+  const reportWithFableCap = (value: 'on' | 'off'): SettingsReport => ({
+    startedAtMs: Date.now() - 2 * H,
+    settings: [
+      { name: 'auto-switch', value: 'on', source: 'default' },
+      { name: 'greedy burn-back', value: 'on', source: 'default' },
+      { name: 'fable cap trigger', value, source: value === 'on' ? 'default' : 'env' },
+    ],
+  });
+  /** Both accounts with plenty of 5-hour window and week, Fable weekly cap full. */
+  const fableCapped = () => {
+    const now = Date.now();
+    const limits: Limit[] = [
+      { kind: 'session', percent: 10, resetsAt: now + 3 * H },
+      { kind: 'weekly_all', percent: 50, resetsAt: now + 72 * H },
+      { kind: 'weekly_scoped', percent: 100, resetsAt: now + 48 * H },
+    ];
+    return [
+      { id: 'a1', label: 'work1', limits },
+      { id: 'a2', label: 'work2', limits },
+    ];
+  };
+
+  it('a Fable-cap opt-out saved since the daemon started does not hide its outage', async () => {
+    // The running daemon counts the cap (its report), and has an outage open on it.
+    await seedHeartbeat('alive');
+    settingsIo.readSettingsReport.mockImplementation(() =>
+      Promise.resolve(reportWithFableCap('on')),
+    );
+    // The opt-out was saved since; it reaches the daemon only on its next start.
+    await writeFile(
+      settingsIo.configPath,
+      JSON.stringify({ env: { CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' } }),
+    );
+    await seedUsage(fableCapped());
+    await seedOpenOutage(Date.now() - 20 * 60_000, 'weekly_scoped', [
+      { kind: 'weekly_scoped', percent: 100, resetsAt: Date.now() + 48 * H },
+    ]);
+    expect((await runCli(['outages'])).out).toContain('ongoing');
+    expect((await runCli(['usage'])).out).toContain(BANNER);
+  });
+
+  it('a daemon running with the Fable cap off logs no outage, so there is no banner', async () => {
+    await seedHeartbeat('alive');
+    settingsIo.readSettingsReport.mockImplementation(() =>
+      Promise.resolve(reportWithFableCap('off')),
+    );
+    await seedUsage(fableCapped());
+    expect((await runCli(['usage'])).out).not.toContain(BANNER);
+  });
+
+  it('timeline: with the Fable cap off the plan does not say "No usable account" beside no banner', async () => {
+    vi.stubEnv('CCTL_AUTOSWITCH_ON_FABLE_CAP', '0');
+    settingsIo.readSettingsReport.mockImplementation(() =>
+      Promise.resolve(reportWithFableCap('off')),
+    );
+    await seedUsage(fableCapped());
+    const r = await runCli(['timeline']);
+    expect(r.out).not.toContain(BANNER);
+    expect(r.out).not.toMatch(/Plan: No usable account/);
+  });
+
+  it('timeline: windows that reset since the last snapshot are not out, in the plan or the banner', async () => {
+    const now = Date.now();
+    await seedUsage([
+      {
+        id: 'a1',
+        label: 'work1',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now - 10 * 60_000 }],
+      },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now - 5 * 60_000 }],
+      },
+    ]);
+    const r = await runCli(['timeline']);
+    expect(r.out).not.toContain(BANNER);
+    expect(r.out).not.toMatch(/Plan: No usable account/);
+  });
+
+  it('an account whose last poll came back empty does not hide an open outage', async () => {
+    const now = Date.now();
+    await seedOpenOutage(now - 20 * 60_000, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now + 3 * H },
+    ]);
+    await seedUsage([
+      { id: 'a1', label: 'work1', limits: [] },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now + 4 * H }],
+      },
+    ]);
+    const r = await runCli(['usage']);
+    expect(r.out).toMatch(
+      /^No account can take work since .+ \(20m\)\. First back expected: work1 at /,
+    );
+  });
+
+  it('an open outage the latest numbers show is over says so in cctl outages', async () => {
+    const now = Date.now();
+    await seedOpenOutage(now - 4 * H, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now - H },
+    ]);
+    await seedUsage([
+      {
+        id: 'a1',
+        label: 'work1',
+        limits: [{ kind: 'session', percent: 5, resetsAt: now + 4 * H }],
+      },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now + 4 * H }],
+      },
+    ]);
+    const text = (await runCli(['outages'])).out;
+    expect(text).toMatch(
+      /-> over by the latest numbers: work1 back since .+ \(its 5-hour window reset\)/,
+    );
+    const json = JSON.parse((await runCli(['outages', '--json'])).out) as {
+      open: { id: string; overBy?: { label: string; how: string } } | null;
+    };
+    expect(json.open).toMatchObject({ overBy: { label: 'work1', how: 'reset' } });
+    expect((await runCli(['usage'])).out).not.toContain(BANNER);
+  });
+
+  it('cctl outages names who is still expected back, not a time that has already passed', async () => {
+    const now = Date.now();
+    // The start expected work1 back 7 hours ago; its window has since been reset and spent again.
+    await seedOpenOutage(now - 10 * H, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now - 8 * H },
+    ]);
+    await seedUsage([
+      {
+        id: 'a1',
+        label: 'work1',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now + 3 * H }],
+      },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 100, resetsAt: now + 4 * H }],
+      },
+    ]);
+    const text = (await runCli(['outages'])).out;
+    expect(text).toContain(
+      `ongoing, 10h so far; first back expected: work1 at ${formatLocalTime(now + 3 * H, now)}`,
+    );
+    expect(text).not.toContain(formatLocalTime(now - 7 * H, now));
+  });
+
+  it('a heartbeat file that holds no object does not stop usage or timeline', async () => {
+    const now = Date.now();
+    await seedUsage([
+      {
+        id: 'a1',
+        label: 'work1',
+        limits: [{ kind: 'session', percent: 10, resetsAt: now + 3 * H }],
+      },
+      {
+        id: 'a2',
+        label: 'work2',
+        limits: [{ kind: 'session', percent: 20, resetsAt: now + 4 * H }],
+      },
+    ]);
+    await writeFile(settingsIo.heartbeatPath, 'null');
+    for (const command of ['usage', 'timeline']) {
+      const r = await runCli([command]);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain('work1');
+    }
+  });
+
+  it('a report left by a daemon stopped days ago does not overrule the saved Fable-cap opt-out', async () => {
+    await seedHeartbeat('stopped');
+    settingsIo.readSettingsReport.mockImplementation(() =>
+      Promise.resolve(reportWithFableCap('on')),
+    );
+    await writeFile(
+      settingsIo.configPath,
+      JSON.stringify({ env: { CCTL_AUTOSWITCH_ON_FABLE_CAP: 'off' } }),
+    );
+    await seedUsage(fableCapped());
+    const r = await runCli(['timeline']);
+    expect(r.out).not.toContain(BANNER);
+    expect(r.out).not.toMatch(/Plan: No usable account/);
+  });
+
+  it('cctl outages still prints the history when daemon.db cannot be opened', async () => {
+    const now = Date.now();
+    await seedOpenOutage(now - 20 * 60_000, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now + 3 * H },
+    ]);
+    await writeFile(join(dataDir(), 'daemon.db'), 'not a database '.repeat(50));
+    const r = await runCli(['outages']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toContain('ongoing');
+  });
+
+  it('cctl outages still prints the history when the vault cannot be listed', async () => {
+    const now = Date.now();
+    await seedOpenOutage(now - 20 * 60_000, 'session', [
+      { kind: 'session', percent: 100, resetsAt: now + 3 * H },
+    ]);
+    engine.listAccounts.mockImplementation(() =>
+      Promise.reject(new Error('vault metadata unreadable')),
+    );
+    const r = await runCli(['outages']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toContain('ongoing');
   });
 });

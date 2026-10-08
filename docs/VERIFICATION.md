@@ -71,6 +71,11 @@ token was persisted; a follow-up `claude -p` authenticated on the refreshed toke
 run also live-validated two M0 alignment features: `accounts add --fresh` captured the
 spare without touching the live login, and the cadence guard refused an immediate
 switch-back ("next switch allowed in Ns") until `--force`.
+**Follow-up (RE-OPEN for endpoint move):** the above result was against the previous
+`console.anthropic.com/v1/oauth/token` host with a form-urlencoded body. `DEFAULT_TOKEN_ENDPOINT`
+now points at the CLI's current `platform.claude.com/v1/oauth/token` (the old host still answers as
+an alias), and the refresh body now matches the CLI: JSON with `client_id` and `scope`. Re-run the
+live probe to reconfirm rotation against the new host/format before shipping.
 
 ### 3. Usage endpoint ✅ CLOSED 2026-07-16
 
@@ -262,13 +267,18 @@ cross-repo split gates 2, 4 and 6 use.
 
 **Verify (assumptions A1–A4, defined in `claude-control-orchestrator/tasks/mac-compatibility-plan.md`):**
 
-- **A1 — item name/account.** The CLI's live credentials are assumed to live in Keychain
-  service `Claude Code-credentials` under the login user; confirm the exact account name via an
-  **attribute-only** dump. Never `-w`/`-g` on the live item — those print the OAuth token, and
-  this file is public. A miss here is a config fix (`CLAUDE_CLI_KEYCHAIN_SERVICE` /
-  `CLAUDE_CLI_KEYCHAIN_ACCOUNT`), not a code change.
+- **A1 — item name/account.** The current CLI stores its live credentials in Keychain under the
+  fixed account `claude-code-user`, service `Claude Code` + `-credentials` + (when the config dir
+  is customized) `-` + the first 8 hex chars of `sha256(NFC(configDir))`; older CLIs used a single
+  item under the **login username** and the un-suffixed service (read as a fallback). Confirm the
+  live account/service via an **attribute-only** dump. Never `-w`/`-g` on the live item — those
+  print the OAuth token, and this file is public. A miss here is a config fix
+  (`CLAUDE_CLI_KEYCHAIN_SERVICE` / `CLAUDE_CLI_KEYCHAIN_ACCOUNT`), not a code change.
 - **A2 — payload shape.** The item decodes to the same `{claudeAiOauth:{…}}` shape as
-  `.credentials.json`, confirmed **keys-only**, never by echoing values.
+  `.credentials.json`, confirmed **keys-only**, never by echoing values. A value over ~2400 bytes
+  is base64-encoded and split into `claude-code-user#<i>` chunk items plus a `claude-code-user#m`
+  metadata item (`{n,l}`); confirm the chunk/metadata **attribute names** exist when the credential
+  is large, again keys-only.
 - **A3 — `CLAUDE_CONFIG_DIR` + `--fresh`.** A fresh login with `CLAUDE_CONFIG_DIR` set writes a
   `.credentials.json` **into that dir** (the CLI respects it, as on Windows per WT-1) → `--fresh`
   capture is safe. If instead the login mutates the global Keychain item (clobbering the live
@@ -337,9 +347,11 @@ no headless test can check.
 
 **State of the code:** the PKCE mint, the authorize-URL shape, the paste parser, the code exchange,
 the identity guard, the in-place vault write and the whole daemon-side pending-flow state machine
-are unit-proven against injected fakes. What no headless test can check is whether the
-reverse-engineered endpoints and formats in `switch-engine/src/oauth.ts` are what the real service
-actually does — the same posture as gate 2, whose module this shares.
+are unit-proven against injected fakes. The endpoints, redirect, scope set and request shapes in
+`switch-engine/src/oauth.ts` are taken from the CLI's own prod OAuth config so a token cctl mints
+matches one the CLI would; what no headless test can check is that a live login accepts them
+end-to-end — the same posture as gate 2, whose module this shares. Note the `account`/`organization`
+field names `mapExchangeResponse` reads are still assumptions.
 
 **Verify (run the CLI verb first — same engine call as the phone, minus the daemon):**
 
@@ -468,6 +480,99 @@ is written to `~/.claude/debug/<session-id>.txt` — instead of attaching as the
 
 **Pass:** an idle session took the prompt with no local input, the reply reached the phone, a
 killed daemon lost nothing, and the nested session refused with a printed reason.
+
+**Result:** not yet run.
+
+### 18. macOS Keychain interop round-trip — cctl ↔ CLI ⏳ OPEN
+
+**Claim to verify:** on macOS the CLI and cctl address the exact same login-Keychain item, so a
+credential written by one is read back — and refreshed — by the other, in BOTH size regimes:
+
+- **cctl writes → CLI reads + refreshes:** after a `switch`, a `claude` launched under the new
+  account reads the swapped item, and its own token rotation writes the new (single-use) token back
+  to the very item cctl reads.
+- **CLI writes → cctl reads:** a fresh `claude` login writes the item; the daemon reads that live
+  credential with no re-login.
+- **unchunked (≤2400 bytes) and chunked (>2400 bytes):** the small case is one item; the large case
+  is the base64 chunk set plus the `#m` metadata item. A real credential can cross the threshold, so
+  both must round-trip — including a shrink back under the threshold, which must tear down the stale
+  chunk set and leave a single unchunked item the CLI still reads.
+
+**Unit-proven already:** the chunk/reassembly layout, the metadata-last write ordering, the
+shrink/grow cleanup, the un-suffixed legacy-read fallback, and the corrupt-set → typed-error paths
+are covered in `packages/switch-engine/src/keychain.test.ts` — but every one drives a **fake
+`ExecRunner`**. They prove our encoding is self-consistent, NOT that the real `security(1)` item
+attributes match what the CLI's secure-storage layer reads, and NOT that a >2400-byte value survives
+the real `security -i` write path.
+
+**What no headless test can close:** whether the CLI's Bun secure-storage and our `security(1)`
+path resolve to the same `kSecAttrService`/`kSecAttrAccount` item (and the same chunk/metadata
+sibling names) on real hardware, and whether the CLI accepts a chunk set we wrote — and we accept
+one it wrote — without forcing a re-login.
+
+**Verify (attribute/keys-only — NEVER `-w`/`-g` on the live item; this file is public):**
+
+- cctl-writes-CLI-reads: `switch` to a spare, run `claude -p` under it, confirm it authenticates
+  with no re-login; force a token refresh and confirm the rotated token lands where cctl reads.
+- CLI-writes-cctl-reads: fresh `claude` login, then `cctl doctor` reports `login` green off the same
+  item.
+- chunked: repeat both directions with a credential large enough to exceed 2400 bytes (confirm the
+  `#m` + `#<i>` siblings exist, keys-only), then shrink it back and confirm the unchunked item is
+  authoritative and the stale chunks are gone.
+
+**Pass (each stamped with evidence):** both directions round-trip in both size regimes, a CLI-side
+refresh after a cctl write is read back by cctl, and the shrink path leaves exactly one unchunked
+item. Record the verdict **arch-scoped** (arm64 ≠ Intel — do not generalize one to the other).
+
+**Result:** not yet run — no Mac available. The fake-runner unit tests and the `macos-latest` CI
+leg (own `vault-key` item only) are NOT evidence for this gate.
+
+### 19. Folder-bound accounts — real accounts, real isolation ⏳ OPEN
+
+**State of the code:** the engine layer (the slot-aware switch engine, the two-file
+reservation fence, profile-dir materialization, `bindFolder`/`unbindFolder`, `checkSlots`/
+`repairSlots`) is unit-proven headless — including crash-safety by injected fault after every
+bind/unbind step. Guard **installation** is now unit-proven too: `ensureBindGuard` writes the
+guard script and lands its `UserPromptSubmit` entry in `settings.json`, and both callers that
+invoke it (the daemon's hook self-heal on start, and `cctl bind`/`unbind`) are exercised — so a
+bound folder always has the guard wired without a regression back to "installed by nobody". The
+wire, Discord and docs layer is additive and tested. But the whole point of the feature is that a
+**real** second account runs isolated in a bound folder, and the guard's runtime _decision_ has
+not been exercised against real Anthropic logins, a real Claude Code binary, or the VS Code
+extension. Green tests are not a bound account.
+
+**Claim to verify (each needs a real run):**
+
+- **Two real accounts, isolated.** Bind a folder to a spare account, launch Claude Code there
+  with `cctl claude` (and via the installed `claude` wrapper from `cctl shell-init`), and
+  confirm the session runs on the bound account while a session in an unbound folder stays on
+  the global account — memories, skills, plugins and MCP servers visible in **both**.
+- **The guard blocks a real mismatch.** Start Claude Code in the bound folder on the shared
+  account (no wrapper) and confirm the `UserPromptSubmit` guard blocks the prompt with the
+  documented message; confirm `--override` and `bind-enforce warn`/`off` behave as documented;
+  confirm the guard fails open when the snapshot is absent.
+- **VS Code extension route.** Driven headless against the real VS Code 1.121 and Claude Code
+  extension 2.1.283 (fake API, bearer recorded per request): the extension declares
+  `claudeCode.environmentVariables` machine-scoped, so the snippet in a folder's
+  `.vscode/settings.json` is IGNORED (the session ran on the shared account and was blocked). The
+  snippet in a VS Code profile's user settings, opened with `code --profile <name> <folder>`,
+  routed the session to the bound account — also with VS Code already running. `cctl where`
+  now prints that route. Also measured: the extension sends a session-title request carrying
+  the prompt text in parallel with the first prompt, so a prompt the guard blocks in a wrongly
+  routed window still reaches that window's account once; a multi-root window judges only its
+  first folder. On a real account, confirm the profile route once.
+- **Remote Control in a bound session.** Confirm a first-party `/rc`-style remote session
+  started in a bound folder stays on the bound account (Remote Control is account-bound; this
+  is exactly the interaction most likely to strand it — see the RC note in the repo memory).
+- **Rapid switching with no global hop.** Drive an in-set auto-switch / phone `/switch` between
+  a bound group's members repeatedly and confirm the global slot never changes and no reserved
+  account is ever left live in two slots (`cctl doctor`/`checkSlots` clean throughout), and
+  that a single-member group's exhaustion alerts rather than hops.
+
+**What no headless test can close:** that a real refresh-token rotation stays confined to its
+slot across a real switch, that the profile's shared junctions/hardlinks survive Claude Code's
+own writes over a real session's lifetime, and that the three real launch paths (terminal,
+wrapper, VS Code) all set `CLAUDE_CONFIG_DIR` the way the guard expects.
 
 **Result:** not yet run.
 

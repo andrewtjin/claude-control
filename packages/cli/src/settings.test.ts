@@ -119,6 +119,7 @@ describe('resolveDaemonConfig', () => {
       autoContinue: true,
       autoContinueMaxAttempts: undefined,
       logFilePath: join(dataDir, 'daemon.log'),
+      bindEnforce: 'block',
     });
     for (const r of rows) expect(r.source).toBe('default');
     expect(row(rows, 'auto-switch').value).toBe('on');
@@ -774,6 +775,45 @@ describe('the settable daemon settings', () => {
       value: '/var/log/cctl.log',
     });
     expect(checkSettingValue(path, '   ')).toMatchObject({ ok: false });
+
+    const enforce = setting('CCTL_BIND_ENFORCE');
+    expect(checkSettingValue(enforce, 'Block')).toEqual({ ok: true, value: 'block' });
+    expect(checkSettingValue(enforce, ' warn ')).toEqual({ ok: true, value: 'warn' });
+    expect(checkSettingValue(enforce, 'off')).toEqual({ ok: true, value: 'off' });
+    expect(checkSettingValue(enforce, 'strict')).toMatchObject({ ok: false });
+    expect(checkSettingValue(enforce, '')).toMatchObject({ ok: false });
+  });
+});
+
+describe('CCTL_BIND_ENFORCE resolution', () => {
+  it('defaults to block, and reads env then file with env winning', () => {
+    expect(resolveDaemonConfig({}).values.bindEnforce).toBe('block');
+    expect(resolveDaemonConfig({ CCTL_BIND_ENFORCE: 'warn' }).values.bindEnforce).toBe('warn');
+    expect(resolveDaemonConfig({ CCTL_BIND_ENFORCE: 'OFF' }).values.bindEnforce).toBe('off');
+    // A garbage value falls back to the default rather than refusing to resolve.
+    expect(resolveDaemonConfig({ CCTL_BIND_ENFORCE: 'nonsense' }).values.bindEnforce).toBe('block');
+    // File under env: the file sets it, no env var, so the file wins.
+    expect(
+      resolveDaemonConfig({}, {}, { env: { CCTL_BIND_ENFORCE: 'off' } }).values.bindEnforce,
+    ).toBe('off');
+    // Env shadows the file entirely.
+    expect(
+      resolveDaemonConfig({ CCTL_BIND_ENFORCE: 'warn' }, {}, { env: { CCTL_BIND_ENFORCE: 'off' } })
+        .values.bindEnforce,
+    ).toBe('warn');
+  });
+
+  it('shows the mode and its source in the daemon rows', () => {
+    const rows = resolveDaemonConfig({ CCTL_BIND_ENFORCE: 'warn' }).rows;
+    const enforceRow = rows.find((r) => r.name === 'folder-binding enforcement');
+    expect(enforceRow?.value).toBe('warn');
+    expect(enforceRow?.source).toBe('env');
+    expect(
+      rows.find((r) => r.name === 'folder-binding enforcement' && r.source === 'default'),
+    ).toBe(undefined);
+    expect(
+      resolveDaemonConfig({}).rows.find((r) => r.name === 'folder-binding enforcement')?.value,
+    ).toBe('block');
   });
 });
 

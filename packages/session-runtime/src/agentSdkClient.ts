@@ -118,6 +118,7 @@ export function createAgentSdkClient(deps: CreateAgentSdkClientDeps = {}): Agent
       ? { configDirForAccount: deps.configDirForAccount }
       : {}),
     ...(deps.baseEnv !== undefined ? { baseEnv: deps.baseEnv } : {}),
+    ...(deps.scrubInheritedConfigDir ? { scrubInheritedConfigDir: true } : {}),
   };
 
   let current: SdkQuery | undefined;

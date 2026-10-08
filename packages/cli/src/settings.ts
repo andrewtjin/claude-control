@@ -28,6 +28,7 @@ import {
   DEFAULT_REFRESH_SKEW_MS,
   atomicWriteFile,
   defaultPaths,
+  type BindEnforceMode,
   type Paths,
 } from '@claude-control/switch-engine';
 import {
@@ -52,7 +53,7 @@ export type { SettingRow } from '@claude-control/shared-protocol';
  *  the phone. Lives here (not program.ts) so the daemon's settings report can carry it: after
  *  an `npm i -g` update the running daemon keeps its old build until restarted, and the two
  *  rows ('cli build' vs 'daemon build') are how an operator sees that skew. */
-export const VERSION = '0.5.2';
+export const VERSION = '1.0.0';
 
 /** The hosted control plane a published build dials with no configuration at all. This is the
  *  last fallback in the precedence ladder, not a lock-in: `--relay`, `CCTL_RELAY_URL`, and
@@ -150,7 +151,8 @@ const RELAY_ENV_NAME = 'CCTL_RELAY_URL';
 /** How a value is checked before it is persisted. Each kind uses the SAME parser the daemon
  *  reads with, so `cctl settings set` can only store what the daemon will honor — a value the
  *  daemon would silently treat as unset is the one typo the file exists to protect from. */
-export type SettingKind = 'bool' | 'number' | 'url' | 'log-level' | 'log-format' | 'path';
+export type SettingKind =
+  'bool' | 'number' | 'url' | 'log-level' | 'log-format' | 'bind-enforce' | 'path';
 
 export interface DaemonEnvSetting {
   /** The env var name — also the key inside config.json's `env` block. */
@@ -191,6 +193,7 @@ export const DAEMON_ENV_SETTINGS: readonly DaemonEnvSetting[] = [
   { name: 'CCTL_AUTO_CONTINUE_MAX', alias: 'auto-continue-max', kind: 'number' },
   { name: 'CCTL_LOG_FORMAT', alias: 'log-format', kind: 'log-format' },
   { name: 'CCTL_LOG_FILE', alias: 'log-file', kind: 'path' },
+  { name: 'CCTL_BIND_ENFORCE', alias: 'bind-enforce', kind: 'bind-enforce' },
 ];
 
 /** Look a setting up by alias or env var name, case-insensitively and with `_`/`-` read as
@@ -243,6 +246,26 @@ export function renderSettingForgotten(
  *  throw at logger construction, which for a persisted value means at every daemon start. */
 const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'];
 
+/** The guard's three enforcement modes (see the switch-engine's `BindEnforceMode`): block a
+ *  session running under the wrong slot, warn but let it through, or say nothing. `block` is the
+ *  default everywhere the value is absent. */
+const BIND_ENFORCE_MODES: readonly BindEnforceMode[] = ['block', 'warn', 'off'];
+
+/** Parse a `CCTL_BIND_ENFORCE` value the way the daemon reads it: case-insensitive, blank or
+ *  unknown treated as unset so the caller can fall back to the default. The one enum reader,
+ *  shared by the value-check and the daemon resolution, so the file can only store what the
+ *  daemon will honor. */
+export function parseBindEnforce(raw: string | undefined): BindEnforceMode | undefined {
+  const value = blankAsUnset(raw)?.toLowerCase();
+  return value !== undefined && (BIND_ENFORCE_MODES as readonly string[]).includes(value)
+    ? (value as BindEnforceMode)
+    : undefined;
+}
+
+/** The default the guard and the snapshot fall back to when no value is set anywhere: block a
+ *  session that runs under the wrong slot. */
+export const DEFAULT_BIND_ENFORCE: BindEnforceMode = 'block';
+
 export type SettingValueCheck = { ok: true; value: string } | { ok: false; message: string };
 
 /** Check a value the way the daemon will read it. Returns the text to persist (trimmed, and
@@ -277,6 +300,15 @@ export function checkSettingValue(setting: DaemonEnvSetting, raw: string): Setti
       return value.toLowerCase() === 'json' || value.toLowerCase() === 'pretty'
         ? { ok: true, value: value.toLowerCase() }
         : { ok: false, message: `${setting.name} takes json or pretty, not "${raw}"` };
+    case 'bind-enforce': {
+      const mode = parseBindEnforce(value);
+      return mode !== undefined
+        ? { ok: true, value: mode }
+        : {
+            ok: false,
+            message: `${setting.name} takes one of ${BIND_ENFORCE_MODES.join(', ')}, not "${raw}"`,
+          };
+    }
     case 'path':
       return value === ''
         ? { ok: false, message: `${setting.name} takes a file path` }
@@ -515,6 +547,10 @@ export interface DaemonConfig {
     /** Where the daemon's NDJSON file sink writes, in addition to stdout — an explicit
      *  CCTL_LOG_FILE, or `<dataDir>/daemon.log` when unset (see the `dataDir` parameter). */
     logFilePath: string;
+    /** How the folder-binding guard enforces a session that runs under the wrong slot: block
+     *  it, warn only, or say nothing. Fed to the engine so the guard snapshot reflects it, and
+     *  read back by the guard hook. Defaults to `block`. */
+    bindEnforce: BindEnforceMode;
   };
   rows: SettingRow[];
 }
@@ -655,6 +691,11 @@ export function resolveDaemonConfig(
   // CCTL_LOG_FILE must not win over the real default with an empty path nothing can write to.
   const logFileEnv = blankAsUnset(layered['CCTL_LOG_FILE']);
   const logFilePath = logFileEnv ?? join(dataDir, 'daemon.log');
+  // The folder-binding guard's enforcement mode. Default `block`: a session that runs under the
+  // wrong slot is stopped with instructions rather than silently allowed to burn the wrong
+  // account. daemonRun hands this to the engine so the snapshot the guard reads reflects it.
+  const bindEnforceEnv = parseBindEnforce(layered['CCTL_BIND_ENFORCE']);
+  const bindEnforce = bindEnforceEnv ?? DEFAULT_BIND_ENFORCE;
 
   const rows: SettingRow[] = [
     {
@@ -830,6 +871,14 @@ export function resolveDaemonConfig(
         'CCTL_LOG_FILE (path NDJSON logs are also appended to; an installed daemon has no ' +
         'console, so this defaults to <data dir>/daemon.log rather than off)',
     },
+    {
+      name: 'folder-binding enforcement',
+      value: bindEnforce,
+      source: sourceOf('CCTL_BIND_ENFORCE', bindEnforceEnv !== undefined),
+      detail:
+        'CCTL_BIND_ENFORCE (block: stop a session on the wrong account; warn: allow but flag; ' +
+        'off: silent)',
+    },
   ];
 
   return {
@@ -855,6 +904,7 @@ export function resolveDaemonConfig(
       autoContinue,
       autoContinueMaxAttempts,
       logFilePath,
+      bindEnforce,
     },
     rows,
   };
@@ -1168,6 +1218,15 @@ export function reportSaysGreedyActive(report: SettingsReport | undefined): bool
   if (!report) return false;
   const value = (name: string) => report.settings.find((r) => r.name === name)?.value;
   return value('auto-switch') === 'on' && value('greedy burn-back') === 'on';
+}
+
+/** Whether the daemon that wrote the report counts the Fable weekly cap (its `fable cap trigger`
+ *  row), or `undefined` when there is no report or no such row. A setting saved since that
+ *  daemon started does not count until it restarts, so a view that must agree with the running
+ *  daemon reads this rather than config.json. */
+export function reportedFableCapTrigger(report: SettingsReport | undefined): boolean | undefined {
+  const value = report?.settings.find((r) => r.name === 'fable cap trigger')?.value;
+  return value === 'on' ? true : value === 'off' ? false : undefined;
 }
 
 /** Missing, corrupt, or foreign content degrades to `undefined` ("no daemon has reported")
