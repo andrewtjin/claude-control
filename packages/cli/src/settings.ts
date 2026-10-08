@@ -1220,6 +1220,15 @@ export function reportSaysGreedyActive(report: SettingsReport | undefined): bool
   return value('auto-switch') === 'on' && value('greedy burn-back') === 'on';
 }
 
+/** Whether the daemon that wrote the report counts the Fable weekly cap (its `fable cap trigger`
+ *  row), or `undefined` when there is no report or no such row. A setting saved since that
+ *  daemon started does not count until it restarts, so a view that must agree with the running
+ *  daemon reads this rather than config.json. */
+export function reportedFableCapTrigger(report: SettingsReport | undefined): boolean | undefined {
+  const value = report?.settings.find((r) => r.name === 'fable cap trigger')?.value;
+  return value === 'on' ? true : value === 'off' ? false : undefined;
+}
+
 /** Missing, corrupt, or foreign content degrades to `undefined` ("no daemon has reported")
  *  rather than crashing a purely informational view. */
 export async function readSettingsReport(filePath: string): Promise<SettingsReport | undefined> {

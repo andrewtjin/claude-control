@@ -260,6 +260,13 @@ describe('readHeartbeat', () => {
     expect(await readHeartbeat(filePath)).toEqual({ state: 'never' });
   });
 
+  it("reads 'never' when the JSON is well-formed but not an object", async () => {
+    for (const content of ['null', '42', '"text"']) {
+      await writeFile(filePath, content, 'utf8');
+      expect(await readHeartbeat(filePath)).toEqual({ state: 'never' });
+    }
+  });
+
   it("reads 'never' when the JSON is well-formed but missing writtenAtMs", async () => {
     await writeFile(filePath, JSON.stringify({ other: 1 }), 'utf8');
     expect(await readHeartbeat(filePath)).toEqual({ state: 'never' });

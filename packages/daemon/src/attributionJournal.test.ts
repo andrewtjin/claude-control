@@ -239,4 +239,35 @@ describe('AttributionJournal', () => {
       expect(journal.accountActiveAt(Date.now())).toBeNull();
     });
   });
+
+  describe('switchesBetween', () => {
+    it('returns the live-account switches inside the window, oldest first, with who and why', async () => {
+      await writeAuditLog(vaultDir, [
+        {
+          ts: 3000,
+          event: 'activated',
+          fromAccountId: 'a',
+          toAccountId: 'b',
+          origin: 'auto',
+          detail: 'a at 95%',
+        },
+        { ts: 500, event: 'activated', fromAccountId: null, toAccountId: 'a', origin: 'manual' },
+        { ts: 1000, event: 'activated', fromAccountId: 'x', toAccountId: 'a' },
+        { ts: 2000, event: 'refreshed', fromAccountId: null, toAccountId: 'a' },
+        { ts: 2500, event: 'activated', fromAccountId: 'a', toAccountId: null },
+        { ts: 4001, event: 'activated', fromAccountId: 'b', toAccountId: 'a' },
+      ]);
+      const journal = new AttributionJournal({ store, vaultDir });
+      // Both ends inclusive; a refresh, a target-less entry and anything outside are not switches.
+      expect(await journal.switchesBetween(1000, 4000)).toEqual([
+        { at: 1000, fromAccountId: 'x', toAccountId: 'a' },
+        { at: 3000, fromAccountId: 'a', toAccountId: 'b', origin: 'auto', reason: 'a at 95%' },
+      ]);
+    });
+
+    it('is empty when nothing was ever switched', async () => {
+      const journal = new AttributionJournal({ store, vaultDir });
+      expect(await journal.switchesBetween(0, Date.now())).toEqual([]);
+    });
+  });
 });

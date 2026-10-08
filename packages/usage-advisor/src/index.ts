@@ -4,8 +4,6 @@ export { computePlan } from './advisor.js';
 export {
   decideAutoSwitch,
   isAutoSwitchCandidate,
-  hasUsableHeadroom,
-  MIN_USABLE_HEADROOM_PCT,
   DEFAULT_TRIGGER_PERCENT,
   DEFAULT_STALE_TRIGGER_PERCENT,
   DEFAULT_STALE_AFTER_MS,
@@ -16,7 +14,25 @@ export {
   type AutoSwitchPolicy,
   type DecideAutoSwitchOptions,
 } from './autoswitch.js';
-export { formatTokens, humanizeDaysUntil, humanizeDuration, roundPct } from './format.js';
+export {
+  assessFleet,
+  describeFirstBack,
+  describeUnavailable,
+  describeWalls,
+  hasUsableHeadroom,
+  MIN_USABLE_HEADROOM_PCT,
+  type AccountAvailability,
+  type FleetAvailability,
+  type UnavailableReason,
+} from './availability.js';
+export { LIMIT_NOUN } from './limits.js';
+export {
+  formatTokens,
+  humanizeDaysUntil,
+  humanizeDuration,
+  humanizeElapsed,
+  roundPct,
+} from './format.js';
 export {
   planWeight,
   type PlanTierSignals,

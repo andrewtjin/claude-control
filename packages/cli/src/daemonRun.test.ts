@@ -17,6 +17,7 @@ import {
 import {
   dpapiIdentityStore,
   makeAgentSdkClientFactory,
+  pollerAdvisorOptions,
   runShutdownSequence,
   type ShutdownSequence,
 } from './daemonRun.js';
@@ -213,4 +214,24 @@ describe('runShutdownSequence', () => {
       expect(order.slice(-2)).toEqual(['markStopped', 'flushHeartbeat']);
     },
   );
+});
+
+describe('pollerAdvisorOptions', () => {
+  const policy = { fableCapTriggers: false, triggerPercent: 90 };
+
+  it('hands the plan the policy even without greedy, so the Fable cap counts the same everywhere', () => {
+    expect(pollerAdvisorOptions({ autoSwitch: true, greedy: false, policy })).toEqual({
+      autoSwitchPolicy: policy,
+    });
+    expect(pollerAdvisorOptions({ autoSwitch: false, greedy: true, policy })).toEqual({
+      autoSwitchPolicy: policy,
+    });
+  });
+
+  it('describes the hops the daemon makes only when it runs greedy auto-switch', () => {
+    expect(pollerAdvisorOptions({ autoSwitch: true, greedy: true, policy })).toEqual({
+      autoSwitchPolicy: policy,
+      greedyAutoSwitch: true,
+    });
+  });
 });

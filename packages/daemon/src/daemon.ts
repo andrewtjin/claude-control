@@ -66,8 +66,23 @@ import {
   selectWeeklyBudget,
   type AccountUsageInput,
   type AutoSwitchPolicy,
+  type FleetAvailability,
 } from '@claude-control/usage-advisor';
 import type { ProbeCandidate } from './accountProbe.js';
+import {
+  exhaustedCardBody,
+  exhaustedRecord,
+  fileWallChanges,
+  judgeOutage,
+  openEpisodeFrom,
+  resumeOpenEpisode,
+  recoveredRecord,
+  SWITCH_CHAIN_WINDOW_MS,
+  type ExhaustionLog,
+  type ExhaustionRecord,
+  type OpenEpisode,
+  type Recovery,
+} from './exhaustionLog.js';
 import type { Store } from './store.js';
 import { slotBySessionMap } from './store.js';
 import {
@@ -260,10 +275,17 @@ export interface DaemonOptions {
    *  interval: the numbers move slowly, the scan is seconds of disk IO, and `/stats` renders the
    *  last pushed snapshot rather than triggering a fresh one. */
   statsIntervalMs?: number;
+  /** Where each time no account can take work is recorded (see exhaustionLog.ts). Injected —
+   *  the composition root owns where the data directory is — and optional so tests that are not
+   *  about it never write a file; absent = nothing is tracked. */
+  exhaustionLog?: ExhaustionLog;
   logger?: Logger;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
+/** How many poll cycles the exhaustion log may fail to read on resume before tracking goes on
+ *  without it. */
+const EXHAUSTION_READ_ATTEMPTS = 3;
 /** A poll-cycle phase whose own synchronous run blocks the event loop this long is logged at
  *  warn. Deliberately the loop-lag monitor's own threshold: one block past it is, by that
  *  monitor's definition, a stall, so a phase that warns here is one the monitor also saw. */
@@ -807,6 +829,19 @@ export class Daemon {
    *  deliberate (an account already quarantined at startup is surfaced by the usage snapshot,
    *  not re-pushed on every restart). */
   private quarantineState = new Map<string, QuarantineNoticeState>();
+  private readonly exhaustionLog: ExhaustionLog | undefined;
+  /** The exhaustion episode open right now (no account can take work), or `undefined`. Read
+   *  back from the log on the first cycle, so an outage that spans a daemon restart stays one
+   *  episode with one pair of cards; {@link exhaustionLoaded} says whether that read happened. */
+  private openExhaustion: OpenEpisode | undefined;
+  private exhaustionLoaded = false;
+  /** Consecutive failed reads of the log on resume (see {@link EXHAUSTION_READ_ATTEMPTS}). */
+  private exhaustionReadFailures = 0;
+  /** The write queue's flushes, chained so a shutdown's flush never runs beside a cycle's. */
+  private exhaustionFlush: Promise<void> = Promise.resolve();
+  /** Exhaustion entries not yet on disk, oldest first (see {@link writeExhaustion}). */
+  private readonly pendingExhaustionWrites: ExhaustionRecord[] = [];
+  private exhaustionWriteFailureLogged = false;
   /** The account each LIVE managed session is currently running its turns against — the value
    *  stamped on its `session.status`/`session.output` frames. Mutable because a session outlives
    *  the account it was spawned on: a usage-limit park resumed after a switch runs everything
@@ -890,6 +925,7 @@ export class Daemon {
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.scanTranscripts = options.scanTranscripts;
     this.statsIntervalMs = options.statsIntervalMs ?? DEFAULT_STATS_INTERVAL_MS;
+    this.exhaustionLog = options.exhaustionLog;
     this.logger = options.logger ?? noopLogger;
     this.isProcessAlive = options.isProcessAlive ?? pidIsAlive;
     // Waking the receiver's held poll on enqueue is what makes injection feel immediate rather
@@ -1148,6 +1184,16 @@ export class Daemon {
     // `claude` child processes — still running under the last-activated account, invisible
     // to the next daemon run (whose recover() only stamps the registry rows 'orphaned').
     await this.stopLiveSessions();
+    // A last try at exhaustion entries a failed write left queued: the next run reads the file.
+    // Bounded like the session teardown above, so a write that never settles cannot hold the
+    // process open.
+    if (this.exhaustionLog !== undefined) {
+      const bound = new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, this.sessionStopOnShutdownMs);
+        timer.unref();
+      });
+      await Promise.race([this.flushExhaustionWrites(this.exhaustionLog), bound]);
+    }
     this.controlPlaneClient.close();
     await this.hookReceiver.close();
     this.store.close();
@@ -1368,6 +1414,16 @@ export class Daemon {
     if (this.settingsReport) {
       this.sendEnvelope({ type: 'settings.snapshot', payload: this.settingsReport });
     }
+
+    // Record the times no account can take work: after the snapshot ships, so the phone has the
+    // numbers before the card that sums them up, and judged on the same merged inputs the plan
+    // and auto-switch read. Its own catch, like auto-switch's below: a bug in the bookkeeping
+    // must never take down the poll loop.
+    await this.timePhase('exhaustion', () =>
+      this.trackExhaustion(snapshot.inputs, accounts, activeId).catch((err: unknown) => {
+        this.logger.error({ err }, 'exhaustion tracking failed');
+      }),
+    );
 
     // Auto-switch runs AFTER the snapshot ships, so the phone always sees the usage state
     // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
@@ -1868,6 +1924,172 @@ export class Daemon {
           notificationType: 'quarantine',
         },
       });
+    }
+  }
+
+  /**
+   * Keep the exhaustion log: open an episode the cycle no account can take work, close it the
+   * cycle one provably can, and send the phone a card both times. When each happens is decided
+   * by the pure {@link judgeOutage}; this method owns the IO around it.
+   */
+  private async trackExhaustion(
+    inputs: AccountUsageInput[],
+    accounts: ReadonlyArray<{ id: string; label: string }>,
+    activeId: string | null,
+  ): Promise<void> {
+    const log = this.exhaustionLog;
+    if (log === undefined || !(await this.loadOpenExhaustion(log))) return;
+    // Entries an earlier cycle could not write go first, so the file keeps their order.
+    await this.flushExhaustionWrites(log);
+    const now = this.clock();
+    // The Fable cap counts exactly when auto-switch counts it.
+    const judged = judgeOutage(inputs, this.openExhaustion, now, this.autoSwitchPolicy);
+    const { transition, open } = judged;
+    if (transition.kind === 'start') {
+      await this.startExhaustion(log, judged.fleet, accounts, activeId, now);
+    } else if (open !== undefined && transition.kind === 'end') {
+      await this.endExhaustion(log, open, transition.recovery, now);
+    } else if (open !== undefined) {
+      // Still out: file what this cycle changed about any account, so a restart judges its
+      // return by what was last seen rather than by the start entry alone.
+      const filed = fileWallChanges(open, now);
+      this.openExhaustion = filed.open;
+      for (const record of filed.records) await this.writeExhaustion(log, record);
+    }
+  }
+
+  /** Read the open episode back from the log, once per daemon run. False while the read keeps
+   *  failing: judging before the log is read could announce an outage it already holds. A read
+   *  that fails (the file briefly held by a scanner) is retried next cycle; only after several
+   *  does tracking go on without it, at the cost of at most one repeated "out of usage". */
+  private async loadOpenExhaustion(log: ExhaustionLog): Promise<boolean> {
+    if (this.exhaustionLoaded) return true;
+    try {
+      this.openExhaustion = resumeOpenEpisode(await log.read());
+    } catch (err) {
+      this.exhaustionReadFailures += 1;
+      if (this.exhaustionReadFailures < EXHAUSTION_READ_ATTEMPTS) {
+        this.logger.warn({ err, path: log.path }, 'exhaustion log unreadable; retrying next cycle');
+        return false;
+      }
+      this.logger.warn({ err, path: log.path }, 'exhaustion log unreadable; no episode resumed');
+    }
+    this.exhaustionLoaded = true;
+    return true;
+  }
+
+  /**
+   * Open an episode: tell the phone, then file the start. The card goes first. A shutdown that
+   * lands mid-cycle closes the relay client and the store under it, and of the two ways that can
+   * cut the pair short, only this one heals: a start never filed is announced by the next run,
+   * while one filed but never announced would be resumed in silence for good.
+   */
+  private async startExhaustion(
+    log: ExhaustionLog,
+    fleet: FleetAvailability,
+    accounts: ReadonlyArray<{ id: string; label: string }>,
+    activeId: string | null,
+    now: number,
+  ): Promise<void> {
+    const labelOf = (id: string): string => accounts.find((a) => a.id === id)?.label ?? id;
+    const steps = await this.attributionJournal.switchesBetween(now - SWITCH_CHAIN_WINDOW_MS, now);
+    const record = exhaustedRecord({
+      fleet,
+      now,
+      active: activeId === null ? null : labelOf(activeId),
+      switches: steps.map((s) => ({
+        at: s.at,
+        from: s.fromAccountId === null ? null : labelOf(s.fromAccountId),
+        to: labelOf(s.toAccountId),
+        ...(s.origin !== undefined ? { origin: s.origin } : {}),
+        ...(s.reason !== undefined ? { reason: s.reason } : {}),
+      })),
+    });
+    this.logger.warn({ episode: record.id, summary: record.summary }, 'no account can take work');
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        title: 'All accounts are out of usage',
+        body: exhaustedCardBody(fleet, record),
+        level: 'warn',
+        notificationType: 'usage_exhausted',
+      },
+    });
+    this.openExhaustion = openEpisodeFrom(record);
+    await this.writeExhaustion(log, record);
+  }
+
+  /** Close the open episode: tell the phone, then file the end, card first for the same reason
+   *  as a start (an end never filed is announced again by the next run; one never announced is
+   *  lost). */
+  private async endExhaustion(
+    log: ExhaustionLog,
+    open: OpenEpisode,
+    recovery: Recovery,
+    now: number,
+  ): Promise<void> {
+    const record = recoveredRecord(open.record, recovery, now);
+    this.logger.info({ episode: record.id, summary: record.summary }, 'usage is back');
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        title: 'Usage is back',
+        body: record.summary,
+        level: 'success',
+        notificationType: 'usage_restored',
+      },
+    });
+    this.openExhaustion = undefined;
+    await this.writeExhaustion(log, record);
+  }
+
+  /**
+   * Queue one exhaustion entry and write whatever is queued. A write that fails (the file held
+   * by a scanner, a full disk) stays queued and is retried every cycle and on shutdown, so a
+   * transient failure costs a delay, not an entry: a missing end would make the next daemon run
+   * resume the episode and announce its end a second time, and a missing start would make it
+   * announce the outage twice. The card has gone out before this, because the phone hearing about
+   * the outage now matters more than the file; only a disk that stays unwritable until a restart
+   * can still cost a repeated card.
+   */
+  private async writeExhaustion(log: ExhaustionLog, record: ExhaustionRecord): Promise<void> {
+    this.pendingExhaustionWrites.push(record);
+    await this.flushExhaustionWrites(log);
+  }
+
+  /** Write the queued exhaustion entries. Flushes run one after another, never side by side: a
+   *  shutdown arriving while a cycle is mid-write would otherwise append the same entry twice. */
+  private flushExhaustionWrites(log: ExhaustionLog): Promise<void> {
+    const run = this.exhaustionFlush.then(() => this.flushExhaustionQueue(log));
+    this.exhaustionFlush = run.catch(() => {});
+    return run;
+  }
+
+  /** Write the queued exhaustion entries in order, stopping at the first that fails. Each failure
+   *  is logged once at error WITH the entry, so daemon.log holds it even if the file never does;
+   *  retries of the same entry log quietly. */
+  private async flushExhaustionQueue(log: ExhaustionLog): Promise<void> {
+    const queue = this.pendingExhaustionWrites;
+    // Flushes never overlap (see flushExhaustionWrites), so the head is still the entry written.
+    for (let next = queue[0]; next !== undefined; next = queue[0]) {
+      try {
+        await log.append(next);
+        queue.shift();
+        this.exhaustionWriteFailureLogged = false;
+      } catch (err) {
+        if (!this.exhaustionWriteFailureLogged) {
+          this.exhaustionWriteFailureLogged = true;
+          this.logger.error(
+            { err, path: log.path, record: next },
+            'could not write the exhaustion log; retrying every cycle',
+          );
+        } else {
+          this.logger.debug({ err, path: log.path }, 'exhaustion log still not writable');
+        }
+        return;
+      }
     }
   }
 

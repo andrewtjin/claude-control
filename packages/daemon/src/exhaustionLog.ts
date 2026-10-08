@@ -1,0 +1,738 @@
+// The exhaustion log: one line each time no account could take work, and one when usage came
+// back. That is the fleet's worst failure (auto-switch walked every account and all of them are
+// spent), so every occurrence goes on record: when, for how long, why each account was out, and
+// the switches that led there.
+//
+// The file IS the log, the only store: append-only JSON lines at
+// `<dataDir>/exhaustion-log.jsonl`, each carrying a plain-English `summary` so the file reads on
+// its own, rendered by `cctl outages`. The daemon reads it back on start to resume an episode
+// that was open when it stopped, so a restart never announces the same outage twice.
+//
+// Deciding WHEN an episode starts and ends is pure (see {@link decideExhaustion}) and leans on
+// the usage advisor's shared availability rule, so the log can never disagree with the plan or
+// the post-switch session resume about whether an account has usage left.
+
+import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import {
+  assessFleet,
+  describeFirstBack,
+  describeUnavailable,
+  humanizeElapsed,
+  LIMIT_NOUN,
+  type AccountAvailability,
+  type AccountUsageInput,
+  type AutoSwitchPolicy,
+  type FleetAvailability,
+  type LimitInput,
+  type UnavailableReason,
+} from '@claude-control/usage-advisor';
+
+/** The log's file name inside the daemon's data directory. */
+const EXHAUSTION_LOG_FILE = 'exhaustion-log.jsonl';
+
+/** How far back the switch chain in an `exhausted` entry reaches: one 5-hour window, the
+ *  span over which auto-switch could have walked every account's window. */
+export const SWITCH_CHAIN_WINDOW_MS = 5 * 60 * 60_000;
+
+/** {@link SWITCH_CHAIN_WINDOW_MS} in words, for the card and the CLI. */
+export const SWITCH_CHAIN_WINDOW_WORDS = '5 hours';
+
+/** Where the log lives for a given data directory. Shared by the daemon (writer) and the CLI
+ *  (reader), so the two can never look in different places. */
+export function exhaustionLogPath(dataDir: string): string {
+  return join(dataDir, EXHAUSTION_LOG_FILE);
+}
+
+/** One account as it stood when the episode began. */
+export interface ExhaustedAccount {
+  accountId: string;
+  label: string;
+  reason: UnavailableReason;
+  /** Percent used on the binding limit, when known. */
+  percent?: number;
+  /** When it was expected back (the last of its walls to reset). */
+  backAt?: number;
+  backAtPredicted?: boolean;
+  /** The limits at the wall, with their reported resets: what a later cycle checks to tell a
+   *  real return from a poll that merely came back empty. */
+  spent: LimitInput[];
+}
+
+/** One switch in the walk that led to the episode, by each account's label when the entry was
+ *  written (an account removed since shows its id). */
+export interface ExhaustionSwitch {
+  at: number;
+  from: string | null;
+  to: string;
+  origin?: string;
+  reason?: string;
+}
+
+/** Written when the last account runs out. */
+export interface ExhaustedRecord {
+  v: 1;
+  event: 'exhausted';
+  /** Pairs this entry with its `recovered` entry. */
+  id: string;
+  at: number;
+  /** `at` as ISO-8601, for a human reading the file. */
+  time: string;
+  summary: string;
+  /** The live account's label at that moment, or null when none was live. */
+  active: string | null;
+  accounts: ExhaustedAccount[];
+  firstBack?: { accountId: string; label: string; at: number; predicted: boolean };
+  /** Every switch of the live account in the {@link SWITCH_CHAIN_WINDOW_MS} before `at`. */
+  switches: ExhaustionSwitch[];
+}
+
+/** Every way an account can come back; the reader accepts exactly these. */
+const RECOVERY_HOWS = ['reset', 'headroom', 'relogin', 'new_account'] as const;
+
+/** How the first account came back. */
+export type RecoveryHow = (typeof RECOVERY_HOWS)[number];
+
+/** Written when some account can take work again. */
+export interface RecoveredRecord {
+  v: 1;
+  event: 'recovered';
+  id: string;
+  /** When the daemon saw it. */
+  at: number;
+  time: string;
+  summary: string;
+  /** When the account actually came back: the reset that brought it back when that is how,
+   *  else `at`. A daemon that was stopped through the reset still measures the outage right. */
+  backSince: number;
+  /** `backSince` minus the episode's start. */
+  durationMs: number;
+  account: { accountId: string; label: string };
+  how: RecoveryHow;
+  /** For `reset`: the limit whose reset brought it back. */
+  limit?: LimitInput['kind'];
+}
+
+/**
+ * Written while an episode is open, when what keeps an account out changes materially: it hits a
+ * new limit, its login dies, a reset it waits on moves by more than {@link WALL_MOVE_MS}, or it
+ * joins the episode (added mid-outage). A restarted daemon, and the CLI, fold these into the
+ * start entry's accounts, so a return is judged against what was last seen, not only against what
+ * was true at the start.
+ */
+export interface WallsRecord {
+  v: 1;
+  event: 'walls';
+  /** The open episode it belongs to. */
+  id: string;
+  at: number;
+  time: string;
+  accountId: string;
+  label: string;
+  reason: UnavailableReason;
+  spent: LimitInput[];
+}
+
+export type ExhaustionRecord = ExhaustedRecord | RecoveredRecord | WallsRecord;
+
+/** How far a reset must move before it is worth a `walls` line: the endpoint recomputes every
+ *  reset per response with about a second of jitter, and a line per poll would bury the history. */
+export const WALL_MOVE_MS = 5 * 60_000;
+
+/** An episode as the CLI lists it: its start and, once over, its end. */
+export interface ExhaustionEpisode {
+  start: ExhaustedRecord;
+  end?: RecoveredRecord;
+}
+
+// ---- reading lines back -----------------------------------------------------------------------
+//
+// Every field the daemon or the CLI reads is checked before a line is accepted, down to each
+// account and limit: a line from a newer build (another `v`), a torn write, or a hand edit that
+// left a field out is skipped whole, never half-used. Half-used, it would throw on every poll
+// cycle that judged the episode it describes, and stop `cctl outages` from printing anything.
+
+// Taken from the exhaustive per-kind table, so a limit kind added there is read here too rather
+// than dropping every line that carries it.
+const LIMIT_KINDS = new Set<string>(Object.keys(LIMIT_NOUN));
+const REASONS = new Set<string>([...LIMIT_KINDS, 'quarantined']);
+const HOWS = new Set<string>(RECOVERY_HOWS);
+
+/** The largest magnitude a `Date` can hold: a timestamp past it renders as "NaN". */
+const MAX_TIME_MS = 8.64e15;
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+const isNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isTime = (v: unknown): v is number => isNumber(v) && Math.abs(v) <= MAX_TIME_MS;
+const isString = (v: unknown): v is string => typeof v === 'string';
+const optional = (v: unknown, check: (v: unknown) => boolean): boolean =>
+  v === undefined || check(v);
+
+function isLimit(v: unknown): boolean {
+  return (
+    isObject(v) &&
+    isString(v.kind) &&
+    LIMIT_KINDS.has(v.kind) &&
+    isNumber(v.percent) &&
+    optional(v.resetsAt, isTime)
+  );
+}
+
+function isExhaustedAccount(v: unknown): boolean {
+  return (
+    isObject(v) &&
+    isString(v.accountId) &&
+    isString(v.label) &&
+    isString(v.reason) &&
+    REASONS.has(v.reason) &&
+    Array.isArray(v.spent) &&
+    v.spent.every(isLimit) &&
+    optional(v.percent, isNumber) &&
+    optional(v.backAt, isTime)
+  );
+}
+
+function isSwitch(v: unknown): boolean {
+  return (
+    isObject(v) &&
+    isTime(v.at) &&
+    (v.from === null || isString(v.from)) &&
+    isString(v.to) &&
+    optional(v.origin, isString) &&
+    optional(v.reason, isString)
+  );
+}
+
+/** Narrow one parsed line to a record this build understands (see above). */
+function isRecord(value: unknown): value is ExhaustionRecord {
+  if (!isObject(value) || value.v !== 1 || !isString(value.id) || !isTime(value.at)) {
+    return false;
+  }
+  if (value.event === 'exhausted') {
+    return (
+      Array.isArray(value.accounts) &&
+      value.accounts.every(isExhaustedAccount) &&
+      Array.isArray(value.switches) &&
+      value.switches.every(isSwitch) &&
+      (value.active === null || isString(value.active)) &&
+      optional(value.firstBack, (f) => isObject(f) && isString(f.label) && isTime(f.at))
+    );
+  }
+  if (value.event === 'walls') {
+    return isExhaustedAccount(value);
+  }
+  if (value.event === 'recovered') {
+    const account = value.account;
+    return (
+      isObject(account) &&
+      isString(account.accountId) &&
+      isString(account.label) &&
+      isTime(value.backSince) &&
+      isNumber(value.durationMs) &&
+      isString(value.how) &&
+      HOWS.has(value.how) &&
+      optional(value.limit, (l) => isString(l) && LIMIT_KINDS.has(l))
+    );
+  }
+  return false;
+}
+
+/** Pair starts with their ends, oldest first. An end with no start (a hand-edited file) is
+ *  dropped; a start with no end is the episode still open. `walls` lines are tracking, not
+ *  history, and are left to {@link resumeOpenEpisode}. A start written twice (a write retried
+ *  after it had in fact landed) is one episode. */
+export function episodesOf(records: ExhaustionRecord[]): ExhaustionEpisode[] {
+  const episodes: ExhaustionEpisode[] = [];
+  const byId = new Map<string, ExhaustionEpisode>();
+  for (const r of records) {
+    if (r.event === 'exhausted') {
+      if (byId.has(r.id)) continue;
+      const episode: ExhaustionEpisode = { start: r };
+      episodes.push(episode);
+      byId.set(r.id, episode);
+    } else if (r.event === 'recovered') {
+      const episode = byId.get(r.id);
+      if (episode !== undefined && episode.end === undefined) episode.end = r;
+    }
+  }
+  return episodes;
+}
+
+/** The episode still open: the LAST start, when it has no end. An older start left without an
+ *  end (a crash between two writes) is history, not a second open episode. */
+export function openEpisodeOf(records: ExhaustionRecord[]): ExhaustedRecord | undefined {
+  const last = episodesOf(records).at(-1);
+  return last !== undefined && last.end === undefined ? last.start : undefined;
+}
+
+/** Reads and appends the log file. */
+export class ExhaustionLog {
+  constructor(readonly path: string) {}
+
+  /** Append one record as one line. Creates the directory on first use. A crash mid-append can
+   *  leave the file ending in a fragment with no newline; a record appended straight onto it
+   *  would join that fragment and be unreadable, so it starts on a fresh line instead. */
+  async append(record: ExhaustionRecord): Promise<void> {
+    await mkdir(dirname(this.path), { recursive: true });
+    const lead = (await endsMidLine(this.path)) ? '\n' : '';
+    await appendFile(this.path, lead + JSON.stringify(record) + '\n', 'utf8');
+  }
+
+  /** Every record, oldest first. A missing file is an empty log; an unreadable line is skipped. */
+  async read(): Promise<ExhaustionRecord[]> {
+    let raw: string;
+    try {
+      raw = await readFile(this.path, 'utf8');
+    } catch (err) {
+      if (isNoSuchFile(err)) return [];
+      throw err;
+    }
+    const records: ExhaustionRecord[] = [];
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed === '') continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        continue; // a torn write from a crash mid-append
+      }
+      if (isRecord(parsed)) records.push(parsed);
+    }
+    return records;
+  }
+}
+
+/** Whether an error says no file exists at the path: ENOENT, or ENOTDIR when a parent in the path
+ *  is a file, which Linux reports where Windows says ENOENT. Either way there is no log to read,
+ *  which is not the same as one that cannot be read right now. */
+function isNoSuchFile(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/** Whether a file's last byte is something other than a newline. A missing or empty file ends
+ *  on a line boundary. Reads one byte, however long the log grows. */
+async function endsMidLine(path: string): Promise<boolean> {
+  let handle;
+  try {
+    handle = await open(path, 'r');
+  } catch (err) {
+    if (isNoSuchFile(err)) return false;
+    throw err;
+  }
+  try {
+    const { size } = await handle.stat();
+    if (size === 0) return false;
+    const last = Buffer.alloc(1);
+    await handle.read(last, 0, 1, size - 1);
+    return last[0] !== 0x0a;
+  } finally {
+    await handle.close();
+  }
+}
+
+// ---- an open episode ---------------------------------------------------------------------------
+
+/** One account as the daemon tracks it through an open episode: what keeps it out, as of the
+ *  latest reading that showed it out. */
+export interface TrackedAccount {
+  label: string;
+  reason: UnavailableReason;
+  /** Its walls, from the latest reading with numbers that showed it out. */
+  spent: LimitInput[];
+  /** The last moment a reading showed it out: its return is never dated earlier. */
+  lastOutAt: number;
+  /** What the log file holds for it (the start entry or its last `walls` line), or `undefined`
+   *  when the file has nothing yet: what a change is measured against before it is written. */
+  filed?: { reason: UnavailableReason; spent: LimitInput[] };
+}
+
+/**
+ * An open episode: the start entry as the file holds it, plus every account's latest known
+ * state. It is what a return is judged against, so a wall an account hits mid-outage, or a reset
+ * the endpoint moves later, cannot be mistaken for the account coming back once the reset
+ * recorded at the start has passed. The tracking lives in memory; its material changes are filed
+ * as `walls` lines (see {@link fileWallChanges}), which is what a restart rebuilds it from.
+ */
+export interface OpenEpisode {
+  record: ExhaustedRecord;
+  accounts: ReadonlyMap<string, TrackedAccount>;
+}
+
+/** The open episode as its start entry describes it, with any `walls` lines filed since folded
+ *  in, oldest first. */
+export function openEpisodeFrom(record: ExhaustedRecord, walls: WallsRecord[] = []): OpenEpisode {
+  const accounts = new Map<string, TrackedAccount>(
+    record.accounts.map((a) => [
+      a.accountId,
+      {
+        label: a.label,
+        reason: a.reason,
+        spent: a.spent,
+        lastOutAt: record.at,
+        filed: { reason: a.reason, spent: a.spent },
+      },
+    ]),
+  );
+  for (const w of walls) {
+    if (w.id !== record.id) continue;
+    accounts.set(w.accountId, {
+      label: w.label,
+      reason: w.reason,
+      spent: w.spent,
+      lastOutAt: Math.max(w.at, accounts.get(w.accountId)?.lastOutAt ?? w.at),
+      filed: { reason: w.reason, spent: w.spent },
+    });
+  }
+  return { record, accounts };
+}
+
+/** The open episode as the log holds it: the last start without an end, and its `walls` lines.
+ *  What a restarted daemon resumes, and what the CLI judges an outage by. */
+export function resumeOpenEpisode(records: ExhaustionRecord[]): OpenEpisode | undefined {
+  const open = openEpisodeOf(records);
+  if (open === undefined) return undefined;
+  const walls = records.filter((r): r is WallsRecord => r.event === 'walls' && r.id === open.id);
+  return openEpisodeFrom(open, walls);
+}
+
+/** Whether two sets of walls differ in a way that changes a return: a limit added or gone, or a
+ *  reset moved by more than {@link WALL_MOVE_MS} (or becoming known or unknown). A percent that
+ *  moves at the wall changes nothing. Compared as sorted lists, not by looking each kind up: one
+ *  reading can carry two limits of the same kind (an Opus and a Fable weekly cap both normalize
+ *  to `weekly_scoped`), and a lookup would pair them crosswise and see a change every cycle. */
+function wallsDiffer(a: LimitInput[], b: LimitInput[]): boolean {
+  if (a.length !== b.length) return true;
+  const order = (l: LimitInput) =>
+    `${l.kind}:${String(l.resetsAt ?? Number.MAX_SAFE_INTEGER).padStart(16, '0')}`;
+  const sortedA = [...a].sort((x, y) => order(x).localeCompare(order(y)));
+  const sortedB = [...b].sort((x, y) => order(x).localeCompare(order(y)));
+  return sortedA.some((limit, i) => {
+    const other = sortedB[i] as LimitInput;
+    if (other.kind !== limit.kind) return true;
+    if ((limit.resetsAt === undefined) !== (other.resetsAt === undefined)) return true;
+    return (
+      limit.resetsAt !== undefined &&
+      other.resetsAt !== undefined &&
+      Math.abs(limit.resetsAt - other.resetsAt) > WALL_MOVE_MS
+    );
+  });
+}
+
+/** When an account tracked by an open episode is expected back: the last reset among the walls
+ *  it was last seen out on, or `undefined` when one of them has no known reset, or it is out on a
+ *  dead login with nothing else to wait for. */
+export function trackedBackAt(account: TrackedAccount): number | undefined {
+  if (account.spent.length === 0) return undefined;
+  let backAt = Number.NEGATIVE_INFINITY;
+  for (const limit of account.spent) {
+    if (limit.resetsAt === undefined) return undefined;
+    backAt = Math.max(backAt, limit.resetsAt);
+  }
+  return backAt;
+}
+
+/**
+ * The `walls` lines this cycle's tracking calls for: one per account whose reason or walls
+ * changed materially since the file last described it, or that the file has never described.
+ * Returns the episode with those accounts marked as filed, so the same change is not written
+ * twice.
+ */
+export function fileWallChanges(
+  open: OpenEpisode,
+  now: number,
+): { open: OpenEpisode; records: WallsRecord[] } {
+  const records: WallsRecord[] = [];
+  const accounts = new Map(open.accounts);
+  for (const [accountId, a] of open.accounts) {
+    const filed = a.filed;
+    if (filed !== undefined && filed.reason === a.reason && !wallsDiffer(filed.spent, a.spent)) {
+      continue;
+    }
+    records.push({
+      v: 1,
+      event: 'walls',
+      id: open.record.id,
+      at: now,
+      time: new Date(now).toISOString(),
+      accountId,
+      label: a.label,
+      reason: a.reason,
+      spent: a.spent,
+    });
+    accounts.set(accountId, { ...a, filed: { reason: a.reason, spent: a.spent } });
+  }
+  return { open: { record: open.record, accounts }, records };
+}
+
+/**
+ * Fold one cycle's readings into the open episode. Every account out right now is tracked as of
+ * now: its walls replaced by this reading's when the reading has numbers (a dead login with no
+ * numbers keeps the walls it had), its last-seen-out moved to now. An account first seen out
+ * mid-outage joins here, so its return needs the same evidence as everyone else's. Accounts that
+ * can take work are left as they were: whether they are back is {@link decideExhaustion}'s call.
+ */
+export function trackOpenEpisode(
+  open: OpenEpisode,
+  fleet: FleetAvailability,
+  now: number,
+): OpenEpisode {
+  const accounts = new Map(open.accounts);
+  for (const a of fleet.accounts) {
+    if (a.usable || a.reason === undefined) continue;
+    const before = accounts.get(a.accountId);
+    accounts.set(a.accountId, {
+      label: a.label,
+      reason: a.reason,
+      spent: a.measured ? a.spent : (before?.spent ?? []),
+      lastOutAt: now,
+      ...(before?.filed !== undefined ? { filed: before.filed } : {}),
+    });
+  }
+  return { record: open.record, accounts };
+}
+
+/** One cycle's verdict on the outage. */
+export interface OutageJudgement {
+  /** The fleet as this reading stands now. */
+  fleet: FleetAvailability;
+  /** The open episode with this reading folded in (see {@link trackOpenEpisode}); `undefined`
+   *  when none was open. */
+  open: OpenEpisode | undefined;
+  transition: ExhaustionTransition;
+  /** Whether an outage is on once the transition is applied. */
+  on: boolean;
+}
+
+/**
+ * Judge the outage from the log's open episode and one reading: whether one starts, the open
+ * one ends, or nothing changes. The daemon acts on it every poll cycle; the CLI judges the same
+ * way from the file and the latest numbers, so the banner and `cctl outages` can never disagree
+ * with what the daemon would record. Whether the Fable cap counts comes from `policy`, exactly
+ * as for auto-switch.
+ *
+ * Resets are the endpoint's times, compared against this machine's clock. A clock stepped ahead
+ * across a reset therefore ends an outage early, and a step back can then start a second one.
+ * No margin is held against that: the poller re-polls an account only every few minutes, so any
+ * margin would delay every real "usage is back" by up to its length, to guard against a step
+ * that has to land within minutes of a reset to matter.
+ */
+export function judgeOutage(
+  inputs: AccountUsageInput[],
+  open: OpenEpisode | undefined,
+  now: number,
+  policy: Pick<AutoSwitchPolicy, 'fableCapTriggers'>,
+): OutageJudgement {
+  const fleet = assessFleet(inputs, now, policy);
+  if (open === undefined) {
+    const transition = decideExhaustion(undefined, fleet, now);
+    return { fleet, open, transition, on: transition.kind === 'start' };
+  }
+  // This reading refreshes what the episode knows about every account still out before judging
+  // whether any is back.
+  const tracked = trackOpenEpisode(open, fleet, now);
+  const transition = decideExhaustion(tracked, fleet, now);
+  return { fleet, open: tracked, transition, on: transition.kind !== 'end' };
+}
+
+// ---- deciding transitions ----------------------------------------------------------------------
+
+/** How the first account came back, and since when. */
+export interface Recovery {
+  accountId: string;
+  label: string;
+  how: RecoveryHow;
+  backSince: number;
+  limit?: LimitInput['kind'];
+}
+
+/** What one poll cycle changes. */
+export type ExhaustionTransition =
+  { kind: 'none' } | { kind: 'start' } | { kind: 'end'; recovery: Recovery };
+
+/**
+ * Decide whether this cycle starts an episode, ends the open one, or changes nothing (the pure
+ * core of {@link judgeOutage}).
+ *
+ * Starting needs the shared rule to say no account can take work. Ending needs POSITIVE
+ * evidence that one can, because the shared rule counts an account with no live numbers as
+ * usable (unknown is not exhausted) and a poll that failed this cycle reports exactly that. An
+ * episode ended on a failed poll would send a false "usage is back" card and, when the numbers
+ * return next cycle, a second "out of usage" card for the same outage.
+ */
+export function decideExhaustion(
+  open: OpenEpisode | undefined,
+  fleet: FleetAvailability,
+  now: number,
+): ExhaustionTransition {
+  if (open === undefined) return fleet.exhausted ? { kind: 'start' } : { kind: 'none' };
+  let best: Recovery | undefined;
+  for (const account of fleet.accounts) {
+    const recovery = recoveryOf(open.accounts.get(account.accountId), account, now);
+    if (recovery === undefined) continue;
+    // The account back earliest names the end; ties break by label for a stable answer.
+    if (
+      best === undefined ||
+      recovery.backSince < best.backSince ||
+      (recovery.backSince === best.backSince && recovery.label < best.label)
+    ) {
+      best = recovery;
+    }
+  }
+  return best === undefined ? { kind: 'none' } : { kind: 'end', recovery: best };
+}
+
+/**
+ * Whether one account is back, judged against how the episode last saw it. Live numbers with
+ * headroom are evidence; no numbers (never polled, or a poll that failed) are evidence only when
+ * the clock alone proves that what kept the account out is gone.
+ */
+function recoveryOf(
+  before: TrackedAccount | undefined,
+  now: AccountAvailability,
+  at: number,
+): Recovery | undefined {
+  if (!now.usable) return undefined;
+  const who = { accountId: now.accountId, label: now.label };
+  // An account this episode has never seen out (added during it): back only on numbers. A login
+  // whose first poll fails has none, and may be just as spent as the rest.
+  if (before === undefined) {
+    return now.measured ? { ...who, how: 'new_account', backSince: at } : undefined;
+  }
+  const wall = wallResetOf(before, at);
+  if (before.reason === 'quarantined') {
+    // A restored login: its numbers show headroom, or the walls it also had have since reset.
+    return now.measured || wall !== undefined
+      ? { ...who, how: 'relogin', backSince: at }
+      : undefined;
+  }
+  if (wall !== undefined) {
+    // Dated to the reset, but never before the last reading that still showed it out: a reset
+    // the endpoint moved later is not a return.
+    return {
+      ...who,
+      how: 'reset',
+      backSince: Math.max(wall.at, before.lastOutAt),
+      limit: wall.kind,
+    };
+  }
+  // Numbers with headroom before the walls' reported resets.
+  return now.measured ? { ...who, how: 'headroom', backSince: at } : undefined;
+}
+
+/** When every limit the account was last seen out on has reset by `now`, and which reset came
+ *  last; undefined while any is still ahead or was never known. */
+function wallResetOf(
+  before: TrackedAccount,
+  now: number,
+): { at: number; kind: LimitInput['kind'] } | undefined {
+  const at = trackedBackAt(before);
+  if (at === undefined || at > now) return undefined;
+  // trackedBackAt is the latest reset among the walls, so one of them carries it.
+  const last = before.spent.find((l) => l.resetsAt === at) as LimitInput;
+  return { at, kind: last.kind };
+}
+
+// ---- building records ----------------------------------------------------------------------------
+
+/** The `exhausted` entry for an exhausted fleet. */
+export function exhaustedRecord(args: {
+  fleet: FleetAvailability;
+  now: number;
+  active: string | null;
+  switches: ExhaustionSwitch[];
+}): ExhaustedRecord {
+  const { fleet, now } = args;
+  const accounts: ExhaustedAccount[] = fleet.accounts.map((a) => ({
+    accountId: a.accountId,
+    label: a.label,
+    reason: reasonOf(a),
+    ...(a.percent !== undefined ? { percent: a.percent } : {}),
+    ...(a.backAt !== undefined ? { backAt: a.backAt } : {}),
+    ...(a.backAtPredicted === true ? { backAtPredicted: true } : {}),
+    spent: a.spent,
+  }));
+  return {
+    v: 1,
+    event: 'exhausted',
+    id: `ep-${now}`,
+    at: now,
+    time: new Date(now).toISOString(),
+    summary:
+      `No account can take work: ${fleet.accounts.map((a) => describeUnavailable(a, now)).join(', ')}. ` +
+      describeFirstBack(fleet, now),
+    active: args.active,
+    accounts,
+    ...(fleet.firstBack !== undefined ? { firstBack: fleet.firstBack } : {}),
+    switches: args.switches,
+  };
+}
+
+/** Why an account in an exhausted fleet is out. Every one of them is unavailable, so a reason is
+ *  always there; a usable one here means the caller recorded a fleet that was not exhausted. */
+function reasonOf(a: AccountAvailability): UnavailableReason {
+  if (a.reason === undefined) {
+    throw new Error(`exhausted entry built for a fleet where ${a.label} can still take work`);
+  }
+  return a.reason;
+}
+
+/** What brought an account back, in words. Shared with `cctl outages`, so the file's summary
+ *  and the CLI never word the same recovery differently. */
+export function recoveryText(recovery: Pick<Recovery, 'how' | 'limit'>): string {
+  switch (recovery.how) {
+    case 'reset':
+      return recovery.limit !== undefined
+        ? `its ${LIMIT_NOUN[recovery.limit]} reset`
+        : 'its limits reset';
+    case 'relogin':
+      return 'its login was restored';
+    case 'new_account':
+      return 'a newly added account';
+    case 'headroom':
+      return 'it has usage left again';
+  }
+}
+
+/** The `recovered` entry that closes `open`. */
+export function recoveredRecord(
+  open: ExhaustedRecord,
+  recovery: Recovery,
+  now: number,
+): RecoveredRecord {
+  // Never before the start: a clock stepped back between the two must not yield a negative
+  // outage.
+  const backSince = Math.max(recovery.backSince, open.at);
+  const durationMs = backSince - open.at;
+  return {
+    v: 1,
+    event: 'recovered',
+    id: open.id,
+    at: now,
+    time: new Date(now).toISOString(),
+    summary:
+      `Usage is back: ${recovery.label} (${recoveryText(recovery)}). ` +
+      `No account could take work for ${humanizeElapsed(durationMs)}.`,
+    backSince,
+    durationMs,
+    account: { accountId: recovery.accountId, label: recovery.label },
+    how: recovery.how,
+    ...(recovery.limit !== undefined ? { limit: recovery.limit } : {}),
+  };
+}
+
+/** The phone card for the start of an episode: one account per line, then when it ends. */
+export function exhaustedCardBody(fleet: FleetAvailability, record: ExhaustedRecord): string {
+  const lines = fleet.accounts.map((a) => `• ${describeUnavailable(a, record.at)}`);
+  const walk =
+    record.switches.length > 0
+      ? [
+          `${record.switches.length} switch${record.switches.length === 1 ? '' : 'es'} in the last ${SWITCH_CHAIN_WINDOW_WORDS}; cctl outages lists them.`,
+        ]
+      : [];
+  return ['No account can take work.', ...lines, describeFirstBack(fleet, record.at), ...walk].join(
+    '\n',
+  );
+}

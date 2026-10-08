@@ -52,6 +52,9 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   session or the phone connection.
 - **Every limit in one view.** 5-hour, weekly, and per-model limits across all
   accounts at once, with the reset clocks that make them actionable.
+- **A record of every time you ran out.** When every account is spent, the daemon logs
+  when, why each account was out, and the switches that led there, then how long it
+  lasted. `cctl outages` lists them; the phone gets a card at the start and the end.
 - **Approve from anywhere.** Permission prompts, questions, and "done / waiting" notices reach
   your phone; approve or deny from Discord. Send live prompts or start a fresh
   session and watch milestones stream back.

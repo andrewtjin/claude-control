@@ -56,6 +56,26 @@ export {
 export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
 
 export {
+  episodesOf,
+  ExhaustionLog,
+  exhaustionLogPath,
+  judgeOutage,
+  openEpisodeFrom,
+  recoveryText,
+  resumeOpenEpisode,
+  SWITCH_CHAIN_WINDOW_WORDS,
+  trackedBackAt,
+  type ExhaustedAccount,
+  type ExhaustedRecord,
+  type ExhaustionEpisode,
+  type ExhaustionSwitch,
+  type OpenEpisode,
+  type OutageJudgement,
+  type RecoveredRecord,
+  type Recovery,
+} from './exhaustionLog.js';
+
+export {
   readTranscriptTurns,
   type ReadTranscriptTurnsOptions,
   type TranscriptScan,
