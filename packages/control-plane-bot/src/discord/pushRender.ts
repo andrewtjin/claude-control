@@ -22,7 +22,7 @@ import { permissionButtons, type ButtonSpec } from './buttons.js';
 import { encodeReauthPasteButton } from './reauthCards.js';
 import { questionSelectSpecs, type SelectSpec } from './questionCards.js';
 import { chunkMessage } from './messageChunks.js';
-import { MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
+import { escapeDiscordMarkdown, MESSAGE_CONTENT_LIMIT, truncateLabeled } from './richFormat.js';
 import { defuseFences, formatTables } from './tableFormat.js';
 
 /** Everything a `content` push actually reaches the reader as: the gateway sends it through
@@ -177,8 +177,8 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
 
 /** hook.notification → the right lifecycle card, or `undefined` to suppress a DM. Stop always wins
  *  (it carries the final message); otherwise the tolerant `notificationType` string selects
- *  tool-output/waiting/quarantine, and anything unknown falls back to the generic title/body
- *  content an N-1 bot would also show. */
+ *  tool-output/waiting/quarantine/slot-alert, and anything unknown falls back to the generic
+ *  title/body content an N-1 bot would also show. */
 function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | undefined {
   // The daemon may send a `question_prompt` notification ALONGSIDE the richer question.request
   // card for the same prompt. The card is the real, answerable UI, so the plain-text companion is
@@ -242,6 +242,18 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
           }),
         ],
       };
+    case 'slot_alert': {
+      // A folder-bound group is out of quota. The body is a daemon-composed sentence that embeds
+      // operator-chosen identifiers — a bound folder path and an account label — which are data,
+      // not markup. Routed through the generic branch below they render as Discord markdown:
+      // underscores in a path italicize, a backtick opens a code span, and a crafted label such as
+      // `](https://evil)` splices in a masked link. Escaping the whole line renders every
+      // metacharacter literally, so the alert reads exactly as the daemon wrote it. Clamped to the
+      // content ceiling so a long path can never get the send rejected (which would hide the alert).
+      const title = escapeDiscordMarkdown(p.title);
+      const body = escapeDiscordMarkdown(p.body);
+      return { content: truncateLabeled(`**${title}**\n${body}`, MESSAGE_CONTENT_LIMIT) };
+    }
     default: {
       // The generic card is a bold title over relayed body text; that body is whatever the
       // session had to say, tables included, so it goes through the formatter like every other

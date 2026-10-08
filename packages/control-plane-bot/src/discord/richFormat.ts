@@ -184,6 +184,42 @@ export const EMBED_FIELD_VALUE_LIMIT = 1024;
 export const MESSAGE_CONTENT_LIMIT = 2000;
 
 /**
+ * Neutralize Discord markdown in a user-derived label or folder before it is interpolated into an
+ * embed title, field name, field value, description, or raw message content.
+ *
+ * Only NAMES the user chose go through here — account labels, folder/group labels — never model
+ * prose (a done-card summary is meant to render its markdown). The names are identifiers, so any
+ * markup they carry is at best noise and at worst an injection: a label like `](https://evil)`
+ * would splice a link into a field, `**x**` would bold a neighbouring word, and a folder with a
+ * backtick would break out of a code fence. Each metacharacter is backslash-escaped, which Discord
+ * renders as the literal character, so the name reads exactly as typed.
+ *
+ * The rules mirror what Discord's parser actually keys on:
+ *  - The inline set (backslash, backtick, `*`, `_`, `~`, `|`, `>`, `[`, `]`, `(`, `)`) is markup
+ *    anywhere on a line, so it is always escaped. The backslash is first in the class so the escape
+ *    we add is never itself re-read as the start of another escape.
+ *  - `#` and `-` are markup ONLY at the start of a line (heading / bullet), so they are escaped
+ *    only there — escaping every `-` would leave a stray backslash in `max-20x` or a hyphenated
+ *    folder path, which Discord shows literally.
+ *  - Newlines are collapsed to spaces so a crafted label cannot inject its own lines into a field
+ *    (and so the leading-character rule has a single line to reason about).
+ *  - Every mention trigger (`@everyone`/`@here`, `<@id>`, `<@&id>`, `<#id>`) is broken by inserting
+ *    a zero-width space after the `@` the parser needs. This is defence-in-depth with the gateway's
+ *    process-wide `allowedMentions: { parse: [] }` — an embed never pings, but a raw-content path
+ *    might, and the caller should not have to know which surface a label lands on.
+ */
+export function escapeDiscordMarkdown(text: string): string {
+  const singleLine = text.replace(/\r\n?|\n/g, ' ');
+  const escaped = singleLine
+    .replace(/[\\`*_~|>[\]()]/g, (ch) => `\\${ch}`)
+    // Break the mention the parser keys on, not the visible text: a zero-width space renders as
+    // nothing, so `@everyone` still reads as `@everyone` but no longer parses as a trigger.
+    .replace(/@/g, '@​');
+  // Leading heading/bullet marker, after any indentation the collapse may have left.
+  return escaped.replace(/^(\s*)([#-])/, (_m, ws: string, ch: string) => `${ws}\\${ch}`);
+}
+
+/**
  * Shorten `text` to at most `max` characters, appending a VISIBLE marker of exactly how much
  * was cut. The plan bans silent truncation: a shortened `last_assistant_message` must say so,
  * so the reader knows the tail exists (full text arrives via the attachment path). The

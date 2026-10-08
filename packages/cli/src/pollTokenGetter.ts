@@ -37,6 +37,7 @@ import {
   LockTimeoutError,
   RefreshError,
   type RefreshTokenResult,
+  type SlotLiveToken,
   type Vault,
 } from '@claude-control/switch-engine';
 
@@ -57,9 +58,13 @@ export const PROFILE_BETA_HEADER = 'oauth-2025-04-20';
  *  abort lands in the same catch as any other network error, which already fails open. */
 export const PROFILE_FETCH_TIMEOUT_MS = 10_000;
 
-/** The one engine capability this wrapper needs — tests inject a fake. */
+/** The engine capabilities this wrapper needs — tests inject a fake. */
 export interface PollRefreshEngine {
   refreshToken(accountId: string): Promise<RefreshTokenResult>;
+  /** The live token from the slot an account is live in, or `undefined` when it is not slot-live.
+   *  Used before the vault bundle so a slot-live account (global or a folder-bound group member) is
+   *  polled with the freshest token — the one a running session rotates — and never refreshed. */
+  liveSlotToken(accountId: string): Promise<SlotLiveToken | undefined>;
 }
 
 /** The slice of a registry row the identity checks need. Structurally satisfied by
@@ -212,6 +217,33 @@ export function createPollTokenGetter(
       throw new Error(
         `account is quarantined (${row.quarantineReason ?? 're-login required'}) - not polled`,
       );
+    }
+
+    // Slot-live accounts read their LIVE token, not the vault bundle. The live `.credentials.json`
+    // is the freshest copy — a running session rotates it ahead of the vault — and its single-use
+    // refresh token belongs to that session, so this path never refreshes. For a group-live member
+    // this is the ONLY usable token: the tier-0 cache the vault path falls back to describes the
+    // global account alone, so without this a group member would poll blind.
+    const slotLive = await options.engine.liveSlotToken(accountId).catch(() => undefined);
+    if (slotLive !== undefined) {
+      // Local identity check: the slot's own identity block must name the account it is filed under.
+      if (
+        identity !== undefined &&
+        row?.accountUuid !== undefined &&
+        slotLive.accountUuid !== undefined &&
+        slotLive.accountUuid !== row.accountUuid
+      ) {
+        const reason = `slot identity mismatch (slot ${slotLive.accountUuid} != registry ${row.accountUuid})`;
+        await identity.quarantine(accountId, reason);
+        throw new IdentityMismatchError(`${reason} - quarantined; run cctl accounts relogin`);
+      }
+      // An expired/near-expiry slot token is NOT refreshed here (that would consume the running
+      // session's refresh token); fall through to the vault path, which for the active account
+      // reaches the tier-0 cache and for an idle one may refresh — but a slot-live token that has
+      // gone stale means no session is refreshing it, so the quiet fallback is the honest answer.
+      if (slotLive.expiresAt - clock() >= options.minTtlMs) {
+        return verifiedToken(accountId, row, slotLive.accessToken);
+      }
     }
 
     let token: string | undefined;

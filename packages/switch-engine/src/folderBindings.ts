@@ -1,0 +1,135 @@
+// The non-secret folder-bindings snapshot.
+//
+// The enforcement guard (a dependency-free hook Claude Code spawns on every prompt) cannot open the
+// encrypted vault or import this package; it decides whether a session's config dir matches the
+// folder it runs in by reading ONE small JSON file. This module builds that file from the reserved
+// side of the registry and reads it back for cctl-side consumers (the doctor's freshness check).
+//
+// It carries NO tokens and NO account ids beyond a group's own id — only what a mismatch message
+// needs: the bound folders, the group's profile dir, and the member LABELS. The guard's own reader
+// lives in the hook script and is deliberately separate (it fails OPEN on any error); this reader is
+// for trusted callers and validates strictly.
+
+import type { FolderBindingSnapshot, FolderBindingSnapshotGroup, StoredGroup } from './types.js';
+import { atomicWriteFile, readJsonIfExists } from './fsutil.js';
+import { VaultError } from './errors.js';
+
+/** Schema tag for `folder-bindings.json`. The guard treats an unknown value as "fail open"; this
+ *  trusted reader treats it as a corrupt file and refuses it by name. */
+const SNAPSHOT_SCHEMA_VERSION = 1;
+
+/** How the guard should act on a session/folder mismatch. Mirrors the daemon's current policy and
+ *  is copied into the snapshot so the guard never has to reach back into cctl's config. */
+export type BindEnforceMode = 'block' | 'warn' | 'off';
+
+/** Everything the pure {@link buildFolderBindingSnapshot} needs; kept as inputs (not read from the
+ *  vault directly) so the builder stays testable and the caller controls the profile-dir mapping. */
+export interface BuildSnapshotInput {
+  groups: readonly StoredGroup[];
+  /** The `groups.json` generation these groups came from — carried so a stale snapshot is
+   *  detectable against the live registry. */
+  generation: number;
+  enforce: BindEnforceMode;
+  /** The main Claude Code config dir the global slot runs in (canonical). */
+  mainConfigDir: string;
+  /** Maps a group id to its on-disk profile dir; the guard matches a session's config dir against
+   *  the value. Injected so the vault's path convention stays in one place (see `paths.ts`). */
+  profileDirOf: (groupId: string) => string;
+}
+
+/**
+ * Build the guard snapshot from the reserved side of the registry. Pure: no IO, so it is trivially
+ * testable and the caller decides when to persist it. Every group becomes a row of
+ * {folders, profileDir, member LABELS} — no member ids, no tokens.
+ */
+export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBindingSnapshot {
+  const groups: FolderBindingSnapshotGroup[] = input.groups.map((g) => ({
+    id: g.id,
+    label: g.label,
+    profileDir: input.profileDirOf(g.id),
+    folders: g.folders.slice(),
+    members: g.members.map((m) => m.label),
+  }));
+  return {
+    schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+    generation: input.generation,
+    enforce: input.enforce,
+    mainConfigDir: input.mainConfigDir,
+    groups,
+  };
+}
+
+/**
+ * Whether two snapshots are equal in the fields the guard actually reads — enforce mode, main config
+ * dir, and every group's id/label/profileDir/folders/members. The `generation` is DELIBERATELY
+ * ignored: it bumps on registry writes the guard never sees (a group's active member, metadata), and
+ * comparing it would report a snapshot as stale after a routine switch even though nothing the guard
+ * enforces changed. Pure.
+ */
+export function folderBindingSnapshotContentEqual(
+  a: FolderBindingSnapshot,
+  b: FolderBindingSnapshot,
+): boolean {
+  return guardRelevantKey(a) === guardRelevantKey(b);
+}
+
+/** A deterministic string of only the guard-relevant fields, for content comparison. */
+function guardRelevantKey(s: FolderBindingSnapshot): string {
+  return JSON.stringify({
+    enforce: s.enforce,
+    mainConfigDir: s.mainConfigDir,
+    groups: s.groups.map((g) => ({
+      id: g.id,
+      label: g.label,
+      profileDir: g.profileDir,
+      folders: g.folders,
+      members: g.members,
+    })),
+  });
+}
+
+/** Atomically write the snapshot. Non-secret, so it uses the ordinary 0o644 file mode rather than
+ *  the vault's 0o600 — the guard runs as the same user, but the file is meant to be plainly
+ *  readable and carries nothing sensitive. */
+export async function writeFolderBindingSnapshot(
+  path: string,
+  snapshot: FolderBindingSnapshot,
+): Promise<void> {
+  await atomicWriteFile(path, JSON.stringify(snapshot, null, 2), 0o644);
+}
+
+/**
+ * Read and validate the snapshot for a TRUSTED caller (returns undefined when absent). Strict on
+ * shape and schema version — a malformed or newer-schema file is refused by name rather than acted
+ * on. The guard does NOT use this: its own reader fails open on the same conditions, because a
+ * missing or unreadable snapshot must never block a prompt.
+ */
+export async function readFolderBindingSnapshot(
+  path: string,
+): Promise<FolderBindingSnapshot | undefined> {
+  const raw = await readJsonIfExists<unknown>(path);
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new VaultError(`${path} is not an object`);
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.schemaVersion !== SNAPSHOT_SCHEMA_VERSION) {
+    throw new VaultError(
+      `${path} has an unsupported schemaVersion (${JSON.stringify(obj.schemaVersion)})`,
+    );
+  }
+  if (typeof obj.generation !== 'number' || !Number.isInteger(obj.generation)) {
+    throw new VaultError(`${path} generation is not an integer`);
+  }
+  if (obj.enforce !== 'block' && obj.enforce !== 'warn' && obj.enforce !== 'off') {
+    throw new VaultError(`${path} enforce is not block|warn|off`);
+  }
+  if (typeof obj.mainConfigDir !== 'string') {
+    throw new VaultError(`${path} mainConfigDir is not a string`);
+  }
+  if (!Array.isArray(obj.groups)) throw new VaultError(`${path} groups is not an array`);
+  // The rows are shaped by our own writer; a trusted reader trusts their inner shape once the
+  // envelope validates, so no per-field re-check here (the guard, reading an untrusted file, does
+  // its own defensive parse).
+  return obj as unknown as FolderBindingSnapshot;
+}

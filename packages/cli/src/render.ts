@@ -28,7 +28,7 @@ import {
   type PacingOptions,
   type PacingStyle,
 } from '@claude-control/usage-advisor';
-import { PLAIN_PALETTE, severityPaint, type Palette } from './ansi.js';
+import { PLAIN_PALETTE, sanitizeForTerminal, severityPaint, type Palette } from './ansi.js';
 import { MANUAL_START_HINT, type AutostartQuery } from './autostart.js';
 
 /** Render the accounts registry as an aligned table. `activeId` is marked with `*`. `nowMs`
@@ -451,4 +451,199 @@ export function renderAccountHeal(report: DedupeReport, palette: Palette = PLAIN
     ),
   ];
   return lines.length === 0 ? '' : lines.join('\n') + '\n';
+}
+
+// ---------------------------------------------------------------------------
+// Folder-bound accounts (bindings / where)
+// ---------------------------------------------------------------------------
+//
+// Every folder path and account label rendered here is operator- or filesystem-supplied, so both go
+// through sanitizeForTerminal before they reach the terminal (see ansi.ts) — a label carrying an
+// ANSI/bidi escape can neither recolor the surface nor reorder a path.
+
+/** One member of a folder-bound group, as shown in the bindings views. */
+export interface BindingMemberView {
+  label: string;
+  /** The member currently live in the group's slot (reconciled, not just the recorded activeId). */
+  live: boolean;
+  quarantined: boolean;
+  excluded: boolean;
+}
+
+/** One folder-bound group for display. */
+export interface BindingGroupView {
+  label: string;
+  folders: string[];
+  members: BindingMemberView[];
+  profileDir: string;
+  /** True when no member could be made live (all quarantined) — the folder has no working account. */
+  noWorkingAccount: boolean;
+}
+
+/** Render the per-group listing (folders, members with the live one marked, profile dir). Shared by
+ *  `cctl bindings`, and appended to `cctl accounts list` / `cctl usage` so a binding is always
+ *  visible alongside the shared pool. Returns '' when there are no groups. */
+export function renderBindingGroups(
+  groups: BindingGroupView[],
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (groups.length === 0) return '';
+  const blocks = groups.map((g) => {
+    const header = palette.bold(sanitizeForTerminal(g.label));
+    const folderLines = g.folders.map((f) => `  folder:  ${sanitizeForTerminal(f)}`);
+    const memberLine =
+      '  accounts: ' +
+      g.members
+        .map((m) => {
+          const name = sanitizeForTerminal(m.label);
+          const marks: string[] = [];
+          if (m.quarantined) marks.push('quarantined');
+          else if (m.excluded) marks.push('excluded');
+          const suffix = marks.length > 0 ? ` (${marks.join(', ')})` : '';
+          // The live member is marked with * and painted green, matching the accounts table.
+          return m.live ? palette.green(`*${name}${suffix}`) : `${name}${suffix}`;
+        })
+        .join(', ');
+    const liveLine = g.noWorkingAccount
+      ? '  ' + palette.red('live:    none usable (re-login a member: cctl accounts relogin <ref>)')
+      : null;
+    const profileLine = '  profile: ' + palette.dim(sanitizeForTerminal(g.profileDir));
+    return [header, ...folderLines, memberLine, ...(liveLine ? [liveLine] : []), profileLine].join(
+      '\n',
+    );
+  });
+  return blocks.join('\n\n');
+}
+
+/** The freshness + enforce footer for `cctl bindings`. Freshness is judged by the guard-relevant
+ *  CONTENT of the snapshot the guard reads (bound folders, profile dirs, member labels, enforce), not
+ *  the groups generation — the generation also bumps on a routine group member switch the guard never
+ *  sees, which must not read as stale. A genuine STALE means a bound folder/profile/member/enforce
+ *  changed without the snapshot being rewritten (a bind/unbind or a daemon restart rewrites it). */
+export interface BindingsFooterView {
+  /** Whether a guard snapshot exists at all. */
+  present: boolean;
+  /** Whether the snapshot's guard-relevant content matches the live registry. */
+  fresh: boolean;
+  enforce: 'block' | 'warn' | 'off';
+}
+
+export function renderBindingsFooter(
+  view: BindingsFooterView,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  const enforceLine = `enforcement: ${view.enforce}`;
+  let freshness: string;
+  if (!view.present) {
+    freshness = palette.yellow(
+      'guard snapshot: missing (the guard cannot enforce until the daemon writes it, or a bind does)',
+    );
+  } else if (view.fresh) {
+    freshness = 'guard snapshot: fresh';
+  } else {
+    freshness = palette.yellow(
+      'guard snapshot: STALE (the guard is enforcing an out-of-date binding view); ' +
+        'run cctl bind/unbind again or restart the daemon to refresh it',
+    );
+  }
+  return `${enforceLine}\n${freshness}`;
+}
+
+/** The full `cctl bindings` view: the group listing plus the footer. */
+export function renderBindings(
+  input: { groups: BindingGroupView[]; footer: BindingsFooterView },
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (input.groups.length === 0) {
+    return 'No folder-bound accounts. Bind one with: cctl bind <folder> <account>[,<account>...]';
+  }
+  return (
+    renderBindingGroups(input.groups, palette) +
+    '\n\n' +
+    renderBindingsFooter(input.footer, palette)
+  );
+}
+
+/** The resolution `cctl where` explains for a folder. */
+export interface WhereView {
+  /** The canonical folder queried. */
+  folder: string;
+  /** The group it resolves to, or null when it runs on the global (shared) account. */
+  bound: {
+    groupLabel: string;
+    matchedFolder: string;
+    members: string[];
+    profileDir: string;
+    liveMemberLabel: string | null;
+  } | null;
+}
+
+/** Quote one argument so it pastes into the operator's shell as a single literal word: PowerShell
+ *  single quotes (a `'` doubled) on Windows, POSIX single quotes (`'\''`) elsewhere. Single quotes
+ *  because nothing inside them expands in either shell — a folder or label may hold `$`, a backtick
+ *  or a double quote. */
+export function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32'
+    ? `'${value.replace(/'/g, "''")}'`
+    : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/** The VS Code profile name `cctl where` suggests for a binding: `cctl-<label>`, reduced to
+ *  letters, digits, `.`, `_` and `-` so it is one plain word in any shell and in VS Code's UI. */
+export function vscodeProfileName(groupLabel: string): string {
+  const slug = groupLabel.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return `cctl-${slug === '' ? 'binding' : slug}`;
+}
+
+/** Explain which account a folder runs on, print the env line a session needs, and how to point
+ *  the VS Code Claude Code extension at that account (a VS Code profile holding the
+ *  claudeCode.environmentVariables setting). */
+export function renderWhere(
+  view: WhereView,
+  palette: Palette = PLAIN_PALETTE,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const folder = sanitizeForTerminal(view.folder);
+  if (view.bound === null) {
+    return [
+      `${palette.bold(folder)}`,
+      '  runs on: the global (shared) account — no folder binding applies here',
+      '  env:     CLAUDE_CONFIG_DIR is not set (the global slot)',
+      '',
+      'Bind this folder to an account with: cctl bind ' + folder + ' <account>[,<account>...]',
+    ].join('\n');
+  }
+  const b = view.bound;
+  const members = b.members.map((m) => sanitizeForTerminal(m)).join(', ');
+  const live = b.liveMemberLabel ? sanitizeForTerminal(b.liveMemberLabel) : 'none usable';
+  const profile = sanitizeForTerminal(b.profileDir);
+  // The extension's setting is declared as a list of {name, value} pairs (its default is []), so
+  // that is the shape printed. The setting is MACHINE-scoped: VS Code ignores it in a folder's or
+  // workspace's .vscode/settings.json (it only greys the line out), and reads it from user settings
+  // only. Per-folder routing therefore needs a VS Code profile whose user settings carry it — one
+  // profile per binding, opened on the bound folder.
+  const vscodeSnippet = JSON.stringify(
+    { 'claudeCode.environmentVariables': [{ name: 'CLAUDE_CONFIG_DIR', value: b.profileDir }] },
+    null,
+    2,
+  );
+  const openCommand = `code --profile ${shellQuote(vscodeProfileName(b.groupLabel), platform)} ${shellQuote(folder, platform)}`;
+  return [
+    `${palette.bold(folder)}`,
+    `  runs on: ${palette.bold(sanitizeForTerminal(b.groupLabel))} (${members})`,
+    `  live:    ${live}`,
+    `  matched: ${sanitizeForTerminal(b.matchedFolder)}`,
+    `  env:     CLAUDE_CONFIG_DIR=${profile}`,
+    '',
+    'Start Claude Code here with the right account using: cctl claude',
+    '(or install the wrapper once: cctl shell-init powershell)',
+    '',
+    'For VS Code: the Claude Code extension reads its environment from USER settings only (a',
+    "folder's .vscode/settings.json is ignored), so give this binding its own VS Code profile:",
+    `  1. ${openCommand}`,
+    '     (creates the profile the first time; install or enable Claude Code in it)',
+    '  2. in that window run "Preferences: Open User Settings (JSON)" and add:',
+    vscodeSnippet,
+    `  3. open this folder with the same command from then on. Other windows keep the shared account.`,
+  ].join('\n');
 }

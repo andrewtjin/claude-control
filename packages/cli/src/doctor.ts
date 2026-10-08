@@ -4,7 +4,7 @@
 // summary are pure so their output is unit-tested. Each check reports a human detail so a
 // failure is actionable, never a bare boolean.
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   defaultLiveCredentialChannel,
@@ -14,9 +14,12 @@ import {
   type Paths,
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
-import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { isBindGuardInSettingsText } from '@claude-control/daemon';
+import type { SwitchEngine } from '@claude-control/switch-engine';
+import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import type { AutostartState } from './autostart.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
+import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
 
 export interface DoctorCheck {
   name: string;
@@ -139,10 +142,18 @@ export async function probeRelay(
   }
 }
 
-/** Render checks as `[ok]/[!!]` lines (green/red when a color palette is injected). Pure. */
+/** Render checks as `[ok]/[!!]` lines (green/red when a color palette is injected). Pure.
+ *
+ *  A detail quotes account labels, group labels and folder paths straight out of the registry files,
+ *  which an older build or a hand edit may have left carrying terminal controls, so each line of it
+ *  is made terminal-safe here — the one place every check's text reaches the terminal. */
 export function renderDoctor(checks: DoctorCheck[], palette: Palette = PLAIN_PALETTE): string {
+  const safe = (text: string): string => text.split('\n').map(sanitizeForTerminal).join('\n');
   return checks
-    .map((c) => `${c.ok ? palette.green('[ok]') : palette.red('[!!]')} ${c.name}: ${c.detail}`)
+    .map(
+      (c) =>
+        `${c.ok ? palette.green('[ok]') : palette.red('[!!]')} ${safe(c.name)}: ${safe(c.detail)}`,
+    )
     .join('\n');
 }
 
@@ -310,6 +321,292 @@ export function checkAutostart(state: AutostartState): DoctorCheck {
       'none registered: a stopped or rebooted daemon stays down until started by hand. ' +
       'Run: cctl daemon install',
   };
+}
+
+// ---------------------------------------------------------------------------
+// Folder-bound accounts (slots, guard snapshot, guard hook, version skew)
+// ---------------------------------------------------------------------------
+
+/** The slot invariant checker (engine.checkSlots) is the single authority for "is any account live
+ *  where it must not be" — a reserved account squatting in global, a non-member in a group profile, a
+ *  group's active id disagreeing with its live login, a broken profile link. A clean result is a
+ *  pass; any violation is a failure naming each one, with the fix being `cctl doctor` -> repair (the
+ *  daemon repairs these automatically on each poll). */
+export async function checkSlots(engine: Pick<SwitchEngine, 'checkSlots'>): Promise<DoctorCheck> {
+  try {
+    const violations = await engine.checkSlots();
+    if (violations.length === 0) {
+      return { name: 'slots', ok: true, detail: 'no slot invariant violations' };
+    }
+    return {
+      name: 'slots',
+      ok: false,
+      detail:
+        `${violations.length} slot violation(s): ` +
+        violations.map((v) => `${v.kind} (${v.detail})`).join('; '),
+    };
+  } catch (err) {
+    return { name: 'slots', ok: false, detail: `could not check slots: ${(err as Error).message}` };
+  }
+}
+
+/** The guard reads a snapshot copy of the groups file, stamped with the generation it was built
+ *  from. If that lags the live groups generation, the guard is enforcing a stale binding view until
+ *  the daemon restarts or a `cctl settings` change rewrites it. No groups + no snapshot is a pass
+ *  (nothing to enforce). */
+export async function checkGuardSnapshot(
+  engine: Pick<SwitchEngine, 'getGuardSnapshotFreshness' | 'listGroups'>,
+): Promise<DoctorCheck> {
+  try {
+    const [freshness, groups] = await Promise.all([
+      engine.getGuardSnapshotFreshness(),
+      engine.listGroups(),
+    ]);
+    if (!freshness.present) {
+      if (groups.length === 0) {
+        return {
+          name: 'guard-snapshot',
+          ok: true,
+          detail: 'no folder bindings; nothing to enforce',
+        };
+      }
+      return {
+        name: 'guard-snapshot',
+        ok: false,
+        detail: `${groups.length} folder binding(s) but no guard snapshot — restart the daemon (cctl daemon restart) to write it`,
+      };
+    }
+    // Freshness is by CONTENT, not the groups generation: a routine group member switch bumps the
+    // generation on fields the snapshot does not carry and must not read as stale. A genuine STALE
+    // means a bound folder / profile / member / enforce mode changed without the snapshot being
+    // rewritten — a bind/unbind or a daemon restart rewrites it (a settings change only does so for
+    // CCTL_BIND_ENFORCE, so it is not offered as the general fix).
+    return {
+      name: 'guard-snapshot',
+      ok: freshness.fresh,
+      detail: freshness.fresh
+        ? `fresh (generation ${freshness.generation}, enforce=${freshness.enforce})`
+        : `STALE (the guard is enforcing an out-of-date binding view) — run \`cctl bind\`/\`cctl unbind\` again or restart the daemon (cctl daemon restart) to rewrite it`,
+    };
+  } catch (err) {
+    return {
+      name: 'guard-snapshot',
+      ok: false,
+      detail: `could not read the guard snapshot: ${(err as Error).message}`,
+    };
+  }
+}
+
+/**
+ * The folder-binding checks `cctl doctor` appends: slot invariants, guard snapshot freshness, guard
+ * hook presence. They all read `groups.json`, and a doctor exists precisely for the day that file
+ * cannot be read (corrupt, or written by a newer build) — so an unreadable registry is reported as
+ * ONE failed `bindings` check naming the reason, and every other check still runs and reports, instead
+ * of the whole command dying on the first read with nothing but that error. With the bindings unknown,
+ * the guard hook is judged as if bindings exist: a missing guard may then be a real gap.
+ */
+export async function checkFolderBindings(
+  engine: Pick<SwitchEngine, 'listGroups' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
+  paths: Paths,
+): Promise<DoctorCheck[]> {
+  const out: DoctorCheck[] = [];
+  let hasBindings: boolean;
+  try {
+    hasBindings = (await engine.listGroups()).length > 0;
+  } catch (err) {
+    hasBindings = true;
+    out.push({
+      name: 'bindings',
+      ok: false,
+      detail: `could not read the folder bindings: ${(err as Error).message}`,
+    });
+  }
+  out.push(
+    await checkSlots(engine),
+    await checkGuardSnapshot(engine),
+    checkGuardHook(paths, hasBindings),
+  );
+  return out;
+}
+
+/** Whether the enforcement guard hook is installed in the main config dir's settings.json. When
+ *  bindings exist but the guard is absent, nothing enforces them — a failure. With no bindings, its
+ *  presence is optional and reported without failing. */
+export function checkGuardHook(paths: Paths, hasBindings: boolean): DoctorCheck {
+  const settingsPath = join(paths.claudeDir, 'settings.json');
+  let installed = false;
+  let unparseable = false;
+  try {
+    let raw = readFileSync(settingsPath, 'utf8');
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1); // tolerate a PowerShell/Notepad UTF-8 BOM
+    // Parse rather than substring-match alone: parsing tells a genuine install apart from a
+    // settings.json the guard installer would REFUSE to write to (invalid JSON), which otherwise
+    // looks identical ("guard absent") while the real cause — and fix — is different.
+    JSON.parse(raw);
+    // Recognize the guard by the SAME exact installed shape the installer uses, not a bare
+    // `bind-guard.cjs` substring: a foreign hook that merely mentions the filename (e.g.
+    // `node linter.js --config bind-guard.cjs.rc`), or an incidental mention in a comment or path,
+    // must NOT read as the enforcement guard — otherwise doctor reports a security control installed
+    // when nothing enforces the bindings.
+    installed = isBindGuardInSettingsText(raw);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      installed = false;
+    } else if (err instanceof SyntaxError) {
+      unparseable = true;
+    }
+  }
+  if (installed) {
+    return { name: 'guard-hook', ok: true, detail: `installed in ${settingsPath}` };
+  }
+  if (unparseable) {
+    // The installer refuses to overwrite invalid JSON, so the guard is NOT installed and bindings are
+    // unenforced no matter how many binds run until the file is repaired. Say so plainly rather than
+    // reporting a generic "not installed".
+    return {
+      name: 'guard-hook',
+      ok: !hasBindings,
+      detail: hasBindings
+        ? `guard NOT installed — ${settingsPath} is not valid JSON, so the installer refuses to write to it and folder bindings are NOT enforced. Fix the file (e.g. remove comments/trailing commas), then run \`cctl bind\` again or restart the daemon.`
+        : `${settingsPath} is not valid JSON (no bindings need the guard yet, but a bind would fail to install it until the file is fixed)`,
+    };
+  }
+  return {
+    name: 'guard-hook',
+    ok: !hasBindings,
+    detail: hasBindings
+      ? `not installed in ${settingsPath}, but folder bindings exist — bindings are NOT enforced. Run \`cctl bind\` again (it reinstalls the guard) or restart the daemon.`
+      : 'not installed (no folder bindings need it yet)',
+  };
+}
+
+/** Compare this CLI's build against the running daemon's last-reported build (the same two values
+ *  `cctl version` shows). After an `npm i -g` upgrade the running daemon keeps its old build until
+ *  restarted, so a live daemon on a different build is a real skew — the guard script, snapshot
+ *  format, and poll behavior may not match. `daemonBuild` is undefined / `daemonAlive` false when no
+ *  daemon is running to compare, which is a pass. Pure. */
+export function checkVersionSkew(
+  cliVersion: string,
+  daemonBuild: string | undefined,
+  daemonAlive: boolean,
+): DoctorCheck {
+  // The daemon-build value comes from the settings report, which stores it 'v'-prefixed
+  // (`v${VERSION}`), while callers here pass the bare package VERSION. `cctl version` reconciles
+  // this by prefixing its CLI value before comparing; do the mirror here by stripping an optional
+  // leading 'v' from both sides, so an identical build never reads as a skew merely because one
+  // string carries the 'v' and the other does not. Display the normalized numbers too, so a real
+  // skew shows two genuinely different versions and the pass line matches `cctl version`.
+  const strip = (v: string): string => v.replace(/^v/i, '');
+  const cli = strip(cliVersion);
+  if (!daemonAlive || daemonBuild === undefined) {
+    return {
+      name: 'daemon-version',
+      ok: true,
+      detail: `CLI is ${cli}; no running daemon to compare`,
+    };
+  }
+  const daemon = strip(daemonBuild);
+  if (daemon === cli) {
+    return { name: 'daemon-version', ok: true, detail: `CLI and daemon both ${cli}` };
+  }
+  return {
+    name: 'daemon-version',
+    ok: false,
+    detail: `CLI is ${cli} but the running daemon is ${daemon} — restart it so both match: cctl daemon restart`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// PowerShell `claude` wrapper (Windows) — stale embedded paths
+// ---------------------------------------------------------------------------
+
+/** Candidate PowerShell profile locations on Windows — Windows PowerShell 5.1 and PowerShell 7, plus
+ *  a OneDrive-redirected Documents (the common case where `$PROFILE` does not live under
+ *  `%USERPROFILE%\Documents`). Best-effort; used only by the wrapper check. Pure over `env`. */
+export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = env.USERPROFILE;
+  if (!home || home.length === 0) return [];
+  const docRoots = [join(home, 'Documents')];
+  if (env.OneDrive && env.OneDrive.length > 0) docRoots.push(join(env.OneDrive, 'Documents'));
+  if (env.OneDriveCommercial && env.OneDriveCommercial.length > 0) {
+    docRoots.push(join(env.OneDriveCommercial, 'Documents'));
+  }
+  const paths: string[] = [];
+  for (const root of docRoots) {
+    // Windows PowerShell 5.1 uses the WindowsPowerShell folder; PowerShell 7+ uses PowerShell.
+    for (const dir of ['WindowsPowerShell', 'PowerShell']) {
+      paths.push(join(root, dir, 'Microsoft.PowerShell_profile.ps1'));
+      paths.push(join(root, dir, 'profile.ps1'));
+    }
+  }
+  return paths;
+}
+
+/** Whether an installed PowerShell `claude` wrapper still points at a node binary and cctl entry that
+ *  exist. A node upgrade/move or a cctl reinstall can change the absolute paths the wrapper embedded,
+ *  after which typing `claude` fails with a raw CommandNotFoundException or a "Cannot find module"
+ *  stack trace that never mentions cctl. This check turns that into an actionable line. Pure over its
+ *  inputs: `profileText` undefined means no profile carried the wrapper (a pass), the `shim` form has
+ *  no embedded paths to go stale (a pass), and only the node-direct form is existence-checked. */
+export function checkPowerShellWrapper(
+  profileText: string | undefined,
+  existsSyncFn: (p: string) => boolean = existsSync,
+): DoctorCheck {
+  if (profileText === undefined) {
+    return {
+      name: 'ps-wrapper',
+      ok: true,
+      detail: 'no PowerShell profile carries a cctl claude wrapper',
+    };
+  }
+  const parsed = parsePowerShellWrapper(profileText);
+  if (parsed === undefined) {
+    return {
+      name: 'ps-wrapper',
+      ok: true,
+      detail: 'no cctl claude wrapper in the PowerShell profile',
+    };
+  }
+  if (parsed.kind === 'shim') {
+    return {
+      name: 'ps-wrapper',
+      ok: true,
+      detail: 'cctl claude wrapper installed (cctl-shim form; no embedded paths to go stale)',
+    };
+  }
+  const missing: string[] = [];
+  if (!existsSyncFn(parsed.nodePath)) missing.push(`node (${parsed.nodePath})`);
+  if (!existsSyncFn(parsed.cctlEntry)) missing.push(`cctl entry (${parsed.cctlEntry})`);
+  if (missing.length === 0) {
+    return {
+      name: 'ps-wrapper',
+      ok: true,
+      detail: 'cctl claude wrapper points at an existing node and cctl entry',
+    };
+  }
+  return {
+    name: 'ps-wrapper',
+    ok: false,
+    detail:
+      `the PowerShell claude wrapper points at ${missing.join(' and ')} that no longer exist(s) — ` +
+      'regenerate it: cctl shell-init powershell | Out-File -Append $PROFILE',
+  };
+}
+
+/** Read the first PowerShell profile that carries a cctl wrapper (by its marker), for the wrapper
+ *  check. Returns undefined when none of the candidate profiles exist or carry the wrapper. */
+export function readPowerShellWrapperProfile(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  for (const p of powerShellProfilePaths(env)) {
+    try {
+      const text = readFileSync(p, 'utf8');
+      if (text.includes(POWERSHELL_WRAPPER_MARKER)) return text;
+    } catch {
+      // Absent or unreadable profile: skip and try the next candidate.
+    }
+  }
+  return undefined;
 }
 
 /** Run every check for the given paths. */

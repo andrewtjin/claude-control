@@ -201,6 +201,10 @@ interface SessionView {
   state: SessionState;
   summary: string | undefined;
   accountId: string | undefined;
+  /** The credential slot the session runs in (`"global"` / `"group:<id>"`), from its status
+   *  frames. Carried so the card can show a folder-bound session's binding; `undefined` for a
+   *  daemon predating the field, which renders no slot tag. */
+  slot: string | undefined;
   /** Optimistic: a stop was requested and no terminal status has arrived to confirm it yet. */
   stopping: boolean;
   output: OrderedOutput;
@@ -269,6 +273,9 @@ export class SessionPlanner {
     view.state = payload.state;
     view.summary = payload.summary ?? undefined;
     view.accountId = payload.accountId ?? undefined;
+    // Only advance the slot on a frame that carries one: a later status frame from an older code
+    // path (or a reconnect) must not erase a binding an earlier frame already established.
+    if (payload.slot != null) view.slot = payload.slot;
 
     const ops: GatewayOp[] = [];
     if (view.mode === 'card') {
@@ -407,6 +414,7 @@ export class SessionPlanner {
         state: 'starting',
         summary: undefined,
         accountId: undefined,
+        slot: undefined,
         stopping: false,
         output: this.makeOrderedOutput(),
         pendingStream: '',
@@ -721,6 +729,7 @@ export class SessionPlanner {
       stopping: view.stopping,
       ...(view.summary !== undefined ? { summary: view.summary } : {}),
       ...(view.accountId !== undefined ? { accountId: view.accountId } : {}),
+      ...(view.slot !== undefined ? { slot: view.slot } : {}),
       ...(tail !== undefined ? { outputTail: tail } : {}),
       totalOutputChars: view.fullStdout.length,
       attached: view.attached,

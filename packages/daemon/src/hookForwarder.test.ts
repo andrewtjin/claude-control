@@ -22,6 +22,14 @@ import { HOOK_FORWARDER_SOURCE, hookForwarderPath, writeHookForwarder } from './
 
 const SECRET_ARG = 'x-claude-control-secret: shh';
 
+/** The runner's env with CLAUDE_CONFIG_DIR removed — the deterministic "global slot" base a
+ *  test starts from before optionally setting the var to a profile dir. */
+function envWithoutConfigDir(): NodeJS.ProcessEnv {
+  const base = { ...process.env };
+  delete base.CLAUDE_CONFIG_DIR;
+  return base;
+}
+
 interface RunResult {
   code: number | null;
   stdout: string;
@@ -38,12 +46,19 @@ function runForwarder(
   payload: string,
   args?: string[],
   beforeEnd?: () => Promise<void>,
+  env?: NodeJS.ProcessEnv,
 ): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [
-      scriptPath,
-      ...(args ?? ['--secret-header', SECRET_ARG]),
-    ]);
+    const child = spawn(
+      process.execPath,
+      [scriptPath, ...(args ?? ['--secret-header', SECRET_ARG])],
+      {
+        // A hook is spawned under the session's launch env, which the forwarder now reads
+        // CLAUDE_CONFIG_DIR from. Tests pin it explicitly (and clear an inherited one by
+        // default) so the injected `configDir` is deterministic regardless of the runner's env.
+        env: env ?? envWithoutConfigDir(),
+      },
+    );
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString('utf8')));
@@ -140,13 +155,74 @@ describe('hook forwarder script', () => {
         stderr: '',
       });
       expect(requests).toHaveLength(1);
-      expect(requests[0]?.body).toBe(payload);
+      // The forwarder re-serializes to stamp configDir; the original fields survive verbatim.
+      expect(JSON.parse(requests[0]?.body ?? '')).toEqual({
+        hook_event_name: 'Stop',
+        session_id: 's-1',
+        configDir: null,
+      });
       expect(requests[0]?.headers['x-claude-control-secret']).toBe('shh');
       expect(requests[0]?.headers['content-type']).toBe('application/json');
     } finally {
       server.close();
     }
   });
+
+  it('stamps the launch-time CLAUDE_CONFIG_DIR onto the forwarded body as configDir', async () => {
+    const { server, port, requests } = await startServer('{"ok":true}');
+    try {
+      await writeHookEndpoint(hookEndpointPath(dataDir), { port });
+      const profileDir = 'C:\\profiles\\group-xyz';
+      const result = await runForwarder(
+        scriptPath,
+        '{"hook_event_name":"UserPromptSubmit","session_id":"s-9"}',
+        undefined,
+        undefined,
+        { ...envWithoutConfigDir(), CLAUDE_CONFIG_DIR: profileDir },
+      );
+      expect(result.code).toBe(0);
+      expect(JSON.parse(requests[0]?.body ?? '')).toEqual({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 's-9',
+        configDir: profileDir,
+      });
+    } finally {
+      server.close();
+    }
+  });
+
+  it('stamps configDir:null when CLAUDE_CONFIG_DIR is unset (the global slot)', async () => {
+    const { server, port, requests } = await startServer('{"ok":true}');
+    try {
+      await writeHookEndpoint(hookEndpointPath(dataDir), { port });
+      await runForwarder(scriptPath, '{"hook_event_name":"PermissionRequest"}');
+      expect(JSON.parse(requests[0]?.body ?? '')).toEqual({
+        hook_event_name: 'PermissionRequest',
+        configDir: null,
+      });
+    } finally {
+      server.close();
+    }
+  });
+
+  it('a non-object JSON payload is forwarded byte-for-byte — configDir only attaches to an object', async () => {
+    // The hook contract always sends an object, but a defensive forwarder must never turn a
+    // scalar/array into an object: it forwards whatever it got, unchanged.
+    const { server, port, requests } = await startServer('{"ok":true}', 600);
+    try {
+      await writeHookEndpoint(hookEndpointPath(dataDir), { port });
+      const payload = '[1,2,3]';
+      const result = await runForwarder(scriptPath, payload, undefined, undefined, {
+        ...envWithoutConfigDir(),
+        CLAUDE_CONFIG_DIR: 'C:\\profiles\\g',
+      });
+      expect(result.code).toBe(0);
+      await until(() => requests.length === 1);
+      expect(requests[0]?.body).toBe(payload);
+    } finally {
+      server.close();
+    }
+  }, 15_000);
 
   it('UserPromptSubmit rides the response — its additionalContext must reach the session, not fire-and-forget', async () => {
     const responseBody =
@@ -190,7 +266,11 @@ describe('hook forwarder script', () => {
         const result = await runForwarder(scriptPath, payload);
         expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
         await until(() => requests.length === 1);
-        expect(requests[0]?.body).toBe(payload);
+        expect(JSON.parse(requests[0]?.body ?? '')).toEqual({
+          hook_event_name: event,
+          session_id: 's-1',
+          configDir: null,
+        });
       } finally {
         server.close();
       }

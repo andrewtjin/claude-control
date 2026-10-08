@@ -3,6 +3,7 @@ export * from './types.js';
 export { computePlan } from './advisor.js';
 export {
   decideAutoSwitch,
+  isAutoSwitchCandidate,
   hasUsableHeadroom,
   MIN_USABLE_HEADROOM_PCT,
   DEFAULT_TRIGGER_PERCENT,
@@ -13,6 +14,7 @@ export {
   DEFAULT_GREEDY_PREDICTED_RESET_MARGIN_MS,
   type AutoSwitchDecision,
   type AutoSwitchPolicy,
+  type DecideAutoSwitchOptions,
 } from './autoswitch.js';
 export { formatTokens, humanizeDaysUntil, humanizeDuration, roundPct } from './format.js';
 export {

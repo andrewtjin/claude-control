@@ -155,4 +155,56 @@ describe('buildSdkQueryOptions', () => {
     expect(shape).toEqual({ cwd: '/w' });
     expect(onUnbound).not.toHaveBeenCalled();
   });
+
+  it('scrubs an inherited CLAUDE_CONFIG_DIR on a global spawn, keeping the rest of the env', () => {
+    // A global (unbound) spawn must not inherit a CLAUDE_CONFIG_DIR that points at a group profile,
+    // or it would silently run on that group's account. The flag drops just that key; PATH/HOME stay.
+    const shape = buildSdkQueryOptions(
+      { cwd: '/w' },
+      {
+        scrubInheritedConfigDir: true,
+        baseEnv: { PATH: '/bin', HOME: '/home', CLAUDE_CONFIG_DIR: '/profiles/g1' },
+      },
+    );
+    expect(shape.env).toEqual({ PATH: '/bin', HOME: '/home' });
+    expect(shape.env).not.toHaveProperty('CLAUDE_CONFIG_DIR');
+  });
+
+  it('scrubs on a global spawn that still carries an accountId attribution tag', () => {
+    const onUnbound = vi.fn();
+    const shape = buildSdkQueryOptions(
+      { accountId: 'acct-1' },
+      {
+        scrubInheritedConfigDir: true,
+        onUnboundAccountId: onUnbound,
+        baseEnv: { PATH: '/bin', CLAUDE_CONFIG_DIR: '/profiles/g1' },
+      },
+    );
+    // Unbound (no resolver), so the drop is still made loud AND the inherited config dir is scrubbed.
+    expect(onUnbound).toHaveBeenCalledWith('acct-1');
+    expect(shape.env).toEqual({ PATH: '/bin' });
+  });
+
+  it('does not scrub when the flag is off (an inherited config dir is left to pass through)', () => {
+    // Without the flag, a global spawn sets no env at all — the child inherits the parent env as
+    // before. The daemon only sets the flag when the inherited dir actually names a group profile.
+    const shape = buildSdkQueryOptions(
+      { cwd: '/w' },
+      { baseEnv: { PATH: '/bin', CLAUDE_CONFIG_DIR: '/somewhere' } },
+    );
+    expect(shape.env).toBeUndefined();
+  });
+
+  it('a bound config dir wins over the scrub flag (binding pins CLAUDE_CONFIG_DIR)', () => {
+    const shape = buildSdkQueryOptions(
+      { accountId: 'acct-1' },
+      {
+        configDirForAccount: (id) => `/cfg/${id}`,
+        scrubInheritedConfigDir: true,
+        baseEnv: { PATH: '/bin', CLAUDE_CONFIG_DIR: '/profiles/g1' },
+      },
+    );
+    // The bound account's config dir is set, not dropped — a bound spawn has nothing to scrub.
+    expect(shape.env).toEqual({ PATH: '/bin', CLAUDE_CONFIG_DIR: '/cfg/acct-1' });
+  });
 });

@@ -193,6 +193,92 @@ describe('aggregateTokenStats', () => {
     expect(stats.overall.turns).toBe(0);
     expect(stats.byAccount).toEqual([]);
   });
+
+  describe('slot-aware attribution', () => {
+    // Tokens for one account, by account label, out of a finished snapshot.
+    function tokensFor(
+      stats: ReturnType<typeof aggregateTokenStats>,
+      label: string,
+    ): number | undefined {
+      const row = stats.byAccount.find((r) => r.label === label);
+      return row ? totalTokens(row.totals) : undefined;
+    }
+
+    it('attributes a turn against its session slot, not the global account live at the same instant', () => {
+      // At T0 two accounts are live AT ONCE — 'acct-a' globally, 'acct-b' in group:x. A turn from a
+      // session bound to group:x must be credited to acct-b, even though acct-a is the global live
+      // account at that instant.
+      const intervals: ActivationWindow[] = [
+        { accountId: 'acct-a', startedAtMs: T0 - HOUR, endedAtMs: null, slot: 'global' },
+        { accountId: 'acct-b', startedAtMs: T0 - HOUR, endedAtMs: null, slot: 'group:x' },
+      ];
+      const stats = aggregateTokenStats({
+        scan: scanOf([
+          turn({ tsMs: T0, sessionId: 'sess-global', inputTokens: 100 }),
+          turn({ tsMs: T0, sessionId: 'sess-group', inputTokens: 200 }),
+        ]),
+        intervals,
+        windowStartMs: T0 - 7 * 24 * HOUR,
+        windowEndMs: T0 + 24 * HOUR,
+        labelById: new Map([
+          ['acct-a', 'main'],
+          ['acct-b', 'spare'],
+        ]),
+        slotBySession: new Map([['sess-group', 'group:x']]),
+      });
+      // acct-a gets the global session's turn (100 + 2 + 4 + 8 = 114); acct-b the group's (200+2+4+8).
+      expect(tokensFor(stats, 'main')).toBe(114);
+      expect(tokensFor(stats, 'spare')).toBe(214);
+    });
+
+    it('a session absent from the slot map falls to the global timeline', () => {
+      const intervals: ActivationWindow[] = [
+        { accountId: 'acct-a', startedAtMs: T0 - HOUR, endedAtMs: null, slot: 'global' },
+        { accountId: 'acct-b', startedAtMs: T0 - HOUR, endedAtMs: null, slot: 'group:x' },
+      ];
+      const stats = aggregateTokenStats({
+        scan: scanOf([turn({ tsMs: T0, sessionId: 'unknown-session', inputTokens: 50 })]),
+        intervals,
+        windowStartMs: T0 - 7 * 24 * HOUR,
+        windowEndMs: T0 + 24 * HOUR,
+        labelById: new Map([
+          ['acct-a', 'main'],
+          ['acct-b', 'spare'],
+        ]),
+        slotBySession: new Map([['some-other', 'group:x']]),
+      });
+      // The unknown session is global → acct-a, never the group's acct-b.
+      expect(tokensFor(stats, 'main')).toBe(64);
+      expect(tokensFor(stats, 'spare')).toBeUndefined();
+    });
+
+    it('a group turn with no member live in its slot at that instant is unattributed', () => {
+      // The group slot only became live AFTER the turn; nothing global covers it either.
+      const intervals: ActivationWindow[] = [
+        { accountId: 'acct-b', startedAtMs: T0 + HOUR, endedAtMs: null, slot: 'group:x' },
+      ];
+      const stats = aggregateTokenStats({
+        scan: scanOf([turn({ tsMs: T0, sessionId: 'sess-group', inputTokens: 9 })]),
+        intervals,
+        windowStartMs: T0 - 7 * 24 * HOUR,
+        windowEndMs: T0 + 24 * HOUR,
+        labelById: new Map([['acct-b', 'spare']]),
+        slotBySession: new Map([['sess-group', 'group:x']]),
+      });
+      expect(tokensFor(stats, UNATTRIBUTED_LABEL)).toBe(9 + 2 + 4 + 8);
+      expect(tokensFor(stats, 'spare')).toBeUndefined();
+    });
+
+    it('with no slots configured, behaves exactly as the global-only path (a legacy interval + turn)', () => {
+      // Legacy intervals carry no slot (undefined) and turns no sessionId — everything is global.
+      const stats = aggregate(
+        [turn({ tsMs: T0, inputTokens: 5 })],
+        [{ accountId: 'acct-a', startedAtMs: T0 - HOUR, endedAtMs: null }],
+      );
+      const row = stats.byAccount.find((r) => r.label === 'main');
+      expect(row && totalTokens(row.totals)).toBe(5 + 2 + 4 + 8);
+    });
+  });
 });
 
 describe('localDayKey', () => {

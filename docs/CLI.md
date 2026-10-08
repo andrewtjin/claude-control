@@ -50,12 +50,142 @@ twice is merged onto one row (the active one, else the most recently captured), 
 logins under one label keep the earlier row's label while the later one becomes `jina25 (2)`.
 Each repair is printed above the listing it precedes.
 
+## Folder-bound accounts
+
+By default every Claude Code session on the machine runs on one live account — the
+_global_ account — and a switch moves all of them at once. A **binding** carves out an
+exception: a folder (and everything under it) is tied to one account, or a set of
+accounts, and sessions started there run on that set. The bound accounts are held apart
+from the global pool — auto-switch never hops to them, and a global switch never touches
+them — so work in a bound folder cannot spend the account you keep for everything else,
+and vice versa. Memories, settings, skills, plugins, MCP servers and history stay shared;
+only the login differs.
+
+```
+cctl bind <folder> <account>[,<account>...]   # bind a folder to one account or a set
+cctl unbind <folder>                          # remove a binding (dissolves the group on its last folder)
+cctl unbind <folder> --force                  # dissolve even while a session runs in the profile
+cctl bindings                                 # list every binding, its accounts, and which is live
+```
+
+`cctl bind` reports what it changed: if a to-be-bound account was the global live account
+it is moved out first (the global slot switches to the best remaining shared account, and
+`bind` refuses if none is left), the account's isolated profile is prepared, and any
+sessions already running under the folder are named — they keep their old account until
+they are relaunched.
+
+A **set** of accounts (`cctl bind C:\work alice,bob`) rotates internally: auto-switch and
+the phone's `/switch` move only among the set's members, never out to a global account.
+A single-account binding never hops; when its account is out of quota you are told, rather
+than being moved onto an account the folder is not meant to use.
+
+Nesting is allowed: a subfolder can be bound to a different account than its parent, and
+the longest matching binding wins. `cctl bind` refuses a filesystem root, your home
+directory, anything inside cctl's own data directories, and a folder already bound to a
+_different_ set (unbind it first).
+
+### Running Claude Code in a bound folder
+
+A binding only takes effect for a session that launches with the folder's account. That is
+what `cctl claude` does:
+
+```
+cctl claude                        # launch Claude Code on the folder's bound account (or the
+                                    # global account when the folder is not bound)
+cctl claude --account <id|label>   # launch on a specific account for this one session
+cctl claude --override             # launch here on the global account, on purpose (see below)
+cctl claude -- <claude args...>    # everything after -- is passed through to claude
+```
+
+`cctl claude` resolves which account to use — an explicit `--account`, else the folder's
+binding, else global — prepares the profile, prints a one-line banner naming the account
+and binding, and hands off to the real `claude` executable. Its exit code is yours;
+Ctrl+C reaches Claude Code, not the wrapper.
+
+To make an ordinary `claude` do this automatically, install the wrapper for your shell:
+
+```
+cctl shell-init powershell   # prints a `claude` function that calls `cctl claude`
+cctl shell-init bash         # (also: zsh, fish)
+```
+
+For PowerShell, `cctl shell-init powershell` prints a function to add to your profile
+(`$PROFILE`); afterwards typing `claude` in any bound folder starts on the right account,
+and typing it anywhere else behaves exactly as before. The command prints where to put it.
+
+In **VS Code**, the Claude Code extension takes its environment from the
+`claudeCode.environmentVariables` setting (a list of `{ "name", "value" }` pairs). That
+setting is machine-scoped: VS Code reads it from **user** settings only and silently ignores
+it in a folder's `.vscode/settings.json`. So give each binding its own VS Code profile, and
+open the bound folder in it:
+
+1. `code --profile cctl-<label> <folder>` — creates the profile the first time; install or
+   enable the Claude Code extension in it.
+2. In that window, run **Preferences: Open User Settings (JSON)** and add the snippet
+   `cctl where` prints:
+
+   ```json
+   {
+     "claudeCode.environmentVariables": [
+       { "name": "CLAUDE_CONFIG_DIR", "value": "<the profile dir cctl where prints>" }
+     ]
+   }
+   ```
+
+3. Open the folder with the same `code --profile ...` command from then on. Windows in any
+   other profile keep the shared account.
+
+`cctl where` prints the exact command, quoted for your shell. A `claude` typed in VS Code's
+integrated terminal is covered by the shell wrapper above.
+
+Two VS Code specifics. The extension asks the model for a session title **in parallel with**
+your first prompt, so a prompt the guard blocks in a wrongly configured window has already
+sent its text, for that title, to the window's account; the guard cannot stop that request —
+routing the window correctly does. And a multi-root workspace runs its session in the FIRST
+folder; the other folders are added working directories that the guard does not judge, so
+keep a bound folder in its own window.
+
+```
+cctl where              # explain how THIS folder resolves, with the env line and a
+                        # ready-to-paste VS Code settings snippet
+cctl where <folder>     # the same for another folder
+```
+
+### Enforcement: what a session in the wrong account sees
+
+So a session does not silently run on the wrong account, cctl installs a guard that checks
+each prompt against the folder's binding. When a folder is bound but the session is on the
+shared account, the guard blocks the prompt with:
+
+```
+cctl: C:\work is bound to alice, but this session runs on the shared account.
+Exit and start it with: cctl claude   (or set up the claude wrapper: cctl shell-init powershell)
+```
+
+There are three enforcement modes, set with `cctl settings set bind-enforce <mode>`:
+
+- **block** (default) — a mismatched prompt is refused with the message above.
+- **warn** — the same message is shown, but the prompt proceeds.
+- **off** — no check.
+
+To run in a bound folder on the global account _on purpose_ for one session, launch it
+with `cctl claude --override`; to run a bound account against a folder it is not bound to,
+launch with `cctl claude --account <that account>`. Both are honored by the guard for that
+session only.
+
+### macOS
+
+Folder-bound accounts are **not supported on macOS yet** — `cctl bind` refuses there. The
+isolation relies on a per-account credential store, and on macOS each store would prompt
+the Keychain. See `docs/PLATFORM.md`.
+
 ## Switching and recovery
 
 ```
-cctl switch <id|label>       # activate an account
+cctl switch <id|label>       # activate an account (a bound account switches ITS group's slot)
 cctl switch <id|label> --force   # bypass the switch-cadence guard
-cctl recover                 # recover from an interrupted switch (safe to run anytime)
+cctl recover                 # recover from an interrupted switch (safe to run anytime);
+                             # exits 1 with the reason when it cannot be settled yet
 ```
 
 ## Usage and timeline
@@ -344,6 +474,7 @@ Every setting has a short alias for the command line (case and `-`/`_` do not ma
 | `probe-timeout`     | `CCTL_PROBE_TIMEOUT_MS`                  | milliseconds          |
 | `auto-continue`     | `CCTL_AUTO_CONTINUE`                     | on / off              |
 | `auto-continue-max` | `CCTL_AUTO_CONTINUE_MAX`                 | count                 |
+| `bind-enforce`      | `CCTL_BIND_ENFORCE`                      | block / warn / off    |
 
 A missing, corrupt, or wrong-shaped file is ignored rather than being a startup
 error, so a typo costs you the override, never the daemon (`cctl settings set` will

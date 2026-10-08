@@ -73,9 +73,38 @@ export {
   Vault,
   ACCOUNT_METADATA_REV,
   METADATA_BACKFILL_RETRY_MS,
+  MAX_GROUPS,
+  MAX_GROUP_MEMBERS,
+  MAX_GROUP_FOLDERS,
   needsMetadataBackfill,
   type DedupeReport,
 } from './vault.js';
+// Folder canonicalization — shared verbatim between this package and the enforcement guard, which
+// embeds the compiled source of the canonicalizer trio (see folderPath.ts).
+export {
+  canonicalizeFolder,
+  folderKey,
+  isWithin,
+  resolveBinding,
+  exactBinding,
+  checkBindTarget,
+  embeddableFolderPathSource,
+  type CanonicalizeDeps,
+  type CanonicalizeResult,
+  type BindTargetDeps,
+  type FolderBoundGroup,
+} from './folderPath.js';
+// Terminal-safe text stripping — shared verbatim between cctl-side renderers (the CLI re-exports
+// it) and the enforcement guard, which embeds the compiled source (see terminalSafe.ts).
+export { sanitizeTerminalText, embeddableSanitizeSource } from './terminalSafe.js';
+// The non-secret folder-bindings snapshot the guard reads.
+export {
+  buildFolderBindingSnapshot,
+  readFolderBindingSnapshot,
+  writeFolderBindingSnapshot,
+  type BindEnforceMode,
+  type BuildSnapshotInput,
+} from './folderBindings.js';
 export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
 export {
   CredentialStore,
@@ -90,6 +119,7 @@ export {
   DEFAULT_MIN_SWITCH_INTERVAL_MS,
   type SwitchEngineOptions,
   type ActivateOptions,
+  type BindFs,
   type RefreshFn,
   type ExchangeFn,
   type ReauthResult,
@@ -98,3 +128,31 @@ export {
 // other packages replace a state file the way this one already does, instead of hand-rolling a
 // plain writeFile that a concurrent reader can catch half-written.
 export { atomicWriteFile } from './fsutil.js';
+// Profile directory materialization: builds/re-verifies a group's config dir against main.
+export {
+  ensureGroupProfile,
+  planGroupProfile,
+  computeClaudeJsonMerge,
+  createNodeProfileFs,
+  SHARED_PROFILE_DIRS,
+  PROFILE_LOCAL_DIRS,
+  SHARED_PROFILE_FILES,
+  CLAUDE_JSON_MERGE_ALLOWLIST,
+  CLAUDE_JSON_MIRROR_KEYS,
+  CLAUDE_JSON_SEED_KEYS,
+  type ProfileFs,
+  type ProfilePlatform,
+  type EntryKind,
+  type FileIdentity,
+  type ProfilePlan,
+  type DirPlan,
+  type FilePlan,
+  type ClaudeJsonPlan,
+  type DirAction,
+  type FileAction,
+  type ClaudeJsonAction,
+  type RepairWinner,
+  type ProfileReport,
+  type ProfileSkip,
+  type EnsureProfileOptions,
+} from './profile.js';

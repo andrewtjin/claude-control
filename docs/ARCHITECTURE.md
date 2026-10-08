@@ -90,9 +90,19 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   snapshot the current live creds → reconcile (adopt the previous account's token if
   the CLI rotated it under us) → refresh the target if near expiry and persist the
   rotated single-use token immediately → atomically write both `.credentials.json` and
-  the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. A
-  write-ahead intent makes every step crash-recoverable (`recover()` rolls forward if
-  the new creds are already live, else back to an encrypted snapshot).
+  the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. Any
+  failure after the first live write undoes the switch before the error surfaces: the
+  previous login goes back (identity, then credentials), unless another writer's token
+  landed meanwhile, which stays live and is stored in no bundle. A write-ahead intent per
+  slot, recorded before the first live write, makes every step crash-recoverable: `recover()`
+  at startup, and every locked operation on a slot, looks at its live files and completes or
+  undoes the switch (undoing it when completing needs a write that cannot be made, or when the
+  target no longer belongs to that slot). A switch that can be neither is reported, refuses
+  writes to its slot and operations on the two accounts it was between, and is retried until it
+  settles; everything else still runs. Which slot a switch targets is decided under the same
+  lock, so a bind or unbind that lands first can never have a switch write an account into a
+  slot it just left. Rotation adoption never stores a live token that another account's bundle
+  already holds, and a token two accounts store is never seated in any slot.
 - **Usage.** Tier-0 reads each profile's cached `cachedUsageUtilization` for free;
   tier-1 hits the OAuth usage endpoint. Cross-account visibility never requires
   switching, and the poller degrades to cached data (labelled stale) rather than
@@ -123,6 +133,62 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   structured streaming to Discord); a user's own terminal is a **observed** ConPTY
   session (notify/approve/inject only). Switching mid-session interrupts, activates,
   and resumes via `claude --resume`.
+
+## Folder-bound accounts
+
+A session's account is decided by one thing: the config dir it runs in
+(`CLAUDE_CONFIG_DIR` at launch). Everything else — the `env` block in settings, a project
+API-key token — Claude Code ignores once a login is stored. So binding a folder to an
+account is, mechanically, launching its sessions in a different config dir that holds that
+account's login. That dir is a **slot**.
+
+- **Slots.** The **global slot** is today's config dir (`~/.claude` or `CLAUDE_CONFIG_DIR`)
+  and holds the shared account. Each bound group gets a **group slot**: a **profile dir**
+  under `<machine-local data>/claude-control/profiles/<groupId>/`. An account is live in at
+  most one slot at a time — Claude Code rotates a refresh token on use, so the same login
+  cannot be live in two dirs without one corrupting the other. Swapping a slot's
+  `.credentials.json` reaches its running sessions in about two seconds, which is what makes
+  an in-set auto-switch work exactly like the global switch, but scoped.
+- **Profile dirs.** A profile is not a copy of `~/.claude`; it is a dir whose
+  account-neutral entries are **shared** back to main and whose account-specific ones are
+  its own. Content dirs (`projects`, `plugins`, `skills`, `agents`, `commands`, `todos`,
+  `sessions`, …) are directory junctions (Windows) or symlinks (POSIX) to main, so
+  memories, skills and history are one set of files no matter which account a session runs
+  on. Root files that are account-neutral (`settings.json`, `CLAUDE.md` and other root
+  `*.md`, `keybindings.json`, `history.jsonl`) are **hardlinks** to main — one inode, so an
+  edit through either name is seen by both; the link is re-verified on every materialize and
+  repaired newest-wins if Claude Code's temp-and-rename write ever severs it. Account-scoped
+  dirs (`statsig`, `logs`, `backups`, `telemetry`, the daemon's own runtime, …) stay
+  profile-local. `.claude.json` is **profile-owned**: the profile keeps its own
+  `oauthAccount`, and only an allowlist of account-neutral keys (onboarding flags, theme,
+  `mcpServers`, migration markers) is merged main → profile — never the reverse. Trust flows
+  one way too: a project's `hasTrustDialogAccepted` propagates main → profile, never back.
+- **The reservation fence.** A reserved account's registry row is physically **moved out**
+  of `accounts.json` into a separate `groups.json`. This is the load-bearing downgrade-safety
+  move: an older cctl (the installed daemon may predate this feature) rewrites `accounts.json`
+  from only `{activeId, accounts}` and refreshes the tokens of every account it can see. It
+  must never see a reserved account — or it would poll it, refresh its single-use token, or
+  switch to it, silently breaking a binding. Because the row lives in a file the old code does
+  not know about, its writes cannot touch it. `groups.json` records each group's members
+  (their full rows), its folders, and which member is live in its slot. A row found in both
+  files (a crash mid-move) resolves to the `groups.json` copy and heals on the next write.
+- **The guard.** A binding is only useful if a session in the wrong account is caught. A
+  dependency-free `UserPromptSubmit` hook (installed beside the relay forwarder, which keeps
+  its own never-block contract) reads a non-secret snapshot — `folder-bindings.json`, written
+  last in every binding change — and compares the session's config dir and project dir
+  against it. A bound folder on the shared account, or a group slot used against an unbound
+  folder, is blocked (or warned, or ignored, per the enforce mode). The guard fails **open**:
+  any internal error, a missing or unparseable snapshot, or an unknown schema version exits 0
+  and lets the prompt through. It prevents accidents; it is not a security boundary (see
+  `docs/THREAT_MODEL.md`).
+- **One engine, one lock.** The switch engine became slot-aware rather than being duplicated:
+  the same `activate` / recovery / adoption / identity-guard machinery runs per slot, all
+  under one cross-process lock, so no two slots can be written at once and every slot is
+  crash-recoverable the same way the global one always was. A doctor pass (`checkSlots`)
+  detects the invariant violations — an account live in two slots, a reserved account in
+  global, a non-member in a group slot, a drifted active id, a broken profile link — and a
+  repair pass fixes them by adopting the freshest token and re-seating each slot's rightful
+  account.
 
 ## State
 

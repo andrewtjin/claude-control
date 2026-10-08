@@ -1286,7 +1286,12 @@ describe('Daemon lifecycle', () => {
       },
     });
     await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
-    expect(switchEngine.activate).toHaveBeenCalledWith('acct-x', { origin: 'phone' });
+    // A shared account is switched in the global slot, and the daemon asserts that slot so a bind
+    // landing between the lookup and the switch refuses it instead of re-routing it.
+    expect(switchEngine.activate).toHaveBeenCalledWith('acct-x', {
+      origin: 'phone',
+      slot: 'global',
+    });
     const result = relay.received.find((e) => e.type === 'switch.result');
     if (result?.type === 'switch.result') {
       expect(result.payload).toMatchObject({
@@ -1515,7 +1520,10 @@ describe('Daemon lifecycle', () => {
       },
     });
     await waitFor(() => relay.received.some((e) => e.type === 'switch.result'));
-    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y', { origin: 'phone' });
+    expect(switchEngine.activate).toHaveBeenCalledWith('acct-y', {
+      origin: 'phone',
+      slot: 'global',
+    });
     const result = relay.received.find((e) => e.type === 'switch.result');
     if (result?.type === 'switch.result') {
       expect(result.payload).toMatchObject({ ok: true, activeAccountId: 'acct-y' });

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { Store } from './store.js';
+import { Store, slotBySessionMap } from './store.js';
 
 describe('Store', () => {
   let store: Store;
@@ -165,7 +165,7 @@ describe('Store', () => {
       // `openActivationInterval` never sets an origin — only `replaceActivationIntervals` (the
       // attribution journal's write path) carries one in from the audit log.
       expect(all).toEqual([
-        { id, accountId: 'acct-1', startedAtMs: 1000, endedAtMs: 2000, origin: null },
+        { id, accountId: 'acct-1', startedAtMs: 1000, endedAtMs: 2000, origin: null, slot: null },
       ]);
     });
 
@@ -322,6 +322,64 @@ describe('Store', () => {
       expect(store.deleteSession('sess-3')).toBe(true);
       expect(store.getSession('sess-3')).toBeUndefined();
       expect(store.deleteSession('sess-3')).toBe(false);
+    });
+
+    it('persists a slot and defaults an omitted one to NULL (read as global)', () => {
+      store.upsertSession({
+        id: 'sess-slot',
+        kind: 'managed',
+        state: 'running',
+        accountId: 'm',
+        slot: 'group:x',
+        json: '{}',
+        updatedAtMs: 1,
+      });
+      store.upsertSession({
+        id: 'sess-noslot',
+        kind: 'managed',
+        state: 'running',
+        accountId: 'a',
+        json: '{}',
+        updatedAtMs: 1,
+      });
+      expect(store.getSession('sess-slot')?.slot).toBe('group:x');
+      expect(store.getSession('sess-noslot')?.slot).toBeNull();
+    });
+  });
+
+  describe('slotBySessionMap', () => {
+    it('maps only the folder-bound sessions, omitting global and NULL', () => {
+      store.upsertSession({
+        id: 'a',
+        kind: 'managed',
+        state: 'running',
+        accountId: null,
+        slot: 'group:x',
+        json: '{}',
+        updatedAtMs: 1,
+      });
+      store.upsertSession({
+        id: 'b',
+        kind: 'managed',
+        state: 'running',
+        accountId: null,
+        slot: 'global',
+        json: '{}',
+        updatedAtMs: 1,
+      });
+      store.upsertSession({
+        id: 'c',
+        kind: 'managed',
+        state: 'running',
+        accountId: null,
+        json: '{}',
+        updatedAtMs: 1,
+      });
+      const map = slotBySessionMap(store.listSessions());
+      expect(map.get('a')).toBe('group:x');
+      expect(map.has('b')).toBe(false); // global is the default, never mapped
+      expect(map.has('c')).toBe(false); // NULL slot too
+      expect(map.size).toBe(1);
     });
   });
 
@@ -644,13 +702,15 @@ describe('Store migration', () => {
       // The legacy row's source audit line predates `origin` entirely — null is the honest
       // answer, never a fabricated 'manual'.
       expect(store.listActivationIntervals()).toEqual([
-        { id: 1, accountId: 'a', startedAtMs: 1000, endedAtMs: 2000, origin: null },
+        { id: 1, accountId: 'a', startedAtMs: 1000, endedAtMs: 2000, origin: null, slot: null },
       ]);
-      // Post-upgrade writes (the attribution journal's replace path) carry an origin end to end.
+      // Post-upgrade writes (the attribution journal's replace path) carry an origin AND a slot end
+      // to end — the legacy table had neither column, both were added by the migration.
       store.replaceActivationIntervals([
-        { accountId: 'b', startedAtMs: 3000, endedAtMs: null, origin: 'auto' },
+        { accountId: 'b', startedAtMs: 3000, endedAtMs: null, origin: 'auto', slot: 'group:g1' },
       ]);
       expect(store.listActivationIntervals()[0]?.origin).toBe('auto');
+      expect(store.listActivationIntervals()[0]?.slot).toBe('group:g1');
     } finally {
       store.close();
     }
