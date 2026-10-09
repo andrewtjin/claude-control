@@ -50,14 +50,7 @@ import {
 } from './oauth.js';
 import { folderBindingsPath, groupProfileDir, profilesRoot, type Paths } from './paths.js';
 import { atomicWriteFile, removeIfExists } from './fsutil.js';
-import {
-  canonicalizeFolder,
-  checkBindTarget,
-  exactBinding,
-  folderKey,
-  isWithin,
-  resolveBinding,
-} from './folderPath.js';
+import { canonicalizeFolder, checkBindTarget, folderKey, isWithin } from './folderPath.js';
 import { createNodeProfileFs, ensureGroupProfile, planGroupProfile } from './profile.js';
 import {
   buildFolderBindingSnapshot,
@@ -65,39 +58,55 @@ import {
   writeFolderBindingSnapshot,
   type BindEnforceMode,
 } from './folderBindings.js';
+import {
+  allSlots,
+  availableInOrder,
+  exactFolderRule,
+  legitimateOccupancy,
+  liveElsewhere,
+  resolveFolderRule,
+  rulesIncluding,
+  slotMayHold,
+  slotPool,
+  withRule,
+  type RulesPicture,
+} from './folderRules.js';
 import { readdir, readFile, rm } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { groupSlotId } from './types.js';
+import { ruleIdOfSlot, ruleSlotId } from './types.js';
 import type {
   AccountView,
   ActivateResult,
-  BindResult,
   ClaudeOauth,
   CredentialBundle,
+  ExcludeResult,
   FolderBindingSnapshot,
-  GroupLiveResult,
+  FolderRule,
+  IncludeResult,
   OauthAccount,
+  PoolEntry,
   RecoverResult,
   RefreshTokenResult,
   ReloginResult,
   RepairResult,
+  ResetResult,
+  RuleLiveResult,
   RunningSession,
+  SlotHandOff,
   SlotId,
   SlotLiveToken,
   SlotViolation,
   StoredAccount,
-  StoredGroup,
   SwitchIntent,
-  UnbindResult,
 } from './types.js';
-import { needsMetadataBackfill, Vault, type DedupeReport } from './vault.js';
+import { needsMetadataBackfill, Vault, type DedupeReport, type RegistryPicture } from './vault.js';
 import { tokenPrints, type StoredTokens } from './tokenPrints.js';
 
-/** The filesystem seam {@link SwitchEngine.bindFolder} / {@link SwitchEngine.unbindFolder} use to
- *  canonicalize a folder and check it is a real directory. Injected (never read from `node:*`
+/** The filesystem seam the folder-rule verbs ({@link SwitchEngine.includeInFolder} and its
+ *  siblings) use to canonicalize a folder and check it is a real directory. Injected (never read from `node:*`
  *  directly in the method bodies) so a test can bind a sandbox directory and control what counts as
  *  the home dir, exactly as the rest of the engine funnels IO through seams. */
 export interface BindFs {
@@ -108,7 +117,7 @@ export interface BindFs {
   isDirectory: (path: string) => boolean;
   /** Base dir a relative folder is resolved against (`process.cwd()`). */
   cwd: () => string;
-  /** The user's home directory (`os.homedir()`), refused as a bind target. */
+  /** The user's home directory (`os.homedir()`), refused as a rule folder. */
   homedir: () => string;
 }
 
@@ -181,24 +190,24 @@ export interface SwitchEngineOptions {
   lockOptions?: LockOptions;
   logger?: Logger;
   /** Selects the platform rules that differ across slots: the folder-key case fold the vault uses
-   *  to tell groups apart, the profiles-root containment check that refuses a capture inside a
-   *  profile, and the macOS refusal of group slots (per-config-dir Keychain slots are not built
+   *  to tell rule folders apart, the profiles-root containment check that refuses a capture inside a
+   *  profile, and the macOS refusal of rule slots (per-config-dir Keychain slots are not built
    *  yet). A parameter rather than a `process.platform` read so a test can drive either OS. */
   platform?: NodeJS.Platform;
-  /** Filesystem seam for folder canonicalization in bind/unbind. Defaults to a `node:fs`-backed
+  /** Filesystem seam for folder canonicalization in the rule verbs. Defaults to a `node:fs`-backed
    *  one; tests inject a sandbox-aware version (notably a controlled home dir). */
   bindFs?: BindFs;
   /** Process-liveness probe for the running-session scan. Defaults to a signal-0 check; tests inject
    *  a deterministic one. */
   isProcessAlive?: (pid: number) => boolean;
-  /** The enforcement mode stamped into the guard snapshot written after every group mutation.
+  /** The enforcement mode stamped into the guard snapshot written after every rule mutation.
    *  Defaults to `'block'`. Pass a plain mode for a one-shot CLI process; pass a RESOLVER for a
    *  long-lived process (the daemon), which is called at each snapshot write so a live
    *  `cctl settings set bind-enforce <mode>` takes effect without a restart. A cached value would let
    *  a daemon-side snapshot rewrite (e.g. from repairSlots) revert an operator's live change. */
   bindEnforce?: BindEnforceMode | (() => BindEnforceMode);
-  /** Fault-injection seam for the multi-step group mutations, called at labeled checkpoints so a
-   *  test can throw partway through and prove the next `ensureGroupLive`/`repairSlots` converges.
+  /** Fault-injection seam for the multi-step rule mutations, called at labeled checkpoints so a
+   *  test can throw partway through and prove the next `ensureRuleLive`/`repairSlots` converges.
    *  Undefined in production, where every checkpoint is a zero-cost no-op. */
   faultAt?: (checkpoint: string) => void;
 }
@@ -217,12 +226,13 @@ export interface ActivateOptions {
    *  Recorded as the audit entry's existing `detail` field — the origin needs no new column of
    *  its own to carry a "why". */
   reason?: string;
-  /** The slot this activation must land in. OMITTED is the norm: the slot is derived from the
-   *  target's membership (a reserved account → its group's slot, a shared account → global), and
-   *  the derived slot always wins. Passing one that DISAGREES with membership is refused rather
-   *  than silently overridden — it is how a caller asserts "activate this account in THIS slot"
-   *  and gets told when that is impossible (a reserved account can never be global; a non-member
-   *  can never be a group). It cannot force a different slot; it can only fail fast on a mismatch. */
+  /** The slot this activation must land in. OMITTED, the slot follows from the registry (a shared
+   *  account → global; a reserved account → the slot of the rule including it, or the one it is
+   *  live in when several do). Named, it may be any slot whose pool holds the target — a rule's slot
+   *  takes its included accounts and the shared accounts it does not exclude — and a slot whose pool
+   *  does not is refused rather than silently replaced: it is how a caller asserts "activate this
+   *  account in THIS slot" and gets told when that is impossible (a reserved account can never be
+   *  global; an excluded or foreign account never in that rule's slot). */
   slot?: SlotId;
 }
 
@@ -349,63 +359,45 @@ interface PhysicalOccupant {
   ambiguous?: { holders: string[]; identityId: string | null; identityUuid?: string };
 }
 
-/** A profile dir no group owns that still holds a live login (see `orphanProfileLogins`). */
+/** A profile dir no rule owns that still holds a live login (see `orphanProfileLogins`). */
 interface OrphanLogin {
-  /** The dir's name — the id of the group that once owned it. */
+  /** The dir's name — the id of the rule that once owned it. */
   name: string;
   dir: string;
   store: CredentialStore;
   occupant: PhysicalOccupant;
 }
 
-/** The refusal of a capture whose config dir is a group profile: a {@link RefreshError} with a stable
- *  code, so the CLI can render guidance ("onboard in a throwaway dir") rather than a raw message. */
+/** The refusal of a capture whose config dir is a folder profile: a {@link RefreshError} with a
+ *  stable code, so the CLI can render guidance ("onboard in a throwaway dir") rather than a raw
+ *  message. */
 function captureInProfileError(configDir: string): RefreshError {
   return new RefreshError(
-    `"${configDir}" is inside the folder-bound profiles area; onboard a new account in a ` +
-      'throwaway config dir instead of a group profile',
+    `"${configDir}" is inside the folder profiles area; onboard a new account in a ` +
+      'throwaway config dir instead of a folder profile',
     'capture_in_profile',
   );
 }
 
-/** Set equality by membership — the two account-id sets compare identical. */
-function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-  if (a.size !== b.size) return false;
-  for (const x of a) if (!b.has(x)) return false;
-  return true;
-}
-
-/** A group's members as a display list for a refusal/violation message ("<label> + <label>"). */
-function describeMembers(group: StoredGroup): string {
-  const labels = group.members.map((m) => m.label);
-  return labels.length > 0 ? labels.join(' + ') : group.label;
-}
-
-/** A group's bound folders as a display list, for "already reserved to <folders>" messages. */
-function describeFolders(group: StoredGroup): string {
-  return group.folders.length > 0 ? group.folders.join(', ') : describeMembers(group);
-}
-
-/** The order {@link SwitchEngine.ensureGroupLiveLocked} tries members in: the recorded active member
- *  first (continuity), then eligible members (not quarantined, not excluded), then quarantine-free but
- *  excluded members as a last resort — a quarantined member is never a candidate (its token is dead).
- *  De-duplicated so the recorded active member is not tried twice. */
-function orderedGroupCandidates(group: StoredGroup): StoredAccount[] {
-  const alive = group.members.filter((m) => !m.quarantined);
-  const active = group.activeId !== null ? alive.filter((m) => m.id === group.activeId) : [];
-  const eligible = alive.filter((m) => m.id !== group.activeId && m.autoSwitchExcluded !== true);
-  const excludedFallback = alive.filter(
-    (m) => m.id !== group.activeId && m.autoSwitchExcluded === true,
-  );
-  return [...active, ...eligible, ...excludedFallback];
+/** A rule's folders as a display list, for messages ("the folder slot of <folders>"). Falls back to
+ *  the rule's label for a rule that somehow holds no folder. */
+function describeRule(rule: FolderRule): string {
+  return rule.folders.length > 0 ? rule.folders.join(', ') : rule.label;
 }
 
 /** Structural equality of two violations — enough to tell whether a breach the repair set out to fix
- *  is still present afterward (its kind, the account/group/slot it named). */
+ *  is still present afterward (its kind, the account/rule/slot it named). */
 function sameViolation(a: SlotViolation, b: SlotViolation): boolean {
   return (
-    a.kind === b.kind && a.accountId === b.accountId && a.groupId === b.groupId && a.slot === b.slot
+    a.kind === b.kind && a.accountId === b.accountId && a.ruleId === b.ruleId && a.slot === b.slot
   );
+}
+
+/** The rule id a slot belongs to as a violation's `ruleId` field, spread into the violation (empty
+ *  for the global slot). */
+function ruleField(slotId: SlotId): { ruleId?: string } {
+  const ruleId = ruleIdOfSlot(slotId);
+  return ruleId === undefined ? {} : { ruleId };
 }
 
 /** The identity fields a registry row and a login's identity block BOTH carry — the only ones a
@@ -489,8 +481,8 @@ function reloginIdentityRefusal(
  * A slot is one credential seat: a live-credential location, plus the crash-recovery state that
  * describes an in-flight switch of that seat (cadence clock, intent WAL, rollback snapshot). The
  * GLOBAL slot keeps the historical file names in the vault dir so a switch interrupted by a
- * pre-upgrade build recovers unchanged; a group slot lives in the group's own profile dir with its
- * state under `<vaultDir>/slots/<groupId>/`. ONE lock (the vault-dir lock) still serialises every
+ * pre-upgrade build recovers unchanged; a rule slot lives in the rule's own profile dir with its
+ * state under `<vaultDir>/slots/<ruleId>/`. ONE lock (the vault-dir lock) still serialises every
  * slot — the state dirs only separate the on-disk records, never the mutual exclusion.
  */
 interface SlotRuntime {
@@ -501,11 +493,11 @@ interface SlotRuntime {
   intent: IntentStore;
   /** Directory holding this slot's `last-switch.json` and `.rollback.enc`. */
   stateDir: string;
-  /** A group slot's config dir (materialised by {@link ensureGroupProfile} before a write); absent
+  /** A rule slot's config dir (materialised by {@link ensureGroupProfile} before a write); absent
    *  for the global slot. */
   profileDir?: string;
-  /** The group id backing a group slot; absent for the global slot. */
-  groupId?: string;
+  /** The rule id backing a rule slot; absent for the global slot. */
+  ruleId?: string;
 }
 
 export class SwitchEngine {
@@ -522,7 +514,7 @@ export class SwitchEngine {
   private readonly minSwitchIntervalMs: number;
   private readonly lockOptions: LockOptions;
   private readonly log: Logger;
-  /** Kept so per-slot rollback snapshots encrypt with the same protector the vault uses — a group
+  /** Kept so per-slot rollback snapshots encrypt with the same protector the vault uses — a rule
    *  slot's `.rollback.enc` is as sensitive as the global one and must be sealed the same way. */
   private readonly protector: Protector;
   /** See {@link SwitchEngineOptions.platform}. Also handed to the {@link Vault} so the engine and
@@ -621,96 +613,129 @@ export class SwitchEngine {
   listAccounts(): Promise<StoredAccount[]> {
     return this.vault.listAccounts();
   }
-  // ---- read-only group / snapshot accessors (for the CLI's bindings / where / accounts views) ----
+  // ---- read-only rule / snapshot accessors (for the CLI's and the daemon's views) ----
   //
-  // The vault is private to the engine, but the CLI must read the folder-bound groups to render
-  // `bindings`, tag `accounts`/`usage` with a binding, and resolve `where`. These are thin
-  // pass-throughs (metadata reads, no decryption, no lock) so the CLI reaches the SAME configured
+  // The vault is private to the engine, but the CLI and the daemon must read the folder rules to
+  // render them, tag `accounts`/`usage` with them, resolve `where`, and decide per slot. These are
+  // thin pass-throughs (metadata reads, no decryption, no lock) so callers reach the SAME configured
   // vault the engine already holds instead of constructing a second one with a duplicated protector.
-  /** All folder-bound groups (full member rows). */
-  listGroups(): Promise<StoredGroup[]> {
-    return this.vault.listGroups();
+  /** Every folder rule, in file order. */
+  listRules(): Promise<FolderRule[]> {
+    return this.vault.listRules();
   }
-  /** One folder-bound group by id, or undefined. */
-  getGroup(id: string): Promise<StoredGroup | undefined> {
-    return this.vault.getGroup(id);
+  /** One folder rule by id, or undefined. */
+  getRule(id: string): Promise<FolderRule | undefined> {
+    return this.vault.getRule(id);
   }
-  /** The shared pool AND every reserved member in one view; each reserved row carries its groupId. */
+  /** The shared pool AND every reserved account in one view; each reserved row carries the ids of
+   *  the rules including it. */
   listAllAccounts(): Promise<AccountView[]> {
     return this.vault.listAllAccounts();
   }
   /** The groups.json generation the snapshot is derived from — used to judge snapshot freshness. */
-  getGroupsGeneration(): Promise<number> {
-    return this.vault.getGroupsGeneration();
+  getRulesGeneration(): Promise<number> {
+    return this.vault.getRulesGeneration();
   }
   /** The non-secret guard snapshot as last written, or undefined when none exists yet. */
   readSnapshot(): Promise<FolderBindingSnapshot | undefined> {
     return this.vault.readFolderBindings();
   }
+
+  /**
+   * The effective pool of a slot, in pool order, with each account's liveness elsewhere: what the
+   * daemon chooses a slot's account from and what the CLI shows for a folder. For the global slot,
+   * the shared pool; for a rule's slot, its included accounts first, then the shared pool minus its
+   * exclusions (see `folderRules.ts` for every rule of membership and order). An entry whose
+   * `liveElsewhere` is set is in the pool but NOT available to this slot right now.
+   *
+   * An unlocked read, like {@link liveSlots}: a concurrent switch can make the answer stale by the
+   * time it is used, which is why every switch re-checks candidacy under the lock.
+   */
+  async slotPool(slotId: SlotId): Promise<PoolEntry[]> {
+    const picture = await this.vault.readPicture();
+    const occupancy = await this.slotOccupancy(picture);
+    return slotPool(slotId, picture, occupancy);
+  }
+
+  /** The folder rule a directory runs under — the longest rule folder containing it, no merging
+   *  between nested rules — or `null` for a directory that runs on the global slot. Canonicalizes
+   *  leniently: an unresolvable path simply has no rule, never an error. */
+  async resolveFolderRule(cwd: string): Promise<{ ruleId: string; folder: string } | null> {
+    const rules = await this.vault.listRules();
+    if (rules.length === 0) return null;
+    const match = resolveFolderRule(this.canonReserved(cwd), rules, this.platform);
+    return match === null ? null : { ruleId: match.rule.id, folder: match.folder };
+  }
+
   addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
     return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
   }
   /**
-   * Remove an account wherever it lives, and clean the group slot it occupied.
+   * Remove an account wherever it lives, and clean every rule slot it occupied.
    *
-   * The vault drops the row (dissolving an emptied group) and its bundle. On top of that, a member
-   * that was LIVE in its group slot must not leave its credentials behind in the profile: a removed
-   * account whose `.credentials.json` still sits live in a group's config dir is the stale live seat
-   * the reservation fence exists to prevent. So its live files are cleared, failing that slot closed
-   * (an empty config dir = not logged in — measured). The global slot is deliberately NOT cleared
-   * this way: removing the global active account leaves its live files for the historical reasons the
-   * vault's own active-id clearing already encodes. Removing a member rewrites the guard snapshot,
-   * which names members and — when the removal dissolves the group — enforces its folders.
+   * The vault drops the row and every rule's reference to it (dissolving a rule left with nothing
+   * to include or exclude) and its bundle. On top of that, an account LIVE in a rule's slot must not
+   * leave its credentials behind in the profile: a removed account whose `.credentials.json` still
+   * sits live in a folder's config dir is a stale live seat nothing would ever clear. So its live
+   * files are cleared, failing that slot closed (an empty config dir = not logged in — measured) until
+   * the rule's self-heal seats another account; a rule this removal dissolves has its seat cleared
+   * whoever holds it. The global slot is deliberately NOT cleared this way: removing the global active
+   * account leaves its live files for the historical reasons the vault's own active-id clearing
+   * already encodes. Removing a reserved account, or dissolving a rule, rewrites the guard snapshot.
    *
-   * ORDER is the crash-safety contract, and it is the one an unbind's dissolve uses: adopt the seat's
-   * rotation, clear the seat, THEN drop the row. Dying after the clear leaves the account whole (row,
-   * bundle holding its latest token) with an empty seat the group re-fills, and a rerun completes the
+   * ORDER is the crash-safety contract, and it is the one a dissolve uses: adopt the seat's rotation,
+   * clear the seat, THEN drop the row. Dying after the clear leaves the account whole (row, bundle
+   * holding its latest token) with an empty seat the rule re-fills, and a rerun completes the
    * removal. The reverse order leaves the removed login live in the profile — and when the removal
-   * dissolved the group, in a profile no slot owns, which nothing else would ever clear.
+   * dissolved the rule, in a profile no slot owns, which nothing else would ever clear.
    */
   removeAccount(id: string): Promise<void> {
     return this.withCredentialLock(async () => {
       // A pending switch to or from this account needs its bundle to be settled correctly; one that
       // cannot be settled yet refuses the removal.
       const untrusted = await this.settleForAccountsLocked([id]);
-      const { slotId, group } = await this.slotForAccount(id);
-      if (group === undefined) {
-        await this.vault.removeAccount(id);
-        return;
-      }
-      const rt = this.slotRuntime(slotId);
-      // Only a member live in its own group slot has a seat to clear — or every seat of a group this
-      // removal dissolves. Live by its token as much as by the identity block: a seat holding its
-      // token under another member's identity is still its seat.
-      const liveMember = await this.getActiveId(slotId);
-      const dissolves = group.members.length === 1;
-      if ((await this.possibleLiveOwners(slotId)).has(id) || dissolves) {
-        // Whatever rotation the seat holds reaches the vault first, so dying between here and the row
-        // drop never costs the account its latest token — unless a switch left there unsettled makes
-        // the live login untrustworthy, when nothing is adopted from it.
-        if (!untrusted.has(slotId)) {
-          const liveNow = await rt.credStore.readLiveCredentials().catch(() => undefined);
-          const liveOauth = await rt.credStore.readOauthAccount().catch(() => undefined);
-          await this.adoptRotationIfNeeded(liveMember, liveNow, liveOauth);
-        }
+      const picture = await this.vault.readPicture();
+      const reserved = picture.reserved.some((a) => a.id === id);
+      const dissolving = picture.rules.filter(
+        (r) =>
+          (r.include.includes(id) || r.exclude.includes(id)) &&
+          r.include.every((x) => x === id) &&
+          r.exclude.every((x) => x === id),
+      );
+      const stored = await this.vault.readStoredTokens();
+      let cleared = false;
+      for (const rule of picture.rules) {
+        const slotId = ruleSlotId(rule.id);
+        // Live by its token as much as by the identity block: a seat holding its token under another
+        // account's identity is still its seat.
+        const owners = await this.possibleLiveOwners(slotId, stored);
+        if (!owners.has(id) && !dissolving.includes(rule)) continue;
+        const rt = this.slotRuntime(slotId);
+        // Whatever rotation the seat holds reaches the vault first, so dying between here and the
+        // row drop never costs an account its latest token — unless a switch left there unsettled
+        // makes the live login untrustworthy, when nothing is adopted from it.
+        if (!untrusted.has(slotId)) await this.adoptSlotRotation(rt);
         await this.clearSlotLive(rt);
-        this.fault('remove:after-clear-live');
+        cleared = true;
       }
+      if (cleared) this.fault('remove:after-clear-live');
       await this.vault.removeAccount(id);
       this.fault('remove:after-registry-drop');
-      // A dissolved group's slot no longer exists: drop its recovery state too, so no intent is left
-      // behind for a slot nothing will ever walk again (the same cleanup an unbind's dissolve does).
-      if (dissolves) await this.clearSlotState(rt);
-      // The guard names a group's members and enforces its folders; a removal changed one or both.
-      // Written LAST, like every other group mutation.
-      await this.writeSnapshotLocked();
+      // A dissolved rule's slot no longer exists: drop its recovery state too, so no intent is left
+      // behind for a slot nothing will ever walk again (the same cleanup a reset's dissolve does).
+      for (const rule of dissolving)
+        await this.clearSlotState(this.slotRuntime(ruleSlotId(rule.id)));
+      // The guard names a rule's included accounts and enforces its folders; a removal changed one or
+      // both. Written LAST, like every other rule mutation.
+      if (reserved || dissolving.length > 0) await this.writeSnapshotLocked();
     });
   }
   renameAccount(id: string, label: string): Promise<StoredAccount> {
     return this.withCredentialLock(async () => {
       const renamed = await this.vault.renameAccount(id, label);
-      // A reserved member's label is part of what the guard's block reason shows.
-      if ((await this.slotForAccount(id)).group !== undefined) await this.writeSnapshotLocked();
+      // A reserved account's label is part of what the guard's block reason shows.
+      const picture = await this.vault.readPicture();
+      if (picture.reserved.some((a) => a.id === id)) await this.writeSnapshotLocked();
       return renamed;
     });
   }
@@ -802,7 +827,7 @@ export class SwitchEngine {
     try {
       const report = await this.withCredentialLockIfFree(async () => {
         const r = await this.vault.dedupeAccounts();
-        // A merge or a relabel can change a reserved member's label, which the guard names.
+        // A merge or a relabel can change a reserved account's label, which the guard names.
         if (r.merged.length > 0 || r.relabelled.length > 0)
           await this.refreshSnapshotIfStaleLocked();
         return r;
@@ -861,11 +886,12 @@ export class SwitchEngine {
   /**
    * The per-slot IO surface for a {@link SlotId}. PURE — no vault read, so it is safe to build
    * anywhere (inside or outside the lock) and cannot itself change state. The global slot reuses
-   * the engine's own credential store and the vault dir (historical file names); a group slot is
+   * the engine's own credential store and the vault dir (historical file names); a rule slot is
    * addressed by the profile dir its id names, with its recovery state under `<vaultDir>/slots/<id>`.
    */
   private slotRuntime(slotId: SlotId): SlotRuntime {
-    if (slotId === 'global') {
+    const ruleId = ruleIdOfSlot(slotId);
+    if (ruleId === undefined) {
       return {
         id: slotId,
         credStore: this.credStore,
@@ -873,69 +899,78 @@ export class SwitchEngine {
         stateDir: this.paths.vaultDir,
       };
     }
-    const groupId = slotId.slice('group:'.length);
-    const profileDir = groupProfileDir(this.paths.vaultDir, groupId);
-    // A group slot is always FILE-based: it never uses the darwin Keychain channel (group slots are
+    const profileDir = groupProfileDir(this.paths.vaultDir, ruleId);
+    // A rule slot is always FILE-based: it never uses the darwin Keychain channel (rule slots are
     // refused on macOS), so a plain CredentialStore over the profile dir is the whole story.
     const credStore = this.configDirStore(profileDir);
-    const stateDir = join(this.paths.vaultDir, 'slots', groupId);
+    const stateDir = join(this.paths.vaultDir, 'slots', ruleId);
     return {
       id: slotId,
       credStore,
       intent: new IntentStore(stateDir),
       stateDir,
       profileDir,
-      groupId,
+      ruleId,
     };
   }
 
   /**
-   * The slot an account BELONGS to, derived from membership: a reserved account's own group slot,
-   * else the global slot. This is the routing authority for {@link activate} — a reserved account
-   * is never live globally and a shared account never in a group, so the slot is a fact about the
-   * account, not a caller's choice.
+   * The slot an activation that names none goes to. A shared account goes to the global slot — the
+   * historical meaning of "switch to it"; a rule's slot takes a shared account only when the caller
+   * names that slot. A reserved account goes to its rule's slot; one several rules include goes to
+   * the slot it is live in, and with none of them live there is no single answer, so the caller is
+   * told to name the folder rather than have one picked for it.
    */
-  private async slotForAccount(id: string): Promise<{ slotId: SlotId; group?: StoredGroup }> {
-    for (const g of await this.vault.listGroups()) {
-      if (g.members.some((m) => m.id === id)) return { slotId: groupSlotId(g.id), group: g };
+  private async defaultSlotFor(target: StoredAccount, picture: RulesPicture): Promise<SlotId> {
+    const including = rulesIncluding(target.id, picture.rules);
+    if (including.length === 0) return 'global';
+    if (including.length === 1) return ruleSlotId(including[0]!.id);
+    for (const rule of including) {
+      const slotId = ruleSlotId(rule.id);
+      if ((await this.getActiveId(slotId)) === target.id) return slotId;
     }
-    return { slotId: 'global' };
+    throw new SlotError(
+      `account "${target.label}" is included by several folder rules ` +
+        `(${including.map(describeRule).join('; ')}); name the folder slot to switch it in`,
+      'slot_ambiguous',
+    );
   }
 
-  /** The registry side of one slot: the id it last recorded as active, and the accounts that may be
-   *  active in it. Global = `{ vault.activeId, shared pool }`; a group = `{ group.activeId, members }`.
-   *  A group that no longer exists yields `{ null, [] }` — nothing can be live in a slot with no
-   *  registry backing. */
+  /** The registry side of one slot: the id it last recorded as active, and the accounts a live login
+   *  there is recognized as. Global = `{ vault.activeId, shared pool }`. A rule slot recognizes ANY
+   *  stored account (shared or reserved): an account outside the rule's pool that is live there is
+   *  still that account, and naming it is what lets its rotation be adopted before it is moved off and
+   *  the slot check report it. Its recorded id counts only while it names a stored account. A rule
+   *  that no longer exists yields `{ null, [] }` — nothing can be live in a slot with no registry
+   *  backing. */
   private async slotRegistry(
     slotId: SlotId,
   ): Promise<{ registryId: string | null; candidates: StoredAccount[] }> {
-    if (slotId === 'global') {
-      const [registryId, candidates] = await Promise.all([
-        this.vault.getActiveId(),
-        this.vault.listAccounts(),
-      ]);
-      return { registryId, candidates };
-    }
-    const group = await this.vault.getGroup(slotId.slice('group:'.length));
-    if (!group) return { registryId: null, candidates: [] };
-    return { registryId: group.activeId, candidates: group.members };
+    const picture = await this.vault.readPicture();
+    const ruleId = ruleIdOfSlot(slotId);
+    if (ruleId === undefined)
+      return { registryId: picture.activeId, candidates: [...picture.shared] };
+    const rule = picture.rules.find((r) => r.id === ruleId);
+    if (!rule) return { registryId: null, candidates: [] };
+    const candidates = [...picture.shared, ...picture.reserved];
+    const registryId = candidates.some((a) => a.id === rule.activeId) ? rule.activeId : null;
+    return { registryId, candidates };
   }
 
-  /** Every slot that has a registry backing: the global slot plus one per group. The set
+  /** Every slot that has a registry backing: the global slot plus one per rule. The set
    *  {@link liveSlots}, {@link recover}, and {@link liveSlotOf} walk. */
   private async allSlotIds(): Promise<SlotId[]> {
-    const ids: SlotId[] = ['global'];
-    for (const g of await this.vault.listGroups()) ids.push(groupSlotId(g.id));
-    return ids;
+    return allSlots(await this.vault.listRules());
   }
 
   /**
    * The slot an account is live in RIGHT NOW (reconciled), or undefined when it is live nowhere.
    *
-   * Walks every slot rather than only the account's own group slot: the whole point is to catch an
-   * account that is live where it should not be, so that {@link refreshToken} never network-refreshes
-   * a token some session is holding and a re-login heals the seat the account actually occupies.
-   * Short-circuits on the first hit — the invariant is that there is at most one.
+   * Walks every slot: an account may legitimately be live in the global slot or any rule slot whose
+   * pool holds it, and the whole point is also to catch one live where it should not be, so that
+   * {@link refreshToken} never network-refreshes a token some session is holding and a re-login heals
+   * the seat the account actually occupies. Short-circuits on the first hit — the invariant is that
+   * there is at most one.
    */
   private async liveSlotOf(accountId: string): Promise<SlotId | undefined> {
     for (const slotId of await this.allSlotIds()) {
@@ -952,19 +987,35 @@ export class SwitchEngine {
    * leaves behind — and a decision about whom to move off a slot, or whose seat to clear, must then
    * treat both as live: the token is what a session spends, the identity is what every reader
    * believes. A token no bundle stores (rotated since it was stored) leaves the identity as the best
-   * evidence there is.
+   * evidence there is. A slot with no live credentials holds nobody, whatever its records say.
+   *
+   * `stored` lets a caller walking every slot read the stored tokens once.
    */
-  private async possibleLiveOwners(slotId: SlotId): Promise<Set<string>> {
+  private async possibleLiveOwners(slotId: SlotId, stored?: StoredTokens): Promise<Set<string>> {
     const owners = new Set<string>();
-    const byIdentity = await this.getActiveId(slotId);
-    if (byIdentity !== null) owners.add(byIdentity);
     const live = await this.slotRuntime(slotId)
       .credStore.readLiveCredentials()
       .catch(() => undefined);
-    if (live !== undefined) {
-      for (const id of (await this.vault.readStoredTokens()).holdersOf(live)) owners.add(id);
-    }
+    if (live === undefined) return owners;
+    const byIdentity = await this.getActiveId(slotId);
+    if (byIdentity !== null) owners.add(byIdentity);
+    const tokens = stored ?? (await this.vault.readStoredTokens());
+    for (const id of tokens.holdersOf(live)) owners.add(id);
     return owners;
+  }
+
+  /**
+   * Who is live in every slot right now ({@link possibleLiveOwners}), in slot order — the
+   * {@link SlotOccupancy} every "available to this slot" decision reads. The stored tokens are read
+   * once for the whole walk.
+   */
+  private async slotOccupancy(picture: RulesPicture): Promise<Map<SlotId, Set<string>>> {
+    const stored = await this.vault.readStoredTokens();
+    const occupancy = new Map<SlotId, Set<string>>();
+    for (const slotId of allSlots(picture.rules)) {
+      occupancy.set(slotId, await this.possibleLiveOwners(slotId, stored));
+    }
+    return occupancy;
   }
 
   /** The slot whose live credentials hold exactly this refresh token, whoever its identity block
@@ -980,15 +1031,25 @@ export class SwitchEngine {
   }
 
   /**
-   * Clear a GROUP slot's live seat: remove its `.credentials.json` and drop the `oauthAccount`
+   * Clear a RULE slot's live seat: remove its `.credentials.json` and drop the `oauthAccount`
    * block, so the slot fails closed (an empty config dir is "not logged in" — measured). A no-op for
    * the global slot, which is never cleared this way. The profile dir itself is kept (its shared
-   * links and history survive a member's removal or a group's dissolution).
+   * links and history survive an account's removal or a rule's dissolution).
    */
   private async clearSlotLive(rt: SlotRuntime): Promise<void> {
     if (rt.profileDir === undefined) return;
     await removeIfExists(join(rt.profileDir, '.credentials.json'));
     await rt.credStore.clearOauthAccount();
+  }
+
+  /** Adopt into the vault whatever rotation the account live in `rt` holds — the reconcile-by-reading
+   *  a switch does — ahead of clearing that seat, so clearing never costs an account its latest token.
+   *  Returns whether it adopted. The caller has settled the slot (an untrusted one is never read). */
+  private async adoptSlotRotation(rt: SlotRuntime): Promise<boolean> {
+    const liveAccount = await this.getActiveId(rt.id);
+    const liveNow = await rt.credStore.readLiveCredentials().catch(() => undefined);
+    const liveOauth = await rt.credStore.readOauthAccount().catch(() => undefined);
+    return this.adoptRotationIfNeeded(liveAccount, liveNow, liveOauth);
   }
 
   /** The reconciled live account of every slot — the doctor/daemon view of "who is where". */
@@ -1005,8 +1066,8 @@ export class SwitchEngine {
    * not live in any slot. The live `.credentials.json` is the freshest copy of a slot-live account's
    * token — a running session rotates it ahead of the vault bundle — and it must never be
    * network-refreshed (its single-use refresh token belongs to that session). The daemon's poll-token
-   * getter uses this so a group-live member is polled with its own fresh token instead of falling back
-   * to the global tier-0 cache, which only ever describes the global account.
+   * getter uses this so an account live in a rule slot is polled with its own fresh token instead of
+   * falling back to the global tier-0 cache, which only ever describes the global account.
    */
   async liveSlotToken(accountId: string): Promise<SlotLiveToken | undefined> {
     let slotId: SlotId | undefined;
@@ -1029,325 +1090,407 @@ export class SwitchEngine {
     };
   }
 
-  /**
-   * The config dir a managed spawn should run in for `accountId`, or `undefined` for a shared
-   * account (which runs in the global/main config dir and inherits the global live login). This is
-   * the `configDirForAccount` seam the daemon wires into the Agent SDK client: a reserved member
-   * binds to its group's profile dir, so its session's per-request credential reads come from that
-   * slot rather than the shared `~/.claude`.
-   */
-  async configDirForAccount(accountId: string): Promise<string | undefined> {
-    const { group } = await this.slotForAccount(accountId);
-    if (group === undefined) return undefined;
-    return groupProfileDir(this.paths.vaultDir, group.id);
+  /** The config dir sessions of a slot run in: a rule slot's profile dir, or `undefined` for the
+   *  global slot (the main config dir and its live login). Pure. */
+  configDirForSlot(slotId: SlotId): string | undefined {
+    const ruleId = ruleIdOfSlot(slotId);
+    return ruleId === undefined ? undefined : groupProfileDir(this.paths.vaultDir, ruleId);
   }
 
   /**
-   * The slot a session's launch-time `CLAUDE_CONFIG_DIR` names: the group whose profile dir the
-   * config dir canonically equals, else the global slot. An absent, main, or unrecognized dir maps
-   * to global. Canonicalized so a case difference or trailing separator still matches on Windows.
+   * The config dir a managed spawn should run in for `accountId`: the profile of the rule slot it is
+   * live in; else, for an account exactly one rule includes, that rule's profile (where it belongs);
+   * else `undefined` — a shared account runs in the global/main config dir and inherits the global
+   * live login. This is the `configDirForAccount` seam the daemon wires into the Agent SDK client, so
+   * a session's per-request credential reads come from the slot the account is in.
+   */
+  async configDirForAccount(accountId: string): Promise<string | undefined> {
+    const live = await this.liveSlotOf(accountId);
+    if (live !== undefined) return this.configDirForSlot(live);
+    const including = rulesIncluding(accountId, await this.vault.listRules());
+    return including.length === 1 ? this.configDirForSlot(ruleSlotId(including[0]!.id)) : undefined;
+  }
+
+  /**
+   * The slot a session's launch-time `CLAUDE_CONFIG_DIR` names: the rule whose profile dir the config
+   * dir canonically equals, else the global slot. An absent, main, or unrecognized dir maps to
+   * global. Canonicalized so a case difference or trailing separator still matches on Windows.
    */
   async slotForConfigDir(configDir: string | null | undefined): Promise<SlotId> {
     if (configDir === undefined || configDir === null || configDir === '') return 'global';
     const key = folderKey(this.canonReserved(configDir), this.platform);
-    for (const g of await this.vault.listGroups()) {
+    for (const rule of await this.vault.listRules()) {
       const profileKey = folderKey(
-        this.canonReserved(groupProfileDir(this.paths.vaultDir, g.id)),
+        this.canonReserved(groupProfileDir(this.paths.vaultDir, rule.id)),
         this.platform,
       );
-      if (key === profileKey) return groupSlotId(g.id);
+      if (key === profileKey) return ruleSlotId(rule.id);
     }
     return 'global';
   }
 
-  /**
-   * Resolve a spawn's working directory to the group it is bound to, or `null` for an unbound cwd
-   * (which runs on the global slot). Canonicalizes leniently — an unresolvable cwd is simply
-   * unbound, never an error — and applies §5's longest-match rule.
-   */
-  async resolveCwdBinding(cwd: string): Promise<{ groupId: string } | null> {
-    const groups = await this.vault.listGroups();
-    if (groups.length === 0) return null;
-    const match = resolveBinding(
-      this.canonReserved(cwd),
-      groups.map((g) => ({ id: g.id, folders: g.folders })),
-      this.platform,
-    );
-    return match === null ? null : { groupId: match.groupId };
-  }
-
-  // ---- group lifecycle (bind / unbind / ensure-live) ----
+  // ---- folder rules (include / exclude / reset / ensure-live) ----
   //
-  // These are the operator-facing verbs that create, tear down, and self-heal a folder-bound group.
-  // Each runs the WHOLE operation under one credential lock (so nothing else moves a member mid-way)
-  // and reaches the vault + slot internals directly, exactly as the switch state machine does — it
-  // must NOT call the public `activate()`, which re-acquires the (non-reentrant) lock and would
-  // deadlock. The step ORDER is the crash-safety contract (see each method) and every step is
-  // idempotent, so a crash anywhere leaves a state the next `ensureGroupLive`/`repairSlots`
-  // converges from without an account ever being live in two slots.
+  // These are the operator-facing verbs that create, edit, tear down, and self-heal a folder rule.
+  // Each runs the WHOLE operation under one credential lock (so nothing else moves an account
+  // mid-way) and reaches the vault + slot internals directly, exactly as the switch state machine
+  // does — it must NOT call the public `activate()`, which re-acquires the (non-reentrant) lock and
+  // would deadlock. Every refusal happens before anything moves; past that, the step ORDER is the
+  // crash-safety contract (see each method) and every step is idempotent, so a crash anywhere leaves
+  // a state a rerun, the next `ensureRuleLive` or `repairSlots` converges from, without an account
+  // ever being live in two slots.
+  //
+  // No verb ever defaults an account to the one in use: every call names its accounts. A default
+  // would silently reserve the account currently live, and halt every other folder using it.
 
   /**
-   * Bind a folder to a set of accounts, creating (or reusing) their group. The exact §7 order:
-   *   1. canonicalize + validate the folder; resolve the members; refuse a member reserved to a
-   *      DIFFERENT group (named), and refuse the folder if it is already bound to a group whose
-   *      member set differs (unbind first); refuse a new group the registry caps would reject. Every
-   *      refusal happens here, before step 2 has moved anything.
-   *   2. if a to-be-member is live in the GLOBAL slot, move global OFF it first (adopting its
-   *      rotation), refusing when no shared account remains to hold the global slot.
-   *   3. move the member rows out of `accounts.json` into the group (groups.json first — the vault's
-   *      crash-safe order).
-   *   4. materialize the profile and make the group's slot live (iterating members).
+   * Include accounts in a folder's rule, creating the rule (and its profile and slot) when the folder
+   * has none. In order:
+   *   1. canonicalize + validate the folder; resolve the accounts; run every refusal the registry
+   *      write would make (caps, folder conflicts, unknown accounts) — nothing has moved yet.
+   *   2. hand off: an account this moves from the shared pool to the reserved side must be live in no
+   *      slot that may not hold it afterwards. The global slot never holds a reserved account, and
+   *      another rule's slot holds it only if that rule includes it — each such slot is moved onto
+   *      the best account still available to it, refusing (nothing changed) when one has none.
+   *   3. write the rule (groups.json first, then accounts.json — the vault's reservation order).
+   *   4. materialize the profile and make the slot live, preferring an included account: a
+   *      deliberate include puts the folder on its own account at once, as a new rule would.
    *   5. write the guard snapshot LAST.
-   * Returns what moved plus the running sessions under the folder (the CLI warns they keep their old
-   * account until relaunched).
+   * An account another rule already reserves is just added (those folders share it); one this rule
+   * excluded moves from its exclude list to its include list.
    */
-  async bindFolder(
+  async includeInFolder(
     folder: string,
     accountIds: readonly string[],
     opts: { label?: string } = {},
-  ): Promise<BindResult> {
-    // A group slot is a second config dir; macOS has no per-config-dir credential slot yet, so
-    // creating one there would silently share the global Keychain item. Refuse up front.
-    if (this.platform === 'darwin') {
-      throw new RefreshError(
-        'folder-bound accounts are not supported on macOS yet (per-config-dir Keychain slots)',
-        'group_slot_unsupported',
-      );
-    }
+  ): Promise<IncludeResult> {
+    this.refuseRuleSlotsOnDarwin();
     const canonicalFolder = this.canonicalizeBindFolder(folder);
-    // De-dupe the request but keep it non-empty and every id real; a bind of nothing, or of a
-    // typo'd id, is a mistake to reject before anything moves.
-    const requestedIds = [...new Set(accountIds)];
-    if (requestedIds.length === 0)
-      throw new RefreshError('bind needs at least one account', 'bind_no_accounts');
-
+    const requestedIds = this.requireAccountIds(accountIds, 'include');
+    const label = opts.label !== undefined ? { label: opts.label } : {};
     // Fingerprint the stored bundles before the lock, as activate() does: the hand-off below checks
-    // the global slot's live token against every stored one under it.
+    // every slot's live token against every stored one under it.
     await this.vault.readStoredTokens().catch(() => undefined);
     return this.withCredentialLock(async () => {
-      const requested: StoredAccount[] = [];
-      for (const id of requestedIds) {
-        const row = await this.vault.getAccount(id);
-        if (!row) throw new UnknownAccountError(id);
-        requested.push(row);
-      }
-      // Who is live where decides the hand-off below, so a switch left in a slot these accounts
-      // belong to (for a shared account, the global slot) is settled first — and the bind refused
-      // while one to or from them cannot be. The group's own slot is settled by the activation that
-      // fills it.
+      const requested = await this.resolveRequested(requestedIds);
+      // Who is live where decides the hand-off, so a switch left in a slot these accounts may be in
+      // is settled first — and the include refused while one to or from them cannot be.
       await this.settleForAccountsLocked(requestedIds);
-      const requestedSet = new Set(requestedIds);
-      const groups = await this.vault.listGroups();
-
-      // Refuse any requested account already reserved to a group whose member set differs from this
-      // request — that account belongs to another folder's set and must be unbound there first.
-      for (const req of requested) {
-        const owner = groups.find((g) => g.members.some((m) => m.id === req.id));
-        if (owner && !setsEqual(new Set(owner.members.map((m) => m.id)), requestedSet)) {
-          throw new RefreshError(
-            `account "${req.label}" is already reserved to ${describeFolders(owner)}; unbind it there first`,
-            'account_reserved_elsewhere',
-          );
-        }
-      }
-
-      // The group whose member set is EXACTLY the request (if any) is the one we reuse.
-      const matching = groups.find((g) =>
-        setsEqual(new Set(g.members.map((m) => m.id)), requestedSet),
-      );
-      // If this folder is already bound, it must be bound to that same group — otherwise the request
-      // is trying to point one folder at two different account sets.
-      const exactOwnerId = exactBinding(canonicalFolder, groups, this.platform);
-      if (exactOwnerId !== null && exactOwnerId !== matching?.id) {
-        const owner = groups.find((g) => g.id === exactOwnerId)!;
-        throw new RefreshError(
-          `"${canonicalFolder}" is already bound to ${describeMembers(owner)}; unbind it first`,
-          'folder_bound_elsewhere',
-        );
-      }
-
-      let group: StoredGroup;
-      let created: boolean;
-      let movedOffGlobal: string | null = null;
-      let globalSwitchedTo: string | null = null;
-
-      if (matching !== undefined) {
-        // Reuse: the members are already reserved to this group, so only the folder is new. A member
-        // of an existing group can never be globally live, so step 2 does not apply here.
-        group =
-          exactOwnerId === matching.id
-            ? matching
-            : await this.vault.addFolderToGroup(matching.id, canonicalFolder);
-        created = false;
-      } else {
-        // Every refusal the group creation below can make (group count, member count, folder
-        // conflicts) is checked NOW, before the global hand-off: a bind that was always going to be
-        // refused must not first move the global slot off an account and then leave it moved.
-        await this.vault.checkCreateGroup({ memberIds: requestedIds, folders: [canonicalFolder] });
-        // New group: a requested member may be the GLOBAL live account. Move global off it FIRST
-        // (while it is still a shared account activate() can route to global), so it is live nowhere
-        // at the instant its row moves into the group. "Live" by its token as much as by the identity
-        // block: a global slot holding a requested account's token under another account's identity
-        // (a torn switch nothing recorded) would otherwise keep that token live beside the group's.
-        const globalLive =
-          [...(await this.possibleLiveOwners('global'))].find((id) => requestedSet.has(id)) ?? null;
-        if (globalLive !== null) {
-          const replacement = this.pickGlobalReplacement(
-            await this.vault.listAccounts(),
-            requestedSet,
-          );
-          if (replacement === undefined) {
-            throw new RefreshError(
-              `cannot bind: "${requested.find((r) => r.id === globalLive)!.label}" is the only usable ` +
-                'shared account, so moving it into a folder would leave the global slot with none',
-              'no_shared_account_remains',
-            );
-          }
-          // Deliberate operator move: force past the cadence guard (a bind should never be blocked by
-          // a recent hop) and adopt the outgoing account's rotation, which activateInSlot does for the
-          // previous live account automatically.
-          const globalRt = this.slotRuntime('global');
-          const res = await this.activateInSlot(globalRt, replacement.id, {
-            force: true,
-            origin: 'manual',
-            reason: 'freeing the global slot for a folder bind',
-          });
-          movedOffGlobal = globalLive;
-          globalSwitchedTo = res.activeAccountId;
-        }
-        this.fault('bind:after-global-switch');
-        group = await this.vault.createGroup({
-          memberIds: requestedIds,
+      const picture = await this.vault.readPicture();
+      const existing = exactFolderRule(canonicalFolder, picture.rules, this.platform);
+      if (existing) await this.vault.checkInclude(existing.id, requestedIds);
+      else {
+        await this.vault.checkCreateRule({
           folders: [canonicalFolder],
-          ...(opts.label !== undefined ? { label: opts.label } : {}),
+          include: requestedIds,
+          ...label,
         });
-        created = true;
       }
 
-      this.fault('bind:after-row-move');
-      // Materialize the profile and make the slot live (iterating members). ensureGroupLiveLocked
-      // runs ensureGroupProfile itself, so the profile exists before any live write.
-      const live = await this.ensureGroupLiveLocked(group);
-      this.fault('bind:after-ensure-live');
+      const reserving = requested.filter((a) => picture.shared.some((s) => s.id === a.id));
+      const ownSlot = existing !== undefined ? ruleSlotId(existing.id) : undefined;
+      const handedOff = await this.handOffLocked(reserving, picture, ownSlot);
+      this.fault('include:after-hand-off');
 
-      // The snapshot the guard reads is written LAST, from the freshly-loaded group set.
+      let rule: FolderRule;
+      let unexcluded: string[] = [];
+      if (existing) {
+        const res = await this.vault.includeAccounts(existing.id, requestedIds);
+        rule = res.rule;
+        unexcluded = res.unexcluded;
+      } else {
+        rule = await this.vault.createRule({
+          folders: [canonicalFolder],
+          include: requestedIds,
+          ...label,
+        });
+      }
+      this.fault('include:after-row-move');
+
+      const live = await this.ensureRuleLiveLocked(rule, { preferIncluded: true });
+      this.fault('include:after-ensure-live');
       await this.writeSnapshotLocked();
-
-      const runningSessions = await this.runningSessionsUnder([canonicalFolder]);
-      return { group, created, movedOffGlobal, globalSwitchedTo, live, runningSessions };
+      return {
+        rule: (await this.vault.getRule(rule.id)) ?? rule,
+        created: existing === undefined,
+        reserved: reserving.map((a) => a.id),
+        unexcluded,
+        handedOff,
+        live,
+        runningSessions: await this.runningSessionsUnder([canonicalFolder]),
+      };
     });
   }
 
   /**
-   * Unbind a folder. Removing a group's LAST folder dissolves it; removing one of several just drops
-   * that binding. A dissolve refuses (without `force`) when a session is observed running under the
-   * group's folders — the profile's live credentials are about to be cleared, and a running session
-   * would lose its account. On dissolve: adopt the profile's rotation into the vault, clear the
-   * profile's live credentials (so the slot fails closed), move the member rows back to the shared
-   * pool, discard the slot's crash-recovery state, and keep the profile dir (its history). The
-   * snapshot is rewritten LAST.
+   * Exclude shared accounts from a folder's pool, creating the rule (with nothing included) when the
+   * folder has none: the folder then gets its own slot, so it can avoid the global live account when
+   * that is one it excludes. Only a shared account can be excluded (a reserved one is refused by
+   * name). When an excluded account is live in the folder's slot, the slot moves to the next account
+   * available in its pool; with none left, the same rule as a dissolve applies — refused while a
+   * session runs under the folder unless `force`, otherwise its rotation is adopted and the slot is
+   * cleared. The rule is written before the slot moves: dying between leaves an excluded account
+   * live there, which the slot check reports and the next ensure-live moves.
    */
-  async unbindFolder(folder: string, opts: { force?: boolean } = {}): Promise<UnbindResult> {
-    const canonicalFolder = this.canonicalizeBindFolder(folder, { mustExist: false });
+  async excludeInFolder(
+    folder: string,
+    accountIds: readonly string[],
+    opts: { force?: boolean; label?: string } = {},
+  ): Promise<ExcludeResult> {
+    this.refuseRuleSlotsOnDarwin();
+    const canonicalFolder = this.canonicalizeBindFolder(folder);
+    const requestedIds = this.requireAccountIds(accountIds, 'exclude');
+    const label = opts.label !== undefined ? { label: opts.label } : {};
+    await this.vault.readStoredTokens().catch(() => undefined);
     return this.withCredentialLock(async () => {
-      const groups = await this.vault.listGroups();
-      const ownerId = exactBinding(canonicalFolder, groups, this.platform);
-      if (ownerId === null) {
-        throw new RefreshError(
-          `"${canonicalFolder}" is not bound to any folder-bound account`,
-          'not_bound',
+      const requested = await this.resolveRequested(requestedIds);
+      await this.settleForAccountsLocked(requestedIds);
+      const picture = await this.vault.readPicture();
+      const existing = exactFolderRule(canonicalFolder, picture.rules, this.platform);
+      if (existing) await this.vault.checkExclude(existing.id, requestedIds);
+      else {
+        await this.vault.checkCreateRule({
+          folders: [canonicalFolder],
+          exclude: requestedIds,
+          ...label,
+        });
+      }
+
+      // A new rule's slot is empty, so only an existing rule can have an excluded account live.
+      let movedOff: string | null = null;
+      let runningSessions: RunningSession[] = [];
+      if (existing) {
+        const slotId = ruleSlotId(existing.id);
+        const occupancy = await this.slotOccupancy(picture);
+        const owners = occupancy.get(slotId) ?? new Set<string>();
+        movedOff = requested.find((a) => owners.has(a.id))?.id ?? null;
+        if (movedOff !== null) {
+          const after = withRule(picture, {
+            ...existing,
+            exclude: [...new Set([...existing.exclude, ...requestedIds])],
+          });
+          runningSessions = await this.refuseEmptyingWhileRunning(
+            existing,
+            availableInOrder(slotPool(slotId, after, occupancy)),
+            `excluding "${requested.find((a) => a.id === movedOff)!.label}"`,
+            opts.force === true,
+          );
+        }
+      }
+
+      const rule = existing
+        ? (await this.vault.excludeAccounts(existing.id, requestedIds)).rule
+        : await this.vault.createRule({
+            folders: [canonicalFolder],
+            exclude: requestedIds,
+            ...label,
+          });
+      this.fault('exclude:after-rule-write');
+      const live = await this.ensureRuleLiveLocked(rule);
+      this.fault('exclude:after-ensure-live');
+      await this.writeSnapshotLocked();
+      return {
+        rule: (await this.vault.getRule(rule.id)) ?? rule,
+        created: existing === undefined,
+        movedOff,
+        live,
+        runningSessions:
+          runningSessions.length > 0
+            ? runningSessions
+            : await this.runningSessionsUnder(rule.folders),
+      };
+    });
+  }
+
+  /**
+   * Remove accounts from a folder's rule, or the rule itself.
+   *
+   * With no accounts named, the folder leaves its rule: a rule that keeps other folders just drops
+   * this one; the rule's last folder DISSOLVES it (see {@link dissolveRuleLocked}). With accounts
+   * named, each must be one the rule includes or excludes. An account no rule includes any more
+   * returns to the shared pool (accounts.json first, then groups.json — an interrupted release
+   * reverts and a rerun completes it). A rule left with nothing to include or exclude dissolves.
+   * When the slot's live account can no longer be held there (un-included while another rule still
+   * reserves it), the slot moves to the next available account, or — with none — follows the dissolve
+   * rule for running sessions and is cleared.
+   */
+  async resetFolder(
+    folder: string,
+    accountIds?: readonly string[],
+    opts: { force?: boolean } = {},
+  ): Promise<ResetResult> {
+    // The folder may since have been deleted, but its rule still needs clearing.
+    const canonicalFolder = this.canonicalizeBindFolder(folder, { mustExist: false });
+    const requestedIds =
+      accountIds === undefined ? undefined : this.requireAccountIds(accountIds, 'reset');
+    return this.withCredentialLock(async () => {
+      const picture = await this.vault.readPicture();
+      const rule = exactFolderRule(canonicalFolder, picture.rules, this.platform);
+      if (rule === undefined) {
+        throw new RefreshError(`"${canonicalFolder}" has no folder rule`, 'not_ruled');
+      }
+      const force = opts.force === true;
+
+      if (requestedIds === undefined) {
+        if (rule.folders.length > 1) {
+          // One of several folders leaves; the rule and its live slot stay intact.
+          const updated = await this.vault.removeFolderFromRule(rule.id, canonicalFolder);
+          await this.writeSnapshotLocked();
+          return {
+            folder: canonicalFolder,
+            dissolved: false,
+            rule: updated,
+            released: [],
+            adoptedRotation: false,
+            runningSessions: [],
+          };
+        }
+        return this.dissolveRuleLocked(rule, canonicalFolder, force);
+      }
+
+      const requested = await this.resolveRequested(requestedIds);
+      for (const a of requested) {
+        if (!rule.include.includes(a.id) && !rule.exclude.includes(a.id)) {
+          throw new RefreshError(
+            `account "${a.label}" is neither included nor excluded by the rule on ${describeRule(rule)}`,
+            'not_in_rule',
+          );
+        }
+      }
+      const include = rule.include.filter((id) => !requestedIds.includes(id));
+      const exclude = rule.exclude.filter((id) => !requestedIds.includes(id));
+      if (include.length === 0 && exclude.length === 0) {
+        return this.dissolveRuleLocked(rule, canonicalFolder, force);
+      }
+
+      await this.settleForAccountsLocked(requestedIds);
+      const slotId = ruleSlotId(rule.id);
+      const occupancy = await this.slotOccupancy(picture);
+      const owners = occupancy.get(slotId) ?? new Set<string>();
+      // The registry as it will be: what this rule's slot may still hold afterwards.
+      const others = picture.rules.filter((r) => r.id !== rule.id);
+      const released = picture.reserved.filter(
+        (a) =>
+          requestedIds.includes(a.id) &&
+          rule.include.includes(a.id) &&
+          !others.some((r) => r.include.includes(a.id)),
+      );
+      const after = withRule(
+        {
+          shared: [...picture.shared, ...released],
+          reserved: picture.reserved.filter((a) => !released.includes(a)),
+          rules: picture.rules,
+        },
+        { ...rule, include, exclude },
+      );
+      const leaving = requested.find((a) => owners.has(a.id) && !slotMayHold(slotId, a.id, after));
+      let runningSessions: RunningSession[] = [];
+      if (leaving !== undefined) {
+        runningSessions = await this.refuseEmptyingWhileRunning(
+          rule,
+          availableInOrder(slotPool(slotId, after, occupancy)),
+          `removing "${leaving.label}" from it`,
+          force,
         );
       }
-      const group = groups.find((g) => g.id === ownerId)!;
 
-      // Removing one of several folders keeps the group (and its live slot) intact — no session
-      // concern, no member move.
-      if (group.folders.length > 1) {
-        const updated = await this.vault.removeFolderFromGroup(group.id, canonicalFolder);
-        await this.writeSnapshotLocked();
-        return {
-          folder: canonicalFolder,
-          dissolved: false,
-          group: updated,
-          releasedMembers: [],
-          adoptedRotation: false,
-          runningSessions: [],
-        };
-      }
-
-      // Last folder: dissolve. Observed sessions block a non-forced dissolve.
-      const runningSessions = await this.runningSessionsUnder(group.folders);
-      if (runningSessions.length > 0 && opts.force !== true) {
-        throw new RefreshError(
-          `"${canonicalFolder}" (${describeMembers(group)}) has ${runningSessions.length} running ` +
-            'session(s) under it; exit them or rerun with --force',
-          'sessions_running',
-        );
-      }
-
-      const slotId = groupSlotId(group.id);
-      const rt = this.slotRuntime(slotId);
-      // The dissolving slot is read below. A switch left there that cannot be settled does not stop
-      // the dissolve — its seat and its recovery state are cleared either way, which retires it — but
-      // nothing is adopted from a live login it may have left half-written.
-      const untrusted = (await this.settleSlotsLocked([slotId])).has(slotId);
-      // Adopt any CLI-side rotation of the profile's live token before it is discarded — the same
-      // reconcile-by-reading a switch does, so a token minted inside the profile is never lost.
-      let adoptedRotation = false;
-      if (!untrusted) {
-        const currentLive = await this.getActiveId(slotId);
-        const liveNow = await rt.credStore.readLiveCredentials();
-        const liveOauth = await rt.credStore.readOauthAccount();
-        adoptedRotation = await this.adoptRotationIfNeeded(currentLive, liveNow, liveOauth);
-      }
-      this.fault('unbind:after-adopt');
-
-      // Clear the profile's live seat (fails the slot closed) and drop its crash-recovery state; the
-      // profile dir itself stays for history.
-      await this.clearSlotLive(rt);
-      await this.clearSlotState(rt);
-      this.fault('unbind:after-clear-live');
-
-      const releasedMembers = group.members.map((m) => m.id);
-      await this.vault.releaseAccounts(group.id, releasedMembers);
-      this.fault('unbind:after-release');
-
+      const res = await this.vault.removeFromRule(rule.id, requestedIds);
+      this.fault('reset:after-rule-write');
+      await this.ensureRuleLiveLocked(res.rule);
       await this.writeSnapshotLocked();
       return {
         folder: canonicalFolder,
-        dissolved: true,
-        releasedMembers,
-        adoptedRotation,
+        dissolved: false,
+        rule: (await this.vault.getRule(rule.id)) ?? res.rule,
+        released: res.released,
+        adoptedRotation: false,
         runningSessions,
       };
     });
   }
 
   /**
-   * Ensure a group's slot has a working live member — the self-healing verb launch, managed spawn,
-   * and the daemon poll all call. Acquires the lock; see {@link ensureGroupLiveLocked} for the
-   * mechanism. Throws {@link UnknownAccountError} if the group no longer exists.
+   * Remove a rule entirely. Refused (without `force`) when a session is observed running under the
+   * rule's folders — the slot's live credentials are about to be cleared, and a running session would
+   * lose its account. Then: adopt the slot's rotation into the vault, clear its live credentials (so
+   * the slot fails closed), discard its crash-recovery state, release every account only it included
+   * back to the shared pool, and keep the profile dir (its history). The snapshot is rewritten LAST.
+   * A switch left in the slot that cannot be settled does not stop the dissolve — its seat and its
+   * recovery state are cleared either way, which retires it — but nothing is adopted from it.
    */
-  async ensureGroupLive(groupId: string): Promise<GroupLiveResult> {
+  private async dissolveRuleLocked(
+    rule: FolderRule,
+    canonicalFolder: string,
+    force: boolean,
+  ): Promise<ResetResult> {
+    const runningSessions = await this.runningSessionsUnder(rule.folders);
+    if (runningSessions.length > 0 && !force) {
+      throw new RefreshError(
+        `"${canonicalFolder}" (${describeRule(rule)}) has ${runningSessions.length} running ` +
+          'session(s) under it; exit them or rerun with --force',
+        'sessions_running',
+      );
+    }
+    const slotId = ruleSlotId(rule.id);
+    const rt = this.slotRuntime(slotId);
+    const untrusted = (await this.settleSlotsLocked([slotId])).has(slotId);
+    const adoptedRotation = untrusted ? false : await this.adoptSlotRotation(rt);
+    this.fault('reset:after-adopt');
+
+    await this.clearSlotLive(rt);
+    await this.clearSlotState(rt);
+    this.fault('reset:after-clear-live');
+
+    const { released } = await this.vault.removeRule(rule.id);
+    this.fault('reset:after-release');
+
+    await this.writeSnapshotLocked();
+    return {
+      folder: canonicalFolder,
+      dissolved: true,
+      released,
+      adoptedRotation,
+      runningSessions,
+    };
+  }
+
+  /**
+   * Ensure a rule's slot holds a working account — the self-healing verb launch, managed spawn, and
+   * the daemon poll all call. Acquires the lock; see {@link ensureRuleLiveLocked} for the mechanism.
+   */
+  async ensureRuleLive(ruleId: string): Promise<RuleLiveResult> {
     return this.withCredentialLock(async () => {
-      const group = await this.vault.getGroup(groupId);
-      if (!group) throw new UnknownAccountError(groupId);
-      return this.ensureGroupLiveLocked(group);
+      const rule = await this.vault.getRule(ruleId);
+      if (!rule) throw new RefreshError(`no folder rule with id "${ruleId}"`, 'rule_gone');
+      return this.ensureRuleLiveLocked(rule);
     });
   }
 
   /**
-   * Make a group's slot live, assuming the caller holds the credential lock. Idempotent: if a member
-   * is already correctly live (identity present AND live credentials on disk) it only heals a drifted
-   * `activeId`; otherwise it activates the first usable member — preferring the recorded `activeId`,
-   * then eligible members (not quarantined, not excluded), finally a quarantine-free but excluded
-   * member so a group whose only members are all excluded still comes up rather than sitting dead
-   * (exclusion governs UNATTENDED targeting, not whether an account may hold its own group's slot).
-   * When every attempt fails the binding still stands, and the result says the folder has no working
-   * account.
+   * Make a rule's slot live, assuming the caller holds the credential lock. Idempotent.
+   *
+   * The account live there is KEPT when the slot may hold it (an included account, or a shared one the
+   * rule does not exclude) and it is live in no other slot; only a drifted `activeId` is healed then.
+   * Two cases still move a kept account: a quarantined one (a dead login, though a legitimate one) is
+   * replaced by any available account and kept only when none is — reported as `noWorkingAccount`,
+   * since a dead login is no working account; and `preferIncluded` (a deliberate include) moves an
+   * inherited account aside for an available included one.
+   *
+   * Otherwise the slot is seated with the first account available in pool order — the recorded
+   * `activeId` first for continuity, then the pool's auto targets, then a globally excluded shared
+   * account as a last resort (see `availableInOrder`). Usage-based choice is the daemon's; this is
+   * the engine's usable default. When nothing can be seated, a login that does not belong (outside
+   * the pool, live in another slot too, or unrecognized) is cleared after its rotation is adopted,
+   * failing the slot closed, and the rule's recorded account is cleared with it — a record naming an
+   * account the slot no longer holds would have every reader that falls back on it (who is live,
+   * which profile an account's session runs in) place that account in an empty slot. The rule still
+   * stands, and the result says the folder has no working account.
    */
-  private async ensureGroupLiveLocked(group: StoredGroup): Promise<GroupLiveResult> {
-    const slotId = groupSlotId(group.id);
+  private async ensureRuleLiveLocked(
+    rule: FolderRule,
+    opts: { preferIncluded?: boolean } = {},
+  ): Promise<RuleLiveResult> {
+    const slotId = ruleSlotId(rule.id);
     const rt = this.slotRuntime(slotId);
     // The profile must exist before any live read/write; idempotent, so it costs nothing steady-state.
     if (rt.profileDir !== undefined) {
@@ -1360,66 +1503,230 @@ export class SwitchEngine {
     // one that cannot be settled yet refuses this, since every path below may write the slot.
     await this.requireSettledLocked(rt);
 
-    const liveMember = await this.getActiveId(slotId);
+    const picture = await this.vault.readPicture();
+    const current = picture.rules.find((r) => r.id === rule.id) ?? rule;
+    const occupancy = await this.slotOccupancy(picture);
+    const pool = slotPool(slotId, picture, occupancy);
+    const available = availableInOrder(pool);
+    const live = await this.getActiveId(slotId);
     const liveCreds = await rt.credStore.readLiveCredentials().catch(() => undefined);
-    if (liveMember !== null && group.members.some((m) => m.id === liveMember) && liveCreds) {
-      // A member is genuinely live. If the registry drifted from it (an external /login), commit the
-      // reconciled member — a same-account heal, cadence-exempt and adoption-safe.
-      if (group.activeId !== liveMember) {
-        await this.activateInSlot(rt, liveMember, {
+    const seated = (liveAccount: string, activated: boolean): RuleLiveResult => ({
+      ruleId: rule.id,
+      liveAccount,
+      activated,
+      noWorkingAccount: false,
+    });
+
+    // Whether the occupant may stay is judged against the other slots' LEGITIMATE copies only: a copy
+    // squatting where its pool does not have it is evicted by that slot's own repair, and must not
+    // cost this slot the account. A new account, below, is still chosen against every copy.
+    const legitimate =
+      live !== null &&
+      liveCreds !== undefined &&
+      slotMayHold(slotId, live, picture) &&
+      liveElsewhere(slotId, live, legitimateOccupancy(occupancy, picture)) === null;
+    if (legitimate) {
+      const entry = pool.find((e) => e.account.id === live);
+      const better =
+        entry === undefined
+          ? available.filter((a) => a.id !== live)
+          : opts.preferIncluded === true && entry.source === 'inherited'
+            ? pool
+                .filter((e) => e.source === 'include' && e.liveElsewhere === null)
+                .map((e) => e.account)
+            : [];
+      const moved = await this.seatFirst(rt, better, 'moving the folder slot to a better account');
+      if (moved !== null) return seated(moved, true);
+      // The live account stays. If the registry drifted from it (an external /login), commit it — a
+      // same-account heal, cadence-exempt and adoption-safe.
+      if (current.activeId !== live) {
+        await this.activateInSlot(rt, live, {
           force: true,
           origin: 'recovery',
-          reason: 'reconciling group active id with the live login',
+          reason: 'reconciling the rule active id with the live login',
         });
       }
-      return { groupId: group.id, liveMember, activated: false, noWorkingAccount: false };
+      // A quarantined account kept for want of any other is live, but not working.
+      return { ...seated(live, false), noWorkingAccount: entry === undefined };
     }
 
-    // No usable member is live: try members in priority order until one activates.
-    for (const member of orderedGroupCandidates(group)) {
+    // Nothing legitimate is live: seat the recorded account first (continuity), then pool order.
+    const recorded = available.find((a) => a.id === current.activeId);
+    const order = recorded ? [recorded, ...available.filter((a) => a !== recorded)] : available;
+    const filled = await this.seatFirst(rt, order, 'ensuring the folder slot has a live account');
+    if (filled !== null) return seated(filled, true);
+
+    // Nothing could be seated. Credentials still in the profile belong to an account the slot may not
+    // hold, one live in another slot too, or an unrecognized login: a legitimate occupant would have
+    // been kept above. Fail the slot closed rather than let a session in the folder run as an account
+    // it may not use — but adopt the occupant's rotation first, so clearing costs it nothing.
+    let clearedSquatter = false;
+    if (liveCreds !== undefined) {
+      await this.adoptSlotRotation(rt);
+      await this.clearSlotLive(rt);
+      clearedSquatter = true;
+    }
+    // The slot holds nobody now; neither may its record.
+    if (current.activeId !== null) await this.vault.setRuleActive(rule.id, null);
+    return {
+      ruleId: rule.id,
+      liveAccount: null,
+      activated: false,
+      noWorkingAccount: true,
+      ...(clearedSquatter ? { clearedSquatter } : {}),
+    };
+  }
+
+  /** Activate the first of `candidates` that will go live in `rt`'s slot, returning its id, or null
+   *  when none would. One account's failure (a dead token, a transient error, a candidacy that
+   *  changed) must not stop the next; a process that died mid-activation does not go on. */
+  private async seatFirst(
+    rt: SlotRuntime,
+    candidates: readonly StoredAccount[],
+    reason: string,
+  ): Promise<string | null> {
+    for (const account of candidates) {
       try {
-        await this.activateInSlot(rt, member.id, {
-          force: true,
-          origin: 'recovery',
-          reason: 'ensuring the group slot has a live member',
-        });
-        return {
-          groupId: group.id,
-          liveMember: member.id,
-          activated: true,
-          noWorkingAccount: false,
-        };
+        await this.activateInSlot(rt, account.id, { force: true, origin: 'recovery', reason });
+        return account.id;
       } catch (err) {
-        // A process that died mid-activation does not go on to the next member.
         if (this.isSimulatedDeath(err)) throw err;
-        // A dead token (quarantine) or a transient failure on one member must not stop the others.
         this.log.warn(
-          { groupId: group.id, memberId: member.id, reason: errorReason(err) },
-          'group member failed to activate; trying the next',
+          { slot: rt.id, accountId: account.id, reason: errorReason(err) },
+          'account failed to activate in a folder slot; trying the next',
         );
       }
     }
+    return null;
+  }
 
-    // No member could be seated. Any credentials still physically live in the profile at this point
-    // belong to a non-member or an unrecognized login: a rightful member would have been reconciled
-    // by the early return above (getActiveId recognizes a live member — quarantined or not — and its
-    // credentials, so it never reaches here). Fail the slot closed by clearing that squatter, so a
-    // session started in the bound folder is "not logged in" rather than silently running as an
-    // account the folder does not reserve. This mirrors the global slot's clear-when-no-replacement
-    // fallback (see repairGlobalSlot / clearGlobalLive) and preserves the "at most one slot" and
-    // reserved-fence invariants that repairSlots is contracted to heal.
-    const squatterCreds = await rt.credStore.readLiveCredentials().catch(() => undefined);
-    if (squatterCreds) {
-      await this.clearSlotLive(rt);
-      return {
-        groupId: group.id,
-        liveMember: null,
-        activated: false,
-        noWorkingAccount: true,
-        clearedSquatter: true,
-      };
+  /**
+   * Move every slot off the accounts an include is about to reserve, where that slot may not hold
+   * them afterwards: the global slot (never a reserved account) and every other rule's slot that does
+   * not include them. Each slot is moved onto the best account still AVAILABLE to it once the rows
+   * have moved (pool order, live nowhere else, and not already chosen for another slot here). Every
+   * replacement is chosen before the first one is made, so a slot left with none refuses the whole
+   * include with nothing moved. `ownSlot` — the rule being edited — keeps its account: the account is
+   * included there.
+   */
+  private async handOffLocked(
+    reserving: readonly StoredAccount[],
+    picture: RegistryPicture,
+    ownSlot: SlotId | undefined,
+  ): Promise<SlotHandOff[]> {
+    if (reserving.length === 0) return [];
+    const ids = new Set(reserving.map((a) => a.id));
+    const after: RulesPicture = {
+      shared: picture.shared.filter((a) => !ids.has(a.id)),
+      reserved: [...picture.reserved, ...reserving],
+      rules: picture.rules,
+    };
+    const occupancy = await this.slotOccupancy(picture);
+    const plan: Array<{ slotId: SlotId; from: StoredAccount; to: StoredAccount }> = [];
+    const taken = new Set<string>();
+    for (const [slotId, owners] of occupancy) {
+      if (slotId === ownSlot) continue;
+      const from = reserving.find((a) => owners.has(a.id));
+      if (from === undefined) continue;
+      const to = availableInOrder(slotPool(slotId, after, occupancy)).find((a) => !taken.has(a.id));
+      if (to === undefined) throw this.noReplacementError(slotId, from, picture);
+      taken.add(to.id);
+      plan.push({ slotId, from, to });
     }
-    return { groupId: group.id, liveMember: null, activated: false, noWorkingAccount: true };
+    const handedOff: SlotHandOff[] = [];
+    for (const step of plan) {
+      // A deliberate operator move: forced past the cadence guard (an include should never be blocked
+      // by a recent hop), and the outgoing account's rotation is adopted by the switch itself.
+      const res = await this.activateInSlot(this.slotRuntime(step.slotId), step.to.id, {
+        force: true,
+        origin: 'manual',
+        reason: 'freeing the slot for a folder include',
+      });
+      handedOff.push({ slot: step.slotId, from: step.from.id, to: res.activeAccountId });
+    }
+    return handedOff;
+  }
+
+  /** The refusal of an include that would leave a slot holding a newly reserved account with no
+   *  other account to move to. The global slot keeps its historical code. */
+  private noReplacementError(
+    slotId: SlotId,
+    from: StoredAccount,
+    picture: RulesPicture,
+  ): RefreshError {
+    const ruleId = ruleIdOfSlot(slotId);
+    if (ruleId === undefined) {
+      return new RefreshError(
+        `cannot include "${from.label}": it is the only usable shared account, so reserving it ` +
+          'would leave the global slot with none',
+        'no_shared_account_remains',
+      );
+    }
+    const rule = picture.rules.find((r) => r.id === ruleId);
+    return new RefreshError(
+      `cannot include "${from.label}": it is live in the folder slot of ` +
+        `${rule ? describeRule(rule) : slotId}, and that folder has no other account to switch to`,
+      'no_account_remains',
+    );
+  }
+
+  /**
+   * The running-session rule for a change that leaves a rule's slot with nothing to seat (`next` is
+   * empty): refused while a session runs under the rule's folders, unless `force`. Returns the
+   * sessions found (empty when `next` has an account and nothing needed checking).
+   */
+  private async refuseEmptyingWhileRunning(
+    rule: FolderRule,
+    next: readonly StoredAccount[],
+    what: string,
+    force: boolean,
+  ): Promise<RunningSession[]> {
+    if (next.length > 0) return [];
+    const sessions = await this.runningSessionsUnder(rule.folders);
+    if (sessions.length > 0 && !force) {
+      throw new RefreshError(
+        `${what} leaves ${describeRule(rule)} with no account to switch to, and ${sessions.length} ` +
+          'running session(s) are using it; exit them or rerun with --force',
+        'sessions_running',
+      );
+    }
+    return sessions;
+  }
+
+  /** Refuse a verb that creates or fills a rule slot on macOS: a rule slot is a second config dir,
+   *  and macOS has no per-config-dir credential slot yet, so it would silently share the global
+   *  Keychain item. */
+  private refuseRuleSlotsOnDarwin(): void {
+    if (this.platform === 'darwin') {
+      throw new RefreshError(
+        'folder rules are not supported on macOS yet (per-config-dir Keychain slots)',
+        'group_slot_unsupported',
+      );
+    }
+  }
+
+  /** De-duplicate the accounts a verb names and refuse an empty list. Nothing ever stands in for a
+   *  missing account — least of all the one in use. */
+  private requireAccountIds(accountIds: readonly string[], verb: string): string[] {
+    const ids = [...new Set(accountIds)];
+    if (ids.length === 0) {
+      throw new RefreshError(
+        `${verb} needs at least one account, named explicitly`,
+        'no_accounts_named',
+      );
+    }
+    return ids;
+  }
+
+  /** The rows of the named accounts, refusing an unknown id by name before anything moves. */
+  private async resolveRequested(ids: readonly string[]): Promise<StoredAccount[]> {
+    const rows: StoredAccount[] = [];
+    for (const id of ids) {
+      const row = await this.vault.getAccount(id);
+      if (!row) throw new UnknownAccountError(id);
+      rows.push(row);
+    }
+    return rows;
   }
 
   // ---- invariant checker (checkSlots / repairSlots) ----
@@ -1427,16 +1734,17 @@ export class SwitchEngine {
   /**
    * The single authority for "is any slot in an illegal state", read by both `cctl doctor` and the
    * daemon watchdog. Read-only, apart from keeping the token-fingerprint cache current (see
-   * tokenPrints.ts). Reports the §7 (a)-(e) violations, a slot whose live token and
-   * identity name different accounts, a profile no group owns that is still logged in, and a token
-   * stored under two accounts; {@link repairSlots} fixes all but (e) and the last.
+   * tokenPrints.ts). Reports the §7 (a)-(e) violations — an account live in two slots, a reserved
+   * account live in the global slot, an account live in a rule slot outside that rule's pool, a
+   * rule whose recorded account is not the one live, broken profile links — plus a slot whose live
+   * token and identity name different accounts, a profile no rule owns that is still logged in, and
+   * a token stored under two accounts; {@link repairSlots} fixes all but (e) and the last.
    *
    * Slot occupancy is read PHYSICALLY here (the live token, then the live identity block, matched
    * against the WHOLE registry — see {@link physicalLiveId}), not through {@link getActiveId} —
-   * because getActiveId only recognizes an account that is a candidate for the slot and goes by the
-   * identity block alone, and the whole point of the check is to catch an account living where it is
-   * NOT a candidate (a reserved account squatting in global, a non-member in a group profile) or
-   * where the identity block misnames it.
+   * because getActiveId goes by the identity block alone, and the whole point of the check is to
+   * catch an account living where it may not (a reserved account squatting in global, an excluded
+   * one in a rule profile) or where the identity block misnames it.
    */
   async checkSlots(): Promise<SlotViolation[]> {
     return this.computeViolations({ locked: false });
@@ -1446,14 +1754,17 @@ export class SwitchEngine {
    * Repair the invariant breaches {@link checkSlots} finds, under the lock. Fixes (a)-(d):
    *   - adopt the freshest live token (identity-guarded) for every KNOWN account that is live
    *     anywhere, so a rotation is preserved before any slot is overwritten;
-   *   - move the global slot off a reserved account onto a shared one (or clear it if none remains);
    *   - re-seat a slot whose live token and identity name different accounts;
-   *   - re-activate each group slot's rightful member, evicting a non-member;
-   *   - clear the live login of a profile no group owns (after adopting its rotation).
+   *   - move the global slot off a reserved account onto an available shared one (or clear it if
+   *     none remains);
+   *   - re-seat each rule slot from its pool, evicting an account outside it or live elsewhere too
+   *     (the global slot, repaired first, keeps a shared account both hold — the global slot keeps
+   *     the last shared account; between two rule slots the later one in file order keeps it);
+   *   - clear the live login of a profile no rule owns (after adopting its rotation).
    * Unrecognized logins are never adopted (alert only), broken profile links (e) are left to
    * `ensureGroupProfile`, and a token stored under two accounts cannot be told apart from the files;
    * all three are reported in `remaining`. A hostile registry cannot widen access: every write only
-   * ever makes a slot hold an account that is RIGHTFULLY its own.
+   * ever makes a slot hold an account its pool RIGHTFULLY contains.
    */
   async repairSlots(): Promise<RepairResult> {
     return this.withCredentialLock(async () => {
@@ -1463,9 +1774,9 @@ export class SwitchEngine {
       const unsettled = await this.settleSlotsLocked(await this.allSlotIds());
       const before = await this.computeViolations({ locked: true });
       if (before.length === 0) {
-        // No slot to move — but the snapshot can still lag the registry (a crash between a group
+        // No slot to move — but the snapshot can still lag the registry (a crash between a rule
         // write and its snapshot write leaves every slot legal). Converge that too, or the guard
-        // keeps enforcing a binding set that no longer exists until something else rewrites it.
+        // keeps enforcing a rule set that no longer exists until something else rewrites it.
         const rewrote = await this.refreshSnapshotIfStaleLocked();
         return {
           repaired: [],
@@ -1476,9 +1787,9 @@ export class SwitchEngine {
 
       const actions: string[] = [];
       const allRows = await this.vault.listAllAccounts();
-      const groups = await this.vault.listGroups();
+      const picture = await this.vault.readPicture();
       const stored = await this.vault.readStoredTokens();
-      const slotIds = (await this.allSlotIds()).filter((slotId) => !unsettled.has(slotId));
+      const slotIds = allSlots(picture.rules).filter((slotId) => !unsettled.has(slotId));
 
       // Step 1: adopt the freshest rotation for every known account that is live in any slot. Applied
       // per (account, slot); adoption only replaces the vault copy when the live token is newer, so
@@ -1496,7 +1807,7 @@ export class SwitchEngine {
         }
       }
 
-      // Steps 2-4 each re-seat one slot, and one slot's refusal (a member whose stored token another
+      // Steps 2-4 each re-seat one slot, and one slot's refusal (an account whose stored token another
       // account also holds, say) must not leave every other slot unrepaired: it is logged, and the
       // violation it left stays in `remaining`.
       const perSlot = async (slotId: SlotId, step: () => Promise<void>): Promise<void> => {
@@ -1515,9 +1826,7 @@ export class SwitchEngine {
         const phys = await this.physicalLiveId(rt.credStore, allRows, stored);
         if (phys.mismatch !== undefined && phys.id !== null) {
           const owner = phys.id;
-          await perSlot(slotId, () =>
-            this.reseatMismatchedSlot(rt, owner, allRows, groups, actions),
-          );
+          await perSlot(slotId, () => this.reseatMismatchedSlot(rt, owner, allRows, actions));
         }
       }
 
@@ -1526,20 +1835,31 @@ export class SwitchEngine {
         await perSlot('global', () => this.repairGlobalSlot(allRows, stored, actions));
       }
 
-      // Step 4: reconcile each group slot to its rightful member (evicting a non-member).
-      for (const group of groups) {
-        const slotId = groupSlotId(group.id);
+      // Step 4: reconcile each rule slot from its pool (evicting what may not, or cannot, be there).
+      for (const rule of picture.rules) {
+        const slotId = ruleSlotId(rule.id);
         if (unsettled.has(slotId)) continue;
         await perSlot(slotId, async () => {
-          const res = await this.ensureGroupLiveLocked(group);
-          if (res.activated) actions.push(`re-activated a member in ${describeMembers(group)}`);
+          const res = await this.ensureRuleLiveLocked(rule);
+          if (res.activated) actions.push(`re-seated the folder slot of ${describeRule(rule)}`);
           else if (res.clearedSquatter)
-            actions.push(`cleared a non-member login from ${describeMembers(group)}`);
+            actions.push(`cleared a login that does not belong from ${describeRule(rule)}`);
         });
       }
 
-      // Step 5: a profile no group owns may not keep a login live.
-      await this.clearOrphanProfileLogins(allRows, groups, stored, actions);
+      // Step 5: an account that was live in two slots kept the one the steps above left it in — but
+      // when the evicted copy was the newer one, step 1 adopted that into the vault, and the copy that
+      // stayed holds a token the other session already spent. Re-seat it with the vault's.
+      const rowsNow = await this.vault.listAllAccounts();
+      const storedNow = await this.vault.readStoredTokens();
+      for (const slotId of slotIds) {
+        await perSlot(slotId, () =>
+          this.reseatSpentLiveToken(this.slotRuntime(slotId), rowsNow, storedNow, actions),
+        );
+      }
+
+      // Step 6: a profile no rule owns may not keep a login live.
+      await this.clearOrphanProfileLogins(allRows, picture.rules, stored, actions);
 
       // Snapshot LAST — an activeId may have moved (its generation is what freshness checks read).
       await this.writeSnapshotLocked();
@@ -1556,18 +1876,18 @@ export class SwitchEngine {
   private async computeViolations(opts: { locked: boolean }): Promise<SlotViolation[]> {
     const violations: SlotViolation[] = [];
     const allRows = await this.vault.listAllAccounts();
-    const groups = await this.vault.listGroups();
+    const picture = await this.vault.readPicture();
+    const rules = picture.rules;
     const stored = await this.vault.readStoredTokens();
     const labelOf = (id: string): string => allRows.find((r) => r.id === id)?.label ?? id;
-    const groupIdOf = (id: string): string | undefined => allRows.find((r) => r.id === id)?.groupId;
     const slotLabel = (slotId: SlotId): string => {
-      const group = groups.find((g) => groupSlotId(g.id) === slotId);
-      return group === undefined ? 'the global slot' : describeMembers(group);
+      const rule = rules.find((r) => ruleSlotId(r.id) === slotId);
+      return rule === undefined ? 'the global slot' : `the folder slot of ${describeRule(rule)}`;
     };
 
     // Physical occupancy of every slot.
     const physical = new Map<SlotId, PhysicalOccupant>();
-    for (const slotId of await this.allSlotIds()) {
+    for (const slotId of allSlots(rules)) {
       physical.set(
         slotId,
         await this.physicalLiveId(this.slotRuntime(slotId).credStore, allRows, stored),
@@ -1580,7 +1900,6 @@ export class SwitchEngine {
     // A slot holding one account's token under another account's identity: everything that goes by
     // the identity block (who is live, whose rotation to adopt) is wrong about it.
     for (const [slotId, phys] of physical) {
-      const inGroup = slotId !== 'global' ? { groupId: slotId.slice('group:'.length) } : {};
       if (phys.ambiguous !== undefined) {
         const { holders, identityId, identityUuid } = phys.ambiguous;
         const named =
@@ -1590,7 +1909,7 @@ export class SwitchEngine {
         trailing.push({
           kind: 'live_identity_mismatch',
           slot: slotId,
-          ...inGroup,
+          ...ruleField(slotId),
           detail:
             `${slotLabel(slotId)} holds a login token stored under ${quotedLabels(holders, allRows)} ` +
             `at once, under the identity of ${named}, so whose it is cannot be told: ${SHARED_TOKEN_REMEDY}`,
@@ -1606,7 +1925,7 @@ export class SwitchEngine {
         kind: 'live_identity_mismatch',
         accountId: phys.id,
         slot: slotId,
-        ...inGroup,
+        ...ruleField(slotId),
         detail: `${slotLabel(slotId)} holds the credentials of "${labelOf(phys.id)}" but its identity names ${named}`,
       });
     }
@@ -1620,19 +1939,19 @@ export class SwitchEngine {
       });
     }
 
-    // A profile no group owns that is still logged in. An unlocked read can pair a group list read
-    // before a concurrent bind committed with a profile that bind has since logged in, so a finding
-    // there is confirmed under the lock first (see confirmedOrphanLogins).
+    // A profile no rule owns that is still logged in. An unlocked read can pair a rule list read
+    // before a concurrent include committed with a profile that include has since logged in, so a
+    // finding there is confirmed under the lock first (see confirmedOrphanLogins).
     const orphans = opts.locked
-      ? await this.orphanProfileLogins(allRows, groups, stored)
-      : await this.confirmedOrphanLogins(allRows, groups, stored);
+      ? await this.orphanProfileLogins(allRows, rules, stored)
+      : await this.confirmedOrphanLogins(allRows, rules, stored);
     for (const orphan of orphans) {
       trailing.push({
         kind: 'orphan_profile_login',
         ...(orphan.occupant.id !== null ? { accountId: orphan.occupant.id } : {}),
-        groupId: orphan.name,
+        ruleId: orphan.name,
         detail:
-          `${orphan.dir}, a profile no binding owns any more, still holds a live login` +
+          `${orphan.dir}, a profile no folder rule owns any more, still holds a live login` +
           (orphan.occupant.id !== null ? ` of "${labelOf(orphan.occupant.id)}"` : ''),
       });
     }
@@ -1652,7 +1971,6 @@ export class SwitchEngine {
     // allowed to run is counted.
     const staleMs = this.lockOptions.staleMs ?? LOCK_STALE_MS;
     for (const slotId of physical.keys()) {
-      const inGroup = slotId !== 'global' ? { groupId: slotId.slice('group:'.length) } : {};
       let pending: SwitchIntent | undefined;
       try {
         pending = await this.slotRuntime(slotId).intent.read();
@@ -1660,7 +1978,7 @@ export class SwitchEngine {
         trailing.push({
           kind: 'unsettled_switch',
           slot: slotId,
-          ...inGroup,
+          ...ruleField(slotId),
           detail:
             `the record of an interrupted switch of ${slotLabel(slotId)} could not be read ` +
             `(${errorReason(err)}); that slot stays blocked until the file is deleted - check first ` +
@@ -1674,7 +1992,7 @@ export class SwitchEngine {
         kind: 'unsettled_switch',
         accountId: pending.targetId,
         slot: slotId,
-        ...inGroup,
+        ...ruleField(slotId),
         detail:
           `a switch of ${slotLabel(slotId)} to "${labelOf(pending.targetId)}" was interrupted and ` +
           'has not been finished or undone; that slot is not written until it is (`cctl recover` ' +
@@ -1697,7 +2015,7 @@ export class SwitchEngine {
           kind: 'account_in_multiple_slots',
           accountId: id,
           slots,
-          detail: `account "${labelOf(id)}" is live in ${slots.join(' and ')}`,
+          detail: `account "${labelOf(id)}" is live in ${slots.map(slotLabel).join(' and ')}`,
         });
       }
     }
@@ -1732,65 +2050,102 @@ export class SwitchEngine {
     // (b) a reserved account live in the global slot.
     const globalPhys = physical.get('global')!;
     if (globalPhys.id !== null) {
-      const gid = groupIdOf(globalPhys.id);
-      if (gid !== undefined) {
+      const ruleIds = allRows.find((r) => r.id === globalPhys.id)?.ruleIds;
+      if (ruleIds !== undefined) {
         violations.push({
           kind: 'reserved_live_in_global',
           accountId: globalPhys.id,
           slot: 'global',
-          groupId: gid,
+          ...(ruleIds[0] !== undefined ? { ruleId: ruleIds[0] } : {}),
           detail: `reserved account "${labelOf(globalPhys.id)}" is live in the global slot`,
         });
       }
     }
 
-    for (const group of groups) {
-      const slotId = groupSlotId(group.id);
+    for (const rule of rules) {
+      const slotId = ruleSlotId(rule.id);
       const phys = physical.get(slotId)!;
       if (phys.id !== null) {
-        const isMember = group.members.some((m) => m.id === phys.id);
-        if (!isMember) {
-          // (c) a known account that is not a member is live in this profile.
+        if (!slotMayHold(slotId, phys.id, picture)) {
+          // (c) a known account outside the rule's pool is live in its profile: one the rule
+          // excludes, or one reserved only to other rules.
+          const why = rule.exclude.includes(phys.id)
+            ? 'which that folder excludes'
+            : 'which is reserved to other folders';
           violations.push({
-            kind: 'nonmember_live_in_group',
+            kind: 'outside_pool_live_in_rule',
             accountId: phys.id,
             slot: slotId,
-            groupId: group.id,
-            detail: `non-member "${labelOf(phys.id)}" is live in ${describeMembers(group)}`,
+            ruleId: rule.id,
+            detail: `"${labelOf(phys.id)}", ${why}, is live in ${slotLabel(slotId)}`,
           });
-        } else if (group.activeId !== phys.id) {
-          // (d) the profile's live identity is a different member than the group recorded.
+        } else if (rule.activeId !== phys.id) {
+          // (d) the profile's live identity is a different account than the rule recorded.
           violations.push({
-            kind: 'group_active_mismatch',
+            kind: 'rule_active_mismatch',
             accountId: phys.id,
             slot: slotId,
-            groupId: group.id,
-            detail: `${describeMembers(group)} records ${group.activeId === null ? 'no member' : `"${labelOf(group.activeId)}"`} live, but "${labelOf(phys.id)}" is`,
+            ruleId: rule.id,
+            detail: `${slotLabel(slotId)} records ${rule.activeId === null ? 'no account' : `"${labelOf(rule.activeId)}"`} live, but "${labelOf(phys.id)}" is`,
           });
         }
       } else if (phys.hasCreds && phys.foreignUuid !== undefined) {
-        // (c') an unrecognized login is live in a group profile — alert only (never adopted).
+        // (c') an unrecognized login is live in a rule profile — alert only (never adopted).
         violations.push({
-          kind: 'nonmember_live_in_group',
+          kind: 'outside_pool_live_in_rule',
           slot: slotId,
-          groupId: group.id,
-          detail: `an unrecognized login (${phys.foreignUuid}) is live in ${describeMembers(group)}`,
+          ruleId: rule.id,
+          detail: `an unrecognized login (${phys.foreignUuid}) is live in ${slotLabel(slotId)}`,
         });
       }
 
       // (e) broken profile links — a read-only plan tells us without touching anything.
-      for (const v of this.brokenLinkViolations(group)) violations.push(v);
+      for (const v of this.brokenLinkViolations(rule)) violations.push(v);
     }
 
     violations.push(...trailing);
     return violations;
   }
 
-  /** Read-only detection of §7 (e): any shared file in the group's profile whose hard link to main
+  /**
+   * Re-seat an account whose live token in `rt`'s slot is older than the one its vault bundle holds.
+   * A login has one live refresh token: when two copies were live and the other one rotated (its
+   * rotation adopted into the vault by repair's first step), the copy left here is spent, and the
+   * first refresh in this slot would fail as a dead login. Same-account, so it is a heal — no hop
+   * for the cadence clock, and nothing to adopt (the live token is not the newer one). "Older" is
+   * judged the way rotation adoption judges it: a different refresh token whose grant expires later.
+   */
+  private async reseatSpentLiveToken(
+    rt: SlotRuntime,
+    allRows: AccountView[],
+    stored: StoredTokens,
+    actions: string[],
+  ): Promise<void> {
+    const phys = await this.physicalLiveId(rt.credStore, allRows, stored);
+    if (phys.id === null || phys.mismatch !== undefined || phys.ambiguous !== undefined) return;
+    const live = await rt.credStore.readLiveCredentials().catch(() => undefined);
+    const vaultCopy = (await this.vault.readBundle(phys.id).catch(() => undefined))?.claudeAiOauth;
+    if (live === undefined || vaultCopy === undefined) return;
+    if (vaultCopy.refreshToken === live.refreshToken || vaultCopy.expiresAt <= live.expiresAt)
+      return;
+    await this.activateInSlot(rt, phys.id, {
+      force: true,
+      origin: 'recovery',
+      reason: 'replacing a live token another copy of the login already spent',
+    });
+    const label = allRows.find((r) => r.id === phys.id)?.label ?? phys.id;
+    actions.push(
+      `re-seated "${label}" in ${await this.slotLabelOf(rt.id)} with its freshest token; ` +
+        'the one live there was already spent',
+    );
+  }
+
+  /** Read-only detection of §7 (e): any shared file in the rule's profile whose hard link to main
    *  is broken (`ensureGroupProfile` rebuilds these; `repairSlots` does not). Best-effort — a fault
    *  probing the profile is swallowed, since the check must never throw on the doctor's read path. */
-  private brokenLinkViolations(group: StoredGroup): SlotViolation[] {
-    const rt = this.slotRuntime(groupSlotId(group.id));
+  private brokenLinkViolations(rule: FolderRule): SlotViolation[] {
+    const slotId = ruleSlotId(rule.id);
+    const rt = this.slotRuntime(slotId);
     if (rt.profileDir === undefined) return [];
     try {
       const plan = planGroupProfile(
@@ -1804,21 +2159,22 @@ export class SwitchEngine {
       return [
         {
           kind: 'broken_profile_link',
-          slot: groupSlotId(group.id),
-          groupId: group.id,
-          detail: `${describeMembers(group)} has broken profile links: ${broken.join(', ')}`,
+          slot: slotId,
+          ruleId: rule.id,
+          detail: `the folder slot of ${describeRule(rule)} has broken profile links: ${broken.join(', ')}`,
         },
       ];
     } catch (err) {
-      this.log.debug({ groupId: group.id, reason: errorReason(err) }, 'broken-link probe failed');
+      this.log.debug({ ruleId: rule.id, reason: errorReason(err) }, 'broken-link probe failed');
       return [];
     }
   }
 
   /** Move the global slot off a reserved account, if one is squatting there. Adoption already ran
-   *  (repairSlots step 1), so the squatter's rotation is safe; here we only re-seat global onto a
-   *  shared account, or clear it (fail closed) when none remains. A shared account in global, an
-   *  empty global, or an unrecognized login in global are all left alone — none breaches the fence. */
+   *  (repairSlots step 1), so the squatter's rotation is safe; here we only re-seat global onto the
+   *  best shared account still available to it (live in no rule slot), or clear it (fail closed) when
+   *  none remains. A shared account in global, an empty global, or an unrecognized login in global
+   *  are all left alone — none breaches the fence. */
   private async repairGlobalSlot(
     allRows: AccountView[],
     stored: StoredTokens,
@@ -1828,12 +2184,11 @@ export class SwitchEngine {
     const phys = await this.physicalLiveId(rt.credStore, allRows, stored);
     if (phys.id === null) return; // empty or unrecognized login — not a fence breach.
     const squatter = allRows.find((r) => r.id === phys.id);
-    if (squatter?.groupId === undefined) return; // a shared account belongs in global.
+    if (squatter?.ruleIds === undefined) return; // a shared account belongs in global.
 
-    const replacement = this.pickGlobalReplacement(
-      allRows.filter((r) => r.groupId === undefined),
-      new Set(),
-    );
+    const picture = await this.vault.readPicture();
+    const occupancy = await this.slotOccupancy(picture);
+    const replacement = availableInOrder(slotPool('global', picture, occupancy))[0];
     if (replacement !== undefined) {
       await this.activateInSlot(rt, replacement.id, {
         force: true,
@@ -1855,7 +2210,7 @@ export class SwitchEngine {
 
   /**
    * The physical live account of a set of live files (a slot's, or an orphaned profile's), matched
-   * against the WHOLE registry so a reserved/non-member login is recognized.
+   * against the WHOLE registry so a reserved or out-of-pool login is recognized.
    *
    * The token decides first: a live token equal to a stored account's token IS that account's login,
    * whatever the identity block beside it says — the token is the one artifact that cannot be stale.
@@ -1931,59 +2286,62 @@ export class SwitchEngine {
 
   /**
    * Re-seat a slot whose live token belongs to `ownerId` while its identity block names someone else
-   * (see {@link physicalLiveId}). When the owner may hold this slot it is activated there: its own
+   * (see {@link physicalLiveId}). When the slot's pool holds the owner it is activated there: its own
    * token is what is live, so this rewrites the identity to match and commits it — nothing is
    * adopted, because adoption refuses a token another account stores. When it may not, the slot's
-   * rightful account is put back: for a group, a member here (the per-group step that follows goes by
-   * the identity block and would take the member it names for live); for the global slot the reserved
-   * owner is evicted by {@link repairGlobalSlot}, which reads the token the same way.
+   * rightful account is put back: for a rule slot, the first available account of its pool (the
+   * per-rule step that follows goes by the identity block and would take the account it names for
+   * live); for the global slot the reserved owner is evicted by {@link repairGlobalSlot}, which reads
+   * the token the same way.
    */
   private async reseatMismatchedSlot(
     rt: SlotRuntime,
     ownerId: string,
     allRows: AccountView[],
-    groups: StoredGroup[],
     actions: string[],
   ): Promise<void> {
+    const picture = await this.vault.readPicture();
     const owner = allRows.find((r) => r.id === ownerId);
-    const group = rt.groupId === undefined ? undefined : groups.find((g) => g.id === rt.groupId);
-    const where = group === undefined ? 'the global slot' : describeMembers(group);
+    const rule =
+      rt.ruleId === undefined ? undefined : picture.rules.find((r) => r.id === rt.ruleId);
+    const where =
+      rule === undefined ? 'the global slot' : `the folder slot of ${describeRule(rule)}`;
     const reason = "re-seating a slot whose credentials were under another account's identity";
-    if (owner !== undefined && owner.groupId === rt.groupId) {
+    if (owner !== undefined && slotMayHold(rt.id, owner.id, picture)) {
       await this.activateInSlot(rt, owner.id, { force: true, origin: 'recovery', reason });
       actions.push(
         `re-seated "${owner.label}" in ${where}; its credentials were under another identity`,
       );
       return;
     }
-    if (group === undefined) return; // a reserved owner in global: repairGlobalSlot evicts it
-    for (const member of orderedGroupCandidates(group)) {
-      try {
-        await this.activateInSlot(rt, member.id, { force: true, origin: 'recovery', reason });
-        actions.push(`restored "${member.label}" in ${where} over another account's credentials`);
-        return;
-      } catch (err) {
-        if (this.isSimulatedDeath(err)) throw err;
-        this.log.warn(
-          { groupId: group.id, memberId: member.id, reason: errorReason(err) },
-          'group member failed to activate over a mismatched login; trying the next',
-        );
-      }
+    if (rule === undefined) return; // a reserved owner in global: repairGlobalSlot evicts it
+    const occupancy = await this.slotOccupancy(picture);
+    const seated = await this.seatFirst(
+      rt,
+      availableInOrder(slotPool(rt.id, picture, occupancy)),
+      reason,
+    );
+    if (seated !== null) {
+      const label = allRows.find((r) => r.id === seated)?.label ?? seated;
+      actions.push(`restored "${label}" in ${where} over another account's credentials`);
+      return;
     }
     await this.clearSlotLive(rt);
-    actions.push(`cleared another account's credentials from ${where} (no member could take it)`);
+    // The slot holds nobody now; neither may its record (see ensureRuleLiveLocked).
+    if (rule.activeId !== null) await this.vault.setRuleActive(rule.id, null);
+    actions.push(`cleared another account's credentials from ${where} (no account could take it)`);
   }
 
   /**
-   * Profile dirs no group owns that still hold a live login (`orphan_profile_login`). A dissolved
-   * group's profile is kept for its history with its live seat cleared; one still logged in is what
+   * Profile dirs no rule owns that still hold a live login (`orphan_profile_login`). A dissolved
+   * rule's profile is kept for its history with its live seat cleared; one still logged in is what
    * an interrupted removal by an older build leaves, and it is no slot — nothing else reads it, so the
    * login would sit there, a second live copy of an account's token, for good. Cheap: one directory
    * listing, and one read of a missing file per dissolved profile.
    */
   private async orphanProfileLogins(
     allRows: AccountView[],
-    groups: StoredGroup[],
+    rules: readonly FolderRule[],
     stored: StoredTokens,
   ): Promise<OrphanLogin[]> {
     const root = profilesRoot(this.paths.vaultDir);
@@ -1991,11 +2349,11 @@ export class SwitchEngine {
     try {
       names = await readdir(root);
     } catch {
-      return []; // no profiles root yet: nothing was ever bound
+      return []; // no profiles root yet: no rule ever existed
     }
     const fold = (name: string): string => (this.platform === 'win32' ? name.toLowerCase() : name);
     const owned = new Set(
-      groups.map((g) => fold(basename(groupProfileDir(this.paths.vaultDir, g.id)))),
+      rules.map((r) => fold(basename(groupProfileDir(this.paths.vaultDir, r.id)))),
     );
     const out: OrphanLogin[] = [];
     for (const name of names) {
@@ -2010,23 +2368,23 @@ export class SwitchEngine {
 
   /**
    * {@link orphanProfileLogins} for a reader that does not hold the lock, found and then CONFIRMED
-   * under it. Unlocked, the group list and the profile dirs are read at different moments, and a bind
-   * committing in between (its group written, then its profile logged in) makes the new binding's own
-   * profile look like one no group owns. Orphans are rare, so the lock is taken only when one is
+   * under it. Unlocked, the rule list and the profile dirs are read at different moments, and an
+   * include committing in between (its rule written, then its profile logged in) makes the new rule's
+   * own profile look like one no rule owns. Orphans are rare, so the lock is taken only when one is
    * found, and only if it is free right now: a finding that cannot be confirmed is left for the next
-   * check rather than reported (a real orphan is still there then; a bind's profile is not an orphan).
+   * check rather than reported (a real orphan is still there then; a new rule's profile is not one).
    */
   private async confirmedOrphanLogins(
     allRows: AccountView[],
-    groups: StoredGroup[],
+    rules: readonly FolderRule[],
     stored: StoredTokens,
   ): Promise<OrphanLogin[]> {
-    const found = await this.orphanProfileLogins(allRows, groups, stored);
+    const found = await this.orphanProfileLogins(allRows, rules, stored);
     if (found.length === 0) return found;
     const confirmed = await this.withCredentialLockIfFree(async () =>
       this.orphanProfileLogins(
         await this.vault.listAllAccounts(),
-        await this.vault.listGroups(),
+        await this.vault.listRules(),
         await this.vault.readStoredTokens(),
       ),
     );
@@ -2038,11 +2396,11 @@ export class SwitchEngine {
    *  dissolve uses, so clearing never costs an account its latest token. */
   private async clearOrphanProfileLogins(
     allRows: AccountView[],
-    groups: StoredGroup[],
+    rules: readonly FolderRule[],
     stored: StoredTokens,
     actions: string[],
   ): Promise<void> {
-    for (const orphan of await this.orphanProfileLogins(allRows, groups, stored)) {
+    for (const orphan of await this.orphanProfileLogins(allRows, rules, stored)) {
       if (orphan.occupant.id !== null && orphan.occupant.mismatch === undefined) {
         const liveNow = await orphan.store.readLiveCredentials().catch(() => undefined);
         const liveOauth = await orphan.store.readOauthAccount().catch(() => undefined);
@@ -2052,16 +2410,17 @@ export class SwitchEngine {
       await orphan.store.clearOauthAccount();
       const who = allRows.find((r) => r.id === orphan.occupant.id)?.label;
       actions.push(
-        `cleared ${who !== undefined ? `"${who}"'s` : 'a'} login from ${orphan.dir}, a profile no binding owns`,
+        `cleared ${who !== undefined ? `"${who}"'s` : 'a'} login from ${orphan.dir}, a profile no folder rule owns`,
       );
     }
   }
 
-  // ---- group-lifecycle helpers ----
+  // ---- folder-rule helpers ----
 
-  /** Canonicalize an operator-supplied folder for a bind/unbind, refusing the same targets §5
-   *  reserves. `mustExist` is relaxed for unbind (the folder may since have been deleted, but its
-   *  binding still needs clearing). Throws a `bind_refused` {@link RefreshError} on any refusal. */
+  /** Canonicalize an operator-supplied folder for a rule verb, refusing the same targets §5
+   *  reserves (a filesystem root, the home dir, cctl's own dirs). `mustExist` is relaxed for a reset
+   *  (the folder may since have been deleted, but its rule still needs clearing). Throws a
+   *  `bind_refused` {@link RefreshError} on any refusal. */
   private canonicalizeBindFolder(folder: string, opts: { mustExist?: boolean } = {}): string {
     const canon = canonicalizeFolder(folder, {
       platform: this.platform,
@@ -2071,9 +2430,8 @@ export class SwitchEngine {
     if (!canon.ok) {
       throw new RefreshError(`cannot use folder "${folder}": ${canon.reason}`, 'bind_refused');
     }
-    // The reserved-target rules (root/home/overlaps-cctl) apply to a bind, where a real directory is
-    // required. For unbind we skip the existence check but keep the structural refusals meaningless
-    // to re-check (a non-bound folder is caught later by exactBinding).
+    // The reserved-target rules (root/home/overlaps-cctl) apply where a rule is made or edited, and
+    // a real directory is required. A reset skips them: a folder without a rule is caught later.
     if (opts.mustExist !== false) {
       const check = checkBindTarget(canon.path, {
         platform: this.platform,
@@ -2084,15 +2442,18 @@ export class SwitchEngine {
         mainConfigDir: this.canonReserved(this.paths.claudeDir),
       });
       if (!check.ok) {
-        throw new RefreshError(`cannot bind "${canon.path}": ${check.reason}`, 'bind_refused');
+        throw new RefreshError(
+          `cannot give "${canon.path}" a folder rule: ${check.reason}`,
+          'bind_refused',
+        );
       }
     }
     return canon.path;
   }
 
-  /** Canonicalize a cctl-internal reserved path for containment checks — same rules as a bind target,
-   *  but falling back to the raw path when it does not exist yet (the profiles root has no directory
-   *  until the first bind). */
+  /** Canonicalize a cctl-internal reserved path for containment checks — same rules as a rule
+   *  folder, but falling back to the raw path when it does not exist yet (the profiles root has no
+   *  directory until the first rule). */
   private canonReserved(path: string): string {
     const canon = canonicalizeFolder(path, {
       platform: this.platform,
@@ -2102,31 +2463,19 @@ export class SwitchEngine {
     return canon.ok ? canon.path : path;
   }
 
-  /** Pick the best shared account to hold the global slot, excluding a set of ids (the members being
-   *  reserved). Prefers a non-excluded, non-quarantined account, then any non-quarantined one — a
-   *  deliberate global move may land on an auto-switch-excluded account, since exclusion governs only
-   *  unattended targeting. `undefined` when no usable shared account remains. */
-  private pickGlobalReplacement(
-    shared: readonly StoredAccount[],
-    exclude: ReadonlySet<string>,
-  ): StoredAccount | undefined {
-    const usable = shared.filter((a) => !exclude.has(a.id) && !a.quarantined);
-    return usable.find((a) => a.autoSwitchExcluded !== true) ?? usable[0];
-  }
-
   /** Clear the GLOBAL slot's live seat (remove `.credentials.json`, drop the identity block) so it
    *  fails closed. Reached only by repair when a reserved account squats in global and no shared
-   *  account remains — never on the darwin Keychain path, which has no group slots to trigger it. */
+   *  account remains — never on the darwin Keychain path, which has no rule slots to trigger it. */
   private async clearGlobalLive(): Promise<void> {
     await removeIfExists(this.paths.credentialsPath);
     await this.credStore.clearOauthAccount();
   }
 
-  /** Discard a group slot's crash-recovery state (intent WAL, rollback snapshot, cadence clock) on
-   *  dissolution — the slot is going away, so leaving `slots/<groupId>/` behind would strand an
+  /** Discard a rule slot's crash-recovery state (intent WAL, rollback snapshot, cadence clock) on
+   *  dissolution — the slot is going away, so leaving `slots/<ruleId>/` behind would strand an
    *  orphaned intent that a later `recover()` could act on. */
   private async clearSlotState(rt: SlotRuntime): Promise<void> {
-    if (rt.groupId === undefined) return; // never wipe the global slot's historical state
+    if (rt.ruleId === undefined) return; // never wipe the global slot's historical state
     await rm(rt.stateDir, { recursive: true, force: true });
   }
 
@@ -2169,21 +2518,19 @@ export class SwitchEngine {
    *  enforce mode is resolved HERE, at build time, so a long-lived daemon honors a live settings
    *  change instead of a value cached at construction. */
   private async buildSnapshotObject(): Promise<FolderBindingSnapshot> {
-    const [groups, generation] = await Promise.all([
-      this.vault.listGroups(),
-      this.vault.getGroupsGeneration(),
-    ]);
+    const picture = await this.vault.readPicture();
     return buildFolderBindingSnapshot({
-      groups,
-      generation,
+      rules: picture.rules,
+      reserved: picture.reserved,
+      generation: picture.generation,
       enforce: this.resolveBindEnforce(),
       mainConfigDir: this.canonReserved(this.paths.claudeDir),
-      profileDirOf: (groupId) => this.canonReserved(groupProfileDir(this.paths.vaultDir, groupId)),
+      profileDirOf: (ruleId) => this.canonReserved(groupProfileDir(this.paths.vaultDir, ruleId)),
     });
   }
 
   /** Rewrite the guard snapshot from the current registry, assuming the lock is held. Called LAST in
-   *  every group mutation. */
+   *  every rule mutation. */
   private async writeSnapshotLocked(): Promise<void> {
     const snapshot = await this.buildSnapshotObject();
     await writeFolderBindingSnapshot(folderBindingsPath(this.paths.vaultDir), snapshot);
@@ -2198,9 +2545,9 @@ export class SwitchEngine {
   /**
    * Rewrite the guard snapshot only when it no longer matches the registry (see
    * {@link getGuardSnapshotFreshness}); returns whether it rewrote. What the daemon's periodic
-   * maintenance calls, so a snapshot left stale — a crash between a group write and its snapshot
+   * maintenance calls, so a snapshot left stale — a crash between a rule write and its snapshot
    * write, an offline registry edit — is healed within one cycle rather than at the next restart or
-   * the next group mutation. The steady-state check is lock-free; the lock is taken only to rewrite,
+   * the next rule mutation. The steady-state check is lock-free; the lock is taken only to rewrite,
    * and the check is repeated under it so a concurrent writer's fresh snapshot is not rewritten.
    */
   async refreshSnapshotIfStale(): Promise<boolean> {
@@ -2228,7 +2575,7 @@ export class SwitchEngine {
   /**
    * Whether the guard snapshot on disk still reflects the guard-relevant registry (bound folders,
    * profile dirs, member labels, enforce mode) — the ONLY inputs the guard reads. Freshness is by
-   * CONTENT, not by the groups generation: a routine group member switch bumps the generation on
+   * CONTENT, not by the rules generation: a routine rule-slot switch bumps the generation on
    * fields the snapshot does not carry (activeId, metadata), which must not read as stale, and a real
    * change to a bound folder always changes the content compared here. Returns what a health surface
    * needs: whether a snapshot exists, whether it is fresh, its enforce mode and its generation.
@@ -2254,14 +2601,14 @@ export class SwitchEngine {
 
   /** Whether a config dir points at (or into) the profiles root — the one place a capture must
    *  refuse to run, because onboarding always uses a throwaway dir and a login performed inside a
-   *  profile would capture (and could overwrite) a group slot's live seat. */
+   *  profile would capture (and could overwrite) a rule slot's live seat. */
   private isInsideProfilesRoot(configDir: string): boolean {
     return isWithin(configDir, profilesRoot(this.paths.vaultDir), this.platform);
   }
 
   /** Refuse a capture whose config dir sits inside the profiles root (see
    *  {@link isInsideProfilesRoot}). A {@link RefreshError} with a stable code so the CLI can render
-   *  guidance ("onboard in a throwaway dir, not a group profile") rather than a raw message. */
+   *  guidance ("onboard in a throwaway dir, not a folder profile") rather than a raw message. */
   private refuseCaptureInProfile(configDir: string): void {
     if (this.isInsideProfilesRoot(configDir)) throw captureInProfileError(configDir);
   }
@@ -2299,12 +2646,12 @@ export class SwitchEngine {
     const rt = this.slotRuntime(slot);
     const { registryId, candidates } = await this.slotRegistry(slot);
     // A corrupt/unreadable .claude.json must degrade to the registry answer, never throw —
-    // this is a read path callers hit on every listing and poll cycle. For a group slot the block
+    // this is a read path callers hit on every listing and poll cycle. For a rule slot the block
     // read is the profile's own `.claude.json`, so each slot reconciles against ITS OWN identity.
     const live = await rt.credStore.readOauthAccount().catch(() => undefined);
     const liveUuid = live?.accountUuid;
     if (liveUuid === undefined) return registryId;
-    // Only this slot's candidates can be live in it: a group reconciles against its members, global
+    // Only this slot's candidates are recognized in it: a rule slot recognizes any stored account, global
     // against the shared pool. A uuid that matches no candidate is a login this slot never owned.
     const matches = candidates.filter((a) => a.accountUuid === liveUuid);
     if (matches.some((m) => m.id === registryId)) return registryId;
@@ -2347,14 +2694,14 @@ export class SwitchEngine {
    * `cctl accounts add` right after an interactive login populated the live files.
    */
   async captureCurrentLogin(label: string): Promise<StoredAccount> {
-    // A capture reads whoever is live in THIS config dir. Run inside a group profile, that seat is a
-    // group's live credentials — onboarding always uses a throwaway dir, so a config dir pointing
+    // A capture reads whoever is live in THIS config dir. Run inside a folder profile, that seat is a
+    // rule slot's live credentials — onboarding always uses a throwaway dir, so a config dir pointing
     // into the profiles root is a mistake to refuse, not a login to capture. The session's OWN config
     // dir is checked too: inside a bound session the paths are seen through to the main dir, so
     // `claudeDir` alone would capture the main dir's login instead of the one just made in the
     // profile — and report it as if it were the new one.
     this.refuseCaptureInProfile(this.paths.claudeDir);
-    // Set only when the environment's config dir IS a group profile (defaultPaths decided that by
+    // Set only when the environment's config dir IS a folder profile (defaultPaths decided that by
     // the same profiles-root rule), so it is refused outright rather than re-derived here.
     if (this.paths.profileConfigDir !== undefined) {
       throw captureInProfileError(this.paths.profileConfigDir);
@@ -2408,7 +2755,7 @@ export class SwitchEngine {
    * alone. The caller owns the transient dir and MUST delete it afterwards (token-bearing).
    */
   async captureFromConfigDir(label: string, configDir: string): Promise<StoredAccount> {
-    // A transient onboarding dir is never inside the profiles root; one that is would be a group
+    // A transient onboarding dir is never inside the profiles root; one that is would be a rule
     // slot's live seat, which this flow must not vault as a fresh account.
     this.refuseCaptureInProfile(configDir);
     // Deliberately FILE-based on every platform: the transient dir's contents are what we
@@ -2553,7 +2900,7 @@ export class SwitchEngine {
     });
   }
 
-  /** A file-based CredentialStore over one config dir — a group profile, an orphaned profile, or a
+  /** A file-based CredentialStore over one config dir — a rule profile, an orphaned profile, or a
    *  transient `CLAUDE_CONFIG_DIR` a login was performed in (the darwin flows read only the latter's
    *  `.claude.json`; its `.credentials.json` never exists there). Always file-based: only the global
    *  slot ever uses the platform's live-credential channel. */
@@ -2647,7 +2994,7 @@ export class SwitchEngine {
     // WHICH slot this account is live in, decided BEFORE the bundle overwrite below: getActiveId()'s
     // stale-identity corroboration compares the live token against the STORED bundle, and this
     // method is about to replace that bundle — asked afterwards, the comparison would run against
-    // the fresh capture and could never corroborate. A group member heals its group's profile, not
+    // the fresh capture and could never corroborate. An account live in a rule slot heals that profile, not
     // the global files (see {@link applyReloginBundle}).
     const liveSlot = await this.liveSlotOf(existing.id);
 
@@ -2741,8 +3088,8 @@ export class SwitchEngine {
       );
     }
     if (liveSlot !== undefined && !pendingThere) {
-      // Heal the seat the account actually occupies: a group member's fresh grant is written into
-      // its group profile, never the global files. The profile dir already exists (the account is
+      // Heal the seat the account actually occupies: the fresh grant of an account live in a rule
+      // slot is written into that profile, never the global files. The profile dir already exists (the account is
       // live there), so no ensureGroupProfile is needed on this repair path.
       const credStore = this.slotRuntime(liveSlot).credStore;
       try {
@@ -2890,20 +3237,24 @@ export class SwitchEngine {
   // ---- the state machine ----
 
   /**
-   * Make `targetId` the live account IN ITS OWN SLOT. See the class comment for the guarantees.
+   * Make `targetId` the live account in a slot whose pool holds it. See the class comment for the
+   * guarantees.
    *
-   * The slot is derived from membership, not chosen by the caller: a reserved account activates in
-   * its group's slot, a shared account in the global slot. A group activation materialises the
-   * profile dir first ({@link ensureGroupProfile}) and commits by moving the group's live member,
-   * leaving the global slot untouched. `options.slot`, when given, may only AGREE with the derived
-   * slot — a disagreement is the "reserved account can't be global / non-member can't be a group"
-   * refusal ({@link SlotError} `slot_mismatch`), made explicit rather than silently overridden.
+   * With no `options.slot`, the slot follows from the registry (see {@link defaultSlotFor}): a shared
+   * account goes to the global slot, a reserved one to the slot of the rule including it. Naming a
+   * slot is how a caller puts an account in a particular slot — a rule's slot may hold its included
+   * accounts and the shared accounts it does not exclude — and a slot whose pool does not hold the
+   * target is refused ({@link SlotError} `slot_mismatch`) rather than silently replaced: a reserved
+   * account can never be global, and an excluded or foreign account never in a rule's slot. Either
+   * way the target must be live in no other slot (`live_elsewhere`). A rule-slot activation
+   * materialises the profile dir first ({@link ensureGroupProfile}) and commits the rule's live
+   * account, leaving the global slot untouched.
    *
-   * Everything that decides WHERE the target goes is read UNDER the lock. Membership is a fact another
-   * process changes (a bind reserves an account, an unbind dissolves a group); a slot derived before
-   * the lock can name a slot the target no longer belongs to by the time it is written — putting one
-   * account live in two slots, or seeding a dissolved group's profile nothing checks any more. A
-   * caller that decided against an older picture (the daemon's per-slot auto-switch, a phone
+   * Everything that decides WHERE the target goes is read UNDER the lock. The rules are a fact
+   * another process changes (an include reserves an account, a reset dissolves a rule); a slot
+   * decided before the lock can name a slot the target may no longer be in by the time it is written
+   * — putting one account live in two slots, or seeding a dissolved rule's profile nothing checks any
+   * more. A caller that decided against an older picture (the daemon's per-slot auto-switch, a phone
    * `/switch`) passes the slot it decided for, so a changed picture fails the switch rather than
    * landing it somewhere the caller never meant.
    */
@@ -2923,28 +3274,20 @@ export class SwitchEngine {
         throw new QuarantineError(`account "${target.label}" is quarantined; re-login required`);
       }
 
-      const { slotId, group } = await this.slotForAccount(targetId);
-      if (options.slot !== undefined && options.slot !== slotId) {
-        // The caller asserted a slot membership forbids. Name which invariant it hit.
-        const why =
-          group !== undefined
-            ? `account "${target.label}" is reserved to a folder-bound group and can only be live in its group slot, not ${options.slot}`
-            : `account "${target.label}" is a shared account and can only be live in the global slot, not ${options.slot}`;
-        throw new SlotError(why, 'slot_mismatch');
+      const picture = await this.vault.readPicture();
+      const slotId = options.slot ?? (await this.defaultSlotFor(target, picture));
+      if (options.slot !== undefined && !slotMayHold(slotId, targetId, picture)) {
+        // The caller asserted a slot whose pool does not hold the target. Name which rule it hit.
+        throw new SlotError(this.notInPoolReason(target, slotId, picture), 'slot_mismatch');
       }
-      if (group !== undefined && this.platform === 'darwin') {
-        throw new RefreshError(
-          'folder-bound group slots are not supported on macOS yet (per-config-dir Keychain slots)',
-          'group_slot_unsupported',
-        );
-      }
+      if (slotId !== 'global') this.refuseRuleSlotsOnDarwin();
 
       const rt = this.slotRuntime(slotId);
-      // A group slot must exist before its live files are written. Idempotent: a no-op when the
+      // A rule slot must exist before its live files are written. Idempotent: a no-op when the
       // profile is already materialised, so running it on every activation costs nothing
-      // steady-state. Reached only for a group read under this lock, so it can never re-create the
-      // profile of a group an unbind already dissolved.
-      if (group !== undefined && rt.profileDir !== undefined) {
+      // steady-state. Reached only for a rule read under this lock, so it can never re-create the
+      // profile of a rule a reset already dissolved.
+      if (rt.profileDir !== undefined && picture.rules.some((r) => r.id === rt.ruleId)) {
         ensureGroupProfile(rt.profileDir, this.paths.claudeDir, {
           logger: this.log,
           mainClaudeJsonPath: this.paths.claudeJsonPath,
@@ -2956,11 +3299,36 @@ export class SwitchEngine {
     }
   }
 
+  /** Why `target` may not be live in `slotId` by the registry alone, as a refusal message. */
+  private notInPoolReason(
+    target: Pick<StoredAccount, 'id' | 'label'>,
+    slotId: SlotId,
+    picture: RulesPicture,
+  ): string {
+    const ruleId = ruleIdOfSlot(slotId);
+    if (ruleId === undefined) {
+      return picture.reserved.some((a) => a.id === target.id)
+        ? `account "${target.label}" is reserved to a folder rule and can only be live in its folders' slots, not the global slot`
+        : `account "${target.label}" is not a shared account, so it cannot be live in the global slot`;
+    }
+    const rule = picture.rules.find((r) => r.id === ruleId);
+    if (rule === undefined) {
+      return `the folder rule ${ruleId} no longer exists, so nothing can be made live in its slot`;
+    }
+    const why = rule.exclude.includes(target.id)
+      ? 'that folder excludes it'
+      : picture.reserved.some((a) => a.id === target.id)
+        ? 'it is reserved to other folders'
+        : 'it is not a stored account';
+    return `account "${target.label}" cannot be live in the folder slot of ${describeRule(rule)}: ${why}`;
+  }
+
   /**
-   * Whether `targetId` may be live in `rt`'s slot RIGHT NOW, read from the registry: a shared account
-   * for the global slot; a member of a still-existing group for a group slot. Returns the slot's
-   * group (undefined for the global slot) when it may, or the {@link SlotError} naming why it may not.
-   * The caller holds the credential lock, so the answer stays true until it releases it.
+   * Whether `targetId` may be live in `rt`'s slot RIGHT NOW: the slot's pool holds it (read from the
+   * registry — see `slotMayHold`), its rule still exists, and it is live in no OTHER slot (token-aware;
+   * no account is ever live in two). Returns the slot's rule (undefined for the global slot) when it
+   * may, or the {@link SlotError} naming why it may not. The caller holds the credential lock, so the
+   * answer stays true until it releases it.
    *
    * The one authority both {@link activateInSlot} (refuse before writing) and {@link settleSwitch}
    * (roll back rather than commit) consult, so the two can never disagree about who belongs where.
@@ -2968,48 +3336,51 @@ export class SwitchEngine {
   private async slotCandidacy(
     rt: SlotRuntime,
     targetId: string,
-  ): Promise<{ ok: true; group: StoredGroup | undefined } | { ok: false; error: SlotError }> {
-    const labelOf = async (): Promise<string> =>
-      (await this.vault.getAccount(targetId))?.label ?? targetId;
-    if (rt.groupId === undefined) {
-      if ((await this.vault.listAccounts()).some((a) => a.id === targetId)) {
-        return { ok: true, group: undefined };
+  ): Promise<{ ok: true; rule: FolderRule | undefined } | { ok: false; error: SlotError }> {
+    const picture = await this.vault.readPicture();
+    const target = [...picture.shared, ...picture.reserved].find((a) => a.id === targetId) ?? {
+      id: targetId,
+      label: targetId,
+    };
+    const rule =
+      rt.ruleId === undefined ? undefined : picture.rules.find((r) => r.id === rt.ruleId);
+    if (rt.ruleId !== undefined && rule === undefined) {
+      return {
+        ok: false,
+        error: new SlotError(
+          `the folder rule ${rt.ruleId} no longer exists, so nothing can be made live in its slot`,
+          'rule_gone',
+        ),
+      };
+    }
+    if (!slotMayHold(rt.id, targetId, picture)) {
+      return {
+        ok: false,
+        error: new SlotError(this.notInPoolReason(target, rt.id, picture), 'not_slot_candidate'),
+      };
+    }
+    const stored = await this.vault.readStoredTokens();
+    for (const other of allSlots(picture.rules)) {
+      if (other === rt.id) continue;
+      if ((await this.possibleLiveOwners(other, stored)).has(targetId)) {
+        return {
+          ok: false,
+          error: new SlotError(
+            `account "${target.label}" is live in ${await this.slotLabelOf(other)}, and an account ` +
+              'is live in one slot at a time',
+            'live_elsewhere',
+          ),
+        };
       }
-      return {
-        ok: false,
-        error: new SlotError(
-          `account "${await labelOf()}" is not a shared account, so it cannot be live in the global slot`,
-          'not_slot_candidate',
-        ),
-      };
     }
-    const group = await this.vault.getGroup(rt.groupId);
-    if (!group) {
-      return {
-        ok: false,
-        error: new SlotError(
-          `the folder-bound group ${rt.groupId} no longer exists, so nothing can be made live in its slot`,
-          'group_gone',
-        ),
-      };
-    }
-    if (!group.members.some((m) => m.id === targetId)) {
-      return {
-        ok: false,
-        error: new SlotError(
-          `account "${await labelOf()}" is not a member of ${describeMembers(group)}, so it cannot be live in that group's slot`,
-          'not_slot_candidate',
-        ),
-      };
-    }
-    return { ok: true, group };
+    return { ok: true, rule };
   }
 
   /**
    * The switch state machine for one slot — the historical `activate` body, parameterised by the
    * slot it operates on. Every live read/write, the intent WAL, the rollback snapshot and the
-   * cadence clock are the SLOT's; the commit is `setActive` for global and `setGroupActive` for a
-   * group. The single credential lock (held by the caller) still serialises all slots.
+   * cadence clock are the SLOT's; the commit is `setActive` for global and `setRuleActive` for a
+   * rule. The single credential lock (held by the caller) still serialises all slots.
    *
    * A switch this slot was left in the middle of (a crash, or an undo that failed) is settled FIRST,
    * before anything here reads the slot: every read below — who is live, whose rotation to adopt —
@@ -3041,7 +3412,7 @@ export class SwitchEngine {
     await this.requireSettledLocked(rt);
     const candidacy = await this.slotCandidacy(rt, targetId);
     if (!candidacy.ok) throw candidacy.error;
-    const group = candidacy.group;
+    const rule = candidacy.rule;
     await this.refuseSharedToken(targetId);
 
     // Live-reconciled, not the raw registry: `prevActiveId` names who OWNS the live token below
@@ -3050,7 +3421,7 @@ export class SwitchEngine {
     const prevActiveId = await this.getActiveId(rt.id);
 
     // Cadence guard (ToS posture): switching ACCOUNTS faster than a human plausibly would is
-    // refused. Each slot keeps its OWN clock, so a group hop never spends the global slot's budget
+    // refused. Each slot keeps its OWN clock, so a rule-slot hop never spends the global slot's budget
     // (and vice versa). Re-activating the already-active account is a heal, not a hop — exempt.
     if (!options.force && this.minSwitchIntervalMs > 0 && targetId !== prevActiveId) {
       const last = await this.readLastSwitchAtMs(rt);
@@ -3140,8 +3511,8 @@ export class SwitchEngine {
       }
 
       // Commit into the slot's own registry side — the last step that can still be undone.
-      writing = join(this.paths.vaultDir, group !== undefined ? 'groups.json' : 'accounts.json');
-      if (group !== undefined) await this.vault.setGroupActive(group.id, targetId);
+      writing = join(this.paths.vaultDir, rule !== undefined ? 'groups.json' : 'accounts.json');
+      if (rule !== undefined) await this.vault.setRuleActive(rule.id, targetId);
       else await this.vault.setActive(targetId);
     } catch (err) {
       // A process that died here runs nothing more; its intent is what recovers it.
@@ -3170,7 +3541,7 @@ export class SwitchEngine {
       fromAccountId: prevActiveId,
       toAccountId: targetId,
       origin: options.origin ?? 'manual',
-      // The slot this activation landed in, so attribution can build one timeline per slot: a group
+      // The slot this activation landed in, so attribution can build one timeline per slot: a rule
       // hop must not appear on the global account's timeline (and vice versa).
       slot: rt.id,
       ...(options.reason !== undefined ? { detail: options.reason } : {}),
@@ -3285,7 +3656,7 @@ export class SwitchEngine {
       const untrusted = await this.settleForAccountsLocked([targetId]);
       // Live-reconciled for the same reason as `activate()`, and across EVERY slot: the adopt-only
       // protection below must shield the account whose token is ACTUALLY live wherever it is live —
-      // network-refreshing a token some session (global OR a group profile) is holding would strand
+      // network-refreshing a token some session (global OR a rule profile) is holding would strand
       // it. An account is live in at most one slot, so the first hit is the whole answer.
       const liveSlot = await this.liveSlotOf(targetId);
 
@@ -3355,7 +3726,7 @@ export class SwitchEngine {
    *
    * Each slot keeps its own intent WAL, so a crash can leave one pending per slot. This walks the
    * global slot (whose WAL is the historical vault-dir `.switch-intent.json`, so a pre-upgrade
-   * intent recovers unchanged) and every group slot. The single lock serialises the whole sweep.
+   * intent recovers unchanged) and every rule slot. The single lock serialises the whole sweep.
    *
    * The return preserves the historical single-slot contract: with one pending intent (the common
    * case, and every global-only path) it returns exactly that slot's result; only a genuine
@@ -3368,7 +3739,7 @@ export class SwitchEngine {
    */
   async recover(): Promise<RecoverResult> {
     // Fast path: peek every currently-known slot's intent without locking. Most startups have none.
-    // A group created between this peek and the lock cannot have a crashed switch yet, so missing it
+    // A rule created between this peek and the lock cannot have a crashed switch yet, so missing it
     // here is harmless; the authoritative walk re-derives the slot set under the lock. A record that
     // cannot be read counts as pending: the locked attempt below reports it.
     let anyPending = false;
@@ -3437,24 +3808,16 @@ export class SwitchEngine {
   }
 
   /**
-   * Settle what an operation on these accounts' bundles depends on — each account's own slot (the
-   * only one it may legitimately be live in) and any slot whose pending switch was to or from it —
-   * and refuse the operation ({@link UnsettledSwitchError}) when one of those switches cannot be
-   * settled yet: settling it reads and may write exactly these bundles. Any other operation runs;
-   * the slots returned are the stuck ones it must neither adopt from nor write.
+   * Settle what an operation on these accounts' bundles depends on, and refuse the operation
+   * ({@link UnsettledSwitchError}) when a switch to or from one of them cannot be settled yet:
+   * settling it reads and may write exactly these bundles. An account may legitimately be live in the
+   * global slot or in any rule slot whose pool holds it, so every slot is settled — one read of an
+   * absent intent file per slot when nothing is pending. A stuck slot whose switch involves none of
+   * these accounts lets the operation run; the slots returned are the stuck ones it must neither
+   * adopt from nor write.
    */
   private async settleForAccountsLocked(accountIds: readonly string[]): Promise<Set<SlotId>> {
-    const slots: SlotId[] = [];
-    for (const id of accountIds) slots.push((await this.slotForAccount(id)).slotId);
-    for (const slotId of await this.allSlotIds()) {
-      const pending = await this.slotRuntime(slotId)
-        .intent.read()
-        .catch(() => undefined);
-      if (pending !== undefined && accountIds.some((id) => involves(pending, id))) {
-        slots.push(slotId);
-      }
-    }
-    const unsettled = await this.settleSlotsLocked(slots);
+    const unsettled = await this.settleSlotsLocked(await this.allSlotIds());
     for (const { pending, error } of unsettled.values()) {
       if (pending !== undefined && accountIds.some((id) => involves(pending, id))) throw error;
     }
@@ -3535,13 +3898,14 @@ export class SwitchEngine {
       : this.paths.credentialsPath;
   }
 
-  /** A slot as a message names it: "the global slot", or the folder slot of a group's members. */
+  /** A slot as a message names it: "the global slot", or the folder slot of a rule's folders. */
   private async slotLabelOf(slotId: SlotId): Promise<string> {
-    if (slotId === 'global') return 'the global slot';
-    const group = await this.vault.getGroup(slotId.slice('group:'.length)).catch(() => undefined);
-    return group === undefined
+    const ruleId = ruleIdOfSlot(slotId);
+    if (ruleId === undefined) return 'the global slot';
+    const rule = await this.vault.getRule(ruleId).catch(() => undefined);
+    return rule === undefined
       ? `the folder slot ${slotId}`
-      : `the folder slot of ${describeMembers(group)}`;
+      : `the folder slot of ${describeRule(rule)}`;
   }
 
   /**
@@ -3626,7 +3990,7 @@ export class SwitchEngine {
             return false;
           },
         );
-        if (identityLanded) return this.rollForward(rt, pending, candidacy.group);
+        if (identityLanded) return this.rollForward(rt, pending, candidacy.rule);
       }
       return this.rollBack(rt, pending, prior, mode);
     }
@@ -3661,7 +4025,7 @@ export class SwitchEngine {
       targetUuid !== undefined &&
       liveIdentity?.accountUuid === targetUuid
     ) {
-      if (mayForward) return this.rollForward(rt, pending, candidacy.group);
+      if (mayForward) return this.rollForward(rt, pending, candidacy.rule);
       await this.adoptRotationIfNeeded(pending.targetId, live, liveIdentity);
       return this.rollBack(rt, pending, prior, mode);
     }
@@ -3722,9 +4086,9 @@ export class SwitchEngine {
   private async rollForward(
     rt: SlotRuntime,
     pending: SwitchIntent,
-    group: StoredGroup | undefined,
+    rule: FolderRule | undefined,
   ): Promise<RecoverResult> {
-    if (group !== undefined) await this.vault.setGroupActive(group.id, pending.targetId);
+    if (rule !== undefined) await this.vault.setRuleActive(rule.id, pending.targetId);
     else await this.vault.setActive(pending.targetId);
     this.auditRecovery(pending.prevActiveId, pending.targetId, `rolled forward (${rt.id})`);
     await this.finishIntent(rt);
@@ -4000,7 +4364,7 @@ export class SwitchEngine {
   // ---- per-slot rollback snapshot (secret; mid-switch only) ----
   //
   // A slot's rollback lives beside its intent WAL (global: the vault dir's historical `.rollback.enc`;
-  // a group: `<vaultDir>/slots/<groupId>/.rollback.enc`). Sealed with the same protector the vault
+  // a rule: `<vaultDir>/slots/<ruleId>/.rollback.enc`). Sealed with the same protector the vault
   // uses for account bundles, because a rollback snapshot holds the previous live credentials.
 
   private slotRollbackPath(rt: SlotRuntime): string {

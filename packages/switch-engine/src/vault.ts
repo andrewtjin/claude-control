@@ -2,7 +2,7 @@
 //
 // Layout under `vaultDir`:
 //   accounts.json        registry: active id + StoredAccount[] (non-secret metadata)
-//   groups.json          the reserved side of the registry (folder-bound groups)
+//   groups.json          the reserved side of the registry and the folder rules over it
 //   <id>/cred.enc        DPAPI-encrypted CredentialBundle for one account
 //   .rollback.enc        DPAPI-encrypted snapshot of the previous live creds (mid-switch only)
 //   token-prints.json    one-way fingerprints of each bundle's tokens, a cache (see tokenPrints.ts)
@@ -13,18 +13,21 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { ruleSlotId } from './types.js';
 import type {
   AccountView,
   CredentialBundle,
-  GroupsFile,
+  FolderRule,
   OauthAccount,
   Registry,
+  RulesFile,
   StoredAccount,
-  StoredGroup,
 } from './types.js';
 import type { FolderBindingSnapshot } from './types.js';
 import type { Protector } from './dpapi.js';
 import { folderUniquenessKey } from './folderPath.js';
+import { rulesIncluding, slotMayHold, type RulesPicture } from './folderRules.js';
 import { sanitizeTerminalText } from './terminalSafe.js';
 import {
   buildFolderBindingSnapshot,
@@ -53,13 +56,38 @@ export interface DedupeReport {
   relabelled: Array<{ id: string; from: string; to: string }>;
 }
 
+/** One consistent read of the registry ({@link Vault.readPicture}): the {@link RulesPicture} every
+ *  pool decision takes, plus the global slot's recorded account and the rules generation. */
+export interface RegistryPicture extends RulesPicture {
+  activeId: string | null;
+  generation: number;
+}
+
+/** What a new folder rule is made of ({@link Vault.createRule}). */
+export interface NewRuleOptions {
+  /** Canonical folders the rule applies to (the engine always passes exactly one). */
+  folders: readonly string[];
+  /** Accounts to include, in preference order. */
+  include?: readonly string[];
+  /** Shared accounts to exclude. */
+  exclude?: readonly string[];
+  /** Display name; defaults to the first folder. */
+  label?: string;
+}
+
+/** The folders of some rules as a display list, for "reserved to <folders>" messages. */
+function describeRuleFolders(rules: readonly FolderRule[]): string {
+  const folders = rules.flatMap((r) => (r.folders.length > 0 ? r.folders : [r.label]));
+  return folders.length > 0 ? folders.join(', ') : 'a folder rule';
+}
+
 /** Refuse a label another row already answers to (any case) or that spells an account id:
  *  `resolveAccountRef` matches id first, then exact label, then case-insensitive label, so
  *  either collision would leave one of the two accounts unreachable by name. `exceptId` is
  *  the row being renamed, whose own label is not a collision with itself.
  *
  *  Checked across ALL rows — shared AND reserved — because `resolveAccountRef` resolves a name
- *  against the one logical registry: a label a group member already carries must be as off-limits
+ *  against the one logical registry: a label a reserved account already carries must be as off-limits
  *  to a shared account as another shared account's is, or `cctl switch <name>` could not tell the
  *  two apart. */
 function assertLabelFree(rows: StoredAccount[], label: string, exceptId: string | undefined): void {
@@ -76,11 +104,11 @@ function assertLabelFree(rows: StoredAccount[], label: string, exceptId: string 
 }
 
 /** The reusable core of {@link Vault.dedupeAccounts}, run once over the shared rows and once over
- *  each group's members — every set of rows that answers to one logical registry must be internally
+ *  the reserved rows — every set of rows that answers to one logical registry must be internally
  *  consistent under the same rules (one row per login, one name per row). Mutates and returns `rows`
  *  in place; the caller persists only the sets that actually {@link DedupeCoreResult.changed}.
- *  `activeId` (the shared active id, or a group's) picks the survivor when the same login is stored
- *  twice, exactly as the single-file version did. */
+ *  `preferred` (the global active id, or every rule's live account) picks the survivor when the same
+ *  login is stored twice: the row that is live keeps its seat. */
 interface DedupeCoreResult {
   removedIds: Set<string>;
   merged: DedupeReport['merged'];
@@ -89,7 +117,7 @@ interface DedupeCoreResult {
 }
 function dedupeRows(
   rows: StoredAccount[],
-  activeId: string | null,
+  preferred: ReadonlySet<string>,
   clock: () => number,
 ): { rows: StoredAccount[]; result: DedupeCoreResult } {
   const merged: DedupeReport['merged'] = [];
@@ -106,7 +134,7 @@ function dedupeRows(
     // The active row wins; absent one, the most recently CAPTURED (largest createdAtMs) — a capture
     // always writes fresh tokens, whereas updatedAtMs also moves on a metadata touch.
     const keep =
-      group.find((r) => r.id === activeId) ??
+      group.find((r) => preferred.has(r.id)) ??
       group.reduce((best, r) => (r.createdAtMs > best.createdAtMs ? r : best));
     for (const r of group) {
       if (r === keep) continue;
@@ -165,23 +193,29 @@ function emptyRegistry(): Registry {
 }
 
 /** Registry schema tag written into `accounts.json` from this build on. Its presence marks a file
- *  the group split is aware of; its ABSENCE is the legacy pre-split shape (see {@link Registry}). */
+ *  the reserved split is aware of; its ABSENCE is the legacy pre-split shape (see {@link Registry}). */
 const ACCOUNTS_SCHEMA_VERSION = 2;
-/** Schema tag for `groups.json`. Only value ever accepted on load — an unknown one fails closed
- *  rather than being read as a shape this build does not understand. */
-const GROUPS_SCHEMA_VERSION = 1;
+/** Schema tag `groups.json` is written with: folder rules over the inherited pool. */
+const RULES_SCHEMA_VERSION = 2;
+/** Schema tag of the set-bound groups `groups.json` held before folder rules. Still READ, and
+ *  migrated to {@link RULES_SCHEMA_VERSION} in memory (written back as such on the next write). Any
+ *  other value fails closed rather than being read as a shape this build does not understand. */
+const LEGACY_GROUPS_SCHEMA_VERSION = 1;
 
 /**
- * Upper bounds on the group registry, enforced on every load and every mutation.
+ * Upper bounds on the rules registry, enforced on every load and every mutation.
  *
  * These are refusal points, not capacity targets: the files are read into memory, parsed, and
  * (for the guard snapshot) copied around, so an unbounded count turns one hostile or corrupt file
  * into an out-of-memory or a wedged daemon. The numbers are far above any real fleet — dozens of
- * folders per group, dozens of groups — so a legitimate operator never meets them.
+ * folders per rule, dozens of rules — so a legitimate operator never meets them.
  */
-export const MAX_GROUPS = 64;
-export const MAX_GROUP_MEMBERS = 32;
-export const MAX_GROUP_FOLDERS = 256;
+export const MAX_RULES = 64;
+/** Per rule, the most accounts its include list may name, and separately its exclude list. */
+export const MAX_RULE_ACCOUNTS = 32;
+export const MAX_RULE_FOLDERS = 256;
+/** The most reserved rows `groups.json` may hold across all rules. */
+export const MAX_RESERVED_ACCOUNTS = 256;
 
 /** Property names that, if copied onto an object literal or used as a plain-object map key, reach
  *  through to `Object.prototype` (prototype pollution). Registry files are operator-editable and,
@@ -211,8 +245,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * {@link VaultError}, nothing written) on anything malformed.
  *
  * Stricter than the shared-registry shape check: a shared row an older build wrote may legitimately
- * lack derived fields, but every member here was moved out of a row this build created, so the full
- * required shape must be intact — a member missing its id or timestamps is corruption, not an old
+ * lack derived fields, but every reserved row was moved out of a row this build created, so the full
+ * required shape must be intact — a row missing its id or timestamps is corruption, not an old
  * file, and reading it loosely would let a broken row flow into a live credential decision.
  */
 function validateMember(value: unknown, where: string): StoredAccount {
@@ -230,71 +264,264 @@ function validateMember(value: unknown, where: string): StoredAccount {
   return value as unknown as StoredAccount;
 }
 
-/**
- * Parse and STRICTLY validate `groups.json`, healing nothing and writing nothing.
- *
- * Fails closed (named {@link VaultError}) on: a wrong top-level shape or schema version; a group
- * that is not an object or carries a forbidden key; a missing id/label; an over-cap or empty member
- * list (an empty group has no reason to exist and would leave `activeId` unsatisfiable); a member
- * that fails {@link validateMember}; a member id repeated across the whole file (two rows answering
- * to one account); a member login (`accountUuid`) repeated across the whole file (one login placed in
- * two group slots — both slots would attribute to it, double-counting its usage and making
- * resolution ambiguous); an `activeId` that is neither null nor one of the group's own members; an
- * over-cap folder list; or a folder that collides (by {@link folderUniquenessKey}, i.e. after
- * canonicalization) with one already claimed by any group. The caller separately heals a member id
- * that ALSO lingers in `accounts.json`.
- */
-function validateGroupsFile(
-  value: unknown,
+/** Validate a list of folders one rule (or legacy group) claims, against every folder an earlier one
+ *  already claimed (`seenKeys`, updated in place). Keyed on {@link folderUniquenessKey} — the same
+ *  key the write guards use — so two spellings of one directory can never both load. */
+function validateFolders(
+  raw: unknown,
+  where: string,
+  seenKeys: Set<string>,
   platform: NodeJS.Platform,
-): { file: GroupsFile; extras: GroupsExtras } {
-  if (!isPlainObject(value)) throw new VaultError('groups.json is not an object');
-  assertNoForbiddenKeys(value, 'groups.json');
-  if (value.schemaVersion !== GROUPS_SCHEMA_VERSION) {
+): string[] {
+  if (!Array.isArray(raw)) throw new VaultError(`${where} folders is not an array`);
+  if (raw.length > MAX_RULE_FOLDERS) {
+    throw new VaultError(`${where} holds ${raw.length} folders (max ${MAX_RULE_FOLDERS})`);
+  }
+  const folders: string[] = [];
+  for (const folder of raw) {
+    if (typeof folder !== 'string' || folder === '') {
+      throw new VaultError(`${where} has a non-string folder`);
+    }
+    const key = folderUniquenessKey(folder, platform);
+    if (seenKeys.has(key)) throw new VaultError(`folder ${folder} has more than one rule`);
+    seenKeys.add(key);
+    folders.push(folder);
+  }
+  return folders;
+}
+
+/** Validate a rule's include or exclude list: an array of distinct non-empty ids within the cap. */
+function validateIdList(raw: unknown, where: string, field: 'include' | 'exclude'): string[] {
+  if (!Array.isArray(raw)) throw new VaultError(`${where} ${field} is not an array`);
+  if (raw.length > MAX_RULE_ACCOUNTS) {
     throw new VaultError(
-      `groups.json has an unsupported schemaVersion (${JSON.stringify(value.schemaVersion)}); ` +
-        'a newer build wrote it — this one refuses to read it rather than drop the bindings it holds',
+      `${where} ${field} names ${raw.length} accounts (max ${MAX_RULE_ACCOUNTS})`,
     );
   }
+  const ids: string[] = [];
+  for (const id of raw) {
+    if (typeof id !== 'string' || id === '') {
+      throw new VaultError(`${where} ${field} has a non-string account id`);
+    }
+    if (ids.includes(id)) throw new VaultError(`${where} ${field} names account ${id} twice`);
+    ids.push(id);
+  }
+  return ids;
+}
+
+/** The fields of a rule (or legacy group) every schema shares: a plain object without forbidden keys,
+ *  a string id and label, numeric timestamps. Returns the object for the caller's own fields. */
+function validateEntryBase(
+  value: unknown,
+  where: string,
+): Record<string, unknown> & {
+  id: string;
+  label: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+} {
+  if (!isPlainObject(value)) throw new VaultError(`${where} is not an object`);
+  assertNoForbiddenKeys(value, where);
+  if (typeof value.id !== 'string' || value.id === '') {
+    throw new VaultError(`${where} has no string id`);
+  }
+  if (typeof value.label !== 'string')
+    throw new VaultError(`${where} (${value.id}) has no string label`);
+  if (typeof value.createdAtMs !== 'number' || typeof value.updatedAtMs !== 'number') {
+    throw new VaultError(`${where} (${value.id}) has non-numeric timestamps`);
+  }
+  return value as Record<string, unknown> & {
+    id: string;
+    label: string;
+    createdAtMs: number;
+    updatedAtMs: number;
+  };
+}
+
+/**
+ * Parse and STRICTLY validate `groups.json` in either schema, healing nothing and writing nothing.
+ * A schema-1 file (set-bound groups) is validated by its own rules first — which still refuse what
+ * they always refused — and then migrated in memory (see {@link migrateLegacyGroups}); the next write
+ * persists it as schema 2. Any other schema version fails closed.
+ */
+function parseRulesFile(
+  value: unknown,
+  platform: NodeJS.Platform,
+): { file: RulesFile; extras: RulesExtras } {
+  if (!isPlainObject(value)) throw new VaultError('groups.json is not an object');
+  assertNoForbiddenKeys(value, 'groups.json');
   if (typeof value.generation !== 'number' || !Number.isInteger(value.generation)) {
     throw new VaultError('groups.json generation is not an integer');
   }
-  const rawGroups = value.groups;
-  if (!Array.isArray(rawGroups)) throw new VaultError('groups.json groups is not an array');
-  if (rawGroups.length > MAX_GROUPS) {
-    throw new VaultError(`groups.json holds ${rawGroups.length} groups (max ${MAX_GROUPS})`);
+  if (value.schemaVersion === LEGACY_GROUPS_SCHEMA_VERSION) {
+    return migrateLegacyGroups(validateLegacyGroups(value, platform), value.generation);
+  }
+  if (value.schemaVersion !== RULES_SCHEMA_VERSION) {
+    throw new VaultError(
+      `groups.json has an unsupported schemaVersion (${JSON.stringify(value.schemaVersion)}); ` +
+        'a newer build wrote it — this one refuses to read it rather than drop the rules it holds',
+    );
+  }
+  return validateRulesFile(value, platform);
+}
+
+/**
+ * Validate a schema-2 `groups.json`. Fails closed (named {@link VaultError}) on: a malformed
+ * `reserved` list or row (see {@link validateMember}), a reserved id repeated, or more rows than the
+ * cap; a rule that is not an object, carries a forbidden key, lacks its id/label/timestamps, or
+ * repeats another rule's id; folders, include or exclude lists that are malformed or over the cap; a
+ * folder held by two rules (after canonicalization); an include id that is not a reserved row; an
+ * account both included and excluded by one rule; an `activeId` that is not null or a string; and
+ * a reserved row no rule includes (an account is reserved exactly while some rule includes it, and
+ * the move order never leaves one behind — a hand edit or corruption does).
+ *
+ * Deliberately NOT checked here: whether an exclude id or an `activeId` names an existing shared
+ * account. A build that predates rules can remove a shared account without knowing any rule names
+ * it; refusing the whole file for that would brick every command over an inert reference. Such an
+ * exclude simply has no effect, and a stale `activeId` is reconciled by the slot logic.
+ *
+ * A login (`accountUuid`) repeated within `reserved` is accepted: it is the dedupe-able duplicate
+ * {@link Vault.dedupeAccounts} collapses, and failing the load would make it unrepairable.
+ */
+function validateRulesFile(
+  value: Record<string, unknown>,
+  platform: NodeJS.Platform,
+): { file: RulesFile; extras: RulesExtras } {
+  const rawReserved = value.reserved;
+  if (!Array.isArray(rawReserved)) throw new VaultError('groups.json reserved is not an array');
+  if (rawReserved.length > MAX_RESERVED_ACCOUNTS) {
+    throw new VaultError(
+      `groups.json holds ${rawReserved.length} reserved accounts (max ${MAX_RESERVED_ACCOUNTS})`,
+    );
+  }
+  const reserved: StoredAccount[] = [];
+  for (let i = 0; i < rawReserved.length; i += 1) {
+    const row = validateMember(rawReserved[i], `reserved[${i}]`);
+    if (reserved.some((r) => r.id === row.id)) {
+      throw new VaultError(`account ${row.id} is reserved twice`);
+    }
+    reserved.push(row);
   }
 
+  const rawRules = value.rules;
+  if (!Array.isArray(rawRules)) throw new VaultError('groups.json rules is not an array');
+  if (rawRules.length > MAX_RULES) {
+    throw new VaultError(`groups.json holds ${rawRules.length} rules (max ${MAX_RULES})`);
+  }
+  const seenFolderKeys = new Set<string>();
+  const rules: FolderRule[] = [];
+  const extras: RulesExtras = { top: unownedFields(value, RULES_FILE_KEYS), byRule: new Map() };
+  for (let i = 0; i < rawRules.length; i += 1) {
+    const where = `rules[${i}]`;
+    const r = validateEntryBase(rawRules[i], where);
+    if (rules.some((x) => x.id === r.id)) throw new VaultError(`rule id ${r.id} appears twice`);
+    const ruleExtras = unownedFields(r, RULE_KEYS);
+    if (Object.keys(ruleExtras).length > 0) extras.byRule.set(r.id, ruleExtras);
+    const folders = validateFolders(r.folders, `${where} (${r.id})`, seenFolderKeys, platform);
+    const include = validateIdList(r.include, `${where} (${r.id})`, 'include');
+    const exclude = validateIdList(r.exclude, `${where} (${r.id})`, 'exclude');
+    for (const id of include) {
+      if (!reserved.some((a) => a.id === id)) {
+        throw new VaultError(`${where} (${r.id}) includes ${id}, which is not a reserved account`);
+      }
+      if (exclude.includes(id)) {
+        throw new VaultError(`${where} (${r.id}) both includes and excludes ${id}`);
+      }
+    }
+    const activeId = r.activeId;
+    if (activeId !== null && (typeof activeId !== 'string' || activeId === '')) {
+      throw new VaultError(`${where} (${r.id}) activeId is not an account id or null`);
+    }
+    rules.push({
+      id: r.id,
+      label: r.label,
+      folders,
+      include,
+      exclude,
+      activeId,
+      createdAtMs: r.createdAtMs,
+      updatedAtMs: r.updatedAtMs,
+    });
+  }
+  for (const row of reserved) {
+    if (!rules.some((r) => r.include.includes(row.id))) {
+      throw new VaultError(`reserved account ${row.id} is included by no rule`);
+    }
+  }
+  return {
+    file: {
+      schemaVersion: RULES_SCHEMA_VERSION,
+      generation: value.generation as number,
+      reserved,
+      rules,
+    },
+    extras,
+  };
+}
+
+/** A schema-1 group: a set of reserved rows bound to a set of folders. Only read, to migrate. */
+interface LegacyGroup {
+  id: string;
+  label: string;
+  members: StoredAccount[];
+  activeId: string | null;
+  folders: string[];
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+/** The top-level keys of a schema-1 file this build understood. */
+const LEGACY_FILE_KEYS: ReadonlySet<string> = new Set(['schemaVersion', 'generation', 'groups']);
+/** The keys of one schema-1 group this build understood. */
+const LEGACY_GROUP_KEYS: ReadonlySet<string> = new Set([
+  'id',
+  'label',
+  'members',
+  'activeId',
+  'folders',
+  'createdAtMs',
+  'updatedAtMs',
+]);
+
+/**
+ * Validate a schema-1 `groups.json` exactly as strictly as the build that wrote it did, failing
+ * closed on: a group with no members (or over the cap); a member that fails {@link validateMember};
+ * a member id or login (`accountUuid`) in two groups — one account placed in two slots, which the
+ * set model never allowed and which this build refuses to guess its way out of; an `activeId` that
+ * is not one of the group's own members; a folder bound twice. A login repeated WITHIN one group is
+ * the dedupe-able duplicate and is accepted.
+ */
+function validateLegacyGroups(
+  value: Record<string, unknown>,
+  platform: NodeJS.Platform,
+): { groups: LegacyGroup[]; extras: RulesExtras } {
+  const rawGroups = value.groups;
+  if (!Array.isArray(rawGroups)) throw new VaultError('groups.json groups is not an array');
+  if (rawGroups.length > MAX_RULES) {
+    throw new VaultError(`groups.json holds ${rawGroups.length} groups (max ${MAX_RULES})`);
+  }
   const seenMemberIds = new Set<string>();
   const seenAccountUuids = new Set<string>();
   const seenFolderKeys = new Set<string>();
-  const groups: StoredGroup[] = [];
-  const extras: GroupsExtras = { top: unownedFields(value, GROUPS_FILE_KEYS), byGroup: new Map() };
+  const groups: LegacyGroup[] = [];
+  const extras: RulesExtras = { top: unownedFields(value, LEGACY_FILE_KEYS), byRule: new Map() };
   for (let i = 0; i < rawGroups.length; i += 1) {
-    const g: unknown = rawGroups[i];
     const where = `groups[${i}]`;
-    if (!isPlainObject(g)) throw new VaultError(`${where} is not an object`);
-    assertNoForbiddenKeys(g, where);
-    if (typeof g.id !== 'string' || g.id === '') throw new VaultError(`${where} has no string id`);
-    const groupExtras = unownedFields(g, GROUP_KEYS);
-    if (Object.keys(groupExtras).length > 0) extras.byGroup.set(g.id, groupExtras);
-    if (typeof g.label !== 'string') throw new VaultError(`${where} (${g.id}) has no string label`);
-    if (typeof g.createdAtMs !== 'number' || typeof g.updatedAtMs !== 'number') {
-      throw new VaultError(`${where} (${g.id}) has non-numeric timestamps`);
-    }
+    const g = validateEntryBase(rawGroups[i], where);
+    const groupExtras = unownedFields(g, LEGACY_GROUP_KEYS);
+    if (Object.keys(groupExtras).length > 0) extras.byRule.set(g.id, groupExtras);
     if (!Array.isArray(g.members) || g.members.length === 0) {
       throw new VaultError(`${where} (${g.id}) has no members`);
     }
-    if (g.members.length > MAX_GROUP_MEMBERS) {
+    if (g.members.length > MAX_RULE_ACCOUNTS) {
       throw new VaultError(
-        `${where} (${g.id}) holds ${g.members.length} members (max ${MAX_GROUP_MEMBERS})`,
+        `${where} (${g.id}) holds ${g.members.length} members (max ${MAX_RULE_ACCOUNTS})`,
       );
     }
     const members: StoredAccount[] = [];
-    // Logins this group carries. A login repeated WITHIN one group is a dedupe-able duplicate that
-    // `dedupeAccounts` collapses per group, so it is accepted here (failing closed would make it
-    // unrepairable); a login that ALSO appears in an EARLIER group is not, so the cross-group check
-    // compares against `seenAccountUuids` (prior groups only) and this set is merged in afterward.
+    // Logins this group carries. A login repeated WITHIN one group is a dedupe-able duplicate, so it
+    // is accepted; one that ALSO appears in an EARLIER group is not, so the cross-group check compares
+    // against `seenAccountUuids` (prior groups only) and this set is merged in afterward.
     const thisGroupUuids = new Set<string>();
     for (let j = 0; j < g.members.length; j += 1) {
       const member = validateMember(g.members[j], `${where}.members[${j}]`);
@@ -302,10 +529,8 @@ function validateGroupsFile(
         throw new VaultError(`account ${member.id} appears in more than one group`);
       }
       seenMemberIds.add(member.id);
-      // A login (accountUuid) may reserve to at most one group. The same login in two groups places
-      // the one logical login in two slots: both attribute to it (double-counting its usage) and
-      // resolveAccountRef becomes ambiguous. Rows predating metadata capture carry no accountUuid;
-      // those are keyed by id alone (nothing to compare) rather than colliding on `undefined`.
+      // Rows predating metadata capture carry no accountUuid; those are keyed by id alone (nothing to
+      // compare) rather than colliding on `undefined`.
       if (member.accountUuid !== undefined) {
         if (seenAccountUuids.has(member.accountUuid)) {
           throw new VaultError(
@@ -323,26 +548,7 @@ function validateGroupsFile(
         throw new VaultError(`${where} (${g.id}) activeId is not one of its members`);
       }
     }
-    const rawFolders = g.folders;
-    if (!Array.isArray(rawFolders))
-      throw new VaultError(`${where} (${g.id}) folders is not an array`);
-    if (rawFolders.length > MAX_GROUP_FOLDERS) {
-      throw new VaultError(
-        `${where} (${g.id}) holds ${rawFolders.length} folders (max ${MAX_GROUP_FOLDERS})`,
-      );
-    }
-    const folders: string[] = [];
-    for (const folder of rawFolders) {
-      if (typeof folder !== 'string' || folder === '') {
-        throw new VaultError(`${where} (${g.id}) has a non-string folder`);
-      }
-      const key = folderUniquenessKey(folder, platform);
-      if (seenFolderKeys.has(key)) {
-        throw new VaultError(`folder ${folder} is bound by more than one group`);
-      }
-      seenFolderKeys.add(key);
-      folders.push(folder);
-    }
+    const folders = validateFolders(g.folders, `${where} (${g.id})`, seenFolderKeys, platform);
     groups.push({
       id: g.id,
       label: g.label,
@@ -353,9 +559,38 @@ function validateGroupsFile(
       updatedAtMs: g.updatedAtMs,
     });
   }
+  return { groups, extras };
+}
+
+/**
+ * Read a validated schema-1 file as folder rules: each group becomes ONE rule with the same id (so
+ * its profile dir and slot id carry over), the same label, folders and live account, `include` = its
+ * members in their stored order and `exclude` = []. Every member row moves to `reserved`. The
+ * binding therefore keeps working unchanged, and now also inherits the shared pool once its members
+ * are out. Unknown fields carry over at both levels, exactly as a schema-1 rewrite kept them.
+ */
+function migrateLegacyGroups(
+  legacy: { groups: LegacyGroup[]; extras: RulesExtras },
+  generation: number,
+): { file: RulesFile; extras: RulesExtras } {
+  const reserved: StoredAccount[] = [];
+  const rules: FolderRule[] = [];
+  for (const g of legacy.groups) {
+    for (const m of g.members) if (!reserved.some((r) => r.id === m.id)) reserved.push(m);
+    rules.push({
+      id: g.id,
+      label: g.label,
+      folders: g.folders,
+      include: g.members.map((m) => m.id),
+      exclude: [],
+      activeId: g.activeId,
+      createdAtMs: g.createdAtMs,
+      updatedAtMs: g.updatedAtMs,
+    });
+  }
   return {
-    file: { schemaVersion: GROUPS_SCHEMA_VERSION, generation: value.generation, groups },
-    extras,
+    file: { schemaVersion: RULES_SCHEMA_VERSION, generation, reserved, rules },
+    extras: legacy.extras,
   };
 }
 
@@ -363,27 +598,33 @@ function validateGroupsFile(
  * The fields of `groups.json` this build does not own, carried forward on every rewrite — the same
  * forward-compatibility `accounts.json` already has for its top-level keys and rows. A build of the
  * same schema version that adds an optional field must not lose it the moment an older build touches
- * a group (an ordinary switch rewrites the file). A change older builds must NOT carry forward blindly
+ * a rule (an ordinary switch rewrites the file). A change older builds must NOT carry forward blindly
  * bumps the schema version instead, which this build refuses to read at all.
  *
- * Kept beside the typed groups rather than on them, so nothing this build hands out (the CLI views,
- * the guard snapshot, the wire) ever carries a field it does not understand. A group this build
- * removes takes its unknown fields with it; member rows keep theirs on the row, as shared rows do.
+ * Kept beside the typed rules rather than on them, so nothing this build hands out (the CLI views,
+ * the guard snapshot, the wire) ever carries a field it does not understand. A rule this build
+ * removes takes its unknown fields with it; reserved rows keep theirs on the row, as shared rows do.
  */
-interface GroupsExtras {
+interface RulesExtras {
   top: Record<string, unknown>;
-  byGroup: Map<string, Record<string, unknown>>;
+  byRule: Map<string, Record<string, unknown>>;
 }
 
 /** The top-level keys of `groups.json` this build writes itself. */
-const GROUPS_FILE_KEYS: ReadonlySet<string> = new Set(['schemaVersion', 'generation', 'groups']);
-/** The keys of one group this build writes itself (see {@link StoredGroup}). */
-const GROUP_KEYS: ReadonlySet<string> = new Set([
+const RULES_FILE_KEYS: ReadonlySet<string> = new Set([
+  'schemaVersion',
+  'generation',
+  'reserved',
+  'rules',
+]);
+/** The keys of one rule this build writes itself (see {@link FolderRule}). */
+const RULE_KEYS: ReadonlySet<string> = new Set([
   'id',
   'label',
-  'members',
-  'activeId',
   'folders',
+  'include',
+  'exclude',
+  'activeId',
   'createdAtMs',
   'updatedAtMs',
 ]);
@@ -595,11 +836,11 @@ function applyBundleMetadata(
 
 /**
  * The whole registry as one in-memory picture: the shared side (`accounts.json`) and the reserved
- * side (`groups.json`), already healed of a crash-mid-move duplicate. Every vault mutator loads one
- * of these, mutates the relevant slice, and persists ONLY the file(s) it touched.
+ * side with its rules (`groups.json`), already healed of a crash-mid-move duplicate. Every vault
+ * mutator loads one of these, mutates the relevant slice, and persists ONLY the file(s) it touched.
  */
 interface RegistryState {
-  /** The shared account rows — `accounts.json` minus any row that is really a group member. */
+  /** The shared account rows — `accounts.json` minus any row that is really reserved. */
   shared: StoredAccount[];
   /** The GLOBAL slot's active account (a shared id), or null. Reserved ids are healed to null. */
   activeId: string | null;
@@ -607,37 +848,35 @@ interface RegistryState {
    *  older-but-newer-than-this build writes survives our rewrites (`schemaVersion`/`activeId`/
    *  `accounts` are excluded — those we own). */
   unknownKeys: Record<string, unknown>;
-  /** The reserved side. */
-  groups: StoredGroup[];
-  /** `groups.json`'s generation; the next groups write is `generation + 1`. */
+  /** The reserved rows: every account some rule includes. */
+  reserved: StoredAccount[];
+  /** The folder rules. */
+  rules: FolderRule[];
+  /** `groups.json`'s generation; the next rules write is `generation + 1`. */
   generation: number;
-  /** The fields of `groups.json` this build does not own, re-emitted on every groups write. */
-  groupsExtras: GroupsExtras;
-  /** True when a member id (or a reserved active id) still lingered in `accounts.json` and the next
-   *  shared write must drop it. See {@link Vault.heal}. */
+  /** The fields of `groups.json` this build does not own, re-emitted on every rules write. */
+  rulesExtras: RulesExtras;
+  /** True when a reserved id (or a reserved global active id) still lingered in `accounts.json` and
+   *  the next shared write must drop it. See {@link Vault.heal}. */
   needsSharedRewrite: boolean;
 }
 
-/** Every row in the one logical registry — shared rows plus every group's members — as a flat list,
- *  for the checks (label uniqueness, login uniqueness) that must see the whole namespace at once. */
+/** Every row in the one logical registry — shared rows plus the reserved rows — as a flat list, for
+ *  the checks (label uniqueness, login uniqueness) that must see the whole namespace at once. */
 function allRowsOf(st: RegistryState): StoredAccount[] {
-  const rows = st.shared.slice();
-  for (const g of st.groups) rows.push(...g.members);
-  return rows;
+  return [...st.shared, ...st.reserved];
 }
 
-/** Locate a row by id across both files. `group` is the group holding it, or undefined when the row
- *  is shared — which is exactly the signal a mutator needs to pick which file to persist. */
+/** Locate a row by id across both files. `reserved` says which file holds it — exactly the signal a
+ *  mutator needs to pick which file to persist. */
 function findRowIn(
   st: RegistryState,
   id: string,
-): { row: StoredAccount; group?: StoredGroup } | undefined {
+): { row: StoredAccount; reserved: boolean } | undefined {
   const shared = st.shared.find((a) => a.id === id);
-  if (shared) return { row: shared };
-  for (const g of st.groups) {
-    const m = g.members.find((a) => a.id === id);
-    if (m) return { row: m, group: g };
-  }
+  if (shared) return { row: shared, reserved: false };
+  const reserved = st.reserved.find((a) => a.id === id);
+  if (reserved) return { row: reserved, reserved: true };
   return undefined;
 }
 
@@ -646,6 +885,12 @@ function collectDedupe(report: DedupeReport, removed: Set<string>, result: Dedup
   report.merged.push(...result.merged);
   report.relabelled.push(...result.relabelled);
   for (const id of result.removedIds) removed.add(id);
+}
+
+/** A rule with nothing left to include or exclude has no reason to exist: its slot would be the
+ *  global pool under another name. Mutations dissolve such a rule instead of writing it. */
+function ruleIsEmpty(rule: Pick<FolderRule, 'include' | 'exclude'>): boolean {
+  return rule.include.length === 0 && rule.exclude.length === 0;
 }
 
 export class Vault {
@@ -670,7 +915,7 @@ export class Vault {
      *  discarding it, so read-only vault handles and tests stay one-liners; the engine passes
      *  its own. */
     private readonly log: Logger = noopLogger,
-    /** Selects the folder-key case rule for validating that no folder is bound by two groups.
+    /** Selects the folder-key case rule for validating that no folder has two rules.
      *  A parameter (not a `process.platform` read) so a test can drive either rule. */
     private readonly platform: NodeJS.Platform = process.platform,
   ) {}
@@ -681,12 +926,12 @@ export class Vault {
    * Load and validate BOTH registry files into one healed picture.
    *
    * Reads `accounts.json` (the shared side, same tolerant shape check as before) and `groups.json`
-   * (the reserved side, validated STRICTLY by {@link validateGroupsFile}); a malformed file is
-   * refused by name and left untouched. Then it HEALS a crash mid-move: the move primitives write
-   * one file before the other, so a crash between can leave a member's row in BOTH — the groups.json
-   * copy always wins (the account is reserved), and the shared copy is dropped here (and flushed by
-   * {@link heal} or the next shared write). A global `activeId` pointing at a now-reserved account is
-   * likewise healed to null.
+   * (the reserved side and the rules, validated STRICTLY by {@link parseRulesFile}, which also
+   * migrates a schema-1 file in memory); a malformed file is refused by name and left untouched.
+   * Then it HEALS a crash mid-move: the move primitives write one file before the other, so a crash
+   * between can leave a reserved row in BOTH — the groups.json copy always wins (the account is
+   * reserved), and the shared copy is dropped here (and flushed by {@link heal} or the next shared
+   * write). A global `activeId` pointing at a now-reserved account is likewise healed to null.
    */
   private async loadState(): Promise<RegistryState> {
     const raw = await readJsonIfExists<unknown>(this.registryPath());
@@ -710,14 +955,19 @@ export class Vault {
       unknownKeys[key] = reg[key];
     }
 
-    const rawGroups = await readJsonIfExists<unknown>(this.groupsPath());
-    const { file: groupsFile, extras: groupsExtras } =
-      rawGroups === undefined
+    const rawRules = await readJsonIfExists<unknown>(this.rulesPath());
+    const { file: rulesFile, extras: rulesExtras } =
+      rawRules === undefined
         ? {
-            file: { schemaVersion: GROUPS_SCHEMA_VERSION, generation: 0, groups: [] },
-            extras: { top: {}, byGroup: new Map() },
+            file: {
+              schemaVersion: RULES_SCHEMA_VERSION,
+              generation: 0,
+              reserved: [],
+              rules: [],
+            } satisfies RulesFile,
+            extras: { top: {}, byRule: new Map<string, Record<string, unknown>>() },
           }
-        : validateGroupsFile(rawGroups, this.platform);
+        : parseRulesFile(rawRules, this.platform);
 
     // Heal: no shared row may duplicate a reserved account (groups.json wins), and the global active
     // id must never be a reserved account. Uniqueness is enforced on BOTH keys a row is identified
@@ -725,21 +975,18 @@ export class Vault {
     // predates groups.json cannot see a reserved row, so `accounts add` of that same login writes a
     // fresh shared row under a NEW random id carrying the same accountUuid. Dropping on id would miss
     // it, leaving the reserved login back in the global pool: a global auto-switch candidate and a
-    // network-refresh target that would rotate the login's single-use token out from under the group
-    // slot. So a shared row whose login matches any reserved member is dropped here too.
-    const memberIds = new Set<string>();
+    // network-refresh target that would rotate the login's single-use token out from under the rule
+    // slot. So a shared row whose login matches any reserved row is dropped here too.
+    const reservedIds = new Set(rulesFile.reserved.map((r) => r.id));
     const reservedUuids = new Set<string>();
-    for (const g of groupsFile.groups) {
-      for (const m of g.members) {
-        memberIds.add(m.id);
-        if (m.accountUuid !== undefined) reservedUuids.add(m.accountUuid);
-      }
+    for (const r of rulesFile.reserved) {
+      if (r.accountUuid !== undefined) reservedUuids.add(r.accountUuid);
     }
     let needsSharedRewrite = false;
     const droppedIds = new Set<string>();
     const shared = sharedRows.filter((a) => {
       if (
-        memberIds.has(a.id) ||
+        reservedIds.has(a.id) ||
         (a.accountUuid !== undefined && reservedUuids.has(a.accountUuid))
       ) {
         needsSharedRewrite = true;
@@ -748,9 +995,9 @@ export class Vault {
       }
       return true;
     });
-    // A global active id pointing at a reserved member (by id) or at a dropped duplicate row (by id)
-    // is stale — the row it named is gone from the shared side, so the global slot has no valid seat.
-    if (activeId !== null && (memberIds.has(activeId) || droppedIds.has(activeId))) {
+    // A global active id pointing at a reserved row (by id) or at a dropped duplicate row (by id) is
+    // stale — the row it named is gone from the shared side, so the global slot has no valid seat.
+    if (activeId !== null && (reservedIds.has(activeId) || droppedIds.has(activeId))) {
       activeId = null;
       needsSharedRewrite = true;
     }
@@ -759,9 +1006,10 @@ export class Vault {
       shared,
       activeId,
       unknownKeys,
-      groups: groupsFile.groups,
-      generation: groupsFile.generation,
-      groupsExtras,
+      reserved: rulesFile.reserved,
+      rules: rulesFile.rules,
+      generation: rulesFile.generation,
+      rulesExtras,
       needsSharedRewrite,
     };
   }
@@ -787,33 +1035,35 @@ export class Vault {
     await atomicWriteFile(this.registryPath(), JSON.stringify(out, null, 2));
   }
 
-  /** Persist the reserved side, incrementing `generation` (the guard snapshot carries it, so a
-   *  bump is what lets a stale snapshot be detected). Mutates `st.generation` to the value written
-   *  so a caller that then writes the snapshot reports the right number. Fields this build does not
-   *  own are written back where they were read (see {@link GroupsExtras}); this build's own fields
-   *  are spread last, so an unknown field can never shadow one of them. */
-  private async saveGroups(st: RegistryState): Promise<void> {
+  /** Persist the reserved side and the rules, always as schema 2 (a migrated schema-1 file is
+   *  rewritten here), incrementing `generation` (the guard snapshot carries it, so a bump is what
+   *  lets a stale snapshot be detected). Mutates `st.generation` to the value written so a caller
+   *  that then writes the snapshot reports the right number. Fields this build does not own are
+   *  written back where they were read (see {@link RulesExtras}); this build's own fields are spread
+   *  last, so an unknown field can never shadow one of them. */
+  private async saveRules(st: RegistryState): Promise<void> {
     st.generation += 1;
-    const file: GroupsFile = {
-      schemaVersion: GROUPS_SCHEMA_VERSION,
+    const file: RulesFile = {
+      schemaVersion: RULES_SCHEMA_VERSION,
       generation: st.generation,
-      groups: st.groups,
+      reserved: st.reserved,
+      rules: st.rules,
     };
     const out = {
-      ...st.groupsExtras.top,
+      ...st.rulesExtras.top,
       ...file,
-      groups: st.groups.map((g) => ({ ...st.groupsExtras.byGroup.get(g.id), ...g })),
+      rules: st.rules.map((r) => ({ ...st.rulesExtras.byRule.get(r.id), ...r })),
     };
-    await atomicWriteFile(this.groupsPath(), JSON.stringify(out, null, 2));
+    await atomicWriteFile(this.rulesPath(), JSON.stringify(out, null, 2));
   }
 
   /**
    * Flush a pending crash-mid-move heal: rewrite `accounts.json` without a row that has since become
-   * a group member (and clear a global active id that points at one). Returns whether it wrote.
+   * reserved (and clear a global active id that points at one). Returns whether it wrote.
    *
    * The window it closes matters to the fence: while a reserved row lingers in `accounts.json`, an
    * OLDER cctl that only reads that file would see it, poll it, and rotate its token — corrupting the
-   * group slot. Callers run this under the engine lock on start so the window is closed proactively
+   * rule slot. Callers run this under the engine lock on start so the window is closed proactively
    * rather than only on the next shared write.
    */
   async heal(): Promise<boolean> {
@@ -828,21 +1078,22 @@ export class Vault {
   }
 
   /**
-   * The one logical registry as a unified list: shared rows first, then every group's members, each
-   * member tagged with its `groupId`. This is what the CLI's `accounts list`, `doctor`, and the
-   * name resolver read — {@link listAccounts} stays SHARED-only because that is the global pool.
+   * The one logical registry as a unified list: shared rows first, then the reserved rows, each
+   * reserved row tagged with the ids of the rules including it. This is what the CLI's `accounts
+   * list`, `doctor`, and the name resolver read — {@link listAccounts} stays SHARED-only because that
+   * is the global pool.
    */
   async listAllAccounts(): Promise<AccountView[]> {
     const st = await this.loadState();
     const views: AccountView[] = st.shared.map((a) => ({ ...a }));
-    for (const g of st.groups) {
-      for (const m of g.members) views.push({ ...m, groupId: g.id });
+    for (const r of st.reserved) {
+      views.push({ ...r, ruleIds: rulesIncluding(r.id, st.rules).map((rule) => rule.id) });
     }
     return views;
   }
 
   /** Find an account by id ACROSS the whole registry (shared or reserved). Returns the row itself
-   *  (no group tag); callers needing the tag use {@link listAllAccounts}. */
+   *  (no rule tag); callers needing the tag use {@link listAllAccounts}. */
   async getAccount(id: string): Promise<StoredAccount | undefined> {
     const st = await this.loadState();
     return findRowIn(st, id)?.row;
@@ -855,261 +1106,396 @@ export class Vault {
     return (await this.loadState()).activeId;
   }
 
-  // ---- groups (the reserved side) ----
+  // ---- folder rules (the reserved side) ----
 
-  /** Every group, reserved side of the one logical registry. */
-  async listGroups(): Promise<StoredGroup[]> {
-    return (await this.loadState()).groups;
+  /** One consistent read of everything a slot decision needs: both sides of the registry, the
+   *  rules, the global active id and the rules generation, from a single load. */
+  async readPicture(): Promise<RegistryPicture> {
+    const st = await this.loadState();
+    return {
+      shared: st.shared,
+      reserved: st.reserved,
+      rules: st.rules,
+      activeId: st.activeId,
+      generation: st.generation,
+    };
   }
 
-  /** One group by id, or undefined. */
-  async getGroup(id: string): Promise<StoredGroup | undefined> {
-    return (await this.loadState()).groups.find((g) => g.id === id);
+  /** Every folder rule, in file order. */
+  async listRules(): Promise<FolderRule[]> {
+    return (await this.loadState()).rules;
+  }
+
+  /** One folder rule by id, or undefined. */
+  async getRule(id: string): Promise<FolderRule | undefined> {
+    return (await this.loadState()).rules.find((r) => r.id === id);
   }
 
   /** The current `groups.json` generation — for the doctor's snapshot-freshness check. */
-  async getGroupsGeneration(): Promise<number> {
+  async getRulesGeneration(): Promise<number> {
     return (await this.loadState()).generation;
   }
 
   /**
-   * Create a new group by RESERVING shared accounts into it: their rows move out of `accounts.json`
-   * and into a fresh group in `groups.json`.
+   * Create a folder rule on `folders`, including and/or excluding accounts. An included account
+   * that is still shared is RESERVED: its row moves out of `accounts.json` into the reserved side;
+   * one another rule already reserved is only referenced (those folders share it).
    *
    * Crash-safe ORDER — groups.json is written FIRST, then accounts.json. A crash between leaves the
    * moved rows in both files, which {@link loadState} heals toward the groups.json copy, so the
-   * reservation is effectively committed the instant groups.json lands. Refuses an empty member set,
-   * a member that is unknown or already reserved elsewhere, a folder already bound to another group,
-   * and any cap breach.
+   * reservation is effectively committed the instant groups.json lands. Every refusal (see
+   * {@link checkCreateRule}) happens before anything is written.
    */
-  async createGroup(opts: {
-    memberIds: readonly string[];
-    folders?: readonly string[];
-    label?: string;
-  }): Promise<StoredGroup> {
+  async createRule(opts: NewRuleOptions): Promise<FolderRule> {
     const st = await this.loadState();
-    const { folders, moved } = this.validateNewGroup(st, opts);
+    const plan = this.planNewRule(st, opts);
     const now = this.clock();
-    // Stored terminal-safe, exactly as an account label is (see addAccount): the group label is
+    // Stored terminal-safe, exactly as an account label is (see addAccount): the rule label is
     // rendered on the CLI, in the doctor, in the guard's decision text and in phone alerts, and an
     // operator types it freely. A label with nothing printable left falls back to the default.
     const label =
       sanitizeTerminalText(opts.label ?? '').trim() ||
-      sanitizeTerminalText(moved.map((m) => m.label).join(', '));
-    const group: StoredGroup = {
+      sanitizeTerminalText(plan.folders[0] ?? '').trim() ||
+      'folder rule';
+    const rule: FolderRule = {
       id: randomUUID(),
       label,
-      members: moved,
+      folders: plan.folders,
+      include: plan.include,
+      exclude: plan.exclude,
       activeId: null,
-      folders,
       createdAtMs: now,
       updatedAtMs: now,
     };
-    st.groups.push(group);
-    await this.saveGroups(st); // groups.json FIRST
-    this.removeSharedRows(st, opts.memberIds);
-    await this.saveShared(st); // accounts.json SECOND
-    return group;
+    st.rules.push(rule);
+    st.reserved.push(...plan.moved);
+    await this.saveRules(st); // groups.json FIRST
+    if (plan.moved.length > 0) {
+      this.removeSharedRows(st, plan.moved);
+      await this.saveShared(st); // accounts.json SECOND
+    }
+    return rule;
   }
 
   /**
-   * Run every refusal {@link createGroup} would make — group count, member count, folder conflicts,
-   * members that are unknown or already reserved — WITHOUT writing anything. For a caller whose
-   * group creation is preceded by its own side effects (a bind moves the global slot off a
-   * to-be-member first): checking here first means a request that was always going to be refused
-   * is refused before anything moved, not after.
+   * Run every refusal {@link createRule} would make — rule count, account caps, folder conflicts,
+   * accounts that are unknown, an exclusion of a reserved account, an account both included and
+   * excluded — WITHOUT writing anything. For a caller whose rule creation is preceded by its own side
+   * effects (an include moves the global slot off an account first): a request that was always going
+   * to be refused is refused before anything moved, not after.
    */
-  async checkCreateGroup(opts: {
-    memberIds: readonly string[];
-    folders?: readonly string[];
-  }): Promise<void> {
-    this.validateNewGroup(await this.loadState(), opts);
+  async checkCreateRule(opts: NewRuleOptions): Promise<void> {
+    this.planNewRule(await this.loadState(), opts);
   }
 
-  /** The shared validation behind {@link createGroup} and {@link checkCreateGroup}: throws the named
-   *  refusal, else returns the checked folders and the shared rows that would move. Pure over `st`. */
-  private validateNewGroup(
+  /** The shared validation behind {@link createRule} and {@link checkCreateRule}: throws the named
+   *  refusal, else returns what would be written. Pure over `st`. */
+  private planNewRule(
     st: RegistryState,
-    opts: { memberIds: readonly string[]; folders?: readonly string[] },
-  ): { folders: string[]; moved: StoredAccount[] } {
-    if (st.groups.length >= MAX_GROUPS) {
-      throw new VaultError(`cannot create another group (max ${MAX_GROUPS})`);
+    opts: NewRuleOptions,
+  ): { folders: string[]; include: string[]; exclude: string[]; moved: StoredAccount[] } {
+    if (st.rules.length >= MAX_RULES) {
+      throw new VaultError(`cannot create another folder rule (max ${MAX_RULES})`);
     }
-    if (opts.memberIds.length === 0) throw new VaultError('a group needs at least one member');
-    if (opts.memberIds.length > MAX_GROUP_MEMBERS) {
-      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
+    const include = [...new Set(opts.include ?? [])];
+    const exclude = [...new Set(opts.exclude ?? [])];
+    if (include.length === 0 && exclude.length === 0) {
+      throw new VaultError('a folder rule needs at least one account to include or exclude');
     }
-    const folders = this.checkNewFolders(st, opts.folders ?? [], null);
-    const moved = this.takeSharedRows(st, opts.memberIds);
-    return { folders, moved };
+    const folders = this.checkNewFolders(st, opts.folders, null);
+    const draft: Pick<FolderRule, 'include' | 'exclude'> = { include: [], exclude: [] };
+    const inc = this.planInclude(st, draft, include);
+    this.checkExcludable(st, { ...draft, include }, exclude);
+    return { folders, include, exclude, moved: inc.moved };
   }
 
   /**
-   * Reserve already-shared accounts INTO an existing group (grow its member set). Same crash-safe
-   * order as {@link createGroup}: groups.json first, then accounts.json.
+   * Include accounts in an existing rule. A shared account is reserved (its row moves, groups.json
+   * FIRST, then accounts.json — the order {@link createRule} uses); an account another rule already
+   * reserved is only referenced; one this rule already includes is a no-op. An account the rule
+   * excluded is moved from its exclude list to its include list (the newer instruction wins), and
+   * reported as `unexcluded`. Writes nothing when nothing changes.
    */
-  async reserveAccounts(groupId: string, memberIds: readonly string[]): Promise<StoredGroup> {
+  async includeAccounts(
+    ruleId: string,
+    accountIds: readonly string[],
+  ): Promise<{ rule: FolderRule; reserved: string[]; unexcluded: string[] }> {
     const st = await this.loadState();
-    const group = this.mustGroup(st, groupId);
-    if (memberIds.length === 0) throw new VaultError('no accounts to reserve');
-    if (group.members.length + memberIds.length > MAX_GROUP_MEMBERS) {
-      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_MEMBERS} members`);
+    const rule = this.mustRule(st, ruleId);
+    const plan = this.planInclude(st, rule, accountIds);
+    if (plan.added.length === 0) return { rule, reserved: [], unexcluded: [] };
+    const unexcluded = rule.exclude.filter((id) => plan.added.includes(id));
+    rule.exclude = rule.exclude.filter((id) => !plan.added.includes(id));
+    rule.include.push(...plan.added);
+    rule.updatedAtMs = this.clock();
+    st.reserved.push(...plan.moved);
+    await this.saveRules(st); // groups.json FIRST
+    if (plan.moved.length > 0) {
+      this.removeSharedRows(st, plan.moved);
+      await this.saveShared(st); // accounts.json SECOND
     }
-    const moved = this.takeSharedRows(st, memberIds);
-    group.members.push(...moved);
-    group.updatedAtMs = this.clock();
-    await this.saveGroups(st); // groups.json FIRST
-    this.removeSharedRows(st, memberIds);
-    await this.saveShared(st); // accounts.json SECOND
-    return group;
+    return { rule, reserved: plan.moved.map((m) => m.id), unexcluded };
+  }
+
+  /** Run every refusal {@link includeAccounts} would make, writing nothing. */
+  async checkInclude(ruleId: string, accountIds: readonly string[]): Promise<void> {
+    const st = await this.loadState();
+    this.planInclude(st, this.mustRule(st, ruleId), accountIds);
+  }
+
+  /** What including `accountIds` in `rule` would add (`added`, in request order, without the ones
+   *  already included) and which shared rows it would move to the reserved side (`moved`). Refuses an
+   *  unknown id and a breach of the include or reserved caps. Pure over `st`. */
+  private planInclude(
+    st: RegistryState,
+    rule: Pick<FolderRule, 'include' | 'exclude'>,
+    accountIds: readonly string[],
+  ): { added: string[]; moved: StoredAccount[] } {
+    const added: string[] = [];
+    const moved: StoredAccount[] = [];
+    for (const id of accountIds) {
+      if (rule.include.includes(id) || added.includes(id)) continue;
+      const shared = st.shared.find((a) => a.id === id);
+      if (shared) moved.push(shared);
+      else if (!st.reserved.some((a) => a.id === id)) throw new UnknownAccountError(id);
+      added.push(id);
+    }
+    if (rule.include.length + added.length > MAX_RULE_ACCOUNTS) {
+      throw new VaultError(`a folder rule cannot include more than ${MAX_RULE_ACCOUNTS} accounts`);
+    }
+    if (st.reserved.length + moved.length > MAX_RESERVED_ACCOUNTS) {
+      throw new VaultError(`cannot reserve more than ${MAX_RESERVED_ACCOUNTS} accounts`);
+    }
+    return { added, moved };
   }
 
   /**
-   * Release members of a group back to the shared pool (the reverse move). ORDER is reversed too:
-   * accounts.json is written FIRST, then groups.json. A crash between leaves the rows in both files,
-   * which {@link loadState} heals toward the groups.json copy — so an interrupted release safely
-   * REVERTS to reserved rather than half-completing. Dissolves the group when its last member leaves.
+   * Exclude shared accounts from an existing rule's pool. Only a SHARED account can be excluded: a
+   * reserved one is already out of every pool but its own rules', so excluding it here is either a
+   * no-op (another rule reserves it) or a contradiction (this rule includes it) — both refused by
+   * name. Writes groups.json only (no row moves); nothing when every account is already excluded.
    */
-  async releaseAccounts(groupId: string, memberIds: readonly string[]): Promise<void> {
+  async excludeAccounts(
+    ruleId: string,
+    accountIds: readonly string[],
+  ): Promise<{ rule: FolderRule; added: string[] }> {
     const st = await this.loadState();
-    const group = this.mustGroup(st, groupId);
-    if (memberIds.length === 0) return;
-    const ids = new Set(memberIds);
-    const released: StoredAccount[] = [];
-    for (const id of ids) {
-      const member = group.members.find((m) => m.id === id);
-      if (!member) throw new VaultError(`account ${id} is not a member of group ${groupId}`);
-      released.push(member);
-    }
-    st.shared.push(...released);
-    await this.saveShared(st); // accounts.json FIRST
-    group.members = group.members.filter((m) => !ids.has(m.id));
-    if (group.activeId !== null && ids.has(group.activeId)) group.activeId = null;
-    if (group.members.length === 0) st.groups = st.groups.filter((g) => g !== group);
-    else group.updatedAtMs = this.clock();
-    await this.saveGroups(st); // groups.json SECOND
+    const rule = this.mustRule(st, ruleId);
+    const added = this.checkExcludable(st, rule, accountIds);
+    if (added.length === 0) return { rule, added };
+    rule.exclude.push(...added);
+    rule.updatedAtMs = this.clock();
+    await this.saveRules(st);
+    return { rule, added };
   }
 
-  /** Bind another (already-canonical) folder to a group. Refuses a folder any group already holds
-   *  by its exact key; a nested subfolder is a different key and is allowed (longest-match wins at
-   *  resolution). */
-  async addFolderToGroup(groupId: string, canonicalFolder: string): Promise<StoredGroup> {
+  /** Run every refusal {@link excludeAccounts} would make, writing nothing. */
+  async checkExclude(ruleId: string, accountIds: readonly string[]): Promise<void> {
     const st = await this.loadState();
-    const group = this.mustGroup(st, groupId);
-    const folders = this.checkNewFolders(st, [canonicalFolder], groupId);
-    if (group.folders.length >= MAX_GROUP_FOLDERS) {
-      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_FOLDERS} folders`);
+    this.checkExcludable(st, this.mustRule(st, ruleId), accountIds);
+  }
+
+  /** Validate an exclusion against `rule`, returning the ids it would newly add (request order,
+   *  without ones already excluded). Refuses an unknown id, a reserved account (naming whether this
+   *  rule or another reserves it), and a breach of the exclude cap. Pure over `st`. */
+  private checkExcludable(
+    st: RegistryState,
+    rule: Pick<FolderRule, 'include' | 'exclude'>,
+    accountIds: readonly string[],
+  ): string[] {
+    const added: string[] = [];
+    for (const id of accountIds) {
+      if (rule.exclude.includes(id) || added.includes(id)) continue;
+      if (rule.include.includes(id)) {
+        const label = findRowIn(st, id)?.row.label ?? id;
+        throw new VaultError(
+          `account "${label}" is included by this folder rule, so it cannot also be excluded; ` +
+            'reset it there first',
+        );
+      }
+      if (!st.shared.some((a) => a.id === id)) {
+        const reserved = st.reserved.find((a) => a.id === id);
+        if (reserved === undefined) throw new UnknownAccountError(id);
+        throw new VaultError(
+          `account "${reserved.label}" is reserved to ${describeRuleFolders(rulesIncluding(id, st.rules))}; ` +
+            'only a shared account can be excluded',
+        );
+      }
+      added.push(id);
     }
-    group.folders.push(...folders);
-    group.updatedAtMs = this.clock();
-    await this.saveGroups(st);
-    return group;
-  }
-
-  /** Remove a folder binding from a group (compared by key). A no-op group with zero folders is
-   *  left in place — moving its members back is {@link releaseAccounts}, a separate decision. */
-  async removeFolderFromGroup(groupId: string, folder: string): Promise<StoredGroup> {
-    const st = await this.loadState();
-    const group = this.mustGroup(st, groupId);
-    // Key on folderUniquenessKey (canonicalize-then-fold), the same key bind and the load validator
-    // use, so a canonical query still removes a folder stored under a non-canonical spelling.
-    const key = folderUniquenessKey(folder, this.platform);
-    const before = group.folders.length;
-    group.folders = group.folders.filter((f) => folderUniquenessKey(f, this.platform) !== key);
-    if (group.folders.length === before) {
-      throw new VaultError(`folder ${folder} is not bound to group ${groupId}`);
+    if (rule.exclude.length + added.length > MAX_RULE_ACCOUNTS) {
+      throw new VaultError(`a folder rule cannot exclude more than ${MAX_RULE_ACCOUNTS} accounts`);
     }
-    group.updatedAtMs = this.clock();
-    await this.saveGroups(st);
-    return group;
+    return added;
   }
 
-  /** Set (or clear) which member is live in a group's slot. A non-null id must be a member. */
-  async setGroupActive(groupId: string, memberId: string | null): Promise<StoredGroup> {
-    const st = await this.loadState();
-    const group = this.mustGroup(st, groupId);
-    if (memberId !== null && !group.members.some((m) => m.id === memberId)) {
-      throw new UnknownAccountError(memberId);
-    }
-    group.activeId = memberId;
-    group.updatedAtMs = this.clock();
-    await this.saveGroups(st);
-    return group;
-  }
-
-  /** Resolve a group by id or throw a named error. */
-  private mustGroup(st: RegistryState, groupId: string): StoredGroup {
-    const group = st.groups.find((g) => g.id === groupId);
-    if (!group) throw new VaultError(`no group with id "${groupId}"`);
-    return group;
-  }
-
-  /** Validate a set of NEW folders against the current bindings: each must be a non-empty string,
-   *  unique within the set, not already held by a DIFFERENT group, and not already held by the group
-   *  being grown (`ignoreGroupId`). Returns them unchanged.
+  /**
+   * Remove accounts from a rule's include and/or exclude lists. An account no rule includes any
+   * more is RELEASED back to the shared pool. ORDER is the reverse of a reservation: accounts.json is
+   * written FIRST, then groups.json. A crash between leaves the rows in both files, which
+   * {@link loadState} heals toward the groups.json copy — so an interrupted release safely REVERTS to
+   * reserved rather than half-completing, and a rerun completes it.
    *
-   *  Keys on {@link folderUniquenessKey} — the SAME key {@link validateGroupsFile} enforces at load.
+   * Refuses an id the rule neither includes nor excludes, and a removal that would leave the rule
+   * empty: that is {@link removeRule}, whose caller tears the slot down first.
+   */
+  async removeFromRule(
+    ruleId: string,
+    accountIds: readonly string[],
+  ): Promise<{ rule: FolderRule; released: string[] }> {
+    const st = await this.loadState();
+    const rule = this.mustRule(st, ruleId);
+    const ids = new Set(accountIds);
+    for (const id of ids) {
+      if (!rule.include.includes(id) && !rule.exclude.includes(id)) {
+        const label = findRowIn(st, id)?.row.label ?? id;
+        throw new VaultError(
+          `account "${label}" is neither included nor excluded by the rule on ${describeRuleFolders([rule])}`,
+        );
+      }
+    }
+    const include = rule.include.filter((id) => !ids.has(id));
+    const exclude = rule.exclude.filter((id) => !ids.has(id));
+    if (ruleIsEmpty({ include, exclude })) {
+      throw new VaultError('that would leave the folder rule empty; remove the rule instead');
+    }
+    const released = this.releasable(st, rule, [...ids]);
+    if (released.length > 0) {
+      st.shared.push(...released);
+      await this.saveShared(st); // accounts.json FIRST
+    }
+    rule.include = include;
+    rule.exclude = exclude;
+    rule.updatedAtMs = this.clock();
+    this.dropReservedRows(st, released);
+    await this.saveRules(st); // groups.json SECOND
+    return { rule, released: released.map((r) => r.id) };
+  }
+
+  /**
+   * Remove a whole rule, releasing every account only it included — the same accounts.json-FIRST
+   * order as {@link removeFromRule}, so an interrupted removal reverts to the rule still standing.
+   * The caller tears the rule's slot down BEFORE this (adopt its rotation, clear its seat), so no
+   * login is left live in a profile no rule owns.
+   */
+  async removeRule(ruleId: string): Promise<{ released: string[] }> {
+    const st = await this.loadState();
+    const rule = this.mustRule(st, ruleId);
+    const released = this.releasable(st, rule, rule.include);
+    if (released.length > 0) {
+      st.shared.push(...released);
+      await this.saveShared(st); // accounts.json FIRST
+    }
+    st.rules = st.rules.filter((r) => r !== rule);
+    this.dropReservedRows(st, released);
+    await this.saveRules(st); // groups.json SECOND
+    return { released: released.map((r) => r.id) };
+  }
+
+  /** The reserved rows among `ids` that `rule` includes and NO OTHER rule does: what removing them
+   *  from `rule` returns to the shared pool. */
+  private releasable(st: RegistryState, rule: FolderRule, ids: readonly string[]): StoredAccount[] {
+    return st.reserved.filter(
+      (row) =>
+        ids.includes(row.id) &&
+        rule.include.includes(row.id) &&
+        !st.rules.some((other) => other !== rule && other.include.includes(row.id)),
+    );
+  }
+
+  /** Remove another (already-canonical) folder from a rule, compared by key. A rule left with no
+   *  folders stays in place — removing it is {@link removeRule}, a separate decision. */
+  async removeFolderFromRule(ruleId: string, folder: string): Promise<FolderRule> {
+    const st = await this.loadState();
+    const rule = this.mustRule(st, ruleId);
+    // Key on folderUniquenessKey (canonicalize-then-fold), the same key the write guards and the
+    // load validator use, so a canonical query still removes a folder stored under another spelling.
+    const key = folderUniquenessKey(folder, this.platform);
+    const before = rule.folders.length;
+    rule.folders = rule.folders.filter((f) => folderUniquenessKey(f, this.platform) !== key);
+    if (rule.folders.length === before) {
+      throw new VaultError(`folder ${folder} is not in folder rule ${ruleId}`);
+    }
+    rule.updatedAtMs = this.clock();
+    await this.saveRules(st);
+    return rule;
+  }
+
+  /** Set (or clear) which account is live in a rule's slot. A non-null id must be an account the
+   *  rule's slot may hold: one it includes, or a shared account it does not exclude. */
+  async setRuleActive(ruleId: string, accountId: string | null): Promise<FolderRule> {
+    const st = await this.loadState();
+    const rule = this.mustRule(st, ruleId);
+    if (accountId !== null) {
+      const row = findRowIn(st, accountId);
+      if (!row) throw new UnknownAccountError(accountId);
+      if (!slotMayHold(ruleSlotId(rule.id), accountId, st)) {
+        throw new VaultError(
+          `account "${row.row.label}" is not in the pool of the rule on ${describeRuleFolders([rule])}`,
+        );
+      }
+    }
+    rule.activeId = accountId;
+    rule.updatedAtMs = this.clock();
+    await this.saveRules(st);
+    return rule;
+  }
+
+  /** Resolve a rule by id or throw a named error. */
+  private mustRule(st: RegistryState, ruleId: string): FolderRule {
+    const rule = st.rules.find((r) => r.id === ruleId);
+    if (!rule) throw new VaultError(`no folder rule with id "${ruleId}"`);
+    return rule;
+  }
+
+  /** Validate a set of NEW folders against the current rules: each must be a non-empty string,
+   *  unique within the set, not already held by a DIFFERENT rule, and not already held by the rule
+   *  being grown (`ignoreRuleId`). Returns them unchanged.
+   *
+   *  Keys on {@link folderUniquenessKey} — the SAME key {@link validateRulesFile} enforces at load.
    *  folderKey alone (case-fold only) would let two non-canonical spellings of one directory (a
-   *  `C:/x` vs `C:\x` separator difference) both pass here yet collapse to one key at load, and would
-   *  let the target group re-add its OWN folder; either way the write persists a `groups.json` the
-   *  next load rejects, bricking every command until the file is hand-repaired. `ignoreGroupId` is
-   *  still honoured — a group's own folders are checked as a self-collision, not a cross-group one, so
-   *  the error names the right cause — but re-adding is refused rather than silently duplicated. */
+   *  `C:/x` vs `C:\x` separator difference) both pass here yet collapse to one key at load; either way
+   *  the write persists a `groups.json` the next load rejects, bricking every command until the file
+   *  is hand-repaired. */
   private checkNewFolders(
     st: RegistryState,
     folders: readonly string[],
-    ignoreGroupId: string | null,
+    ignoreRuleId: string | null,
   ): string[] {
-    const otherGroups = new Set<string>();
-    const ownGroup = new Set<string>();
-    for (const g of st.groups) {
-      const bucket = g.id === ignoreGroupId ? ownGroup : otherGroups;
-      for (const f of g.folders) bucket.add(folderUniquenessKey(f, this.platform));
+    const otherRules = new Set<string>();
+    const ownRule = new Set<string>();
+    for (const r of st.rules) {
+      const bucket = r.id === ignoreRuleId ? ownRule : otherRules;
+      for (const f of r.folders) bucket.add(folderUniquenessKey(f, this.platform));
     }
     const seen = new Set<string>();
     const out: string[] = [];
     for (const folder of folders) {
       if (typeof folder !== 'string' || folder === '') throw new VaultError('a folder is empty');
       const key = folderUniquenessKey(folder, this.platform);
-      if (otherGroups.has(key))
-        throw new VaultError(`folder ${folder} is already bound to another group`);
-      if (ownGroup.has(key))
-        throw new VaultError(`folder ${folder} is already bound to this group`);
+      if (otherRules.has(key)) throw new VaultError(`folder ${folder} already has a folder rule`);
+      if (ownRule.has(key)) throw new VaultError(`folder ${folder} is already in this folder rule`);
       if (seen.has(key)) throw new VaultError(`folder ${folder} is listed twice`);
       seen.add(key);
       out.push(folder);
     }
-    if (out.length > MAX_GROUP_FOLDERS) {
-      throw new VaultError(`a group cannot hold more than ${MAX_GROUP_FOLDERS} folders`);
+    if (out.length > MAX_RULE_FOLDERS) {
+      throw new VaultError(`a folder rule cannot hold more than ${MAX_RULE_FOLDERS} folders`);
     }
     return out;
   }
 
-  /** Look up shared rows to move into a group: every id must currently be a SHARED account (an
-   *  unknown id, or one already reserved elsewhere, is refused by name). Returns the rows; the
-   *  caller writes groups.json before {@link removeSharedRows} drops them from the shared side. */
-  private takeSharedRows(st: RegistryState, memberIds: readonly string[]): StoredAccount[] {
-    const rows: StoredAccount[] = [];
-    for (const id of memberIds) {
-      const shared = st.shared.find((a) => a.id === id);
-      if (shared) {
-        rows.push(shared);
-        continue;
-      }
-      const owner = st.groups.find((g) => g.members.some((m) => m.id === id));
-      if (owner) {
-        throw new VaultError(`account ${id} is already reserved to group ${owner.id}`);
-      }
-      throw new UnknownAccountError(id);
-    }
-    return rows;
-  }
-
   /** Drop moved rows from the shared side and clear a global active id that pointed at one. */
-  private removeSharedRows(st: RegistryState, memberIds: readonly string[]): void {
-    const ids = new Set(memberIds);
+  private removeSharedRows(st: RegistryState, rows: readonly StoredAccount[]): void {
+    const ids = new Set(rows.map((r) => r.id));
     st.shared = st.shared.filter((a) => !ids.has(a.id));
     if (st.activeId !== null && ids.has(st.activeId)) st.activeId = null;
+  }
+
+  /** Drop released rows from the reserved side (after the shared side gained them). */
+  private dropReservedRows(st: RegistryState, rows: readonly StoredAccount[]): void {
+    const ids = new Set(rows.map((r) => r.id));
+    st.reserved = st.reserved.filter((a) => !ids.has(a.id));
   }
 
   // ---- account lifecycle ----
@@ -1120,9 +1506,9 @@ export class Vault {
    * to decrypt.
    *
    * The label/login collision checks run against the WHOLE registry (shared + reserved): a login
-   * already reserved to a group, or a label a group member carries, is refused here too, or the
-   * name resolver could not tell the two apart. A newly added account is always shared — reserving
-   * it into a group is a separate {@link reserveAccounts} step.
+   * already reserved, or a label a reserved account carries, is refused here too, or the name
+   * resolver could not tell the two apart. A newly added account is always shared — including it in
+   * a folder rule is a separate step.
    */
   async addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
     const st = await this.loadState();
@@ -1167,39 +1553,47 @@ export class Vault {
   }
 
   /**
-   * Remove an account wherever it lives. A shared row is dropped from `accounts.json` (clearing the
-   * global active id if it pointed at it); a member is dropped from its group (clearing that group's
-   * active id, and DISSOLVING the group when its last member leaves — a memberless group is invalid).
-   * The encrypted bundle is removed either way.
+   * Remove an account wherever it lives, and every reference to it: a shared row is dropped from
+   * `accounts.json` (clearing the global active id if it pointed at it), a reserved row from the
+   * reserved side; either way it leaves every rule's include and exclude list, a rule's active id that
+   * named it is cleared, and a rule left with nothing to include or exclude is DISSOLVED (the caller
+   * clears that rule's slot first). The encrypted bundle is removed either way.
+   *
+   * A shared removal writes accounts.json first: dying before groups.json follows leaves an exclude
+   * or an active id naming an account that no longer exists, which is inert by design (see
+   * {@link validateRulesFile}).
    */
   async removeAccount(id: string): Promise<void> {
     const st = await this.loadState();
-    let wrote = false;
+    let sharedChanged = false;
     if (st.shared.some((a) => a.id === id)) {
       st.shared = st.shared.filter((a) => a.id !== id);
       if (st.activeId === id) st.activeId = null;
-      await this.saveShared(st);
-      wrote = true;
-    } else {
-      const group = st.groups.find((g) => g.members.some((m) => m.id === id));
-      if (group) {
-        group.members = group.members.filter((m) => m.id !== id);
-        if (group.activeId === id) group.activeId = null;
-        if (group.members.length === 0) st.groups = st.groups.filter((g) => g !== group);
-        else group.updatedAtMs = this.clock();
-        await this.saveGroups(st);
-        wrote = true;
-      }
+      sharedChanged = true;
     }
-    // The id was neither shared nor reserved, but a crash-mid-move heal may still be pending; flush
+    const wasReserved = st.reserved.some((a) => a.id === id);
+    st.reserved = st.reserved.filter((a) => a.id !== id);
+    let rulesChanged = wasReserved;
+    for (const rule of st.rules) {
+      if (!rule.include.includes(id) && !rule.exclude.includes(id) && rule.activeId !== id)
+        continue;
+      rule.include = rule.include.filter((x) => x !== id);
+      rule.exclude = rule.exclude.filter((x) => x !== id);
+      if (rule.activeId === id) rule.activeId = null;
+      rule.updatedAtMs = this.clock();
+      rulesChanged = true;
+    }
+    st.rules = st.rules.filter((r) => !ruleIsEmpty(r));
+    // The id was neither shared nor referenced, but a crash-mid-move heal may still be pending; flush
     // it so a removal request never leaves a half-moved row behind.
-    if (!wrote && st.needsSharedRewrite) await this.saveShared(st);
+    if (sharedChanged || st.needsSharedRewrite) await this.saveShared(st);
+    if (rulesChanged) await this.saveRules(st);
     await removeIfExists(this.bundlePath(id));
   }
 
   /** Mark the GLOBAL slot's active account (after a committed global switch). The id must be a
-   *  SHARED account — a reserved account is made live in its own group's slot via
-   *  {@link setGroupActive}, never here. */
+   *  SHARED account — a reserved account is made live in a rule's slot via {@link setRuleActive},
+   *  never here. */
   async setActive(id: string): Promise<void> {
     const st = await this.loadState();
     if (!st.shared.some((a) => a.id === id)) throw new UnknownAccountError(id);
@@ -1261,15 +1655,16 @@ export class Vault {
 
   /**
    * Resolve duplicates that predate the refusals in {@link addAccount}: the same login stored
-   * twice is merged onto one row (the active one, else the most recently captured: a capture
+   * twice is merged onto one row (the live one, else the most recently captured: a capture
    * always writes fresh tokens, whereas the registry's updated clock also moves on metadata
    * touches and says nothing about which tokens are newer), and two logins under one label keep the
    * earlier row's label while the later ones get a numbered suffix. Both leave every account
    * reachable by exactly one name.
    *
-   * Run separately over the shared rows and over EACH group's members — every set that answers to
-   * the one logical registry must be internally consistent, and a member's survivor is chosen by
-   * its own group's active id, not the global one. Only the files that actually changed are
+   * Run separately over the shared rows and over the reserved rows — every set that answers to the
+   * one logical registry must be internally consistent, and a reserved survivor is chosen by the
+   * rules' live accounts, not the global one. A merged row's references in the rules (include,
+   * exclude, active id) are re-pointed at the survivor. Only the files that actually changed are
    * rewritten (a clean vault is left byte-identical); a merged row's bundle is removed with it.
    */
   async dedupeAccounts(): Promise<DedupeReport> {
@@ -1277,22 +1672,46 @@ export class Vault {
     const report: DedupeReport = { merged: [], relabelled: [] };
     const removed = new Set<string>();
 
-    const sharedResult = dedupeRows(st.shared, st.activeId, this.clock);
+    const sharedResult = dedupeRows(
+      st.shared,
+      new Set(st.activeId !== null ? [st.activeId] : []),
+      this.clock,
+    );
     st.shared = sharedResult.rows;
     collectDedupe(report, removed, sharedResult.result);
-    let groupsChanged = false;
-    for (const group of st.groups) {
-      const res = dedupeRows(group.members, group.activeId, this.clock);
-      group.members = res.rows;
-      if (res.result.changed) {
-        group.updatedAtMs = this.clock();
-        groupsChanged = true;
+    const ruleLive = new Set(
+      st.rules.map((r) => r.activeId).filter((x): x is string => x !== null),
+    );
+    const reservedResult = dedupeRows(st.reserved, ruleLive, this.clock);
+    st.reserved = reservedResult.rows;
+    collectDedupe(report, removed, reservedResult.result);
+
+    // Re-point every rule reference at the surviving row, keeping each list free of repeats and an
+    // account out of an exclude list once it is (through the survivor) included.
+    const survivor = new Map(report.merged.map((m) => [m.removedId, m.keptId]));
+    let rulesChanged = reservedResult.result.changed;
+    if (survivor.size > 0) {
+      const remap = (ids: readonly string[]): string[] => [
+        ...new Set(ids.map((id) => survivor.get(id) ?? id)),
+      ];
+      for (const rule of st.rules) {
+        const include = remap(rule.include);
+        const exclude = remap(rule.exclude).filter((id) => !include.includes(id));
+        const activeId =
+          rule.activeId === null ? null : (survivor.get(rule.activeId) ?? rule.activeId);
+        if (
+          !isDeepStrictEqual(include, rule.include) ||
+          !isDeepStrictEqual(exclude, rule.exclude) ||
+          activeId !== rule.activeId
+        ) {
+          Object.assign(rule, { include, exclude, activeId, updatedAtMs: this.clock() });
+          rulesChanged = true;
+        }
       }
-      collectDedupe(report, removed, res.result);
     }
 
     if (sharedResult.result.changed) await this.saveShared(st);
-    if (groupsChanged) await this.saveGroups(st);
+    if (rulesChanged) await this.saveRules(st);
     if (removed.size > 0) for (const id of removed) await removeIfExists(this.bundlePath(id));
     return report;
   }
@@ -1310,12 +1729,8 @@ export class Vault {
     if (!found) throw new UnknownAccountError(id);
     mutate(found.row, st);
     found.row.updatedAtMs = this.clock();
-    if (found.group) {
-      found.group.updatedAtMs = this.clock();
-      await this.saveGroups(st);
-    } else {
-      await this.saveShared(st);
-    }
+    if (found.reserved) await this.saveRules(st);
+    else await this.saveShared(st);
     return found.row;
   }
 
@@ -1477,12 +1892,8 @@ export class Vault {
     if (!found) return false;
     if (!applyBundleMetadata(found.row, bundle, this.log)) return false;
     found.row.updatedAtMs = this.clock();
-    if (found.group) {
-      found.group.updatedAtMs = this.clock();
-      await this.saveGroups(st);
-    } else {
-      await this.saveShared(st);
-    }
+    if (found.reserved) await this.saveRules(st);
+    else await this.saveShared(st);
     return true;
   }
 
@@ -1503,9 +1914,9 @@ export class Vault {
     const found = findRowIn(st, id);
     if (!found) return;
     // Deliberately does NOT bump updatedAtMs (see doc above) — but the row still moves to the file
-    // that holds it. A group member's failed-backfill mark belongs in groups.json, not accounts.json.
+    // that holds it. A reserved row's failed-backfill mark belongs in groups.json, not accounts.json.
     found.row.metadataBackfillFailedAtMs = this.clock();
-    if (found.group) await this.saveGroups(st);
+    if (found.reserved) await this.saveRules(st);
     else await this.saveShared(st);
   }
 
@@ -1544,11 +1955,10 @@ export class Vault {
   // ---- folder-bindings snapshot (non-secret, for the enforcement guard) ----
 
   /**
-   * Rebuild and atomically write `folder-bindings.json` from the current reserved side of the
-   * registry, and return what was written. Callers run this LAST in every group mutation and on
-   * daemon start, so the guard always reads a snapshot no older than the last committed change.
-   * `enforce` and `mainConfigDir` come from the caller's policy/config; the profile-dir mapping is
-   * the vault's own path convention.
+   * Rebuild and atomically write `folder-bindings.json` from the current rules, and return what was
+   * written. Callers run this LAST in every rule mutation and on daemon start, so the guard always
+   * reads a snapshot no older than the last committed change. `enforce` and `mainConfigDir` come
+   * from the caller's policy/config; the profile-dir mapping is the vault's own path convention.
    */
   async writeFolderBindings(opts: {
     enforce: BindEnforceMode;
@@ -1556,11 +1966,12 @@ export class Vault {
   }): Promise<FolderBindingSnapshot> {
     const st = await this.loadState();
     const snapshot = buildFolderBindingSnapshot({
-      groups: st.groups,
+      rules: st.rules,
+      reserved: st.reserved,
       generation: st.generation,
       enforce: opts.enforce,
       mainConfigDir: opts.mainConfigDir,
-      profileDirOf: (groupId) => groupProfileDir(this.vaultDir, groupId),
+      profileDirOf: (ruleId) => groupProfileDir(this.vaultDir, ruleId),
     });
     await writeFolderBindingSnapshot(folderBindingsPath(this.vaultDir), snapshot);
     return snapshot;
@@ -1575,7 +1986,9 @@ export class Vault {
   private registryPath(): string {
     return join(this.vaultDir, 'accounts.json');
   }
-  private groupsPath(): string {
+  /** `groups.json`: the file name predates folder rules and is kept, so the downgrade fence and the
+   *  migration both find it where every earlier build put it. */
+  private rulesPath(): string {
     return join(this.vaultDir, 'groups.json');
   }
   private bundlePath(id: string): string {

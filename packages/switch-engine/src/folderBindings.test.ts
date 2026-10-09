@@ -11,7 +11,7 @@ import {
 import { folderBindingsPath, groupProfileDir } from './paths.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { VaultError } from './errors.js';
-import type { CredentialBundle, StoredGroup } from './types.js';
+import type { CredentialBundle, FolderRule, StoredAccount } from './types.js';
 
 let dirs: string[] = [];
 async function vaultAt() {
@@ -35,31 +35,35 @@ const bundle = (token: string): CredentialBundle => ({
   oauthAccount: { accountUuid: 'uuid-' + token, emailAddress: token + '@x.com' },
 });
 
+/** A reserved row as `groups.json` holds it. Only its label may reach the snapshot. */
+function row(id: string, label: string, extra: Partial<StoredAccount> = {}): StoredAccount {
+  return { id, label, quarantined: false, createdAtMs: 1, updatedAtMs: 1, ...extra };
+}
+
+/** A folder rule with the given include/exclude lists; every other field is fixture noise. */
+function rule(
+  id: string,
+  include: string[],
+  exclude: string[] = [],
+  folders: string[] = ['C:\\work'],
+): FolderRule {
+  return {
+    id,
+    label: 'Work',
+    folders,
+    include,
+    exclude,
+    activeId: include[0] ?? null,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+  };
+}
+
 describe('buildFolderBindingSnapshot (pure)', () => {
-  it('projects groups to {folders, profileDir, member LABELS} and carries the envelope fields', () => {
-    const groups: StoredGroup[] = [
-      {
-        id: 'g1',
-        label: 'Work',
-        members: [
-          {
-            id: 'm1',
-            label: 'jina',
-            accountUuid: 'uuid-1',
-            quarantined: false,
-            createdAtMs: 1,
-            updatedAtMs: 1,
-          },
-          { id: 'm2', label: 'debate', quarantined: false, createdAtMs: 1, updatedAtMs: 1 },
-        ],
-        activeId: 'm1',
-        folders: ['C:\\work'],
-        createdAtMs: 1,
-        updatedAtMs: 1,
-      },
-    ];
+  it('projects rules to {folders, profileDir, included LABELS} and carries the envelope fields', () => {
     const snapshot = buildFolderBindingSnapshot({
-      groups,
+      rules: [rule('g1', ['m1', 'm2'])],
+      reserved: [row('m1', 'A', { accountUuid: 'uuid-1' }), row('m2', 'B')],
       generation: 7,
       enforce: 'block',
       mainConfigDir: 'C:\\Users\\me\\.claude',
@@ -76,36 +80,91 @@ describe('buildFolderBindingSnapshot (pure)', () => {
           label: 'Work',
           profileDir: 'C:\\profiles\\g1',
           folders: ['C:\\work'],
-          members: ['jina', 'debate'],
+          members: ['A', 'B'],
         },
       ],
     });
   });
 
-  it('carries no member ids and no token material', () => {
-    const groups: StoredGroup[] = [
+  it('lists members in INCLUDE order, not the order the reserved rows are stored in', () => {
+    // The include list is the folder's preference order, which is what the guard's message should
+    // show; the reserved side is ordered by when each row happened to be moved there.
+    const snapshot = buildFolderBindingSnapshot({
+      rules: [rule('g1', ['m2', 'm1'])],
+      reserved: [row('m1', 'A'), row('m2', 'B')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\m',
+      profileDirOf: (id) => id,
+    });
+    expect(snapshot.groups[0]?.members).toEqual(['B', 'A']);
+  });
+
+  it('gives an exclude-only rule a row with an empty member list, never the labels it excludes', () => {
+    // The folder still runs in its own slot, so the guard needs its row; but an excluded account is
+    // one the folder must NOT use, and naming it as a member would say the opposite.
+    const snapshot = buildFolderBindingSnapshot({
+      rules: [rule('g1', [], ['s1'])],
+      reserved: [],
+      generation: 1,
+      enforce: 'warn',
+      mainConfigDir: 'C:\\m',
+      profileDirOf: (id) => `C:\\profiles\\${id}`,
+    });
+    expect(snapshot.groups).toEqual([
       {
         id: 'g1',
         label: 'Work',
-        members: [
-          {
-            id: 'secret-id',
-            label: 'jina',
-            accountUuid: 'uuid-secret',
-            quarantined: false,
-            createdAtMs: 1,
-            updatedAtMs: 1,
-          },
-        ],
-        activeId: null,
+        profileDir: 'C:\\profiles\\g1',
         folders: ['C:\\work'],
-        createdAtMs: 1,
-        updatedAtMs: 1,
+        members: [],
       },
-    ];
+    ]);
+  });
+
+  it('labels only the included accounts of a rule that both includes and excludes', () => {
+    const snapshot = buildFolderBindingSnapshot({
+      rules: [rule('g1', ['m1'], ['s1'])],
+      reserved: [row('m1', 'A')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\m',
+      profileDirOf: (id) => id,
+    });
+    expect(snapshot.groups[0]?.members).toEqual(['A']);
+  });
+
+  it('names an account several rules include in every one of their rows', () => {
+    // Folders may share an included account; each folder's row must still say it uses it.
+    const snapshot = buildFolderBindingSnapshot({
+      rules: [rule('g1', ['m1'], [], ['C:\\work']), rule('g2', ['m1', 'm2'], [], ['C:\\client'])],
+      reserved: [row('m1', 'A'), row('m2', 'B')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\m',
+      profileDirOf: (id) => id,
+    });
+    expect(snapshot.groups.map((g) => g.members)).toEqual([['A'], ['A', 'B']]);
+  });
+
+  it('drops an included id with no reserved row rather than printing a raw id', () => {
+    // Members are labels only: an id with no row has no label, and the snapshot carries no ids.
+    const snapshot = buildFolderBindingSnapshot({
+      rules: [rule('g1', ['m1', 'gone'])],
+      reserved: [row('m1', 'A')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\m',
+      profileDirOf: (id) => id,
+    });
+    expect(snapshot.groups[0]?.members).toEqual(['A']);
+  });
+
+  it('carries no account ids and no token material', () => {
     const text = JSON.stringify(
       buildFolderBindingSnapshot({
-        groups,
+        rules: [rule('g1', ['secret-id'], ['excluded-id'])],
+        reserved: [row('secret-id', 'A', { accountUuid: 'uuid-secret' })],
         generation: 1,
         enforce: 'warn',
         mainConfigDir: 'C:\\m',
@@ -113,40 +172,30 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       }),
     );
     expect(text).not.toContain('secret-id');
+    expect(text).not.toContain('excluded-id');
     expect(text).not.toContain('uuid-secret');
-    expect(text).toContain('jina');
+    expect(text).toContain('"A"');
   });
 });
 
 describe('folderBindingSnapshotContentEqual (pure)', () => {
   const base = () =>
     buildFolderBindingSnapshot({
-      groups: [
-        {
-          id: 'g1',
-          label: 'Work',
-          members: [
-            { id: 'm1', label: 'jina', quarantined: false, createdAtMs: 1, updatedAtMs: 1 },
-          ],
-          activeId: 'm1',
-          folders: ['C:\\work'],
-          createdAtMs: 1,
-          updatedAtMs: 1,
-        },
-      ],
+      rules: [rule('g1', ['m1'])],
+      reserved: [row('m1', 'A')],
       generation: 5,
       enforce: 'block',
       mainConfigDir: 'C:\\main',
       profileDirOf: (id) => `C:\\profiles\\${id}`,
     });
 
-  it('is equal when ONLY the generation differs (a routine group switch bumps generation)', () => {
+  it('is equal when ONLY the generation differs (a routine rule-slot switch bumps generation)', () => {
     const a = base();
     const b = { ...base(), generation: 99 };
     expect(folderBindingSnapshotContentEqual(a, b)).toBe(true);
   });
 
-  it('is unequal when a bound folder changes', () => {
+  it('is unequal when a ruled folder changes', () => {
     const a = base();
     const b = base();
     b.groups[0]!.folders = ['C:\\work', 'C:\\extra'];
@@ -165,18 +214,33 @@ describe('folderBindingSnapshotContentEqual (pure)', () => {
     b.groups[0]!.members = ['someone-else'];
     expect(folderBindingSnapshotContentEqual(a, b)).toBe(false);
   });
+
+  it('is unequal when a rule is left with no included account', () => {
+    const a = base();
+    const b = base();
+    b.groups[0]!.members = [];
+    expect(folderBindingSnapshotContentEqual(a, b)).toBe(false);
+  });
 });
 
 describe('Vault.writeFolderBindings / readFolderBindings', () => {
   it('writes the snapshot beside the vault and reads it back with the live generation', async () => {
     const { v, vaultDir, snapshotPath } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));
-    const group = await v.createGroup({ memberIds: [a.id], folders: ['C:\\work'] });
+    const b = await v.addAccount('b', bundle('b'));
+    const included = await v.createRule({ folders: ['C:\\work'], include: [a.id] });
+    const excludeOnly = await v.createRule({ folders: ['C:\\other'], exclude: [b.id] });
 
     const written = await v.writeFolderBindings({ enforce: 'block', mainConfigDir: 'C:\\main' });
-    expect(written.generation).toBe(await v.getGroupsGeneration());
-    expect(written.groups[0]?.profileDir).toBe(groupProfileDir(vaultDir, group.id));
+    expect(written.generation).toBe(await v.getRulesGeneration());
+    expect(written.groups[0]?.profileDir).toBe(groupProfileDir(vaultDir, included.id));
     expect(written.groups[0]?.members).toEqual(['a']);
+    // The exclude-only rule gets its row too (its folder runs in its own slot), naming no one.
+    expect(written.groups[1]).toMatchObject({
+      profileDir: groupProfileDir(vaultDir, excludeOnly.id),
+      folders: ['C:\\other'],
+      members: [],
+    });
 
     const readBack = await v.readFolderBindings();
     expect(readBack).toEqual(written);

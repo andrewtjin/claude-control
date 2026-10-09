@@ -22,7 +22,7 @@ import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { IntentStore } from './intent.js';
 import { Vault } from './vault.js';
 import { groupProfileDir, sandboxPaths, type Paths } from './paths.js';
-import { groupSlotId } from './types.js';
+import { ruleSlotId } from './types.js';
 import type { ClaudeOauth, CredentialBundle, OauthAccount } from './types.js';
 
 const NOW = 100_000_000;
@@ -431,9 +431,9 @@ describe('a stored bundle that cannot be used', () => {
   });
 });
 
-/** A group slot's live files, read the way Claude Code started in that profile reads them. */
-function groupStore(paths: Paths, groupId: string): CredentialStore {
-  const dir = groupProfileDir(paths.vaultDir, groupId);
+/** A rule slot's live files, read the way Claude Code started in that profile reads them. */
+function ruleStore(paths: Paths, ruleId: string): CredentialStore {
+  const dir = groupProfileDir(paths.vaultDir, ruleId);
   return new CredentialStore({
     claudeDir: dir,
     credentialsPath: join(dir, '.credentials.json'),
@@ -452,7 +452,7 @@ async function storeTokenUnder(h: Harness, holder: string, owner: string, name: 
 }
 
 describe('a slot torn outside any intent: one account token under another identity', () => {
-  it('a bind of the token owner moves the global slot off it first', async () => {
+  it('an include of the token owner moves the global slot off it first', async () => {
     const h = await harness();
     const { P, T } = await seed(h);
     // What an older build's failed identity write leaves once its own recovery cleared the intent.
@@ -460,10 +460,10 @@ describe('a slot torn outside any intent: one account token under another identi
     expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
 
     const e = h.mk();
-    const bound = await e.bindFolder(await h.folder('repo'), [T.id]);
+    const included = await e.includeInFolder(await h.folder('repo'), [T.id]);
 
-    expect(bound.movedOffGlobal).toBe(T.id);
-    expect((await groupStore(h.paths, bound.group.id).readLiveCredentials())?.refreshToken).toBe(
+    expect(included.handedOff).toEqual([{ slot: 'global', from: T.id, to: P.id }]);
+    expect((await ruleStore(h.paths, included.rule.id).readLiveCredentials())?.refreshToken).toBe(
       'rt-T',
     );
     expect((await h.global.readLiveCredentials())?.refreshToken).not.toBe('rt-T');
@@ -471,13 +471,13 @@ describe('a slot torn outside any intent: one account token under another identi
     expect(await e.checkSlots()).toEqual([]);
   });
 
-  it("removing a member clears its token from the group's seat even under another member's identity", async () => {
+  it("removing an included account clears its token from the rule's seat even under another included account's identity", async () => {
     const h = await harness();
     const { P } = await seed(h);
     const G1 = await h.mk().addAccount('G1', bundle('G1', NOW + 8 * HOUR));
     const G2 = await h.mk().addAccount('G2', bundle('G2', NOW + 8 * HOUR));
-    const bound = await h.mk().bindFolder(await h.folder('repo'), [G1.id, G2.id]);
-    const seat = groupStore(h.paths, bound.group.id);
+    const included = await h.mk().includeInFolder(await h.folder('repo'), [G1.id, G2.id]);
+    const seat = ruleStore(h.paths, included.rule.id);
     expect((await seat.readOauthAccount())?.accountUuid).toBe('uuid-G1');
     // G2's token live in the seat under G1's identity.
     await seat.writeLiveCredentials((await h.vault.readBundle(G2.id)).claudeAiOauth);
@@ -506,18 +506,18 @@ describe('a vault holding one refresh token under two accounts', () => {
     expect(await globalLive(h)).toEqual({ creds: 'R', identity: 'R' });
   });
 
-  it('a bind of one of them never puts the token live in a second slot', async () => {
+  it('an include of one of them never puts the token live in a second slot', async () => {
     const h = await harness();
     const { P, T } = await seed(h);
     await h.mk().activate(T.id, { force: true });
     await storeTokenUnder(h, P.id, T.id, 'P');
 
-    await expect(h.mk().bindFolder(await h.folder('repo'), [P.id])).rejects.toMatchObject({
+    await expect(h.mk().includeInFolder(await h.folder('repo'), [P.id])).rejects.toMatchObject({
       code: 'shared_token',
     });
 
-    // Refused before anything moved: no group, and the token live only where it was.
-    expect(await h.mk().listGroups()).toEqual([]);
+    // Refused before anything moved: no rule, and the token live only where it was.
+    expect(await h.mk().listRules()).toEqual([]);
     expect(await globalLive(h)).toEqual({ creds: 'T', identity: 'T' });
     expect((await h.mk().checkSlots()).map((v) => v.kind)).toEqual(['duplicate_stored_token']);
   });
@@ -525,11 +525,11 @@ describe('a vault holding one refresh token under two accounts', () => {
   it('checkSlots reports the token live in two slots, whatever account each slot names', async () => {
     const h = await harness();
     const { P, T } = await seed(h);
-    const bound = await h.mk().bindFolder(await h.folder('repo'), [P.id]);
+    const included = await h.mk().includeInFolder(await h.folder('repo'), [P.id]);
     await h.mk().activate(T.id, { force: true });
     // An older build seated P's contaminated bundle in the folder slot: T's token under P's name.
     await storeTokenUnder(h, P.id, T.id, 'P');
-    await groupStore(h.paths, bound.group.id).writeLiveCredentials(
+    await ruleStore(h.paths, included.rule.id).writeLiveCredentials(
       (await h.vault.readBundle(T.id)).claudeAiOauth,
     );
 
@@ -538,7 +538,7 @@ describe('a vault holding one refresh token under two accounts', () => {
     expect(found).toContainEqual(
       expect.objectContaining({
         kind: 'token_in_multiple_slots',
-        slots: ['global', groupSlotId(bound.group.id)],
+        slots: ['global', ruleSlotId(included.rule.id)],
       }),
     );
     expect(found).toContainEqual(expect.objectContaining({ kind: 'duplicate_stored_token' }));
@@ -589,27 +589,27 @@ describe('a vault holding one refresh token under two accounts', () => {
   });
 });
 
-describe('the unlocked slot check racing a bind', () => {
-  it("never reports the new binding's own profile as a login no binding owns", async () => {
+describe('the unlocked slot check racing an include', () => {
+  it("never reports the new rule's own profile as a login no rule owns", async () => {
     const h = await harness();
     await seed(h);
     const S = await h.mk().addAccount('S', bundle('S', NOW + 8 * HOUR));
     const repo = await h.folder('repo');
     const checker = h.mk();
     const cli = h.mk();
-    // The check reads the group list, then the bind commits (its group, then its logged-in
+    // The check reads the rule list, then the include commits (its rule, then its logged-in
     // profile), then the check lists the profile dirs. Only the check's first read is intercepted:
-    // the spy is gone before the bind (and the check's own read) run.
+    // the spy is gone before the include (and the check's own read) run.
     const spy = vi.spyOn(Vault.prototype, 'readStoredTokens');
     spy.mockImplementationOnce(async function (this: Vault) {
       spy.mockRestore();
-      await cli.bindFolder(repo, [S.id]);
+      await cli.includeInFolder(repo, [S.id]);
       return this.readStoredTokens();
     });
 
     const found = await checker.checkSlots();
 
-    expect(await h.mk().listGroups()).toHaveLength(1);
+    expect(await h.mk().listRules()).toHaveLength(1);
     expect(found.filter((v) => v.kind === 'orphan_profile_login')).toEqual([]);
   });
 });

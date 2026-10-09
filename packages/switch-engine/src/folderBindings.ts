@@ -2,15 +2,20 @@
 //
 // The enforcement guard (a dependency-free hook Claude Code spawns on every prompt) cannot open the
 // encrypted vault or import this package; it decides whether a session's config dir matches the
-// folder it runs in by reading ONE small JSON file. This module builds that file from the reserved
-// side of the registry and reads it back for cctl-side consumers (the doctor's freshness check).
+// folder it runs in by reading ONE small JSON file. This module builds that file from the folder
+// rules and reads it back for cctl-side consumers (the doctor's freshness check).
 //
-// It carries NO tokens and NO account ids beyond a group's own id — only what a mismatch message
-// needs: the bound folders, the group's profile dir, and the member LABELS. The guard's own reader
+// It carries NO tokens and NO account ids beyond a rule's own id — only what a mismatch message
+// needs: the ruled folders, the rule's profile dir, and the LABELS of the accounts it includes. The guard's own reader
 // lives in the hook script and is deliberately separate (it fails OPEN on any error); this reader is
 // for trusted callers and validates strictly.
 
-import type { FolderBindingSnapshot, FolderBindingSnapshotGroup, StoredGroup } from './types.js';
+import type {
+  FolderBindingSnapshot,
+  FolderBindingSnapshotGroup,
+  FolderRule,
+  StoredAccount,
+} from './types.js';
 import { atomicWriteFile, readJsonIfExists } from './fsutil.js';
 import { VaultError } from './errors.js';
 
@@ -25,30 +30,35 @@ export type BindEnforceMode = 'block' | 'warn' | 'off';
 /** Everything the pure {@link buildFolderBindingSnapshot} needs; kept as inputs (not read from the
  *  vault directly) so the builder stays testable and the caller controls the profile-dir mapping. */
 export interface BuildSnapshotInput {
-  groups: readonly StoredGroup[];
-  /** The `groups.json` generation these groups came from — carried so a stale snapshot is
+  rules: readonly FolderRule[];
+  /** The reserved rows the rules' include lists name — the source of the member labels. */
+  reserved: readonly StoredAccount[];
+  /** The `groups.json` generation these rules came from — carried so a stale snapshot is
    *  detectable against the live registry. */
   generation: number;
   enforce: BindEnforceMode;
   /** The main Claude Code config dir the global slot runs in (canonical). */
   mainConfigDir: string;
-  /** Maps a group id to its on-disk profile dir; the guard matches a session's config dir against
+  /** Maps a rule id to its on-disk profile dir; the guard matches a session's config dir against
    *  the value. Injected so the vault's path convention stays in one place (see `paths.ts`). */
-  profileDirOf: (groupId: string) => string;
+  profileDirOf: (ruleId: string) => string;
 }
 
 /**
- * Build the guard snapshot from the reserved side of the registry. Pure: no IO, so it is trivially
- * testable and the caller decides when to persist it. Every group becomes a row of
- * {folders, profileDir, member LABELS} — no member ids, no tokens.
+ * Build the guard snapshot from the folder rules. Pure: no IO, so it is trivially testable and the
+ * caller decides when to persist it. Every rule becomes a row of {folders, profileDir, LABELS of its
+ * included accounts in include order} — no account ids, no tokens. A rule that only excludes has an
+ * empty member list; the guard words its message for that case.
  */
 export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBindingSnapshot {
-  const groups: FolderBindingSnapshotGroup[] = input.groups.map((g) => ({
-    id: g.id,
-    label: g.label,
-    profileDir: input.profileDirOf(g.id),
-    folders: g.folders.slice(),
-    members: g.members.map((m) => m.label),
+  const labelOf = (id: string): string | undefined =>
+    input.reserved.find((a) => a.id === id)?.label;
+  const groups: FolderBindingSnapshotGroup[] = input.rules.map((r) => ({
+    id: r.id,
+    label: r.label,
+    profileDir: input.profileDirOf(r.id),
+    folders: r.folders.slice(),
+    members: r.include.map(labelOf).filter((l): l is string => l !== undefined),
   }));
   return {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
@@ -61,8 +71,8 @@ export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBin
 
 /**
  * Whether two snapshots are equal in the fields the guard actually reads — enforce mode, main config
- * dir, and every group's id/label/profileDir/folders/members. The `generation` is DELIBERATELY
- * ignored: it bumps on registry writes the guard never sees (a group's active member, metadata), and
+ * dir, and every rule's id/label/profileDir/folders/members. The `generation` is DELIBERATELY
+ * ignored: it bumps on registry writes the guard never sees (a rule's live account, metadata), and
  * comparing it would report a snapshot as stale after a routine switch even though nothing the guard
  * enforces changed. Pure.
  */

@@ -314,7 +314,7 @@ export function isWithin(child: string, parent: string, platform: NodeJS.Platfor
 }
 
 /** Minimal shape {@link resolveBinding}/{@link exactBinding} need from a group: an id and its
- *  canonical folders. Kept structural so both the vault's `StoredGroup` and the snapshot's group
+ *  canonical folders. Kept structural so both a vault `FolderRule` and the snapshot's rule
  *  rows satisfy it without conversion. */
 export interface FolderBoundGroup {
   id: string;

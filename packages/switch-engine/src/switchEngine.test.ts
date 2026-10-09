@@ -1506,8 +1506,8 @@ describe('recover', () => {
     const h = await harness();
     const { accountA, accountB } = await seedAActiveWithB(h);
     // The live files had no identity block when the switch began, so the snapshot has none
-    // either; the switch then wrote B's credentials and identity. B has since been reserved to a
-    // folder group, so it may not stay in the global slot and the switch is rolled back.
+    // either; the switch then wrote B's credentials and identity. A folder rule has since included
+    // (reserved) B, so it may not stay in the global slot and the switch is rolled back.
     const a = await h.vault.readBundle(accountA.id);
     await h.vault.writeRollback({ claudeAiOauth: a.claudeAiOauth });
     const b = await h.vault.readBundle(accountB.id);
@@ -1520,7 +1520,7 @@ describe('recover', () => {
       hasRollback: true,
       startedAtMs: NOW,
     });
-    await h.vault.createGroup({ memberIds: [accountB.id], folders: [join(h.paths.vaultDir, 'w')] });
+    await h.vault.createRule({ folders: [join(h.paths.vaultDir, 'w')], include: [accountB.id] });
 
     expect((await h.engine.recover()).action).toBe('rolled_back');
     expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');

@@ -104,15 +104,22 @@ export class VaultError extends SwitchEngineError {
   }
 }
 
-/** An activation was refused because its target may not be live in the slot it was headed for:
- *  - `slot_mismatch`: the caller named a slot the target does not belong to (a reserved account
- *    asked for the global slot, a shared account for a group) — typically a decision made against a
- *    membership picture that changed before the switch reached the lock;
+/** Why an activation was refused for its slot (see {@link SlotError}):
+ *  - `slot_mismatch`: the caller named a slot whose pool does not hold the target (a reserved account
+ *    asked for the global slot, an account a rule excludes asked for that rule's slot) — typically a
+ *    decision made against a picture that changed before the switch reached the lock;
  *  - `not_slot_candidate`: the target is not a legitimate occupant of the slot being written;
- *  - `group_gone`: the group whose slot was to be written no longer exists.
+ *  - `rule_gone`: the folder rule whose slot was to be written no longer exists;
+ *  - `live_elsewhere`: the target is live in another slot, and no account is live in two;
+ *  - `slot_ambiguous`: no slot was named and the target could legitimately go to more than one (an
+ *    account several rules include, live in none of them). */
+export type SlotErrorCode =
+  'slot_mismatch' | 'not_slot_candidate' | 'rule_gone' | 'live_elsewhere' | 'slot_ambiguous';
+
+/** An activation was refused because its target may not be live in the slot it was headed for.
  *  Always raised BEFORE anything live is written, so a refused switch changes nothing. */
 export class SlotError extends SwitchEngineError {
-  constructor(message: string, code: 'slot_mismatch' | 'not_slot_candidate' | 'group_gone') {
+  constructor(message: string, code: SlotErrorCode) {
     super(message, code);
   }
 }

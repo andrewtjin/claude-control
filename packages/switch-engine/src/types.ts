@@ -106,29 +106,40 @@ export interface StoredAccount {
 /** The registry index persisted at `vault/accounts.json`.
  *
  *  Holds only SHARED (global-pool) rows. A reserved account's row is MOVED out of here into
- *  `groups.json` (see {@link StoredGroup}) so that an older cctl — which rewrites this file knowing
+ *  `groups.json` (see {@link RulesFile}) so that an older cctl — which rewrites this file knowing
  *  only `{activeId, accounts}` — never sees, refreshes, or switches to a reserved account, and its
- *  writes can never drop a binding. That downgrade fence is the whole reason for the split. */
+ *  writes can never drop a rule. That downgrade fence is the whole reason for the split. */
 export interface Registry {
-  /** Schema tag, `2` once the group split exists. ABSENT means a file written by a build that
+  /** Schema tag, `2` once the reserved split exists. ABSENT means a file written by a build that
    *  predates the feature; it is read as the pre-split shape (all rows shared) and upgraded on the
    *  next write. Never fail a load purely because this is missing — that is the legacy path. */
   schemaVersion?: number;
   /** Id of the SHARED account whose credentials are currently written to the global live files.
-   *  A reserved account is never live here (its group slot holds it); see {@link StoredGroup}. */
+   *  A reserved account is never live here (a rule slot holds it); see {@link FolderRule}. */
   activeId: string | null;
   accounts: StoredAccount[];
 }
 
-/** Identifies one credential slot. `global` is today's config dir; a group gets its own profile
- *  dir addressed as `group:<groupId>`. A template-literal type so a slot id and an ordinary string
- *  are not silently interchangeable at call sites. */
+/** Identifies one credential slot. `global` is today's config dir; a folder rule gets its own
+ *  profile dir addressed as `group:<ruleId>`. The `group:` spelling predates folder rules and is
+ *  kept because slot ids are recorded (the audit trail, the daemon's session slots, the wire), so a
+ *  rule migrated from a group keeps one slot id across the upgrade. A template-literal type so a
+ *  slot id and an ordinary string are not silently interchangeable at call sites. */
 export type SlotId = 'global' | `group:${string}`;
 
-/** Build the {@link SlotId} for a group. The one place the `group:` prefix is spelled, so callers
- *  never hand-concatenate it (and a rename of the scheme stays a one-line change). */
-export function groupSlotId(groupId: string): SlotId {
-  return `group:${groupId}`;
+/** The prefix of a rule slot's {@link SlotId}. Spelled once, here and in the type above. */
+const RULE_SLOT_PREFIX = 'group:';
+
+/** Build the {@link SlotId} for a folder rule. The one place a rule slot id is built, so callers
+ *  never hand-concatenate the prefix. */
+export function ruleSlotId(ruleId: string): SlotId {
+  return `${RULE_SLOT_PREFIX}${ruleId}`;
+}
+
+/** The rule id a slot belongs to, or `undefined` for the global slot. The inverse of
+ *  {@link ruleSlotId}. */
+export function ruleIdOfSlot(slot: SlotId): string | undefined {
+  return slot === 'global' ? undefined : slot.slice(RULE_SLOT_PREFIX.length);
 }
 
 /** The live token read from the slot an account is currently live in (see
@@ -146,71 +157,104 @@ export interface SlotLiveToken {
 }
 
 /**
- * A set of accounts reserved to a set of folders, persisted in `groups.json` beside the registry.
+ * A per-folder rule over the inherited global pool, persisted in `groups.json`.
  *
- * The members' FULL rows live here, not in `accounts.json` — see {@link Registry} for why. Sessions
- * started under one of `folders` run on this group's slot; auto-switch rotates only among `members`;
- * the members are never used anywhere else.
+ * A rule applies to its folders and everything beneath them (the longest matching folder wins, with
+ * no merging between nested rules). Sessions there run in the rule's own slot, whose pool is the
+ * rule's included accounts first, then the shared pool minus the rule's exclusions (see
+ * `folderRules.ts`). Rows are not held here: an included account's full row lives in
+ * {@link RulesFile.reserved}, and a shared row stays in `accounts.json`.
  */
-export interface StoredGroup {
-  /** Random UUID. Unguessable because it also names the on-disk profile dir. */
+export interface FolderRule {
+  /** Random UUID. Unguessable because it also names the on-disk profile dir. A rule migrated from a
+   *  1.0.0 group keeps the group's id, and so its profile dir and its slot id. */
   id: string;
-  /** Display name. Defaults to the joined member labels when the operator gives none. */
+  /** Display name. Defaults to the folder the rule was created on. */
   label: string;
-  /** The FULL rows of the reserved accounts, moved out of the registry into this group. */
-  members: StoredAccount[];
-  /** The member currently live in this group's slot, or `null` when none is. Always a member id
-   *  (or null); validated on load. */
-  activeId: string | null;
-  /** Canonical folder paths bound to this group (see `folderPath.ts`). Unique across all groups. */
+  /** Canonical folder paths this rule applies to (see `folderPath.ts`). Unique across all rules. */
   folders: string[];
+  /** Ids of the accounts positively assigned to these folders, in preference order. Each is a
+   *  RESERVED account (its row is in {@link RulesFile.reserved}); several rules may include the same
+   *  account, and those folders share it. Including an account overrides its global auto-switch
+   *  exclusion inside these folders. */
+  include: string[];
+  /** Ids of SHARED accounts these folders must not use; they stay usable everywhere else. An id that
+   *  names no shared account right now (reserved since, or removed by a build that does not know
+   *  rules) is inert: it takes effect again only if that account is shared again. */
+  exclude: string[];
+  /** The account currently live in this rule's slot, or `null` when none is: an included account, or
+   *  an inherited shared one while every included account is out. */
+  activeId: string | null;
   createdAtMs: number;
   updatedAtMs: number;
 }
 
-/** The `groups.json` file: the reserved side of the one logical registry. */
-export interface GroupsFile {
-  schemaVersion: 1;
+/** The `groups.json` file, schema 2: the reserved side of the one logical registry plus the folder
+ *  rules over it. An account is in `reserved` (and absent from `accounts.json`) exactly while at
+ *  least one rule includes it. Schema 1 (set-bound groups) is migrated on read. */
+export interface RulesFile {
+  schemaVersion: 2;
   /** Bumped on every write; the guard snapshot (see {@link FolderBindingSnapshot}) carries it so a
    *  stale snapshot can be detected. */
   generation: number;
-  groups: StoredGroup[];
+  /** The FULL rows of every account some rule includes, moved out of `accounts.json`. */
+  reserved: StoredAccount[];
+  rules: FolderRule[];
 }
 
 /** A row as the unified listing returns it: a {@link StoredAccount} plus, for a reserved account,
- *  the id of the group holding it. The tag is VIEW-ONLY — it is derived from which file the row was
- *  found in and is never written back into `accounts.json`. */
+ *  the ids of the rules that include it. The tag is VIEW-ONLY — it is derived from which file the
+ *  row was found in and is never written back into `accounts.json`. */
 export interface AccountView extends StoredAccount {
-  /** Present iff the account is reserved to a group; the group's id. */
-  groupId?: string;
+  /** Present iff the account is reserved: the ids of the rules including it, in rule order. */
+  ruleIds?: string[];
+}
+
+/** Where an account in a slot's effective pool comes from: one of the rule's own included accounts,
+ *  or the shared pool the slot inherits. */
+export type PoolSource = 'include' | 'inherited';
+
+/** One account of a slot's effective pool, in pool order (see `folderRules.ts`). */
+export interface PoolEntry {
+  account: StoredAccount;
+  source: PoolSource;
+  /** Whether an unattended choice (auto-switch, the self-heal) may pick it: false for a shared
+   *  account the operator excluded from auto-switch globally. An included account is always a
+   *  target in its rule's slot — the inclusion overrides the global exclusion there. */
+  autoTarget: boolean;
+  /** Another slot the account is live in right now (token-aware), or `null`. An account live
+   *  elsewhere is in the pool but not AVAILABLE to this slot: no account is live in two slots. */
+  liveElsewhere: SlotId | null;
 }
 
 /**
  * The non-secret snapshot the enforcement guard reads: `<vaultDir>/../folder-bindings.json`.
  *
- * Written LAST in every group mutation and on daemon start, atomically. It carries no tokens — only
+ * Written LAST in every rule mutation and on daemon start, atomically. It carries no tokens — only
  * what the guard needs to decide whether a session's config dir matches the folder it is running in.
  */
 export interface FolderBindingSnapshot {
   schemaVersion: 1;
-  /** The {@link GroupsFile} generation this snapshot was derived from. */
+  /** The {@link RulesFile} generation this snapshot was derived from. */
   generation: number;
   /** How the guard should act on a mismatch. Mirrors the daemon's current policy. */
   enforce: 'block' | 'warn' | 'off';
   /** The main Claude Code config dir the global slot runs in (canonical). */
   mainConfigDir: string;
+  /** One row per folder rule (the key predates rules and is kept for the guard's reader). */
   groups: FolderBindingSnapshotGroup[];
 }
 
-/** One group as the guard snapshot describes it. Members are LABELS only (for the block message);
- *  no ids, no tokens. */
+/** One folder rule as the guard snapshot describes it. Members are LABELS only (for the block
+ *  message); no ids, no tokens. */
 export interface FolderBindingSnapshotGroup {
   id: string;
   label: string;
-  /** The group's profile dir; the guard matches a session's canonical config dir against it. */
+  /** The rule's profile dir; the guard matches a session's canonical config dir against it. */
   profileDir: string;
   folders: string[];
-  /** Member display labels, for the "bound to <members>" message. */
+  /** Labels of the rule's INCLUDED accounts, in include order — empty for a rule that only
+   *  excludes. */
   members: string[];
 }
 
@@ -291,94 +335,123 @@ export interface RefreshTokenResult {
   expiresAt: number;
 }
 
-/** A Claude Code session observed running under a bound folder, from `<mainConfigDir>/sessions/*.json`.
+/** A Claude Code session observed running under a ruled folder, from `<mainConfigDir>/sessions/*.json`.
  *  The engine cannot see a session's config dir (it is set at launch, not recorded), so a match is by
  *  a LIVE pid whose recorded cwd sits within the folder — enough to warn "these will be blocked until
  *  relaunched", never a hard guarantee that the session actually ran on the shared account. */
 export interface RunningSession {
   /** The OS process id recorded in the session file, confirmed alive at scan time. */
   pid: number;
-  /** The session's working directory, canonical, within the bound folder. */
+  /** The session's working directory, canonical, within the ruled folder. */
   cwd: string;
   /** The session file it was read from, for diagnostics. */
   sessionFile: string;
 }
 
-/** What {@link SwitchEngine.ensureGroupLive} settled a group's slot to — reported at the mechanism
- *  level like {@link ActivateResult}: `liveMember` is the member whose credentials are now written to
- *  the profile, never a claim that a running session picked them up. */
-export interface GroupLiveResult {
-  groupId: string;
-  /** The member now live in the group's slot, or `null` when none could be made live. */
-  liveMember: string | null;
-  /** True when this call wrote a member's credentials into the profile (as opposed to finding one
+/** What {@link SwitchEngine.ensureRuleLive} settled a rule's slot to — reported at the mechanism
+ *  level like {@link ActivateResult}: `liveAccount` is the account whose credentials are now written
+ *  to the profile, never a claim that a running session picked them up. */
+export interface RuleLiveResult {
+  ruleId: string;
+  /** The account now live in the rule's slot, or `null` when none could be made live. */
+  liveAccount: string | null;
+  /** True when this call wrote an account's credentials into the profile (as opposed to finding one
    *  already correctly live). */
   activated: boolean;
-  /** True when every eligible member failed to activate — the binding exists but has no working
-   *  account. */
+  /** True when no account of the rule's pool could be made live — every one is quarantined, live in
+   *  another slot, or failed to activate — or the only one live is a quarantined account kept for want
+   *  of another (`liveAccount` names it then). The rule stands; its folders have no working account
+   *  until one frees up or is re-logged in. */
   noWorkingAccount: boolean;
-  /** True when no member could be seated AND a non-member/unrecognized login squatting in the profile
-   *  was cleared to fail the slot closed. Lets the repair/doctor report the eviction (an eviction
-   *  leaves `activated` false, so it would otherwise be silent). */
+  /** True when nothing could be seated AND a login that does not belong in the slot (outside its
+   *  pool, live elsewhere, or unrecognized) was cleared to fail the slot closed. Lets the
+   *  repair/doctor report the eviction (an eviction leaves `activated` false, so it would otherwise
+   *  be silent). */
   clearedSquatter?: boolean;
 }
 
-/** What {@link SwitchEngine.bindFolder} did — reported so the CLI can tell the operator exactly what
- *  moved (the whole point of the verb's chattiness in §10). */
-export interface BindResult {
-  /** The group the folder is now bound to (created or reused). */
-  group: StoredGroup;
-  /** True when a new group was created; false when the folder joined an existing group of the same
-   *  member set. */
+/** A slot moved off an account because the account could no longer be live there (see
+ *  {@link IncludeResult.handedOff}). */
+export interface SlotHandOff {
+  slot: SlotId;
+  /** The account the slot was moved off. */
+  from: string;
+  /** The account the slot now holds. */
+  to: string;
+}
+
+/** What {@link SwitchEngine.includeInFolder} did — reported so the CLI can tell the operator exactly
+ *  what moved. */
+export interface IncludeResult {
+  /** The folder's rule after the change (created or updated). */
+  rule: FolderRule;
+  /** True when the folder had no rule and one was created. */
   created: boolean;
-  /** The account that was live in the GLOBAL slot and had to be moved off it (because it became a
-   *  reserved member), or `null` when no member was globally live. */
-  movedOffGlobal: string | null;
-  /** The shared account the global slot was switched to when a member was moved off it, or `null`
-   *  when no global switch was needed. */
-  globalSwitchedTo: string | null;
-  /** The outcome of making the group's slot live (see {@link GroupLiveResult}). */
-  live: GroupLiveResult;
-  /** Running sessions found under the folder that will keep running on their current account until
-   *  relaunched (the CLI warns about these). */
+  /** The accounts this call moved from the shared pool into the reserved side. An account already
+   *  reserved to another rule is only added to this rule's include list, and is not named here. */
+  reserved: string[];
+  /** The account ids removed from this rule's exclude list because they are now included. */
+  unexcluded: string[];
+  /** Slots that were moved off a newly reserved account first, because it could no longer be live
+   *  there: the global slot (it never holds a reserved account), or another rule's slot whose pool
+   *  no longer has it. */
+  handedOff: SlotHandOff[];
+  /** The outcome of making the rule's slot live (see {@link RuleLiveResult}). */
+  live: RuleLiveResult;
+  /** Running sessions found under the folder that keep their current account until relaunched. */
   runningSessions: RunningSession[];
 }
 
-/** What {@link SwitchEngine.unbindFolder} did. */
-export interface UnbindResult {
-  /** The canonical folder that was unbound. */
+/** What {@link SwitchEngine.excludeInFolder} did. */
+export interface ExcludeResult {
+  /** The folder's rule after the change (created or updated). */
+  rule: FolderRule;
+  /** True when the folder had no rule and one was created. */
+  created: boolean;
+  /** The account the rule's slot was moved off (or cleared of) because it is now excluded, or
+   *  `null` when no excluded account was live there. */
+  movedOff: string | null;
+  /** The outcome of making the rule's slot live afterwards. */
+  live: RuleLiveResult;
+  /** Running sessions found under the rule's folders when the change was made. */
+  runningSessions: RunningSession[];
+}
+
+/** What {@link SwitchEngine.resetFolder} did. */
+export interface ResetResult {
+  /** The canonical folder that was reset. */
   folder: string;
-  /** True when removing this folder was the group's LAST binding, dissolving the group (members
-   *  returned to the shared pool); false when the group kept other folders. */
+  /** True when the rule was removed entirely (no accounts named, or nothing left in it); false when
+   *  only some accounts were removed, or only this folder left a rule that keeps other folders. */
   dissolved: boolean;
-  /** The surviving group when the folder was removed but the group persisted; absent on dissolve. */
-  group?: StoredGroup;
-  /** Member ids returned to the shared pool (only on dissolve). */
-  releasedMembers: string[];
-  /** True when the profile's live token had rotated under us and was adopted into the vault before
-   *  the profile's live credentials were cleared (only on dissolve). */
+  /** The surviving rule when it was not dissolved. */
+  rule?: FolderRule;
+  /** Account ids returned to the shared pool because no rule includes them any more. */
+  released: string[];
+  /** True when the slot's live token had rotated under us and was adopted into the vault before the
+   *  slot was cleared (only on dissolve). */
   adoptedRotation: boolean;
-  /** Sessions observed running under the group's folders at unbind time — non-empty is what a
-   *  non-forced dissolve refuses on. */
+  /** Sessions observed running under the rule's folders — non-empty is what a non-forced dissolve
+   *  (or a non-forced change that would leave the slot empty) refuses on. */
   runningSessions: RunningSession[];
 }
 
 /** The invariant {@link SwitchEngine.checkSlots} found broken. The kinds mirror §7's (a)-(e):
  *  - `account_in_multiple_slots` (a): one account's credentials are live in more than one slot —
- *    the single invariant the whole reservation fence exists to protect (a rotating refresh token
- *    can only survive in one place).
- *  - `reserved_live_in_global` (b): a group member's credentials are live in the global slot.
- *  - `nonmember_live_in_group` (c): an account that is not a member (a shared account, another
- *    group's member, or an unrecognized login) is live in a group's slot.
- *  - `group_active_mismatch` (d): a group's recorded `activeId` names a different member than the
- *    one whose identity is actually live in the profile.
+ *    the single invariant the whole slot model exists to protect (a rotating refresh token can only
+ *    survive in one place).
+ *  - `reserved_live_in_global` (b): an account some rule includes is live in the global slot.
+ *  - `outside_pool_live_in_rule` (c): an account that is not in a rule's pool (excluded there,
+ *    reserved only to other rules, or an unrecognized login) is live in that rule's slot.
+ *  - `rule_active_mismatch` (d): a rule's recorded `activeId` names a different account than the
+ *    one whose identity is actually live in its profile.
  *  - `broken_profile_link` (e): a shared file/dir in a profile is no longer correctly linked to
  *    main (repaired by `ensureGroupProfile`, not by `repairSlots`).
  *  - `live_identity_mismatch`: a slot's live credentials are one stored account's token while its
  *    identity block names a different account — a switch torn between its two live writes that no
  *    pending intent describes. Every reader that goes by the identity block misjudges who is live, so
  *    it is repaired by re-seating the account the token belongs to (or the slot's rightful one).
- *  - `orphan_profile_login`: a profile dir no group owns still holds a live login. It is no slot, so
+ *  - `orphan_profile_login`: a profile dir no rule owns still holds a live login. It is no slot, so
  *    nothing else would ever notice or clear it; `repairSlots` clears it (after adopting its rotation).
  *  - `duplicate_stored_token`: two accounts' bundles store the same token — either the same login
  *    stored twice, or one account holding another's token. Nothing can tell which bundle is wrong
@@ -396,8 +469,8 @@ export interface UnbindResult {
 export type SlotViolationKind =
   | 'account_in_multiple_slots'
   | 'reserved_live_in_global'
-  | 'nonmember_live_in_group'
-  | 'group_active_mismatch'
+  | 'outside_pool_live_in_rule'
+  | 'rule_active_mismatch'
   | 'broken_profile_link'
   | 'live_identity_mismatch'
   | 'orphan_profile_login'
@@ -418,9 +491,9 @@ export interface SlotViolation {
   slot?: SlotId;
   /** For `account_in_multiple_slots`: every slot the account is live in. */
   slots?: SlotId[];
-  /** The group the breach concerns, when it is a group slot. For `orphan_profile_login`, the name of
-   *  the profile dir (the id of the group that once owned it). */
-  groupId?: string;
+  /** The rule the breach concerns, when it is a rule slot. For `orphan_profile_login`, the name of
+   *  the profile dir (the id of the rule that once owned it). */
+  ruleId?: string;
 }
 
 /** What {@link SwitchEngine.repairSlots} did: the violations it fixed, those it could only alert on

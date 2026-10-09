@@ -24,7 +24,7 @@ import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { IntentStore } from './intent.js';
 import { Vault } from './vault.js';
 import { groupProfileDir, sandboxPaths, type Paths } from './paths.js';
-import { groupSlotId } from './types.js';
+import { ruleSlotId } from './types.js';
 import type { ClaudeOauth, CredentialBundle, OauthAccount } from './types.js';
 import type { Logger } from './logger.js';
 
@@ -155,8 +155,8 @@ function bundle(t: string, expiresAt: number): CredentialBundle {
   };
 }
 
-function groupStore(paths: Paths, groupId: string): CredentialStore {
-  const dir = groupProfileDir(paths.vaultDir, groupId);
+function ruleStore(paths: Paths, ruleId: string): CredentialStore {
+  const dir = groupProfileDir(paths.vaultDir, ruleId);
   return new CredentialStore({
     claudeDir: dir,
     credentialsPath: join(dir, '.credentials.json'),
@@ -277,35 +277,35 @@ describe('a switch whose identity write fails after its credentials landed', () 
     expect(await globalLive(h)).toEqual({ creds: 'R', identity: 'R' });
   });
 
-  it('never leaves the target live in two slots when it is bound right after', async () => {
+  it('never leaves the target live in two slots when a folder includes it right after', async () => {
     const h = await harness();
     const { T } = await seed(h);
     failWrites(h.paths.claudeJsonPath);
     await expect(h.mk().activate(T.id, { force: true })).rejects.toThrow();
 
     const e = h.mk();
-    const bound = await e.bindFolder(await h.folder('repo'), [T.id]);
+    const included = await e.includeInFolder(await h.folder('repo'), [T.id]);
 
-    const inGroup = (await groupStore(h.paths, bound.group.id).readLiveCredentials())?.refreshToken;
+    const inRule = (await ruleStore(h.paths, included.rule.id).readLiveCredentials())?.refreshToken;
     const inGlobal = (await h.global.readLiveCredentials())?.refreshToken;
-    expect(inGroup).toBe('rt-T');
+    expect(inRule).toBe('rt-T');
     expect(inGlobal).not.toBe('rt-T');
     expect(await e.checkSlots()).toEqual([]);
   });
 
-  it('undoes a failed group-slot switch inside the profile and leaves the global slot alone', async () => {
+  it('undoes a failed rule-slot switch inside the profile and leaves the global slot alone', async () => {
     const h = await harness();
     const { P, T, R } = await seed(h);
-    const bound = await h.mk().bindFolder(await h.folder('repo'), [T.id, R.id]);
-    const slot = groupSlotId(bound.group.id);
-    const gStore = groupStore(h.paths, bound.group.id);
+    const included = await h.mk().includeInFolder(await h.folder('repo'), [T.id, R.id]);
+    const slot = ruleSlotId(included.rule.id);
+    const gStore = ruleStore(h.paths, included.rule.id);
     const before = {
       creds: (await gStore.readLiveCredentials())?.refreshToken,
       identity: (await gStore.readOauthAccount())?.accountUuid,
     };
     const liveId = await h.mk().getActiveId(slot);
     const other = liveId === T.id ? R : T;
-    failWrites(join(groupProfileDir(h.paths.vaultDir, bound.group.id), '.claude.json'));
+    failWrites(join(groupProfileDir(h.paths.vaultDir, included.rule.id), '.claude.json'));
 
     await expect(h.mk().activate(other.id, { force: true, slot })).rejects.toThrow();
 
@@ -316,9 +316,38 @@ describe('a switch whose identity write fails after its credentials landed', () 
     expect(await h.mk().getActiveId(slot)).toBe(liveId);
     expect(await globalLive(h)).toEqual({ creds: 'P', identity: 'P' });
     expect(await h.mk().getActiveId('global')).toBe(P.id);
-    expect(await new IntentStore(join(h.paths.vaultDir, 'slots', bound.group.id)).read()).toBe(
+    expect(await new IntentStore(join(h.paths.vaultDir, 'slots', included.rule.id)).read()).toBe(
       undefined,
     );
+    expect(await h.mk().checkSlots()).toEqual([]);
+  });
+
+  it('undoes a failed switch of an inherited shared account inside a rule slot', async () => {
+    // A rule slot also takes the shared accounts its rule does not exclude. A switch between two of
+    // them is torn and undone the same way, and the shared account it failed to seat stays free.
+    const h = await harness();
+    const { P, T, R } = await seed(h);
+    const Q = await h.mk().addAccount('Q', bundle('Q', NOW + 8 * HOUR));
+    const excluded = await h.mk().excludeInFolder(await h.folder('repo'), [R.id]);
+    const slot = ruleSlotId(excluded.rule.id);
+    const store = ruleStore(h.paths, excluded.rule.id);
+    // P is live in the global slot, so the rule slot inherited the next shared account.
+    expect(excluded.live.liveAccount).toBe(T.id);
+    failWrites(join(groupProfileDir(h.paths.vaultDir, excluded.rule.id), '.claude.json'));
+
+    await expect(h.mk().activate(Q.id, { force: true, slot })).rejects.toThrow();
+
+    expect((await store.readLiveCredentials())?.refreshToken).toBe('rt-T');
+    expect((await store.readOauthAccount())?.accountUuid).toBe('uuid-T');
+    expect(await h.mk().getActiveId(slot)).toBe(T.id);
+    expect((await h.vault.getRule(excluded.rule.id))?.activeId).toBe(T.id);
+    expect(await globalLive(h)).toEqual({ creds: 'P', identity: 'P' });
+    expect(await h.mk().getActiveId('global')).toBe(P.id);
+    expect(await storedTokens(h, { P: P.id, T: T.id, Q: Q.id })).toEqual({
+      P: 'rt-P',
+      T: 'rt-T',
+      Q: 'rt-Q',
+    });
     expect(await h.mk().checkSlots()).toEqual([]);
   });
 });
@@ -426,7 +455,7 @@ describe('a process that dies between the credentials and identity writes', () =
     expect(await globalLive(h)).toEqual({ creds: 'R', identity: 'R' });
   });
 
-  it('a bind of the target right after the crash moves it off the global slot first', async () => {
+  it('an include of the target right after the crash moves it off the global slot first', async () => {
     const h = await harness();
     const { T } = await seed(h);
     await expect(h.mk(dieBetweenWrites).activate(T.id, { force: true })).rejects.toThrow(
@@ -434,7 +463,7 @@ describe('a process that dies between the credentials and identity writes', () =
     );
 
     const e = h.mk();
-    await e.bindFolder(await h.folder('repo'), [T.id]);
+    await e.includeInFolder(await h.folder('repo'), [T.id]);
 
     expect((await h.global.readLiveCredentials())?.refreshToken).not.toBe('rt-T');
     expect(await e.checkSlots()).toEqual([]);
@@ -522,8 +551,8 @@ describe('a pending switch whose slot cannot be settled at all', () => {
     const Q = await h.mk().addAccount('Q', bundle('Q', NOW + 60_000));
     const G1 = await h.mk().addAccount('G1', bundle('G1', NOW + 8 * HOUR));
     const G2 = await h.mk().addAccount('G2', bundle('G2', NOW + 8 * HOUR));
-    const bound = await h.mk().bindFolder(await h.folder('repo'), [G1.id, G2.id]);
-    const slot = groupSlotId(bound.group.id);
+    const included = await h.mk().includeInFolder(await h.folder('repo'), [G1.id, G2.id]);
+    const slot = ruleSlotId(included.rule.id);
     await expect(h.mk(dieBetweenWrites).activate(T.id, { force: true })).rejects.toThrow(
       'process died',
     );
@@ -546,8 +575,8 @@ describe('a pending switch whose slot cannot be settled at all', () => {
     await expect(h.mk().removeAccount(T.id)).rejects.toMatchObject(unsettledError);
     // Anything else goes on: another account's refresh, a switch inside a folder's own slot.
     await expect(h.mk().refreshToken(Q.id)).resolves.toMatchObject({ refreshed: true });
-    const inGroup = (await h.mk().getActiveId(slot)) === G1.id ? G2 : G1;
-    await expect(h.mk().activate(inGroup.id, { force: true, slot })).resolves.toMatchObject({
+    const inRule = (await h.mk().getActiveId(slot)) === G1.id ? G2 : G1;
+    await expect(h.mk().activate(inRule.id, { force: true, slot })).resolves.toMatchObject({
       ok: true,
     });
 

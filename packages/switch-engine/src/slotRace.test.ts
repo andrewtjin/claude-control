@@ -1,11 +1,13 @@
-// Interleavings between a switch and a membership change made by another process.
+// Interleavings between a switch and a folder-rule change made by another process.
 //
-// An account is live in at most ONE slot, and a reserved account is never live in the global slot.
-// A switch that was DECIDED against one membership picture (a daemon's auto-switch, a phone /switch)
-// can reach the credential lock after another process (an operator's `cctl bind` / `cctl unbind`)
+// An account is live in at most ONE slot, a reserved (included) account is never live in the global
+// slot, and a rule's slot only ever holds an account in that rule's pool. A switch that was DECIDED
+// against one registry picture (a daemon's auto-switch, a phone /switch) can reach the credential
+// lock after another process (an operator's `cctl folder include|exclude|reset`, another switch)
 // changed that picture. These tests pin the outcome: the late switch is refused or re-routed under
-// the lock, never written into a slot its target no longer belongs to; and a switch interrupted
-// after its live write recovers to a legal state even when its target has changed slot since.
+// the lock, never written into a slot its target no longer belongs to or is already live elsewhere
+// than; and a switch interrupted after its live write recovers to a legal state even when its
+// target has changed slot since.
 //
 // Interleavings are made deterministic by pausing ONE engine's next acquireLock call (the lock module
 // is wrapped; nothing else is mocked). The paused engine has already done every read it does before
@@ -22,7 +24,7 @@ import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { IntentStore } from './intent.js';
 import { Vault } from './vault.js';
 import { groupProfileDir, sandboxPaths, type Paths } from './paths.js';
-import { groupSlotId } from './types.js';
+import { ruleSlotId } from './types.js';
 import type { ClaudeOauth, CredentialBundle } from './types.js';
 
 // ---- lock pause: hold the NEXT acquireLock call until released ------------------------------------
@@ -145,9 +147,9 @@ function bundleFor(access: string): CredentialBundle {
   };
 }
 
-/** A credential store over one group's profile dir — how a test inspects a group slot's live files. */
-function groupStore(paths: Paths, groupId: string): CredentialStore {
-  const profileDir = groupProfileDir(paths.vaultDir, groupId);
+/** A credential store over one rule's profile dir — how a test inspects a rule slot's live files. */
+function ruleStore(paths: Paths, ruleId: string): CredentialStore {
+  const profileDir = groupProfileDir(paths.vaultDir, ruleId);
   return new CredentialStore({
     claudeDir: profileDir,
     credentialsPath: join(profileDir, '.credentials.json'),
@@ -173,8 +175,8 @@ function settle<T>(
   );
 }
 
-describe('a switch decided before a bind reserved its target', () => {
-  it('a global hop is refused, and the newly reserved account is live only in its group', async () => {
+describe('a switch decided before an include reserved its target', () => {
+  it('a global hop is refused, and the newly reserved account is live only in its rule slot', async () => {
     const h = await harness();
     const { A, C } = await seed(h);
     const work = await h.folder('work');
@@ -186,16 +188,16 @@ describe('a switch decided before a bind reserved its target', () => {
     const p = pauseNextLock();
     const hop = settle(daemon.activate(C.id, { origin: 'auto', slot: 'global' }));
     await p.arrived;
-    // ...while the operator's bind holds it: C becomes reserved and is seated in its group.
-    const bound = await h.engine.bindFolder(work, [C.id]);
-    expect(bound.live.liveMember).toBe(C.id);
+    // ...while the operator's include holds it: C becomes reserved and is seated in its rule slot.
+    const included = await h.engine.includeInFolder(work, [C.id]);
+    expect(included.live.liveAccount).toBe(C.id);
     p.release();
     const outcome = await hop;
 
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.err.code).toBe('slot_mismatch');
     expect((await h.credStore.readLiveCredentials())?.refreshToken).toBe('r-A');
-    expect((await groupStore(h.paths, bound.group.id).readLiveCredentials())?.refreshToken).toBe(
+    expect((await ruleStore(h.paths, included.rule.id).readLiveCredentials())?.refreshToken).toBe(
       'r-C',
     );
     expect(await h.engine.checkSlots()).toEqual([]);
@@ -203,10 +205,10 @@ describe('a switch decided before a bind reserved its target', () => {
     expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
   });
 
-  it('with the real lock: a hop started while a bind holds the lock never lands in two slots', async () => {
-    // No pause: the hop is started from inside the bind (the checkpoint right after its global
+  it('with the real lock: a hop started while an include holds the lock never lands in two slots', async () => {
+    // No pause: the hop is started from inside the include (the checkpoint right after its
     // hand-off, used here only as a non-throwing signal) and simply waits on the real lock. Every
-    // read that routes it now happens after the bind released, so the outcome is fixed.
+    // read that routes it now happens after the include released, so the outcome is fixed.
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const h = await harness();
       const { A, C } = await seed(h);
@@ -217,11 +219,11 @@ describe('a switch decided before a bind reserved its target', () => {
       const daemon = h.other();
       let hop: Promise<unknown> = Promise.resolve();
       const cli = h.other((checkpoint) => {
-        if (checkpoint === 'bind:after-global-switch') {
+        if (checkpoint === 'include:after-hand-off') {
           hop = settle(daemon.activate(C.id, { origin: 'auto', slot: 'global' }));
         }
       });
-      await cli.bindFolder(work, [C.id]);
+      await cli.includeInFolder(work, [C.id]);
       const outcome = (await hop) as Awaited<ReturnType<typeof settle>>;
 
       expect(outcome.ok).toBe(false);
@@ -230,7 +232,7 @@ describe('a switch decided before a bind reserved its target', () => {
     }
   });
 
-  it('a hop that names no slot follows the target into its group instead of the global slot', async () => {
+  it('a hop that names no slot follows the target into its rule slot instead of the global slot', async () => {
     const h = await harness();
     const { A, C } = await seed(h);
     const work = await h.folder('work');
@@ -241,40 +243,140 @@ describe('a switch decided before a bind reserved its target', () => {
     const p = pauseNextLock();
     const hop = settle(daemon.activate(C.id, { origin: 'auto' }));
     await p.arrived;
-    const bound = await h.engine.bindFolder(work, [C.id]);
+    const included = await h.engine.includeInFolder(work, [C.id]);
     p.release();
     const outcome = await hop;
 
     expect(outcome.ok).toBe(true);
     expect((await h.credStore.readLiveCredentials())?.refreshToken).toBe('r-A');
-    expect(await h.engine.getActiveId(groupSlotId(bound.group.id))).toBe(C.id);
+    expect(await h.engine.getActiveId(ruleSlotId(included.rule.id))).toBe(C.id);
     expect(await h.engine.checkSlots()).toEqual([]);
   });
 });
 
-describe('a group switch decided before an unbind dissolved the group', () => {
+describe('a rule-slot switch decided before an exclude of its target', () => {
+  it('is refused, and the excluded account is never written into the slot', async () => {
+    const h = await harness();
+    const { A, B, C } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.activate(A.id, { force: true });
+    // An exclude-only rule: its slot inherits the shared pool minus A, and A is global anyway.
+    const excluded = await h.engine.excludeInFolder(work, [A.id]);
+    expect(excluded.live.liveAccount).toBe(B.id);
+    const slot = ruleSlotId(excluded.rule.id);
+    h.setNow(NOW + 10 * 60_000);
+
+    // The daemon's per-slot auto-switch decides B -> C for the folder and reaches the lock...
+    const daemon = h.other();
+    const p = pauseNextLock();
+    const hop = settle(daemon.activate(C.id, { origin: 'auto', slot }));
+    await p.arrived;
+    // ...while the operator excludes C from that folder.
+    await h.engine.excludeInFolder(work, [C.id]);
+    p.release();
+    const outcome = await hop;
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.err.code).toBe('slot_mismatch');
+    const store = ruleStore(h.paths, excluded.rule.id);
+    expect((await store.readLiveCredentials())?.refreshToken).toBe('r-B');
+    expect(await h.engine.getActiveId(slot)).toBe(B.id);
+    expect(await h.engine.checkSlots()).toEqual([]);
+    expect(await new IntentStore(join(h.paths.vaultDir, 'slots', excluded.rule.id)).read()).toBe(
+      undefined,
+    );
+  });
+});
+
+describe('a switch decided before another slot took its target', () => {
+  it('a global hop onto a shared account a rule slot has since taken is refused (live elsewhere)', async () => {
+    const h = await harness();
+    const { A, B, C } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.activate(A.id, { force: true });
+    const excluded = await h.engine.excludeInFolder(work, [A.id]);
+    expect(excluded.live.liveAccount).toBe(B.id);
+    const slot = ruleSlotId(excluded.rule.id);
+    h.setNow(NOW + 10 * 60_000);
+
+    // The daemon decides to hop the GLOBAL slot onto C, which nothing holds yet...
+    const daemon = h.other();
+    const p = pauseNextLock();
+    const hop = settle(daemon.activate(C.id, { origin: 'auto', slot: 'global' }));
+    await p.arrived;
+    // ...while the folder's slot is moved onto C (C is shared and the rule does not exclude it).
+    await h.engine.activate(C.id, { force: true, slot });
+    p.release();
+    const outcome = await hop;
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.err.code).toBe('live_elsewhere');
+    expect((await h.credStore.readLiveCredentials())?.refreshToken).toBe('r-A');
+    expect(await h.engine.getActiveId(slot)).toBe(C.id);
+    expect(await h.engine.checkSlots()).toEqual([]);
+    expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
+  });
+
+  it('two rule slots that include the same account: the second hop onto it is refused', async () => {
+    const h = await harness();
+    const { A, B, C } = await seed(h);
+    const S = await h.engine.addAccount('S', bundleFor('S'));
+    const work1 = await h.folder('work1');
+    const work2 = await h.folder('work2');
+    await h.engine.activate(A.id, { force: true });
+    // Both folders include S; it is seated in the first, and the second inherits a shared account.
+    const r1 = await h.engine.includeInFolder(work1, [S.id]);
+    const r2 = await h.engine.includeInFolder(work2, [S.id]);
+    const slot1 = ruleSlotId(r1.rule.id);
+    const slot2 = ruleSlotId(r2.rule.id);
+    expect(r1.live.liveAccount).toBe(S.id);
+    expect(r2.live.liveAccount).toBe(B.id);
+    // The first folder moves onto shared C, which frees S.
+    await h.engine.activate(C.id, { force: true, slot: slot1 });
+    h.setNow(NOW + 10 * 60_000);
+
+    // The daemon decides to return the SECOND folder to its included S...
+    const daemon = h.other();
+    const p = pauseNextLock();
+    const hop = settle(daemon.activate(S.id, { origin: 'auto', slot: slot2 }));
+    await p.arrived;
+    // ...while the operator puts S back in the FIRST folder's slot.
+    await h.engine.activate(S.id, { force: true, slot: slot1 });
+    p.release();
+    const outcome = await hop;
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.err.code).toBe('live_elsewhere');
+    expect(await h.engine.getActiveId(slot1)).toBe(S.id);
+    expect(await h.engine.getActiveId(slot2)).toBe(B.id);
+    expect((await ruleStore(h.paths, r2.rule.id).readLiveCredentials())?.refreshToken).toBe('r-B');
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+});
+
+describe('a rule-slot switch decided before a reset dissolved the rule', () => {
   it('is refused, never re-seeds the dissolved profile, and the target can then go global alone', async () => {
     const h = await harness();
     const { A, B, C } = await seed(h);
     const work = await h.folder('work');
     await h.engine.activate(A.id, { force: true });
-    const bound = await h.engine.bindFolder(work, [B.id, C.id]);
-    expect(bound.live.liveMember).toBe(B.id);
-    const slot = groupSlotId(bound.group.id);
+    const included = await h.engine.includeInFolder(work, [B.id, C.id]);
+    expect(included.live.liveAccount).toBe(B.id);
+    const slot = ruleSlotId(included.rule.id);
     const profileCreds = join(
-      groupProfileDir(h.paths.vaultDir, bound.group.id),
+      groupProfileDir(h.paths.vaultDir, included.rule.id),
       '.credentials.json',
     );
     h.setNow(NOW + 10 * 60_000);
 
-    // The daemon's group auto-switch decides B -> C and reaches the lock...
+    // The daemon's rule-slot auto-switch decides B -> C and reaches the lock...
     const daemon = h.other();
     const p = pauseNextLock();
     const hop = settle(daemon.activate(C.id, { origin: 'auto', slot }));
     await p.arrived;
-    // ...while the operator's unbind dissolves the group: B and C are shared again.
-    const unbound = await h.engine.unbindFolder(work);
-    expect(unbound.dissolved).toBe(true);
+    // ...while the operator's reset dissolves the rule: B and C are shared again.
+    const reset = await h.engine.resetFolder(work);
+    expect(reset.dissolved).toBe(true);
     expect(existsSync(profileCreds)).toBe(false);
     p.release();
     const outcome = await hop;
@@ -282,7 +384,7 @@ describe('a group switch decided before an unbind dissolved the group', () => {
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.err.code).toBe('slot_mismatch');
     expect(existsSync(profileCreds)).toBe(false);
-    expect(await new IntentStore(join(h.paths.vaultDir, 'slots', bound.group.id)).read()).toBe(
+    expect(await new IntentStore(join(h.paths.vaultDir, 'slots', included.rule.id)).read()).toBe(
       undefined,
     );
 
@@ -300,9 +402,9 @@ describe('a group switch decided before an unbind dissolved the group', () => {
     const { A, B, C } = await seed(h);
     const work = await h.folder('work');
     await h.engine.activate(A.id, { force: true });
-    const bound = await h.engine.bindFolder(work, [B.id, C.id]);
+    const included = await h.engine.includeInFolder(work, [B.id, C.id]);
     const profileCreds = join(
-      groupProfileDir(h.paths.vaultDir, bound.group.id),
+      groupProfileDir(h.paths.vaultDir, included.rule.id),
       '.credentials.json',
     );
     h.setNow(NOW + 10 * 60_000);
@@ -311,7 +413,7 @@ describe('a group switch decided before an unbind dissolved the group', () => {
     const p = pauseNextLock();
     const hop = settle(daemon.activate(C.id, { origin: 'auto' }));
     await p.arrived;
-    await h.engine.unbindFolder(work);
+    await h.engine.resetFolder(work);
     p.release();
     const outcome = await hop;
 
@@ -339,7 +441,7 @@ describe('recovering a switch whose target changed slot after its live write', (
     await expect(crashAfterLiveWrite(h).activate(C.id, { force: true })).rejects.toThrow('crash');
     expect((await h.credStore.readLiveCredentials())?.refreshToken).toBe('r-C');
     // C is reserved before anything recovers (the registry move another process made meanwhile).
-    await h.vault.createGroup({ memberIds: [C.id], folders: [work] });
+    await h.vault.createRule({ folders: [work], include: [C.id] });
 
     const rec = await settle(h.other().recover());
 
@@ -360,7 +462,7 @@ describe('recovering a switch whose target changed slot after its live write', (
 
     // Nothing was live before the switch, so there is no rollback snapshot.
     await expect(crashAfterLiveWrite(h).activate(C.id, { force: true })).rejects.toThrow('crash');
-    await h.vault.createGroup({ memberIds: [C.id], folders: [work] });
+    await h.vault.createRule({ folders: [work], include: [C.id] });
 
     const rec = await settle(h.other().recover());
 
@@ -370,52 +472,113 @@ describe('recovering a switch whose target changed slot after its live write', (
     expect(await h.engine.checkSlots()).toEqual([]);
   });
 
-  it('rolls a group switch back to the previous member when its target has left the group', async () => {
+  it("rolls a rule-slot switch back to the previous account when its target has left the rule's pool", async () => {
     const h = await harness();
     const { A, B, C } = await seed(h);
     const work = await h.folder('work');
     await h.engine.activate(A.id, { force: true });
-    const bound = await h.engine.bindFolder(work, [B.id, C.id]);
-    const slot = groupSlotId(bound.group.id);
-    const gStore = groupStore(h.paths, bound.group.id);
+    const included = await h.engine.includeInFolder(work, [B.id, C.id]);
+    const slot = ruleSlotId(included.rule.id);
+    const store = ruleStore(h.paths, included.rule.id);
 
     await expect(crashAfterLiveWrite(h).activate(C.id, { force: true, slot })).rejects.toThrow(
       'crash',
     );
-    expect((await gStore.readLiveCredentials())?.refreshToken).toBe('r-C');
-    await h.vault.releaseAccounts(bound.group.id, [C.id]);
+    expect((await store.readLiveCredentials())?.refreshToken).toBe('r-C');
+    // C leaves the pool before anything recovers: un-included (so shared again), then excluded.
+    // Un-including alone would not do it — the rule inherits the shared pool.
+    await h.vault.removeFromRule(included.rule.id, [C.id]);
+    await h.vault.excludeAccounts(included.rule.id, [C.id]);
 
     const rec = await settle(h.other().recover());
 
     expect(rec.ok).toBe(true);
     if (rec.ok) expect(rec.value.action).toBe('rolled_back');
-    expect((await gStore.readLiveCredentials())?.refreshToken).toBe('r-B');
-    expect((await h.vault.getGroup(bound.group.id))?.activeId).toBe(B.id);
+    expect((await store.readLiveCredentials())?.refreshToken).toBe('r-B');
+    expect((await h.vault.getRule(included.rule.id))?.activeId).toBe(B.id);
     expect(await h.engine.checkSlots()).toEqual([]);
   });
 
-  it('fails a group slot closed when the departed target had no predecessor to restore', async () => {
+  it('rolls a rule-slot switch forward when its target was un-included but the rule still inherits it', async () => {
+    // Un-including an account returns it to the shared pool, and a rule that does not exclude it
+    // still inherits it, so the interrupted switch is still a legitimate one to finish.
     const h = await harness();
     const { A, B, C } = await seed(h);
     const work = await h.folder('work');
     await h.engine.activate(A.id, { force: true });
-    const bound = await h.engine.bindFolder(work, [B.id, C.id]);
-    const slot = groupSlotId(bound.group.id);
-    const gStore = groupStore(h.paths, bound.group.id);
-    // The profile holds no live login when the switch starts, so there is no rollback snapshot.
-    await rm(join(groupProfileDir(h.paths.vaultDir, bound.group.id), '.credentials.json'));
+    const included = await h.engine.includeInFolder(work, [B.id, C.id]);
+    const slot = ruleSlotId(included.rule.id);
+    const store = ruleStore(h.paths, included.rule.id);
 
     await expect(crashAfterLiveWrite(h).activate(C.id, { force: true, slot })).rejects.toThrow(
       'crash',
     );
-    await h.vault.releaseAccounts(bound.group.id, [C.id]);
+    expect((await h.vault.removeFromRule(included.rule.id, [C.id])).released).toEqual([C.id]);
 
     const rec = await settle(h.other().recover());
 
     expect(rec.ok).toBe(true);
-    expect(await gStore.readLiveCredentials()).toBeUndefined();
+    if (rec.ok) expect(rec.value.action).toBe('rolled_forward');
+    expect((await store.readLiveCredentials())?.refreshToken).toBe('r-C');
+    expect((await h.vault.getRule(included.rule.id))?.activeId).toBe(C.id);
+    // C is shared now and live only in the folder's slot; the global slot kept A.
+    expect((await h.credStore.readLiveCredentials())?.refreshToken).toBe('r-A');
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+
+  it('fails a rule slot closed when the departed target had no predecessor to restore', async () => {
+    const h = await harness();
+    const { A, B, C } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.activate(A.id, { force: true });
+    const included = await h.engine.includeInFolder(work, [B.id, C.id]);
+    const slot = ruleSlotId(included.rule.id);
+    const store = ruleStore(h.paths, included.rule.id);
+    // The profile holds no live login when the switch starts, so there is no rollback snapshot.
+    await rm(join(groupProfileDir(h.paths.vaultDir, included.rule.id), '.credentials.json'));
+
+    await expect(crashAfterLiveWrite(h).activate(C.id, { force: true, slot })).rejects.toThrow(
+      'crash',
+    );
+    await h.vault.removeFromRule(included.rule.id, [C.id]);
+    await h.vault.excludeAccounts(included.rule.id, [C.id]);
+
+    const rec = await settle(h.other().recover());
+
+    expect(rec.ok).toBe(true);
+    expect(await store.readLiveCredentials()).toBeUndefined();
     expect((await h.engine.checkSlots()).map((v) => v.kind)).not.toContain(
-      'nonmember_live_in_group',
+      'outside_pool_live_in_rule',
+    );
+  });
+
+  it('rolls a rule-slot switch back when its target has since gone live in another slot', async () => {
+    // The target was free when the switch began; by recovery it is live in the global slot. Rolling
+    // forward would leave it live in two slots.
+    const h = await harness();
+    const { A, B, C } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.activate(A.id, { force: true });
+    const excluded = await h.engine.excludeInFolder(work, [A.id]);
+    expect(excluded.live.liveAccount).toBe(B.id);
+    const slot = ruleSlotId(excluded.rule.id);
+    const store = ruleStore(h.paths, excluded.rule.id);
+
+    await expect(crashAfterLiveWrite(h).activate(C.id, { force: true, slot })).rejects.toThrow(
+      'crash',
+    );
+    // Another process logs C into the main config dir before anything recovers.
+    await h.credStore.writeLiveCredentials(bundleFor('C').claudeAiOauth);
+    await h.credStore.writeOauthAccount(bundleFor('C').oauthAccount!);
+
+    const rec = await settle(h.other().recover());
+
+    expect(rec.ok).toBe(true);
+    if (rec.ok) expect(rec.value.action).toBe('rolled_back');
+    expect((await store.readLiveCredentials())?.refreshToken).toBe('r-B');
+    expect((await h.vault.getRule(excluded.rule.id))?.activeId).toBe(B.id);
+    expect(await new IntentStore(join(h.paths.vaultDir, 'slots', excluded.rule.id)).read()).toBe(
+      undefined,
     );
   });
 });

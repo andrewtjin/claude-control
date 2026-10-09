@@ -73,12 +73,33 @@ export {
   Vault,
   ACCOUNT_METADATA_REV,
   METADATA_BACKFILL_RETRY_MS,
-  MAX_GROUPS,
-  MAX_GROUP_MEMBERS,
-  MAX_GROUP_FOLDERS,
+  MAX_RULES,
+  MAX_RULE_ACCOUNTS,
+  MAX_RULE_FOLDERS,
+  MAX_RESERVED_ACCOUNTS,
   needsMetadataBackfill,
   type DedupeReport,
+  type NewRuleOptions,
+  type RegistryPicture,
 } from './vault.js';
+// Folder rules: the effective pool of every slot, and folder -> rule resolution. Pure, so the CLI
+// and the daemon decide with exactly the engine's rules.
+export {
+  allSlots,
+  availableInOrder,
+  exactFolderRule,
+  legitimateOccupancy,
+  liveElsewhere,
+  resolveFolderRule,
+  ruleOfSlot,
+  rulesIncluding,
+  slotMayHold,
+  slotMembers,
+  slotPool,
+  withRule,
+  type RulesPicture,
+  type SlotOccupancy,
+} from './folderRules.js';
 // Folder canonicalization — shared verbatim between this package and the enforcement guard, which
 // embeds the compiled source of the canonicalizer trio (see folderPath.ts).
 export {

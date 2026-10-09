@@ -1,9 +1,9 @@
-// `defaultPaths()` sees a group profile's CLAUDE_CONFIG_DIR through to the main config dir, so a cctl
-// command run inside a bound session acts on the main dir. Capturing "the current login" is the one
-// command that must NOT follow it there: after a `/login` inside the bound session the new login is
-// in the profile, and capturing the main dir's login instead stores (or refuses as a duplicate) an
-// account the operator never asked for. The capture refuses by the session's own config dir.
-// Real files, a profile materialized by a real bind, the production defaultPaths().
+// `defaultPaths()` sees a folder rule's profile CLAUDE_CONFIG_DIR through to the main config dir, so
+// a cctl command run inside a session in a ruled folder acts on the main dir. Capturing "the current
+// login" is the one command that must NOT follow it there: after a `/login` inside that session the
+// new login is in the profile, and capturing the main dir's login instead stores (or refuses as a
+// duplicate) an account the operator never asked for. The capture refuses by the session's own
+// config dir. Real files, a profile materialized by a real include, the production defaultPaths().
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
@@ -57,7 +57,7 @@ const bundle = (t: string): CredentialBundle => ({
   oauthAccount: { accountUuid: 'uuid-' + t, emailAddress: t + '@x.com' },
 });
 
-describe('capturing the current login from inside a bound session', () => {
+describe('capturing the current login from inside a session in a ruled folder', () => {
   it('refuses as capture_in_profile instead of capturing the main dir login', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ce-seethru-'));
     dirs.push(root);
@@ -75,10 +75,10 @@ describe('capturing the current login from inside a bound session', () => {
     const P = await e.addAccount('main', bundle('P'));
     const W = await e.addAccount('work', bundle('W'));
     await e.activate(P.id, { force: true });
-    const g = (await e.bindFolder(realpathSync.native(join(root, 'repo')), [W.id])).group;
-    const profile = groupProfileDir(mainPaths.vaultDir, g.id);
+    const rule = (await e.includeInFolder(realpathSync.native(join(root, 'repo')), [W.id])).rule;
+    const profile = groupProfileDir(mainPaths.vaultDir, rule.id);
 
-    // Inside the bound session the operator runs `/login` as a NEW account N; Claude Code writes it
+    // Inside the folder's session the operator runs `/login` as a NEW account N; Claude Code writes it
     // into the session's config dir, the profile. Then they ask cctl to store it.
     await writeFile(
       join(profile, '.credentials.json'),
