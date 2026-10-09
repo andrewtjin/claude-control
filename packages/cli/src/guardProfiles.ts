@@ -9,29 +9,29 @@
 
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { profilesRoot, type StoredGroup } from '@claude-control/switch-engine';
+import { profilesRoot, type FolderRule } from '@claude-control/switch-engine';
 
-/** The settings.json inside a single group profile dir (`<profilesRoot>/<groupId>/settings.json`). */
-function profileSettingsPath(vaultDir: string, groupId: string): string {
-  return join(profilesRoot(vaultDir), groupId, 'settings.json');
+/** The settings.json inside a single rule profile dir (`<profilesRoot>/<ruleId>/settings.json`). */
+function profileSettingsPath(vaultDir: string, ruleId: string): string {
+  return join(profilesRoot(vaultDir), ruleId, 'settings.json');
 }
 
 /**
  * The profile settings.json paths the guard reconcile should touch.
  *
- * When bindings exist, that is exactly the CURRENTLY bound groups' profiles — the guard must reach
- * each. When the last folder is unbound (`hasBindings` false), the dissolved group's profile dir is
- * kept for history and is no longer in the group list, so a guard entry can be stranded in its
+ * When rules exist, that is exactly the CURRENT rules' profiles — the guard must reach each. When
+ * the last rule is removed (`hasBindings` false), the dissolved rule's profile dir is kept for
+ * history and is no longer in the rule list, so a guard entry can be stranded in its
  * (severed) settings.json; we therefore scan the whole profiles root so the reconcile can clean every
  * profile, dissolved ones included. Best-effort: a missing/unreadable profiles root yields none.
  */
 export function resolveGuardProfileSettingsPaths(
   vaultDir: string,
-  groups: readonly StoredGroup[],
+  rules: readonly Pick<FolderRule, 'id'>[],
   hasBindings: boolean,
 ): string[] {
   if (hasBindings) {
-    return groups.map((g) => profileSettingsPath(vaultDir, g.id));
+    return rules.map((r) => profileSettingsPath(vaultDir, r.id));
   }
   let entries: string[];
   try {

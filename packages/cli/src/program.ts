@@ -27,7 +27,6 @@ import {
   defaultProtector,
   generatePkce,
   generateState,
-  groupSlotId,
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
@@ -126,6 +125,7 @@ import {
   buildBindCommands,
   describeSwitchedGroup,
   renderBindingsAppendix,
+  switchSlotOf,
 } from './bindCommands.js';
 import {
   renderAccountHeal,
@@ -286,29 +286,31 @@ export function buildProgram(): Command {
     .option('--force', 'bypass the switch-cadence guard (deliberate override)')
     .action(async (ref: string, opts: { force?: boolean }) => {
       const engine = buildEngine();
-      // Resolve across the WHOLE registry (shared pool + reserved members) so `cctl switch <member>`
-      // reaches a folder-bound account; activate() routes it to its group slot by membership.
+      // Resolve across the WHOLE registry (shared pool + reserved accounts) so `cctl switch <ref>`
+      // reaches an account a folder rule includes; activate() routes it to that rule's slot.
       const fleet = await engine.listAllAccounts();
       const resolved = resolveAccountRef(fleet, ref);
       if (!resolved.ok) fail(resolved.message);
-      // The slot the account belonged to when it was resolved. Asserted on the switch, so a bind or
-      // unbind landing in between fails this command instead of switching a slot it never named.
-      const groupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
+      // The slot the account belonged to when it was resolved. Asserted on the switch, so a rule
+      // change landing in between fails this command instead of switching a slot it never named.
+      // An account several rules include has no single slot: the engine picks the one it is live in,
+      // or refuses and says to name the folder.
+      const slot = switchSlotOf(fleet.find((a) => a.id === resolved.account.id));
       try {
         const result = await engine.activate(resolved.account.id, {
           force: Boolean(opts.force),
           origin: 'manual',
-          slot: groupId !== undefined ? groupSlotId(groupId) : 'global',
+          ...(slot !== undefined ? { slot } : {}),
         });
         const bits = [
           result.wroteCredentials ? 'credentials written' : 'no change',
           result.refreshed ? 'token refreshed' : null,
           result.adoptedPreviousRotation ? 'adopted previous rotation' : null,
         ].filter(Boolean);
-        // A reserved account's switch moves its FOLDER group's slot, not the global one — say which.
+        // A switch into a folder rule's slot moves that slot, not the global one — say which.
         const group = await describeSwitchedGroup(engine, resolved.account.id);
         const where = group
-          ? ` in the ${sanitizeForTerminal(group.folders.join(', '))} folder group`
+          ? ` in the folder slot of ${sanitizeForTerminal(group.folders.join(', '))}`
           : '';
         process.stdout.write(
           `Activated ${sanitizeForTerminal(resolved.account.label)}${where} (${bits.join(', ')}).\n`,

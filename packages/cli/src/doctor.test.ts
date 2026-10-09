@@ -342,7 +342,7 @@ describe('checkGuardSnapshot', () => {
     const check = await checkGuardSnapshot({
       getGuardSnapshotFreshness: () =>
         Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
-      listGroups: () => Promise.resolve([]),
+      listRules: () => Promise.resolve([]),
     });
     expect(check.ok).toBe(true);
     expect(check.detail).toContain('nothing to enforce');
@@ -352,7 +352,7 @@ describe('checkGuardSnapshot', () => {
     const check = await checkGuardSnapshot({
       getGuardSnapshotFreshness: () =>
         Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
-      listGroups: () => Promise.resolve(baseGroups as never),
+      listRules: () => Promise.resolve(baseGroups as never),
     });
     expect(check.ok).toBe(false);
     expect(check.detail).toContain('no guard snapshot');
@@ -362,7 +362,7 @@ describe('checkGuardSnapshot', () => {
     const check = await checkGuardSnapshot({
       getGuardSnapshotFreshness: () =>
         Promise.resolve({ present: true, fresh: true, enforce: 'block', generation: 4 }),
-      listGroups: () => Promise.resolve(baseGroups as never),
+      listRules: () => Promise.resolve(baseGroups as never),
     });
     expect(check.ok).toBe(true);
     expect(check.detail).toContain('fresh');
@@ -372,7 +372,7 @@ describe('checkGuardSnapshot', () => {
     const check = await checkGuardSnapshot({
       getGuardSnapshotFreshness: () =>
         Promise.resolve({ present: true, fresh: false, enforce: 'warn', generation: 2 }),
-      listGroups: () => Promise.resolve(baseGroups as never),
+      listRules: () => Promise.resolve(baseGroups as never),
     });
     expect(check.ok).toBe(false);
     expect(check.detail).toContain('STALE');

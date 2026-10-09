@@ -9,17 +9,16 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { sandboxPaths, type Paths, type StoredGroup } from '@claude-control/switch-engine';
+import { sandboxPaths, type FolderRule, type Paths } from '@claude-control/switch-engine';
 import { BIND_GUARD_MARKER, bindGuardPath } from '@claude-control/daemon';
 import { reconcileBindGuard, relaxationBannerLine } from './bindCommands.js';
 
-/** A minimal stand-in for the switch engine: `reconcileBindGuard` only asks it how many groups
- *  (folder bindings) exist. `count` is what `listGroups` reports — the one input that decides
- *  install vs. remove. */
+/** A minimal stand-in for the switch engine: `reconcileBindGuard` only asks it how many folder
+ *  rules exist. `count` is what `listRules` reports — the one input that decides install vs. remove. */
 function engineWithGroups(count: number): Parameters<typeof reconcileBindGuard>[0] {
-  const groups = Array.from({ length: count }, (_, i) => ({ id: `g${i}` }) as StoredGroup);
+  const rules = Array.from({ length: count }, (_, i) => ({ id: `g${i}` }) as FolderRule);
   return {
-    listGroups: () => Promise.resolve(groups),
+    listRules: () => Promise.resolve(rules),
   } as unknown as Parameters<typeof reconcileBindGuard>[0];
 }
 

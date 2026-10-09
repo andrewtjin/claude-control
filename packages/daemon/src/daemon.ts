@@ -17,13 +17,13 @@ import type {
   ReauthResult,
   StoredAccount,
   AccountView,
-  StoredGroup,
+  FolderRule,
   SlotId,
   SlotViolation,
   RepairResult,
-  GroupLiveResult,
+  RuleLiveResult,
 } from '@claude-control/switch-engine';
-import { groupSlotId } from '@claude-control/switch-engine';
+import { ruleIdOfSlot, ruleSlotId } from '@claude-control/switch-engine';
 import {
   buildAuthorizeUrl,
   generatePkce,
@@ -129,15 +129,15 @@ export interface SwitchEngineLike {
   getActiveId(slot?: SlotId): Promise<string | null>;
   // ---- folder-bound slots (optional so lifecycle-only fakes need not implement them; the real
   //      engine always provides them, and the daemon degrades to global-only when they are absent).
-  /** The whole fleet — shared rows plus reserved members, each tagged with its `groupId`. The
-   *  per-slot poll needs the reserved members `listAccounts` omits. */
+  /** The whole fleet — shared rows plus reserved accounts, each reserved row tagged with the ids of
+   *  the rules including it. The per-slot poll needs the reserved accounts `listAccounts` omits. */
   listAllAccounts?(): Promise<AccountView[]>;
-  /** Every folder-bound group, for its members/label/folders and recorded live member. */
-  listGroups?(): Promise<StoredGroup[]>;
-  /** The reconciled live account of each slot (global + every group). */
+  /** Every folder rule, for its included accounts, label, folders and recorded live account. */
+  listRules?(): Promise<FolderRule[]>;
+  /** The reconciled live account of each slot (global + every rule). */
   liveSlots?(): Promise<Map<SlotId, string | null>>;
-  /** Materialize a group's profile and make its slot hold a working member (self-healing). */
-  ensureGroupLive?(groupId: string): Promise<GroupLiveResult>;
+  /** Materialize a rule's profile and make its slot hold a working account (self-healing). */
+  ensureRuleLive?(ruleId: string): Promise<RuleLiveResult>;
   /** Read-only detection of illegal slot occupancy (a)-(e); the daemon watchdog alerts on it. */
   checkSlots?(): Promise<SlotViolation[]>;
   /** Repair the (a)-(d) breaches `checkSlots` finds, under the engine lock. */
@@ -147,13 +147,15 @@ export interface SwitchEngineLike {
   /** Rewrite the guard snapshot only when it no longer matches the registry; resolves whether it
    *  rewrote. Lock-free when the snapshot is fresh, so it is cheap enough to run every cycle. */
   refreshSnapshotIfStale?(): Promise<boolean>;
-  /** The config dir a managed spawn runs in for an account (a reserved member's profile dir, or
-   *  undefined for a shared account) — the seam wired into the SDK client. */
+  /** The config dir a managed spawn runs in for an account (the profile of the rule slot it is in,
+   *  or undefined for the global slot) — the seam wired into the SDK client. */
   configDirForAccount?(accountId: string): Promise<string | undefined>;
-  /** The slot a session's launch-time config dir names (a group profile, else global). */
+  /** The config dir sessions of a slot run in: a rule's profile dir, or undefined for global. */
+  configDirForSlot?(slotId: SlotId): string | undefined;
+  /** The slot a session's launch-time config dir names (a rule's profile, else global). */
   slotForConfigDir?(configDir: string | null | undefined): Promise<SlotId>;
-  /** The group a working directory is bound to, or null for an unbound cwd. */
-  resolveCwdBinding?(cwd: string): Promise<{ groupId: string } | null>;
+  /** The folder rule a working directory runs under, or null for one on the global slot. */
+  resolveFolderRule?(cwd: string): Promise<{ ruleId: string; folder: string } | null>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
   reauthenticate(
     id: string,
@@ -348,7 +350,7 @@ class SpawnBindingError extends Error {}
 /** Identity of one breach across two checks in the same cycle: the same kind about the same
  *  account in the same slot or group is the same breach, whatever its detail text says. */
 function slotViolationKey(v: SlotViolation): string {
-  return [v.kind, v.accountId ?? '', v.slot ?? '', v.groupId ?? '', (v.slots ?? []).join(',')].join(
+  return [v.kind, v.accountId ?? '', v.slot ?? '', v.ruleId ?? '', (v.slots ?? []).join(',')].join(
     '|',
   );
 }
@@ -356,14 +358,16 @@ function slotViolationKey(v: SlotViolation): string {
 function describeRepairedViolation(v: SlotViolation): string {
   switch (v.kind) {
     case 'reserved_live_in_global':
-      // A member surfaced in the shared slot; the fence moved the shared slot back to a shared account.
+      // A reserved account surfaced in the shared slot; the fence moved the shared slot back to a
+      // shared account.
       return `${v.detail}; cctl moved the shared slot back to a shared account.`;
-    case 'nonmember_live_in_group':
-      // A stranger surfaced in a group profile; the rightful member was re-activated in it.
-      return `${v.detail}; cctl restored the folder group's own account.`;
-    case 'group_active_mismatch':
-      // The recorded member and the profile's live identity disagreed; the recorded member was re-activated.
-      return `${v.detail}; cctl re-activated the folder group's recorded account.`;
+    case 'outside_pool_live_in_rule':
+      // An account the folder may not use surfaced in its profile; the slot was re-seated from the
+      // folder's own pool.
+      return `${v.detail}; cctl moved the folder slot back onto an account its rule allows.`;
+    case 'rule_active_mismatch':
+      // The recorded account and the profile's live identity disagreed; the record was healed.
+      return `${v.detail}; cctl re-activated the folder slot's account.`;
     case 'account_in_multiple_slots':
       // One account was live in more than one slot; each slot was re-seated on its rightful account.
       return `${v.detail}; cctl re-seated each slot on its own account.`;
@@ -1295,14 +1299,14 @@ export class Daemon {
   private async pollCycle(): Promise<void> {
     await this.timePhase('attributionJournal.sync', () => this.attributionJournal.sync());
 
-    // Every folder-bound group, read first so slot maintenance can run BEFORE the fleet is polled:
-    // ensuring a group is live and repairing illegal occupancy can change who is live where, and
-    // the numbers this cycle ships must reflect the repaired state, not the state it walked in on.
-    const groups = await this.timePhase('listGroups', () => this.loadGroups());
-    await this.timePhase('maintainSlots', () => this.maintainSlots(groups));
+    // Every folder rule, read first so slot maintenance can run BEFORE the fleet is polled:
+    // ensuring a rule's slot is live and repairing illegal occupancy can change who is live where,
+    // and the numbers this cycle ships must reflect the repaired state, not the state it walked in on.
+    const rules = await this.timePhase('listRules', () => this.loadRules());
+    await this.timePhase('maintainSlots', () => this.maintainSlots(rules));
 
     // Load the whole fleet and every slot's live account AFTER maintenance. `accounts` is the WHOLE
-    // fleet — shared rows plus reserved group members — so the poll and the wire cover reserved
+    // fleet — shared rows plus reserved accounts — so the poll and the wire cover reserved
     // accounts too; `activeId` is the GLOBAL slot's live account, which is the only account the
     // wire `active` flag ever names (a group's live member is marked by `groupActive` instead).
     const { accounts, liveSlots } = await this.timePhase('loadFleet', () => this.loadFleet());
@@ -1342,9 +1346,9 @@ export class Daemon {
     // Ordered after that refresh so the headroom guard inside the kick reads this cycle's
     // numbers, not the previous one's.
     this.noticeActiveAccountChange(activeId, accounts);
-    // The per-group counterpart: an external `cctl switch <member>` (or a phone /switch) resumes
-    // only that group's parked sessions.
-    this.noticeGroupActiveChanges(groups, liveSlots);
+    // The per-rule counterpart: an external `cctl switch` into a folder slot (or a phone /switch)
+    // resumes only that slot's parked sessions.
+    this.noticeGroupActiveChanges(rules, liveSlots, accounts);
     await this.timePhase('persistSnapshots', () => {
       for (const result of polled.results) {
         if (result.outcome === 'skipped') continue; // nothing new to persist
@@ -1398,10 +1402,10 @@ export class Daemon {
       this.latestAdvisorInputs.set(input.accountId, input);
     }
 
-    // Registry facts carry the folder-binding fields (groupId/groupLabel/groupActive) onto the wire
-    // beside plan/billing, so `/accounts` and `/usage` can group reserved accounts under their
-    // binding and mark the live member of each group.
-    const registryFacts = this.buildRegistryFacts(accounts, groups, liveSlots);
+    // Registry facts carry the folder-rule fields (groupId/groupLabel/groupActive on the wire) beside
+    // plan/billing, so `/accounts` and `/usage` can group reserved accounts under their rule and
+    // mark the account live in each folder slot.
+    const registryFacts = this.buildRegistryFacts(accounts, rules, liveSlots);
     await this.timePhase('sendUsageSnapshot', () => {
       this.sendEnvelope({
         type: 'usage.snapshot',
@@ -1435,12 +1439,12 @@ export class Daemon {
     // the value.
     const autoSwitcher = this.autoSwitcher;
     if (autoSwitcher !== undefined) {
-      // One decision PER SLOT: the global slot over the shared pool, and each group over its own
-      // members. `snapshot.inputs` is the same array the plan above was computed from (predictions
+      // One decision PER SLOT: the global slot over the shared pool, and each rule over its own
+      // included accounts. `snapshot.inputs` is the same array the plan above was computed from (predictions
       // merged); the per-slot helper slices it and overrides `active` to the slot's live member so
       // each decision reasons about its own slot alone (see runSlotAutoSwitch).
       await this.timePhase('autoSwitch', () =>
-        this.runSlotAutoSwitch(autoSwitcher, snapshot.inputs, accounts, groups, liveSlots),
+        this.runSlotAutoSwitch(autoSwitcher, snapshot.inputs, accounts, rules, liveSlots),
       );
 
       // Inside the auto-switch block on purpose: the probe exists to widen the pool the policy
@@ -1461,9 +1465,9 @@ export class Daemon {
     await this.timePhase('tokenStats', () => this.maybePushTokenStats(accounts));
   }
 
-  /** Every folder-bound group, or `[]` when the engine predates folder support. */
-  private async loadGroups(): Promise<StoredGroup[]> {
-    return (await this.switchEngine.listGroups?.()) ?? [];
+  /** Every folder rule, or `[]` when the engine predates folder support. */
+  private async loadRules(): Promise<FolderRule[]> {
+    return (await this.switchEngine.listRules?.()) ?? [];
   }
 
   /**
@@ -1485,17 +1489,17 @@ export class Daemon {
   }
 
   /**
-   * Self-heal every group slot and repair illegal slot occupancy, once per cycle. First a stale guard
-   * snapshot is rewritten (see the body for why nothing else would). Then, for each group:
-   * `ensureGroupLive` materializes its profile and makes a usable member live (a no-op steady-state),
-   * and a group left with no working account is alerted on. Then `checkSlots` finds any invariant
+   * Self-heal every rule slot and repair illegal slot occupancy, once per cycle. First a stale guard
+   * snapshot is rewritten (see the body for why nothing else would). Then, for each rule:
+   * `ensureRuleLive` materializes its profile and makes an available account of its pool live (a
+   * no-op steady-state), and a folder left with no working account is alerted on, by name. Then `checkSlots` finds any invariant
    * breach and `repairSlots` fixes the (a)-(d) ones under the engine lock; whatever a repair could
    * NOT resolve (a broken profile link, an unrecognized login) raises one alert per kind per window.
    * A breach the self-heal itself clears is caught by a check taken before it, and alerted on the
    * same way as one repairSlots fixes.
    */
-  private async maintainSlots(groups: StoredGroup[]): Promise<void> {
-    // Every group mutation writes the guard snapshot LAST, so a crash between the registry write and
+  private async maintainSlots(rules: FolderRule[]): Promise<void> {
+    // Every rule mutation writes the guard snapshot LAST, so a crash between the registry write and
     // the snapshot write leaves the snapshot stale while every slot is legal — nothing below would
     // notice, and the guard would keep enforcing the old binding set (fail-open for a new binding,
     // a stray block for a dissolved one) until a restart. Converge it here, once per cycle.
@@ -1513,10 +1517,10 @@ export class Daemon {
     }
 
     const checkSlots = this.switchEngine.checkSlots?.bind(this.switchEngine);
-    // Take the breach snapshot BEFORE the per-group self-heal. ensureGroupLive re-seats a group's
-    // rightful member over a stranger it finds in the profile as a side effect, so a check taken
-    // only afterwards never sees that breach and the operator is never told the folder's account
-    // changed under them.
+    // Take the breach snapshot BEFORE the per-rule self-heal. ensureRuleLive re-seats a folder slot
+    // from its pool over an account it finds there that may not be, as a side effect, so a check
+    // taken only afterwards never sees that breach and the operator is never told the folder's
+    // account changed under them.
     let beforeHeal: SlotViolation[] = [];
     if (checkSlots) {
       try {
@@ -1526,19 +1530,22 @@ export class Daemon {
       }
     }
 
-    const ensureGroupLive = this.switchEngine.ensureGroupLive?.bind(this.switchEngine);
-    if (ensureGroupLive) {
-      for (const group of groups) {
+    const ensureRuleLive = this.switchEngine.ensureRuleLive?.bind(this.switchEngine);
+    if (ensureRuleLive) {
+      for (const rule of rules) {
         try {
-          const result = await ensureGroupLive(group.id);
+          const result = await ensureRuleLive(rule.id);
           if (result.noWorkingAccount) {
+            // Named by folder: that is what the operator acts on, and what is waiting.
+            const folder = rule.folders.length > 0 ? rule.folders.join(', ') : rule.label;
             this.emitSlotAlert(
-              `no_account:${group.id}`,
-              `${group.label} has no working account — every member failed to activate; re-login one`,
+              `no_account:${rule.id}`,
+              `${folder} has no working account — nothing in its pool is free to take its slot; ` +
+                're-login one, or wait for one to free up',
             );
           }
         } catch (err) {
-          this.logger.warn({ err, groupId: group.id }, 'ensureGroupLive failed');
+          this.logger.warn({ err, ruleId: rule.id }, 'ensureRuleLive failed');
         }
       }
     }
@@ -1602,52 +1609,61 @@ export class Daemon {
   }
 
   /**
-   * Build the wire's registry facts for the whole fleet, carrying the folder-binding fields
-   * (groupId/groupLabel/groupActive) onto the usage snapshot beside plan/billing. A shared account
-   * is returned as-is (it already satisfies the facts shape and carries no group fields); a reserved
-   * member is tagged with its group's id, label, and whether it is the member live in the group slot.
+   * Build the wire's registry facts for the whole fleet, carrying the folder-rule fields (the wire's
+   * groupId/groupLabel/groupActive) onto the usage snapshot beside plan/billing. A shared account is
+   * returned without them; a reserved account is tagged with one of the rules including it — the one
+   * whose slot it is live in, else the first — its label, and whether it is live in that slot.
    */
   private buildRegistryFacts(
     accounts: AccountView[],
-    groups: StoredGroup[],
+    rules: FolderRule[],
     liveSlots: Map<SlotId, string | null>,
   ): RegistryFacts[] {
-    const labelByGroup = new Map(groups.map((g) => [g.id, g.label]));
+    const labelByRule = new Map(rules.map((r) => [r.id, r.label]));
     return accounts.map((a): RegistryFacts => {
-      if (a.groupId === undefined) return a;
-      const groupLabel = labelByGroup.get(a.groupId);
+      const { ruleIds, ...row } = a;
+      if (ruleIds === undefined || ruleIds.length === 0) return row;
+      const ruleId = ruleIds.find((id) => liveSlots.get(ruleSlotId(id)) === a.id) ?? ruleIds[0]!;
+      const groupLabel = labelByRule.get(ruleId);
       return {
-        ...a,
-        groupId: a.groupId,
+        ...row,
+        groupId: ruleId,
         ...(groupLabel !== undefined ? { groupLabel } : {}),
-        groupActive: liveSlots.get(groupSlotId(a.groupId)) === a.id,
+        groupActive: liveSlots.get(ruleSlotId(ruleId)) === a.id,
       };
     });
   }
 
   /**
-   * Run the auto-switch executor ONCE PER SLOT: the global slot over the shared pool, and each group
-   * over its own members. The one snapshot `inputs` array is sliced per slot and its `active` flag
-   * is overridden to the slot's live member, so each decision reasons about its own slot alone; the
-   * candidate id set restricts each hop's TARGETS to that slot's accounts (a reserved account is
-   * never a global target, nor a foreign account a group's), and a per-slot cooldown key keeps one
-   * slot's hop from spending another's cooldown. A hop is absorbed by id (like the global one always
-   * was) so the next cycle's change-notice does not read the daemon's own hop as an external switch.
+   * Run the auto-switch executor ONCE PER SLOT: the global slot over the shared pool, and each rule
+   * over its own included accounts. The one snapshot `inputs` array is sliced per slot and its
+   * `active` flag is overridden to the slot's live account, so each decision reasons about its own
+   * slot alone; the candidate id set restricts each hop's TARGETS to accounts that slot may take
+   * right now (a reserved account is never a global target, an account live in another slot never
+   * anyone's), and a per-slot cooldown key keeps one slot's hop from spending another's cooldown. A
+   * hop is absorbed by id (like the global one always was) so the next cycle's change-notice does not
+   * read the daemon's own hop as an external switch.
    */
   private async runSlotAutoSwitch(
     autoSwitcher: AutoSwitcherLike,
     inputs: AccountUsageInput[],
     accounts: AccountView[],
-    groups: StoredGroup[],
+    rules: FolderRule[],
     liveSlots: Map<SlotId, string | null>,
   ): Promise<void> {
     const inputById = new Map(inputs.map((i) => [i.accountId, i]));
-    const reservedIds = new Set(accounts.filter((a) => a.groupId !== undefined).map((a) => a.id));
+    const reservedIds = new Set(accounts.filter((a) => a.ruleIds !== undefined).map((a) => a.id));
+    /** Whether an account is live in a slot other than `slot` — never a target there. */
+    const liveElsewhere = (slot: SlotId, accountId: string): boolean =>
+      [...liveSlots].some(([other, live]) => other !== slot && live === accountId);
 
-    // Global slot: shared accounts only (reserved members are never global candidates). Their
-    // `active` flag is already global-live from the poll, so the subset is ready to decide on.
+    // Global slot: shared accounts only (reserved ones are never global candidates), and none live in
+    // a folder slot. Their `active` flag is already global-live from the poll, so the subset is ready
+    // to decide on.
     const sharedInputs = inputs.filter((i) => !reservedIds.has(i.accountId));
-    const sharedIds = new Set(sharedInputs.map((i) => i.accountId));
+    const sharedIds = new Set(
+      sharedInputs.map((i) => i.accountId).filter((id) => !liveElsewhere('global', id)),
+    );
     const globalHop = await autoSwitcher
       .evaluate(sharedInputs, { slotKey: 'global', candidateIds: sharedIds })
       .catch((err: unknown) => {
@@ -1656,23 +1672,23 @@ export class Daemon {
       });
     if (globalHop !== undefined) this.lastObservedActiveId = globalHop;
 
-    // Each group over its own members, with the group's live member marked active.
-    for (const group of groups) {
-      const slot = groupSlotId(group.id);
-      const memberIds = new Set(group.members.map((m) => m.id));
+    // Each rule over its own included accounts, with the slot's live account marked active.
+    for (const rule of rules) {
+      const slot = ruleSlotId(rule.id);
+      const memberIds = new Set(rule.include.filter((id) => !liveElsewhere(slot, id)));
       const groupLive = liveSlots.get(slot) ?? null;
-      const memberInputs = group.members
-        .map((m) => inputById.get(m.id))
+      const memberInputs = rule.include
+        .map((id) => inputById.get(id))
         .filter((i): i is AccountUsageInput => i !== undefined)
         .map((i) => ({ ...i, active: i.accountId === groupLive }));
 
-      // A group that cannot hop away from an exhausted live member (single member, or every member
-      // spent) is a standing condition worth one alert per window.
-      this.maybeAlertGroupExhausted(group, memberInputs);
+      // A folder that cannot hop away from an exhausted live account (one included account, or every
+      // one spent) is a standing condition worth one alert per window.
+      this.maybeAlertGroupExhausted(rule, memberInputs);
 
-      // Name the folder(s) on the group hop's phone notice so it reads as a group rotation, not a
-      // global switch — the same folder choice the exhaustion alert makes.
-      const slotLabel = group.folders.length > 0 ? group.folders.join(', ') : group.label;
+      // Name the folder(s) on the hop's phone notice so it reads as a folder rotation, not a global
+      // switch — the same folder choice the exhaustion alert makes.
+      const slotLabel = rule.folders.length > 0 ? rule.folders.join(', ') : rule.label;
       const hop = await autoSwitcher
         .evaluate(memberInputs, { slotKey: slot, candidateIds: memberIds, slotLabel })
         .catch((err: unknown) => {
@@ -1688,7 +1704,7 @@ export class Daemon {
    * over — the single-member group, or the group whose every member is spent. Nothing to alert on
    * while a hop is still possible (auto-switch handles that) or while the live member has headroom.
    */
-  private maybeAlertGroupExhausted(group: StoredGroup, memberInputs: AccountUsageInput[]): void {
+  private maybeAlertGroupExhausted(group: FolderRule, memberInputs: AccountUsageInput[]): void {
     const now = this.clock();
     const live = memberInputs.find((i) => i.active);
     if (live === undefined || hasUsableHeadroom(live, now)) return;
@@ -2113,8 +2129,8 @@ export class Daemon {
     // retrying an activation is the outcome this guard exists to prevent.
     rememberBoundedAt(this.seenSwitchKeys, idempotencyKey, MAX_SEEN_STOP_KEYS, nowMs);
     // The target's slot, resolved once for the absorb, the resume scope, and the failure
-    // envelope's "who is live now". A reserved member switches its GROUP slot (activate routes by
-    // membership); a shared account switches the global slot.
+    // envelope's "who is live now". A reserved account switches the slot of the rule including it;
+    // a shared account switches the global slot.
     let targetSlot: SlotId = 'global';
     try {
       // Phone-side commands carry whatever the user typed — an id or a label. Resolve it against
@@ -2125,15 +2141,17 @@ export class Daemon {
         : await this.switchEngine.listAccounts();
       const resolved = resolveAccountRef(fleet, targetAccountId);
       if (!resolved.ok) throw new Error(resolved.message);
-      const targetGroupId = fleet.find((a) => a.id === resolved.account.id)?.groupId;
-      if (targetGroupId !== undefined) targetSlot = groupSlotId(targetGroupId);
+      const asserted = await this.switchSlotFor(fleet.find((a) => a.id === resolved.account.id));
+      if (asserted !== undefined) targetSlot = asserted;
       // Phone-initiated: stamped 'phone' so the audit trail (and activation_intervals) can tell
       // this apart from the CLI's own 'manual' /switch and from a policy-driven 'auto' hop. The slot
-      // resolved above is asserted: if a bind or unbind moved the account between that read and the
-      // switch, the engine refuses rather than switching a slot the operator was not told about.
+      // resolved above is asserted: if a rule change moved the account between that read and the
+      // switch, the engine refuses rather than switching a slot the operator was not told about. An
+      // account several rules include, live in none of them, has no slot to assert; the engine then
+      // refuses it as ambiguous rather than pick a folder for the operator.
       const result = await this.switchEngine.activate(resolved.account.id, {
         origin: 'phone',
-        slot: targetSlot,
+        ...(asserted !== undefined ? { slot: asserted } : {}),
       });
       // Named by LABEL, which is how the operator addressed the account and how the auto-switch
       // card already reports one. A `/switch spare` answered with "switched to 6f2a-…" tells the
@@ -2417,25 +2435,26 @@ export class Daemon {
   }
 
   /**
-   * The group counterpart of {@link noticeActiveAccountChange}: notice a group slot's live member
-   * changing outside this daemon (a local `cctl switch <member>` or a phone `/switch <member>` that
-   * committed since the last cycle) and resume ONLY that group's parked sessions. A hop this daemon
-   * made itself is absorbed by id in {@link runSlotAutoSwitch}, exactly as the global one is.
+   * The rule counterpart of {@link noticeActiveAccountChange}: notice a folder slot's live account
+   * changing outside this daemon (a local `cctl switch` or a phone `/switch` that committed since the
+   * last cycle) and resume ONLY that slot's parked sessions. A hop this daemon made itself is
+   * absorbed by id in {@link runSlotAutoSwitch}, exactly as the global one is.
    */
   private noticeGroupActiveChanges(
-    groups: StoredGroup[],
+    rules: FolderRule[],
     liveSlots: Map<SlotId, string | null>,
+    accounts: AccountView[],
   ): void {
-    for (const group of groups) {
-      const slot = groupSlotId(group.id);
+    for (const rule of rules) {
+      const slot = ruleSlotId(rule.id);
       const live = liveSlots.get(slot) ?? null;
       const previous = this.lastObservedGroupActiveId.get(slot);
       this.lastObservedGroupActiveId.set(slot, live);
       if (previous === undefined || live === null || previous === live) continue;
-      const label = group.members.find((m) => m.id === live)?.label;
+      const label = accounts.find((a) => a.id === live)?.label;
       this.logger.info(
         { accountId: live, slot },
-        'group active member changed outside this daemon',
+        'folder slot live account changed outside this daemon',
       );
       this.resumeUsageStalledSessions(
         live,
@@ -3688,15 +3707,32 @@ export class Daemon {
   }
 
   /**
+   * The slot an operator's switch to `account` (or a spawn naming it) goes to: the global slot for a
+   * shared or unknown account; for a reserved one, the slot of the rule including it — when several
+   * rules include it, the one it is live in, or `undefined` when it is live in none of them (there is
+   * then no single answer, and the caller must not guess one).
+   */
+  private async switchSlotFor(account: AccountView | undefined): Promise<SlotId | undefined> {
+    const ruleIds = account?.ruleIds ?? [];
+    if (account === undefined || ruleIds.length === 0) return 'global';
+    if (ruleIds.length === 1) return ruleSlotId(ruleIds[0]!);
+    const live = this.switchEngine.liveSlots
+      ? await this.switchEngine.liveSlots()
+      : new Map<SlotId, string | null>();
+    return ruleIds.map((id) => ruleSlotId(id)).find((slot) => live.get(slot) === account.id);
+  }
+
+  /**
    * Resolve which slot a managed spawn runs in, honoring §8's decision tree:
-   *  - an explicit RESERVED account → its group slot (the group is ensured live first, and the
-   *    session binds to the group's profile dir);
+   *  - an explicit RESERVED account → the slot of the rule including it (see {@link switchSlotFor};
+   *    the slot is ensured live first, and the session binds to the rule's profile dir);
    *  - an explicit SHARED account → the global slot, but only when it is the account live in the
    *    global slot (a session cannot switch the global slot out from under others) — otherwise
    *    refused;
-   *  - no account but a BOUND working directory → that group's slot, spawned on its live member;
+   *  - no account but a working directory with a folder rule → that rule's slot, spawned on whatever
+   *    account the slot holds (an included one, or an inherited one while they are all out);
    *  - anything else → the global slot, inheriting the global live login (the historical model).
-   * Returns the account to attribute/spawn, the config dir to bind (a group profile, or undefined
+   * Returns the account to attribute/spawn, the config dir to bind (a rule profile, or undefined
    * for the shared config dir), and the slot to record.
    */
   private async resolveSpawnSlot(
@@ -3711,27 +3747,37 @@ export class Daemon {
 
     if (accountId !== undefined) {
       const acct = (await engine.listAllAccounts()).find((a) => a.id === accountId);
-      if (acct?.groupId !== undefined) {
-        // Reserved member: make its group live before the spawn reads the profile's credentials.
-        // A failure to place the session in the group slot (ensure-live threw, or no config dir
-        // resolves) is a REFUSAL, not a resolution fault: a reserved account must never fall back
-        // to the global slot, or the session would silently run under the global account. Rethrow
-        // as SpawnBindingError so the handler answers the phone instead of spawning on global.
+      if (acct?.ruleIds !== undefined && acct.ruleIds.length > 0) {
+        // Reserved account: make its rule's slot live before the spawn reads the profile's
+        // credentials. A failure to place the session in that slot (no single slot, ensure-live
+        // threw, or no config dir resolves) is a REFUSAL, not a resolution fault: a reserved account
+        // must never fall back to the global slot, or the session would silently run under the
+        // global account. Rethrow as SpawnBindingError so the handler answers the phone instead of
+        // spawning on global.
         try {
-          if (engine.ensureGroupLive) await engine.ensureGroupLive(acct.groupId);
-          const configDir = await engine.configDirForAccount(accountId);
-          if (configDir === undefined) {
+          const slot = await this.switchSlotFor(acct);
+          const ruleId = slot === undefined ? undefined : ruleIdOfSlot(slot);
+          if (slot === undefined || ruleId === undefined) {
             throw new SpawnBindingError(
-              `account "${acct.label}" is bound to a folder but its profile could not be ` +
-                'prepared; re-login the member (cctl bindings)',
+              `account "${acct.label}" is included by several folders and live in none of them; ` +
+                'start the session in one of its folders',
             );
           }
-          return { slot: groupSlotId(acct.groupId), accountId, configDir };
+          if (engine.ensureRuleLive) await engine.ensureRuleLive(ruleId);
+          const configDir =
+            engine.configDirForSlot?.(slot) ?? (await engine.configDirForAccount(accountId));
+          if (configDir === undefined) {
+            throw new SpawnBindingError(
+              `account "${acct.label}" belongs to a folder but its profile could not be ` +
+                'prepared; re-login it (cctl bindings)',
+            );
+          }
+          return { slot, accountId, configDir };
         } catch (err) {
           if (err instanceof SpawnBindingError) throw err;
           throw new SpawnBindingError(
-            `account "${acct.label}" is bound to a folder but its group could not be made live ` +
-              `(${err instanceof Error ? err.message : String(err)}); re-login the member (cctl bindings)`,
+            `account "${acct.label}" belongs to a folder but its slot could not be made live ` +
+              `(${err instanceof Error ? err.message : String(err)}); re-login it (cctl bindings)`,
           );
         }
       }
@@ -3747,38 +3793,39 @@ export class Daemon {
       return { slot: 'global', accountId, configDir: undefined };
     }
 
-    // No explicit account: resolve the working directory's binding.
-    if (cwd !== undefined && engine.resolveCwdBinding) {
-      const binding = await engine.resolveCwdBinding(cwd);
-      if (binding !== null) {
-        // Once the cwd is known to be bound, the session MUST run in the group slot. Any failure to
-        // place it there is a REFUSAL, never a fall-through to the global slot: a bound-folder
-        // session that ran under the global account would spend the wrong quota and defeat the
-        // binding. Every failure path below raises SpawnBindingError so the handler answers the
+    // No explicit account: resolve the working directory's folder rule.
+    if (cwd !== undefined && engine.resolveFolderRule) {
+      const match = await engine.resolveFolderRule(cwd);
+      if (match !== null) {
+        // Once the cwd is known to have a rule, the session MUST run in that rule's slot. Any
+        // failure to place it there is a REFUSAL, never a fall-through to the global slot: a session
+        // in a ruled folder that ran under the global account would spend the wrong quota and defeat
+        // the rule. Every failure path below raises SpawnBindingError so the handler answers the
         // phone with a clear message instead of spawning on global.
+        const slot = ruleSlotId(match.ruleId);
         try {
-          const live = engine.ensureGroupLive
-            ? await engine.ensureGroupLive(binding.groupId)
+          const live = engine.ensureRuleLive
+            ? await engine.ensureRuleLive(match.ruleId)
             : undefined;
-          const member =
-            live?.liveMember ?? (await engine.getActiveId(groupSlotId(binding.groupId)));
-          if (member === null || member === undefined) {
+          const account = live?.liveAccount ?? (await engine.getActiveId(slot));
+          if (account === null || account === undefined) {
             throw new SpawnBindingError(
-              'the folder bound to this session has no working account; re-login a member (cctl bindings)',
+              'the folder of this session has no working account; re-login one (cctl bindings)',
             );
           }
-          const configDir = await engine.configDirForAccount(member);
+          const configDir =
+            engine.configDirForSlot?.(slot) ?? (await engine.configDirForAccount(account));
           if (configDir === undefined) {
             throw new SpawnBindingError(
-              'the folder bound to this session has no working account; re-login a member (cctl bindings)',
+              'the folder of this session has no working account; re-login one (cctl bindings)',
             );
           }
-          return { slot: groupSlotId(binding.groupId), accountId: member, configDir };
+          return { slot, accountId: account, configDir };
         } catch (err) {
           if (err instanceof SpawnBindingError) throw err;
           throw new SpawnBindingError(
-            `the folder bound to this session could not be made live ` +
-              `(${err instanceof Error ? err.message : String(err)}); re-login a member (cctl bindings)`,
+            `the folder of this session could not be made live ` +
+              `(${err instanceof Error ? err.message : String(err)}); re-login one (cctl bindings)`,
           );
         }
       }

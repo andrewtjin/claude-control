@@ -350,20 +350,19 @@ export async function checkSlots(engine: Pick<SwitchEngine, 'checkSlots'>): Prom
   }
 }
 
-/** The guard reads a snapshot copy of the groups file, stamped with the generation it was built
- *  from. If that lags the live groups generation, the guard is enforcing a stale binding view until
- *  the daemon restarts or a `cctl settings` change rewrites it. No groups + no snapshot is a pass
- *  (nothing to enforce). */
+/** The guard reads a snapshot copy of the rules file, stamped with the generation it was built
+ *  from. If that lags the live rules, the guard is enforcing a stale view until the daemon restarts
+ *  or a `cctl settings` change rewrites it. No rules + no snapshot is a pass (nothing to enforce). */
 export async function checkGuardSnapshot(
-  engine: Pick<SwitchEngine, 'getGuardSnapshotFreshness' | 'listGroups'>,
+  engine: Pick<SwitchEngine, 'getGuardSnapshotFreshness' | 'listRules'>,
 ): Promise<DoctorCheck> {
   try {
-    const [freshness, groups] = await Promise.all([
+    const [freshness, rules] = await Promise.all([
       engine.getGuardSnapshotFreshness(),
-      engine.listGroups(),
+      engine.listRules(),
     ]);
     if (!freshness.present) {
-      if (groups.length === 0) {
+      if (rules.length === 0) {
         return {
           name: 'guard-snapshot',
           ok: true,
@@ -373,7 +372,7 @@ export async function checkGuardSnapshot(
       return {
         name: 'guard-snapshot',
         ok: false,
-        detail: `${groups.length} folder binding(s) but no guard snapshot — restart the daemon (cctl daemon restart) to write it`,
+        detail: `${rules.length} folder binding(s) but no guard snapshot — restart the daemon (cctl daemon restart) to write it`,
       };
     }
     // Freshness is by CONTENT, not the groups generation: a routine group member switch bumps the
@@ -406,13 +405,13 @@ export async function checkGuardSnapshot(
  * the guard hook is judged as if bindings exist: a missing guard may then be a real gap.
  */
 export async function checkFolderBindings(
-  engine: Pick<SwitchEngine, 'listGroups' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
+  engine: Pick<SwitchEngine, 'listRules' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
   paths: Paths,
 ): Promise<DoctorCheck[]> {
   const out: DoctorCheck[] = [];
   let hasBindings: boolean;
   try {
-    hasBindings = (await engine.listGroups()).length > 0;
+    hasBindings = (await engine.listRules()).length > 0;
   } catch (err) {
     hasBindings = true;
     out.push({

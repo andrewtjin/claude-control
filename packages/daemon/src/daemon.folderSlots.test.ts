@@ -23,18 +23,18 @@ import {
   type PayloadOf,
 } from '@claude-control/shared-protocol';
 import {
-  groupSlotId,
+  ruleSlotId,
   type AccountView,
   type ActivateOptions,
   type ActivateResult,
-  type GroupLiveResult,
+  type FolderRule,
+  type RuleLiveResult,
   type Logger,
   type RecoverResult,
   type RepairResult,
   type SlotId,
   type SlotViolation,
   type StoredAccount,
-  type StoredGroup,
 } from '@claude-control/switch-engine';
 import type { SessionManager, SessionRecord } from '@claude-control/session-runtime';
 import { Store } from './store.js';
@@ -127,23 +127,50 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
   }
 }
 
-function view(id: string, label: string, groupId?: string): AccountView {
+function view(id: string, label: string, ruleId?: string): AccountView {
   return {
     id,
     label,
     quarantined: false,
     createdAtMs: 0,
     updatedAtMs: 0,
-    ...(groupId !== undefined ? { groupId } : {}),
+    ...(ruleId !== undefined ? { ruleIds: [ruleId] } : {}),
   };
 }
 
-/** A group-aware fake engine. Live slots are mutable so an activation is observable to the next
+/** A folder's rule as the fixtures describe it: its included accounts as full rows, so a case can
+ *  name labels and flags beside ids. The fake engine hands the daemon the {@link FolderRule} it
+ *  stands for (include = the members' ids, in order; nothing excluded). */
+interface TestGroup {
+  id: string;
+  label: string;
+  members: AccountView[];
+  activeId: string | null;
+  folders: string[];
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+/** The rule a {@link TestGroup} fixture stands for. */
+function ruleOf(g: TestGroup): FolderRule {
+  return {
+    id: g.id,
+    label: g.label,
+    folders: g.folders,
+    include: g.members.map((m) => m.id),
+    exclude: [],
+    activeId: g.activeId,
+    createdAtMs: g.createdAtMs,
+    updatedAtMs: g.updatedAtMs,
+  };
+}
+
+/** A rule-aware fake engine. Live slots are mutable so an activation is observable to the next
  *  liveSlots() read; checkSlots/repairSlots are stubbable per case. */
 interface FakeEngineControls {
   engine: SwitchEngineLike;
   activateCalls: Array<{ id: string; options: ActivateOptions | undefined }>;
-  ensureGroupLiveCalls: string[];
+  ensureRuleLiveCalls: string[];
   refreshSnapshotCalls: number;
   refreshSnapshotIfStaleCalls: number;
   checkSlotsCalls: number;
@@ -153,16 +180,16 @@ interface FakeEngineControls {
 
 function fakeEngine(opts: {
   accounts: AccountView[];
-  groups: StoredGroup[];
+  groups: TestGroup[];
   live: Map<SlotId, string | null>;
   violations?: SlotViolation[];
   repair?: RepairResult;
-  /** Bind a cwd to a group so a spawn resolves into a group slot (default: everything unbound). */
+  /** Give a cwd a folder rule so a spawn resolves into its slot (default: no folder has one). */
   cwdBinding?: (cwd: string) => { groupId: string } | null;
   /** The profile dir for a reserved account (default: `/profiles/<accountId>` for members). */
   configDirFor?: (accountId: string) => string | undefined;
-  /** Override ensureGroupLive to model a group that cannot be made live (throws or no member). */
-  ensureGroupLiveImpl?: (groupId: string) => Promise<GroupLiveResult>;
+  /** Override ensureRuleLive to model a rule slot that cannot be made live (throws or no account). */
+  ensureRuleLiveImpl?: (ruleId: string) => Promise<RuleLiveResult>;
   /** Override checkSlots, e.g. to model a breach that the per-group self-heal clears. */
   checkSlotsImpl?: () => Promise<SlotViolation[]>;
   /** What refreshSnapshotIfStale reports (default: the snapshot was already fresh). */
@@ -170,7 +197,7 @@ function fakeEngine(opts: {
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
-    ensureGroupLiveCalls: [],
+    ensureRuleLiveCalls: [],
     refreshSnapshotCalls: 0,
     refreshSnapshotIfStaleCalls: 0,
     checkSlotsCalls: 0,
@@ -192,9 +219,9 @@ function fakeEngine(opts: {
       });
     },
     listAccounts: (): Promise<StoredAccount[]> =>
-      Promise.resolve(opts.accounts.filter((a) => a.groupId === undefined)),
+      Promise.resolve(opts.accounts.filter((a) => a.ruleIds === undefined)),
     listAllAccounts: (): Promise<AccountView[]> => Promise.resolve(opts.accounts),
-    listGroups: (): Promise<StoredGroup[]> => Promise.resolve(opts.groups),
+    listRules: (): Promise<FolderRule[]> => Promise.resolve(opts.groups.map(ruleOf)),
     liveSlots: (): Promise<Map<SlotId, string | null>> =>
       Promise.resolve(new Map(controls.liveSlots)),
     getActiveId: (slot: SlotId = 'global'): Promise<string | null> =>
@@ -209,15 +236,17 @@ function fakeEngine(opts: {
             ? `/profiles/${accountId}`
             : undefined,
       ),
-    resolveCwdBinding: (cwd: string): Promise<{ groupId: string } | null> =>
-      Promise.resolve(opts.cwdBinding ? opts.cwdBinding(cwd) : null),
-    ensureGroupLive: (groupId: string): Promise<GroupLiveResult> => {
-      controls.ensureGroupLiveCalls.push(groupId);
-      if (opts.ensureGroupLiveImpl) return opts.ensureGroupLiveImpl(groupId);
-      const live = controls.liveSlots.get(groupSlotId(groupId)) ?? null;
+    resolveFolderRule: (cwd: string): Promise<{ ruleId: string; folder: string } | null> => {
+      const match = opts.cwdBinding ? opts.cwdBinding(cwd) : null;
+      return Promise.resolve(match === null ? null : { ruleId: match.groupId, folder: cwd });
+    },
+    ensureRuleLive: (ruleId: string): Promise<RuleLiveResult> => {
+      controls.ensureRuleLiveCalls.push(ruleId);
+      if (opts.ensureRuleLiveImpl) return opts.ensureRuleLiveImpl(ruleId);
+      const live = controls.liveSlots.get(ruleSlotId(ruleId)) ?? null;
       return Promise.resolve({
-        groupId,
-        liveMember: live,
+        ruleId,
+        liveAccount: live,
         activated: false,
         noWorkingAccount: false,
       });
@@ -393,13 +422,13 @@ function errorFrames(relay: SteadyRelay): Array<PayloadOf<'error'>> {
 // One shared account (live global), a group of two members (m1 live), all healthy.
 function twoAccountGroup(): {
   accounts: AccountView[];
-  groups: StoredGroup[];
+  groups: TestGroup[];
   live: Map<SlotId, string | null>;
 } {
   const m1 = view('m1', 'Member One', 'g1');
   const m2 = view('m2', 'Member Two', 'g1');
   const shared = view('s1', 'Shared');
-  const group: StoredGroup = {
+  const group: TestGroup = {
     id: 'g1',
     label: 'C:/work',
     members: [m1, m2],
@@ -410,7 +439,7 @@ function twoAccountGroup(): {
   };
   const live = new Map<SlotId, string | null>([
     ['global', 's1'],
-    [groupSlotId('g1'), 'm1'],
+    [ruleSlotId('g1'), 'm1'],
   ]);
   return { accounts: [shared, m1, m2], groups: [group], live };
 }
@@ -429,7 +458,7 @@ describe('daemon folder-bound slots — startup and maintenance', () => {
     await waitFor(() => rig.relay.received.some((e) => e.type === 'usage.snapshot'));
 
     expect(controls.refreshSnapshotCalls).toBe(1);
-    expect(controls.ensureGroupLiveCalls).toContain('g1');
+    expect(controls.ensureRuleLiveCalls).toContain('g1');
     expect(controls.checkSlotsCalls).toBeGreaterThanOrEqual(1);
   });
 
@@ -457,7 +486,7 @@ describe('daemon folder-bound slots — startup and maintenance', () => {
     const remaining: SlotViolation = {
       kind: 'broken_profile_link',
       detail: 'C:/work profile link to settings.json is broken',
-      groupId: 'g1',
+      ruleId: 'g1',
     };
     const controls = fakeEngine({
       accounts,
@@ -532,7 +561,7 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     const m2 = view('m2', 'Member Two', 'g1');
     const s1 = view('s1', 'Shared One');
     const s2 = view('s2', 'Shared Two');
-    const group: StoredGroup = {
+    const group: TestGroup = {
       id: 'g1',
       label: 'C:/work',
       members: [m1, m2],
@@ -543,7 +572,7 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     };
     const live = new Map<SlotId, string | null>([
       ['global', 's1'],
-      [groupSlotId('g1'), 'm1'],
+      [ruleSlotId('g1'), 'm1'],
     ]);
     const controls = fakeEngine({ accounts: [s1, s2, m1, m2], groups: [group], live });
     const rig = await createRig({ controls, bodyFor, withAutoSwitcher: true });
@@ -558,7 +587,7 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     // switch reaches the engine lock refuses the hop instead of re-routing it to another slot.
     const slotOf = new Map(controls.activateCalls.map((c) => [c.id, c.options?.slot]));
     expect(slotOf.get('s2')).toBe('global');
-    expect(slotOf.get('m2')).toBe(groupSlotId('g1'));
+    expect(slotOf.get('m2')).toBe(ruleSlotId('g1'));
   });
 
   it('names the folder group on the phone notice for a GROUP hop (not a global switch)', async () => {
@@ -569,7 +598,7 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     const m2 = view('m2', 'Member Two', 'g1');
     const s1 = view('s1', 'Shared One');
     const s2 = view('s2', 'Shared Two');
-    const group: StoredGroup = {
+    const group: TestGroup = {
       id: 'g1',
       label: 'work@corp',
       members: [m1, m2],
@@ -580,7 +609,7 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
     };
     const live = new Map<SlotId, string | null>([
       ['global', 's1'],
-      [groupSlotId('g1'), 'm1'],
+      [ruleSlotId('g1'), 'm1'],
     ]);
     const controls = fakeEngine({ accounts: [s1, s2, m1, m2], groups: [group], live });
     const rig = await createRig({ controls, bodyFor, withAutoSwitcher: true });
@@ -600,16 +629,16 @@ describe('daemon folder-bound slots — per-slot auto-switch', () => {
 });
 
 describe('daemon folder-bound slots — a breach the self-heal clears is still surfaced', () => {
-  it('alerts once when ensureGroupLive re-seats the group over a stranger before checkSlots runs', async () => {
-    // ensureGroupLive re-activates a group's rightful member over whatever it finds in the profile,
+  it('alerts once when ensureRuleLive re-seats the folder slot over a stranger before checkSlots runs', async () => {
+    // ensureRuleLive re-seats a folder slot from its pool over whatever it finds in the profile,
     // so by the time the post-heal checkSlots runs, a stranger that was live there is already gone.
     // The breach seen BEFORE the heal must still reach the operator, exactly once per window.
     const { accounts, groups, live } = twoAccountGroup();
     const stranger: SlotViolation = {
-      kind: 'nonmember_live_in_group',
-      detail: 'non-member "Shared" is live in the C:/work group',
+      kind: 'outside_pool_live_in_rule',
+      detail: '"Shared", which that folder excludes, is live in the folder slot of C:/work',
       accountId: 's1',
-      groupId: 'g1',
+      ruleId: 'g1',
     };
     let healed = false;
     const controls = fakeEngine({
@@ -617,11 +646,11 @@ describe('daemon folder-bound slots — a breach the self-heal clears is still s
       groups,
       live,
       checkSlotsImpl: () => Promise.resolve(healed ? [] : [stranger]),
-      ensureGroupLiveImpl: (groupId) => {
+      ensureRuleLiveImpl: (groupId) => {
         healed = true;
         return Promise.resolve({
-          groupId,
-          liveMember: 'm1',
+          ruleId: groupId,
+          liveAccount: 'm1',
           activated: true,
           noWorkingAccount: false,
         });
@@ -639,8 +668,8 @@ describe('daemon folder-bound slots — a breach the self-heal clears is still s
     await waitFor(() => slotAlerts(rig.relay).length >= 1);
 
     const body = slotAlerts(rig.relay)[0]?.body ?? '';
-    expect(body).toContain('is live in the C:/work group');
-    expect(body).toContain("cctl restored the folder group's own account");
+    expect(body).toContain('is live in the folder slot of C:/work');
+    expect(body).toContain('cctl moved the folder slot back onto an account its rule allows');
     // Nothing was left for repairSlots, and later cycles (the breach is gone) add no alert.
     await waitFor(() => countUsageSnapshots(rig.relay) >= 3);
     expect(slotAlerts(rig.relay)).toHaveLength(1);
@@ -652,7 +681,7 @@ describe('daemon folder-bound slots — a breach the self-heal clears is still s
     const brokenLink: SlotViolation = {
       kind: 'broken_profile_link',
       detail: 'profile of the C:/work group: settings.json is no longer linked to the main config',
-      groupId: 'g1',
+      ruleId: 'g1',
     };
     let healed = false;
     const controls = fakeEngine({
@@ -660,11 +689,11 @@ describe('daemon folder-bound slots — a breach the self-heal clears is still s
       groups,
       live,
       checkSlotsImpl: () => Promise.resolve(healed ? [] : [brokenLink]),
-      ensureGroupLiveImpl: (groupId) => {
+      ensureRuleLiveImpl: (groupId) => {
         healed = true;
         return Promise.resolve({
-          groupId,
-          liveMember: 'm1',
+          ruleId: groupId,
+          liveAccount: 'm1',
           activated: false,
           noWorkingAccount: false,
         });
@@ -697,10 +726,10 @@ describe('daemon folder-bound slots — repair is surfaced to the operator', () 
       slot: 'global',
     };
     const repairedGroup: SlotViolation = {
-      kind: 'nonmember_live_in_group',
-      detail: 'non-member "Shared" is live in the C:/work group',
+      kind: 'outside_pool_live_in_rule',
+      detail: '"Shared", which that folder excludes, is live in the folder slot of C:/work',
       accountId: 's1',
-      groupId: 'g1',
+      ruleId: 'g1',
     };
     const controls = fakeEngine({
       accounts,
@@ -728,8 +757,8 @@ describe('daemon folder-bound slots — repair is surfaced to the operator', () 
     // One alert per repaired kind, each naming the offending account AND what cctl did about it.
     const globalAlert = bodies.find((b) => b.includes('is live in the global slot'));
     expect(globalAlert).toContain('cctl moved the shared slot back to a shared account');
-    const groupAlert = bodies.find((b) => b.includes('is live in the C:/work group'));
-    expect(groupAlert).toContain("cctl restored the folder group's own account");
+    const groupAlert = bodies.find((b) => b.includes('is live in the folder slot of C:/work'));
+    expect(groupAlert).toContain('cctl moved the folder slot back onto an account its rule allows');
 
     // Several more cycles inside the window must not repeat either alert.
     await waitFor(() => countUsageSnapshots(rig.relay) >= 3);
@@ -746,7 +775,7 @@ describe('daemon folder-bound slots — a spawn that cannot take its group slot 
     const { accounts, groups } = twoAccountGroup();
     const live = new Map<SlotId, string | null>([
       ['global', 's1'],
-      [groupSlotId('g1'), null],
+      [ruleSlotId('g1'), null],
     ]);
     const spawnCalls = { count: 0 };
     const controls = fakeEngine({
@@ -755,8 +784,13 @@ describe('daemon folder-bound slots — a spawn that cannot take its group slot 
       live,
       cwdBinding: (cwd) => (cwd === boundCwd ? { groupId: 'g1' } : null),
       // The group has no live member and none can be activated.
-      ensureGroupLiveImpl: (groupId) =>
-        Promise.resolve({ groupId, liveMember: null, activated: false, noWorkingAccount: true }),
+      ensureRuleLiveImpl: (groupId) =>
+        Promise.resolve({
+          ruleId: groupId,
+          liveAccount: null,
+          activated: false,
+          noWorkingAccount: true,
+        }),
     });
     const rig = await createRig({
       controls,
@@ -783,7 +817,7 @@ describe('daemon folder-bound slots — a spawn that cannot take its group slot 
     const { accounts, groups } = twoAccountGroup();
     const live = new Map<SlotId, string | null>([
       ['global', 's1'],
-      [groupSlotId('g1'), 'm1'],
+      [ruleSlotId('g1'), 'm1'],
     ]);
     const spawnCalls = { count: 0 };
     const controls = fakeEngine({
@@ -793,7 +827,7 @@ describe('daemon folder-bound slots — a spawn that cannot take its group slot 
       cwdBinding: (cwd) => (cwd === boundCwd ? { groupId: 'g1' } : null),
       // A resolution fault (e.g. a profile write error) must become a refusal for a BOUND folder,
       // never a silent global fallback that spends the wrong account.
-      ensureGroupLiveImpl: () => Promise.reject(new Error('profile write failed')),
+      ensureRuleLiveImpl: () => Promise.reject(new Error('profile write failed')),
     });
     const rig = await createRig({
       controls,
@@ -823,7 +857,7 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
     // FOLDER (the actionable thing), not the label, or it would read "work@corp account work@corp".
     const only = view('m1', 'work@corp', 'g1');
     const shared = view('s1', 'Shared');
-    const group: StoredGroup = {
+    const group: TestGroup = {
       id: 'g1',
       label: 'work@corp',
       members: [only],
@@ -834,7 +868,7 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
     };
     const live = new Map<SlotId, string | null>([
       ['global', 's1'],
-      [groupSlotId('g1'), 'm1'],
+      [ruleSlotId('g1'), 'm1'],
     ]);
     const controls = fakeEngine({ accounts: [shared, only], groups: [group], live });
     const bodyFor = (accountId: string): unknown =>
@@ -873,7 +907,7 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
       autoSwitchExcluded: true,
     };
     const shared = view('s1', 'Shared');
-    const group: StoredGroup = {
+    const group: TestGroup = {
       id: 'g1',
       label: 'work@corp',
       members: [live, excludedSpare],
@@ -884,7 +918,7 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
     };
     const liveSlots = new Map<SlotId, string | null>([
       ['global', 's1'],
-      [groupSlotId('g1'), 'm1'],
+      [ruleSlotId('g1'), 'm1'],
     ]);
     const controls = fakeEngine({
       accounts: [shared, live, excludedSpare],
@@ -917,7 +951,7 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
     // A group can hold several folders; the alert joins them so the operator sees all stalled slots.
     const only = view('m1', 'work@corp', 'g1');
     const shared = view('s1', 'Shared');
-    const group: StoredGroup = {
+    const group: TestGroup = {
       id: 'g1',
       label: 'work@corp',
       members: [only],
@@ -928,7 +962,7 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
     };
     const live = new Map<SlotId, string | null>([
       ['global', 's1'],
-      [groupSlotId('g1'), 'm1'],
+      [ruleSlotId('g1'), 'm1'],
     ]);
     const controls = fakeEngine({ accounts: [shared, only], groups: [group], live });
     const bodyFor = (accountId: string): unknown =>
@@ -970,7 +1004,7 @@ describe('daemon folder-bound slots — a phone switch asserts the slot it resol
     await waitFor(() => switchResults(rig.relay).some((r) => r.requestId === 'rq-member'));
 
     expect(controls.activateCalls).toEqual([
-      { id: 'm2', options: { origin: 'phone', slot: groupSlotId('g1') } },
+      { id: 'm2', options: { origin: 'phone', slot: ruleSlotId('g1') } },
     ]);
   });
 });
@@ -989,7 +1023,7 @@ describe('daemon folder-bound slots — reauth resolves reserved members', () =>
   it('mints a link for a reserved member resolved by id and by label', async () => {
     const member = view('m1', 'work@corp', 'g1');
     const shared = view('s1', 'Shared');
-    const group: StoredGroup = {
+    const group: TestGroup = {
       id: 'g1',
       label: 'work@corp',
       members: [member],
@@ -1000,7 +1034,7 @@ describe('daemon folder-bound slots — reauth resolves reserved members', () =>
     };
     const liveSlots = new Map<SlotId, string | null>([
       ['global', 's1'],
-      [groupSlotId('g1'), 'm1'],
+      [ruleSlotId('g1'), 'm1'],
     ]);
     const controls = fakeEngine({ accounts: [shared, member], groups: [group], live: liveSlots });
     // The reserved member is intentionally ABSENT from the shared-only list — this is the state that
@@ -1025,5 +1059,118 @@ describe('daemon folder-bound slots — reauth resolves reserved members', () =>
       expect(link?.accountId).toBe('m1');
       expect(link?.url).toBeTruthy();
     }
+  });
+});
+
+describe('daemon folder rules — slots never share an account', () => {
+  it('never hops the global slot onto a shared account live in a folder slot', async () => {
+    // s2 is shared but live in the folder slot (an inherited account while the folder's own m1 is
+    // out). It is the healthiest account, so only the "live elsewhere" filter keeps the global slot
+    // from taking it — which would put one login live in two slots.
+    const m1 = view('m1', 'Member One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const s3 = view('s3', 'Shared Three');
+    const group: TestGroup = {
+      id: 'g1',
+      label: 'C:/work',
+      members: [m1],
+      activeId: 's2',
+      folders: ['C:/work'],
+      createdAtMs: 0,
+      updatedAtMs: 0,
+    };
+    const live = new Map<SlotId, string | null>([
+      ['global', 's1'],
+      [ruleSlotId('g1'), 's2'],
+    ]);
+    const controls = fakeEngine({ accounts: [s1, s2, s3, m1], groups: [group], live });
+    const bodyFor = (accountId: string): unknown => {
+      if (accountId === 's1' || accountId === 'm1') {
+        return { limits: [{ kind: 'session', percent: 96, resets_at: iso(NOW + 2 * HOUR_MS) }] };
+      }
+      const percent = accountId === 's2' ? 1 : 30;
+      return { limits: [{ kind: 'weekly_all', percent, resets_at: iso(NOW + 2 * DAY_MS) }] };
+    };
+    const rig = await createRig({ controls, bodyFor, withAutoSwitcher: true });
+    await rig.start();
+    await waitFor(() => controls.activateCalls.some((c) => c.options?.slot === 'global'));
+
+    const globalHops = controls.activateCalls.filter((c) => c.options?.slot === 'global');
+    expect(globalHops.map((c) => c.id)).toEqual(['s3']);
+  });
+
+  it('tags an account two rules include with the rule whose slot it is live in', async () => {
+    const shared = view('s1', 'Shared');
+    const both: AccountView = { ...view('m1', 'Member One'), ruleIds: ['g1', 'g2'] };
+    const rule = (id: string, folder: string): TestGroup => ({
+      id,
+      label: folder,
+      members: [both],
+      activeId: id === 'g2' ? 'm1' : null,
+      folders: [folder],
+      createdAtMs: 0,
+      updatedAtMs: 0,
+    });
+    const live = new Map<SlotId, string | null>([
+      ['global', 's1'],
+      [ruleSlotId('g1'), null],
+      [ruleSlotId('g2'), 'm1'],
+    ]);
+    const controls = fakeEngine({
+      accounts: [shared, both],
+      groups: [rule('g1', 'C:/one'), rule('g2', 'C:/two')],
+      live,
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({
+        limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }],
+      }),
+    });
+    await rig.start();
+    await waitFor(() => rig.relay.received.some((e) => e.type === 'usage.snapshot'));
+
+    const m1 = lastUsageSnapshot(rig.relay).accounts.find((a) => a.accountId === 'm1');
+    expect(m1?.groupId).toBe('g2');
+    expect(m1?.groupLabel).toBe('C:/two');
+    expect(m1?.groupActive).toBe(true);
+  });
+
+  it('a phone switch of an account two rules include, live in neither, names no slot', async () => {
+    // There is no single slot to assert; the engine then refuses it as ambiguous rather than the
+    // daemon picking a folder for the operator.
+    const shared = view('s1', 'Shared');
+    const both: AccountView = { ...view('m1', 'Member One'), ruleIds: ['g1', 'g2'] };
+    const rule = (id: string, folder: string): TestGroup => ({
+      id,
+      label: folder,
+      members: [both],
+      activeId: null,
+      folders: [folder],
+      createdAtMs: 0,
+      updatedAtMs: 0,
+    });
+    const live = new Map<SlotId, string | null>([['global', 's1']]);
+    const controls = fakeEngine({
+      accounts: [shared, both],
+      groups: [rule('g1', 'C:/one'), rule('g2', 'C:/two')],
+      live,
+    });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    await rig.start();
+
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'switch.command',
+      payload: {
+        requestId: 'rq-both',
+        targetAccountId: 'Member One',
+        reason: 'manual',
+        idempotencyKey: 'ik-both',
+      },
+    });
+    await waitFor(() => switchResults(rig.relay).some((r) => r.requestId === 'rq-both'));
+    expect(controls.activateCalls).toEqual([{ id: 'm1', options: { origin: 'phone' } }]);
   });
 });

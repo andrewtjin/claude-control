@@ -59,16 +59,16 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  * the script needs no arguments and no knowledge of the vault layout.
  *
  * The script implements the enforcement rules:
- *   - session slot = the group whose canonical profileDir equals the session's canonical
- *     CLAUDE_CONFIG_DIR, else the global slot (outside every group). A CLAUDE_CONFIG_DIR naming the
+ *   - session slot = the folder rule whose canonical profileDir equals the session's canonical
+ *     CLAUDE_CONFIG_DIR, else the global slot (outside every rule). A CLAUDE_CONFIG_DIR naming the
  *     snapshot's main config dir IS the global slot, keyed exactly like an unset one.
  *   - a project folder whose name has no canonical form (a control or bidi/format character) is
  *     judged by its nearest clean ancestor, which a binding covers exactly when it covers the folder.
- *   - (A) the project dir is bound to a group the session is NOT running on -> block. The block
- *     reason names the account the session is actually on (a different group, or the shared account).
+ *   - (A) the project dir has a folder rule the session is NOT running on -> block. The block reason
+ *     names the slot the session is actually on (another rule's folder slot, or the shared account).
  *     A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a visible
  *     systemMessage warning instead.
- *   - (B) the session runs on a group's slot but the project dir is not within that group's folders
+ *   - (B) the session runs on a rule's slot but the project dir is not within that rule's folders
  *     -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT) allows it, with a visible
  *     systemMessage so the bypass is never silent.
  *   - The relaxation env vars are NOT plain switches: each must name a token file the launcher minted
@@ -172,6 +172,16 @@ function emitSystemMessage(message) {
 
 function readValidEnforce(value) {
   return value === 'block' || value === 'warn' || value === 'off' ? value : undefined;
+}
+
+// How a block message names a folder's rule. A rule that includes accounts names them (the accounts
+// that folder uses first); a rule that only excludes accounts has none to name, so it is described
+// as the folder having its own rules rather than as bound to an empty list.
+function describeRule(g) {
+  var members = Array.isArray(g.members) ? g.members.join(', ') : '';
+  return members
+    ? 'has its own cctl folder rules (it uses ' + members + ' first)'
+    : 'has its own cctl folder rules';
 }
 
 // A real folder whose name carries a control or bidi/format character has no canonical form, so no
@@ -312,36 +322,30 @@ function run(input) {
 
   var sessionGroupId = sessionGroup ? sessionGroup.id : null;
 
-  // Case A: the project dir is bound to a group, and the session is not on that group's slot.
+  // Case A: the project dir has a folder rule, and the session is not on that rule's slot.
   if (projectBinding && projectBinding.group.id !== sessionGroupId) {
-    var members = Array.isArray(projectBinding.group.members)
-      ? projectBinding.group.members.join(', ')
-      : '';
-    // The reason must name the account this session is ACTUALLY on. A session on the global slot runs
-    // on the shared account; a session on another group's slot runs on that group's reserved account,
-    // so telling it to "cctl claude" (which would put it on the bound folder's account) is right, but
-    // "runs on the shared account" would be false. Branch on sessionGroup accordingly.
+    // The reason must name the slot this session is ACTUALLY on. A session on the global slot runs
+    // on the shared account; a session on another rule's slot runs on whatever that slot holds, so
+    // telling it to "cctl claude" (which puts it on this folder's slot) is right, but "runs on the
+    // shared account" would be false. Branch on sessionGroup accordingly.
     var reasonA;
     if (sessionGroup) {
-      var sMembers = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
       var sFolders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
       reasonA =
         'cctl: ' +
         projectBinding.folder +
-        ' is bound to ' +
-        members +
-        ', but this session runs on ' +
-        sMembers +
-        ' (bound to ' +
+        ' ' +
+        describeRule(projectBinding.group) +
+        ', but this session runs on the folder slot of ' +
         sFolders +
-        '). Exit and start it here with: cctl claude' +
+        '. Exit and start it here with: cctl claude' +
         '   (or add --override to use this account here anyway)';
     } else {
       reasonA =
         'cctl: ' +
         projectBinding.folder +
-        ' is bound to ' +
-        members +
+        ' ' +
+        describeRule(projectBinding.group) +
         ', but this session runs on the shared account. Exit and start it with: cctl claude' +
         '   (or set up the claude wrapper: cctl shell-init powershell)';
     }
@@ -353,7 +357,7 @@ function run(input) {
     return emitBlock(reasonA, enforce);
   }
 
-  // Case B: the session runs on a group's slot, but the project dir is outside that group's folders.
+  // Case B: the session runs on a rule's slot, but the project dir is outside that rule's folders.
   if (sessionGroup) {
     var within = false;
     if (Array.isArray(sessionGroup.folders)) {
@@ -372,23 +376,20 @@ function run(input) {
       // (surfaced in interactive sessions; the launcher banner is the headless signal) so it is clear
       // the reserved account is being used outside its folders on purpose.
       if (honorRelaxation(process.env.CCTL_LAUNCH_EXPLICIT, 'explicit', sessionConfigKey)) {
-        var membersB = Array.isArray(sessionGroup.members) ? sessionGroup.members.join(', ') : '';
         return emitSystemMessage(
-          'cctl: running ' +
-            membersB +
-            ' (bound to ' +
+          'cctl: running the folder slot of ' +
             folders +
-            ') in ' +
+            ' in ' +
             projectShown +
-            ' — launched explicitly with --account. This account is reserved to its folders.',
+            ' — launched explicitly with --account. That slot belongs to its folders.',
         );
       }
       var reasonB =
-        'cctl: this session runs on the account bound to ' +
+        'cctl: this session runs on the folder slot of ' +
         folders +
         ', but ' +
         projectShown +
-        ' is not one of its folders. That account is reserved to its folders. Run Claude Code ' +
+        ' is not one of its folders. That slot belongs to its folders. Run Claude Code ' +
         'here normally, or launch it explicitly with: cctl claude --account <account>';
       return emitBlock(reasonB, enforce);
     }

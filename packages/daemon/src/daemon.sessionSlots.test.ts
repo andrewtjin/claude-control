@@ -11,10 +11,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  groupSlotId,
+  ruleSlotId,
   type AccountView,
   type ActivateResult,
-  type GroupLiveResult,
+  type RuleLiveResult,
   type RecoverResult,
   type ReauthResult,
   type SlotId,
@@ -54,12 +54,12 @@ async function sandbox(): Promise<string> {
 
 const PROFILE_DIR = 'C:/profiles/g1';
 
-/** A group-aware fake engine: one shared pool (acct-x live global, acct-y idle) plus a group `g1`
- *  of two reserved members (m1 live), bound to `boundFolder`. Only the seams these tests read are
- *  implemented; everything else throws so an unexpected call is loud. */
-type GroupEngine = FakeSwitchEngine & { ensureGroupLiveCalls: string[] };
+/** A rule-aware fake engine: one shared pool (acct-x live global, acct-y idle) plus a folder rule
+ *  `g1` including two reserved accounts (m1 live), on `boundFolder`. Only the seams these tests read
+ *  are implemented; everything else throws so an unexpected call is loud. */
+type GroupEngine = FakeSwitchEngine & { ensureRuleLiveCalls: string[] };
 
-function groupEngine(boundFolder: string): GroupEngine {
+function groupEngine(boundFolder: string, liveInRule = 'm1'): GroupEngine {
   const accounts: AccountView[] = [
     { id: 'acct-x', label: 'main', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
     { id: 'acct-y', label: 'spare', quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
@@ -69,7 +69,7 @@ function groupEngine(boundFolder: string): GroupEngine {
       quarantined: false,
       createdAtMs: 0,
       updatedAtMs: 0,
-      groupId: 'g1',
+      ruleIds: ['g1'],
     },
     {
       id: 'm2',
@@ -77,23 +77,23 @@ function groupEngine(boundFolder: string): GroupEngine {
       quarantined: false,
       createdAtMs: 0,
       updatedAtMs: 0,
-      groupId: 'g1',
+      ruleIds: ['g1'],
     },
   ];
   const live = new Map<SlotId, string | null>([
     ['global', 'acct-x'],
-    [groupSlotId('g1'), 'm1'],
+    [ruleSlotId('g1'), liveInRule],
   ]);
   const engine: GroupEngine = {
     activeId: 'acct-x',
     activations: [],
-    accounts: accounts.filter((a) => a.groupId === undefined),
-    ensureGroupLiveCalls: [] as string[],
+    accounts: accounts.filter((a) => a.ruleIds === undefined),
+    ensureRuleLiveCalls: [] as string[],
     recover: (): Promise<RecoverResult> => Promise.resolve({ recovered: false, action: 'none' }),
     activate(id: string, options?: { origin?: string }): Promise<ActivateResult> {
       engine.activations.push({ accountId: id, origin: options?.origin });
       const view = accounts.find((a) => a.id === id);
-      if (view?.groupId !== undefined) live.set(groupSlotId(view.groupId), id);
+      if (view?.ruleIds !== undefined) live.set(ruleSlotId(view.ruleIds[0]!), id);
       else {
         engine.activeId = id;
         live.set('global', id);
@@ -107,27 +107,29 @@ function groupEngine(boundFolder: string): GroupEngine {
       });
     },
     listAccounts: (): Promise<StoredAccount[]> =>
-      Promise.resolve(accounts.filter((a) => a.groupId === undefined)),
+      Promise.resolve(accounts.filter((a) => a.ruleIds === undefined)),
     listAllAccounts: (): Promise<AccountView[]> => Promise.resolve(accounts),
     getActiveId: (slot: SlotId = 'global'): Promise<string | null> =>
       Promise.resolve(live.get(slot) ?? null),
-    ensureGroupLive: (groupId: string): Promise<GroupLiveResult> => {
-      engine.ensureGroupLiveCalls.push(groupId);
+    ensureRuleLive: (ruleId: string): Promise<RuleLiveResult> => {
+      engine.ensureRuleLiveCalls.push(ruleId);
       return Promise.resolve({
-        groupId,
-        liveMember: live.get(groupSlotId(groupId)) ?? null,
+        ruleId,
+        liveAccount: live.get(ruleSlotId(ruleId)) ?? null,
         activated: false,
         noWorkingAccount: false,
       });
     },
     configDirForAccount: (accountId: string): Promise<string | undefined> =>
       Promise.resolve(
-        accounts.find((a) => a.id === accountId)?.groupId !== undefined ? PROFILE_DIR : undefined,
+        accounts.find((a) => a.id === accountId)?.ruleIds !== undefined ? PROFILE_DIR : undefined,
       ),
+    configDirForSlot: (slot: SlotId): string | undefined =>
+      slot === ruleSlotId('g1') ? PROFILE_DIR : undefined,
     slotForConfigDir: (configDir: string | null | undefined): Promise<SlotId> =>
-      Promise.resolve(configDir === PROFILE_DIR ? groupSlotId('g1') : 'global'),
-    resolveCwdBinding: (cwd: string): Promise<{ groupId: string } | null> =>
-      Promise.resolve(cwd === boundFolder ? { groupId: 'g1' } : null),
+      Promise.resolve(configDir === PROFILE_DIR ? ruleSlotId('g1') : 'global'),
+    resolveFolderRule: (cwd: string): Promise<{ ruleId: string; folder: string } | null> =>
+      Promise.resolve(cwd === boundFolder ? { ruleId: 'g1', folder: boundFolder } : null),
     reauthenticate: (id: string): Promise<ReauthResult> =>
       Promise.resolve({
         account: { id, label: id, quarantined: false, createdAtMs: 0, updatedAtMs: 0 },
@@ -162,14 +164,45 @@ describe('Daemon: folder-bound slots on the session path', () => {
     // The SDK client was bound to the group's profile dir, not the shared config dir.
     expect(capturedConfigDirs).toEqual([PROFILE_DIR]);
     // The group was ensured live before the spawn read its credentials.
-    expect(engine.ensureGroupLiveCalls).toContain('g1');
+    expect(engine.ensureRuleLiveCalls).toContain('g1');
     // Spawned + attributed on the group's live member (m1), never the payload's (absent) account.
     const spawn = harness.sessionManager as unknown as {
       spawnCalls: Array<{ accountId?: string }>;
     };
     expect(spawn.spawnCalls[0]?.accountId).toBe('m1');
     // The mirrored row carries the group slot.
-    expect(harness.store.getSession('spawned-session')?.slot).toBe(groupSlotId('g1'));
+    expect(harness.store.getSession('spawned-session')?.slot).toBe(ruleSlotId('g1'));
+  });
+
+  it('binds a spawn in a ruled cwd to the rule profile while an inherited shared account holds it', async () => {
+    // Every included account is out, so the folder's slot runs on a shared account it inherits.
+    // The session must still run in the folder's profile (that is where the slot is), on the account
+    // live there — not fall back to the global slot because the account is a shared one.
+    const boundFolder = await sandbox();
+    const capturedConfigDirs: Array<string | undefined> = [];
+    const engine = groupEngine(boundFolder, 'acct-y');
+    harness = await createHarness({
+      switchEngine: engine,
+      createAgentSdkClient: (configDir?: string): AgentSdkClient => {
+        capturedConfigDirs.push(configDir);
+        return scriptedAgentSdkClient([]);
+      },
+    });
+    await harness.daemon.start();
+
+    harness.relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r1', prompt: 'go', idempotencyKey: 's1', cwd: boundFolder },
+    });
+    await waitFor(() => harness!.store.getSession('spawned-session') !== undefined);
+
+    expect(capturedConfigDirs).toEqual([PROFILE_DIR]);
+    const spawn = harness.sessionManager as unknown as {
+      spawnCalls: Array<{ accountId?: string }>;
+    };
+    expect(spawn.spawnCalls[0]?.accountId).toBe('acct-y');
+    expect(harness.store.getSession('spawned-session')?.slot).toBe(ruleSlotId('g1'));
   });
 
   it('binds an explicit reserved account to its group profile even with no cwd', async () => {
@@ -196,7 +229,7 @@ describe('Daemon: folder-bound slots on the session path', () => {
       spawnCalls: Array<{ accountId?: string }>;
     };
     expect(spawn.spawnCalls[0]?.accountId).toBe('m2');
-    expect(harness.store.getSession('spawned-session')?.slot).toBe(groupSlotId('g1'));
+    expect(harness.store.getSession('spawned-session')?.slot).toBe(ruleSlotId('g1'));
   });
 
   it('refuses an explicit shared account that is not the live global account', async () => {

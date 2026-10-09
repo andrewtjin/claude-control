@@ -566,8 +566,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       // at prompt time. The snapshot it reads was refreshed just before this in Daemon.start(), so a
       // restart always leaves the guard consistent with the live registry. Fail-open with the rest of
       // this closure: a settings.json we cannot write only degrades enforcement, never daemon startup.
-      const groups = await engine.listGroups();
-      const hasBindings = groups.length > 0;
+      const rules = await engine.listRules();
+      const hasBindings = rules.length > 0;
       await ensureBindGuard({
         settingsPath,
         guardPath: bindGuardPath(dataDir),
@@ -575,7 +575,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         hasBindings,
         // A group-slot session reads its profile's settings.json, which a temp+rename write to main
         // severs from the guard; propagate the guard into (or clean it out of) each profile too.
-        profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, groups, hasBindings),
+        profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, rules, hasBindings),
       });
     },
     // Publish the receiver's actual loopback port so `cctl session register|label|watch` can

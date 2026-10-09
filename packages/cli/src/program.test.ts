@@ -51,10 +51,10 @@ const engine = vi.hoisted(() => ({
   // The folder-bound registry view: defaults to the shared pool (set below to delegate to
   // listAccounts) so switch/where/accounts tests that stub listAccounts drive it too.
   listAllAccounts: vi.fn((): Promise<StoredAccount[]> => Promise.resolve([])),
-  listGroups: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
+  listRules: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
   liveSlots: vi.fn((): Promise<Map<string, string | null>> => Promise.resolve(new Map())),
-  getGroup: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
-  getGroupsGeneration: vi.fn((): Promise<number> => Promise.resolve(0)),
+  getRule: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
+  getRulesGeneration: vi.fn((): Promise<number> => Promise.resolve(0)),
   readSnapshot: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
   getGuardSnapshotFreshness: vi.fn(
     (): Promise<{
@@ -66,14 +66,14 @@ const engine = vi.hoisted(() => ({
   ),
   checkSlots: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
   refreshSnapshot: vi.fn((): Promise<void> => Promise.resolve()),
-  bindFolder: vi.fn((f: string): Promise<never> =>
-    Promise.reject(new Error(`bindFolder(${f}) not stubbed`)),
+  includeInFolder: vi.fn((f: string): Promise<never> =>
+    Promise.reject(new Error(`includeInFolder(${f}) not stubbed`)),
   ),
-  unbindFolder: vi.fn((f: string): Promise<never> =>
-    Promise.reject(new Error(`unbindFolder(${f}) not stubbed`)),
+  resetFolder: vi.fn((f: string): Promise<never> =>
+    Promise.reject(new Error(`resetFolder(${f}) not stubbed`)),
   ),
-  ensureGroupLive: vi.fn((): Promise<never> =>
-    Promise.reject(new Error('ensureGroupLive not stubbed')),
+  ensureRuleLive: vi.fn((): Promise<never> =>
+    Promise.reject(new Error('ensureRuleLive not stubbed')),
   ),
   getActiveId: vi.fn((): Promise<string | null> => Promise.resolve(null)),
   activate: vi.fn((id: string): Promise<ActivateResult> =>
@@ -1068,7 +1068,7 @@ describe('folder-bound account commands', () => {
   });
 
   it('bindings with nothing bound prints the empty-state message', async () => {
-    engine.listGroups.mockResolvedValueOnce([]);
+    engine.listRules.mockResolvedValueOnce([]);
     engine.liveSlots.mockResolvedValueOnce(new Map());
     engine.getGuardSnapshotFreshness.mockResolvedValueOnce({
       present: false,
@@ -1081,7 +1081,7 @@ describe('folder-bound account commands', () => {
   });
 
   it('where on an unbound folder explains the global account', async () => {
-    engine.listGroups.mockResolvedValue([]);
+    engine.listRules.mockResolvedValue([]);
     engine.liveSlots.mockResolvedValue(new Map());
     const r = await runCli(['where', '.']);
     expect(r.out).toContain('global (shared) account');
@@ -1089,7 +1089,7 @@ describe('folder-bound account commands', () => {
 
   it('bind surfaces an engine refusal as a single error line', async () => {
     engine.listAccounts.mockResolvedValue([acct()]);
-    engine.bindFolder.mockRejectedValueOnce(
+    engine.includeInFolder.mockRejectedValueOnce(
       new RefreshError(
         'already bound to something else; unbind it first',
         'folder_bound_elsewhere',
@@ -1100,7 +1100,7 @@ describe('folder-bound account commands', () => {
     expect(r.err).toContain('already bound to something else');
   });
 
-  it('switch of a folder-bound member names its folder group', async () => {
+  it('switch of an account a folder includes names the folder slot it went to', async () => {
     const member = acct({ id: 'm-1', label: 'client@me.com' });
     engine.listAccounts.mockResolvedValue([member]);
     engine.activate.mockResolvedValueOnce({
@@ -1110,18 +1110,21 @@ describe('folder-bound account commands', () => {
       refreshed: false,
       adoptedPreviousRotation: false,
     });
-    engine.listGroups.mockResolvedValue([
+    engine.listRules.mockResolvedValue([
       {
         id: 'g1',
         label: 'client',
-        members: [member],
+        include: ['m-1'],
+        exclude: [],
         activeId: 'm-1',
         folders: ['C:\\repos\\client'],
       },
     ]);
+    // The account is live in the rule's slot after the switch.
+    engine.liveSlots.mockResolvedValue(new Map([['group:g1', 'm-1']]));
     const r = await runCli(['switch', 'client@me.com']);
     expect(r.out).toContain('client@me.com');
-    expect(r.out).toContain('folder group');
+    expect(r.out).toContain('folder slot of');
     expect(r.out).toContain('C:\\repos\\client');
   });
 
@@ -1158,7 +1161,7 @@ describe('doctor with a folder-bindings registry this build cannot read', () => 
       const unreadable = new VaultError(
         'groups.json has an unsupported schemaVersion (2); a newer build wrote it',
       );
-      engine.listGroups.mockRejectedValueOnce(unreadable);
+      engine.listRules.mockRejectedValueOnce(unreadable);
       engine.checkSlots.mockRejectedValueOnce(unreadable);
       engine.getGuardSnapshotFreshness.mockRejectedValueOnce(unreadable);
 

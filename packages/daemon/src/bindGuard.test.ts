@@ -140,7 +140,8 @@ describe('bind guard script', () => {
     return (
       'cctl: ' +
       boundFolder +
-      ' is bound to Alice, Bob, but this session runs on the shared account. ' +
+      ' has its own cctl folder rules (it uses Alice, Bob first), but this session runs on the ' +
+      'shared account. ' +
       'Exit and start it with: cctl claude' +
       '   (or set up the claude wrapper: cctl shell-init powershell)'
     );
@@ -256,10 +257,10 @@ describe('bind guard script', () => {
     expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: expectedReasonA() });
   });
 
-  it('(A) session on ANOTHER group slot names that account, not "the shared account"', async () => {
-    // A session on group X's reserved slot, working in a folder bound to group W. The block is
-    // correct, but the reason must name the account the session is really on (group X), not claim it
-    // "runs on the shared account" — which is false and misdirects the fix.
+  it('(A) session on ANOTHER rule slot names that slot, not "the shared account"', async () => {
+    // A session on rule X's slot, working in a folder with rule W. The block is correct, but the
+    // reason must name the slot the session is really on (rule X's), not claim it "runs on the shared
+    // account" — which is false and misdirects the fix.
     const xFolderReal = join(root, 'xwork');
     const xProfileReal = join(root, 'xprofile');
     await mkdir(xFolderReal, { recursive: true });
@@ -298,13 +299,33 @@ describe('bind guard script', () => {
     expect(result.code).toBe(0);
     const parsed = JSON.parse(result.stdout) as { decision?: string; reason?: string };
     expect(parsed.decision).toBe('block');
-    // Names group X's account and folders, and does NOT falsely claim the shared account.
-    expect(parsed.reason).toContain('work@x');
-    expect(parsed.reason).toContain(xFolder);
+    // Names rule X's folder slot, and does NOT falsely claim the shared account.
+    expect(parsed.reason).toContain(`this session runs on the folder slot of ${xFolder}`);
     expect(parsed.reason).not.toContain('the shared account');
     // And the remediation points at --override / relaunch, not the shell-wrapper hint that only makes
     // sense for a genuinely-global session.
     expect(parsed.reason).toContain('--override');
+  });
+
+  it('(A) a rule that only excludes accounts reads as the folder having its own rules', async () => {
+    // An exclude-only rule includes nobody, so there is no account list to name: the reason must not
+    // read "is bound to " followed by nothing.
+    await writeSnapshot({
+      groups: [{ id: 'group-1', label: 'excl', profileDir, folders: [boundFolder], members: [] }],
+    });
+    const result = await runGuard(scriptPath, PAYLOAD, {
+      ...baseEnv(),
+      CLAUDE_PROJECT_DIR: boundFolder,
+    });
+    expect(JSON.parse(result.stdout)).toEqual({
+      decision: 'block',
+      reason:
+        'cctl: ' +
+        boundFolder +
+        ' has its own cctl folder rules, but this session runs on the shared account. ' +
+        'Exit and start it with: cctl claude' +
+        '   (or set up the claude wrapper: cctl shell-init powershell)',
+    });
   });
 
   it('correct pairing (project bound to G, session on G) → silent allow', async () => {

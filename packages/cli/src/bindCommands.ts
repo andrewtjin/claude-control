@@ -1,6 +1,7 @@
-// The folder-bound-account command surface: bind, unbind, bindings, where, shell-init, claude.
+// The folder-account command surface: bind, unbind, bindings, where, shell-init, claude. `bind` adds
+// accounts to a folder's rule (include) and `unbind` removes the folder's rule (reset).
 //
-// Action bodies stay thin — the engine owns the state machine (bind/unbind/ensureGroupLive) and the
+// Action bodies stay thin — the engine owns the state machine (include/reset/ensureRuleLive) and the
 // pure helpers own resolution (launcher.ts), text (shellInit.ts) and rendering (render.ts). Here we
 // only wire, resolve refs, and print. Every folder/label printed passes sanitizeForTerminal at the
 // render layer (see render.ts) so operator- and filesystem-supplied text can never drive the terminal.
@@ -13,14 +14,15 @@ import {
   canonicalizeFolder,
   folderBindingsPath,
   folderKey,
-  groupSlotId,
   profilesRoot,
   resolveAccountRef,
-  resolveBinding,
+  resolveFolderRule,
+  ruleIdOfSlot,
+  ruleSlotId,
   type AccountView,
   type Paths,
+  type SlotId,
   type StoredAccount,
-  type StoredGroup,
 } from '@claude-control/switch-engine';
 import { defaultPaths } from '@claude-control/switch-engine';
 import {
@@ -71,10 +73,15 @@ function canonicalizeCliFolder(input: string): string {
   return r.path;
 }
 
-/** The profile config dir for a group — the same location the engine materializes
- *  (`<profilesRoot>/<groupId>`). Computed here rather than read from the (possibly stale) snapshot. */
-function groupProfilePath(vaultDir: string, groupId: string): string {
-  return join(profilesRoot(vaultDir), groupId);
+/** The profile config dir for a folder rule — the same location the engine materializes
+ *  (`<profilesRoot>/<ruleId>`). Computed here rather than read from the (possibly stale) snapshot. */
+function groupProfilePath(vaultDir: string, ruleId: string): string {
+  return join(profilesRoot(vaultDir), ruleId);
+}
+
+/** The label of an account id among `accounts`, falling back to the id itself. */
+function labelOf(accounts: readonly StoredAccount[], id: string): string {
+  return accounts.find((a) => a.id === id)?.label ?? id;
 }
 
 /** Install (or, after the last unbind, remove) the enforcement guard hook so a binding change takes
@@ -82,17 +89,17 @@ function groupProfilePath(vaultDir: string, groupId: string): string {
  *  is reported as a warning, never a command failure, because the daemon also reconciles the guard on
  *  its next start. Keeps the bind/unbind actions from each re-deriving the same paths. */
 export async function reconcileBindGuard(engine: Engine, paths: Paths): Promise<void> {
-  const groups = await engine.listGroups();
-  const hasBindings = groups.length > 0;
+  const rules = await engine.listRules();
+  const hasBindings = rules.length > 0;
   try {
     await ensureBindGuard({
       settingsPath: join(paths.claudeDir, 'settings.json'),
       guardPath: bindGuardPath(dirname(paths.vaultDir)),
       snapshotPath: folderBindingsPath(paths.vaultDir),
       hasBindings,
-      // Propagate the guard into (or clean it out of) every group profile's settings.json — a
-      // group-slot session reads its profile copy, which a temp+rename write to main un-shares.
-      profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, groups, hasBindings),
+      // Propagate the guard into (or clean it out of) every rule profile's settings.json — a
+      // rule-slot session reads its profile copy, which a temp+rename write to main un-shares.
+      profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, rules, hasBindings),
     });
   } catch (err) {
     process.stderr.write(
@@ -103,23 +110,30 @@ export async function reconcileBindGuard(engine: Engine, paths: Paths): Promise<
   }
 }
 
-/** Build the display view of every group: members with the reconciled live one marked. */
+/** Build the display view of every folder rule: its included accounts with the reconciled live one
+ *  marked. (An inherited shared account live in the slot is not one of them, so none is marked.) */
 async function buildGroupViews(engine: Engine): Promise<BindingGroupView[]> {
   const paths = defaultPaths();
-  const [groups, live] = await Promise.all([engine.listGroups(), engine.liveSlots()]);
-  return groups.map((g) => {
-    const liveMemberId = live.get(groupSlotId(g.id)) ?? null;
+  const rules = await engine.listRules();
+  // Nothing more to read with no rules: `accounts list` / `usage` append this to every listing.
+  if (rules.length === 0) return [];
+  const [live, accounts] = await Promise.all([engine.liveSlots(), engine.listAllAccounts()]);
+  return rules.map((r) => {
+    const liveId = live.get(ruleSlotId(r.id)) ?? null;
     return {
-      label: g.label,
-      folders: g.folders,
-      members: g.members.map((m) => ({
-        label: m.label,
-        live: m.id === liveMemberId,
-        quarantined: m.quarantined,
-        excluded: m.autoSwitchExcluded ?? false,
-      })),
-      profileDir: groupProfilePath(paths.vaultDir, g.id),
-      noWorkingAccount: liveMemberId === null,
+      label: r.label,
+      folders: r.folders,
+      members: r.include
+        .map((id) => accounts.find((a) => a.id === id))
+        .filter((a): a is AccountView => a !== undefined)
+        .map((m) => ({
+          label: m.label,
+          live: m.id === liveId,
+          quarantined: m.quarantined,
+          excluded: m.autoSwitchExcluded ?? false,
+        })),
+      profileDir: groupProfilePath(paths.vaultDir, r.id),
+      noWorkingAccount: liveId === null,
     };
   });
 }
@@ -133,7 +147,7 @@ export async function renderBindingsAppendix(engine: Engine, palette: Palette): 
   return '\n\nFolder-bound accounts:\n' + renderBindingGroups(groups, palette);
 }
 
-/** Resolve one account ref against the full registry (shared pool + reserved members). */
+/** Resolve one account ref against the full registry (shared pool + reserved accounts). */
 async function resolveAcrossAll(engine: Engine, ref: string): Promise<AccountView> {
   const all = (await engine.listAllAccounts()) as StoredAccount[];
   const resolved = resolveAccountRef(all, ref);
@@ -147,8 +161,10 @@ export function buildBindCommands(program: Command): void {
   // -------------------------------------------------------------------------
   program
     .command('bind <folder> <accounts>')
-    .description('bind a folder (and its subfolders) to one account or a comma-separated set')
-    .option('--label <label>', 'a display name for the group (default: joined member labels)')
+    .description(
+      'have a folder (and its subfolders) use one account or a comma-separated set first',
+    )
+    .option('--label <label>', "a display name for the folder's rule (default: the folder)")
     .action(async (folder: string, accounts: string, opts: { label?: string }) => {
       const engine = buildEngine();
       const refs = accounts
@@ -162,54 +178,53 @@ export function buildBindCommands(program: Command): void {
         if (!ids.includes(acct.id)) ids.push(acct.id);
       }
       try {
-        const result = await engine.bindFolder(
+        const result = await engine.includeInFolder(
           folder,
           ids,
           opts.label ? { label: opts.label } : {},
         );
         const palette = detectPalette();
+        const accounts = await engine.listAllAccounts();
         const lines: string[] = [];
-        const groupLabel = sanitizeForTerminal(result.group.label);
+        const ruleLabel = sanitizeForTerminal(result.rule.label);
         const boundFolder = sanitizeForTerminal(
-          result.group.folders[result.group.folders.length - 1] ?? folder,
+          result.rule.folders[result.rule.folders.length - 1] ?? folder,
         );
+        const included = sanitizeForTerminal(ids.map((id) => labelOf(accounts, id)).join(', '));
         lines.push(
           result.created
-            ? `Bound ${boundFolder} to a new folder account: ${groupLabel}.`
-            : `Bound ${boundFolder} to the existing folder account: ${groupLabel}.`,
+            ? `Bound ${boundFolder} to a new folder rule (${ruleLabel}) using ${included} first.`
+            : `Added ${included} to the folder rule of ${boundFolder} (${ruleLabel}).`,
         );
-        if (result.movedOffGlobal !== null) {
-          const movedLabel = result.group.members.find(
-            (m) => m.id === result.movedOffGlobal,
-          )?.label;
-          const toLabel = result.globalSwitchedTo
-            ? sanitizeForTerminal(
-                (await engine.listAccounts()).find((a) => a.id === result.globalSwitchedTo)
-                  ?.label ?? result.globalSwitchedTo,
-              )
-            : 'none';
+        // Every slot moved off a newly reserved account, said out loud: an include can change which
+        // account another place runs on.
+        for (const h of result.handedOff) {
+          const from = sanitizeForTerminal(labelOf(accounts, h.from));
+          const to = sanitizeForTerminal(labelOf(accounts, h.to));
+          const ruleId = ruleIdOfSlot(h.slot);
+          const slotName =
+            ruleId === undefined
+              ? 'global slot'
+              : `folder slot of ${sanitizeForTerminal(
+                  (await engine.getRule(ruleId))?.folders.join(', ') ?? h.slot,
+                )}`;
           lines.push(
-            `  global slot switched off ${sanitizeForTerminal(movedLabel ?? result.movedOffGlobal)} ` +
-              `(it is now reserved to this folder); global is now on ${toLabel}.`,
+            `  ${slotName} switched off ${from} (it is now reserved to this folder); it is now on ${to}.`,
           );
         }
         const profileDir = sanitizeForTerminal(
-          groupProfilePath(defaultPaths().vaultDir, result.group.id),
+          groupProfilePath(defaultPaths().vaultDir, result.rule.id),
         );
-        if (result.live.noWorkingAccount) {
+        if (result.live.noWorkingAccount || result.live.liveAccount === null) {
           lines.push(
             palette.red(
-              `  the folder has no working account (all members quarantined); re-login one: ` +
-                `cctl accounts relogin <ref>`,
+              `  the folder has no working account (every account it may use is quarantined or ` +
+                `live elsewhere); re-login one: cctl accounts relogin <ref>`,
             ),
           );
         } else {
-          const liveLabel = result.group.members.find(
-            (m) => m.id === result.live.liveMember,
-          )?.label;
-          lines.push(
-            `  profile ready on ${sanitizeForTerminal(liveLabel ?? 'a member')}: ${profileDir}`,
-          );
+          const liveLabel = labelOf(accounts, result.live.liveAccount);
+          lines.push(`  profile ready on ${sanitizeForTerminal(liveLabel)}: ${profileDir}`);
         }
         if (result.runningSessions.length > 0) {
           lines.push(
@@ -233,23 +248,27 @@ export function buildBindCommands(program: Command): void {
   // -------------------------------------------------------------------------
   program
     .command('unbind <folder>')
-    .description('remove a folder binding; the last folder of a group dissolves it')
+    .description("remove a folder's rule; a rule's last folder dissolves it")
     .option('--force', 'dissolve even when sessions are observed running under the folder')
     .action(async (folder: string, opts: { force?: boolean }) => {
       const engine = buildEngine();
       try {
-        const result = await engine.unbindFolder(folder, opts.force ? { force: true } : {});
+        const result = await engine.resetFolder(
+          folder,
+          undefined,
+          opts.force ? { force: true } : {},
+        );
         const folderText = sanitizeForTerminal(result.folder);
         if (!result.dissolved) {
           process.stdout.write(
-            `Unbound ${folderText}. The group keeps its other folders and stays live.\n`,
+            `Unbound ${folderText}. Its rule keeps its other folders and stays live.\n`,
           );
           return;
         }
-        const lines = [`Unbound ${folderText} and dissolved its folder account.`];
-        if (result.releasedMembers.length > 0) {
+        const lines = [`Unbound ${folderText} and removed its folder rule.`];
+        if (result.released.length > 0) {
           lines.push(
-            `  ${result.releasedMembers.length} account(s) returned to the shared pool` +
+            `  ${result.released.length} account(s) returned to the shared pool` +
               (result.adoptedRotation ? ' (adopted the profile’s latest token first)' : '') +
               '.',
           );
@@ -302,24 +321,27 @@ export function buildBindCommands(program: Command): void {
     .action(async (folderArg: string | undefined) => {
       const engine = buildEngine();
       const canonical = canonicalizeCliFolder(folderArg ?? process.cwd());
-      const [groups, live] = await Promise.all([engine.listGroups(), engine.liveSlots()]);
-      const binding = resolveBinding(canonical, groups, process.platform);
+      const [rules, live, accounts] = await Promise.all([
+        engine.listRules(),
+        engine.liveSlots(),
+        engine.listAllAccounts(),
+      ]);
+      const match = resolveFolderRule(canonical, rules, process.platform);
       let view: WhereView;
-      if (binding === null) {
+      if (match === null) {
         view = { folder: canonical, bound: null };
       } else {
-        const group = groups.find((g) => g.id === binding.groupId) as StoredGroup;
-        const liveId = live.get(groupSlotId(group.id)) ?? null;
+        const rule = match.rule;
+        const liveId = live.get(ruleSlotId(rule.id)) ?? null;
         view = {
           folder: canonical,
           bound: {
-            groupLabel: group.label,
-            matchedFolder: binding.folder,
-            members: group.members.map((m) => m.label),
-            profileDir: groupProfilePath(defaultPaths().vaultDir, group.id),
-            liveMemberLabel: liveId
-              ? (group.members.find((m) => m.id === liveId)?.label ?? null)
-              : null,
+            groupLabel: rule.label,
+            matchedFolder: match.folder,
+            members: rule.include.map((id) => labelOf(accounts, id)),
+            profileDir: groupProfilePath(defaultPaths().vaultDir, rule.id),
+            // Any account live in the slot — an inherited one too, while the included ones are out.
+            liveMemberLabel: liveId !== null ? labelOf(accounts, liveId) : null,
           },
         };
       }
@@ -352,7 +374,10 @@ export function buildBindCommands(program: Command): void {
   program
     .command('claude [args...]')
     .description('launch Claude Code on the account for the current folder (or --account)')
-    .option('--account <ref>', 'launch a specific account (its group profile, or the global slot)')
+    .option(
+      '--account <ref>',
+      "launch a specific account (its folder's profile, or the global slot)",
+    )
     .option('--override', 'allow this session in a folder bound to a DIFFERENT account')
     .helpOption(false)
     .allowUnknownOption(true)
@@ -406,18 +431,29 @@ async function runClaude(opts: {
   if (opts.account !== undefined) {
     explicit = true;
     const acct = await resolveAcrossAll(engine, opts.account);
-    if (acct.groupId !== undefined) {
-      // A reserved member: make it live in its group slot (a deliberate launch overrides cadence),
-      // then run in that profile.
-      const group = await engine.getGroup(acct.groupId);
-      if (!group) fail(`account ${acct.label} is reserved to a group that no longer exists.`);
+    if (acct.ruleIds !== undefined && acct.ruleIds.length > 0) {
+      // A reserved account: make it live in its rule's slot (a deliberate launch overrides cadence),
+      // then run in that profile. One several rules include goes to the slot it is live in.
+      const live = await engine.liveSlots();
+      const ruleId =
+        acct.ruleIds.length === 1
+          ? acct.ruleIds[0]
+          : acct.ruleIds.find((id) => live.get(ruleSlotId(id)) === acct.id);
+      if (ruleId === undefined) {
+        fail(
+          `${acct.label} is included by several folders and live in none of them; ` +
+            'run cctl claude from one of its folders instead.',
+        );
+      }
+      const rule = await engine.getRule(ruleId);
+      if (!rule) fail(`account ${acct.label} is reserved to a folder rule that no longer exists.`);
       try {
-        // Asserting the group slot: if the account was released between the lookup above and this
+        // Asserting the rule slot: if the account was released between the lookup above and this
         // switch, it must fail here rather than switch the GLOBAL slot and then launch into a profile.
         await engine.activate(acct.id, {
           force: true,
           origin: 'manual',
-          slot: groupSlotId(group.id),
+          slot: ruleSlotId(rule.id),
         });
       } catch (err) {
         if (err instanceof SwitchEngineError) fail(err.message);
@@ -425,9 +461,9 @@ async function runClaude(opts: {
       }
       slot = {
         kind: 'group',
-        profileDir: groupProfilePath(paths.vaultDir, group.id),
+        profileDir: groupProfilePath(paths.vaultDir, rule.id),
         label: acct.label,
-        context: `explicit account, ${group.folders.join(', ')}`,
+        context: `explicit account, ${rule.folders.join(', ')}`,
       };
     } else {
       // A shared account can only be live in the global slot, and only one at a time — so --account
@@ -443,31 +479,31 @@ async function runClaude(opts: {
       slot = { kind: 'global', label: acct.label, context: 'global (shared account)' };
     }
   } else {
-    // No explicit account: the cwd's folder binding decides.
+    // No explicit account: the cwd's folder rule decides.
     const canonical = canonicalizeCliFolder(process.cwd());
-    const groups = await engine.listGroups();
-    const binding = resolveBinding(canonical, groups, platform);
-    if (binding !== null) {
-      const group = groups.find((g) => g.id === binding.groupId) as StoredGroup;
+    const rules = await engine.listRules();
+    const match = resolveFolderRule(canonical, rules, platform);
+    if (match !== null) {
+      const rule = match.rule;
       let live;
       try {
-        live = await engine.ensureGroupLive(group.id);
+        live = await engine.ensureRuleLive(rule.id);
       } catch (err) {
         if (err instanceof SwitchEngineError) fail(err.message);
         throw err;
       }
-      if (live.noWorkingAccount) {
+      if (live.noWorkingAccount || live.liveAccount === null) {
         fail(
-          `${binding.folder} is bound to ${group.members.map((m) => m.label).join(', ')}, but none ` +
-            `of its accounts are usable (all quarantined). Re-login one: cctl accounts relogin <ref>.`,
+          `${match.folder} has a folder rule, but no account it may use is usable right now ` +
+            `(quarantined, or live in another slot). Re-login one: cctl accounts relogin <ref>.`,
         );
       }
-      const liveLabel = group.members.find((m) => m.id === live.liveMember)?.label ?? group.label;
+      const liveLabel = labelOf(await engine.listAllAccounts(), live.liveAccount);
       slot = {
         kind: 'group',
-        profileDir: groupProfilePath(paths.vaultDir, group.id),
+        profileDir: groupProfilePath(paths.vaultDir, rule.id),
         label: liveLabel,
-        context: `${binding.folder} binding`,
+        context: `${match.folder} binding`,
       };
     } else {
       const globalLive = await engine.getActiveId('global');
@@ -573,13 +609,23 @@ function slotProfileKey(slot: LaunchSlot, platform: NodeJS.Platform): string {
   return r.ok ? folderKey(r.path, platform) : folderKey(slot.profileDir, platform);
 }
 
-/** Also used by `cctl switch`: describe the group a just-switched member belongs to (or null when it
- *  is a shared account). Kept here beside the other group helpers. */
+/** Also used by `cctl switch`: the folder rule whose slot a just-switched account is now live in, or
+ *  null when it went to the global slot. Kept here beside the other folder helpers. */
 export async function describeSwitchedGroup(
   engine: Engine,
   accountId: string,
 ): Promise<{ label: string; folders: string[] } | null> {
-  const groups = await engine.listGroups();
-  const group = groups.find((g) => g.members.some((m) => m.id === accountId));
-  return group ? { label: group.label, folders: group.folders } : null;
+  const [rules, live] = await Promise.all([engine.listRules(), engine.liveSlots()]);
+  const rule = rules.find((r) => live.get(ruleSlotId(r.id)) === accountId);
+  return rule ? { label: rule.label, folders: rule.folders } : null;
+}
+
+/** The slot `cctl switch` asserts for an account: the global slot for a shared one, the rule's slot
+ *  for an account one rule includes, and none for an account several rules include — the engine then
+ *  takes the slot it is live in, or refuses and says to name the folder, rather than this command
+ *  picking one. */
+export function switchSlotOf(account: AccountView | undefined): SlotId | undefined {
+  const ruleIds = account?.ruleIds ?? [];
+  if (ruleIds.length === 0) return 'global';
+  return ruleIds.length === 1 ? ruleSlotId(ruleIds[0]!) : undefined;
 }
