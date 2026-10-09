@@ -8,6 +8,7 @@
 import { Command } from 'commander';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -27,6 +28,7 @@ import {
   defaultProtector,
   generatePkce,
   generateState,
+  canonicalizeFolder,
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
@@ -40,8 +42,10 @@ import {
   buildDaemonHookSpecs,
   episodesOf,
   exhaustionLogPath,
-  judgeOutage,
-  resumeOpenEpisode,
+  judgeScope,
+  outageScopes,
+  resumeOpenEpisodes,
+  scopeOf,
   readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
@@ -49,6 +53,7 @@ import {
   uninstallHooks,
   type OpenEpisode,
   type OutageJudgement,
+  type ScopeView,
   type SessionRow,
 } from '@claude-control/daemon';
 import type { AccountUsage } from '@claude-control/shared-protocol';
@@ -64,6 +69,7 @@ import {
   type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
 import {
+  episodesForFolder,
   episodesInWindow,
   expectedFirstBack,
   renderOutageBanner,
@@ -391,7 +397,7 @@ export function buildProgram(): Command {
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       text += await renderBindingsAppendix(buildEngine(), detectPalette());
-      const banner = await exhaustionBanner(inputs, await cliAutoSwitchPolicy(), nowMs);
+      const banner = await exhaustionBanner(await cliAutoSwitchPolicy(), nowMs);
       process.stdout.write((banner !== undefined ? `${banner}\n\n` : '') + text + '\n');
     });
 
@@ -405,7 +411,7 @@ export function buildProgram(): Command {
       const inputs = buildAdvisorInputs(state);
       const outlook = computeOutlook(inputs, nowMs);
       const autoSwitchPolicy = await cliAutoSwitchPolicy();
-      const banner = await exhaustionBanner(inputs, autoSwitchPolicy, nowMs);
+      const banner = await exhaustionBanner(autoSwitchPolicy, nowMs);
       let text =
         (banner !== undefined ? `${banner}\n\n` : '') +
         renderOutlook(outlook, { style: outlookStyle(detectPalette()) });
@@ -436,44 +442,35 @@ export function buildProgram(): Command {
     });
 
   // The history of the fleet's worst failure: every time no account could take work, written by
-  // the daemon (see the daemon's exhaustionLog.ts). Works with the daemon stopped: the file is
-  // the history, and an outage still open in it is checked against the latest numbers in
-  // daemon.db, so one that is over but that no running daemon has closed says so.
+  // the daemon (see the daemon's exhaustionLog.ts), for the global pool and for each folder rule's
+  // pool. Works with the daemon stopped: the file is the history, and an outage still open in it is
+  // checked against the latest numbers in daemon.db, so one that is over but that no running daemon
+  // has closed says so.
   program
     .command('outages')
     .description(
       'every time no account could take work: when, for how long, why, and the switches before it',
     )
     .option('--days <n>', 'only the times that started in the last <n> days')
+    .option('--folder <folder>', 'only the times the folder rule <folder> runs under ran out')
     .option('--json', 'print the times as JSON, newest first')
-    .action(async (opts: { days?: string; json?: boolean }) => {
+    .action(async (opts: { days?: string; folder?: string; json?: boolean }) => {
       let days: number | undefined;
       if (opts.days !== undefined) {
         days = Number(opts.days);
         if (!Number.isFinite(days) || days <= 0) fail('--days must be a positive number.');
       }
+      const folder = opts.folder !== undefined ? canonicalOutageFolder(opts.folder) : undefined;
       const nowMs = Date.now();
       const log = exhaustionLog();
       const records = await log.read();
-      const resumed = resumeOpenEpisode(records);
-      let open: OutageStatus | undefined;
-      if (resumed !== undefined) {
-        // Where it stands by the latest numbers: over, or who is expected back first.
-        const judged = await judgeLatestNumbers(resumed, nowMs);
-        const transition = judged?.transition;
-        const expected = expectedFirstBack(judged?.open ?? resumed, nowMs, judged?.fleet);
-        open = {
-          id: resumed.record.id,
-          ...(transition?.kind === 'end' ? { overBy: transition.recovery } : {}),
-          ...(expected !== undefined ? { expected } : {}),
-        };
-      }
-      const episodes = episodesInWindow(episodesOf(records), nowMs, days, open?.id);
+      const open = await openOutageStatuses(resumeOpenEpisodes(records), nowMs);
+      let episodes = episodesInWindow(episodesOf(records), nowMs, days, open);
+      if (folder !== undefined) episodes = episodesForFolder(episodes, folder, process.platform);
       if (opts.json === true) {
-        const newestFirst = [...episodes].reverse();
+        const newestFirst = [...episodes].reverse().map((e) => ({ scope: scopeOf(e.start), ...e }));
         process.stdout.write(
-          JSON.stringify({ log: log.path, open: open ?? null, episodes: newestFirst }, null, 2) +
-            '\n',
+          JSON.stringify({ log: log.path, open, episodes: newestFirst }, null, 2) + '\n',
         );
         return;
       }
@@ -482,7 +479,8 @@ export function buildProgram(): Command {
           now: nowMs,
           logPath: log.path,
           ...(days !== undefined ? { days } : {}),
-          ...(open !== undefined ? { open } : {}),
+          ...(folder !== undefined ? { folder } : {}),
+          open,
           palette: detectPalette(),
         }) + '\n',
       );
@@ -1247,9 +1245,15 @@ interface UsageState {
   burnUnitsPerDay: number | undefined;
 }
 
-async function readUsageState(nowMs: number): Promise<UsageState> {
+/** The usage view's state: the shared accounts, the global live account and each account's latest
+ *  snapshot. `only` names the accounts to read instead (the outage judgement reads the whole fleet,
+ *  reserved accounts included). */
+async function readUsageState(nowMs: number, only?: StoredAccount[]): Promise<UsageState> {
   const engine = buildEngine();
-  const [accounts, activeId] = await Promise.all([engine.listAccounts(), engine.getActiveId()]);
+  const [accounts, activeId] = await Promise.all([
+    only !== undefined ? Promise.resolve(only) : engine.listAccounts(),
+    engine.getActiveId(),
+  ]);
   const store = new Store(daemonDbPath());
   try {
     const byId = new Map<string, AccountUsage>();
@@ -1331,43 +1335,109 @@ function exhaustionLog(): ExhaustionLog {
   return new ExhaustionLog(exhaustionLogPath(dirname(defaultPaths().vaultDir)));
 }
 
-/** The log's open outage judged against the latest numbers the way the daemon judges it
- *  (`judgeOutage`), or `undefined` when they cannot be read: `cctl outages` prints the history
- *  either way, and an unreadable daemon.db or vault must not stop it. */
-async function judgeLatestNumbers(
-  open: OpenEpisode,
-  nowMs: number,
-): Promise<OutageJudgement | undefined> {
-  try {
-    const inputs = buildAdvisorInputs(await readUsageState(nowMs));
-    return judgeOutage(inputs, open, nowMs, await cliAutoSwitchPolicy());
-  } catch {
-    return undefined;
-  }
+/** A `--folder` argument as the rules key folders, failing the command with the reason on a path
+ *  no folder can have. A folder that no longer exists still canonicalizes (by its spelling), so
+ *  the history of a removed folder stays reachable. */
+function canonicalOutageFolder(input: string): string {
+  const r = canonicalizeFolder(input, {
+    platform: process.platform,
+    cwd: process.cwd(),
+    realpath: (p) => realpathSync.native(p),
+  });
+  if (!r.ok) fail(`cannot use folder "${input}": ${r.reason}`);
+  return r.path;
 }
 
-/** The banner `usage` and `timeline` lead with while no account can take work, judged the way
- *  the daemon judges it (`judgeOutage`): an outage open in the log stays on until the numbers
+/** Every scope as the daemon sees it this moment (the global pool and each folder rule's pool, see
+ *  `outageScopes`), with the latest numbers for the whole fleet, reserved accounts included. */
+async function readOutageScopes(
+  nowMs: number,
+): Promise<{ inputs: AccountUsageInput[]; scopes: ScopeView[] }> {
+  const engine = buildEngine();
+  const [accounts, rules, liveSlots] = await Promise.all([
+    engine.listAllAccounts(),
+    engine.listRules(),
+    engine.liveSlots(),
+  ]);
+  const inputs = buildAdvisorInputs(await readUsageState(nowMs, accounts));
+  return { inputs, scopes: outageScopes({ accounts, rules, liveSlots }) };
+}
+
+/**
+ * Where each scope's open outage stands by the latest numbers, judged the way the daemon judges it
+ * (`judgeScope`): over and how, or who is expected back first. A folder whose rule is gone is
+ * marked so (a running daemon closes it as removed). When the numbers or the registry cannot be
+ * read each open outage is still listed, as the log last saw it: `cctl outages` prints the history
+ * either way, and an unreadable daemon.db or vault must not stop it.
+ */
+async function openOutageStatuses(
+  opens: Map<string, OpenEpisode>,
+  nowMs: number,
+): Promise<OutageStatus[]> {
+  if (opens.size === 0) return [];
+  let current: { inputs: AccountUsageInput[]; scopes: ScopeView[] } | undefined;
+  let policy: AutoSwitchPolicy = {};
+  try {
+    current = await readOutageScopes(nowMs);
+    policy = await cliAutoSwitchPolicy();
+  } catch {
+    current = undefined;
+  }
+  const statuses: OutageStatus[] = [];
+  for (const [key, resumed] of opens) {
+    const scope = scopeOf(resumed.record);
+    const view = current?.scopes.find((s) => s.key === key);
+    if (current !== undefined && view === undefined) {
+      statuses.push({ id: resumed.record.id, scope, ruleRemoved: true });
+      continue;
+    }
+    let judged: OutageJudgement | undefined;
+    try {
+      judged =
+        current !== undefined && view !== undefined
+          ? judgeScope(current.inputs, view, resumed, nowMs, policy)
+          : undefined;
+    } catch {
+      judged = undefined;
+    }
+    const transition = judged?.transition;
+    const expected = expectedFirstBack(judged?.open ?? resumed, nowMs, judged?.fleet);
+    statuses.push({
+      id: resumed.record.id,
+      scope,
+      ...(transition?.kind === 'end' ? { overBy: transition.recovery } : {}),
+      ...(expected !== undefined ? { expected } : {}),
+    });
+  }
+  return statuses;
+}
+
+/** The banner `usage` and `timeline` lead with while some pool has no account that can take
+ *  work: one line for the global pool, and one per folder rule whose pool is out, each judged the
+ *  way the daemon judges it (`judgeScope`): an outage open in the log stays on until the numbers
  *  the view prints prove an account is back, so a poll that came back empty does not hide it;
- *  with none open, it is on when no account can take work. A log that cannot be read is treated
- *  as having none open, and a banner that cannot be worked out is left off: it leads the view,
- *  it must never replace it. */
+ *  with none open, it is on when nothing in the pool can take work. A log that cannot be read is
+ *  treated as having none open, and a banner that cannot be worked out is left off: it leads the
+ *  view, it must never replace it. */
 async function exhaustionBanner(
-  inputs: AccountUsageInput[],
   policy: AutoSwitchPolicy,
   nowMs: number,
 ): Promise<string | undefined> {
-  let open: OpenEpisode | undefined;
+  let opens = new Map<string, OpenEpisode>();
   try {
-    open = resumeOpenEpisode(await exhaustionLog().read());
+    opens = resumeOpenEpisodes(await exhaustionLog().read());
   } catch {
-    open = undefined;
+    opens = new Map();
   }
   try {
-    const judged = judgeOutage(inputs, open, nowMs, policy);
-    return judged.on
-      ? renderOutageBanner(judged.fleet, judged.open, nowMs, detectPalette())
-      : undefined;
+    const { inputs, scopes } = await readOutageScopes(nowMs);
+    const lines: string[] = [];
+    for (const view of scopes) {
+      const judged = judgeScope(inputs, view, opens.get(view.key), nowMs, policy);
+      if (!judged.on) continue;
+      lines.push(renderOutageBanner(judged.fleet, judged.open, nowMs, detectPalette(), view.scope));
+    }
+    return lines.length > 0 ? lines.join('\n') : undefined;
   } catch {
     return undefined;
   }

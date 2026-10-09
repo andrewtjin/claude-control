@@ -1189,6 +1189,9 @@ describe('outages, and the banner usage and timeline lead with', () => {
     pathsIo.dataRoot = '';
     settingsIo.configPath = '';
     engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+    engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
+    engine.listRules.mockImplementation(() => Promise.resolve([]));
+    engine.liveSlots.mockImplementation(() => Promise.resolve(new Map<string, string | null>()));
     engine.getActiveId.mockImplementation(() => Promise.resolve(null));
     await rm(dir, { recursive: true, force: true });
   });
@@ -1275,9 +1278,9 @@ describe('outages, and the banner usage and timeline lead with', () => {
     }
   };
 
-  it('offers --days and --json', () => {
+  it('offers --days, --folder and --json', () => {
     const cmd = buildProgram().commands.find((c) => c.name() === 'outages');
-    expect(cmd?.options.map((o) => o.long).sort()).toEqual(['--days', '--json']);
+    expect(cmd?.options.map((o) => o.long).sort()).toEqual(['--days', '--folder', '--json']);
   });
 
   it('lists every time, newest first, and says where the log is', async () => {
@@ -1353,6 +1356,143 @@ describe('outages, and the banner usage and timeline lead with', () => {
     ]);
     const r = await runCli(['usage']);
     expect(r.out).not.toContain('No account can take work');
+  });
+
+  describe('per scope: the global pool and each folder rule', () => {
+    const FOLDER = process.platform === 'win32' ? 'C:\\research' : '/research';
+    const scope = { kind: 'folder', ruleId: 'r1', folders: [FOLDER], label: FOLDER };
+    /** A folder's start line, as the daemon writes it. */
+    const folderStarted = (at: number) => ({
+      ...started(at, `ep-${at}-r1`),
+      v: 2,
+      scope,
+      summary: `No account in ${FOLDER}'s pool can take work: ...`,
+      accounts: [
+        {
+          accountId: 'e1',
+          label: 'inc1',
+          reason: 'session',
+          percent: 100,
+          backAt: at + 2 * H,
+          spent: [],
+        },
+        {
+          accountId: 'a1',
+          label: 'work1',
+          reason: 'live_elsewhere',
+          spent: [],
+          liveIn: 'the global slot',
+        },
+      ],
+    });
+    /** The research rule including e1, which is live in its slot; work1 live globally. */
+    const withRule = () => {
+      engine.listAllAccounts.mockImplementation(() =>
+        Promise.resolve([
+          account('a1', 'work1'),
+          account('a2', 'work2'),
+          { ...account('e1', 'inc1'), ruleIds: ['r1'] },
+        ]),
+      );
+      engine.listRules.mockImplementation(() =>
+        Promise.resolve([
+          {
+            id: 'r1',
+            label: FOLDER,
+            folders: [FOLDER],
+            include: ['e1'],
+            exclude: ['a2'],
+            activeId: 'e1',
+            createdAtMs: 0,
+            updatedAtMs: 0,
+          },
+        ]),
+      );
+      engine.liveSlots.mockImplementation(() =>
+        Promise.resolve(
+          new Map([
+            ['global', 'a1'],
+            ['group:r1', 'e1'],
+          ]),
+        ),
+      );
+    };
+
+    it('cctl outages lists both scopes, each labeled, and --json carries the scope', async () => {
+      const now = Date.now();
+      const old = started(now - 50 * H);
+      await seedLog([old, recovered(old, now - 49 * H), folderStarted(now - 2 * H)]);
+      const r = await runCli(['outages']);
+      expect(r.out).toMatch(/^2 times no account could take work \(newest first\):/);
+      expect(r.out).toContain(`[${FOLDER}] `);
+      expect(r.out).toContain('[global] ');
+      expect(r.out.indexOf(`[${FOLDER}]`)).toBeLessThan(r.out.indexOf('[global]'));
+      expect(r.out).toContain('work1  live in the global slot');
+      const json = JSON.parse((await runCli(['outages', '--json'])).out) as {
+        open: Array<{ scope: unknown }>;
+        episodes: Array<{ scope: unknown; start: { id: string } }>;
+      };
+      expect(json.episodes.map((e) => e.scope)).toEqual([scope, { kind: 'global' }]);
+      expect(json.open).toMatchObject([{ scope }]);
+    });
+
+    it('--folder narrows to the rule a folder runs under, a subfolder included', async () => {
+      const now = Date.now();
+      const old = started(now - 50 * H);
+      await seedLog([old, recovered(old, now - 49 * H), folderStarted(now - 2 * H)]);
+      const sub = join(FOLDER, 'project');
+      for (const arg of [FOLDER, sub]) {
+        const json = JSON.parse((await runCli(['outages', '--json', '--folder', arg])).out) as {
+          episodes: Array<{ start: { id: string } }>;
+        };
+        expect(json.episodes.map((e) => e.start.id)).toEqual([`ep-${now - 2 * H}-r1`]);
+      }
+      const other = await runCli(['outages', '--folder', join(FOLDER, '..', 'elsewhere')]);
+      expect(other.out).toMatch(
+        /^No time on record when every account in .+'s pool was out of usage\./,
+      );
+    });
+
+    it('usage leads with the global line and one line per folder that is out', async () => {
+      const now = Date.now();
+      withRule();
+      // Global: work1 spent, work2 spent. Folder: inc1 spent, work1 spent too (work2 excluded).
+      await seedUsage([
+        { id: 'a1', label: 'work1', percent: 100, resetsAt: now + 2 * H },
+        { id: 'a2', label: 'work2', percent: 100, resetsAt: now + 4 * H },
+        { id: 'e1', label: 'inc1', percent: 100, resetsAt: now + 3 * H },
+      ]);
+      const lines = (await runCli(['usage'])).out.split('\n');
+      expect(lines[0]).toMatch(/^No account can take work\. First back: work1 in /);
+      expect(lines[1]).toMatch(
+        new RegExp(
+          `^No account in ${FOLDER.replace(/\\/g, '\\\\')}'s pool can take work\\. First back: work1 in `,
+        ),
+      );
+    });
+
+    it('a folder out while the global pool works shows the folder line alone', async () => {
+      const now = Date.now();
+      withRule();
+      // work1 can work but is live in the global slot; inc1 is spent; work2 is excluded there.
+      await seedUsage([
+        { id: 'a1', label: 'work1', percent: 10, resetsAt: now + 2 * H },
+        { id: 'a2', label: 'work2', percent: 100, resetsAt: now + 4 * H },
+        { id: 'e1', label: 'inc1', percent: 100, resetsAt: now + 3 * H },
+      ]);
+      const out = (await runCli(['timeline'])).out;
+      expect(out.startsWith(`No account in ${FOLDER}'s pool can take work.`)).toBe(true);
+      expect(out).not.toMatch(/^No account can take work/m);
+    });
+
+    it('a folder episode whose rule is gone says so in cctl outages', async () => {
+      const now = Date.now();
+      await seedLog([folderStarted(now - 2 * H)]);
+      const r = await runCli(['outages']);
+      expect(r.out).toContain(
+        '-> its folder rule was removed; no running daemon has recorded the end yet',
+      );
+    });
   });
 });
 
@@ -1571,9 +1711,11 @@ describe('the banner and the plan agree with the running daemon', () => {
       /-> over by the latest numbers: work1 back since .+ \(its 5-hour window reset\)/,
     );
     const json = JSON.parse((await runCli(['outages', '--json'])).out) as {
-      open: { id: string; overBy?: { label: string; how: string } } | null;
+      open: Array<{ id: string; scope: unknown; overBy?: { label: string; how: string } }>;
     };
-    expect(json.open).toMatchObject({ overBy: { label: 'work1', how: 'reset' } });
+    expect(json.open).toMatchObject([
+      { scope: { kind: 'global' }, overBy: { label: 'work1', how: 'reset' } },
+    ]);
     expect((await runCli(['usage'])).out).not.toContain(BANNER);
   });
 

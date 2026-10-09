@@ -11,9 +11,26 @@
 // Deciding WHEN an episode starts and ends is pure (see {@link decideExhaustion}) and leans on
 // the usage advisor's shared availability rule, so the log can never disagree with the plan or
 // the post-switch session resume about whether an account has usage left.
+//
+// Every episode has a SCOPE: the global pool, or one folder rule's effective pool (see
+// {@link outageScopes}). Each scope runs its own episodes side by side, and a scope is out when
+// nothing in its pool can take work, where an account live in another slot does not count: one
+// login is never live in two slots, so that slot cannot have it. The global scope follows the same
+// rule, so an account held by a folder slot is not counted as the global pool's. A line without a
+// scope is the global pool's, which is how every line written before scopes existed reads. Folder
+// lines are written as `v: 2` so that a build predating scopes, which reads only `v: 1`, skips them
+// rather than taking a folder's outage for the whole fleet's.
 
 import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import {
+  ruleIdOfSlot,
+  ruleSlotId,
+  slotMayHold,
+  type AccountView,
+  type FolderRule,
+  type SlotId,
+} from '@claude-control/switch-engine';
 import {
   assessFleet,
   describeFirstBack,
@@ -27,6 +44,7 @@ import {
   type LimitInput,
   type UnavailableReason,
 } from '@claude-control/usage-advisor';
+import { folderNameOf, rulesPictureOf } from './folderSlots.js';
 
 /** The log's file name inside the daemon's data directory. */
 const EXHAUSTION_LOG_FILE = 'exhaustion-log.jsonl';
@@ -44,6 +62,129 @@ export function exhaustionLogPath(dataDir: string): string {
   return join(dataDir, EXHAUSTION_LOG_FILE);
 }
 
+// ---- scopes -------------------------------------------------------------------------------------
+
+/** Which pool an episode is about: the global pool, or one folder rule's effective pool. A folder
+ *  scope records the rule's folders and label as they stood when the episode began, so the
+ *  history still names it after the rule changes or is removed. */
+export type OutageScope =
+  { kind: 'global' } | { kind: 'folder'; ruleId: string; folders: string[]; label: string };
+
+/** The global pool's scope. */
+export const GLOBAL_SCOPE: OutageScope = { kind: 'global' };
+
+/** One string per scope, stable across a rule's edits: `global`, or `folder:<rule id>`. */
+export function scopeKey(scope: OutageScope): string {
+  return scope.kind === 'global' ? 'global' : folderScopeKey(scope.ruleId);
+}
+
+/** The {@link scopeKey} of a folder rule's scope. */
+export function folderScopeKey(ruleId: string): string {
+  return `folder:${ruleId}`;
+}
+
+/** A record's scope. A line without one is the global pool's: every line written before scopes
+ *  existed reads that way. */
+export function scopeOf(record: { scope?: OutageScope }): OutageScope {
+  return record.scope ?? GLOBAL_SCOPE;
+}
+
+/** The scope in words: "the global pool", or the rule's folders (its label when it has none). */
+export function describeScope(scope: OutageScope): string {
+  return scope.kind === 'global' ? 'the global pool' : folderNameOf(scope);
+}
+
+/** The `v` a record of this scope is written with (see the module header). */
+function versionOf(scope: OutageScope): 1 | 2 {
+  return scope.kind === 'global' ? 1 : 2;
+}
+
+/** One scope as one poll cycle sees it: the accounts in its effective pool, and those of them live
+ *  in another slot, mapped to where in words (what {@link judgeOutage} takes). */
+export interface ScopeView {
+  scope: OutageScope;
+  key: string;
+  accountIds: string[];
+  liveElsewhere: Map<string, string>;
+}
+
+/** A slot in words, as an account live in it is described: "the global slot", or "the slot of"
+ *  its rule's folders. */
+function slotWords(slot: SlotId, rules: readonly FolderRule[]): string {
+  if (slot === 'global') return 'the global slot';
+  const rule = rules.find((r) => r.id === ruleIdOfSlot(slot));
+  return rule === undefined ? 'another slot' : `the slot of ${folderNameOf(rule)}`;
+}
+
+/** A rule's scope as it stands now. */
+function folderScope(rule: FolderRule): OutageScope {
+  return { kind: 'folder', ruleId: rule.id, folders: [...rule.folders], label: rule.label };
+}
+
+/**
+ * Every scope this cycle: the global pool, then one per folder rule in rule order. Membership is
+ * the engine's own `slotMayHold` (a rule's included accounts plus the shared accounts it does not
+ * exclude; the shared accounts for the global pool), so the log can never count an account a slot
+ * may not take, nor leave out one it may. Unlike the switching pool it keeps quarantined and
+ * globally excluded accounts: a dead login is an account out (and named so), and an excluded one
+ * still takes work when chosen by hand. An account live in a slot other than the scope's own is
+ * listed in `liveElsewhere`.
+ */
+export function outageScopes(fleet: {
+  accounts: readonly AccountView[];
+  rules: readonly FolderRule[];
+  liveSlots: ReadonlyMap<SlotId, string | null>;
+}): ScopeView[] {
+  const { accounts, rules, liveSlots } = fleet;
+  const picture = rulesPictureOf(accounts, rules);
+  const view = (slot: SlotId, scope: OutageScope, order: readonly string[]): ScopeView => {
+    const members = accounts
+      .filter((a) => slotMayHold(slot, a.id, picture))
+      .map((a) => a.id)
+      // The rule's own accounts first, in its order, as its pool lists them.
+      .sort((a, b) => rank(order, a) - rank(order, b));
+    const liveElsewhere = new Map<string, string>();
+    for (const id of members) {
+      for (const [other, live] of liveSlots) {
+        if (other !== slot && live === id) {
+          liveElsewhere.set(id, slotWords(other, rules));
+          break;
+        }
+      }
+    }
+    return { scope, key: scopeKey(scope), accountIds: members, liveElsewhere };
+  };
+  return [
+    view('global', GLOBAL_SCOPE, []),
+    ...rules.map((r) => view(ruleSlotId(r.id), folderScope(r), r.include)),
+  ];
+}
+
+/** Where an id sits in a preferred order; anything not in it after, in its existing order. */
+function rank(order: readonly string[], id: string): number {
+  const at = order.indexOf(id);
+  return at === -1 ? order.length : at;
+}
+
+/** {@link judgeOutage} for one scope: its own accounts out of the cycle's inputs, judged with those
+ *  live in other slots counted out. */
+export function judgeScope(
+  inputs: AccountUsageInput[],
+  scope: ScopeView,
+  open: OpenEpisode | undefined,
+  now: number,
+  policy: Pick<AutoSwitchPolicy, 'fableCapTriggers'>,
+): OutageJudgement {
+  const members = new Set(scope.accountIds);
+  return judgeOutage(
+    inputs.filter((i) => members.has(i.accountId)),
+    open,
+    now,
+    policy,
+    scope.liveElsewhere,
+  );
+}
+
 /** One account as it stood when the episode began. */
 export interface ExhaustedAccount {
   accountId: string;
@@ -57,7 +198,12 @@ export interface ExhaustedAccount {
   /** The limits at the wall, with their reported resets: what a later cycle checks to tell a
    *  real return from a poll that merely came back empty. */
   spent: LimitInput[];
+  /** For `live_elsewhere`: the slot it was live in, in words. */
+  liveIn?: string;
 }
+
+/** A record's version: 1 for the global pool, 2 for a folder scope (see the module header). */
+export type ExhaustionVersion = 1 | 2;
 
 /** One switch in the walk that led to the episode, by each account's label when the entry was
  *  written (an account removed since shows its id). */
@@ -69,12 +215,14 @@ export interface ExhaustionSwitch {
   reason?: string;
 }
 
-/** Written when the last account runs out. */
+/** Written when the last account of a scope runs out. */
 export interface ExhaustedRecord {
-  v: 1;
+  v: ExhaustionVersion;
   event: 'exhausted';
   /** Pairs this entry with its `recovered` entry. */
   id: string;
+  /** The pool this episode is about; absent reads as the global pool. */
+  scope?: OutageScope;
   at: number;
   /** `at` as ISO-8601, for a human reading the file. */
   time: string;
@@ -87,17 +235,27 @@ export interface ExhaustedRecord {
   switches: ExhaustionSwitch[];
 }
 
-/** Every way an account can come back; the reader accepts exactly these. */
-const RECOVERY_HOWS = ['reset', 'headroom', 'relogin', 'new_account'] as const;
+/** Every way an episode can end; the reader accepts exactly these. All but `rule_removed` are an
+ *  account coming back: `released` is one another slot let go of. `rule_removed` ends a folder's
+ *  episode because its rule is gone, so there is no pool left to be out. */
+const RECOVERY_HOWS = [
+  'reset',
+  'headroom',
+  'relogin',
+  'new_account',
+  'released',
+  'rule_removed',
+] as const;
 
-/** How the first account came back. */
+/** How an episode ended: how the first account came back, or its rule being removed. */
 export type RecoveryHow = (typeof RECOVERY_HOWS)[number];
 
-/** Written when some account can take work again. */
+/** Written when some account of the scope can take work again, or the scope's rule is gone. */
 export interface RecoveredRecord {
-  v: 1;
+  v: ExhaustionVersion;
   event: 'recovered';
   id: string;
+  scope?: OutageScope;
   /** When the daemon saw it. */
   at: number;
   time: string;
@@ -107,7 +265,8 @@ export interface RecoveredRecord {
   backSince: number;
   /** `backSince` minus the episode's start. */
   durationMs: number;
-  account: { accountId: string; label: string };
+  /** The account that came back; absent only when the episode ended with its rule removed. */
+  account?: { accountId: string; label: string };
   how: RecoveryHow;
   /** For `reset`: the limit whose reset brought it back. */
   limit?: LimitInput['kind'];
@@ -115,22 +274,24 @@ export interface RecoveredRecord {
 
 /**
  * Written while an episode is open, when what keeps an account out changes materially: it hits a
- * new limit, its login dies, a reset it waits on moves by more than {@link WALL_MOVE_MS}, or it
- * joins the episode (added mid-outage). A restarted daemon, and the CLI, fold these into the
- * start entry's accounts, so a return is judged against what was last seen, not only against what
- * was true at the start.
+ * new limit, its login dies, a reset it waits on moves by more than {@link WALL_MOVE_MS}, it is
+ * taken by another slot, or it joins the episode (added mid-outage). A restarted daemon, and the
+ * CLI, fold these into the start entry's accounts, so a return is judged against what was last
+ * seen, not only against what was true at the start.
  */
 export interface WallsRecord {
-  v: 1;
+  v: ExhaustionVersion;
   event: 'walls';
   /** The open episode it belongs to. */
   id: string;
+  scope?: OutageScope;
   at: number;
   time: string;
   accountId: string;
   label: string;
   reason: UnavailableReason;
   spent: LimitInput[];
+  liveIn?: string;
 }
 
 export type ExhaustionRecord = ExhaustedRecord | RecoveredRecord | WallsRecord;
@@ -139,7 +300,7 @@ export type ExhaustionRecord = ExhaustedRecord | RecoveredRecord | WallsRecord;
  *  reset per response with about a second of jitter, and a line per poll would bury the history. */
 export const WALL_MOVE_MS = 5 * 60_000;
 
-/** An episode as the CLI lists it: its start and, once over, its end. */
+/** An episode as the CLI lists it: its start and, once over, its end. Its scope is the start's. */
 export interface ExhaustionEpisode {
   start: ExhaustedRecord;
   end?: RecoveredRecord;
@@ -155,7 +316,7 @@ export interface ExhaustionEpisode {
 // Taken from the exhaustive per-kind table, so a limit kind added there is read here too rather
 // than dropping every line that carries it.
 const LIMIT_KINDS = new Set<string>(Object.keys(LIMIT_NOUN));
-const REASONS = new Set<string>([...LIMIT_KINDS, 'quarantined']);
+const REASONS = new Set<string>([...LIMIT_KINDS, 'quarantined', 'live_elsewhere']);
 const HOWS = new Set<string>(RECOVERY_HOWS);
 
 /** The largest magnitude a `Date` can hold: a timestamp past it renders as "NaN". */
@@ -189,7 +350,8 @@ function isExhaustedAccount(v: unknown): boolean {
     Array.isArray(v.spent) &&
     v.spent.every(isLimit) &&
     optional(v.percent, isNumber) &&
-    optional(v.backAt, isTime)
+    optional(v.backAt, isTime) &&
+    optional(v.liveIn, isString)
   );
 }
 
@@ -204,9 +366,25 @@ function isSwitch(v: unknown): boolean {
   );
 }
 
+/** Whether a line's version and scope agree: `v: 1` is the global pool's (its scope absent or
+ *  global), `v: 2` a folder's, with every field of the folder scope present. */
+function hasScopeOfVersion(value: Record<string, unknown>): boolean {
+  const scope = value.scope;
+  if (value.v === 1) return scope === undefined || (isObject(scope) && scope.kind === 'global');
+  return (
+    value.v === 2 &&
+    isObject(scope) &&
+    scope.kind === 'folder' &&
+    isString(scope.ruleId) &&
+    Array.isArray(scope.folders) &&
+    scope.folders.every(isString) &&
+    isString(scope.label)
+  );
+}
+
 /** Narrow one parsed line to a record this build understands (see above). */
 function isRecord(value: unknown): value is ExhaustionRecord {
-  if (!isObject(value) || value.v !== 1 || !isString(value.id) || !isTime(value.at)) {
+  if (!isObject(value) || !hasScopeOfVersion(value) || !isString(value.id) || !isTime(value.at)) {
     return false;
   }
   if (value.event === 'exhausted') {
@@ -224,10 +402,13 @@ function isRecord(value: unknown): value is ExhaustionRecord {
   }
   if (value.event === 'recovered') {
     const account = value.account;
+    // Only a removed rule ends an episode with no account back.
+    const accountOk =
+      value.how === 'rule_removed'
+        ? account === undefined
+        : isObject(account) && isString(account.accountId) && isString(account.label);
     return (
-      isObject(account) &&
-      isString(account.accountId) &&
-      isString(account.label) &&
+      accountOk &&
       isTime(value.backSince) &&
       isNumber(value.durationMs) &&
       isString(value.how) &&
@@ -238,31 +419,44 @@ function isRecord(value: unknown): value is ExhaustionRecord {
   return false;
 }
 
-/** Pair starts with their ends, oldest first. An end with no start (a hand-edited file) is
- *  dropped; a start with no end is the episode still open. `walls` lines are tracking, not
- *  history, and are left to {@link resumeOpenEpisode}. A start written twice (a write retried
- *  after it had in fact landed) is one episode. */
+/** The key that pairs a start with its end and its `walls` lines: the scope, then the id. Two
+ *  scopes can never share an episode, whatever their ids. */
+function episodeKey(record: ExhaustionRecord): string {
+  return `${scopeKey(scopeOf(record))} ${record.id}`;
+}
+
+/** Pair starts with their ends, oldest first, across every scope (each episode's scope is its
+ *  start's). An end with no start (a hand-edited file) is dropped; a start with no end is the
+ *  episode still open. `walls` lines are tracking, not history, and are left to
+ *  {@link resumeOpenEpisode}. A start written twice (a write retried after it had in fact landed)
+ *  is one episode. */
 export function episodesOf(records: ExhaustionRecord[]): ExhaustionEpisode[] {
   const episodes: ExhaustionEpisode[] = [];
-  const byId = new Map<string, ExhaustionEpisode>();
+  const byKey = new Map<string, ExhaustionEpisode>();
   for (const r of records) {
     if (r.event === 'exhausted') {
-      if (byId.has(r.id)) continue;
+      if (byKey.has(episodeKey(r))) continue;
       const episode: ExhaustionEpisode = { start: r };
       episodes.push(episode);
-      byId.set(r.id, episode);
+      byKey.set(episodeKey(r), episode);
     } else if (r.event === 'recovered') {
-      const episode = byId.get(r.id);
+      const episode = byKey.get(episodeKey(r));
       if (episode !== undefined && episode.end === undefined) episode.end = r;
     }
   }
   return episodes;
 }
 
-/** The episode still open: the LAST start, when it has no end. An older start left without an
- *  end (a crash between two writes) is history, not a second open episode. */
-export function openEpisodeOf(records: ExhaustionRecord[]): ExhaustedRecord | undefined {
-  const last = episodesOf(records).at(-1);
+/** A scope's episode still open: its LAST start, when that has no end. An older start left
+ *  without an end (a crash between two writes) is history, not a second open episode. */
+export function openEpisodeOf(
+  records: ExhaustionRecord[],
+  scope: OutageScope = GLOBAL_SCOPE,
+): ExhaustedRecord | undefined {
+  const key = scopeKey(scope);
+  const last = episodesOf(records)
+    .filter((e) => scopeKey(scopeOf(e.start)) === key)
+    .at(-1);
   return last !== undefined && last.end === undefined ? last.start : undefined;
 }
 
@@ -347,6 +541,9 @@ export interface TrackedAccount {
   /** What the log file holds for it (the start entry or its last `walls` line), or `undefined`
    *  when the file has nothing yet: what a change is measured against before it is written. */
   filed?: { reason: UnavailableReason; spent: LimitInput[] };
+  /** For `live_elsewhere`: the slot it is live in, in words. Not a material change on its own: an
+   *  account moving between two other slots is still not this scope's. */
+  liveIn?: string;
 }
 
 /**
@@ -373,29 +570,54 @@ export function openEpisodeFrom(record: ExhaustedRecord, walls: WallsRecord[] = 
         spent: a.spent,
         lastOutAt: record.at,
         filed: { reason: a.reason, spent: a.spent },
+        ...(a.liveIn !== undefined ? { liveIn: a.liveIn } : {}),
       },
     ]),
   );
+  const key = episodeKey(record);
   for (const w of walls) {
-    if (w.id !== record.id) continue;
+    if (episodeKey(w) !== key) continue;
     accounts.set(w.accountId, {
       label: w.label,
       reason: w.reason,
       spent: w.spent,
       lastOutAt: Math.max(w.at, accounts.get(w.accountId)?.lastOutAt ?? w.at),
       filed: { reason: w.reason, spent: w.spent },
+      ...(w.liveIn !== undefined ? { liveIn: w.liveIn } : {}),
     });
   }
   return { record, accounts };
 }
 
-/** The open episode as the log holds it: the last start without an end, and its `walls` lines.
- *  What a restarted daemon resumes, and what the CLI judges an outage by. */
-export function resumeOpenEpisode(records: ExhaustionRecord[]): OpenEpisode | undefined {
-  const open = openEpisodeOf(records);
+/** A scope's open episode as the log holds it: its last start without an end, and its `walls`
+ *  lines. What a restarted daemon resumes, and what the CLI judges an outage by. */
+export function resumeOpenEpisode(
+  records: ExhaustionRecord[],
+  scope: OutageScope = GLOBAL_SCOPE,
+): OpenEpisode | undefined {
+  const open = openEpisodeOf(records, scope);
   if (open === undefined) return undefined;
-  const walls = records.filter((r): r is WallsRecord => r.event === 'walls' && r.id === open.id);
+  const key = episodeKey(open);
+  const walls = records.filter(
+    (r): r is WallsRecord => r.event === 'walls' && episodeKey(r) === key,
+  );
   return openEpisodeFrom(open, walls);
+}
+
+/** Every scope's open episode, keyed by {@link scopeKey}: what a restarted daemon resumes, and
+ *  what the CLI judges each scope's outage by. A scope whose rule has since been removed is
+ *  still here; ending it is the daemon's job. */
+export function resumeOpenEpisodes(records: ExhaustionRecord[]): Map<string, OpenEpisode> {
+  const scopes = new Map<string, OutageScope>();
+  for (const r of records) {
+    if (r.event === 'exhausted') scopes.set(scopeKey(scopeOf(r)), scopeOf(r));
+  }
+  const open = new Map<string, OpenEpisode>();
+  for (const [key, scope] of scopes) {
+    const episode = resumeOpenEpisode(records, scope);
+    if (episode !== undefined) open.set(key, episode);
+  }
+  return open;
 }
 
 /** Whether two sets of walls differ in a way that changes a return: a limit added or gone, or a
@@ -451,16 +673,19 @@ export function fileWallChanges(
     if (filed !== undefined && filed.reason === a.reason && !wallsDiffer(filed.spent, a.spent)) {
       continue;
     }
+    const scope = scopeOf(open.record);
     records.push({
-      v: 1,
+      v: versionOf(scope),
       event: 'walls',
       id: open.record.id,
+      scope,
       at: now,
       time: new Date(now).toISOString(),
       accountId,
       label: a.label,
       reason: a.reason,
       spent: a.spent,
+      ...(a.liveIn !== undefined ? { liveIn: a.liveIn } : {}),
     });
     accounts.set(accountId, { ...a, filed: { reason: a.reason, spent: a.spent } });
   }
@@ -489,6 +714,7 @@ export function trackOpenEpisode(
       spent: a.measured ? a.spent : (before?.spent ?? []),
       lastOutAt: now,
       ...(before?.filed !== undefined ? { filed: before.filed } : {}),
+      ...(a.liveIn !== undefined ? { liveIn: a.liveIn } : {}),
     });
   }
   return { record: open.record, accounts };
@@ -518,14 +744,22 @@ export interface OutageJudgement {
  * No margin is held against that: the poller re-polls an account only every few minutes, so any
  * margin would delay every real "usage is back" by up to its length, to guard against a step
  * that has to land within minutes of a reset to matter.
+ *
+ * `liveElsewhere` names the accounts live in a slot other than the judged scope's, which that
+ * scope cannot take (see {@link judgeScope}); absent, every account counts as free.
  */
 export function judgeOutage(
   inputs: AccountUsageInput[],
   open: OpenEpisode | undefined,
   now: number,
   policy: Pick<AutoSwitchPolicy, 'fableCapTriggers'>,
+  liveElsewhere?: ReadonlyMap<string, string>,
 ): OutageJudgement {
-  const fleet = assessFleet(inputs, now, policy);
+  const fleet = assessFleet(
+    inputs,
+    now,
+    liveElsewhere === undefined ? policy : { ...policy, liveElsewhere },
+  );
   if (open === undefined) {
     const transition = decideExhaustion(undefined, fleet, now);
     return { fleet, open, transition, on: transition.kind === 'start' };
@@ -601,6 +835,11 @@ function recoveryOf(
   if (before === undefined) {
     return now.measured ? { ...who, how: 'new_account', backSince: at } : undefined;
   }
+  // Let go by the slot that held it. Being free is certain (the slots say so), but whether it can
+  // take work needs numbers, as for an added account: a poll that failed reads as usable too.
+  if (before.reason === 'live_elsewhere') {
+    return now.measured ? { ...who, how: 'released', backSince: at } : undefined;
+  }
   const wall = wallResetOf(before, at);
   if (before.reason === 'quarantined') {
     // A restored login: its numbers show headroom, or the walls it also had have since reset.
@@ -637,14 +876,24 @@ function wallResetOf(
 
 // ---- building records ----------------------------------------------------------------------------
 
-/** The `exhausted` entry for an exhausted fleet. */
+/** "No account can take work" for the global pool; "No account in <folder>'s pool can take work"
+ *  for a folder, so a folder's card and line never read as the whole fleet's. */
+function noAccountSentence(scope: OutageScope): string {
+  return scope.kind === 'global'
+    ? 'No account can take work'
+    : `No account in ${describeScope(scope)}'s pool can take work`;
+}
+
+/** The `exhausted` entry for an exhausted fleet, of the global pool unless `scope` says else. */
 export function exhaustedRecord(args: {
   fleet: FleetAvailability;
   now: number;
   active: string | null;
   switches: ExhaustionSwitch[];
+  scope?: OutageScope;
 }): ExhaustedRecord {
   const { fleet, now } = args;
+  const scope = args.scope ?? GLOBAL_SCOPE;
   const accounts: ExhaustedAccount[] = fleet.accounts.map((a) => ({
     accountId: a.accountId,
     label: a.label,
@@ -653,15 +902,18 @@ export function exhaustedRecord(args: {
     ...(a.backAt !== undefined ? { backAt: a.backAt } : {}),
     ...(a.backAtPredicted === true ? { backAtPredicted: true } : {}),
     spent: a.spent,
+    ...(a.liveIn !== undefined ? { liveIn: a.liveIn } : {}),
   }));
   return {
-    v: 1,
+    v: versionOf(scope),
     event: 'exhausted',
-    id: `ep-${now}`,
+    // The rule id keeps two scopes that run out in the same cycle apart in the file, too.
+    id: scope.kind === 'global' ? `ep-${now}` : `ep-${now}-${scope.ruleId}`,
+    scope,
     at: now,
     time: new Date(now).toISOString(),
     summary:
-      `No account can take work: ${fleet.accounts.map((a) => describeUnavailable(a, now)).join(', ')}. ` +
+      `${noAccountSentence(scope)}: ${fleet.accounts.map((a) => describeUnavailable(a, now)).join(', ')}. ` +
       describeFirstBack(fleet, now),
     active: args.active,
     accounts,
@@ -679,8 +931,8 @@ function reasonOf(a: AccountAvailability): UnavailableReason {
   return a.reason;
 }
 
-/** What brought an account back, in words. Shared with `cctl outages`, so the file's summary
- *  and the CLI never word the same recovery differently. */
+/** How an episode ended, in words. Shared with `cctl outages`, so the file's summary and the CLI
+ *  never word the same end differently. */
 export function recoveryText(recovery: Pick<Recovery, 'how' | 'limit'>): string {
   switch (recovery.how) {
     case 'reset':
@@ -693,6 +945,10 @@ export function recoveryText(recovery: Pick<Recovery, 'how' | 'limit'>): string 
       return 'a newly added account';
     case 'headroom':
       return 'it has usage left again';
+    case 'released':
+      return 'another slot let it go';
+    case 'rule_removed':
+      return 'its folder rule was removed';
   }
 }
 
@@ -706,21 +962,62 @@ export function recoveredRecord(
   // outage.
   const backSince = Math.max(recovery.backSince, open.at);
   const durationMs = backSince - open.at;
+  const scope = scopeOf(open);
+  const where = scope.kind === 'global' ? '' : ` in ${describeScope(scope)}`;
+  const could = scope.kind === 'global' ? 'No account could' : 'No account in its pool could';
   return {
-    v: 1,
+    v: versionOf(scope),
     event: 'recovered',
     id: open.id,
+    scope,
     at: now,
     time: new Date(now).toISOString(),
     summary:
-      `Usage is back: ${recovery.label} (${recoveryText(recovery)}). ` +
-      `No account could take work for ${humanizeElapsed(durationMs)}.`,
+      `Usage is back${where}: ${recovery.label} (${recoveryText(recovery)}). ` +
+      `${could} take work for ${humanizeElapsed(durationMs)}.`,
     backSince,
     durationMs,
     account: { accountId: recovery.accountId, label: recovery.label },
     how: recovery.how,
     ...(recovery.limit !== undefined ? { limit: recovery.limit } : {}),
   };
+}
+
+/** The entry that closes a folder's open episode because its rule is gone: with no rule there is
+ *  no pool left to be out, and leaving it open would keep it "ongoing" in the history for good.
+ *  Dated to when the daemon noticed. */
+export function ruleRemovedRecord(open: ExhaustedRecord, now: number): RecoveredRecord {
+  const backSince = Math.max(now, open.at);
+  const durationMs = backSince - open.at;
+  const scope = scopeOf(open);
+  return {
+    v: versionOf(scope),
+    event: 'recovered',
+    id: open.id,
+    scope,
+    at: now,
+    time: new Date(now).toISOString(),
+    summary:
+      `The folder rule for ${describeScope(scope)} was removed, which ends its outage. ` +
+      `No account in its pool could take work for ${humanizeElapsed(durationMs)}.`,
+    backSince,
+    durationMs,
+    how: 'rule_removed',
+  };
+}
+
+/** The phone card's title for the start of an episode. */
+export function exhaustedCardTitle(scope: OutageScope): string {
+  return scope.kind === 'global'
+    ? 'All accounts are out of usage'
+    : `${describeScope(scope)}: every account in its pool is out`;
+}
+
+/** The phone card's title for the end of an episode. */
+export function recoveredCardTitle(record: RecoveredRecord): string {
+  const scope = scopeOf(record);
+  if (record.how === 'rule_removed') return `${describeScope(scope)}: folder rule removed`;
+  return scope.kind === 'global' ? 'Usage is back' : `Usage is back in ${describeScope(scope)}`;
 }
 
 /** The phone card for the start of an episode: one account per line, then when it ends. */
@@ -732,7 +1029,10 @@ export function exhaustedCardBody(fleet: FleetAvailability, record: ExhaustedRec
           `${record.switches.length} switch${record.switches.length === 1 ? '' : 'es'} in the last ${SWITCH_CHAIN_WINDOW_WORDS}; cctl outages lists them.`,
         ]
       : [];
-  return ['No account can take work.', ...lines, describeFirstBack(fleet, record.at), ...walk].join(
-    '\n',
-  );
+  return [
+    `${noAccountSentence(scopeOf(record))}.`,
+    ...lines,
+    describeFirstBack(fleet, record.at),
+    ...walk,
+  ].join('\n');
 }
