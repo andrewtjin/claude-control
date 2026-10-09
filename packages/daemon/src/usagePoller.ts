@@ -100,6 +100,12 @@ export interface RegistryFacts extends PlanTierSignals, BillingSignals {
   /** True when this account is the one live in its group's slot — the group counterpart of the
    *  global `active`. Absent/false for a shared account or a non-live member. */
   groupActive?: boolean;
+  /** The slot the account is live in right now, shared accounts included (a folder slot in
+   *  fallback runs on one), and that slot's folders when it is a folder's. */
+  liveSlot?: string;
+  liveSlotLabel?: string;
+  /** Every rule including a reserved account. */
+  ruleIds?: string[];
 }
 
 /** The wire's plan/billing pair for one account. Both are omitted rather than nulled when
@@ -114,6 +120,9 @@ function registryFields(
   groupId?: string;
   groupLabel?: string;
   groupActive?: boolean;
+  liveSlot?: string;
+  liveSlotLabel?: string;
+  ruleIds?: string[];
 } {
   if (facts === undefined) return {};
   const weight = planWeight(facts);
@@ -125,6 +134,9 @@ function registryFields(
     ...(facts.groupId !== undefined ? { groupId: facts.groupId } : {}),
     ...(facts.groupLabel !== undefined ? { groupLabel: facts.groupLabel } : {}),
     ...(facts.groupActive !== undefined ? { groupActive: facts.groupActive } : {}),
+    ...(facts.liveSlot !== undefined ? { liveSlot: facts.liveSlot } : {}),
+    ...(facts.liveSlotLabel !== undefined ? { liveSlotLabel: facts.liveSlotLabel } : {}),
+    ...(facts.ruleIds !== undefined ? { ruleIds: facts.ruleIds } : {}),
   };
 }
 

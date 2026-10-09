@@ -96,6 +96,19 @@ export const AccountUsage = z.object({
    *  the global `active`). Absent/false for a shared account, a non-live member, or an older daemon.
    *  Display-only: the phone marks which member of a group is in use, and routes on nothing here. */
   groupActive: z.boolean().nullish(),
+  /** The slot this account is live in right now: `global`, or `group:<rule id>` for a folder
+   *  rule's slot. Present for a SHARED account too, which is how a folder slot running on an
+   *  inherited account (its fallback while every included one is out) is told apart from one on its
+   *  own. Absent when the account is live nowhere, or from a daemon predating the field.
+   *  Display-only: a renderer shows a known prefix and ignores the rest. */
+  liveSlot: z.string().nullish(),
+  /** The folder(s) of that slot when it is a folder slot, pre-rendered by the daemon. Display-only,
+   *  same contract as `groupLabel`. */
+  liveSlotLabel: z.string().nullish(),
+  /** Every folder rule that includes (reserves) this account — several folders may share one.
+   *  Absent for a shared account or a daemon predating the field, which then reads from `groupId`
+   *  alone. Display/grouping only, like `groupId`. Bounded like the registry's own rule cap. */
+  ruleIds: z.array(z.string()).max(256).nullish(),
 });
 
 // ---------------------------------------------------------------------------

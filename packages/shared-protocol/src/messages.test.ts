@@ -991,6 +991,31 @@ describe('usage.snapshot folder-bound group fields (additive, N/N-1 tolerant)', 
       decode(rawFrame('usage.snapshot', { accounts: [{ ...account, groupActive: 'yes' }] })).ok,
     ).toBe(false);
   });
+
+  it('carries the live slot, its folder and every including rule through', () => {
+    const result = decode(
+      rawFrame('usage.snapshot', {
+        accounts: [
+          { ...account, liveSlot: 'group:r2', liveSlotLabel: 'C:/two', ruleIds: ['r1', 'r2'] },
+        ],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'usage.snapshot')) {
+      const row = result.envelope.payload.accounts[0];
+      expect(row?.liveSlot).toBe('group:r2');
+      expect(row?.liveSlotLabel).toBe('C:/two');
+      expect(row?.ruleIds).toEqual(['r1', 'r2']);
+    }
+  });
+
+  it('refuses rule ids that are not a bounded list of strings', () => {
+    const decodeWith = (ruleIds: unknown) =>
+      decode(rawFrame('usage.snapshot', { accounts: [{ ...account, ruleIds }] })).ok;
+    expect(decodeWith('r1')).toBe(false);
+    expect(decodeWith([1])).toBe(false);
+    expect(decodeWith(Array.from({ length: 257 }, (_, i) => `r${i}`))).toBe(false);
+  });
 });
 
 describe('session.status slot (additive, N/N-1 tolerant)', () => {

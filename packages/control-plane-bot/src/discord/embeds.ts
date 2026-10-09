@@ -360,8 +360,9 @@ function exclusionSuffix(account: Pick<AccountUsage, 'autoSwitchExcluded'> | und
   return account?.autoSwitchExcluded === true ? '\n⏸ excluded from auto-switch' : '';
 }
 
-/** "\n📁 live in <folder> group" / "\n📁 bound: <folder>" — the folder binding a reserved account
- *  carries, or '' for a shared (global-pool) account and for a daemon predating the group fields.
+/** "\n📁 live in <folder>" for any account live in a folder's slot, else "\n📁 live in <folder>
+ *  group" / "\n📁 bound: <folder>" — the folder binding a reserved account carries, or '' for a
+ *  shared (global-pool) account and for a daemon predating the slot and group fields.
  *
  *  `groupId` present is the sole test for "reserved": a shared account omits it, which reads the
  *  same as an older daemon, so both render exactly as before. `groupActive` picks the wording —
@@ -370,8 +371,15 @@ function exclusionSuffix(account: Pick<AccountUsage, 'autoSwitchExcluded'> | und
  *  right now). The label is the daemon's pre-rendered folder binding; it is user-derived, so it
  *  goes through the markdown escaper like every other label on the card. */
 function groupSuffix(
-  account: Pick<AccountUsage, 'groupId' | 'groupLabel' | 'groupActive'> | undefined,
+  account:
+    | Pick<AccountUsage, 'groupId' | 'groupLabel' | 'groupActive' | 'liveSlot' | 'liveSlotLabel'>
+    | undefined,
 ): string {
+  // Live in a folder's slot, said by a daemon that reports slots: this covers a SHARED account a
+  // folder runs on while its own accounts are out, which carries no group fields at all.
+  if (account?.liveSlot?.startsWith('group:') === true) {
+    return `\n📁 live in ${escapeDiscordMarkdown(account.liveSlotLabel ?? 'a folder slot')}`;
+  }
   if (account?.groupId == null) return '';
   const label = escapeDiscordMarkdown(account.groupLabel ?? 'a folder binding');
   return account.groupActive === true ? `\n📁 live in ${label} group` : `\n📁 bound: ${label}`;
