@@ -73,6 +73,10 @@ export interface EvaluateOptions {
   slotKey?: SlotId;
   /** Restrict hop targets to this id set (the slot's own pool). Passed through to the policy. */
   candidateIds?: ReadonlySet<string>;
+  /** The slot's preferred accounts — a folder rule's included ones — which make the decision
+   *  tiered: used first, left only when none can take over, returned to as soon as one can.
+   *  Passed through to the policy (see `decideAutoSwitch`). */
+  preferredIds?: ReadonlySet<string>;
   /** Human name of the slot this hop is in — the bound folder(s) for a group slot. When present it
    *  is woven into the `switch.result` message so the phone notice for a GROUP hop says WHICH folder
    *  group rotated, exactly as the operator needs to tell a group hop apart from the global one.
@@ -124,12 +128,10 @@ export class AutoSwitcher {
   ): Promise<string | undefined> {
     const now = this.clock();
     const slotKey = opts.slotKey ?? GLOBAL_SLOT_KEY;
-    const decision = decideAutoSwitch(
-      accounts,
-      now,
-      this.policy,
-      opts.candidateIds !== undefined ? { candidateIds: opts.candidateIds } : {},
-    );
+    const decision = decideAutoSwitch(accounts, now, this.policy, {
+      ...(opts.candidateIds !== undefined ? { candidateIds: opts.candidateIds } : {}),
+      ...(opts.preferredIds !== undefined ? { preferredIds: opts.preferredIds } : {}),
+    });
     if (!decision) return undefined;
 
     const lastAttempt = this.lastAttemptAtMs.get(slotKey) ?? -Infinity;

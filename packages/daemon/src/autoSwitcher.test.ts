@@ -260,3 +260,30 @@ describe('AutoSwitcher — per-slot restriction and cooldown', () => {
     expect(activate).toHaveBeenLastCalledWith('m2', expect.anything());
   });
 });
+
+describe('AutoSwitcher — a tiered slot', () => {
+  it('hands the preferred tier to the policy, so a healthy fallback returns to a preferred account', async () => {
+    const { switcher, activate, notify } = makeSwitcher();
+    const [hot, spare] = lowSnapshot() as [AccountUsageInput, AccountUsageInput];
+    // The slot runs on an inherited account that is healthy; its own account (spare) is free.
+    const fallback = {
+      ...hot,
+      limits: [{ kind: 'weekly_all' as const, percent: 5, resetsAt: NOW + 50 * H }],
+    };
+    const hop = await switcher.evaluate([fallback, spare], {
+      slotKey: 'group:r1',
+      preferredIds: new Set(['spare']),
+      slotLabel: 'C:/work',
+    });
+    expect(hop).toBe('spare');
+    expect(activate).toHaveBeenCalledWith('spare', expect.objectContaining({ slot: 'group:r1' }));
+    expect(notify.mock.calls[0]?.[0].message).toContain(
+      'auto-switch (C:/work): spare can take work again',
+    );
+    // Without the tier, a healthy active account is no reason to hop.
+    const flat = makeSwitcher();
+    expect(
+      await flat.switcher.evaluate([fallback, spare], { slotKey: 'group:r1' }),
+    ).toBeUndefined();
+  });
+});
