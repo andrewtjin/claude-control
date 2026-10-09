@@ -65,6 +65,7 @@ import {
   MIN_STATS_DAYS,
 } from '@claude-control/shared-protocol';
 import {
+  assessFleet,
   hasUsableHeadroom,
   humanizeDuration,
   isAutoSwitchCandidate,
@@ -1782,7 +1783,9 @@ export class Daemon {
   ): string | undefined {
     const now = this.clock();
     const live = slotInputs.find((i) => i.active);
-    if (live === undefined || hasUsableHeadroom(live, now)) return undefined;
+    if (live === undefined) return undefined;
+    const judged = assessFleet([live], now).accounts[0]!;
+    if (judged.usable) return undefined;
     // An account auto-switch would actually hop to means the slot is not stuck. This must be the
     // EXACT complement of the executor's hop predicate — the same policy, the same candidate gate,
     // the same targets — so the alert never suppresses on an account the executor refuses (excluded
@@ -1792,10 +1795,11 @@ export class Daemon {
       (i) => candidateIds.has(i.accountId) && isAutoSwitchCandidate(i, now, this.autoSwitchPolicy),
     );
     if (canHop) return undefined;
-    const budget = selectWeeklyBudget(live.limits, now, live.predictedResetAt);
+    // The account is back when the LAST wall holding it resets, whichever it is: the weekly reset
+    // alone would tell a folder stopped by its 5-hour window that it waits days.
     const resetText =
-      budget?.resetsAt !== undefined
-        ? `until it resets in ${humanizeDuration(budget.resetsAt - now)}`
+      judged.backAt !== undefined
+        ? `until it resets in ${humanizeDuration(judged.backAt - now)}`
         : 'until it resets';
     // Named by folder, not the rule label: the folder is what the operator acts on.
     return (
@@ -3876,18 +3880,25 @@ export class Daemon {
   }
 
   /**
-   * The slot an operator's switch to `account` (or a spawn naming it) goes to: the global slot for a
-   * shared or unknown account; for a reserved one, the slot of the rule including it — when several
-   * rules include it, the one it is live in, or `undefined` when it is live in none of them (there is
-   * then no single answer, and the caller must not guess one).
+   * The slot an operator's switch to `account` (or a spawn naming it) goes to: for an unknown
+   * account, the global slot; for a shared one, the folder slot it is live in (inherited, or in a
+   * folder that excludes the global account), else the global slot — the global slot cannot take
+   * an account live in a folder slot, and switching it where it is live is what resumes that
+   * folder's sessions parked on a usage limit; for a reserved one, the slot of the rule including
+   * it — when several rules include it, the one it is live in, or `undefined` when it is live in
+   * none of them (there is then no single answer, and the caller must not guess one).
    */
   private async switchSlotFor(account: AccountView | undefined): Promise<SlotId | undefined> {
-    const ruleIds = account?.ruleIds ?? [];
-    if (account === undefined || ruleIds.length === 0) return 'global';
+    if (account === undefined) return 'global';
+    const ruleIds = account.ruleIds ?? [];
     if (ruleIds.length === 1) return ruleSlotId(ruleIds[0]!);
     const live = this.switchEngine.liveSlots
       ? await this.switchEngine.liveSlots()
       : new Map<SlotId, string | null>();
+    if (ruleIds.length === 0) {
+      const inFolder = [...live].find(([slot, id]) => slot !== 'global' && id === account.id);
+      return inFolder?.[0] ?? 'global';
+    }
     return ruleIds.map((id) => ruleSlotId(id)).find((slot) => live.get(slot) === account.id);
   }
 
@@ -3938,7 +3949,7 @@ export class Daemon {
           if (configDir === undefined) {
             throw new SpawnBindingError(
               `account "${acct.label}" belongs to a folder but its profile could not be ` +
-                'prepared; re-login it (cctl bindings)',
+                `prepared; re-login it (cctl accounts relogin ${acct.label})`,
             );
           }
           return { slot, accountId, configDir };
@@ -3946,17 +3957,34 @@ export class Daemon {
           if (err instanceof SpawnBindingError) throw err;
           throw new SpawnBindingError(
             `account "${acct.label}" belongs to a folder but its slot could not be made live ` +
-              `(${err instanceof Error ? err.message : String(err)}); re-login it (cctl bindings)`,
+              `(${err instanceof Error ? err.message : String(err)}); see its folders with ` +
+              'cctl folders',
           );
         }
       }
-      // Shared (or unknown) account. A KNOWN shared account may only be spawned when it is the
-      // account live in the global slot; an unknown id keeps the legacy attribution-tag behavior.
+      // Shared (or unknown) account. A KNOWN shared account runs where it is already live: the
+      // global slot, or the slot of this session's folder when it is live there (as the folder's
+      // fallback, or in a folder that excludes the global account). A spawn never switches a slot
+      // out from under the sessions on it, so anywhere else it is refused. An unknown id keeps the
+      // legacy attribution-tag behavior.
       const globalLive = await engine.getActiveId('global');
       if (acct !== undefined && accountId !== globalLive) {
+        const match =
+          cwd !== undefined && engine.resolveFolderRule
+            ? await engine.resolveFolderRule(cwd)
+            : null;
+        if (match !== null) {
+          const slot = ruleSlotId(match.ruleId);
+          if ((await engine.getActiveId(slot)) === accountId) {
+            const configDir =
+              engine.configDirForSlot?.(slot) ?? (await engine.configDirForAccount(accountId));
+            if (configDir !== undefined) return { slot, accountId, configDir };
+          }
+        }
         throw new SpawnBindingError(
-          `account "${acct.label}" is a shared account and is not the live global account; ` +
-            'switch to it first (cctl switch) or start the session in its bound folder',
+          `account "${acct.label}" is a shared account live neither in the global slot nor in ` +
+            `the slot of this session's folder; switch to it first (cctl switch ${acct.label}) ` +
+            'or start the session without naming an account',
         );
       }
       return { slot: 'global', accountId, configDir: undefined };
@@ -3977,16 +4005,14 @@ export class Daemon {
             ? await engine.ensureRuleLive(match.ruleId)
             : undefined;
           const account = live?.liveAccount ?? (await engine.getActiveId(slot));
-          if (account === null || account === undefined) {
-            throw new SpawnBindingError(
-              'the folder of this session has no working account; re-login one (cctl bindings)',
-            );
-          }
           const configDir =
-            engine.configDirForSlot?.(slot) ?? (await engine.configDirForAccount(account));
-          if (configDir === undefined) {
+            account === null || account === undefined
+              ? undefined
+              : (engine.configDirForSlot?.(slot) ?? (await engine.configDirForAccount(account)));
+          if (account === null || account === undefined || configDir === undefined) {
             throw new SpawnBindingError(
-              'the folder of this session has no working account; re-login one (cctl bindings)',
+              'the folder of this session has no working account (every account in its pool is ' +
+                'quarantined or live in another slot); see its pool with cctl folders',
             );
           }
           return { slot, accountId: account, configDir };
@@ -3994,7 +4020,7 @@ export class Daemon {
           if (err instanceof SpawnBindingError) throw err;
           throw new SpawnBindingError(
             `the folder of this session could not be made live ` +
-              `(${err instanceof Error ? err.message : String(err)}); re-login one (cctl bindings)`,
+              `(${err instanceof Error ? err.message : String(err)}); see its pool with cctl folders`,
           );
         }
       }

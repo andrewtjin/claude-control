@@ -830,6 +830,9 @@ describe('daemon folder-bound slots — a spawn that cannot take its group slot 
     const err = errorFrames(rig.relay)[0];
     expect(err?.code).toBe('spawn_failed');
     expect(err?.message).toContain('no working account');
+    // The remedy names a command this build has.
+    expect(err?.message).toContain('cctl folders');
+    expect(err?.message).not.toContain('cctl bindings');
     // The whole point: the session was NOT spawned on the global account as a fallback.
     expect(spawnCalls.count).toBe(0);
     expect(rig.relay.received.some((e) => e.type === 'session.status')).toBe(false);
@@ -867,6 +870,7 @@ describe('daemon folder-bound slots — a spawn that cannot take its group slot 
     const err = errorFrames(rig.relay)[0];
     expect(err?.code).toBe('spawn_failed');
     expect(err?.message).toContain('could not be made live');
+    expect(err?.message).not.toContain('cctl bindings');
     expect(spawnCalls.count).toBe(0);
     expect(rig.relay.received.some((e) => e.type === 'session.status')).toBe(false);
   });
@@ -1595,5 +1599,181 @@ describe('folder rules — the plan on the phone is the one for the global slot'
     // And the executor agrees with it.
     await waitFor(() => hopsIn(controls, 'global').length >= 1);
     expect(hopsIn(controls, 'global')).toEqual(['s3']);
+  });
+});
+
+describe('folder rules — the pool-out alert names the reset that ends the wait', () => {
+  it('says the 5-hour window when that is the wall, not the weekly reset days out', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const controls = fakeEngine({
+      accounts: [s1, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 'm1')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 'm1'],
+      ]),
+    });
+    const bodies: Record<string, unknown> = {
+      s1: healthyIn(30),
+      m1: {
+        limits: [
+          { kind: 'session', percent: 100, resets_at: iso(NOW + 2 * HOUR_MS) },
+          { kind: 'weekly_all', percent: 20, resets_at: iso(NOW + 100 * HOUR_MS) },
+        ],
+      },
+    };
+    const rig = await createRig({ controls, bodyFor: (id) => bodies[id], withAutoSwitcher: true });
+    await rig.start();
+    await waitFor(() => slotAlerts(rig.relay).some((a) => a.body.includes('out of quota')));
+    const alert = slotAlerts(rig.relay).find((a) => a.body.includes('out of quota'));
+    expect(alert?.body).toContain('C:/work account Inc One is out of quota until it resets in 2h');
+  });
+});
+
+describe('folder rules — a phone switch to a shared account live in a folder slot', () => {
+  it('switches it in that slot, so the folder sessions parked on a usage limit resume', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const controls = fakeEngine({
+      accounts: [s1, s2, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 's2')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 's2'],
+      ]),
+    });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    await rig.start();
+
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'switch.command',
+      payload: {
+        requestId: 'rq-fallback',
+        targetAccountId: 'Shared Two',
+        reason: 'manual',
+        idempotencyKey: 'ik-fallback',
+      },
+    });
+    await waitFor(() => switchResults(rig.relay).some((r) => r.requestId === 'rq-fallback'));
+    expect(controls.activateCalls).toEqual([
+      { id: 's2', options: { origin: 'phone', slot: ruleSlotId('g1') } },
+    ]);
+  });
+});
+
+describe('folder rules — a slot moves off a live account its pool leaves out', () => {
+  it('hops the global slot off a quarantined, spent account', async () => {
+    const s1: AccountView = { ...view('s1', 'Shared One'), quarantined: true };
+    const s2 = view('s2', 'Shared Two');
+    const controls = fakeEngine({
+      accounts: [s1, s2],
+      groups: [],
+      live: new Map<SlotId, string | null>([['global', 's1']]),
+    });
+    const bodies: Record<string, unknown> = { s1: SPENT, s2: healthyIn(50) };
+    const rig = await createRig({ controls, bodyFor: (id) => bodies[id], withAutoSwitcher: true });
+    await rig.start();
+    await waitFor(() => hopsIn(controls, 'global').length >= 1);
+    expect(hopsIn(controls, 'global')).toEqual(['s2']);
+  });
+
+  it('hops a folder slot off a spent account the folder excludes, onto an included one', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s3 = view('s3', 'Shared Three');
+    const controls = fakeEngine({
+      accounts: [s1, s3, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 's3', ['s3'])],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 's3'],
+      ]),
+    });
+    const bodies: Record<string, unknown> = { s1: healthyIn(30), s3: SPENT, m1: healthyIn(50) };
+    const rig = await createRig({ controls, bodyFor: (id) => bodies[id], withAutoSwitcher: true });
+    await rig.start();
+    await waitFor(() => hopsIn(controls, ruleSlotId('g1')).length >= 1);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['m1']);
+  });
+});
+
+describe('folder rules — a spawn naming a shared account live in its folder slot', () => {
+  const boundCwd = process.cwd();
+
+  it('runs in that folder slot rather than refusing it as not the global account', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const spawnCalls = { count: 0 };
+    const controls = fakeEngine({
+      accounts: [s1, s2, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 's2')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 's2'],
+      ]),
+      cwdBinding: (cwd) => (cwd === boundCwd ? { groupId: 'g1' } : null),
+      // The folder slot's profile, where s2 is live.
+      configDirFor: (id) => (id === 'm1' || id === 's2' ? '/profiles/g1' : undefined),
+    });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }), spawnCalls });
+    await rig.start();
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r-s2',
+        prompt: 'go',
+        idempotencyKey: 'k-s2',
+        cwd: boundCwd,
+        accountId: 's2',
+      },
+    });
+    await waitFor(() => spawnCalls.count > 0 || errorFrames(rig.relay).length > 0);
+    expect(
+      errorFrames(rig.relay)
+        .map((e) => e.message)
+        .join(),
+    ).not.toContain('not the live global account');
+    expect(spawnCalls.count).toBe(1);
+  });
+
+  it('refuses a shared account live in neither slot, naming the slots it may run in', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const s3 = view('s3', 'Shared Three');
+    const spawnCalls = { count: 0 };
+    const controls = fakeEngine({
+      accounts: [s1, s2, s3, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 's2')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 's2'],
+      ]),
+      cwdBinding: (cwd) => (cwd === boundCwd ? { groupId: 'g1' } : null),
+    });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }), spawnCalls });
+    await rig.start();
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r-s3',
+        prompt: 'go',
+        idempotencyKey: 'k-s3',
+        cwd: boundCwd,
+        accountId: 's3',
+      },
+    });
+    await waitFor(() => errorFrames(rig.relay).some((e) => e.relatesTo !== undefined));
+    const err = errorFrames(rig.relay)[0];
+    expect(err?.code).toBe('spawn_failed');
+    expect(err?.message).toContain('Shared Three');
+    expect(err?.message).not.toContain('bound folder');
+    expect(spawnCalls.count).toBe(0);
   });
 });
