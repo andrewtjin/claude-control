@@ -240,6 +240,15 @@ async function refreshSnapshotIfBindEnforce(settingName: string): Promise<void> 
   }
 }
 
+/** Verbs an earlier build had, mapped to what replaced them, so a remembered command line is
+ *  pointed at its successor rather than only refused. A Map, not an object literal, so a word like
+ *  `constructor` is not found on the prototype chain. */
+const RETIRED_COMMANDS: ReadonlyMap<string, string> = new Map([
+  ['bind', 'cctl folder include <folder> <accounts>'],
+  ['unbind', 'cctl folder reset <folder> [accounts]'],
+  ['bindings', 'cctl folders'],
+]);
+
 export function buildProgram(): Command {
   const program = new Command();
   program
@@ -277,7 +286,8 @@ export function buildProgram(): Command {
       process.stdout.write(target.helpInformation());
     });
 
-  // Commander's own refusals (an unknown command, a missing argument) reach stderr through this
+  // Commander's own refusals (an unknown subcommand, a missing argument, and the root's
+  // unknown-command line raised through `program.error` below) reach stderr through this
   // hook. They take the same red as `fail()`'s line so every `error:` the CLI prints looks
   // alike, and the same stderr-is-a-terminal test so a redirected stderr stays plain.
   program.configureOutput({
@@ -1072,7 +1082,26 @@ export function buildProgram(): Command {
   // Bare `cctl` (no subcommand): a short status summary once there are accounts, otherwise a
   // single nudge to run setup — never Commander's raw usage dump. `--help`/`--version` are
   // handled by Commander before this ever runs.
+  //
+  // Having an action of its own makes Commander read an unmatched first word as an argument to
+  // bare `cctl` and refuse it as "too many arguments", never naming it as an unknown command. So
+  // the root accepts the extra words and refuses them here, in Commander's own wording and through
+  // its own error path (same stderr styling, exit 1). This must stay after every `.command()`
+  // above: a subcommand copies the setting when it is created, and each must keep refusing stray
+  // arguments of its own.
+  program.allowExcessArguments();
   program.action(async () => {
+    const [stray] = program.args;
+    if (stray !== undefined) {
+      const replacement = RETIRED_COMMANDS.get(stray);
+      program.error(
+        `error: unknown command '${stray}'` +
+          (replacement !== undefined
+            ? ` - use ${replacement}`
+            : ' - run cctl help for the command list'),
+        { code: 'commander.unknownCommand' },
+      );
+    }
     const summary = await readStatusSummary();
     if (summary.accounts.length === 0) {
       process.stdout.write('Not set up yet. Run: cctl setup\n');

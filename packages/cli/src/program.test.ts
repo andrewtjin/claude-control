@@ -876,6 +876,73 @@ describe('help', () => {
   });
 });
 
+// The root program has an action of its own (the bare `cctl` summary), which by default makes
+// Commander read an unmatched first word as an argument to it and refuse it as "too many
+// arguments" - a message that never says the word is not a command.
+describe('an unknown first word', () => {
+  let root: string;
+  beforeEach(async () => {
+    // The bare summary reads the registry, the hooks file and the pairing identity; every one of
+    // them resolves inside a sandbox here, never near the operator's real files.
+    root = await mkdtemp(join(tmpdir(), 'cctl-root-word-'));
+    pathsIo.dataRoot = root;
+    vi.stubEnv('LOCALAPPDATA', root);
+    vi.stubEnv('XDG_DATA_HOME', root);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'claude'));
+    vi.stubEnv('NO_COLOR', '1');
+  });
+  afterEach(async () => {
+    pathsIo.dataRoot = '';
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('is refused as an unknown command, pointing at the command list', async () => {
+    const r = await runCli(['nope']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain("error: unknown command 'nope'");
+    expect(r.err).toContain('cctl help');
+    expect(r.err).not.toContain('too many arguments');
+    expect(r.out).toBe('');
+  });
+
+  it('is refused the same way when more words follow it', async () => {
+    const r = await runCli(['nope', 'x', 'y']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain("error: unknown command 'nope'");
+    expect(r.err).not.toContain('too many arguments');
+  });
+
+  it.each([
+    ['bind', 'cctl folder include <folder> <accounts>'],
+    ['unbind', 'cctl folder reset <folder> [accounts]'],
+    ['bindings', 'cctl folders'],
+  ])('names what replaced the retired `%s`', async (verb, replacement) => {
+    const r = await runCli([verb, 'x', 'y']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain(`error: unknown command '${verb}' - use ${replacement}`);
+  });
+
+  it('does not mistake an inherited object property for a retired verb', async () => {
+    const r = await runCli(['constructor']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain("error: unknown command 'constructor'");
+    expect(r.err).toContain('cctl help');
+  });
+
+  it('leaves subcommands refusing stray arguments of their own', async () => {
+    const r = await runCli(['usage', 'extra']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain("too many arguments for 'usage'");
+  });
+
+  it('still prints the summary for bare `cctl`', async () => {
+    const r = await runCli([]);
+    expect(r.exited).toBe(false);
+    expect(r.out).toContain('Not set up yet. Run: cctl setup');
+  });
+});
+
 // Exclusion is a registry write behind a resolved ref, so the verbs are worth running for real:
 // a typo'd command name or a wrong-way-round boolean would sail past a surface-only assertion.
 describe('accounts exclude / include', () => {
