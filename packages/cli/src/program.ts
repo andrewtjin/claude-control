@@ -42,6 +42,7 @@ import {
   buildDaemonHookSpecs,
   episodesOf,
   exhaustionLogPath,
+  globalSlotAccountIds,
   judgeScope,
   outageScopes,
   resumeOpenEpisodes,
@@ -444,6 +445,9 @@ export function buildProgram(): Command {
             computePlan(inputs, {
               autoSwitchPolicy,
               ...(greedy ? { greedyAutoSwitch: true } : {}),
+              // The plan is the global slot's, as the daemon computes it: a shared account live
+              // in a folder slot is one that slot cannot switch to.
+              slotAccountIds: await globalSlotAccountsNow(),
             }),
           );
         text +=
@@ -1362,6 +1366,17 @@ function canonicalOutageFolder(input: string): string {
   });
   if (!r.ok) fail(`cannot use folder "${input}": ${r.reason}`);
   return r.path;
+}
+
+/** The accounts the global slot may switch to this moment (see `globalSlotAccountIds`). */
+async function globalSlotAccountsNow(): Promise<Set<string>> {
+  const engine = buildEngine();
+  const [accounts, rules, liveSlots] = await Promise.all([
+    engine.listAllAccounts(),
+    engine.listRules(),
+    engine.liveSlots(),
+  ]);
+  return globalSlotAccountIds(accounts, rules, liveSlots);
 }
 
 /** Every scope as the daemon sees it this moment (the global pool and each folder rule's pool, see

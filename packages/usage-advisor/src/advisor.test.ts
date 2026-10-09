@@ -608,3 +608,43 @@ describe('computePlan — the scoped (Fable) weekly cap is not the weekly budget
     expect(plan.reason).not.toContain('fable left');
   });
 });
+
+describe('computePlan — the slot the plan is for', () => {
+  // The global slot's plan, with folder rules: Folder is reserved to a folder (or live in a folder
+  // slot) and has the soonest-expiring budget, but the global slot can never switch to it.
+  const live = acct(
+    's1',
+    'Live',
+    [{ kind: 'weekly_all', percent: 20, resetsAt: NOW + 100 * HOUR }],
+    {
+      active: true,
+    },
+  );
+  const folder = acct('m1', 'Folder', [
+    { kind: 'weekly_all', percent: 10, resetsAt: NOW + 2 * HOUR },
+  ]);
+  const spare = acct('s3', 'Spare', [
+    { kind: 'weekly_all', percent: 10, resetsAt: NOW + 50 * HOUR },
+  ]);
+
+  it('never names an account outside the slot as a target, greedy or not', () => {
+    for (const greedyAutoSwitch of [true, false]) {
+      const plan = computePlan([live, folder, spare], {
+        ...opts,
+        greedyAutoSwitch,
+        slotAccountIds: new Set(['s1', 's3']),
+      });
+      expect(plan.recommendedAccountId).not.toBe('m1');
+      expect(plan.reason).not.toContain('Folder');
+      // The ranking still shows every account.
+      expect(plan.ranking.map((r) => r.accountId).sort()).toEqual(['m1', 's1', 's3']);
+    }
+  });
+
+  it('is unchanged when every account is in the slot', () => {
+    const all = new Set(['s1', 'm1', 's3']);
+    expect(computePlan([live, folder, spare], { ...opts, slotAccountIds: all })).toEqual(
+      computePlan([live, folder, spare], opts),
+    );
+  });
+});

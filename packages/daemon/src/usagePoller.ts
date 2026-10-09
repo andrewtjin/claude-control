@@ -263,6 +263,7 @@ export class UsagePoller {
   assemble(
     polled: PollCycleResult,
     predictedResets: ReadonlyMap<string, number> = new Map(),
+    slotAccountIds?: ReadonlySet<string>,
   ): SnapshotResult {
     const inputs: AccountUsageInput[] = polled.results.map((r) => {
       const predicted = normalizePredictedReset(predictedResets.get(r.accountId));
@@ -270,7 +271,13 @@ export class UsagePoller {
         ? r.usage.advisorInput
         : { ...r.usage.advisorInput, predictedResetAt: predicted };
     });
-    return { ...polled, inputs, plan: computePlan(inputs, this.advisorOptions) };
+    // The plan describes the global slot: `slotAccountIds` (see `AdvisorOptions`) keeps it to the
+    // accounts that slot may switch to, so it never names a hop its executor refuses.
+    const options =
+      slotAccountIds === undefined
+        ? this.advisorOptions
+        : { ...this.advisorOptions, slotAccountIds };
+    return { ...polled, inputs, plan: computePlan(inputs, options) };
   }
 
   /** The executor's policy this poller's plan is gated by, when the composition root passed one

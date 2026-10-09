@@ -326,6 +326,9 @@ async function createRig(opts: {
   slotAlertWindowMs?: number;
   pollIntervalMs?: number;
   spawnCalls?: { count: number };
+  /** Run greedy auto-switch, with the plan phrased and gated the way the daemon's composition root
+   *  sets the poller up for it. */
+  greedy?: boolean;
 }): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
@@ -340,6 +343,15 @@ async function createRig(opts: {
     getToken: (accountId: string) => Promise.resolve(`tok-${accountId}`),
     getCachedUsage: () => Promise.resolve(undefined),
     clock: () => NOW,
+    ...(opts.greedy === true
+      ? {
+          advisorOptions: {
+            autoSwitchPolicy: { greedy: true },
+            greedyAutoSwitch: true,
+            now: () => NOW,
+          },
+        }
+      : {}),
   });
 
   const controlPlaneClient = new ControlPlaneClient({
@@ -359,6 +371,7 @@ async function createRig(opts: {
             controlPlaneClient.send({ type: 'switch.result', payload, daemonId: 'd' }),
           clock: () => NOW,
           cooldownMs: 0,
+          ...(opts.greedy === true ? { policy: { greedy: true } } : {}),
         })
       : undefined;
 
@@ -1542,5 +1555,45 @@ describe('folder rules — per-slot auto-switch over the effective pool', () => 
     // An included account live nowhere carries no live slot.
     expect(byId.get('m3')?.liveSlot ?? undefined).toBeUndefined();
     expect(byId.get('m3')?.ruleIds).toEqual(['g3']);
+  });
+});
+
+describe('folder rules — the plan on the phone is the one for the global slot', () => {
+  it('never announces a greedy hop to an account reserved to a folder or live in a folder slot', async () => {
+    // m1 is reserved to the folder and s2 is shared but live in its slot as a fallback; both
+    // expire far sooner than s3, so a fleet-wide greedy plan would burn them as s1 runs low.
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const s3 = view('s3', 'Shared Three');
+    const controls = fakeEngine({
+      accounts: [s1, s2, s3, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 's2')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 's2'],
+      ]),
+    });
+    const bodies: Record<string, unknown> = {
+      s1: LOW,
+      s2: healthyIn(2),
+      s3: healthyIn(50),
+      m1: healthyIn(1),
+    };
+    const rig = await createRig({
+      controls,
+      bodyFor: (id) => bodies[id],
+      withAutoSwitcher: true,
+      greedy: true,
+    });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 1);
+    const plan = lastUsageSnapshot(rig.relay).plan;
+    expect(plan?.recommendedAccountId).toBe('s3');
+    expect(plan?.reason).not.toContain('Inc One');
+    expect(plan?.reason).not.toContain('Shared Two');
+    // And the executor agrees with it.
+    await waitFor(() => hopsIn(controls, 'global').length >= 1);
+    expect(hopsIn(controls, 'global')).toEqual(['s3']);
   });
 });

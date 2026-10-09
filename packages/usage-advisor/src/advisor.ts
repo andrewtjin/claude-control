@@ -101,6 +101,15 @@ export function computePlan(
   const greedy = options.greedyAutoSwitch === true;
   const analyses = accounts.map((a) => analyze(a, now, cfg));
   const ranking = toRanking(analyses);
+  // What the plan may say about where to GO is about its slot alone: an account the slot can never
+  // hold (reserved to a folder, or live in a folder slot) is neither burned, held nor recommended
+  // there, greedy or not — the executor will not hop to it, and a human switching the slot cannot
+  // put it there either. The live account always belongs to the slot.
+  const slotIds = options.slotAccountIds;
+  const inSlot =
+    slotIds === undefined
+      ? analyses
+      : analyses.filter((a) => a.input.active === true || slotIds.has(a.input.accountId));
   // May the plan name this account as somewhere to GO? Under greedy auto-switch the plan text
   // stops being advice and starts describing what the daemon will actually do ("Greedy
   // auto-switch burns A -> B"), so an account the operator excluded from auto-switch must not
@@ -121,7 +130,7 @@ export function computePlan(
   // expiry first (ties by label for determinism). This IS the plan — burn down the queue.
   // `dropped` keeps the entries greedy removed, so the advice can still account for them
   // rather than letting an expiring budget disappear from the line (see `buildReason`).
-  const burnable = analyses
+  const burnable = inSlot
     .filter((a) => a.usable && a.burn)
     .sort(
       (a, b) =>
@@ -138,12 +147,12 @@ export function computePlan(
   // There is deliberately no unfiltered fallback: resurrecting an excluded account as the
   // recommendation is exactly the false promise this gate exists to prevent — the advisories
   // would then announce a hop the executor refuses to make.
-  const recommended = burns[0] ?? pickRecommended(analyses.filter(targetable));
+  const recommended = burns[0] ?? pickRecommended(inSlot.filter(targetable));
   const advisories = buildAdvisories(analyses, recommended, burns.length > 0, greedy);
 
   return {
     recommendedAccountId: recommended?.input.accountId ?? null,
-    reason: buildReason(recommended, analyses, burns, dropped, greedy, now),
+    reason: buildReason(recommended, inSlot, burns, dropped, greedy, now),
     ranking,
     advisories,
     generatedAtMs: now,

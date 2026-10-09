@@ -573,6 +573,29 @@ describe('cctl usage and timeline', () => {
   });
 });
 
+describe('cctl timeline plan', () => {
+  it('never recommends a shared account live in a folder slot, which the global slot cannot take', async () => {
+    // F is shared but live in the research folder's slot (that folder excludes G); with nothing
+    // polled the two tie, and F would win the tie on its label.
+    const G = account('g', { label: 'G' });
+    const F = account('f', { label: 'F' });
+    engine.listAccounts.mockResolvedValue([G, F]);
+    engine.listAllAccounts.mockResolvedValue([G, F]);
+    engine.getActiveId.mockResolvedValue('g');
+    engine.listRules.mockResolvedValue([ruleOn(research, { exclude: ['g'], activeId: 'f' })]);
+    engine.liveSlots.mockResolvedValue(
+      new Map([
+        ['global', 'g'],
+        ['group:r1', 'f'],
+      ]),
+    );
+    const r = await runCli(['timeline']);
+    expect(r.exited).toBe(false);
+    expect(r.out).not.toContain('F has the most available headroom');
+    expect(r.out).toContain('G has the most available headroom');
+  });
+});
+
 describe('cctl doctor', () => {
   it('flags a running daemon that predates folder rules', { timeout: 60_000 }, async () => {
     await daemonRunning(olderReport);

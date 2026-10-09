@@ -95,7 +95,7 @@ import {
   type Recovery,
   type ScopeView,
 } from './exhaustionLog.js';
-import { folderNameOf, rulesPictureOf } from './folderSlots.js';
+import { folderNameOf, globalSlotAccountIds, rulesPictureOf } from './folderSlots.js';
 import type { Store } from './store.js';
 import { slotBySessionMap } from './store.js';
 import {
@@ -1419,7 +1419,12 @@ export class Daemon {
     // daemon makes would then be computed from different accounts. The policy labels a
     // predicted reset and holds it to a stricter bar (see autoswitch.ts); an account with no
     // history at all carries no prediction and is skipped as before.
-    const snapshot = this.poller.assemble(polled, history.predictedResetByAccount);
+    // The plan is the global slot's, so it reads only the accounts that slot may switch to.
+    const snapshot = this.poller.assemble(
+      polled,
+      history.predictedResetByAccount,
+      globalSlotAccountIds(accounts, rules, liveSlots),
+    );
     // Re-stamped from the MERGED inputs, so the post-switch kick reasons about exactly what
     // the plan and the executor saw.
     for (const input of snapshot.inputs) {

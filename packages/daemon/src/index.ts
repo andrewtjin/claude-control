@@ -56,6 +56,8 @@ export {
 
 export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
 
+export { globalSlotAccountIds } from './folderSlots.js';
+
 export {
   describeScope,
   episodesOf,
