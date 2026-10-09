@@ -76,7 +76,7 @@ and history stay shared; only the login differs.
 
 ```
 cctl folder include <folder> <account>[,<account>...]   # reserve accounts to a folder, used there first
-cctl folder include <folder> <accounts> --label <name>  # ...naming the rule (default: the folder)
+cctl folder include <folder> <accounts> --label <name>  # ...naming the rule it creates (default: the folder)
 cctl folder exclude <folder> <account>[,<account>...]   # keep a folder off some shared accounts
 cctl folder exclude <folder> <accounts> --force         # ...even if that empties its slot while sessions run
 cctl folder reset <folder> <account>[,<account>...]     # take accounts back out of a folder's rule
@@ -125,8 +125,11 @@ inside cctl's own data directories.
 **An older daemon must be restarted first.** A folder slot can hold a shared account, and
 a daemon built before folder rules would treat that account as free for the global slot,
 putting one login live in two places (the second copy logs itself out on the next refresh).
-So while such a daemon is running, `cctl folder include` and `cctl folder exclude` refuse
-and change nothing:
+So while such a daemon is running, every command that could leave a shared account live in a
+folder slot refuses and changes nothing: `cctl folder include` and `cctl folder exclude`,
+`cctl folder reset <folder> <accounts>` (removing the whole rule with `cctl folder reset
+<folder>` still works), `cctl switch` of a shared account into a folder's slot, and `cctl claude`
+in a ruled folder unless its slot already holds one of the folder's own included accounts:
 
 ```
 error: the running daemon (v0.5.2) predates folder rules: it could put an account live in a
@@ -134,7 +137,9 @@ folder and in the global slot at once. Restart it on this build first: cctl daem
 Nothing was changed.
 ```
 
-`cctl doctor` flags the same mismatch (`daemon-folder-rules`).
+`cctl doctor` flags the same mismatch (`daemon-folder-rules`). The check is made when a command
+runs: it cannot stop an older daemon started later (an older install's logon task, say). Before
+going back to an older build, remove every folder rule with `cctl folder reset <folder>`.
 
 ### Switching a folder's slot by hand
 

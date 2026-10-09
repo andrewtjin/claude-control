@@ -135,6 +135,7 @@ import {
   describeSwitchedGroup,
   renderFolderRulesAppendix,
   renderReservedAppendix,
+  refuseOnOlderDaemon,
   switchSlotForFolder,
   switchSlotOf,
 } from './folderCommands.js';
@@ -316,6 +317,10 @@ export function buildProgram(): Command {
       const target =
         opts.folder !== undefined ? await switchSlotForFolder(engine, opts.folder) : undefined;
       const slot = target?.slot ?? switchSlotOf(fleet.find((a) => a.id === resolved.account.id));
+      // A shared account switched into a folder slot is one a daemon that predates folder rules
+      // could put live in the global slot as well.
+      const shared = (fleet.find((a) => a.id === resolved.account.id)?.ruleIds ?? []).length === 0;
+      if (slot !== undefined && slot !== 'global' && shared) await refuseOnOlderDaemon();
       try {
         const result = await engine.activate(resolved.account.id, {
           force: Boolean(opts.force),

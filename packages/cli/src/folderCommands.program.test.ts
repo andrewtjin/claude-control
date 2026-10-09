@@ -57,6 +57,7 @@ const engine = vi.hoisted(() => ({
   includeInFolder: vi.fn(),
   excludeInFolder: vi.fn(),
   resetFolder: vi.fn(),
+  ensureRuleLive: vi.fn(),
   activate: vi.fn((id: string): Promise<ActivateResult> =>
     Promise.reject(new Error(`activate(${id})`)),
   ),
@@ -79,6 +80,19 @@ vi.mock('./settings.js', async (importOriginal) => ({
   daemonSettingsPath: () => '',
   daemonHeartbeatPath: () => settingsIo.heartbeatPath,
   readSettingsReport: settingsIo.readSettingsReport,
+}));
+
+// `cctl claude` finds and spawns the real executable; here it spawns nothing and reports the env.
+const launcher = vi.hoisted(() => ({
+  spawnClaude: vi.fn((_opts: { command: string; args: string[]; env: NodeJS.ProcessEnv }) =>
+    Promise.resolve(0),
+  ),
+}));
+vi.mock('./launcher.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./launcher.js')>()),
+  findClaudeOnPath: () => 'claude',
+  resolveLaunchTarget: () => ({ kind: 'run', command: 'claude', prefixArgs: [] }),
+  spawnClaude: launcher.spawnClaude,
 }));
 
 /** Run one command with stdout/stderr captured; a refusal comes back as `exited` with its line. */
@@ -616,5 +630,191 @@ describe('retired commands', () => {
     const r = await runCli(['bind', research, 'A']);
     expect(r.exited).toBe(true);
     expect(engine.includeInFolder).not.toHaveBeenCalled();
+  });
+});
+
+describe('older daemon: every command that can put a shared account live in a folder slot refuses', () => {
+  it('folder reset of named accounts refuses (it can release a live account into the shared pool)', async () => {
+    await daemonRunning(olderReport);
+    engine.listRules.mockResolvedValue([ruleOn(research, { include: ['e'] })]);
+    const r = await runCli(['folder', 'reset', research, 'E']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('predates folder rules');
+    expect(r.err).toContain('Nothing was changed.');
+    expect(engine.resetFolder).not.toHaveBeenCalled();
+  });
+
+  it('folder reset of the whole rule goes ahead: it clears the slot and seats nothing', async () => {
+    await daemonRunning(olderReport);
+    engine.listRules.mockResolvedValue([ruleOn(research, { include: ['e'] })]);
+    engine.resetFolder.mockResolvedValueOnce({
+      folder: research,
+      dissolved: true,
+      released: ['e'],
+      adoptedRotation: false,
+      runningSessions: [],
+    });
+    const r = await runCli(['folder', 'reset', research]);
+    expect(r.exited).toBe(false);
+    expect(engine.resetFolder).toHaveBeenCalled();
+  });
+
+  it('switch of a shared account into a folder slot refuses; a reserved one into its own slot does not', async () => {
+    await daemonRunning(olderReport);
+    engine.listRules.mockResolvedValue([ruleOn(research, { include: ['e'] })]);
+    const shared = await runCli(['switch', 'B', '--folder', research]);
+    expect(shared.exited).toBe(true);
+    expect(shared.err).toContain('predates folder rules');
+    expect(engine.activate).not.toHaveBeenCalled();
+
+    engine.activate.mockResolvedValueOnce({
+      ok: true,
+      activeAccountId: 'e',
+      wroteCredentials: true,
+      refreshed: false,
+      adoptedPreviousRotation: false,
+    });
+    const reserved = await runCli(['switch', 'E']);
+    expect(reserved.exited).toBe(false);
+    expect(engine.activate).toHaveBeenCalledWith(
+      'e',
+      expect.objectContaining({ slot: 'group:r1' }),
+    );
+  });
+});
+
+describe('cctl claude', () => {
+  /** Run `cctl claude` from `cwd`, returning what it printed and the env it launched with. */
+  async function launch(args: string[], cwd: string) {
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwd);
+    launcher.spawnClaude.mockClear();
+    try {
+      const r = await runCli(['claude', ...args]);
+      const env = launcher.spawnClaude.mock.calls[0]?.[0]?.env;
+      return { ...r, env };
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  }
+  const rulesLiveOn = (live: string | null, rule: FolderRule) => {
+    engine.listRules.mockResolvedValue([rule]);
+    engine.getRule.mockResolvedValue(rule);
+    engine.liveSlots.mockResolvedValue(
+      new Map([
+        ['global', 'a'],
+        ['group:r1', live],
+      ]),
+    );
+    engine.getActiveId.mockImplementation((slot?: string) =>
+      Promise.resolve(slot === 'group:r1' ? live : 'a'),
+    );
+    engine.ensureRuleLive.mockResolvedValue({
+      ruleId: 'r1',
+      liveAccount: live,
+      activated: false,
+      noWorkingAccount: live === null,
+    });
+  };
+
+  it('--account of a shared account live in this folder slot runs in that slot', async () => {
+    rulesLiveOn('b', ruleOn(research, { exclude: ['a'], activeId: 'b' }));
+    const r = await launch(['--account', 'B'], research);
+    expect(r.exited).toBe(false);
+    expect(r.err).not.toContain('can only run in the global slot');
+    expect(r.env?.CLAUDE_CONFIG_DIR).toContain('r1');
+  });
+
+  it('--account of a shared account live in neither slot is refused with a fix that works', async () => {
+    rulesLiveOn('b', ruleOn(research, { exclude: ['a'], activeId: 'b' }));
+    const C = account('c', { label: 'C' });
+    engine.listAllAccounts.mockResolvedValue([A, B, C, E]);
+    const r = await launch(['--account', 'C'], research);
+    expect(r.exited).toBe(true);
+    expect(r.err).not.toContain('can only run in the global slot');
+    expect(r.err).toContain('cctl switch C');
+  });
+
+  it('--override in a ruled folder launches on the global account, as documented', async () => {
+    rulesLiveOn('e', ruleOn(research, { include: ['e'], activeId: 'e' }));
+    const r = await launch(['--override'], research);
+    expect(r.exited).toBe(false);
+    expect(engine.ensureRuleLive).not.toHaveBeenCalled();
+    expect(r.env?.CLAUDE_CONFIG_DIR ?? '').not.toContain('r1');
+    expect(r.err).toContain('--override in effect');
+  });
+
+  it('says why nothing is usable instead of always asking for a re-login', async () => {
+    rulesLiveOn(null, ruleOn(research, { exclude: ['a'] }));
+    engine.slotPool.mockResolvedValue([
+      { account: B, source: 'inherited', autoTarget: true, liveElsewhere: 'global' },
+    ]);
+    const r = await launch([], research);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('B is live in the global slot');
+    expect(r.err).not.toContain('relogin');
+  });
+
+  it('refuses while a daemon that predates folder rules runs, unless the slot is on an included account', async () => {
+    await daemonRunning(olderReport);
+    rulesLiveOn('b', ruleOn(research, { include: ['e'], activeId: 'b' }));
+    const onShared = await launch([], research);
+    expect(onShared.exited).toBe(true);
+    expect(onShared.err).toContain('predates folder rules');
+    expect(engine.ensureRuleLive).not.toHaveBeenCalled();
+
+    rulesLiveOn('e', ruleOn(research, { include: ['e'], activeId: 'e' }));
+    const onIncluded = await launch([], research);
+    expect(onIncluded.exited).toBe(false);
+  });
+});
+
+describe('rule change reports say why a slot has nothing usable', () => {
+  it('names the account live elsewhere rather than asking for a re-login', async () => {
+    const rule = ruleOn(research, { exclude: ['a'] });
+    engine.excludeInFolder.mockResolvedValueOnce({
+      rule,
+      created: true,
+      movedOff: null,
+      live: { ruleId: 'r1', liveAccount: null, activated: false, noWorkingAccount: true },
+      runningSessions: [],
+    });
+    engine.listRules.mockResolvedValue([rule]);
+    engine.slotPool.mockResolvedValue([
+      { account: B, source: 'inherited', autoTarget: true, liveElsewhere: 'global' },
+    ]);
+    const r = await runCli(['folder', 'exclude', research, 'A']);
+    expect(r.out).toContain('B is live in the global slot');
+    expect(r.out).not.toContain('relogin');
+  });
+
+  it('says a pool emptied by the rule is empty, not that its accounts are reserved elsewhere', async () => {
+    const rule = ruleOn(research, { exclude: ['a', 'b'] });
+    engine.listRules.mockResolvedValue([rule]);
+    engine.listAllAccounts.mockResolvedValue([A, B]);
+    engine.slotPool.mockResolvedValue([]);
+    const r = await runCli(['folders']);
+    expect(r.out).not.toContain('reserved elsewhere');
+    expect(r.out).toContain('excluded by its rule');
+    expect(r.out).not.toContain('relogin');
+  });
+});
+
+describe('cctl folder include --label', () => {
+  it('says the label was not applied when the folder already has a rule', async () => {
+    const rule = ruleOn(research, { include: ['e'] });
+    engine.includeInFolder.mockResolvedValueOnce({
+      rule: { ...rule, include: ['e', 'b'] },
+      created: false,
+      reserved: ['b'],
+      unexcluded: [],
+      handedOff: [],
+      live: { ruleId: 'r1', liveAccount: 'e', activated: false, noWorkingAccount: false },
+      runningSessions: [],
+    });
+    engine.listRules.mockResolvedValue([rule]);
+    const r = await runCli(['folder', 'include', research, 'B', '--label', 'renamed']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toContain('--label');
+    expect(r.out).toContain('research');
   });
 });

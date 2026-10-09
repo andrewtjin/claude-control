@@ -9,6 +9,7 @@ import {
   renderWhere,
   shellQuote,
   vscodeProfileName,
+  vscodeProfileNames,
   type FolderRuleView,
   type GlobalSlotView,
   type PoolEntryView,
@@ -294,7 +295,47 @@ describe('renderWhere', () => {
     expect(out).toContain('live:    A');
     expect(out).toContain('1. A  live here');
     expect(out).toContain('CLAUDE_CONFIG_DIR is not set');
-    expect(out).toContain('cctl folder include C:\\tmp <account>');
-    expect(out).toContain('cctl folder exclude C:\\tmp <account>');
+    expect(out).toContain("cctl folder include 'C:\\tmp' <account>");
+    expect(out).toContain("cctl folder exclude 'C:\\tmp' <account>");
+  });
+
+  it('quotes the folder in the rule hints, so a path with spaces pastes as one argument', () => {
+    const folder = 'C:\\code\\my projects\\x';
+    for (const platform of ['win32', 'linux'] as const) {
+      const out = renderWhere({ folder, rule: null, global: globalSlot }, PLAIN_PALETTE, platform);
+      expect(out).toContain(`cctl folder include ${shellQuote(folder, platform)} <account>`);
+      expect(out).toContain(`cctl folder exclude ${shellQuote(folder, platform)} <account>`);
+    }
+  });
+
+  it('uses the VS Code profile it is given, so two rules never share one', () => {
+    const out = renderWhere(
+      {
+        folder: 'C:\\code\\my-app',
+        rule: { ...research, matchedFolder: 'C:\\code\\my-app', vscodeProfile: 'cctl-my-app-r2' },
+        global: globalSlot,
+      },
+      PLAIN_PALETTE,
+      'win32',
+    );
+    expect(out).toContain("code --profile 'cctl-my-app-r2' 'C:\\code\\my-app'");
+  });
+});
+
+describe('vscodeProfileNames', () => {
+  it('gives rules whose labels reduce to one name different profiles, the first rule keeping the plain one', () => {
+    const names = vscodeProfileNames([
+      { id: 'later-rule', label: 'C:\\code\\my-app', createdAtMs: 2 },
+      { id: 'first-rule', label: 'C:\\code\\my app', createdAtMs: 1 },
+      { id: 'han-1', label: '/研究', createdAtMs: 3 },
+      { id: 'han-2', label: '/项目', createdAtMs: 4 },
+      { id: 'alone', label: 'research', createdAtMs: 5 },
+    ]);
+    expect(names.get('first-rule')).toBe('cctl-C-code-my-app');
+    expect(names.get('later-rule')).toBe('cctl-C-code-my-app-laterrul');
+    expect(names.get('han-1')).toBe('cctl-folder');
+    expect(names.get('han-2')).toBe('cctl-folder-han2');
+    expect(names.get('alone')).toBe('cctl-research');
+    expect(new Set(names.values()).size).toBe(5);
   });
 });

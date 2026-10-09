@@ -91,15 +91,59 @@ function anyAvailable(pool: readonly PoolEntryView[]): boolean {
   return pool.some((e) => !e.quarantined && e.liveElsewhere === null);
 }
 
+/** An empty pool in words. A folder's pool is emptied by its own excludes or by other folders
+ *  reserving what it inherits; the global pool only by folders reserving every account. */
+function emptyPoolWords(slot: 'global' | 'rule'): string {
+  return slot === 'global'
+    ? 'nothing (every account is reserved to a folder)'
+    : 'nothing (every account it could use is excluded by its rule or reserved to other folders)';
+}
+
+/**
+ * Why a slot has no account it can use, from its pool, ending in the fix that applies: a pool that
+ * is empty, accounts live in another slot (free that slot), or logins that expired (re-login one).
+ * A re-login is suggested only for a login that actually expired.
+ */
+export function nothingUsableReason(
+  pool: readonly PoolEntryView[],
+  slot: 'global' | 'rule' = 'rule',
+): string {
+  if (pool.length === 0) {
+    return slot === 'global'
+      ? 'its pool is empty: every account is reserved to a folder'
+      : 'its pool is empty: every account it could use is excluded by its rule or reserved to ' +
+          'other folders (cctl folder reset <folder> <account> lets an excluded one back in)';
+  }
+  const parts: string[] = [];
+  const held = pool.filter((e) => !e.quarantined && e.liveElsewhere !== null);
+  if (held.length > 0) {
+    const where = held.map(
+      (e) =>
+        `${sanitizeForTerminal(e.label)} is live in ${sanitizeForTerminal(e.liveElsewhere ?? '')}`,
+    );
+    parts.push(`${where.join(', ')}; switch that slot to another account to free it`);
+  }
+  const dead = pool.filter((e) => e.quarantined);
+  if (dead.length > 0) {
+    const names = dead.map((e) => sanitizeForTerminal(e.label));
+    parts.push(
+      `the login of ${names.join(', ')} expired; re-login one: cctl accounts relogin ${names[0]}`,
+    );
+  }
+  return parts.join('; ');
+}
+
 /** The pool in order, one numbered account per line, every limit spelled out. `indent` is the
- *  column the first line's label is already at, so continuation lines align under it. */
+ *  column the first line's label is already at, so continuation lines align under it. The global
+ *  slot's pool names no sources: every account in it is shared. */
 function poolLines(
   pool: readonly PoolEntryView[],
   palette: Palette,
   indent: number,
-  showSource = true,
+  slot: 'global' | 'rule' = 'rule',
 ): string[] {
-  if (pool.length === 0) return ['nothing (every account it could use is reserved elsewhere)'];
+  const showSource = slot === 'rule';
+  if (pool.length === 0) return [emptyPoolWords(slot)];
   const width = String(pool.length).length;
   return pool.map((e, i) => {
     const n = `${String(i + 1).padStart(width)}.`;
@@ -112,7 +156,7 @@ function poolLines(
 /** The pool on one line, for the compact per-folder section: the live one starred, and only the
  *  limits that make an account unavailable named. */
 function poolInline(pool: readonly PoolEntryView[], palette: Palette): string {
-  if (pool.length === 0) return 'nothing (every account it could use is reserved elsewhere)';
+  if (pool.length === 0) return emptyPoolWords('rule');
   return pool
     .map((e) => {
       const notes: string[] = [];
@@ -148,8 +192,7 @@ export function describeSlotLive(
     return anyAvailable(pool)
       ? 'none yet (cctl claude or the daemon seats the first available account)'
       : palette.red(
-          'none usable (every account it may use is quarantined or live elsewhere; ' +
-            're-login one: cctl accounts relogin <account>)',
+          `none usable (${nothingUsableReason(pool, slot === 'global' ? 'global' : 'rule')})`,
         );
   }
   const name = sanitizeForTerminal(live.label);
@@ -201,7 +244,7 @@ export function renderGlobalSlot(view: GlobalSlotView, palette: Palette = PLAIN_
   return [
     palette.bold('every other folder (the global slot)'),
     `  live:     ${describeSlotLive(view.live, view.pool, 'global', palette)}`,
-    `  pool:     ${poolLines(view.pool, palette, 12, false).join('\n')}`,
+    `  pool:     ${poolLines(view.pool, palette, 12, 'global').join('\n')}`,
   ].join('\n');
 }
 
@@ -336,8 +379,10 @@ export function renderReservedAccounts(
 export interface WhereView {
   /** The canonical folder queried. */
   folder: string;
-  /** The rule it resolves to and the rule folder that matched, or null for the global slot. */
-  rule: (FolderRuleView & { matchedFolder: string }) | null;
+  /** The rule it resolves to and the rule folder that matched, or null for the global slot, with
+   *  the VS Code profile it gets among every rule (see {@link vscodeProfileNames}; absent, the
+   *  name its label alone gives). */
+  rule: (FolderRuleView & { matchedFolder: string; vscodeProfile?: string }) | null;
   global: GlobalSlotView;
 }
 
@@ -358,6 +403,34 @@ export function vscodeProfileName(ruleLabel: string): string {
   return `cctl-${slug === '' ? 'folder' : slug}`;
 }
 
+/**
+ * The VS Code profile each rule gets, by rule id. Reducing labels to plain words can give two rules
+ * one name (`my app` and `my-app`, or two labels of only non-ASCII letters), and one VS Code profile
+ * holds one CLAUDE_CONFIG_DIR, so sharing it would point one folder's window at the other's slot.
+ * The rule made first keeps the plain name (a profile already set up for it stays right); every
+ * later rule with that name gets the first eight letters and digits of its id appended.
+ */
+export function vscodeProfileNames(
+  rules: ReadonlyArray<{ id: string; label: string; createdAtMs: number }>,
+): Map<string, string> {
+  const byName = new Map<string, Array<{ id: string; createdAtMs: number }>>();
+  for (const r of rules) {
+    const name = vscodeProfileName(r.label);
+    byName.set(name, [...(byName.get(name) ?? []), r]);
+  }
+  const out = new Map<string, string>();
+  for (const [name, holders] of byName) {
+    const first = [...holders].sort(
+      (a, b) => a.createdAtMs - b.createdAtMs || a.id.localeCompare(b.id),
+    )[0]!;
+    for (const r of holders) {
+      const suffix = r.id.replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
+      out.set(r.id, r.id === first.id ? name : `${name}-${suffix}`);
+    }
+  }
+  return out;
+}
+
 /** Explain which slot a folder runs on, its rule, live account and pool in order, print the env line
  *  a session needs, and how to point the VS Code Claude Code extension at that slot (a VS Code
  *  profile holding the claudeCode.environmentVariables setting). */
@@ -367,16 +440,18 @@ export function renderWhere(
   platform: NodeJS.Platform = process.platform,
 ): string {
   const folder = sanitizeForTerminal(view.folder);
+  const quoted = shellQuote(folder, platform);
   if (view.rule === null) {
     return [
       `${palette.bold(folder)}`,
       '  runs on: the global slot and the shared pool (no folder rule applies here)',
       `  live:    ${describeSlotLive(view.global.live, view.global.pool, 'global', palette)}`,
-      `  pool:    ${poolLines(view.global.pool, palette, 11, false).join('\n')}`,
+      `  pool:    ${poolLines(view.global.pool, palette, 11, 'global').join('\n')}`,
       '  env:     CLAUDE_CONFIG_DIR is not set (the global slot)',
       '',
-      `Give this folder its own rule with: cctl folder include ${folder} <account>[,<account>...]`,
-      `                                or: cctl folder exclude ${folder} <account>[,<account>...]`,
+      // Quoted like the VS Code command below: these are pasted, and a folder may hold spaces.
+      `Give this folder its own rule with: cctl folder include ${quoted} <account>[,<account>...]`,
+      `                                or: cctl folder exclude ${quoted} <account>[,<account>...]`,
     ].join('\n');
   }
   const r = view.rule;
@@ -391,7 +466,8 @@ export function renderWhere(
     null,
     2,
   );
-  const openCommand = `code --profile ${shellQuote(vscodeProfileName(r.label), platform)} ${shellQuote(folder, platform)}`;
+  const profileName = r.vscodeProfile ?? vscodeProfileName(r.label);
+  const openCommand = `code --profile ${shellQuote(profileName, platform)} ${quoted}`;
   return [
     `${palette.bold(folder)}`,
     `  runs on:  the folder rule ${palette.bold(sanitizeForTerminal(r.label))}, in its own slot`,

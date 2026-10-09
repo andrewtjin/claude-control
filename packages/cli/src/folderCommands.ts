@@ -54,6 +54,8 @@ import {
   renderFolders,
   renderReservedAccounts,
   renderWhere,
+  nothingUsableReason,
+  vscodeProfileNames,
   type FolderRuleView,
   type GlobalSlotView,
   type PoolEntryView,
@@ -202,15 +204,23 @@ async function resolveAcrossAll(engine: Engine, ref: string): Promise<AccountVie
   return resolved.account;
 }
 
-/** Refuse a rule change while a daemon that predates folder rules runs (see folderRulesSupport.ts):
- *  it could put an inherited account live in two places. Checked before anything is resolved or
- *  written, so a refusal changes nothing. */
-async function refuseOnOlderDaemon(): Promise<void> {
+/** Why the running daemon cannot be trusted with a shared account live in a folder slot, or
+ *  undefined when it can (see folderRulesSupport.ts). */
+async function olderDaemonRunning(): Promise<string | undefined> {
   const [report, heartbeat] = await Promise.all([
     readSettingsReport(daemonSettingsPath()),
     readHeartbeat(daemonHeartbeatPath()),
   ]);
-  const reason = olderDaemonReason(report, heartbeat);
+  return olderDaemonReason(report, heartbeat);
+}
+
+/** Refuse a command while a daemon that predates folder rules runs, when the command could leave a
+ *  SHARED account live in a folder slot (see folderRulesSupport.ts): that daemon could put the same
+ *  account live in the global slot too. Every such command calls this — a rule edit, a reset that
+ *  can release a live account, a switch of a shared account into a folder slot, a launch that may
+ *  seat one — before anything is resolved or written, so a refusal changes nothing. */
+export async function refuseOnOlderDaemon(): Promise<void> {
+  const reason = await olderDaemonRunning();
   if (reason !== undefined) fail(`${reason}. Nothing was changed.`);
 }
 
@@ -308,6 +318,17 @@ async function readFolderPicture(engine: Engine): Promise<{
   return { rules, live, accounts };
 }
 
+/** One rule's pool as the views show it (see {@link buildPoolView}). */
+async function rulePoolView(
+  engine: Engine,
+  rule: FolderRule,
+  picture: Awaited<ReturnType<typeof readFolderPicture>>,
+): Promise<PoolEntryView[]> {
+  const slot = ruleSlotId(rule.id);
+  const liveId = picture.live.get(slot) ?? null;
+  return buildPoolView(rule, await engine.slotPool(slot), liveId, picture.accounts, picture.rules);
+}
+
 /** The full view of one rule. */
 async function buildRuleView(
   engine: Engine,
@@ -316,14 +337,13 @@ async function buildRuleView(
 ): Promise<FolderRuleView> {
   const slot = ruleSlotId(rule.id);
   const liveId = picture.live.get(slot) ?? null;
-  const pool = await engine.slotPool(slot);
   return {
     label: rule.label,
     folders: rule.folders,
     include: rule.include.map((id) => labelOf(picture.accounts, id)),
     exclude: rule.exclude.map((id) => labelOf(picture.accounts, id)),
     live: buildLiveView(liveId, rule, picture.accounts),
-    pool: buildPoolView(rule, pool, liveId, picture.accounts, picture.rules),
+    pool: await rulePoolView(engine, rule, picture),
     profileDir: ruleProfilePath(defaultPaths().vaultDir, rule.id),
   };
 }
@@ -396,6 +416,9 @@ export interface ChangeContext {
   rules: readonly FolderRule[];
   vaultDir: string;
   palette: Palette;
+  /** Each rule's pool as the views show it, by rule id: what says why a slot has nothing usable.
+   *  Absent, that reason is given in general terms. */
+  pools?: ReadonlyMap<string, PoolEntryView[]>;
 }
 
 /** The lines every rule change ends on: who is live in the folder's slot now, and the running
@@ -408,12 +431,13 @@ function liveAndSessionLines(
 ): string[] {
   const lines: string[] = [];
   if (live.liveAccount === null) {
-    lines.push(
-      ctx.palette.red(
-        "  the folder's slot has no working account: every account it may use is quarantined or " +
-          'live elsewhere. Re-login one: cctl accounts relogin <account>',
-      ),
-    );
+    const pool = ctx.pools?.get(rule.id);
+    const why =
+      pool !== undefined
+        ? nothingUsableReason(pool)
+        : 'every account it may use is quarantined, live in another slot or excluded ' +
+          '(cctl folders shows which)';
+    lines.push(ctx.palette.red(`  the folder's slot has no working account: ${why}`));
   } else {
     const label = sanitizeForTerminal(labelOf(ctx.accounts, live.liveAccount));
     const source = liveSource(live.liveAccount, rule, ctx.accounts);
@@ -443,6 +467,24 @@ function liveAndSessionLines(
   return lines;
 }
 
+/** The line saying a `--label` was not applied: it names a rule only when the command creates one,
+ *  so an existing rule keeps its label. Nothing when no label was given or it matches. */
+function labelNotApplied(
+  result: { created: boolean; rule: FolderRule },
+  label: string | undefined,
+): string[] {
+  if (label === undefined || result.created || label === result.rule.label) return [];
+  return [
+    `  --label was not applied: the rule already exists and keeps its label ` +
+      `${sanitizeForTerminal(result.rule.label)} (--label names a rule only when it creates it).`,
+  ];
+}
+
+/** A VS Code profile name as an optional field: present only when there is one. */
+function profileOf(name: string | undefined): { vscodeProfile?: string } {
+  return name === undefined ? {} : { vscodeProfile: name };
+}
+
 /** The rule's folders as one phrase. */
 function foldersOf(rule: FolderRule): string {
   return sanitizeForTerminal(rule.folders.join(', '));
@@ -455,6 +497,7 @@ export function describeInclude(
   result: IncludeResult,
   requested: readonly string[],
   ctx: ChangeContext,
+  label?: string,
 ): string {
   const { rule } = result;
   const names = sanitizeForTerminal(labelsOf(ctx.accounts, requested));
@@ -462,6 +505,7 @@ export function describeInclude(
     result.created
       ? `Created a folder rule on ${foldersOf(rule)}: it uses ${names} first, then the shared pool.`
       : `Included ${names} in the folder rule on ${foldersOf(rule)}.`,
+    ...labelNotApplied(result, label),
   ];
   if (result.reserved.length > 0) {
     lines.push(
@@ -503,6 +547,7 @@ export function describeExclude(
   result: ExcludeResult,
   requested: readonly string[],
   ctx: ChangeContext,
+  label?: string,
 ): string {
   const { rule } = result;
   const names = sanitizeForTerminal(labelsOf(ctx.accounts, requested));
@@ -511,6 +556,7 @@ export function describeExclude(
       ? `Created a folder rule on ${foldersOf(rule)} that excludes ${names}; it uses the rest of ` +
         'the shared pool, in its own slot.'
       : `Excluded ${names} from the folder rule on ${foldersOf(rule)}.`,
+    ...labelNotApplied(result, label),
     `  ${names} ${requested.length === 1 ? 'stays' : 'stay'} usable everywhere else.`,
   ];
   if (result.movedOff !== null) {
@@ -622,8 +668,16 @@ export function describeReset(
 
 /** Read the registry after a change, for the describe* helpers. */
 async function changeContext(engine: Engine): Promise<ChangeContext> {
-  const [accounts, rules] = await Promise.all([engine.listAllAccounts(), engine.listRules()]);
-  return { accounts, rules, vaultDir: defaultPaths().vaultDir, palette: detectPalette() };
+  const picture = await readFolderPicture(engine);
+  const pools = new Map<string, PoolEntryView[]>();
+  for (const rule of picture.rules) pools.set(rule.id, await rulePoolView(engine, rule, picture));
+  return {
+    accounts: picture.accounts,
+    rules: picture.rules,
+    vaultDir: defaultPaths().vaultDir,
+    palette: detectPalette(),
+    pools,
+  };
 }
 
 /** Run a rule change: an engine refusal is the whole error line (it already says what is wrong and
@@ -717,7 +771,10 @@ export function buildFolderCommands(program: Command): void {
       'reserve accounts to a folder and use them there first (comma-separated labels, emails or ids; ' +
         'always named, never the account in use)',
     )
-    .option('--label <label>', "a display name for the folder's rule (default: the folder)")
+    .option(
+      '--label <label>',
+      "a display name for the folder's rule, if this creates it (default: the folder)",
+    )
     .action(async (folderArg: string, accountsArg: string, opts: { label?: string }) => {
       await refuseOnOlderDaemon();
       const engine = buildEngine();
@@ -725,7 +782,9 @@ export function buildFolderCommands(program: Command): void {
       const result = await engineCall(() =>
         engine.includeInFolder(folderArg, ids, opts.label ? { label: opts.label } : {}),
       );
-      process.stdout.write(describeInclude(result, ids, await changeContext(engine)) + '\n');
+      process.stdout.write(
+        describeInclude(result, ids, await changeContext(engine), opts.label) + '\n',
+      );
       // Wire the guard now so the rule is enforced without waiting for a daemon restart.
       await reconcileFolderGuard(engine, defaultPaths());
     });
@@ -754,7 +813,9 @@ export function buildFolderCommands(program: Command): void {
             ...(opts.force ? { force: true } : {}),
           }),
         );
-        process.stdout.write(describeExclude(result, ids, await changeContext(engine)) + '\n');
+        process.stdout.write(
+          describeExclude(result, ids, await changeContext(engine), opts.label) + '\n',
+        );
         await reconcileFolderGuard(engine, defaultPaths());
       },
     );
@@ -772,6 +833,10 @@ export function buildFolderCommands(program: Command): void {
     .option('--force', 'go ahead even when sessions are running under the folder')
     .action(
       async (folderArg: string, accountsArg: string | undefined, opts: { force?: boolean }) => {
+        // Removing named accounts can return one live in the folder's slot to the shared pool while
+        // it stays live there. Removing the whole rule clears the slot and seats nothing, so it is
+        // left open: it is also how an operator backs out of rules an older daemon cannot honor.
+        if (accountsArg !== undefined) await refuseOnOlderDaemon();
         const engine = buildEngine();
         // An empty account list is a usage error, never "the whole rule": removing the rule must be
         // asked for by leaving the argument out.
@@ -847,7 +912,11 @@ export function buildFolderCommands(program: Command): void {
       const rule =
         match === null
           ? null
-          : { ...(await buildRuleView(engine, match.rule, picture)), matchedFolder: match.folder };
+          : {
+              ...(await buildRuleView(engine, match.rule, picture)),
+              matchedFolder: match.folder,
+              ...profileOf(vscodeProfileNames(picture.rules).get(match.rule.id)),
+            };
       process.stdout.write(
         renderWhere({ folder: canonical, rule, global }, detectPalette()) + '\n',
       );
@@ -918,6 +987,22 @@ export function relaxationBannerLine(
         `${safeCwd} on purpose.\n`;
 }
 
+/**
+ * Refuse a launch into a rule's slot while a daemon that predates folder rules runs, unless the slot
+ * already holds one of the rule's own included accounts with a working login: making the slot live
+ * would otherwise seat (or keep) a SHARED account there, which that daemon could put live in the
+ * global slot as well. An included account kept where it is seats nothing new.
+ */
+async function refuseSeatingUnderOlderDaemon(engine: Engine, rule: FolderRule): Promise<void> {
+  const reason = await olderDaemonRunning();
+  if (reason === undefined) return;
+  const [live, accounts] = await Promise.all([engine.liveSlots(), engine.listAllAccounts()]);
+  const liveId = live.get(ruleSlotId(rule.id)) ?? null;
+  const working = accounts.find((a) => a.id === liveId)?.quarantined === false;
+  if (liveId !== null && rule.include.includes(liveId) && working) return;
+  fail(`${reason}. Nothing was changed.`);
+}
+
 /** Orchestrate `cctl claude`: resolve the slot (explicit account > folder rule > global), make it
  *  live, print the one-line banner, and spawn the real executable. */
 async function runClaude(opts: {
@@ -971,25 +1056,46 @@ async function runClaude(opts: {
         context: `explicit account, ${rule.folders.join(', ')}`,
       };
     } else {
-      // A shared account can only be live in the global slot, and only one at a time — so --account
-      // of a shared account is honored ONLY when it is already the global live account.
+      // A shared account runs where it is already live: the global slot, or the slot of this
+      // folder's rule when it is live there (the folder's fallback, or a folder that excludes the
+      // global account). A launch never switches a slot out from under the sessions on it, so
+      // anywhere else --account of a shared account is refused.
       const globalLive = await engine.getActiveId('global');
-      if (acct.id !== globalLive) {
+      const match = resolveFolderRule(
+        canonicalizeCliFolder(process.cwd()),
+        await engine.listRules(),
+        platform,
+      );
+      const liveHere =
+        match !== null && (await engine.liveSlots()).get(ruleSlotId(match.rule.id)) === acct.id;
+      if (acct.id === globalLive) {
+        slot = { kind: 'global', label: acct.label, context: 'global (shared account)' };
+      } else if (match !== null && liveHere) {
+        // The folder's own slot on the account it holds: no relaxation is involved.
+        explicit = false;
+        slot = {
+          kind: 'group',
+          profileDir: ruleProfilePath(paths.vaultDir, match.rule.id),
+          label: acct.label,
+          context: `${match.folder} folder rule`,
+        };
+      } else {
         fail(
-          `${acct.label} is a shared account and is not the one currently live in the global slot. ` +
-            `A shared account can only run in the global slot, one at a time. Switch to it first ` +
-            `(cctl switch ${acct.label}), then run cctl claude, or omit --account.`,
+          `${acct.label} is a shared account live neither in the global slot nor in this folder's ` +
+            `slot. Switch to it first (cctl switch ${acct.label}, with --folder <folder> for a ` +
+            `folder's slot), then run cctl claude, or omit --account.`,
         );
       }
-      slot = { kind: 'global', label: acct.label, context: 'global (shared account)' };
     }
   } else {
-    // No explicit account: the cwd's folder rule decides.
+    // No explicit account: the cwd's folder rule decides, unless --override asks for the global
+    // account here on purpose (the guard honors that launch's token for this session).
     const canonical = canonicalizeCliFolder(process.cwd());
     const rules = await engine.listRules();
-    const match = resolveFolderRule(canonical, rules, platform);
+    const match = opts.override ? null : resolveFolderRule(canonical, rules, platform);
     if (match !== null) {
       const rule = match.rule;
+      await refuseSeatingUnderOlderDaemon(engine, rule);
       let live;
       try {
         live = await engine.ensureRuleLive(rule.id);
@@ -998,10 +1104,9 @@ async function runClaude(opts: {
         throw err;
       }
       if (live.noWorkingAccount || live.liveAccount === null) {
-        fail(
-          `${match.folder} has a folder rule, but no account it may use is usable right now ` +
-            `(quarantined, or live in another slot). Re-login one: cctl accounts relogin <ref>.`,
-        );
+        const picture = await readFolderPicture(engine);
+        const why = nothingUsableReason(await rulePoolView(engine, rule, picture));
+        fail(`${match.folder} has a folder rule, but no account it may use is usable: ${why}.`);
       }
       const liveLabel = labelOf(await engine.listAllAccounts(), live.liveAccount);
       slot = {

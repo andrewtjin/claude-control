@@ -307,10 +307,28 @@ describe('describeInclude', () => {
         runningSessions: [],
       },
       ['e'],
-      ctx([e, f], [r1]),
+      {
+        ...ctx([e, f], [r1]),
+        // E's login expired: that is the one case a re-login fixes, and the line says so.
+        pools: new Map([
+          [
+            r1.id,
+            [
+              {
+                label: 'E',
+                source: 'include' as const,
+                live: false,
+                liveElsewhere: null,
+                quarantined: true,
+                autoTarget: false,
+              },
+            ],
+          ],
+        ]),
+      },
     );
     expect(out).toContain('no working account');
-    expect(out).toContain('cctl accounts relogin');
+    expect(out).toContain('the login of E expired; re-login one: cctl accounts relogin E');
   });
 
   it('flags a quarantined account kept live for want of another', () => {
