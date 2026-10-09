@@ -1,7 +1,8 @@
-// Folder-bound slots in the daemon poll cycle: the per-slot auto-switch (global over the shared
-// pool, each group over its own members), the group context carried onto the usage wire, the
-// startup snapshot refresh, the per-cycle group ensure-live + slot-invariant repair, and the
-// once-per-window alert a group out of quota raises.
+// Folder-bound slots in the daemon poll cycle: the per-slot auto-switch over each slot's effective
+// pool (global over the shared pool, each folder rule over its included accounts first, then the
+// shared pool it inherits), the slot context carried onto the usage wire, the startup snapshot
+// refresh, the per-cycle rule ensure-live + slot-invariant repair, and the once-per-episode alert a
+// folder whose whole pool is out raises.
 //
 // Driven through the real Daemon against a real Store/HookReceiver/ControlPlaneClient and a
 // minimal in-process relay, like daemon.pollCycle.test.ts — a group-aware FAKE switch engine is
@@ -149,6 +150,8 @@ interface TestGroup {
   folders: string[];
   createdAtMs: number;
   updatedAtMs: number;
+  /** Shared accounts the folder must not use (default none). */
+  exclude?: string[];
 }
 
 /** The rule a {@link TestGroup} fixture stands for. */
@@ -158,7 +161,7 @@ function ruleOf(g: TestGroup): FolderRule {
     label: g.label,
     folders: g.folders,
     include: g.members.map((m) => m.id),
-    exclude: [],
+    exclude: g.exclude ?? [],
     activeId: g.activeId,
     createdAtMs: g.createdAtMs,
     updatedAtMs: g.updatedAtMs,
@@ -194,6 +197,9 @@ function fakeEngine(opts: {
   checkSlotsImpl?: () => Promise<SlotViolation[]>;
   /** What refreshSnapshotIfStale reports (default: the snapshot was already fresh). */
   snapshotStale?: boolean;
+  /** Seat each activation in the slot it named, so the next cycle sees the hop (default: the live
+   *  slots never move, as for a single-cycle case). */
+  applyActivations?: boolean;
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
@@ -210,6 +216,7 @@ function fakeEngine(opts: {
     recover: (): Promise<RecoverResult> => Promise.resolve({ recovered: false, action: 'none' }),
     activate: (id: string, options?: ActivateOptions): Promise<ActivateResult> => {
       controls.activateCalls.push({ id, options });
+      if (opts.applyActivations === true) controls.liveSlots.set(options?.slot ?? 'global', id);
       return Promise.resolve({
         ok: true,
         activeAccountId: id,
@@ -305,6 +312,8 @@ afterEach(async () => {
 
 interface Rig {
   daemon: Daemon;
+  /** The poller, so a case that changes an account's numbers can have it re-read next cycle. */
+  poller: UsagePoller;
   relay: SteadyRelay;
   controls: FakeEngineControls;
   start: () => Promise<void>;
@@ -379,7 +388,7 @@ async function createRig(opts: {
     await rm(vaultDir, { recursive: true, force: true });
   });
 
-  return { daemon, relay, controls: opts.controls, start: () => daemon.start() };
+  return { daemon, poller, relay, controls: opts.controls, start: () => daemon.start() };
 }
 
 function fakeIdentityStore(): IdentityStore {
@@ -896,21 +905,19 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
     expect(slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'))).toHaveLength(1);
   });
 
-  it('alerts when the only spare member has headroom but is auto-switch-excluded', async () => {
-    // The group's live member is out of quota; its one spare has headroom but the operator excluded
-    // it from auto-switch. Auto-switch therefore cannot hop, so the exhaustion is terminal and must
-    // be alerted. The alert's hop check must be the exact complement of the executor's candidate
-    // gate — a plain "has headroom" test would see the spare and wrongly suppress the alert.
+  it('alerts when the only spare is an inherited account with headroom but auto-switch-excluded', async () => {
+    // The folder's live account is out of quota; the one shared account it could fall back to has
+    // headroom but the operator excluded it from auto-switch, and the global slot holds the other.
+    // Auto-switch therefore cannot hop, so the alert must go out. The alert's hop check must be the
+    // exact complement of the executor's candidate gate — a plain "has headroom" test would see the
+    // spare and wrongly suppress the alert.
     const live = view('m1', 'work@corp', 'g1');
-    const excludedSpare: AccountView = {
-      ...view('m2', 'work@backup', 'g1'),
-      autoSwitchExcluded: true,
-    };
+    const excludedSpare: AccountView = { ...view('s2', 'Spare'), autoSwitchExcluded: true };
     const shared = view('s1', 'Shared');
     const group: TestGroup = {
       id: 'g1',
       label: 'work@corp',
-      members: [live, excludedSpare],
+      members: [live],
       activeId: 'm1',
       folders: ['C:/ai-research'],
       createdAtMs: 0,
@@ -921,11 +928,11 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
       [ruleSlotId('g1'), 'm1'],
     ]);
     const controls = fakeEngine({
-      accounts: [shared, live, excludedSpare],
+      accounts: [shared, excludedSpare, live],
       groups: [group],
       live: liveSlots,
     });
-    // m1 (live) fully spent; m2 (excluded spare) has ample headroom but is not an eligible target.
+    // m1 (live) fully spent; s2 (excluded spare) has ample headroom but is not an eligible target.
     const bodyFor = (accountId: string): unknown =>
       accountId === 'm1'
         ? { limits: [{ kind: 'weekly_all', percent: 100, resets_at: iso(NOW + 3 * HOUR_MS) }] }
@@ -944,7 +951,7 @@ describe('daemon folder-bound slots — group out of quota alert', () => {
     expect(exhaustion.length).toBeGreaterThanOrEqual(1);
     expect(exhaustion[0]?.body).toContain('C:/ai-research account work@corp is out of quota');
     // The excluded spare is never chosen as a hop target, so no activation happened.
-    expect(controls.activateCalls.map((c) => c.id)).not.toContain('m2');
+    expect(controls.activateCalls.map((c) => c.id)).not.toContain('s2');
   });
 
   it('names every bound folder when a multi-folder group is exhausted', async () => {
@@ -1172,5 +1179,368 @@ describe('daemon folder rules — slots never share an account', () => {
     });
     await waitFor(() => switchResults(rig.relay).some((r) => r.requestId === 'rq-both'));
     expect(controls.activateCalls).toEqual([{ id: 'm1', options: { origin: 'phone' } }]);
+  });
+});
+
+// ---- per-slot switching over the effective pool ------------------------------------------------
+
+/** A folder rule fixture: its included accounts, its live account and what it excludes. */
+function folderRule(
+  id: string,
+  folder: string,
+  members: AccountView[],
+  activeId: string | null,
+  exclude: string[] = [],
+): TestGroup {
+  return {
+    id,
+    label: folder,
+    members,
+    activeId,
+    folders: [folder],
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    exclude,
+  };
+}
+
+/** Endpoint bodies by name: `low` is past the 94% trigger but not spent, `spent` is at the wall,
+ *  `healthy(reset)` has a weekly reset `reset` hours out and plenty left. */
+const LOW = { limits: [{ kind: 'session', percent: 96, resets_at: iso(NOW + 2 * HOUR_MS) }] };
+const SPENT = { limits: [{ kind: 'weekly_all', percent: 100, resets_at: iso(NOW + 3 * HOUR_MS) }] };
+const healthyIn = (hours: number, percent = 10): unknown => ({
+  limits: [{ kind: 'weekly_all', percent, resets_at: iso(NOW + hours * HOUR_MS) }],
+});
+
+/** The hops one slot made, in order. */
+const hopsIn = (controls: FakeEngineControls, slot: SlotId): string[] =>
+  controls.activateCalls.filter((c) => c.options?.slot === slot).map((c) => c.id);
+
+/** Let a few more poll cycles run (and their frames cross the socket). */
+async function cycles(rig: Rig, n: number): Promise<void> {
+  const target = countUsageSnapshots(rig.relay) + n;
+  await waitFor(() => countUsageSnapshots(rig.relay) >= target);
+}
+
+describe('folder rules — per-slot auto-switch over the effective pool', () => {
+  it('rotates to another included account before any inherited one, however soon that resets', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const m2 = view('m2', 'Inc Two', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const controls = fakeEngine({
+      accounts: [s1, s2, m1, m2],
+      groups: [folderRule('g1', 'C:/work', [m1, m2], 'm1')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 'm1'],
+      ]),
+    });
+    const bodies: Record<string, unknown> = {
+      s1: healthyIn(30),
+      s2: healthyIn(2),
+      m1: LOW,
+      m2: healthyIn(100),
+    };
+    const rig = await createRig({ controls, bodyFor: (id) => bodies[id], withAutoSwitcher: true });
+    await rig.start();
+    await waitFor(() => hopsIn(controls, ruleSlotId('g1')).length >= 1);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['m2']);
+  });
+
+  it('falls back to a free inherited account only when every included account is out', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const s3 = view('s3', 'Shared Three');
+    const controls = fakeEngine({
+      accounts: [s1, s2, s3, m1],
+      // s3 is excluded by the folder: never its target, however healthy.
+      groups: [folderRule('g1', 'C:/work', [m1], 'm1', ['s3'])],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 'm1'],
+      ]),
+    });
+    const bodies: Record<string, unknown> = {
+      s1: healthyIn(30),
+      s2: healthyIn(50),
+      s3: healthyIn(1),
+      m1: LOW,
+    };
+    const rig = await createRig({ controls, bodyFor: (id) => bodies[id], withAutoSwitcher: true });
+    await rig.start();
+    await waitFor(() => hopsIn(controls, ruleSlotId('g1')).length >= 1);
+    // s1 is live in the global slot, s3 is excluded: s2 is the one fallback.
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['s2']);
+    expect(hopsIn(controls, 'global')).toEqual([]);
+  });
+
+  it('returns to the included account once it can take work again, with the reason on the notice', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const controls = fakeEngine({
+      accounts: [s1, s2, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 'm1')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 'm1'],
+      ]),
+      applyActivations: true,
+    });
+    const bodies: Record<string, unknown> = { s1: healthyIn(30), s2: healthyIn(50), m1: LOW };
+    const rig = await createRig({
+      controls,
+      bodyFor: (id) => bodies[id],
+      withAutoSwitcher: true,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => hopsIn(controls, ruleSlotId('g1')).length >= 1);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['s2']);
+
+    // Still out: the slot stays on the inherited account.
+    await cycles(rig, 2);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['s2']);
+
+    // m1's window resets: back to it, though s2 is perfectly healthy.
+    bodies.m1 = healthyIn(80);
+    rig.poller.repollNow('m1');
+    await waitFor(() => hopsIn(controls, ruleSlotId('g1')).length >= 2);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['s2', 'm1']);
+    await waitFor(() => switchResults(rig.relay).some((r) => r.activeAccountId === 'm1'));
+    const notice = switchResults(rig.relay).find((r) => r.activeAccountId === 'm1');
+    expect(notice?.message).toContain('auto-switch (C:/work): Inc One can take work again');
+    // And it stays there: no ping-pong.
+    await cycles(rig, 2);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['s2', 'm1']);
+  });
+
+  it('an included account is a target even when excluded globally; an inherited excluded one is not', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const m2: AccountView = { ...view('m2', 'Inc Two', 'g1'), autoSwitchExcluded: true };
+    const s1 = view('s1', 'Shared One');
+    const s2: AccountView = { ...view('s2', 'Shared Two'), autoSwitchExcluded: true };
+    const controls = fakeEngine({
+      accounts: [s1, s2, m1, m2],
+      groups: [folderRule('g1', 'C:/work', [m1, m2], 'm1')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 'm1'],
+      ]),
+      applyActivations: true,
+    });
+    const bodies: Record<string, unknown> = {
+      s1: healthyIn(30),
+      s2: healthyIn(1),
+      m1: LOW,
+      m2: healthyIn(100),
+    };
+    const rig = await createRig({
+      controls,
+      bodyFor: (id) => bodies[id],
+      withAutoSwitcher: true,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => hopsIn(controls, ruleSlotId('g1')).length >= 1);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['m2']);
+
+    // Now m2 runs low too: the only inherited account left is excluded, so the slot stays.
+    bodies.m2 = LOW;
+    rig.poller.repollNow('m2');
+    await cycles(rig, 3);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['m2']);
+  });
+
+  it('never takes an account live in another slot, included or inherited', async () => {
+    // e1 is included by both folders and live in the second; s2 is live in the third as its
+    // fallback. The free s3 is the only legal target, though both others reset far sooner.
+    const e1: AccountView = { ...view('e1', 'Both'), ruleIds: ['g1', 'g2'] };
+    const m1 = view('m1', 'Inc One', 'g1');
+    const m3 = view('m3', 'Inc Three', 'g3');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const s3 = view('s3', 'Shared Three');
+    const controls = fakeEngine({
+      accounts: [s1, s2, s3, m1, e1, m3],
+      groups: [
+        folderRule('g1', 'C:/one', [m1, e1], 'm1'),
+        folderRule('g2', 'C:/two', [e1], 'e1'),
+        folderRule('g3', 'C:/three', [m3], 's2'),
+      ],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 'm1'],
+        [ruleSlotId('g2'), 'e1'],
+        [ruleSlotId('g3'), 's2'],
+      ]),
+    });
+    const bodies: Record<string, unknown> = {
+      s1: healthyIn(30),
+      s2: healthyIn(2),
+      s3: healthyIn(60),
+      m1: LOW,
+      e1: healthyIn(1),
+      m3: SPENT,
+    };
+    const rig = await createRig({ controls, bodyFor: (id) => bodies[id], withAutoSwitcher: true });
+    await rig.start();
+    await waitFor(() => hopsIn(controls, ruleSlotId('g1')).length >= 1);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['s3']);
+  });
+
+  it('under contention the global slot takes the last free shared account and the folder waits', async () => {
+    // Both the global slot and the folder (in fallback) want out; s2 is the one free account.
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const controls = fakeEngine({
+      accounts: [s1, s2, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 'm1')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 'm1'],
+      ]),
+      applyActivations: true,
+    });
+    const bodies: Record<string, unknown> = { s1: LOW, s2: healthyIn(50), m1: SPENT };
+    const rig = await createRig({
+      controls,
+      bodyFor: (id) => bodies[id],
+      withAutoSwitcher: true,
+      slotAlertWindowMs: 60 * 60_000,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => hopsIn(controls, 'global').length >= 1);
+    await cycles(rig, 2);
+    expect(hopsIn(controls, 'global')).toEqual(['s2']);
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual([]);
+    // The folder is told it waits, by name.
+    const alerts = slotAlerts(rig.relay).filter((a) => a.body.startsWith('C:/work'));
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.body).toContain('nothing else in its pool is free to take over');
+  });
+
+  it('alerts once per episode when a folder whole pool is out, and again on the next episode', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const controls = fakeEngine({
+      accounts: [s1, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 'm1')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 'm1'],
+      ]),
+    });
+    const bodies: Record<string, unknown> = { s1: healthyIn(30), m1: SPENT };
+    // A short window: a per-window alert would repeat here, a per-episode one must not.
+    const rig = await createRig({
+      controls,
+      bodyFor: (id) => bodies[id],
+      withAutoSwitcher: true,
+      slotAlertWindowMs: 1,
+      pollIntervalMs: 25,
+    });
+    const poolOut = () => slotAlerts(rig.relay).filter((a) => a.body.includes('out of quota'));
+    await rig.start();
+    await waitFor(() => poolOut().length >= 1);
+    await cycles(rig, 3);
+    expect(poolOut()).toHaveLength(1);
+
+    // m1 comes back: the episode is over, nothing new is said.
+    bodies.m1 = healthyIn(80);
+    rig.poller.repollNow('m1');
+    await cycles(rig, 3);
+    expect(poolOut()).toHaveLength(1);
+
+    // And runs out again: a new episode, a new alert.
+    bodies.m1 = SPENT;
+    rig.poller.repollNow('m1');
+    await waitFor(() => poolOut().length >= 2);
+    await cycles(rig, 2);
+    expect(poolOut()).toHaveLength(2);
+  });
+
+  it('a folder with no working account is alerted on once per episode too', async () => {
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    let working = false;
+    const controls = fakeEngine({
+      accounts: [s1, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], null)],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), null],
+      ]),
+      ensureRuleLiveImpl: (ruleId) =>
+        Promise.resolve({
+          ruleId,
+          liveAccount: working ? 'm1' : null,
+          activated: false,
+          noWorkingAccount: !working,
+        }),
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => healthyIn(30),
+      slotAlertWindowMs: 1,
+      pollIntervalMs: 25,
+    });
+    const noAccount = () =>
+      slotAlerts(rig.relay).filter((a) => a.body.includes('has no working account'));
+    await rig.start();
+    await waitFor(() => noAccount().length >= 1);
+    await cycles(rig, 3);
+    expect(noAccount()).toHaveLength(1);
+    expect(noAccount()[0]?.body.startsWith('C:/work has no working account')).toBe(true);
+    working = true;
+    await cycles(rig, 2);
+    working = false;
+    await waitFor(() => noAccount().length >= 2);
+  });
+
+  it('carries where each account is live and every rule including it on the usage wire', async () => {
+    const e1: AccountView = { ...view('e1', 'Both'), ruleIds: ['g1', 'g2'] };
+    const m3 = view('m3', 'Inc Three', 'g3');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const controls = fakeEngine({
+      accounts: [s1, s2, e1, m3],
+      groups: [
+        folderRule('g1', 'C:/one', [e1], null),
+        folderRule('g2', 'C:/two', [e1], 'e1'),
+        folderRule('g3', 'C:/three', [m3], 's2'),
+      ],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), null],
+        [ruleSlotId('g2'), 'e1'],
+        [ruleSlotId('g3'), 's2'],
+      ]),
+    });
+    const rig = await createRig({ controls, bodyFor: () => healthyIn(30) });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 1);
+    const byId = new Map(lastUsageSnapshot(rig.relay).accounts.map((a) => [a.accountId, a]));
+    // A shared account live in a folder slot (that folder's fallback) says so, and stays shared.
+    expect(byId.get('s2')).toMatchObject({ liveSlot: ruleSlotId('g3'), liveSlotLabel: 'C:/three' });
+    expect(byId.get('s2')?.groupId ?? undefined).toBeUndefined();
+    // The global slot's account carries its slot, with no folder label.
+    expect(byId.get('s1')?.liveSlot).toBe('global');
+    expect(byId.get('s1')?.liveSlotLabel ?? undefined).toBeUndefined();
+    // A shared account two rules include lists both, and the legacy fields name the live one.
+    expect(byId.get('e1')).toMatchObject({
+      ruleIds: ['g1', 'g2'],
+      liveSlot: ruleSlotId('g2'),
+      liveSlotLabel: 'C:/two',
+      groupId: 'g2',
+      groupActive: true,
+    });
+    // An included account live nowhere carries no live slot.
+    expect(byId.get('m3')?.liveSlot ?? undefined).toBeUndefined();
+    expect(byId.get('m3')?.ruleIds).toEqual(['g3']);
   });
 });

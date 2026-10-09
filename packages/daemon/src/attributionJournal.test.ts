@@ -269,5 +269,19 @@ describe('AttributionJournal', () => {
       const journal = new AttributionJournal({ store, vaultDir });
       expect(await journal.switchesBetween(0, Date.now())).toEqual([]);
     });
+
+    it('keeps only the named slot switches when asked, an entry naming no slot being global', async () => {
+      await writeAuditLog(vaultDir, [
+        { ts: 1000, event: 'activated', fromAccountId: 'x', toAccountId: 'a' },
+        { ts: 2000, event: 'activated', fromAccountId: 'a', toAccountId: 'b', slot: 'global' },
+        { ts: 3000, event: 'activated', fromAccountId: 'e', toAccountId: 'c', slot: 'group:r1' },
+      ]);
+      const journal = new AttributionJournal({ store, vaultDir });
+      expect((await journal.switchesBetween(0, 5000, 'global')).map((s) => s.at)).toEqual([
+        1000, 2000,
+      ]);
+      expect((await journal.switchesBetween(0, 5000, 'group:r1')).map((s) => s.at)).toEqual([3000]);
+      expect(await journal.switchesBetween(0, 5000)).toHaveLength(3);
+    });
   });
 });

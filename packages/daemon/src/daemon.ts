@@ -23,7 +23,13 @@ import type {
   RepairResult,
   RuleLiveResult,
 } from '@claude-control/switch-engine';
-import { ruleIdOfSlot, ruleSlotId } from '@claude-control/switch-engine';
+import {
+  allSlots,
+  ruleIdOfSlot,
+  ruleOfSlot,
+  ruleSlotId,
+  slotMembers,
+} from '@claude-control/switch-engine';
 import {
   buildAuthorizeUrl,
   generatePkce,
@@ -71,18 +77,25 @@ import {
 import type { ProbeCandidate } from './accountProbe.js';
 import {
   exhaustedCardBody,
+  exhaustedCardTitle,
   exhaustedRecord,
   fileWallChanges,
-  judgeOutage,
+  folderScopeKey,
+  judgeScope,
   openEpisodeFrom,
-  resumeOpenEpisode,
+  outageScopes,
+  recoveredCardTitle,
   recoveredRecord,
+  resumeOpenEpisodes,
+  ruleRemovedRecord,
   SWITCH_CHAIN_WINDOW_MS,
   type ExhaustionLog,
   type ExhaustionRecord,
   type OpenEpisode,
   type Recovery,
+  type ScopeView,
 } from './exhaustionLog.js';
+import { folderNameOf, rulesPictureOf } from './folderSlots.js';
 import type { Store } from './store.js';
 import { slotBySessionMap } from './store.js';
 import {
@@ -171,7 +184,12 @@ export interface SwitchEngineLike {
 export interface AutoSwitcherLike {
   evaluate(
     accounts: AccountUsageInput[],
-    opts?: { slotKey?: SlotId; candidateIds?: ReadonlySet<string>; slotLabel?: string },
+    opts?: {
+      slotKey?: SlotId;
+      candidateIds?: ReadonlySet<string>;
+      preferredIds?: ReadonlySet<string>;
+      slotLabel?: string;
+    },
   ): Promise<string | undefined>;
 }
 
@@ -835,10 +853,11 @@ export class Daemon {
    *  not re-pushed on every restart). */
   private quarantineState = new Map<string, QuarantineNoticeState>();
   private readonly exhaustionLog: ExhaustionLog | undefined;
-  /** The exhaustion episode open right now (no account can take work), or `undefined`. Read
-   *  back from the log on the first cycle, so an outage that spans a daemon restart stays one
-   *  episode with one pair of cards; {@link exhaustionLoaded} says whether that read happened. */
-  private openExhaustion: OpenEpisode | undefined;
+  /** The exhaustion episodes open right now, one per scope at most (the global pool, or a folder
+   *  rule's pool, where no account can take work), keyed by `scopeKey`. Read back from the log on
+   *  the first cycle, so an outage that spans a daemon restart stays one episode with one pair of
+   *  cards; {@link exhaustionLoaded} says whether that read happened. */
+  private readonly openExhaustion = new Map<string, OpenEpisode>();
   private exhaustionLoaded = false;
   /** Consecutive failed reads of the log on resume (see {@link EXHAUSTION_READ_ATTEMPTS}). */
   private exhaustionReadFailures = 0;
@@ -877,6 +896,9 @@ export class Daemon {
    *  persistent condition does not spam the phone every poll cycle. In-memory: a restart re-alerts
    *  once, which is the right behavior for a still-broken condition. */
   private readonly slotAlertAtMs = new Map<string, number>();
+  /** The folder rules whose whole pool is out right now (see {@link alertPoolsOut}): each is
+   *  alerted on once when it runs out and again only after it has recovered and run out anew. */
+  private readonly poolOutRules = new Set<string>();
   /** Each account's advisor input from the most recent poll cycle — what the post-switch
    *  stalled-session kick consults to answer "does the switch target have usage left?"
    *  without a blocking re-poll (see {@link resumeUsageStalledSessions}). In-memory only:
@@ -1303,7 +1325,9 @@ export class Daemon {
     // ensuring a rule's slot is live and repairing illegal occupancy can change who is live where,
     // and the numbers this cycle ships must reflect the repaired state, not the state it walked in on.
     const rules = await this.timePhase('listRules', () => this.loadRules());
-    await this.timePhase('maintainSlots', () => this.maintainSlots(rules));
+    // The folders left with no account at all; alerted on with the ones auto-switch cannot move
+    // (see alertPoolsOut), once the cycle knows both.
+    const poolsOut = await this.timePhase('maintainSlots', () => this.maintainSlots(rules));
 
     // Load the whole fleet and every slot's live account AFTER maintenance. `accounts` is the WHOLE
     // fleet — shared rows plus reserved accounts — so the poll and the wire cover reserved
@@ -1425,7 +1449,7 @@ export class Daemon {
     // and auto-switch read. Its own catch, like auto-switch's below: a bug in the bookkeeping
     // must never take down the poll loop.
     await this.timePhase('exhaustion', () =>
-      this.trackExhaustion(snapshot.inputs, accounts, activeId).catch((err: unknown) => {
+      this.trackExhaustion(snapshot.inputs, accounts, rules, liveSlots).catch((err: unknown) => {
         this.logger.error({ err }, 'exhaustion tracking failed');
       }),
     );
@@ -1439,13 +1463,17 @@ export class Daemon {
     // the value.
     const autoSwitcher = this.autoSwitcher;
     if (autoSwitcher !== undefined) {
-      // One decision PER SLOT: the global slot over the shared pool, and each rule over its own
-      // included accounts. `snapshot.inputs` is the same array the plan above was computed from (predictions
-      // merged); the per-slot helper slices it and overrides `active` to the slot's live member so
-      // each decision reasons about its own slot alone (see runSlotAutoSwitch).
-      await this.timePhase('autoSwitch', () =>
+      // One decision PER SLOT, each over its slot's effective pool: the global slot over the
+      // shared pool, and each rule over its included accounts first, then the shared pool it
+      // inherits. `snapshot.inputs` is the same array the plan above was computed from
+      // (predictions merged); the per-slot helper slices it and overrides `active` to the slot's
+      // live account so each decision reasons about its own slot alone (see runSlotAutoSwitch).
+      const stuck = await this.timePhase('autoSwitch', () =>
         this.runSlotAutoSwitch(autoSwitcher, snapshot.inputs, accounts, rules, liveSlots),
       );
+      for (const [ruleId, message] of stuck) {
+        if (!poolsOut.has(ruleId)) poolsOut.set(ruleId, message);
+      }
 
       // Inside the auto-switch block on purpose: the probe exists to widen the pool the policy
       // above chooses from, so with no policy running there is nothing to widen it for. Runs
@@ -1456,6 +1484,7 @@ export class Daemon {
         this.probeUnknownAccounts(snapshot.results, snapshot.inputs),
       );
     }
+    this.alertPoolsOut(rules, poolsOut);
 
     // LAST in the cycle, deliberately: the transcript scan is seconds of disk IO, and everything
     // above it is either time-sensitive (auto-switch) or what the phone polls for (the usage
@@ -1492,13 +1521,15 @@ export class Daemon {
    * Self-heal every rule slot and repair illegal slot occupancy, once per cycle. First a stale guard
    * snapshot is rewritten (see the body for why nothing else would). Then, for each rule:
    * `ensureRuleLive` materializes its profile and makes an available account of its pool live (a
-   * no-op steady-state), and a folder left with no working account is alerted on, by name. Then `checkSlots` finds any invariant
+   * no-op steady-state), and a folder left with no working account is returned, by rule id with the
+   * sentence its alert says (see {@link alertPoolsOut}). Then `checkSlots` finds any invariant
    * breach and `repairSlots` fixes the (a)-(d) ones under the engine lock; whatever a repair could
    * NOT resolve (a broken profile link, an unrecognized login) raises one alert per kind per window.
    * A breach the self-heal itself clears is caught by a check taken before it, and alerted on the
    * same way as one repairSlots fixes.
    */
-  private async maintainSlots(rules: FolderRule[]): Promise<void> {
+  private async maintainSlots(rules: FolderRule[]): Promise<Map<string, string>> {
+    const poolsOut = new Map<string, string>();
     // Every rule mutation writes the guard snapshot LAST, so a crash between the registry write and
     // the snapshot write leaves the snapshot stale while every slot is legal — nothing below would
     // notice, and the guard would keep enforcing the old binding set (fail-open for a new binding,
@@ -1537,11 +1568,10 @@ export class Daemon {
           const result = await ensureRuleLive(rule.id);
           if (result.noWorkingAccount) {
             // Named by folder: that is what the operator acts on, and what is waiting.
-            const folder = rule.folders.length > 0 ? rule.folders.join(', ') : rule.label;
-            this.emitSlotAlert(
-              `no_account:${rule.id}`,
-              `${folder} has no working account — nothing in its pool is free to take its slot; ` +
-                're-login one, or wait for one to free up',
+            poolsOut.set(
+              rule.id,
+              `${folderNameOf(rule)} has no working account — nothing in its pool is free to ` +
+                'take its slot; re-login one, or wait for one to free up',
             );
           }
         } catch (err) {
@@ -1550,13 +1580,13 @@ export class Daemon {
       }
     }
 
-    if (!checkSlots) return;
+    if (!checkSlots) return poolsOut;
     let violations: SlotViolation[];
     try {
       violations = await checkSlots();
     } catch (err) {
       this.logger.warn({ err }, 'checkSlots failed');
-      return;
+      return poolsOut;
     }
 
     // Credential breaches the self-heal already cleared: present before it, gone after. They get
@@ -1569,7 +1599,7 @@ export class Daemon {
       if (v.kind === 'broken_profile_link' || stillPresent.has(slotViolationKey(v))) continue;
       this.emitSlotAlert(`repaired:${v.kind}`, describeRepairedViolation(v));
     }
-    if (violations.length === 0) return;
+    if (violations.length === 0) return poolsOut;
 
     // Repair fixes (a)-(d). A repair is a SILENT correction of a credential move the operator did
     // not make — a reserved member that surfaced in the shared slot, a stranger that surfaced in a
@@ -1606,27 +1636,41 @@ export class Daemon {
         `cctl: slot invariant unresolved (${kind}) — ${v.detail}`,
       );
     }
+    return poolsOut;
   }
 
   /**
-   * Build the wire's registry facts for the whole fleet, carrying the folder-rule fields (the wire's
-   * groupId/groupLabel/groupActive) onto the usage snapshot beside plan/billing. A shared account is
-   * returned without them; a reserved account is tagged with one of the rules including it — the one
-   * whose slot it is live in, else the first — its label, and whether it is live in that slot.
+   * Build the wire's registry facts for the whole fleet, carrying the folder-rule fields onto the
+   * usage snapshot beside plan/billing:
+   *   - `liveSlot` / `liveSlotLabel`: the slot the account is live in right now and, for a folder
+   *     slot, its folders. This is what says that a SHARED account is live in a folder slot (the
+   *     folder's fallback), and which of several including folders holds a reserved one;
+   *   - `ruleIds`: every rule including a reserved account (several folders may share one);
+   *   - `groupId` / `groupLabel` / `groupActive`, kept for older phones: one of the rules including a
+   *     reserved account — the one whose slot it is live in, else the first — its label, and whether
+   *     it is live in that slot. A shared account carries none of them, as before.
    */
   private buildRegistryFacts(
     accounts: AccountView[],
     rules: FolderRule[],
     liveSlots: Map<SlotId, string | null>,
   ): RegistryFacts[] {
-    const labelByRule = new Map(rules.map((r) => [r.id, r.label]));
+    const ruleById = new Map(rules.map((r) => [r.id, r]));
     return accounts.map((a): RegistryFacts => {
       const { ruleIds, ...row } = a;
-      if (ruleIds === undefined || ruleIds.length === 0) return row;
+      const liveSlot = [...liveSlots].find(([, live]) => live === a.id)?.[0];
+      const liveRule = liveSlot === undefined ? undefined : ruleOfSlot(liveSlot, rules);
+      const live = {
+        ...(liveSlot !== undefined ? { liveSlot } : {}),
+        ...(liveRule !== undefined ? { liveSlotLabel: folderNameOf(liveRule) } : {}),
+      };
+      if (ruleIds === undefined || ruleIds.length === 0) return { ...row, ...live };
       const ruleId = ruleIds.find((id) => liveSlots.get(ruleSlotId(id)) === a.id) ?? ruleIds[0]!;
-      const groupLabel = labelByRule.get(ruleId);
+      const groupLabel = ruleById.get(ruleId)?.label;
       return {
         ...row,
+        ...live,
+        ruleIds: [...ruleIds],
         groupId: ruleId,
         ...(groupLabel !== undefined ? { groupLabel } : {}),
         groupActive: liveSlots.get(ruleSlotId(ruleId)) === a.id,
@@ -1635,14 +1679,25 @@ export class Daemon {
   }
 
   /**
-   * Run the auto-switch executor ONCE PER SLOT: the global slot over the shared pool, and each rule
-   * over its own included accounts. The one snapshot `inputs` array is sliced per slot and its
-   * `active` flag is overridden to the slot's live account, so each decision reasons about its own
-   * slot alone; the candidate id set restricts each hop's TARGETS to accounts that slot may take
-   * right now (a reserved account is never a global target, an account live in another slot never
-   * anyone's), and a per-slot cooldown key keeps one slot's hop from spending another's cooldown. A
-   * hop is absorbed by id (like the global one always was) so the next cycle's change-notice does not
-   * read the daemon's own hop as an external switch.
+   * Run the auto-switch executor ONCE PER SLOT, each over its slot's EFFECTIVE pool (the engine's
+   * `slotMembers`): the global slot over the shared pool, and each rule over its included accounts
+   * first, then the shared accounts it inherits (minus its excludes). The one snapshot `inputs`
+   * array is sliced per slot, with `active` overridden to the slot's live account and the exclusion
+   * flag to the pool's own word on it (an included account is always a target in its folder, an
+   * inherited one honors the global exclusion), so each decision reasons about its own slot alone.
+   *
+   * A rule's included accounts are its PREFERRED tier (see `decideAutoSwitch`): it rotates among
+   * them, falls back to the inherited ones only when none can take over, and returns as soon as one
+   * can. The candidate id set restricts every hop's TARGETS to accounts no other slot holds — read
+   * from a copy of the live map that each hop updates, so two slots never reach for the same free
+   * account in one cycle. The global slot decides first: under contention it keeps the last shared
+   * account, and a folder in fallback with nothing free waits. A per-slot cooldown key keeps one
+   * slot's hop from spending another's cooldown, and a hop is absorbed by id (like the global one
+   * always was) so the next cycle's change-notice does not read the daemon's own hop as an
+   * external switch.
+   *
+   * Resolves with the folder rules that cannot move off a live account that is out of usage, each
+   * with the sentence its alert says (see {@link alertPoolsOut}).
    */
   private async runSlotAutoSwitch(
     autoSwitcher: AutoSwitcherLike,
@@ -1650,97 +1705,140 @@ export class Daemon {
     accounts: AccountView[],
     rules: FolderRule[],
     liveSlots: Map<SlotId, string | null>,
-  ): Promise<void> {
+  ): Promise<Map<string, string>> {
     const inputById = new Map(inputs.map((i) => [i.accountId, i]));
-    const reservedIds = new Set(accounts.filter((a) => a.ruleIds !== undefined).map((a) => a.id));
+    const picture = rulesPictureOf(accounts, rules);
+    const live = new Map(liveSlots);
     /** Whether an account is live in a slot other than `slot` — never a target there. */
     const liveElsewhere = (slot: SlotId, accountId: string): boolean =>
-      [...liveSlots].some(([other, live]) => other !== slot && live === accountId);
+      [...live].some(([other, id]) => other !== slot && id === accountId);
+    const stuck = new Map<string, string>();
 
-    // Global slot: shared accounts only (reserved ones are never global candidates), and none live in
-    // a folder slot. Their `active` flag is already global-live from the poll, so the subset is ready
-    // to decide on.
-    const sharedInputs = inputs.filter((i) => !reservedIds.has(i.accountId));
-    const sharedIds = new Set(
-      sharedInputs.map((i) => i.accountId).filter((id) => !liveElsewhere('global', id)),
-    );
-    const globalHop = await autoSwitcher
-      .evaluate(sharedInputs, { slotKey: 'global', candidateIds: sharedIds })
-      .catch((err: unknown) => {
-        this.logger.error({ err, slot: 'global' }, 'auto-switch evaluation failed');
-        return undefined;
-      });
-    if (globalHop !== undefined) this.lastObservedActiveId = globalHop;
+    for (const slot of allSlots(rules)) {
+      const rule = ruleOfSlot(slot, rules);
+      const liveId = live.get(slot) ?? null;
+      const slotInputs: AccountUsageInput[] = [];
+      for (const entry of slotMembers(slot, picture)) {
+        const input = inputById.get(entry.account.id);
+        if (input === undefined) continue;
+        slotInputs.push({
+          ...input,
+          active: input.accountId === liveId,
+          autoSwitchExcluded: !entry.autoTarget,
+        });
+      }
+      // A live account outside the pool (a dead login the pool leaves out) is still the one a hop
+      // leaves, so the decision needs it as the active account.
+      const liveInput = liveId === null ? undefined : inputById.get(liveId);
+      if (liveInput !== undefined && !slotInputs.some((i) => i.accountId === liveId)) {
+        slotInputs.push({ ...liveInput, active: true });
+      }
+      const candidateIds = new Set(
+        slotInputs.map((i) => i.accountId).filter((id) => !liveElsewhere(slot, id)),
+      );
 
-    // Each rule over its own included accounts, with the slot's live account marked active.
-    for (const rule of rules) {
-      const slot = ruleSlotId(rule.id);
-      const memberIds = new Set(rule.include.filter((id) => !liveElsewhere(slot, id)));
-      const groupLive = liveSlots.get(slot) ?? null;
-      const memberInputs = rule.include
-        .map((id) => inputById.get(id))
-        .filter((i): i is AccountUsageInput => i !== undefined)
-        .map((i) => ({ ...i, active: i.accountId === groupLive }));
+      if (rule !== undefined) {
+        const message = this.stuckMessage(rule, slotInputs, candidateIds);
+        if (message !== undefined) stuck.set(rule.id, message);
+      }
 
-      // A folder that cannot hop away from an exhausted live account (one included account, or every
-      // one spent) is a standing condition worth one alert per window.
-      this.maybeAlertGroupExhausted(rule, memberInputs);
-
-      // Name the folder(s) on the hop's phone notice so it reads as a folder rotation, not a global
-      // switch — the same folder choice the exhaustion alert makes.
-      const slotLabel = rule.folders.length > 0 ? rule.folders.join(', ') : rule.label;
+      // A folder hop's phone notice names the folder(s) so it reads as a folder rotation, not a
+      // global switch.
       const hop = await autoSwitcher
-        .evaluate(memberInputs, { slotKey: slot, candidateIds: memberIds, slotLabel })
+        .evaluate(slotInputs, {
+          slotKey: slot,
+          candidateIds,
+          ...(rule !== undefined
+            ? { preferredIds: new Set(rule.include), slotLabel: folderNameOf(rule) }
+            : {}),
+        })
         .catch((err: unknown) => {
           this.logger.error({ err, slot }, 'auto-switch evaluation failed');
           return undefined;
         });
-      if (hop !== undefined) this.lastObservedGroupActiveId.set(slot, hop);
+      if (hop === undefined) continue;
+      live.set(slot, hop);
+      if (rule === undefined) this.lastObservedActiveId = hop;
+      else this.lastObservedGroupActiveId.set(slot, hop);
     }
+    return stuck;
   }
 
   /**
-   * Alert once per window when a group's live member is out of quota and no other member can take
-   * over — the single-member group, or the group whose every member is spent. Nothing to alert on
-   * while a hop is still possible (auto-switch handles that) or while the live member has headroom.
+   * The alert sentence for a folder whose live account is out of usage while nothing else in its
+   * pool can take over — every included account spent and every inherited one spent, excluded or
+   * live in another slot — or `undefined` while a hop is still possible (auto-switch makes it) or
+   * the live account has usage left.
    */
-  private maybeAlertGroupExhausted(group: FolderRule, memberInputs: AccountUsageInput[]): void {
+  private stuckMessage(
+    rule: FolderRule,
+    slotInputs: AccountUsageInput[],
+    candidateIds: ReadonlySet<string>,
+  ): string | undefined {
     const now = this.clock();
-    const live = memberInputs.find((i) => i.active);
-    if (live === undefined || hasUsableHeadroom(live, now)) return;
-    // A member auto-switch would actually hop to means the exhaustion is not terminal. This must be
-    // the EXACT complement of the executor's hop predicate — the same policy, the same candidate
-    // gate — so the alert never suppresses on a member the executor refuses (excluded from
-    // auto-switch, no resolvable weekly reset, too little session headroom, or stale near the wall).
-    // `isAutoSwitchCandidate` already rejects the active member, so no separate self-exclusion.
-    const canHop = memberInputs.some((i) => isAutoSwitchCandidate(i, now, this.autoSwitchPolicy));
-    if (canHop) return;
+    const live = slotInputs.find((i) => i.active);
+    if (live === undefined || hasUsableHeadroom(live, now)) return undefined;
+    // An account auto-switch would actually hop to means the slot is not stuck. This must be the
+    // EXACT complement of the executor's hop predicate — the same policy, the same candidate gate,
+    // the same targets — so the alert never suppresses on an account the executor refuses (excluded
+    // from auto-switch, live in another slot, no resolvable weekly reset, too little session
+    // headroom, or stale near the wall). `isAutoSwitchCandidate` already rejects the active account.
+    const canHop = slotInputs.some(
+      (i) => candidateIds.has(i.accountId) && isAutoSwitchCandidate(i, now, this.autoSwitchPolicy),
+    );
+    if (canHop) return undefined;
     const budget = selectWeeklyBudget(live.limits, now, live.predictedResetAt);
     const resetText =
       budget?.resetsAt !== undefined
         ? `until it resets in ${humanizeDuration(budget.resetsAt - now)}`
         : 'until it resets';
-    // Name the bound folder, not the group label: the label defaults to the joined member labels,
-    // so a single-account group would read "<label> account <label> ..." and never say which folder
-    // stalled. The folder is what the operator acts on. Join when a group holds several folders, and
-    // fall back to the label only if a group somehow has no folder recorded.
-    const folder = group.folders.length > 0 ? group.folders.join(', ') : group.label;
-    this.emitSlotAlert(
-      `exhausted:${group.id}`,
-      `${folder} account ${live.label} is out of quota ${resetText}`,
+    // Named by folder, not the rule label: the folder is what the operator acts on.
+    return (
+      `${folderNameOf(rule)} account ${live.label} is out of quota ${resetText}, and nothing else ` +
+      'in its pool is free to take over; it waits for an account to free up or reset'
     );
   }
 
   /**
+   * Alert once per episode on each folder whose whole pool is out: its slot has no working account
+   * (see {@link maintainSlots}), or its live account is out of usage and nothing in its pool is free
+   * to take over (see {@link stuckMessage}). A folder is alerted on when it runs out and again only
+   * once it has recovered and run out anew, however long it stays out; a daemon restart alerts once
+   * more on a folder still out. A folder whose outage card has already gone out (its scope in the
+   * exhaustion log is open) is not alerted on twice: that card is the stronger statement of the
+   * same news.
+   */
+  private alertPoolsOut(rules: FolderRule[], out: ReadonlyMap<string, string>): void {
+    for (const ruleId of [...this.poolOutRules]) {
+      if (!out.has(ruleId)) this.poolOutRules.delete(ruleId);
+    }
+    for (const rule of rules) {
+      const message = out.get(rule.id);
+      if (message === undefined || this.poolOutRules.has(rule.id)) continue;
+      this.poolOutRules.add(rule.id);
+      if (this.openExhaustion.has(folderScopeKey(rule.id))) {
+        this.logger.warn({ alert: `pool_out:${rule.id}` }, message);
+        continue;
+      }
+      this.sendSlotAlert(`pool_out:${rule.id}`, message);
+    }
+  }
+
+  /**
    * Emit a per-slot alert to the log and the phone, deduplicated to once per {@link slotAlertWindowMs}
-   * per key so a persistent condition does not spam the phone every cycle. The phone card rides the
-   * same `hook.notification` channel the daemon already uses for operator-facing alerts.
+   * per key so a persistent condition does not spam the phone every cycle.
    */
   private emitSlotAlert(key: string, message: string): void {
     const now = this.clock();
     const last = this.slotAlertAtMs.get(key);
     if (last !== undefined && now - last < this.slotAlertWindowMs) return;
     this.slotAlertAtMs.set(key, now);
+    this.sendSlotAlert(key, message);
+  }
+
+  /** Send one slot alert to the log and the phone. The card rides the same `hook.notification`
+   *  channel the daemon already uses for operator-facing alerts. */
+  private sendSlotAlert(key: string, message: string): void {
     this.logger.warn({ alert: key }, message);
     this.sendEnvelope({
       type: 'hook.notification',
@@ -1945,44 +2043,71 @@ export class Daemon {
   }
 
   /**
-   * Keep the exhaustion log: open an episode the cycle no account can take work, close it the
-   * cycle one provably can, and send the phone a card both times. When each happens is decided
-   * by the pure {@link judgeOutage}; this method owns the IO around it.
+   * Keep the exhaustion log, one scope at a time: the global pool, and each folder rule's pool
+   * (see `outageScopes`). For each, open an episode the cycle nothing in its pool can take work,
+   * close it the cycle one provably can, and send the phone a card both times. When each happens
+   * is decided by the pure `judgeScope` (the one judge, `judgeOutage`, per scope); this method owns
+   * the IO around it. A folder episode still open when its rule is gone is closed as such: there is
+   * no pool left to be out, and an episode no scope can ever end would read "ongoing" for good.
    */
   private async trackExhaustion(
     inputs: AccountUsageInput[],
-    accounts: ReadonlyArray<{ id: string; label: string }>,
-    activeId: string | null,
+    accounts: AccountView[],
+    rules: FolderRule[],
+    liveSlots: Map<SlotId, string | null>,
   ): Promise<void> {
     const log = this.exhaustionLog;
     if (log === undefined || !(await this.loadOpenExhaustion(log))) return;
     // Entries an earlier cycle could not write go first, so the file keeps their order.
     await this.flushExhaustionWrites(log);
     const now = this.clock();
-    // The Fable cap counts exactly when auto-switch counts it.
-    const judged = judgeOutage(inputs, this.openExhaustion, now, this.autoSwitchPolicy);
-    const { transition, open } = judged;
-    if (transition.kind === 'start') {
-      await this.startExhaustion(log, judged.fleet, accounts, activeId, now);
-    } else if (open !== undefined && transition.kind === 'end') {
-      await this.endExhaustion(log, open, transition.recovery, now);
-    } else if (open !== undefined) {
-      // Still out: file what this cycle changed about any account, so a restart judges its
-      // return by what was last seen rather than by the start entry alone.
-      const filed = fileWallChanges(open, now);
-      this.openExhaustion = filed.open;
-      for (const record of filed.records) await this.writeExhaustion(log, record);
+    const scopes = outageScopes({ accounts, rules, liveSlots });
+    const current = new Set(scopes.map((s) => s.key));
+    for (const [key, open] of [...this.openExhaustion]) {
+      if (!current.has(key)) await this.closeRemovedScope(log, key, open, now);
+    }
+    for (const scope of scopes) {
+      // The Fable cap counts exactly when auto-switch counts it.
+      const judged = judgeScope(
+        inputs,
+        scope,
+        this.openExhaustion.get(scope.key),
+        now,
+        this.autoSwitchPolicy,
+      );
+      const { transition, open } = judged;
+      if (transition.kind === 'start') {
+        const slot = scope.scope.kind === 'global' ? 'global' : ruleSlotId(scope.scope.ruleId);
+        await this.startExhaustion(
+          log,
+          scope,
+          judged.fleet,
+          accounts,
+          liveSlots.get(slot) ?? null,
+          now,
+        );
+      } else if (open !== undefined && transition.kind === 'end') {
+        await this.endExhaustion(log, scope.key, open, transition.recovery, now);
+      } else if (open !== undefined) {
+        // Still out: file what this cycle changed about any account, so a restart judges its
+        // return by what was last seen rather than by the start entry alone.
+        const filed = fileWallChanges(open, now);
+        this.openExhaustion.set(scope.key, filed.open);
+        for (const record of filed.records) await this.writeExhaustion(log, record);
+      }
     }
   }
 
-  /** Read the open episode back from the log, once per daemon run. False while the read keeps
-   *  failing: judging before the log is read could announce an outage it already holds. A read
-   *  that fails (the file briefly held by a scanner) is retried next cycle; only after several
-   *  does tracking go on without it, at the cost of at most one repeated "out of usage". */
+  /** Read every scope's open episode back from the log, once per daemon run. False while the read
+   *  keeps failing: judging before the log is read could announce an outage it already holds. A
+   *  read that fails (the file briefly held by a scanner) is retried next cycle; only after several
+   *  does tracking go on without it, at the cost of at most one repeated "out of usage" per scope. */
   private async loadOpenExhaustion(log: ExhaustionLog): Promise<boolean> {
     if (this.exhaustionLoaded) return true;
     try {
-      this.openExhaustion = resumeOpenEpisode(await log.read());
+      for (const [key, open] of resumeOpenEpisodes(await log.read())) {
+        this.openExhaustion.set(key, open);
+      }
     } catch (err) {
       this.exhaustionReadFailures += 1;
       if (this.exhaustionReadFailures < EXHAUSTION_READ_ATTEMPTS) {
@@ -1999,20 +2124,28 @@ export class Daemon {
    * Open an episode: tell the phone, then file the start. The card goes first. A shutdown that
    * lands mid-cycle closes the relay client and the store under it, and of the two ways that can
    * cut the pair short, only this one heals: a start never filed is announced by the next run,
-   * while one filed but never announced would be resumed in silence for good.
+   * while one filed but never announced would be resumed in silence for good. The walk it records
+   * is the scope's own slot's switches.
    */
   private async startExhaustion(
     log: ExhaustionLog,
+    scope: ScopeView,
     fleet: FleetAvailability,
     accounts: ReadonlyArray<{ id: string; label: string }>,
     activeId: string | null,
     now: number,
   ): Promise<void> {
     const labelOf = (id: string): string => accounts.find((a) => a.id === id)?.label ?? id;
-    const steps = await this.attributionJournal.switchesBetween(now - SWITCH_CHAIN_WINDOW_MS, now);
+    const slot = scope.scope.kind === 'global' ? 'global' : ruleSlotId(scope.scope.ruleId);
+    const steps = await this.attributionJournal.switchesBetween(
+      now - SWITCH_CHAIN_WINDOW_MS,
+      now,
+      slot,
+    );
     const record = exhaustedRecord({
       fleet,
       now,
+      scope: scope.scope,
       active: activeId === null ? null : labelOf(activeId),
       switches: steps.map((s) => ({
         at: s.at,
@@ -2022,43 +2155,74 @@ export class Daemon {
         ...(s.reason !== undefined ? { reason: s.reason } : {}),
       })),
     });
-    this.logger.warn({ episode: record.id, summary: record.summary }, 'no account can take work');
+    this.logger.warn(
+      { episode: record.id, scope: scope.key, summary: record.summary },
+      'no account can take work',
+    );
     this.sendEnvelope({
       type: 'hook.notification',
       payload: {
         event: 'notification',
-        title: 'All accounts are out of usage',
+        title: exhaustedCardTitle(scope.scope),
         body: exhaustedCardBody(fleet, record),
         level: 'warn',
         notificationType: 'usage_exhausted',
       },
     });
-    this.openExhaustion = openEpisodeFrom(record);
+    this.openExhaustion.set(scope.key, openEpisodeFrom(record));
     await this.writeExhaustion(log, record);
   }
 
-  /** Close the open episode: tell the phone, then file the end, card first for the same reason
-   *  as a start (an end never filed is announced again by the next run; one never announced is
-   *  lost). */
+  /** Close a scope's open episode: tell the phone, then file the end, card first for the same
+   *  reason as a start (an end never filed is announced again by the next run; one never
+   *  announced is lost). */
   private async endExhaustion(
     log: ExhaustionLog,
+    key: string,
     open: OpenEpisode,
     recovery: Recovery,
     now: number,
   ): Promise<void> {
     const record = recoveredRecord(open.record, recovery, now);
-    this.logger.info({ episode: record.id, summary: record.summary }, 'usage is back');
+    this.logger.info({ episode: record.id, scope: key, summary: record.summary }, 'usage is back');
     this.sendEnvelope({
       type: 'hook.notification',
       payload: {
         event: 'notification',
-        title: 'Usage is back',
+        title: recoveredCardTitle(record),
         body: record.summary,
         level: 'success',
         notificationType: 'usage_restored',
       },
     });
-    this.openExhaustion = undefined;
+    this.openExhaustion.delete(key);
+    await this.writeExhaustion(log, record);
+  }
+
+  /** Close a folder's open episode whose rule is gone, card first like every end. Not "usage is
+   *  back": nothing came back, the operator removed the rule, so the card says that, as info. */
+  private async closeRemovedScope(
+    log: ExhaustionLog,
+    key: string,
+    open: OpenEpisode,
+    now: number,
+  ): Promise<void> {
+    const record = ruleRemovedRecord(open.record, now);
+    this.logger.info(
+      { episode: record.id, scope: key, summary: record.summary },
+      'folder rule removed',
+    );
+    this.sendEnvelope({
+      type: 'hook.notification',
+      payload: {
+        event: 'notification',
+        title: recoveredCardTitle(record),
+        body: record.summary,
+        level: 'info',
+        notificationType: 'usage_restored',
+      },
+    });
+    this.openExhaustion.delete(key);
     await this.writeExhaustion(log, record);
   }
 

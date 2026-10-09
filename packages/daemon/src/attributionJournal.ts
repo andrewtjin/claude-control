@@ -226,11 +226,14 @@ export class AttributionJournal {
   /** The switches that changed the live account between two moments (inclusive), oldest first,
    *  with who made each and why — the walk the exhaustion log shows leading up to the moment no
    *  account was left. Read fresh from the audit log, like {@link sync}: it runs once per
-   *  exhaustion episode, never per cycle. */
-  async switchesBetween(fromMs: number, toMs: number): Promise<SwitchStep[]> {
+   *  exhaustion episode, never per cycle. With `slot`, only that slot's switches: a folder's
+   *  outage is led up to by its own slot's walk, not the global one's (an entry naming no slot is
+   *  the global slot's). */
+  async switchesBetween(fromMs: number, toMs: number, slot?: string): Promise<SwitchStep[]> {
     const entries = await readAuditLog(this.vaultDir);
     return entries
       .filter(movedLiveAccount)
+      .filter((e) => slot === undefined || (e.slot ?? 'global') === slot)
       .filter((e) => e.ts >= fromMs && e.ts <= toMs)
       .sort((a, b) => a.ts - b.ts)
       .map((e) => ({

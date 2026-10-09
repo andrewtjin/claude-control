@@ -57,13 +57,21 @@ export {
 export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
 
 export {
+  describeScope,
   episodesOf,
   ExhaustionLog,
   exhaustionLogPath,
+  folderScopeKey,
+  GLOBAL_SCOPE,
   judgeOutage,
+  judgeScope,
   openEpisodeFrom,
+  outageScopes,
   recoveryText,
   resumeOpenEpisode,
+  resumeOpenEpisodes,
+  scopeKey,
+  scopeOf,
   SWITCH_CHAIN_WINDOW_WORDS,
   trackedBackAt,
   type ExhaustedAccount,
@@ -72,8 +80,10 @@ export {
   type ExhaustionSwitch,
   type OpenEpisode,
   type OutageJudgement,
+  type OutageScope,
   type RecoveredRecord,
   type Recovery,
+  type ScopeView,
 } from './exhaustionLog.js';
 
 export {

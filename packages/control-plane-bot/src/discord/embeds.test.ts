@@ -657,6 +657,29 @@ describe('folder-bound account rendering', () => {
     expect(value).not.toContain('](');
   });
 
+  it('marks any account live in a folder slot, a shared fallback included, from the slot fields', () => {
+    const fallback = buildUsageEmbed({
+      accounts: [account({ liveSlot: 'group:r1', liveSlotLabel: 'C:/research' })],
+    }).toJSON();
+    expect(fallback.fields?.[0]?.value).toContain('📁 live in C:/research');
+    expect(fallback.fields?.[0]?.value).not.toContain('bound');
+    // The global slot is the normal case: no line.
+    const global = buildAccountsEmbed([account({ liveSlot: 'global' })]).toJSON();
+    expect(global.fields?.[0]?.value).not.toContain('📁');
+    // A reserved account live in one of the folders including it: the slot wins over the group.
+    const shared = buildAccountsEmbed([
+      account({
+        groupId: 'g1',
+        groupLabel: 'C:/one',
+        groupActive: true,
+        ruleIds: ['g1', 'g2'],
+        liveSlot: 'group:g2',
+        liveSlotLabel: 'C:/two',
+      }),
+    ]).toJSON();
+    expect(shared.fields?.[0]?.value).toContain('📁 live in C:/two');
+  });
+
   it('renders a folder with backticks inert', () => {
     const embed = buildAccountsEmbed([
       account({ groupId: 'g1', groupLabel: 'C:/x/`ls`', groupActive: true }),

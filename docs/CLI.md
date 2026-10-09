@@ -265,14 +265,16 @@ cctl timeline   # 5h-session budget per account + when every limit resets, with 
 Both read the daemon's last-persisted snapshot, so they work whether or not the daemon
 is currently running. While no account can take work, both lead with a line saying so, with
 since when once the daemon has recorded it and which account is expected back first when a
-reset time is known.
+reset time is known: one line for the global pool, and one for each folder rule whose pool is
+out (see below).
 
 ## When every account is out of usage
 
 ```
-cctl outages             # every time no account could take work, newest first
-cctl outages --days 30   # only the times that started in the last 30 days (plus one still on)
-cctl outages --json      # the same, as JSON
+cctl outages                   # every time no account could take work, newest first
+cctl outages --days 30         # only the times that started in the last 30 days (plus any still on)
+cctl outages --folder <folder> # only the times the folder rule <folder> runs under ran out
+cctl outages --json            # the same, as JSON (each episode carries its scope)
 ```
 
 When auto-switch has walked every account and all of them are spent, the daemon records it.
@@ -313,6 +315,40 @@ shutdown, and the entry is in `daemon.log` either way.
 by what was last seen. If the latest numbers already show
 an account back but no running daemon has recorded the end, it says so (`over by the latest
 numbers`) instead. A start whose end was never written is shown as `end not recorded`.
+
+### Per pool: the global pool and each folder rule
+
+Outages are kept per **scope**: the global pool (the shared accounts the global slot draws from)
+and each folder rule's pool (its included accounts plus the shared accounts it keeps). Each scope
+has its own episodes, cards and `walls` lines, side by side in the one log, so a folder can be
+out while the rest of the machine works, and the other way round.
+
+A scope is out when nothing in its pool can take work, where an account **live in another slot**
+does not count as available: one login is never live in two places, so that slot cannot have it.
+This holds for the global pool too: a shared account a folder is running on (its fallback while
+its own accounts are out) is not counted as the global pool's while the folder holds it. Such an
+account is listed as `live in <the slot>`, and when the other slot lets it go and its numbers
+show usage left, the outage ends as `another slot let it go`. Accounts reserved to a folder are
+never part of the global pool.
+
+The phone card names the folder (`<folder>: every account in its pool is out`, then `Usage is
+back in <folder>`), and the `usage` / `timeline` banner adds one line per folder that is out.
+`cctl outages` labels each entry `[global]` or `[<folder>]` once any folder has an entry (a log
+with no folder entries reads as before); `--folder` resolves a folder the way a session does
+(the longest rule folder containing it), so a subfolder finds its rule's history, and
+`--json` gives every episode a `scope` (`{ "kind": "global" }` or `{ "kind": "folder",
+"ruleId", "folders", "label" }`) and lists each scope's open outage under `open`.
+
+Removing a folder rule while its pool is out ends that outage, recorded as `its folder rule was
+removed` (with an informational card), since there is no pool left to be out. Lines written
+before scopes existed carry no scope and read as the global pool's. A folder's lines are written
+as version 2, so an older cctl that knows only the global pool skips them rather than reading a
+folder's outage as the whole machine's.
+
+Separately from the log, the daemon alerts once (per episode, not per hour) when a folder's slot
+cannot move: its live account is out of usage and nothing else in its pool is free to take over,
+or its slot has no working account at all. A folder whose outage card has already gone out is not
+alerted on twice.
 
 ## Token stats
 

@@ -5,12 +5,15 @@ import {
   type LimitInput,
 } from '@claude-control/usage-advisor';
 import {
+  GLOBAL_SCOPE,
   openEpisodeFrom,
   type ExhaustedRecord,
   type ExhaustionEpisode,
+  type OutageScope,
   type RecoveredRecord,
 } from '@claude-control/daemon';
 import {
+  episodesForFolder,
   episodesInWindow,
   expectedFirstBack,
   formatLocalTime,
@@ -105,7 +108,13 @@ describe('renderOutages', () => {
       renderOutages(episodes, {
         now: NOW,
         logPath: 'C:\\data\\exhaustion-log.jsonl',
-        open: { id: ongoing.id, expected: { label: 'w2', at: local(10, 1, 16, 20) } },
+        open: [
+          {
+            id: ongoing.id,
+            scope: GLOBAL_SCOPE,
+            expected: { label: 'w2', at: local(10, 1, 16, 20) },
+          },
+        ],
       }),
     ).toBe(
       [
@@ -149,7 +158,7 @@ describe('renderOutages', () => {
     const text = renderOutages([{ start: s }], {
       now: NOW,
       logPath: 'x',
-      open: { id: s.id },
+      open: [{ id: s.id, scope: GLOBAL_SCOPE }],
     });
     expect(text).toContain('  a  5-hour window 100% and weekly budget 99%, back Oct 4 14:00');
   });
@@ -178,7 +187,7 @@ describe('renderOutages', () => {
     const text = renderOutages([{ start: s }], {
       now: NOW,
       logPath: 'x',
-      open: { id: s.id },
+      open: [{ id: s.id, scope: GLOBAL_SCOPE }],
     });
     expect(text).toContain('  a  Fable weekly cap 100%, reset time unknown');
     expect(text).toContain('  b  weekly budget 100%, back Oct 3 09:00 (predicted)');
@@ -195,16 +204,19 @@ describe('renderOutages', () => {
     const text = renderOutages([{ start: ongoing }], {
       now: NOW,
       logPath: 'x',
-      open: {
-        id: ongoing.id,
-        overBy: {
-          accountId: 'a2',
-          label: 'w2',
-          how: 'reset',
-          limit: 'session',
-          backSince: local(10, 1, 14, 50),
+      open: [
+        {
+          id: ongoing.id,
+          scope: GLOBAL_SCOPE,
+          overBy: {
+            accountId: 'a2',
+            label: 'w2',
+            how: 'reset',
+            limit: 'session',
+            backSince: local(10, 1, 14, 50),
+          },
         },
-      },
+      ],
     });
     expect(text).toContain(
       'Oct 1 14:20 -> over by the latest numbers: w2 back since Oct 1 14:50 (its 5-hour window reset); no running daemon has recorded the end yet',
@@ -236,11 +248,14 @@ describe('episodesInWindow', () => {
       { start: recent, end: end(recent, recent.at + H) },
       { start: openOld },
     ];
-    expect(episodesInWindow(all, NOW, 7, openOld.id).map((e) => e.start.id)).toEqual([
-      recent.id,
-      openOld.id,
-    ]);
-    expect(episodesInWindow(all, NOW, undefined, openOld.id)).toHaveLength(4);
+    expect(
+      episodesInWindow(all, NOW, 7, [{ id: openOld.id, scope: GLOBAL_SCOPE }]).map(
+        (e) => e.start.id,
+      ),
+    ).toEqual([recent.id, openOld.id]);
+    expect(
+      episodesInWindow(all, NOW, undefined, [{ id: openOld.id, scope: GLOBAL_SCOPE }]),
+    ).toHaveLength(4);
   });
 });
 
@@ -333,5 +348,134 @@ describe('expectedFirstBack', () => {
       at: local(10, 2, 20, 20),
     });
     expect(expectedFirstBack(openEpisodeFrom(s0), NOW, assessFleet([], NOW))).toBeUndefined();
+  });
+});
+
+describe('scopes in the views', () => {
+  const research: OutageScope = {
+    kind: 'folder',
+    ruleId: 'r1',
+    folders: ['C:\\research'],
+    label: 'C:\\research',
+  };
+  const folderStart = (at: number): ExhaustedRecord =>
+    start(at, {
+      v: 2,
+      id: `ep-${at}-r1`,
+      scope: research,
+      accounts: [
+        {
+          accountId: 'e1',
+          label: 'inc1',
+          reason: 'session',
+          percent: 100,
+          backAt: at + 2 * H,
+          spent: [{ kind: 'session', percent: 100, resetsAt: at + 2 * H }],
+        },
+        {
+          accountId: 'a1',
+          label: 'work1',
+          reason: 'live_elsewhere',
+          spent: [],
+          liveIn: 'the global slot',
+        },
+      ],
+    });
+
+  it('tags every episode with its scope once one is a folder, and says where a held account is live', () => {
+    const g = start(local(9, 29, 9, 44));
+    const f = folderStart(local(10, 1, 14, 20));
+    const text = renderOutages([{ start: g, end: end(g, local(9, 29, 11, 44)) }, { start: f }], {
+      now: NOW,
+      logPath: 'x',
+      open: [{ id: f.id, scope: research }],
+    });
+    expect(text).toContain('[C:\\research] Oct 1 14:20 -> ongoing, 40m so far');
+    expect(text).toContain('[global] Sep 29 09:44 -> Sep 29 11:44  2h  back: w2');
+    expect(text).toContain('  work1  live in the global slot');
+  });
+
+  it('matches an open status by scope as well as id', () => {
+    const f = folderStart(local(10, 1, 14, 20));
+    // A global status with the same id is not this folder episode's.
+    const text = renderOutages([{ start: f }], {
+      now: NOW,
+      logPath: 'x',
+      open: [{ id: f.id, scope: GLOBAL_SCOPE }],
+    });
+    expect(text).toContain('end not recorded');
+  });
+
+  it('an episode ended by its rule removed names no account', () => {
+    const f = folderStart(local(10, 1, 12, 0));
+    const removed: RecoveredRecord = {
+      v: 2,
+      event: 'recovered',
+      id: f.id,
+      scope: research,
+      at: local(10, 1, 13, 0),
+      time: '',
+      summary: '',
+      backSince: local(10, 1, 13, 0),
+      durationMs: H,
+      how: 'rule_removed',
+    };
+    const text = renderOutages([{ start: f, end: removed }], { now: NOW, logPath: 'x' });
+    expect(text).toContain(
+      '[C:\\research] Oct 1 12:00 -> Oct 1 13:00  1h  ended: its folder rule was removed',
+    );
+  });
+
+  it('an open folder episode whose rule is gone says so', () => {
+    const f = folderStart(local(10, 1, 14, 20));
+    const text = renderOutages([{ start: f }], {
+      now: NOW,
+      logPath: 'x',
+      open: [{ id: f.id, scope: research, ruleRemoved: true }],
+    });
+    expect(text).toContain(
+      'Oct 1 14:20 -> its folder rule was removed; no running daemon has recorded the end yet',
+    );
+  });
+
+  it('a list narrowed to a folder with nothing on record names the folder', () => {
+    expect(renderOutages([], { now: NOW, logPath: 'x', folder: 'C:\\research' })).toBe(
+      "No time on record when every account in C:\\research's pool was out of usage.\nLog: x",
+    );
+  });
+
+  it('--folder resolves a folder or a subfolder to its rule, the longest rule folder winning', () => {
+    const outer = folderStart(local(10, 1, 10, 0));
+    const inner = start(local(10, 1, 11, 0), {
+      v: 2,
+      id: 'inner',
+      scope: { ...research, ruleId: 'r2', folders: ['C:\\research\\deep'], label: 'deep' },
+    });
+    const g = start(local(10, 1, 9, 0));
+    const all: ExhaustionEpisode[] = [{ start: g }, { start: outer }, { start: inner }];
+    const ids = (folder: string) => episodesForFolder(all, folder, 'win32').map((e) => e.start.id);
+    expect(ids('C:\\research')).toEqual([outer.id]);
+    expect(ids('C:\\research\\other')).toEqual([outer.id]);
+    expect(ids('C:\\research\\deep\\x')).toEqual(['inner']);
+    expect(ids('C:\\elsewhere')).toEqual([]);
+  });
+
+  it('a folder banner line names the folder', () => {
+    const out = assessFleet(
+      [
+        {
+          accountId: 'e1',
+          label: 'inc1',
+          active: false,
+          quarantined: false,
+          limits: [{ kind: 'session', percent: 100, resetsAt: NOW + 2 * H }],
+        },
+      ],
+      NOW,
+    );
+    expect(renderOutageBanner(out, undefined, NOW, undefined, research)).toBe(
+      "No account in C:\\research's pool can take work. First back: inc1 in 2h. " +
+        'cctl outages lists every time this happened.',
+    );
   });
 });

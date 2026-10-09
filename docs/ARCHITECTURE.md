@@ -204,6 +204,20 @@ unruled folder's pool is the shared pool.
   profile link — and a
   repair pass fixes them by adopting the freshest token and re-seating each slot's rightful
   account.
+- **Per-slot auto-switch.** The daemon decides once per slot per poll cycle, each over the slot's
+  **effective pool**: the global slot over the shared pool, a folder rule's slot over its
+  included accounts first and the shared accounts it inherits (minus its excludes) after. A
+  folder slot rotates among its included accounts by the usual policy, falls back to an inherited
+  account only on the low-quota trigger when no included account can take over (greedy never
+  leaves the included accounts), and returns to an included account as soon as one is a
+  candidate again, under the same per-slot cooldown and cadence guard as any hop. An included
+  account is always a target in its folder, even when excluded from auto-switch globally; an
+  inherited one honors the global exclusion. No slot ever targets an account live in another
+  slot, and each hop is seen by the slots decided after it in the same cycle. The global slot
+  decides first, so under contention it keeps the last free shared account and a folder in
+  fallback waits (with one alert per episode naming the folder). The usage wire marks the slot
+  each account is live in and every rule including it, so a folder running on a shared account is
+  visible on the phone.
 
 ## State
 

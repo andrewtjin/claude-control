@@ -31,8 +31,10 @@ import type { AccountUsageInput, LimitInput } from './types.js';
  *  two different things. */
 export const MIN_USABLE_HEADROOM_PCT = 2;
 
-/** Why an account cannot take work: a dead login, or the kind of limit it hit. */
-export type UnavailableReason = 'quarantined' | LimitInput['kind'];
+/** Why an account cannot take work: a dead login, the kind of limit it hit, or (for a caller that
+ *  judges one slot of several) its login being live in another slot, which this slot may not take
+ *  while it is: one login is never live in two places. */
+export type UnavailableReason = 'quarantined' | 'live_elsewhere' | LimitInput['kind'];
 
 /** One account's verdict, with what a log entry needs to explain it. */
 export interface AccountAvailability {
@@ -58,6 +60,8 @@ export interface AccountAvailability {
   backAt?: number;
   /** True when `backAt` leans on the history-derived weekly prediction. */
   backAtPredicted?: boolean;
+  /** For `live_elsewhere`: where it is live, in the caller's words ("the global slot"). */
+  liveIn?: string;
 }
 
 /** The whole fleet's verdict. */
@@ -69,9 +73,12 @@ export interface FleetAvailability {
   firstBack?: { accountId: string; label: string; at: number; predicted: boolean };
 }
 
-/** What changes the rule: only whether the Fable weekly cap counts as a wall. Pass the
- *  auto-switch policy, so the cap counts exactly when auto-switch counts it. */
-export type AvailabilityOptions = FableCapPolicy;
+/** What changes the rule: whether the Fable weekly cap counts as a wall (pass the auto-switch
+ *  policy, so the cap counts exactly when auto-switch counts it), and which accounts the caller's
+ *  slot cannot take because each is live in another slot, mapped to where, in words. */
+export interface AvailabilityOptions extends FableCapPolicy {
+  liveElsewhere?: ReadonlyMap<string, string>;
+}
 
 /**
  * Judge one account. Quarantined = out (dead refresh token, unusable regardless of quota). No
@@ -96,8 +103,15 @@ export function assessAccount(
     ...(binding !== undefined ? { percent: binding.percent } : {}),
   };
   if (account.quarantined) return { ...base, usable: false, reason: 'quarantined' };
-  // `binding` is the worst live limit, so whenever anything is at the wall it is too.
-  if (binding === undefined || spent.length === 0) return { ...base, usable: true };
+  // `binding` is the worst live limit, so whenever anything is at the wall it is too. Being live
+  // in another slot is checked only once the account has no wall: a spent account stays out on
+  // its limits when it is freed, so the limits are what its return is judged by.
+  if (binding === undefined || spent.length === 0) {
+    const liveIn = options.liveElsewhere?.get(account.accountId);
+    return liveIn === undefined
+      ? { ...base, usable: true }
+      : { ...base, usable: false, reason: 'live_elsewhere', liveIn };
+  }
   return { ...base, usable: false, reason: binding.kind, ...backAtOf(spent, account, now) };
 }
 
@@ -184,6 +198,7 @@ export function describeWalls(spent: LimitInput[]): string {
  *  never describe the same account differently: "work2 (5-hour window 99%, back in 2h 13m)". */
 export function describeUnavailable(a: AccountAvailability, now: number): string {
   if (a.reason === 'quarantined') return `${a.label} (login expired)`;
+  if (a.reason === 'live_elsewhere') return `${a.label} (live in ${a.liveIn ?? 'another slot'})`;
   const limit = describeWalls(a.spent);
   const back =
     a.backAt === undefined
@@ -196,8 +211,13 @@ export function describeUnavailable(a: AccountAvailability, now: number): string
 export function describeFirstBack(fleet: FleetAvailability, now: number): string {
   const first = fleet.firstBack;
   if (first === undefined) {
-    return fleet.accounts.every((a) => a.reason === 'quarantined')
-      ? 'Every login has expired: run cctl accounts reauth <name> to bring one back.'
+    if (fleet.accounts.every((a) => a.reason === 'quarantined')) {
+      return 'Every login has expired: run cctl accounts reauth <name> to bring one back.';
+    }
+    // An account live in another slot has no reset to wait for: it is back when that slot lets
+    // it go, which no clock predicts.
+    return fleet.accounts.some((a) => a.reason === 'live_elsewhere')
+      ? 'It waits for an account to be freed by another slot or to reset.'
       : 'No reset time is known for any of them.';
   }
   return (
