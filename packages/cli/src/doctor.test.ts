@@ -13,7 +13,8 @@ import {
   checkSlots,
   checkGuardSnapshot,
   checkGuardHook,
-  checkFolderBindings,
+  checkFolderRules,
+  checkDaemonFolderRules,
   checkVersionSkew,
   checkPowerShellWrapper,
   powerShellProfilePaths,
@@ -338,7 +339,7 @@ describe('checkSlots', () => {
 describe('checkGuardSnapshot', () => {
   const baseGroups = [{ id: 'g1' }];
 
-  it('passes when there are no bindings and no snapshot', async () => {
+  it('passes when there are no folder rules and no snapshot', async () => {
     const check = await checkGuardSnapshot({
       getGuardSnapshotFreshness: () =>
         Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
@@ -348,7 +349,7 @@ describe('checkGuardSnapshot', () => {
     expect(check.detail).toContain('nothing to enforce');
   });
 
-  it('fails when bindings exist but the snapshot is missing', async () => {
+  it('fails when folder rules exist but the snapshot is missing', async () => {
     const check = await checkGuardSnapshot({
       getGuardSnapshotFreshness: () =>
         Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
@@ -407,7 +408,7 @@ describe('checkGuardHook', () => {
     expect(check.detail).toContain('installed');
   });
 
-  it('fails when bindings exist but the guard is not installed', () => {
+  it('fails when folder rules exist but the guard is not installed', () => {
     const check = checkGuardHook(sandboxPaths(dir), true);
     expect(check.ok).toBe(false);
     expect(check.detail).toContain('NOT enforced');
@@ -416,7 +417,7 @@ describe('checkGuardHook', () => {
   it('does NOT read a foreign hook that merely mentions the filename as the guard', async () => {
     // A foreign hook whose command references bind-guard.cjs as an unrelated argument (e.g. a config
     // file) must not read as our enforcement guard: doctor must agree with the installer's exact-shape
-    // recognition, or it reports a security control installed when nothing enforces the bindings.
+    // recognition, or it reports a security control installed when nothing enforces the folder rules.
     const { writeFile, mkdir } = await import('node:fs/promises');
     const claudeDir = join(dir, 'claude');
     await mkdir(claudeDir, { recursive: true });
@@ -437,9 +438,53 @@ describe('checkGuardHook', () => {
     expect(check.detail).toContain('NOT enforced');
   });
 
-  it('passes (optional) when there are no bindings and no guard', () => {
+  it('passes (optional) when there are no folder rules and no guard', () => {
     const check = checkGuardHook(sandboxPaths(dir), false);
     expect(check.ok).toBe(true);
+  });
+});
+
+describe('checkDaemonFolderRules', () => {
+  const alive = { state: 'alive', writtenAtMs: 1, ageMs: 1 } as const;
+  const stopped = { state: 'stopped', writtenAtMs: 1, stoppedAtMs: 2, ageMs: 1 } as const;
+  const report = (rows: { name: string; value: string }[]) => ({
+    startedAtMs: 1,
+    settings: rows.map((r) => ({ ...r, source: 'default' as const })),
+  });
+
+  it('fails while a live daemon reports no folder-rules row, naming the build and the fix', () => {
+    const check = checkDaemonFolderRules(
+      report([{ name: 'daemon build', value: 'v0.5.2' }]),
+      alive,
+    );
+    expect(check.name).toBe('daemon-folder-rules');
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('v0.5.2');
+    expect(check.detail).toContain('predates folder rules');
+    expect(check.detail).toContain('cctl daemon restart');
+  });
+
+  it('fails while a live daemon has written no readable report at all', () => {
+    expect(checkDaemonFolderRules(undefined, alive).ok).toBe(false);
+  });
+
+  it('passes when the live daemon reports that it honors folder rules', () => {
+    const check = checkDaemonFolderRules(
+      report([
+        { name: 'daemon build', value: 'v1.0.0' },
+        { name: 'folder rules', value: 'supported' },
+      ]),
+      alive,
+    );
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('honors folder rules');
+  });
+
+  it('passes with no running daemon, whatever its last report said', () => {
+    expect(checkDaemonFolderRules(report([]), stopped).ok).toBe(true);
+    expect(checkDaemonFolderRules(undefined, { state: 'never' }).ok).toBe(true);
+    const stale = { state: 'stale', writtenAtMs: 1, ageMs: 999_999 } as const;
+    expect(checkDaemonFolderRules(report([]), stale).ok).toBe(true);
   });
 });
 
@@ -547,10 +592,10 @@ describe('checkPowerShellWrapper', () => {
   });
 });
 
-describe('checkFolderBindings', () => {
+describe('checkFolderRules', () => {
   let root: string;
   beforeEach(async () => {
-    root = await mkdtemp(join(tmpdir(), 'cctl-doctor-bindings-'));
+    root = await mkdtemp(join(tmpdir(), 'cctl-doctor-rules-'));
   });
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
@@ -567,7 +612,7 @@ describe('checkFolderBindings', () => {
     });
   }
 
-  it('still runs every binding check when groups.json was written by a newer build', async () => {
+  it('still runs every folder-rule check when groups.json was written by a newer build', async () => {
     const paths = sandboxPaths(root);
     await mkdir(paths.vaultDir, { recursive: true });
     await writeFile(
@@ -575,15 +620,20 @@ describe('checkFolderBindings', () => {
       JSON.stringify({ schemaVersion: 99, generation: 1, groups: [] }),
     );
 
-    const out = await checkFolderBindings(sandboxEngine(), paths);
+    const out = await checkFolderRules(sandboxEngine(), paths);
 
     // One failed check names the unreadable file; the rest still report instead of the whole doctor
     // dying on the first read.
-    expect(out.map((c) => c.name)).toEqual(['bindings', 'slots', 'guard-snapshot', 'guard-hook']);
-    const bindings = out.find((c) => c.name === 'bindings')!;
-    expect(bindings.ok).toBe(false);
-    expect(bindings.detail).toContain('schemaVersion');
-    // With the bindings unknown, a missing guard is reported as the failure it may be.
+    expect(out.map((c) => c.name)).toEqual([
+      'folder-rules',
+      'slots',
+      'guard-snapshot',
+      'guard-hook',
+    ]);
+    const rules = out.find((c) => c.name === 'folder-rules')!;
+    expect(rules.ok).toBe(false);
+    expect(rules.detail).toContain('schemaVersion');
+    // With the rules unknown, a missing guard is reported as the failure it may be.
     expect(out.find((c) => c.name === 'guard-hook')!.ok).toBe(false);
   });
 
@@ -592,14 +642,14 @@ describe('checkFolderBindings', () => {
     await mkdir(paths.vaultDir, { recursive: true });
     await writeFile(join(paths.vaultDir, 'groups.json'), '{ not json');
 
-    const out = await checkFolderBindings(sandboxEngine(), paths);
+    const out = await checkFolderRules(sandboxEngine(), paths);
 
-    expect(out[0]).toMatchObject({ name: 'bindings', ok: false });
+    expect(out[0]).toMatchObject({ name: 'folder-rules', ok: false });
     expect(out).toHaveLength(4);
   });
 
-  it('adds no extra line when the bindings read fine', async () => {
-    const out = await checkFolderBindings(sandboxEngine(), sandboxPaths(root));
+  it('adds no extra line when the rules read fine', async () => {
+    const out = await checkFolderRules(sandboxEngine(), sandboxPaths(root));
 
     expect(out.map((c) => c.name)).toEqual(['slots', 'guard-snapshot', 'guard-hook']);
     expect(out.every((c) => c.ok)).toBe(true);

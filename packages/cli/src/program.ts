@@ -122,11 +122,14 @@ import {
   sanitizeForTerminal,
 } from './ansi.js';
 import {
-  buildBindCommands,
+  buildFolderCommands,
+  describeSlotRefusal,
   describeSwitchedGroup,
-  renderBindingsAppendix,
+  renderFolderRulesAppendix,
+  renderReservedAppendix,
+  switchSlotForFolder,
   switchSlotOf,
-} from './bindCommands.js';
+} from './folderCommands.js';
 import {
   renderAccountHeal,
   renderAccountsTable,
@@ -151,7 +154,8 @@ import {
 } from './sessionClient.js';
 import {
   checkAutostart,
-  checkFolderBindings,
+  checkDaemonFolderRules,
+  checkFolderRules,
   checkLiveLogin,
   checkPowerShellWrapper,
   checkVersionSkew,
@@ -271,31 +275,39 @@ export function buildProgram(): Command {
     outputError: (str, write) => write(paintErrorLine(str, detectPalette(process.stderr))),
   });
 
-  // passThroughOptions on `cctl claude` (see bindCommands.ts) needs positional-options mode on the
+  // passThroughOptions on `cctl claude` (see folderCommands.ts) needs positional-options mode on the
   // program so our --account/--override are parsed before Claude Code's own flags pass through.
   program.enablePositionalOptions();
 
   buildAccountCommands(program);
   buildSessionCommands(program);
   buildChannelCommands(program);
-  buildBindCommands(program);
+  buildFolderCommands(program);
 
   program
     .command('switch <ref>')
     .description('activate an account by id or label')
     .option('--force', 'bypass the switch-cadence guard (deliberate override)')
-    .action(async (ref: string, opts: { force?: boolean }) => {
+    .option(
+      '--folder <folder>',
+      "put the account in that folder's slot (the slot of the folder rule it runs under)",
+    )
+    .action(async (ref: string, opts: { force?: boolean; folder?: string }) => {
       const engine = buildEngine();
       // Resolve across the WHOLE registry (shared pool + reserved accounts) so `cctl switch <ref>`
       // reaches an account a folder rule includes; activate() routes it to that rule's slot.
       const fleet = await engine.listAllAccounts();
       const resolved = resolveAccountRef(fleet, ref);
       if (!resolved.ok) fail(resolved.message);
-      // The slot the account belonged to when it was resolved. Asserted on the switch, so a rule
-      // change landing in between fails this command instead of switching a slot it never named.
-      // An account several rules include has no single slot: the engine picks the one it is live in,
-      // or refuses and says to name the folder.
-      const slot = switchSlotOf(fleet.find((a) => a.id === resolved.account.id));
+      // --folder names the slot outright: the folder's rule slot (a rule slot may also take a shared
+      // account it does not exclude), or the global slot where no rule applies. Without it, the
+      // slot the account belonged to when it was resolved — asserted on the switch, so a rule change
+      // landing in between fails this command instead of switching a slot it never named. An account
+      // several rules include has no single slot: the engine picks the one it is live in, or refuses
+      // and says to name the folder.
+      const target =
+        opts.folder !== undefined ? await switchSlotForFolder(engine, opts.folder) : undefined;
+      const slot = target?.slot ?? switchSlotOf(fleet.find((a) => a.id === resolved.account.id));
       try {
         const result = await engine.activate(resolved.account.id, {
           force: Boolean(opts.force),
@@ -311,7 +323,9 @@ export function buildProgram(): Command {
         const group = await describeSwitchedGroup(engine, resolved.account.id);
         const where = group
           ? ` in the folder slot of ${sanitizeForTerminal(group.folders.join(', '))}`
-          : '';
+          : target !== undefined
+            ? ` in the global slot (no folder rule applies to ${sanitizeForTerminal(opts.folder ?? '')})`
+            : '';
         process.stdout.write(
           `Activated ${sanitizeForTerminal(resolved.account.label)}${where} (${bits.join(', ')}).\n`,
         );
@@ -320,9 +334,7 @@ export function buildProgram(): Command {
           fail(`${resolved.account.label} is quarantined; re-login required.`);
         if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
         if (err instanceof UnknownAccountError) fail(err.message);
-        if (err instanceof SlotError) {
-          fail(`${err.message}. Nothing was changed - check \`cctl bindings\`.`);
-        }
+        if (err instanceof SlotError) fail(describeSlotRefusal(err, resolved.account.label));
         // A switch that failed after it began writing the live login, one an earlier switch still
         // blocks, or a login stored under two accounts: the engine's message already says what the
         // live login is now and what to do, in words — it is the whole error line.
@@ -390,7 +402,7 @@ export function buildProgram(): Command {
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
-      text += await renderBindingsAppendix(buildEngine(), detectPalette());
+      text += await renderFolderRulesAppendix(buildEngine(), detectPalette());
       const banner = await exhaustionBanner(inputs, await cliAutoSwitchPolicy(), nowMs);
       process.stdout.write((banner !== undefined ? `${banner}\n\n` : '') + text + '\n');
     });
@@ -432,6 +444,8 @@ export function buildProgram(): Command {
           '\n\n' +
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
+      // What each folder rule runs on, so a folder burning its own accounts shows beside the plan.
+      text += await renderFolderRulesAppendix(buildEngine(), detectPalette());
       process.stdout.write(text + '\n');
     });
 
@@ -656,14 +670,16 @@ export function buildProgram(): Command {
       const paths = defaultPaths();
       const engine = buildEngine(paths);
       const checks = [...(await runDoctor(paths)), checkAutostart(readAutostartState())];
-      // Folder-bound-account checks (slot invariants, guard snapshot freshness, guard hook presence)
-      // and CLI/daemon build skew — appended so the base environment report stays unchanged. The
-      // binding checks report an unreadable groups.json as one failed check rather than throwing.
+      // Folder-rule checks (slot invariants, guard snapshot freshness, guard hook presence), whether
+      // the running daemon honors folder rules, and CLI/daemon build skew — appended so the base
+      // environment report stays unchanged. The folder-rule checks report an unreadable groups.json
+      // as one failed check rather than throwing.
       const report = await readSettingsReport(daemonSettingsPath());
       const heartbeat = await readHeartbeat(daemonHeartbeatPath());
       const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
       checks.push(
-        ...(await checkFolderBindings(engine, paths)),
+        ...(await checkFolderRules(engine, paths)),
+        checkDaemonFolderRules(report, heartbeat),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
       );
       // Windows only: flag a PowerShell `claude` wrapper whose embedded node/cctl paths have gone
@@ -1637,7 +1653,7 @@ function buildAccountCommands(program: Command): void {
       const palette = detectPalette();
       process.stdout.write(
         renderAccountsTable(list, activeId, palette) +
-          (await renderBindingsAppendix(engine, palette)) +
+          (await renderReservedAppendix(engine, palette)) +
           '\n',
       );
     });

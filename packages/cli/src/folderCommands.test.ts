@@ -1,9 +1,10 @@
-// Regression coverage for the guard-install wiring on the CLI bind/unbind path.
+// Unit coverage for the folder-rule commands' pure halves (account refs, views, what a change did)
+// and the guard-install wiring.
 //
-// The enforcement guard machinery (writeBindGuard / installBindGuard) was fully functional and
-// unit-proven, but no production code ever CALLED it — so folder bindings were recorded and never
-// enforced at prompt time. `reconcileBindGuard` is the caller `cctl bind` / `cctl unbind` now run;
-// these tests exercise it against a sandbox so the wiring cannot silently regress to "no caller".
+// The enforcement guard machinery (writeBindGuard / installBindGuard) is unit-proven elsewhere, but it
+// only enforces anything if production code CALLS it. `reconcileFolderGuard` is the caller every
+// `cctl folder` change runs; the tests below exercise it against a sandbox so the wiring cannot
+// silently regress to "no caller".
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -11,15 +12,15 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { sandboxPaths, type FolderRule, type Paths } from '@claude-control/switch-engine';
 import { BIND_GUARD_MARKER, bindGuardPath } from '@claude-control/daemon';
-import { reconcileBindGuard, relaxationBannerLine } from './bindCommands.js';
+import { reconcileFolderGuard, relaxationBannerLine } from './folderCommands.js';
 
-/** A minimal stand-in for the switch engine: `reconcileBindGuard` only asks it how many folder
+/** A minimal stand-in for the switch engine: `reconcileFolderGuard` only asks it how many folder
  *  rules exist. `count` is what `listRules` reports — the one input that decides install vs. remove. */
-function engineWithGroups(count: number): Parameters<typeof reconcileBindGuard>[0] {
+function engineWithGroups(count: number): Parameters<typeof reconcileFolderGuard>[0] {
   const rules = Array.from({ length: count }, (_, i) => ({ id: `g${i}` }) as FolderRule);
   return {
     listRules: () => Promise.resolve(rules),
-  } as unknown as Parameters<typeof reconcileBindGuard>[0];
+  } as unknown as Parameters<typeof reconcileFolderGuard>[0];
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -31,7 +32,7 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-describe('reconcileBindGuard', () => {
+describe('reconcileFolderGuard', () => {
   let root: string;
   let paths: Paths;
 
@@ -43,8 +44,8 @@ describe('reconcileBindGuard', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('installs the guard (marker in settings.json + script on disk) when a folder is bound', async () => {
-    await reconcileBindGuard(engineWithGroups(1), paths);
+  it('installs the guard (marker in settings.json + script on disk) when a folder has a rule', async () => {
+    await reconcileFolderGuard(engineWithGroups(1), paths);
 
     const settingsPath = join(paths.claudeDir, 'settings.json');
     const raw = await readFile(settingsPath, 'utf8');
@@ -55,9 +56,9 @@ describe('reconcileBindGuard', () => {
     expect(await exists(guardPath)).toBe(true);
   });
 
-  it('removes the guard when the last binding is gone', async () => {
-    await reconcileBindGuard(engineWithGroups(1), paths);
-    await reconcileBindGuard(engineWithGroups(0), paths);
+  it('removes the guard when the last rule is gone', async () => {
+    await reconcileFolderGuard(engineWithGroups(1), paths);
+    await reconcileFolderGuard(engineWithGroups(0), paths);
 
     const raw = await readFile(join(paths.claudeDir, 'settings.json'), 'utf8');
     expect(raw.includes(BIND_GUARD_MARKER)).toBe(false);
@@ -72,7 +73,7 @@ describe('reconcileBindGuard', () => {
 
     const warn = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     try {
-      await expect(reconcileBindGuard(engineWithGroups(1), brokenPaths)).resolves.toBeUndefined();
+      await expect(reconcileFolderGuard(engineWithGroups(1), brokenPaths)).resolves.toBeUndefined();
       expect(warn).toHaveBeenCalled();
       const warned = warn.mock.calls.map((c) => String(c[0])).join('');
       expect(warned).toContain('enforcement guard');
@@ -86,12 +87,12 @@ describe('reconcileBindGuard', () => {
 // the guard's systemMessage (which Claude Code drops in a headless -p / SDK run). The banner names the
 // actual session cwd — where the relaxation applies — and sanitizes both label and path.
 describe('relaxationBannerLine', () => {
-  it('names the session cwd (not the bound folder) for an override', () => {
+  it('names the session cwd (not the rule folder) for an override', () => {
     const line = relaxationBannerLine('override', 'work@corp', 'C:/other/place');
     expect(line).toContain('--override in effect');
     expect(line).toContain('work@corp');
     expect(line).toContain('C:/other/place');
-    expect(line).toContain('bound to a different account');
+    expect(line).toContain('whose folder rule runs on a different slot');
     expect(line.endsWith('\n')).toBe(true);
   });
 

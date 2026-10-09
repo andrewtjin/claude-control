@@ -1,0 +1,413 @@
+// Pure rendering for the folder-rule views: `cctl folders`, `cctl where`, the per-folder section of
+// `cctl usage` / `cctl timeline`, and the reserved-accounts section of `cctl accounts list`.
+//
+// Kept apart from the IO in folderCommands.ts so the exact output is unit-tested. Every folder path
+// and account label rendered here is operator- or filesystem-supplied, so each goes through
+// sanitizeForTerminal before it reaches the terminal (see ansi.ts): a label carrying an ANSI or bidi
+// escape can neither recolor the surface nor reorder a path.
+
+import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
+
+/** Where an account of a folder's pool comes from: the rule's own included accounts, or the shared
+ *  pool every folder inherits. */
+export type PoolSourceView = 'include' | 'inherited';
+
+/** One account of a slot's effective pool, in pool order, as the folder views show it. */
+export interface PoolEntryView {
+  label: string;
+  source: PoolSourceView;
+  /** Live in THIS slot right now. */
+  live: boolean;
+  /** The other slot it is live in, already worded ("the global slot"), or null. An account live
+   *  elsewhere is in the pool but cannot be taken: no account is live in two places. */
+  liveElsewhere: string | null;
+  /** A dead login: never used until re-logged in. */
+  quarantined: boolean;
+  /** False for a shared account excluded from auto-switch: usable by hand, never picked unattended. */
+  autoTarget: boolean;
+}
+
+/** The account live in a slot and how it got there. `outside` is a login the slot's pool does not
+ *  hold (left behind by an older build, or a rule edited under it); the daemon moves it off. */
+export interface SlotLiveView {
+  label: string;
+  source: PoolSourceView | 'outside';
+  quarantined: boolean;
+}
+
+/** One folder rule for display. */
+export interface FolderRuleView {
+  label: string;
+  folders: string[];
+  /** Labels of the included (reserved) accounts, in preference order. */
+  include: string[];
+  /** Labels of the shared accounts the folder must not use. */
+  exclude: string[];
+  /** The account live in the rule's slot, or null when the slot holds none. */
+  live: SlotLiveView | null;
+  pool: PoolEntryView[];
+  profileDir: string;
+}
+
+/** The global slot, which every folder without a rule runs on. */
+export interface GlobalSlotView {
+  live: SlotLiveView | null;
+  pool: PoolEntryView[];
+}
+
+/** The guard snapshot's freshness and the enforcement mode, shown under `cctl folders`. Freshness is
+ *  judged by the guard-relevant CONTENT of the snapshot (folders, profile dirs, included labels,
+ *  enforce), not the rules generation, which also bumps on a routine switch the guard never sees. */
+export interface FolderGuardFooterView {
+  /** Whether a guard snapshot exists at all. */
+  present: boolean;
+  /** Whether the snapshot's guard-relevant content matches the live registry. */
+  fresh: boolean;
+  enforce: 'block' | 'warn' | 'off';
+}
+
+/** The words after a pool entry: where it comes from (in a folder's pool only: the global pool is
+ *  all shared accounts, so there it would say nothing), then everything that limits it. */
+function poolEntryNotes(e: PoolEntryView, showSource: boolean): string[] {
+  const notes: string[] = showSource ? [e.source === 'include' ? 'included' : 'inherited'] : [];
+  if (e.live) notes.push('live here');
+  if (e.liveElsewhere !== null) notes.push(`live in ${sanitizeForTerminal(e.liveElsewhere)}`);
+  // A dead login is never a target anyway; saying so twice adds nothing.
+  if (e.quarantined) notes.push('quarantined');
+  else if (!e.autoTarget) notes.push('not an auto-switch target');
+  return notes;
+}
+
+/** Paint an entry by what it means for the slot: green live here, red dead, dim unavailable. */
+function paintEntry(e: PoolEntryView, palette: Palette): (text: string) => string {
+  if (e.live) return palette.green;
+  if (e.quarantined) return palette.red;
+  if (e.liveElsewhere !== null) return palette.dim;
+  return (t) => t;
+}
+
+/** Whether anything in the pool could be seated right now. */
+function anyAvailable(pool: readonly PoolEntryView[]): boolean {
+  return pool.some((e) => !e.quarantined && e.liveElsewhere === null);
+}
+
+/** The pool in order, one numbered account per line, every limit spelled out. `indent` is the
+ *  column the first line's label is already at, so continuation lines align under it. */
+function poolLines(
+  pool: readonly PoolEntryView[],
+  palette: Palette,
+  indent: number,
+  showSource = true,
+): string[] {
+  if (pool.length === 0) return ['nothing (every account it could use is reserved elsewhere)'];
+  const width = String(pool.length).length;
+  return pool.map((e, i) => {
+    const n = `${String(i + 1).padStart(width)}.`;
+    const notes = poolEntryNotes(e, showSource);
+    const text = `${n} ${sanitizeForTerminal(e.label)}${notes.length > 0 ? `  ${notes.join(', ')}` : ''}`;
+    return (i === 0 ? '' : ' '.repeat(indent)) + paintEntry(e, palette)(text);
+  });
+}
+
+/** The pool on one line, for the compact per-folder section: the live one starred, and only the
+ *  limits that make an account unavailable named. */
+function poolInline(pool: readonly PoolEntryView[], palette: Palette): string {
+  if (pool.length === 0) return 'nothing (every account it could use is reserved elsewhere)';
+  return pool
+    .map((e) => {
+      const notes: string[] = [];
+      if (e.liveElsewhere !== null) notes.push(`live in ${sanitizeForTerminal(e.liveElsewhere)}`);
+      if (e.quarantined) notes.push('quarantined');
+      else if (!e.autoTarget) notes.push('not an auto-switch target');
+      const name = (e.live ? '*' : '') + sanitizeForTerminal(e.label);
+      const text = notes.length > 0 ? `${name} (${notes.join(', ')})` : name;
+      return paintEntry(e, palette)(text);
+    })
+    .join(', ');
+}
+
+/** Which kind of slot a live line describes: the global slot, or a folder slot with or without
+ *  included accounts (an inherited account there means something different in each). */
+export type SlotKind = 'global' | 'rule-with-includes' | 'rule';
+
+/** The slot kind of a rule view. */
+function ruleSlotKind(view: Pick<FolderRuleView, 'include'>): SlotKind {
+  return view.include.length > 0 ? 'rule-with-includes' : 'rule';
+}
+
+/** The live line's value: who is live and why, or why nobody is. An empty slot with something
+ *  available is merely not seated yet (the daemon or `cctl claude` seats it); with nothing available
+ *  it is a real outage for that folder. */
+export function describeSlotLive(
+  live: SlotLiveView | null,
+  pool: readonly PoolEntryView[],
+  slot: SlotKind,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (live === null) {
+    return anyAvailable(pool)
+      ? 'none yet (cctl claude or the daemon seats the first available account)'
+      : palette.red(
+          'none usable (every account it may use is quarantined or live elsewhere; ' +
+            're-login one: cctl accounts relogin <account>)',
+        );
+  }
+  const name = sanitizeForTerminal(live.label);
+  if (live.quarantined) {
+    return palette.red(`${name} (quarantined; re-login it: cctl accounts relogin ${name})`);
+  }
+  if (live.source === 'outside') {
+    return palette.yellow(`${name} (not in this pool any more; the daemon moves the slot off it)`);
+  }
+  if (live.source === 'include') return palette.green(`${name} (included)`);
+  if (slot === 'global') return palette.green(name);
+  // An inherited account in a folder that includes some means every included one is out.
+  return palette.green(
+    slot === 'rule-with-includes'
+      ? `${name} (inherited from the shared pool: no included account is available)`
+      : `${name} (inherited from the shared pool)`,
+  );
+}
+
+/** The labels as a list, or what an empty list means for the rule. */
+function labelList(labels: readonly string[], empty: string): string {
+  return labels.length === 0 ? empty : labels.map((l) => sanitizeForTerminal(l)).join(', ');
+}
+
+/** The lines every full rule view shares (`cctl folders`, `cctl where`): includes, excludes, live,
+ *  pool. Labels are padded to one column. */
+function ruleBodyLines(view: FolderRuleView, palette: Palette): string[] {
+  return [
+    `  includes: ${labelList(view.include, 'nothing (no account is reserved to it)')}`,
+    `  excludes: ${labelList(view.exclude, 'nothing')}`,
+    `  live:     ${describeSlotLive(view.live, view.pool, ruleSlotKind(view), palette)}`,
+    `  pool:     ${poolLines(view.pool, palette, 12).join('\n')}`,
+  ];
+}
+
+/** One rule in full: its folders, what it includes and excludes, the live account, the effective
+ *  pool in order with availability, and its profile dir. */
+export function renderFolderRule(view: FolderRuleView, palette: Palette = PLAIN_PALETTE): string {
+  return [
+    palette.bold(sanitizeForTerminal(view.label)),
+    ...view.folders.map((f) => `  folder:   ${sanitizeForTerminal(f)}`),
+    ...ruleBodyLines(view, palette),
+    `  profile:  ${palette.dim(sanitizeForTerminal(view.profileDir))}`,
+  ].join('\n');
+}
+
+/** The global slot in the same shape, so `cctl folders` also says what every other folder runs on. */
+export function renderGlobalSlot(view: GlobalSlotView, palette: Palette = PLAIN_PALETTE): string {
+  return [
+    palette.bold('every other folder (the global slot)'),
+    `  live:     ${describeSlotLive(view.live, view.pool, 'global', palette)}`,
+    `  pool:     ${poolLines(view.pool, palette, 12, false).join('\n')}`,
+  ].join('\n');
+}
+
+export function renderFolderGuardFooter(
+  view: FolderGuardFooterView,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  const enforceLine = `enforcement: ${view.enforce}`;
+  let freshness: string;
+  if (!view.present) {
+    freshness = palette.yellow(
+      'guard snapshot: missing (the guard cannot enforce until the daemon writes it, or a ' +
+        'cctl folder change does)',
+    );
+  } else if (view.fresh) {
+    freshness = 'guard snapshot: fresh';
+  } else {
+    freshness = palette.yellow(
+      'guard snapshot: STALE (the guard is enforcing an out-of-date view of the folder rules); ' +
+        'restart the daemon to refresh it: cctl daemon restart',
+    );
+  }
+  return `${enforceLine}\n${freshness}`;
+}
+
+/** The hint every empty view ends on: both ways to give a folder a rule. */
+export const ADD_FOLDER_RULE_HINT =
+  'Add one with: cctl folder include <folder> <account>[,<account>...]\n' +
+  '          or: cctl folder exclude <folder> <account>[,<account>...]';
+
+/** The full `cctl folders` view: every rule, the global slot, then the guard footer. */
+export function renderFolders(
+  input: { rules: FolderRuleView[]; global: GlobalSlotView; footer: FolderGuardFooterView },
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (input.rules.length === 0) {
+    return (
+      'No folder rules: every folder uses the global slot and the shared pool.\n' +
+      ADD_FOLDER_RULE_HINT
+    );
+  }
+  return [
+    ...input.rules.map((r) => renderFolderRule(r, palette)),
+    renderGlobalSlot(input.global, palette),
+    renderFolderGuardFooter(input.footer, palette),
+  ].join('\n\n');
+}
+
+/** The compact per-folder section `cctl usage` and `cctl timeline` end on: each rule's folders, the
+ *  account live in its slot, and its pool on one line. '' when there are no rules. */
+export function renderFolderRulesSection(
+  rules: readonly FolderRuleView[],
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (rules.length === 0) return '';
+  const blocks = rules.map((r) =>
+    [
+      `${palette.bold(sanitizeForTerminal(r.label))}  ${palette.dim(
+        r.folders.map((f) => sanitizeForTerminal(f)).join(', '),
+      )}`,
+      `  live: ${describeSlotLive(r.live, r.pool, ruleSlotKind(r), palette)}`,
+      `  pool: ${poolInline(r.pool, palette)}`,
+    ].join('\n'),
+  );
+  return 'Folder rules (cctl folders for detail):\n' + blocks.join('\n');
+}
+
+/** One account reserved to folder rules, for the section under `cctl accounts list`. */
+export interface ReservedAccountView {
+  id: string;
+  label: string;
+  email: string | undefined;
+  quarantined: boolean;
+  /** Live in one of its folders' slots right now. */
+  live: boolean;
+  /** The folders of each rule that includes it, one string per rule. */
+  includedBy: string[];
+}
+
+/** The reserved accounts as an aligned table: they are not in the shared table above it, and each
+ *  is usable only in the folders that include it, which the last-but-one column names. '' when no
+ *  account is reserved. */
+export function renderReservedAccounts(
+  rows: readonly ReservedAccountView[],
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (rows.length === 0) return '';
+  const cells = rows.map((r) => ({
+    live: r.live ? '*' : ' ',
+    label: sanitizeForTerminal(r.label),
+    email: sanitizeForTerminal(r.email ?? '-'),
+    status: r.quarantined ? 'quarantined' : 'ok',
+    includedBy: r.includedBy.map((f) => sanitizeForTerminal(f)).join('; '),
+    id: sanitizeForTerminal(r.id),
+  }));
+  const headers = {
+    live: ' ',
+    label: 'LABEL',
+    email: 'EMAIL',
+    status: 'STATUS',
+    includedBy: 'INCLUDED BY',
+    id: 'ID',
+  };
+  type Cells = typeof headers;
+  const keys = Object.keys(headers) as (keyof Cells)[];
+  const width = (k: keyof Cells): number =>
+    Math.max(headers[k].length, ...cells.map((c) => c[k].length));
+  const padded = (c: Cells): string[] => keys.map((k) => c[k].padEnd(width(k)));
+  // Pad first, paint after: ANSI codes are zero-width, so alignment survives.
+  const line = (c: Cells): string => {
+    const [live, label, email, status, includedBy, id] = padded(c);
+    return [
+      palette.green(live ?? ''),
+      palette.bold(label ?? ''),
+      email ?? '',
+      c.status === 'quarantined' ? palette.red(status ?? '') : (status ?? ''),
+      includedBy ?? '',
+      palette.dim(id ?? ''),
+    ]
+      .join('  ')
+      .trimEnd();
+  };
+  return [
+    'Reserved to folder rules (used only in the folders that include them; * = live there):',
+    palette.dim(padded(headers).join('  ').trimEnd()),
+    ...cells.map(line),
+  ].join('\n');
+}
+
+/** What `cctl where` explains for a folder: the rule that applies (longest match, no merging) or,
+ *  without one, the global slot. */
+export interface WhereView {
+  /** The canonical folder queried. */
+  folder: string;
+  /** The rule it resolves to and the rule folder that matched, or null for the global slot. */
+  rule: (FolderRuleView & { matchedFolder: string }) | null;
+  global: GlobalSlotView;
+}
+
+/** Quote one argument so it pastes into the operator's shell as a single literal word: PowerShell
+ *  single quotes (a `'` doubled) on Windows, POSIX single quotes (`'\''`) elsewhere. Single quotes
+ *  because nothing inside them expands in either shell — a folder or label may hold `$`, a backtick
+ *  or a double quote. */
+export function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32'
+    ? `'${value.replace(/'/g, "''")}'`
+    : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/** The VS Code profile name `cctl where` suggests for a folder rule: `cctl-<label>`, reduced to
+ *  letters, digits, `.`, `_` and `-` so it is one plain word in any shell and in VS Code's UI. */
+export function vscodeProfileName(ruleLabel: string): string {
+  const slug = ruleLabel.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return `cctl-${slug === '' ? 'folder' : slug}`;
+}
+
+/** Explain which slot a folder runs on, its rule, live account and pool in order, print the env line
+ *  a session needs, and how to point the VS Code Claude Code extension at that slot (a VS Code
+ *  profile holding the claudeCode.environmentVariables setting). */
+export function renderWhere(
+  view: WhereView,
+  palette: Palette = PLAIN_PALETTE,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const folder = sanitizeForTerminal(view.folder);
+  if (view.rule === null) {
+    return [
+      `${palette.bold(folder)}`,
+      '  runs on: the global slot and the shared pool (no folder rule applies here)',
+      `  live:    ${describeSlotLive(view.global.live, view.global.pool, 'global', palette)}`,
+      `  pool:    ${poolLines(view.global.pool, palette, 11, false).join('\n')}`,
+      '  env:     CLAUDE_CONFIG_DIR is not set (the global slot)',
+      '',
+      `Give this folder its own rule with: cctl folder include ${folder} <account>[,<account>...]`,
+      `                                or: cctl folder exclude ${folder} <account>[,<account>...]`,
+    ].join('\n');
+  }
+  const r = view.rule;
+  const profile = sanitizeForTerminal(r.profileDir);
+  // The extension's setting is declared as a list of {name, value} pairs (its default is []), so
+  // that is the shape printed. The setting is MACHINE-scoped: VS Code ignores it in a folder's or
+  // workspace's .vscode/settings.json (it only greys the line out), and reads it from user settings
+  // only. Per-folder routing therefore needs a VS Code profile whose user settings carry it — one
+  // profile per folder rule, opened on its folder.
+  const vscodeSnippet = JSON.stringify(
+    { 'claudeCode.environmentVariables': [{ name: 'CLAUDE_CONFIG_DIR', value: r.profileDir }] },
+    null,
+    2,
+  );
+  const openCommand = `code --profile ${shellQuote(vscodeProfileName(r.label), platform)} ${shellQuote(folder, platform)}`;
+  return [
+    `${palette.bold(folder)}`,
+    `  runs on:  the folder rule ${palette.bold(sanitizeForTerminal(r.label))}, in its own slot`,
+    `  matched:  ${sanitizeForTerminal(r.matchedFolder)} (the longest matching rule wins; rules do not merge)`,
+    ...ruleBodyLines(r, palette),
+    `  env:      CLAUDE_CONFIG_DIR=${profile}`,
+    '',
+    'Start Claude Code here with the right account using: cctl claude',
+    '(or install the wrapper once: cctl shell-init powershell)',
+    '',
+    'For VS Code: the Claude Code extension reads its environment from USER settings only (a',
+    "folder's .vscode/settings.json is ignored), so give this folder rule its own VS Code profile:",
+    `  1. ${openCommand}`,
+    '     (creates the profile the first time; install or enable Claude Code in it)',
+    '  2. in that window run "Preferences: Open User Settings (JSON)" and add:',
+    vscodeSnippet,
+    `  3. open this folder with the same command from then on. Other windows keep the global slot.`,
+  ].join('\n');
+}
