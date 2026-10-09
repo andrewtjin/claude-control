@@ -105,6 +105,8 @@ interface Harness {
   host: FakeHost;
   mover: BackgroundMover;
   notices: Array<{ title: string; body: string; level: string }>;
+  /** Every warn line the mover logged. */
+  warns: string[];
   now: { ms: number };
 }
 
@@ -113,7 +115,9 @@ interface Harness {
 function harness(opts: { minIntervalMs?: number } = {}): Harness {
   const host = new FakeHost();
   const notices: Harness['notices'] = [];
+  const warns: string[] = [];
   const now = { ms: 1_000_000 };
+  const noop = (): void => {};
   const mover = new BackgroundMover({
     host,
     resolveRule: (cwd) =>
@@ -121,12 +125,13 @@ function harness(opts: { minIntervalMs?: number } = {}): Harness {
         cwd.startsWith('C:/research') ? 'rule-1' : cwd.startsWith('C:/other') ? 'rule-2' : null,
       ),
     notify: (n) => notices.push(n),
+    logger: { debug: noop, info: noop, error: noop, warn: (_obj, msg) => warns.push(String(msg)) },
     clock: () => now.ms,
     ...(opts.minIntervalMs !== undefined ? { minIntervalMs: opts.minIntervalMs } : {}),
     confirmTimeoutMs: 0,
     sleep: () => Promise.resolve(),
   });
-  return { host, mover, notices, now };
+  return { host, mover, notices, warns, now };
 }
 
 const targets = (...t: MoveTarget[]): Map<string, MoveTarget> =>
@@ -275,6 +280,9 @@ describe('BackgroundMover', () => {
     h.host.failActivity = true;
     expect((await h.mover.run(targets(TARGET)))[0]).toMatchObject({ result: 'skipped' });
     expect(h.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
+    // Said once, not every cycle: a daemon without claude on its PATH would otherwise be silent.
+    await h.mover.run(targets(TARGET));
+    expect(h.warns).toEqual(['could not tell whether a background session is idle; not moving it']);
     h.host.failActivity = false;
     expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('moved');
   });

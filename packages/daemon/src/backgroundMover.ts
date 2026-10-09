@@ -142,6 +142,9 @@ export class BackgroundMover {
   /** Sessions a move failed for: never tried again while this daemon runs, so a session Claude Code
    *  will not host under the rule's profile cannot be stopped and resumed over and over. */
   private readonly gaveUp = new Set<string>();
+  /** The last reason Claude Code could not say what sessions are doing, logged once per reason: a
+   *  daemon whose PATH has no `claude` would otherwise skip every move without a word. */
+  private lastActivityFailure: string | undefined;
 
   constructor(options: BackgroundMoverOptions) {
     this.host = options.host;
@@ -166,8 +169,8 @@ export class BackgroundMover {
     try {
       hosted = await this.host.listHosted(null);
     } catch (err) {
-      // No Claude Code to ask, or no service running: nothing to move. Debug, not warn — on a box
-      // without background sessions this is every cycle.
+      // An unreadable roster: nothing to move this cycle. Debug, not warn — it heals on its own (a
+      // roster caught mid-write) and a later cycle reads it.
       this.logger.debug({ reason: reasonOf(err) }, 'could not list background sessions');
       return [];
     }
@@ -197,8 +200,17 @@ export class BackgroundMover {
     let activity: SessionActivity | undefined;
     try {
       activity = (await this.host.activity(null)).get(session.short);
+      this.lastActivityFailure = undefined;
     } catch (err) {
-      return { ...base, result: 'skipped', reason: reasonOf(err) };
+      const reason = reasonOf(err);
+      if (reason !== this.lastActivityFailure) {
+        this.lastActivityFailure = reason;
+        this.logger.warn(
+          { sessionId: session.sessionId, reason },
+          'could not tell whether a background session is idle; not moving it',
+        );
+      }
+      return { ...base, result: 'skipped', reason };
     }
     if (activity === undefined || !activity.idle) {
       return { ...base, result: 'skipped', reason: 'not idle between turns' };
