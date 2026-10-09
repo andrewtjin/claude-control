@@ -8,24 +8,29 @@
 //     session id, working directory and the pid of its terminal host. It also holds attach secrets;
 //     only the four fields above are ever read out of it, and nothing from it is logged;
 //   - `jobs/<short>/state.json`: the session's job row, with the launch options it saved
-//     (`respawnFlags`) — which, measured, can also hold the session's first prompt.
+//     (`respawnFlags`, see {@link replayOptions}) and the permission rules granted while it ran
+//     (`sessionPermissionRules`);
+//   - `daemon/attach-journal/*.json`: one entry per terminal opening a session of the service
+//     (`claude attach`, or the agent view), naming that terminal's process; Claude Code clears it
+//     when the terminal leaves the session. It does not say which session.
 // Everything else is asked of Claude Code itself, run as the operator's own `claude` on PATH (the
 // binary that started the service), with CLAUDE_CONFIG_DIR naming the service to talk to:
 //   - `claude agents --json`: every session with its status (`idle` between turns, `busy` in one,
 //     `waiting` on a prompt or a permission); the listing spans every working directory;
 //   - `claude stop <short>`: stops it, synchronously;
-//   - `claude rm <short>`: drops that config dir's job row only (the conversation is kept);
 //   - `claude --bg --resume <session id> [options]` with no prompt: resumes it idle under that
 //     config dir's service ("idle — send a prompt to start"), or prints that it started a copy.
+// `claude rm` is never run: it deletes the session's worktree and branch along with its job row.
 // These shapes were measured against Claude Code 2.1.295; anything else is read defensively, and an
 // unexpected answer fails the operation rather than guessing.
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
   BackgroundSession,
   BackgroundSessionHost,
+  SavedLaunch,
   SessionActivity,
 } from '@claude-control/daemon';
 import { findClaudeOnPath, resolveLaunchTarget } from './launcher.js';
@@ -52,6 +57,8 @@ export interface ClaudeBackgroundHostOptions {
   /** How Claude Code is run (default: the `claude` on PATH, without a shell). */
   run?: RunClaude;
   readFile?: (path: string) => string;
+  /** The names in a directory; throws (ENOENT) for one that does not exist. */
+  readDir?: (path: string) => string[];
   isProcessAlive?: (pid: number) => boolean;
 }
 
@@ -60,22 +67,120 @@ export interface ClaudeBackgroundHostOptions {
 const CLAUDE_COMMAND_TIMEOUT_MS = 60_000;
 
 const SHORT_ID = /^[0-9a-f]{8}$/;
+/** How Claude Code says a resume started a copy instead (every reason it gives ends this way). */
+const COPY_STARTED = /started a (?:restricted )?copy(?: of that conversation)? as ([0-9a-f]{8})/;
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
- * The saved launch options a move replays, by flag: those taking a value, and those standing alone.
- * Only these: a job row's saved list can also hold the session's first prompt, which replayed would
- * start a turn, and an option this build does not know could mean anything. What is left out is the
- * session's default for it under the new config dir.
+ * The launch options Claude Code saves in a job row (`respawnFlags`), by how it reads them: options
+ * taking a value, those of them taking several, and switches. These are Claude Code 2.1.295's own
+ * lists of what it saves, so a row holds only these and their values. Claude Code drops every other
+ * word when it saves, the session's first prompt among them, except that every word after an option
+ * taking several values is saved as one of its values: that is how Claude Code read them at launch
+ * too, so they ARE its values, and a replay keeps them so.
  */
-const REPLAYED_VALUE_OPTIONS: ReadonlySet<string> = new Set([
+const SAVED_VALUE_OPTIONS: ReadonlySet<string> = new Set([
   '--model',
   '--permission-mode',
-  '--add-dir',
-  '--fallback-model',
+  '--inherit-permission-mode',
+  '--proactivity',
   '--agent',
+  '--agents',
+  '--routine',
+  '--effort',
+  '--add-dir',
+  '--mcp-config',
+  '--settings',
+  '--setting-sources',
+  '--managed-settings',
+  '--client-data-url',
+  '--system-prompt',
+  '--system-prompt-file',
+  '--append-system-prompt',
+  '--append-system-prompt-file',
+  '--system-prompt-snapshot',
+  '--append-subagent-system-prompt',
+  '--append-subagent-system-prompt-file',
+  '--fallback-model',
+  '--advisor',
+  '--channels',
+  '--watch-artifact',
+  '--watch-artifact-no-autoreact',
+  '--permission-prompt-tool',
+  '--permission-prompts',
+  '--allowed-tools',
+  '--allowedTools',
+  '--disallowed-tools',
+  '--disallowedTools',
+  '--tools',
+  '--debug-file',
+  '--name',
+  '--autocompact',
+  '--betas',
+  '--max-budget-usd',
+  '--max-thinking-tokens',
+  '--max-turns',
+  '--task-budget',
+  '--plan-mode-instructions',
+  '--plugin-dir',
+  '--plugin-dir-no-mcp',
+  '--plugin-url',
+  '--thinking',
+  '--thinking-display',
+  '--remote-control-session-name-prefix',
+  '--json-schema',
 ]);
-const REPLAYED_SWITCH_OPTIONS: ReadonlySet<string> = new Set(['--dangerously-skip-permissions']);
+const SAVED_LIST_OPTIONS: ReadonlySet<string> = new Set([
+  '--allowed-tools',
+  '--allowedTools',
+  '--disallowed-tools',
+  '--disallowedTools',
+  '--tools',
+  '--mcp-config',
+  '--betas',
+  '--add-dir',
+  '--channels',
+]);
+const SAVED_SWITCH_OPTIONS: ReadonlySet<string> = new Set([
+  '--dangerously-skip-permissions',
+  '--allow-dangerously-skip-permissions',
+  '--strict-mcp-config',
+  '--dangerously-allow-browser-network-access',
+  '--restricted',
+  '--disable-slash-commands',
+  '--verbose',
+  '--ide',
+  '--chrome',
+  '--no-chrome',
+  '--bare',
+  '--brief',
+  '--remote-control',
+  '--rc',
+  '--local',
+]);
+/** Short spellings Claude Code saves as given, replayed by their long name. */
+const SHORT_OPTIONS: ReadonlyMap<string, string> = new Map([['-n', '--name']]);
+/**
+ * Saved options a move never replays, so a session saved with one is not moved: replayed on a
+ * resume, each would act again at startup (rewind files, download files, run a command, answer on
+ * resume, which spends a turn) or name a new session id rather than resume this one. Claude Code
+ * also saves `-m` and `--exec`, which it reads before its options and documents nowhere.
+ */
+const NOT_REPLAYED_OPTIONS: ReadonlySet<string> = new Set([
+  '--session-id',
+  '--rewind-files',
+  '--file',
+  '--exec',
+  '-m',
+  '--reply-on-resume',
+]);
+
+/** A saved option list as a move would replay it: every option in a canonical spelling, or why it
+ *  cannot be replayed. */
+export type OptionReplay = { ok: true; options: string[] } | { ok: false; reason: string };
+
+/** A word that names an option, safe to repeat in a reason: never a prompt or a value. */
+const OPTION_NAME = /^--?[A-Za-z][A-Za-z0-9-]*$/;
 
 /** Environment variables that mark a process as running inside a Claude Code session, or carry
  *  cctl's per-launch guard relaxations. A daemon started from a session would otherwise hand them to
@@ -93,31 +198,69 @@ const SESSION_MARKERS: readonly string[] = [
   'CCTL_BIND_ENFORCE',
 ];
 
-/** Keep only the replayable options of a saved list (see {@link REPLAYED_VALUE_OPTIONS}). Accepts
- *  both `--flag value` and `--flag=value`. */
-export function replayableOptions(saved: unknown): string[] {
-  if (!Array.isArray(saved)) return [];
+/**
+ * A saved option list (`respawnFlags`) as a move replays it: ALL of it, read the way Claude Code
+ * saved it (see {@link SAVED_VALUE_OPTIONS}), or not at all. Leaving out what this build cannot place
+ * would resume the session without it, and the options a session is saved with include its
+ * restrictions (a tool deny list, a settings file, a budget). Every value is replayed attached to its
+ * option (`--flag=value`, one per value of a list option), so no word can ever reach the resume as a
+ * prompt; two lists saved with the same options give the same words however each was spelled.
+ */
+export function replayOptions(saved: unknown): OptionReplay {
+  if (saved === undefined) return { ok: true, options: [] };
+  const unreadable: OptionReplay = {
+    ok: false,
+    reason: 'its saved launch options could not be read',
+  };
+  if (!Array.isArray(saved)) return unreadable;
+  const words: unknown[] = saved;
   const out: string[] = [];
-  for (let i = 0; i < saved.length; i++) {
-    const arg: unknown = saved[i];
-    if (typeof arg !== 'string') continue;
-    const eq = arg.indexOf('=');
-    const flag = arg.startsWith('--') && eq > 0 ? arg.slice(0, eq) : arg;
-    if (REPLAYED_SWITCH_OPTIONS.has(flag) && flag === arg) {
-      out.push(arg);
-    } else if (REPLAYED_VALUE_OPTIONS.has(flag)) {
-      if (flag !== arg) {
-        out.push(arg);
-      } else {
-        const value: unknown = saved[i + 1];
-        if (typeof value === 'string' && !value.startsWith('--')) {
-          out.push(arg, value);
-          i++;
-        }
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (typeof word !== 'string') return unreadable;
+    const eq = word.startsWith('--') ? word.indexOf('=') : -1;
+    const spelled = eq > 0 ? word.slice(0, eq) : word;
+    const flag = SHORT_OPTIONS.get(spelled) ?? spelled;
+    if (NOT_REPLAYED_OPTIONS.has(flag)) {
+      return { ok: false, reason: `it was started with ${flag}, which a move does not replay` };
+    }
+    if (eq > 0 && SAVED_VALUE_OPTIONS.has(flag)) {
+      out.push(`${flag}=${word.slice(eq + 1)}`);
+    } else if (eq < 0 && SAVED_SWITCH_OPTIONS.has(flag)) {
+      out.push(flag);
+    } else if (eq < 0 && SAVED_VALUE_OPTIONS.has(flag) && typeof words[i + 1] === 'string') {
+      // Claude Code takes the next word as the value whatever it looks like, and for a list option
+      // every word after it up to the next option.
+      out.push(`${flag}=${words[++i] as string}`);
+      while (SAVED_LIST_OPTIONS.has(flag) && i + 1 < words.length) {
+        const next = words[i + 1];
+        if (typeof next !== 'string' || next.startsWith('-')) break;
+        out.push(`${flag}=${next}`);
+        i++;
       }
+    } else {
+      // An option this build does not know, or a word Claude Code would not have saved here. Only an
+      // option's name is repeated: any other word could be the session's own text.
+      return {
+        ok: false,
+        reason: OPTION_NAME.test(spelled)
+          ? `it was started with ${spelled}, which this cctl cannot carry over`
+          : 'its saved launch options hold a word this cctl cannot place',
+      };
     }
   }
-  return out;
+  return { ok: true, options: out };
+}
+
+/** Whether a job row holds permission rules granted while the session ran. They live in the row,
+ *  not in its options, so no option carries them over, and a deny rule among them is a restriction
+ *  the session would lose. Anything but an absent or empty set counts, read or not. */
+function holdsPermissionRules(rules: unknown): boolean {
+  if (rules === undefined || rules === null) return false;
+  if (typeof rules !== 'object' || Array.isArray(rules)) return true;
+  return Object.values(rules as Record<string, unknown>).some(
+    (list) => !Array.isArray(list) || list.length > 0,
+  );
 }
 
 /** The first line of a command's output, trimmed, for an error message. */
@@ -192,6 +335,7 @@ export function createClaudeBackgroundHost(
   const platform = options.platform ?? process.platform;
   const run = options.run ?? defaultRunClaude(platform, baseEnv);
   const readFile = options.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
+  const readDir = options.readDir ?? ((p: string) => readdirSync(p));
   const isAlive = options.isProcessAlive ?? pidIsAlive;
 
   /** The config dir whose files describe a service: the named one, or the main one. */
@@ -226,18 +370,44 @@ export function createClaudeBackgroundHost(
     return result;
   };
 
-  /** A config dir's job row for a session, or undefined when it holds none (or an unreadable one). */
-  const jobRow = (configDir: string | null, short: string): Record<string, unknown> | undefined => {
+  /** A config dir's job row for a session: none, one that cannot be read right now (caught
+   *  mid-write, or not what Claude Code writes), or the row. */
+  const jobRow = (
+    configDir: string | null,
+    short: string,
+  ): { kind: 'none' } | { kind: 'unreadable' } | { kind: 'row'; row: Record<string, unknown> } => {
+    let text: string;
     try {
-      const parsed: unknown = JSON.parse(
-        readFile(join(home(configDir), 'jobs', short, 'state.json')),
-      );
-      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : undefined;
-    } catch {
-      return undefined;
+      text = readFile(join(home(configDir), 'jobs', short, 'state.json'));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      return code === 'ENOENT' || code === 'ENOTDIR' ? { kind: 'none' } : { kind: 'unreadable' };
     }
+    try {
+      const parsed: unknown = JSON.parse(text);
+      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? { kind: 'row', row: parsed as Record<string, unknown> }
+        : { kind: 'unreadable' };
+    } catch {
+      return { kind: 'unreadable' };
+    }
+  };
+
+  /** Whether an attach journal entry names a terminal that is still running. Claude Code records the
+   *  terminal's process before it writes an entry, and leaves `{}` where it cleared one, so an entry
+   *  naming no process names no terminal. One that cannot be read (caught mid-write) counts as open:
+   *  a stop under someone cannot be taken back. */
+  const attachLive = (path: string): boolean => {
+    let entry: unknown;
+    try {
+      entry = JSON.parse(readFile(path));
+    } catch (err) {
+      // Gone since the listing: that terminal has left.
+      return (err as NodeJS.ErrnoException).code !== 'ENOENT';
+    }
+    const pid =
+      entry !== null && typeof entry === 'object' ? (entry as { pid?: unknown }).pid : undefined;
+    return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && isAlive(pid);
   };
 
   /** The sessions a config dir's service hosts, from its roster (see the header). */
@@ -296,14 +466,41 @@ export function createClaudeBackgroundHost(
       return out;
     },
 
+    attachedNow(configDir) {
+      const dir = join(home(configDir), 'daemon', 'attach-journal');
+      let names: string[];
+      try {
+        names = readDir(dir);
+      } catch (err) {
+        // No journal: no terminal has opened a session of this service.
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return Promise.resolve(false);
+        return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+      // Only `<id>.json` names an entry; Claude Code renames one it is retiring to another suffix.
+      return Promise.resolve(names.some((n) => n.endsWith('.json') && attachLive(join(dir, n))));
+    },
+
     async stop(configDir, short) {
       if (!SHORT_ID.test(short)) throw new Error(`not a background session id: ${short}`);
       await runOk(configDir, ['stop', short]);
     },
 
-    savedOptions(configDir, short) {
-      if (!SHORT_ID.test(short)) return Promise.resolve([]);
-      return Promise.resolve(replayableOptions(jobRow(configDir, short)?.respawnFlags));
+    savedOptions(configDir, short): Promise<SavedLaunch> {
+      if (!SHORT_ID.test(short)) return Promise.resolve({ kind: 'none' });
+      const found = jobRow(configDir, short);
+      if (found.kind !== 'row') return Promise.resolve(found);
+      if (holdsPermissionRules(found.row.sessionPermissionRules)) {
+        return Promise.resolve({
+          kind: 'unreplayable',
+          reason: 'it holds permission rules granted while it ran, which a move cannot carry over',
+        });
+      }
+      const replay = replayOptions(found.row.respawnFlags);
+      return Promise.resolve(
+        replay.ok
+          ? { kind: 'replayable', options: replay.options }
+          : { kind: 'unreplayable', reason: replay.reason },
+      );
     },
 
     async resumeIdle(input) {
@@ -312,20 +509,32 @@ export function createClaudeBackgroundHost(
       }
       const args = ['--bg', '--resume', input.sessionId];
       if (input.options !== undefined) {
-        // A row this config dir already holds for the session keeps its own saved options and
-        // starts a copy when others are passed; dropping it first lets these apply to the same id.
-        if (jobRow(input.configDir, input.short) !== undefined) {
-          await runOk(input.configDir, ['rm', input.short]);
+        // A row this config dir already holds for the session keeps its own saved options and starts
+        // a copy when others are passed. It is never dropped to make way: `claude rm` deletes the
+        // session's worktree and branch along with it.
+        if (jobRow(input.configDir, input.short).kind !== 'none') {
+          throw new Error('that config dir already holds a job row for it');
         }
         args.push(...input.options);
       }
       const result = await runOk(input.configDir, args, input.cwd);
-      const copy = /started a copy as ([0-9a-f]{8})/.exec(`${result.stdout}\n${result.stderr}`);
+      const output = `${result.stdout}\n${result.stderr}`;
+      const copy = COPY_STARTED.exec(output);
       if (copy !== null) {
-        // Claude Code saw the session as still live, or kept other saved options, and forked it
-        // under a new id. The copy is not the session being moved: stop it and fail the move.
-        await runOk(input.configDir, ['stop', copy[1]!]).catch(() => undefined);
-        throw new Error(`claude started a copy (${copy[1]!}) instead of resuming it`);
+        // Claude Code forked the session under a new id instead (it counted the session as still
+        // running or open somewhere, or could not check). The copy is not the session being moved:
+        // stop it and fail, with Claude Code's own reason, which is what tells the cases apart.
+        const short = copy[1]!;
+        await runOk(input.configDir, ['stop', short]).catch(() => undefined);
+        const note = output
+          .split(/\r?\n/)
+          .find((line) => COPY_STARTED.test(line))
+          ?.trim()
+          .replace(/^note:\s*/, '');
+        throw new Error(
+          `claude started a copy (${short}) instead of resuming it` +
+            (note !== undefined && note.length > 0 ? `: ${note}` : ''),
+        );
       }
     },
   };

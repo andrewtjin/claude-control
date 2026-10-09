@@ -12,15 +12,19 @@
 // and the same conversation on the rule's account — measured against the real binary:
 //   - resuming with no prompt leaves it idle ("send a prompt to start"); no turn is spent;
 //   - resuming while it is still live anywhere starts a COPY under a new id, so it is stopped first;
-//   - the target config's own job row would override the options passed, starting a copy, so a
-//     stale row there is dropped first; the source's saved options are passed explicitly, because a
-//     first move does not inherit them.
+//   - a first move does not inherit the source's saved options, so they are passed explicitly, ALL
+//     of them: a session started with restrictions (a tool deny list, a settings file) must not
+//     come back without them. One holding anything a move cannot carry over is not moved at all;
+//   - a target config that already holds a job row for the session (it was moved before) wakes it
+//     with that row's options, and passing others starts a copy. Dropping the row is no way out:
+//     Claude Code's `rm` deletes the session's worktree with it. So a row there is used as it is
+//     when it saved the same options, and the session is not moved when it saved others.
 //
 // This module owns WHEN and WHICH: only sessions the main config's service hosts (the global slot),
-// only between turns, only in a folder whose rule has an included account live in its slot that can
-// take work, at most once an hour per session, and never again after an attempt that failed. HOW is
-// the injected {@link BackgroundSessionHost}, the one seam to Claude Code's own commands, so every
-// decision here is testable without a Claude Code binary.
+// only between turns and while no terminal has one open, only in a folder whose rule has an included
+// account live in its slot that can take work, at most once an hour per session, and never again
+// after an attempt that failed. HOW is the injected {@link BackgroundSessionHost}, the one seam to
+// Claude Code's own commands, so every decision here is testable without a Claude Code binary.
 
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 
@@ -43,6 +47,21 @@ export interface SessionActivity {
 }
 
 /**
+ * What a config dir's job row saved for a session, as a move would carry it over:
+ *   - `none`: the config dir holds no row for it;
+ *   - `unreadable`: it holds one that cannot be read right now;
+ *   - `replayable`: every saved option, in a canonical spelling, so two rows saved with the same
+ *     options compare equal however each was spelled;
+ *   - `unreplayable`: the row holds something a move cannot carry over (`reason` says what, without
+ *     repeating anything the session was told), so moving it would quietly change the session.
+ */
+export type SavedLaunch =
+  | { kind: 'none' }
+  | { kind: 'unreadable' }
+  | { kind: 'replayable'; options: string[] }
+  | { kind: 'unreplayable'; reason: string };
+
+/**
  * The seam to Claude Code's background service. A config dir of `null` is the main config dir —
  * the global slot — exactly as the daemon itself resolves it.
  */
@@ -53,16 +72,19 @@ export interface BackgroundSessionHost {
   /** What each session is doing, by short id, as a config dir's Claude Code reports it. Asks Claude
    *  Code itself, so it is read only when there is a session to move. */
   activity(configDir: string | null): Promise<Map<string, SessionActivity>>;
+  /** Whether a terminal has a background session of a config dir's service open right now. Claude
+   *  Code does not say which one, and reports an open session as idle all the same. */
+  attachedNow(configDir: string | null): Promise<boolean>;
   /** Stop a hosted session. Claude Code's stop is synchronous: it is stopped once this resolves. */
   stop(configDir: string | null, short: string): Promise<void>;
-  /** The launch options a config dir saved for a session, limited to the ones safe to replay (no
-   *  prompt, nothing unrecognized). */
-  savedOptions(configDir: string | null, short: string): Promise<string[]>;
+  /** What a config dir's job row saved for a session (see {@link SavedLaunch}). */
+  savedOptions(configDir: string | null, short: string): Promise<SavedLaunch>;
   /**
    * Resume a session by its full id in a config dir's service, idle (no prompt), from its cwd.
-   * With `options`, a job row that config dir already holds for the session is dropped first, so
-   * the options apply under the same id; without, the session wakes with that row's saved options.
-   * Rejects when Claude Code refuses, or starts a copy instead.
+   * Without `options`, the session wakes with the saved options of the row that config dir holds
+   * for it. With `options`, that config dir must hold no row for it (a row there would keep its own
+   * options and start a copy); the call rejects rather than drop one, since dropping a row drops the
+   * session's worktree with it. Rejects when Claude Code refuses, or starts a copy instead.
    */
   resumeIdle(input: {
     configDir: string | null;
@@ -101,13 +123,17 @@ export interface BackgroundMoverOptions {
   /** One operator notice: the log line is written here; this reaches the phone. */
   notify: (notice: { title: string; body: string; level: 'info' | 'warn' }) => void;
   logger?: Logger;
+  /** A monotonic clock in ms (default `performance.now`). Everything it measures is a duration (the
+   *  interval between moves, the confirm window), and wall time steps on some boxes: stepped back,
+   *  it would hold the poll cycle in a confirm loop for as long as the step. */
   clock?: () => number;
   /** The least time between two moves of one session. A session woken back onto the global slot by
    *  hand is moved again only after this, so cctl and the operator can never bounce it every cycle. */
   minIntervalMs?: number;
   /** How long a resume may take to show up in the target service's roster. */
   confirmTimeoutMs?: number;
-  /** Pause between roster reads while confirming. Injectable so tests need not wait. */
+  /** Pause between roster reads while confirming, and between tries of a way back. Injectable so
+   *  tests need not wait. */
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -117,10 +143,36 @@ export const DEFAULT_MOVE_INTERVAL_MS = 60 * 60_000;
  *  within a second or two on a loaded box. */
 const DEFAULT_CONFIRM_TIMEOUT_MS = 15_000;
 const CONFIRM_POLL_MS = 500;
+/** How many times a failed move tries to resume the session back on the global slot, and the pause
+ *  between tries. Right after a stop, Claude Code can still count the session as open or running
+ *  and start a copy instead; that clears within moments, so one immediate try is not enough. A few
+ *  are: every refused try leaves a stopped copy behind in the list. */
+const PUT_BACK_TRIES = 3;
+const PUT_BACK_PAUSE_MS = 2_000;
 
 /** A thrown value as one line. */
 function reasonOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Whether two canonical option lists hold the same options, in any order. */
+function sameOptions(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const left = [...a].sort();
+  const right = [...b].sort();
+  return left.every((x, i) => x === right[i]);
+}
+
+/** Why a move of one session is not made, and whether that can change on a later cycle. */
+class NotMoved extends Error {
+  constructor(
+    message: string,
+    /** True when nothing about the session will change it (its saved options), so it is given up;
+     *  false when a later cycle may find it movable (a row caught mid-write). */
+    readonly final: boolean,
+  ) {
+    super(message);
+  }
 }
 
 /** How a session is named to the operator: its name and short id, or the short id alone. */
@@ -151,7 +203,7 @@ export class BackgroundMover {
     this.resolveRule = options.resolveRule;
     this.notify = options.notify;
     this.logger = options.logger ?? noopLogger;
-    this.clock = options.clock ?? Date.now;
+    this.clock = options.clock ?? (() => performance.now());
     this.minIntervalMs = options.minIntervalMs ?? DEFAULT_MOVE_INTERVAL_MS;
     this.confirmTimeoutMs = options.confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS;
     this.sleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -191,8 +243,9 @@ export class BackgroundMover {
     return outcomes;
   }
 
-  /** Move one session: re-check it is idle, stop it, resume it under the target, confirm it is
-   *  hosted there; on any failure put it back where it was and give up on it. */
+  /** Move one session: re-check it is idle and that no terminal has one open, decide what it
+   *  resumes with, stop it, resume it under the target, confirm it is hosted there; on any failure
+   *  put it back where it was and give up on it. */
   private async move(session: BackgroundSession, target: MoveTarget): Promise<MoveOutcome> {
     const base = { sessionId: session.sessionId, ruleId: target.ruleId };
     // Read right before stopping, per session: a stop mid-turn would cut the turn off, and a turn can
@@ -215,11 +268,31 @@ export class BackgroundMover {
     if (activity === undefined || !activity.idle) {
       return { ...base, result: 'skipped', reason: 'not idle between turns' };
     }
+    // Idle is all Claude Code reports for a session someone has open in a terminal too, reading it
+    // or typing the next prompt; stopping it would close that terminal under them. Which session a
+    // terminal has open is not said, so any open one holds every move back. Not knowing counts as
+    // open: a stop is the one step here that cannot be taken back.
+    const attached = await this.host.attachedNow(null).catch(() => true);
+    if (attached) {
+      return { ...base, result: 'skipped', reason: 'a terminal has a background session open' };
+    }
     const name = activity.name;
+
+    // What it resumes with under the profile, decided before anything is touched.
+    let options: string[] | undefined;
+    try {
+      options = await this.resumeOptions(session, target);
+    } catch (err) {
+      // Nothing touched: the session still runs where it was. Given up on only when nothing about it
+      // will change; anything else is tried again next cycle.
+      if (err instanceof NotMoved && err.final) {
+        return this.giveUp(session, name, target, err.message, true);
+      }
+      return { ...base, result: 'skipped', reason: reasonOf(err) };
+    }
     // Recorded before anything is touched, so even a move that dies half way is not retried before
     // the interval is up.
     this.lastAttemptAt.set(session.sessionId, this.clock());
-    const options = await this.host.savedOptions(null, session.short).catch(() => []);
 
     try {
       await this.host.stop(null, session.short);
@@ -233,30 +306,13 @@ export class BackgroundMover {
         sessionId: session.sessionId,
         short: session.short,
         cwd: session.cwd,
-        options,
+        ...(options !== undefined ? { options } : {}),
       });
       if (!(await this.confirmHosted(target.configDir, session.short))) {
         throw new Error(`it did not appear under ${target.folder}'s slot`);
       }
     } catch (err) {
-      // Put it back: the main config kept its job row with its saved options, so a plain resume
-      // there wakes it exactly as it was.
-      let restored = false;
-      try {
-        await this.host.resumeIdle({
-          configDir: null,
-          sessionId: session.sessionId,
-          short: session.short,
-          cwd: session.cwd,
-        });
-        restored = await this.confirmHosted(null, session.short);
-      } catch (restoreErr) {
-        this.logger.warn(
-          { sessionId: session.sessionId, reason: reasonOf(restoreErr) },
-          'could not resume a background session back on the global slot',
-        );
-      }
-      return this.giveUp(session, name, target, reasonOf(err), restored);
+      return this.giveUp(session, name, target, reasonOf(err), await this.putBack(session));
     }
 
     const body =
@@ -264,11 +320,68 @@ export class BackgroundMover {
       `${target.accountLabel}, the folder's own account. Same session, same conversation; it is ` +
       'idle until its next prompt.';
     this.logger.info(
-      { sessionId: session.sessionId, ruleId: target.ruleId, options: options.length },
+      { sessionId: session.sessionId, ruleId: target.ruleId, options: options?.length ?? 'kept' },
       body,
     );
     this.notify({ title: 'Background session moved', body, level: 'info' });
     return { ...base, result: 'moved' };
+  }
+
+  /**
+   * The options a session resumes with under the target: the source's saved options when the
+   * target holds no row for it, or none (`undefined`, the target row's own) when the target's row
+   * saved the same ones. Throws {@link NotMoved} when it cannot move without changing the session.
+   */
+  private async resumeOptions(
+    session: BackgroundSession,
+    target: MoveTarget,
+  ): Promise<string[] | undefined> {
+    const source = await this.host.savedOptions(null, session.short);
+    // The way back after a failed move is a plain resume on the global slot, which needs its row.
+    if (source.kind === 'none' || source.kind === 'unreadable') {
+      throw new NotMoved('its job row on the global slot could not be read', false);
+    }
+    if (source.kind === 'unreplayable') throw new NotMoved(source.reason, true);
+    const there = await this.host.savedOptions(target.configDir, session.short);
+    switch (there.kind) {
+      case 'none':
+        return source.options;
+      case 'unreadable':
+        throw new NotMoved(`its job row on ${target.folder}'s slot could not be read`, false);
+      case 'replayable':
+        if (sameOptions(there.options, source.options)) return undefined;
+        throw new NotMoved(
+          `${target.folder}'s slot still holds it from an earlier move, saved with other options`,
+          true,
+        );
+      case 'unreplayable':
+        throw new NotMoved(`${target.folder}'s slot still holds it: ${there.reason}`, true);
+    }
+  }
+
+  /** Put a session whose move failed back on the global slot: the main config kept its job row with
+   *  its saved options, so a plain resume there wakes it exactly as it was. Tried a few times (see
+   *  {@link PUT_BACK_TRIES}); true once it is hosted there again. */
+  private async putBack(session: BackgroundSession): Promise<boolean> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.host.resumeIdle({
+          configDir: null,
+          sessionId: session.sessionId,
+          short: session.short,
+          cwd: session.cwd,
+        });
+        // Accepted: trying again would only start copies of a session that is already coming up.
+        return await this.confirmHosted(null, session.short);
+      } catch (err) {
+        this.logger.warn(
+          { sessionId: session.sessionId, attempt, reason: reasonOf(err) },
+          'could not resume a background session back on the global slot',
+        );
+        if (attempt >= PUT_BACK_TRIES) return false;
+        await this.sleep(PUT_BACK_PAUSE_MS);
+      }
+    }
   }
 
   /** Whether a config dir's service hosts the session, polling until the confirm window closes. */

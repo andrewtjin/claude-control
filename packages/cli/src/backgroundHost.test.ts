@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   createClaudeBackgroundHost,
-  replayableOptions,
+  replayOptions,
   type ClaudeRunResult,
   type RunClaude,
 } from './backgroundHost.js';
@@ -46,12 +46,14 @@ interface Recorded {
   cwd: string | undefined;
 }
 
-/** A host over in-memory files and a scripted runner. */
+/** A host over in-memory files and a scripted runner. A directory exists when a file sits in it;
+ *  `failDir` makes reading one fail the way an unreadable directory does. */
 function hostWith(opts: {
   files?: Record<string, string>;
   answer?: (args: string[]) => ClaudeRunResult;
   env?: NodeJS.ProcessEnv;
   alive?: (pid: number) => boolean;
+  failDir?: string;
 }): { host: ReturnType<typeof createClaudeBackgroundHost>; runs: Recorded[] } {
   const runs: Recorded[] = [];
   const files = opts.files ?? {};
@@ -69,44 +71,140 @@ function hostWith(opts: {
       if (text === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
       return text;
     },
+    readDir: (p) => {
+      const dir = p.replace(/\\/g, '/');
+      if (dir === opts.failDir) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      const names = Object.keys(files)
+        .filter((f) => f.startsWith(`${dir}/`))
+        .map((f) => f.slice(dir.length + 1))
+        .filter((n) => !n.includes('/'));
+      if (names.length === 0) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      return names;
+    },
     isProcessAlive: opts.alive ?? (() => true),
   });
   return { host, runs };
 }
 
-describe('replayableOptions', () => {
-  it('keeps model, permission mode, added dirs and the skip-permissions switch, in both spellings', () => {
+describe('replayOptions', () => {
+  const ok = (options: string[]) => ({ ok: true, options });
+
+  it('replays everything Claude Code saves, each value attached to its option', () => {
+    // The shape a session started with
+    //   --bg --effort low --disallowedTools Bash WebFetch --permission-mode acceptEdits
+    //   --model claude-haiku-4-5 --add-dir <a> <b>
+    // is saved in (measured), restrictions included.
     expect(
-      replayableOptions([
-        '--model',
-        'opus',
-        '--permission-mode=auto',
+      replayOptions([
+        '--effort',
+        'low',
+        '--disallowedTools',
+        'Bash',
+        'WebFetch',
+        '--permission-mode',
+        'acceptEdits',
         '--add-dir',
         'C:/a',
+        'C:/b',
+        '--model',
+        'claude-haiku-4-5',
         '--dangerously-skip-permissions',
+        '--settings',
+        'C:/s.json',
+        '--max-budget-usd',
+        '2',
+        '--restricted',
       ]),
-    ).toEqual([
-      '--model',
-      'opus',
-      '--permission-mode=auto',
-      '--add-dir',
-      'C:/a',
-      '--dangerously-skip-permissions',
-    ]);
+    ).toEqual(
+      ok([
+        '--effort=low',
+        '--disallowedTools=Bash',
+        '--disallowedTools=WebFetch',
+        '--permission-mode=acceptEdits',
+        '--add-dir=C:/a',
+        '--add-dir=C:/b',
+        '--model=claude-haiku-4-5',
+        '--dangerously-skip-permissions',
+        '--settings=C:/s.json',
+        '--max-budget-usd=2',
+        '--restricted',
+      ]),
+    );
   });
 
-  it('drops the first prompt a job row can hold, and anything it does not know', () => {
-    // Measured: a session started with a prompt saved it in respawnFlags. Replayed, it would start
-    // a turn under the new account.
-    expect(replayableOptions(['E1 initial prompt'])).toEqual([]);
-    expect(replayableOptions(['--verbose', '--settings', 'x.json', 'hello'])).toEqual([]);
-    expect(replayableOptions(['--model'])).toEqual([]);
-    expect(replayableOptions(['--model', '--permission-mode', 'auto'])).toEqual([
-      '--permission-mode',
-      'auto',
+  it('never drops a restriction while keeping the bypass switch', () => {
+    const replay = replayOptions([
+      '--dangerously-skip-permissions',
+      '--disallowedTools',
+      'Bash',
+      'WebFetch',
     ]);
-    expect(replayableOptions('not a list')).toEqual([]);
-    expect(replayableOptions([1, null, '--model', 'opus'])).toEqual(['--model', 'opus']);
+    expect(replay).toEqual(
+      ok([
+        '--dangerously-skip-permissions',
+        '--disallowedTools=Bash',
+        '--disallowedTools=WebFetch',
+      ]),
+    );
+  });
+
+  it('spells one option the same however it was saved, so two rows compare equal', () => {
+    expect(replayOptions(['--model=opus', '--add-dir=C:/a'])).toEqual(
+      replayOptions(['--model', 'opus', '--add-dir', 'C:/a']),
+    );
+    expect(replayOptions(['-n', 'pods'])).toEqual(ok(['--name=pods']));
+  });
+
+  it('every word after a list option is one of its values, so none can reach the resume as a prompt', () => {
+    // Measured: `--add-dir <a> "trailing words"` saves the trailing words as a directory, which is
+    // also how Claude Code read them at launch. Attached to the option, they stay one.
+    expect(replayOptions(['--add-dir', 'C:/a', 'trailing words', '--model', 'opus'])).toEqual(
+      ok(['--add-dir=C:/a', '--add-dir=trailing words', '--model=opus']),
+    );
+    // A single-value option takes the next word whatever it looks like, as Claude Code does.
+    expect(replayOptions(['--append-system-prompt', '-be terse'])).toEqual(
+      ok(['--append-system-prompt=-be terse']),
+    );
+  });
+
+  it('an empty or absent list replays nothing', () => {
+    expect(replayOptions([])).toEqual(ok([]));
+    expect(replayOptions(undefined)).toEqual(ok([]));
+  });
+
+  it('refuses, rather than drops, anything it cannot place', () => {
+    expect(replayOptions(['--model', 'opus', '--brand-new-flag', 'x'])).toEqual({
+      ok: false,
+      reason: 'it was started with --brand-new-flag, which this cctl cannot carry over',
+    });
+    // A stray word is never repeated: it could be the session's own text.
+    expect(replayOptions(['E1 initial prompt'])).toEqual({
+      ok: false,
+      reason: 'its saved launch options hold a word this cctl cannot place',
+    });
+    expect(replayOptions(['--model'])).toMatchObject({ ok: false });
+    expect(replayOptions(['--verbose=1'])).toMatchObject({ ok: false });
+    expect(replayOptions('not a list')).toEqual({
+      ok: false,
+      reason: 'its saved launch options could not be read',
+    });
+    expect(replayOptions([1, '--model', 'opus'])).toMatchObject({ ok: false });
+  });
+
+  it('refuses the options that would act again at startup, or name another session', () => {
+    for (const saved of [
+      ['--file', 'f:a.txt'],
+      ['--rewind-files', 'abc'],
+      ['--session-id', '1ee43a2b-076b-42a1-b487-70a8b77401fa'],
+      ['--exec', 'x'],
+      ['-m', 'x'],
+      ['--reply-on-resume'],
+    ]) {
+      expect(replayOptions(saved)).toEqual({
+        ok: false,
+        reason: `it was started with ${saved[0]!}, which a move does not replay`,
+      });
+    }
   });
 });
 
@@ -255,24 +353,108 @@ describe('createClaudeBackgroundHost', () => {
       await expect(ok.host.stop(null, '../x')).rejects.toThrow(/not a background session id/);
     });
 
-    it("replays only the safe options of the config dir's job row", async () => {
+    it("reads a config dir's job row: none, unreadable, replayable or not", async () => {
+      const row = (o: Record<string, unknown>): string => JSON.stringify(o);
       const { host } = hostWith({
         files: {
-          [`${MAIN}/jobs/${SHORT}/state.json`]: JSON.stringify({
-            respawnFlags: ['--permission-mode', 'auto', 'S initial prompt'],
+          [`${MAIN}/jobs/${SHORT}/state.json`]: row({
+            respawnFlags: ['--permission-mode', 'auto'],
             providerEnv: { CLAUDE_CONFIG_DIR: MAIN },
+          }),
+          [`${PROFILE}/jobs/${SHORT}/state.json`]: '{"respawnFlags": [',
+          [`${PROFILE}/jobs/aaaaaaaa/state.json`]: row({ respawnFlags: ['--brand-new-flag'] }),
+        },
+      });
+      expect(await host.savedOptions(null, SHORT)).toEqual({
+        kind: 'replayable',
+        options: ['--permission-mode=auto'],
+      });
+      expect(await host.savedOptions(null, 'bbbbbbbb')).toEqual({ kind: 'none' });
+      expect(await host.savedOptions(PROFILE, SHORT)).toEqual({ kind: 'unreadable' });
+      expect(await host.savedOptions(PROFILE, 'aaaaaaaa')).toMatchObject({ kind: 'unreplayable' });
+      expect(await host.savedOptions(null, '../x')).toEqual({ kind: 'none' });
+    });
+
+    it('a row holding permission rules granted while it ran cannot be carried over', async () => {
+      const reason =
+        'it holds permission rules granted while it ran, which a move cannot carry over';
+      for (const rules of [
+        { allow: [], deny: ['Bash(rm:*)'] },
+        { allow: ['Bash(npm test:*)'], deny: [] },
+        { allow: [], deny: [], addDirs: ['C:/x'] },
+        'garbled',
+      ]) {
+        const { host } = hostWith({
+          files: {
+            [`${MAIN}/jobs/${SHORT}/state.json`]: JSON.stringify({
+              respawnFlags: [],
+              sessionPermissionRules: rules,
+            }),
+          },
+        });
+        expect(await host.savedOptions(null, SHORT)).toEqual({ kind: 'unreplayable', reason });
+      }
+      const empty = hostWith({
+        files: {
+          [`${MAIN}/jobs/${SHORT}/state.json`]: JSON.stringify({
+            respawnFlags: [],
+            sessionPermissionRules: { allow: [], deny: [] },
           }),
         },
       });
-      expect(await host.savedOptions(null, SHORT)).toEqual(['--permission-mode', 'auto']);
-      expect(await host.savedOptions(PROFILE, SHORT)).toEqual([]);
+      expect(await empty.host.savedOptions(null, SHORT)).toEqual({
+        kind: 'replayable',
+        options: [],
+      });
+    });
+  });
+
+  describe('attachedNow', () => {
+    const JOURNAL = `${MAIN}/daemon/attach-journal`;
+    const entry = (pid: unknown): string =>
+      JSON.stringify({ gestureId: 'g', surface: 'bg_cli', startedAtEpochMs: 1, attempt: 1, pid });
+
+    it('is true while a terminal named in the journal is still running', async () => {
+      const { host, runs } = hostWith({
+        files: { [`${JOURNAL}/g1.json`]: entry(500), [`${JOURNAL}/g2.json`]: entry(501) },
+        alive: (pid) => pid === 501,
+      });
+      expect(await host.attachedNow(null)).toBe(true);
+      expect(runs).toEqual([]);
+    });
+
+    it('is false with no journal, or only entries of terminals that have exited or were cleared', async () => {
+      expect(await hostWith({}).host.attachedNow(null)).toBe(false);
+      const { host } = hostWith({
+        files: {
+          [`${JOURNAL}/g1.json`]: entry(500),
+          [`${JOURNAL}/g2.json`]: '{}',
+          [`${JOURNAL}/g3.json.123.cleared`]: 'whatever',
+        },
+        alive: () => false,
+      });
+      expect(await host.attachedNow(null)).toBe(false);
+    });
+
+    it("reads a profile's own journal for a profile config dir", async () => {
+      const { host } = hostWith({
+        files: { [`${PROFILE}/daemon/attach-journal/g.json`]: entry(7) },
+      });
+      expect(await host.attachedNow(null)).toBe(false);
+      expect(await host.attachedNow(PROFILE)).toBe(true);
+    });
+
+    it('an entry caught mid-write counts as open; a journal that cannot be listed fails', async () => {
+      const torn = hostWith({ files: { [`${JOURNAL}/g.json`]: '{"pid": 5' }, alive: () => false });
+      expect(await torn.host.attachedNow(null)).toBe(true);
+      const locked = hostWith({ failDir: JOURNAL });
+      await expect(locked.host.attachedNow(null)).rejects.toThrow('EACCES');
     });
   });
 
   describe('resumeIdle', () => {
-    it('drops a stale row in the target first, then resumes by full id from the cwd, with no prompt', async () => {
+    it('resumes by full id from the cwd, with the options passed and no prompt', async () => {
       const { host, runs } = hostWith({
-        files: { [`${PROFILE}/jobs/${SHORT}/state.json`]: '{"state":"stopped"}' },
         answer: (args) => ({
           code: 0,
           stderr: '',
@@ -285,15 +467,50 @@ describe('createClaudeBackgroundHost', () => {
         sessionId: SID,
         short: SHORT,
         cwd: 'C:/research',
-        options: ['--model', 'opus'],
+        options: ['--model=opus'],
       });
       expect(runs.map((r) => [r.args, r.cwd, r.env.CLAUDE_CONFIG_DIR])).toEqual([
-        [['rm', SHORT], undefined, PROFILE],
-        [['--bg', '--resume', SID, '--model', 'opus'], 'C:/research', PROFILE],
+        [['--bg', '--resume', SID, '--model=opus'], 'C:/research', PROFILE],
       ]);
     });
 
-    it('does not drop anything when the target has no row, or when no options are passed', async () => {
+    it('never drops a row the target holds: with options it refuses, without it wakes with that row', async () => {
+      // Claude Code's rm deletes the session's worktree and branch along with the row.
+      const files = { [`${PROFILE}/jobs/${SHORT}/state.json`]: '{"state":"stopped"}' };
+      const withOptions = hostWith({ files });
+      await expect(
+        withOptions.host.resumeIdle({
+          configDir: PROFILE,
+          sessionId: SID,
+          short: SHORT,
+          cwd: 'C:/r',
+          options: ['--model=opus'],
+        }),
+      ).rejects.toThrow('that config dir already holds a job row for it');
+      expect(withOptions.runs).toEqual([]);
+      // Even a row that cannot be read is never dropped.
+      const torn = hostWith({ files: { [`${PROFILE}/jobs/${SHORT}/state.json`]: '{' } });
+      await expect(
+        torn.host.resumeIdle({
+          configDir: PROFILE,
+          sessionId: SID,
+          short: SHORT,
+          cwd: 'C:/r',
+          options: [],
+        }),
+      ).rejects.toThrow(/already holds a job row/);
+      const plain = hostWith({ files });
+      await plain.host.resumeIdle({
+        configDir: PROFILE,
+        sessionId: SID,
+        short: SHORT,
+        cwd: 'C:/r',
+      });
+      expect(plain.runs.map((r) => r.args)).toEqual([['--bg', '--resume', SID]]);
+      expect(plain.runs.some((r) => r.args[0] === 'rm')).toBe(false);
+    });
+
+    it('passes no options when none are given, and an empty list when the target has no row', async () => {
       const noRow = hostWith({});
       await noRow.host.resumeIdle({
         configDir: PROFILE,
@@ -324,11 +541,41 @@ describe('createClaudeBackgroundHost', () => {
       });
       await expect(
         host.resumeIdle({ configDir: PROFILE, sessionId: SID, short: SHORT, cwd: 'C:/r' }),
-      ).rejects.toThrow('claude started a copy (5ad47a09) instead of resuming it');
+      ).rejects.toThrow(
+        'claude started a copy (5ad47a09) instead of resuming it: session 1ee43a2b is already ' +
+          'running in the background, so this started a copy as 5ad47a09.',
+      );
       expect(runs.map((r) => r.args)).toEqual([
         ['--bg', '--resume', SID],
         ['stop', '5ad47a09'],
       ]);
+    });
+
+    it("keeps Claude Code's reason for every kind of copy, which is what tells them apart", async () => {
+      for (const note of [
+        'note: session 1ee43a2b is open in another Claude Code process, so this started a copy ' +
+          'as 5ad47a09. The original conversation is unchanged.',
+        'note: could not check whether session 1ee43a2b is running, so this started a copy as ' +
+          '5ad47a09.',
+        'note: a restricted shell does not wake background session 1ee43a2b in place, so this ' +
+          'started a restricted copy as 5ad47a09.',
+      ]) {
+        const { host } = hostWith({
+          answer: (args) =>
+            args[0] === '--bg'
+              ? { code: 0, stdout: 'backgrounded · 5ad47a09', stderr: note }
+              : { code: 0, stdout: '', stderr: '' },
+        });
+        const failure = await host
+          .resumeIdle({ configDir: PROFILE, sessionId: SID, short: SHORT, cwd: 'C:/r' })
+          .then(
+            () => undefined,
+            (err: unknown) => (err as Error).message,
+          );
+        expect(failure).toBe(
+          `claude started a copy (5ad47a09) instead of resuming it: ${note.replace(/^note: /, '')}`,
+        );
+      }
     });
 
     it("fails on Claude Code's refusal, and refuses an id that is not a full session id", async () => {
@@ -411,7 +658,7 @@ process.stdout.write('backgrounded · 1ee43a2b (idle — send a prompt to start)
       sessionId: SID,
       short: SHORT,
       cwd: work,
-      options: ['--model', 'a b "c"'],
+      options: ['--model=a b "c"', '--add-dir=C:/x y'],
     });
     const seen = JSON.parse(await readFile(record, 'utf8')) as {
       argv: string[];
@@ -420,7 +667,7 @@ process.stdout.write('backgrounded · 1ee43a2b (idle — send a prompt to start)
       claudecode: string | null;
       stdinClosed: boolean;
     };
-    expect(seen.argv).toEqual(['--bg', '--resume', SID, '--model', 'a b "c"']);
+    expect(seen.argv).toEqual(['--bg', '--resume', SID, '--model=a b "c"', '--add-dir=C:/x y']);
     expect(realpathSync.native(seen.cwd)).toBe(realpathSync.native(work));
     expect(seen.configDir).toBe(PROFILE);
     expect(seen.claudecode).toBeNull();

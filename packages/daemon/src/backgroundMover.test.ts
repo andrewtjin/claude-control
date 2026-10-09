@@ -1,15 +1,18 @@
 // The background mover's decisions, against a fake Claude Code service: which sessions move (idle,
-// on the global slot, in a folder with a target), how (stop, resume by full id under the folder's
-// profile with the saved options, confirm), how often (once per interval per session), and what a
-// failure leaves behind (put back where it was, never tried again, one notice). The real commands
-// sit behind the host seam; cli/backgroundHost.test.ts covers them.
+// on the global slot, with no terminal open, in a folder with a target), how (stop, resume by full
+// id under the folder's profile with every saved option, or with the profile's own row when it
+// saved the same ones, confirm), how often (once per interval per session), what it refuses to move
+// (options it cannot carry over, a profile row saved with other options), and what a failure leaves
+// behind (put back where it was, tried a few times, never tried again, one notice). The real
+// commands sit behind the host seam; cli/backgroundHost.test.ts covers them.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   BackgroundMover,
   type BackgroundSession,
   type BackgroundSessionHost,
   type MoveTarget,
+  type SavedLaunch,
   type SessionActivity,
 } from './backgroundMover.js';
 
@@ -18,21 +21,33 @@ const PROFILE = 'C:/vault/profiles/rule-1';
 const SID = '1ee43a2b-076b-42a1-b487-70a8b77401fa';
 const SID2 = 'f38038c6-523b-4be5-9dff-160c472faeb0';
 
-/** A fake Claude Code: which config dir hosts which session, what each is doing, and a log of every
- *  command. Commands behave like the real ones by default (a stop removes the session from its
- *  host, a resume adds it), and each can be made to fail. */
+/** A fake Claude Code: which config dir hosts which session, what each is doing, what each config
+ *  dir's job row saved, and a log of every command. Commands behave like the real ones by default (a
+ *  stop removes the session from its host, a resume adds it and writes the target's row the way
+ *  Claude Code does, a resume with options over an existing row is refused), and each can be made to
+ *  fail. */
 class FakeHost implements BackgroundSessionHost {
   readonly calls: string[] = [];
   readonly hosted = new Map<string | null, BackgroundSession[]>();
   readonly states = new Map<string, SessionActivity>();
-  savedFlags: string[] = ['--permission-mode', 'auto'];
+  /** Each config dir's job row for the session; a dir with none holds no row. */
+  readonly saved = new Map<string | null, SavedLaunch>([
+    [MAIN, { kind: 'replayable', options: ['--permission-mode=auto'] }],
+  ]);
+  attached = false;
+  failAttached = false;
   failListing = false;
   failActivity = false;
   failStop = false;
   /** Config dirs whose resume fails. */
   readonly failResumeIn = new Set<string | null>();
+  /** Config dirs whose next N resumes start a copy instead (then they work). */
+  readonly copyResumesIn = new Map<string | null, number>();
   /** Config dirs whose resume "succeeds" but never shows the session hosted. */
   readonly silentResumeIn = new Set<string | null>();
+  /** Config dirs whose resumed session shows up only on the Nth roster read after the resume. */
+  readonly showOnReadIn = new Map<string | null, number>();
+  private readonly pendingReads = new Map<string | null, number>();
 
   add(configDir: string | null, s: BackgroundSession, activity: SessionActivity): void {
     this.hosted.set(configDir, [...(this.hosted.get(configDir) ?? []), s]);
@@ -42,6 +57,12 @@ class FakeHost implements BackgroundSessionHost {
   listHosted(configDir: string | null): Promise<BackgroundSession[]> {
     this.calls.push(`list ${String(configDir)}`);
     if (this.failListing) return Promise.reject(new Error('no claude'));
+    const pending = this.pendingReads.get(configDir);
+    if (pending !== undefined && pending > 1) {
+      this.pendingReads.set(configDir, pending - 1);
+      return Promise.resolve([]);
+    }
+    this.pendingReads.delete(configDir);
     return Promise.resolve([...(this.hosted.get(configDir) ?? [])]);
   }
 
@@ -49,6 +70,12 @@ class FakeHost implements BackgroundSessionHost {
     this.calls.push(`activity ${String(configDir)}`);
     if (this.failActivity) return Promise.reject(new Error('agents failed'));
     return Promise.resolve(new Map(this.states));
+  }
+
+  attachedNow(configDir: string | null): Promise<boolean> {
+    this.calls.push(`attached ${String(configDir)}`);
+    if (this.failAttached) return Promise.reject(new Error('journal unreadable'));
+    return Promise.resolve(this.attached);
   }
 
   stop(configDir: string | null, short: string): Promise<void> {
@@ -61,9 +88,9 @@ class FakeHost implements BackgroundSessionHost {
     return Promise.resolve();
   }
 
-  savedOptions(configDir: string | null, short: string): Promise<string[]> {
+  savedOptions(configDir: string | null, short: string): Promise<SavedLaunch> {
     this.calls.push(`options ${String(configDir)} ${short}`);
-    return Promise.resolve([...this.savedFlags]);
+    return Promise.resolve(this.saved.get(configDir) ?? { kind: 'none' });
   }
 
   resumeIdle(input: {
@@ -77,12 +104,26 @@ class FakeHost implements BackgroundSessionHost {
       `resume ${String(input.configDir)} ${input.sessionId} ${input.cwd}` +
         (input.options === undefined ? '' : ` [${input.options.join(' ')}]`),
     );
+    if (input.options !== undefined && this.saved.has(input.configDir)) {
+      return Promise.reject(new Error('that config dir already holds a job row for it'));
+    }
     if (this.failResumeIn.has(input.configDir)) return Promise.reject(new Error('untrusted'));
+    const copiesLeft = this.copyResumesIn.get(input.configDir) ?? 0;
+    if (copiesLeft > 0) {
+      this.copyResumesIn.set(input.configDir, copiesLeft - 1);
+      return Promise.reject(new Error('claude started a copy (5ad47a09) instead of resuming it'));
+    }
+    // Claude Code saves the options a first resume was given as that config dir's row.
+    if (input.options !== undefined) {
+      this.saved.set(input.configDir, { kind: 'replayable', options: [...input.options] });
+    }
     if (!this.silentResumeIn.has(input.configDir)) {
       this.hosted.set(input.configDir, [
         ...(this.hosted.get(input.configDir) ?? []),
         { short: input.short, sessionId: input.sessionId, cwd: input.cwd },
       ]);
+      const reads = this.showOnReadIn.get(input.configDir);
+      if (reads !== undefined) this.pendingReads.set(input.configDir, reads);
     }
     return Promise.resolve();
   }
@@ -107,15 +148,18 @@ interface Harness {
   notices: Array<{ title: string; body: string; level: string }>;
   /** Every warn line the mover logged. */
   warns: string[];
+  /** Every pause the mover asked for. */
+  sleeps: number[];
   now: { ms: number };
 }
 
 /** A mover whose rule resolution maps C:/research (and below) to rule-1, C:/other to rule-2, and
- *  everything else to no rule. */
-function harness(opts: { minIntervalMs?: number } = {}): Harness {
+ *  everything else to no rule. Its clock is `now`, which only its pauses move forward. */
+function harness(opts: { minIntervalMs?: number; confirmTimeoutMs?: number } = {}): Harness {
   const host = new FakeHost();
   const notices: Harness['notices'] = [];
   const warns: string[] = [];
+  const sleeps: number[] = [];
   const now = { ms: 1_000_000 };
   const noop = (): void => {};
   const mover = new BackgroundMover({
@@ -128,10 +172,14 @@ function harness(opts: { minIntervalMs?: number } = {}): Harness {
     logger: { debug: noop, info: noop, error: noop, warn: (_obj, msg) => warns.push(String(msg)) },
     clock: () => now.ms,
     ...(opts.minIntervalMs !== undefined ? { minIntervalMs: opts.minIntervalMs } : {}),
-    confirmTimeoutMs: 0,
-    sleep: () => Promise.resolve(),
+    confirmTimeoutMs: opts.confirmTimeoutMs ?? 0,
+    sleep: (ms) => {
+      sleeps.push(ms);
+      now.ms += ms;
+      return Promise.resolve();
+    },
   });
-  return { host, mover, notices, warns, now };
+  return { host, mover, notices, warns, sleeps, now };
 }
 
 const targets = (...t: MoveTarget[]): Map<string, MoveTarget> =>
@@ -153,10 +201,12 @@ describe('BackgroundMover', () => {
     expect(h.host.calls).toEqual([
       'list null',
       'activity null',
+      'attached null',
       'options null 1ee43a2b',
+      `options ${PROFILE} 1ee43a2b`,
       'stop null 1ee43a2b',
       // Same full id, same cwd, the source's saved options, under the rule's profile.
-      `resume ${PROFILE} ${SID} C:/research/sub [--permission-mode auto]`,
+      `resume ${PROFILE} ${SID} C:/research/sub [--permission-mode=auto]`,
       `list ${PROFILE}`,
     ]);
     expect(h.host.hosted.get(PROFILE)?.map((s) => s.sessionId)).toEqual([SID]);
@@ -213,7 +263,11 @@ describe('BackgroundMover', () => {
     h.now.ms += 59_000;
     expect(await h.mover.run(targets(TARGET))).toEqual([]);
     h.now.ms += 2_000;
+    h.host.calls.length = 0;
     expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('moved');
+    // The profile kept the row the first move gave it, saved with the same options: the session
+    // wakes with that row, so nothing is passed (and nothing there is dropped).
+    expect(h.host.calls).toContain(`resume ${PROFILE} ${SID} C:/research`);
   });
 
   it('a resume the target refuses puts the session back, gives up on it, and says so once', async () => {
@@ -293,5 +347,199 @@ describe('BackgroundMover', () => {
     h.host.states.clear();
     expect((await h.mover.run(targets(TARGET)))[0]).toMatchObject({ result: 'skipped' });
     expect(h.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
+  });
+
+  describe('what it carries over, or refuses to', () => {
+    it('passes every saved option on a first move, restrictions included', async () => {
+      const h = harness();
+      const saved = [
+        '--effort=low',
+        '--disallowedTools=Bash',
+        '--disallowedTools=WebFetch',
+        '--dangerously-skip-permissions',
+      ];
+      h.host.saved.set(MAIN, { kind: 'replayable', options: saved });
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('moved');
+      expect(h.host.calls).toContain(`resume ${PROFILE} ${SID} C:/research [${saved.join(' ')}]`);
+    });
+
+    it('a session saved with something a move cannot carry over is never stopped, and said so once', async () => {
+      const h = harness();
+      h.host.saved.set(MAIN, {
+        kind: 'unreplayable',
+        reason: 'it was started with --file, which a move does not replay',
+      });
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      const outcomes = await h.mover.run(targets(TARGET));
+      expect(outcomes).toEqual([
+        {
+          sessionId: SID,
+          ruleId: 'rule-1',
+          result: 'failed',
+          restored: true,
+          reason: 'it was started with --file, which a move does not replay',
+        },
+      ]);
+      expect(h.host.calls.some((c) => c.startsWith('stop') || c.startsWith('resume'))).toBe(false);
+      expect(h.notices).toHaveLength(1);
+      expect(h.notices[0]?.body).toContain('It is still on the shared account, as before.');
+      // Its saved options do not change, so it is not looked at again.
+      h.host.calls.length = 0;
+      expect(await h.mover.run(targets(TARGET))).toEqual([]);
+      expect(h.notices).toHaveLength(1);
+    });
+
+    it('a profile row saved with other options is left alone: no stop, no resume over it', async () => {
+      // Dropping that row is no way out: Claude Code's rm takes the session's worktree with it.
+      const h = harness();
+      h.host.saved.set(PROFILE, { kind: 'replayable', options: ['--permission-mode=plan'] });
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      const outcomes = await h.mover.run(targets(TARGET));
+      expect(outcomes[0]).toMatchObject({ result: 'failed', restored: true });
+      expect(outcomes[0]?.reason).toBe(
+        "C:/research's slot still holds it from an earlier move, saved with other options",
+      );
+      expect(h.host.calls.some((c) => c.startsWith('stop') || c.startsWith('resume'))).toBe(false);
+    });
+
+    it('a profile row that cannot be carried over itself is left alone too', async () => {
+      const h = harness();
+      h.host.saved.set(PROFILE, {
+        kind: 'unreplayable',
+        reason: 'it holds permission rules granted while it ran, which a move cannot carry over',
+      });
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      const outcomes = await h.mover.run(targets(TARGET));
+      expect(outcomes[0]?.reason).toBe(
+        "C:/research's slot still holds it: it holds permission rules granted while it ran, " +
+          'which a move cannot carry over',
+      );
+      expect(h.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
+    });
+
+    it('a row that cannot be read right now is skipped, not given up on', async () => {
+      for (const where of [MAIN, PROFILE]) {
+        const h = harness();
+        h.host.saved.set(where, { kind: 'unreadable' });
+        h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+        expect((await h.mover.run(targets(TARGET)))[0]).toMatchObject({ result: 'skipped' });
+        expect(h.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
+        expect(h.notices).toEqual([]);
+        // Readable next cycle (written in full by then): moved.
+        if (where === MAIN) {
+          h.host.saved.set(MAIN, { kind: 'replayable', options: [] });
+        } else {
+          h.host.saved.delete(PROFILE);
+        }
+        expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('moved');
+      }
+    });
+
+    it('a session with no row on the global slot is skipped: the way back would need it', async () => {
+      const h = harness();
+      h.host.saved.delete(MAIN);
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      expect((await h.mover.run(targets(TARGET)))[0]).toMatchObject({ result: 'skipped' });
+      expect(h.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
+    });
+  });
+
+  describe('a terminal with a session open', () => {
+    it('holds every move back while one is open, and moves once it has left', async () => {
+      const h = harness();
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      h.host.attached = true;
+      expect(await h.mover.run(targets(TARGET))).toEqual([
+        {
+          sessionId: SID,
+          ruleId: 'rule-1',
+          result: 'skipped',
+          reason: 'a terminal has a background session open',
+        },
+      ]);
+      expect(h.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
+      h.host.attached = false;
+      expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('moved');
+    });
+
+    it('when it cannot be told whether one is open, the session is not stopped', async () => {
+      const h = harness();
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      h.host.failAttached = true;
+      expect((await h.mover.run(targets(TARGET)))[0]).toMatchObject({ result: 'skipped' });
+      expect(h.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
+    });
+  });
+
+  describe('confirming, and the way back', () => {
+    it('waits for a resumed session that shows up only a few roster reads later', async () => {
+      // Claude Code returns once the session is dispatched; its worker reaches the roster later.
+      const h = harness({ confirmTimeoutMs: 15_000 });
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      h.host.showOnReadIn.set(PROFILE, 3);
+      expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('moved');
+      expect(h.host.calls.filter((c) => c === `list ${PROFILE}`)).toHaveLength(3);
+      expect(h.sleeps).toEqual([500, 500]);
+    });
+
+    it('a way back that is accepted but never shows up is not reported as restored', async () => {
+      const h = harness({ confirmTimeoutMs: 2_000 });
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      h.host.silentResumeIn.add(PROFILE);
+      h.host.silentResumeIn.add(MAIN);
+      const outcomes = await h.mover.run(targets(TARGET));
+      expect(outcomes[0]).toMatchObject({ result: 'failed', restored: false });
+      expect(h.notices[0]?.body).toContain(`resume it with: claude --bg --resume ${SID}`);
+      expect(h.notices[0]?.body).not.toContain('as before');
+      // Accepted once is enough: another try would only start a copy of a session coming up.
+      expect(h.host.calls.filter((c) => c.startsWith('resume null'))).toHaveLength(1);
+    });
+
+    it('a way back Claude Code answers with a copy is tried again, after a pause', async () => {
+      const h = harness();
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      h.host.failResumeIn.add(PROFILE);
+      h.host.copyResumesIn.set(MAIN, 1);
+      const outcomes = await h.mover.run(targets(TARGET));
+      expect(outcomes[0]).toMatchObject({ result: 'failed', restored: true });
+      expect(h.host.calls.filter((c) => c.startsWith('resume null'))).toHaveLength(2);
+      expect(h.sleeps).toEqual([2_000]);
+      expect(h.host.hosted.get(MAIN)?.map((s) => s.sessionId)).toEqual([SID]);
+    });
+
+    it('gives up on the way back after a few tries', async () => {
+      const h = harness();
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      h.host.failResumeIn.add(PROFILE);
+      h.host.copyResumesIn.set(MAIN, 10);
+      const outcomes = await h.mover.run(targets(TARGET));
+      expect(outcomes[0]).toMatchObject({ result: 'failed', restored: false });
+      expect(h.host.calls.filter((c) => c.startsWith('resume null'))).toHaveLength(3);
+      expect(h.sleeps).toEqual([2_000, 2_000]);
+    });
+
+    it('measures the confirm window on its own clock: a frozen wall clock cannot hold it open', async () => {
+      // No clock given, as the daemon builds it. Were the window measured on Date.now, frozen here,
+      // it would never close and the poll cycle would wait on it forever.
+      const frozen = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      try {
+        const host = new FakeHost();
+        host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+        host.silentResumeIn.add(PROFILE);
+        host.silentResumeIn.add(MAIN);
+        const mover = new BackgroundMover({
+          host,
+          resolveRule: () => Promise.resolve('rule-1'),
+          notify: () => {},
+          confirmTimeoutMs: 30,
+          sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5))),
+        });
+        const outcomes = await mover.run(targets(TARGET));
+        expect(outcomes[0]).toMatchObject({ result: 'failed', restored: false });
+      } finally {
+        frozen.mockRestore();
+      }
+    });
   });
 });

@@ -308,6 +308,9 @@ export interface DaemonOptions {
   backgroundSessionHost?: BackgroundSessionHost;
   /** The least time between two moves of one background session (see backgroundMover.ts). */
   backgroundMoveIntervalMs?: number;
+  /** How long a moved background session may take to show up where it was resumed (see
+   *  backgroundMover.ts). */
+  backgroundMoveConfirmMs?: number;
   logger?: Logger;
 }
 
@@ -988,10 +991,14 @@ export class Daemon {
                 },
               }),
             logger: this.logger,
-            clock: this.clock,
             ...(options.backgroundMoveIntervalMs !== undefined
               ? { minIntervalMs: options.backgroundMoveIntervalMs }
               : {}),
+            ...(options.backgroundMoveConfirmMs !== undefined
+              ? { confirmTimeoutMs: options.backgroundMoveConfirmMs }
+              : {}),
+            // No clock passed: the mover measures durations on its own monotonic clock, never on
+            // this.clock (wall time, for timestamps).
           });
     // Waking the receiver's held poll on enqueue is what makes injection feel immediate rather
     // than arriving up to a poll-bound later. `pollMs` comes from the receiver rather than a

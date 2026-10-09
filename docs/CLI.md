@@ -284,18 +284,31 @@ cycle, for every rule whose slot holds one of its included accounts with usage l
 daemon moves each background session the global slot's service hosts in that folder:
 
 1. it checks that the session is idle between turns (`claude agents` reports it idle) — a
-   session in a turn, or waiting on a permission prompt, is left for a later cycle;
+   session in a turn, or waiting on a permission prompt, is left for a later cycle — and that
+   no terminal has a background session open (`claude attach`, or the agent view). Claude Code
+   does not say which session a terminal has open, so while one is open, nothing moves;
 2. it stops the session (`claude stop`) and resumes it by its full session id under the
    folder's profile (`claude --bg --resume <id>`, with no prompt, so no turn is spent), from
-   the session's working directory, with the session's saved model, permission mode and added
-   directories;
+   the session's working directory, with every option the session was started with and
+   Claude Code saved (its model, permission mode, added directories, tool restrictions,
+   settings, budgets and the rest). A session the folder's profile already holds from an
+   earlier move wakes with what the profile saved for it, worktree included;
 3. it confirms the folder's service now hosts it, logs the move in the daemon log and sends
    one phone notice.
 
 A session moves at most once an hour, so one woken back onto the global slot by hand is not
-bounced every cycle. If a move fails, the session is resumed back on the global slot, the
+bounced every cycle. If a move fails, the session is resumed back on the global slot (tried
+a few times, since Claude Code can count a session it just stopped as still open), the
 daemon logs it and sends one phone notice, and it does not try that session again until it
-restarts. Sessions in folders without a rule are never moved, and an exclude-only rule
+restarts.
+
+A session that cannot move without changing is left where it is, with one notice: one
+started with an option this cctl does not know, or one that would act again at startup
+(`--file`, `--rewind-files`, `--session-id`, `--reply-on-resume`); one holding permission
+rules granted while it ran (they are kept in its job row, and no option carries them over);
+and one the folder's profile already holds from an earlier move with other saved options.
+
+Sessions in folders without a rule are never moved, and an exclude-only rule
 prefers no account, so its sessions stay where they are. The moves use the `claude` on the
 daemon's PATH (the one that started the background service). Not on macOS, where folder
 rules are not supported.

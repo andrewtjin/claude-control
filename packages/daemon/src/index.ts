@@ -171,6 +171,7 @@ export {
   type BackgroundSessionHost,
   type MoveOutcome,
   type MoveTarget,
+  type SavedLaunch,
   type SessionActivity,
 } from './backgroundMover.js';
 

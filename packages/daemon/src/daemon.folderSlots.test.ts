@@ -339,6 +339,8 @@ async function createRig(opts: {
   greedy?: boolean;
   /** Claude Code's background service, for the cases about moving background sessions. */
   backgroundSessionHost?: BackgroundSessionHost;
+  /** How long a moved session may take to show up where it was resumed. */
+  backgroundMoveConfirmMs?: number;
 }): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
@@ -405,6 +407,9 @@ async function createRig(opts: {
     ...(opts.slotAlertWindowMs !== undefined ? { slotAlertWindowMs: opts.slotAlertWindowMs } : {}),
     ...(opts.backgroundSessionHost !== undefined
       ? { backgroundSessionHost: opts.backgroundSessionHost }
+      : {}),
+    ...(opts.backgroundMoveConfirmMs !== undefined
+      ? { backgroundMoveConfirmMs: opts.backgroundMoveConfirmMs }
       : {}),
   });
 
@@ -1797,8 +1802,12 @@ describe('daemon folder-bound slots — background sessions move onto their fold
   const OUT = { limits: [{ kind: 'weekly_all', percent: 100, resets_at: iso(NOW + 3 * HOUR_MS) }] };
 
   /** A Claude Code service on the global slot hosting one idle background session in `cwd`; a
-   *  resume moves it to the named config dir. Records every command. */
-  function recordingHost(cwd: string): { host: BackgroundSessionHost; calls: string[] } {
+   *  resume moves it to the named config dir, unless `silent` (accepted, never shows up). Records
+   *  every command. */
+  function recordingHost(
+    cwd: string,
+    opts: { silent?: boolean } = {},
+  ): { host: BackgroundSessionHost; calls: string[] } {
     const calls: string[] = [];
     const hosted = new Map<string | null, BackgroundSession[]>([
       [null, [{ short: SID.slice(0, 8), sessionId: SID, cwd }]],
@@ -1819,16 +1828,29 @@ describe('daemon folder-bound slots — background sessions move onto their fold
         hosted.set(configDir, []);
         return Promise.resolve();
       },
-      savedOptions: () => Promise.resolve(['--model', 'opus']),
+      attachedNow: () => Promise.resolve(false),
+      savedOptions: (configDir) =>
+        Promise.resolve(
+          configDir === null
+            ? { kind: 'replayable' as const, options: ['--model=opus'] }
+            : { kind: 'none' as const },
+        ),
       resumeIdle: (input) => {
         calls.push(`resume ${String(input.configDir)} ${input.sessionId}`);
-        hosted.set(input.configDir, [
-          { short: input.short, sessionId: input.sessionId, cwd: input.cwd },
-        ]);
+        if (opts.silent !== true) {
+          hosted.set(input.configDir, [
+            { short: input.short, sessionId: input.sessionId, cwd: input.cwd },
+          ]);
+        }
         return Promise.resolve();
       },
     };
     return { host, calls };
+  }
+
+  /** The notices of a move that failed. */
+  function notMovedNotices(relay: SteadyRelay): Array<PayloadOf<'hook.notification'>> {
+    return movedNotices(relay).filter((p) => p.title === 'Background session not moved');
   }
 
   function movedNotices(relay: SteadyRelay): Array<PayloadOf<'hook.notification'>> {
@@ -1903,6 +1925,28 @@ describe('daemon folder-bound slots — background sessions move onto their fold
     await new Promise((r) => setTimeout(r, 50));
 
     expect(calls).toEqual([]);
+  });
+
+  it("a move that never confirms ends on the mover's own clock, whatever the wall clock says", async () => {
+    // The rig's wall clock is frozen. Measured on it, the confirm window would never close and the
+    // poll cycle would wait on it for good.
+    const { accounts, groups, live } = twoAccountGroup();
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      cwdBinding: (cwd) => (cwd.startsWith('C:/work') ? { groupId: 'g1' } : null),
+    });
+    const { host } = recordingHost('C:/work', { silent: true });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => HEALTHY,
+      backgroundSessionHost: host,
+      backgroundMoveConfirmMs: 50,
+    });
+    await rig.start();
+    await waitFor(() => notMovedNotices(rig.relay).length > 0);
+    expect(notMovedNotices(rig.relay)[0]?.body).toContain('resume it with');
   });
 
   it('never moves a session out of a folder without a rule', async () => {
