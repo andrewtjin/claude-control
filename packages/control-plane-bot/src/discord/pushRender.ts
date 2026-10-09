@@ -177,7 +177,7 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
 
 /** hook.notification → the right lifecycle card, or `undefined` to suppress a DM. Stop always wins
  *  (it carries the final message); otherwise the tolerant `notificationType` string selects
- *  tool-output/waiting/quarantine/slot-alert, and anything unknown falls back to the generic
+ *  tool-output/waiting/quarantine/slot-alert/outage, and anything unknown falls back to the generic
  *  title/body content an N-1 bot would also show. */
 function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | undefined {
   // The daemon may send a `question_prompt` notification ALONGSIDE the richer question.request
@@ -253,6 +253,20 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
       const title = escapeDiscordMarkdown(p.title);
       const body = escapeDiscordMarkdown(p.body);
       return { content: truncateLabeled(`**${title}**\n${body}`, MESSAGE_CONTENT_LIMIT) };
+    }
+    case 'usage_exhausted':
+    case 'usage_restored': {
+      // An outage card and its end. Daemon-composed like a slot alert, and escaped for the same
+      // reason: they name a folder by its path and each account by its label, identifiers the
+      // operator chose, which must render literally. Escaped line by line rather than as one
+      // line, because the body lists one account per line. Not clamped: a long fleet's card goes
+      // out over as many messages as it needs, as the generic card does.
+      const title = escapeDiscordMarkdown(p.title);
+      const body = p.body
+        .split(/\r\n?|\n/)
+        .map(escapeDiscordMarkdown)
+        .join('\n');
+      return { content: `**${title}**\n${body}` };
     }
     default: {
       // The generic card is a bold title over relayed body text; that body is whatever the
