@@ -142,33 +142,56 @@ export function episodesInWindow(
 }
 
 /**
- * Which episodes `--folder` shows: those of the folder rule `folder` runs under, resolved the way
- * the engine resolves a folder (the longest rule folder containing it wins) against every folder
- * scope in the log, so a subfolder finds its rule's history. A rule keeps its id across edits, so
- * every episode of that rule is shown, whatever folders it had then. `folder` must be canonical.
+ * Which episodes `--folder` shows: those of the pool `folder` runs under now, resolved the way the
+ * engine resolves a folder (the longest rule folder containing it wins, with no merging) against
+ * `rules`, the rules in force. A rule keeps its id across edits, so every episode of that rule is
+ * shown, whatever folders it had then; a rule made anew on the same folder (after a reset) is a new
+ * pool, and only its own history is. A folder no rule applies to runs under the global pool, so
+ * the global pool's episodes are shown, with those of any removed rule that covered it, the pool it
+ * ran under before. Without `rules` (the registry could not be read) the folder is resolved
+ * against the folders the log records, the best that history alone can say. `folder` must be
+ * canonical.
  */
 export function episodesForFolder(
   episodes: ExhaustionEpisode[],
   folder: string,
   platform: NodeJS.Platform,
+  rules?: ReadonlyArray<{ id: string; folders: readonly string[] }>,
 ): ExhaustionEpisode[] {
-  const folders = new Map<string, Set<string>>();
+  const ruleIdOf = (e: ExhaustionEpisode): string | undefined => {
+    const scope = scopeOf(e.start);
+    return scope.kind === 'folder' ? scope.ruleId : undefined;
+  };
+  const logged = new Map<string, Set<string>>();
   for (const e of episodes) {
     const scope = scopeOf(e.start);
     if (scope.kind !== 'folder') continue;
-    const known = folders.get(scope.ruleId) ?? new Set<string>();
+    const known = logged.get(scope.ruleId) ?? new Set<string>();
     for (const f of scope.folders) known.add(f);
-    folders.set(scope.ruleId, known);
+    logged.set(scope.ruleId, known);
   }
-  const match = resolveBinding(
+  /** The rule among those the log records (less `skip`) that `folder` resolves to. */
+  const fromHistory = (skip: ReadonlySet<string>): string | undefined =>
+    resolveBinding(
+      folder,
+      [...logged].filter(([id]) => !skip.has(id)).map(([id, set]) => ({ id, folders: [...set] })),
+      platform,
+    )?.groupId;
+
+  if (rules === undefined) {
+    const id = fromHistory(new Set());
+    return id === undefined ? [] : episodes.filter((e) => ruleIdOf(e) === id);
+  }
+  const current = resolveBinding(
     folder,
-    [...folders].map(([id, set]) => ({ id, folders: [...set] })),
+    rules.map((r) => ({ id: r.id, folders: [...r.folders] })),
     platform,
   );
-  if (match === null) return [];
+  if (current !== null) return episodes.filter((e) => ruleIdOf(e) === current.groupId);
+  const removed = fromHistory(new Set(rules.map((r) => r.id)));
   return episodes.filter((e) => {
-    const scope = scopeOf(e.start);
-    return scope.kind === 'folder' && scope.ruleId === match.groupId;
+    const id = ruleIdOf(e);
+    return id === undefined || id === removed;
   });
 }
 

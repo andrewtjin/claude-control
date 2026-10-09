@@ -46,6 +46,7 @@ import {
   judgeScope,
   outageScopes,
   resumeOpenEpisodes,
+  scopeKey,
   scopeOf,
   readFleetHistory,
   readHeartbeat,
@@ -470,7 +471,7 @@ export function buildProgram(): Command {
       'every time no account could take work: when, for how long, why, and the switches before it',
     )
     .option('--days <n>', 'only the times that started in the last <n> days')
-    .option('--folder <folder>', 'only the times the folder rule <folder> runs under ran out')
+    .option('--folder <folder>', 'only the times the pool <folder> runs under ran out')
     .option('--json', 'print the times as JSON, newest first')
     .action(async (opts: { days?: string; folder?: string; json?: boolean }) => {
       let days: number | undefined;
@@ -484,11 +485,27 @@ export function buildProgram(): Command {
       const records = await log.read();
       const open = await openOutageStatuses(resumeOpenEpisodes(records), nowMs);
       let episodes = episodesInWindow(episodesOf(records), nowMs, days, open);
-      if (folder !== undefined) episodes = episodesForFolder(episodes, folder, process.platform);
+      if (folder !== undefined) {
+        // Resolved against the rules in force, as a session in the folder is; history alone when
+        // the registry cannot be read, so the log still prints.
+        const rules = await buildEngine()
+          .listRules()
+          .catch(() => undefined);
+        episodes = episodesForFolder(episodes, folder, process.platform, rules);
+      }
       if (opts.json === true) {
         const newestFirst = [...episodes].reverse().map((e) => ({ scope: scopeOf(e.start), ...e }));
+        // Narrowed with the list: an open outage is listed only beside its own episode.
+        const shownOpen =
+          folder === undefined
+            ? open
+            : open.filter((o) =>
+                episodes.some(
+                  (e) => e.start.id === o.id && scopeKey(scopeOf(e.start)) === scopeKey(o.scope),
+                ),
+              );
         process.stdout.write(
-          JSON.stringify({ log: log.path, open, episodes: newestFirst }, null, 2) + '\n',
+          JSON.stringify({ log: log.path, open: shownOpen, episodes: newestFirst }, null, 2) + '\n',
         );
         return;
       }

@@ -276,7 +276,7 @@ slot, and its pool in order (`cctl folders` has the full picture).
 ```
 cctl outages                   # every time no account could take work, newest first
 cctl outages --days 30         # only the times that started in the last 30 days (plus any still on)
-cctl outages --folder <folder> # only the times the folder rule <folder> runs under ran out
+cctl outages --folder <folder> # only the times the pool <folder> runs under ran out
 cctl outages --json            # the same, as JSON (each episode carries its scope)
 ```
 
@@ -332,13 +332,20 @@ This holds for the global pool too: a shared account a folder is running on (its
 its own accounts are out) is not counted as the global pool's while the folder holds it. Such an
 account is listed as `live in <the slot>`, and when the other slot lets it go and its numbers
 show usage left, the outage ends as `another slot let it go`. Accounts reserved to a folder are
-never part of the global pool.
+never part of the global pool. A pool with nothing in it at all (a folder that excludes every
+shared account, or whose last one another folder reserved) is out too, and says its pool is
+empty; it ends once an account that can work joins it.
 
 The phone card names the folder (`<folder>: every account in its pool is out`, then `Usage is
 back in <folder>`), and the `usage` / `timeline` banner adds one line per folder that is out.
-`cctl outages` labels each entry `[global]` or `[<folder>]` once any folder has an entry (a log
-with no folder entries reads as before); `--folder` resolves a folder the way a session does
-(the longest rule folder containing it), so a subfolder finds its rule's history, and
+While folder rules exist the global pool is not every account, so its card, log lines and banner
+name it too (`Every account in the global pool is out`, `No account in the global pool can take
+work`); with none they read as before. `cctl outages` labels each entry `[global]` or
+`[<folder>]` once any folder has an entry or a global one was recorded beside folder rules (a log
+with neither reads as before); `--folder` resolves a folder the way a session does, against the
+rules in force (the longest rule folder containing it), so a subfolder finds its rule's history,
+a rule made anew on the same folder shows only its own, and a folder no rule applies to shows
+the global pool's (with that of any removed rule that covered it), and
 `--json` gives every episode a `scope` (`{ "kind": "global" }` or `{ "kind": "folder",
 "ruleId", "folders", "label" }`) and lists each scope's open outage under `open`.
 

@@ -460,6 +460,39 @@ describe('scopes in the views', () => {
     expect(ids('C:\\elsewhere')).toEqual([]);
   });
 
+  it('--folder resolves against the rules in force, not only those with outages on record', () => {
+    // r1 was reset and the folder included again, which made a new rule r9 on the same folder.
+    const old = folderStart(local(10, 1, 10, 0));
+    const current = start(local(10, 1, 12, 0), {
+      v: 2,
+      id: 'current',
+      scope: { ...research, ruleId: 'r9' },
+    });
+    const g = start(local(10, 1, 9, 0));
+    const all: ExhaustionEpisode[] = [{ start: g }, { start: old }, { start: current }];
+    const rules = [
+      { id: 'r9', folders: ['C:\\research'] },
+      { id: 'deep', folders: ['C:\\research\\deep'] },
+    ];
+    const ids = (folder: string) =>
+      episodesForFolder(all, folder, 'win32', rules).map((e) => e.start.id);
+    expect(ids('C:\\research')).toEqual(['current']);
+    // deep runs under its own rule now, which has nothing on record: not its parent's outages.
+    expect(ids('C:\\research\\deep\\x')).toEqual([]);
+    // A folder no rule applies to runs under the global pool.
+    expect(ids('C:\\elsewhere')).toEqual([g.id]);
+  });
+
+  it('--folder on a folder whose rule was removed shows the global pool and that rule history', () => {
+    const removed = folderStart(local(10, 1, 10, 0));
+    const g = start(local(10, 1, 9, 0));
+    const all: ExhaustionEpisode[] = [{ start: g }, { start: removed }];
+    expect(episodesForFolder(all, 'C:\\research', 'win32', []).map((e) => e.start.id)).toEqual([
+      g.id,
+      removed.id,
+    ]);
+  });
+
   it('a folder banner line names the folder', () => {
     const out = assessFleet(
       [

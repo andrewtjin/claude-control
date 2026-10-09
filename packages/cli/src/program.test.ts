@@ -1408,17 +1408,47 @@ describe('outages, and the banner usage and timeline lead with', () => {
 
     it('--folder narrows to the rule a folder runs under, a subfolder included', async () => {
       const now = Date.now();
+      withRule();
       const old = started(now - 50 * H);
       await seedLog([old, recovered(old, now - 49 * H), folderStarted(now - 2 * H)]);
       const sub = join(FOLDER, 'project');
       for (const arg of [FOLDER, sub]) {
         const json = JSON.parse((await runCli(['outages', '--json', '--folder', arg])).out) as {
+          open: Array<{ id: string }>;
           episodes: Array<{ start: { id: string } }>;
         };
         expect(json.episodes.map((e) => e.start.id)).toEqual([`ep-${now - 2 * H}-r1`]);
+        // Only that rule's open outage rides along, not every scope's.
+        expect(json.open.map((o) => o.id)).toEqual([`ep-${now - 2 * H}-r1`]);
       }
-      const other = await runCli(['outages', '--folder', join(FOLDER, '..', 'elsewhere')]);
-      expect(other.out).toMatch(
+      // A folder no rule applies to runs under the global pool, whose history it shows.
+      const other = JSON.parse(
+        (await runCli(['outages', '--json', '--folder', join(FOLDER, '..', 'elsewhere')])).out,
+      ) as { open: unknown[]; episodes: Array<{ start: { id: string } }> };
+      expect(other.episodes.map((e) => e.start.id)).toEqual([old.id]);
+      expect(other.open).toEqual([]);
+    });
+
+    it('--folder shows nothing for a folder whose own rule has no outages on record', async () => {
+      const now = Date.now();
+      withRule();
+      // The deeper folder has its own rule now; its parent's outage is not its history.
+      const deep = join(FOLDER, 'deep');
+      const rules = await engine.listRules();
+      const deepRule = {
+        id: 'r2',
+        label: deep,
+        folders: [deep],
+        include: [],
+        exclude: ['a2'],
+        activeId: null,
+        createdAtMs: 0,
+        updatedAtMs: 0,
+      };
+      engine.listRules.mockImplementation(() => Promise.resolve([...rules, deepRule]));
+      await seedLog([folderStarted(now - 2 * H)]);
+      const r = await runCli(['outages', '--folder', join(deep, 'x')]);
+      expect(r.out).toMatch(
         /^No time on record when every account in .+'s pool was out of usage\./,
       );
     });
