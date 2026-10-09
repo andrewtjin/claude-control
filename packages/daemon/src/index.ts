@@ -159,8 +159,20 @@ export {
   buildBindGuardCommand,
   generateBindGuardSource,
   writeBindGuard,
+  guardNoticesDir,
   BIND_GUARD_MARKER,
 } from './bindGuard.js';
+
+export {
+  BackgroundMover,
+  DEFAULT_MOVE_INTERVAL_MS,
+  type BackgroundMoverOptions,
+  type BackgroundSession,
+  type BackgroundSessionHost,
+  type MoveOutcome,
+  type MoveTarget,
+  type SessionActivity,
+} from './backgroundMover.js';
 
 export {
   bindTokensDir,

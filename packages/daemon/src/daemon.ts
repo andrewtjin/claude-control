@@ -76,6 +76,7 @@ import {
   type FleetAvailability,
 } from '@claude-control/usage-advisor';
 import type { ProbeCandidate } from './accountProbe.js';
+import { BackgroundMover, type BackgroundSessionHost, type MoveTarget } from './backgroundMover.js';
 import {
   exhaustedCardBody,
   exhaustedCardTitle,
@@ -300,6 +301,13 @@ export interface DaemonOptions {
    *  the composition root owns where the data directory is — and optional so tests that are not
    *  about it never write a file; absent = nothing is tracked. */
   exhaustionLog?: ExhaustionLog;
+  /** Claude Code's background service, through which a background session in a ruled folder that
+   *  runs on the global slot is moved onto the folder's own slot (see backgroundMover.ts). Injected
+   *  — the composition root owns how Claude Code is found and run — and optional so tests that are
+   *  not about it never touch it; absent = nothing is moved. */
+  backgroundSessionHost?: BackgroundSessionHost;
+  /** The least time between two moves of one background session (see backgroundMover.ts). */
+  backgroundMoveIntervalMs?: number;
   logger?: Logger;
 }
 
@@ -854,6 +862,8 @@ export class Daemon {
    *  not re-pushed on every restart). */
   private quarantineState = new Map<string, QuarantineNoticeState>();
   private readonly exhaustionLog: ExhaustionLog | undefined;
+  /** Moves background sessions in ruled folders off the global slot; absent without a host. */
+  private readonly backgroundMover: BackgroundMover | undefined;
   /** The exhaustion episodes open right now, one per scope at most (the global pool, or a folder
    *  rule's pool, where no account can take work), keyed by `scopeKey`. Read back from the log on
    *  the first cycle, so an outage that spans a daemon restart stays one episode with one pair of
@@ -956,6 +966,33 @@ export class Daemon {
     this.exhaustionLog = options.exhaustionLog;
     this.logger = options.logger ?? noopLogger;
     this.isProcessAlive = options.isProcessAlive ?? pidIsAlive;
+    const host = options.backgroundSessionHost;
+    this.backgroundMover =
+      host === undefined
+        ? undefined
+        : new BackgroundMover({
+            host,
+            // Resolved by the engine exactly as a launch is, so a session moves to the slot `cctl
+            // claude` would have started it on; an engine without folder support resolves nothing.
+            resolveRule: async (cwd) =>
+              (await this.switchEngine.resolveFolderRule?.(cwd))?.ruleId ?? null,
+            notify: (notice) =>
+              this.sendEnvelope({
+                type: 'hook.notification',
+                payload: {
+                  event: 'notification',
+                  title: notice.title,
+                  body: notice.body,
+                  level: notice.level,
+                  notificationType: 'session_moved',
+                },
+              }),
+            logger: this.logger,
+            clock: this.clock,
+            ...(options.backgroundMoveIntervalMs !== undefined
+              ? { minIntervalMs: options.backgroundMoveIntervalMs }
+              : {}),
+          });
     // Waking the receiver's held poll on enqueue is what makes injection feel immediate rather
     // than arriving up to a poll-bound later. `pollMs` comes from the receiver rather than a
     // second copy of the default, so a tuned poll bound carries into the staleness window
@@ -1493,6 +1530,21 @@ export class Daemon {
       ),
     );
 
+    // Background sessions in a ruled folder that run on the global slot move onto the folder's slot
+    // once an included account there can take work: judged on the live map after this cycle's hops,
+    // like the outages above, so a folder that just returned to its own account moves them now. Its
+    // own catch: a fault in Claude Code's commands must never take down the poll loop.
+    const mover = this.backgroundMover;
+    if (mover !== undefined) {
+      await this.timePhase('moveBackground', () =>
+        mover
+          .run(this.backgroundMoveTargets(rules, snapshot.inputs, accounts, liveAfterHops))
+          .catch((err: unknown) => {
+            this.logger.error({ err }, 'moving background sessions failed');
+          }),
+      );
+    }
+
     if (autoSwitcher !== undefined) {
       // Only with a policy running, on purpose: the probe exists to widen the pool the policy
       // above chooses from, so with no policy running there is nothing to widen it for. Runs
@@ -1782,6 +1834,40 @@ export class Daemon {
       else this.lastObservedGroupActiveId.set(slot, hop);
     }
     return { stuck, live };
+  }
+
+  /**
+   * The folders whose background sessions should move onto their own slot right now, by rule id:
+   * each rule that includes accounts and whose slot holds one of them that can take work (by this
+   * cycle's numbers). A folder in fallback on a shared account, or whose included account is out, is
+   * left out: moving a session there would gain nothing. An exclude-only rule prefers no account, so
+   * it never asks for a move.
+   */
+  private backgroundMoveTargets(
+    rules: FolderRule[],
+    inputs: AccountUsageInput[],
+    accounts: AccountView[],
+    live: ReadonlyMap<SlotId, string | null>,
+  ): Map<string, MoveTarget> {
+    const now = this.clock();
+    const targets = new Map<string, MoveTarget>();
+    for (const rule of rules) {
+      if (rule.include.length === 0) continue;
+      const slot = ruleSlotId(rule.id);
+      const liveId = live.get(slot) ?? null;
+      if (liveId === null || !rule.include.includes(liveId)) continue;
+      const input = inputs.find((i) => i.accountId === liveId);
+      if (input === undefined || !assessFleet([input], now).accounts[0]!.usable) continue;
+      const configDir = this.switchEngine.configDirForSlot?.(slot);
+      if (configDir === undefined) continue;
+      targets.set(rule.id, {
+        ruleId: rule.id,
+        folder: folderNameOf(rule),
+        configDir,
+        accountLabel: accounts.find((a) => a.id === liveId)?.label ?? liveId,
+      });
+    }
+    return targets;
   }
 
   /**

@@ -57,6 +57,7 @@ import { createAgentSdkClient, createSessionManager } from '@claude-control/sess
 import type { AdvisorOptions, AutoSwitchPolicy } from '@claude-control/usage-advisor';
 import type { AgentSdkClient, CreateAgentSdkClientDeps } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath, fail, resolveBindEnforce } from './context.js';
+import { createClaudeBackgroundHost } from './backgroundHost.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
@@ -547,6 +548,17 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // Every time no account can take work, beside daemon.log; `cctl outages` reads the same
     // path through the same helper.
     exhaustionLog: new ExhaustionLog(exhaustionLogPath(dataDir)),
+    // Moves background sessions in a ruled folder off the global slot onto the folder's own slot,
+    // through the operator's own `claude`. Not on macOS, where folder rules are refused: a session
+    // there could not be hosted under a folder profile's login anyway (the CLI keeps one Keychain
+    // login for every config dir).
+    ...(process.platform !== 'darwin'
+      ? {
+          // The daemon's own environment, not the logging one: a service this starts hands its
+          // environment to every session it hosts, and the daemon's log file is not theirs.
+          backgroundSessionHost: createClaudeBackgroundHost({ mainConfigDir: paths.claudeDir }),
+        }
+      : {}),
     installHooks: async () => {
       // The forwarder script is (re)written before the hook entries that point at it, so the
       // installed command always has a current script behind it. The command itself is

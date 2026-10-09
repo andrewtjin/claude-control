@@ -49,6 +49,11 @@ import {
 } from './controlPlaneClient.js';
 import { AutoSwitcher } from './autoSwitcher.js';
 import { Daemon, type SwitchEngineLike } from './daemon.js';
+import type {
+  BackgroundSession,
+  BackgroundSessionHost,
+  SessionActivity,
+} from './backgroundMover.js';
 
 const NOW = Date.parse('2026-07-25T19:00:00.000Z');
 const HOUR_MS = 60 * 60 * 1000;
@@ -243,6 +248,9 @@ function fakeEngine(opts: {
             ? `/profiles/${accountId}`
             : undefined,
       ),
+    // A rule slot's profile dir, as the background mover resumes a session under it.
+    configDirForSlot: (slotId: SlotId): string | undefined =>
+      slotId === 'global' ? undefined : `/profiles/${slotId}`,
     resolveFolderRule: (cwd: string): Promise<{ ruleId: string; folder: string } | null> => {
       const match = opts.cwdBinding ? opts.cwdBinding(cwd) : null;
       return Promise.resolve(match === null ? null : { ruleId: match.groupId, folder: cwd });
@@ -329,6 +337,8 @@ async function createRig(opts: {
   /** Run greedy auto-switch, with the plan phrased and gated the way the daemon's composition root
    *  sets the poller up for it. */
   greedy?: boolean;
+  /** Claude Code's background service, for the cases about moving background sessions. */
+  backgroundSessionHost?: BackgroundSessionHost;
 }): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
@@ -393,6 +403,9 @@ async function createRig(opts: {
     clock: () => NOW,
     pollIntervalMs: opts.pollIntervalMs ?? 100_000,
     ...(opts.slotAlertWindowMs !== undefined ? { slotAlertWindowMs: opts.slotAlertWindowMs } : {}),
+    ...(opts.backgroundSessionHost !== undefined
+      ? { backgroundSessionHost: opts.backgroundSessionHost }
+      : {}),
   });
 
   cleanups.push(async () => {
@@ -1775,5 +1788,138 @@ describe('folder rules — a spawn naming a shared account live in its folder sl
     expect(err?.message).toContain('Shared Three');
     expect(err?.message).not.toContain('bound folder');
     expect(spawnCalls.count).toBe(0);
+  });
+});
+
+describe('daemon folder-bound slots — background sessions move onto their folder slot', () => {
+  const SID = '1ee43a2b-076b-42a1-b487-70a8b77401fa';
+  const HEALTHY = { limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }] };
+  const OUT = { limits: [{ kind: 'weekly_all', percent: 100, resets_at: iso(NOW + 3 * HOUR_MS) }] };
+
+  /** A Claude Code service on the global slot hosting one idle background session in `cwd`; a
+   *  resume moves it to the named config dir. Records every command. */
+  function recordingHost(cwd: string): { host: BackgroundSessionHost; calls: string[] } {
+    const calls: string[] = [];
+    const hosted = new Map<string | null, BackgroundSession[]>([
+      [null, [{ short: SID.slice(0, 8), sessionId: SID, cwd }]],
+    ]);
+    const host: BackgroundSessionHost = {
+      listHosted: (configDir) => {
+        calls.push(`list ${String(configDir)}`);
+        return Promise.resolve([...(hosted.get(configDir) ?? [])]);
+      },
+      activity: (configDir) => {
+        calls.push(`activity ${String(configDir)}`);
+        return Promise.resolve(
+          new Map<string, SessionActivity>([[SID.slice(0, 8), { idle: true, name: 'pods' }]]),
+        );
+      },
+      stop: (configDir, short) => {
+        calls.push(`stop ${String(configDir)} ${short}`);
+        hosted.set(configDir, []);
+        return Promise.resolve();
+      },
+      savedOptions: () => Promise.resolve(['--model', 'opus']),
+      resumeIdle: (input) => {
+        calls.push(`resume ${String(input.configDir)} ${input.sessionId}`);
+        hosted.set(input.configDir, [
+          { short: input.short, sessionId: input.sessionId, cwd: input.cwd },
+        ]);
+        return Promise.resolve();
+      },
+    };
+    return { host, calls };
+  }
+
+  function movedNotices(relay: SteadyRelay): Array<PayloadOf<'hook.notification'>> {
+    return relay.received
+      .filter((e) => e.type === 'hook.notification')
+      .map((e) => (e.type === 'hook.notification' ? e.payload : undefined))
+      .filter(
+        (p): p is PayloadOf<'hook.notification'> =>
+          p !== undefined && p.notificationType === 'session_moved',
+      );
+  }
+
+  it('moves an idle global-slot session in the folder once its included account is live and can take work', async () => {
+    const { accounts, groups, live } = twoAccountGroup();
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      cwdBinding: (cwd) => (cwd.startsWith('C:/work') ? { groupId: 'g1' } : null),
+    });
+    const { host, calls } = recordingHost('C:/work/app');
+    const rig = await createRig({ controls, bodyFor: () => HEALTHY, backgroundSessionHost: host });
+    await rig.start();
+    await waitFor(() => movedNotices(rig.relay).length > 0);
+
+    expect(calls).toContain('stop null 1ee43a2b');
+    expect(calls).toContain(`resume /profiles/${ruleSlotId('g1')} ${SID}`);
+    const [notice] = movedNotices(rig.relay);
+    expect(notice?.level).toBe('info');
+    expect(notice?.body).toContain('"pods" (1ee43a2b) in C:/work onto Member One');
+  });
+
+  it('leaves it alone while the included account live in the folder slot is out of usage', async () => {
+    const { accounts, groups, live } = twoAccountGroup();
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      cwdBinding: (cwd) => (cwd.startsWith('C:/work') ? { groupId: 'g1' } : null),
+    });
+    const { host, calls } = recordingHost('C:/work');
+    const rig = await createRig({
+      controls,
+      bodyFor: (id) => (id === 'm1' ? OUT : HEALTHY),
+      backgroundSessionHost: host,
+    });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 1);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // No folder is ready, so Claude Code is not even asked.
+    expect(calls).toEqual([]);
+    expect(movedNotices(rig.relay)).toEqual([]);
+  });
+
+  it('leaves it alone while the folder slot runs on a shared account (its fallback)', async () => {
+    const { accounts, groups } = twoAccountGroup();
+    const live = new Map<SlotId, string | null>([
+      ['global', null],
+      [ruleSlotId('g1'), 's1'],
+    ]);
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      cwdBinding: (cwd) => (cwd.startsWith('C:/work') ? { groupId: 'g1' } : null),
+    });
+    const { host, calls } = recordingHost('C:/work');
+    const rig = await createRig({ controls, bodyFor: () => HEALTHY, backgroundSessionHost: host });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 1);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(calls).toEqual([]);
+  });
+
+  it('never moves a session out of a folder without a rule', async () => {
+    const { accounts, groups, live } = twoAccountGroup();
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      cwdBinding: (cwd) => (cwd.startsWith('C:/work') ? { groupId: 'g1' } : null),
+    });
+    const { host, calls } = recordingHost('C:/elsewhere');
+    const rig = await createRig({ controls, bodyFor: () => HEALTHY, backgroundSessionHost: host });
+    await rig.start();
+    await waitFor(() => calls.includes('list null'));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(calls).toEqual(['list null']);
+    expect(movedNotices(rig.relay)).toEqual([]);
   });
 });
