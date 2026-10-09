@@ -100,8 +100,8 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   target no longer belongs to that slot). A switch that can be neither is reported, refuses
   writes to its slot and operations on the two accounts it was between, and is retried until it
   settles; everything else still runs. Which slot a switch targets is decided under the same
-  lock, so a bind or unbind that lands first can never have a switch write an account into a
-  slot it just left. Rotation adoption never stores a live token that another account's bundle
+  lock, so a folder-rule change that lands first can never have a switch write an account
+  into a slot it just left. Rotation adoption never stores a live token that another account's bundle
   already holds, and a token two accounts store is never seated in any slot.
 - **Usage.** Tier-0 reads each profile's cached `cachedUsageUtilization` for free;
   tier-1 hits the OAuth usage endpoint. Cross-account visibility never requires
@@ -134,21 +134,31 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   session (notify/approve/inject only). Switching mid-session interrupts, activates,
   and resumes via `claude --resume`.
 
-## Folder-bound accounts
+## Folder rules
 
 A session's account is decided by one thing: the config dir it runs in
 (`CLAUDE_CONFIG_DIR` at launch). Everything else — the `env` block in settings, a project
-API-key token — Claude Code ignores once a login is stored. So binding a folder to an
-account is, mechanically, launching its sessions in a different config dir that holds that
-account's login. That dir is a **slot**.
+API-key token — Claude Code ignores once a login is stored. So giving a folder its own
+accounts is, mechanically, launching its sessions in a different config dir that holds
+another login. That dir is a **slot**.
+
+A **folder rule** applies to its folder and everything under it (the longest matching rule
+wins; nested rules do not merge). It **includes** accounts — reserved to the folders that
+include them and used there first — and **excludes** shared accounts the folder must not
+use. A ruled folder's **effective pool** is its included accounts first, then the shared
+pool minus its exclusions, with global auto-switch exclusions and quarantine inherited; an
+unruled folder's pool is the shared pool.
 
 - **Slots.** The **global slot** is today's config dir (`~/.claude` or `CLAUDE_CONFIG_DIR`)
-  and holds the shared account. Each bound group gets a **group slot**: a **profile dir**
-  under `<machine-local data>/claude-control/profiles/<groupId>/`. An account is live in at
+  and holds a shared account. Each folder rule gets a **folder slot**: a **profile dir**
+  under `<machine-local data>/claude-control/profiles/<ruleId>/`. An account is live in at
   most one slot at a time — Claude Code rotates a refresh token on use, so the same login
-  cannot be live in two dirs without one corrupting the other. Swapping a slot's
-  `.credentials.json` reaches its running sessions in about two seconds, which is what makes
-  an in-set auto-switch work exactly like the global switch, but scoped.
+  cannot be live in two dirs without one corrupting the other. A slot therefore takes from
+  its pool only an account live nowhere else; the global slot never takes a reserved account
+  or a shared one live in a folder slot, and keeps the last free shared account when both
+  want it. Swapping a slot's `.credentials.json` reaches its running sessions in about two
+  seconds, which is what makes a per-folder auto-switch work exactly like the global
+  switch, but scoped.
 - **Profile dirs.** A profile is not a copy of `~/.claude`; it is a dir whose
   account-neutral entries are **shared** back to main and whose account-specific ones are
   its own. Content dirs (`projects`, `plugins`, `skills`, `agents`, `commands`, `todos`,
@@ -168,16 +178,20 @@ account's login. That dir is a **slot**.
   move: an older cctl (the installed daemon may predate this feature) rewrites `accounts.json`
   from only `{activeId, accounts}` and refreshes the tokens of every account it can see. It
   must never see a reserved account — or it would poll it, refresh its single-use token, or
-  switch to it, silently breaking a binding. Because the row lives in a file the old code does
-  not know about, its writes cannot touch it. `groups.json` records each group's members
-  (their full rows), its folders, and which member is live in its slot. A row found in both
-  files (a crash mid-move) resolves to the `groups.json` copy and heals on the next write.
-- **The guard.** A binding is only useful if a session in the wrong account is caught. A
+  switch to it, silently breaking a rule. Because the row lives in a file the old code does
+  not know about, its writes cannot touch it. `groups.json` records the reserved rows and
+  each rule (its folders, includes, excludes, and which account is live in its slot). A row
+  found in both files (a crash mid-move) resolves to the `groups.json` copy and heals on the
+  next write. The fence covers reserved accounts only: a folder slot can also hold a SHARED
+  account (inherited, or in a folder that only excludes), which an older daemon sees. So
+  `cctl folder include|exclude` refuse while a running daemon's settings report lacks the
+  `folder rules` row, and `cctl doctor` flags the same mismatch.
+- **The guard.** A rule is only useful if a session in the wrong slot is caught. A
   dependency-free `UserPromptSubmit` hook (installed beside the relay forwarder, which keeps
   its own never-block contract) reads a non-secret snapshot — `folder-bindings.json`, written
-  last in every binding change — and compares the session's config dir and project dir
-  against it. A bound folder on the shared account, or a group slot used against an unbound
-  folder, is blocked (or warned, or ignored, per the enforce mode). The guard fails **open**:
+  last in every rule change — and compares the session's config dir and project dir
+  against it. A ruled folder on the shared account, or a folder slot used against a folder
+  without that rule, is blocked (or warned, or ignored, per the enforce mode). The guard fails **open**:
   any internal error, a missing or unparseable snapshot, or an unknown schema version exits 0
   and lets the prompt through. It prevents accidents; it is not a security boundary (see
   `docs/THREAT_MODEL.md`).
@@ -186,7 +200,8 @@ account's login. That dir is a **slot**.
   under one cross-process lock, so no two slots can be written at once and every slot is
   crash-recoverable the same way the global one always was. A doctor pass (`checkSlots`)
   detects the invariant violations — an account live in two slots, a reserved account in
-  global, a non-member in a group slot, a drifted active id, a broken profile link — and a
+  global, an account outside a folder slot's pool live there, a drifted active id, a broken
+  profile link — and a
   repair pass fixes them by adopting the freshest token and re-seating each slot's rightful
   account.
 

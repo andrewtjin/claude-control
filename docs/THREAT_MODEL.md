@@ -175,10 +175,10 @@ the package dependency closure, not by policy. Do not treat the relay as zero-kn
 "holds no long-term credentials, but sees session traffic in flight." (This matches the disclosures
 in `README.md` and `docs/ARCHITECTURE.md`.)
 
-### 5. Folder-bound account profiles hold live credentials, and the guard is not a boundary
+### 5. Folder-rule profiles hold live credentials, and the guard is not a boundary
 
-Binding a folder to an account stores that account's live login in a **profile config dir**
-(`<machine-local data>/claude-control/profiles/<groupId>/`). That dir holds a
+A folder rule stores the live login of the account its folder runs on in a **profile config
+dir** (`<machine-local data>/claude-control/profiles/<ruleId>/`). That dir holds a
 `.credentials.json` with an OAuth token, exactly as `~/.claude` does for the global account —
 it is not an extra secret store, it is the same class of secret in another location, created
 owner-private (POSIX `0700`; Windows under `%LOCALAPPDATA%` with the vault's ACL). The
@@ -203,21 +203,21 @@ Discord embeds above. Its `reason`/`systemMessage` interpolate a folder path and
 line/paragraph separators included), Unicode bidi/format controls, or invisible zero-width and tag
 characters — and Claude Code decodes that string and prints it (block) or hands it to the model
 (warn/override). The guard therefore strips the same control set the CLI does
-(`sanitizeTerminalText`, shared verbatim by embedding) before emitting, and bound folders reject
+(`sanitizeTerminalText`, shared verbatim by embedding) before emitting, and ruled folders reject
 control and bidi characters at canonicalization, so neither a crafted folder name nor a crafted
 label can forge a `[system]` directive or reorder what the operator reads. A project folder whose
-name carries such a character is judged by its nearest clean ancestor (a binding covers the folder
+name carries such a character is judged by its nearest clean ancestor (a rule covers the folder
 exactly when it covers that ancestor), not waved through.
 
 Two structural properties are load-bearing and must not regress:
 
 - **MCP servers are shared into profiles.** The `mcpServers` block is merged main → profile,
-  so a tool configured once is available under every bound account. A bound session therefore
-  reaches the same MCP servers — and their access — as a global one; that is intended, and it
-  means a binding isolates the _account_, not the tool surface.
+  so a tool configured once is available in every folder slot. A session in a ruled folder
+  therefore reaches the same MCP servers — and their access — as a global one; that is
+  intended, and it means a folder rule isolates the _account_, not the tool surface.
 - **Trust flows one way, main → profile.** A project's `hasTrustDialogAccepted` (and the
   account-neutral `.claude.json` allowlist) propagates from main into a profile, never from a
-  profile back into main. A folder trusted only inside a bound profile can never silently mark
+  profile back into main. A folder trusted only inside a folder profile can never silently mark
   itself trusted for the global account.
 
 Finally, the bot's process-wide `allowedMentions: { parse: [] }` default must stay: card and
