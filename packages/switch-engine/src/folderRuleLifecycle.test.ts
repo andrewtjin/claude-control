@@ -19,6 +19,7 @@ import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { MAX_RULE_ACCOUNTS, MAX_RULES, Vault } from './vault.js';
 import { groupProfileDir, sandboxPaths, folderBindingsPath, type Paths } from './paths.js';
+import { snapshotIdentityKey } from './folderBindings.js';
 import {
   readFolderBindingSnapshot,
   writeFolderBindingSnapshot,
@@ -1808,6 +1809,59 @@ describe('the guard snapshot follows every rule change', () => {
 
     expect((await snapshotOf(h)).groups[0]!.members).toEqual(['A', 'Research']);
     expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+  });
+
+  it("carries the global slot's identity file and every account's identity keys, never raw ids", async () => {
+    // What the guard needs to tell which account a global-slot session runs on, and whether the
+    // folder's rule excludes it.
+    const h = await harness();
+    const { A, D } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.includeInFolder(work, [A.id]);
+    await h.engine.excludeInFolder(work, [D.id]);
+
+    const snap = await snapshotOf(h);
+    expect(snap.mainIdentityFile).toBe(h.paths.claudeJsonPath);
+    expect(snap.groups[0]!.excluded).toEqual([
+      { label: 'D', accountKey: snapshotIdentityKey('uuid-D') },
+    ]);
+    expect(snap.accounts?.find((a) => a.label === 'A')).toEqual({
+      label: 'A',
+      accountKey: snapshotIdentityKey('uuid-A'),
+      ruleIds: [snap.groups[0]!.id],
+    });
+    expect(snap.accounts?.find((a) => a.label === 'D')?.ruleIds).toEqual([]);
+    const text = JSON.stringify(snap);
+    expect(text).not.toContain('uuid-D');
+    expect(text).not.toContain('@x.com');
+  });
+
+  it('adding, renaming or removing a SHARED account keeps the snapshot fresh while rules exist', async () => {
+    // The guard names the global slot's account by these labels; a stale list would name it wrong,
+    // or not recognize a new login, until the daemon's next cycle.
+    const h = await harness();
+    const { A, C } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.includeInFolder(work, [A.id]);
+
+    const E = await addAccount(h, 'E');
+    expect((await snapshotOf(h)).accounts?.some((a) => a.label === 'E')).toBe(true);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+
+    await h.engine.renameAccount(C.id, 'Carol');
+    expect((await snapshotOf(h)).accounts?.map((a) => a.label)).toContain('Carol');
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+
+    await h.engine.removeAccount(E.id);
+    expect((await snapshotOf(h)).accounts?.some((a) => a.label === 'E')).toBe(false);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+  });
+
+  it('without any rule, an account change writes no snapshot', async () => {
+    const h = await harness();
+    const { A } = await seed(h);
+    await h.engine.renameAccount(A.id, 'Alpha');
+    expect(existsSync(folderBindingsPath(h.paths.vaultDir))).toBe(false);
   });
 
   it('refreshSnapshotIfStale rewrites a stale snapshot once and leaves a fresh one alone', async () => {

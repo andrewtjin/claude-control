@@ -11,13 +11,25 @@
 // prefix-boundary + case rules match the TS canonicalizer (because the guard embeds it).
 
 import { spawn } from 'node:child_process';
-import { realpathSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync, realpathSync } from 'node:fs';
+import { mkdir, mkdtemp, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { canonicalizeFolder, folderKey } from '@claude-control/switch-engine';
-import { bindGuardPath, generateBindGuardSource, writeBindGuard } from './bindGuard.js';
+import {
+  buildFolderBindingSnapshot,
+  canonicalizeFolder,
+  folderKey,
+  snapshotIdentityKey,
+  type FolderRule,
+  type StoredAccount,
+} from '@claude-control/switch-engine';
+import {
+  bindGuardPath,
+  generateBindGuardSource,
+  guardNoticesDir,
+  writeBindGuard,
+} from './bindGuard.js';
 import { bindTokensDir, mintBindToken, type BindTokenKind } from './bindToken.js';
 
 interface GuardResult {
@@ -61,6 +73,16 @@ function baseEnv(): NodeJS.ProcessEnv {
 
 const PAYLOAD = '{"hook_event_name":"UserPromptSubmit","session_id":"s-1"}';
 
+/** A prompt payload from a given session (the notice is remembered per session id). */
+function payloadFor(sessionId: string): string {
+  return JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: sessionId });
+}
+
+/** The snapshot's identity entry for a fixture account: its label and the key of its uuid. */
+function ident(label: string, uuid: string, extra: Record<string, unknown> = {}) {
+  return { label, accountKey: snapshotIdentityKey(uuid), ...extra };
+}
+
 describe('bind guard script', () => {
   let root: string;
   let scriptPath: string;
@@ -68,6 +90,7 @@ describe('bind guard script', () => {
   let boundFolder: string; // canonical, as stored in the snapshot
   let profileDir: string; // canonical, the group's slot config dir
   let outsideFolder: string; // canonical, bound to nothing
+  let identityFile: string; // the global slot's .claude.json
 
   /** Canonicalize a real path the same way the engine + guard do, so snapshot values and expected
    *  reason strings use the exact stored form. */
@@ -81,14 +104,24 @@ describe('bind guard script', () => {
     return r.path;
   }
 
-  /** Write a snapshot with one group bound to `boundFolder`, members Alice+Bob. Overrides let a
-   *  test change enforce mode or the schema. */
+  /** Write a snapshot with one rule on `boundFolder` that includes Alice+Bob and excludes the shared
+   *  account Dora; Carol is a shared account it keeps. The global slot's identity block lives in
+   *  `<root>/.claude.json` (see {@link setGlobalAccount}). Overrides let a test change enforce mode,
+   *  the schema or the rule rows. */
   async function writeSnapshot(overrides: Record<string, unknown> = {}): Promise<void> {
     const snapshot = {
       schemaVersion: 1,
       generation: 1,
       enforce: 'block',
       mainConfigDir: canon(root),
+      mainIdentityFile: identityFile,
+      accounts: [
+        ident('Alice', 'uuid-alice', { ruleIds: ['group-1'] }),
+        ident('Bob', 'uuid-bob', { ruleIds: ['group-1'] }),
+        ident('Carol', 'uuid-carol', { ruleIds: [] }),
+        ident('Dora', 'uuid-dora', { ruleIds: [] }),
+        ident('Erin', 'uuid-erin', { ruleIds: ['group-other'] }),
+      ],
       groups: [
         {
           id: 'group-1',
@@ -96,11 +129,37 @@ describe('bind guard script', () => {
           profileDir,
           folders: [boundFolder],
           members: ['Alice', 'Bob'],
+          excluded: [ident('Dora', 'uuid-dora')],
         },
       ],
       ...overrides,
     };
     await writeFile(snapshotPath, JSON.stringify(snapshot), 'utf8');
+  }
+
+  /** Put an account's identity block in the global slot's `.claude.json` the way Claude Code
+   *  writes it (no credentials anywhere), or remove the file for `null`. */
+  async function setGlobalAccount(
+    accountUuid: string | null,
+    organizationUuid?: string,
+  ): Promise<void> {
+    if (accountUuid === null) {
+      await rm(identityFile, { force: true });
+      return;
+    }
+    await writeFile(
+      identityFile,
+      JSON.stringify({
+        numStartups: 3,
+        oauthAccount: {
+          accountUuid,
+          emailAddress: 'someone@example.test',
+          ...(organizationUuid !== undefined ? { organizationUuid } : {}),
+        },
+        projects: {},
+      }),
+      'utf8',
+    );
   }
 
   /** The folderKey of a slot config dir the guard will compute for that dir ('' for the global
@@ -128,6 +187,10 @@ describe('bind guard script', () => {
     boundFolder = canon(bf);
     profileDir = canon(pf);
     outsideFolder = canon(of);
+    identityFile = join(root, '.claude.json');
+    // By default the global slot holds Dora, the account the rule excludes: a session on the global
+    // slot in the ruled folder is refused, which is what the case-A tests below exercise.
+    await setGlobalAccount('uuid-dora');
     await writeBindGuard(scriptPath, snapshotPath);
   });
 
@@ -135,19 +198,20 @@ describe('bind guard script', () => {
     await rm(root, { recursive: true, force: true, maxRetries: 5 });
   });
 
-  // The exact case-A reason text (spec §9), reproduced here so a drift in the script is caught.
+  // The exact case-A reason text for a global-slot session on an account the rule excludes,
+  // reproduced here so a drift in the script is caught.
   function expectedReasonA(): string {
     return (
       'cctl: ' +
       boundFolder +
-      ' has its own cctl folder rules (it uses Alice, Bob first), but this session runs on the ' +
-      'shared account. ' +
+      ' has its own cctl folder rules (it uses Alice, Bob first) and excludes Dora, the account ' +
+      'this session runs on. ' +
       'Exit and start it with: cctl claude' +
       '   (or set up the claude wrapper: cctl shell-init powershell)'
     );
   }
 
-  it('(A) project bound to a group, session on the shared account → block with the exact reason', async () => {
+  it('(A) project bound to a group, session on an EXCLUDED shared account → block with the exact reason', async () => {
     await writeSnapshot();
     const result = await runGuard(scriptPath, PAYLOAD, {
       ...baseEnv(),
@@ -191,7 +255,7 @@ describe('bind guard script', () => {
     }
   });
 
-  it('(A) the main config dir spelled out is still the shared account without a token → block', async () => {
+  it('(A) the main config dir spelled out is still the global slot without a token → block', async () => {
     await writeSnapshot();
     const result = await runGuard(scriptPath, PAYLOAD, {
       ...baseEnv(),
@@ -311,7 +375,16 @@ describe('bind guard script', () => {
     // An exclude-only rule includes nobody, so there is no account list to name: the reason must not
     // read "is bound to " followed by nothing.
     await writeSnapshot({
-      groups: [{ id: 'group-1', label: 'excl', profileDir, folders: [boundFolder], members: [] }],
+      groups: [
+        {
+          id: 'group-1',
+          label: 'excl',
+          profileDir,
+          folders: [boundFolder],
+          members: [],
+          excluded: [ident('Dora', 'uuid-dora')],
+        },
+      ],
     });
     const result = await runGuard(scriptPath, PAYLOAD, {
       ...baseEnv(),
@@ -322,9 +395,420 @@ describe('bind guard script', () => {
       reason:
         'cctl: ' +
         boundFolder +
-        ' has its own cctl folder rules, but this session runs on the shared account. ' +
+        ' has its own cctl folder rules and excludes Dora, the account this session runs on. ' +
         'Exit and start it with: cctl claude' +
         '   (or set up the claude wrapper: cctl shell-init powershell)',
+    });
+  });
+
+  describe('a session on the global slot in a ruled folder', () => {
+    // A ruled folder's pool inherits the shared pool, so the global slot's account is accepted —
+    // unless the rule excludes it or it is reserved to other folders. The account is read from the
+    // global slot's identity block, never from credentials.
+    function noticeFor(onAccount: string, tail: string): string {
+      return (
+        'cctl: ' +
+        boundFolder +
+        ' has its own cctl folder rules (it uses Alice, Bob first). This session runs on ' +
+        onAccount +
+        ', which this folder also accepts. ' +
+        tail
+      );
+    }
+    const RELAUNCH_TAIL =
+      'To use Alice, Bob here, exit and start it with: cctl claude' +
+      '   (or set up the claude wrapper: cctl shell-init powershell)';
+    const MOVE_TAIL =
+      'cctl moves this background session onto Alice, Bob between turns once one of them can ' +
+      'take work.';
+
+    it('a shared account the folder keeps → allowed, with the relaunch notice ONCE per session', async () => {
+      await writeSnapshot();
+      await setGlobalAccount('uuid-carol');
+      const env = { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder };
+      const first = await runGuard(scriptPath, payloadFor('sess-a'), env);
+      expect(first.code).toBe(0);
+      expect(JSON.parse(first.stdout)).toEqual({
+        systemMessage: noticeFor('Carol from the shared pool', RELAUNCH_TAIL),
+      });
+      // The same session's next prompt is silent; another session gets its own notice.
+      const again = await runGuard(scriptPath, payloadFor('sess-a'), env);
+      expect(again).toEqual({ code: 0, stdout: '', stderr: '' });
+      const other = await runGuard(scriptPath, payloadFor('sess-b'), env);
+      expect(JSON.parse(other.stdout)).toEqual({
+        systemMessage: noticeFor('Carol from the shared pool', RELAUNCH_TAIL),
+      });
+      expect((await readdir(guardNoticesDir(snapshotPath))).sort()).toEqual(['sess-a', 'sess-b']);
+    });
+
+    it('a background session is told cctl moves it between turns', async () => {
+      await writeSnapshot();
+      await setGlobalAccount('uuid-carol');
+      for (const marker of [
+        { CLAUDE_CODE_SESSION_KIND: 'bg' },
+        { CLAUDE_JOB_DIR: join(root, 'jobs', 'abcd1234') },
+      ]) {
+        const result = await runGuard(scriptPath, payloadFor(`bg-${Object.keys(marker)[0]}`), {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+          ...marker,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({
+          systemMessage: noticeFor('Carol from the shared pool', MOVE_TAIL),
+        });
+      }
+    });
+
+    it('warn mode shows the same one-time notice for an accepted account', async () => {
+      await writeSnapshot({ enforce: 'warn' });
+      await setGlobalAccount('uuid-carol');
+      const env = { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder };
+      const first = await runGuard(scriptPath, payloadFor('w-1'), env);
+      expect(JSON.parse(first.stdout)).toEqual({
+        systemMessage: noticeFor('Carol from the shared pool', RELAUNCH_TAIL),
+      });
+      expect(await runGuard(scriptPath, payloadFor('w-1'), env)).toEqual({
+        code: 0,
+        stdout: '',
+        stderr: '',
+      });
+    });
+
+    it('an excluded account in warn mode warns on every prompt and never blocks', async () => {
+      await writeSnapshot({ enforce: 'warn' });
+      const env = { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder };
+      for (let i = 0; i < 2; i++) {
+        const result = await runGuard(scriptPath, payloadFor('w-2'), env);
+        expect(JSON.parse(result.stdout)).toEqual({ systemMessage: expectedReasonA() });
+      }
+    });
+
+    it("the global slot on one of the folder's own included accounts → silent allow", async () => {
+      await writeSnapshot();
+      await setGlobalAccount('uuid-alice');
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: boundFolder,
+      });
+      expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+    });
+
+    it('an exclude-only rule prefers no account → an accepted account is silent', async () => {
+      await writeSnapshot({
+        groups: [
+          {
+            id: 'group-1',
+            label: 'excl',
+            profileDir,
+            folders: [boundFolder],
+            members: [],
+            excluded: [ident('Dora', 'uuid-dora')],
+          },
+        ],
+      });
+      await setGlobalAccount('uuid-carol');
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: boundFolder,
+      });
+      expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+    });
+
+    it('a login cctl does not store, not excluded → accepted, named as the shared account', async () => {
+      await writeSnapshot();
+      await setGlobalAccount('uuid-stranger');
+      const result = await runGuard(scriptPath, payloadFor('stranger'), {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: boundFolder,
+      });
+      expect(JSON.parse(result.stdout)).toEqual({
+        systemMessage: noticeFor('the shared account', RELAUNCH_TAIL),
+      });
+    });
+
+    it('an account reserved only to OTHER folders → block, naming it', async () => {
+      await writeSnapshot();
+      await setGlobalAccount('uuid-erin');
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: boundFolder,
+      });
+      expect(JSON.parse(result.stdout)).toEqual({
+        decision: 'block',
+        reason:
+          'cctl: ' +
+          boundFolder +
+          ' has its own cctl folder rules (it uses Alice, Bob first), but this session runs on ' +
+          'Erin, which is reserved to other folders. ' +
+          'Exit and start it with: cctl claude' +
+          '   (or set up the claude wrapper: cctl shell-init powershell)',
+      });
+    });
+
+    describe('when the account cannot be told', () => {
+      const cannotTell = (): string =>
+        'cctl: ' +
+        boundFolder +
+        ' has its own cctl folder rules (it uses Alice, Bob first), and cctl cannot tell whether ' +
+        'the account this session runs on is one it allows. ' +
+        'Exit and start it with: cctl claude' +
+        '   (or set up the claude wrapper: cctl shell-init powershell)';
+
+      it('no identity block and the rule excludes an account → block (the safe side)', async () => {
+        await writeSnapshot();
+        await setGlobalAccount(null);
+        const result = await runGuard(scriptPath, PAYLOAD, {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: cannotTell() });
+      });
+
+      it('an unparseable identity file and the rule excludes an account → block', async () => {
+        await writeSnapshot();
+        await writeFile(identityFile, '{ "oauthAccount": ', 'utf8');
+        const result = await runGuard(scriptPath, PAYLOAD, {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: cannotTell() });
+      });
+
+      it('no identity block and the rule excludes nothing → allowed, with the notice', async () => {
+        await writeSnapshot({
+          groups: [
+            {
+              id: 'group-1',
+              label: 'Alice + Bob',
+              profileDir,
+              folders: [boundFolder],
+              members: ['Alice', 'Bob'],
+              excluded: [],
+            },
+          ],
+        });
+        await setGlobalAccount(null);
+        const result = await runGuard(scriptPath, payloadFor('unknown-ok'), {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({
+          systemMessage: noticeFor('the shared account', RELAUNCH_TAIL),
+        });
+      });
+
+      it('an excluded account with no recorded identity → block, even on another account', async () => {
+        // Nothing to match it by, so the global slot could be holding it.
+        await writeSnapshot({
+          groups: [
+            {
+              id: 'group-1',
+              label: 'Alice + Bob',
+              profileDir,
+              folders: [boundFolder],
+              members: ['Alice', 'Bob'],
+              excluded: [{ label: 'Old' }],
+            },
+          ],
+        });
+        await setGlobalAccount('uuid-carol');
+        const result = await runGuard(scriptPath, PAYLOAD, {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: cannotTell() });
+      });
+
+      it('a snapshot from before the excluded identities existed → block', async () => {
+        await writeSnapshot({
+          groups: [
+            {
+              id: 'group-1',
+              label: 'Alice + Bob',
+              profileDir,
+              folders: [boundFolder],
+              members: ['Alice', 'Bob'],
+            },
+          ],
+        });
+        await setGlobalAccount('uuid-carol');
+        const result = await runGuard(scriptPath, PAYLOAD, {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({ decision: 'block', reason: cannotTell() });
+      });
+
+      it('a valid --override still relaxes it, visibly', async () => {
+        await writeSnapshot();
+        await setGlobalAccount(null);
+        const token = mintToken('override', slotKey(undefined));
+        const result = await runGuard(scriptPath, PAYLOAD, {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+          CCTL_BIND_OVERRIDE: token,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({ systemMessage: cannotTell() });
+      });
+    });
+
+    describe('organizations', () => {
+      it('the excluded account in ANOTHER organization is a different login → accepted', async () => {
+        await writeSnapshot({
+          groups: [
+            {
+              id: 'group-1',
+              label: 'Alice + Bob',
+              profileDir,
+              folders: [boundFolder],
+              members: ['Alice', 'Bob'],
+              excluded: [
+                ident('Dora', 'uuid-dora', { organizationKey: snapshotIdentityKey('org-1') }),
+              ],
+            },
+          ],
+        });
+        await setGlobalAccount('uuid-dora', 'org-2');
+        const result = await runGuard(scriptPath, payloadFor('org-2'), {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({
+          systemMessage: noticeFor('Dora from the shared pool', RELAUNCH_TAIL),
+        });
+      });
+
+      it('the same organization, or a login that records none → refused', async () => {
+        await writeSnapshot({
+          groups: [
+            {
+              id: 'group-1',
+              label: 'Alice + Bob',
+              profileDir,
+              folders: [boundFolder],
+              members: ['Alice', 'Bob'],
+              excluded: [
+                ident('Dora', 'uuid-dora', { organizationKey: snapshotIdentityKey('org-1') }),
+              ],
+            },
+          ],
+        });
+        for (const org of ['org-1', undefined]) {
+          await setGlobalAccount('uuid-dora', org);
+          const result = await runGuard(scriptPath, PAYLOAD, {
+            ...baseEnv(),
+            CLAUDE_PROJECT_DIR: boundFolder,
+          });
+          expect({ org, out: JSON.parse(result.stdout) as unknown }).toEqual({
+            org,
+            out: { decision: 'block', reason: expectedReasonA() },
+          });
+        }
+      });
+    });
+
+    describe('the per-session notice marker', () => {
+      it('a session id that cannot name a file shows the notice and writes nothing', async () => {
+        await writeSnapshot();
+        await setGlobalAccount('uuid-carol');
+        const env = { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder };
+        for (const id of ['../escape', 'a/b', '']) {
+          const result = await runGuard(scriptPath, payloadFor(id), env);
+          expect(JSON.parse(result.stdout)).toEqual({
+            systemMessage: noticeFor('Carol from the shared pool', RELAUNCH_TAIL),
+          });
+        }
+        expect(existsSync(join(root, 'escape'))).toBe(false);
+        expect(existsSync(guardNoticesDir(snapshotPath))).toBe(false);
+      });
+
+      it('a new marker prunes markers older than a month and keeps recent ones', async () => {
+        await writeSnapshot();
+        await setGlobalAccount('uuid-carol');
+        const dir = guardNoticesDir(snapshotPath);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, 'old-session'), '', 'utf8');
+        await writeFile(join(dir, 'recent-session'), '', 'utf8');
+        const longAgo = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+        await utimes(join(dir, 'old-session'), longAgo, longAgo);
+        await runGuard(scriptPath, payloadFor('new-session'), {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+        });
+        expect((await readdir(dir)).sort()).toEqual(['new-session', 'recent-session']);
+      });
+
+      it('a marker dir that cannot be written shows the notice every time rather than lose it', async () => {
+        await writeSnapshot();
+        await setGlobalAccount('uuid-carol');
+        // A FILE where the marker dir should be: mkdir fails, and the notice still shows.
+        await writeFile(guardNoticesDir(snapshotPath), 'not a dir', 'utf8');
+        const env = { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder };
+        for (let i = 0; i < 2; i++) {
+          const result = await runGuard(scriptPath, payloadFor('blocked-dir'), env);
+          expect(result.code).toBe(0);
+          expect(JSON.parse(result.stdout)).toEqual({
+            systemMessage: noticeFor('Carol from the shared pool', RELAUNCH_TAIL),
+          });
+        }
+      });
+    });
+
+    it('agrees with the engine-built snapshot end to end (the identity key is the same on both sides)', async () => {
+      // The real builder writes the snapshot; the guard recognizes the live login by its own key of
+      // the identity block. A drift in either key derivation would accept an excluded account.
+      const account = (id: string, label: string, uuid: string): StoredAccount => ({
+        id,
+        label,
+        accountUuid: uuid,
+        organizationUuid: 'org-shared',
+        quarantined: false,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      });
+      const rule: FolderRule = {
+        id: 'group-1',
+        label: 'research',
+        folders: [boundFolder],
+        include: ['a1'],
+        exclude: ['s2'],
+        activeId: 'a1',
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      };
+      const snapshot = buildFolderBindingSnapshot({
+        rules: [rule],
+        shared: [account('s1', 'Carol', 'uuid-carol'), account('s2', 'Dora', 'uuid-dora')],
+        reserved: [account('a1', 'Alice', 'uuid-alice')],
+        generation: 1,
+        enforce: 'block',
+        mainConfigDir: canon(root),
+        mainIdentityFile: identityFile,
+        profileDirOf: () => profileDir,
+      });
+      await writeFile(snapshotPath, JSON.stringify(snapshot), 'utf8');
+      const env = { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder };
+
+      await setGlobalAccount('uuid-dora', 'org-shared');
+      const refused = JSON.parse((await runGuard(scriptPath, PAYLOAD, env)).stdout) as {
+        decision?: string;
+        reason?: string;
+      };
+      expect(refused.decision).toBe('block');
+      expect(refused.reason).toContain('excludes Dora, the account this session runs on');
+
+      await setGlobalAccount('uuid-carol', 'org-shared');
+      const accepted = JSON.parse((await runGuard(scriptPath, payloadFor('e2e'), env)).stdout) as {
+        systemMessage?: string;
+      };
+      expect(accepted.systemMessage).toContain('This session runs on Carol from the shared pool');
+
+      await setGlobalAccount('uuid-alice', 'org-shared');
+      expect(await runGuard(scriptPath, payloadFor('e2e-own'), env)).toEqual({
+        code: 0,
+        stdout: '',
+        stderr: '',
+      });
     });
   });
 

@@ -25,8 +25,16 @@ import { dirname, join } from 'node:path';
 import {
   embeddableFolderPathSource,
   embeddableSanitizeSource,
+  SNAPSHOT_IDENTITY_KEY_PREFIX,
 } from '@claude-control/switch-engine';
 import { bindTokensDir } from './bindToken.js';
+
+/** Where the guard remembers the sessions it has already shown its one-time notice in: one empty
+ *  file per session id, beside the snapshot (derived from the snapshot path alone, like the tokens
+ *  dir, so the script needs nothing else baked in). */
+export function guardNoticesDir(snapshotPath: string): string {
+  return join(dirname(snapshotPath), 'bind-guard-notices');
+}
 
 /** Stable on-disk location of the guard script, beside `hook-forward.cjs` in the daemon data dir.
  *  Keeping the two colocated means one directory holds every generated hook script. */
@@ -64,10 +72,25 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *     snapshot's main config dir IS the global slot, keyed exactly like an unset one.
  *   - a project folder whose name has no canonical form (a control or bidi/format character) is
  *     judged by its nearest clean ancestor, which a binding covers exactly when it covers the folder.
- *   - (A) the project dir has a folder rule the session is NOT running on -> block. The block reason
- *     names the slot the session is actually on (another rule's folder slot, or the shared account).
- *     A valid --override relaxation token (CCTL_BIND_OVERRIDE) allows the session with a visible
- *     systemMessage warning instead.
+ *   - (A, global) the project dir has a folder rule and the session runs on the GLOBAL slot. A ruled
+ *     folder's pool inherits the shared pool, so the global slot's account is one the folder accepts
+ *     — unless the rule excludes it, or it is reserved to other folders only. The account is told by
+ *     the non-secret identity block (`oauthAccount`) in the main config's `.claude.json`, matched
+ *     against the identities the snapshot carries; credentials are never read. So:
+ *       - an account the folder does not take -> block, naming it;
+ *       - an account it takes -> allow. When the rule includes accounts and the session is not on
+ *         one, a notice says so ONCE per session (a marker file per hook session_id): an interactive
+ *         session is told to relaunch through `cctl claude`, a background one that cctl moves it
+ *         between turns;
+ *       - which account it is cannot be told (no readable identity block, an excluded account with
+ *         no recorded identity, or a snapshot that predates the excluded identities) -> block when
+ *         the rule excludes anything (or might), allow when it excludes nothing. Allowing would let
+ *         a folder run on an account its rule rules out, which is the one thing the rule exists to
+ *         prevent; a rule with nothing to exclude has nothing to get wrong.
+ *     A valid --override relaxation token (CCTL_BIND_OVERRIDE) turns a block into a visible
+ *     systemMessage instead.
+ *   - (A, another rule) the project dir has a folder rule and the session runs on ANOTHER rule's
+ *     slot -> block, naming that slot. --override relaxes it the same way.
  *   - (B) the session runs on a rule's slot but the project dir is not within that rule's folders
  *     -> block. A valid --account relaxation token (CCTL_LAUNCH_EXPLICIT) allows it, with a visible
  *     systemMessage so the bypass is never silent.
@@ -95,6 +118,7 @@ export function generateBindGuardSource(opts: { snapshotPath: string }): string 
 // Dependency-free CommonJS. Fails OPEN (exit 0) on any error so it can never lock a session out.
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 ${embeddableFolderPathSource()}
 
@@ -102,6 +126,13 @@ ${embeddableSanitizeSource()}
 
 // The non-secret folder-bindings snapshot, baked in at install time.
 const SNAPSHOT_PATH = ${JSON.stringify(opts.snapshotPath)};
+
+// Where the one-time notice per session is remembered: an empty file named by the hook payload's
+// session_id. A marker older than a month is dropped when a new one is written, so the directory
+// cannot grow without bound across months of sessions.
+const NOTICES_DIR = ${JSON.stringify(guardNoticesDir(opts.snapshotPath))};
+const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const NOTICE_MARKER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Where the launcher writes a per-launch relaxation token (see bindToken.ts). A token is honored
 // only when the env var names a file here whose recorded slot matches this session's slot; a plain
@@ -184,6 +215,144 @@ function describeRule(g) {
     : 'has its own cctl folder rules';
 }
 
+// The snapshot names accounts by one-way keys of their identity (see the engine's
+// snapshotIdentityKey); the live identity is keyed the same way to compare.
+const IDENTITY_KEY_PREFIX = ${JSON.stringify(SNAPSHOT_IDENTITY_KEY_PREFIX)};
+function identityKey(value) {
+  return crypto.createHash('sha256').update(IDENTITY_KEY_PREFIX + value, 'utf8').digest('hex');
+}
+
+// Which account the global slot holds, by the identity block Claude Code keeps for its login in the
+// main config's .claude.json (oauthAccount), as identity keys. Never the credentials. null when it
+// cannot be read: no file, unparseable, or no account id in it.
+function readGlobalIdentity(snapshot) {
+  var file = snapshot.mainIdentityFile;
+  if (typeof file !== 'string' || file.length === 0) return null;
+  var parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    return null;
+  }
+  var oa = parsed && typeof parsed === 'object' ? parsed.oauthAccount : null;
+  if (!oa || typeof oa !== 'object' || typeof oa.accountUuid !== 'string' || !oa.accountUuid) {
+    return null;
+  }
+  return {
+    accountKey: identityKey(oa.accountUuid),
+    organizationKey:
+      typeof oa.organizationUuid === 'string' && oa.organizationUuid
+        ? identityKey(oa.organizationUuid)
+        : undefined,
+  };
+}
+
+// Whether a snapshot identity names the live login: the same account, and the same organization
+// when both sides record one (one person can hold logins in several organizations).
+function sameIdentity(entry, live) {
+  if (!entry || typeof entry.accountKey !== 'string' || entry.accountKey !== live.accountKey) {
+    return false;
+  }
+  return (
+    typeof entry.organizationKey !== 'string' ||
+    live.organizationKey === undefined ||
+    entry.organizationKey === live.organizationKey
+  );
+}
+
+// Judge a session on the GLOBAL slot in a folder with a rule. Returns one of:
+//   { verdict: 'refuse', label, why }  the global slot holds an account this folder does not take
+//                                      (why: 'excluded' or 'reserved');
+//   { verdict: 'unknown' }             which account it holds cannot be told, and it might matter;
+//   { verdict: 'accept', label, own }  the folder takes it; own = it is one of the rule's own
+//                                      included accounts (nothing to tell the operator).
+// label is the account's stored label, or null for a login cctl does not store.
+function judgeGlobal(snapshot, rule) {
+  // A snapshot from a build that predates the excluded identities cannot say what the rule rules out.
+  if (!Array.isArray(rule.excluded)) return { verdict: 'unknown' };
+  var live = readGlobalIdentity(snapshot);
+  var accounts = Array.isArray(snapshot.accounts) ? snapshot.accounts : [];
+  var matches = [];
+  if (live !== null) {
+    for (var i = 0; i < accounts.length; i++) {
+      if (sameIdentity(accounts[i], live)) matches.push(accounts[i]);
+    }
+  }
+  var label = matches.length > 0 && typeof matches[0].label === 'string' ? matches[0].label : null;
+  if (live !== null) {
+    for (var e = 0; e < rule.excluded.length; e++) {
+      var ex = rule.excluded[e];
+      if (sameIdentity(ex, live)) {
+        return { verdict: 'refuse', label: typeof ex.label === 'string' ? ex.label : label, why: 'excluded' };
+      }
+    }
+    // Reserved to other folders and not to this one: outside this folder's pool. (The global slot
+    // holding a reserved account at all is a breach the daemon repairs; it is still refused here.)
+    var reservedElsewhere =
+      matches.length > 0 &&
+      matches.every(function (a) {
+        return Array.isArray(a.ruleIds) && a.ruleIds.length > 0 && a.ruleIds.indexOf(rule.id) < 0;
+      });
+    if (reservedElsewhere) return { verdict: 'refuse', label: label, why: 'reserved' };
+  }
+  var excludedUnmatchable = rule.excluded.some(function (x) {
+    return !x || typeof x.accountKey !== 'string';
+  });
+  if (rule.excluded.length > 0 && (live === null || excludedUnmatchable)) {
+    return { verdict: 'unknown' };
+  }
+  var own = matches.some(function (a) {
+    return Array.isArray(a.ruleIds) && a.ruleIds.indexOf(rule.id) >= 0;
+  });
+  return { verdict: 'accept', label: label, own: own };
+}
+
+// Claim the one-time notice for a session: true when it has not been shown in this session yet (and
+// is now recorded as shown), false when it has. A session id that cannot name a file, or a marker
+// that cannot be written, shows the notice rather than lose it.
+function claimNotice(sessionId) {
+  if (typeof sessionId !== 'string' || !SESSION_ID_PATTERN.test(sessionId)) return true;
+  var file = path.join(NOTICES_DIR, sessionId);
+  try {
+    fs.mkdirSync(NOTICES_DIR, { recursive: true });
+  } catch (e) {
+    return true;
+  }
+  try {
+    fs.writeFileSync(file, '', { flag: 'wx' });
+  } catch (e) {
+    // Only an existing marker means "already shown"; any other failure shows it.
+    return !(e && e.code === 'EEXIST');
+  }
+  pruneNotices(file);
+  return true;
+}
+
+// Drop notice markers older than a month (their sessions are long gone). Best effort: a marker that
+// cannot be read or removed is simply left.
+function pruneNotices(keep) {
+  try {
+    var now = Date.now();
+    var names = fs.readdirSync(NOTICES_DIR);
+    for (var i = 0; i < names.length; i++) {
+      var p = path.join(NOTICES_DIR, names[i]);
+      if (p === keep) continue;
+      try {
+        if (now - fs.statSync(p).mtimeMs > NOTICE_MARKER_MAX_AGE_MS) fs.unlinkSync(p);
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+// A background session (claude --bg) runs under Claude Code's own background service, which marks
+// its workers' environment; an interactive session carries neither mark.
+function isBackgroundSession() {
+  return (
+    process.env.CLAUDE_CODE_SESSION_KIND === 'bg' ||
+    (typeof process.env.CLAUDE_JOB_DIR === 'string' && process.env.CLAUDE_JOB_DIR.length > 0)
+  );
+}
+
 // A real folder whose name carries a control or bidi/format character has no canonical form, so no
 // binding can name it or anything beneath it. It is still judged exactly: a bound folder contains it
 // precisely when that folder contains its nearest clean ancestor (the path up to the separator before
@@ -214,7 +383,8 @@ function run(input) {
     },
   };
 
-  // The hook payload is only needed for its \`cwd\` fallback when CLAUDE_PROJECT_DIR is unset.
+  // The hook payload: its \`cwd\` is the fallback when CLAUDE_PROJECT_DIR is unset, and its
+  // \`session_id\` keys the one-time notice.
   var payload = {};
   try {
     var parsed = JSON.parse(input);
@@ -322,35 +492,78 @@ function run(input) {
 
   var sessionGroupId = sessionGroup ? sessionGroup.id : null;
 
-  // Case A: the project dir has a folder rule, and the session is not on that rule's slot.
-  if (projectBinding && projectBinding.group.id !== sessionGroupId) {
-    // The reason must name the slot this session is ACTUALLY on. A session on the global slot runs
-    // on the shared account; a session on another rule's slot runs on whatever that slot holds, so
-    // telling it to "cctl claude" (which puts it on this folder's slot) is right, but "runs on the
-    // shared account" would be false. Branch on sessionGroup accordingly.
-    var reasonA;
-    if (sessionGroup) {
-      var sFolders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
-      reasonA =
+  // Case A on the global slot: the folder accepts the global slot's account unless its rule rules it
+  // out (see judgeGlobal).
+  if (projectBinding && sessionGroup === null) {
+    var rule = projectBinding.group;
+    var judged = judgeGlobal(snapshot, rule);
+    var relaunch =
+      'Exit and start it with: cctl claude' +
+      '   (or set up the claude wrapper: cctl shell-init powershell)';
+    if (judged.verdict === 'accept') {
+      var members = Array.isArray(rule.members) ? rule.members.join(', ') : '';
+      // Nothing to tell when the rule prefers no account (it only excludes) or the global slot
+      // already holds one of its own; otherwise tell it once per session.
+      if (!members || judged.own || !claimNotice(payload.session_id)) process.exit(0);
+      var onAccount = judged.label ? judged.label + ' from the shared pool' : 'the shared account';
+      var notice =
         'cctl: ' +
         projectBinding.folder +
         ' ' +
-        describeRule(projectBinding.group) +
-        ', but this session runs on the folder slot of ' +
-        sFolders +
-        '. Exit and start it here with: cctl claude' +
-        '   (or add --override to use this account here anyway)';
-    } else {
-      reasonA =
-        'cctl: ' +
-        projectBinding.folder +
-        ' ' +
-        describeRule(projectBinding.group) +
-        ', but this session runs on the shared account. Exit and start it with: cctl claude' +
-        '   (or set up the claude wrapper: cctl shell-init powershell)';
+        describeRule(rule) +
+        '. This session runs on ' +
+        onAccount +
+        ', which this folder also accepts. ' +
+        (isBackgroundSession()
+          ? 'cctl moves this background session onto ' +
+            members +
+            ' between turns once one of them can take work.'
+          : 'To use ' + members + ' here, ' + relaunch.charAt(0).toLowerCase() + relaunch.slice(1));
+      return emitSystemMessage(notice);
     }
-    // --override relaxes case A, but only via a token the launcher minted for this launch's slot; an
-    // inherited env value is not honored, so the binding still applies. A honored override is visible.
+    var reasonG;
+    if (judged.verdict === 'refuse') {
+      var who = judged.label ? judged.label : 'an account';
+      reasonG =
+        'cctl: ' +
+        projectBinding.folder +
+        ' ' +
+        describeRule(rule) +
+        (judged.why === 'excluded'
+          ? ' and excludes ' + who + ', the account this session runs on. '
+          : ', but this session runs on ' + who + ', which is reserved to other folders. ') +
+        relaunch;
+    } else {
+      reasonG =
+        'cctl: ' +
+        projectBinding.folder +
+        ' ' +
+        describeRule(rule) +
+        ', and cctl cannot tell whether the account this session runs on is one it allows. ' +
+        relaunch;
+    }
+    // --override relaxes it, but only via a token the launcher minted for this launch's slot; an
+    // inherited env value is not honored, so the rule still applies. A honored override is visible.
+    if (honorRelaxation(process.env.CCTL_BIND_OVERRIDE, 'override', sessionConfigKey)) {
+      return emitSystemMessage(reasonG);
+    }
+    return emitBlock(reasonG, enforce);
+  }
+
+  // Case A on another rule's slot: the project dir has a folder rule, and the session runs on the
+  // slot of a different rule. The reason names the slot the session is ACTUALLY on, and points at
+  // cctl claude (which puts it on this folder's slot) or --override.
+  if (projectBinding && projectBinding.group.id !== sessionGroupId) {
+    var sFolders = Array.isArray(sessionGroup.folders) ? sessionGroup.folders.join(', ') : '';
+    var reasonA =
+      'cctl: ' +
+      projectBinding.folder +
+      ' ' +
+      describeRule(projectBinding.group) +
+      ', but this session runs on the folder slot of ' +
+      sFolders +
+      '. Exit and start it here with: cctl claude' +
+      '   (or add --override to use this account here anyway)';
     if (honorRelaxation(process.env.CCTL_BIND_OVERRIDE, 'override', sessionConfigKey)) {
       return emitSystemMessage(reasonA);
     }

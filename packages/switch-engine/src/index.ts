@@ -122,6 +122,8 @@ export { sanitizeTerminalText, embeddableSanitizeSource } from './terminalSafe.j
 export {
   buildFolderBindingSnapshot,
   readFolderBindingSnapshot,
+  snapshotIdentityKey,
+  SNAPSHOT_IDENTITY_KEY_PREFIX,
   writeFolderBindingSnapshot,
   type BindEnforceMode,
   type BuildSnapshotInput,

@@ -241,8 +241,31 @@ export interface FolderBindingSnapshot {
   enforce: 'block' | 'warn' | 'off';
   /** The main Claude Code config dir the global slot runs in (canonical). */
   mainConfigDir: string;
+  /** The `.claude.json` holding the global slot's identity block (`oauthAccount`): where the guard
+   *  reads which account a session on the global slot runs on, without touching credentials.
+   *  Absent in a snapshot written by a build that predates it. */
+  mainIdentityFile?: string;
+  /** Every stored account Claude Code can name by identity, so the guard can tell which one the
+   *  global slot holds and say it by label. Absent in a snapshot written by an older build. */
+  accounts?: FolderBindingSnapshotAccount[];
   /** One row per folder rule (the key predates rules and is kept for the guard's reader). */
   groups: FolderBindingSnapshotGroup[];
+}
+
+/** An account as the guard snapshot names it: its label and one-way keys of the identity Claude
+ *  Code records for a login in `.claude.json` (`oauthAccount.accountUuid` / `organizationUuid`; see
+ *  `snapshotIdentityKey`), so the guard can recognize the login live in the global slot while the
+ *  snapshot carries no account ids, no email and no tokens. */
+export interface FolderBindingSnapshotIdentity {
+  label: string;
+  accountKey?: string;
+  organizationKey?: string;
+}
+
+/** A stored account in the guard snapshot: its identity plus the rules that include (reserve) it —
+ *  empty for a shared account. */
+export interface FolderBindingSnapshotAccount extends FolderBindingSnapshotIdentity {
+  ruleIds: string[];
 }
 
 /** One folder rule as the guard snapshot describes it. Members are LABELS only (for the block
@@ -256,6 +279,10 @@ export interface FolderBindingSnapshotGroup {
   /** Labels of the rule's INCLUDED accounts, in include order — empty for a rule that only
    *  excludes. */
   members: string[];
+  /** The shared accounts the rule excludes, by identity: a session on the global slot in this
+   *  folder is refused while the global slot holds one of them. Absent in a snapshot written by a
+   *  build that predates it, which the guard reads as "cannot tell". */
+  excluded?: FolderBindingSnapshotIdentity[];
 }
 
 /** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets.

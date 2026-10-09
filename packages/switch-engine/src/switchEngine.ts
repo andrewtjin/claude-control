@@ -669,7 +669,11 @@ export class SwitchEngine {
   }
 
   addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
-    return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
+    return this.withCredentialLock(async () => {
+      const account = await this.vault.addAccount(label, bundle);
+      await this.refreshSnapshotForAccountsLocked();
+      return account;
+    });
   }
   /**
    * Remove an account wherever it lives, and clean every rule slot it occupied.
@@ -727,16 +731,17 @@ export class SwitchEngine {
       for (const rule of dissolving)
         await this.clearSlotState(this.slotRuntime(ruleSlotId(rule.id)));
       // The guard names a rule's included accounts and enforces its folders; a removal changed one or
-      // both. Written LAST, like every other rule mutation.
+      // both. Written LAST, like every other rule mutation. Any other removal still drops an account
+      // the guard can name the global slot by.
       if (reserved || dissolving.length > 0) await this.writeSnapshotLocked();
+      else await this.refreshSnapshotForAccountsLocked();
     });
   }
   renameAccount(id: string, label: string): Promise<StoredAccount> {
     return this.withCredentialLock(async () => {
       const renamed = await this.vault.renameAccount(id, label);
-      // A reserved account's label is part of what the guard's block reason shows.
-      const picture = await this.vault.readPicture();
-      if (picture.reserved.some((a) => a.id === id)) await this.writeSnapshotLocked();
+      // Every stored account's label is part of what the guard's messages show.
+      await this.refreshSnapshotForAccountsLocked();
       return renamed;
     });
   }
@@ -2541,12 +2546,24 @@ export class SwitchEngine {
     const picture = await this.vault.readPicture();
     return buildFolderBindingSnapshot({
       rules: picture.rules,
+      shared: picture.shared,
       reserved: picture.reserved,
       generation: picture.generation,
       enforce: this.resolveBindEnforce(),
       mainConfigDir: this.canonReserved(this.paths.claudeDir),
+      mainIdentityFile: this.paths.claudeJsonPath,
       profileDirOf: (ruleId) => this.canonReserved(groupProfileDir(this.paths.vaultDir, ruleId)),
     });
+  }
+
+  /** Bring the guard snapshot up to date after an account change it names (a label or an identity),
+   *  when folder rules exist: the guard reads accounts only in a ruled folder, and a vault without
+   *  rules keeps no snapshot current. Assumes the lock is held. Without it the guard would name the
+   *  global slot's account by a stale label, or not recognize a new one, until the daemon's next
+   *  cycle rewrote the snapshot. */
+  private async refreshSnapshotForAccountsLocked(): Promise<void> {
+    if ((await this.vault.listRules()).length === 0) return;
+    await this.refreshSnapshotIfStaleLocked();
   }
 
   /** Rewrite the guard snapshot from the current registry, assuming the lock is held. Called LAST in
@@ -2763,6 +2780,7 @@ export class SwitchEngine {
       const account = await this.vault.addAccount(label, bundle);
       // The just-captured account IS the live one; record that so the first switch reconciles.
       await this.vault.setActive(account.id);
+      await this.refreshSnapshotForAccountsLocked();
       return account;
     });
   }
@@ -2795,7 +2813,11 @@ export class SwitchEngine {
       : { claudeAiOauth: creds };
     // Unlike captureCurrentLogin, the live account is unchanged — do NOT touch activeId. The
     // transient-dir reads above touch no shared state; only the registry write needs the lock.
-    return this.withCredentialLock(() => this.vault.addAccount(label, bundle));
+    return this.withCredentialLock(async () => {
+      const account = await this.vault.addAccount(label, bundle);
+      await this.refreshSnapshotForAccountsLocked();
+      return account;
+    });
   }
 
   /**

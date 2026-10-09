@@ -1955,20 +1955,24 @@ export class Vault {
   /**
    * Rebuild and atomically write `folder-bindings.json` from the current rules, and return what was
    * written. Callers run this LAST in every rule mutation and on daemon start, so the guard always
-   * reads a snapshot no older than the last committed change. `enforce` and `mainConfigDir` come
-   * from the caller's policy/config; the profile-dir mapping is the vault's own path convention.
+   * reads a snapshot no older than the last committed change. `enforce`, `mainConfigDir` and
+   * `mainIdentityFile` come from the caller's policy/config; the profile-dir mapping is the vault's
+   * own path convention.
    */
   async writeFolderBindings(opts: {
     enforce: BindEnforceMode;
     mainConfigDir: string;
+    mainIdentityFile: string;
   }): Promise<FolderBindingSnapshot> {
     const st = await this.loadState();
     const snapshot = buildFolderBindingSnapshot({
       rules: st.rules,
+      shared: st.shared,
       reserved: st.reserved,
       generation: st.generation,
       enforce: opts.enforce,
       mainConfigDir: opts.mainConfigDir,
+      mainIdentityFile: opts.mainIdentityFile,
       profileDirOf: (ruleId) => groupProfileDir(this.vaultDir, ruleId),
     });
     await writeFolderBindingSnapshot(folderBindingsPath(this.vaultDir), snapshot);
