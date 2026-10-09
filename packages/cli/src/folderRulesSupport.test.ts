@@ -5,7 +5,7 @@ import {
   olderDaemonReason,
   reportSupportsFolderRules,
 } from './folderRulesSupport.js';
-import type { SettingsReport } from './settings.js';
+import { resolveDaemonConfig, type SettingsReport } from './settings.js';
 
 const report = (rows: { name: string; value: string }[]): SettingsReport => ({
   startedAtMs: 1,
@@ -15,6 +15,13 @@ const supported = { name: FOLDER_RULES_REPORT_ROW, value: FOLDER_RULES_SUPPORTED
 const alive = { state: 'alive', writtenAtMs: 1, ageMs: 1 } as const;
 
 describe('reportSupportsFolderRules', () => {
+  it('accepts the report a daemon of this build writes', () => {
+    // The refusal reads the row the daemon side writes; this ties the two together, so renaming
+    // either side cannot leave every daemon looking older than folder rules.
+    const settings = resolveDaemonConfig({}).rows;
+    expect(reportSupportsFolderRules({ startedAtMs: 1, settings })).toBe(true);
+  });
+
   it('reads the folder-rules row the daemon writes', () => {
     expect(reportSupportsFolderRules(report([supported]))).toBe(true);
     expect(reportSupportsFolderRules(report([{ name: 'daemon build', value: 'v0.5.2' }]))).toBe(

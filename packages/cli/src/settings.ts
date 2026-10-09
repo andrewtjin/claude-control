@@ -46,6 +46,7 @@ import {
   type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { FOLDER_RULES_REPORT_ROW, FOLDER_RULES_SUPPORTED } from './folderRulesSupport.js';
 
 export type { SettingRow } from '@claude-control/shared-protocol';
 
@@ -711,8 +712,8 @@ export function resolveDaemonConfig(
       // (per-slot switching over each folder's pool). The CLI refuses folder rule edits while a
       // running daemon's report lacks it, since an older daemon could seat an account a folder
       // slot holds in the global slot too.
-      name: 'folder rules',
-      value: 'supported',
+      name: FOLDER_RULES_REPORT_ROW,
+      value: FOLDER_RULES_SUPPORTED,
       source: 'default',
       detail: 'cctl folder include / exclude: per-folder account pools',
     },

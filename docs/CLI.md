@@ -268,6 +268,9 @@ since when once the daemon has recorded it and which account is expected back fi
 reset time is known: one line for the global pool, and one for each folder rule whose pool is
 out (see below).
 
+Where folder rules exist, both end with a section per rule: its folders, the account live in its
+slot, and its pool in order (`cctl folders` has the full picture).
+
 ## When every account is out of usage
 
 ```
