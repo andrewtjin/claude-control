@@ -18,6 +18,7 @@ import { isBindGuardInSettingsText, type HeartbeatReading } from '@claude-contro
 import type { SwitchEngine } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import type { AutostartState } from './autostart.js';
+import { describeEnforceMode } from './folderRender.js';
 import { olderDaemonReason } from './folderRulesSupport.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 import type { SettingsReport } from './settings.js';
@@ -386,7 +387,7 @@ export async function checkGuardSnapshot(
       name: 'guard-snapshot',
       ok: freshness.fresh,
       detail: freshness.fresh
-        ? `fresh (generation ${freshness.generation}, enforce=${freshness.enforce})`
+        ? `fresh (generation ${freshness.generation}, enforce=${freshness.enforce}: ${describeEnforceMode(freshness.enforce)})`
         : `STALE (the guard is enforcing an out-of-date view of the folder rules) — restart the daemon (cctl daemon restart) to rewrite it`,
     };
   } catch (err) {

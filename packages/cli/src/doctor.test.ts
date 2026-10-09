@@ -367,6 +367,10 @@ describe('checkGuardSnapshot', () => {
     });
     expect(check.ok).toBe(true);
     expect(check.detail).toContain('fresh');
+    // The mode says what it does: block refuses only what a folder's rule rules out.
+    expect(check.detail).toContain(
+      "enforce=block: refuses a session on an account a folder's rule rules out",
+    );
   });
 
   it('fails when the snapshot content lags the live registry', async () => {

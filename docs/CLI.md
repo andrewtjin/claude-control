@@ -223,21 +223,80 @@ cctl where <folder>     # the same for another folder
 
 ### Enforcement: what a session on the wrong slot sees
 
-So a session does not silently run on the wrong account, cctl installs a guard that checks
-each prompt against the folder's rule. When a folder has a rule but the session runs on the
-shared account, the guard blocks the prompt with:
+So a session does not silently run on an account its folder must not use, cctl installs a
+guard that checks each prompt against the folder's rule.
+
+**A plain `claude` in a ruled folder** (no wrapper) runs on the global slot. A ruled folder's
+pool inherits the shared pool, so the global slot's account is one the folder accepts, and
+the prompt goes through. When the rule includes accounts, the session is told once (on its
+first prompt, not on every one) that it is not on them:
 
 ```
-cctl: C:\work has its own cctl folder rules (it uses A, B first), but this session runs on
-the shared account. Exit and start it with: cctl claude   (or set up the claude wrapper:
-cctl shell-init powershell)
+cctl: C:\work has its own cctl folder rules (it uses A, B first). This session runs on C
+from the shared pool, which this folder also accepts. To use A, B here, exit and start it
+with: cctl claude   (or set up the claude wrapper: cctl shell-init powershell)
 ```
+
+A background session (`claude --bg`) is told instead that cctl moves it: once one of the
+folder's included accounts is live in its slot and can take work, the daemon stops the
+session between turns and resumes it under the folder's slot, with the same session id and
+the same conversation (see below).
+
+**The global slot on an account the folder must not use** is refused: one the rule
+excludes, or one reserved to other folders.
+
+```
+cctl: C:\work has its own cctl folder rules (it uses A, B first) and excludes D, the
+account this session runs on. Exit and start it with: cctl claude   (or set up the claude
+wrapper: cctl shell-init powershell)
+```
+
+The guard tells which account the global slot holds from the identity Claude Code records
+for its login (`oauthAccount` in the main config's `.claude.json`), never from credentials.
+When it cannot tell (that file is missing or unreadable, or an excluded account has no
+recorded identity), a folder whose rule excludes accounts refuses the prompt — allowing it
+could run the folder on the very account it excludes — and a folder that excludes nothing
+lets it through with the notice.
+
+**A session on another folder's slot** is refused in a ruled folder, and a session on a
+folder's slot is refused outside that folder's folders, exactly as before.
 
 There are three enforcement modes, set with `cctl settings set bind-enforce <mode>`:
 
-- **block** (default) — a mismatched prompt is refused with the message above.
-- **warn** — the same message is shown, but the prompt proceeds.
+- **block** (default) — refuses only the sessions above: an account the folder's rule rules
+  out, or a slot that is not the folder's. Every other account is allowed, with the
+  one-time notice.
+- **warn** — the same sessions are flagged on every prompt, but nothing is refused.
 - **off** — no check.
+
+### Background sessions move onto the folder's slot
+
+A running Claude Code session cannot change account: its account is the config dir it
+started with, and the global slot is shared by every plain session in every folder, so it
+cannot be switched for one folder. Background sessions are the exception. Claude Code hosts
+them in a background service of its own, one per config dir, and keeps their conversations
+in `projects/`, which every folder profile shares with the main config dir. So in each poll
+cycle, for every rule whose slot holds one of its included accounts with usage left, the
+daemon moves each background session the global slot's service hosts in that folder:
+
+1. it checks that the session is idle between turns (`claude agents` reports it idle) — a
+   session in a turn, or waiting on a permission prompt, is left for a later cycle;
+2. it stops the session (`claude stop`) and resumes it by its full session id under the
+   folder's profile (`claude --bg --resume <id>`, with no prompt, so no turn is spent), from
+   the session's working directory, with the session's saved model, permission mode and added
+   directories;
+3. it confirms the folder's service now hosts it, logs the move in the daemon log and sends
+   one phone notice.
+
+A session moves at most once an hour, so one woken back onto the global slot by hand is not
+bounced every cycle. If a move fails, the session is resumed back on the global slot, the
+daemon logs it and sends one phone notice, and it does not try that session again until it
+restarts. Sessions in folders without a rule are never moved, and an exclude-only rule
+prefers no account, so its sessions stay where they are. The moves use the `claude` on the
+daemon's PATH (the one that started the background service). Not on macOS, where folder
+rules are not supported.
+
+An interactive session cannot be moved this way; it gets the relaunch notice above.
 
 To run in a ruled folder on the global account _on purpose_ for one session, launch it
 with `cctl claude --override`; to run a reserved account in a folder that does not include

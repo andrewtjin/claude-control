@@ -248,8 +248,9 @@ export function renderSettingForgotten(
 const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'];
 
 /** The guard's three enforcement modes (see the switch-engine's `BindEnforceMode`): block a
- *  session running under the wrong slot, warn but let it through, or say nothing. `block` is the
- *  default everywhere the value is absent. */
+ *  session in a ruled folder that runs on an account the folder's rule rules out (or on another
+ *  folder's slot), warn but let it through, or say nothing. `block` is the default everywhere the
+ *  value is absent. */
 const BIND_ENFORCE_MODES: readonly BindEnforceMode[] = ['block', 'warn', 'off'];
 
 /** Parse a `CCTL_BIND_ENFORCE` value the way the daemon reads it: case-insensitive, blank or
@@ -264,7 +265,7 @@ export function parseBindEnforce(raw: string | undefined): BindEnforceMode | und
 }
 
 /** The default the guard and the snapshot fall back to when no value is set anywhere: block a
- *  session that runs under the wrong slot. */
+ *  session on an account the folder's rule rules out. */
 export const DEFAULT_BIND_ENFORCE: BindEnforceMode = 'block';
 
 export type SettingValueCheck = { ok: true; value: string } | { ok: false; message: string };
@@ -548,9 +549,9 @@ export interface DaemonConfig {
     /** Where the daemon's NDJSON file sink writes, in addition to stdout — an explicit
      *  CCTL_LOG_FILE, or `<dataDir>/daemon.log` when unset (see the `dataDir` parameter). */
     logFilePath: string;
-    /** How the folder-binding guard enforces a session that runs under the wrong slot: block
-     *  it, warn only, or say nothing. Fed to the engine so the guard snapshot reflects it, and
-     *  read back by the guard hook. Defaults to `block`. */
+    /** How the folder-binding guard enforces a session on an account the folder's rule rules out:
+     *  block it, warn only, or say nothing. Fed to the engine so the guard snapshot reflects it,
+     *  and read back by the guard hook. Defaults to `block`. */
     bindEnforce: BindEnforceMode;
   };
   rows: SettingRow[];
@@ -692,9 +693,9 @@ export function resolveDaemonConfig(
   // CCTL_LOG_FILE must not win over the real default with an empty path nothing can write to.
   const logFileEnv = blankAsUnset(layered['CCTL_LOG_FILE']);
   const logFilePath = logFileEnv ?? join(dataDir, 'daemon.log');
-  // The folder-binding guard's enforcement mode. Default `block`: a session that runs under the
-  // wrong slot is stopped with instructions rather than silently allowed to burn the wrong
-  // account. daemonRun hands this to the engine so the snapshot the guard reads reflects it.
+  // The folder-binding guard's enforcement mode. Default `block`: a session on an account the
+  // folder's rule rules out is stopped with instructions rather than silently allowed to burn it.
+  // daemonRun hands this to the engine so the snapshot the guard reads reflects it.
   const bindEnforceEnv = parseBindEnforce(layered['CCTL_BIND_ENFORCE']);
   const bindEnforce = bindEnforceEnv ?? DEFAULT_BIND_ENFORCE;
 
@@ -887,8 +888,8 @@ export function resolveDaemonConfig(
       value: bindEnforce,
       source: sourceOf('CCTL_BIND_ENFORCE', bindEnforceEnv !== undefined),
       detail:
-        'CCTL_BIND_ENFORCE (block: stop a session on the wrong account; warn: allow but flag; ' +
-        'off: silent)',
+        'CCTL_BIND_ENFORCE (block: in a ruled folder, stop a session on an account the rule rules ' +
+        "out, or on another folder's slot; warn: allow but flag; off: silent)",
     },
   ];
 

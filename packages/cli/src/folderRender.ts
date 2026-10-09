@@ -248,11 +248,26 @@ export function renderGlobalSlot(view: GlobalSlotView, palette: Palette = PLAIN_
   ].join('\n');
 }
 
+/** What each enforcement mode does, in the few words `cctl folders` and `cctl doctor` print beside
+ *  it. In a ruled folder the guard judges only a session on the wrong slot for that folder: the
+ *  global slot's account is accepted unless the rule rules it out (excluded, or reserved to other
+ *  folders), and a session on another folder's slot is out of place. */
+export function describeEnforceMode(mode: 'block' | 'warn' | 'off'): string {
+  switch (mode) {
+    case 'block':
+      return "refuses a session on an account a folder's rule rules out, or on another folder's slot";
+    case 'warn':
+      return 'flags those sessions, refuses none';
+    case 'off':
+      return 'no check';
+  }
+}
+
 export function renderFolderGuardFooter(
   view: FolderGuardFooterView,
   palette: Palette = PLAIN_PALETTE,
 ): string {
-  const enforceLine = `enforcement: ${view.enforce}`;
+  const enforceLine = `enforcement: ${view.enforce} (${describeEnforceMode(view.enforce)})`;
   let freshness: string;
   if (!view.present) {
     freshness = palette.yellow(
@@ -431,6 +446,19 @@ export function vscodeProfileNames(
   return out;
 }
 
+/** What happens to a session started here on the global slot (a plain `claude` without the
+ *  wrapper): the folder accepts the global slot's account unless its rule excludes it, and a rule
+ *  that includes accounts gets its background sessions moved onto its own slot. */
+function globalSlotHere(rule: Pick<FolderRuleView, 'include' | 'exclude'>): string {
+  const accepted =
+    rule.exclude.length > 0
+      ? `a session on the global slot is accepted unless it is on ${labelList(rule.exclude, '')}`
+      : 'a session on the global slot is accepted';
+  return rule.include.length > 0
+    ? `${accepted}; cctl moves background sessions onto ${labelList(rule.include, '')} between turns`
+    : accepted;
+}
+
 /** Explain which slot a folder runs on, its rule, live account and pool in order, print the env line
  *  a session needs, and how to point the VS Code Claude Code extension at that slot (a VS Code
  *  profile holding the claudeCode.environmentVariables setting). */
@@ -474,6 +502,7 @@ export function renderWhere(
     `  matched:  ${sanitizeForTerminal(r.matchedFolder)} (the longest matching rule wins; rules do not merge)`,
     ...ruleBodyLines(r, palette),
     `  env:      CLAUDE_CONFIG_DIR=${profile}`,
+    `  global:   ${globalSlotHere(r)}`,
     '',
     'Start Claude Code here with the right account using: cctl claude',
     '(or install the wrapper once: cctl shell-init powershell)',

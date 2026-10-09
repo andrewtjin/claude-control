@@ -547,10 +547,15 @@ extension. Green tests are not a bound account.
   with `cctl claude` (and via the installed `claude` wrapper from `cctl shell-init`), and
   confirm the session runs on the bound account while a session in an unbound folder stays on
   the global account — memories, skills, plugins and MCP servers visible in **both**.
-- **The guard blocks a real mismatch.** Start Claude Code in the bound folder on the shared
-  account (no wrapper) and confirm the `UserPromptSubmit` guard blocks the prompt with the
-  documented message; confirm `--override` and `bind-enforce warn`/`off` behave as documented;
-  confirm the guard fails open when the snapshot is absent.
+- **The guard blocks a real mismatch.** Start Claude Code in the ruled folder on the global slot
+  (no wrapper) while it holds an account the rule excludes, and confirm the `UserPromptSubmit`
+  guard blocks the prompt with the documented message; with an account the rule keeps, confirm
+  the prompt goes through with the one-time notice; confirm `--override` and `bind-enforce
+warn`/`off` behave as documented; confirm the guard fails open when the snapshot is absent.
+- **A background session moves.** Start `claude --bg` in the ruled folder from a plain shell,
+  let it finish its turn, and confirm the daemon stops it and resumes it under the folder's
+  profile with the same session id and conversation (the next prompt bills the included
+  account), with one phone notice.
 - **VS Code extension route.** Driven headless against the real VS Code 1.121 and Claude Code
   extension 2.1.283 (fake API, bearer recorded per request): the extension declares
   `claudeCode.environmentVariables` machine-scoped, so the snippet in a folder's

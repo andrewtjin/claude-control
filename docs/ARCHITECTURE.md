@@ -190,11 +190,28 @@ unruled folder's pool is the shared pool.
   dependency-free `UserPromptSubmit` hook (installed beside the relay forwarder, which keeps
   its own never-block contract) reads a non-secret snapshot — `folder-bindings.json`, written
   last in every rule change — and compares the session's config dir and project dir
-  against it. A ruled folder on the shared account, or a folder slot used against a folder
-  without that rule, is blocked (or warned, or ignored, per the enforce mode). The guard fails **open**:
-  any internal error, a missing or unparseable snapshot, or an unknown schema version exits 0
-  and lets the prompt through. It prevents accidents; it is not a security boundary (see
-  `docs/THREAT_MODEL.md`).
+  against it. A ruled folder accepts the global slot's account, since its pool inherits the
+  shared pool, unless the rule excludes that account or it is reserved to other folders; the
+  guard tells which account the global slot holds from the identity block in the main config's
+  `.claude.json`, matched against one-way identity keys in the snapshot, and never reads
+  credentials. An accepted session is told once (a marker per session id) that the folder
+  prefers its included accounts. A ruled folder on an account it rules out, a ruled folder on
+  another folder's slot, or a folder slot used outside its folders is blocked (or warned, or
+  ignored, per the enforce mode); when the global slot's account cannot be told, a rule that
+  excludes accounts blocks and one that excludes nothing allows. The guard fails **open** on
+  any internal error, a missing or unparseable snapshot, or an unknown schema version: it
+  exits 0 and lets the prompt through. It prevents accidents; it is not a security boundary
+  (see `docs/THREAT_MODEL.md`).
+- **Moving background sessions.** An interactive session cannot change account, but a
+  background session (`claude --bg`) can be stopped and resumed elsewhere: Claude Code hosts
+  them in one service per config dir, and the conversation lives in the shared `projects/`.
+  So once a rule's slot holds an included account with usage left, the daemon moves each idle
+  background session the main config's service hosts in that folder onto the rule's profile
+  (stop, then resume by full session id with no prompt and the saved options), confirms it in
+  the profile service's roster, and notifies once. At most one move per session per hour; a
+  failed move puts the session back and is not retried while the daemon runs. Claude Code's
+  commands sit behind one seam (`BackgroundSessionHost`), so every decision is tested without
+  the binary.
 - **One engine, one lock.** The switch engine became slot-aware rather than being duplicated:
   the same `activate` / recovery / adoption / identity-guard machinery runs per slot, all
   under one cross-process lock, so no two slots can be written at once and every slot is

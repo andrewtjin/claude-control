@@ -196,6 +196,11 @@ running on the wrong account. It is **not** a security boundary:
   run commands can move itself between accounts regardless of the guard, which is one more
   reason the channel `instructions` name credential handling and the cctl account verbs as
   things channel content may never authorise (risk 1).
+- It reads which account the global slot holds from the identity block in `.claude.json`, a
+  file the user can edit. Editing it can only change which account the guard **believes** is
+  live, not which one is, so it is one more same-user bypass, not a new one. The snapshot
+  names accounts by one-way keys of their identity (a namespaced SHA-256), not by their ids
+  or emails, so the plainly readable snapshot adds no identifier that was not already on disk.
 
 The guard's own **decision text is a sanitized surface**, on par with the CLI terminal and the
 Discord embeds above. Its `reason`/`systemMessage` interpolate a folder path and account labels

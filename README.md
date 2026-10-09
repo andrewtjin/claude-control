@@ -67,8 +67,9 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   to the shared pool when it is out, and no other folder can spend it. `cctl folder exclude`
   keeps a folder off accounts it must not use; `cctl folders` shows every rule and who is
   live where. Memories, skills, plugins and settings stay shared, and a guard catches a
-  session launched on the wrong account before it runs. Windows and Linux; see
-  `docs/CLI.md`.
+  session launched on an account the folder must not use before it runs. Background
+  sessions started on the global account move onto the folder's own account between turns.
+  Windows and Linux; see `docs/CLI.md`.
 
 ## Local-only (no Discord)
 

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  describeEnforceMode,
   describeSlotLive,
   renderFolderGuardFooter,
   renderFolderRule,
@@ -170,6 +171,15 @@ describe('renderFolderGuardFooter', () => {
       'fresh',
     );
   });
+
+  it('says what each mode does: block refuses only what a rule rules out', () => {
+    expect(renderFolderGuardFooter({ present: true, fresh: true, enforce: 'block' })).toContain(
+      "enforcement: block (refuses a session on an account a folder's rule rules out, or on " +
+        "another folder's slot)",
+    );
+    expect(describeEnforceMode('warn')).toBe('flags those sessions, refuses none');
+    expect(describeEnforceMode('off')).toBe('no check');
+  });
 });
 
 describe('renderFolderRulesSection', () => {
@@ -256,6 +266,12 @@ describe('renderWhere', () => {
     expect(out).toContain('live:     E (included)');
     expect(out).toContain('1. E  included, live here');
     expect(out).toContain('CLAUDE_CONFIG_DIR=C:\\data\\profiles\\r1');
+    // A plain `claude` here runs on the global slot: accepted unless on an excluded account, and a
+    // background one is moved onto the folder's own accounts.
+    expect(out).toContain(
+      'global:   a session on the global slot is accepted unless it is on D; cctl moves ' +
+        'background sessions onto E, B between turns',
+    );
     // The extension's setting is machine-scoped: a folder's .vscode/settings.json is ignored, so the
     // advice is a VS Code profile whose USER settings carry it, never the workspace file.
     expect(out).toContain('USER settings only');
@@ -267,6 +283,22 @@ describe('renderWhere', () => {
     expect(parsed['claudeCode.environmentVariables']).toEqual([
       { name: 'CLAUDE_CONFIG_DIR', value: 'C:\\data\\profiles\\r1' },
     ]);
+  });
+
+  it('words the global-slot line for a rule that excludes nothing, or includes nothing', () => {
+    const where = (rule: FolderRuleView): string =>
+      renderWhere(
+        { folder: 'C:\\w', rule: { ...rule, matchedFolder: 'C:\\w' }, global: globalSlot },
+        PLAIN_PALETTE,
+        'win32',
+      );
+    expect(where({ ...research, exclude: [] })).toContain(
+      'global:   a session on the global slot is accepted; cctl moves background sessions onto ' +
+        'E, B between turns',
+    );
+    expect(where({ ...research, include: [] })).toContain(
+      'global:   a session on the global slot is accepted unless it is on D\n',
+    );
   });
 
   it('quotes the VS Code command for the shell, whatever the folder or label holds', () => {
