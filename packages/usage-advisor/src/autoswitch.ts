@@ -176,6 +176,9 @@ function candidateGate(now: number, policy: AutoSwitchPolicy, candidateIds?: Rea
   return { triggerPercent, snapshotAge, lowThreshold, visibleLimits, weeklyResetAt, isCandidate };
 }
 
+/** The resolved gate one decision reads (see {@link candidateGate}). */
+type CandidateGate = ReturnType<typeof candidateGate>;
+
 /** Whether `decideAutoSwitch` could pick this account as a hop target right now, under the
  *  same policy — for surfaces that describe what the executor will do (the greedy plan), so
  *  they never announce a hop the executor refuses. */
@@ -193,6 +196,9 @@ export interface DecideAutoSwitchOptions {
    *  the group's members for a group). The active account is never filtered by it, so a slot
    *  can always leave its current account. Absent = no restriction. */
   candidateIds?: ReadonlySet<string>;
+  /** The slot's PREFERRED accounts (a folder rule's included accounts): the decision is then
+   *  tiered (see {@link decideAutoSwitch}). Absent = one flat pool, exactly as before. */
+  preferredIds?: ReadonlySet<string>;
 }
 
 /**
@@ -204,6 +210,18 @@ export interface DecideAutoSwitchOptions {
  * carry them).
  *
  * `opts.candidateIds` restricts hop targets to a slot's own pool; see `candidateGate`.
+ *
+ * With `opts.preferredIds` the pool is TIERED, which is how a folder rule's slot uses its own
+ * included accounts first and the shared pool it inherits only as a fallback:
+ *   - on a preferred account, the slot rotates among the preferred ones exactly as a flat pool
+ *     would (greedy included); it falls back to the rest only on the low-quota trigger, when no
+ *     preferred account is a candidate. Greedy never leaves the preferred tier: a sooner weekly
+ *     reset on an inherited account is no reason to stop using the folder's own accounts;
+ *   - off the preferred tier (in fallback), the slot RETURNS to the best preferred candidate as
+ *     soon as there is one, whatever the active account's numbers say; until then it rotates
+ *     among the rest as a flat pool would.
+ * A candidate is judged by the same gate in every tier, so a return never lands on an account
+ * the low-quota trigger would hop straight back off.
  */
 export function decideAutoSwitch(
   accounts: AccountUsageInput[],
@@ -211,14 +229,107 @@ export function decideAutoSwitch(
   policy: AutoSwitchPolicy = {},
   opts: DecideAutoSwitchOptions = {},
 ): AutoSwitchDecision | null {
-  const gate = candidateGate(now, policy, opts.candidateIds);
+  const preferred = opts.preferredIds;
+  if (preferred === undefined) return decideWithin(accounts, now, policy, opts.candidateIds);
+
+  const active = accounts.find((a) => a.active);
+  if (!active) return null;
+  const allowed = (id: string): boolean =>
+    opts.candidateIds === undefined || opts.candidateIds.has(id);
+  const ids = accounts.map((a) => a.accountId).filter(allowed);
+  const preferredTargets = new Set(ids.filter((id) => preferred.has(id)));
+  const fallbackTargets = new Set(ids.filter((id) => !preferred.has(id)));
+
+  if (!preferred.has(active.accountId)) {
+    return (
+      decideReturn(accounts, active, now, policy, preferredTargets) ??
+      decideWithin(accounts, now, policy, fallbackTargets)
+    );
+  }
+  return (
+    decideWithin(accounts, now, policy, preferredTargets) ??
+    decideWithin(accounts, now, { ...policy, greedy: false }, fallbackTargets)
+  );
+}
+
+/**
+ * The tiered decision's way back: off the preferred tier, hop to the best preferred candidate as
+ * soon as one exists, ranked like any other choice (see {@link rankCandidates}). `null` while no
+ * preferred account is a candidate.
+ */
+function decideReturn(
+  accounts: AccountUsageInput[],
+  active: AccountUsageInput,
+  now: number,
+  policy: AutoSwitchPolicy,
+  preferredTargets: ReadonlySet<string>,
+): AutoSwitchDecision | null {
+  const gate = candidateGate(now, policy, preferredTargets);
+  const target = rankCandidates(accounts.filter(gate.isCandidate), gate, now)[0];
+  if (target === undefined) return null;
+  return {
+    targetAccountId: target.accountId,
+    targetLabel: target.label,
+    reason:
+      `${target.label} can take work again — back from ${active.label} ` +
+      `(${targetBudgetText(target, gate, now)})`,
+  };
+}
+
+/**
+ * Order eligible candidates best first. Soonest weekly reset wins — weekly is the budget. On the
+ * same reset moment a REPORTED reset outranks a predicted one (live work goes to the account
+ * whose clock we can actually see), then the account with MORE weekly budget remaining (the
+ * larger expiring asset), then label so the decision is deterministic. The 5h window
+ * deliberately never ranks. Every candidate has a known weekly reset: the gate requires one.
+ */
+function rankCandidates(
+  candidates: AccountUsageInput[],
+  gate: CandidateGate,
+  now: number,
+): AccountUsageInput[] {
+  const { weeklyResetAt } = gate;
+  const weeklyUsedPct = (a: AccountUsageInput) =>
+    weeklyBudget(gate.visibleLimits(a), a, now)?.percent ?? 0;
+  const weeklyPredicted = (a: AccountUsageInput) =>
+    weeklyBudget(gate.visibleLimits(a), a, now)?.predicted ?? false;
+  return [...candidates].sort((a, b) => {
+    const resetDelta = (weeklyResetAt(a) as number) - (weeklyResetAt(b) as number);
+    if (resetDelta !== 0) return resetDelta;
+    const confidenceDelta = Number(weeklyPredicted(a)) - Number(weeklyPredicted(b));
+    if (confidenceDelta !== 0) return confidenceDelta;
+    const weeklyDelta = weeklyUsedPct(a) - weeklyUsedPct(b);
+    if (weeklyDelta !== 0) return weeklyDelta;
+    return a.label.localeCompare(b.label);
+  });
+}
+
+/** "in 2d 3h (predicted), 60% weekly budget left": the chosen target's budget as every reason
+ *  states it. The reason ships verbatim to the phone, so a derived reset is labelled there too —
+ *  a switch card must never present a prediction as something the endpoint reported. */
+function targetBudgetText(target: AccountUsageInput, gate: CandidateGate, now: number): string {
+  const budget = weeklyBudget(gate.visibleLimits(target), target, now);
+  const reset = gate.weeklyResetAt(target) as number;
+  return (
+    `in ${humanizeDuration(reset - now)}${budget?.predicted === true ? ' (predicted)' : ''}, ` +
+    `${roundPct(100 - (budget?.percent ?? 0))}% weekly budget left`
+  );
+}
+
+/** One flat-pool decision: the policy as the module header describes it, over the targets
+ *  `candidateIds` allows. */
+function decideWithin(
+  accounts: AccountUsageInput[],
+  now: number,
+  policy: AutoSwitchPolicy,
+  candidateIds: ReadonlySet<string> | undefined,
+): AutoSwitchDecision | null {
+  const gate = candidateGate(now, policy, candidateIds);
   const { triggerPercent, snapshotAge, lowThreshold, visibleLimits, weeklyResetAt } = gate;
 
   const active = accounts.find((a) => a.active);
   if (!active) return null;
 
-  const weeklyUsedPct = (a: AccountUsageInput) =>
-    weeklyBudget(visibleLimits(a), a, now)?.percent ?? 0;
   const weeklyPredicted = (a: AccountUsageInput) =>
     weeklyBudget(visibleLimits(a), a, now)?.predicted ?? false;
 
@@ -230,29 +341,10 @@ export function decideAutoSwitch(
   // since "97% used" alone cannot tell a full Fable cap from a spent weekly budget.
   const activeWall = `${roundPct(activeWorst)}% of its ${LIMIT_NOUN[activeLimit.kind]}`;
 
-  const candidates = accounts.filter(gate.isCandidate);
-  if (candidates.length === 0) return null;
-
-  // Soonest weekly reset wins — weekly is the budget. On the same reset moment a REPORTED
-  // reset outranks a predicted one (live work goes to the account whose clock we can actually
-  // see), then the account with MORE weekly budget remaining (the larger expiring asset), then
-  // label so the decision is deterministic. The 5h window deliberately never ranks.
-  candidates.sort((a, b) => {
-    const resetDelta = (weeklyResetAt(a) as number) - (weeklyResetAt(b) as number);
-    if (resetDelta !== 0) return resetDelta;
-    const confidenceDelta = Number(weeklyPredicted(a)) - Number(weeklyPredicted(b));
-    if (confidenceDelta !== 0) return confidenceDelta;
-    const weeklyDelta = weeklyUsedPct(a) - weeklyUsedPct(b);
-    if (weeklyDelta !== 0) return weeklyDelta;
-    return a.label.localeCompare(b.label);
-  });
-  const target = candidates[0] as AccountUsageInput;
+  const target = rankCandidates(accounts.filter(gate.isCandidate), gate, now)[0];
+  if (target === undefined) return null;
   const targetReset = weeklyResetAt(target) as number;
-  // The reason ships verbatim to the phone, so a derived reset is labelled there too — a
-  // switch card must never present a prediction as something the endpoint reported.
-  const targetBudget =
-    `in ${humanizeDuration(targetReset - now)}${weeklyPredicted(target) ? ' (predicted)' : ''}, ` +
-    `${roundPct(100 - weeklyUsedPct(target))}% weekly budget left`;
+  const targetBudget = targetBudgetText(target, gate, now);
 
   // Primary trigger: the active account is nearly out of quota. On a stale snapshot the
   // tightened threshold applies; a hop that ONLY the derate explains says so in its reason

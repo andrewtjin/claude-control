@@ -247,3 +247,50 @@ describe('the advisor reads the same rule', () => {
     expect(plan.reason).not.toMatch(/^No usable account/);
   });
 });
+
+describe('an account live in another slot', () => {
+  const free = (id: string) =>
+    acct(id, {}, [{ kind: 'weekly_all', percent: 20, resetsAt: NOW + 50 * H }]);
+  const elsewhere = new Map([['b', 'the global slot']]);
+
+  it('is out for the slot that asks, and says where it is live', () => {
+    const a = assessAccount(free('b'), NOW, { liveElsewhere: elsewhere });
+    expect(a).toMatchObject({
+      usable: false,
+      measured: true,
+      reason: 'live_elsewhere',
+      liveIn: 'the global slot',
+    });
+    expect(a.backAt).toBeUndefined();
+    expect(describeUnavailable(a, NOW)).toBe('b (live in the global slot)');
+  });
+
+  it('a spent account live elsewhere is out on its limits, which its return waits for', () => {
+    const a = assessAccount(sessionSpent('b', 2), NOW, { liveElsewhere: elsewhere });
+    expect(a.reason).toBe('session');
+    expect(a.backAt).toBe(NOW + 2 * H);
+  });
+
+  it('a quarantined account stays quarantined wherever it is live', () => {
+    const a = assessAccount(acct('b', { quarantined: true }), NOW, { liveElsewhere: elsewhere });
+    expect(a.reason).toBe('quarantined');
+  });
+
+  it('exhausts a fleet when it was the last free account, and the first-back line says why', () => {
+    const fleet = assessFleet([sessionSpent('a', 3), free('b')], NOW, {
+      liveElsewhere: elsewhere,
+    });
+    expect(fleet.exhausted).toBe(true);
+    expect(fleet.firstBack?.label).toBe('a');
+    const onlyElsewhere = assessFleet([free('b')], NOW, { liveElsewhere: elsewhere });
+    expect(onlyElsewhere.exhausted).toBe(true);
+    expect(describeFirstBack(onlyElsewhere, NOW)).toBe(
+      'It waits for an account to be freed by another slot or to reset.',
+    );
+  });
+
+  it('an account live elsewhere is usable for a caller that names no slots', () => {
+    expect(assessAccount(free('b'), NOW).usable).toBe(true);
+    expect(hasUsableHeadroom(free('b'), NOW)).toBe(true);
+  });
+});
