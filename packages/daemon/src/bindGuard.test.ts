@@ -371,6 +371,91 @@ describe('bind guard script', () => {
     expect(parsed.reason).toContain('--override');
   });
 
+  describe('(A) a session on a config dir that is neither the main one nor a rule slot', () => {
+    // A second Claude Code config a shell or editor exports, or the profile of a rule since removed:
+    // its login is its own, not the global slot's, so the global slot's identity says nothing about
+    // it. It is not this folder's slot, so it is refused whatever account it holds.
+    function unmanagedReason(shown: string): string {
+      return (
+        'cctl: ' +
+        boundFolder +
+        ' has its own cctl folder rules (it uses Alice, Bob first), but this session runs on ' +
+        shown +
+        ', a Claude Code config dir cctl does not manage. Exit and start it with: cctl claude' +
+        '   (or set up the claude wrapper: cctl shell-init powershell)'
+      );
+    }
+
+    async function otherConfigOn(accountUuid: string): Promise<string> {
+      const dir = join(root, 'other-config');
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        join(dir, '.claude.json'),
+        JSON.stringify({ oauthAccount: { accountUuid, emailAddress: 'x@example.test' } }),
+        'utf8',
+      );
+      return dir;
+    }
+
+    it('logged into the excluded account while the global slot holds an accepted one → block', async () => {
+      await writeSnapshot();
+      await setGlobalAccount('uuid-carol');
+      const other = await otherConfigOn('uuid-dora');
+      const result = await runGuard(scriptPath, payloadFor('other-dora'), {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: boundFolder,
+        CLAUDE_CONFIG_DIR: other,
+      });
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        decision: 'block',
+        reason: unmanagedReason(canon(other)),
+      });
+    });
+
+    it('logged into an account the folder accepts → still block: it is not the global slot', async () => {
+      await writeSnapshot();
+      await setGlobalAccount('uuid-carol');
+      const other = await otherConfigOn('uuid-carol');
+      const result = await runGuard(scriptPath, payloadFor('other-carol'), {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: boundFolder,
+        CLAUDE_CONFIG_DIR: other,
+      });
+      expect(JSON.parse(result.stdout)).toEqual({
+        decision: 'block',
+        reason: unmanagedReason(canon(other)),
+      });
+    });
+
+    it('a config dir with no canonical form is not folded into the global slot → block', async () => {
+      await writeSnapshot();
+      await setGlobalAccount('uuid-carol');
+      // A name with a bidi control has no canonical form; it is shown as spelled, sanitized.
+      const raw = join(root, 'cfg‮evil');
+      const result = await runGuard(scriptPath, payloadFor('other-raw'), {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: boundFolder,
+        CLAUDE_CONFIG_DIR: raw,
+      });
+      const parsed = JSON.parse(result.stdout) as { decision?: string; reason?: string };
+      expect(parsed.decision).toBe('block');
+      expect(parsed.reason).toContain(', a Claude Code config dir cctl does not manage.');
+      expect(parsed.reason).not.toContain('‮');
+    });
+
+    it('outside every ruled folder → silent, as before', async () => {
+      await writeSnapshot();
+      const other = await otherConfigOn('uuid-dora');
+      const result = await runGuard(scriptPath, PAYLOAD, {
+        ...baseEnv(),
+        CLAUDE_PROJECT_DIR: outsideFolder,
+        CLAUDE_CONFIG_DIR: other,
+      });
+      expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+    });
+  });
+
   it('(A) a rule that only excludes accounts reads as the folder having its own rules', async () => {
     // An exclude-only rule includes nobody, so there is no account list to name: the reason must not
     // read "is bound to " followed by nothing.

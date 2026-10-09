@@ -259,7 +259,11 @@ could run the folder on the very account it excludes — and a folder that exclu
 lets it through with the notice.
 
 **A session on another folder's slot** is refused in a ruled folder, and a session on a
-folder's slot is refused outside that folder's folders, exactly as before.
+folder's slot is refused outside that folder's folders, exactly as before. So is **a session
+on a config dir cctl does not manage** (a `CLAUDE_CONFIG_DIR` that is neither the main config
+dir nor a folder's profile, such as a second Claude Code config a shell exports, or the
+profile of a rule since removed): its login is its own, so the global slot's identity says
+nothing about which account it runs on.
 
 There are three enforcement modes, set with `cctl settings set bind-enforce <mode>`:
 

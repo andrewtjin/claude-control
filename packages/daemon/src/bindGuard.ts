@@ -68,8 +68,11 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *
  * The script implements the enforcement rules:
  *   - session slot = the folder rule whose canonical profileDir equals the session's canonical
- *     CLAUDE_CONFIG_DIR, else the global slot (outside every rule). A CLAUDE_CONFIG_DIR naming the
- *     snapshot's main config dir IS the global slot, keyed exactly like an unset one.
+ *     CLAUDE_CONFIG_DIR; the global slot (outside every rule) when it is unset or names the
+ *     snapshot's main config dir, keyed exactly like an unset one; otherwise an UNMANAGED config dir.
+ *   - (A, unmanaged) the project dir has a folder rule and the session runs on an unmanaged config
+ *     dir -> block, naming that dir. Its login is its own, so the global slot's identity cannot say
+ *     which account it is. --override relaxes it the same way.
  *   - a project folder whose name has no canonical form (a control or bidi/format character) is
  *     judged by its nearest clean ancestor, which a binding covers exactly when it covers the folder.
  *   - (A, global) the project dir has a folder rule and the session runs on the GLOBAL slot. A ruled
@@ -447,17 +450,22 @@ function run(input) {
   }
 
   // The session's slot: the group whose canonical profileDir equals the session's canonical
-  // CLAUDE_CONFIG_DIR. No config dir, the main config dir, or no match means the global (shared)
-  // slot. sessionConfigKey is the canonical folderKey of CLAUDE_CONFIG_DIR, and '' for the global
-  // slot however it is spelled — the key the launcher mints a global-slot relaxation token for; a
-  // token is honored only when it was minted for this same slot key.
+  // CLAUDE_CONFIG_DIR. No config dir, or the main config dir, means the global (shared) slot. Any
+  // OTHER config dir is unmanaged: a second Claude Code config a shell or editor exports, or the
+  // profile of a rule since removed. Its login is its own, so the global slot's identity says nothing
+  // about it, and it is never folded into the global slot. A config dir with no canonical form is
+  // keyed as spelled, the way a profile dir with none is, so it can still match one exactly.
+  // sessionConfigKey is the folderKey of CLAUDE_CONFIG_DIR, and '' for the global slot however it is
+  // spelled — the key the launcher mints a global-slot relaxation token for; a token is honored only
+  // when it was minted for this same slot key.
   var sessionGroup = null;
   var sessionConfigKey = '';
+  var unmanagedConfig = null;
   var rawConfig = process.env.CLAUDE_CONFIG_DIR;
   if (typeof rawConfig === 'string' && rawConfig.length > 0) {
     var cfgCanon = canonicalizeFolder(rawConfig, deps);
-    var cfgKey = cfgCanon.ok ? folderKey(cfgCanon.path, platform) : null;
-    if (cfgKey !== null && cfgKey !== mainConfigKey) {
+    var cfgKey = folderKey(cfgCanon.ok ? cfgCanon.path : rawConfig, platform);
+    if (cfgKey !== mainConfigKey) {
       sessionConfigKey = cfgKey;
       for (var i = 0; i < snapshot.groups.length; i++) {
         var g = snapshot.groups[i];
@@ -470,6 +478,7 @@ function run(input) {
           }
         }
       }
+      if (sessionGroup === null) unmanagedConfig = cfgCanon.ok ? cfgCanon.path : rawConfig;
     }
   }
 
@@ -491,15 +500,35 @@ function run(input) {
   }
 
   var sessionGroupId = sessionGroup ? sessionGroup.id : null;
+  // How a refusal tells the operator to get onto the folder's own slot.
+  var relaunch =
+    'Exit and start it with: cctl claude' +
+    '   (or set up the claude wrapper: cctl shell-init powershell)';
+
+  // Case A on an unmanaged config dir: it is not this folder's slot, and which account it runs on is
+  // not something the global slot's identity can tell, so it is refused whatever account it holds.
+  // Letting it through would let a folder run on an account its rule excludes.
+  if (projectBinding && unmanagedConfig !== null) {
+    var reasonU =
+      'cctl: ' +
+      projectBinding.folder +
+      ' ' +
+      describeRule(projectBinding.group) +
+      ', but this session runs on ' +
+      unmanagedConfig +
+      ', a Claude Code config dir cctl does not manage. ' +
+      relaunch;
+    if (honorRelaxation(process.env.CCTL_BIND_OVERRIDE, 'override', sessionConfigKey)) {
+      return emitSystemMessage(reasonU);
+    }
+    return emitBlock(reasonU, enforce);
+  }
 
   // Case A on the global slot: the folder accepts the global slot's account unless its rule rules it
   // out (see judgeGlobal).
   if (projectBinding && sessionGroup === null) {
     var rule = projectBinding.group;
     var judged = judgeGlobal(snapshot, rule);
-    var relaunch =
-      'Exit and start it with: cctl claude' +
-      '   (or set up the claude wrapper: cctl shell-init powershell)';
     if (judged.verdict === 'accept') {
       var members = Array.isArray(rule.members) ? rule.members.join(', ') : '';
       // Nothing to tell when the rule prefers no account (it only excludes) or the global slot
