@@ -1391,7 +1391,9 @@ describe('outages, and the banner usage and timeline lead with', () => {
       const old = started(now - 50 * H);
       await seedLog([old, recovered(old, now - 49 * H), folderStarted(now - 2 * H)]);
       const r = await runCli(['outages']);
-      expect(r.out).toMatch(/^2 times no account could take work \(newest first\):/);
+      expect(r.out).toMatch(
+        /^2 times a pool had no account that could take work \(newest first\):/,
+      );
       expect(r.out).toContain(`[${FOLDER}] `);
       expect(r.out).toContain('[global] ');
       expect(r.out.indexOf(`[${FOLDER}]`)).toBeLessThan(r.out.indexOf('[global]'));
@@ -1431,7 +1433,10 @@ describe('outages, and the banner usage and timeline lead with', () => {
         { id: 'e1', label: 'inc1', percent: 100, resetsAt: now + 3 * H },
       ]);
       const lines = (await runCli(['usage'])).out.split('\n');
-      expect(lines[0]).toMatch(/^No account can take work\. First back: work1 in /);
+      // Beside a folder rule the global pool is not every account, and the line says which pool.
+      expect(lines[0]).toMatch(
+        /^No account in the global pool can take work\. First back: work1 in /,
+      );
       expect(lines[1]).toMatch(
         new RegExp(
           `^No account in ${FOLDER.replace(/\\/g, '\\\\')}'s pool can take work\\. First back: work1 in `,

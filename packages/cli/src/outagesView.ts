@@ -6,14 +6,15 @@
 
 import { resolveBinding } from '@claude-control/switch-engine';
 import {
-  describeFirstBack,
   describeWalls,
   humanizeElapsed,
   type FleetAvailability,
 } from '@claude-control/usage-advisor';
 import {
   describeScope,
+  firstBackSentence,
   GLOBAL_SCOPE,
+  noAccountSentence,
   recoveryText,
   scopeKey,
   scopeOf,
@@ -173,7 +174,8 @@ export function episodesForFolder(
 
 /** `cctl outages`: every episode, newest first, each with its accounts and the switches that led
  *  there, then where the log lives. Each heading leads with its scope once any episode is a
- *  folder's, so a log with no folder rules reads exactly as it always did. */
+ *  folder's or was judged beside folder rules, so a log with no folder rules reads exactly as it
+ *  always did. */
 export function renderOutages(
   episodes: ExhaustionEpisode[],
   options: {
@@ -195,7 +197,10 @@ export function renderOutages(
     const whose = options.folder !== undefined ? `account in ${options.folder}'s pool` : 'account';
     return `No time on record${window} when every ${whose} was out of usage.\n${footer}`;
   }
-  const scoped = episodes.some((e) => scopeOf(e.start).kind === 'folder');
+  const scoped = episodes.some((e) => {
+    const scope = scopeOf(e.start);
+    return scope.kind === 'folder' || scope.ruled === true;
+  });
   const blocks = [...episodes].reverse().map((e) => {
     const width = Math.max(0, ...e.start.accounts.map((a) => a.label.length));
     const accounts = e.start.accounts.map(
@@ -211,7 +216,8 @@ export function renderOutages(
     const tag = scoped ? `${palette.bold(`[${scopeTag(scopeOf(e.start))}]`)} ` : '';
     return [tag + episodeHeading(e, now, open, palette), ...accounts, ...walk].join('\n');
   });
-  const count = `${episodes.length} time${episodes.length === 1 ? '' : 's'}${window} no account could take work (newest first):`;
+  const who = scoped ? 'a pool had no account that' : 'no account';
+  const count = `${episodes.length} time${episodes.length === 1 ? '' : 's'}${window} ${who} could take work (newest first):`;
   return [count, '', blocks.join('\n\n'), '', footer].join('\n');
 }
 
@@ -259,14 +265,11 @@ export function renderOutageBanner(
       : '';
   const expected = open !== undefined ? expectedFirstBack(open, now, fleet) : undefined;
   const firstBack = fleet.exhausted
-    ? describeFirstBack(fleet, now)
+    ? firstBackSentence(fleet, now)
     : expected !== undefined
       ? `First back expected: ${expected.label} at ${formatLocalTime(expected.at, now)}.`
       : '';
-  const headline =
-    scope.kind === 'global'
-      ? 'No account can take work'
-      : `No account in ${describeScope(scope)}'s pool can take work`;
+  const headline = noAccountSentence(scope);
   return (
     palette.red(palette.bold(`${headline}${since}.`)) +
     (firstBack !== '' ? ` ${firstBack}` : '') +

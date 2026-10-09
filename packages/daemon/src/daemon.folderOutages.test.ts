@@ -313,7 +313,7 @@ describe('per-scope outages through the poll cycle', () => {
       bodies: { A: spentUntil(T0 + H), B: spentUntil(T0 + 2 * H), E: free() },
     });
     await waitFor(() => rig.relay.cards().length === 1);
-    expect(rig.relay.cards()[0]?.title).toBe('All accounts are out of usage');
+    expect(rig.relay.cards()[0]?.title).toBe('Every account in the global pool is out');
     await rig.cycle(T0 + 10 * M);
     await settle();
     expect(rig.relay.cards()).toHaveLength(1);
@@ -333,7 +333,9 @@ describe('per-scope outages through the poll cycle', () => {
       bodies: { A: spentUntil(T0 + H), B: free(), E: spentUntil(T0 + 5 * H) },
     });
     await waitFor(() => rig.relay.cards().length >= 1);
-    const global = rig.relay.cards().find((c) => c.title === 'All accounts are out of usage');
+    const global = rig.relay
+      .cards()
+      .find((c) => c.title === 'Every account in the global pool is out');
     expect(global?.body).toContain('• B (live in the slot of C:/research)');
     // The folder holds B and B can work: the folder is not out.
     expect(rig.relay.cards().some((c) => c.title.startsWith('C:/research'))).toBe(false);

@@ -98,7 +98,8 @@ function fleet(liveSlots: Array<[SlotId, string | null]>) {
 describe('outageScopes', () => {
   it('the global pool is the shared accounts; a folder is its included accounts first, then the shared ones it keeps', () => {
     const [global, folder] = fleet([['global', 'A']]);
-    expect(global?.scope).toEqual(GLOBAL_SCOPE);
+    // Beside folder rules the global pool is not every account, and its words say so.
+    expect(global?.scope).toEqual({ kind: 'global', ruled: true });
     expect(global?.accountIds).toEqual(['A', 'B', 'C']);
     expect(folder?.scope).toEqual(research);
     expect(folder?.key).toBe('folder:r1');
@@ -390,5 +391,122 @@ describe('scopes in the file', () => {
     ).read();
     expect(records.map((r) => `${r.event}:${r.id}`)).toEqual(['exhausted:f', 'recovered:f']);
     expect(resumeOpenEpisodes(records).size).toBe(0);
+  });
+});
+
+describe('the global pool beside folder rules', () => {
+  const ruled = outageScopes({
+    accounts: [view('A'), view('B'), view('E', ['r1'])],
+    rules: [rule('r1', 'C:/research', ['E'])],
+    liveSlots: new Map<SlotId, string | null>([['global', 'A']]),
+  })[0]!;
+
+  it('is named as the global pool once folder rules exist, never as every account', () => {
+    expect(ruled.scope).toEqual({ kind: 'global', ruled: true });
+    const f = assessFleet([spent('A'), spent('B')], T0);
+    const record = exhaustedRecord({
+      fleet: f,
+      now: T0,
+      active: 'A',
+      switches: [],
+      scope: ruled.scope,
+    });
+    expect(record).toMatchObject({ v: 1, scope: { kind: 'global' } });
+    expect(record.summary.startsWith('No account in the global pool can take work: ')).toBe(true);
+    expect(exhaustedCardTitle(ruled.scope)).toBe('Every account in the global pool is out');
+    expect(exhaustedCardBody(f, record).split('\n')[0]).toBe(
+      'No account in the global pool can take work.',
+    );
+    const end = recoveredRecord(
+      record,
+      { accountId: 'A', label: 'A', how: 'headroom', backSince: T0 + H },
+      T0 + H,
+    );
+    expect(end.summary).toBe(
+      'Usage is back in the global pool: A (it has usage left again). No account in its pool could take work for 1h.',
+    );
+    expect(recoveredCardTitle(end)).toBe('Usage is back in the global pool');
+  });
+
+  it('is worded as before with no folder rules', () => {
+    const plain = outageScopes({
+      accounts: [view('A')],
+      rules: [],
+      liveSlots: new Map<SlotId, string | null>([['global', 'A']]),
+    })[0]!;
+    expect(plain.scope).toEqual(GLOBAL_SCOPE);
+    expect(exhaustedCardTitle(plain.scope)).toBe('All accounts are out of usage');
+  });
+
+  it('reads a global line that says folder rules existed, and keeps it the global scope', async () => {
+    const f = assessFleet([spent('A')], T0);
+    const record = exhaustedRecord({
+      fleet: f,
+      now: T0,
+      active: 'A',
+      switches: [],
+      scope: ruled.scope,
+    });
+    const dir = await mkdtemp(join(tmpdir(), 'exh-ruled-'));
+    try {
+      const log = new ExhaustionLog(join(dir, 'log.jsonl'));
+      await log.append(record);
+      const [read] = await log.read();
+      expect(read).toMatchObject({ scope: { kind: 'global', ruled: true } });
+      expect(scopeKey(scopeOf(read!))).toBe('global');
+      expect(resumeOpenEpisodes([read!]).has('global')).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('a folder whose pool is empty', () => {
+  const emptied = (exclude: string[]) =>
+    outageScopes({
+      accounts: [view('A'), view('B')],
+      rules: [rule('r1', 'C:/scratch', [], exclude)],
+      liveSlots: new Map<SlotId, string | null>([['global', 'A']]),
+    })[1]!;
+
+  it('is out, worded as an empty pool rather than as expired logins', () => {
+    const scope = emptied(['A', 'B']);
+    expect(scope.accountIds).toEqual([]);
+    const judged = judgeScope([free('A'), free('B')], scope, undefined, T0, {});
+    expect(judged.on).toBe(true);
+    expect(judged.transition).toEqual({ kind: 'start' });
+    const record = exhaustedRecord({
+      fleet: judged.fleet,
+      now: T0,
+      active: null,
+      switches: [],
+      scope: scope.scope,
+    });
+    expect(record.summary).toBe(
+      "No account in C:/scratch's pool can take work. Its pool is empty: every account it could " +
+        'use is excluded by its rule or reserved to other folders.',
+    );
+    expect(exhaustedCardBody(judged.fleet, record)).toContain('Its pool is empty');
+    expect(exhaustedCardBody(judged.fleet, record)).not.toContain('login');
+  });
+
+  it('ends once an account that can work joins its pool', () => {
+    const start = judgeScope([free('A'), free('B')], emptied(['A', 'B']), undefined, T0, {});
+    const record = exhaustedRecord({
+      fleet: start.fleet,
+      now: T0,
+      active: null,
+      switches: [],
+      scope: emptied(['A', 'B']).scope,
+    });
+    const open = openEpisodeFrom(record);
+    expect(judgeScope([free('A'), free('B')], emptied(['A', 'B']), open, T0 + H, {}).on).toBe(true);
+    const end = judgeScope([free('A'), free('B')], emptied(['A']), open, T0 + H, {});
+    expect(end.transition).toMatchObject({ kind: 'end', recovery: { accountId: 'B' } });
+  });
+
+  it('a fleet with no accounts at all is not an outage', () => {
+    const none = outageScopes({ accounts: [], rules: [], liveSlots: new Map() })[0]!;
+    expect(judgeScope([], none, undefined, T0, {}).on).toBe(false);
   });
 });

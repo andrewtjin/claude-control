@@ -66,9 +66,13 @@ export function exhaustionLogPath(dataDir: string): string {
 
 /** Which pool an episode is about: the global pool, or one folder rule's effective pool. A folder
  *  scope records the rule's folders and label as they stood when the episode began, so the
- *  history still names it after the rule changes or is removed. */
+ *  history still names it after the rule changes or is removed. A global scope marked `ruled`
+ *  was judged while folder rules existed: the global pool was then not every account (a folder
+ *  could still be working on its own), so it is worded as the global pool, never as all of them.
+ *  The mark is wording only; it is the same scope either way. */
 export type OutageScope =
-  { kind: 'global' } | { kind: 'folder'; ruleId: string; folders: string[]; label: string };
+  | { kind: 'global'; ruled?: true }
+  | { kind: 'folder'; ruleId: string; folders: string[]; label: string };
 
 /** The global pool's scope. */
 export const GLOBAL_SCOPE: OutageScope = { kind: 'global' };
@@ -92,6 +96,12 @@ export function scopeOf(record: { scope?: OutageScope }): OutageScope {
 /** The scope in words: "the global pool", or the rule's folders (its label when it has none). */
 export function describeScope(scope: OutageScope): string {
   return scope.kind === 'global' ? 'the global pool' : folderNameOf(scope);
+}
+
+/** Whether the scope's words name it: a folder always, the global pool only beside folder rules
+ *  (see {@link OutageScope}). With no rules the global pool is every account, and says so. */
+function namesScope(scope: OutageScope): boolean {
+  return scope.kind === 'folder' || scope.ruled === true;
 }
 
 /** The `v` a record of this scope is written with (see the module header). */
@@ -155,7 +165,7 @@ export function outageScopes(fleet: {
     return { scope, key: scopeKey(scope), accountIds: members, liveElsewhere };
   };
   return [
-    view('global', GLOBAL_SCOPE, []),
+    view('global', rules.length > 0 ? { kind: 'global', ruled: true } : GLOBAL_SCOPE, []),
     ...rules.map((r) => view(ruleSlotId(r.id), folderScope(r), r.include)),
   ];
 }
@@ -176,13 +186,27 @@ export function judgeScope(
   policy: Pick<AutoSwitchPolicy, 'fableCapTriggers'>,
 ): OutageJudgement {
   const members = new Set(scope.accountIds);
-  return judgeOutage(
+  const judged = judgeOutage(
     inputs.filter((i) => members.has(i.accountId)),
     open,
     now,
     policy,
     scope.liveElsewhere,
   );
+  // A pool with nothing in it (a folder that excludes every shared account, or whose last one
+  // another folder reserved) cannot take work either, though the shared rule calls a fleet of no
+  // accounts not exhausted. That rule stands for a machine with no accounts at all, which has no
+  // pool to be out of; so an empty pool counts as out only while some account exists. It ends the
+  // usual way, once an account that can work joins it.
+  if (scope.accountIds.length === 0 && inputs.length > 0 && open === undefined) {
+    return {
+      ...judged,
+      fleet: { ...judged.fleet, exhausted: true },
+      transition: { kind: 'start' },
+      on: true,
+    };
+  }
+  return judged;
 }
 
 /** One account as it stood when the episode began. */
@@ -370,7 +394,12 @@ function isSwitch(v: unknown): boolean {
  *  global), `v: 2` a folder's, with every field of the folder scope present. */
 function hasScopeOfVersion(value: Record<string, unknown>): boolean {
   const scope = value.scope;
-  if (value.v === 1) return scope === undefined || (isObject(scope) && scope.kind === 'global');
+  if (value.v === 1) {
+    return (
+      scope === undefined ||
+      (isObject(scope) && scope.kind === 'global' && optional(scope.ruled, (r) => r === true))
+    );
+  }
   return (
     value.v === 2 &&
     isObject(scope) &&
@@ -876,12 +905,24 @@ function wallResetOf(
 
 // ---- building records ----------------------------------------------------------------------------
 
-/** "No account can take work" for the global pool; "No account in <folder>'s pool can take work"
- *  for a folder, so a folder's card and line never read as the whole fleet's. */
-function noAccountSentence(scope: OutageScope): string {
-  return scope.kind === 'global'
-    ? 'No account can take work'
-    : `No account in ${describeScope(scope)}'s pool can take work`;
+/** "No account can take work" for the global pool with no folder rules; "No account in the global
+ *  pool can take work" beside them; "No account in <folder>'s pool can take work" for a folder; so
+ *  no card, line or banner reads as the whole fleet's unless it is. Shared with the CLI banner. */
+export function noAccountSentence(scope: OutageScope): string {
+  if (scope.kind === 'folder') return `No account in ${describeScope(scope)}'s pool can take work`;
+  return scope.ruled === true
+    ? 'No account in the global pool can take work'
+    : 'No account can take work';
+}
+
+/** When the first account is expected back, or for a pool with nothing in it, that it is empty:
+ *  the shared sentence would read an empty list as every login having expired. Shared with the
+ *  CLI banner. */
+export function firstBackSentence(fleet: FleetAvailability, now: number): string {
+  return fleet.accounts.length === 0
+    ? 'Its pool is empty: every account it could use is excluded by its rule or reserved to ' +
+        'other folders.'
+    : describeFirstBack(fleet, now);
 }
 
 /** The `exhausted` entry for an exhausted fleet, of the global pool unless `scope` says else. */
@@ -913,8 +954,10 @@ export function exhaustedRecord(args: {
     at: now,
     time: new Date(now).toISOString(),
     summary:
-      `${noAccountSentence(scope)}: ${fleet.accounts.map((a) => describeUnavailable(a, now)).join(', ')}. ` +
-      describeFirstBack(fleet, now),
+      fleet.accounts.length === 0
+        ? `${noAccountSentence(scope)}. ${firstBackSentence(fleet, now)}`
+        : `${noAccountSentence(scope)}: ${fleet.accounts.map((a) => describeUnavailable(a, now)).join(', ')}. ` +
+          firstBackSentence(fleet, now),
     active: args.active,
     accounts,
     ...(fleet.firstBack !== undefined ? { firstBack: fleet.firstBack } : {}),
@@ -963,8 +1006,8 @@ export function recoveredRecord(
   const backSince = Math.max(recovery.backSince, open.at);
   const durationMs = backSince - open.at;
   const scope = scopeOf(open);
-  const where = scope.kind === 'global' ? '' : ` in ${describeScope(scope)}`;
-  const could = scope.kind === 'global' ? 'No account could' : 'No account in its pool could';
+  const where = namesScope(scope) ? ` in ${describeScope(scope)}` : '';
+  const could = namesScope(scope) ? 'No account in its pool could' : 'No account could';
   return {
     v: versionOf(scope),
     event: 'recovered',
@@ -1008,16 +1051,17 @@ export function ruleRemovedRecord(open: ExhaustedRecord, now: number): Recovered
 
 /** The phone card's title for the start of an episode. */
 export function exhaustedCardTitle(scope: OutageScope): string {
-  return scope.kind === 'global'
-    ? 'All accounts are out of usage'
-    : `${describeScope(scope)}: every account in its pool is out`;
+  if (scope.kind === 'folder') return `${describeScope(scope)}: every account in its pool is out`;
+  return scope.ruled === true
+    ? 'Every account in the global pool is out'
+    : 'All accounts are out of usage';
 }
 
 /** The phone card's title for the end of an episode. */
 export function recoveredCardTitle(record: RecoveredRecord): string {
   const scope = scopeOf(record);
   if (record.how === 'rule_removed') return `${describeScope(scope)}: folder rule removed`;
-  return scope.kind === 'global' ? 'Usage is back' : `Usage is back in ${describeScope(scope)}`;
+  return namesScope(scope) ? `Usage is back in ${describeScope(scope)}` : 'Usage is back';
 }
 
 /** The phone card for the start of an episode: one account per line, then when it ends. */
@@ -1032,7 +1076,7 @@ export function exhaustedCardBody(fleet: FleetAvailability, record: ExhaustedRec
   return [
     `${noAccountSentence(scopeOf(record))}.`,
     ...lines,
-    describeFirstBack(fleet, record.at),
+    firstBackSentence(fleet, record.at),
     ...walk,
   ].join('\n');
 }
