@@ -1897,3 +1897,173 @@ describe('getGuardSnapshotFreshness is by content, not generation', () => {
     });
   });
 });
+
+describe('rule edits refuse before anything moves while a slot they write cannot be settled', () => {
+  /** Leave a record of an interrupted switch in a rule's slot that nothing can read, so nothing can
+   *  settle it: the slot stays blocked whichever accounts the switch was between. */
+  async function jamRuleSlot(h: Harness, ruleId: string): Promise<void> {
+    const stateDir = join(h.paths.vaultDir, 'slots', ruleId);
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, '.switch-intent.json'), '{"phase":', 'utf8');
+  }
+
+  it('exclude: refused with the rule unchanged', async () => {
+    const h = await harness();
+    const { A, C } = await seed(h);
+    const work = await h.folder('work');
+    const inc = await h.engine.includeInFolder(work, [A.id]);
+    await jamRuleSlot(h, inc.rule.id);
+
+    const err = await refusal(h.engine.excludeInFolder(work, [C.id]));
+
+    expect(err.code).toBe('switch_unsettled');
+    expect(await h.engine.getRule(inc.rule.id)).toMatchObject({ include: [A.id], exclude: [] });
+  });
+
+  it('include: refused before the global slot is handed off or the account reserved', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    await h.engine.activate(B.id);
+    const work = await h.folder('work');
+    const inc = await h.engine.includeInFolder(work, [A.id]);
+    await jamRuleSlot(h, inc.rule.id);
+
+    const err = await refusal(h.engine.includeInFolder(work, [B.id]));
+
+    expect(err.code).toBe('switch_unsettled');
+    expect(await liveInGlobal(h)).toBe('B');
+    expect(await h.engine.getActiveId('global')).toBe(B.id);
+    expect(await sharedIds(h)).toContain(B.id);
+    expect(await h.engine.getRule(inc.rule.id)).toMatchObject({ include: [A.id] });
+    expect((await snapshotOf(h)).groups[0]!.members).toEqual(['A']);
+  });
+
+  it('include: refused before any slot moves when one of the slots it hands off is blocked', async () => {
+    const h = await harness();
+    const { A, B, D } = await seed(h);
+    await addAccount(h, 'E');
+    await h.engine.activate(A.id);
+    const other = await h.folder('other');
+    const excl = await h.engine.excludeInFolder(other, [D.id]);
+    expect(excl.live.liveAccount).toBe(B.id);
+    await jamRuleSlot(h, excl.rule.id);
+    const work = await h.folder('work');
+
+    const err = await refusal(h.engine.includeInFolder(work, [A.id, B.id]));
+
+    expect(err.code).toBe('switch_unsettled');
+    // The global slot was not moved off A ahead of the slot that could not be.
+    expect(await liveInGlobal(h)).toBe('A');
+    expect(await h.engine.listRules()).toHaveLength(1);
+    expect(await sharedIds(h)).toEqual(expect.arrayContaining([A.id, B.id]));
+  });
+
+  it('reset of named accounts: refused with nothing released', async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const work = await h.folder('work');
+    const inc = await h.engine.includeInFolder(work, [A.id, B.id]);
+    await jamRuleSlot(h, inc.rule.id);
+
+    const err = await refusal(h.engine.resetFolder(work, [B.id]));
+
+    expect(err.code).toBe('switch_unsettled');
+    expect(await h.engine.getRule(inc.rule.id)).toMatchObject({ include: [A.id, B.id] });
+    expect(await sharedIds(h)).not.toContain(B.id);
+  });
+});
+
+describe('includeInFolder — handing several slots off at once', () => {
+  it('finds a replacement for every slot when one exists, rather than refusing on the first fit', async () => {
+    const h = await harness();
+    const { A, B, C, D } = await seed(h);
+    await h.engine.activate(A.id);
+    const other = await h.folder('other');
+    // The other folder excludes D and runs on B (A is live in global).
+    const excl = await h.engine.excludeInFolder(other, [D.id]);
+    expect(excl.live.liveAccount).toBe(B.id);
+    const work = await h.folder('work');
+
+    // Once A and B are reserved, the other folder can only take C, so the global slot must take D.
+    const res = await h.engine.includeInFolder(work, [A.id, B.id]);
+
+    expect(res.handedOff).toEqual([
+      { slot: 'global', from: A.id, to: D.id },
+      { slot: ruleSlotId(excl.rule.id), from: B.id, to: C.id },
+    ]);
+    expect(await liveInGlobal(h)).toBe('D');
+    expect(await liveIn(h, excl.rule.id)).toBe('C');
+    expect(await liveIn(h, res.rule.id)).toBe('A');
+    await expectOneSlotPerAccount(h.engine);
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+
+  it('never gives two slots the same replacement, refusing with nothing moved when one is left short', async () => {
+    const h = await harness();
+    const { A, B, C, D } = await seed(h);
+    await h.engine.activate(A.id);
+    const other = await h.folder('other');
+    const excl = await h.engine.excludeInFolder(other, [D.id]); // runs on B
+    expect(excl.live.liveAccount).toBe(B.id);
+    const work = await h.folder('work');
+
+    // Reserving A, B and D leaves C as the only replacement, and both slots need one.
+    const err = await refusal(h.engine.includeInFolder(work, [A.id, B.id, D.id]));
+
+    expect(err.code).toBe('no_account_remains');
+    expect(err.message).toContain('"B"');
+    expect(await liveInGlobal(h)).toBe('A');
+    expect(await liveIn(h, excl.rule.id)).toBe('B');
+    expect(await h.engine.listRules()).toHaveLength(1);
+    expect(await sharedIds(h)).toEqual([A.id, B.id, C.id, D.id].sort());
+  });
+});
+
+describe('resetFolder — un-including the account a running session is on', () => {
+  it('refuses while a session runs when the folder is left with nothing it can seat', async () => {
+    const h = await harness();
+    const { A, B, D } = await seed(h);
+    await h.engine.activate(B.id);
+    const work1 = await h.folder('work1');
+    const work2 = await h.folder('work2');
+    const first = await h.engine.includeInFolder(work1, [A.id]); // A live in work1
+    await h.engine.excludeInFolder(work1, [D.id]);
+    const second = await h.engine.includeInFolder(work2, [A.id]); // work2 takes C
+    expect(await liveIn(h, second.rule.id)).toBe('C');
+    await runSession(h, work1, 9191);
+
+    // A stays reserved to work2, so work1 may not keep it, and B and C are live elsewhere.
+    const err = await refusal(h.engine.resetFolder(work1, [A.id]));
+
+    expect(err.code).toBe('sessions_running');
+    expect(await h.engine.getRule(first.rule.id)).toMatchObject({ include: [A.id] });
+    expect(await liveIn(h, first.rule.id)).toBe('A');
+
+    // Forced, it goes through: the slot is cleared and the session is reported.
+    const res = await h.engine.resetFolder(work1, [A.id], { force: true });
+    expect(res.runningSessions.map((s) => s.pid)).toEqual([9191]);
+    expect(await liveIn(h, first.rule.id)).toBeUndefined();
+    await expectOneSlotPerAccount(h.engine);
+  });
+});
+
+describe('ensureRuleLive — a stray copy elsewhere', () => {
+  it('commits a drifted record to the live account even while a copy of it squats in the global slot', async () => {
+    const h = await harness();
+    const { A, B, C } = await seed(h);
+    await h.engine.activate(C.id);
+    const work = await h.folder('work');
+    const inc = await h.engine.includeInFolder(work, [A.id, B.id]);
+    // A login inside the profile put B live there without telling the registry...
+    await rotateInSlot(h, inc.rule.id, 'B', 'r-B');
+    // ...and a copy of B's login is live in the global slot, where a reserved account never belongs.
+    await h.credStore.writeLiveCredentials(oauth('B', NOW + 10 * HOUR));
+    await h.credStore.writeOauthAccount({ accountUuid: 'uuid-B', emailAddress: 'B@x.com' });
+
+    const res = await h.engine.ensureRuleLive(inc.rule.id);
+
+    expect(res).toMatchObject({ liveAccount: B.id, activated: false, noWorkingAccount: false });
+    expect((await h.engine.getRule(inc.rule.id))?.activeId).toBe(B.id);
+    expect(await liveIn(h, inc.rule.id)).toBe('B');
+  });
+});

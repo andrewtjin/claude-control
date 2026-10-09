@@ -509,6 +509,33 @@ describe('row-level mutations route to the file that holds the row', () => {
     expect(r2?.activeId).toBe(a.id);
     expect((await v.readPicture()).reserved.map((r) => r.id)).toEqual([a.id]);
   });
+
+  it('dedupes shared rows keeping the one live in a rule slot, not just the global one', async () => {
+    const { v, accountsPath } = await vaultAt();
+    const x = await v.addAccount('x', bundle('x'));
+    const y = await v.addAccount('y', bundle('y'));
+    await v.setActive(x.id);
+    // The folder excludes x, so its slot runs on the shared y.
+    const rule = await v.createRule({ folders: ['C:\\w'], exclude: [x.id] });
+    await v.setRuleActive(rule.id, y.id);
+    // An older build captured y's login again, later than the row the folder slot is live on.
+    const file = await readJson(accountsPath);
+    (file.accounts as Record<string, unknown>[]).push({
+      id: 'y-2',
+      label: 'y',
+      accountUuid: 'uuid-y',
+      quarantined: false,
+      createdAtMs: 99_999,
+      updatedAtMs: 99_999,
+    });
+    await writeFile(accountsPath, JSON.stringify(file), 'utf8');
+
+    const report = await v.dedupeAccounts();
+
+    expect(report.merged).toEqual([{ label: 'y', keptId: y.id, removedId: 'y-2' }]);
+    expect((await v.getRule(rule.id))?.activeId).toBe(y.id);
+    expect((await v.readBundle(y.id)).claudeAiOauth.accessToken).toBe('y');
+  });
 });
 
 describe('strict validation of a schema-2 groups.json fails CLOSED, naming the field, leaving the file', () => {

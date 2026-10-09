@@ -152,6 +152,44 @@ export function availableInOrder(pool: readonly PoolEntry[]): StoredAccount[] {
   ];
 }
 
+/**
+ * Give each of several slots a DIFFERENT account from its own candidates (each list best first), or
+ * say which slot cannot have one. Taking each slot's first free candidate in turn is not enough: an
+ * earlier slot can take the only account a later one could use while it had another to spare, and
+ * the later slot is then refused although a valid assignment exists. So a slot whose candidates are
+ * all taken asks their holders to move to a candidate of their own still free, recursively (an
+ * augmenting path). A slot takes a free candidate of its own before it moves anyone, so a slot keeps
+ * the account it took unless another slot would otherwise go without.
+ * Returns the chosen id per slot in input order, or the index of the first slot no assignment can
+ * serve. Pure; the slot counts here are a handful, so the quadratic search costs nothing.
+ */
+export function assignDistinct(
+  candidates: readonly (readonly string[])[],
+): { ok: true; chosen: string[] } | { ok: false; unserved: number } {
+  const holder = new Map<string, number>();
+  const chosen: string[] = [];
+  const take = (slot: number, id: string): true => {
+    holder.set(id, slot);
+    chosen[slot] = id;
+    return true;
+  };
+  const place = (slot: number, visited: Set<string>): boolean => {
+    // A free candidate first, so no slot is moved while the one asking has one of its own.
+    const free = candidates[slot]!.find((id) => !visited.has(id) && !holder.has(id));
+    if (free !== undefined) return take(slot, free);
+    for (const id of candidates[slot]!) {
+      if (visited.has(id)) continue;
+      visited.add(id);
+      if (place(holder.get(id)!, visited)) return take(slot, id);
+    }
+    return false;
+  };
+  for (let slot = 0; slot < candidates.length; slot += 1) {
+    if (!place(slot, new Set())) return { ok: false, unserved: slot };
+  }
+  return { ok: true, chosen };
+}
+
 /** The rule a folder runs under: the longest rule folder that contains it wins, with no merging
  *  between nested rules; `null` means the global slot. `folder` must be canonical. */
 export function resolveFolderRule(

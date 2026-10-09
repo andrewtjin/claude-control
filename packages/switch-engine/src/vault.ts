@@ -107,8 +107,8 @@ function assertLabelFree(rows: StoredAccount[], label: string, exceptId: string 
  *  the reserved rows — every set of rows that answers to one logical registry must be internally
  *  consistent under the same rules (one row per login, one name per row). Mutates and returns `rows`
  *  in place; the caller persists only the sets that actually {@link DedupeCoreResult.changed}.
- *  `preferred` (the global active id, or every rule's live account) picks the survivor when the same
- *  login is stored twice: the row that is live keeps its seat. */
+ *  `preferred` (every slot's live account) picks the survivor when the same login is stored twice:
+ *  the row that is live keeps its seat. */
 interface DedupeCoreResult {
   removedIds: Set<string>;
   merged: DedupeReport['merged'];
@@ -1662,9 +1662,9 @@ export class Vault {
    * reachable by exactly one name.
    *
    * Run separately over the shared rows and over the reserved rows — every set that answers to the
-   * one logical registry must be internally consistent, and a reserved survivor is chosen by the
-   * rules' live accounts, not the global one. A merged row's references in the rules (include,
-   * exclude, active id) are re-pointed at the survivor. Only the files that actually changed are
+   * one logical registry must be internally consistent — and in both the survivor is the row live in
+   * any slot: a shared account may be live in a folder slot as well as the global one. A merged
+   * row's references in the rules (include, exclude, active id) are re-pointed at the survivor. Only the files that actually changed are
    * rewritten (a clean vault is left byte-identical); a merged row's bundle is removed with it.
    */
   async dedupeAccounts(): Promise<DedupeReport> {
@@ -1672,17 +1672,15 @@ export class Vault {
     const report: DedupeReport = { merged: [], relabelled: [] };
     const removed = new Set<string>();
 
-    const sharedResult = dedupeRows(
-      st.shared,
-      new Set(st.activeId !== null ? [st.activeId] : []),
-      this.clock,
+    // Every slot's live account: a shared account can be live in a folder slot too (inherited, or in
+    // an exclude-only folder), and the copy in use is the one kept wherever it is live.
+    const live = new Set(
+      [st.activeId, ...st.rules.map((r) => r.activeId)].filter((x): x is string => x !== null),
     );
+    const sharedResult = dedupeRows(st.shared, live, this.clock);
     st.shared = sharedResult.rows;
     collectDedupe(report, removed, sharedResult.result);
-    const ruleLive = new Set(
-      st.rules.map((r) => r.activeId).filter((x): x is string => x !== null),
-    );
-    const reservedResult = dedupeRows(st.reserved, ruleLive, this.clock);
+    const reservedResult = dedupeRows(st.reserved, live, this.clock);
     st.reserved = reservedResult.rows;
     collectDedupe(report, removed, reservedResult.result);
 

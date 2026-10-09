@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   allSlots,
+  assignDistinct,
   availableInOrder,
   exactFolderRule,
   legitimateOccupancy,
@@ -320,5 +321,35 @@ describe('folder -> rule resolution', () => {
     expect(exactFolderRule('C:\\work', rules, 'win32')?.id).toBe('outer');
     expect(exactFolderRule('c:/WORK', rules, 'win32')?.id).toBe('outer');
     expect(exactFolderRule('C:\\work\\client\\src', rules, 'win32')).toBeUndefined();
+  });
+});
+
+describe('assignDistinct — one different account per slot', () => {
+  it('gives each slot its best candidate when they do not contend', () => {
+    expect(assignDistinct([['a', 'b'], ['c']])).toEqual({ ok: true, chosen: ['a', 'c'] });
+  });
+
+  it('moves an earlier slot to its next candidate when a later slot has no other', () => {
+    expect(assignDistinct([['c', 'd'], ['c']])).toEqual({ ok: true, chosen: ['d', 'c'] });
+  });
+
+  it('does not move an earlier slot while the later one has a free candidate of its own', () => {
+    expect(assignDistinct([['a', 'b'], ['a', 'c']])).toEqual({ ok: true, chosen: ['a', 'c'] });
+  });
+
+  it('follows a chain of moves', () => {
+    expect(assignDistinct([['a', 'b'], ['a', 'c'], ['a']])).toEqual({
+      ok: true,
+      chosen: ['b', 'c', 'a'],
+    });
+  });
+
+  it('never gives two slots the same account, naming the first slot left without', () => {
+    expect(assignDistinct([['c'], ['c']])).toEqual({ ok: false, unserved: 1 });
+    expect(assignDistinct([['a'], []])).toEqual({ ok: false, unserved: 1 });
+  });
+
+  it('serves no slots trivially', () => {
+    expect(assignDistinct([])).toEqual({ ok: true, chosen: [] });
   });
 });

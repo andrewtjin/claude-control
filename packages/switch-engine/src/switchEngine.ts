@@ -60,6 +60,7 @@ import {
 } from './folderBindings.js';
 import {
   allSlots,
+  assignDistinct,
   availableInOrder,
   exactFolderRule,
   legitimateOccupancy,
@@ -1178,8 +1179,12 @@ export class SwitchEngine {
       await this.settleForAccountsLocked(requestedIds);
       const picture = await this.vault.readPicture();
       const existing = exactFolderRule(canonicalFolder, picture.rules, this.platform);
-      if (existing) await this.vault.checkInclude(existing.id, requestedIds);
-      else {
+      if (existing) {
+        await this.vault.checkInclude(existing.id, requestedIds);
+        // The rule's own slot is written last (ensure-live); a switch stuck there would refuse that
+        // only after the registry and the other slots had moved, so it refuses here instead.
+        await this.requireSettledLocked(this.slotRuntime(ruleSlotId(existing.id)));
+      } else {
         await this.vault.checkCreateRule({
           folders: [canonicalFolder],
           include: requestedIds,
@@ -1247,8 +1252,11 @@ export class SwitchEngine {
       await this.settleForAccountsLocked(requestedIds);
       const picture = await this.vault.readPicture();
       const existing = exactFolderRule(canonicalFolder, picture.rules, this.platform);
-      if (existing) await this.vault.checkExclude(existing.id, requestedIds);
-      else {
+      if (existing) {
+        await this.vault.checkExclude(existing.id, requestedIds);
+        // Refused here, not after the rule write: ensure-live writes this slot (see include).
+        await this.requireSettledLocked(this.slotRuntime(ruleSlotId(existing.id)));
+      } else {
         await this.vault.checkCreateRule({
           folders: [canonicalFolder],
           exclude: requestedIds,
@@ -1365,6 +1373,8 @@ export class SwitchEngine {
 
       await this.settleForAccountsLocked(requestedIds);
       const slotId = ruleSlotId(rule.id);
+      // Refused here, not after the rule write: ensure-live writes this slot (see include).
+      await this.requireSettledLocked(this.slotRuntime(slotId));
       const occupancy = await this.slotOccupancy(picture);
       const owners = occupancy.get(slotId) ?? new Set<string>();
       // The registry as it will be: what this rule's slot may still hold afterwards.
@@ -1537,14 +1547,13 @@ export class SwitchEngine {
             : [];
       const moved = await this.seatFirst(rt, better, 'moving the folder slot to a better account');
       if (moved !== null) return seated(moved, true);
-      // The live account stays. If the registry drifted from it (an external /login), commit it — a
-      // same-account heal, cadence-exempt and adoption-safe.
+      // The live account stays. If the registry drifted from it (an external /login), commit it: adopt
+      // its rotation, then record it. Not a switch — nothing live changes, and a switch's candidacy
+      // checks every copy, so a squatter's copy elsewhere (the one judged irrelevant above, which its
+      // own slot's repair evicts) would refuse the very account just kept.
       if (current.activeId !== live) {
-        await this.activateInSlot(rt, live, {
-          force: true,
-          origin: 'recovery',
-          reason: 'reconciling the rule active id with the live login',
-        });
+        await this.adoptSlotRotation(rt);
+        await this.vault.setRuleActive(rule.id, live);
       }
       // A quarantined account kept for want of any other is live, but not working.
       return { ...seated(live, false), noWorkingAccount: entry === undefined };
@@ -1603,11 +1612,14 @@ export class SwitchEngine {
   /**
    * Move every slot off the accounts an include is about to reserve, where that slot may not hold
    * them afterwards: the global slot (never a reserved account) and every other rule's slot that does
-   * not include them. Each slot is moved onto the best account still AVAILABLE to it once the rows
-   * have moved (pool order, live nowhere else, and not already chosen for another slot here). Every
-   * replacement is chosen before the first one is made, so a slot left with none refuses the whole
-   * include with nothing moved. `ownSlot` — the rule being edited — keeps its account: the account is
-   * included there.
+   * not include them. Each slot is moved onto an account AVAILABLE to it once the rows have moved
+   * (live nowhere else), best in pool order, and no two slots onto the same one — the replacements
+   * are assigned together (`assignDistinct`), so a slot is refused only when no assignment leaves it
+   * one, not because an earlier slot took the account it needed while it had another to spare.
+   * Every replacement is chosen, and every slot to be moved is settled, before the first one is
+   * made, so a slot left with none — or one a stuck switch blocks — refuses the whole include with
+   * nothing moved. `ownSlot` — the rule being edited — keeps its account: the account is included
+   * there.
    */
   private async handOffLocked(
     reserving: readonly StoredAccount[],
@@ -1622,22 +1634,26 @@ export class SwitchEngine {
       rules: picture.rules,
     };
     const occupancy = await this.slotOccupancy(picture);
-    const plan: Array<{ slotId: SlotId; from: StoredAccount; to: StoredAccount }> = [];
-    const taken = new Set<string>();
+    const moving: Array<{ slotId: SlotId; from: StoredAccount; options: StoredAccount[] }> = [];
     for (const [slotId, owners] of occupancy) {
       if (slotId === ownSlot) continue;
       const from = reserving.find((a) => owners.has(a.id));
       if (from === undefined) continue;
-      const to = availableInOrder(slotPool(slotId, after, occupancy)).find((a) => !taken.has(a.id));
-      if (to === undefined) throw this.noReplacementError(slotId, from, picture);
-      taken.add(to.id);
-      plan.push({ slotId, from, to });
+      moving.push({ slotId, from, options: availableInOrder(slotPool(slotId, after, occupancy)) });
     }
+    const assigned = assignDistinct(moving.map((m) => m.options.map((a) => a.id)));
+    if (!assigned.ok) {
+      const short = moving[assigned.unserved]!;
+      throw this.noReplacementError(short.slotId, short.from, picture);
+    }
+    const plan = moving.map((m, i) => ({ slotId: m.slotId, from: m.from, to: assigned.chosen[i]! }));
+    // A slot whose switch is stuck would refuse its move only after the slots before it had moved.
+    for (const step of plan) await this.requireSettledLocked(this.slotRuntime(step.slotId));
     const handedOff: SlotHandOff[] = [];
     for (const step of plan) {
       // A deliberate operator move: forced past the cadence guard (an include should never be blocked
       // by a recent hop), and the outgoing account's rotation is adopted by the switch itself.
-      const res = await this.activateInSlot(this.slotRuntime(step.slotId), step.to.id, {
+      const res = await this.activateInSlot(this.slotRuntime(step.slotId), step.to, {
         force: true,
         origin: 'manual',
         reason: 'freeing the slot for a folder include',
