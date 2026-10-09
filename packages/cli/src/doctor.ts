@@ -14,11 +14,13 @@ import {
   type Paths,
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
-import { isBindGuardInSettingsText } from '@claude-control/daemon';
+import { isBindGuardInSettingsText, type HeartbeatReading } from '@claude-control/daemon';
 import type { SwitchEngine } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import type { AutostartState } from './autostart.js';
+import { olderDaemonReason } from './folderRulesSupport.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
+import type { SettingsReport } from './settings.js';
 import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
 
 export interface DoctorCheck {
@@ -366,26 +368,26 @@ export async function checkGuardSnapshot(
         return {
           name: 'guard-snapshot',
           ok: true,
-          detail: 'no folder bindings; nothing to enforce',
+          detail: 'no folder rules; nothing to enforce',
         };
       }
       return {
         name: 'guard-snapshot',
         ok: false,
-        detail: `${rules.length} folder binding(s) but no guard snapshot — restart the daemon (cctl daemon restart) to write it`,
+        detail: `${rules.length} folder rule(s) but no guard snapshot — restart the daemon (cctl daemon restart) to write it`,
       };
     }
     // Freshness is by CONTENT, not the groups generation: a routine group member switch bumps the
     // generation on fields the snapshot does not carry and must not read as stale. A genuine STALE
-    // means a bound folder / profile / member / enforce mode changed without the snapshot being
-    // rewritten — a bind/unbind or a daemon restart rewrites it (a settings change only does so for
-    // CCTL_BIND_ENFORCE, so it is not offered as the general fix).
+    // means a ruled folder / profile / included account / enforce mode changed without the snapshot
+    // being rewritten — every `cctl folder` change and a daemon restart rewrite it (a settings change
+    // only does so for CCTL_BIND_ENFORCE, so it is not offered as the general fix).
     return {
       name: 'guard-snapshot',
       ok: freshness.fresh,
       detail: freshness.fresh
         ? `fresh (generation ${freshness.generation}, enforce=${freshness.enforce})`
-        : `STALE (the guard is enforcing an out-of-date binding view) — run \`cctl bind\`/\`cctl unbind\` again or restart the daemon (cctl daemon restart) to rewrite it`,
+        : `STALE (the guard is enforcing an out-of-date view of the folder rules) — restart the daemon (cctl daemon restart) to rewrite it`,
     };
   } catch (err) {
     return {
@@ -397,41 +399,41 @@ export async function checkGuardSnapshot(
 }
 
 /**
- * The folder-binding checks `cctl doctor` appends: slot invariants, guard snapshot freshness, guard
+ * The folder-rule checks `cctl doctor` appends: slot invariants, guard snapshot freshness, guard
  * hook presence. They all read `groups.json`, and a doctor exists precisely for the day that file
  * cannot be read (corrupt, or written by a newer build) — so an unreadable registry is reported as
- * ONE failed `bindings` check naming the reason, and every other check still runs and reports, instead
- * of the whole command dying on the first read with nothing but that error. With the bindings unknown,
- * the guard hook is judged as if bindings exist: a missing guard may then be a real gap.
+ * ONE failed `folder-rules` check naming the reason, and every other check still runs and reports,
+ * instead of the whole command dying on the first read with nothing but that error. With the rules
+ * unknown, the guard hook is judged as if rules exist: a missing guard may then be a real gap.
  */
-export async function checkFolderBindings(
+export async function checkFolderRules(
   engine: Pick<SwitchEngine, 'listRules' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
   paths: Paths,
 ): Promise<DoctorCheck[]> {
   const out: DoctorCheck[] = [];
-  let hasBindings: boolean;
+  let hasRules: boolean;
   try {
-    hasBindings = (await engine.listRules()).length > 0;
+    hasRules = (await engine.listRules()).length > 0;
   } catch (err) {
-    hasBindings = true;
+    hasRules = true;
     out.push({
-      name: 'bindings',
+      name: 'folder-rules',
       ok: false,
-      detail: `could not read the folder bindings: ${(err as Error).message}`,
+      detail: `could not read the folder rules: ${(err as Error).message}`,
     });
   }
   out.push(
     await checkSlots(engine),
     await checkGuardSnapshot(engine),
-    checkGuardHook(paths, hasBindings),
+    checkGuardHook(paths, hasRules),
   );
   return out;
 }
 
 /** Whether the enforcement guard hook is installed in the main config dir's settings.json. When
- *  bindings exist but the guard is absent, nothing enforces them — a failure. With no bindings, its
+ *  folder rules exist but the guard is absent, nothing enforces them — a failure. With no rules, its
  *  presence is optional and reported without failing. */
-export function checkGuardHook(paths: Paths, hasBindings: boolean): DoctorCheck {
+export function checkGuardHook(paths: Paths, hasRules: boolean): DoctorCheck {
   const settingsPath = join(paths.claudeDir, 'settings.json');
   let installed = false;
   let unparseable = false;
@@ -446,7 +448,7 @@ export function checkGuardHook(paths: Paths, hasBindings: boolean): DoctorCheck 
     // `bind-guard.cjs` substring: a foreign hook that merely mentions the filename (e.g.
     // `node linter.js --config bind-guard.cjs.rc`), or an incidental mention in a comment or path,
     // must NOT read as the enforcement guard — otherwise doctor reports a security control installed
-    // when nothing enforces the bindings.
+    // when nothing enforces the folder rules.
     installed = isBindGuardInSettingsText(raw);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -459,23 +461,42 @@ export function checkGuardHook(paths: Paths, hasBindings: boolean): DoctorCheck 
     return { name: 'guard-hook', ok: true, detail: `installed in ${settingsPath}` };
   }
   if (unparseable) {
-    // The installer refuses to overwrite invalid JSON, so the guard is NOT installed and bindings are
-    // unenforced no matter how many binds run until the file is repaired. Say so plainly rather than
+    // The installer refuses to overwrite invalid JSON, so the guard is NOT installed and folder rules
+    // are unenforced no matter how many rule changes run until the file is repaired. Say so plainly rather than
     // reporting a generic "not installed".
     return {
       name: 'guard-hook',
-      ok: !hasBindings,
-      detail: hasBindings
-        ? `guard NOT installed — ${settingsPath} is not valid JSON, so the installer refuses to write to it and folder bindings are NOT enforced. Fix the file (e.g. remove comments/trailing commas), then run \`cctl bind\` again or restart the daemon.`
-        : `${settingsPath} is not valid JSON (no bindings need the guard yet, but a bind would fail to install it until the file is fixed)`,
+      ok: !hasRules,
+      detail: hasRules
+        ? `guard NOT installed — ${settingsPath} is not valid JSON, so the installer refuses to write to it and folder rules are NOT enforced. Fix the file (e.g. remove comments/trailing commas), then restart the daemon (cctl daemon restart).`
+        : `${settingsPath} is not valid JSON (no folder rule needs the guard yet, but a cctl folder change would fail to install it until the file is fixed)`,
     };
   }
   return {
     name: 'guard-hook',
-    ok: !hasBindings,
-    detail: hasBindings
-      ? `not installed in ${settingsPath}, but folder bindings exist — bindings are NOT enforced. Run \`cctl bind\` again (it reinstalls the guard) or restart the daemon.`
-      : 'not installed (no folder bindings need it yet)',
+    ok: !hasRules,
+    detail: hasRules
+      ? `not installed in ${settingsPath}, but folder rules exist — they are NOT enforced. Restart the daemon (cctl daemon restart) to reinstall the guard.`
+      : 'not installed (no folder rule needs it yet)',
+  };
+}
+
+/** Whether the running daemon honors folder rules (see folderRulesSupport.ts). A daemon built before
+ *  them could auto-switch the global slot onto an account live in a folder slot, so a live one is a
+ *  failure naming the fix; no running daemon, or one that says it honors them, is a pass. Pure. */
+export function checkDaemonFolderRules(
+  report: SettingsReport | undefined,
+  heartbeat: HeartbeatReading,
+): DoctorCheck {
+  const reason = olderDaemonReason(report, heartbeat);
+  if (reason !== undefined) return { name: 'daemon-folder-rules', ok: false, detail: reason };
+  return {
+    name: 'daemon-folder-rules',
+    ok: true,
+    detail:
+      heartbeat.state === 'alive'
+        ? 'the running daemon honors folder rules'
+        : 'no running daemon to check',
   };
 }
 

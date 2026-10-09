@@ -65,6 +65,7 @@ const engine = vi.hoisted(() => ({
     }> => Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
   ),
   checkSlots: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
+  slotPool: vi.fn((): Promise<unknown[]> => Promise.resolve([])),
   refreshSnapshot: vi.fn((): Promise<void> => Promise.resolve()),
   includeInFolder: vi.fn((f: string): Promise<never> =>
     Promise.reject(new Error(`includeInFolder(${f}) not stubbed`)),
@@ -923,7 +924,7 @@ describe('accounts exclude / include', () => {
   });
 });
 
-describe('reserved (folder-bound) members are reachable by row-level account mutations', () => {
+describe('reserved members (included by folder rules) are reachable by row-level account mutations', () => {
   // A reserved member lives in groups.json, so it appears in the whole-registry view
   // (listAllAccounts) but NOT in the shared-only global pool (listAccounts). Row-level mutations must
   // resolve against the whole registry — exactly as relogin/reauth do — or a folder-bound account is
@@ -1043,7 +1044,7 @@ describe('color on a terminal', () => {
   });
 });
 
-describe('folder-bound account commands', () => {
+describe('folder-rule account commands', () => {
   const acct = (over: Partial<StoredAccount> = {}): StoredAccount => ({
     id: 'a-1',
     label: 'work@me.com',
@@ -1065,39 +1066,6 @@ describe('folder-bound account commands', () => {
     const r = await runCli(['shell-init', 'cmd']);
     expect(r.exited).toBe(true);
     expect(r.err).toContain('unsupported shell');
-  });
-
-  it('bindings with nothing bound prints the empty-state message', async () => {
-    engine.listRules.mockResolvedValueOnce([]);
-    engine.liveSlots.mockResolvedValueOnce(new Map());
-    engine.getGuardSnapshotFreshness.mockResolvedValueOnce({
-      present: false,
-      fresh: false,
-      enforce: 'block',
-      generation: null,
-    });
-    const r = await runCli(['bindings']);
-    expect(r.out).toContain('No folder-bound accounts');
-  });
-
-  it('where on an unbound folder explains the global account', async () => {
-    engine.listRules.mockResolvedValue([]);
-    engine.liveSlots.mockResolvedValue(new Map());
-    const r = await runCli(['where', '.']);
-    expect(r.out).toContain('global (shared) account');
-  });
-
-  it('bind surfaces an engine refusal as a single error line', async () => {
-    engine.listAccounts.mockResolvedValue([acct()]);
-    engine.includeInFolder.mockRejectedValueOnce(
-      new RefreshError(
-        'already bound to something else; unbind it first',
-        'folder_bound_elsewhere',
-      ),
-    );
-    const r = await runCli(['bind', '.', 'work@me.com']);
-    expect(r.exited).toBe(true);
-    expect(r.err).toContain('already bound to something else');
   });
 
   it('switch of an account a folder includes names the folder slot it went to', async () => {
@@ -1139,7 +1107,7 @@ describe('folder-bound account commands', () => {
   });
 });
 
-describe('doctor with a folder-bindings registry this build cannot read', () => {
+describe('doctor with a folder-rules registry this build cannot read', () => {
   let root: string;
   beforeEach(async () => {
     // Every path doctor reads resolves inside a sandbox, never near the operator's real files.
@@ -1168,7 +1136,7 @@ describe('doctor with a folder-bindings registry this build cannot read', () => 
       const r = await runCli(['doctor']);
 
       expect(r.exited).toBe(false);
-      expect(r.out).toMatch(/\[!!\] bindings: .*schemaVersion/);
+      expect(r.out).toMatch(/\[!!\] folder-rules: .*schemaVersion/);
       expect(r.out).toContain('[!!] slots:');
       expect(r.out).toContain('guard-hook:');
       expect(r.out).toMatch(/\d+ ok, \d+ to look at\./);

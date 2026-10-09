@@ -50,57 +50,121 @@ twice is merged onto one row (the active one, else the most recently captured), 
 logins under one label keep the earlier row's label while the later one becomes `jina25 (2)`.
 Each repair is printed above the listing it precedes.
 
-## Folder-bound accounts
+## Folder rules
 
-By default every Claude Code session on the machine runs on one live account — the
-_global_ account — and a switch moves all of them at once. A **binding** carves out an
-exception: a folder (and everything under it) is tied to one account, or a set of
-accounts, and sessions started there run on that set. The bound accounts are held apart
-from the global pool — auto-switch never hops to them, and a global switch never touches
-them — so work in a bound folder cannot spend the account you keep for everything else,
-and vice versa. Memories, settings, skills, plugins, MCP servers and history stay shared;
-only the login differs.
+By default every Claude Code session on the machine runs on one live account, the
+_global_ account, drawn from the **shared pool** (every stored account), and a switch
+moves all of them at once. A **folder rule** gives a folder (and everything under it) its
+own say over that pool. The folder still **inherits the shared pool**; the rule adds two
+things on top:
 
-```
-cctl bind <folder> <account>[,<account>...]   # bind a folder to one account or a set
-cctl unbind <folder>                          # remove a binding (dissolves the group on its last folder)
-cctl unbind <folder> --force                  # dissolve even while a session runs in the profile
-cctl bindings                                 # list every binding, its accounts, and which is live
-```
+- **include**: accounts the folder uses **first**. An included account is **reserved**:
+  it leaves the shared pool, so no other folder, and not the global slot, can use it.
+  Including an account you excluded from auto-switch (`cctl accounts exclude`) makes it a
+  normal target inside that folder.
+- **exclude**: shared accounts the folder must not use. They stay usable everywhere else.
 
-`cctl bind` reports what it changed: if a to-be-bound account was the global live account
-it is moved out first (the global slot switches to the best remaining shared account, and
-`bind` refuses if none is left), the account's isolated profile is prepared, and any
-sessions already running under the folder are named — they keep their old account until
-they are relaunched.
-
-A **set** of accounts (`cctl bind C:\work alice,bob`) rotates internally: auto-switch and
-the phone's `/switch` move only among the set's members, never out to a global account.
-A single-account binding never hops; when its account is out of quota you are told, rather
-than being moved onto an account the folder is not meant to use.
-
-Nesting is allowed: a subfolder can be bound to a different account than its parent, and
-the longest matching binding wins. `cctl bind` refuses a filesystem root, your home
-directory, anything inside cctl's own data directories, and a folder already bound to a
-_different_ set (unbind it first).
-
-### Running Claude Code in a bound folder
-
-A binding only takes effect for a session that launches with the folder's account. That is
-what `cctl claude` does:
+A ruled folder runs in its **own slot** (its own login, in a profile dir cctl prepares),
+so its pool is: its included accounts first, then the rest of the shared pool minus what
+it excludes. Global exclusions and quarantined logins are honored as everywhere else.
+When every included account is out, the folder falls back to an inherited shared account,
+and it returns to an included one as soon as that has usage again. One account is live in
+one place at a time: a shared account live in another slot is skipped, and when two
+places want the last free account, the global slot keeps it and the folder waits (the
+phone gets an alert naming the folder). Memories, settings, skills, plugins, MCP servers
+and history stay shared; only the login differs.
 
 ```
-cctl claude                        # launch Claude Code on the folder's bound account (or the
-                                    # global account when the folder is not bound)
+cctl folder include <folder> <account>[,<account>...]   # reserve accounts to a folder, used there first
+cctl folder include <folder> <accounts> --label <name>  # ...naming the rule (default: the folder)
+cctl folder exclude <folder> <account>[,<account>...]   # keep a folder off some shared accounts
+cctl folder exclude <folder> <accounts> --force         # ...even if that empties its slot while sessions run
+cctl folder reset <folder> <account>[,<account>...]     # take accounts back out of a folder's rule
+cctl folder reset <folder>                              # remove the folder's rule entirely
+cctl folders                                            # every rule: includes, excludes, live account, pool
+```
+
+Accounts are named by label, email or id, one or several separated by commas. **The
+account is never filled in for you**: `cctl folder include C:\work` with no account is a
+usage error. A default would silently reserve the account you are using right now, and
+every other project on it would stop.
+
+Every change says what it did:
+
+- `include` names each account that left the shared pool, every slot that was moved off
+  one of them (if the global slot was live on it, the global slot switches to the best
+  remaining shared account first, and the include is refused, with nothing changed, when
+  none is left), the account now live in the folder's slot, and any sessions already
+  running under the folder, which keep their old account until relaunched.
+- `exclude` says the accounts stay usable elsewhere, and, when an excluded account was live
+  in the folder's slot, that the slot moved off it. With nothing else free the slot would be
+  emptied; that is refused while sessions run under the folder unless you pass `--force`.
+- `reset` with accounts removes each from what the folder includes or excludes; an account
+  no folder includes any more returns to the shared pool. `reset` with no accounts removes
+  the rule: its included accounts return to the shared pool (unless another folder also
+  includes them), its profile's live login is cleared (the profile dir is kept for history),
+  and the folder goes back to the global slot, or to a parent folder's rule.
+
+Several folders may include the same account: they share it, and it is live in at most one
+of them at a time. A folder that only excludes still gets its own slot, so it can avoid the
+global live account when that is one it excludes.
+
+`cctl folders` lists every rule: its folder(s), what it includes and excludes, the account
+live in its slot (and whether that one is included or inherited), and the whole pool in
+order, with what limits each account: live elsewhere, quarantined, or not an auto-switch
+target. It ends with the global slot and the guard's state. `cctl usage` and `cctl timeline`
+end with a short per-folder section (the live account and the pool on one line), and
+`cctl accounts list` shows the reserved accounts in their own table, each with its email and
+the folders that include it.
+
+Nesting is allowed: a subfolder can have its own rule, and the **longest matching rule
+wins**, with no merging: a nested rule does not add to its parent's, it replaces it there.
+`cctl folder include|exclude` refuses a filesystem root, your home directory, and anything
+inside cctl's own data directories.
+
+**An older daemon must be restarted first.** A folder slot can hold a shared account, and
+a daemon built before folder rules would treat that account as free for the global slot,
+putting one login live in two places (the second copy logs itself out on the next refresh).
+So while such a daemon is running, `cctl folder include` and `cctl folder exclude` refuse
+and change nothing:
+
+```
+error: the running daemon (v0.5.2) predates folder rules: it could put an account live in a
+folder and in the global slot at once. Restart it on this build first: cctl daemon restart.
+Nothing was changed.
+```
+
+`cctl doctor` flags the same mismatch (`daemon-folder-rules`).
+
+### Switching a folder's slot by hand
+
+```
+cctl switch <account> --folder <folder>   # put the account in the slot that folder runs on
+```
+
+The folder's slot is the slot of the rule that applies there (or the global slot when none
+does). The slot may take one of its included accounts, or a shared account the folder does
+not exclude. The switch is refused, with nothing changed, when the folder's rule does not
+allow the account, when the account is live in another slot, or (without `--folder`) when
+several folders include the account and it is live in none of them: name the folder then.
+
+### Running Claude Code in a ruled folder
+
+A rule only takes effect for a session that launches on the folder's slot. That is what
+`cctl claude` does:
+
+```
+cctl claude                        # launch Claude Code on the folder's slot (or the global
+                                    # slot when no rule applies here)
 cctl claude --account <id|label>   # launch on a specific account for this one session
 cctl claude --override             # launch here on the global account, on purpose (see below)
 cctl claude -- <claude args...>    # everything after -- is passed through to claude
 ```
 
-`cctl claude` resolves which account to use — an explicit `--account`, else the folder's
-binding, else global — prepares the profile, prints a one-line banner naming the account
-and binding, and hands off to the real `claude` executable. Its exit code is yours;
-Ctrl+C reaches Claude Code, not the wrapper.
+`cctl claude` resolves which slot to use (an explicit `--account`, else the folder's
+rule, else global), makes sure an account is live there, prints a one-line banner naming
+the account and the rule, and hands off to the real `claude` executable. Its exit code is
+yours; Ctrl+C reaches Claude Code, not the wrapper.
 
 To make an ordinary `claude` do this automatically, install the wrapper for your shell:
 
@@ -110,14 +174,14 @@ cctl shell-init bash         # (also: zsh, fish)
 ```
 
 For PowerShell, `cctl shell-init powershell` prints a function to add to your profile
-(`$PROFILE`); afterwards typing `claude` in any bound folder starts on the right account,
+(`$PROFILE`); afterwards typing `claude` in any ruled folder starts on the right slot,
 and typing it anywhere else behaves exactly as before. The command prints where to put it.
 
 In **VS Code**, the Claude Code extension takes its environment from the
 `claudeCode.environmentVariables` setting (a list of `{ "name", "value" }` pairs). That
 setting is machine-scoped: VS Code reads it from **user** settings only and silently ignores
-it in a folder's `.vscode/settings.json`. So give each binding its own VS Code profile, and
-open the bound folder in it:
+it in a folder's `.vscode/settings.json`. So give each folder rule its own VS Code profile,
+and open the folder in it:
 
 1. `code --profile cctl-<label> <folder>` — creates the profile the first time; install or
    enable the Claude Code extension in it.
@@ -133,7 +197,7 @@ open the bound folder in it:
    ```
 
 3. Open the folder with the same `code --profile ...` command from then on. Windows in any
-   other profile keep the shared account.
+   other profile keep the global slot.
 
 `cctl where` prints the exact command, quoted for your shell. A `claude` typed in VS Code's
 integrated terminal is covered by the shell wrapper above.
@@ -143,23 +207,25 @@ your first prompt, so a prompt the guard blocks in a wrongly configured window h
 sent its text, for that title, to the window's account; the guard cannot stop that request —
 routing the window correctly does. And a multi-root workspace runs its session in the FIRST
 folder; the other folders are added working directories that the guard does not judge, so
-keep a bound folder in its own window.
+keep a ruled folder in its own window.
 
 ```
-cctl where              # explain how THIS folder resolves, with the env line and a
-                        # ready-to-paste VS Code settings snippet
+cctl where              # explain how THIS folder resolves: the rule that matched, what it
+                        # includes and excludes, the live account, the pool in order, the env
+                        # line and a ready-to-paste VS Code settings snippet
 cctl where <folder>     # the same for another folder
 ```
 
-### Enforcement: what a session in the wrong account sees
+### Enforcement: what a session on the wrong slot sees
 
 So a session does not silently run on the wrong account, cctl installs a guard that checks
-each prompt against the folder's binding. When a folder is bound but the session is on the
+each prompt against the folder's rule. When a folder has a rule but the session runs on the
 shared account, the guard blocks the prompt with:
 
 ```
-cctl: C:\work is bound to alice, but this session runs on the shared account.
-Exit and start it with: cctl claude   (or set up the claude wrapper: cctl shell-init powershell)
+cctl: C:\work has its own cctl folder rules (it uses A, B first), but this session runs on
+the shared account. Exit and start it with: cctl claude   (or set up the claude wrapper:
+cctl shell-init powershell)
 ```
 
 There are three enforcement modes, set with `cctl settings set bind-enforce <mode>`:
@@ -168,21 +234,21 @@ There are three enforcement modes, set with `cctl settings set bind-enforce <mod
 - **warn** — the same message is shown, but the prompt proceeds.
 - **off** — no check.
 
-To run in a bound folder on the global account _on purpose_ for one session, launch it
-with `cctl claude --override`; to run a bound account against a folder it is not bound to,
-launch with `cctl claude --account <that account>`. Both are honored by the guard for that
-session only.
+To run in a ruled folder on the global account _on purpose_ for one session, launch it
+with `cctl claude --override`; to run a reserved account in a folder that does not include
+it, launch with `cctl claude --account <that account>`. Both are honored by the guard for
+that session only.
 
 ### macOS
 
-Folder-bound accounts are **not supported on macOS yet** — `cctl bind` refuses there. The
-isolation relies on a per-account credential store, and on macOS each store would prompt
-the Keychain. See `docs/PLATFORM.md`.
+Folder rules are **not supported on macOS yet** — `cctl folder include|exclude` refuse
+there. The isolation relies on a per-slot credential store, and on macOS each store would
+prompt the Keychain. See `docs/PLATFORM.md`.
 
 ## Switching and recovery
 
 ```
-cctl switch <id|label>       # activate an account (a bound account switches ITS group's slot)
+cctl switch <id|label>       # activate an account (a reserved account switches its folder's slot)
 cctl switch <id|label> --force   # bypass the switch-cadence guard
 cctl recover                 # recover from an interrupted switch (safe to run anytime);
                              # exits 1 with the reason when it cannot be settled yet
