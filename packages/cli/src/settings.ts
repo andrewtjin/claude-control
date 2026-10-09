@@ -707,6 +707,16 @@ export function resolveDaemonConfig(
       detail: 'update: npm i -g @andrewtjin/cctl, then cctl daemon restart',
     },
     {
+      // A capability, not a knob: a daemon whose report carries this row honors folder rules
+      // (per-slot switching over each folder's pool). The CLI refuses folder rule edits while a
+      // running daemon's report lacks it, since an older daemon could seat an account a folder
+      // slot holds in the global slot too.
+      name: 'folder rules',
+      value: 'supported',
+      source: 'default',
+      detail: 'cctl folder include / exclude: per-folder account pools',
+    },
+    {
       name: 'auto-switch',
       value: autoSwitch ? 'on' : 'off',
       source:

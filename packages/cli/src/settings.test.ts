@@ -160,6 +160,16 @@ describe('resolveDaemonConfig', () => {
     });
   });
 
+  it('reports that this daemon honors folder rules, whatever the environment says', () => {
+    // The CLI refuses folder rule edits while a running daemon's report lacks this exact row.
+    for (const env of [{}, { CCTL_AUTOSWITCH: '0' }]) {
+      expect(row(resolveDaemonConfig(env).rows, 'folder rules')).toMatchObject({
+        value: 'supported',
+        source: 'default',
+      });
+    }
+  });
+
   it('describes what actually ends an unanswered question hold', () => {
     // The help line is the only place an operator learns what the knob buys them. It promised a
     // terminal picker after the window; the hold declines the question instead, so the session
