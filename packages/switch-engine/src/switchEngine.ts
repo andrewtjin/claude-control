@@ -1646,7 +1646,11 @@ export class SwitchEngine {
       const short = moving[assigned.unserved]!;
       throw this.noReplacementError(short.slotId, short.from, picture);
     }
-    const plan = moving.map((m, i) => ({ slotId: m.slotId, from: m.from, to: assigned.chosen[i]! }));
+    const plan = moving.map((m, i) => ({
+      slotId: m.slotId,
+      from: m.from,
+      to: assigned.chosen[i]!,
+    }));
     // A slot whose switch is stuck would refuse its move only after the slots before it had moved.
     for (const step of plan) await this.requireSettledLocked(this.slotRuntime(step.slotId));
     const handedOff: SlotHandOff[] = [];

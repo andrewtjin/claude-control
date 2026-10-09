@@ -334,7 +334,12 @@ describe('assignDistinct — one different account per slot', () => {
   });
 
   it('does not move an earlier slot while the later one has a free candidate of its own', () => {
-    expect(assignDistinct([['a', 'b'], ['a', 'c']])).toEqual({ ok: true, chosen: ['a', 'c'] });
+    expect(
+      assignDistinct([
+        ['a', 'b'],
+        ['a', 'c'],
+      ]),
+    ).toEqual({ ok: true, chosen: ['a', 'c'] });
   });
 
   it('follows a chain of moves', () => {
