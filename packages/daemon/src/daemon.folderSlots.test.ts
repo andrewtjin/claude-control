@@ -1927,6 +1927,39 @@ describe('daemon folder-bound slots — background sessions move onto their fold
     expect(calls).toEqual([]);
   });
 
+  it('moves it in the same cycle its folder slot returns to the included account', async () => {
+    // The slot runs on an inherited shared account while its own account, m1, can take work again:
+    // this cycle's auto-switch takes it back to m1, and the move is judged on the slot as it stands
+    // after that hop. Judged before it, nothing would move until the next cycle, minutes later.
+    const m1 = view('m1', 'Inc One', 'g1');
+    const s1 = view('s1', 'Shared One');
+    const s2 = view('s2', 'Shared Two');
+    const controls = fakeEngine({
+      accounts: [s1, s2, m1],
+      groups: [folderRule('g1', 'C:/work', [m1], 'm1')],
+      live: new Map<SlotId, string | null>([
+        ['global', 's1'],
+        [ruleSlotId('g1'), 's2'],
+      ]),
+      applyActivations: true,
+      cwdBinding: (cwd) => (cwd.startsWith('C:/work') ? { groupId: 'g1' } : null),
+    });
+    const { host, calls } = recordingHost('C:/work/app');
+    const rig = await createRig({
+      controls,
+      bodyFor: () => healthyIn(30),
+      withAutoSwitcher: true,
+      backgroundSessionHost: host,
+    });
+    await rig.start();
+    await waitFor(() => movedNotices(rig.relay).length > 0);
+
+    expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['m1']);
+    expect(countUsageSnapshots(rig.relay)).toBe(1);
+    expect(calls).toContain(`resume /profiles/${ruleSlotId('g1')} ${SID}`);
+    expect(movedNotices(rig.relay)[0]?.body).toContain('onto Inc One');
+  });
+
   it("a move that never confirms ends on the mover's own clock, whatever the wall clock says", async () => {
     // The rig's wall clock is frozen. Measured on it, the confirm window would never close and the
     // poll cycle would wait on it for good.
