@@ -1857,6 +1857,27 @@ describe('the guard snapshot follows every rule change', () => {
     expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
   });
 
+  it('capturing the live login as a new account keeps the snapshot fresh while rules exist', async () => {
+    // Without it, a ruled folder's session on that login would be named "the shared account", and
+    // could not be matched if it were excluded, until the daemon's next cycle.
+    const h = await harness();
+    const { A } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.includeInFolder(work, [A.id]);
+    // A login made by hand in the global slot, one cctl does not store yet.
+    await h.credStore.writeLiveCredentials(oauth('E', NOW + 10 * HOUR));
+    await h.credStore.writeOauthAccount({ accountUuid: 'uuid-E', emailAddress: 'E@x.com' });
+
+    await h.engine.captureCurrentLogin('E');
+
+    expect((await snapshotOf(h)).accounts?.find((a) => a.label === 'E')).toEqual({
+      label: 'E',
+      accountKey: snapshotIdentityKey('uuid-E'),
+      ruleIds: [],
+    });
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+  });
+
   it('without any rule, an account change writes no snapshot', async () => {
     const h = await harness();
     const { A } = await seed(h);
