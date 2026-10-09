@@ -28,7 +28,7 @@ import { UsagePoller, type FetchLikeResponse } from './usagePoller.js';
 import { AttributionJournal } from './attributionJournal.js';
 import { HookReceiver } from './hookReceiver.js';
 import { ControlPlaneClient, type DaemonIdentity } from './controlPlaneClient.js';
-import { Daemon, type SwitchEngineLike } from './daemon.js';
+import { Daemon, type AutoSwitcherLike, type SwitchEngineLike } from './daemon.js';
 import { TestRelay, waitFor as waitForWithin } from './testing/sessionDaemonHarness.js';
 import {
   ExhaustionLog,
@@ -137,6 +137,8 @@ async function createRig(options: {
   logPath?: string;
   /** Rules whose slot the engine reports as having no working account. */
   noWorking?: string[];
+  /** A policy that hops slots, given the registry it moves; none runs by default. */
+  autoSwitcher?: (registry: Rig['registry']) => AutoSwitcherLike;
 }): Promise<Rig> {
   const relay = new CardRelay();
   const relayPort = await relay.listen();
@@ -225,6 +227,7 @@ async function createRig(options: {
     }),
     controlPlaneClient,
     exhaustionLog: log,
+    ...(options.autoSwitcher !== undefined ? { autoSwitcher: options.autoSwitcher(registry) } : {}),
     logger,
     clock: () => clock.now,
     pollIntervalMs: 100_000,
@@ -528,5 +531,71 @@ describe('a folder out of usage and out of accounts', () => {
       (e) => e.type === 'hook.notification' && e.payload.notificationType === 'slot_alert',
     );
     expect(slotAlerts).toHaveLength(0);
+  });
+});
+
+/** Hops a slot whose live account is spent onto the first free account it may take, and moves the
+ *  engine's live map the way a real activation would. */
+const firstFree = (registry: Rig['registry']): AutoSwitcherLike => ({
+  evaluate: (inputs, opts) => {
+    const spent = (id: string | undefined): boolean =>
+      inputs.find((i) => i.accountId === id)?.limits.some((l) => l.percent >= 100) ?? true;
+    if (!spent(inputs.find((i) => i.active)?.accountId)) return Promise.resolve(undefined);
+    const target = inputs.find(
+      (i) => !i.active && (opts?.candidateIds?.has(i.accountId) ?? true) && !spent(i.accountId),
+    );
+    if (target === undefined || opts?.slotKey === undefined) return Promise.resolve(undefined);
+    registry.live.set(opts.slotKey, target.accountId);
+    return Promise.resolve(target.accountId);
+  },
+});
+
+describe('two folders out when one shared account frees', () => {
+  it('only the folder that takes it is back; the other stays out, with no card', async () => {
+    // Each folder's own account is spent; shared A is free but held by the global slot, shared B
+    // is spent. Both folders are out.
+    const registry: Rig['registry'] = {
+      accounts: [view('A'), view('B'), view('W1', ['r1']), view('W2', ['r2'])],
+      rules: [rule('r1', 'C:/alpha', ['W1']), rule('r2', 'C:/beta', ['W2'])],
+      live: new Map<SlotId, string | null>([
+        ['global', 'A'],
+        [ruleSlotId('r1'), 'W1'],
+        [ruleSlotId('r2'), 'W2'],
+      ]),
+    };
+    const rig = await createRig({
+      registry,
+      bodies: {
+        A: free(),
+        B: spentUntil(T0 + H),
+        W1: spentUntil(T0 + 9 * H),
+        W2: spentUntil(T0 + 9 * H),
+      },
+      autoSwitcher: firstFree,
+    });
+    await waitFor(() => rig.relay.cards().length === 2);
+
+    // B's window resets. Only one folder can have it: alpha's hop takes it this cycle, so beta
+    // must neither hear that usage is back nor be told again that it is out.
+    rig.bodies.set('B', free());
+    await rig.cycle(T0 + H + 5 * M);
+    await settle();
+    await rig.cycle(T0 + H + 10 * M);
+    await settle();
+
+    expect(registry.live.get(ruleSlotId('r1'))).toBe('B');
+    expect(rig.relay.cards().map((c) => c.title)).toEqual([
+      'C:/alpha: every account in its pool is out',
+      'C:/beta: every account in its pool is out',
+      'Usage is back in C:/alpha',
+    ]);
+    // Beta's episode never closed: one start, no end (walls lines only note B moving under it).
+    const betaEpisode = (await rig.log.read()).flatMap((r) => {
+      const scope = scopeOf(r);
+      return scope.kind === 'folder' && scope.ruleId === 'r2' && r.event !== 'walls'
+        ? [r.event]
+        : [];
+    });
+    expect(betaEpisode).toEqual(['exhausted']);
   });
 });

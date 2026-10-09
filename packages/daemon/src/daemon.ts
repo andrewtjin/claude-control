@@ -1450,16 +1450,6 @@ export class Daemon {
       this.sendEnvelope({ type: 'settings.snapshot', payload: this.settingsReport });
     }
 
-    // Record the times no account can take work: after the snapshot ships, so the phone has the
-    // numbers before the card that sums them up, and judged on the same merged inputs the plan
-    // and auto-switch read. Its own catch, like auto-switch's below: a bug in the bookkeeping
-    // must never take down the poll loop.
-    await this.timePhase('exhaustion', () =>
-      this.trackExhaustion(snapshot.inputs, accounts, rules, liveSlots).catch((err: unknown) => {
-        this.logger.error({ err }, 'exhaustion tracking failed');
-      }),
-    );
-
     // Auto-switch runs AFTER the snapshot ships, so the phone always sees the usage state
     // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
     // engine failures itself; this catch only guards against bugs in the evaluator so a
@@ -1468,20 +1458,43 @@ export class Daemon {
     // not), which is also what lets the evaluation report its hop back without an `?.` swallowing
     // the value.
     const autoSwitcher = this.autoSwitcher;
+    // Which account each slot holds once this cycle's hops are made; the cycle's own reading when no
+    // policy runs.
+    let liveAfterHops: ReadonlyMap<SlotId, string | null> = liveSlots;
     if (autoSwitcher !== undefined) {
       // One decision PER SLOT, each over its slot's effective pool: the global slot over the
       // shared pool, and each rule over its included accounts first, then the shared pool it
       // inherits. `snapshot.inputs` is the same array the plan above was computed from
       // (predictions merged); the per-slot helper slices it and overrides `active` to the slot's
       // live account so each decision reasons about its own slot alone (see runSlotAutoSwitch).
-      const stuck = await this.timePhase('autoSwitch', () =>
+      const { stuck, live } = await this.timePhase('autoSwitch', () =>
         this.runSlotAutoSwitch(autoSwitcher, snapshot.inputs, accounts, rules, liveSlots),
       );
+      liveAfterHops = live;
       for (const [ruleId, message] of stuck) {
         if (!poolsOut.has(ruleId)) poolsOut.set(ruleId, message);
       }
+    }
 
-      // Inside the auto-switch block on purpose: the probe exists to widen the pool the policy
+    // Record the times no account can take work: after the snapshot ships, so the phone has the
+    // numbers before the card that sums them up, and judged on the same merged inputs the plan
+    // and auto-switch read. Judged on the live map AFTER this cycle's hops: one account freeing
+    // while several folders are out can be taken by only one of them, and judging before the hops
+    // would tell every waiting folder its usage is back, then re-open all but the one that took it
+    // on the next cycle. Before the probe below, so a probe's turn never delays a card, and before
+    // the pool-out alerts, which hold back their own line for a folder whose card is already out.
+    // Its own catch, like auto-switch's: a bug in the bookkeeping must never take down the poll
+    // loop.
+    await this.timePhase('exhaustion', () =>
+      this.trackExhaustion(snapshot.inputs, accounts, rules, liveAfterHops).catch(
+        (err: unknown) => {
+          this.logger.error({ err }, 'exhaustion tracking failed');
+        },
+      ),
+    );
+
+    if (autoSwitcher !== undefined) {
+      // Only with a policy running, on purpose: the probe exists to widen the pool the policy
       // above chooses from, so with no policy running there is nothing to widen it for. Runs
       // AFTER the evaluation, so a cycle that already had a hop to make makes it first. It needs
       // no absorb of its own: a probe runs its turn in a throwaway config dir precisely so it
@@ -1703,7 +1716,8 @@ export class Daemon {
    * external switch.
    *
    * Resolves with the folder rules that cannot move off a live account that is out of usage, each
-   * with the sentence its alert says (see {@link alertPoolsOut}).
+   * with the sentence its alert says (see {@link alertPoolsOut}), and the live map with this
+   * cycle's hops applied, which the outage bookkeeping judges on.
    */
   private async runSlotAutoSwitch(
     autoSwitcher: AutoSwitcherLike,
@@ -1711,7 +1725,7 @@ export class Daemon {
     accounts: AccountView[],
     rules: FolderRule[],
     liveSlots: Map<SlotId, string | null>,
-  ): Promise<Map<string, string>> {
+  ): Promise<{ stuck: Map<string, string>; live: Map<SlotId, string | null> }> {
     const inputById = new Map(inputs.map((i) => [i.accountId, i]));
     const picture = rulesPictureOf(accounts, rules);
     const live = new Map(liveSlots);
@@ -1767,7 +1781,7 @@ export class Daemon {
       if (rule === undefined) this.lastObservedActiveId = hop;
       else this.lastObservedGroupActiveId.set(slot, hop);
     }
-    return stuck;
+    return { stuck, live };
   }
 
   /**
@@ -2063,7 +2077,7 @@ export class Daemon {
     inputs: AccountUsageInput[],
     accounts: AccountView[],
     rules: FolderRule[],
-    liveSlots: Map<SlotId, string | null>,
+    liveSlots: ReadonlyMap<SlotId, string | null>,
   ): Promise<void> {
     const log = this.exhaustionLog;
     if (log === undefined || !(await this.loadOpenExhaustion(log))) return;
