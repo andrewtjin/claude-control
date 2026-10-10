@@ -21,8 +21,11 @@
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import {
   DEFAULT_CONFIRM_TIMEOUT_MS,
+  lockMove,
   moveBackgroundSession,
+  moveLockIds,
   reasonOf,
+  recoveryCommand,
   sessionLabel,
   type BackgroundSession,
   type BackgroundSessionHost,
@@ -158,7 +161,7 @@ export class BackgroundMover {
     // now, and the next cycle looks again.
     let lock: SessionLock | undefined;
     try {
-      lock = await this.host.lockSession(session.sessionId, 0);
+      lock = await lockMove(this.host, await this.lockIdsOf(session), 0);
     } catch (err) {
       return { ...base, result: 'skipped', reason: reasonOf(err) };
     }
@@ -229,6 +232,20 @@ export class BackgroundMover {
     }
   }
 
+  /** The ids a session's move lock is taken on (see moveLockIds): the id its job started with, as
+   *  the roster lists it, and the conversation the registry says the job runs now and its row on the
+   *  global slot ran last, which differ after /clear. A registry that cannot be read right now
+   *  rejects, and the session is looked at again next cycle. */
+  private async lockIdsOf(session: BackgroundSession): Promise<string[]> {
+    const live = await this.host.liveSessions();
+    const row = await this.host.jobRow(null, session.short);
+    return moveLockIds([
+      session.sessionId,
+      ...live.filter((e) => e.kind === 'bg' && e.jobId === session.short).map((e) => e.sessionId),
+      row.kind === 'row' ? row.row.resumeSessionId : undefined,
+    ]);
+  }
+
   /** How one move is timed: this mover's clock, confirm window, pauses and log. */
   private timing(): MoveTiming {
     return {
@@ -240,7 +257,8 @@ export class BackgroundMover {
   }
 
   /** Stop trying a session for good, and tell the operator once where it was left: still where it
-   *  was, or (`recovery`) possibly stopped, with the command that brings it back as it was. */
+   *  was, or (`recovery`) possibly stopped, with the command that brings it back as it was (the move
+   *  saved how, see backgroundMove.ts). */
   private giveUp(
     session: BackgroundSession,
     name: string | undefined,
@@ -252,11 +270,7 @@ export class BackgroundMover {
     const restored = recovery === undefined;
     const where = restored
       ? 'It is still on the shared account, as before.'
-      : `It may be stopped: resume it with: ${this.host.resumeHint(
-          recovery.configDir,
-          recovery.sessionId,
-          recovery.options,
-        )}`;
+      : `It may be stopped: bring it back with: ${recoveryCommand(recovery.sessionId)}`;
     const body =
       `cctl could not move background session ${sessionLabel(session.short, name)} in ` +
       `${target.folder} onto ${target.accountLabel} (${reason}), and will not try again until the ` +

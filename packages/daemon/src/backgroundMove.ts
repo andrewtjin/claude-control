@@ -24,7 +24,10 @@
 //   - `/clear` in a background session starts a new conversation in the same job: the shared session
 //     registry then names the new id (with the job's short id), while the roster and the row keep the
 //     id the job started with and the row records the new one as `resumeSessionId`. A move resumes
-//     the CURRENT conversation, which then runs under a job named after it;
+//     the CURRENT conversation, which then runs under a job named after it. A row elsewhere that
+//     records another conversation under the same job id (the job's earlier conversation, or that
+//     conversation resumed as a job of its own) is not this session's: it is left alone, since a
+//     wake of it reaches only that job id, which the moved session no longer runs under;
 //   - a session waiting on a scheduled wakeup or running background work is reported idle, but its
 //     row records the work (`inFlight`); a stop would drop it, so such a session is not moved.
 //
@@ -32,10 +35,12 @@
 // the same terms whoever moves it: the daemon's background mover (backgroundMover.ts), which decides
 // every poll cycle WHEN and WHICH, and `cctl claude`, which moves a session the operator opens from a
 // ruled folder. They can reach the same session at the same moment, so each holds the session's
-// cross-process move lock ({@link BackgroundSessionHost.lockSession}) around a move, and a move first
-// reads again where the session runs. HOW is the injected {@link BackgroundSessionHost}, the one seam
-// to Claude Code's own commands and files, so every decision here is testable without a Claude Code
-// binary.
+// cross-process move lock ({@link lockMove}) around a move, and a move first reads again where the
+// session runs. A move that commits leaves a record of how to bring the session back
+// ({@link BackgroundSessionHost.saveRecovery}) until it runs somewhere again, so a move cut off half
+// way, even with its process gone, can be undone by `cctl claude --resume <id>`. HOW is the injected
+// {@link BackgroundSessionHost}, the one seam to Claude Code's own commands and files, so every
+// decision here is testable without a Claude Code binary.
 
 import { folderUniquenessKey, type Logger } from '@claude-control/switch-engine';
 import { assessFleet, type AccountUsageInput } from '@claude-control/usage-advisor';
@@ -178,18 +183,21 @@ export interface BackgroundSessionHost {
     options?: string[];
   }): Promise<void>;
   /** Remove a config dir's job row (`claude rm <short>`), keeping the conversation. Refuses a row
-   *  that records a worktree (rm would delete it) or whose session is live, and resolves at once
-   *  when there is no row. */
+   *  that records a worktree (rm would delete it), and one whose session is live or starting in any
+   *  service, read verified right before the rm; resolves at once when there is no row. */
   removeRow(configDir: string | null, short: string): Promise<void>;
   /**
-   * Take the cross-process lock that serializes moves of one session (the daemon and `cctl claude`
-   * are separate processes), waiting up to `waitMs` for a holder to let go. Resolves `undefined`
-   * when another process still holds it then. A holder that died leaves no lock behind.
+   * Take the cross-process lock on one id (the daemon and `cctl claude` are separate processes),
+   * waiting up to `waitMs` for a holder to let go. Resolves `undefined` when another process still
+   * holds it then. A holder that died leaves no lock behind. A move takes it through
+   * {@link lockMove}, on every id the session is known by.
    */
   lockSession(sessionId: string, waitMs: number): Promise<SessionLock | undefined>;
-  /** The command an operator runs to resume a session idle under a config dir by hand, naming the
-   *  config dir the way this host reaches it. */
-  resumeHint(configDir: string | null, sessionId: string, options: readonly string[]): string;
+  /** Keep, where it outlives this process, how to bring a session back by hand (see
+   *  {@link ResumeRecovery}), by the conversation it resumes. Rejects when it cannot be kept. */
+  saveRecovery(recovery: ResumeRecovery): Promise<void>;
+  /** Forget a session's recovery: it is known to run somewhere again. Resolves when there is none. */
+  dropRecovery(sessionId: string): Promise<void>;
 }
 
 /** One end of a move: a config dir and the slot it is, in words. */
@@ -241,14 +249,28 @@ export type NotMovedCause =
   /** It works in a git worktree Claude Code made for it. */
   | 'worktree'
   /** It cannot move without changing (its options), or its row cannot be read right now. */
-  | 'options';
+  | 'options'
+  /** Claude Code keeps another conversation under the job id it would run under after the move. */
+  | 'conversations';
 
-/** How to bring a session back by hand when a failed move could not: resume it under `configDir`
- *  with these options (see {@link BackgroundSessionHost.resumeHint}). */
+/** How to bring a session back where a move found it, should the move be cut off: resume its
+ *  conversation under `configDir`, from its working directory, waking the row that config dir holds
+ *  for its job or, with none, with these options (see {@link bringBack}). */
 export interface ResumeRecovery {
   configDir: string | null;
+  /** The conversation it runs. */
   sessionId: string;
+  /** The job that ran it there: its short id, and the id it started with (after /clear, not the
+   *  conversation's own), by which Claude Code wakes its row. */
+  job: { short: string; sessionId: string };
   options: string[];
+  cwd: string;
+}
+
+/** The command that brings a session back by hand from its saved recovery, in any shell and from any
+ *  folder: `cctl claude --resume <id>` runs the very resume a move's way back runs. */
+export function recoveryCommand(sessionId: string): string {
+  return `cctl claude --resume ${sessionId}`;
 }
 
 /** What one move did. `name` is Claude Code's name for the session, when it was read. */
@@ -376,11 +398,21 @@ export async function allRows(host: BackgroundSessionHost): Promise<LocatedRow[]
   return out;
 }
 
+/** Whether a row records one of these session ids: the one its job started with, or the
+ *  conversation it ran last. */
+function rowNames(row: JobRow, ids: ReadonlySet<string>): boolean {
+  return (
+    ids.has(row.sessionId) || (row.resumeSessionId !== undefined && ids.has(row.resumeSessionId))
+  );
+}
+
 /**
- * A session's lineage, grown from what is known of it to everything linked to it: a row links the
- * job id it is filed under, the id the job started with and the conversation it runs now; a live
- * background entry links its job id and its conversation. Rows in two config dirs filed under the
- * same job id are the same session (a job id is the start of the session id it was made from).
+ * A session's lineage, grown from what is known of it to everything linked to it by a full session
+ * id: a row links the id its job started with and the conversation it runs now, and adds the job id
+ * it is filed under; a live background entry links its conversation and adds its job id. Only full
+ * ids link: a job id alone is no proof of one session, as two jobs in two config dirs can share one
+ * while running different conversations (a job's earlier conversation resumed as a job of its own).
+ * What such a lineage holds is told apart by {@link conversationOf}.
  */
 export function lineageOf(
   seed: { ids: readonly string[]; shorts: readonly string[] },
@@ -398,33 +430,72 @@ export function lineageOf(
       }
     };
     for (const { row } of rows) {
-      const linked =
-        shorts.has(row.short) ||
-        ids.has(row.sessionId) ||
-        (row.resumeSessionId !== undefined && ids.has(row.resumeSessionId));
-      if (!linked) continue;
+      if (!rowNames(row, ids)) continue;
       add(shorts, row.short);
       add(ids, row.sessionId);
       add(ids, row.resumeSessionId);
     }
     for (const entry of live) {
-      if (entry.kind !== 'bg' || entry.jobId === undefined) continue;
-      if (!shorts.has(entry.jobId) && !ids.has(entry.sessionId)) continue;
+      if (entry.kind !== 'bg' || entry.jobId === undefined || !ids.has(entry.sessionId)) continue;
       add(shorts, entry.jobId);
-      add(ids, entry.sessionId);
     }
   }
   return { ids, shorts };
 }
 
-/** The rows of a session's lineage. */
+/** The rows of a session's lineage: every row recording one of its ids. */
 export function rowsOf(lineage: Lineage, rows: readonly LocatedRow[]): LocatedRow[] {
-  return rows.filter(
-    ({ row }) =>
-      lineage.shorts.has(row.short) ||
-      lineage.ids.has(row.sessionId) ||
-      (row.resumeSessionId !== undefined && lineage.ids.has(row.resumeSessionId)),
-  );
+  return rows.filter(({ row }) => rowNames(row, lineage.ids));
+}
+
+/** The conversation a row says its job runs: the one it moved on to after /clear, else the one it
+ *  started with. */
+export function conversationOf(row: JobRow): string {
+  return row.resumeSessionId ?? row.sessionId;
+}
+
+/**
+ * The ids a session's move lock is taken on: the id its job started with and the conversation it
+ * runs now (with any other id a look read for it). A /clear moves the conversation on inside the
+ * job, and a move after it resumes that conversation as a job named after it, so the ids two looks
+ * either side of either change read always share one, and two processes holding the lock of one
+ * session always hold one id in common. Sorted, so every process takes them in one order.
+ */
+export function moveLockIds(ids: Iterable<string | undefined>): string[] {
+  return [...new Set([...ids].filter((id): id is string => id !== undefined))].sort();
+}
+
+/**
+ * Take a session's move lock: the lock of each of its ids (see {@link moveLockIds}), in order, each
+ * waited for up to `waitMs`. All or none: when one cannot be had, those taken are let go and this
+ * resolves `undefined`. Released once, as a whole.
+ */
+export async function lockMove(
+  host: BackgroundSessionHost,
+  ids: readonly string[],
+  waitMs: number,
+): Promise<SessionLock | undefined> {
+  const order = moveLockIds(ids);
+  // No id is no lock at all: never resolve one that serializes nothing.
+  if (order.length === 0) throw new Error('no session id to take a move lock on');
+  const held: SessionLock[] = [];
+  const releaseAll = (): void => {
+    for (const lock of held.splice(0).reverse()) lock.release();
+  };
+  try {
+    for (const id of order) {
+      const lock = await host.lockSession(id, waitMs);
+      if (lock === undefined) {
+        releaseAll();
+        return undefined;
+      }
+      held.push(lock);
+    }
+  } catch (err) {
+    releaseAll();
+    throw err;
+  }
+  return { release: releaseAll };
 }
 
 /**
@@ -539,10 +610,13 @@ class NotMoved extends Error {
 
 /** What a move resumes, and with what, decided before anything is touched. */
 interface MovePlan {
-  /** Every row the session has, in every config dir: all removed once it runs nowhere. */
+  /** Every row the session has, in every config dir: all removed once it runs nowhere. A row
+   *  recording another conversation under one of its job ids is not one of them. */
   rows: LocatedRow[];
   /** The session's job short id on the source. */
   sourceShort: string;
+  /** The id that job started with, as its row on the source records it. */
+  sourceStartId: string;
   /** The conversation it runs now, which the target resumes. */
   currentId: string;
   /** Every saved option of its row on the source, replayed on the target (and on a way back). */
@@ -553,8 +627,8 @@ interface MovePlan {
 /**
  * Read everything a move needs and check it may be made: where the session runs (still where the
  * caller found it, or nowhere for a start), what it is doing, its rows (none recording a worktree,
- * none unreadable), whether a terminal watches its service, and its saved options. Throws
- * {@link NotMoved}.
+ * none unreadable, none of another conversation under the job id it would run under), whether a
+ * terminal watches its service, and its saved options. Throws {@link NotMoved}.
  */
 async function planMove(
   host: BackgroundSessionHost,
@@ -585,9 +659,9 @@ async function planMove(
   if (where.kind === 'bg' && !sameConfigDir(where.configDir, from.configDir, platform)) {
     throw refuse('gone', `it is no longer on ${from.name}`);
   }
-  const mine = rowsOf(lineage, rows);
+  const linked = rowsOf(lineage, rows);
   const sourceShort = where.kind === 'bg' ? where.short : session.short;
-  const source = mine.find(
+  const source = linked.find(
     (r) => sameConfigDir(r.configDir, from.configDir, platform) && r.row.short === sourceShort,
   );
   name = source?.row.name;
@@ -615,8 +689,28 @@ async function planMove(
   // The way back after a failed move resumes it with this row's options.
   if (source === undefined)
     throw refuse('options', `its job row on ${from.name} could not be read`);
+  // Only a live session holds work: Claude Code drops a scheduled wakeup when it stops one, and a
+  // stopped row records none (measured), so a start has none to lose.
   if (where.kind === 'bg' && source.row.pending) {
     throw refuse('busy', 'it holds work between turns (a scheduled wakeup or a background task)');
+  }
+  // The registry names the conversation a live session runs now; a stopped one's row does.
+  const currentId = where.kind === 'bg' ? where.currentId : conversationOf(source.row);
+  // Its rows: its own on the source, and every row recording the conversation it runs now. A row
+  // that records another conversation under one of its job ids is another job's, and is left
+  // alone: a wake of it reaches that job id only, and after a /clear the session moves on to a job
+  // named after its current conversation. One under the very job id the session runs under after
+  // the move (no /clear since it started) would reach it there, and nothing tells the two apart.
+  const mine = linked.filter((r) => r === source || conversationOf(r.row) === currentId);
+  const afterShort = currentId.slice(0, 8);
+  const other = linked.find((r) => !mine.includes(r) && r.row.short === afterShort);
+  if (other !== undefined) {
+    throw refuse(
+      'conversations',
+      `Claude Code keeps another conversation (${conversationOf(other.row)}) under the job id it ` +
+        `would run under (${afterShort}), so a move cannot tell the two apart`,
+      true,
+    );
   }
   if (mine.some((r) => r.row.worktreePath !== undefined)) {
     throw refuse(
@@ -629,7 +723,7 @@ async function planMove(
   // A row of it that cannot be read right now could hold anything, a worktree among them.
   for (const configDir of configDirs) {
     for (const short of lineage.shorts) {
-      const known = mine.some(
+      const known = linked.some(
         (r) => sameConfigDir(r.configDir, configDir, platform) && r.row.short === short,
       );
       if (!known && (await host.jobRow(configDir, short)).kind === 'unreadable') {
@@ -654,11 +748,8 @@ async function planMove(
     plan: {
       rows: mine,
       sourceShort,
-      // The registry names the conversation a live session runs now; a stopped one's row does.
-      currentId:
-        where.kind === 'bg'
-          ? where.currentId
-          : (source.row.resumeSessionId ?? source.row.sessionId),
+      sourceStartId: source.row.sessionId,
+      currentId,
       options: saved.options,
       ...(name !== undefined ? { name } : {}),
     },
@@ -675,33 +766,46 @@ async function removeIfHeld(
   if ((await host.jobRow(configDir, short)).kind !== 'none') await host.removeRow(configDir, short);
 }
 
-/** Put a session whose move failed back where it was: resumed under the source with its saved
- *  options (its row there is gone by then, unless the failure came before the rows were removed).
- *  Tried a few times (see {@link PUT_BACK_TRIES}); true once it is hosted there again. */
-async function putBack(
+/**
+ * Bring a session back where a move found it, from its recovery: its conversation resumed under
+ * that config dir, from its working directory. A row the config dir still holds for its job (the
+ * move failed before the rows went) is woken by the id the job started with, which Claude Code
+ * wakes into the conversation the row ran last, with the options it saved (measured: after /clear,
+ * given the conversation's own id, it starts a new job of that name with no options instead). With
+ * no such row, the conversation is resumed with the saved options, waking a row named after it
+ * when there is one. Tried a few times (see {@link PUT_BACK_TRIES}); true once that config dir's
+ * service hosts it. This is a failed move's way back, and what `cctl claude --resume <id>` runs
+ * over a move cut off half way. `where` names that config dir in the log line a failed try leaves.
+ */
+export async function bringBack(
   host: BackgroundSessionHost,
-  request: MoveRequest,
-  plan: MovePlan,
+  recovery: ResumeRecovery,
   timing: MoveTiming,
+  where: string,
 ): Promise<boolean> {
-  const { session, from } = request;
-  const short = plan.currentId.slice(0, 8);
+  const { configDir, job } = recovery;
   for (let attempt = 1; ; attempt++) {
     try {
-      const held = await host.jobRow(from.configDir, short);
+      // A row of its job that cannot be read is still its row: never resumed over.
+      const own = await host.jobRow(configDir, job.short);
+      const wakes =
+        own.kind === 'unreadable' ||
+        (own.kind === 'row' && rowNames(own.row, new Set([recovery.sessionId])));
+      const short = wakes ? job.short : recovery.sessionId.slice(0, 8);
+      const held = wakes ? own : await host.jobRow(configDir, short);
       await host.resumeIdle({
-        configDir: from.configDir,
-        sessionId: plan.currentId,
+        configDir,
+        sessionId: wakes ? job.sessionId : recovery.sessionId,
         short,
-        cwd: session.cwd,
-        ...(held.kind === 'none' ? { options: plan.options } : {}),
+        cwd: recovery.cwd,
+        ...(held.kind === 'none' ? { options: recovery.options } : {}),
       });
       // Accepted: trying again would only start copies of a session that is already coming up.
-      return await confirmHosted(host, from.configDir, short, timing);
+      return await confirmHosted(host, configDir, short, timing);
     } catch (err) {
       timing.logger.warn(
-        { sessionId: plan.currentId, attempt, reason: reasonOf(err) },
-        `could not resume a background session back on ${from.name}`,
+        { sessionId: recovery.sessionId, attempt, reason: reasonOf(err) },
+        `could not resume a background session back on ${where}`,
       );
       if (attempt >= PUT_BACK_TRIES) return false;
       await timing.sleep(PUT_BACK_PAUSE_MS);
@@ -716,9 +820,10 @@ async function putBack(
  * every job row it has; resume its current conversation under the target with its saved options and
  * confirm it is hosted there. On any failure after the stop, put it back where it was. With
  * `request.start`, the session runs nowhere and is started under the target from its row on `from`
- * the same way, minus the stop. The caller holds the session's move lock. `onCommit` runs once,
- * with how the session is brought back by hand should the move be cut off from here on,
- * right before the first change: the last moment nothing has been touched.
+ * the same way, minus the stop. The caller holds the session's move lock. Right before the first
+ * change, the last moment nothing has been touched, how to bring the session back is saved where it
+ * outlives this process (a move that cannot save it is not made), and `onCommit` runs once with it;
+ * it is dropped again once the session is known to run somewhere.
  */
 export async function moveBackgroundSession(
   host: BackgroundSessionHost,
@@ -726,8 +831,7 @@ export async function moveBackgroundSession(
   timing: MoveTiming,
   onCommit?: (recovery: ResumeRecovery) => void,
 ): Promise<MoveResult> {
-  const { session, from, to } = request;
-  const platform = request.platform ?? process.platform;
+  const { session, from } = request;
   let plan: MovePlan;
   let lineage: Lineage;
   try {
@@ -745,23 +849,56 @@ export async function moveBackgroundSession(
       ...(err.sessionName !== undefined ? { name: err.sessionName } : {}),
     };
   }
-  const named = plan.name !== undefined ? { name: plan.name } : {};
   const recovery: ResumeRecovery = {
     configDir: from.configDir,
     sessionId: plan.currentId,
+    job: { short: plan.sourceShort, sessionId: plan.sourceStartId },
     options: plan.options,
+    cwd: session.cwd,
   };
+  try {
+    await host.saveRecovery(recovery);
+  } catch (err) {
+    return {
+      result: 'not-moved',
+      cause: 'unknown',
+      final: false,
+      reason: `how to bring it back could not be saved: ${reasonOf(err)}`,
+      ...(plan.name !== undefined ? { name: plan.name } : {}),
+    };
+  }
+  onCommit?.(recovery);
+  const result = await carryOut(host, request, timing, plan, lineage, recovery);
+  // Running again where it was, or where it moved: there is nothing left to bring back.
+  if (result.result === 'moved' || (result.result === 'failed' && result.restored)) {
+    await host.dropRecovery(recovery.sessionId).catch(() => undefined);
+  }
+  return result;
+}
+
+/** A committed move (see {@link moveBackgroundSession}): the stop, the row removals, the resume
+ *  and its confirmation, and on any failure the way back. */
+async function carryOut(
+  host: BackgroundSessionHost,
+  request: MoveRequest,
+  timing: MoveTiming,
+  plan: MovePlan,
+  lineage: Lineage,
+  recovery: ResumeRecovery,
+): Promise<MoveResult> {
+  const { session, from, to } = request;
+  const platform = request.platform ?? process.platform;
+  const named = plan.name !== undefined ? { name: plan.name } : {};
   // `back` is whether it is known to be where it was, or 'put-back' to resume it there now.
   const failed = async (reason: string, back: boolean | 'put-back'): Promise<MoveResult> => ({
     result: 'failed',
-    restored: back === 'put-back' ? await putBack(host, request, plan, timing) : back,
+    restored: back === 'put-back' ? await bringBack(host, recovery, timing, from.name) : back,
     reason,
     recovery,
     ...named,
   });
   const runsOnSource = (w: SessionWhere): boolean =>
     w.kind === 'bg' && sameConfigDir(w.configDir, from.configDir, platform);
-  onCommit?.(recovery);
 
   if (request.start !== true) {
     try {

@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { whereRuns } from '@claude-control/daemon';
+import { routeBackgroundLaunch, type RouteContext } from './backgroundAttach.js';
 import {
   backgroundHostOptions,
   createClaudeBackgroundHost,
@@ -114,6 +115,8 @@ function hostWith(opts: {
       if (text === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
       return text;
     },
+    writeFile: (p, text) => void (files[p.replace(/\\/g, '/')] = text),
+    removeFile: (p) => void delete files[p.replace(/\\/g, '/')],
     readDir: (p) => {
       const dir = p.replace(/\\/g, '/');
       if (dir === opts.failDir) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
@@ -1422,20 +1425,6 @@ describe('one main config dir, for every read and every command', () => {
     });
   });
 
-  it('a resume by hand names the config dir it must run under, and every option', () => {
-    const viaDefault = hostWith({ mainConfigDirInEnv: false });
-    expect(viaDefault.host.resumeHint(null, SID, ['--model=opus'])).toBe(
-      `claude --bg --resume ${SID} --model=opus`,
-    );
-    expect(viaDefault.host.resumeHint(PROFILE, SID, ['--name=bg eval'])).toBe(
-      `CLAUDE_CONFIG_DIR=${PROFILE} claude --bg --resume ${SID} "--name=bg eval"`,
-    );
-    const viaEnv = hostWith({ mainConfigDirInEnv: true });
-    expect(viaEnv.host.resumeHint(null, SID, [])).toBe(
-      `CLAUDE_CONFIG_DIR=${MAIN} claude --bg --resume ${SID}`,
-    );
-  });
-
   it('the daemon and cctl claude build their hosts alike: the main dir as Claude Code reaches it, every profile, the shared locks', async () => {
     const VAULT = 'C:/Users/me/AppData/Local/claude-control/vault';
     // The default layout, from a shell inside a folder profile's session: cctl's paths already see
@@ -1474,6 +1463,74 @@ describe('one main config dir, for every read and every command', () => {
         vaultDir: VAULT,
       }).mainConfigDirInEnv,
     ).toBe(true);
+  });
+});
+
+describe("a committed move's recovery", () => {
+  const REC = `${LOCKS}/recovery/${SID}.json`;
+  const recovery = {
+    configDir: PROFILE,
+    sessionId: SID,
+    job: { short: SHORT, sessionId: SID },
+    options: ['--name=bg eval'],
+    cwd: 'C:/work',
+  };
+
+  it('is kept beside the move locks, read back, and forgotten', async () => {
+    const files: Record<string, string> = {};
+    const { host } = hostWith({ files });
+    expect(await host.recoveryOf(SID)).toBeUndefined();
+    await host.saveRecovery(recovery);
+    expect(JSON.parse(files[REC]!)).toEqual(recovery);
+    expect(await host.recoveryOf(SID)).toEqual(recovery);
+    await host.dropRecovery(SID);
+    expect(files[REC]).toBeUndefined();
+    expect(await host.recoveryOf(SID)).toBeUndefined();
+    // Forgetting one that is not there is no error.
+    await host.dropRecovery(SID);
+  });
+
+  it('one that is not whole, or not the conversation asked for, is no recovery', async () => {
+    for (const text of [
+      '{"sessionId": "',
+      JSON.stringify({ ...recovery, sessionId: 'f38038c6-523b-4be5-9dff-160c472faeb0' }),
+      JSON.stringify({ ...recovery, options: [1] }),
+      JSON.stringify({ ...recovery, cwd: '' }),
+      JSON.stringify({ ...recovery, configDir: 3 }),
+    ]) {
+      const { host } = hostWith({ files: { [REC]: text } });
+      expect({ text, read: await host.recoveryOf(SID) }).toEqual({ text, read: undefined });
+    }
+    const { host } = hostWith({
+      files: { [REC]: JSON.stringify({ ...recovery, configDir: null }) },
+    });
+    expect(await host.recoveryOf(SID)).toEqual({ ...recovery, configDir: null });
+  });
+
+  it('is named only after a session id', async () => {
+    const { host } = hostWith({});
+    await expect(host.saveRecovery({ ...recovery, sessionId: '../x' })).rejects.toThrow(
+      /not a background session id/,
+    );
+    expect(await host.recoveryOf('../x')).toBeUndefined();
+  });
+
+  it('on disk, is written whole: a temp file renamed into place, its folder made first', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-recovery-'));
+    try {
+      const host = createClaudeBackgroundHost({
+        mainConfigDir: MAIN,
+        moveLockDir: moveLocksDir(dir),
+      });
+      await host.saveRecovery(recovery);
+      const kept = join(moveLocksDir(dir), 'recovery');
+      expect(await readdir(kept)).toEqual([`${SID}.json`]);
+      expect(await host.recoveryOf(SID)).toEqual(recovery);
+      await host.dropRecovery(SID);
+      expect(await readdir(kept)).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    }
   });
 });
 
@@ -1528,6 +1585,65 @@ describe('a copy started instead of the session', () => {
     await expect(
       host.resumeIdle({ configDir: PROFILE, sessionId: SID, short: SHORT, cwd: 'C:/r' }),
     ).rejects.toThrow(/the copy could not be stopped \(claude stop exited 1: refused\)/);
+  });
+});
+
+describe("a slot's trap check, over these reads", () => {
+  it("a profile's roster record whose pid now names another process is not where the session runs: its row there is a trap", async () => {
+    // It runs on the main config dir. The profile's roster still lists it under a pid reused since,
+    // so only a verified read tells that the profile's row would wake it there and take it over.
+    const { host } = hostWith({
+      profilesRoot: 'C:/Users/me/AppData/Local/claude-control/profiles',
+      files: {
+        [`${MAIN}/daemon/roster.json`]: roster({
+          [SHORT]: { ...worker(SID, 'C:/work', 4242), procStart: '134360864829411286' },
+        }),
+        [`${PROFILE}/daemon/roster.json`]: roster({
+          [SHORT]: { ...worker(SID, 'C:/work', 4343), procStart: '134360000000000001' },
+        }),
+        [`${PROFILE}/jobs/${SHORT}/state.json`]: JSON.stringify({
+          state: 'stopped',
+          sessionId: SID,
+          cwd: 'C:/work',
+        }),
+        [`${MAIN}/sessions/100.json`]: JSON.stringify({
+          pid: 100,
+          sessionId: SID,
+          kind: 'bg',
+          status: 'busy',
+          jobId: SHORT,
+        }),
+      },
+      starts: new Map([
+        [4242, '134360864829411286'],
+        [4343, '134360999999999999'],
+      ]),
+    });
+    const ctx: RouteContext = {
+      host,
+      cwd: 'C:/work',
+      platform: 'win32',
+      sameFolder: (a, b) => a.toLowerCase() === b.toLowerCase(),
+      titleFolders: (c) => Promise.resolve([c]),
+      homeOf: () => Promise.resolve({ configDir: PROFILE, movable: true }),
+      launchConfigDir: () => Promise.resolve(PROFILE),
+      view: (c) => Promise.resolve({ slot: c === null ? 'the global slot' : 'the folder slot' }),
+      daemonRunning: false,
+      say: () => {},
+      shield: (fn) => fn(() => {}),
+      lockWaitMs: 0,
+      timing: {
+        clock: () => 0,
+        confirmTimeoutMs: 0,
+        sleep: () => Promise.resolve(),
+        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      },
+    };
+    const decision = await routeBackgroundLaunch({ verb: 'guard' }, ctx, { kind: 'follow' });
+    expect(decision.kind).toBe('refuse');
+    expect(decision.kind === 'refuse' ? decision.message : '').toContain(
+      'the folder slot still holds a job row for a background session that runs elsewhere',
+    );
   });
 });
 

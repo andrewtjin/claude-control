@@ -313,21 +313,30 @@ dir, reaches the session where it runs and kills it there, in the middle of a tu
 background session keeps a job row only in the config dir where it runs or last ran.
 
 After `/clear` inside a background session, its job runs a new conversation; the move
-resumes that one (the job then shows up under the new conversation's short id).
+resumes that one (the job then shows up under the new conversation's short id). A row another
+config dir keeps of the job's earlier conversation, or of that conversation resumed as a job of
+its own, is not this session's and is left alone: it reaches only the old job id, which the moved
+session no longer runs under. When the session would keep its job id (no `/clear` since it
+started) and another config dir runs a different conversation under that id, nothing tells the
+two apart, so the session is not moved (one notice).
 
 Claude Code's `claude stop` returns a moment before the session has exited, so the move waits
 until the session is gone from Claude Code's session registry and from the service before it
 removes its rows and resumes it elsewhere (a resume while it still runs would start a copy).
 The daemon and `cctl claude` (below) never move one session at once: each takes the
-session's move lock, under cctl's data folder, and the daemon leaves a session alone while
-`cctl claude` holds it.
+session's move lock, under cctl's data folder, on every id the session is known by (the id its
+job started with and, after `/clear`, the conversation it runs now, so the two always meet on
+one), and the daemon leaves a session alone while `cctl claude` holds it.
 
 A session moves at most once an hour, so one woken back onto the global slot by hand is not
 bounced every cycle. If a move fails, the session is resumed back on the global slot with its
 saved options (tried a few times, since Claude Code can count a session it just stopped as
 still open), the daemon logs it and sends one phone notice, and it does not try that session
 again until it restarts. When even that fails, the notice gives the command that brings it
-back as it was.
+back as it was: `cctl claude --resume <id>`, in any shell, from any folder. A move saves how
+to bring the session back (where it ran, its folder and its saved options) before it touches
+anything, and drops that once the session runs again; that command runs the move's own way
+back from it, then opens the session as below.
 
 A session that cannot move without changing is left where it is, with one notice: one
 started with an option this cctl does not know, or one that would act again at startup
@@ -376,8 +385,13 @@ id from another folder follows the session, not the folder you are in). Then:
   that service**: cctl says it is moving it, moves it where it belongs by the same move the
   daemon makes and on the same terms (the folder's slot holds one of its included accounts
   with usage left, its saved options carry over, no git worktree), and then opens it there.
-  Ctrl-C during the move does not cut it off: the move finishes, or puts the session back,
-  and then nothing is opened. One line says it was moved, and onto which account;
+  Ctrl-C from the moment it says it is moving does not cut the move off: the move finishes,
+  or puts the session back, and then nothing is opened (before that line, nothing has been
+  touched, and Ctrl-C ends `cctl claude` as usual). Closing the window is not waited on for
+  long: Windows ends a program a few seconds after its console closes. Should that, or
+  anything else, end `cctl claude` in the middle of a move, `cctl claude --resume <id>` (said
+  when you press Ctrl-C) brings the session back where it was. One line says it was moved,
+  and onto which account;
 - **it runs on another account and is in a turn, waiting on a prompt, holding work between
   turns, watched from another terminal, in a git worktree, or cannot move** (or the move
   failed and it was put back): it is opened where it runs, with one line saying it stays on
@@ -391,7 +405,9 @@ id from another folder follows the session, not the folder you are in). Then:
   restarting a failed row there, or, when the profile holds no row for it, starting it there
   with the options its latest row saved (when those cannot carry over, or its row records a
   git worktree, it is opened where that row is). `--resume` runs it in the foreground as
-  Claude Code does.
+  Claude Code does. When its rows record different conversations under one job id (its
+  conversation before `/clear` among them), `attach` cannot tell which is meant: it is refused
+  with each conversation's id and where its row is, to resume one by its id.
 
 A prompt given after the session (`cctl claude --resume <id> "<prompt>"`) is passed on as
 `claude --resume <id> "<prompt>"` under the config dir that runs it, where Claude Code sends it

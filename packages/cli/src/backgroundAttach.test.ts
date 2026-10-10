@@ -9,12 +9,15 @@
 // backgroundAttach.integration.test.ts.
 
 import { describe, expect, it } from 'vitest';
-import type {
-  JobRow,
-  LiveSession,
-  RowRead,
-  SavedLaunch,
-  SessionActivity,
+import {
+  BackgroundMover,
+  type JobRow,
+  type LiveSession,
+  type MoveOutcome,
+  type ResumeRecovery,
+  type RowRead,
+  type SavedLaunch,
+  type SessionActivity,
 } from '@claude-control/daemon';
 import {
   parseBackgroundRequest,
@@ -52,12 +55,16 @@ interface FakeRow {
   saved: SavedLaunch;
 }
 
-/** A Claude Code with services in MAIN, X (the folder's profile) and Q (a removed rule's profile).
- *  Commands behave like the real ones: a stop removes the session from its service and the registry
- *  and leaves its row stopped (a failed one failed); a resume while it runs anywhere starts a copy
- *  (refused here); a resume with options over a row is refused; a resume wakes the row (a new one
- *  saved with the options given); `rm` removes a row, refusing one with a worktree or of a live
- *  session. Every command and every copy is recorded. */
+/** A Claude Code with services in MAIN, X (the folder's profile) and Q (a removed rule's profile),
+ *  behind a host that behaves like the real one: a stop removes the session from its service and
+ *  the registry and leaves its row stopped (a failed one failed); a resume while it runs anywhere
+ *  starts a copy (refused here); a resume with options over a row is refused; a resume wakes the row
+ *  (a new one saved with the options given); `rm` removes a row, refusing one with a worktree, one
+ *  Claude Code is waking, and one of a session live or starting anywhere (by the registry, the way
+ *  Claude Code's rm reaches it, or by any roster). Verified reads leave out roster records whose pid
+ *  was reused; titles are searched in the folders given only; the move lock is one per id, taken by
+ *  one holder at a time, a wait for it ending when its holder lets go. Every command and every copy
+ *  is recorded. */
 class FakeClaude implements ClaudeBackgroundHost {
   readonly calls: string[] = [];
   /** Resumes run while the session ran as a background session somewhere: copies. */
@@ -71,6 +78,12 @@ class FakeClaude implements ClaudeBackgroundHost {
   readonly titles = new Map<string, string>();
   /** Titles of conversations no background session has: what `titlesIn` finds. */
   readonly plainTitles = new Map<string, string>();
+  /** The folder each of those conversations was filed under (by default the work folder). */
+  readonly plainFolders = new Map<string, string>();
+  /** Roster records whose pid now names another process: only an unverified read lists them. */
+  readonly reusedPids = new Map<string, Array<{ short: string; sessionId: string; cwd: string }>>();
+  /** The recoveries a move saved, by the conversation it resumes. */
+  readonly recoveries = new Map<string, ResumeRecovery>();
   readonly attachedIn = new Set<string>();
   readonly attachedPids = new Map<string, number[]>();
   readonly failResumeIn = new Set<string>();
@@ -83,7 +96,12 @@ class FakeClaude implements ClaudeBackgroundHost {
   failStop = false;
   /** How many lock takes another process wins before letting go (Infinity: never). */
   lockedFor = 0;
+  /** Every take and every release of a move lock, a lock on several ids counted once. */
   readonly locks: string[] = [];
+  /** Every id taken, in order. */
+  readonly lockedIds: string[] = [];
+  /** Ids held now, each with the takers waiting on it. */
+  private readonly held = new Map<string, Array<() => void>>();
   /** Runs before a roster read, by config dir (to move the session between two looks). */
   beforeList: ((c: Config) => void) | undefined;
   /** Runs before every registry read, with its count so far. */
@@ -210,12 +228,29 @@ class FakeClaude implements ClaudeBackgroundHost {
   sessionTitle(sessionId: string): Promise<string | undefined> {
     return Promise.resolve(this.titles.get(sessionId));
   }
-  titlesIn(): Promise<Map<string, string>> {
-    return Promise.resolve(new Map([...this.titles, ...this.plainTitles]));
+  titlesIn(folders: readonly string[]): Promise<Map<string, string>> {
+    const inScope = (f: string): boolean =>
+      folders.some((x) => x.toLowerCase() === f.toLowerCase());
+    // A background session's conversation is filed under the folder it started in.
+    const folderOf = (id: string): string =>
+      [...this.hosted.values()].flat().find((w) => w.sessionId === id)?.cwd ??
+      [...this.rows.values()].flatMap((m) => [...m.values()]).find((r) => r.sessionId === id)
+        ?.cwd ??
+      WORK;
+    return Promise.resolve(
+      new Map([
+        ...[...this.titles].filter(([id]) => inScope(folderOf(id))),
+        ...[...this.plainTitles].filter(([id]) => inScope(this.plainFolders.get(id) ?? WORK)),
+      ]),
+    );
   }
-  listHosted(c: Config): Promise<Array<{ short: string; sessionId: string; cwd: string }>> {
+  listHosted(
+    c: Config,
+    opts?: { verified?: boolean },
+  ): Promise<Array<{ short: string; sessionId: string; cwd: string }>> {
     this.beforeList?.(c);
-    return Promise.resolve([...(this.hosted.get(key(c)) ?? [])]);
+    const reused = opts?.verified === true ? [] : (this.reusedPids.get(key(c)) ?? []);
+    return Promise.resolve([...(this.hosted.get(key(c)) ?? []), ...reused]);
   }
   activity(c: Config): Promise<Map<string, SessionActivity>> {
     this.calls.push(`agents ${key(c)}`);
@@ -326,25 +361,47 @@ class FakeClaude implements ClaudeBackgroundHost {
     this.rows.get(key(c))!.delete(short);
     return Promise.resolve();
   }
-  lockSession(_sessionId: string, waitMs: number): Promise<{ release(): void } | undefined> {
+  /** One lock per id, as on disk: a second take of a held id gets nothing at once, or waits for
+   *  its holder to let go. `locks` counts a move lock once, however many ids it is taken on. */
+  async lockSession(sessionId: string, waitMs: number): Promise<{ release(): void } | undefined> {
     if (this.lockedFor > 0) {
       this.lockedFor--;
-      return Promise.resolve(undefined);
+      return undefined;
     }
-    this.locks.push(`take ${waitMs}`);
+    while (this.held.has(sessionId)) {
+      if (waitMs === 0) return undefined;
+      await new Promise<void>((resolve) => this.held.get(sessionId)!.push(resolve));
+    }
+    const first = this.held.size === 0;
+    this.held.set(sessionId, []);
+    this.lockedIds.push(sessionId);
+    if (first) this.locks.push(`take ${waitMs}`);
     let released = false;
-    return Promise.resolve({
+    return {
       release: () => {
-        if (!released) this.locks.push('release');
+        if (released) return;
         released = true;
+        const waiting = this.held.get(sessionId) ?? [];
+        this.held.delete(sessionId);
+        if (this.held.size === 0) this.locks.push('release');
+        for (const wake of waiting) wake();
       },
-    });
+    };
   }
-  resumeHint(c: Config, sessionId: string, options: readonly string[]): string {
-    return (
-      (c === null ? '' : `CLAUDE_CONFIG_DIR=${c} `) +
-      ['claude', '--bg', '--resume', sessionId, ...options].join(' ')
-    );
+  /** Whether an id's lock is held now. */
+  isLocked(sessionId: string): boolean {
+    return this.held.has(sessionId);
+  }
+  saveRecovery(recovery: ResumeRecovery): Promise<void> {
+    this.recoveries.set(recovery.sessionId, recovery);
+    return Promise.resolve();
+  }
+  dropRecovery(sessionId: string): Promise<void> {
+    this.recoveries.delete(sessionId);
+    return Promise.resolve();
+  }
+  recoveryOf(sessionId: string): Promise<ResumeRecovery | undefined> {
+    return Promise.resolve(this.recoveries.get(sessionId));
   }
   configEnv(c: Config): string | undefined {
     return c ?? undefined;
@@ -356,8 +413,9 @@ interface World {
   ctx: RouteContext;
   lines: string[];
   home: SessionHome;
-  /** How many times the move shield ran. */
-  shields: { n: number };
+  /** How many times the move shield ran, how many of those a move committed in (held Ctrl-C), and
+   *  the command each said would bring the session back. */
+  shields: { n: number; held: number; hints: string[] };
 }
 
 /** A world where C:/work belongs to the rule whose profile is X, and anything else to MAIN. */
@@ -367,7 +425,7 @@ function world(
 ): World {
   const host = new FakeClaude();
   const lines: string[] = [];
-  const shields = { n: 0 };
+  const shields = { n: 0, held: 0, hints: [] as string[] };
   const homeX: SessionHome = { configDir: X, movable: true, ...home };
   const views: Record<string, { account?: string; slot: string; removed?: boolean }> = {
     main: { account: 'Shared', slot: 'the global slot' },
@@ -386,9 +444,14 @@ function world(
     view: (c) => Promise.resolve(views[key(c)]!),
     daemonRunning: opts.daemonRunning ?? false,
     say: (line) => lines.push(line),
-    shield: (fn) => {
+    shield: async (fn, note) => {
       shields.n++;
-      return fn();
+      try {
+        return await fn(() => void shields.held++);
+      } finally {
+        const hint = note?.();
+        if (hint !== undefined) shields.hints.push(hint);
+      }
     },
     lockWaitMs: 90_000,
     timing: {
@@ -452,6 +515,23 @@ async function expectNoSteal(w: World, d: RouteDecision, mode: RouteMode = FOLLO
         runsElsewhere: [],
       });
     }
+  }
+  // What Claude Code's wake sweep reaches from a row under that config dir (measured): a live
+  // background session in another service filed under the row's job id, or whose conversation
+  // starts with it. After /clear and a move, a row of the job's earlier conversation reaches none.
+  if (under !== undefined) {
+    const here = [...(w.host.rows.get(key(under))?.keys() ?? [])];
+    const elsewhere = (jobId: string | undefined): boolean =>
+      [...w.host.hosted.entries()].some(
+        ([c, list]) => c !== key(under) && list.some((j) => j.short === jobId),
+      );
+    const reached = w.host.registry.filter(
+      (e) =>
+        e.kind === 'bg' &&
+        elsewhere(e.jobId) &&
+        here.some((short) => e.jobId === short || e.sessionId.startsWith(short)),
+    );
+    expect({ under: key(under), reached }).toEqual({ under: key(under), reached: [] });
   }
   // Moved, or put back, with every row removal done: a row only where it runs.
   const moved =
@@ -891,8 +971,7 @@ describe('routeBackgroundLaunch — the session runs on another account', () => 
       kind: 'refuse',
       message:
         'could not move c5f2097e onto Inc (the folder slot of C:/work) (untrusted folder), nor resume ' +
-        `it on the profile of a folder rule since removed. Resume it there with: CLAUDE_CONFIG_DIR=${Q} ` +
-        `claude --bg --resume ${SID} --model=opus`,
+        `it on the profile of a folder rule since removed. Bring it back with: cctl claude --resume ${SID}`,
     });
     expect(w.host.locks).toEqual(['take 0', 'release']);
   });
@@ -1234,9 +1313,13 @@ describe('routeBackgroundLaunch — which session a name means', () => {
     const w = world();
     w.host.runs(X, SID, { name: 'bg eval' });
     w.host.row(MAIN, 'stopped', SID2, { name: 'bg eval two' });
-    // "eval" is part of both names; "bg eval" is one whole name and wins, in any case.
-    expect(await decideIn(w, attach('bg eval'))).toMatchObject(openUnder(X));
-    expect(await decideIn(w, attach(' BG Eval '))).toMatchObject(openUnder(X));
+    // "eval" is part of both names; "bg eval" is one whole name and wins, in any case. Each open
+    // holds the lock for its terminal, let go here as the terminal shows up.
+    for (const ref of ['bg eval', ' BG Eval ']) {
+      const d = await decideIn(w, attach(ref));
+      expect(d).toMatchObject(openUnder(X));
+      if (d.kind === 'open') d.hold?.lock.release();
+    }
     expect(await decideIn(w, attach('eval'))).toEqual({
       kind: 'refuse',
       message:
@@ -1447,6 +1530,443 @@ describe('routeBackgroundLaunch — a slot chosen with --account or --override',
   });
 });
 
+describe('routeBackgroundLaunch and the daemon on one session after /clear', () => {
+  const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
+
+  /** The daemon's mover over the same Claude Code, moving C:/work's sessions onto X. */
+  function daemonOf(w: World): { run: () => Promise<MoveOutcome[]> } {
+    const mover = new BackgroundMover({
+      host: w.host,
+      resolveRule: (cwd) =>
+        Promise.resolve(cwd.toLowerCase().startsWith('c:/work') ? 'rule-x' : null),
+      notify: () => {},
+      clock: () => 0,
+      confirmTimeoutMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    const targets = new Map([
+      ['rule-x', { ruleId: 'rule-x', folder: 'C:/work', configDir: X, accountLabel: 'Inc' }],
+    ]);
+    return { run: () => mover.run(targets) };
+  }
+
+  it('takes the lock on every id the session is known by: the id its job started with and the one it runs now', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { current: NEW, status: 'busy' });
+    await routeBackgroundLaunch(attach(SHORT), w.ctx, FOLLOW);
+    // The daemon's mover takes the roster's id (the job's start) and the registry's (its current).
+    expect([...w.host.lockedIds].sort()).toEqual([SID, NEW].sort());
+  });
+
+  it('the daemon moving it first: cctl waits for the move, then opens it where it went', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { current: NEW });
+    const daemon = daemonOf(w);
+    let opened: Promise<RouteDecision> | undefined;
+    const stop = w.host.stop.bind(w.host);
+    w.host.stop = async (c, short) => {
+      if (opened === undefined) {
+        // The operator opens it as the daemon's move is about to stop it: cctl finds it running
+        // there, and comes to its lock (or, held by nothing, would go on, which a bound lets show).
+        opened = routeBackgroundLaunch(attach(SHORT), w.ctx, FOLLOW);
+        for (let i = 0; i < 500 && !w.lines.some((l) => l.includes('is moving')); i++) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+      return stop(c, short);
+    };
+    expect(await daemon.run()).toMatchObject([{ result: 'moved' }]);
+    const d = await opened!;
+    expect(w.lines[0]).toContain('another cctl process is moving');
+    expect(d).toMatchObject({ kind: 'open', configDir: X, args: ['attach', '7a7a7a7a'] });
+    expect(w.host.calls.filter((c) => c.startsWith('stop'))).toEqual([`stop main ${SHORT}`]);
+    expect(w.host.copies).toEqual([]);
+    expect(w.host.badRemovals).toEqual([]);
+    expect(w.host.hostOf(NEW)).toEqual([X]);
+  });
+
+  it('cctl moving it first: the daemon holds back while the move runs, and while the terminal opens', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { current: NEW });
+    const daemon = daemonOf(w);
+    const during: MoveOutcome[][] = [];
+    const stop = w.host.stop.bind(w.host);
+    w.host.stop = async (c, short) => {
+      // The daemon's cycle comes while cctl's move is about to stop it.
+      during.push(await daemon.run());
+      return stop(c, short);
+    };
+    const d = await routeBackgroundLaunch(attach(SHORT), w.ctx, FOLLOW);
+    expect(during).toEqual([
+      [
+        {
+          sessionId: SID,
+          ruleId: 'rule-x',
+          result: 'skipped',
+          reason: 'another cctl process is moving it',
+        },
+      ],
+    ]);
+    expect(d).toMatchObject({ kind: 'open', configDir: X, args: ['attach', '7a7a7a7a'] });
+    // Held for the terminal: the session, now its own job under the folder slot, is still locked.
+    expect(d.kind === 'open' && d.hold).toBeTruthy();
+    expect(w.host.isLocked(NEW)).toBe(true);
+    expect(w.host.calls.filter((c) => c.startsWith('stop'))).toEqual([`stop main ${SHORT}`]);
+    if (d.kind === 'open') d.hold?.lock.release();
+    expect(w.host.isLocked(NEW)).toBe(false);
+    expect(w.host.isLocked(SID)).toBe(false);
+  });
+
+  it('a move put back after /clear is opened under the job it runs as now', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, {
+      current: NEW,
+      saved: { kind: 'replayable', options: ['--model=opus'] },
+    });
+    w.host.failResumeIn.add(X);
+    const d = await decideIn(w, attach(SHORT));
+    // The way back resumed its conversation as a job named after it.
+    expect(w.host.hostOf(NEW)).toEqual(['main']);
+    expect(d).toMatchObject({ kind: 'open', configDir: MAIN, args: ['attach', '7a7a7a7a'] });
+    expect(w.lines.at(-1)).toContain(
+      'stays on Shared (the global slot) for now: untrusted folder.',
+    );
+  });
+});
+
+describe('routeBackgroundLaunch — a move cut off half way', () => {
+  const recoveryOn = (configDir: Config, options: string[]): ResumeRecovery => ({
+    configDir,
+    sessionId: SID,
+    job: { short: SHORT, sessionId: SID },
+    options,
+    cwd: WORK,
+  });
+
+  it('every move says, as it commits, the command that brings the session back from what it saved', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { saved: { kind: 'replayable', options: ['--model=opus'] } });
+    await decideIn(w, attach(SHORT));
+    expect(w.shields.hints).toEqual([`cctl claude --resume ${SID}`]);
+    // Moved: nothing is left to bring back.
+    expect(w.host.recoveries.size).toBe(0);
+  });
+
+  it('cctl claude --resume <id> brings back a session its move left stopped nowhere, where the move found it, then opens it', async () => {
+    // Its rows were removed and its resume never ran: the move's process was ended half way.
+    const w = world();
+    w.host.recoveries.set(SID, recoveryOn(MAIN, ['--model=opus']));
+    w.host.titles.set(SID, 'bg eval');
+    const d = await decideIn(w, resume(SID));
+    expect(w.host.calls[0]).toBe('resume main [--model=opus]');
+    expect(w.lines[0]).toBe(
+      'cctl: brought background session c5f2097e-d500-42a0-9ddf-8a33f4f9a886 back on Shared (the ' +
+        'global slot), where a move found it.',
+    );
+    expect(w.host.recoveries.size).toBe(0);
+    // Then like any session found on another account: moved where it belongs, and opened there.
+    expect(d).toMatchObject(openUnder(X));
+    expect(w.host.hostOf()).toEqual([X]);
+  });
+
+  it('cut off right after the stop, its row still there: the row is woken, never resumed over', async () => {
+    const w = world();
+    w.host.row(Q, 'stopped', SID, { saved: { kind: 'replayable', options: ['--model=opus'] } });
+    w.host.recoveries.set(SID, recoveryOn(Q, ['--model=opus']));
+    await decideIn(w, attach(SID));
+    expect(w.host.calls[0]).toBe(`resume ${Q}`);
+  });
+
+  it('a session that runs again needs nothing: its recovery is dropped, and it is opened as usual', async () => {
+    const w = world();
+    w.host.runs(X);
+    w.host.recoveries.set(SID, recoveryOn(MAIN, []));
+    expect(await decideIn(w, resume(SID))).toMatchObject(openUnder(X));
+    expect(w.host.calls).toEqual([]);
+    expect(w.host.recoveries.size).toBe(0);
+  });
+
+  it('a way back that fails again runs nothing and keeps the recovery for a later try', async () => {
+    const w = world();
+    w.host.recoveries.set(SID, recoveryOn(MAIN, []));
+    w.host.failResumeIn.add('main');
+    expect(await decideIn(w, resume(SID))).toEqual({
+      kind: 'refuse',
+      message: `could not bring ${SID} back on Shared (the global slot), where a move found it; try again in a moment.`,
+    });
+    expect(w.host.recoveries.has(SID)).toBe(true);
+  });
+
+  it('waits for a move of it still running in another cctl process', async () => {
+    const w = world();
+    w.host.recoveries.set(SID, recoveryOn(MAIN, []));
+    w.host.lockedFor = Infinity;
+    expect(await decideIn(w, resume(SID))).toEqual({
+      kind: 'refuse',
+      message: `another cctl process is still moving ${SID}; try again in a moment.`,
+    });
+    expect(w.host.calls).toEqual([]);
+  });
+});
+
+describe('routeBackgroundLaunch — rows of more than one conversation under one job id', () => {
+  const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
+
+  it('running nowhere: refused with each conversation and where its row is, nothing removed', async () => {
+    // The job moved on after /clear on the global slot; the folder profile kept a row of its
+    // earlier conversation.
+    const w = world();
+    w.host.row(MAIN, 'stopped', SID, { resumeSessionId: NEW });
+    w.host.row(X, 'failed', SID);
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toEqual({
+      kind: 'refuse',
+      message:
+        `c5f2097e has job rows for more than one conversation (${NEW} on Shared (the global ` +
+        `slot); ${SID} on Inc (the folder slot of C:/work)); resume the one you mean by its id: ` +
+        'cctl claude --resume <id>.',
+    });
+    expect(w.host.calls).toEqual([]);
+  });
+
+  it("running after /clear: moved with its own rows, the earlier conversation's row left as it was", async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { current: NEW });
+    w.host.row(Q, 'stopped', SID);
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(X, '7a7a7a7a'));
+    expect(w.host.calls.filter((c) => c.startsWith('rm'))).toEqual([`rm main ${SHORT}`]);
+    expect(w.host.rowsOf(SID)).toEqual([Q]);
+    expect(w.host.rowsOf(NEW)).toEqual([X]);
+  });
+});
+
+describe('Ctrl-C around a move', () => {
+  it('is held only once the move commits: a move refused by its own checks holds nothing', async () => {
+    const refused = world();
+    refused.host.runs(MAIN);
+    refused.host.agentsStatus = 'busy';
+    await decideIn(refused, attach(SHORT));
+    expect(refused.shields).toMatchObject({ n: 1, held: 0 });
+
+    const moved = world();
+    moved.host.runs(MAIN);
+    await decideIn(moved, attach(SHORT));
+    expect(moved.shields).toMatchObject({ n: 1, held: 1 });
+  });
+});
+
+describe('routeBackgroundLaunch — which rows are traps', () => {
+  const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
+  const guardRef = (ref: string): BackgroundRequest => ({ verb: 'guard', ref });
+
+  it('after /clear on the global slot, a stale profile row naming only the id the job started with is still a trap', async () => {
+    // Claude Code's wake and rm reach a session by its job id, which /clear keeps.
+    const w = world();
+    w.host.runs(MAIN, SID, { current: NEW, status: 'busy' });
+    w.host.row(X, 'stopped');
+    expect(await decideIn(w, GUARD)).toMatchObject({ kind: 'refuse' });
+  });
+
+  it("a session live in the registry that no service of cctl's lists still makes its row here a trap", async () => {
+    const w = world();
+    w.host.registry.push({
+      pid: 4100,
+      sessionId: SID,
+      kind: 'bg',
+      status: 'busy',
+      jobId: SHORT,
+      cwd: WORK,
+    });
+    w.host.row(X, 'stopped');
+    const d = await routeBackgroundLaunch(GUARD, w.ctx, FOLLOW);
+    expect(d.kind === 'refuse' && d.message).toContain('runs on another background service');
+  });
+
+  it('a trap check that cannot read the registry refuses rather than passes', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { status: 'busy' });
+    w.host.row(X, 'stopped');
+    w.host.failRegistry = 3;
+    const d = await routeBackgroundLaunch(GUARD, w.ctx, FOLLOW);
+    expect(d.kind === 'refuse' && d.message).toContain('cannot tell whether a background session');
+  });
+
+  it('a registry read caught mid-write is read again before the trap check answers', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { status: 'busy' });
+    w.host.row(X, 'stopped');
+    w.host.failRegistry = 1;
+    const d = await routeBackgroundLaunch(GUARD, w.ctx, FOLLOW);
+    expect(d.kind === 'refuse' && d.message).toContain('still holds a job row');
+  });
+
+  it('a print-mode resume naming the trap session any way Claude Code could take it is refused', async () => {
+    const trapWorld = (): World => {
+      const w = world();
+      w.host.runs(MAIN, SID, { name: 'bg eval', status: 'busy' });
+      w.host.row(X, 'stopped', SID, { name: 'ok', resumeSessionId: NEW });
+      w.host.titles.set(SID, 'feat x');
+      return w;
+    };
+    // Its full id, its /clear id, a job id prefix, part of its name, the row's own name, its
+    // title, its whole name.
+    for (const ref of [SID, NEW, 'c5f2', 'eval', 'ok', 'feat x', 'bg eval']) {
+      const d = await routeBackgroundLaunch(guardRef(ref), trapWorld().ctx, FOLLOW);
+      expect({ ref, kind: d.kind }).toEqual({ ref, kind: 'refuse' });
+    }
+    expect(await routeBackgroundLaunch(guardRef('unrelated'), trapWorld().ctx, FOLLOW)).toEqual({
+      kind: 'pass',
+    });
+  });
+});
+
+describe('routeBackgroundLaunch — every id a session has had', () => {
+  const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
+
+  it('a stopped session is found by the conversation it ran after /clear', async () => {
+    const w = world();
+    w.host.row(X, 'stopped', SID, { resumeSessionId: NEW });
+    expect(await decideIn(w, attach(NEW))).toMatchObject(openUnder(X));
+  });
+
+  it('an uppercase hex word is a name for Claude Code, never a job id prefix', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { name: 'BEEF', status: 'busy' });
+    w.host.row(X, 'stopped', SID, { name: 'BEEF' });
+    expect(await decideIn(w, attach('BEEF'))).toMatchObject(openUnder(MAIN));
+  });
+
+  it('after /clear, a prompt given with --resume reaches the conversation it moved, on the folder slot', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { current: NEW });
+    expect(await decideIn(w, resume(SID, ['carry on']))).toMatchObject({
+      kind: 'open',
+      configDir: X,
+      args: ['--resume', NEW, 'carry on'],
+    });
+  });
+});
+
+describe('routeBackgroundLaunch — stop, rm, kill and respawn, read with care', () => {
+  it('a session whose service cannot be told is not stopped on a guess', async () => {
+    const w = world();
+    // Live in the registry, but no roster of cctl's lists it; a row of it here.
+    w.host.registry.push({
+      pid: 4100,
+      sessionId: SID,
+      kind: 'bg',
+      status: 'busy',
+      jobId: SHORT,
+      cwd: WORK,
+    });
+    w.host.row(X, 'stopped');
+    const d = await routeBackgroundLaunch(control('stop', SHORT), w.ctx, FOLLOW);
+    expect(d.kind === 'refuse' && d.message).toContain(
+      "cannot tell which account's background service",
+    );
+  });
+
+  it('the session is located for a stop while its move lock is held', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { status: 'busy' });
+    let heldAtLook = false;
+    w.host.beforeRegistry = (n) => {
+      // Read 1 finds the session; the next ones are the look under the lock.
+      if (n >= 2) heldAtLook = w.host.isLocked(SID);
+    };
+    await routeBackgroundLaunch(control('stop', SHORT), w.ctx, FOLLOW);
+    expect(heldAtLook).toBe(true);
+  });
+});
+
+describe('routeBackgroundLaunch — a --resume title, searched where Claude Code searches', () => {
+  const TREE = 'C:/work/app/.claude/worktrees/feat';
+
+  it('a session whose row records a worktree of this folder is in scope through that worktree', async () => {
+    const w = world({}, { worktrees: [TREE] });
+    w.host.runs(MAIN, SID, { cwd: OTHER, status: 'busy', worktreePath: TREE });
+    w.host.titles.set(SID, 'feat x');
+    expect(await decideIn(w, resume('feat x'))).toMatchObject(openUnder(MAIN));
+  });
+
+  it('a session that moved into this folder after it started is in scope by where its registry entry says it is', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { cwd: OTHER, status: 'busy' });
+    w.host.registry[0]!.cwd = WORK;
+    w.host.titles.set(SID, 'feat x');
+    expect(await decideIn(w, resume('feat x'))).toMatchObject(openUnder(MAIN));
+  });
+
+  it('a session is in scope by where its service started it, whatever its rows say', async () => {
+    const w = world();
+    w.host.runs(MAIN, SID, { cwd: WORK, status: 'busy' });
+    w.host.rows.get('main')!.get(SHORT)!.cwd = OTHER;
+    w.host.registry[0]!.cwd = OTHER;
+    w.host.titles.set(SID, 'feat x');
+    expect(await decideIn(w, resume('feat x'))).toMatchObject(openUnder(MAIN));
+  });
+
+  it('after /clear, the title of the conversation it runs now is matched', async () => {
+    const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
+    const w = world();
+    w.host.runs(MAIN, SID, { current: NEW, status: 'busy' });
+    w.host.titles.set(NEW, 'next step');
+    expect(await decideIn(w, resume('next step'))).toMatchObject(openUnder(MAIN));
+  });
+
+  it('an ordinary conversation with the same title in a worktree of this folder makes the title ambiguous; one elsewhere does not', async () => {
+    const OLD = '11111111-2222-4333-8444-555555555555';
+    const inTree = world({}, { worktrees: [TREE] });
+    inTree.host.runs(MAIN, SID, { status: 'busy' });
+    inTree.host.row(X, 'stopped');
+    inTree.host.titles.set(SID, 'bg eval');
+    inTree.host.plainTitles.set(OLD, 'bg eval');
+    inTree.host.plainFolders.set(OLD, TREE);
+    const d = await decideIn(inTree, resume('bg eval'));
+    expect(d.kind === 'refuse' && d.message).toContain('names more than one session');
+
+    // Filed under a folder Claude Code does not search from here: the title names one session.
+    const elsewhere = world({}, { worktrees: [TREE] });
+    elsewhere.host.runs(MAIN, SID, { status: 'busy' });
+    elsewhere.host.titles.set(SID, 'bg eval');
+    elsewhere.host.plainTitles.set(OLD, 'bg eval');
+    elsewhere.host.plainFolders.set(OLD, OTHER);
+    expect(await decideIn(elsewhere, resume('bg eval'))).toMatchObject(openUnder(MAIN));
+  });
+});
+
+describe('routeBackgroundLaunch — what a start that runs nowhere says', () => {
+  it('a start whose way back fails too says how to bring it back, from what the move saved', async () => {
+    const w = world();
+    w.host.row(MAIN, 'stopped', SID, {
+      saved: { kind: 'replayable', options: ['--model=opus'] },
+    });
+    w.host.failResumeIn.add(X);
+    w.host.failResumeIn.add('main');
+    const d = await decideIn(w, attach(SHORT));
+    expect(d.kind === 'refuse' && d.message).toContain(
+      `Bring it back with: cctl claude --resume ${SID}`,
+    );
+    expect(w.host.recoveries.get(SID)).toEqual({
+      configDir: MAIN,
+      sessionId: SID,
+      job: { short: SHORT, sessionId: SID },
+      options: ['--model=opus'],
+      cwd: WORK,
+    });
+  });
+
+  it('a row elsewhere that cannot be removed before the open is said', async () => {
+    const w = world();
+    w.host.row(X, 'stopped');
+    w.host.row(MAIN, 'stopped');
+    w.host.failRemoveIn.add('main');
+    await decideIn(w, attach(SHORT));
+    expect(w.lines.join('\n')).toContain('could not remove the job row');
+  });
+});
+
 /** A small deterministic generator (mulberry32), so a failing arrangement can be replayed by its
  *  seed. Its low bits are as random as its high ones, which a plain linear congruence's are not:
  *  picks between two or four would come out in lockstep and leave whole arrangements unvisited. */
@@ -1462,7 +1982,8 @@ function rng(seed: number): (n: number) => number {
 }
 
 describe('the steal property, over every arrangement', () => {
-  it('no arrangement of where it runs, its rows, names, titles, folders, failures, locks and the slot ever lets it be taken', async () => {
+  it('no arrangement of where it runs, its rows, /clear, names, titles, folders, failures, locks and the slot ever lets it be taken', async () => {
+    const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
     const places: Array<Config | undefined> = [MAIN, X, Q, undefined];
     const rowStates = [undefined, 'stopped', 'failed', 'running'];
     // Idle twice as often: a move needs it, and moves are what most needs checking.
@@ -1509,12 +2030,23 @@ describe('the steal property, over every arrangement', () => {
       const w = world(pick(homes), { daemonRunning: r(2) === 0, cwd: pick([WORK, OTHER]) });
       const saved = pick(saves);
       const tree = r(8) === 0 ? 'C:/work/app/.claude/worktrees/feat' : undefined;
+      // A quarter of the time the job moved on to a new conversation with /clear.
+      const cleared = r(4) === 0;
+      // One row at most records the worktree: the one of the config dir that started the session
+      // with it (measured: a resume elsewhere records none).
+      let treeTaken = place !== undefined && tree !== undefined;
+      const withTree = (): boolean => {
+        if (treeTaken || tree === undefined || r(10) !== 0) return false;
+        treeTaken = true;
+        return true;
+      };
       if (place !== undefined) {
         const status = pick(statuses);
         w.host.runs(place, SID, {
           cwd,
           name: 'bg eval',
           saved,
+          ...(cleared ? { current: NEW } : {}),
           ...(status !== undefined ? { status } : {}),
           ...(r(6) === 0 ? { pending: true } : {}),
           ...(tree !== undefined ? { worktreePath: tree } : {}),
@@ -1525,10 +2057,13 @@ describe('the steal property, over every arrangement', () => {
         if (place !== undefined && key(c) === key(place)) continue;
         const state = pick(rowStates);
         if (state !== undefined) {
+          // A row elsewhere of the cleared job: written before the clear, or after it.
+          const resumed = cleared ? pick([undefined, NEW, SID]) : undefined;
           w.host.row(c, state, SID, {
             cwd,
             saved: pick(saves),
-            ...(r(10) === 0 && tree ? { worktreePath: tree } : {}),
+            ...(resumed !== undefined ? { resumeSessionId: resumed } : {}),
+            ...(withTree() && tree !== undefined ? { worktreePath: tree } : {}),
           });
         }
       }
@@ -1559,7 +2094,21 @@ describe('the steal property, over every arrangement', () => {
       const busyAtStart = place !== undefined && w.host.registry[0]?.status !== 'idle';
       const pendingAtStart =
         place !== undefined && w.host.rows.get(key(place))?.get(SHORT)?.pending === true;
-      const d = await decideIn(w, pick(requests), pick(modes));
+      // Its new conversation's id names it only once it has one.
+      const req = pick(
+        cleared ? [...requests, attach(NEW), resume(NEW), resume(NEW, ['carry on'])] : requests,
+      );
+      const mode = pick(modes);
+      let d: RouteDecision;
+      try {
+        d = await decideIn(w, req, mode);
+      } catch (err) {
+        // Named by its seed, so the arrangement can be replayed alone.
+        throw new Error(
+          `arrangement ${seed} (${JSON.stringify({ req, mode, place, cleared })}): ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
       // Never stopped mid-turn or holding work between turns.
       if (pendingAtStart || busyAtStart) {
         expect(w.host.calls.filter((c) => c.startsWith('stop'))).toEqual([]);

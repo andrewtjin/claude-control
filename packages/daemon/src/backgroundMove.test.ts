@@ -25,6 +25,9 @@ const SHORT = SID.slice(0, 8);
 const OLD = 'C:/vault/profiles/rule-old';
 const NEW = 'C:/vault/profiles/rule-new';
 const S: BackgroundSession = { short: SHORT, sessionId: SID, cwd: 'C:/research' };
+/** The conversation a /clear in S moves its job on to; a move resumes it as a job of that name. */
+const CLEARED = '7a7a7a7a-1111-4222-8333-444444444444';
+const CLEARED_SHORT = CLEARED.slice(0, 8);
 
 /** A Claude Code with services in the main config dir, OLD and NEW; S runs idle under OLD, its row
  *  there saved with `--model=opus`. */
@@ -91,7 +94,13 @@ describe('moveBackgroundSession', () => {
     });
     expect(order).toEqual(['commit', 'stop']);
     // Told how to bring it back by hand, should the move be cut off from there on.
-    expect(told).toEqual({ configDir: OLD, sessionId: SID, options: ['--model=opus'] });
+    expect(told).toEqual({
+      configDir: OLD,
+      sessionId: SID,
+      job: { short: SHORT, sessionId: SID },
+      options: ['--model=opus'],
+      cwd: 'C:/research',
+    });
 
     const busy = fakeHost();
     busy.states.set(SHORT, { idle: false });
@@ -157,7 +166,13 @@ describe('moveBackgroundSession', () => {
     expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
       result: 'failed',
       restored: false,
-      recovery: { configDir: OLD, sessionId: SID, options: ['--model=opus'] },
+      recovery: {
+        configDir: OLD,
+        sessionId: SID,
+        job: { short: SHORT, sessionId: SID },
+        options: ['--model=opus'],
+        cwd: 'C:/research',
+      },
     });
   });
 
@@ -169,6 +184,90 @@ describe('moveBackgroundSession', () => {
       restored: true,
     });
     expect(changes(host)).toEqual([`stop ${OLD} ${SHORT}`]);
+  });
+
+  it('a stop that returns while it is still hosted touches nothing more, and it is left where it runs', async () => {
+    // Claude Code's stop returns, but the session is still listed (respawned, or slow to exit).
+    const host = fakeHost();
+    host.stopKeepsHosted = true;
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: true,
+      reason: 'it was still running after the stop',
+    });
+    expect(changes(host)).toEqual([`stop ${OLD} ${SHORT}`]);
+    expect(host.rowsFor(SID)).toEqual([OLD]);
+  });
+
+  it('a look after the stop that cannot be read removes no row and resumes nothing', async () => {
+    const host = fakeHost();
+    const stop = host.stop.bind(host);
+    host.stop = async (c, short) => {
+      await stop(c, short);
+      // Every roster read from here on is torn.
+      host.failListing = true;
+    };
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: false,
+    });
+    expect(changes(host)).toEqual([`stop ${OLD} ${SHORT}`]);
+  });
+
+  it('a stop not seen through, after which where it runs cannot be read: nothing is resumed on a guess', async () => {
+    const host = fakeHost();
+    host.stopNotSeenThrough = true;
+    const stop = host.stop.bind(host);
+    host.stop = async (c, short) => {
+      try {
+        await stop(c, short);
+      } finally {
+        host.failListing = true;
+      }
+    };
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: false,
+    });
+    expect(changes(host)).toEqual([`stop ${OLD} ${SHORT}`]);
+  });
+
+  it('a stop not seen through, after which it runs on another service: nothing is resumed where it was', async () => {
+    const host = fakeHost();
+    host.stopNotSeenThrough = true;
+    const stop = host.stop.bind(host);
+    host.stop = async (c, short) => {
+      try {
+        await stop(c, short);
+      } finally {
+        // Started under NEW by someone else meanwhile.
+        host.hosted.set(NEW, [S]);
+      }
+    };
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: false,
+    });
+    expect(changes(host)).toEqual([`stop ${OLD} ${SHORT}`]);
+  });
+
+  it('a way back over a source row that cannot be read wakes that row, never passes options over it', async () => {
+    // A resume with options over a row Claude Code still holds is refused.
+    const host = fakeHost();
+    host.stopNotSeenThrough = true;
+    const stop = host.stop.bind(host);
+    host.stop = async (c, short) => {
+      try {
+        await stop(c, short);
+      } finally {
+        host.rowOf(OLD, SHORT)!.unreadable = true;
+      }
+    };
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: true,
+    });
+    expect(changes(host)).toEqual([`stop ${OLD} ${SHORT}`, `resume ${OLD} ${SID} C:/research`]);
   });
 
   it('a resume the target refuses is put back on the source with its options, its row there rebuilt', async () => {
@@ -190,6 +289,69 @@ describe('moveBackgroundSession', () => {
       options: ['--model=opus'],
     });
     expect(host.rowsFor(SID)).toEqual([OLD]);
+  });
+
+  it('a resume that fails while the session turns up on a third service is neither a move nor put back', async () => {
+    const host = fakeHost();
+    host.failResumeIn.add(NEW);
+    const resume = host.resumeIdle.bind(host);
+    host.resumeIdle = async (input) => {
+      try {
+        return await resume(input);
+      } finally {
+        // Started under the main config dir by someone else meanwhile.
+        if (input.configDir === NEW) host.hosted.set(null, [S]);
+      }
+    };
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: false,
+    });
+    expect(changes(host)).toEqual([
+      `stop ${OLD} ${SHORT}`,
+      `rm ${OLD} ${SHORT}`,
+      `resume ${NEW} ${SID} C:/research [--model=opus]`,
+    ]);
+  });
+
+  it('a target row a failed resume left that cannot be removed: not put back, as that row would be a trap', async () => {
+    const host = fakeHost();
+    host.silentResumeIn.add(NEW);
+    host.failRemoveIn.add(NEW);
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: false,
+    });
+    expect(changes(host).filter((c) => c.startsWith(`resume ${OLD}`))).toEqual([]);
+  });
+
+  it('a target row a failed resume left is never taken for none when it cannot be read: its removal comes before any way back', async () => {
+    const host = fakeHost();
+    host.silentResumeIn.add(NEW);
+    const resume = host.resumeIdle.bind(host);
+    host.resumeIdle = async (input) => {
+      await resume(input);
+      // Caught mid-write: it is still the row the resume wrote.
+      if (input.configDir === NEW) host.rowOf(NEW, SHORT)!.unreadable = true;
+    };
+    await moveBackgroundSession(host, REQUEST, timing);
+    expect(changes(host)).toContain(`rm ${NEW} ${SHORT}`);
+    // The row could not be removed, so it is not put back either.
+    expect(changes(host).filter((c) => c.startsWith(`resume ${OLD}`))).toEqual([]);
+  });
+
+  it('a roster that cannot be read after the resume is no proof it is hosted there', async () => {
+    const host = fakeHost();
+    host.silentResumeIn.add(NEW);
+    const resume = host.resumeIdle.bind(host);
+    host.resumeIdle = async (input) => {
+      await resume(input);
+      if (input.configDir === NEW) host.failListing = true;
+    };
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: false,
+    });
   });
 
   it('a stale target row saved with fewer options goes: the session keeps its restrictions', async () => {
@@ -311,14 +473,15 @@ describe('moveBackgroundSession', () => {
     expect(changes(host)).toEqual([]);
   });
 
-  it('after /clear, the conversation it runs now is resumed, and its old job is gone everywhere', async () => {
+  it('after /clear, the conversation it runs now is resumed, and every row of that conversation goes', async () => {
     const host = fakeHost();
     const NEXT = '7a7a7a7a-1111-4222-8333-444444444444';
     host.rowOf(OLD, SHORT)!.resumeSessionId = NEXT;
     host.currentIds.set(SHORT, NEXT);
-    // A row of it a move made before the clear, under the main config dir.
+    // A stale row of its job under the main config dir, written after the clear.
     host.setRow(null, SHORT, {
       sessionId: SID,
+      resumeSessionId: NEXT,
       state: 'stopped',
       saved: { kind: 'replayable', options: [] },
     });
@@ -335,6 +498,96 @@ describe('moveBackgroundSession', () => {
     ]);
     expect(host.rowsFor(NEXT)).toEqual([NEW]);
     expect(host.rowsFor(SID)).toEqual([]);
+  });
+
+  it('after /clear, a row elsewhere of its earlier conversation is left as it was: it reaches no job the session runs under', async () => {
+    // Measured: two jobs can share a job id, one running a cleared job's new conversation and one
+    // its earlier conversation, resumed as a job of its own. A wake of the earlier one's row reaches
+    // only its job id, and the moved session runs under a job named after its own conversation.
+    const host = fakeHost();
+    const NEXT = '7a7a7a7a-1111-4222-8333-444444444444';
+    host.rowOf(OLD, SHORT)!.resumeSessionId = NEXT;
+    host.currentIds.set(SHORT, NEXT);
+    host.setRow(null, SHORT, {
+      sessionId: SID,
+      resumeSessionId: SID,
+      name: 'the earlier one',
+      state: 'stopped',
+      saved: { kind: 'replayable', options: ['--name=the earlier one'] },
+    });
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'moved',
+      short: '7a7a7a7a',
+    });
+    expect(changes(host)).toEqual([
+      `stop ${OLD} ${SHORT}`,
+      `rm ${OLD} ${SHORT}`,
+      `resume ${NEW} ${NEXT} C:/research [--model=opus]`,
+    ]);
+    expect(host.rowOf(null, SHORT)).toMatchObject({ name: 'the earlier one', state: 'stopped' });
+  });
+
+  it('another conversation under the very job id the session keeps after the move: not moved, for good', async () => {
+    // No /clear here, so the session keeps its job id when moved; a row elsewhere runs another
+    // conversation under that id (its job was cleared there), and would reach it after the move.
+    const host = fakeHost();
+    const OTHER = '9b9b9b9b-1111-4222-8333-444444444444';
+    host.setRow(null, SHORT, {
+      sessionId: SID,
+      resumeSessionId: OTHER,
+      state: 'stopped',
+      saved: { kind: 'replayable', options: [] },
+    });
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'not-moved',
+      cause: 'conversations',
+      final: true,
+      reason:
+        `Claude Code keeps another conversation (${OTHER}) under the job id it would run under ` +
+        `(${SHORT}), so a move cannot tell the two apart`,
+    });
+    expect(changes(host)).toEqual([]);
+  });
+
+  it('after /clear, a failed move puts back the conversation it ran, not the one it started with', async () => {
+    const host = fakeHost();
+    host.rowOf(OLD, SHORT)!.resumeSessionId = CLEARED;
+    host.currentIds.set(SHORT, CLEARED);
+    host.failResumeIn.add(NEW);
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'failed',
+      restored: true,
+    });
+    expect(changes(host).at(-1)).toBe(`resume ${OLD} ${CLEARED} C:/research [--model=opus]`);
+  });
+
+  it('after /clear, a start resumes the conversation its row ran last, under the job named after it', async () => {
+    const host = fakeHost();
+    host.hosted.set(OLD, []);
+    host.rowOf(OLD, SHORT)!.resumeSessionId = CLEARED;
+    expect(await moveBackgroundSession(host, { ...REQUEST, start: true }, timing)).toMatchObject({
+      result: 'moved',
+      short: CLEARED_SHORT,
+      sessionId: CLEARED,
+    });
+    expect(changes(host)).toEqual([
+      `rm ${OLD} ${SHORT}`,
+      `resume ${NEW} ${CLEARED} C:/research [--model=opus]`,
+    ]);
+  });
+
+  it('after /clear, a resume that shows up just past the confirm window is a move, not a failure', async () => {
+    // The registry names the conversation it runs now; its row has not recorded it yet, so only
+    // the second look, made with the id and job it was resumed as, can find it.
+    const host = fakeHost();
+    host.currentIds.set(SHORT, CLEARED);
+    host.showOnReadIn.set(NEW, 2);
+    expect(await moveBackgroundSession(host, REQUEST, timing)).toMatchObject({
+      result: 'moved',
+      short: CLEARED_SHORT,
+      sessionId: CLEARED,
+    });
+    expect(host.hostsOf(CLEARED_SHORT)).toEqual([NEW]);
   });
 });
 
@@ -372,6 +625,38 @@ describe('where a session runs, and its lineage', () => {
     );
     expect([...lineage.ids].sort()).toEqual([SID, NEXT].sort());
     expect([...lineage.shorts].sort()).toEqual([SHORT, '7a7a7a7a'].sort());
+  });
+
+  it('a chain through a /clear id reaches a row filed under the new job, whatever order the rows come in', () => {
+    // The row naming the new job comes first, before anything links it: only a second pass does.
+    const lineage = lineageOf({ ids: [SID], shorts: [SHORT] }, [
+      {
+        configDir: NEW,
+        row: { short: CLEARED_SHORT, sessionId: CLEARED, state: 'stopped', pending: false },
+      },
+      {
+        configDir: null,
+        row: {
+          short: SHORT,
+          sessionId: SID,
+          resumeSessionId: CLEARED,
+          state: 'stopped',
+          pending: false,
+        },
+      },
+    ]);
+    expect([...lineage.shorts].sort()).toEqual([SHORT, CLEARED_SHORT].sort());
+    expect([...lineage.ids].sort()).toEqual([SID, CLEARED].sort());
+  });
+
+  it('the registry entry of a job after /clear is found by its job id before any row names the new id', async () => {
+    const host = fakeHost();
+    host.currentIds.set(SHORT, CLEARED);
+    expect(await whereRuns(host, { ids: new Set([SID]), shorts: new Set([SHORT]) })).toMatchObject({
+      kind: 'bg',
+      currentId: CLEARED,
+      status: 'idle',
+    });
   });
 
   it('is unclear while a session is live with no service listing it, and nowhere once it is gone', async () => {

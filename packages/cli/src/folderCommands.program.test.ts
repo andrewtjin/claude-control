@@ -1131,13 +1131,30 @@ describe('cctl claude opening a background session', () => {
     expect(bgHost.calls.map((c) => c.args[0])).toEqual(['agents', 'stop', 'rm', '--bg']);
     expect(r.err).toContain(
       'cctl: finishing the move first; stopping now would leave the session stopped. If this ' +
-        `window closes before it finishes, resume it with: claude --bg --resume ${SID} "--name=bg eval"`,
+        `window closes before it finishes, bring it back with: cctl claude --resume ${SID}`,
     );
     expect(r.err).toContain('cctl: interrupted; not opening the session.');
     expect(launcher.spawnClaude).not.toHaveBeenCalled();
     expect(process.exitCode).toBe(130);
     process.exitCode = undefined;
     // The signal is the operator's own again.
+    expect(process.listenerCount('SIGINT')).toBe(0);
+  });
+
+  it('Ctrl-C is held only from the moment the move commits, never during its checks', async () => {
+    ruleOnE();
+    await runsIn(main(), 'idle');
+    answersAMove();
+    const answer = bgHost.answer;
+    const heldAt: Record<string, number> = {};
+    bgHost.answer = (args, configDir) => {
+      // Asked what it is doing: one of the move's own checks, before anything is touched.
+      heldAt[args[0]!] = process.listenerCount('SIGINT');
+      return answer(args, configDir);
+    };
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(heldAt).toEqual({ agents: 0, stop: 1, rm: 1, '--bg': 1 });
     expect(process.listenerCount('SIGINT')).toBe(0);
   });
 

@@ -6,11 +6,11 @@
 // dir that hosts it. A ruled folder runs on its own profile (a config dir of its own), so the same
 // session can be hosted by the main config dir's service or by a profile's. Each config dir keeps a
 // job row for a session it ran, and a row under a config dir X for a session running in another
-// config dir's service is a trap (measured against the real binary, 2.1.295): whatever under X
-// wakes, stops or removes that row — `claude attach`, an interactive `--resume` (by id, by title,
-// or chosen in its picker), `claude stop`, `claude rm`, `claude respawn`, Enter or Ctrl+X in the
-// agents view — reaches the session where it runs and kills it there, mid-turn included (the turn
-// is lost), or answers with the row's stale error. So:
+// config dir's service is a trap (measured against the real binary, 2.1.295 and 2.1.296): whatever
+// under X wakes, stops or removes that row — `claude attach`, an interactive `--resume` (by id, by
+// title, or chosen in its picker), `claude stop`, `claude rm`, `claude respawn`, Enter or Ctrl+X in
+// the agents view — reaches the session where it runs and kills it there, mid-turn included (the
+// turn is lost), or answers with the row's stale error. So:
 //   - a move, by the daemon or by cctl, leaves a session a row only where it runs (see the daemon's
 //     backgroundMove.ts);
 //   - what `cctl claude` is asked to open is found first (by full id; a job id or any prefix of one,
@@ -30,18 +30,24 @@
 //   - it is open in a terminal: nothing is touched, and the operator is told where;
 //   - it runs nowhere: `attach` wakes its row where it belongs (rows elsewhere removed first, a
 //     failed one restarted, none at all started there with the options its latest row saved), and a
-//     plain `--resume` runs it in the foreground as Claude Code does.
+//     plain `--resume` runs it in the foreground as Claude Code does. A conversation whose move was
+//     cut off half way is first brought back where the move found it, from what the move saved.
 // A prompt given with `--resume <session> <prompt>` is passed on to the session where it is opened.
 // The daemon's mover may reach the same session at the same moment, so all of this runs under the
-// session's move lock, which is kept until the terminal opened here has shown up in its service's
-// attach journal: from then on the daemon holds back on its own (see backgroundMover.ts).
+// session's move lock, taken on every id it is known by, and kept until the terminal opened here has
+// shown up in its service's attach journal: from then on the daemon holds back on its own (see
+// backgroundMover.ts).
 
 import {
   SESSION_ID_PATTERN,
   allRows,
+  bringBack,
   confirmHosted,
+  conversationOf,
+  lockMove,
   moveBackgroundSession,
   reasonOf,
+  recoveryCommand,
   sameConfigDir,
   sessionLabel,
   settledWhere,
@@ -296,10 +302,12 @@ export interface RouteContext {
   daemonRunning: boolean;
   /** One line to the operator. */
   say(line: string): void;
-  /** Run a move with Ctrl-C held off until it has finished or put the session back. `recovery`
-   *  says, once the move has committed, the command that brings the session back by hand: it is
-   *  told to an operator who interrupts, in case the window closes before the move ends. */
-  shield<T>(fn: () => Promise<T>, recovery?: () => string | undefined): Promise<T>;
+  /** Run a move with Ctrl-C held off from the moment it commits (`fn` calls `hold`, right before
+   *  its first change) until it has finished or put the session back; before that, nothing has been
+   *  touched and Ctrl-C ends cctl as usual. `recovery` says the command that brings the session back
+   *  by hand: it is told to an operator who interrupts, in case the window closes before the move
+   *  ends. */
+  shield<T>(fn: (hold: () => void) => Promise<T>, recovery?: () => string | undefined): Promise<T>;
   /** How long to wait for another cctl process that is moving the same session. */
   lockWaitMs: number;
   timing: MoveTiming;
@@ -655,10 +663,10 @@ function onWhat(v: ConfigView): string {
   return v.account !== undefined ? `${v.account} (${v.slot})` : v.slot;
 }
 
-/** The command that brings a session back by hand where a move left it to be (see the daemon's
- *  ResumeRecovery), naming the config dir as the host reaches it. */
-function recoveryHint(ctx: RouteContext, recovery: ResumeRecovery): string {
-  return ctx.host.resumeHint(recovery.configDir, recovery.sessionId, recovery.options);
+/** The command that brings a session back by hand where a move found it, from the recovery the
+ *  move saved (see the daemon's ResumeRecovery): the same in every shell, from any folder. */
+function recoveryHint(recovery: ResumeRecovery): string {
+  return recoveryCommand(recovery.sessionId);
 }
 
 /** Why a session running elsewhere is not moved where it belongs, in words. */
@@ -666,6 +674,59 @@ function stayReason(status: string | undefined): string {
   if (status === 'busy') return 'it is in a turn';
   if (status === 'waiting') return 'it is waiting on a prompt';
   return 'it is not idle between turns';
+}
+
+/**
+ * Bring back a conversation whose move was cut off half way (its process killed, its window
+ * closed, or its way back failed), when it is named by its full id: the move saved how before its
+ * first change (see the daemon's ResumeRecovery). Under the session's move lock, a conversation that
+ * runs nowhere is resumed where the move found it, as the move's own way back resumes it; one that
+ * runs anywhere needs nothing, and its recovery is dropped. Undefined when the launch goes on;
+ * otherwise why nothing runs.
+ */
+async function recoverCutOffMove(
+  ref: string,
+  ctx: RouteContext,
+): Promise<RouteDecision | undefined> {
+  const id = ref.trim().toLowerCase();
+  if (!SESSION_ID_PATTERN.test(id)) return undefined;
+  const saved = await ctx.host.recoveryOf(id);
+  if (saved === undefined) return undefined;
+  const lock = await lockMove(ctx.host, [id], ctx.lockWaitMs);
+  if (lock === undefined) {
+    return {
+      kind: 'refuse',
+      message: `another cctl process is still moving ${id}; try again in a moment.`,
+    };
+  }
+  try {
+    const where = await settledWhere(
+      ctx.host,
+      { ids: new Set([id]), shorts: new Set([id.slice(0, 8)]) },
+      ctx.timing,
+    );
+    if (where.kind === 'unclear') {
+      return {
+        kind: 'refuse',
+        message: `cannot tell where ${id} runs right now (${where.reason}); try again in a moment.`,
+      };
+    }
+    if (where.kind === 'nowhere') {
+      const back = onWhat(await ctx.view(saved.configDir));
+      if (!(await bringBack(ctx.host, saved, ctx.timing, back))) {
+        return {
+          kind: 'refuse',
+          message: `could not bring ${id} back on ${back}, where a move found it; try again in a moment.`,
+        };
+      }
+      ctx.say(`cctl: brought background session ${id} back on ${back}, where a move found it.`);
+    }
+    // Running again: there is nothing left to bring back.
+    await ctx.host.dropRecovery(id).catch(() => undefined);
+    return undefined;
+  } finally {
+    lock.release();
+  }
 }
 
 /**
@@ -679,6 +740,12 @@ export async function routeBackgroundLaunch(
   mode: RouteMode,
 ): Promise<RouteDecision> {
   if (req.verb === 'guard') return guardedPass(ctx, mode, req.ref);
+  // A conversation a move was cut off in the middle of is brought back first, where the move found
+  // it, from what the move saved; then it is opened like any other.
+  if (req.verb !== 'control') {
+    const refusal = await recoverCutOffMove(req.ref, ctx);
+    if (refusal !== undefined) return refusal;
+  }
   const found = await resolve(req, ctx);
   // A --resume term that is no title here opens Claude Code's picker, where anything can be
   // chosen; what attach and its kin are given only ever names one session.
@@ -698,10 +765,14 @@ export async function routeBackgroundLaunch(
     };
   }
   const target = found.target;
-  let lock = await ctx.host.lockSession(target.currentId, 0);
+  // Taken on every id it is known by (see the daemon's moveLockIds), as the daemon's mover takes
+  // its own: after /clear the id its job started with and the conversation it runs now differ, and
+  // two movers must meet on one of them.
+  const lockIds = [...target.known.lineage.ids];
+  let lock = await lockMove(ctx.host, lockIds, 0);
   if (lock === undefined) {
     ctx.say(`cctl: another cctl process is moving ${label(target)}; waiting for it to finish.`);
-    lock = await ctx.host.lockSession(target.currentId, ctx.lockWaitMs);
+    lock = await lockMove(ctx.host, lockIds, ctx.lockWaitMs);
   }
   if (lock === undefined) {
     return {
@@ -826,6 +897,8 @@ async function decide(
     const orphaned = runsOn.removed === true && home.unusable === undefined;
     let why: string;
     let final = false;
+    /** Where a move that failed put it back, when that is where it is opened. */
+    let putBack: Extract<SessionWhere, { kind: 'bg' }> | undefined;
     if (tree !== undefined) {
       why = 'it works in a git worktree Claude Code made for it, which a move would delete';
       final = true;
@@ -841,7 +914,7 @@ async function decide(
     } else {
       let hint: string | undefined;
       const moved: MoveResult = await ctx.shield(
-        () =>
+        (hold) =>
           moveBackgroundSession(
             ctx.host,
             {
@@ -852,9 +925,11 @@ async function decide(
             },
             ctx.timing,
             // Said once the move's own checks have passed, right before the stop: from then on
-            // the session runs nowhere until it is resumed, here or back where it was.
+            // the session runs nowhere until it is resumed, here or back where it was, and Ctrl-C
+            // is held off until then.
             (recovery) => {
-              hint = recoveryHint(ctx, recovery);
+              hint = recoveryHint(recovery);
+              hold();
               ctx.say(
                 `cctl: moving background session ${label(target)} from ${onWhat(runsOn)} onto ` +
                   `${onWhat(belongs)}; Ctrl-C waits until it has finished.`,
@@ -874,17 +949,24 @@ async function decide(
       if (moved.result === 'not-moved' && moved.cause === 'gone' && !again) {
         return decide(req, target, ctx, mode, lock, true);
       }
-      if (moved.result === 'failed' && !moved.restored) {
-        return {
-          kind: 'refuse',
-          message:
-            `could not move ${label(target)} onto ${onWhat(belongs)} (${moved.reason}), nor ` +
-            `resume it on ${onWhat(runsOn)}. Resume it there with: ` +
-            recoveryHint(ctx, moved.recovery),
-        };
+      if (moved.result === 'failed') {
+        // Put back, it may run under another job id than before (after /clear the way back
+        // resumes its conversation as a job named after it): it is opened where it runs now.
+        const now = moved.restored ? await locate(target, ctx) : undefined;
+        if (now?.kind !== 'bg') {
+          return {
+            kind: 'refuse',
+            message:
+              `could not move ${label(target)} onto ${onWhat(belongs)} (${moved.reason}), nor ` +
+              `resume it on ${onWhat(runsOn)}. Bring it back with: ${recoveryHint(moved.recovery)}`,
+          };
+        }
+        putBack = now;
+        final = true;
+      } else {
+        final = moved.final;
       }
       why = moved.reason;
-      final = moved.result === 'not-moved' ? moved.final : true;
     }
     // The daemon moves sessions off the global slot only, onto a folder slot it judges movable.
     const daemonMoves =
@@ -904,7 +986,9 @@ async function decide(
           : '') +
         ' Opening it there.',
     );
-    return here(where.configDir);
+    return putBack !== undefined
+      ? open(putBack.configDir, putBack.short, putBack.currentId)
+      : here(where.configDir);
   }
 
   // It runs nowhere. With the slot chosen by the operator, or for a plain --resume (Claude Code
@@ -913,6 +997,25 @@ async function decide(
   const rows = target.known.rows;
   // No row anywhere: nothing of cctl's to open, and Claude Code says so itself.
   if (rows.length === 0) return PASS;
+  // Rows that record different conversations under one job id (its earlier conversation, or that
+  // one resumed as a job of its own elsewhere) leave no telling which the operator means; removing
+  // all but one could drop the one meant. Each is resumed by its own id.
+  const conversations = [...new Set(rows.map((r) => conversationOf(r.row)))];
+  if (conversations.length > 1) {
+    const each: string[] = [];
+    for (const id of conversations) {
+      const on = rows.filter((r) => conversationOf(r.row) === id).map((r) => r.configDir);
+      each.push(
+        `${id} on ${(await Promise.all(on.map((c) => ctx.view(c)))).map(onWhat).join(', ')}`,
+      );
+    }
+    return {
+      kind: 'refuse',
+      message:
+        `${label(target)} has job rows for more than one conversation (${each.join('; ')}); ` +
+        'resume the one you mean by its id: cctl claude --resume <id>.',
+    };
+  }
   const home = await ctx.homeOf(target.cwd);
 
   // Started under a config dir from its row there, idle, and confirmed; a refusal says why. The row
@@ -986,7 +1089,7 @@ async function decide(
   const latest = rows[0]!;
   let hint: string | undefined;
   const started = await ctx.shield(
-    () =>
+    (hold) =>
       moveBackgroundSession(
         ctx.host,
         {
@@ -998,7 +1101,10 @@ async function decide(
         },
         ctx.timing,
         // From here its rows are going, until it is started there or put back.
-        (recovery) => (hint = recoveryHint(ctx, recovery)),
+        (recovery) => {
+          hint = recoveryHint(recovery);
+          hold();
+        },
       ),
     () => hint,
   );
@@ -1015,7 +1121,7 @@ async function decide(
         kind: 'refuse',
         message:
           `could not start ${label(target)} on ${onWhat(await ctx.view(home.configDir))} ` +
-          `(${started.reason}). Resume it with: ${recoveryHint(ctx, started.recovery)}`,
+          `(${started.reason}). Bring it back with: ${recoveryHint(started.recovery)}`,
       };
     }
     return cannotStart(home.configDir, started.reason);

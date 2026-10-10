@@ -1097,10 +1097,13 @@ async function titleFolders(cwd: string): Promise<string[]> {
   return [cwd, ...worktrees, ...own];
 }
 
-/** Ctrl-C held off around a move: between the stop and the resume the session runs nowhere, so a
- *  move interrupted there would leave it stopped. The signals that would end cctl (Ctrl-C, Ctrl-Break,
- *  a closing terminal) are taken while the move runs and said once; the move then finishes or puts
- *  the session back, and `interrupted` tells the launch to open nothing after it. */
+/** Ctrl-C held off around a move from the moment it commits: between the stop and the resume the
+ *  session runs nowhere, so a move interrupted there would leave it stopped. Its checks before that
+ *  touch nothing, and Ctrl-C there ends cctl as usual. Once the move holds them, the signals that
+ *  would end cctl (Ctrl-C, Ctrl-Break, a closing terminal) are taken and said once; the move then
+ *  finishes or puts the session back, and `interrupted` tells the launch to open nothing after it.
+ *  A closing window is not waited on for long (Windows ends a process a few seconds after its
+ *  console closes), so the line says how to bring the session back should that cut the move off. */
 function moveShield(say: (line: string) => void): {
   shield: RouteContext['shield'];
   interrupted: () => boolean;
@@ -1116,7 +1119,7 @@ function moveShield(say: (line: string) => void): {
       say(
         'cctl: finishing the move first; stopping now would leave the session stopped.' +
           (hint !== undefined
-            ? ` If this window closes before it finishes, resume it with: ${hint}`
+            ? ` If this window closes before it finishes, bring it back with: ${hint}`
             : ''),
       );
     }
@@ -1125,11 +1128,16 @@ function moveShield(say: (line: string) => void): {
   return {
     async shield(fn, note) {
       recovery = note;
-      for (const sig of signals) process.on(sig, onSignal);
+      let holding = false;
+      const hold = (): void => {
+        if (holding) return;
+        holding = true;
+        for (const sig of signals) process.on(sig, onSignal);
+      };
       try {
-        return await fn();
+        return await fn(hold);
       } finally {
-        for (const sig of signals) process.off(sig, onSignal);
+        if (holding) for (const sig of signals) process.off(sig, onSignal);
       }
     },
     interrupted: () => interrupted,

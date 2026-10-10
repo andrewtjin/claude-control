@@ -43,9 +43,24 @@
 // These shapes were measured against Claude Code 2.1.295 and again against 2.1.296; anything else
 // is read defensively, and an unexpected answer fails the operation rather than guessing. Every
 // command runs detached from the operator's terminal, so a Ctrl-C there cannot cut one off half way.
+// What cctl keeps of its own beside the move locks: one recovery per move that has committed and not
+// yet seen the session run again (see the daemon's ResumeRecovery), so `cctl claude --resume <id>`
+// can bring back a session whose move was cut off, its process gone with it.
 
+import { randomUUID } from 'node:crypto';
 import { spawn as nodeSpawn } from 'node:child_process';
-import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
   JOB_ID_PATTERN,
@@ -55,6 +70,7 @@ import {
   type BackgroundSessionHost,
   type JobRow,
   type LiveSession,
+  type ResumeRecovery,
   type RowRead,
   type SavedLaunch,
   type SessionActivity,
@@ -100,6 +116,9 @@ export interface ClaudeBackgroundHost extends BackgroundSessionHost {
   /** The CLAUDE_CONFIG_DIR that reaches a config dir's service, or undefined for none (the main
    *  config dir at its default place): a launch there is run with exactly this. */
   configEnv(configDir: string | null): string | undefined;
+  /** The recovery a committed move saved for a conversation and has not dropped (see the daemon's
+   *  saveRecovery), or undefined for none or one that cannot be read. */
+  recoveryOf(sessionId: string): Promise<ResumeRecovery | undefined>;
 }
 
 /** How a host reaches the main config dir, from the paths cctl resolved: the dir itself, and
@@ -125,7 +144,8 @@ export interface ClaudeBackgroundHostOptions {
    * this process's environment sets it.
    */
   mainConfigDirInEnv?: boolean;
-  /** Where the cross-process move locks live, one per session (see {@link moveLocksDir}). */
+  /** Where the cross-process move locks live, one per session id (see {@link moveLocksDir}), and,
+   *  in its `recovery` folder, each committed move's recovery. */
   moveLockDir: string;
   /** cctl's folder profiles root: every directory in it is a config dir with a service. */
   profilesRoot?: string;
@@ -135,6 +155,11 @@ export interface ClaudeBackgroundHostOptions {
   /** How Claude Code is run (default: the `claude` on PATH, without a shell). */
   run?: RunClaude;
   readFile?: (path: string) => string;
+  /** Write a file whole, so a reader never sees half of it (default: a temp file beside it renamed
+   *  into place, its folder made first). */
+  writeFile?: (path: string, text: string) => void;
+  /** Remove a file; one that is not there is no error. */
+  removeFile?: (path: string) => void;
   /** The head and the tail of a conversation, where its title lines are (default: read from disk,
    *  {@link TITLE_WINDOW_BYTES} of each end); undefined when it cannot be read. */
   readEnds?: (path: string) => string | undefined;
@@ -525,11 +550,6 @@ function headAndTail(path: string): string | undefined {
   }
 }
 
-/** One word of a command line, quoted for the operator's shell when it needs it. */
-function shellWord(word: string): string {
-  return /^[A-Za-z0-9_@%+=:,./\\-]+$/.test(word) ? word : `"${word.replace(/"/g, '\\"')}"`;
-}
-
 /** The first line of a command's output, trimmed, for an error message. */
 function firstLine(text: string): string {
   return text.trim().split(/\r?\n/)[0]?.trim() ?? '';
@@ -598,6 +618,20 @@ function defaultRunClaude(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): Ru
     });
 }
 
+/** Write a file whole: a temp file beside it, renamed into place, so a reader never sees half of
+ *  it; its folder is made first. */
+function writeFileWhole(path: string, text: string): void {
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(temp, text);
+    renameSync(temp, path);
+  } catch (err) {
+    rmSync(temp, { force: true });
+    throw err;
+  }
+}
+
 /** A JSON file's top-level object, or undefined for one that is missing, torn or not an object. */
 function readObject(
   readFile: (path: string) => string,
@@ -648,6 +682,8 @@ export function createClaudeBackgroundHost(
   const platform = options.platform ?? process.platform;
   const run = options.run ?? defaultRunClaude(platform, baseEnv);
   const readFile = options.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
+  const writeWhole = options.writeFile ?? writeFileWhole;
+  const removeFile = options.removeFile ?? ((p: string) => rmSync(p, { force: true }));
   const readDir = options.readDir ?? ((p: string) => readdirSync(p));
   const readEnds = options.readEnds ?? headAndTail;
   const isAlive = options.isProcessAlive ?? pidIsAlive;
@@ -1010,6 +1046,10 @@ export function createClaudeBackgroundHost(
     return found.row;
   };
 
+  /** Where a conversation's recovery is kept: one file per conversation, beside the move locks. */
+  const recoveryDir = join(options.moveLockDir, 'recovery');
+  const recoveryPath = (sessionId: string): string => join(recoveryDir, `${sessionId}.json`);
+
   return {
     configDirs() {
       return Promise.resolve(configDirsNow());
@@ -1243,10 +1283,49 @@ export function createClaudeBackgroundHost(
 
     configEnv,
 
-    resumeHint(configDir, sessionId, opts) {
-      const named = configEnv(configDir);
-      const words = ['claude', '--bg', '--resume', sessionId, ...opts].map(shellWord).join(' ');
-      return named === undefined ? words : `CLAUDE_CONFIG_DIR=${shellWord(named)} ${words}`;
+    saveRecovery(recovery) {
+      if (!SESSION_ID.test(recovery.sessionId)) {
+        return Promise.reject(new Error(`not a background session id: ${recovery.sessionId}`));
+      }
+      try {
+        writeWhole(recoveryPath(recovery.sessionId), JSON.stringify(recovery));
+        return Promise.resolve();
+      } catch (err) {
+        return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    },
+
+    dropRecovery(sessionId) {
+      if (!SESSION_ID.test(sessionId)) return Promise.resolve();
+      try {
+        removeFile(recoveryPath(sessionId));
+        return Promise.resolve();
+      } catch (err) {
+        return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    },
+
+    recoveryOf(sessionId) {
+      if (!SESSION_ID.test(sessionId)) return Promise.resolve(undefined);
+      const r = readObject(readFile, recoveryPath(sessionId));
+      const options = r?.options;
+      const job = r?.job as { short?: unknown; sessionId?: unknown } | null | undefined;
+      const valid =
+        r !== undefined &&
+        r.sessionId === sessionId &&
+        (r.configDir === null || (typeof r.configDir === 'string' && r.configDir.length > 0)) &&
+        typeof r.cwd === 'string' &&
+        r.cwd.length > 0 &&
+        Array.isArray(options) &&
+        options.every((o) => typeof o === 'string') &&
+        typeof job === 'object' &&
+        job !== null &&
+        typeof job.short === 'string' &&
+        SHORT_ID.test(job.short) &&
+        typeof job.sessionId === 'string' &&
+        SESSION_ID.test(job.sessionId) &&
+        job.sessionId.startsWith(job.short);
+      return Promise.resolve(valid ? (r as unknown as ResumeRecovery) : undefined);
     },
   };
 }

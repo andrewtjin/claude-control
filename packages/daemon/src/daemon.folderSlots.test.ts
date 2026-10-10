@@ -1955,7 +1955,9 @@ describe('daemon folder-bound slots — background sessions move onto their fold
     });
     await rig.start();
     await waitFor(() => notMovedNotices(rig.relay).length > 0);
-    expect(notMovedNotices(rig.relay)[0]?.body).toContain('resume it with');
+    expect(notMovedNotices(rig.relay)[0]?.body).toContain(
+      'bring it back with: cctl claude --resume',
+    );
   });
 
   it('never moves a session out of a folder without a rule', async () => {

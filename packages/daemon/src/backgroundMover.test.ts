@@ -308,16 +308,22 @@ describe('BackgroundMover', () => {
     expect(h.host.rowsFor(SID)).toEqual([MAIN]);
   });
 
-  it('when even the way back fails, the notice says how to resume it by hand, options included', async () => {
+  it('when even the way back fails, the notice gives the command that brings it back, its options kept for it', async () => {
     const h = harness();
     h.onMain(session(SID, 'C:/research'), { idle: true });
     h.host.failResumeIn.add(PROFILE);
     h.host.failResumeIn.add(MAIN);
     const outcomes = await h.mover.run(targets(TARGET));
     expect(outcomes[0]).toMatchObject({ result: 'failed', restored: false });
-    expect(h.notices[0]?.body).toContain(
-      `resume it with: claude --bg --resume ${SID} --permission-mode=auto`,
-    );
+    expect(h.notices[0]?.body).toContain(`bring it back with: cctl claude --resume ${SID}`);
+    // What that command resumes, kept by the move: where it was, from its folder, every option.
+    expect(h.host.recoveries.get(SID)).toEqual({
+      configDir: MAIN,
+      sessionId: SID,
+      job: { short: SHORT, sessionId: SID },
+      options: SAVED,
+      cwd: 'C:/research',
+    });
   });
 
   it('a stop Claude Code refuses leaves the session running where it was, and gives up', async () => {
@@ -617,7 +623,7 @@ describe('BackgroundMover', () => {
       h.host.silentResumeIn.add(MAIN);
       const outcomes = await h.mover.run(targets(TARGET));
       expect(outcomes[0]).toMatchObject({ result: 'failed', restored: false });
-      expect(h.notices[0]?.body).toContain(`resume it with: claude --bg --resume ${SID}`);
+      expect(h.notices[0]?.body).toContain(`bring it back with: cctl claude --resume ${SID}`);
       expect(h.notices[0]?.body).not.toContain('as before');
       // Accepted once is enough: another try would only start a copy of a session coming up.
       expect(h.host.calls.filter((c) => c.startsWith('resume null'))).toHaveLength(1);

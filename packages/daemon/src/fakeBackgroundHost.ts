@@ -1,19 +1,22 @@
-// An in-memory Claude Code for the background-session tests: services per config dir, a job row per
-// config dir, one shared registry, and every command logged. Its commands behave the way the real
-// binary was measured to (2.1.295): a stop takes the session out of its service and leaves its row
-// stopped; a resume while the session runs anywhere starts a copy (refused here); a resume with
+// An in-memory host for the background-session tests: services per config dir, a job row per config
+// dir, one shared registry, every command logged. It stands in for the real host (cli's
+// backgroundHost.ts) over a Claude Code that behaves as the binary was measured to (2.1.295 and
+// 2.1.296): a stop takes the session out of its service and leaves its row stopped (a failed one
+// failed); a resume while the session runs anywhere starts a copy (refused here); a resume with
 // options over a row is refused; a first resume in a config dir writes a row saved with the options
 // given; `rm` deletes a row. Like the real host, it never runs an rm Claude Code would turn into a
 // kill or a worktree deletion: it refuses a row that records a worktree, one that cannot be read
 // right now, and one whose session is live or starting anywhere (by the registry, the way Claude
-// Code's rm reaches it, or by any service's roster). Each command can be made to fail. Test support
-// only: nothing in the product imports it.
+// Code's rm reaches it, or by any service's roster). Reads can be made verified, as the real host's
+// are: a roster record whose pid was reused is listed only by an unverified read. Each command can
+// be made to fail. Test support only: nothing in the product imports it.
 
 import type {
   BackgroundSession,
   BackgroundSessionHost,
   JobRow,
   LiveSession,
+  ResumeRecovery,
   RowRead,
   SavedLaunch,
   SessionActivity,
@@ -43,6 +46,8 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
   /** Every config dir with a service, the main one first. */
   readonly dirs: Array<string | null>;
   readonly hosted = new Map<string | null, BackgroundSession[]>();
+  /** Roster records whose pid now names another process: only an unverified read lists them. */
+  readonly reusedPids = new Map<string | null, BackgroundSession[]>();
   /** What `claude agents` reports, by short id. */
   readonly states = new Map<string, SessionActivity>();
   /** Each config dir's rows, by short id. */
@@ -53,17 +58,25 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
   readonly currentIds = new Map<string, string>();
   /** Config dirs a terminal has a session of open in. */
   readonly attachedIn = new Set<string | null>();
-  /** Session ids whose move lock another process holds. */
+  /** Ids whose move lock another process holds. */
   readonly lockedElsewhere = new Set<string>();
+  /** Ids whose move lock is held here now, taken and not yet released. */
+  readonly heldLocks = new Set<string>();
   /** Every lock taken and released, in order. */
   readonly locks: string[] = [];
+  /** The recoveries a move saved, by the conversation it resumes. */
+  readonly recoveries = new Map<string, ResumeRecovery>();
   failAttached = false;
   failListing = false;
   failRegistry = false;
   failActivity = false;
   failStop = false;
+  failSaveRecovery = false;
   /** A stop that Claude Code takes but the host does not see through: it rejects after stopping. */
   stopNotSeenThrough = false;
+  /** A stop after which the session is still hosted (slow to exit, or respawned): with
+   *  {@link stopNotSeenThrough} the stop rejects so, without it, it resolves so. */
+  stopKeepsHosted = false;
   /** Config dirs whose `rm` fails. */
   readonly failRemoveIn = new Set<string | null>();
   /** Config dirs whose resume fails. */
@@ -132,7 +145,10 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
     return Promise.resolve([...this.dirs]);
   }
 
-  listHosted(configDir: string | null): Promise<BackgroundSession[]> {
+  listHosted(
+    configDir: string | null,
+    opts?: { verified?: boolean },
+  ): Promise<BackgroundSession[]> {
     this.calls.push(`list ${named(configDir)}`);
     this.beforeList?.(configDir);
     if (this.failListing) return Promise.reject(new Error('roster unreadable'));
@@ -142,7 +158,8 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
       return Promise.resolve([]);
     }
     this.pendingReads.delete(configDir);
-    return Promise.resolve([...(this.hosted.get(configDir) ?? [])]);
+    const reused = opts?.verified === true ? [] : (this.reusedPids.get(configDir) ?? []);
+    return Promise.resolve([...(this.hosted.get(configDir) ?? []), ...reused]);
   }
 
   liveSessions(): Promise<LiveSession[]> {
@@ -185,7 +202,7 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
   stop(configDir: string | null, short: string): Promise<void> {
     this.calls.push(`stop ${named(configDir)} ${short}`);
     if (this.failStop) return Promise.reject(new Error('stop refused'));
-    this.unhost(configDir, short);
+    if (!this.stopKeepsHosted) this.unhost(configDir, short);
     const row = this.rowOf(configDir, short);
     // A failed row stays failed (measured); any other is left stopped.
     if (row !== undefined && row.state !== 'failed') row.state = 'stopped';
@@ -271,6 +288,11 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
       });
     } else {
       row.state = 'running';
+      // Woken by the id its job started with, it runs the conversation it ran last (after /clear,
+      // not that id), as Claude Code wakes a row.
+      if (row.resumeSessionId !== undefined && row.resumeSessionId !== row.sessionId) {
+        this.currentIds.set(input.short, row.resumeSessionId);
+      }
     }
     if (!this.silentResumeIn.has(c)) {
       this.hosted.set(c, [
@@ -306,16 +328,32 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
   }
 
   lockSession(sessionId: string, waitMs: number): Promise<SessionLock | undefined> {
-    if (this.lockedElsewhere.has(sessionId)) return Promise.resolve(undefined);
+    if (this.lockedElsewhere.has(sessionId) || this.heldLocks.has(sessionId)) {
+      return Promise.resolve(undefined);
+    }
+    this.heldLocks.add(sessionId);
     this.locks.push(`take ${sessionId} ${waitMs}`);
-    return Promise.resolve({ release: () => void this.locks.push(`release ${sessionId}`) });
+    let released = false;
+    return Promise.resolve({
+      release: () => {
+        if (released) return;
+        released = true;
+        this.heldLocks.delete(sessionId);
+        this.locks.push(`release ${sessionId}`);
+      },
+    });
   }
 
-  resumeHint(configDir: string | null, sessionId: string, options: readonly string[]): string {
-    return (
-      (configDir === null ? '' : `CLAUDE_CONFIG_DIR=${configDir} `) +
-      `claude --bg --resume ${sessionId}` +
-      options.map((o) => ` ${o}`).join('')
-    );
+  saveRecovery(recovery: ResumeRecovery): Promise<void> {
+    this.calls.push(`save ${recovery.sessionId}`);
+    if (this.failSaveRecovery) return Promise.reject(new Error('disk full'));
+    this.recoveries.set(recovery.sessionId, recovery);
+    return Promise.resolve();
+  }
+
+  dropRecovery(sessionId: string): Promise<void> {
+    this.calls.push(`drop ${sessionId}`);
+    this.recoveries.delete(sessionId);
+    return Promise.resolve();
   }
 }
