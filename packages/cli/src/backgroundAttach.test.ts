@@ -678,9 +678,12 @@ describe('routeBackgroundLaunch — the session runs on another account', () => 
     const d = await decideIn(w, attach(SHORT));
     expect(d).toMatchObject(openUnder(MAIN));
     expect(w.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
-    expect(w.lines.at(-1)).toContain(
-      'for now: it holds work between turns (a scheduled wakeup or a background task).',
-    );
+    // Nothing was moved, so nothing said it would be.
+    expect(w.lines).toEqual([
+      'cctl: background session c5f2097e stays on Shared (the global slot) for now: it holds ' +
+        "work between turns (a scheduled wakeup or a background task). cctl's daemon moves it " +
+        'onto Inc between turns. Opening it there.',
+    ]);
   });
 
   it('a session in a git worktree Claude Code made for it is opened where it runs, never moved', async () => {
@@ -691,8 +694,7 @@ describe('routeBackgroundLaunch — the session runs on another account', () => 
     expect(w.host.calls).toEqual([]);
     expect(w.lines[0]).toBe(
       'cctl: background session c5f2097e stays on Shared (the global slot) for now: it works in a ' +
-        'git worktree Claude Code made for it, which a move would delete, so it stays where it ' +
-        'runs. Opening it there.',
+        'git worktree Claude Code made for it, which a move would delete. Opening it there.',
     );
   });
 

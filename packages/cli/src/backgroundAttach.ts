@@ -710,9 +710,7 @@ async function decide(
     let why: string;
     let final = false;
     if (tree !== undefined) {
-      why =
-        'it works in a git worktree Claude Code made for it, which a move would delete, so it ' +
-        'stays where it runs';
+      why = 'it works in a git worktree Claude Code made for it, which a move would delete';
       final = true;
     } else if (home.unusable !== undefined) {
       why = home.unusable;
@@ -724,10 +722,6 @@ async function decide(
     } else if (where.status !== 'idle') {
       why = stayReason(where.status);
     } else {
-      ctx.say(
-        `cctl: moving background session ${label(target)} from ${onWhat(runsOn)} onto ` +
-          `${onWhat(belongs)}; Ctrl-C waits until it has finished.`,
-      );
       const moved: MoveResult = await ctx.shield(() =>
         moveBackgroundSession(
           ctx.host,
@@ -738,6 +732,13 @@ async function decide(
             platform,
           },
           ctx.timing,
+          // Said once the move's own checks have passed, right before the stop: from then on the
+          // session runs nowhere until it is resumed, here or back where it was.
+          () =>
+            ctx.say(
+              `cctl: moving background session ${label(target)} from ${onWhat(runsOn)} onto ` +
+                `${onWhat(belongs)}; Ctrl-C waits until it has finished.`,
+            ),
         ),
       );
       if (moved.result === 'moved') {
