@@ -28,10 +28,10 @@
 //     started with only until the job is woken again: woken, it runs the conversation its row ran
 //     last, and its worker records that one (measured). So a hosted job is known by its short id,
 //     never by the first digits of an id. A move resumes the CURRENT conversation, which then runs
-//     under a job named after it. A row elsewhere that
-//     records another conversation under the same job id (the job's earlier conversation, or that
-//     conversation resumed as a job of its own) is not this session's: it is left alone, since a
-//     wake of it reaches only that job id, which the moved session no longer runs under;
+//     under a job named after it. A row elsewhere that records another conversation under the same
+//     job id (the job's earlier conversation, or that conversation resumed as a job of its own) is
+//     not this session's: it is left alone, since a wake of it reaches only that job id, which the
+//     moved session no longer runs under;
 //   - a session waiting on a scheduled wakeup or running background work is reported idle, but its
 //     row records the work (`inFlight`); a stop would drop it, so such a session is not moved.
 //
