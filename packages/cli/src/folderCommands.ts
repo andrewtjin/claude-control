@@ -54,9 +54,8 @@ import { timelineInputFromWire, type AccountUsageInput } from '@claude-control/u
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import {
+  backgroundHostOptions,
   createClaudeBackgroundHost,
-  mainConfigOf,
-  moveLocksDir,
   type ClaudeBackgroundHost,
 } from './backgroundHost.js';
 import {
@@ -1028,16 +1027,11 @@ async function refuseSeatingUnderOlderDaemon(engine: Engine, rule: FolderRule): 
  *  was asked to open: a move is a stop, a resume and a confirm, seconds each. */
 const BACKGROUND_LOCK_WAIT_MS = 90_000;
 
-/** The background-service host `cctl claude` reads and drives. It reads the main config dir cctl
- *  resolved (a CLAUDE_CONFIG_DIR naming a folder profile, as inside a profile's session, is seen
- *  through to it) and runs every command against that same dir's service, so what it reads is what
- *  it talks to. */
-function launcherBackgroundHost(paths: Paths, profRoot: string): ClaudeBackgroundHost {
-  return createClaudeBackgroundHost({
-    ...mainConfigOf(paths),
-    moveLockDir: moveLocksDir(dirname(paths.vaultDir)),
-    profilesRoot: profRoot,
-  });
+/** The background-service host `cctl claude` reads and drives: built as the daemon builds its own
+ *  (see backgroundHostOptions), so it reads the main config dir cctl resolved and runs every command
+ *  against that same dir's service, and takes the locks the daemon takes. */
+function launcherBackgroundHost(paths: Paths): ClaudeBackgroundHost {
+  return createClaudeBackgroundHost(backgroundHostOptions(paths));
 }
 
 /** A folder's canonical key, leniently: a path with no canonical form is keyed as spelled. */
@@ -1296,7 +1290,7 @@ async function runClaude(opts: {
     const ctx = routeContext(
       engine,
       paths,
-      launcherBackgroundHost(paths, profRoot),
+      launcherBackgroundHost(paths),
       await daemonIsRunning(),
       guard.shield,
     );

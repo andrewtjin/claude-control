@@ -8,14 +8,17 @@
 // the environment and the working directory are proven on the path production uses.
 
 import { realpathSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { whereRuns } from '@claude-control/daemon';
 import {
+  backgroundHostOptions,
   createClaudeBackgroundHost,
   holdsPendingWork,
   mainConfigOf,
+  MOVE_LOCK_REFRESH_MS,
   moveLocksDir,
   projectDirName,
   replayOptions,
@@ -330,6 +333,58 @@ describe('createClaudeBackgroundHost', () => {
       // A start time that cannot be read is no reason to doubt the process, as for Claude Code.
       const unread = hostWith({ files, starts: new Map() });
       expect(await unread.host.listHosted(null, { verified: true })).toHaveLength(1);
+    });
+
+    it('verified, a worker recorded with its Windows start time (procStartFt) is checked by that', async () => {
+      const files = {
+        [`${MAIN}/daemon/roster.json`]: roster({
+          [SHORT]: { ...worker(SID, 'C:/r', 4242), procStartFt: '134360864829411286' },
+        }),
+      };
+      const reused = hostWith({ files, starts: new Map([[4242, '134360999999999999']]) });
+      expect(await reused.host.listHosted(null, { verified: true })).toEqual([]);
+    });
+
+    it('a start time read over a minute ago is read again: a pid reused since is not the process recorded', async () => {
+      let now = 0;
+      const starts = new Map([[4242, '134360864829411286']]);
+      const { host } = hostWith({
+        files: {
+          [`${MAIN}/daemon/roster.json`]: roster({
+            [SHORT]: { ...worker(SID, 'C:/r', 4242), procStart: '134360864829411286' },
+          }),
+        },
+        starts,
+        clock: () => now,
+      });
+      expect(await host.listHosted(null, { verified: true })).toHaveLength(1);
+      // The process exits and its pid is reused, past the minute a start time is kept.
+      starts.set(4242, '134360999999999999');
+      now += 61_000;
+      expect(await host.listHosted(null, { verified: true })).toEqual([]);
+    });
+
+    it('a worker whose pid is no process id is no live host', async () => {
+      for (const pid of [0, -1, 1.5]) {
+        const { host } = hostWith({
+          files: { [`${MAIN}/daemon/roster.json`]: roster({ [SHORT]: worker(SID, 'C:/r', pid) }) },
+        });
+        expect({ pid, hosted: await host.listHosted(null) }).toEqual({ pid, hosted: [] });
+      }
+    });
+
+    it("the daemon's look at where a session runs reads verified rosters: a worker whose pid was reused hosts nothing", async () => {
+      const { host } = hostWith({
+        files: {
+          [`${MAIN}/daemon/roster.json`]: roster({
+            [SHORT]: { ...worker(SID, 'C:/r', 4242), procStart: '134360864829411286' },
+          }),
+        },
+        starts: new Map([[4242, '134360999999999999']]),
+      });
+      expect(await whereRuns(host, { ids: new Set([SID]), shorts: new Set([SHORT]) })).toEqual({
+        kind: 'nowhere',
+      });
     });
   });
 
@@ -858,6 +913,11 @@ describe('what cctl claude reads to find a session', () => {
     }
   });
 
+  it('a record of background tasks alone holds work between turns', () => {
+    expect(holdsPendingWork({ tasks: 2 })).toBe(true);
+    expect(holdsPendingWork({ tasks: 0, kinds: [] })).toBe(false);
+  });
+
   it('a row that is locked or caught mid-write is unreadable, never taken for no row', async () => {
     const { host } = hostWith({
       files: {
@@ -1096,6 +1156,97 @@ describe('the move lock', () => {
     again!.release();
   });
 
+  it('stops refreshing a claim that is no longer its own, so no timer outlives the lock', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
+    const spy = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      const host = createClaudeBackgroundHost({
+        mainConfigDir: MAIN,
+        moveLockDir: moveLocksDir(dir),
+        lockRefreshMs: 20,
+      });
+      const held = await host.lockSession(SID, 0);
+      // Reclaimed from under it: its directory is gone, or another holder's now.
+      await rm(join(moveLocksDir(dir), SID), { recursive: true, force: true });
+      spy.mockClear();
+      await new Promise((r) => setTimeout(r, 120));
+      expect(spy).toHaveBeenCalledTimes(1);
+      // Nothing of it was written back.
+      expect(await readdir(moveLocksDir(dir))).toEqual([]);
+      held!.release();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a held lock is never reclaimed by age between two refreshes of its claim', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
+    const locks = moveLocksDir(dir);
+    // Only the wall clock the lock ages by is faked: no refresh runs meanwhile.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const claimedAt = 1_000_000;
+      vi.setSystemTime(claimedAt);
+      const a = createClaudeBackgroundHost({ mainConfigDir: MAIN, moveLockDir: locks });
+      const held = await a.lockSession(SID, 0);
+      expect(held).toBeDefined();
+      // As old as a live holder's claim gets, right before its next refresh.
+      vi.setSystemTime(claimedAt + MOVE_LOCK_REFRESH_MS);
+      const b = createClaudeBackgroundHost({ mainConfigDir: MAIN, moveLockDir: locks });
+      expect(await b.lockSession(SID, 0)).toBeUndefined();
+      // Nor was it reclaimed from under its holder on the way: it is still held.
+      expect(await b.lockSession(SID, 0)).toBeUndefined();
+      held!.release();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releasing it stops refreshing its claim at once', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
+    const spy = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      const host = createClaudeBackgroundHost({
+        mainConfigDir: MAIN,
+        moveLockDir: moveLocksDir(dir),
+        lockRefreshMs: 20,
+      });
+      const held = await host.lockSession(SID, 0);
+      spy.mockClear();
+      held!.release();
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('never keeps the process alive on its own while held', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
+    const real = globalThis.setInterval;
+    const timers: NodeJS.Timeout[] = [];
+    // Every refresh timer it starts, started for real.
+    const spy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+      fn: () => void,
+      ms: number,
+    ) => {
+      const timer = real(fn, ms);
+      timers.push(timer);
+      return timer;
+    }) as unknown as typeof setInterval);
+    try {
+      const host = createClaudeBackgroundHost({
+        mainConfigDir: MAIN,
+        moveLockDir: moveLocksDir(dir),
+      });
+      const held = await host.lockSession(SID, 0);
+      expect(timers).toHaveLength(1);
+      expect(timers[0]!.hasRef()).toBe(false);
+      held!.release();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('names its directory only after a session id', async () => {
     dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
     const host = createClaudeBackgroundHost({
@@ -1284,6 +1435,46 @@ describe('one main config dir, for every read and every command', () => {
       `CLAUDE_CONFIG_DIR=${MAIN} claude --bg --resume ${SID}`,
     );
   });
+
+  it('the daemon and cctl claude build their hosts alike: the main dir as Claude Code reaches it, every profile, the shared locks', async () => {
+    const VAULT = 'C:/Users/me/AppData/Local/claude-control/vault';
+    // The default layout, from a shell inside a folder profile's session: cctl's paths already see
+    // through the inherited CLAUDE_CONFIG_DIR to the main dir, which Claude Code reaches unset.
+    const options = backgroundHostOptions({
+      claudeDir: MAIN,
+      claudeJsonPath: 'C:/Users/me/.claude.json',
+      vaultDir: VAULT,
+    });
+    expect(options).toEqual({
+      mainConfigDir: MAIN,
+      mainConfigDirInEnv: false,
+      moveLockDir: 'C:/Users/me/AppData/Local/claude-control/background-moves'.replace(
+        /\//g,
+        process.platform === 'win32' ? '\\' : '/',
+      ),
+      profilesRoot: expect.stringMatching(/profiles$/) as unknown,
+    });
+    const runs: Recorded[] = [];
+    const host = createClaudeBackgroundHost({
+      ...options,
+      env: { PATH: '/bin', CLAUDE_CONFIG_DIR: PROFILE },
+      run: (args, o) => {
+        runs.push({ args, env: o.env, cwd: o.cwd });
+        return Promise.resolve({ code: 0, stdout: '[]', stderr: '' });
+      },
+    });
+    await host.activity(null);
+    // Not the inherited profile, and not ~/.claude named in CLAUDE_CONFIG_DIR (another config).
+    expect('CLAUDE_CONFIG_DIR' in runs[0]!.env).toBe(false);
+    // A main dir set by CLAUDE_CONFIG_DIR is named so.
+    expect(
+      backgroundHostOptions({
+        claudeDir: 'D:/cfg',
+        claudeJsonPath: 'D:/cfg/.claude.json',
+        vaultDir: VAULT,
+      }).mainConfigDirInEnv,
+    ).toBe(true);
+  });
 });
 
 describe('the terminal cctl claude started, in the attach journal', () => {
@@ -1298,6 +1489,13 @@ describe('the terminal cctl claude started, in the attach journal', () => {
     expect(await host.attachedBy(PROFILE, 38016)).toBe(true);
     expect(await host.attachedBy(PROFILE, 4242)).toBe(false);
     expect(await host.attachedBy(null, 38016)).toBe(false);
+  });
+
+  it('is not shown by an entry caught mid-write, whoever it turns out to name', async () => {
+    // Unlike attachedNow, where a torn entry counts as open: here it would let a move lock go
+    // before this terminal is known to have shown up.
+    const { host } = hostWith({ files: { [`${JOURNAL}/g1.json`]: '{"pid": 380' } });
+    expect(await host.attachedBy(PROFILE, 38016)).toBe(false);
   });
 });
 

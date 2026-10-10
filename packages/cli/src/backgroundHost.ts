@@ -60,7 +60,12 @@ import {
   type SessionActivity,
   type SessionLock,
 } from '@claude-control/daemon';
-import { LockTimeoutError, acquireLock } from '@claude-control/switch-engine';
+import {
+  LockTimeoutError,
+  acquireLock,
+  profilesRoot,
+  type Paths,
+} from '@claude-control/switch-engine';
 import { findClaudeOnPath, resolveLaunchTarget } from './launcher.js';
 
 /** One finished Claude Code command. */
@@ -154,6 +159,24 @@ export interface ClaudeBackgroundHostOptions {
 /** Where the move locks live under cctl's data dir (the vault dir's parent). */
 export function moveLocksDir(dataDir: string): string {
   return join(dataDir, 'background-moves');
+}
+
+/**
+ * The options the daemon's host and `cctl claude`'s are both built with, from the paths cctl
+ * resolved: the main config dir exactly as Claude Code reaches it (a CLAUDE_CONFIG_DIR naming a
+ * folder profile, as inside a profile's session, already seen through to it, and never taken for
+ * the main dir's own), the move locks and recoveries under cctl's data dir, and the profiles root,
+ * which lists every config dir a session can hold a job row in. Both processes reading, locking and
+ * removing rows alike is what keeps them from moving one session at once, or leaving a row behind.
+ */
+export function backgroundHostOptions(
+  paths: Pick<Paths, 'claudeDir' | 'claudeJsonPath' | 'vaultDir'>,
+): ClaudeBackgroundHostOptions {
+  return {
+    ...mainConfigOf(paths),
+    moveLockDir: moveLocksDir(dirname(paths.vaultDir)),
+    profilesRoot: profilesRoot(paths.vaultDir),
+  };
 }
 
 /** How long one Claude Code command may run. A resume returns once the session is dispatched, in
@@ -698,9 +721,13 @@ export function createClaudeBackgroundHost(
   /** A process's start time as last read, by pid, and when it was read. */
   const startCache = new Map<number, { at: number; start: string | undefined }>();
   /** The start time of each of these live processes now (cached a while, as Claude Code does);
-   *  one that cannot be read is undefined. */
+   *  one that cannot be read is undefined. Reads past their time are dropped first, so a host that
+   *  lives as long as the daemon keeps only the processes it read lately. */
   const startsOf = async (pids: readonly number[]): Promise<Map<number, string | undefined>> => {
     const now = clock();
+    for (const [pid, hit] of startCache) {
+      if (now - hit.at > START_TIME_TTL_MS) startCache.delete(pid);
+    }
     const stale = pids.filter((pid) => {
       const hit = startCache.get(pid);
       return hit === undefined || now - hit.at > START_TIME_TTL_MS;
@@ -1065,8 +1092,11 @@ export function createClaudeBackgroundHost(
         throw err;
       }
       // Kept fresh for as long as it is held, however long that is; unref'd so a held lock never
-      // keeps the process alive on its own.
-      const refresher = setInterval(() => lock.refresh(), lockRefreshMs);
+      // keeps the process alive on its own. A claim no longer this holder's (reclaimed, released)
+      // is not refreshed again, so no timer outlives the lock it serves.
+      const refresher = setInterval(() => {
+        if (!lock.refresh()) clearInterval(refresher);
+      }, lockRefreshMs);
       refresher.unref();
       return {
         release: () => {
