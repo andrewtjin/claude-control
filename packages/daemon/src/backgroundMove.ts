@@ -467,15 +467,20 @@ export async function whereRuns(
   }
   if (holders.length === 1) {
     const { configDir, worker } = holders[0]!;
-    const entry = entries.find((e) => e.jobId === worker.short) ?? entries[0];
+    const entry = entries.find((e) => e.kind === 'bg' && e.jobId === worker.short);
+    // A session coming up is listed in its roster before its registry entry is written, then has an
+    // entry with a stand-in session id and no status for a moment (measured); one going down loses
+    // its entry first. Until its entry says what it is doing, what it runs is not known either.
+    if (entry?.status === undefined)
+      return { kind: 'unclear', reason: 'it is starting or stopping' };
     return {
       kind: 'bg',
       configDir,
       short: worker.short,
       sessionId: worker.sessionId,
-      currentId: entry?.sessionId ?? worker.sessionId,
+      currentId: entry.sessionId,
       cwd: worker.cwd,
-      ...(entry?.status !== undefined ? { status: entry.status } : {}),
+      status: entry.status,
     };
   }
   if (holders.length === 0 && entries.length === 0) return { kind: 'nowhere' };

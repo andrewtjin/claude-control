@@ -739,11 +739,9 @@ describe('routeBackgroundLaunch — the session runs on another account', () => 
     for (const [status, why] of [
       ['busy', 'it is in a turn'],
       ['waiting', 'it is waiting on a prompt'],
-      [undefined, 'it is not idle between turns'],
     ] as const) {
       const w = world({}, { daemonRunning: true });
-      w.host.runs(MAIN, SID, status === undefined ? {} : { status });
-      if (status === undefined) delete w.host.registry[0]!.status;
+      w.host.runs(MAIN, SID, { status });
       w.host.row(X, 'stopped');
       const d = await decideIn(w, attach(SHORT));
       expect(d).toMatchObject(openUnder(MAIN));
@@ -753,6 +751,37 @@ describe('routeBackgroundLaunch — the session runs on another account', () => 
           "cctl's daemon moves it onto Inc between turns. Opening it there.",
       ]);
     }
+  });
+
+  it('a session still coming up, its registry entry saying nothing yet, is read again and never decided on a guess', async () => {
+    // Measured: a session's first registry entry has a stand-in session id and no status.
+    const w = world();
+    w.host.runs(MAIN, SID, { current: '7a7a7a7a-1111-4222-8333-444444444444' });
+    w.host.registry[0]!.sessionId = '0f0f0f0f-1111-4222-8333-444444444444';
+    delete w.host.registry[0]!.status;
+    let looks = 0;
+    w.host.beforeRegistry = (n) => {
+      looks = n;
+      // Up a moment later: its entry names the conversation it runs, and says it is idle.
+      if (n === 3) {
+        w.host.registry[0]!.sessionId = '7a7a7a7a-1111-4222-8333-444444444444';
+        w.host.registry[0]!.status = 'idle';
+      }
+    };
+    const d = await decideIn(w, resume(SID, ['carry on']));
+    expect(looks).toBeGreaterThanOrEqual(3);
+    expect(d).toMatchObject({
+      kind: 'open',
+      configDir: X,
+      args: ['--resume', '7a7a7a7a-1111-4222-8333-444444444444', 'carry on'],
+    });
+
+    const stuck = world();
+    stuck.host.runs(MAIN, SID);
+    delete stuck.host.registry[0]!.status;
+    const refused = await decideIn(stuck, attach(SHORT));
+    expect(refused.kind === 'refuse' && refused.message).toContain('cannot tell which account');
+    expect(stuck.host.calls).toEqual([]);
   });
 
   it('a session holding a scheduled wakeup is not moved, though it reports idle', async () => {
