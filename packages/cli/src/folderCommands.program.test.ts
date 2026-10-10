@@ -1199,6 +1199,34 @@ describe('cctl claude opening a background session', () => {
     expect(plain.args).toEqual(['--bg']);
   });
 
+  it('a verb first with --bg or --background is routed as the verb alone, never run under a slot holding a trap row', async () => {
+    ruleOnE();
+    await runsIn(main(), 'busy');
+    await rowIn(profile(), 'stopped');
+    // Opened where the session runs, as `attach <short>` is: never under the profile's row of it.
+    const attached = await launchFrom(['attach', SHORT, '--bg']);
+    expect(attached.exited).toBe(false);
+    expect(attached.args).toEqual(['attach', SHORT, '--bg']);
+    expect(attached.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(attached.err).toContain('stays on A (the global slot) for now: it is in a turn.');
+    // Run under the config dir whose service runs it, by its job id there.
+    const stopped = await launchFrom(['stop', 'c5f2', '--background']);
+    expect(stopped.exited).toBe(false);
+    expect(stopped.args).toEqual(['stop', SHORT, '--background']);
+    expect(stopped.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+    // What cctl cannot route to where the session runs is checked against the row: refused.
+    const logs = await launchFrom(['logs', SHORT, '--bg']);
+    expect(logs.exited).toBe(true);
+    expect(logs.err).toContain(`open it with: cctl claude attach ${SHORT}`);
+    expect(logs.args).toBeUndefined();
+    // With --bg after --, Claude Code still just attaches: opened where it runs, not refused.
+    const after = await launchFrom(['attach', SHORT, '--', '--bg']);
+    expect(after.exited).toBe(false);
+    expect(after.args).toEqual(['attach', SHORT, '--', '--bg']);
+    expect(after.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(bgHost.calls).toEqual([]);
+  });
+
   it('a resume spelled -r<id> is opened where the session runs; spellings that are no plain resume are checked first', async () => {
     ruleOnE();
     await runsIn(main(), 'busy');

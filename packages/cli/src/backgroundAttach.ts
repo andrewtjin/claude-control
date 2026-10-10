@@ -42,6 +42,7 @@
 // backgroundMover.ts).
 
 import {
+  JOB_ID_PATTERN,
   SESSION_ID_PATTERN,
   allRows,
   bringBack,
@@ -67,6 +68,7 @@ import {
 import type { BackgroundSession } from '@claude-control/daemon';
 import {
   MOVE_LOCK_STALE_MS,
+  SAVED_LIST_OPTIONS,
   SAVED_VALUE_OPTIONS,
   SHORT_OPTIONS,
   type ClaudeBackgroundHost,
@@ -93,7 +95,8 @@ export type BackgroundRequest =
   | { verb: 'guard'; ref?: string };
 
 /** Options that send a launch to Claude Code's background launcher wherever they stand: it looks for
- *  either word anywhere in the arguments, after `--` and as an option's value too (measured, 2.1.296).
+ *  either word anywhere in the arguments, after `--` and as an option's value too (measured, 2.1.296),
+ *  unless a background-session verb runs first (see {@link claudeCodeVerbAt}).
  *  That launcher starts a new session, wakes this config dir's own row of one that runs nowhere, or
  *  starts a copy of one that runs anywhere; it never opens one in a terminal, so it never takes a
  *  session from the service running it. */
@@ -148,10 +151,176 @@ const VALUE_OPTIONS: ReadonlySet<string> = new Set([
 ]);
 /** Subcommands that stop, remove or restart one session, or all of them. */
 const CONTROL: ReadonlySet<string> = new Set(['stop', 'kill', 'rm', 'respawn']);
+/** Claude Code's background-session verbs (2.1.296): run as the verb when one comes first (see
+ *  {@link claudeCodeVerbAt}). `agents` is none of them. */
+const SESSION_VERBS: ReadonlySet<string> = new Set(['attach', 'logs', ...CONTROL]);
 /** Subcommands that reach a job row, or list rows to choose from: never a plain new session. */
-const ROW_SUBCOMMANDS: ReadonlySet<string> = new Set(['attach', 'agents', 'logs', ...CONTROL]);
+const ROW_SUBCOMMANDS: ReadonlySet<string> = new Set([...SESSION_VERBS, 'agents']);
 /** Long options that resume or continue a conversation: never a plain new session. */
 const RESUMING_OPTIONS: readonly string[] = ['--resume', '--continue', '--from-pr'];
+
+// The rest of Claude Code 2.1.296's own argument scanner, as far as it decides whether a verb runs:
+// options with a value it may leave out, options with several values, the switches it knows, and the
+// words that keep a verb behind them from running.
+/** Options whose value is the next word unless that is an option. */
+const OPTIONAL_VALUE_OPTIONS: ReadonlySet<string> = new Set([
+  '-d',
+  '--debug',
+  '-r',
+  '--resume',
+  '--from-pr',
+  '-w',
+  '--worktree',
+  '--teleport',
+  '--cloud',
+  '--remote',
+  '--project',
+  '--remote-control',
+  '--rc',
+  '--prompt-suggestions',
+]);
+/** Options whose values run on to the next option: the saved ones, and two it never saves. */
+const LIST_OPTIONS: ReadonlySet<string> = new Set([
+  ...SAVED_LIST_OPTIONS,
+  '--file',
+  '--dangerously-load-development-channels',
+]);
+/** The switches Claude Code lets stand before a verb. */
+const ROOT_SWITCHES: ReadonlySet<string> = new Set([
+  '-d2e',
+  '--debug-to-stderr',
+  '--verbose',
+  '-p',
+  '--print',
+  '--bare',
+  '--safe-mode',
+  '--init',
+  '--init-only',
+  '--maintenance',
+  '--include-hook-events',
+  '--include-partial-messages',
+  '--forward-subagent-text',
+  '--session-mirror',
+  '--await-claim',
+  '--await-initialize',
+  '--dangerously-skip-permissions',
+  '--allow-dangerously-skip-permissions',
+  '--replay-user-messages',
+  '--enable-auth-status',
+  '--restricted',
+  '--exclude-dynamic-system-prompt-sections',
+  '-c',
+  '--continue',
+  '--fork-session',
+  '--deep-link-origin',
+  '--no-session-persistence',
+  '--reply-on-resume',
+  '--ide',
+  '--desktop',
+  '--strict-mcp-config',
+  '--disable-slash-commands',
+  '--chrome',
+  '--no-chrome',
+  '--tmux',
+  '--enable-auto-mode',
+  '--bg',
+  '--background',
+  '--brief',
+  '--ax-screen-reader',
+  '--plan-mode-required',
+  '--hard-fail',
+]);
+/** Value options Claude Code reads before any other, which no verb may stand behind. */
+const PRE_READ_OPTIONS: ReadonlySet<string> = new Set(['--exec', '-m', '--handle-uri']);
+/** Words that keep a verb behind them from running (as do `--routine=<name>` and a cluster of short
+ *  options): a print run, a background start, a routine, help and version. */
+const BEFORE_NO_VERB: ReadonlySet<string> = new Set([
+  '-p',
+  '--print',
+  '--bg',
+  '--background',
+  '--routine',
+  '-h',
+  '--help',
+  '-v',
+  '-V',
+  '--version',
+]);
+
+/** Whether Claude Code takes a word for an option (or `--`), as its scanner steps over it. */
+function isOptionWord(word: string): boolean {
+  return word.length > 1 && word.startsWith('-');
+}
+
+/** Where the option at `at` ends with its values, as Claude Code's scanner steps: an optional value
+ *  is the next word unless that is an option; a value is the next word whatever it is, and a list
+ *  option's run on to the next option. Any other word ends where it is. */
+function optionEnd(words: readonly string[], at: number): number {
+  const word = words[at]!;
+  if (OPTIONAL_VALUE_OPTIONS.has(word)) {
+    const next = words[at + 1];
+    return next !== undefined && !isOptionWord(next) ? at + 1 : at;
+  }
+  if (!VALUE_OPTIONS.has(word)) return at;
+  let end = at + 1;
+  if (LIST_OPTIONS.has(word)) {
+    while (end + 1 < words.length && !isOptionWord(words[end + 1]!)) end++;
+  }
+  return end;
+}
+
+/** The first word that is no option nor an option's value, or the word after a `--` met first;
+ *  -1 when there is none. */
+function firstOperandAt(words: readonly string[]): number {
+  for (let i = 0; i < words.length; i++) {
+    if (words[i] === '--') return i + 1 < words.length ? i + 1 : -1;
+    if (!isOptionWord(words[i]!)) return i;
+    i = optionEnd(words, i);
+  }
+  return -1;
+}
+
+/** Whether Claude Code lets a word stand before a verb: an option it knows, with its value attached
+ *  or not, that is no pre-read option. */
+function knownRootOption(word: string): boolean {
+  if (ROOT_SWITCHES.has(word)) return true;
+  const eq = word.indexOf('=');
+  const name = eq === -1 ? word : word.slice(0, eq);
+  return (
+    (VALUE_OPTIONS.has(name) && !PRE_READ_OPTIONS.has(name)) || OPTIONAL_VALUE_OPTIONS.has(name)
+  );
+}
+
+/**
+ * Where Claude Code runs a background-session verb in these words, or -1 (its own
+ * backgroundSessionVerbIndex, 2.1.296). It runs one when the first word that is no option is a verb:
+ * coming first, always, whatever words follow it, `--bg` and `--background` among them; behind root
+ * options, only before a whole job id (or `respawn --all`), behind options it knows, none of them a
+ * print run, a background start, a routine, help, version or a cluster of short options, and not
+ * after `--`. A verb behind root options runs only where Claude Code is not started from a background
+ * session's own shell (`CLAUDE_CODE_SESSION_KIND=bg`, which `cctl claude` passes on to it), so each
+ * caller says which way it takes one: `behindRootOptions` true reads it as a verb.
+ */
+function claudeCodeVerbAt(words: readonly string[], behindRootOptions: boolean): number {
+  const at = firstOperandAt(words);
+  if (at === -1 || !SESSION_VERBS.has(words[at]!)) return -1;
+  if (at === 0) return 0;
+  if (!behindRootOptions || words[at - 1] === '--') return -1;
+  const next = words[at + 1];
+  if (
+    next === undefined ||
+    !(JOB_ID_PATTERN.test(next) || (words[at] === 'respawn' && next === '--all'))
+  ) {
+    return -1;
+  }
+  for (let i = 0; i < at; i = optionEnd(words, i) + 1) {
+    const word = words[i]!;
+    const barred =
+      BEFORE_NO_VERB.has(word) || word.startsWith('--routine=') || /^-[A-Za-z]{2,}$/.test(word);
+    if (barred || !knownRootOption(word)) return -1;
+  }
+  return at;
+}
 
 /**
  * How Claude Code reads short options for a resume (its own argument pre-parser, the same in 2.1.296
@@ -293,14 +462,20 @@ function plainNewSession(words: readonly string[], reading: ResumeReading): bool
  * one wherever it stands, flags before or after: Claude Code reads it so, and a word read as one
  * here that is not one only makes cctl look the session up. A resume is read in every spelling
  * Claude Code takes (`--resume <id>`, `--resume=<id>`, `-r <id>`, `-r<id>`, `-pr <id>`); one that
- * also continues is a continue, as Claude Code runs it. Undefined only for what is positively a plain new session,
- * or a new background start: anything cctl cannot read so is checked against the slot's rows before
- * it runs, whatever it names.
+ * also continues is a continue, as Claude Code runs it. Undefined only for what is positively a plain
+ * new session, or a new background start (`--bg` or `--background` with no verb run first): anything
+ * cctl cannot read so is checked against the slot's rows before it runs, whatever it names.
  */
 export function parseBackgroundRequest(args: readonly string[]): BackgroundRequest | undefined {
   const words = args[0] === '--' ? args.slice(1) : [...args];
-  // A new background session, or a copy of one when it names a session to resume.
-  if (words.some((w) => BACKGROUND_STARTS.has(w))) return undefined;
+  // A new background session, or a copy of one when it names a session to resume, unless Claude
+  // Code runs a verb first: then the background words are no more than words after it, and the verb
+  // is read as it is without them. A verb behind root options counts too, wherever cctl runs: sent
+  // to the launcher instead it never takes a session from the service running it, while one read as
+  // a start here and run as a verb there could wake a row.
+  if (words.some((w) => BACKGROUND_STARTS.has(w)) && claudeCodeVerbAt(args, true) === -1) {
+    return undefined;
+  }
   const attachAt = words.indexOf('attach');
   if (attachAt >= 0) {
     const ref = nextWord(words, attachAt);
@@ -345,9 +520,12 @@ export interface SelfRelaunch {
  * over three hundred copies in little more than a minute, until that service was stopped). `args`
  * are the words Claude Code is given. A short option counts at the end of a cluster Claude Code peels
  * (`-pn --bg`, as `-p -n --bg`); the word after an option not known to take a value is read as the
- * option it is.
+ * option it is. A verb that comes first never reaches the launcher (see {@link claudeCodeVerbAt}),
+ * so nothing is found then; one behind root options is read as reaching it, as it does when cctl
+ * runs in a background session's own shell.
  */
 export function selfRelaunchingWord(args: readonly string[]): SelfRelaunch | undefined {
+  if (claudeCodeVerbAt(args, false) !== -1) return undefined;
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!;
     if (word === '--') {

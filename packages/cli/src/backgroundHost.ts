@@ -306,7 +306,7 @@ export const SAVED_VALUE_OPTIONS: ReadonlySet<string> = new Set([
   '--remote-control-session-name-prefix',
   '--json-schema',
 ]);
-const SAVED_LIST_OPTIONS: ReadonlySet<string> = new Set([
+export const SAVED_LIST_OPTIONS: ReadonlySet<string> = new Set([
   '--allowed-tools',
   '--allowedTools',
   '--disallowed-tools',

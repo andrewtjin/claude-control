@@ -673,6 +673,84 @@ describe('parseBackgroundRequest', () => {
     }
   });
 
+  it('with a background-session verb first, reads the verb whatever background words follow, as Claude Code runs it', () => {
+    // Claude Code runs a verb that comes first and never its background launcher, so these reach a
+    // row just as the same words without --bg do.
+    const asVerb = (verb: string, args: string[]): BackgroundRequest | undefined =>
+      verb === 'logs'
+        ? GUARD
+        : {
+            verb: verb === 'attach' ? 'attach' : 'control',
+            ref: SHORT,
+            args,
+            refAt: args.indexOf(SHORT),
+          };
+    for (const verb of ['attach', 'stop', 'kill', 'rm', 'respawn', 'logs']) {
+      expect(parseBackgroundRequest([verb, SHORT])).toEqual(asVerb(verb, [verb, SHORT]));
+      for (const bg of ['--bg', '--background']) {
+        for (const args of [
+          [verb, SHORT, bg],
+          [verb, bg, SHORT],
+          [verb, SHORT, '--', bg],
+        ]) {
+          expect({ args, parsed: parseBackgroundRequest(args) }).toEqual({
+            args,
+            parsed: asVerb(verb, args),
+          });
+        }
+      }
+    }
+    expect(parseBackgroundRequest(['respawn', '--all', '--bg'])).toEqual(GUARD);
+  });
+
+  it('reads a verb behind root options as Claude Code does: before a whole job id, behind options it knows, no background start among them', () => {
+    expect(parseBackgroundRequest(['--verbose', 'attach', SHORT, '--bg'])).toEqual({
+      verb: 'attach',
+      ref: SHORT,
+      args: ['--verbose', 'attach', SHORT, '--bg'],
+      refAt: 2,
+    });
+    expect(parseBackgroundRequest(['--model', 'opus', 'stop', SHORT, '--background'])).toEqual({
+      verb: 'control',
+      ref: SHORT,
+      args: ['--model', 'opus', 'stop', SHORT, '--background'],
+      refAt: 3,
+    });
+    // The values of a list option end at the next option; the verb after it is read.
+    const listed = ['--allowed-tools', 'Read', 'Edit', '--verbose', 'attach', SHORT, '--bg'];
+    expect(parseBackgroundRequest(listed)).toEqual({
+      verb: 'attach',
+      ref: SHORT,
+      args: listed,
+      refAt: 5,
+    });
+    expect(parseBackgroundRequest(['--verbose', 'respawn', '--all', '--bg'])).toEqual(GUARD);
+    // Claude Code takes each of these to its background launcher instead: a background start.
+    for (const args of [
+      ['--bg', 'attach', SHORT],
+      ['--background', '--verbose', 'stop', SHORT],
+      ['-p', 'attach', SHORT, '--bg'],
+      ['-cp', 'attach', SHORT, '--bg'],
+      ['--routine=nightly', 'attach', SHORT, '--bg'],
+      ['--exec', 'ls', 'attach', SHORT, '--bg'],
+      // A name, or part of a job id, is no job id behind root options.
+      ['--verbose', 'attach', 'bg eval', '--bg'],
+      ['--verbose', 'attach', 'c5f2', '--bg'],
+      // An option Claude Code does not know.
+      ['--some-later-option', 'attach', SHORT, '--bg'],
+      // The verb read as a value: of --name, or one of a list option's.
+      ['--name', 'attach', SHORT, '--bg'],
+      ['--allowed-tools', 'Read', 'attach', SHORT, '--bg'],
+      // After --, no word is a verb.
+      ['--', 'attach', SHORT, '--bg'],
+      ['hello', '--', 'attach', SHORT, '--bg'],
+      // agents is no verb of Claude Code's: with --bg its background launcher starts a session.
+      ['agents', '--bg'],
+    ]) {
+      expect({ args, parsed: parseBackgroundRequest(args) }).toEqual({ args, parsed: undefined });
+    }
+  });
+
   it('reads a resume in every spelling Claude Code takes: -r<id>, -r <id>, -pr <id>, --resume <id>, --resume=<id>', () => {
     expect(parseBackgroundRequest([`-r${SID}`])).toEqual(resume(SID));
     expect(parseBackgroundRequest([`-r${SID}`, 'carry on'])).toEqual(resume(SID, ['carry on']));
@@ -834,6 +912,35 @@ describe('selfRelaunchingWord', () => {
     ]) {
       expect({ args, found: selfRelaunchingWord(args) }).toEqual({ args, found: undefined });
     }
+  });
+
+  it('passes a background-session verb that comes first: Claude Code runs the verb, never its background launcher', () => {
+    for (const args of [
+      ['attach', SHORT, '--', '--bg'],
+      ['attach', 'x', '--', '--background'],
+      ['attach', SHORT, '--name', '--bg'],
+      ['stop', SHORT, '--', '--bg'],
+      ['kill', SHORT, '--append-system-prompt', '--background'],
+      ['rm', SHORT, '--', '--bg'],
+      ['respawn', '--all', '--', '--bg'],
+      ['logs', SHORT, '--', '--background'],
+    ]) {
+      expect({ args, found: selfRelaunchingWord(args) }).toEqual({ args, found: undefined });
+    }
+  });
+
+  it('still refuses what Claude Code may take to its background launcher, a verb behind root options among it', () => {
+    // Behind root options Claude Code runs the verb only outside a background session's own shell,
+    // so cctl refuses it wherever it runs.
+    expect(selfRelaunchingWord(['--verbose', 'attach', SHORT, '--', '--bg'])).toEqual({
+      word: '--bg',
+    });
+    expect(selfRelaunchingWord(['--', 'attach', SHORT, '--bg'])).toEqual({ word: '--bg' });
+    expect(selfRelaunchingWord(['agents', '--', '--bg'])).toEqual({ word: '--bg' });
+    expect(selfRelaunchingWord(['--bg', 'attach', SHORT, '--name', '--bg'])).toEqual({
+      word: '--bg',
+      option: '--name',
+    });
   });
 
   it('says what Claude Code would do and how to write it safely, in two lines', () => {
