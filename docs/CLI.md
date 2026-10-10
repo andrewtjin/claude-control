@@ -265,7 +265,9 @@ folder's slot is refused outside that folder's folders, exactly as before. So is
 on a config dir cctl does not manage** (a `CLAUDE_CONFIG_DIR` that is neither the main config
 dir nor a folder's profile, such as a second Claude Code config a shell exports, or the
 profile of a rule since removed): its login is its own, so the global slot's identity says
-nothing about which account it runs on.
+nothing about which account it runs on. `--override` does not relax this one: it launches on
+the global slot, and such a session is not on it. Unset `CLAUDE_CONFIG_DIR`, or start the
+session with `cctl claude`, which puts it on the folder's slot.
 
 There are three enforcement modes, set with `cctl settings set bind-enforce <mode>`:
 
@@ -369,7 +371,9 @@ along with its row.
 To run in a ruled folder on the global account _on purpose_ for one session, launch it
 with `cctl claude --override`; to run a reserved account in a folder that does not include
 it, launch with `cctl claude --account <that account>`. Both are honored by the guard for
-that session only.
+that session only. `--override` relaxes a session on the global slot only: from a shell whose
+`CLAUDE_CONFIG_DIR` names a config dir cctl does not manage, the session runs there and is
+refused as above.
 
 ### macOS
 

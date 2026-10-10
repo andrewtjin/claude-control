@@ -72,7 +72,8 @@ export function buildBindGuardCommand(opts: { guardPath: string; nodePath?: stri
  *     snapshot's main config dir, keyed exactly like an unset one; otherwise an UNMANAGED config dir.
  *   - (A, unmanaged) the project dir has a folder rule and the session runs on an unmanaged config
  *     dir -> block, naming that dir. Its login is its own, so the global slot's identity cannot say
- *     which account it is. --override relaxes it the same way.
+ *     which account it is. --override does not relax it: the launcher mints its override token
+ *     for the global slot it launches on, and this session is not on it, so no token could match.
  *   - a project folder whose name has no canonical form (a control or bidi/format character) is
  *     judged by its nearest clean ancestor, which a binding covers exactly when it covers the folder.
  *   - (A, global) the project dir has a folder rule and the session runs on the GLOBAL slot. A ruled
@@ -507,7 +508,8 @@ function run(input) {
 
   // Case A on an unmanaged config dir: it is not this folder's slot, and which account it runs on is
   // not something the global slot's identity can tell, so it is refused whatever account it holds.
-  // Letting it through would let a folder run on an account its rule excludes.
+  // Letting it through would let a folder run on an account its rule excludes. No relaxation
+  // applies: --override's token is minted for the global slot, which this session is not on.
   if (projectBinding && unmanagedConfig !== null) {
     var reasonU =
       'cctl: ' +
@@ -518,9 +520,6 @@ function run(input) {
       unmanagedConfig +
       ', a Claude Code config dir cctl does not manage. ' +
       relaunch;
-    if (honorRelaxation(process.env.CCTL_BIND_OVERRIDE, 'override', sessionConfigKey)) {
-      return emitSystemMessage(reasonU);
-    }
     return emitBlock(reasonU, enforce);
   }
 

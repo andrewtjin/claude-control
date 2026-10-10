@@ -444,6 +444,29 @@ describe('bind guard script', () => {
       expect(parsed.reason).not.toContain('‮');
     });
 
+    it('a --override token does not relax it, whatever slot it was minted for → still block', async () => {
+      // `cctl claude --override` launches on the global slot and mints its token for that slot; a
+      // shell exporting another config dir keeps the session there, off the global slot.
+      await writeSnapshot();
+      await setGlobalAccount('uuid-carol');
+      const other = await otherConfigOn('uuid-carol');
+      for (const token of [
+        mintToken('override', slotKey(undefined)),
+        mintToken('override', slotKey(other)),
+      ]) {
+        const result = await runGuard(scriptPath, payloadFor(`other-override-${token}`), {
+          ...baseEnv(),
+          CLAUDE_PROJECT_DIR: boundFolder,
+          CLAUDE_CONFIG_DIR: other,
+          CCTL_BIND_OVERRIDE: token,
+        });
+        expect(JSON.parse(result.stdout)).toEqual({
+          decision: 'block',
+          reason: unmanagedReason(canon(other)),
+        });
+      }
+    });
+
     it('outside every ruled folder → silent, as before', async () => {
       await writeSnapshot();
       const other = await otherConfigOn('uuid-dora');
