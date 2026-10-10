@@ -852,6 +852,24 @@ async function locate(t: Target, ctx: RouteContext): Promise<SessionWhere> {
   return where;
 }
 
+/** How many looks, each read again a few times (see the daemon's settledWhere), find where a
+ *  session put back by a failed move runs, and the pause between two. The way back is confirmed
+ *  once its worker is listed, and its registry entry says what it is doing only 0.45 to 2 s later
+ *  (measured): until then where it runs is unclear, and one look would send the operator to bring
+ *  back a session that is up. */
+const PUT_BACK_LOOKS = 4;
+const PUT_BACK_LOOK_PAUSE_MS = 500;
+
+/** {@link locate}, for a session a failed move has just put back: taken again a few times while
+ *  where it runs is unclear. */
+async function locatePutBack(t: Target, ctx: RouteContext): Promise<SessionWhere> {
+  for (let look = 1; ; look++) {
+    const where = await locate(t, ctx);
+    if (where.kind !== 'unclear' || look >= PUT_BACK_LOOKS) return where;
+    await ctx.timing.sleep(PUT_BACK_LOOK_PAUSE_MS);
+  }
+}
+
 /** `stop`, `kill`, `rm` or `respawn` of one session: run under the config dir whose service runs
  *  it, by its job id there, so no row elsewhere is ever what the command reaches. */
 async function decideControl(
@@ -1005,7 +1023,7 @@ async function decide(
       if (moved.result === 'failed') {
         // Put back, it may run under another job id than before (after /clear the way back
         // resumes its conversation as a job named after it): it is opened where it runs now.
-        const now = moved.restored ? await locate(target, ctx) : undefined;
+        const now = moved.restored ? await locatePutBack(target, ctx) : undefined;
         if (now?.kind !== 'bg') {
           return {
             kind: 'refuse',

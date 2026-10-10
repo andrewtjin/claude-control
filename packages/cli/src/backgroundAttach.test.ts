@@ -978,6 +978,38 @@ describe('routeBackgroundLaunch — the session runs on another account', () => 
     expect(w.lines.at(-1)).toContain('for now: untrusted folder.');
   });
 
+  it('put back, it is looked for a moment longer while its registry entry says nothing yet: opened where it runs, never sent to bring it back', async () => {
+    // Measured: a session coming up has a registry entry saying what it does 0.45 to 2 s after
+    // its worker is listed, which is all a put-back's confirm waits for.
+    const w = world();
+    w.host.runs(MAIN, SID, { saved: { kind: 'replayable', options: ['--model=opus'] } });
+    w.host.failResumeIn.add(X);
+    let looks = 0;
+    w.host.beforeRegistry = () => {
+      if (!w.host.calls.includes('resume main [--model=opus]')) return;
+      const entry = w.host.registry.at(-1)!;
+      if (++looks <= 5) delete entry.status;
+      else entry.status = 'idle';
+    };
+    const d = await decideIn(w, attach(SHORT));
+    expect(looks).toBeGreaterThan(5);
+    expect(d).toMatchObject(openUnder(MAIN));
+    expect(w.lines.at(-1)).toContain('for now: untrusted folder.');
+    // Still saying nothing after that: refused with the way back, as before.
+    const stuck = world();
+    stuck.host.runs(MAIN, SID, { saved: { kind: 'replayable', options: ['--model=opus'] } });
+    stuck.host.failResumeIn.add(X);
+    stuck.host.beforeRegistry = () => {
+      if (stuck.host.calls.includes('resume main [--model=opus]')) {
+        delete stuck.host.registry.at(-1)!.status;
+      }
+    };
+    const refused = await decideIn(stuck, attach(SHORT));
+    expect(refused.kind === 'refuse' && refused.message).toContain(
+      `Bring it back with: cctl claude --resume ${SID}`,
+    );
+  });
+
   it('a move whose way back fails too runs nothing, and says how to resume it by hand there', async () => {
     const w = world();
     w.host.runs(Q, SID, { cwd: WORK, saved: { kind: 'replayable', options: ['--model=opus'] } });
