@@ -915,17 +915,19 @@ async function decide(
   if (rows.length === 0) return PASS;
   const home = await ctx.homeOf(target.cwd);
 
-  // Started under a config dir from its row there, idle, and confirmed; a refusal says why.
+  // Started under a config dir from its row there, idle, and confirmed; a refusal says why. The row
+  // is woken by the id its job started with: Claude Code wakes it into the conversation it ran last,
+  // with the options it saved, under its own job id (measured: after /clear, given the
+  // conversation's own id, it starts a new job of that name with no options, and the row stays).
   const wake = async (configDir: string | null, row: JobRow): Promise<string | undefined> => {
-    const currentId = row.resumeSessionId ?? row.sessionId;
     try {
       await ctx.host.resumeIdle({
         configDir,
-        sessionId: currentId,
-        short: currentId.slice(0, 8),
+        sessionId: row.sessionId,
+        short: row.short,
         cwd: target.cwd,
       });
-      if (!(await confirmHosted(ctx.host, configDir, currentId.slice(0, 8), ctx.timing))) {
+      if (!(await confirmHosted(ctx.host, configDir, row.short, ctx.timing))) {
         return 'it did not show up there';
       }
       return undefined;

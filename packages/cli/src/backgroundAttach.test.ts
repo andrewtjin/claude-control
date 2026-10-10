@@ -264,12 +264,18 @@ class FakeClaude implements ClaudeBackgroundHost {
     this.calls.push(
       `resume ${key(c)}` + (input.options !== undefined ? ` [${input.options.join(' ')}]` : ''),
     );
-    const running = this.hostOf(input.sessionId);
-    if (running.length > 0 || this.registry.some((e) => e.sessionId === input.sessionId)) {
+    const existing = this.rows.get(key(c))?.get(input.short);
+    // A row woken by the id its job started with runs the conversation it ran last (after /clear,
+    // not that id), as Claude Code wakes one.
+    const conversation =
+      existing !== undefined && existing.sessionId === input.sessionId
+        ? (existing.resumeSessionId ?? existing.sessionId)
+        : input.sessionId;
+    const running = this.hostOf(conversation);
+    if (running.length > 0 || this.registry.some((e) => e.sessionId === conversation)) {
       this.copies.push(`resume under ${key(c)} while it ran in ${running.join(', ')}`);
       return Promise.reject(new Error('claude started a copy (5e1d04b2) instead of resuming it'));
     }
-    const existing = this.rows.get(key(c))?.get(input.short);
     if (input.options !== undefined && existing !== undefined) {
       return Promise.reject(new Error('that config dir already holds a job row for it'));
     }
@@ -289,7 +295,7 @@ class FakeClaude implements ClaudeBackgroundHost {
     ]);
     this.registry.push({
       pid: 5000 + this.registry.length,
-      sessionId: input.sessionId,
+      sessionId: conversation,
       kind: 'bg',
       status: 'idle',
       jobId: input.short,
@@ -1000,6 +1006,23 @@ describe('routeBackgroundLaunch — the session runs in no service', () => {
     expect(d).toMatchObject(openUnder(X));
     expect(w.host.calls).toEqual([`resume ${X}`]);
     expect(w.host.hostOf()).toEqual([X]);
+  });
+
+  it('a failed row after /clear is woken by the id its job started with: its conversation, its options, its own job id', async () => {
+    // Measured: Claude Code wakes the row given that id, into the conversation it ran last; given
+    // the conversation's own id, it starts a new job of that name with no options instead.
+    const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
+    const w = world();
+    w.host.row(X, 'failed', SID, {
+      resumeSessionId: NEW,
+      saved: { kind: 'replayable', options: ['--name=bg eval'] },
+    });
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(X));
+    expect(w.host.calls).toEqual([`resume ${X}`]);
+    expect([...w.host.rows.get(X)!.keys()]).toEqual([SHORT]);
+    expect(w.host.hosted.get(X)).toEqual([{ short: SHORT, sessionId: SID, cwd: WORK }]);
+    expect(w.host.registry.at(-1)).toMatchObject({ sessionId: NEW, jobId: SHORT });
   });
 
   it('a restart accepted but never shown under the folder slot runs nothing and says so', async () => {
