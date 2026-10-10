@@ -312,6 +312,8 @@ export function spawnClaude(opts: {
   args: string[];
   env: NodeJS.ProcessEnv;
   deps?: SpawnClaudeDeps;
+  /** Told the child's pid once it is started. */
+  onSpawn?: (pid: number) => void;
 }): Promise<number> {
   const spawn = opts.deps?.spawn ?? nodeSpawn;
   const signals: SignalSeam = opts.deps?.signals ?? process;
@@ -323,6 +325,7 @@ export function spawnClaude(opts: {
     shell: false,
     windowsHide: false,
   });
+  if (child.pid !== undefined) opts.onSpawn?.(child.pid);
 
   const ignore = (): void => {
     // Intentionally empty: swallow the signal in the parent; the child owns Ctrl-C.
