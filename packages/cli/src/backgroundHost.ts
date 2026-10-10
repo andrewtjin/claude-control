@@ -37,10 +37,12 @@
 //     config dir's service ("idle — send a prompt to start"), or prints that it started a copy;
 //   - `claude rm <short>`: deletes the job row and keeps the conversation (measured: the transcript is
 //     unchanged), but also deletes a worktree recorded on the row, and kills the session when it is
-//     live. So it is run only on a row that records no worktree, for a session that runs nowhere.
-// These shapes were measured against Claude Code 2.1.295; anything else is read defensively, and an
-// unexpected answer fails the operation rather than guessing. Every command runs detached from the
-// operator's terminal, so a Ctrl-C there cannot cut one off half way.
+//     live or starting (a wake shows its worker in the roster a moment before its registry entry).
+//     So it is run only on a row that records no worktree, for a session no registry entry and no
+//     roster holds, read verified right before it runs.
+// These shapes were measured against Claude Code 2.1.295 and again against 2.1.296; anything else
+// is read defensively, and an unexpected answer fails the operation rather than guessing. Every
+// command runs detached from the operator's terminal, so a Ctrl-C there cannot cut one off half way.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
@@ -933,17 +935,57 @@ export function createClaudeBackgroundHost(
     );
   };
 
+  /** Every config dir with a service: the main one, then each folder profile. A profile is a
+   *  directory named after its rule's id; anything else in the profiles root is not one. */
+  const configDirsNow = (): Array<string | null> => {
+    const root = options.profilesRoot;
+    if (root === undefined) return [null];
+    return [
+      null,
+      ...namesIn(root)
+        .filter((name) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
+        .map((name) => join(root, name)),
+    ];
+  };
+
+  /** Refuse while a session runs or is starting anywhere, read verified: a background registry
+   *  entry for its job id or either of its ids (what Claude Code's rm reaches it by), or a worker for
+   *  it in any service's roster (a session being woken is listed there a moment before its registry
+   *  entry is written). Anything that cannot be read right now refuses too. */
+  const refuseWhileLive = async (short: string, ids: readonly string[]): Promise<void> => {
+    const live = (await readRegistry(true, true)).some(
+      (e) => e.kind === 'bg' && (e.jobId === short || ids.includes(e.sessionId)),
+    );
+    if (live) throw new Error('its session is live, and claude rm would kill it');
+    for (const configDir of configDirsNow()) {
+      const hosted = await readHosted(configDir, true);
+      if (hosted.some((w) => w.short === short || ids.includes(w.sessionId))) {
+        throw new Error(
+          'its session is starting or live in a service, and claude rm would kill it',
+        );
+      }
+    }
+  };
+
+  /** The row of a short id, as `claude rm` would find it, refused unless rm takes only the row: it
+   *  must be readable, record no worktree, and not be one Claude Code is waking right now. */
+  const removableRow = (configDir: string | null, short: string): JobRow | undefined => {
+    const found = jobRow(configDir, short);
+    if (found.kind === 'none') return undefined;
+    if (found.kind === 'unreadable') throw new Error('its job row could not be read right now');
+    // `claude rm` deletes a worktree recorded on the row.
+    if (found.row.worktreePath !== undefined) {
+      throw new Error('its job row records a git worktree, which claude rm would delete');
+    }
+    if (found.row.state === 'starting') {
+      throw new Error('its session is starting, and claude rm would kill it');
+    }
+    return found.row;
+  };
+
   return {
     configDirs() {
-      const root = options.profilesRoot;
-      if (root === undefined) return Promise.resolve([null]);
-      // A profile is a directory named after its rule's id; anything else there is not one.
-      return Promise.resolve([
-        null,
-        ...namesIn(root)
-          .filter((name) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
-          .map((name) => join(root, name)),
-      ]);
+      return Promise.resolve(configDirsNow());
     },
 
     liveSessions() {
@@ -1155,18 +1197,17 @@ export function createClaudeBackgroundHost(
 
     async removeRow(configDir, short) {
       if (!SHORT_ID.test(short)) throw new Error(`not a background session id: ${short}`);
-      const found = jobRow(configDir, short);
-      if (found.kind === 'none') return;
-      if (found.kind === 'unreadable') throw new Error('its job row could not be read right now');
-      // `claude rm` deletes a worktree recorded on the row, and kills the session when it is live.
-      if (found.row.worktreePath !== undefined) {
-        throw new Error('its job row records a git worktree, which claude rm would delete');
-      }
-      const ids = [found.row.sessionId, found.row.resumeSessionId];
-      const live = (await readRegistry(false, false)).some(
-        (e) => e.kind === 'bg' && (e.jobId === short || ids.includes(e.sessionId)),
-      );
-      if (live) throw new Error('its session is live, and claude rm would kill it');
+      const row = removableRow(configDir, short);
+      if (row === undefined) return;
+      const ids = [
+        row.sessionId,
+        ...(row.resumeSessionId !== undefined ? [row.resumeSessionId] : []),
+      ];
+      await refuseWhileLive(short, ids);
+      // Read again right before the rm: a wake can land between the reads, and rm would kill what
+      // it starts.
+      if (removableRow(configDir, short) === undefined) return;
+      await refuseWhileLive(short, ids);
       await runOk(configDir, ['rm', short]);
     },
 

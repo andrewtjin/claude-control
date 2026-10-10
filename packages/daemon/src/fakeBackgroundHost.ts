@@ -3,8 +3,11 @@
 // binary was measured to (2.1.295): a stop takes the session out of its service and leaves its row
 // stopped; a resume while the session runs anywhere starts a copy (refused here); a resume with
 // options over a row is refused; a first resume in a config dir writes a row saved with the options
-// given; `rm` deletes a row, kills the session when it is live, and takes a worktree with it. Each
-// command can be made to fail. Test support only: nothing in the product imports it.
+// given; `rm` deletes a row. Like the real host, it never runs an rm Claude Code would turn into a
+// kill or a worktree deletion: it refuses a row that records a worktree, one that cannot be read
+// right now, and one whose session is live or starting anywhere (by the registry, the way Claude
+// Code's rm reaches it, or by any service's roster). Each command can be made to fail. Test support
+// only: nothing in the product imports it.
 
 import type {
   BackgroundSession,
@@ -281,19 +284,25 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
     return Promise.resolve();
   }
 
-  removeRow(configDir: string | null, short: string): Promise<void> {
+  async removeRow(configDir: string | null, short: string): Promise<void> {
     this.calls.push(`rm ${named(configDir)} ${short}`);
     const row = this.rowOf(configDir, short);
-    if (row === undefined) return Promise.resolve();
-    if (this.failRemoveIn.has(configDir)) return Promise.reject(new Error('rm refused'));
+    if (row === undefined) return;
+    if (row.unreadable === true) throw new Error('its job row could not be read right now');
     if (row.worktreePath !== undefined) {
-      return Promise.reject(new Error('it records a worktree, which claude rm would delete'));
+      throw new Error('it records a worktree, which claude rm would delete');
     }
-    if (this.hostsOf(short).length > 0 || this.hostsOf(row.sessionId).length > 0) {
-      return Promise.reject(new Error('its session is live, and claude rm would kill it'));
+    // Live by the registry (Claude Code's rm reaches its job id or either of its ids) or starting
+    // in any service (listed before its registry entry is written).
+    const ids = [row.sessionId, row.resumeSessionId];
+    const live = (await this.liveSessions()).some(
+      (e) => e.kind === 'bg' && (e.jobId === short || ids.includes(e.sessionId)),
+    );
+    if (live || this.hostsOf(short).length > 0 || this.hostsOf(row.sessionId).length > 0) {
+      throw new Error('its session is live, and claude rm would kill it');
     }
+    if (this.failRemoveIn.has(configDir)) throw new Error('rm refused');
     this.rows.get(configDir)?.delete(short);
-    return Promise.resolve();
   }
 
   lockSession(sessionId: string, waitMs: number): Promise<SessionLock | undefined> {

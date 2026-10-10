@@ -305,7 +305,14 @@ class FakeClaude implements ClaudeBackgroundHost {
       this.badRemovals.push(`worktree row ${key(c)} ${short}`);
       return Promise.reject(new Error('its job row records a git worktree'));
     }
-    if (this.registry.some((e) => e.jobId === short || e.sessionId === row.sessionId)) {
+    const ids = [row.sessionId, row.resumeSessionId];
+    const live =
+      row.state === 'starting' ||
+      this.registry.some(
+        (e) => e.kind === 'bg' && (e.jobId === short || ids.includes(e.sessionId)),
+      ) ||
+      [...this.hosted.values()].flat().some((w) => w.short === short || ids.includes(w.sessionId));
+    if (live) {
       this.badRemovals.push(`live session ${key(c)} ${short}`);
       return Promise.reject(new Error('its session is live'));
     }

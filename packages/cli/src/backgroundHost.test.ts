@@ -70,6 +70,11 @@ function hostWith(opts: {
   /** Files whose read fails as a locked file does (EBUSY). */
   locked?: string[];
   mainConfigDirInEnv?: boolean;
+  /** Runs before every file read, with the path read, to change the files the way Claude Code
+   *  would between two reads. */
+  onRead?: (path: string, files: Record<string, string>) => void;
+  /** The host's clock; by default one that moves only by the host's own pauses. */
+  clock?: () => number;
 }): { host: ReturnType<typeof createClaudeBackgroundHost>; runs: Recorded[]; sleeps: number[] } {
   const runs: Recorded[] = [];
   const sleeps: number[] = [];
@@ -98,6 +103,7 @@ function hostWith(opts: {
       ),
     readFile: (p) => {
       const key = p.replace(/\\/g, '/');
+      opts.onRead?.(key, files);
       if (opts.locked?.includes(key) === true) {
         throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
       }
@@ -120,7 +126,7 @@ function hostWith(opts: {
       return names;
     },
     isProcessAlive: opts.alive ?? (() => true),
-    clock: () => now,
+    clock: opts.clock ?? (() => now),
     sleep: (ms) => {
       sleeps.push(ms);
       now += ms;
@@ -1130,7 +1136,8 @@ describe('removing a row', () => {
     await expect(live.host.removeRow(null, SHORT)).rejects.toThrow(
       /live, and claude rm would kill it/,
     );
-    // Live after /clear: the registry names the conversation it runs now, and the row says which.
+    // Live after /clear: the registry names the conversation it runs now, under the job id it
+    // started with (measured), and the row says which.
     const NEW = 'a579c3c9-9210-4268-84cf-e73a20d40b60';
     const cleared = hostWith({
       files: {
@@ -1139,7 +1146,7 @@ describe('removing a row', () => {
           pid: 100,
           sessionId: NEW,
           kind: 'bg',
-          jobId: 'a579c3c9',
+          jobId: SHORT,
         }),
       },
     });
@@ -1147,6 +1154,77 @@ describe('removing a row', () => {
     const torn = hostWith({ files: { [ROW]: '{' } });
     await expect(torn.host.removeRow(null, SHORT)).rejects.toThrow(/could not be read/);
     for (const h of [tree, live, cleared, torn]) expect(h.runs).toEqual([]);
+  });
+
+  it('never removes the row of a session being woken: its worker listed in a roster before its registry entry, or its row starting', async () => {
+    const ROOT = 'C:/Users/me/AppData/Local/claude-control/profiles';
+    // Measured: a plain attach wakes a stopped row; for a moment the worker is in the roster and
+    // the row reads starting, with no registry entry yet. An rm then kills what is starting.
+    const listed = hostWith({
+      profilesRoot: ROOT,
+      files: {
+        [ROW]: row(),
+        [`${PROFILE}/daemon/roster.json`]: roster({ [SHORT]: worker(SID, 'C:/work', 4242) }),
+        [`${ROOT}/rule-1/x`]: '',
+      },
+    });
+    await expect(listed.host.removeRow(null, SHORT)).rejects.toThrow(/starting or live/);
+    const starting = hostWith({ files: { [ROW]: row({ state: 'starting' }) } });
+    await expect(starting.host.removeRow(null, SHORT)).rejects.toThrow(/starting/);
+    for (const h of [listed, starting]) expect(h.runs).toEqual([]);
+  });
+
+  it('looks again right before the rm, so a wake landing between the reads is not killed', async () => {
+    const ROSTER = `${MAIN}/daemon/roster.json`;
+    let rosterReads = 0;
+    const { host, runs } = hostWith({
+      files: { [ROW]: row(), [ROSTER]: roster({}) },
+      // The second look at the roster is the one right before the rm: by then a wake started it.
+      onRead: (path, files) => {
+        if (path !== ROSTER) return;
+        if (++rosterReads === 2) files[ROSTER] = roster({ [SHORT]: worker(SID, 'C:/work', 4242) });
+      },
+    });
+    await expect(host.removeRow(null, SHORT)).rejects.toThrow(/starting or live/);
+    expect(rosterReads).toBe(2);
+    expect(runs).toEqual([]);
+  });
+
+  it('reads liveness verified: a registry entry or roster record whose pid was reused holds nothing back', async () => {
+    const { host, runs } = hostWith({
+      files: {
+        [ROW]: row(),
+        [`${MAIN}/sessions/100.json`]: JSON.stringify({
+          pid: 100,
+          sessionId: SID,
+          kind: 'bg',
+          jobId: SHORT,
+          procStart: '134360864829411286',
+        }),
+        [`${MAIN}/daemon/roster.json`]: roster({
+          [SHORT]: { ...worker(SID, 'C:/work', 4242), procStart: '134360864829411286' },
+        }),
+      },
+      // Both pids now name other processes, started later.
+      starts: new Map([
+        [100, '134360999999999999'],
+        [4242, '134360999999999999'],
+      ]),
+    });
+    await host.removeRow(null, SHORT);
+    expect(runs.map((r) => r.args)).toEqual([['rm', SHORT]]);
+  });
+
+  it('a registry or roster that cannot be read right now refuses the rm rather than guess', async () => {
+    const tornRegistry = hostWith({
+      files: { [ROW]: row(), [`${MAIN}/sessions/100.json`]: '{"pid": 1' },
+    });
+    await expect(tornRegistry.host.removeRow(null, SHORT)).rejects.toThrow(/could not be read/);
+    const tornRoster = hostWith({
+      files: { [ROW]: row(), [`${MAIN}/daemon/roster.json`]: '{"workers": {' },
+    });
+    await expect(tornRoster.host.removeRow(null, SHORT)).rejects.toThrow(/could not be read/);
+    for (const h of [tornRegistry, tornRoster]) expect(h.runs).toEqual([]);
   });
 
   it('a row that is not there needs nothing; a refused rm fails with what Claude Code said', async () => {
