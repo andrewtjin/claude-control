@@ -1062,14 +1062,21 @@ export function createClaudeBackgroundHost(
       return readRegistry(true, true);
     },
 
-    jobRows(configDir) {
+    jobRows(configDir, opts) {
       const jobs = join(home(configDir), 'jobs');
       const out: JobRow[] = [];
       try {
         for (const short of namesInStrict(jobs)) {
           if (!SHORT_ID.test(short)) continue;
-          const found = jobRow(configDir, short);
-          if (found.kind === 'row') out.push(found.row);
+          const found = rawRow(configDir, short);
+          // A row that cannot be read right now, read strictly, could be any session's. One that
+          // reads whole but is no session's row (no state, another id) is never one Claude Code
+          // wakes, so it is skipped either way, rather than refuse every check for good.
+          if (found.kind === 'unreadable' && opts?.strict === true) {
+            throw new Error(`its job row ${short} there could not be read right now`);
+          }
+          const row = found.kind === 'raw' ? toJobRow(short, found.raw) : undefined;
+          if (row !== undefined) out.push(row);
         }
       } catch (err) {
         return Promise.reject(err instanceof Error ? err : new Error(String(err)));

@@ -237,10 +237,13 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
     };
   }
 
-  jobRows(configDir: string | null): Promise<JobRow[]> {
+  jobRows(configDir: string | null, opts?: { strict?: boolean }): Promise<JobRow[]> {
     const out: JobRow[] = [];
     for (const [short, r] of this.rows.get(configDir) ?? []) {
       if (r.unreadable !== true) out.push(this.toJobRow(short, r));
+      else if (opts?.strict === true) {
+        return Promise.reject(new Error(`its job row ${short} there could not be read right now`));
+      }
     }
     return Promise.resolve(out);
   }

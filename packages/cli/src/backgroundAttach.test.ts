@@ -111,6 +111,8 @@ class FakeClaude implements ClaudeBackgroundHost {
   beforeRegistry: ((n: number) => void) | undefined;
   registryReads = 0;
   failRegistry = 0;
+  /** How many strict reads of a config dir's rows fail next, as one caught mid-write or locked. */
+  readonly unreadableRowsIn = new Map<string, number>();
 
   /** The session runs as a background session in `c`, with a row there in state running. */
   runs(
@@ -215,7 +217,13 @@ class FakeClaude implements ClaudeBackgroundHost {
     }
     return Promise.resolve([...this.registry]);
   }
-  jobRows(c: Config): Promise<JobRow[]> {
+  jobRows(c: Config, opts?: { strict?: boolean }): Promise<JobRow[]> {
+    const failing = this.unreadableRowsIn.get(key(c)) ?? 0;
+    if (opts?.strict === true && failing > 0) {
+      this.unreadableRowsIn.set(key(c), failing - 1);
+      const short = [...(this.rows.get(key(c))?.keys() ?? [])][0] ?? SHORT;
+      return Promise.reject(new Error(`its job row ${short} there could not be read right now`));
+    }
     return Promise.resolve(
       [...(this.rows.get(key(c)) ?? new Map<string, FakeRow>())].map(([short, r]) =>
         this.toJobRow(short, r),
@@ -1834,6 +1842,25 @@ describe('routeBackgroundLaunch — which rows are traps', () => {
     w.host.runs(MAIN, SID, { status: 'busy' });
     w.host.row(X, 'stopped');
     w.host.failRegistry = 1;
+    const d = await routeBackgroundLaunch(GUARD, w.ctx, FOLLOW);
+    expect(d.kind === 'refuse' && d.message).toContain('still holds a job row');
+  });
+
+  it('a row here that cannot be read is read again, and refuses with a retry hint while it cannot', async () => {
+    // It could be the trap row itself: the picker, --continue and the agents view never pass on a
+    // guess that it is not.
+    const w = world();
+    w.host.runs(MAIN, SID, { status: 'busy' });
+    w.host.row(X, 'stopped');
+    w.host.unreadableRowsIn.set(X, 3);
+    expect(await routeBackgroundLaunch(GUARD, w.ctx, FOLLOW)).toEqual({
+      kind: 'refuse',
+      message:
+        'cannot tell whether a background session would be taken from the service running it ' +
+        `(its job row ${SHORT} there could not be read right now); try again in a moment.`,
+    });
+    // Read cleanly a moment later: the row is seen for the trap it is.
+    w.host.unreadableRowsIn.set(X, 1);
     const d = await routeBackgroundLaunch(GUARD, w.ctx, FOLLOW);
     expect(d.kind === 'refuse' && d.message).toContain('still holds a job row');
   });

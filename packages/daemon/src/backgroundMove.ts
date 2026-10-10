@@ -169,8 +169,11 @@ export interface BackgroundSessionHost {
    *  before the session does, and a resume in that moment would start a copy). Rejects when Claude
    *  Code refuses, or when the session is still running a while after the stop. */
   stop(configDir: string | null, short: string): Promise<void>;
-  /** Every readable job row a config dir holds. Rejects when its jobs dir cannot be listed. */
-  jobRows(configDir: string | null): Promise<JobRow[]>;
+  /** Every readable job row a config dir holds. Rejects when its jobs dir cannot be listed, and,
+   *  `strict`, also when one of its rows cannot be read right now (caught mid-write, or locked): a
+   *  check that must know every row (which could take a session from elsewhere) never passes on a
+   *  guess that the one it could not read is harmless. */
+  jobRows(configDir: string | null, opts?: { strict?: boolean }): Promise<JobRow[]>;
   /** One config dir's row for a short id. */
   jobRow(configDir: string | null, short: string): Promise<RowRead>;
   /** What a config dir's job row saved for a session (see {@link SavedLaunch}). */

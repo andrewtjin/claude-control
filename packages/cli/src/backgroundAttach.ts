@@ -559,7 +559,8 @@ async function trapsIn(ctx: RouteContext, configDir: string | null): Promise<Tra
 
 async function readTraps(ctx: RouteContext, configDir: string | null): Promise<Trap[]> {
   const { host, platform } = ctx;
-  const rows = await host.jobRows(configDir);
+  // Strictly: a row here that cannot be read right now could be the trap.
+  const rows = await host.jobRows(configDir, { strict: true });
   if (rows.length === 0) return [];
   const live = (await host.liveSessions()).filter((e) => e.kind === 'bg');
   const traps: Trap[] = [];

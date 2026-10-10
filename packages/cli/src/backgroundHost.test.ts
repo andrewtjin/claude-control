@@ -1769,6 +1769,50 @@ describe("a slot's trap check, over these reads", () => {
     expect(decision).toEqual({ kind: 'pass' });
   });
 
+  it('a row under the slot that cannot be read right now refuses the picker there, with a retry hint', async () => {
+    // It runs busy on the main config dir; the profile's stopped row of it is locked (Windows
+    // EBUSY) whenever it is read. That row could be the one Claude Code's picker wakes.
+    const ROW = `${PROFILE}/jobs/${SHORT}/state.json`;
+    const { host } = hostWith({
+      profilesRoot: 'C:/Users/me/AppData/Local/claude-control/profiles',
+      files: {
+        [`${MAIN}/daemon/roster.json`]: roster({
+          [SHORT]: { ...worker(SID, 'C:/work', 4242), procStart: LIVE_START },
+        }),
+        [`${MAIN}/jobs/${SHORT}/state.json`]: JSON.stringify({
+          state: 'running',
+          sessionId: SID,
+          cwd: 'C:/work',
+        }),
+        [`${MAIN}/sessions/100.json`]: JSON.stringify({
+          pid: 100,
+          procStart: LIVE_START,
+          sessionId: SID,
+          kind: 'bg',
+          status: 'busy',
+          jobId: SHORT,
+          cwd: 'C:/work',
+        }),
+        [ROW]: JSON.stringify({ state: 'stopped', sessionId: SID, cwd: 'C:/work' }),
+      },
+      starts: new Map([
+        [4242, LIVE_START],
+        [100, LIVE_START],
+      ]),
+      locked: [ROW],
+    });
+    expect(
+      await routeBackgroundLaunch({ verb: 'guard' }, ctxFor(host, PROFILE), { kind: 'follow' }),
+    ).toEqual({
+      kind: 'refuse',
+      message:
+        'cannot tell whether a background session would be taken from the service running it ' +
+        `(its job row ${SHORT} there could not be read right now); try again in a moment.`,
+    });
+    // Elsewhere a row that cannot be read is simply not listed.
+    expect(await host.jobRows(PROFILE)).toEqual([]);
+  });
+
   it("a profile's roster record whose pid now names another process is not where the session runs: its row there is a trap", async () => {
     // It runs on the main config dir. The profile's roster still lists it under a pid reused since,
     // so only a verified read tells that the profile's row would wake it there and take it over.
