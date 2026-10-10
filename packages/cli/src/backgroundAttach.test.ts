@@ -658,6 +658,19 @@ describe('parseBackgroundRequest', () => {
     }
   });
 
+  it('--bg or --background after -- or as an option value is a background start too, as Claude Code takes it', () => {
+    // Measured (2.1.296): each of these, run where a stopped row could take the session from the
+    // service running it, went into Claude Code's background launcher and started a copy; none
+    // opened it in a terminal. Read as a resume, cctl would run that very copy where it runs.
+    for (const args of [
+      ['--resume', SID, '--append-system-prompt', '--bg'],
+      ['-r', SID, '--name', '--background'],
+      ['--resume', SID, '--', '--bg'],
+    ]) {
+      expect({ args, parsed: parseBackgroundRequest(args) }).toEqual({ args, parsed: undefined });
+    }
+  });
+
   it('reads a resume in every spelling Claude Code takes: -r<id>, -r <id>, -pr <id>, --resume <id>, --resume=<id>', () => {
     expect(parseBackgroundRequest([`-r${SID}`])).toEqual(resume(SID));
     expect(parseBackgroundRequest([`-r${SID}`, 'carry on'])).toEqual(resume(SID, ['carry on']));

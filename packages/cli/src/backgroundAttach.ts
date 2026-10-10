@@ -84,8 +84,11 @@ export type BackgroundRequest =
    *  new session. Passed as typed once that slot holds no trap row (one matching `ref`, when given). */
   | { verb: 'guard'; ref?: string };
 
-/** Options that start a new background session, or a copy of one: neither ever wakes an existing
- *  row (measured: the words around them become the new session's prompt or options). */
+/** Options that send a launch to Claude Code's background launcher wherever they stand: it looks for
+ *  either word anywhere in the arguments, after `--` and as an option's value too (measured, 2.1.296).
+ *  That launcher starts a new session, wakes this config dir's own row of one that runs nowhere, or
+ *  starts a copy of one that runs anywhere; it never opens one in a terminal, so it never takes a
+ *  session from the service running it. */
 const BACKGROUND_STARTS: ReadonlySet<string> = new Set(['--bg', '--background']);
 /** Subcommands that stop, remove or restart one session, or all of them. */
 const CONTROL: ReadonlySet<string> = new Set(['stop', 'kill', 'rm', 'respawn']);
