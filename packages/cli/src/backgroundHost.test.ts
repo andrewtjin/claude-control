@@ -1305,9 +1305,26 @@ describe('removing a row', () => {
       },
     });
     await expect(cleared.host.removeRow(PROFILE, SHORT)).rejects.toThrow(/live/);
+    // A stale row naming only the id its job started with, while the job runs on after /clear:
+    // Claude Code's rm reaches the session by its job id, so that alone holds the rm back, with
+    // no roster saying anything.
+    const stale = hostWith({
+      files: {
+        [`${PROFILE}/jobs/${SHORT}/state.json`]: row(),
+        [`${MAIN}/sessions/100.json`]: JSON.stringify({
+          pid: 100,
+          sessionId: NEW,
+          kind: 'bg',
+          jobId: SHORT,
+        }),
+      },
+    });
+    await expect(stale.host.removeRow(PROFILE, SHORT)).rejects.toThrow(
+      /live, and claude rm would kill it/,
+    );
     const torn = hostWith({ files: { [ROW]: '{' } });
     await expect(torn.host.removeRow(null, SHORT)).rejects.toThrow(/could not be read/);
-    for (const h of [tree, live, cleared, torn]) expect(h.runs).toEqual([]);
+    for (const h of [tree, live, cleared, stale, torn]) expect(h.runs).toEqual([]);
   });
 
   it('never removes the row of a session being woken: its worker listed in a roster before its registry entry, or its row starting', async () => {
