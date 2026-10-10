@@ -396,6 +396,25 @@ describe('moveBackgroundSession', () => {
     expect(host.rowsFor(SID)).toEqual([NEW]);
   });
 
+  it('a start is not held back by work its row still records: the process that held it is gone', async () => {
+    // Measured: a stop drops a scheduled wakeup and the row's record of it, and a wake does not
+    // bring it back. A row that still records some (its process ended another way) has nothing
+    // left to lose, so it is started like any other.
+    const host = fakeHost();
+    host.hosted.set(OLD, []);
+    const row = host.rowOf(OLD, SHORT)!;
+    row.state = 'failed';
+    row.pending = true;
+    expect(await moveBackgroundSession(host, { ...REQUEST, start: true }, timing)).toMatchObject({
+      result: 'moved',
+      short: SHORT,
+    });
+    expect(changes(host)).toEqual([
+      `rm ${OLD} ${SHORT}`,
+      `resume ${NEW} ${SID} C:/research [--model=opus]`,
+    ]);
+  });
+
   it('a start finds it running again: left alone', async () => {
     const host = fakeHost();
     expect(await moveBackgroundSession(host, { ...REQUEST, start: true }, timing)).toMatchObject({
