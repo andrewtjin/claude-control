@@ -165,7 +165,7 @@ cctl claude --account <id|label>   # launch on a specific account for this one s
 cctl claude --override             # launch here on the global account, on purpose (see below)
 cctl claude -- <claude args...>    # everything after -- is passed through to claude
 cctl claude attach <id|name>       # open a background session on its folder's account (see
-cctl claude --resume <id|name>     # "Opening a background session" below)
+cctl claude --resume <id|title>    # "Opening a background session" below)
 ```
 
 `cctl claude` resolves which slot to use (an explicit `--account`, else the folder's
@@ -288,35 +288,54 @@ cycle, for every rule whose slot holds one of its included accounts with usage l
 daemon moves each background session the global slot's service hosts in that folder:
 
 1. it checks that the session is idle between turns (`claude agents` reports it idle) — a
-   session in a turn, or waiting on a permission prompt, is left for a later cycle — and that
-   no terminal has a background session open (`claude attach`, or the agent view). Claude Code
+   session in a turn, or waiting on a permission prompt, is left for a later cycle — that it
+   holds no work between turns (a scheduled wakeup, a background task: Claude Code reports
+   such a session idle, but a stop would drop the work), and that no terminal has a
+   background session of that service open (`claude attach`, or the agent view). Claude Code
    does not say which session a terminal has open, so while one is open, nothing moves;
-2. it stops the session (`claude stop`) and resumes it by its full session id under the
-   folder's profile (`claude --bg --resume <id>`, with no prompt, so no turn is spent), from
-   the session's working directory, with every option the session was started with and
-   Claude Code saved (its model, permission mode, added directories, tool restrictions,
-   settings, budgets and the rest). A session the folder's profile already holds from an
-   earlier move wakes with what the profile saved for it, worktree included;
-3. it confirms the folder's service now hosts it, logs the move in the daemon log and sends
+2. it stops the session (`claude stop`), and while the session runs nowhere it removes every
+   job row Claude Code keeps for it, in every config dir (`claude rm`, which deletes the row
+   and keeps the conversation);
+3. it resumes the session's current conversation by its full session id under the folder's
+   profile (`claude --bg --resume <id>`, with no prompt, so no turn is spent), from the
+   session's working directory, with every option the session was started with and Claude
+   Code saved (its model, permission mode, added directories, tool restrictions, settings,
+   budgets and the rest);
+4. it confirms the folder's service now hosts it, logs the move in the daemon log and sends
    one phone notice.
+
+Why every row goes: each config dir keeps a job row for a session it ran, and Claude Code
+acts on a row under its own config dir whatever runs elsewhere. A row left under the global
+slot for a session that now runs on the folder's slot is a trap: a `claude attach`, an
+interactive `claude --resume` (by id, by title, or chosen in its picker), a `claude stop`,
+`claude rm` or `claude respawn`, or Enter or Ctrl+X in `claude agents`, run under that config
+dir, reaches the session where it runs and kills it there, in the middle of a turn too. So a
+background session keeps a job row only in the config dir where it runs or last ran.
+
+After `/clear` inside a background session, its job runs a new conversation; the move
+resumes that one (the job then shows up under the new conversation's short id).
 
 Claude Code's `claude stop` returns a moment before the session has exited, so the move waits
 until the session is gone from Claude Code's session registry and from the service before it
-resumes it elsewhere (a resume while it still runs would start a copy). The daemon and
-`cctl claude` (below) never move one session at once: each takes the session's move lock,
-under cctl's data folder, and the daemon leaves a session alone while `cctl claude` holds it.
+removes its rows and resumes it elsewhere (a resume while it still runs would start a copy).
+The daemon and `cctl claude` (below) never move one session at once: each takes the
+session's move lock, under cctl's data folder, and the daemon leaves a session alone while
+`cctl claude` holds it.
 
 A session moves at most once an hour, so one woken back onto the global slot by hand is not
-bounced every cycle. If a move fails, the session is resumed back on the global slot (tried
-a few times, since Claude Code can count a session it just stopped as still open), the
-daemon logs it and sends one phone notice, and it does not try that session again until it
-restarts.
+bounced every cycle. If a move fails, the session is resumed back on the global slot with its
+saved options (tried a few times, since Claude Code can count a session it just stopped as
+still open), the daemon logs it and sends one phone notice, and it does not try that session
+again until it restarts. When even that fails, the notice gives the command that brings it
+back as it was.
 
 A session that cannot move without changing is left where it is, with one notice: one
 started with an option this cctl does not know, or one that would act again at startup
 (`--file`, `--rewind-files`, `--session-id`, `--reply-on-resume`); one holding permission
 rules granted while it ran (they are kept in its job row, and no option carries them over);
-and one the folder's profile already holds from an earlier move with other saved options.
+and one working in a git worktree Claude Code made for it (`claude --bg -w`): `claude rm`
+deletes such a worktree along with the row, so that session is never moved, and stays where
+it runs.
 
 Sessions in folders without a rule are never moved, and an exclude-only rule
 prefers no account, so its sessions stay where they are. The moves use the `claude` on the
@@ -328,45 +347,66 @@ An interactive session cannot be moved this way; it gets the relaunch notice abo
 ### Opening a background session
 
 Claude Code runs one background service per config dir, so a background session runs either
-in the main config dir's service (the global slot) or in a folder profile's, and each config
-dir keeps its own job row for it. A plain `claude attach` or `claude --resume` in a ruled
-folder runs on the folder's profile, and when the session runs in another service that goes
-wrong: with a stopped row in the profile, Claude Code wakes it there and kills the copy
-running elsewhere, even in the middle of a turn (the turn is lost); with a failed row, it
-repeats that row's old error ("That session is running in the background...").
+in the main config dir's service (the global slot) or in a folder profile's. A plain
+`claude attach` or `claude --resume` in a ruled folder runs on the folder's profile, and when
+the session runs in another service, a job row the profile still holds for it is the trap
+described above.
 
-`cctl claude attach <id|name>` and `cctl claude --resume <id|name>` (also after `--`) find
-the session first: by its full id, by its short id (`attach` only), by its name or part of
-it (`attach`, as Claude Code matches it), or by its title among this folder's sessions
-(`--resume`, as Claude Code matches it). A name that matches more than one session is
-refused with their ids. A session cctl does not know is passed to Claude Code as typed. The
-session belongs to the slot of the folder it works in (an attach by id from another folder
-follows the session, not the folder you are in). Then:
+`cctl claude attach <session>` and `cctl claude --resume <session>` (also after `--`, and with
+other options around them) find the session first:
+
+- by any full session id it has had (the id it started with, and the conversation it runs
+  after `/clear`);
+- for `attach`, by its short id or any shorter start of it (Claude Code reads one to eight
+  hex digits as the start of a job id, never as a name), else by its name, whole or in part;
+- for `--resume`, by its conversation title, among the sessions of this folder and of the
+  folder's git worktrees (Claude Code's own `.claude/worktrees` among them), as Claude Code
+  searches. A title more than one conversation there has is passed to Claude Code, whose
+  picker then opens, unless a job row on this slot could be chosen in it into the trap above:
+  then it is refused with their ids.
+
+A name that matches more than one session is refused with their ids. A session that is not a
+background session (no job row anywhere, no background service running it) is passed to
+Claude Code as typed. The session belongs to the slot of the folder it works in (an attach by
+id from another folder follows the session, not the folder you are in). Then:
 
 - **it runs where it belongs**: it is opened there;
-- **it runs on another account, idle between turns, with no terminal on that service**: it is
-  moved where it belongs first, by the same move the daemon makes and on the same terms (the
-  folder's slot holds one of its included accounts with usage left, its saved options carry
-  over, a row the profile already holds was saved with the same ones), and then opened there.
-  One line says it was moved, and onto which account;
-- **it runs on another account and is in a turn, waiting on a prompt, watched from another
-  terminal, or cannot move** (or the move failed and it was put back): it is opened where it
-  runs, with one line saying it stays on that account for now, and, when cctl's daemon is
-  running and will do it, that the daemon moves it between turns;
+- **it runs on another account, idle between turns, holding no work, with no terminal on
+  that service**: cctl says it is moving it, moves it where it belongs by the same move the
+  daemon makes and on the same terms (the folder's slot holds one of its included accounts
+  with usage left, its saved options carry over, no git worktree), and then opens it there.
+  Ctrl-C during the move does not cut it off: the move finishes, or puts the session back,
+  and then nothing is opened. One line says it was moved, and onto which account;
+- **it runs on another account and is in a turn, waiting on a prompt, holding work between
+  turns, watched from another terminal, in a git worktree, or cannot move** (or the move
+  failed and it was put back): it is opened where it runs, with one line saying it stays on
+  that account for now and why, and, when cctl's daemon is running and will do it, that the
+  daemon moves it between turns. A session left on the profile of a rule since removed has
+  no login there (every prompt fails with "Not logged in"), so it is moved onto its folder's
+  slot whenever it is idle, and otherwise opened there with that said plainly;
 - **it is open in a terminal** (an interactive session): nothing is touched, and cctl says
   which process has it open;
-- **it runs nowhere**: `attach` opens it where it belongs, restarting a failed row there
-  first, or, when the profile holds no row for it, starting it there with the options its
-  latest row saved (when those cannot carry over, it is opened where that row is). `--resume`
-  runs it in the foreground as Claude Code does, unless the profile's row for it failed: then
-  it is restarted there in the background and opened.
+- **it runs nowhere**: `attach` opens it where it belongs, removing its rows elsewhere first,
+  restarting a failed row there, or, when the profile holds no row for it, starting it there
+  with the options its latest row saved (when those cannot carry over, or its row records a
+  git worktree, it is opened where that row is). `--resume` runs it in the foreground as
+  Claude Code does.
 
-Nothing is ever opened under one config dir while the session runs in another's service.
-`cctl claude` holds the session's move lock while it decides, and until the terminal it opens
-shows up in the service's attach journal, so the daemon cannot move the session in between.
-With `--account` or `--override` the session is never moved, but it is still opened where it
-runs rather than taken from there. `claude rm` is never run: it deletes a session's worktree
-along with its row.
+A prompt given after the session (`cctl claude --resume <id> "<prompt>"`) is passed on as
+`claude --resume <id> "<prompt>"` under the config dir that runs it, where Claude Code sends it
+to the session and opens it.
+
+`cctl claude stop|kill|rm|respawn <session>` is run under the config dir whose service runs
+the session, by its job id there. Anything else `cctl claude` passes to Claude Code that can
+reach a job row — the `--resume` picker, `--continue`, the `agents` view, a `respawn` of every
+session, an id or a title cctl does not find — is checked first against the job rows of the
+slot it runs on: one held there for a session running in another service refuses the
+command, naming the session, where it runs, and `cctl claude attach <short id>` to open it.
+So nothing `cctl claude` runs opens, stops or removes a session through a row under one
+config dir while it runs in another's service. `cctl claude` holds the session's move lock
+while it decides, and until the terminal it started shows up in the service's attach journal,
+so the daemon cannot move the session in between. With `--account` or `--override` the
+session is never moved, but it is still opened where it runs rather than taken from there.
 
 To run in a ruled folder on the global account _on purpose_ for one session, launch it
 with `cctl claude --override`; to run a reserved account in a folder that does not include
