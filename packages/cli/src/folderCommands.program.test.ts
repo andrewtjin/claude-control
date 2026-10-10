@@ -6,31 +6,41 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
   RefreshError,
   SlotError,
+  SwitchEngineError,
+  sandboxPaths,
   type AccountView,
   type ActivateResult,
   type FolderRule,
   type PoolEntry,
 } from '@claude-control/switch-engine';
 import { BIND_GUARD_MARKER } from '@claude-control/daemon';
+import { backgroundHostOptions, createClaudeBackgroundHost } from './backgroundHost.js';
 import { buildProgram } from './program.js';
 import { CliFailure, reportFatal } from './context.js';
 import type { SettingsReport } from './settings.js';
 
 // Every path the commands resolve (vault, profiles, the guard's settings.json, daemon.db) lands in a
 // per-test sandbox: the guard install that follows a successful rule change must never touch the
-// operator's real Claude settings.
-const sandbox = vi.hoisted(() => ({ root: '' }));
+// operator's real Claude settings. `customMain` lays the main config dir out the way a
+// CLAUDE_CONFIG_DIR set to it does (its .claude.json inside it), rather than the default layout.
+const sandbox = vi.hoisted(() => ({ root: '', customMain: false }));
 vi.mock('@claude-control/switch-engine', async (importOriginal) => {
   const real = await importOriginal<typeof import('@claude-control/switch-engine')>();
+  // Imported here, as vi.mock hoists its factory above the file's own imports.
+  const path = await import('node:path');
   return {
     ...real,
     defaultPaths: () => {
       if (sandbox.root === '') throw new Error('test ran outside its sandbox');
-      return real.sandboxPaths(sandbox.root);
+      const paths = real.sandboxPaths(sandbox.root);
+      return sandbox.customMain
+        ? { ...paths, claudeJsonPath: path.join(paths.claudeDir, '.claude.json') }
+        : paths;
     },
   };
 });
@@ -839,14 +849,20 @@ describe('cctl claude opening a background session', () => {
   }
 
   /** The session runs in a config dir's service (this process stands in for its processes, so it
-   *  counts as alive), with a row there, and the registry entry saying what it is doing. */
-  async function runsIn(configDir: string, status: string, kind = 'bg'): Promise<void> {
+   *  counts as alive), with a row there, and the registry entry saying what it is doing. It works
+   *  in the research folder unless `cwd` says otherwise. */
+  async function runsIn(
+    configDir: string,
+    status: string,
+    kind = 'bg',
+    cwd = research,
+  ): Promise<void> {
     await mkdir(join(configDir, 'daemon'), { recursive: true });
     if (kind === 'bg') {
       await writeFile(
         join(configDir, 'daemon', 'roster.json'),
         JSON.stringify({
-          workers: { [SHORT]: { pid: process.pid, sessionId: SID, cwd: research } },
+          workers: { [SHORT]: { pid: process.pid, sessionId: SID, cwd } },
         }),
       );
     }
@@ -859,13 +875,13 @@ describe('cctl claude opening a background session', () => {
         kind,
         status,
         jobId: SHORT,
-        cwd: research,
+        cwd,
       }),
     );
-    await rowIn(configDir, 'running');
+    await rowIn(configDir, 'running', cwd);
   }
 
-  async function rowIn(configDir: string, state: string): Promise<void> {
+  async function rowIn(configDir: string, state: string, cwd = research): Promise<void> {
     await mkdir(join(configDir, 'jobs', SHORT), { recursive: true });
     await writeFile(
       join(configDir, 'jobs', SHORT, 'state.json'),
@@ -873,7 +889,7 @@ describe('cctl claude opening a background session', () => {
         state,
         sessionId: SID,
         name: 'bg eval',
-        cwd: research,
+        cwd,
         respawnFlags: ['-n', 'bg eval'],
       }),
     );
@@ -1146,7 +1162,11 @@ describe('cctl claude opening a background session', () => {
     expect(routed.exited).toBe(false);
     expect(routed.args).toEqual(['attach', SHORT]);
     expect(routed.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
-    for (const args of [['-cr', SID], ['logs', SHORT], ['agents', '--json']]) {
+    for (const args of [
+      ['-cr', SID],
+      ['logs', SHORT],
+      ['agents', '--json'],
+    ]) {
       const r = await launchFrom(args);
       expect({ args, exited: r.exited }).toEqual({ args, exited: true });
       expect(r.err).toContain(`open it with: cctl claude attach ${SHORT}`);
@@ -1171,6 +1191,204 @@ describe('cctl claude opening a background session', () => {
     expect(r.exited).toBe(false);
     expect(r.args).toEqual(['--resume', SID, 'carry on']);
     expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+  });
+
+  /** Whether the session's move lock is free now: nothing of the command just run still holds it. */
+  async function lockFree(): Promise<boolean> {
+    const host = createClaudeBackgroundHost(backgroundHostOptions(sandboxPaths(sandbox.root)));
+    const lock = await host.lockSession(SID, 0);
+    lock?.release();
+    return lock !== undefined;
+  }
+
+  /** The options the launch spawned Claude Code with, beyond the command, arguments and env. */
+  const spawnedWith = (): { onSpawn?: unknown } =>
+    launcher.spawnClaude.mock.calls[0]?.[0] as { onSpawn?: unknown };
+
+  it('an open routed to where the session runs is told the pid it starts, and lets the move lock go once that terminal is done', async () => {
+    // The lock is kept until the attach journal names that very process (see runHolding).
+    ruleOnE();
+    await runsIn(profile(), 'busy');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(typeof spawnedWith().onSpawn).toBe('function');
+    expect(await lockFree()).toBe(true);
+  });
+
+  it('a launch on the slot is told the pid it starts, and a pass that held the move lock lets it go', async () => {
+    ruleOnE();
+    await runsIn(main(), 'busy');
+    const r = await launchFrom(['--override', 'attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(typeof spawnedWith().onSpawn).toBe('function');
+    expect(await lockFree()).toBe(true);
+  });
+
+  it('Ctrl-C pressed twice during a move is answered once, and the move lock is let go', async () => {
+    ruleOnE();
+    await runsIn(main(), 'idle');
+    answersAMove();
+    const answer = bgHost.answer;
+    bgHost.answer = (args, configDir) => {
+      if (args[0] === 'rm') {
+        process.emit('SIGINT');
+        process.emit('SIGINT');
+      }
+      return answer(args, configDir);
+    };
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.err.split('finishing the move first').length - 1).toBe(1);
+    expect(process.exitCode).toBe(130);
+    process.exitCode = undefined;
+    expect(await lockFree()).toBe(true);
+  });
+
+  for (const sig of ['SIGBREAK', 'SIGHUP'] as const) {
+    // Ctrl-Break and a closing terminal end cctl as Ctrl-C does; Ctrl-Break exists on Windows only.
+    it.skipIf(sig === 'SIGBREAK' && process.platform !== 'win32')(
+      `${sig} during a move is held off like Ctrl-C, then the signal is the operator's own again`,
+      async () => {
+        expect(process.listenerCount(sig)).toBe(0);
+        ruleOnE();
+        await runsIn(main(), 'idle');
+        answersAMove();
+        const answer = bgHost.answer;
+        bgHost.answer = (args, configDir) => {
+          if (args[0] === 'rm') process.emit(sig);
+          return answer(args, configDir);
+        };
+        const r = await launchFrom(['attach', SHORT]);
+        expect(bgHost.calls.map((c) => c.args[0])).toEqual(['agents', 'stop', 'rm', '--bg']);
+        expect(r.err).toContain('cctl: interrupted; not opening the session.');
+        expect(launcher.spawnClaude).not.toHaveBeenCalled();
+        expect(process.exitCode).toBe(130);
+        process.exitCode = undefined;
+        expect(process.listenerCount(sig)).toBe(0);
+      },
+    );
+  }
+
+  /** A session busy in the folder profile, working in `cwd`, whose conversation is titled "feat x". */
+  async function titledSessionIn(cwd: string): Promise<void> {
+    await runsIn(profile(), 'busy', 'bg', cwd);
+    await mkdir(join(main(), 'projects', 'p'), { recursive: true });
+    await writeFile(
+      join(main(), 'projects', 'p', `${SID}.jsonl`),
+      JSON.stringify({ type: 'custom-title', customTitle: 'feat x', sessionId: SID }) + '\n',
+    );
+  }
+
+  it('--resume <title> finds a session working in a worktree Claude Code made under the folder', async () => {
+    ruleOnE();
+    const tree = join(research, '.claude', 'worktrees', 'feat');
+    await mkdir(tree, { recursive: true });
+    await titledSessionIn(tree);
+    const r = await launchFrom(['--resume', 'feat x']);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+  });
+
+  it("--resume <title> finds a session working in a git worktree of the folder's repository", async () => {
+    ruleOnE();
+    // A throwaway repository: no hooks, no signing, whatever the box's git config says.
+    const git = (args: string[], cwd: string): void =>
+      void execFileSync(
+        'git',
+        [
+          '-c',
+          'core.longpaths=true',
+          '-c',
+          `core.hooksPath=${join(sandbox.root, 'no-hooks')}`,
+          '-c',
+          'commit.gpgsign=false',
+          '-c',
+          'user.name=t',
+          '-c',
+          'user.email=t@t',
+          ...args,
+        ],
+        { cwd, stdio: 'pipe', encoding: 'utf8' },
+      );
+    git(['init', '-q'], research);
+    git(['commit', '-q', '--allow-empty', '-m', 'x'], research);
+    const tree = join(dirname(research), 'research-wt');
+    git(['worktree', 'add', '-q', tree], research);
+    await titledSessionIn(realpathSync.native(tree));
+    const r = await launchFrom(['--resume', 'feat x']);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+  });
+
+  it('with the main config dir reached through CLAUDE_CONFIG_DIR, a session there is opened under that very dir', async () => {
+    sandbox.customMain = true;
+    try {
+      ruleOnE();
+      await runsIn(main(), 'busy');
+      const r = await launchFrom(['attach', SHORT]);
+      expect(r.exited).toBe(false);
+      expect(r.args).toEqual(['attach', SHORT]);
+      expect(r.env?.CLAUDE_CONFIG_DIR).toBe(main());
+    } finally {
+      sandbox.customMain = false;
+    }
+  });
+
+  it('a folder slot that cannot be seated is no move target: the session opens where it runs, saying why', async () => {
+    ruleOnE();
+    engine.ensureRuleLive.mockRejectedValue(
+      new SwitchEngineError('the folder slot cannot be seated now', 'NO_SEAT'),
+    );
+    await runsIn(main(), 'idle');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(r.err).toContain('the folder slot cannot be seated now');
+  });
+
+  it('with no daemon running, no move by the daemon is promised', async () => {
+    ruleOnE();
+    await runsIn(main(), 'busy');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.err).toContain('stays on A (the global slot) for now');
+    expect(r.err).not.toContain('daemon moves it');
+  });
+
+  it("a session left on a removed rule's profile is said to have no login there", async () => {
+    ruleOnE();
+    await runsIn(join(sandbox.root, 'profiles', 'old'), 'busy');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(r.err).toContain('That profile has no login');
+  });
+
+  it('a session working in a folder no rule covers is never moved off its folder profile onto the global slot', async () => {
+    ruleOnE();
+    const elsewhere = join(sandbox.root, 'elsewhere');
+    await mkdir(elsewhere, { recursive: true });
+    await runsIn(profile(), 'idle', 'bg', realpathSync.native(elsewhere));
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(bgHost.calls).toEqual([]);
+    expect(r.err).toContain('cctl moves background sessions only onto a folder slot');
+  });
+
+  it('a folder slot left with no working account is no place to start a session: refused, saying why', async () => {
+    ruleOnE();
+    engine.ensureRuleLive.mockResolvedValue({
+      ruleId: 'r1',
+      liveAccount: 'e',
+      activated: false,
+      noWorkingAccount: true,
+    });
+    await rowIn(profile(), 'stopped');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('no account it may use is usable');
+    expect(launcher.spawnClaude).not.toHaveBeenCalled();
   });
 
   /** The research rule includes E, but its slot runs on the shared account B. */
