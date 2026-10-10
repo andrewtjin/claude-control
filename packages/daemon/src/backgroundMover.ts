@@ -232,17 +232,19 @@ export class BackgroundMover {
     }
   }
 
-  /** The ids a session's move lock is taken on (see moveLockIds): the id its job started with, as
-   *  the roster lists it, and the conversation the registry says the job runs now and its row on the
-   *  global slot ran last, which differ after /clear. A registry that cannot be read right now
-   *  rejects, and the session is looked at again next cycle. */
+  /** The ids a session's move lock is taken on (see moveLockIds): the conversation its worker was
+   *  started on, as the roster records it; the id its job started with and the conversation it ran
+   *  last, as its row on the global slot records them; and the conversation the registry says the
+   *  job runs now. After /clear these differ, and once the job is woken again its worker no longer
+   *  records the id the job started with, so that one is read off the row. A registry that cannot be
+   *  read right now rejects, and the session is looked at again next cycle. */
   private async lockIdsOf(session: BackgroundSession): Promise<string[]> {
     const live = await this.host.liveSessions();
     const row = await this.host.jobRow(null, session.short);
     return moveLockIds([
       session.sessionId,
       ...live.filter((e) => e.kind === 'bg' && e.jobId === session.short).map((e) => e.sessionId),
-      row.kind === 'row' ? row.row.resumeSessionId : undefined,
+      ...(row.kind === 'row' ? [row.row.sessionId, row.row.resumeSessionId] : []),
     ]);
   }
 

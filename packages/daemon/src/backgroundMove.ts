@@ -22,9 +22,13 @@
 //     file) must not come back without them. One holding anything a move cannot carry over is not
 //     moved at all. The same options carry it back when a move fails;
 //   - `/clear` in a background session starts a new conversation in the same job: the shared session
-//     registry then names the new id (with the job's short id), while the roster and the row keep the
-//     id the job started with and the row records the new one as `resumeSessionId`. A move resumes
-//     the CURRENT conversation, which then runs under a job named after it. A row elsewhere that
+//     registry then names the new id (with the job's short id), and the row keeps the id the job
+//     started with and records the new one as `resumeSessionId`. The roster lists the job by its
+//     short id; its worker records the conversation it was started on, which is the id the job
+//     started with only until the job is woken again: woken, it runs the conversation its row ran
+//     last, and its worker records that one (measured). So a hosted job is known by its short id,
+//     never by the first digits of an id. A move resumes the CURRENT conversation, which then runs
+//     under a job named after it. A row elsewhere that
 //     records another conversation under the same job id (the job's earlier conversation, or that
 //     conversation resumed as a job of its own) is not this session's: it is left alone, since a
 //     wake of it reaches only that job id, which the moved session no longer runs under;
@@ -52,9 +56,11 @@ export const JOB_ID_PATTERN = /^[0-9a-f]{8}$/;
 
 /** One background session as a config dir's Claude Code service hosts it. */
 export interface BackgroundSession {
-  /** Its job's short id in the service that hosts it. */
+  /** Its job's short id in the service that hosts it: the roster's key, which is what names it. */
   short: string;
-  /** The session id the job started with (the roster's and the row's; see the header on /clear). */
+  /** The conversation its worker was started on, as the roster records it: the id its job started
+   *  with, or for a job woken again after /clear the conversation it was woken into, which does not
+   *  start with `short` (see the header on /clear). */
   sessionId: string;
   /** Its working directory: which folder rule applies, and where a resume must run. */
   cwd: string;
@@ -313,7 +319,7 @@ export type SessionWhere =
       configDir: string | null;
       /** Its job's short id there. */
       short: string;
-      /** The session id that job started with. */
+      /** The conversation its worker was started on (see {@link BackgroundSession.sessionId}). */
       sessionId: string;
       /** The conversation it runs now (differs from `sessionId` after /clear). */
       currentId: string;
@@ -515,7 +521,7 @@ export async function whereRuns(
       (e) => lineage.ids.has(e.sessionId) || (e.jobId !== undefined && lineage.shorts.has(e.jobId)),
     );
     // A live background entry names the job that runs it, which is how its service's roster lists
-    // it (by the id the job started with, not the conversation it runs now).
+    // it (by that short id, whatever conversation its worker records).
     const shorts = new Set(lineage.shorts);
     for (const e of entries) if (e.kind === 'bg' && e.jobId !== undefined) shorts.add(e.jobId);
     for (const configDir of await host.configDirs()) {

@@ -76,10 +76,11 @@ const kill = (short) => {
   if (row) { row.state = 'failed'; row.detail = 'exit 1 before init'; writeRow(c, short, row); }
   return path.basename(c);
 };
-/** Host a job in this config dir's service, live and idle: the roster lists it by the id it
- *  started with, the registry by the conversation it runs (after /clear, not that id). */
+/** Wake a job in this config dir's service, live and idle: the roster lists it by its job id, its
+ *  worker recording the conversation it is woken into, as the registry does (a row cleared before
+ *  its wake runs the conversation it ran last, not the id its job started with, measured). */
 const host = (short, sid, cwd, current) => {
-  const r = roster(cfg); r.workers[short] = { pid: LIVE, procStart: LIVE_START, sessionId: sid, cwd }; writeRoster(cfg, r);
+  const r = roster(cfg); r.workers[short] = { pid: LIVE, procStart: LIVE_START, sessionId: current || sid, cwd }; writeRoster(cfg, r);
   fs.writeFileSync(path.join(reg, String(900000 + Math.floor(Math.random() * 99999)) + '.json'),
     JSON.stringify({ pid: LIVE, procStart: LIVE_START, sessionId: current || sid, kind: 'bg', status: 'idle', jobId: short, cwd }));
 };
@@ -636,6 +637,52 @@ describe('cctl claude reaching a background session, against a fake claude on PA
     ]);
     // Woken in place: no new job named after the conversation it runs.
     expect(await readdir(join(rig.profile, 'jobs'))).toEqual([SHORT]);
+    // Found where it runs now, under its job id, so the next attach just opens it there.
+    expect((await cctlClaude(rig, ['attach', SHORT])).exit).toBe(0);
+    expect(show(await commands(rig)).slice(2)).toEqual([`rule-x attach ${SHORT}`]);
+    expect(harm(await commands(rig))).toEqual([]);
+  }, 60_000);
+
+  it('a move after /clear cut off before its rows went: cctl claude --resume <conversation> brings it back, says so, then moves it where it belongs', async () => {
+    rig = await makeRig();
+    const NEW = 'a579c3c9-9210-4268-84cf-e73a20d40b60';
+    // The move stopped it on the global slot and was cut off there: its row there is stopped, and
+    // what the move saved names the conversation it runs and the job that ran it.
+    await mkdir(join(rig.main, 'jobs', SHORT), { recursive: true });
+    await writeFile(
+      join(rig.main, 'jobs', SHORT, 'state.json'),
+      JSON.stringify({
+        state: 'stopped',
+        sessionId: SID,
+        resumeSessionId: NEW,
+        name: 'bg eval',
+        cwd: rig.work,
+        respawnFlags: ['--name=bg eval'],
+      }),
+    );
+    await hostOf(rig).saveRecovery({
+      configDir: null,
+      sessionId: NEW,
+      job: { short: SHORT, sessionId: SID },
+      options: ['--name=bg eval'],
+      cwd: rig.work,
+    });
+    const { lines, exit } = await cctlClaude(rig, ['--resume', NEW]);
+    expect(exit).toBe(0);
+    expect(lines[0]).toBe(
+      `cctl: brought background session ${NEW} back on Shared (the global slot), where a move found it.`,
+    );
+    expect(show(await commands(rig))).toEqual([
+      // Its row woken by the id its job started with, into the conversation it ran last.
+      `main --bg --resume ${SID}`,
+      'main agents --json',
+      `main stop ${SHORT}`,
+      `main rm ${SHORT}`,
+      `rule-x --bg --resume ${NEW} --name=bg eval`,
+      `rule-x attach ${NEW.slice(0, 8)}`,
+    ]);
+    expect(harm(await commands(rig))).toEqual([]);
+    expect(await hostOf(rig).recoveryOf(NEW)).toBeUndefined();
   }, 60_000);
 
   it("Claude Code's picker under the profile is refused while its stopped row could take the session from the global slot", async () => {

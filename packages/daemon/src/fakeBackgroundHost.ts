@@ -279,6 +279,10 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
       if (copiesLeft > 0) this.copyResumesIn.set(c, copiesLeft - 1);
       return Promise.reject(new Error('claude started a copy (5ad47a09) instead of resuming it'));
     }
+    // Woken by the id its job started with, a row runs the conversation it ran last (after /clear,
+    // not that id), and its worker records that conversation under the row's job id, as Claude
+    // Code wakes a row (measured).
+    const conversation = row?.resumeSessionId ?? input.sessionId;
     if (row === undefined) {
       this.setRow(c, input.short, {
         sessionId: input.sessionId,
@@ -288,16 +292,12 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
       });
     } else {
       row.state = 'running';
-      // Woken by the id its job started with, it runs the conversation it ran last (after /clear,
-      // not that id), as Claude Code wakes a row.
-      if (row.resumeSessionId !== undefined && row.resumeSessionId !== row.sessionId) {
-        this.currentIds.set(input.short, row.resumeSessionId);
-      }
+      if (conversation !== row.sessionId) this.currentIds.set(input.short, conversation);
     }
     if (!this.silentResumeIn.has(c)) {
       this.hosted.set(c, [
         ...(this.hosted.get(c) ?? []),
-        { short: input.short, sessionId: input.sessionId, cwd: input.cwd },
+        { short: input.short, sessionId: conversation, cwd: input.cwd },
       ]);
       this.states.set(input.short, { idle: true });
       const reads = this.showOnReadIn.get(c);

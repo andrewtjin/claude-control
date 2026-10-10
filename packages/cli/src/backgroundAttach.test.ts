@@ -324,9 +324,10 @@ class FakeClaude implements ClaudeBackgroundHost {
       existing.state = 'running';
     }
     if (this.silentResumeIn.has(key(c))) return Promise.resolve();
+    // Its worker records that conversation under the row's job id (measured).
     this.hosted.set(key(c), [
       ...(this.hosted.get(key(c)) ?? []),
-      { short: input.short, sessionId: input.sessionId, cwd: input.cwd },
+      { short: input.short, sessionId: conversation, cwd: input.cwd },
     ]);
     this.registry.push({
       pid: 5000 + this.registry.length,
@@ -1100,7 +1101,8 @@ describe('routeBackgroundLaunch — the session runs in no service', () => {
     expect(d).toMatchObject(openUnder(X));
     expect(w.host.calls).toEqual([`resume ${X}`]);
     expect([...w.host.rows.get(X)!.keys()]).toEqual([SHORT]);
-    expect(w.host.hosted.get(X)).toEqual([{ short: SHORT, sessionId: SID, cwd: WORK }]);
+    // Its worker, under its own job id, records the conversation it was woken into.
+    expect(w.host.hosted.get(X)).toEqual([{ short: SHORT, sessionId: NEW, cwd: WORK }]);
     expect(w.host.registry.at(-1)).toMatchObject({ sessionId: NEW, jobId: SHORT });
   });
 

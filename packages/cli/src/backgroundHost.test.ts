@@ -12,7 +12,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { whereRuns } from '@claude-control/daemon';
+import { settledWhere, whereRuns } from '@claude-control/daemon';
 import { routeBackgroundLaunch, type RouteContext } from './backgroundAttach.js';
 import {
   backgroundHostOptions,
@@ -302,7 +302,6 @@ describe('createClaudeBackgroundHost', () => {
         files: {
           [`${MAIN}/daemon/roster.json`]: roster({
             NOTSHORT: worker(SID, 'C:/r'),
-            f38038c6: worker(SID, 'C:/r'), // a session id that is not this short's
             abcdef12: { ...worker('ABCDEF12-076B-42A1-B487-70A8B77401FA', 'C:/r') },
             '1ee43a2c': { pid: 1, sessionId: '1ee43a2c-076b-42a1-b487-70a8b77401fa' },
           }),
@@ -310,6 +309,19 @@ describe('createClaudeBackgroundHost', () => {
       });
       expect(await host.listHosted(null)).toEqual([]);
       expect(await host.listHosted('C:/nowhere')).toEqual([]);
+    });
+
+    it('lists a worker by its job id, whatever conversation it records: a job woken again after /clear', async () => {
+      // Measured: once a /clear'd job is stopped and woken again, its worker records the
+      // conversation the row ran last, under the same job id.
+      const NEW = '30dc903d-1f15-455f-97fe-91dcf6061834';
+      const { host } = hostWith({
+        files: { [`${MAIN}/daemon/roster.json`]: roster({ [SHORT]: worker(NEW, 'C:/work') }) },
+      });
+      expect(await host.listHosted(null)).toEqual([
+        { short: SHORT, sessionId: NEW, cwd: 'C:/work' },
+      ]);
+      expect(await host.listHosted(null, { verified: true })).toHaveLength(1);
     });
 
     it('a roster caught mid-write is not known, never read as nothing hosted', async () => {
@@ -1606,6 +1618,95 @@ describe('a copy started instead of the session', () => {
 });
 
 describe("a slot's trap check, over these reads", () => {
+  /** What cctl claude routes with, over a host: the launch runs under `launch`. */
+  const ctxFor = (
+    host: ReturnType<typeof createClaudeBackgroundHost>,
+    launch: string | null,
+  ): RouteContext => ({
+    host,
+    cwd: 'C:/work',
+    platform: 'win32',
+    sameFolder: (a, b) => a.toLowerCase() === b.toLowerCase(),
+    titleFolders: (c) => Promise.resolve([c]),
+    homeOf: () => Promise.resolve({ configDir: PROFILE, movable: true }),
+    launchConfigDir: () => Promise.resolve(launch),
+    view: (c) => Promise.resolve({ slot: c === null ? 'the global slot' : 'the folder slot' }),
+    daemonRunning: false,
+    say: () => {},
+    shield: (fn) => fn(() => {}),
+    lockWaitMs: 0,
+    timing: {
+      clock: () => 0,
+      confirmTimeoutMs: 0,
+      sleep: () => Promise.resolve(),
+      logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    },
+  });
+  const LIVE_START = '134360864829411286';
+  const NEW = '30dc903d-1f15-455f-97fe-91dcf6061834';
+
+  /** A /clear'd job woken again on the main config dir, as measured: its row records the id it
+   *  started with and the conversation it ran last; its worker, under its job id, and its registry
+   *  entry record that conversation. */
+  const rewoken = (): ReturnType<typeof hostWith> =>
+    hostWith({
+      profilesRoot: 'C:/Users/me/AppData/Local/claude-control/profiles',
+      files: {
+        [`${MAIN}/daemon/roster.json`]: roster({
+          [SHORT]: { ...worker(NEW, 'C:/work', 4242), procStart: LIVE_START },
+        }),
+        [`${MAIN}/jobs/${SHORT}/state.json`]: JSON.stringify({
+          state: 'running',
+          sessionId: SID,
+          resumeSessionId: NEW,
+          cwd: 'C:/work',
+        }),
+        [`${MAIN}/sessions/100.json`]: JSON.stringify({
+          pid: 100,
+          procStart: LIVE_START,
+          sessionId: NEW,
+          kind: 'bg',
+          status: 'idle',
+          jobId: SHORT,
+          cwd: 'C:/work',
+        }),
+        [`${PROFILE}/x`]: '',
+      },
+      starts: new Map([
+        [4242, LIVE_START],
+        [100, LIVE_START],
+      ]),
+    });
+
+  it("a /clear'd job woken again is found where it runs, under its job id, running its conversation", async () => {
+    const { host } = rewoken();
+    expect(
+      await settledWhere(
+        host,
+        { ids: new Set([SID, NEW]), shorts: new Set([SHORT]) },
+        {
+          sleep: () => Promise.resolve(),
+        },
+      ),
+    ).toEqual({
+      kind: 'bg',
+      configDir: null,
+      short: SHORT,
+      sessionId: NEW,
+      currentId: NEW,
+      status: 'idle',
+      cwd: 'C:/work',
+    });
+  });
+
+  it("a /clear'd job woken again: its own row where it runs is no trap, so --continue there passes", async () => {
+    const { host } = rewoken();
+    const decision = await routeBackgroundLaunch({ verb: 'guard' }, ctxFor(host, null), {
+      kind: 'follow',
+    });
+    expect(decision).toEqual({ kind: 'pass' });
+  });
+
   it("a profile's roster record whose pid now names another process is not where the session runs: its row there is a trap", async () => {
     // It runs on the main config dir. The profile's roster still lists it under a pid reused since,
     // so only a verified read tells that the profile's row would wake it there and take it over.
@@ -1636,27 +1737,9 @@ describe("a slot's trap check, over these reads", () => {
         [4343, '134360999999999999'],
       ]),
     });
-    const ctx: RouteContext = {
-      host,
-      cwd: 'C:/work',
-      platform: 'win32',
-      sameFolder: (a, b) => a.toLowerCase() === b.toLowerCase(),
-      titleFolders: (c) => Promise.resolve([c]),
-      homeOf: () => Promise.resolve({ configDir: PROFILE, movable: true }),
-      launchConfigDir: () => Promise.resolve(PROFILE),
-      view: (c) => Promise.resolve({ slot: c === null ? 'the global slot' : 'the folder slot' }),
-      daemonRunning: false,
-      say: () => {},
-      shield: (fn) => fn(() => {}),
-      lockWaitMs: 0,
-      timing: {
-        clock: () => 0,
-        confirmTimeoutMs: 0,
-        sleep: () => Promise.resolve(),
-        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
-      },
-    };
-    const decision = await routeBackgroundLaunch({ verb: 'guard' }, ctx, { kind: 'follow' });
+    const decision = await routeBackgroundLaunch({ verb: 'guard' }, ctxFor(host, PROFILE), {
+      kind: 'follow',
+    });
     expect(decision.kind).toBe('refuse');
     expect(decision.kind === 'refuse' ? decision.message : '').toContain(
       'the folder slot still holds a job row for a background session that runs elsewhere',

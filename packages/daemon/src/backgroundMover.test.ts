@@ -473,6 +473,34 @@ describe('BackgroundMover', () => {
       expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('failed');
       expect(h.host.locks).toEqual([`take ${SID} 0`, `release ${SID}`]);
     });
+
+    it("a /clear'd job woken again is moved with its conversation, locked on the id its job started with too", async () => {
+      const h = harness();
+      const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
+      // Measured: woken again, its worker records the conversation its row ran last, under the
+      // job id it started with; only its row still names that id.
+      h.onMain(
+        { short: SHORT, sessionId: NEW, cwd: 'C:/research' },
+        { idle: true },
+        { sessionId: SID, resumeSessionId: NEW },
+      );
+      expect((await h.mover.run(targets(TARGET)))[0]).toMatchObject({
+        sessionId: NEW,
+        result: 'moved',
+      });
+      expect(changes(h)).toEqual([
+        `stop null ${SHORT}`,
+        `rm null ${SHORT}`,
+        `resume ${PROFILE} ${NEW} C:/research [--permission-mode=auto]`,
+      ]);
+      // The ids cctl claude takes it on too: the id its job started with and its conversation.
+      expect(h.host.locks).toEqual([
+        `take ${SID} 0`,
+        `take ${NEW} 0`,
+        `release ${NEW}`,
+        `release ${SID}`,
+      ]);
+    });
   });
 
   describe('what it carries over, or refuses to', () => {

@@ -5,9 +5,12 @@
 //
 // Claude Code runs one background service per config dir (keyed on CLAUDE_CONFIG_DIR, or on
 // ~/.claude when it is unset), and keeps that service's state under the config dir:
-//   - `daemon/roster.json`: the workers the service hosts right now, by short id, each with its full
-//     session id, working directory and the pid of its terminal host. It also holds attach secrets;
-//     only the four fields above are ever read out of it, and nothing from it is logged;
+//   - `daemon/roster.json`: the workers the service hosts right now, by job id, each with the
+//     conversation it was started on, its working directory and the pid of its terminal host. That
+//     conversation is the id its job started with, until a job /clear moved on is woken again: its
+//     worker then records the conversation it was woken into, under the same job id (measured), so
+//     a worker is known by its job id alone. It also holds attach secrets; only the four fields
+//     above are ever read out of it, and nothing from it is logged;
 //   - `jobs/<short>/state.json`: the session's job row, with its state (`running`, `stopped`,
 //     `failed`...), its name, the launch options it saved (`respawnFlags`, see {@link replayOptions}),
 //     the permission rules granted while it ran (`sessionPermissionRules`), the worktree Claude Code
@@ -884,9 +887,10 @@ export function createClaudeBackgroundHost(
     return { pids, torn };
   };
 
-  /** The sessions a config dir's service hosts, from its roster (see the header). No roster (no
-   *  service ever ran there) is nothing hosted; one that cannot be read right now (caught mid-write)
-   *  throws, so it is never read as nothing hosted. */
+  /** The sessions a config dir's service hosts, from its roster (see the header), each by its job id
+   *  (the roster's key) with the conversation its worker records, which need not start with that id.
+   *  No roster (no service ever ran there) is nothing hosted; one that cannot be read right now
+   *  (caught mid-write) throws, so it is never read as nothing hosted. */
   const readHosted = async (
     configDir: string | null,
     verified: boolean,
@@ -921,7 +925,6 @@ export function createClaudeBackgroundHost(
       const w = raw as Record<string, unknown>;
       const sessionId = w.sessionId;
       if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) continue;
-      if (!sessionId.startsWith(short)) continue;
       const cwd = nonEmpty(w.cwd);
       if (cwd === undefined) continue;
       // A roster left behind by a service that died still names its workers; only a live terminal
