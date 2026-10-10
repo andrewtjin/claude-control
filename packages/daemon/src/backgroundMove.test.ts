@@ -84,8 +84,14 @@ describe('moveBackgroundSession', () => {
       order.push('stop');
       return stop(c, short);
     };
-    await moveBackgroundSession(host, REQUEST, timing, () => order.push('commit'));
+    let told: unknown;
+    await moveBackgroundSession(host, REQUEST, timing, (recovery) => {
+      order.push('commit');
+      told = recovery;
+    });
     expect(order).toEqual(['commit', 'stop']);
+    // Told how to bring it back by hand, should the move be cut off from there on.
+    expect(told).toEqual({ configDir: OLD, sessionId: SID, options: ['--model=opus'] });
 
     const busy = fakeHost();
     busy.states.set(SHORT, { idle: false });

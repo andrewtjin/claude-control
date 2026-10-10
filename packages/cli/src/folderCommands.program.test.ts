@@ -1113,7 +1113,10 @@ describe('cctl claude opening a background session', () => {
     };
     const r = await launchFrom(['attach', SHORT]);
     expect(bgHost.calls.map((c) => c.args[0])).toEqual(['agents', 'stop', 'rm', '--bg']);
-    expect(r.err).toContain('cctl: finishing the move first');
+    expect(r.err).toContain(
+      'cctl: finishing the move first; stopping now would leave the session stopped. If this ' +
+        `window closes before it finishes, resume it with: claude --bg --resume ${SID} "--name=bg eval"`,
+    );
     expect(r.err).toContain('cctl: interrupted; not opening the session.');
     expect(launcher.spawnClaude).not.toHaveBeenCalled();
     expect(process.exitCode).toBe(130);

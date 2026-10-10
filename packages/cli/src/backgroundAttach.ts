@@ -50,6 +50,7 @@ import {
   type LocatedRow,
   type MoveResult,
   type MoveTiming,
+  type ResumeRecovery,
   type SessionLock,
   type SessionWhere,
 } from '@claude-control/daemon';
@@ -187,8 +188,10 @@ export interface RouteContext {
   daemonRunning: boolean;
   /** One line to the operator. */
   say(line: string): void;
-  /** Run a move with Ctrl-C held off until it has finished or put the session back. */
-  shield<T>(fn: () => Promise<T>): Promise<T>;
+  /** Run a move with Ctrl-C held off until it has finished or put the session back. `recovery`
+   *  says, once the move has committed, the command that brings the session back by hand: it is
+   *  told to an operator who interrupts, in case the window closes before the move ends. */
+  shield<T>(fn: () => Promise<T>, recovery?: () => string | undefined): Promise<T>;
   /** How long to wait for another cctl process that is moving the same session. */
   lockWaitMs: number;
   timing: MoveTiming;
@@ -544,6 +547,12 @@ function onWhat(v: ConfigView): string {
   return v.account !== undefined ? `${v.account} (${v.slot})` : v.slot;
 }
 
+/** The command that brings a session back by hand where a move left it to be (see the daemon's
+ *  ResumeRecovery), naming the config dir as the host reaches it. */
+function recoveryHint(ctx: RouteContext, recovery: ResumeRecovery): string {
+  return ctx.host.resumeHint(recovery.configDir, recovery.sessionId, recovery.options);
+}
+
 /** Why a session running elsewhere is not moved where it belongs, in words. */
 function stayReason(status: string | undefined): string {
   if (status === 'busy') return 'it is in a turn';
@@ -722,24 +731,29 @@ async function decide(
     } else if (where.status !== 'idle') {
       why = stayReason(where.status);
     } else {
-      const moved: MoveResult = await ctx.shield(() =>
-        moveBackgroundSession(
-          ctx.host,
-          {
-            session: { short: where.short, sessionId: where.sessionId, cwd: where.cwd },
-            from: { configDir: where.configDir, name: runsOn.slot },
-            to: { configDir: home.configDir, name: belongs.slot },
-            platform,
-          },
-          ctx.timing,
-          // Said once the move's own checks have passed, right before the stop: from then on the
-          // session runs nowhere until it is resumed, here or back where it was.
-          () =>
-            ctx.say(
-              `cctl: moving background session ${label(target)} from ${onWhat(runsOn)} onto ` +
-                `${onWhat(belongs)}; Ctrl-C waits until it has finished.`,
-            ),
-        ),
+      let hint: string | undefined;
+      const moved: MoveResult = await ctx.shield(
+        () =>
+          moveBackgroundSession(
+            ctx.host,
+            {
+              session: { short: where.short, sessionId: where.sessionId, cwd: where.cwd },
+              from: { configDir: where.configDir, name: runsOn.slot },
+              to: { configDir: home.configDir, name: belongs.slot },
+              platform,
+            },
+            ctx.timing,
+            // Said once the move's own checks have passed, right before the stop: from then on
+            // the session runs nowhere until it is resumed, here or back where it was.
+            (recovery) => {
+              hint = recoveryHint(ctx, recovery);
+              ctx.say(
+                `cctl: moving background session ${label(target)} from ${onWhat(runsOn)} onto ` +
+                  `${onWhat(belongs)}; Ctrl-C waits until it has finished.`,
+              );
+            },
+          ),
+        () => hint,
       );
       if (moved.result === 'moved') {
         ctx.say(
@@ -753,13 +767,12 @@ async function decide(
         return decide(req, target, ctx, mode, lock, true);
       }
       if (moved.result === 'failed' && !moved.restored) {
-        const { configDir, sessionId, options } = moved.recovery;
         return {
           kind: 'refuse',
           message:
             `could not move ${label(target)} onto ${onWhat(belongs)} (${moved.reason}), nor ` +
             `resume it on ${onWhat(runsOn)}. Resume it there with: ` +
-            ctx.host.resumeHint(configDir, sessionId, options),
+            recoveryHint(ctx, moved.recovery),
         };
       }
       why = moved.reason;
@@ -861,18 +874,23 @@ async function decide(
   // The slot it belongs to holds no row: start it there from its latest row, on the terms a move
   // carries options over on (its rows elsewhere go, so it is left one only there).
   const latest = rows[0]!;
-  const started = await ctx.shield(() =>
-    moveBackgroundSession(
-      ctx.host,
-      {
-        session: { short: latest.row.short, sessionId: latest.row.sessionId, cwd: target.cwd },
-        from: { configDir: latest.configDir, name: 'its last config dir' },
-        to: { configDir: home.configDir, name: 'the slot it belongs to' },
-        start: true,
-        platform,
-      },
-      ctx.timing,
-    ),
+  let hint: string | undefined;
+  const started = await ctx.shield(
+    () =>
+      moveBackgroundSession(
+        ctx.host,
+        {
+          session: { short: latest.row.short, sessionId: latest.row.sessionId, cwd: target.cwd },
+          from: { configDir: latest.configDir, name: 'its last config dir' },
+          to: { configDir: home.configDir, name: 'the slot it belongs to' },
+          start: true,
+          platform,
+        },
+        ctx.timing,
+        // From here its rows are going, until it is started there or put back.
+        (recovery) => (hint = recoveryHint(ctx, recovery)),
+      ),
+    () => hint,
   );
   if (started.result === 'moved') {
     ctx.say(
@@ -883,12 +901,11 @@ async function decide(
   }
   if (started.result === 'failed') {
     if (!started.restored) {
-      const { configDir, sessionId, options } = started.recovery;
       return {
         kind: 'refuse',
         message:
           `could not start ${label(target)} on ${onWhat(await ctx.view(home.configDir))} ` +
-          `(${started.reason}). Resume it with: ${ctx.host.resumeHint(configDir, sessionId, options)}`,
+          `(${started.reason}). Resume it with: ${recoveryHint(ctx, started.recovery)}`,
       };
     }
     return cannotStart(home.configDir, started.reason);

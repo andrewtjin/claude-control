@@ -1114,14 +1114,23 @@ function moveShield(say: (line: string) => void): {
   let interrupted = false;
   const signals: NodeJS.Signals[] =
     process.platform === 'win32' ? ['SIGINT', 'SIGBREAK', 'SIGHUP'] : ['SIGINT', 'SIGHUP'];
+  let recovery: (() => string | undefined) | undefined;
   const onSignal = (): void => {
     if (!interrupted) {
-      say('cctl: finishing the move first; stopping now would leave the session stopped.');
+      // Said once, with the way back in case the window closes before the move ends.
+      const hint = recovery?.();
+      say(
+        'cctl: finishing the move first; stopping now would leave the session stopped.' +
+          (hint !== undefined
+            ? ` If this window closes before it finishes, resume it with: ${hint}`
+            : ''),
+      );
     }
     interrupted = true;
   };
   return {
-    async shield(fn) {
+    async shield(fn, note) {
+      recovery = note;
       for (const sig of signals) process.on(sig, onSignal);
       try {
         return await fn();

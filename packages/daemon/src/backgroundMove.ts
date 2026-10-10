@@ -712,13 +712,14 @@ async function putBack(
  * confirm it is hosted there. On any failure after the stop, put it back where it was. With
  * `request.start`, the session runs nowhere and is started under the target from its row on `from`
  * the same way, minus the stop. The caller holds the session's move lock. `onCommit` runs once,
+ * with how the session is brought back by hand should the move be cut off from here on,
  * right before the first change: the last moment nothing has been touched.
  */
 export async function moveBackgroundSession(
   host: BackgroundSessionHost,
   request: MoveRequest,
   timing: MoveTiming,
-  onCommit?: () => void,
+  onCommit?: (recovery: ResumeRecovery) => void,
 ): Promise<MoveResult> {
   const { session, from, to } = request;
   const platform = request.platform ?? process.platform;
@@ -755,7 +756,7 @@ export async function moveBackgroundSession(
   });
   const runsOnSource = (w: SessionWhere): boolean =>
     w.kind === 'bg' && sameConfigDir(w.configDir, from.configDir, platform);
-  onCommit?.();
+  onCommit?.(recovery);
 
   if (request.start !== true) {
     try {
