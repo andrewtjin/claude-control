@@ -1283,12 +1283,19 @@ process.stdout.write('backgrounded · 1ee43a2b (idle — send a prompt to start)
     const work = join(dir, "work & (x) 'q' é");
     await mkdir(bin, { recursive: true });
     await mkdir(work, { recursive: true });
-    await writeFile(join(bin, 'fake.js'), FAKE, 'utf8');
+    // The temp tree declares itself an ES module package, as some do: the fake is a .cjs, so it
+    // stays CommonJS whatever package it sits in.
+    await writeFile(join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
+    await writeFile(join(bin, 'fake.cjs'), FAKE, 'utf8');
     if (process.platform === 'win32') {
-      // An npm-style shim the launcher unwraps to `node fake.js`.
-      await writeFile(join(bin, 'claude.cmd'), '@ECHO off\r\n"%_prog%" "%dp0%\\fake.js" %*\r\n');
+      // An npm-style shim the launcher unwraps to `node fake.cjs`.
+      await writeFile(join(bin, 'claude.cmd'), '@ECHO off\r\n"%_prog%" "%dp0%\\fake.cjs" %*\r\n');
     } else {
-      await writeFile(join(bin, 'claude'), `#!${process.execPath}\n${FAKE}`, 'utf8');
+      await writeFile(
+        join(bin, 'claude'),
+        `#!/bin/sh\nexec "${process.execPath}" "${join(bin, 'fake.cjs')}" "$@"\n`,
+        'utf8',
+      );
       await chmod(join(bin, 'claude'), 0o755);
     }
     const record = join(dir, 'record.json');
