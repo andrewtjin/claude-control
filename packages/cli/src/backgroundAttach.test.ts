@@ -100,6 +100,9 @@ class FakeClaude implements ClaudeBackgroundHost {
   readonly locks: string[] = [];
   /** Every id taken, in order. */
   readonly lockedIds: string[] = [];
+  /** Ids whose lock cannot be let go (its directory still held open): a release throws, and the
+   *  lock stays held, as one left on disk does until it lapses. */
+  readonly stuckLocks = new Set<string>();
   /** Ids held now, each with the takers waiting on it. */
   private readonly held = new Map<string, Array<() => void>>();
   /** Runs before a roster read, by config dir (to move the session between two looks). */
@@ -382,6 +385,11 @@ class FakeClaude implements ClaudeBackgroundHost {
       release: () => {
         if (released) return;
         released = true;
+        if (this.stuckLocks.has(sessionId)) {
+          throw Object.assign(new Error(`EBUSY: resource busy, rmdir '${sessionId}'`), {
+            code: 'EBUSY',
+          });
+        }
         const waiting = this.held.get(sessionId) ?? [];
         this.held.delete(sessionId);
         if (this.held.size === 0) this.locks.push('release');
@@ -1282,6 +1290,33 @@ describe('routeBackgroundLaunch — open in a terminal, unclear, or locked', () 
       message: 'another cctl process is still moving c5f2097e; try again in a moment.',
     });
     expect(w.host.calls).toEqual([]);
+  });
+
+  it('a move lock that cannot be let go is said, and what was decided still runs', async () => {
+    const STUCK =
+      `cctl: could not let go of the move lock on ${SID} (EBUSY: resource busy, rmdir '${SID}'); ` +
+      'it lapses on its own within 2 minutes.';
+    // Let go of as the decision is made: a stop is run where the session runs all the same.
+    const w = world();
+    w.host.runs(MAIN);
+    w.host.stuckLocks.add(SID);
+    expect(await decideIn(w, control('stop', SHORT))).toMatchObject({
+      kind: 'open',
+      configDir: MAIN,
+      args: ['stop', SHORT],
+    });
+    expect(w.lines.at(-1)).toBe(STUCK);
+    // Kept until the terminal shows up, then let go: the terminal's own exit is what is returned.
+    const v = world();
+    v.host.runs(X);
+    v.host.stuckLocks.add(SID);
+    const d = await decideIn(v, attach(SHORT));
+    expect(d).toMatchObject(openUnder(X));
+    const exit = await runHolding(v.host, d.kind === 'open' ? d.hold : undefined, () =>
+      Promise.resolve(7),
+    );
+    expect(exit).toBe(7);
+    expect(v.lines).toEqual([STUCK]);
   });
 });
 

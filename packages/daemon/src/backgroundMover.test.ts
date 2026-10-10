@@ -474,6 +474,21 @@ describe('BackgroundMover', () => {
       expect(h.host.locks).toEqual([`take ${SID} 0`, `release ${SID}`]);
     });
 
+    it('a lock that cannot be let go is said, and the cycle goes on to the next session', async () => {
+      const h = harness();
+      h.onMain(session(SID, 'C:/research'), { idle: true });
+      h.onMain(session(SID2, 'C:/research'), { idle: true });
+      h.host.failRelease.add(SID);
+      const outcomes = await h.mover.run(targets(TARGET));
+      expect(outcomes.map((o) => [o.sessionId, o.result])).toEqual([
+        [SID, 'moved'],
+        [SID2, 'moved'],
+      ]);
+      expect(h.warns).toEqual([
+        "could not let go of a background session's move lock; it lapses on its own once no longer refreshed",
+      ]);
+    });
+
     it("a /clear'd job woken again is moved with its conversation, locked on the id its job started with too", async () => {
       const h = harness();
       const NEW = '7a7a7a7a-1111-4222-8333-444444444444';

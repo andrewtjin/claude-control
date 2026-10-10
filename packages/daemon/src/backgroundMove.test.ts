@@ -10,13 +10,16 @@ import type { AccountUsageInput } from '@claude-control/usage-advisor';
 import {
   isMoveTarget,
   lineageOf,
+  lockMove,
   moveBackgroundSession,
   sameConfigDir,
   sessionLabel,
   whereRuns,
   type BackgroundSession,
+  type BackgroundSessionHost,
   type MoveRequest,
   type MoveTiming,
+  type SessionLock,
 } from './backgroundMove.js';
 import { FakeBackgroundHost } from './fakeBackgroundHost.js';
 
@@ -700,6 +703,53 @@ describe('where a session runs, and its lineage', () => {
       status: 'idle',
       cwd: 'C:/research',
     });
+  });
+});
+
+describe('lockMove', () => {
+  const ONE = '1ee43a2b-076b-42a1-b487-70a8b77401fa';
+  const TWO = '7a7a7a7a-1111-4222-8333-444444444444';
+  const THREE = 'f38038c6-523b-4be5-9dff-160c472faeb0';
+  const ebusy = (): Error => Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' });
+
+  /** A host whose locks record their release, the ids in `stuck` failing to let go (the way a lock
+   *  directory Windows still holds open fails to be removed), and the ids in `busy` held elsewhere. */
+  function lockHost(stuck: string[], busy: string[] = []) {
+    const released: string[] = [];
+    const host = {
+      lockSession: (id: string): Promise<SessionLock | undefined> =>
+        Promise.resolve(
+          busy.includes(id)
+            ? undefined
+            : {
+                release: () => {
+                  if (stuck.includes(id)) throw ebusy();
+                  released.push(id);
+                },
+              },
+        ),
+    } as unknown as BackgroundSessionHost;
+    return { host, released };
+  }
+
+  it('lets go of every lock even when one cannot be let go, then says which could not', async () => {
+    const { host, released } = lockHost([TWO]);
+    const lock = await lockMove(host, [THREE, ONE, TWO], 0);
+    expect(() => lock!.release()).toThrow(/could not let go of the move lock .*EBUSY/);
+    // Taken in one order, let go in the other: every one but the stuck one is free again.
+    expect(released).toEqual([THREE, ONE]);
+    // Released once, as a whole: a second release does nothing.
+    expect(() => lock!.release()).not.toThrow();
+    expect(released).toEqual([THREE, ONE]);
+  });
+
+  it('a take that cannot have every id lets go of those it took, all of them, and says so if one sticks', async () => {
+    const fine = lockHost([], [THREE]);
+    expect(await lockMove(fine.host, [ONE, TWO, THREE], 0)).toBeUndefined();
+    expect(fine.released).toEqual([TWO, ONE]);
+    const stuck = lockHost([ONE], [THREE]);
+    await expect(lockMove(stuck.host, [ONE, TWO, THREE], 0)).rejects.toThrow(/EBUSY/);
+    expect(stuck.released).toEqual([TWO]);
   });
 });
 

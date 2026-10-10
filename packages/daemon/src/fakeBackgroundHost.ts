@@ -62,6 +62,9 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
   readonly lockedElsewhere = new Set<string>();
   /** Ids whose move lock is held here now, taken and not yet released. */
   readonly heldLocks = new Set<string>();
+  /** Ids whose move lock cannot be let go (its directory still held open): a release throws and
+   *  the lock stays held, as one left on disk does until it lapses. */
+  readonly failRelease = new Set<string>();
   /** Every lock taken and released, in order. */
   readonly locks: string[] = [];
   /** The recoveries a move saved, by the conversation it resumes. */
@@ -338,6 +341,12 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
       release: () => {
         if (released) return;
         released = true;
+        if (this.failRelease.has(sessionId)) {
+          this.locks.push(`stuck ${sessionId}`);
+          throw Object.assign(new Error(`EBUSY: resource busy, rmdir '${sessionId}'`), {
+            code: 'EBUSY',
+          });
+        }
         this.heldLocks.delete(sessionId);
         this.locks.push(`release ${sessionId}`);
       },

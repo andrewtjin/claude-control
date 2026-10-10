@@ -134,7 +134,8 @@ export interface LiveSession {
   cwd?: string;
 }
 
-/** A held move lock for one session. Released exactly once by whoever took it. */
+/** A held move lock for one session. Released exactly once by whoever took it. A release that
+ *  cannot let go of it throws, the lock left to lapse on its own (it is no longer refreshed). */
 export interface SessionLock {
   release(): void;
 }
@@ -472,9 +473,33 @@ export function moveLockIds(ids: Iterable<string | undefined>): string[] {
 }
 
 /**
+ * Let go of held locks, the last taken first, every one of them whatever another does: a lock
+ * whose directory Windows still holds open fails to be removed (EBUSY, ENOTEMPTY), and stopping at
+ * it would keep every lock after it held, refreshed for as long as this process lives. The error
+ * naming each that could not be let go (left on disk, unrefreshed, so it lapses), or undefined.
+ */
+function letGo(held: Array<{ id: string; lock: SessionLock }>): Error | undefined {
+  const stuck: Array<{ id: string; err: unknown }> = [];
+  for (const { id, lock } of held.splice(0).reverse()) {
+    try {
+      lock.release();
+    } catch (err) {
+      stuck.push({ id, err });
+    }
+  }
+  if (stuck.length === 0) return undefined;
+  return new AggregateError(
+    stuck.map((s) => s.err),
+    `could not let go of the move lock on ${stuck.map((s) => `${s.id} (${reasonOf(s.err)})`).join(', ')}`,
+  );
+}
+
+/**
  * Take a session's move lock: the lock of each of its ids (see {@link moveLockIds}), in order, each
  * waited for up to `waitMs`. All or none: when one cannot be had, those taken are let go and this
- * resolves `undefined`. Released once, as a whole.
+ * resolves `undefined`. Released once, as a whole: every lock is let go, and the release throws
+ * afterwards when one could not be (see {@link letGo}); so does a take whose locks could not all be
+ * let go again.
  */
 export async function lockMove(
   host: BackgroundSessionHost,
@@ -484,24 +509,30 @@ export async function lockMove(
   const order = moveLockIds(ids);
   // No id is no lock at all: never resolve one that serializes nothing.
   if (order.length === 0) throw new Error('no session id to take a move lock on');
-  const held: SessionLock[] = [];
-  const releaseAll = (): void => {
-    for (const lock of held.splice(0).reverse()) lock.release();
-  };
-  try {
-    for (const id of order) {
-      const lock = await host.lockSession(id, waitMs);
-      if (lock === undefined) {
-        releaseAll();
-        return undefined;
-      }
-      held.push(lock);
+  const held: Array<{ id: string; lock: SessionLock }> = [];
+  for (const id of order) {
+    let lock: SessionLock | undefined;
+    try {
+      lock = await host.lockSession(id, waitMs);
+    } catch (err) {
+      const stuck = letGo(held);
+      throw stuck === undefined
+        ? err
+        : new AggregateError([err, stuck], `${reasonOf(err)}; ${stuck.message}`);
     }
-  } catch (err) {
-    releaseAll();
-    throw err;
+    if (lock === undefined) {
+      const stuck = letGo(held);
+      if (stuck !== undefined) throw stuck;
+      return undefined;
+    }
+    held.push({ id, lock });
   }
-  return { release: releaseAll };
+  return {
+    release: () => {
+      const stuck = letGo(held);
+      if (stuck !== undefined) throw stuck;
+    },
+  };
 }
 
 /**

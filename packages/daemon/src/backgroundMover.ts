@@ -183,7 +183,16 @@ export class BackgroundMover {
         () => this.lastAttemptAt.set(session.sessionId, this.clock()),
       );
     } finally {
-      lock.release();
+      // A lock that cannot be let go is no reason to lose what the move did, or this cycle's other
+      // sessions: it is no longer refreshed, so it lapses, and the session is skipped until then.
+      try {
+        lock.release();
+      } catch (err) {
+        this.logger.warn(
+          { sessionId: session.sessionId, reason: reasonOf(err) },
+          "could not let go of a background session's move lock; it lapses on its own once no longer refreshed",
+        );
+      }
     }
 
     if (moved.result === 'not-moved' && moved.cause === 'activity') {

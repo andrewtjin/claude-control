@@ -221,7 +221,7 @@ const STOP_EXIT_POLL_MS = 100;
  *  {@link MOVE_LOCK_REFRESH_MS} for as long as it holds it, however long that is (a move that waits
  *  on Claude Code, then the hold until a terminal shows up), so no live holder ever outlives it; a
  *  holder that died is noticed at once by its pid. */
-const MOVE_LOCK_STALE_MS = 2 * 60_000;
+export const MOVE_LOCK_STALE_MS = 2 * 60_000;
 export const MOVE_LOCK_REFRESH_MS = 20_000;
 const MOVE_LOCK_POLL_MS = 250;
 /** How long a process's start time is taken as read (Claude Code keeps its own reads a minute). */

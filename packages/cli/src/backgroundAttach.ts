@@ -62,7 +62,7 @@ import {
   type SessionWhere,
 } from '@claude-control/daemon';
 import type { BackgroundSession } from '@claude-control/daemon';
-import type { ClaudeBackgroundHost } from './backgroundHost.js';
+import { MOVE_LOCK_STALE_MS, type ClaudeBackgroundHost } from './backgroundHost.js';
 
 /** Claude Code's own rule for a job id given to `attach` and its kin: one to eight lowercase hex
  *  digits are always a prefix of a job id, never a name. */
@@ -663,6 +663,31 @@ function onWhat(v: ConfigView): string {
   return v.account !== undefined ? `${v.account} (${v.slot})` : v.slot;
 }
 
+/**
+ * Take a session's move lock (see the daemon's lockMove) as one whose release never throws: a lock
+ * that could not be let go is said once, and lapses on its own (it is no longer refreshed), so
+ * neither what was decided nor the terminal opened after it is lost to it.
+ */
+async function takeMoveLock(
+  ctx: RouteContext,
+  ids: readonly string[],
+  waitMs: number,
+): Promise<SessionLock | undefined> {
+  const lock = await lockMove(ctx.host, ids, waitMs);
+  if (lock === undefined) return undefined;
+  return {
+    release: () => {
+      try {
+        lock.release();
+      } catch (err) {
+        ctx.say(
+          `cctl: ${reasonOf(err)}; it lapses on its own within ${MOVE_LOCK_STALE_MS / 60_000} minutes.`,
+        );
+      }
+    },
+  };
+}
+
 /** The command that brings a session back by hand where a move found it, from the recovery the
  *  move saved (see the daemon's ResumeRecovery): the same in every shell, from any folder. */
 function recoveryHint(recovery: ResumeRecovery): string {
@@ -692,7 +717,7 @@ async function recoverCutOffMove(
   if (!SESSION_ID_PATTERN.test(id)) return undefined;
   const saved = await ctx.host.recoveryOf(id);
   if (saved === undefined) return undefined;
-  const lock = await lockMove(ctx.host, [id], ctx.lockWaitMs);
+  const lock = await takeMoveLock(ctx, [id], ctx.lockWaitMs);
   if (lock === undefined) {
     return {
       kind: 'refuse',
@@ -769,10 +794,10 @@ export async function routeBackgroundLaunch(
   // its own: after /clear the id its job started with and the conversation it runs now differ, and
   // two movers must meet on one of them.
   const lockIds = [...target.known.lineage.ids];
-  let lock = await lockMove(ctx.host, lockIds, 0);
+  let lock = await takeMoveLock(ctx, lockIds, 0);
   if (lock === undefined) {
     ctx.say(`cctl: another cctl process is moving ${label(target)}; waiting for it to finish.`);
-    lock = await lockMove(ctx.host, lockIds, ctx.lockWaitMs);
+    lock = await takeMoveLock(ctx, lockIds, ctx.lockWaitMs);
   }
   if (lock === undefined) {
     return {
