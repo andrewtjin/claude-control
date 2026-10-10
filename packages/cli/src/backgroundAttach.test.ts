@@ -23,6 +23,8 @@ import {
   parseBackgroundRequest,
   routeBackgroundLaunch,
   runHolding,
+  selfRelaunchRefusal,
+  selfRelaunchingWord,
   type BackgroundRequest,
   type RouteContext,
   type RouteDecision,
@@ -714,6 +716,145 @@ describe('parseBackgroundRequest', () => {
     ]) {
       expect({ args, parsed: parseBackgroundRequest(args) }).toEqual({ args, parsed: GUARD });
     }
+  });
+});
+
+describe('selfRelaunchingWord', () => {
+  /** Every option Claude Code 2.1.296's own argument scanner reads a value for: the next word,
+   *  whatever it looks like. Written out here as Claude Code's list, so cctl's own is pinned. */
+  const CLAUDE_CODE_VALUE_OPTIONS = `
+    --add-dir --advisor --agent --agent-color --agent-id --agent-name --agent-type --agents
+    --allowed-tools --allowedTools --append-subagent-system-prompt
+    --append-subagent-system-prompt-file --append-system-prompt --append-system-prompt-file
+    --attach-serve --autocompact --betas --channels --client-data-url --correlation-id
+    --dangerously-load-development-channels --debug-file --deep-link-cwd-b64
+    --deep-link-last-fetch --deep-link-repo --disallowed-tools --disallowedTools --effort
+    --environment --exec --fallback-model --file --forward-home-settings --handle-uri
+    --inherit-permission-mode --input-format --json-schema --managed-settings --max-budget-usd
+    --max-thinking-tokens --max-turns --mcp-config --messaging-socket-path --model --name
+    --on-branch --output-format --parent-session-id --permission-mode --permission-prompt-tool
+    --permission-prompts --plan-mode-instructions --plugin-dir --plugin-dir-no-mcp --plugin-url
+    --pool --prefill --prefill-b64 --proactivity --project-config-root --ref
+    --remote-control-session-name-prefix --resume-drops-turn --resume-session-at --rewind-files
+    --routine --sdk-url --session-id --setting-sources --settings --system-prompt
+    --system-prompt-file --system-prompt-snapshot --task-budget --team-name --teammate-mode
+    --thinking --thinking-display --tools --watch-artifact --watch-artifact-no-autoreact
+    --workload -m -n
+  `
+    .trim()
+    .split(/\s+/);
+
+  it('finds --bg or --background given as the separate value of any option Claude Code reads a value for', () => {
+    expect(CLAUDE_CODE_VALUE_OPTIONS).toHaveLength(84);
+    for (const option of CLAUDE_CODE_VALUE_OPTIONS) {
+      for (const word of ['--bg', '--background']) {
+        for (const args of [
+          [option, word],
+          ['--resume', SID, option, word, 'carry on'],
+          // A background start given as well: the copy it starts still keeps the value.
+          ['--bg', option, word],
+        ]) {
+          expect({ args, found: selfRelaunchingWord(args) }).toEqual({
+            args,
+            found: { word, option },
+          });
+        }
+      }
+    }
+  });
+
+  it('finds one given to a short option at the end of a cluster Claude Code peels', () => {
+    expect(selfRelaunchingWord(['-pn', '--bg'])).toEqual({ word: '--bg', option: '-n' });
+    expect(selfRelaunchingWord(['-cn', '--background'])).toEqual({
+      word: '--background',
+      option: '-n',
+    });
+    expect(selfRelaunchingWord(['-pcm', '--bg'])).toEqual({ word: '--bg', option: '-m' });
+  });
+
+  it('finds --bg or --background after --, as a word of the prompt', () => {
+    for (const [args, word] of [
+      [['--', '--bg'], '--bg'],
+      [['--', '--background'], '--background'],
+      [['--resume', SID, '--', '--bg'], '--bg'],
+      [['hello', '--', 'and', '--background', 'too'], '--background'],
+      [['--bg', '--', '--bg'], '--bg'],
+      [['-p', '--', '--bg'], '--bg'],
+    ] as const) {
+      expect({ args, found: selfRelaunchingWord(args) }).toEqual({ args, found: { word } });
+    }
+  });
+
+  it('passes every background start where the word stands as an option, and attached values', () => {
+    for (const args of [
+      ['--bg'],
+      ['--background'],
+      ['--bg', 'fix the failing test'],
+      ['--bg', 'fix the --bg flag'],
+      ['--', 'explain the --bg flag'],
+      ['--bg', '--resume', SID],
+      // The value attached to its option: the word is no --bg of its own, so no background start.
+      ['--append-system-prompt=--bg'],
+      ['--append-system-prompt=--bg', '--bg', 'hi'],
+      ['--name=--background', '--background'],
+      ['-n--bg'],
+      // Switches: the word after one is an option of its own.
+      ['--verbose', '--bg'],
+      ['--dangerously-skip-permissions', '--bg', 'hi'],
+      ['--fork-session', '--bg'],
+      ['-c', '--bg'],
+      // -p is a switch too: Claude Code takes the --bg after it as a background start.
+      ['-p', '--bg', 'what is in this folder'],
+      ['--print', '--background', 'hi'],
+      // Options whose value is optional never take a word that starts with -.
+      ['--resume', '--bg'],
+      ['-r', '--bg'],
+      ['--resume', SID, '--bg'],
+      ['-d', '--bg'],
+      ['--debug', '--bg'],
+      ['-w', '--bg'],
+      ['--worktree', '--background'],
+      ['--from-pr', '--bg'],
+      ['--remote-control', '--bg'],
+      ['--rc', '--bg'],
+      // A list option's later values never start with -.
+      ['--allowed-tools', 'Read', 'Edit', '--bg'],
+      ['--add-dir', 'a', 'b', '--background'],
+      // The value of an option is the next word whatever it is, so the word after it stands free.
+      ['--name', '--', '--bg'],
+      ['--name', '--model', '--bg'],
+      ['--allowed-tools', '--', '--bg'],
+      // -np names the session "p"; -rn resumes "n": neither takes the next word.
+      ['-np', '--bg'],
+      ['-rn', '--bg'],
+      // An option not known to take a value is read as the option it is.
+      ['--some-later-option', '--bg'],
+      ['--name', 'my session', '--', 'hello'],
+      [],
+    ]) {
+      expect({ args, found: selfRelaunchingWord(args) }).toEqual({ args, found: undefined });
+    }
+  });
+
+  it('says what Claude Code would do and how to write it safely, in two lines', () => {
+    const value = selfRelaunchRefusal({ word: '--bg', option: '--append-system-prompt' });
+    expect(value.split('\n')).toEqual([
+      'Claude Code would treat this as a background launch that keeps re-launching itself ' +
+        '(--bg here is the value of --append-system-prompt).',
+      'Attach the value to its option instead: --append-system-prompt=--bg',
+    ]);
+    // A short option is shown by its long name when it has one, else with the value attached.
+    expect(selfRelaunchRefusal({ word: '--background', option: '-n' })).toContain(
+      'instead: --name=--background',
+    );
+    expect(selfRelaunchRefusal({ word: '--bg', option: '-m' })).toContain('instead: -m--bg');
+    const prompt = selfRelaunchRefusal({ word: '--bg' });
+    expect(prompt.split('\n')).toEqual([
+      'Claude Code would treat this as a background launch that keeps re-launching itself ' +
+        '(--bg here is a word of the prompt, after --).',
+      'Quote the prompt as one argument instead, so --bg is no word of its own: ' +
+        '-- "explain the --bg flag"',
+    ]);
   });
 });
 

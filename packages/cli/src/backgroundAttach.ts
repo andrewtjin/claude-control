@@ -19,7 +19,10 @@
 //   - anything else passed to Claude Code as typed under a config dir X is first checked against
 //     X's rows: a row there for a session live in another service refuses the launch, naming where
 //     the session runs and how to open it safely. Arguments cctl cannot tell are a plain new session
-//     are checked so too, whatever they name.
+//     are checked so too, whatever they name;
+//   - before any of this, arguments Claude Code would take as a background launch that starts copies
+//     of itself without end (`--bg` as an option's value, or after `--`) are refused, and nothing
+//     runs (see selfRelaunchingWord).
 // For one session found:
 //   - it runs where it belongs (the slot of the folder it works in): opened there;
 //   - it runs elsewhere, idle with nothing held and no terminal on that service: moved there by the
@@ -62,7 +65,12 @@ import {
   type SessionWhere,
 } from '@claude-control/daemon';
 import type { BackgroundSession } from '@claude-control/daemon';
-import { MOVE_LOCK_STALE_MS, type ClaudeBackgroundHost } from './backgroundHost.js';
+import {
+  MOVE_LOCK_STALE_MS,
+  SAVED_VALUE_OPTIONS,
+  SHORT_OPTIONS,
+  type ClaudeBackgroundHost,
+} from './backgroundHost.js';
 
 /** Claude Code's own rule for a job id given to `attach` and its kin: one to eight lowercase hex
  *  digits are always a prefix of a job id, never a name. */
@@ -90,6 +98,54 @@ export type BackgroundRequest =
  *  starts a copy of one that runs anywhere; it never opens one in a terminal, so it never takes a
  *  session from the service running it. */
 const BACKGROUND_STARTS: ReadonlySet<string> = new Set(['--bg', '--background']);
+/**
+ * Every option Claude Code reads a value for: the next word, whatever it looks like (`--name --bg`
+ * names the session "--bg"). Its own argument scanner's list (2.1.296): the options it saves and a
+ * move replays (see backgroundHost.ts), the ones it saves but a move never replays, and the ones it
+ * never saves. Options whose value is optional (`--resume`, `-r`, `--debug`, `-d`, `--worktree`,
+ * `-w`, `--from-pr`, `--remote-control`, `--rc`...) are not here: they never take a word that
+ * starts with `-`.
+ */
+const VALUE_OPTIONS: ReadonlySet<string> = new Set([
+  ...SAVED_VALUE_OPTIONS,
+  // Saved too: -n, replayed as --name, and those a move never replays.
+  '-n',
+  '-m',
+  '--exec',
+  '--file',
+  '--rewind-files',
+  '--session-id',
+  // Never saved.
+  '--prefill',
+  '--prefill-b64',
+  '--deep-link-repo',
+  '--deep-link-last-fetch',
+  '--deep-link-cwd-b64',
+  '--handle-uri',
+  '--team-name',
+  '--agent-id',
+  '--agent-name',
+  '--agent-color',
+  '--parent-session-id',
+  '--agent-type',
+  '--dangerously-load-development-channels',
+  '--sdk-url',
+  '--resume-session-at',
+  '--resume-drops-turn',
+  '--workload',
+  '--output-format',
+  '--input-format',
+  '--teammate-mode',
+  '--messaging-socket-path',
+  '--environment',
+  '--pool',
+  '--ref',
+  '--on-branch',
+  '--correlation-id',
+  '--forward-home-settings',
+  '--project-config-root',
+  '--attach-serve',
+]);
 /** Subcommands that stop, remove or restart one session, or all of them. */
 const CONTROL: ReadonlySet<string> = new Set(['stop', 'kill', 'rm', 'respawn']);
 /** Subcommands that reach a job row, or list rows to choose from: never a plain new session. */
@@ -108,6 +164,18 @@ const RESUMING_OPTIONS: readonly string[] = ['--resume', '--continue', '--from-p
 const PEELED: ReadonlySet<string> = new Set(['-c', '-p', '-h', '-v']);
 /** A word that is a cluster of short options. */
 const SHORT_CLUSTER = /^-[A-Za-z]/;
+
+/** A word with the short options Claude Code peels off its front taken off (see {@link PEELED}):
+ *  the letters peeled, in order, and what is left (the word itself when nothing is peeled). */
+function peel(word: string): { peeled: string[]; left: string } {
+  const peeled: string[] = [];
+  let left = word;
+  while (/^-[a-zA-Z]./.test(left) && PEELED.has(left.slice(0, 2))) {
+    peeled.push(left[1]!);
+    left = `-${left.slice(2)}`;
+  }
+  return { peeled, left };
+}
 
 /** The first word after `from` that is not an option, and where it is. */
 function nextWord(
@@ -185,12 +253,9 @@ function readResume(words: readonly string[]): ResumeReading {
       continue;
     }
     // Peeled off its front, then read: what is left may be a resume.
-    let left = word;
-    while (/^-[a-zA-Z]./.test(left) && PEELED.has(left.slice(0, 2))) {
-      if (left[1] === 'c') out.continues = true;
-      if (left[1] === 'h' || left[1] === 'v') out.unplain = true;
-      left = `-${left.slice(2)}`;
-    }
+    const { peeled, left } = peel(word);
+    if (peeled.includes('c')) out.continues = true;
+    if (peeled.includes('h') || peeled.includes('v')) out.unplain = true;
     if (left === '-c') out.continues = true;
     if (left === '-r') {
       const value = optionalAt(i + 1);
@@ -260,6 +325,70 @@ export function parseBackgroundRequest(args: readonly string[]): BackgroundReque
   // A one-shot print run is no terminal to open the session in: it is passed on, checked.
   if (reading.print) return { verb: 'guard', ref: reading.ref };
   return { verb: 'resume', ref: reading.ref, rest: reading.rest };
+}
+
+/** A background word Claude Code would carry into the copy it starts (see
+ *  {@link selfRelaunchingWord}): the separate value of `option`, or, with no option, a word of the
+ *  prompt after `--`. */
+export interface SelfRelaunch {
+  word: string;
+  option?: string;
+}
+
+/**
+ * The word that would make Claude Code start copies of a session without end, if any: `--bg` or
+ * `--background` given as the separate value of an option that takes one, or after `--`. Claude Code
+ * sends a launch to its background launcher when either word is anywhere in its arguments (see
+ * {@link BACKGROUND_STARTS}), but the launcher drops the word only where it stands as an option.
+ * Anywhere else the copy it starts keeps the word, among its saved options or as its prompt, so each
+ * start of that copy by its service goes to the launcher again and starts another (measured, 2.1.296:
+ * over three hundred copies in little more than a minute, until that service was stopped). `args`
+ * are the words Claude Code is given. A short option counts at the end of a cluster Claude Code peels
+ * (`-pn --bg`, as `-p -n --bg`); the word after an option not known to take a value is read as the
+ * option it is.
+ */
+export function selfRelaunchingWord(args: readonly string[]): SelfRelaunch | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i]!;
+    if (word === '--') {
+      const inPrompt = args.slice(i + 1).find((w) => BACKGROUND_STARTS.has(w));
+      return inPrompt !== undefined ? { word: inPrompt } : undefined;
+    }
+    // The option itself, or the short one a cluster ends with once the ones before it are peeled.
+    const option = peel(word).left;
+    if (!VALUE_OPTIONS.has(option)) continue;
+    const value = args[i + 1];
+    if (value !== undefined && BACKGROUND_STARTS.has(value)) return { word: value, option };
+    // The value is the next word whatever it is (`--name --` names the session "--"): it is never
+    // an option, nor the end of them.
+    i++;
+  }
+  return undefined;
+}
+
+/** Why `cctl claude` refuses what {@link selfRelaunchingWord} finds, and how to write it so Claude
+ *  Code reads it as meant: the value in the word of its option, or the prompt in one argument. */
+export function selfRelaunchRefusal(found: SelfRelaunch): string {
+  const what = 'Claude Code would treat this as a background launch that keeps re-launching itself';
+  if (found.option === undefined) {
+    return (
+      `${what} (${found.word} here is a word of the prompt, after --).\n` +
+      `Quote the prompt as one argument instead, so ${found.word} is no word of its own: ` +
+      `-- "explain the ${found.word} flag"`
+    );
+  }
+  return (
+    `${what} (${found.word} here is the value of ${found.option}).\n` +
+    `Attach the value to its option instead: ${attachedValue(found.option, found.word)}`
+  );
+}
+
+/** An option and its value in one word, which Claude Code never takes for a background start: a
+ *  long option with `=`, a short one by its long name when it has one, else with the value right
+ *  after it (`-m--bg`, read as `-m` with the value `--bg`). */
+function attachedValue(option: string, value: string): string {
+  const long = SHORT_OPTIONS.get(option) ?? option;
+  return long.startsWith('--') ? `${long}=${value}` : `${long}${value}`;
 }
 
 /** Where a session belongs: the slot of the folder it works in. */

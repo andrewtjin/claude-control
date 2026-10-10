@@ -1171,6 +1171,34 @@ describe('cctl claude opening a background session', () => {
     expect(bgHost.calls).toEqual([]);
   });
 
+  it('a background launch Claude Code would keep re-launching is refused before anything runs; written safely, it is launched', async () => {
+    ruleOnE();
+    await runsIn(main(), 'idle');
+    for (const [args, safe] of [
+      [['--resume', SID, '--append-system-prompt', '--bg'], '--append-system-prompt=--bg'],
+      [['-r', SID, '--name', '--background'], '--name=--background'],
+      // cctl's own `--` is the first one: this hands Claude Code `-- --bg`.
+      [['--', '--', '--bg'], '-- "explain the --bg flag"'],
+    ] as const) {
+      const r = await launchFrom([...args]);
+      expect({ args, exited: r.exited }).toEqual({ args, exited: true });
+      expect(r.err).toContain('a background launch that keeps re-launching itself');
+      expect(r.err).toContain(safe);
+      expect(launcher.spawnClaude).not.toHaveBeenCalled();
+    }
+    expect(bgHost.built).toBe(0);
+    expect(engine.ensureRuleLive).not.toHaveBeenCalled();
+    expect(engine.activate).not.toHaveBeenCalled();
+
+    const attached = await launchFrom(['--append-system-prompt=--bg', '--bg', 'hi']);
+    expect(attached.exited).toBe(false);
+    expect(attached.args).toEqual(['--append-system-prompt=--bg', '--bg', 'hi']);
+    // A lone leading `--` is cctl's own: Claude Code gets a plain background start.
+    const plain = await launchFrom(['--', '--bg']);
+    expect(plain.exited).toBe(false);
+    expect(plain.args).toEqual(['--bg']);
+  });
+
   it('a resume spelled -r<id> is opened where the session runs; spellings that are no plain resume are checked first', async () => {
     ruleOnE();
     await runsIn(main(), 'busy');

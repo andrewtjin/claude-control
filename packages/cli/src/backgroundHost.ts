@@ -252,9 +252,10 @@ const COPY_STARTED = /started a (?:restricted )?copy(?: of that conversation)? a
  * lists of what it saves, so a row holds only these and their values. Claude Code drops every other
  * word when it saves, the session's first prompt among them, except that every word after an option
  * taking several values is saved as one of its values: that is how Claude Code read them at launch
- * too, so they ARE its values, and a replay keeps them so.
+ * too, so they ARE its values, and a replay keeps them so. `cctl claude` reads its arguments by the
+ * value options too (see backgroundAttach.ts).
  */
-const SAVED_VALUE_OPTIONS: ReadonlySet<string> = new Set([
+export const SAVED_VALUE_OPTIONS: ReadonlySet<string> = new Set([
   '--model',
   '--permission-mode',
   '--inherit-permission-mode',
@@ -334,7 +335,7 @@ const SAVED_SWITCH_OPTIONS: ReadonlySet<string> = new Set([
   '--local',
 ]);
 /** Short spellings Claude Code saves as given, replayed by their long name. */
-const SHORT_OPTIONS: ReadonlyMap<string, string> = new Map([['-n', '--name']]);
+export const SHORT_OPTIONS: ReadonlyMap<string, string> = new Map([['-n', '--name']]);
 /**
  * Saved options a move never replays, so a session saved with one is not moved: replayed on a
  * resume, each would act again at startup (rewind files, download files, run a command, answer on

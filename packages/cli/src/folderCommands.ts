@@ -62,6 +62,8 @@ import {
   parseBackgroundRequest,
   routeBackgroundLaunch,
   runHolding,
+  selfRelaunchRefusal,
+  selfRelaunchingWord,
   type ConfigView,
   type RouteContext,
   type RouteDecision,
@@ -1284,6 +1286,10 @@ async function runClaude(opts: {
   override: boolean;
   args: string[];
 }): Promise<void> {
+  // Refused before anything is read or started, on every platform: Claude Code would start copies
+  // of this session without end (see selfRelaunchingWord).
+  const relaunching = selfRelaunchingWord(opts.args);
+  if (relaunching !== undefined) fail(selfRelaunchRefusal(relaunching));
   const engine = buildEngine();
   const paths = defaultPaths();
   const platform = process.platform;
