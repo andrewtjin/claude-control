@@ -48,6 +48,7 @@ import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
   JOB_ID_PATTERN,
   SESSION_ID_PATTERN,
+  reasonOf,
   type BackgroundSession,
   type BackgroundSessionHost,
   type JobRow,
@@ -1137,8 +1138,7 @@ export function createClaudeBackgroundHost(
         const short = copy[1]!;
         const stopped = await runOk(input.configDir, ['stop', short]).then(
           () => '',
-          (err: unknown) =>
-            `; the copy could not be stopped (${err instanceof Error ? err.message : String(err)})`,
+          (err: unknown) => `; the copy could not be stopped (${reasonOf(err)})`,
         );
         const note = output
           .split(/\r?\n/)
