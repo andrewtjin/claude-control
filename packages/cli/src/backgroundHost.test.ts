@@ -12,7 +12,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { settledWhere, whereRuns } from '@claude-control/daemon';
+import { moveBackgroundSession, settledWhere, whereRuns } from '@claude-control/daemon';
 import { routeBackgroundLaunch, type RouteContext } from './backgroundAttach.js';
 import {
   backgroundHostOptions,
@@ -1421,6 +1421,68 @@ describe('removing a row', () => {
     await expect(refused.host.removeRow(null, SHORT)).rejects.toThrow(
       "claude rm exited 1: No job matching '1ee43a2b'",
     );
+  });
+});
+
+describe('a move, over these reads', () => {
+  it('a stale row elsewhere that reads starting is found before the stop: the session is never stopped', async () => {
+    const ROOT = 'C:/Users/me/AppData/Local/claude-control/profiles';
+    const LIVE_START = '134360864829411286';
+    const { host, runs } = hostWith({
+      profilesRoot: ROOT,
+      files: {
+        [`${MAIN}/daemon/roster.json`]: roster({
+          [SHORT]: { ...worker(SID, 'C:/work', 4242), procStart: LIVE_START },
+        }),
+        [`${MAIN}/jobs/${SHORT}/state.json`]: JSON.stringify({
+          state: 'running',
+          sessionId: SID,
+          cwd: 'C:/work',
+          respawnFlags: [],
+        }),
+        [`${MAIN}/sessions/100.json`]: JSON.stringify({
+          pid: 100,
+          procStart: LIVE_START,
+          sessionId: SID,
+          kind: 'bg',
+          status: 'idle',
+          jobId: SHORT,
+          cwd: 'C:/work',
+        }),
+        // Left by a wake that never finished, under another rule's profile.
+        [`${ROOT}/rule-2/jobs/${SHORT}/state.json`]: JSON.stringify({
+          state: 'starting',
+          sessionId: SID,
+          cwd: 'C:/work',
+        }),
+        [`${PROFILE}/x`]: '',
+      },
+      starts: new Map([
+        [4242, LIVE_START],
+        [100, LIVE_START],
+      ]),
+      answer: (args) =>
+        args[0] === 'agents'
+          ? { code: 0, stdout: JSON.stringify([{ id: SHORT, status: 'idle' }]), stderr: '' }
+          : { code: 0, stdout: '', stderr: '' },
+    });
+    const moved = await moveBackgroundSession(
+      host,
+      {
+        session: { short: SHORT, sessionId: SID, cwd: 'C:/work' },
+        from: { configDir: null, name: 'the global slot' },
+        to: { configDir: PROFILE, name: 'the folder slot' },
+        platform: 'win32',
+      },
+      {
+        clock: () => 0,
+        confirmTimeoutMs: 0,
+        sleep: () => Promise.resolve(),
+        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      },
+    );
+    expect(moved).toMatchObject({ result: 'not-moved', cause: 'starting', final: false });
+    expect(runs.map((r) => r.args[0])).toEqual(['agents']);
   });
 });
 

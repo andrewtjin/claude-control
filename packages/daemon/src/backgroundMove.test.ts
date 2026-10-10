@@ -137,6 +137,28 @@ describe('moveBackgroundSession', () => {
     expect(changes(host)).toEqual([]);
   });
 
+  it('a row of it elsewhere that reads starting holds the move back before anything is stopped', async () => {
+    // A row Claude Code is waking reads starting, and removing it would kill what it starts: the
+    // move would stop the session only to fail on that row and put it back.
+    const host = fakeHost();
+    host.setRow(null, SHORT, {
+      sessionId: SID,
+      state: 'starting',
+      saved: { kind: 'replayable', options: [] },
+    });
+    let committed = false;
+    expect(
+      await moveBackgroundSession(host, REQUEST, timing, () => (committed = true)),
+    ).toMatchObject({
+      result: 'not-moved',
+      cause: 'starting',
+      final: false,
+      reason: 'a job row of it reads starting: Claude Code may be starting it there',
+    });
+    expect(committed).toBe(false);
+    expect(changes(host)).toEqual([]);
+  });
+
   it('two services listing it at once is not known either', async () => {
     const host = fakeHost();
     host.hosted.set(NEW, [S]);

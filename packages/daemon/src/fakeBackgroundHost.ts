@@ -6,10 +6,11 @@
 // options over a row is refused; a first resume in a config dir writes a row saved with the options
 // given; `rm` deletes a row. Like the real host, it never runs an rm Claude Code would turn into a
 // kill or a worktree deletion: it refuses a row that records a worktree, one that cannot be read
-// right now, and one whose session is live or starting anywhere (by the registry, the way Claude
-// Code's rm reaches it, or by any service's roster). Reads can be made verified, as the real host's
-// are: a roster record whose pid was reused is listed only by an unverified read. Each command can
-// be made to fail. Test support only: nothing in the product imports it.
+// right now, one that reads starting, and one whose session is live or starting anywhere (by the
+// registry, the way Claude Code's rm reaches it, or by any service's roster). Reads can be made
+// verified, as the real host's are: a roster record whose pid was reused is listed only by an
+// unverified read. Each command can be made to fail. Test support only: nothing in the product
+// imports it.
 
 import type {
   BackgroundSession,
@@ -317,6 +318,8 @@ export class FakeBackgroundHost implements BackgroundSessionHost {
     if (row.worktreePath !== undefined) {
       throw new Error('it records a worktree, which claude rm would delete');
     }
+    if (row.state === 'starting')
+      throw new Error('its session is starting, and claude rm would kill it');
     // Live by the registry (Claude Code's rm reaches its job id or either of its ids) or starting
     // in any service (listed before its registry entry is written).
     const ids = [row.sessionId, row.resumeSessionId];

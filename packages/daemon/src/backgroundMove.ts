@@ -257,6 +257,9 @@ export type NotMovedCause =
   | 'worktree'
   /** It cannot move without changing (its options), or its row cannot be read right now. */
   | 'options'
+  /** A job row of it reads starting: Claude Code may be waking it there, and removing that row,
+   *  as a move must, would kill what it starts. */
+  | 'starting'
   /** Claude Code keeps another conversation under the job id it would run under after the move. */
   | 'conversations';
 
@@ -755,6 +758,15 @@ async function planMove(
       'it works in a git worktree Claude Code made for it, which Claude Code deletes with the job ' +
         'row a move removes',
       true,
+    );
+  }
+  // A row Claude Code is waking reads starting, and is never removed (`claude rm` would kill what
+  // it starts): found only after the stop, it would fail the move and put the session back, every
+  // time. A stale one holds the move back until it settles.
+  if (mine.some((r) => r.row.state === 'starting')) {
+    throw refuse(
+      'starting',
+      'a job row of it reads starting: Claude Code may be starting it there',
     );
   }
   // A row of it that cannot be read right now could hold anything, a worktree among them.
