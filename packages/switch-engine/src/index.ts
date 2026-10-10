@@ -105,6 +105,7 @@ export {
 export {
   canonicalizeFolder,
   folderKey,
+  folderUniquenessKey,
   isWithin,
   resolveBinding,
   exactBinding,
